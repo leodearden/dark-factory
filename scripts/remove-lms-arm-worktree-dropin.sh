@@ -51,6 +51,16 @@ set -euo pipefail
 # uses them to exercise this script's success path end-to-end against a
 # throwaway systemd template, because a script that runs UNSANDBOXED and
 # UNATTENDED must not have its happy path first execute in production.
+#
+# That guarantee is now MECHANICAL (task 4200).  Until then it rested on an
+# operator remembering to run that .sh -- which nothing ever did, since it was
+# the only .sh among the pytest modules in scripts/tests/ and pytest collects
+# only `test_*.py`.  scripts/tests/test_remove_lms_dropin_wrapper.py is the
+# collected caller that closes that gap: it drives the .sh on every default
+# verify run wherever a systemd --user manager is reachable, and skips cleanly
+# (never errors) where one is not.  So a change to this script that breaks its
+# happy path now turns the suite red before it reaches production, instead of
+# after.
 REPO="${LMS_REPO_ROOT:-/home/leo/src/dark-factory}"
 TEMPLATE="${LMS_UNIT_TEMPLATE:-lms-arm@}"
 DROPIN_NAME="${LMS_DROPIN_NAME:-10-worktree-3713.conf}"

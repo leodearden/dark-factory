@@ -1,0 +1,58 @@
+{
+  "role": "reviewer_comprehensive",
+  "schema_version": 1,
+  "session_id": "",
+  "emitted_at": "2026-07-31T21:56:31.003458+00:00",
+  "verdict": {
+    "reviewer": "reviewer_comprehensive",
+    "verdict": "ISSUES_FOUND",
+    "issues": [
+      {
+        "severity": "medium",
+        "category": "efficiency",
+        "file": "fused-memory/src/fused_memory/server/tools.py",
+        "line": 3827,
+        "title": "get_statuses tool description grew 959 \u2192 8,328 chars, loading ~2k tokens into every agent session",
+        "description": "MEASURED, not estimated: `git show main:...` gives the old get_statuses docstring at 959 chars; instantiating the server and calling `list_tools()` on this branch reports the description at 8,328 chars \u2014 ~10% of the server's entire 86,193-char description budget across all 57 tools, and by far the largest (next largest: search at 1,273, get_tasks at 951, get_task at 149). FastMCP uses `fn.__doc__` as the tool description, so this is shipped in every `tools/list` to every LLM client with fused-memory connected \u2014 every orchestrator-dispatched agent, every reconciliation stage, every interactive session \u2014 not just to callers that use pagination. That is ~1,900 extra tokens of standing context per session, spent on the exact token-limited channel this task exists to economise.\n\nMost of the added text is maintainer-facing, not caller-facing: the 'Scope note \u2014 who actually calls this tool' census of Scheduler/dashboard/census_trigger, the eval-harness FakeMcpClient note, the 'Why page_size is not clamped' rationale, the 'Why only the ids-less path is auto-capped' justification, the parenthetical about deliberately omitting line numbers, and the closing 'rule for future maintainers' invariant. None of that changes what a caller should do; all of it is exactly the kind of content the module already places well in the `_STATUSES_AUTO_PAGE_LIMIT` block comment and the inline comment on the auto branch.\n\nSuggested fix: keep the Args block, the 'Pagination contract' bullets, the one-paragraph auto-pagination description, and the existing shape note in the docstring (~1.5 KB \u2014 comparable to search's 1,273 and proportionate to the tool's complexity); move the caller census, the not-clamped rationale, the ids-path asymmetry argument, and the maintainer invariant into a module-level comment adjacent to `_STATUSES_AUTO_PAGE_LIMIT`, where the incident derivation already lives. Nothing is lost \u2014 the reasoning stays a grep away for the maintainer who needs it, and stops being billed to every agent that doesn't.",
+        "reproduce": "python -c \"import asyncio; from unittest.mock import AsyncMock; from fused_memory.server.tools import create_mcp_server; s=create_mcp_server(AsyncMock(), task_interceptor=AsyncMock()); print([ (t.name, len(t.description or '')) for t in asyncio.run(s.list_tools()) if t.name=='get_statuses'])\"  \u2192  ('get_statuses', 8328)"
+      },
+      {
+        "severity": "low",
+        "category": "correctness",
+        "file": "fused-memory/src/fused_memory/server/tools.py",
+        "line": 3999,
+        "title": "offset is silently ignored when page_size is omitted and the auto branch does not fire",
+        "description": "`get_statuses(project_root=..., offset=1000)` \u2014 no page_size, no auto_paginate \u2014 passes validation, then falls through both pagination branches and returns the FULL map starting at index 0, with no `pagination` key and no error. The caller's offset is silently discarded. Same for `auto_paginate=True, offset=1000` when the population happens to be <= 2000.\n\nNo incorrect data results (the response is complete, so a merging loop still assembles the right census) and it matches get_tasks' pre-existing behaviour, which is why this is low and not a bug. But it sits awkwardly against the invariant this change just codified three paragraphs above it \u2014 'prefer a loud failure the caller can see over a quiet truncation it cannot' \u2014 and against the `offset` Arg's own claim that it is 'Honoured on both paged paths', which is true but does not tell the reader what happens on the third, un-paged path. It is also a shape the Stage 3 prompt makes reachable: the prompt says 'pass page_size and offset on every call', and the auto_paginate livelock test in this very diff is premised on the LLM caller forgetting page_size.\n\nSuggested fix: either reject `offset > 0` with neither `page_size` nor `auto_paginate` as a ValidationError (loud, consistent with the stated invariant), or add one sentence to the `offset` Arg documenting that it is ignored when no page is taken.",
+        "reproduce": "get_statuses(project_root='/project', offset=1000) against a 5-task project returns all 5 statuses (ids 1..5) with keys == {'statuses'} \u2014 the requested offset has no effect and nothing reports that."
+      },
+      {
+        "severity": "low",
+        "category": "documentation",
+        "file": "OPERATIONS.md",
+        "line": 296,
+        "title": "Operator runbook still describes get_statuses with no mention of the fail-closed risk or pagination",
+        "description": "OPERATIONS.md's 'reading live state' tool table still reads: `mcp__fused-memory__get_statuses` | Compact `{id: status}` map \u2014 cheap when you only need status, not full records. That table is the surface an operator (i.e. an interactive LLM session crossing the same token-limited transport that produced this incident) consults before calling the tool by hand on a large project. The Stage 3 prompt and the server-instructions string in tools.py were both updated for the new contract; this one was not, so the runbook still advertises the un-paginated call that fails closed at 5,000+ tasks.\n\nSuggested fix: extend the cell to note `page_size`/`offset` paging and that an un-paginated call on a large project can be rejected wholesale \u2014 one clause, matching the length of the surrounding rows.",
+        "reproduce": "grep -n 'get_statuses' OPERATIONS.md \u2192 line 296, unchanged by this diff."
+      },
+      {
+        "severity": "low",
+        "category": "documentation",
+        "file": "fused-memory/src/fused_memory/reconciliation/prompts/stage3.py",
+        "line": 288,
+        "title": "Stage 3 pseudocode advances by the requested page_size, contradicting the docstring's explicit instruction",
+        "description": "The Stage 3 example loop ends with `offset += 1000` \u2014 the value the caller requested. The tool docstring's pagination contract says the opposite, in bold: 'Advance by `pagination['page_size']` (what was actually served), not by the value you requested.' The prompt is the only place an agent learns the pattern, and it teaches the one the docstring warns against.\n\nHarmless today \u2014 page_size is deliberately not clamped, so served always equals requested \u2014 but the two documents disagree, and the discrepancy becomes a silent gap-skipping bug the moment anyone reconsiders clamping (which the docstring explicitly raises and rejects, so it is a live consideration). Reading the served value costs nothing and makes the example self-consistent.\n\nSuggested fix: `offset += page['pagination']['page_size']` in the pseudocode.",
+        "reproduce": "Compare stage3.py's `offset += 1000` against tools.py get_statuses docstring: 'Advance by ``pagination['page_size']`` (what was actually served), not by the value you requested.'"
+      },
+      {
+        "severity": "low",
+        "category": "robustness",
+        "file": "fused-memory/src/fused_memory/server/tools.py",
+        "line": 699,
+        "title": "_status_page's numeric sort key can still raise ValueError on pathological keys",
+        "description": "The sort key guards with `str(k).lstrip('-').isdigit()` and then calls `int(k)`. Two key shapes pass the guard and raise from `int()`: a double-sign key like `'--5'` (`'--5'.lstrip('-')` == `'5'`, isdigit True, `int('--5')` \u2192 ValueError) and unicode-digit keys such as `'\u00b2'` or `'\u00bd'`-class characters (`'\u00b2'.isdigit()` is True, `int('\u00b2')` \u2192 ValueError).\n\nImpact is genuinely small: `@mcp_tool_errors()` catches it and returns a structured `{'error', 'error_type'}` dict rather than crashing the server, no real task id looks like this, and the ids-less path only ever sees backend-generated ids. But the comment attached to that key states the intent explicitly \u2014 a non-standard backend 'must not blow up the sort ... the real shape problem should surface at the caller' \u2014 and a ValueError raised from inside pagination is exactly the masking failure mode the `str(k)` coercion was added to prevent. The guard covers the AttributeError case it was written for but not its sibling.\n\nSuggested fix: tighten the predicate to `s.isascii() and s.isdigit()` on the stripped string plus a single leading-sign check, or wrap the `int()` in try/except and fall through to the non-numeric bucket.",
+        "reproduce": "from fused_memory.server.tools import _status_page; _status_page({'--5': 'done', '1': 'pending'}, 0, 2) \u2192 ValueError: invalid literal for int() with base 10: '--5'  (same for a '\u00b2' key)"
+      }
+    ],
+    "summary": "Verified the change end-to-end: `fused-memory/tests/test_get_statuses_pagination.py` passes (15 tests), the pre-existing `tests/test_task_tools.py` suite still passes (122 tests) after the `_validate_paging`/`_pagination_meta` extraction, `tests/test_status_envelope_contract.py` still holds, and pyright is clean on both changed files. The Stage 3 prompt renders correctly (doubled braces resolve; the false \"Proven safe on projects with 4500+ tasks\" claim is gone). The core logic is sound: `_status_page` imposes an explicit numeric-aware total order so pages tile without gaps or duplicates over the backend's ORDER BY-less query; `has_more` is derived in one place; the opt-in gate genuinely preserves the complete-census contract for the out-of-process programmatic consumers (Scheduler.get_statuses, dashboard fetch_statuses, census_trigger), which I confirmed reach the tool with `project_root` only; and the ids-filtered path is correctly exempt from the auto-cap, including under `auto_paginate=True`. The accepted residual risk \u2014 an LLM Stage 3 caller that ignores the prompt still fails closed on a large project \u2014 is a deliberate, well-argued design decision (loud failure over silent truncation) and I am not flagging it as a defect. No correctness bugs found. What I did find is one measurable cost regression and four minor issues. The notable one: the `get_statuses` docstring grew from 959 to 8,328 chars, and FastMCP ships it verbatim as the MCP tool description, so ~2k tokens of mostly maintainer-facing rationale now load into every agent session that has fused-memory connected \u2014 a token cost on the very LLM channel this task exists to economise. The rest are a silently-ignored `offset` on the un-paged path, a stale OPERATIONS.md entry, a prompt/docstring mismatch on how to advance the offset, and a residual raise vector in the sort key."
+  }
+}

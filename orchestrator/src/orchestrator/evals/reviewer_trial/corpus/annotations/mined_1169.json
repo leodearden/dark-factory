@@ -40,5 +40,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Stage 1 system prompt: add pre-emission suppression check before writing any stage1_flag_marker for task 452",
+      "description": "Stage 1 (memory_consolidator) must search for active suppression records BEFORE emitting any stage1_flag_marker for task 452. Without this check, Stage 1 may write violating markers even when suppression is active, requiring repeated remediation runs to delete them. Four violations have occurred across cycles 38, 39, 51, and potentially future cycles.",
+      "test_strategy": "",
+      "details": "Root cause: Stage 1 flag-dedup logic writes new markers for tasks without first checking if a suppression record exists that prohibits emission. For task 452 (autopilot_video: 'Investigate 2026-04-21 mass task reset', status=deferred since 2026-04-27), two authoritative suppression memories exist: mem0:87643d99 and mem0:ff84b3fb (autopilot_video project). \n\nFix required: At the start of the flag-emission loop in Stage 1 system prompt, add a step: \"Before writing any stage1_flag_marker, search for active suppression records for the target task_id. If a suppression record exists and the task remains in the suppressed status, skip flag emission.\" This prevents the contamination cycle where Stage 1 writes a violating flag \u2192 Stage 3 detects it \u2192 remediation run deletes it \u2192 next cycle Stage 1 writes it again.\n\nSuppression enforcement memories (autopilot_video project):\n- 87643d99-57b1-40e7-a62c-3b36481bb2cb: STAGE 1 FLAG SUPPRESSION directive for task 452\n- ff84b3fb-715e-4e65-a444-94b3bd2050fa: STAGE 1 FLAG SUPPRESSION UPDATE (cycle-51 violation cleanup)\n\nThe fix applies to the Stage 1 system prompt in the dark-factory reconciliation harness, specifically the pre-emission check step.",
+      "authored": false,
+      "id": "1169",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-09T22:40:59.553Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/src/fused_memory/reconciliation/prompts/stage1.py"
+    ],
+    "base_sha": "cbf00218cc0f6d1d7a837c513410697365354df9",
+    "branch_sha": "1e5994c2011cd270737f36dc8be0c15db113358b",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "7659afed4175b52aa3bcb7c5c6da301930498f8e",
+      "merge_base_sha": "cbf00218cc0f6d1d7a837c513410697365354df9",
+      "diff_reproduces_from": "git diff cbf00218cc 7659afed41",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

@@ -10,7 +10,42 @@
 #
 # It never touches lms-arm@ or any real unit, and cleans up on every exit path.
 #
+# WHO RUNS THIS (task 4200).  Until 4200 nothing did: this was the only .sh
+# among 61 pytest modules in scripts/tests/, and pytest collects only
+# `test_*.py`, so the file sat in the tree checked by nobody.  It is now driven
+# by scripts/tests/test_remove_lms_dropin_wrapper.py, which IS collected by the
+# default suite (`pytest ... scripts/tests/`) and so runs on every verify.
+# It remains directly runnable by hand: `scripts/tests/test_remove_lms_dropin.sh`.
+#
+# LMS_SELFTEST_TEMPLATE is a TEST SEAM, not a tuning knob, and it is
+# LOAD-BEARING rather than cosmetic: a run against the DEFAULT template is NOT
+# SAFE TO EXECUTE CONCURRENTLY.  Every instance would write and `rm` the same
+# absolute unit path under the one shared ~/.config/systemd/user, and case 4's
+# `rm -f "$UNIT"` would tear down a sibling run's fixture mid-test.  Measured
+# under task 4200: two concurrent default-template runs BOTH fail
+# deterministically ("drop-in still present after refusal", "template survives
+# the re-run", and a WorkingDirectory resolving to the OTHER run's mktemp dir).
+# The fleet runs max_concurrent_tasks: 48 against one $HOME, so the wrapper
+# passes a unique per-invocation name through this seam.  Three concurrent runs
+# with distinct templates all pass 12/12.
+#
+# COST, and why the wrapper ALSO serializes.  Distinct names fix the collision
+# above; they do nothing about CONTENTION on the one shared `systemd --user`
+# manager.  MEASURED on the operator host: `systemctl --user daemon-reload` is
+# globally serialized at 0.85-0.94s against 66 unit files, this file performs 3
+# of them and the script under test 2 more, and a solo run costs 5.20s -- so a
+# run is essentially all daemon-reload and its wall clock scales LINEARLY in
+# the number of concurrent runs, unique names or not.  The wrapper therefore
+# holds an flock over ~/.config/systemd/user/.lms-dropin-selftest.lock for the
+# whole cycle, so at most one process on the host drives this file at a time.
+# Running it BY HAND does not take that lock; expect to slow (not break) a
+# concurrent verify if you do.  A by-hand run SIGKILLed before its
+# `trap cleanup EXIT` fires strands the default template's unit and drop-in
+# in ~/.config/systemd/user; the wrapper's prune now reaps that residue after
+# _STALE_AFTER_S instead of leaving it there permanently.
+#
 # Usage: scripts/tests/test_remove_lms_dropin.sh
+#        LMS_SELFTEST_TEMPLATE='lms-dropin-selftest-<unique>@' scripts/tests/test_remove_lms_dropin.sh
 
 set -euo pipefail
 
@@ -18,7 +53,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="$REPO_ROOT/scripts/remove-lms-arm-worktree-dropin.sh"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
-TEMPLATE='lms-dropin-selftest@'
+# This default is now LOAD-BEARING for the Python wrapper, not just a
+# fallback: scripts/tests/test_remove_lms_dropin_wrapper.py::_DEFAULT_TEMPLATE
+# must equal it exactly (pinned by
+# test_default_template_constant_matches_the_shell_default), because that
+# equality is what lets the wrapper's prune reap residue a killed HAND-RUN
+# strands under this literal.  Editing this line without editing the wrapper
+# turns that pin red -- by design.
+TEMPLATE="${LMS_SELFTEST_TEMPLATE:-lms-dropin-selftest@}"
 UNIT="$UNIT_DIR/${TEMPLATE}.service"
 DROPIN_DIR="$UNIT_DIR/${TEMPLATE}.service.d"
 DROPIN="$DROPIN_DIR/10-worktree-3713.conf"

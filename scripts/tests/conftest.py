@@ -13,6 +13,12 @@ modules do. Without this, scripts/ on sys.path alone only makes
 scripts/legibility/ importable as a namespace package (`import legibility`),
 not its contents as bare top-level names.
 
+Also APPENDS scripts/tests/ itself, so non-test helper modules living beside
+the tests (`cli_subprocess_timeout`, `write_triage_attach_fixtures`) resolve
+by bare name: importlib mode keeps a test file's own directory off sys.path.
+Like tests/scripts/conftest.py's `_THIS_DIR` entry, but appended rather than
+inserted, so it can never shadow a scripts/ module or an installed package.
+
 Also home to the shared tasks.db test fixtures (`make_tasks_db`,
 `project_root_with_tasks_db`). Each previously existed as three
 near-identical private copies across the sweep-script test files, under
@@ -23,9 +29,11 @@ auto-resolve for every file in this directory, whereas a `from conftest import
 
 `install_fake_httpx` (task 3376) follows the same convention, collapsing six
 copies of one fake-httpx idiom spread across four of this directory's files.
+
+So do `runs_db_path` / `runs_db` (task 5441): a synthetic orchestrator runs.db
+shared by the model-admission audit and review suites.
 """
 import json
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -51,6 +59,10 @@ _LMS_DIR = _SCRIPTS_DIR / 'local-model-serving'
 if str(_LMS_DIR) not in sys.path:
     sys.path.insert(0, str(_LMS_DIR))
 
+_THIS_DIR = Path(__file__).resolve().parent
+if str(_THIS_DIR) not in sys.path:
+    sys.path.append(str(_THIS_DIR))
+
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  A run rooted at
 # this directory does not load the repo-root conftest.py, so each test-root
 # conftest wires the defence itself.  APPEND the repo root, never
@@ -63,8 +75,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
+    _df_fleet_deploy_clock_redirect,  # noqa: F401  — the binding IS the wiring
     _df_fleet_dir_redirect,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
+    _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     _df_no_leaked_drain_processes,  # noqa: F401  — the binding IS the wiring
     _df_no_synthetic_heartbeats_in_live_fleet,  # noqa: F401  — binding IS wiring
     reject_unsafe_basetemp,
@@ -76,69 +90,59 @@ def pytest_configure(config):
     reject_unsafe_basetemp(config)
 
 
-_FLEET_DEPLOY_CLOCK_ENV = 'ORCH_FLEET_DEPLOY_CLOCK'
+# The fleet-deploy-clock redirect this directory relied on used to be defined
+# HERE (task 3797). It is now the suite-wide default applied unconditionally by
+# df_pytest_isolation._df_deploy_clocks_unwritten, autoused into every conftest
+# that imports this module — not just this one (task 5299). This directory
+# keeps only the thin `_df_fleet_deploy_clock_redirect` NAME above, imported
+# rather than redefined, so `test_suite_never_stamps_the_repo_fleet_deploy_clock`
+# can still take the resolved path by fixture rather than reading os.environ
+# bare. See df_pytest_isolation.py's module docstring, SECOND DEFENCE, for the
+# full history.
 
 
-@pytest.fixture(scope='session', autouse=True)
-def _df_fleet_deploy_clock_redirect(tmp_path_factory):
-    """Point the fleet-deploy clock at a tmp file for this whole session (3797).
+# ---------------------------------------------------------------------------
+# Legibility trickle state isolation (task 4514).
+# ---------------------------------------------------------------------------
 
-    ``scripts/restart-all-orchestrators.sh`` resolves its ``CLOCK_FILE`` from
-    ``$ORCH_FLEET_DEPLOY_CLOCK``, falling back to
-    ``$REPO_DIR/data/orchestrator/last_redeploy_orchestrator.json`` — the
-    LIVE checkout the script sits in. Its exit-0 all-units-verified-fresh path
-    stamps that file unconditionally, and every fake-systemctl test in this
-    directory that drives a successful restart reaches it. The stamp is
-    indistinguishable from a genuine one:
-    ``scripts/orchestrator-watchdog.py`` reads it as "the fleet redeployed at
-    <ts>" and SKIPS its staleness backstop for
-    ``ORCH_RESTART_MIN_INTERVAL_SECS`` (28800s = 8h), so a green test run
-    silently disarms fleet staleness recovery for the rest of the day.
 
-    This is deliberately a conftest fixture rather than an extra assignment
-    inside ``_run_script``. The defect class is "a spawner that forgets the env
-    var", so fixing today's single spawner leaves the hole open for the next
-    one. Every spawner in this directory — present and future — inherits the
-    redirect for free, because a subprocess env built from ``dict(os.environ)``
-    picks it up automatically. A test that wants its OWN clock file still wins:
-    ``_run_script`` applies its ``env=`` overrides after copying ``os.environ``.
+@pytest.fixture(autouse=True)
+def _isolate_legibility_trickle_state(tmp_path_factory, monkeypatch):
+    """Point the legibility trickle state root at a per-test tmp dir.
 
-    SESSION scope for the same two reasons ``_df_git_ceiling_at_basetemp``
-    documents (df_pytest_isolation.py) — cost (an autouse function-scoped
-    fixture runs once per test across ~50 files, times every xdist worker) and
-    coverage (module-/session-scoped fixtures that spawn the script must be
-    covered too).
+    WHAT IT PREVENTS. The operator's LIVE state files for two running
+    pipelines sit at ``~/.local/state/dark-factory/legibility/{dark_factory,
+    reify}/trickle-state.json``, carrying real ``last_productive_at`` stamps
+    and streak history. Before task 4514 this directory isolated itself from
+    them ONLY through ``XDG_STATE_HOME`` — ``test_legibility_nightly.py::
+    _isolate_trickle_state``, ``test_check_trickle_progress.py::_run_probe``
+    and ``::_seed`` (whose default ``project_id`` is the literal
+    ``"dark_factory"``), and ~15 sites in ``test_trickle_state.py``. Task 4514
+    makes ``scripts/legibility/trickle_state.py::trickle_state_path`` stop
+    honouring ``XDG_STATE_HOME`` and ``HOME`` entirely, at which instant every
+    one of those isolations becomes a silent no-op. Each is migrated to the
+    variable set here in the same commit as that change; this autouse fixture
+    is the belt to that pair of braces, catching any site the migration missed
+    and any test added later that forgets.
 
-    One shared file across the session is safe DESPITE being shared, and the
-    distinction matters. It is not that nothing in this directory looks at the
-    clock: ``test_suite_never_stamps_the_repo_fleet_deploy_clock`` reads this
-    very file and asserts its ``{ts, iso}`` body. It is that no test may assert
-    on it ABSOLUTELY — every earlier exit-0 test in the session has already
-    stamped this path, so ``exists()`` and "the body is well-formed" are
-    satisfiable by someone else's stamp. Assertions here must therefore be
-    TIME-RELATIVE: snapshot ``(bytes, st_mtime_ns)`` before spawning and require
-    it to have CHANGED. A test that genuinely needs a pristine per-test clock
-    should not weaken this fixture; it should pass its own via ``_run_script``'s
-    ``env=``, which ``full_env.update(env)`` applies last — the shape
-    ``tests/scripts/test_restart_all_orchestrators.py`` uses, where
-    ``clock_file`` is a required per-test parameter precisely because those
-    suites do assert absolutely.
+    Directory-wide and autouse rather than opt-in, because the failure mode is
+    a test that never says it touches trickle state — a plain ``pytest`` run
+    overwriting the operator's live streak history is data loss, not a dirty
+    tmp dir.
 
-    Restores the previous value EXACTLY on teardown, popping the key when it
-    was absent rather than setting an empty string — an empty
-    ``ORCH_FLEET_DEPLOY_CLOCK`` is not "unset" to the script's ``${VAR:-…}``
-    default, and leaking one would be its own bug.
+    A test that deliberately exercises the DEFAULT (passwd-anchored)
+    resolution must ``monkeypatch.delenv('DARK_FACTORY_LEGIBILITY_STATE_ROOT',
+    raising=False)`` first, and must then assert on the RESOLVED PATH only —
+    never call ``record_run``, which would write to the real file.
+
+    The literal is spelled out rather than imported because this fixture
+    predates the constant it mirrors and must stay inert until that
+    constant exists: ``scripts/legibility/trickle_state.py::STATE_ROOT_ENV``.
     """
-    saved = os.environ.get(_FLEET_DEPLOY_CLOCK_ENV)
-    clock = tmp_path_factory.mktemp('fleet-deploy-clock') / 'last_redeploy_orchestrator.json'
-    os.environ[_FLEET_DEPLOY_CLOCK_ENV] = str(clock)
-    try:
-        yield clock
-    finally:
-        if saved is None:
-            os.environ.pop(_FLEET_DEPLOY_CLOCK_ENV, None)
-        else:
-            os.environ[_FLEET_DEPLOY_CLOCK_ENV] = saved
+    monkeypatch.setenv(
+        'DARK_FACTORY_LEGIBILITY_STATE_ROOT',
+        str(tmp_path_factory.mktemp('legibility-state')),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -330,3 +334,211 @@ def install_fake_httpx(monkeypatch):
         return fake
 
     return _make
+
+
+# ---------------------------------------------------------------------------
+# Shared synthetic runs.db fixtures (task 5441).
+#
+# Moved here from test_audit_model_admission.py so the model-admission audit
+# and review suites seed ONE schema copy through one set of helpers. Fixtures
+# for the same importlib-mode reason as the tasks.db fixtures above.
+#
+# RUNS_DB_SCHEMA is a VERBATIM copy of the three tables those scripts read,
+# captured with
+#
+#     sqlite3 data/orchestrator/runs.db ".schema events invocations account_events"
+#
+# Copied rather than imported because this directory is collected by
+# `uv run --project shared pytest` and imports NO first-party package (the
+# comment on dark-factory-orchestrator.yaml::test_command says so), so the
+# orchestrator's event store, which owns this DDL, is out of reach. Re-capture
+# with that command rather than hand-editing if the writer's schema moves.
+# ---------------------------------------------------------------------------
+
+RUNS_DB_SCHEMA = """
+CREATE TABLE events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL,
+    run_id      TEXT    NOT NULL,
+    task_id     TEXT,
+    event_type  TEXT    NOT NULL,
+    phase       TEXT,
+    role        TEXT,
+    data        TEXT    DEFAULT '{}',
+    cost_usd    REAL,
+    duration_ms INTEGER
+);
+CREATE TABLE invocations (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id              TEXT NOT NULL,
+    task_id             TEXT,
+    project_id          TEXT NOT NULL,
+    account_name        TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    role                TEXT NOT NULL,
+    cost_usd            REAL NOT NULL DEFAULT 0.0,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cache_read_tokens   INTEGER,
+    cache_create_tokens INTEGER,
+    duration_ms         INTEGER NOT NULL DEFAULT 0,
+    capped              INTEGER NOT NULL DEFAULT 0,
+    started_at          TEXT NOT NULL,
+    completed_at        TEXT NOT NULL
+);
+CREATE TABLE account_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_name TEXT NOT NULL,
+    event_type   TEXT NOT NULL,
+    project_id   TEXT,
+    run_id       TEXT,
+    details      TEXT,
+    created_at   TEXT NOT NULL
+);
+"""
+
+
+def _payload(value):
+    """JSON-encode a dict/list payload; pass a str or None through VERBATIM.
+
+    The pass-through is what lets a test seed a deliberately malformed payload
+    — the live store holds an ``account_events.details`` of the bare string
+    ``'Escalation watcher (auto)'`` — so tolerant-parse paths are exercised
+    against the real shape rather than a hypothetical one. Same convention as
+    ``make_tasks_db``'s ``metadata`` handling above.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+class SeedingConnection(sqlite3.Connection):
+    """A real, writable ``sqlite3.Connection`` that can also seed scenario rows.
+
+    Still a Connection, so a test seeds through it and hands the SAME object
+    straight to the scan under test. Each ``seed_*`` inserts one row and
+    commits.
+    """
+
+    def seed_event(
+        self,
+        timestamp,
+        event_type,
+        *,
+        run_id='run-1',
+        task_id=None,
+        phase=None,
+        role=None,
+        data=None,
+        cost_usd=None,
+        duration_ms=None,
+    ):
+        """Insert one `events` row, stating its payload as a dict rather than JSON text."""
+        self.execute(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, role, '
+            'data, cost_usd, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                timestamp,
+                run_id,
+                task_id,
+                event_type,
+                phase,
+                role,
+                _payload({} if data is None else data),
+                cost_usd,
+                duration_ms,
+            ),
+        )
+        self.commit()
+
+    def seed_invocation(
+        self,
+        *,
+        model,
+        role,
+        started_at,
+        completed_at,
+        run_id='run-1',
+        task_id=None,
+        project_id='dark_factory',
+        account_name='max-a',
+        cost_usd=0.0,
+        input_tokens=None,
+        output_tokens=None,
+        cache_read_tokens=None,
+        cache_create_tokens=None,
+        duration_ms=0,
+        capped=0,
+    ):
+        """Insert one `invocations` row."""
+        self.execute(
+            'INSERT INTO invocations (run_id, task_id, project_id, account_name, model, '
+            'role, cost_usd, input_tokens, output_tokens, cache_read_tokens, '
+            'cache_create_tokens, duration_ms, capped, started_at, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                run_id,
+                task_id,
+                project_id,
+                account_name,
+                model,
+                role,
+                cost_usd,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_create_tokens,
+                duration_ms,
+                capped,
+                started_at,
+                completed_at,
+            ),
+        )
+        self.commit()
+
+    def seed_account_event(
+        self,
+        *,
+        account_name,
+        event_type,
+        created_at,
+        details=None,
+        project_id='dark_factory',
+        run_id='run-1',
+    ):
+        """Insert one `account_events` row; *details* follows :func:`_payload`."""
+        self.execute(
+            'INSERT INTO account_events (account_name, event_type, project_id, run_id, '
+            'details, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+            (account_name, event_type, project_id, run_id, _payload(details), created_at),
+        )
+        self.commit()
+
+
+@pytest.fixture
+def runs_db_path(tmp_path):
+    """Path to a fresh, empty runs.db carrying :data:`RUNS_DB_SCHEMA`."""
+    path = tmp_path / 'runs.db'
+    conn = sqlite3.connect(path)
+    try:
+        conn.executescript(RUNS_DB_SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
+@pytest.fixture
+def runs_db(runs_db_path):
+    """A WRITABLE :class:`SeedingConnection` on :func:`runs_db_path`.
+
+    The scans under test take an open connection, so a test normally seeds
+    through this fixture and hands the same connection straight to the function
+    under test. Tests that exercise a read-only connection factory or a CLI take
+    ``runs_db_path`` instead — both name the same file.
+    """
+    conn = sqlite3.connect(runs_db_path, factory=SeedingConnection)
+    try:
+        yield conn
+    finally:
+        conn.close()

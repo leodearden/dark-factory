@@ -38,14 +38,21 @@ logger = logging.getLogger(__name__)
 
 
 # The judge's verdict contract, carried as ``--json-schema`` rather than as prose
-# in JUDGE_SYSTEM_PROMPT.  This placement is load-bearing, not cosmetic:
-# ``build_claude_argv`` emits ``--json-schema`` UNCONDITIONALLY
-# (cli_invoke.py:1552-1553) but DROPS ``--system-prompt-file`` on the resume path
-# (:1501-1503).  A cap-retry resume (:1270-1272) therefore re-invokes the CLI
-# with the schema still attached but the system prompt gone — so a prose-only
-# output contract silently evaporates exactly when the run is already degraded,
+# in JUDGE_SYSTEM_PROMPT.  This placement was load-bearing, not cosmetic, when it
+# was made: ``build_claude_argv``'s ``if output_schema:`` block emitted
+# ``--json-schema`` unconditionally, while its ``--system-prompt-file`` write
+# used to live inside the resume branch's ``else`` and so was DROPPED on
+# resume.  A cap-retry resume therefore re-invoked the CLI with the schema
+# still attached but the system prompt gone — so a prose-only output contract
+# would have silently evaporated exactly when the run was already degraded,
 # which is how a 2026-07-25 cap-storm resume produced conversational prose that
-# _parse_verdict fabricated into a phantom severity=serious project halt.
+# _parse_verdict fabricated into a phantom severity=serious project halt.  Task
+# 3983 has since moved the ``--system-prompt-file`` write ahead of the ``if
+# resume_session_id:`` branch and made it unconditional too (cli_invoke.py), so
+# both the schema and the system prompt now survive every resume — the
+# schema-carried contract stays as the delivery mechanism regardless (see the
+# sibling-convention note below), but the resume-drop asymmetry that
+# originally motivated moving it off prose no longer exists.
 #
 # Both severity enums are DERIVED from VerdictSeverity so the schema and the
 # pydantic field that validates the payload cannot drift.  ``summary`` is
@@ -83,17 +90,16 @@ JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
     },
 }
 
-# max_turns for the judge CLI invocation.  NOT 1: ``max_turns=1`` is incompatible
-# with ``--json-schema`` because the schema mechanism burns a tool-use turn, so
-# the CLI returns ``error_max_turns`` even when the structured payload is already
-# attached (task_curator.py:2366-2372).  3 is the floor both migrated siblings
-# use (curator ``ge=3``, path_scope_adjudicator ``ge=3``): schema tool-use +
-# optional reasoning + final response.  We deliberately do NOT rely on
-# cli_invoke's ``schema_salvaged`` boundary fallback (:1794-1797), which would
-# make every judge run report an internal ``is_error`` and spend its turn on an
-# error path.  Cost/duration exposure stays bounded by
-# ``judge_cli_timeout_seconds`` (validated ≤ stage_timeout_seconds) and
-# cli_invoke's ``max_budget_usd`` default.
+# max_turns for the judge CLI invocation.  Never 1 — see
+# fused-memory/src/fused_memory/reconciliation/agent_loop.py::_AGENT_CLI_MAX_TURNS
+# for why a cap of 1 fails with --json-schema and why schema salvage does not
+# cover it.  3 is the floor both migrated siblings use (curator ``ge=3``,
+# path_scope_adjudicator ``ge=3``).  The judge's own prompt/schema shape has not
+# been measured, so 3 is the established value, not a revalidated one: run
+# fused-memory/scripts/probe_schema_max_turns.py --shape judge before retuning.
+#
+# Cost/duration exposure stays bounded by ``judge_cli_timeout_seconds``
+# (validated ≤ stage_timeout_seconds) and cli_invoke's ``max_budget_usd`` default.
 _JUDGE_CLI_MAX_TURNS = 3
 
 # run_id for the throwaway JudgeVerdict built by _call_judge_cli's validation
@@ -214,8 +220,9 @@ class JudgeInfraError(Exception):
        closes): exit 0, ``is_error=false``, non-zero output tokens, yet
        ``structured_output`` was missing, empty, wrong-typed, unparseable, or
        semantically invalid.  This is the 2026-07-25 cap-resume shape — the
-       resume dropped ``--system-prompt-file`` (cli_invoke.py:1501-1503) and the
-       model answered with conversational prose.  Codes:
+       resume dropped ``--system-prompt-file`` at the time (cli_invoke.py;
+       fixed in task 3983) and the model answered with conversational prose.
+       Codes:
        ``cli_output_empty`` (missing/empty payload) and
        ``cli_output_unparseable`` (wrong-typed, unparseable, or invalid payload).
 
@@ -606,23 +613,23 @@ Review this run and provide your verdict as JSON.
 
         The verdict contract rides ``output_schema=JUDGE_VERDICT_SCHEMA`` rather
         than prose in the system prompt, so it survives every cap-retry resume:
-        ``build_claude_argv`` emits ``--json-schema`` unconditionally
-        (cli_invoke.py:1552-1553) while it drops ``--system-prompt-file`` on the
-        resume path (:1501-1503).
+        ``build_claude_argv``'s ``if output_schema:`` block emits
+        ``--json-schema`` unconditionally, and its ``--system-prompt-file``
+        write now precedes (and is unconditional on) the ``if
+        resume_session_id:`` branch too — both the schema and the system
+        prompt survive every resume (cli_invoke.py, task 3983).
 
-        ``disallowed_tools=['*']`` is still passed VERBATIM.  cli_invoke expands
-        the wildcard into ``_REAL_BUILTIN_TOOLS_DENYLIST`` when a schema is
-        present (:1533-1536) — a list that omits the synthetic
-        ``StructuredOutput`` tool the schema is delivered through — so no real
-        file/bash/web tool access is preserved while the schema tool gets
-        through.  Pre-expanding here would duplicate a list documented as needing
-        to stay in sync with the CLI's built-ins and would skip future central
-        fixes.
+        ``disallowed_tools=['*']`` is still passed VERBATIM.  When a schema is
+        present, cli_invoke replaces the wildcard with ``--tools ''``, the
+        registry filter that leaves only the synthetic ``StructuredOutput`` tool
+        the schema is delivered through.  So no built-in or deferred tool is
+        reachable while the schema tool gets through.  Doing that substitution
+        here would skip future central fixes.
 
         MCP tools are closed SEPARATELY, by ``mcp_config=no_mcp_servers_config()``
-        + ``strict_mcp_config=True``.  The wildcard expansion above covers
-        built-ins ONLY — it carries no MCP tool pattern — so it does NOT deny MCP
-        tools, and ``cwd`` here is the project root, which holds a live
+        + ``strict_mcp_config=True``.  ``--tools ''`` removes built-in and
+        deferred tools but does NOT filter MCP tools, and ``cwd`` here is the
+        project root, which holds a live
         ``.mcp.json`` (servers ``escalation``, ``fused-memory``) that the CLI
         would otherwise ambient-merge and expose under ``bypassPermissions``.
         These two kwargs emit ``--strict-mcp-config`` and scope the run to zero
@@ -645,13 +652,11 @@ Review this run and provide your verdict as JSON.
                 disallowed_tools=['*'],
                 output_schema=JUDGE_VERDICT_SCHEMA,
                 # Closes MCP separately from the wildcard deny above, which the
-                # schema expands into a BUILT-INS-ONLY list. See the docstring:
+                # schema turns into --tools '' (no MCP filter). See the docstring:
                 # must stay truthy, or --strict-mcp-config is never emitted.
                 mcp_config=no_mcp_servers_config(),
                 strict_mcp_config=True,
-                # See _JUDGE_CLI_MAX_TURNS: 1 is incompatible with --json-schema
-                # (the schema mechanism burns a tool-use turn — see
-                # task_curator.py:2366-2372).
+                # See _JUDGE_CLI_MAX_TURNS for why this is not 1.
                 max_turns=_JUDGE_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.judge_cli_timeout_seconds),
@@ -793,11 +798,11 @@ Review this run and provide your verdict as JSON.
         #
         # Schema-tool denial first (CLI 2.1.168 regression guard). The verdict
         # contract now rides --json-schema, which is delivered through the
-        # synthetic ``StructuredOutput`` tool that cli_invoke's wildcard expansion
-        # deliberately omits from _REAL_BUILTIN_TOOLS_DENYLIST (:207-226). If a
+        # synthetic ``StructuredOutput`` tool, the one tool cli_invoke's
+        # ``'*'`` -> ``--tools ''`` substitution keeps in the registry. If a
         # future CLI change starts denying that tool, EVERY judge run is starved
-        # of its verdict, and the remedy is specific (fix the cli_invoke
-        # deny-list) — so it gets its own machine-readable code rather than being
+        # of its verdict, and the remedy is specific (fix that substitution in
+        # build_claude_argv) — so it gets its own machine-readable code rather than being
         # folded into the anonymous UNKNOWN dump below.
         #
         # This is the ONLY branch where the check can fire: cli_invoke sets

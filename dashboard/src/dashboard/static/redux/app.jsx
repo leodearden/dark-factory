@@ -1,11 +1,15 @@
 /* Main app — routes tabs, manages filter state, hosts tweaks */
 const { useState: uS, useEffect: uE } = React;
-const { Rail, StatStrip, Toolbar } = window.DF_SHELL;
+const { Rail, StatStrip, Toolbar, DatumReading } = window.DF_SHELL;
 const { OverviewTab } = window.DF_OVERVIEW;
 const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, EscalationsTab, EscalationAnalyticsTab } = window.DF_TABS;
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
+const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
+const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
+const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
+const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
 const DD = window.DF_DATA;
 
 // Tweaks helpers are attached directly to window
@@ -23,6 +27,23 @@ const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
   "showHints": true
 }/*EDITMODE-END*/;
 
+// The wall clock advances once a second; only the timestamp needs to re-render
+// for it. Owning that interval HERE rather than in App() is what keeps the
+// active tab off the 1s cadence — App re-renders on data arrival (~20/min),
+// not on the clock (~60/min). Measured 2026-09-20: with polling frozen, the
+// clock tick alone still accounted for two thirds of the main thread's blocked
+// time, because no tab is wrapped in React.memo and most memoize nothing.
+// Hoisting a timer back into App() silently restores that cost.
+function LiveClock({ live }) {
+  const [now, setNow] = uS(new Date());
+  uE(() => {
+    if (!live) return;
+    const t = setInterval(() => setNow(new Date()), 1000);
+    return () => clearInterval(t);
+  }, [live]);
+  return <>{now.toLocaleTimeString('en-GB', { hour12: false })}</>;
+}
+
 function App() {
   const [tab, setTab] = uS('overview');
   // Cross-tab handoff for the memory-eval escalation links. The SPA has no
@@ -33,7 +54,7 @@ function App() {
   const [tw, setTw] = useTweaks ? useTweaks(TWEAK_DEFAULTS) : [TWEAK_DEFAULTS, () => {}];
 
   // Filter state — per tab
-  const [win, setWin] = uS('24h');
+  const [win, setWin] = uS(CHIP_DEFAULT_WINDOW);
   const [projects, setProjects] = uS([]);     // [] = all
   const [agents, setAgents] = uS([]);
   const [search, setSearch] = uS('');
@@ -49,14 +70,6 @@ function App() {
     document.documentElement.style.setProperty('--pad', tw.density === 'compact' ? '8px' : tw.density === 'roomy' ? '16px' : '12px');
   }, [tw.density]);
 
-  // Last-update tick
-  const [now, setNow] = uS(new Date());
-  uE(() => {
-    if (tw.pauseLive) return;
-    const t = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(t);
-  }, [tw.pauseLive]);
-
   // Re-render when the data loader refreshes window.DF_DATA.
   const [, setDataTick] = uS(0);
   uE(() => {
@@ -69,6 +82,12 @@ function App() {
   uE(() => {
     window.__DF_PAUSE = !!tw.pauseLive;
   }, [tw.pauseLive]);
+
+  // Re-validate the window on every tab switch, whichever path switched it: a
+  // chip tab that does not offer the current window resets it.
+  uE(() => {
+    setWin(w => windowForTab(tab, w));
+  }, [tab]);
 
   // Re-fetch with the new window when the chip changes. Unwindowed endpoints
   // ignore ?window= silently, so passing it from chip-less tabs is harmless.
@@ -93,26 +112,51 @@ function App() {
   ];
   const tabLabel = tabs.find(t => t.id === tab)?.label || 'Overview';
 
+  // ONE census binding feeds both the topbar pill and the rail badge, so the
+  // two cannot show different in-flight numbers.
+  const tasksCensus = censusOver(DD, null);
+
   // Topbar status summary — all derived from real data.  `spend24h` is the
   // current-day total from COSTS.summary.today (server-computed from the
   // cost trend tail).  Falls back to 0 if cost data hasn't loaded yet.
   const summary = {
     orchRunning: DD.ORCHESTRATORS.filter(o => o.running).length,
     orchTotal: DD.ORCHESTRATORS.length,
-    tasksActive: DD.ORCHESTRATORS.reduce((s, o) => s + o.summary.in_progress + o.summary.blocked, 0),
+    tasks: <DatumReading datum={tasksCensus} format={runningOfInFlight} />,
     queue: DD.MEMORY_STATUS.queue.counts.pending,
     spend24h: DD.COSTS?.summary?.today ?? 0,
   };
 
   const railCounts = {
     orch: summary.orchRunning,
-    tasks: DD.ACTIVE_TASKS.filter(t => t.status === 'in-progress' || t.status === 'blocked' || t.status === 'pending').length,
-    recon: DD.RECON_STATE.runs.filter(r => r.status === 'failed' || r.status === 'partial').length,
+    tasks: <DatumReading datum={tasksCensus} format={inFlightCountReading} />,
+    // Runs an operator should go and look at: failures, plus any row whose
+    // status recon_status.js does not recognise, so vocabulary drift is
+    // visible from the rail and not only from the tab. 'interrupted' is
+    // excluded — this fleet is restarted routinely, so those rows would sit
+    // the badge permanently nonzero on a healthy system. In-flight runs get
+    // their own tile on the tab rather than inflating this number.
+    recon: reconAttentionCount(reconRunCounts(DD.RECON_STATE.runs)),
     merge: Object.values(DD.MERGE_QUEUE).reduce((s, d) => s + d.active.length, 0),
     esc: DD.ESCALATIONS?.summary?.by_status?.pending ?? 0,
   };
 
-  const ts = now.toLocaleTimeString('en-GB', { hour12: false });
+  // Per-endpoint staleness for the ACTIVE tab (task 4884, #4791).
+  //
+  // ONE render site, not thirteen: the tab -> endpoint mapping lives in
+  // endpoint_staleness.js::TAB_ENDPOINTS, so adding a tab is a one-line edit
+  // there, and endpoint_staleness.test.mjs fails loudly if a mapped endpoint
+  // stops existing or a tab id goes unmapped. The per-tab toolbar config map
+  // further down this function is the sibling per-tab map; keep the two
+  // tab-id lists in step. (Spelled out rather than naming that binding,
+  // because test_tab_escalation_analytics.py locates it by splitting this
+  // source on the bare identifier — a second mention would shift its slice.)
+  //
+  // No new timer and no second listener: the df-data-refresh effect above
+  // already re-renders every poll cycle, so the reported age advances on its
+  // own. The wall clock is deliberately NOT a second source of App renders —
+  // it lives in LiveClock, whose 1s tick re-renders the timestamp alone.
+  const staleNotices = staleNoticesForTab({ tab, stale: DD.__stale || {}, now: Date.now() });
 
   function renderTab() {
     switch (tab) {
@@ -133,31 +177,26 @@ function App() {
     }
   }
 
-  // Per-tab toolbar config.
-  //
-  // showWindow / windows are scoped per Option-A "honest scoping": the chip
-  // appears only on tabs whose endpoints actually consume ?window=, and the
-  // chip set is restricted to values the server maps. Specifically:
-  //   - Costs / Performance / Merge / Overview-cost-spark obey app.py's
-  //     _WINDOW_DAYS = {24h, 7d, 30d, all} — no 1h, no 90d.
-  //   - Burndown obeys _BURNDOWN_WINDOWS = {24h, 7d, 30d, 90d} — no all.
-  const WIN_DEFAULT  = ['24h', '7d', '30d', 'all'];
-  const WIN_BURNDOWN = ['24h', '7d', '30d', '90d'];
+  // Per-tab toolbar config. Which tabs carry the window chip, and which
+  // windows each offers, is window_chip.js's TAB_WINDOWS.
   const toolbarConfig = {
-    overview: { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    orch:     { showWindow: false,                        showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
-    tasks:     { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
-    scheduler: { showWindow: false, showProjects: false,    showAgents: false, search: false },
-    curator:  { showWindow: false,                        showAgents: false, search: false },
-    perf:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    memory:   { showWindow: false,                        showAgents: true,  search: false },
-    recon:    { showWindow: false,                        showAgents: false, search: true,  searchPlaceholder: 'Search runs…' },
-    merge:    { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    cost:     { showWindow: true,  windows: WIN_DEFAULT,  showAgents: false, search: false },
-    burn:     { showWindow: true,  windows: WIN_BURNDOWN, showAgents: false, search: false },
-    esc:      { showWindow: false,                        showAgents: false, search: false },
-    'esc-analytics': { showWindow: false,                 showAgents: false, search: false },
+    overview:  { showAgents: false, search: false },
+    orch:      { showAgents: true,  search: true,  searchPlaceholder: 'Search tasks…' },
+    tasks:     { showAgents: false, search: true,  searchPlaceholder: 'Search tasks…' },
+    scheduler: { showProjects: false, showAgents: false, search: false },
+    curator:   { showAgents: false, search: false },
+    perf:      { showAgents: false, search: false },
+    memory:    { showAgents: true,  search: false },
+    recon:     { showAgents: false, search: true,  searchPlaceholder: 'Search runs…' },
+    merge:     { showAgents: false, search: false },
+    cost:      { showAgents: false, search: false },
+    burn:      { showAgents: false, search: false },
+    esc:       { showAgents: false, search: false },
+    'esc-analytics': { showAgents: false, search: false },
   }[tab] || {};
+  const chip = CHIP_TAB_WINDOWS[tab];
+  const chipEcho = chip ? windowEcho(DD.__receipt, chip.endpoint) : null;
+  const pending = chip ? pendingWindow(win, chipEcho, chip.windows) : null;
 
   return (
     <div className="app" data-density={tw.density}>
@@ -168,13 +207,14 @@ function App() {
           <span style={{ color: 'var(--fg-3)' }}>/</span>
           <span className="here">{tabLabel}</span>
         </div>
-        <StatStrip live={!tw.pauseLive} lastUpdate={ts} summary={summary} />
+        <StatStrip live={!tw.pauseLive} lastUpdate={<LiveClock live={!tw.pauseLive} />} summary={summary} />
       </div>
       <div className="main">
         <Toolbar
-          window={win} onWindow={setWin}
-          showWindow={toolbarConfig.showWindow !== false}
-          windows={toolbarConfig.windows}
+          showWindow={!!chip}
+          windows={chip?.windows}
+          window={chip ? highlightedWindow(chipEcho, chip.windows) : null}
+          onWindow={setWin}
           showProjects={toolbarConfig.showProjects !== false}
           projects={projects} onProjects={setProjects}
           agents={agents} onAgents={setAgents}
@@ -183,13 +223,39 @@ function App() {
           onSearch={toolbarConfig.search ? setSearch : undefined}
           searchPlaceholder={toolbarConfig.searchPlaceholder}
           extra={
-            <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
-              className="multi" style={{ cursor: 'pointer' }}>
-              {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
-            </button>
+            <>
+              {pending && (
+                <span title="chosen, not yet served" style={{ color: 'var(--fg-3)', fontSize: 11 }}>
+                  {pending} pending
+                </span>
+              )}
+              <button onClick={() => setTw('pauseLive', !tw.pauseLive)}
+                className="multi" style={{ cursor: 'pointer' }}>
+                {tw.pauseLive ? '▶ resume' : '❚❚ pause live'}
+              </button>
+            </>
           }
         />
         <div className="body" key={tab}>
+          {/* ADDITIVE, never a replacement: renderTab() below stays
+              unconditional so the last-good payload refreshOne deliberately
+              preserved stays on screen — marked as old, not blanked. */}
+          {staleNotices.map(notice => (
+            <div key={notice.path} className="col-span-12"
+                 data-testid="endpoint-stale-banner"
+                 style={{
+                   padding: '8px 12px',
+                   border: '1px solid var(--line)',
+                   borderLeft: '3px solid var(--warn)',
+                   borderRadius: 4,
+                   background: 'var(--bg-2)',
+                   color: 'var(--fg-3)',
+                   fontFamily: 'var(--mono)',
+                   fontSize: 11,
+                 }}>
+              {notice.text}
+            </div>
+          ))}
           {renderTab()}
         </div>
       </div>

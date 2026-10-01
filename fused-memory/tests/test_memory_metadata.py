@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 from fused_memory.config.schema import _default_topic_guard_clusters
 from fused_memory.memory_metadata import (
@@ -334,21 +335,15 @@ class TestKeyLayers:
         `tests/test_tag_cgl_eta_rehome_scope.py:309` needs no edit, while
         identity proves the extraction left one object rather than two.
         """
-        import importlib.util
-        import sys
-
         from fused_memory.backends import mem0_client
 
         script_path = Path(__file__).parent.parent / 'scripts' / 'tag_cgl_eta_rehome_scope.py'
-        spec = importlib.util.spec_from_file_location('tag_cgl_eta_rehome_scope', script_path)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        sys.modules['tag_cgl_eta_rehome_scope'] = module
-        try:
-            spec.loader.exec_module(module)
-            assert module._MEM0_MANAGED_METADATA_KEYS is mem0_client.MEM0_MANAGED_METADATA_KEYS
-        finally:
-            sys.modules.pop('tag_cgl_eta_rehome_scope', None)
+        # Left installed rather than popped in `finally`: the key is shared
+        # with test_tag_cgl_eta_rehome_scope.py, whose module-level `_mod`
+        # holds a live reference to it, so evicting it here is what forced a
+        # later load to exec a second copy (task 3895).
+        module = load_script_module(script_path, mod_name='tag_cgl_eta_rehome_scope')
+        assert module._MEM0_MANAGED_METADATA_KEYS is mem0_client.MEM0_MANAGED_METADATA_KEYS
 
     def test_server_stamped_keys(self):
         from fused_memory.memory_metadata import SERVER_STAMPED_KEYS
@@ -364,7 +359,18 @@ class TestKeyLayers:
                            # :2962). Included so a round-tripped search result
                            # re-written as metadata does not census-warn on the
                            # server's own field.
+            'unverified_claim',  # stamped by MemoryService.add_memory when the
+                                 # completion-claim gate flags a write (task 4715).
         }) == SERVER_STAMPED_KEYS
+
+    def test_unverified_claim_tag_is_a_server_stamped_key(self):
+        from fused_memory.memory_metadata import SERVER_STAMPED_KEYS, classify_unknown_keys
+        from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
+
+        assert UNVERIFIED_CLAIM_TAG in SERVER_STAMPED_KEYS
+        assert classify_unknown_keys(
+            {UNVERIFIED_CLAIM_TAG: True, 'category': 'procedural_knowledge'},
+        ) == []
 
     def test_reserved_vocabulary_keys(self):
         from fused_memory.memory_metadata import RESERVED_VOCABULARY_KEYS

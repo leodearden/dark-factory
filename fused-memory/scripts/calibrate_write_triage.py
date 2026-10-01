@@ -50,11 +50,18 @@ Qdrant.
 
 Usage
 -----
-  # Report only (default): measure, derive, write the report, change nothing.
+  # Full run: re-derives the bands into the report, which config.yaml contradicts until --write-config.
   python scripts/calibrate_write_triage.py --project-id reify
 
   # Also write the derived thresholds into config.yaml's write_triage block.
   python scripts/calibrate_write_triage.py --project-id reify --write-config
+
+  # Regenerate the committed report: production recall re-measured, bands of record carried.
+  python scripts/calibrate_write_triage.py --project-id reify --retrieval production \\
+      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
+      --bands-from calibration/write_triage_calibration_report.json \\
+      --report-path calibration/write_triage_calibration_report.json \\
+      --k 1 --k 3 --k 5 --k 10 --k 20 --k 50
 """
 from __future__ import annotations
 
@@ -125,6 +132,35 @@ def load_fixture(path: str | Path) -> list[dict[str, Any]]:
                 raise ValueError(f'{path}:{lineno}: expected a JSON object, got {type(record).__name__}')
             records.append(record)
     return records
+
+
+def load_canonical_aliases(path: str | Path) -> dict[str, str]:
+    """Read the ``{old_cluster_canonical_id: current_memory_id}`` alias map.
+
+    Resolves a rotated-canonical corpus gap: a fixture's ``cluster_id``
+    that no longer exists in the live store because the cluster was
+    re-consolidated under a new id. The map is external, hand-verified
+    data (each entry's target must be confirmed live before it is trusted
+    — see the calibration run's provenance/summary for that evidence), not
+    something this script derives.
+
+    Strict like ``load_fixture``: a malformed file raises rather than
+    silently degrading to an empty map, which would make ``--canonical-
+    aliases`` a silent no-op indistinguishable from "nothing to resolve".
+    """
+    path = Path(path)
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f'{path}: malformed JSON: {exc}') from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f'{path}: expected a JSON object, got {type(raw).__name__}')
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError(
+                f'{path}: alias entries must be str -> str, got {key!r} -> {value!r}',
+            )
+    return dict(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -410,20 +446,59 @@ def derive_bands(
 # Candidate-retrieval recall
 # ---------------------------------------------------------------------------
 
+def _first_match_rank(
+    candidates: Sequence[str],
+    match_ids: frozenset[str],
+    candidate_parents: Mapping[str, str],
+) -> int:
+    """1-based rank of the first *candidates* entry that reaches *match_ids*.
+
+    A candidate reaches *match_ids* by its own id, or — when
+    *candidate_parents* carries an entry for it — by the id it hoists to.
+    ``candidate_parents`` mirrors production's
+    ``write_triage.py::_canonical_id_of``: a sighting/amendment child is
+    counted as reaching whatever its ``metadata.parent_id`` resolves to,
+    the same hoist a live triaged write gets credit for. Returns -1 if no
+    candidate reaches *match_ids*.
+    """
+    for rank, candidate_id in enumerate(candidates, start=1):
+        if candidate_id in match_ids or candidate_parents.get(candidate_id) in match_ids:
+            return rank
+    return -1
+
+
 def compute_recall_at_k(
     retrievals: Sequence[dict[str, Any]],
     ks: Sequence[int],
+    aliases: Mapping[str, str] | None = None,
+    *,
+    count_absent_as_miss: bool = False,
 ) -> dict[str, Any]:
     """Measure how often the existing search surfaces the ground-truth canonical.
 
     Each retrieval carries ``memory_id``, ``canonical_id``,
-    ``canonical_present`` and the ranked ``candidates`` search returned.
+    ``canonical_present``, the ranked ``candidates`` search returned, and
+    optionally ``candidate_parents`` (candidate id -> the parent it hoists to).
 
-    Retrievals whose canonical is not in the corpus are listed under
-    ``canonical_absent`` and dropped from the denominator. The session's
-    duplicates were deleted, so an absent canonical is a CORPUS GAP rather
-    than a retrieval failure; scoring it as a miss would understate recall
-    and could push T_low lower than the evidence supports.
+    A candidate REACHES the canonical by its own id or by the parent
+    ``candidate_parents`` hoists it to. That is production's attach rule
+    (``write_triage.py::_canonical_id_of``), so it holds whatever the two
+    independent choices below are:
+
+    - ``aliases`` ({old_canonical: current_id}) also lets a candidate reach an
+      absent canonical's rotated successor, directly or through a child.
+    - ``count_absent_as_miss`` picks the population. False (default): a
+      retrieval whose canonical is not in the corpus is listed under
+      ``canonical_absent`` and DROPPED from the denominator. A session's
+      duplicates were deleted, so an absent canonical is a CORPUS GAP rather
+      than a retrieval failure when nothing resolves it; scoring it as a miss
+      would understate recall and could push T_low lower than the evidence
+      supports. True: every retrieval is scored, and an absent canonical is a
+      miss unless an alias or a hoisted child reaches it.
+
+    ``canonical_absent`` is always populated from the raw ``canonical_present``
+    flag (informational), independent of which population is scored;
+    ``absent_in_denominator`` says which population that was.
 
     An empty denominator reports ``recall=None``, not ``0.0`` — no
     measurement is not a measured zero.
@@ -431,9 +506,10 @@ def compute_recall_at_k(
     scorable: list[dict[str, Any]] = []
     absent: list[dict[str, str]] = []
     for item in retrievals:
-        if item.get('canonical_present'):
+        present = bool(item.get('canonical_present'))
+        if present or count_absent_as_miss:
             scorable.append(item)
-        else:
+        if not present:
             absent.append({
                 'memory_id': str(item.get('memory_id')),
                 'canonical_id': str(item.get('canonical_id')),
@@ -441,10 +517,17 @@ def compute_recall_at_k(
 
     per_k: list[dict[str, Any]] = []
     for k in ks:
-        hits = sum(
-            1 for item in scorable
-            if item['canonical_id'] in list(item.get('candidates') or [])[:k]
-        )
+        hits = 0
+        for item in scorable:
+            canonical_id = item['canonical_id']
+            match_ids = {canonical_id}
+            alias = aliases.get(canonical_id) if aliases is not None else None
+            if alias:
+                match_ids.add(alias)
+            candidates = list(item.get('candidates') or [])[:k]
+            parents = item.get('candidate_parents') or {}
+            if _first_match_rank(candidates, frozenset(match_ids), parents) != -1:
+                hits += 1
         total = len(scorable)
         per_k.append({
             'k': k,
@@ -453,7 +536,49 @@ def compute_recall_at_k(
             'recall': (hits / total) if total else None,
         })
 
-    return {'per_k': per_k, 'canonical_absent': absent}
+    return {
+        'per_k': per_k,
+        'canonical_absent': absent,
+        'absent_in_denominator': count_absent_as_miss,
+    }
+
+
+def compute_first_hit_ranks(
+    retrievals: Sequence[dict[str, Any]],
+    aliases: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Per-record rank at which its canonical first appears, or -1.
+
+    Reached by :func:`compute_recall_at_k`'s rule: the candidate's own id, or
+    the parent ``candidate_parents`` hoists it to. ``rank`` reaches the
+    canonical alone.
+
+    ``alias_id`` / ``rank_with_aliases`` are present only for a record whose
+    ``canonical_id`` has an entry in *aliases*: ``rank_with_aliases`` is the
+    first rank reaching the canonical or its alias.
+
+    Both ranks are 1-based; -1 means the ranked candidates never reach it.
+    """
+    aliases = dict(aliases or {})
+    rows: list[dict[str, Any]] = []
+    for item in retrievals:
+        canonical_id = item['canonical_id']
+        candidates = list(item.get('candidates') or [])
+        parents = item.get('candidate_parents') or {}
+        row: dict[str, Any] = {
+            'memory_id': item['memory_id'],
+            'canonical_id': canonical_id,
+            'canonical_present': bool(item.get('canonical_present')),
+            'rank': _first_match_rank(candidates, frozenset({canonical_id}), parents),
+        }
+        alias = aliases.get(canonical_id)
+        if alias is not None:
+            row['alias_id'] = alias
+            row['rank_with_aliases'] = _first_match_rank(
+                candidates, frozenset({canonical_id, alias}), parents,
+            )
+        rows.append(row)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -972,13 +1097,18 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f'| {entry["pooled_t_high_negatives_admitted"]} '
                 f'| {entry["reason"] or ""} |',
             )
+    recall = report['recall_at_k']
     lines += ['', '## Candidate-retrieval recall', '',
               '| k | hits | total | recall |', '|---|---|---|---|']
-    for row in report['recall_at_k'].get('per_k', []):
+    for row in recall.get('per_k', []):
         lines.append(f'| {row["k"]} | {row["hits"]} | {row["total"]} | {row["recall"]} |')
-    absent = report['recall_at_k'].get('canonical_absent') or []
-    lines += ['', f'Canonicals absent from the corpus (excluded from the denominator): '
-                  f'{len(absent)}', '', '## Provenance', '']
+    absent = recall.get('canonical_absent') or []
+    population = (
+        'counted in the denominator; each is a miss unless an alias or a hoisted child '
+        'reaches it' if recall['absent_in_denominator'] else 'excluded from the denominator'
+    )
+    lines += ['', f'Canonicals absent from the corpus ({population}): {len(absent)}',
+              '', '## Provenance', '']
     for key, value in report['provenance'].items():
         lines.append(f'- `{key}`: `{value}`')
     return '\n'.join(lines) + '\n'
@@ -991,17 +1121,24 @@ def run_calibration(
     report_path: str | Path,
     ks: Sequence[int],
     provenance: dict[str, Any],
+    aliases: Mapping[str, str] | None = None,
+    count_absent_as_miss: bool = False,
 ) -> dict[str, Any]:
     """Measure, derive, and write the report. Never writes config.
 
     ``embed_fn(memory_id, content)`` is called exactly ONCE per distinct
     record — embedding per pair would multiply API cost by O(n).
-    ``search_fn(record, k)`` returns ``{candidates, canonical_present}``.
+    ``search_fn(record, k)`` returns ``{candidates, canonical_present}``,
+    plus optionally ``candidate_parents`` (see ``compute_recall_at_k``) and
+    ``degraded`` (see ``fetch_recall_hit``).
 
     Neither callable's failure is caught. A swallowed embed error would
     silently shrink the measured population, producing a report whose
     thresholds look fine but were computed on a subset; a swallowed search
     error would be indistinguishable from a genuine recall miss.
+
+    ``aliases`` and ``count_absent_as_miss`` are recall's two independent
+    choices; see :func:`compute_recall_at_k`.
     """
     vectors = {r['memory_id']: embed_fn(r['memory_id'], r['content']) for r in records}
     logger.info('Embedded %d distinct record(s)', len(vectors))
@@ -1038,19 +1175,9 @@ def run_calibration(
         if entry['reason']:
             logger.warning('Category %s: %s', category, entry['reason'])
 
-    max_k = max(ks) if ks else 0
-    retrievals = []
-    for record in records:
-        if record['label'] == LABEL_CANONICAL:
-            continue
-        hit = search_fn(record, max_k)
-        retrievals.append({
-            'memory_id': record['memory_id'],
-            'canonical_id': record['cluster_id'],
-            'canonical_present': bool(hit.get('canonical_present')),
-            'candidates': list(hit.get('candidates') or []),
-        })
-    recall = compute_recall_at_k(retrievals, list(ks))
+    recall, retrievals, degraded_count = _measure_recall(
+        records, search_fn, ks, aliases, count_absent_as_miss,
+    )
 
     per_category_record_counts: dict[str, int] = {}
     for record in records:
@@ -1065,28 +1192,211 @@ def run_calibration(
     run_provenance.setdefault('cluster_count', len({r['cluster_id'] for r in records}))
     run_provenance.setdefault('per_category_record_counts', per_category_record_counts)
     run_provenance.setdefault('cross_category_dropped', partition['cross_category_dropped'])
+    run_provenance.setdefault('degraded_retrievals', degraded_count)
     report = build_report(
         scores_by_class=scores_by_class, t_high=t_high, t_low=t_low,
         reason=reason, recall=recall, provenance=run_provenance,
         per_category=per_category,
     )
+    _write_report(report, report_path)
 
+    return {
+        'report': report, 'scores_by_class': scores_by_class,
+        't_high': t_high, 't_low': t_low, 'reason': reason,
+        'config_written': False, 'retrievals': retrievals,
+    }
+
+
+#: The provenance keys that describe how the BANDS were measured. A
+#: recall-only run carries these from its base report and re-measures the rest.
+BAND_PROVENANCE_KEYS = (
+    'fixture_path', 'embedder_model', 'embedder_dimensions', 'record_count',
+    'cluster_count', 'per_category_record_counts', 'cross_category_dropped',
+    'pair_counts', 'per_category_pair_counts',
+)
+
+
+def remeasure_recall(
+    base_report: Mapping[str, Any],
+    records: list[dict[str, Any]],
+    search_fn: Any,
+    report_path: str | Path,
+    ks: Sequence[int],
+    provenance: Mapping[str, Any],
+    bands_from: str | Path,
+    aliases: Mapping[str, str] | None = None,
+    count_absent_as_miss: bool = False,
+) -> dict[str, Any]:
+    """Re-measure recall alone, carrying *base_report*'s band section verbatim.
+
+    Recall comes from the live store and the bands from embedded fixture
+    pairs, so recall can be re-measured without re-deriving thresholds away
+    from the ones config.yaml deploys (PRD D2). Never embeds; never writes
+    config. *provenance* is this run's, and its band-side keys yield to the
+    base's.
+    """
+    base_provenance = base_report['provenance']
+    if base_provenance.get('fixture_path') != provenance['fixture_path']:
+        raise ValueError(
+            f'{bands_from} measured its bands on {base_provenance.get("fixture_path")!r}, '
+            f'but this run loads {provenance["fixture_path"]!r}',
+        )
+    if base_provenance.get('record_count') != len(records):
+        raise ValueError(
+            f'{bands_from} measured its bands on {base_provenance.get("record_count")} '
+            f'records, but this run loads {len(records)}',
+        )
+
+    recall, retrievals, degraded_count = _measure_recall(
+        records, search_fn, ks, aliases, count_absent_as_miss,
+    )
+    carried = {k: v for k, v in base_provenance.items() if k in BAND_PROVENANCE_KEYS}
+    recall_side = {k: v for k, v in provenance.items() if k not in BAND_PROVENANCE_KEYS}
+    report = {
+        **base_report,
+        'recall_at_k': recall,
+        'provenance': carried | recall_side | {
+            'degraded_retrievals': degraded_count,
+            'bands_from': package_relative(bands_from),
+        },
+    }
+    _write_report(report, report_path)
+    return {'report': report, 'retrievals': retrievals}
+
+
+def _measure_recall(
+    records: list[dict[str, Any]],
+    search_fn: Any,
+    ks: Sequence[int],
+    aliases: Mapping[str, str] | None,
+    count_absent_as_miss: bool,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    """Search each non-canonical record once at ``max(ks)``; score recall@k.
+
+    Returns the recall section, the raw retrievals and the degraded count.
+    """
+    max_k = max(ks) if ks else 0
+    retrievals = []
+    for record in records:
+        if record['label'] == LABEL_CANONICAL:
+            continue
+        hit = search_fn(record, max_k)
+        retrievals.append({
+            'memory_id': record['memory_id'],
+            'canonical_id': record['cluster_id'],
+            'canonical_present': bool(hit.get('canonical_present')),
+            'candidates': list(hit.get('candidates') or []),
+            'candidate_parents': dict(hit.get('candidate_parents') or {}),
+            'degraded': bool(hit.get('degraded')),
+        })
+    degraded = [r['memory_id'] for r in retrievals if r['degraded']]
+    if degraded:
+        logger.warning(
+            '%d retrieval(s) came back DEGRADED, so each scores as a recall miss that '
+            'measured nothing: %s', len(degraded), ', '.join(degraded),
+        )
+    recall = compute_recall_at_k(
+        retrievals, list(ks), aliases=aliases, count_absent_as_miss=count_absent_as_miss,
+    )
+    return recall, retrievals, len(degraded)
+
+
+def _write_report(report: dict[str, Any], report_path: str | Path) -> None:
+    """The JSON report and its rendered .md sibling, written from one dict."""
     report_path = Path(report_path)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     report_path.with_suffix('.md').write_text(render_markdown(report))
     logger.info('Wrote %s and its .md sibling', report_path)
 
-    return {
-        'report': report, 'scores_by_class': scores_by_class,
-        't_high': t_high, 't_low': t_low, 'reason': reason,
-        'config_written': False,
-    }
-
 
 # ---------------------------------------------------------------------------
 # Live edge / CLI
 # ---------------------------------------------------------------------------
+
+RETRIEVAL_LEGACY = 'legacy'
+RETRIEVAL_PRODUCTION = 'production'
+
+#: Each ``--retrieval`` mode, and the search call provenance names for it.
+RETRIEVAL_CALLS = {
+    RETRIEVAL_LEGACY: "fused_memory.services.memory_service::MemoryService.search(stores=['mem0'])",
+    RETRIEVAL_PRODUCTION: 'fused_memory.server.write_triage::retrieve_candidates',
+}
+RETRIEVAL_MODES = tuple(RETRIEVAL_CALLS)
+
+
+def _require_retrieval_mode(retrieval_mode: str) -> None:
+    if retrieval_mode not in RETRIEVAL_CALLS:
+        raise ValueError(
+            f'unknown --retrieval mode {retrieval_mode!r}; expected one of {RETRIEVAL_MODES}',
+        )
+
+
+def recall_provenance(
+    *,
+    project_id: str,
+    retrieval_mode: str,
+    canonical_aliases_path: str | Path | None,
+    aliases: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    """The recall side of a report's provenance.
+
+    It names the search call rather than restating its kwargs, so the record
+    cannot drift from what the call actually sends.
+    """
+    _require_retrieval_mode(retrieval_mode)
+    return {
+        'project_id': project_id,
+        'retrieval_mode': retrieval_mode,
+        'retrieval_call': RETRIEVAL_CALLS[retrieval_mode],
+        'canonical_aliases_path': (
+            package_relative(canonical_aliases_path) if canonical_aliases_path else None
+        ),
+        'canonical_aliases_count': len(aliases) if aliases else 0,
+    }
+
+
+async def fetch_recall_hit(
+    memory_service: Any,
+    record: Mapping[str, Any],
+    *,
+    project_id: str,
+    k: int,
+    retrieval_mode: str,
+) -> dict[str, Any]:
+    """One record's search as *retrieval_mode* makes it, plus its canonical's liveness.
+
+    Returns the ranked candidate ids, the parent each sighting/amendment
+    candidate hoists to (the attach target production would use), whether the
+    canonical is live, and whether the search came back degraded.
+    """
+    _require_retrieval_mode(retrieval_mode)
+    from fused_memory.server.write_triage import (  # noqa: PLC0415
+        _canonical_id_of,
+        retrieve_candidates,
+    )
+
+    if retrieval_mode == RETRIEVAL_PRODUCTION:
+        rows = await retrieve_candidates(memory_service, record['content'], project_id, k)
+    else:
+        # stores=['mem0'] is load-bearing: unscoped, the read router sends this
+        # corpus's queries to graphiti alone, whose edge UUIDs never equal a
+        # mem0 memory_id (measured: 0/6 canonicals in top-10 vs 4/6 scoped).
+        rows = await memory_service.search(
+            query=record['content'], project_id=project_id, limit=k, stores=['mem0'],
+        )
+    degraded = bool(getattr(rows, 'degraded', False))
+    return {
+        'candidates': [row.id for row in rows],
+        'candidate_parents': {
+            row.id: hoisted for row in rows if (hoisted := _canonical_id_of(row)) != row.id
+        },
+        'canonical_present': (
+            await memory_service.get_memory_by_id(project_id, record['cluster_id']) is not None
+        ),
+        'degraded': degraded,
+    }
+
 
 def build_embed_fn(config: Any) -> Any:
     """Mirror Mem0's own embedder wiring — model + api_key, NO dimensions.
@@ -1123,46 +1433,23 @@ async def _run(args: Any) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
+    aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else None
+    # The CLI's one policy coupling: resolving rotated canonicals is what
+    # makes the full population honest to score.
+    count_absent_as_miss = aliases is not None
+    recall_side = recall_provenance(
+        project_id=args.project_id, retrieval_mode=args.retrieval,
+        canonical_aliases_path=args.canonical_aliases, aliases=aliases,
+    )
+    # Read before anything is written: regenerating the base in place is the norm.
+    base_report = json.loads(Path(args.bands_from).read_text()) if args.bands_from else None
+
     config = FusedMemoryConfig()
     memory = MemoryService(config)
     await memory.initialize()
     try:
         records = load_fixture(args.fixture)
         logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
-
-        embed_fn = build_embed_fn(config)
-
-        async def _search_async(record: dict, k: int) -> dict:
-            # stores=['mem0'] is load-bearing, not a narrowing convenience.
-            # An unscoped MemoryService.search runs the read ROUTER first, and
-            # for this corpus the router sends every fixture query to graphiti
-            # alone — so the top-k comes back full of graphiti edge UUIDs,
-            # which can never equal a mem0 memory_id, and recall reads ~0 for
-            # reasons that have nothing to do with retrieval quality.
-            # Write triage's candidate set is the mem0/Qdrant neighbourhood
-            # (near_duplicate_guard searches mem0; the 21 canonicals live in
-            # the fused_reify Qdrant collection), so mem0 is the store whose
-            # recall the bands actually depend on. Measured on a 6-record
-            # probe: 0/6 canonicals in top-10 unscoped vs 4/6 scoped to mem0.
-            results = await memory.search(
-                query=record['content'], project_id=args.project_id, limit=k,
-                stores=['mem0'],
-            )
-            rows = results.get('results', results) if isinstance(results, dict) else results
-            # MemoryService.search returns pydantic MemoryResult rows, not dicts.
-            candidates = [
-                str(r['id'] if isinstance(r, dict) else r.id) for r in rows or []
-            ]
-            canonical = await memory.get_memory_by_id(
-                args.project_id, record['cluster_id'],
-            )
-            if canonical is None:
-                present = False
-            elif isinstance(canonical, dict):
-                present = bool(canonical.get('found', True))
-            else:
-                present = bool(getattr(canonical, 'found', True))
-            return {'candidates': candidates, 'canonical_present': present}
 
         # Pre-resolve retrievals on this loop, then hand run_calibration a
         # plain lookup — keeps the orchestrator fully synchronous and
@@ -1171,31 +1458,54 @@ async def _run(args: Any) -> int:
         prefetched: dict[str, dict] = {}
         for record in records:
             if record['label'] != LABEL_CANONICAL:
-                prefetched[record['memory_id']] = await _search_async(record, max_k)
+                prefetched[record['memory_id']] = await fetch_recall_hit(
+                    memory, record, project_id=args.project_id, k=max_k,
+                    retrieval_mode=args.retrieval,
+                )
 
-        result = run_calibration(
-            records=records,
-            embed_fn=embed_fn,
-            search_fn=lambda record, k: prefetched[record['memory_id']],
-            report_path=args.report_path,
-            ks=args.k,
-            provenance={
-                'fixture_path': package_relative(args.fixture),
-                'project_id': args.project_id,
-                'embedder_model': config.embedder.model,
-                'embedder_dimensions': getattr(config.embedder, 'dimensions', None),
-                'search_stores': 'mem0 (MemoryService.search, stores=[mem0])',
-                'search_categories': 'all',
-            },
-        )
+        def search_fn(record: dict, k: int) -> dict:
+            return prefetched[record['memory_id']]
 
-        print(json.dumps(result['report'], indent=2))
+        provenance = {
+            'fixture_path': package_relative(args.fixture),
+            'embedder_model': config.embedder.model,
+            'embedder_dimensions': getattr(config.embedder, 'dimensions', None),
+            **recall_side,
+        }
+        if base_report is not None:
+            result = remeasure_recall(
+                base_report=base_report, records=records, search_fn=search_fn,
+                report_path=args.report_path, ks=args.k, provenance=provenance,
+                bands_from=args.bands_from, aliases=aliases,
+                count_absent_as_miss=count_absent_as_miss,
+            )
+        else:
+            result = run_calibration(
+                records=records, embed_fn=build_embed_fn(config), search_fn=search_fn,
+                report_path=args.report_path, ks=args.k, provenance=provenance,
+                aliases=aliases, count_absent_as_miss=count_absent_as_miss,
+            )
+
+        if args.ranks_path:
+            ranks = compute_first_hit_ranks(result['retrievals'], aliases=aliases)
+            ranks_path = Path(args.ranks_path)
+            ranks_path.parent.mkdir(parents=True, exist_ok=True)
+            ranks_path.write_text(
+                '\n'.join(json.dumps(row) for row in ranks) + ('\n' if ranks else ''),
+            )
+            logger.info('Wrote %d rank row(s) to %s', len(ranks), ranks_path)
+
+        report = result['report']
+        print(json.dumps(report, indent=2))
         logger.info(
             't_high=%s t_low=%s deterministic-band false positives=%s',
-            result['t_high'], result['t_low'],
-            result['report']['deterministic_band_false_positives'],
+            report['chosen_t_high'], report['chosen_t_low'],
+            report['deterministic_band_false_positives'],
         )
 
+        if args.bands_from:
+            logger.info('Recall only — bands carried from %s; config unchanged.', args.bands_from)
+            return 0
         if not args.write_config:
             logger.info('Report only — config unchanged. Use --write-config to commit.')
             return 0
@@ -1258,9 +1568,30 @@ def main() -> int:
         repo / 'calibration' / 'write_triage_calibration_report.json'))
     parser.add_argument('--config', default=None,
                         help='Path to fused-memory config file (sets CONFIG_PATH)')
-    parser.add_argument('--write-config', dest='write_config', action='store_true',
-                        help='Write the derived thresholds into config.yaml '
-                             '(default: report only)')
+    outcome = parser.add_mutually_exclusive_group()
+    outcome.add_argument('--write-config', dest='write_config', action='store_true',
+                         help='Write the derived thresholds into config.yaml '
+                              '(default: report only)')
+    outcome.add_argument('--bands-from', dest='bands_from', default=None,
+                         help='Recall-only: re-measure recall_at_k and carry this '
+                              "report's band section verbatim, with no embedding and no "
+                              'new thresholds. See remeasure_recall.')
+    parser.add_argument('--retrieval', choices=RETRIEVAL_MODES, default=RETRIEVAL_LEGACY,
+                        help="'production' calls write_triage.py::retrieve_candidates, the "
+                             "search a live triaged write makes; 'legacy' (default) is the "
+                             'older MemoryService.search(stores=[mem0]) shape, kept to '
+                             'reproduce historical reports.')
+    parser.add_argument('--canonical-aliases', dest='canonical_aliases', default=None,
+                        help='Path to a JSON {old_cluster_canonical_id: current_memory_id} '
+                             'map resolving rotated canonicals. When given, recall is '
+                             'measured against the full population (absent canonicals '
+                             'counted, reached through their alias) instead of the '
+                             'legacy present-only population.')
+    parser.add_argument('--ranks-path', dest='ranks_path', default=None,
+                        help='Optional path to write one JSON line per non-canonical '
+                             'record: the rank at which its canonical (or, with '
+                             '--canonical-aliases, its alias) is first reached, '
+                             'or -1. See compute_first_hit_ranks.')
     args = parser.parse_args()
     if not args.k:
         args.k = [1, 3, 5, 10]

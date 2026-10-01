@@ -77,7 +77,7 @@ async def drive_verify_and_advance(
             task_id=_req_for_factory.task_id,
         )
 
-    lease = await allocator.acquire(_local_factory)
+    lease = await allocator.acquire(_local_factory, policy='prefer_local')
     if lease is None:
         # Fallback: force-acquire the local slot (harness path; no competing
         # acquirers in direct-call tests).

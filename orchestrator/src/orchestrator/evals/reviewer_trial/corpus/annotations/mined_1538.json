@@ -32,5 +32,41 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "OCCT throttle L3: dashboard Host load card with live values + 5-min sparklines",
+      "description": "Frontend card in the dashboard's redux SPA rendering the host load metrics with live values + 5-min sparklines. Polls `/api/load` (\u03b6) every 5 s.\n\nImplementation:\n- Add a new card section \"Host load\" to `dashboard/src/dashboard/static/redux/tab_overview.jsx` (tactical: implementer may instead create `tab_load.jsx` per PRD open question 2; default is overview-tab extension).\n- One row per metric showing:\n  - Formatted current value:\n    - PSI metrics: percentage with two decimals (`12.34%`) and \"some/full\" label.\n    - `verify_rss_total_bytes`: GiB with one decimal (`2.3 GiB`).\n    - `occt_queue_depth`, `verify_concurrency`: integer.\n  - 5-min sparkline (reuse existing sparkline component from `charts.jsx`).\n- Empty-data state shows `\u2014` not synthetic data (per feedback_redux_no_synthetic_data).\n- Restart the dashboard after deploying (per feedback_dashboard_restart_after_backend_merge); document this in the task's done-note.\n- Frontend tests in `dashboard/tests/` covering: card renders with empty data; card renders with populated data; polling triggers re-fetch (mocked).\n\nPRD: dark-factory/plans/occt-throttle-layer-2-3.md task \u03b7\nUser-observable signal (LEAF for Unit 2): Firefox at `http://localhost:<dash-port>/redux` shows a \"Host load\" card on the overview tab. Each metric row renders the formatted current value per metric type and a sparkline whose data points correspond to the last 60 samples (sparkline path is non-empty SVG when \u2265 2 samples exist; values may be zero on an idle host but the rendering is non-stub). Under verify load induced during testing (run reify `verify.sh all` in a loop for 60 s) the sparklines visibly rise. Two screenshots \u2014 idle baseline and induced-load \u2014 are the close criterion, paired with a network-trace observation that `/api/load` is being polled every 5 s.\nConsumer: end user (dashboard operator diagnosing host load).\nModules touched: dashboard/src/dashboard/static/redux/tab_overview.jsx (or new tab_load.jsx), dashboard/src/dashboard/static/redux/charts.jsx (reuse), dashboard/tests/\n\nBrowser-cache caveat: Firefox caches dashboard HTML/JS aggressively (feedback_browser_cache_firefox); ?v=N bumps may not suffice \u2014 Ctrl+Shift+R during local validation.",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "1538",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-05-28T14:02:52.467Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "dashboard/src/dashboard/static/redux/index.html",
+      "dashboard/src/dashboard/static/redux/tab_overview.jsx"
+    ],
+    "base_sha": "8153424e859f512d66072e31c35fddc7c8f6d0de",
+    "branch_sha": "d7159145ebce5e9386fdd0b9110180982fa8ed0f",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "4682aca54a8c08baabbb1ad3634790048b442703",
+      "merge_base_sha": "3bfec255400d63fefb89b90a460b78cdc96e1e8a",
+      "diff_reproduces_from": "git diff 8153424e85 4682aca54a",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

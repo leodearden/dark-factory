@@ -57,6 +57,24 @@ CLAUDE_CLI_RESPONSE_SCHEMA = {
     'required': ['thinking', 'tool_calls'],
 }
 
+# max_turns for ONE reconciliation-agent CLI invocation.  It caps a single
+# assistant round-trip, not the conversation: AgentLoop.run() drives multi-turn
+# externally, one _call_claude_cli per outer step (bounded by
+# ``agent_max_steps``), threaded with ``resume_session_id``.
+#
+# Never 1.  With --json-schema the model emits a prose turn before it calls
+# ``StructuredOutput``, and a cap of 1 leaves no room for it: the CLI returns
+# ``error_max_turns``, which in the measured runs carried no structured payload,
+# so schema salvage had nothing to recover and the call failed.  That is
+# measured CLI behaviour, not a guarantee — the rates, sample sizes and CLI
+# versions are recorded only in fused-memory/scripts/probe_schema_max_turns.py;
+# re-run it rather than trusting a number copied elsewhere.
+#
+# 10 over-provisions deliberately: max_turns is a ceiling, not a target, and
+# spend stays bounded by cli_invoke's ``max_budget_usd`` and
+# ``agent_cli_timeout_seconds``.
+_AGENT_CLI_MAX_TURNS = 10
+
 
 class CircuitBreakerError(Exception):
     """Raised when mutation count exceeds the per-stage limit."""
@@ -405,17 +423,14 @@ class AgentLoop:
                 output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
                 disallowed_tools=['*'],
                 # Closes MCP separately from the wildcard deny above, which the
-                # schema expands into a BUILT-INS-ONLY list. Must stay truthy, or
+                # schema turns into --tools '' (no MCP filter). Must stay truthy, or
                 # --strict-mcp-config is never emitted (build_claude_argv gates it
                 # on `if mcp_config:`).
                 mcp_config=no_mcp_servers_config(),
                 strict_mcp_config=True,
                 model=self.config.agent_llm_model,
-                # max_turns=1: AgentLoop.run() drives multi-turn externally by calling
-                # _call_claude_cli again with resume_session_id.  A single CLI
-                # invocation only needs one assistant turn (schema tool-use → JSON
-                # response happens within the same turn when --json-schema is used).
-                max_turns=1,
+                # See _AGENT_CLI_MAX_TURNS for why this is not 1.
+                max_turns=_AGENT_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.agent_cli_timeout_seconds),
                 resume_session_id=self._cli_session_id,
@@ -454,9 +469,9 @@ class AgentLoop:
                 # This cwd is a project root and may hold a live .mcp.json, which
                 # bypassPermissions would otherwise let the CLI ambient-merge and
                 # expose unreviewed. disallowed_tools=['*'] above does NOT cover
-                # that: with output_schema set, cli_invoke expands the wildcard
-                # into _REAL_BUILTIN_TOOLS_DENYLIST, a BUILT-INS-ONLY list that
-                # carries no MCP tool pattern. MCP tools are closed SEPARATELY,
+                # that: with output_schema set, cli_invoke turns the wildcard
+                # into --tools '', which removes built-in and deferred tools but
+                # does not filter MCP. MCP tools are closed SEPARATELY,
                 # by the mcp_config=no_mcp_servers_config() + strict_mcp_config=True
                 # pair above — which must stay truthy, since --strict-mcp-config is
                 # emitted only inside build_claude_argv's `if mcp_config:` block.
@@ -475,8 +490,11 @@ class AgentLoop:
             )
 
             if not result.success:
-                # schema_salvaged=True implies success=True (cli_invoke.py:749-751),
-                # so `not result.success` is the complete failure guard.
+                # schema_salvaged=True implies success=True (see the
+                # ``schema_salvaged`` assignment in cli_invoke's CLI result
+                # parser), so `not result.success` is the complete failure guard.
+                # Salvage is not the backstop here (see _AGENT_CLI_MAX_TURNS):
+                # this guard is what fires on an ``error_max_turns`` failure.
                 raise RuntimeError(build_failure_message('Claude CLI agent', result))
         except Exception:
             # Clear stale session id so callers that retry don't --resume an abandoned session.

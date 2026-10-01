@@ -69,6 +69,13 @@ _WATCHDOG_POLL_SECS = 5.0
 # Minimum poll duration — prevents the poll from degenerating to 0.0 when both
 # time_to_grace and time_to_ceiling have already elapsed (would otherwise cause an
 # asyncio.wait(timeout=0) tight-spin hammering count_transcript_turns).
+# Task 3925 did NOT retire this floor — it changed the shape of the failure the
+# floor prevents.  The transcript reads now run in the default executor
+# (asyncio.to_thread), so a degenerate 0.0 poll no longer blocks the event loop
+# inline; instead it floods that executor with queued whole-file transcript
+# parses.  That is arguably worse: the pool is process-wide and shared by every
+# concurrent agent, so one spinning watchdog starves every other role's offload
+# (and the loop still burns a full core scheduling the hops).  Keep the floor.
 _WATCHDOG_MIN_POLL_SECS = 0.01
 # Coarse poll cadence for the WORKING-regime progress extension (task 2360).
 # Once seen_turn latches AND working_idle_secs/absolute_cap_secs are both set,
@@ -85,6 +92,14 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 # 60s per poll) and, in the startup regime, would fire ~15s after spawn — inside
 # the MCP-init window a healthy stage routinely spends before the CLI writes its
 # first record.  See `note_unreadable_transcript`.
+# Saturation alarm for the off-loop transcript reads (task 3925).  A read that
+# takes this long is not "a big transcript" — a 1.0-1.3 MB parse is ~10-30ms —
+# it means the shared default ThreadPoolExecutor is backed up, which delays the
+# watchdog's kill decisions by however long the pool made the read wait.
+# Deliberately a FLAT threshold rather than "longer than the poll interval":
+# the working-regime poll is 60s, so a poll-relative yardstick would mask a 5s
+# read that already indicates a badly saturated executor.
+_WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # Per-caller cap-wait policy (post-1365 audit, task 1401)
 # ─────────────────────────────────────────────────────────────────────────────
 # _DEFAULT_CAP_WAIT_SANITY_SECS (14 days) is inherited by callers that do NOT
@@ -180,6 +195,77 @@ _WATCHDOG_WORKING_POLL_SECS = 60.0
 # wrapper, where a wait in before_invoke is definitionally a cap wait and can
 # be attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
 # pool from a slow agent and would misattribute the latter.
+#
+# AUDITED NON-CALLERS (task 4736).  A caller that deliberately does NOT route
+# through invoke_with_cap_retry still gets a row, so the next investigator
+# finds an audit ANSWER here rather than an absence and re-derives nothing.
+#
+# Caller                                  Policy / WHY
+# ───────────────────────────────────────────────────────────────────────────
+# scripts/legibility/coder.py             DELIBERATE NON-CALLER — no
+#   (nightly legibility trickle, spawned  cap_wait_sanity_secs, because there
+#    via scripts/legibility/nightly.py)   is no cap WAIT to bound.  Its
+#                                         contract is IMMEDIATE defer/taint,
+#                                         in the shape of evals/runner.py's
+#                                         `cap_exhausted:` marker above: a
+#                                         capped digest is EXCLUDED (labelled
+#                                         CoderCapExhausted, tallied into
+#                                         RunResult.capped, no record
+#                                         fabricated), and a majority-capped
+#                                         storm defers the whole night at
+#                                         exit 0 (coder.is_cap_deferral).
+#                                         Three measured reasons, not an
+#                                         omission:
+#                                         (1) the systemd unit runs `uv run
+#                                             --frozen --project shared python
+#                                             scripts/legibility/nightly.py`;
+#                                             under that interpreter `import
+#                                             orchestrator` resolves to a
+#                                             NAMESPACE package with
+#                                             __file__ is None, so
+#                                             OrchestratorConfig is
+#                                             unreachable — and the unit
+#                                             exports none of the
+#                                             `oauth_token_env` vars named in
+#                                             config/usage-accounts.yaml, so a
+#                                             UsageGate built here would
+#                                             resolve only the single default
+#                                             ~/.claude/.credentials.json
+#                                             credential.  One account: no
+#                                             failover target to wait FOR.
+#                                         (2) with usage_gate=None this
+#                                             function performs NO cap
+#                                             classification at all
+#                                             (classify_invocation runs only
+#                                             in the gated `else` branch), so
+#                                             any cap_wait_sanity_secs
+#                                             documented for it would be
+#                                             inert, and the caller would
+#                                             still have to detect the cap
+#                                             itself.
+#                                         (3) a nightly systemd oneshot must
+#                                             not block on a cap wait across
+#                                             the NEXT night's timer, and its
+#                                             digests are re-derivable — a
+#                                             deferred night simply re-mines
+#                                             tomorrow, so patience buys
+#                                             nothing and costs a missed run.
+#                                         So the trickle detects the cap with
+#                                         the LOOSE defer-gate matcher
+#                                         shared.cap_markers::
+#                                         looks_like_blocking_banner — exactly
+#                                         as its sibling
+#                                         census.py::preflight_headroom does,
+#                                         and per that module's own docstring
+#                                         on skip-guard vs production-detector
+#                                         contracts — and defers.
+#                                         TO CHANGE THIS: making the trickle a
+#                                         real caller requires first giving it
+#                                         an ACCOUNT POOL (a reachable
+#                                         OrchestratorConfig + the
+#                                         oauth_token_env vars in the unit).
+#                                         Until then a row in the bound table
+#                                         above would be decoration.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
@@ -212,10 +298,12 @@ __all__ = [
     'AgentFailureKind',
     'AgentResult',
     'AllAccountsCappedException',
+    'TranscriptEvidence',
     'build_failure_message',
     'classify_agent_failure',
     'count_transcript_turns',
     'detect_ended_awaiting_background',
+    'detect_resumable_progress',
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -226,6 +314,9 @@ __all__ = [
     'note_unreadable_transcript',
     'read_transcript_records',
     'require_non_blank_prompt',
+    'resumable_progress_for_session',
+    'transcript_evidence',
+    'transcript_evidence_for_session',
     'transcript_exists',
 ]
 
@@ -255,65 +346,40 @@ class AllAccountsCappedException(Exception):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# StructuredOutput schema-tool deny-list (CLI 2.1.168 regression guard)
+# Pure-classifier tool scoping: ``'*'`` + ``--json-schema`` → ``--tools ''``
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI 2.1.168 delivers ``--json-schema`` structured output through a *synthetic
-# tool* named ``StructuredOutput``.  A ``disallowed_tools=['*']`` wildcard — used
-# by pure-classifier callers (curator single/batch, recon agent_loop) that want
-# no real tool access — now ALSO matches and denies that schema tool, so every
-# structured answer is permission-denied → ``error_max_structured_output_retries``
-# (or ``error_max_budget_usd``) with no salvageable payload.
+# ``--json-schema`` output rides on a synthetic ``StructuredOutput`` tool, which
+# a ``'*'`` deny would also block (CLI 2.1.168).  So when a caller passes
+# ``disallowed_tools=['*']`` WITH an ``output_schema``, ``build_claude_argv``
+# drops the ``'*'`` and emits ``--tools ''`` instead.  That is the CLI's
+# registry filter: it leaves only ``StructuredOutput`` in the registry
+# (measured on CLI 2.1.283 from the ``system/init`` inventory).  Without a
+# schema, the bare ``'*'`` deny already empties the registry and is kept as-is.
 #
-# Fix (central, in ``_invoke_claude``): when an ``output_schema`` is requested AND
-# ``'*'`` is in ``disallowed_tools``, expand the ``'*'`` into this explicit
-# deny-list of real built-in tools — which deliberately OMITS ``StructuredOutput``
-# — preserving the "no real (file/bash/web/MCP) tool access" guarantee while
-# letting the schema tool through.  Whitelisting ``StructuredOutput`` while keeping
-# ``'*'`` does NOT work: deny precedence beats allow, so the wildcard must be
-# removed entirely (confirmed against live CLI 2.1.168).
+# Do not replace this with an enumerated deny list.  The live registry is
+# account-dependent and churns, so a list cannot be complete, and ToolSearch
+# will load and run any deferred tool the list misses (it ran CronList under
+# the old one).
 #
-# KEEP IN SYNC with the CLI's built-in tool names: a *future new* built-in tool
-# would not be auto-denied by this list.  Accepted because (a) these prompts forbid
-# tool use, and (b) a future change to the CLI's tool-exclusion semantics is caught
-# loudly by the ``schema_tool_denied`` detection below rather than degrading silently.
+# SCOPE: ``--tools`` does NOT filter MCP tools.  An account-scoped claude.ai
+# connector stayed reachable even at an empty neutral cwd.  A wildcard-deny
+# caller must ALSO pass ``mcp_config=no_mcp_servers_config()`` with
+# ``strict_mcp_config=True``.
 #
-# SCOPE — BUILT-INS ONLY: this list contains no MCP tool pattern, so expanding the
-# ``'*'`` narrows the deny to built-ins and leaves every MCP tool REACHABLE.  That
-# is invisible only while no MCP server is in play; the CLI ambient-merges the
-# project-scoped ``.mcp.json`` found at ``cwd``, so a wildcard-deny caller running
-# at a cwd that carries one (e.g. the project root) silently regains MCP tools —
-# under ``bypassPermissions``, that is unreviewed write access.  Such a caller MUST
-# ALSO pass ``mcp_config=no_mcp_servers_config()`` with ``strict_mcp_config=True``
-# to keep MCP tools out of reach; denying built-ins alone does not do it.
+# Two checks guard this.  The live inventory test is
+# shared/tests/test_wildcard_deny_live_inventory.py (``-m integration``).  If a
+# CLI change ever denies the schema tool itself, ``_parse_claude_output``
+# reports ``schema_tool_denied``.
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
-_REAL_BUILTIN_TOOLS_DENYLIST = [
-    'Bash',
-    'BashOutput',
-    'KillShell',
-    'KillBash',
-    'Read',
-    'Edit',
-    'Write',
-    'MultiEdit',
-    'NotebookEdit',
-    'Glob',
-    'Grep',
-    'Task',
-    'Agent',
-    'WebFetch',
-    'WebSearch',
-    'TodoWrite',
-    'ExitPlanMode',
-    'SlashCommand',
-]
+_SCHEMA_OUTPUT_ATTACHMENT = 'structured_output'
 
 
 def no_mcp_servers_config() -> dict[str, Any]:
     """Build a FRESH scoping ``mcp_config`` carrying ZERO MCP servers.
 
     For callers that pass ``disallowed_tools=['*']`` and must keep MCP tools
-    unreachable even when an ``output_schema`` forces the wildcard expansion
-    above (which denies built-ins ONLY).  Paired with
+    unreachable even when an ``output_schema`` turns the wildcard into
+    ``--tools ''`` (which does not filter MCP; see above).  Paired with
     ``strict_mcp_config=True`` this emits ``--mcp-config <file>
     --strict-mcp-config``, scoping the invocation to the file's server set —
     i.e. nothing — instead of ambient-merging the ``.mcp.json`` at the
@@ -351,14 +417,28 @@ class AgentResult:
     - ``account_name``: the OAuth account used for this invocation
     - ``timed_out``: True when the subprocess was killed by a wall-clock timeout
     - ``schema_salvaged``: True when the CLI reported is_error=True but a valid
-      ``structured_output`` was present — commonly ``error_max_turns`` paired
-      with a completed JSON schema tool-use turn. Callers treat this as success.
+      ``structured_output`` was present, so the call is treated as success. The
+      salvage branch fires whenever a dict structured payload accompanies an
+      is_error result — which makes a *surfaced* ``error_max_turns`` failure
+      itself proof that no *dict* payload was attached (a non-dict
+      ``structured_output`` is a payload that IS present yet still is not
+      salvaged — see
+      ``test_is_error_with_non_dict_structured_output_not_salvaged`` — whereas
+      a dict payload would already have flipped the result to success before a
+      caller ever saw the failure). Measured (CLI 2.1.236/2.1.241, via
+      ``fused-memory/scripts/probe_schema_max_turns.py`` — added by task 3241,
+      unmerged as of this writing; the path resolves once that branch lands):
+      ``error_max_turns`` almost never carries a completed JSON schema
+      tool-use turn — the model spent its turns on prose and never invoked
+      the schema tool — so at that boundary salvage is rarely a backstop and
+      usually has nothing to recover. Re-run the probe to re-check this claim
+      if CLI turn-budget behavior changes.
     - ``schema_tool_denied``: True when the CLI reported is_error=True with NO
       structured payload AND a ``StructuredOutput`` permission denial — i.e. the
       schema tool itself was blocked.  This is a systemic config break (the
-      cli_invoke deny-list no longer permits the schema tool), NOT a flaky
-      candidate.  ``success`` stays False (NOT salvaged); callers should raise a
-      loud, un-suppressed escalation so the deny-list gets fixed.
+      ``--tools ''`` substitution no longer permits the schema tool), NOT a
+      flaky candidate.  ``success`` stays False (NOT salvaged); callers should
+      raise a loud, un-suppressed escalation so the substitution gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
       backgrounded Bash command was still pending — launched via
       ``run_in_background`` and never subsequently REAPED, where a reap is a
@@ -509,6 +589,11 @@ def read_transcript_records(
         return None
 
 
+def _is_assistant_turn(record: object) -> bool:
+    """True iff *record* is one assistant turn; every transcript turn count uses this."""
+    return isinstance(record, dict) and record.get('type') == 'assistant'
+
+
 def count_transcript_turns(
     config_dir: Path,
     session_id: str,
@@ -527,7 +612,7 @@ def count_transcript_turns(
     records = read_transcript_records(config_dir, session_id)
     if records is None:
         return None
-    return sum(1 for r in records if r.get('type') == 'assistant')
+    return sum(1 for r in records if _is_assistant_turn(r))
 
 
 def note_unreadable_transcript(
@@ -625,13 +710,40 @@ def note_unreadable_transcript(
     return True
 
 
-# Background-management tool names that "reap" a launched background task — a
-# poll (``BashOutput``) or a kill (``KillShell`` / ``KillBash``, the latter an
-# older CLI spelling), plus their Task-tool analogues: ``TaskOutput`` collects a
-# backgrounded Task/subagent's result and ``TaskStop`` terminates it (task
-# 3639).  All five are equally conclusive evidence that the session engaged with
-# its pending work rather than abandoning it, so any of them AFTER the last
-# background launch clears the abandonment verdict.
+# Background-management tool names that "reap" a launched background task.  Any
+# of them AFTER the last background launch is conclusive evidence the session
+# engaged with its pending work rather than abandoning it, so it clears the
+# abandonment verdict.
+#
+# WHICH OF THESE ARE REAL: only ``TaskStop`` (task 5332).  ``BashOutput`` and
+# ``KillShell`` were never observed in this fleet at all, ``KillBash`` is an
+# older CLI spelling, and ``TaskOutput`` was live until the registry dropped it.
+# The query behind those claims, its dates and the fleet census live at exactly
+# one site -- orchestrator/tests/test_roles_harness_tool_inventory.py::
+# MEASURED_ABSENT_TOOLS -- and are deliberately not restated here, because six
+# hand-copies of them had already drifted apart in shape.
+#
+# KEEP EVERY MEMBER ANYWAY.  This is an ACCEPT set, so the two directions of
+# error are not symmetric: a never-observed name costs nothing, while dropping
+# one silently regresses detection if a CLI build ever ships it again — and the
+# registry demonstrably churns in BOTH directions, so "absent today" is not
+# "gone forever".
+#
+# AND THE SET DOES NOT HAVE TO BE CURRENT, which is the part a future reader
+# tempted to "resync" it needs first.  ``detect_ended_awaiting_background`` reaps
+# on EITHER this set OR its second clause (task 3639): a tool_use of ANY kind
+# whose input references the background task's id or output-file path.  That
+# clause is tool-agnostic, so it catches the ``Read``-the-output-file shape the
+# role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
+# why correcting those prompts needed no change to this detector.  If the first
+# clause were the whole mechanism, only ``TaskStop`` would still fire it.
+#
+# That is an executable claim, not a comment's promise: the exact prescribed
+# shape — a ``Read`` tool_use whose ``file_path`` is the launch's output file —
+# is pinned by tests/test_cli_invoke_background.py::TestForegroundBgLogReadIsAReap::
+# test_read_tool_of_bg_log_is_false.  Narrowing ``_iter_input_strings`` (say, to
+# a ``command`` key) fails there rather than silently downgrading every
+# correctly-behaved session to failure.
 _BACKGROUND_REAP_TOOLS = frozenset(
     {'BashOutput', 'KillShell', 'KillBash', 'TaskOutput', 'TaskStop'}
 )
@@ -925,6 +1037,148 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
 
 
+def detect_resumable_progress(records: list[dict] | None) -> bool:
+    """Return True when the transcript *records* hold work worth CONTINUING.
+
+    The question the cap-hit resume branch must answer after "can I reach the
+    transcript?": does that transcript record anything to continue?  A session
+    capped before it made any tool call has a perfectly reachable transcript
+    holding only a statement of intent, and resuming it injects
+    CAP_HIT_RESUME_PROMPT ("continue where you left off") pointing at nothing.
+
+    SCOPE — what this does NOT cover.  Legibility census 2026-08-16 §1.2
+    (session 4396db7a) is the ADJACENT sighting that named the failure mode; it
+    is NOT a specimen this predicate catches, and 4274 does not close it.  That
+    session spawned an Agent-tool sub-agent, and a sub-agent's turns are written
+    to a sidecar ``<session_id>/subagents/agent-*.jsonl`` carrying the PARENT's
+    ``sessionId`` — never a separately-addressable session file, and not
+    reachable by ``_resolve_transcript_path``'s ``projects/*/<id>.jsonl`` glob.
+    The parent chain that ``read_transcript_records`` DOES read therefore
+    necessarily holds the ``Task``/``Agent`` ``tool_use`` block that spawned the
+    sub-agent (measured 2026-08-29: in all 6 of 89 orchestrator transcripts that
+    spawned sub-agents, spanning CLI 2.1.215-2.1.251, that block is in the
+    non-sidechain parent chain; 0 of 89 parent files contain sidechain records
+    at all).  This predicate returns True on that shape by construction.  The
+    census declined to file a task for 1.2 (§4) and left the remedy with task
+    **2561**'s runner-side persistence protocol; that ownership stands.
+
+    What this DOES cover is the adjacent class the same RCA exposes: a
+    TOP-LEVEL session capped before it made any tool call, which
+    :func:`invoke_with_cap_retry` would otherwise hand CAP_HIT_RESUME_PROMPT's
+    false continuity claim.
+
+    "Progress" = at least one assistant ``tool_use`` block, OR more than one
+    assistant turn.  tool_use is the only durable evidence in a transcript that
+    the agent DID something rather than narrated an intention; the second
+    disjunct deliberately protects prose-only workers (synthesis, judge, review
+    agents) whose accumulated reasoning IS the thing worth resuming.
+
+    Contract — the False case is narrow BY CONSTRUCTION.  Returns False only
+    when emptiness is affirmatively PROVEN: *records* is a non-None list AND it
+    contains zero assistant ``tool_use`` blocks AND at most one assistant
+    record.  Returns True in every other case.
+
+    FAIL-SAFE DIRECTION (load-bearing, and the inverse of
+    :func:`detect_ended_awaiting_background`'s).  This predicate can only ever
+    cause a resume→fresh DOWNGRADE, and a wrong downgrade DISCARDS REAL AGENT
+    WORK — strictly worse than the confusing-but-harmless prompt it exists to
+    prevent.  So every ambiguity resolves to True (resume, today's behaviour):
+
+    - ``None`` records (unreadable/absent transcript) → True;
+    - non-dict records, non-list content, non-dict blocks, blocks missing
+      ``type``, unknown block types, unknown nestings → skipped as
+      unclassifiable, never raise, and never counted as evidence of emptiness.
+
+    Tolerant to both transcript content nestings:
+    ``record['message']['content']`` (the real CLI shape) and a flat
+    ``record['content']`` — mirroring
+    :func:`detect_ended_awaiting_background`'s walk.
+    """
+    if records is None:
+        return True
+    ambiguous = False
+    assistant_count = 0
+    tool_use_count = 0
+    for record in records:
+        if not isinstance(record, dict):
+            # Unclassifiable: this could itself have been an assistant turn, so
+            # it can never contribute to a proof of emptiness.
+            ambiguous = True
+            continue
+        if record.get('type') != 'assistant':
+            continue
+        assistant_count += 1
+        message = record.get('message')
+        if isinstance(message, dict) and isinstance(message.get('content'), list):
+            blocks = message['content']
+        elif isinstance(record.get('content'), list):
+            blocks = record['content']
+        else:
+            # An assistant record whose content shape we do not recognise may
+            # well contain tool calls we cannot see.
+            ambiguous = True
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                ambiguous = True
+                continue
+            btype = block.get('type')
+            if btype == 'tool_use':
+                tool_use_count += 1
+            elif btype != 'text':
+                # Any block type this predicate does not model (a missing
+                # 'type', 'server_tool_use', 'thinking') might be work; only a
+                # plain text block is positive evidence of prose.
+                #
+                # 'thinking' is NOT a future shape — it is in current
+                # transcripts, and it is why this guard's real-world coverage
+                # is partial.  Measured 2026-08-29 over the 89 orchestrator
+                # agent transcripts under
+                # .worktrees/*/.task/claude-config-*/projects/ (CLI
+                # 2.1.215-2.1.251): 89 of 89 contain 'thinking' blocks (1,939
+                # total), and the FIRST assistant record's only block type is
+                # 'thinking' in 29 of 89.  Replaying each transcript truncated
+                # to its first assistant record — the exact "capped before any
+                # work" shape this predicate exists for — the predicate returns
+                # False (fires) on 60 of 89 and True (silently INERT, resumes
+                # anyway) on the 29 whose opening turn is a thinking block.  Do
+                # not over-read the guard's coverage: roughly a third of the
+                # real population is unprotected today.
+                #
+                # Modelling 'thinking' as not-work would WIDEN the False branch,
+                # and a wrong widening DISCARDS REAL AGENT WORK — a design
+                # change, not a fix.  Abstaining is the safe direction and
+                # stays.
+                ambiguous = True
+    if ambiguous:
+        return True
+    return not (tool_use_count == 0 and assistant_count <= 1)
+
+
+def resumable_progress_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> bool:
+    """Return True when *session_id*'s on-disk transcript holds work worth
+    CONTINUING — the second half of cap-hit resume eligibility, after
+    :func:`transcript_exists` answers "can I reach it at all?".
+
+    Mirrors ``ended_awaiting_background_for_session``' shape: delegate all I/O
+    to ``read_transcript_records`` (which already owns the version-robust
+    glob-by-session-id lookup, tolerant JSONL parsing that skips the truncated
+    final line a SIGKILL leaves, and a never-raises contract), then apply the
+    pure ``detect_resumable_progress`` detector.  Never raises.
+
+    Unlike its background sibling this wrapper passes ``None`` STRAIGHT THROUGH
+    to the predicate instead of short-circuiting, because the fail-safe
+    direction is INVERTED: the background detector fails safe to False to avoid
+    downgrading a genuine success, whereas this one fails safe to True to avoid
+    discarding real work.  An unreadable transcript therefore resumes.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    return detect_resumable_progress(records)
+
+
 def ended_awaiting_background_for_session(
     config_dir: Path,
     session_id: str,
@@ -942,6 +1196,90 @@ def ended_awaiting_background_for_session(
     if records is None:
         return False
     return detect_ended_awaiting_background(records)
+
+
+@dataclass(frozen=True)
+class TranscriptEvidence:
+    """What a run did, as recorded in its transcript.
+
+    - ``assistant_turns``: the turn count ``count_transcript_turns`` reports.
+    - ``accepted_schema_payload``: the ``data`` of the last ``structured_output``
+      attachment, i.e. the CLI's record that it accepted a ``StructuredOutput``
+      call against the schema, else None. A rejected or merely attempted call
+      (schema mismatch, unparseable input, permission denial, or killed before
+      validation) has none.
+    - ``other_tool_uses``: every tool_use name other than ``StructuredOutput``,
+      in transcript order, duplicates kept.
+    """
+
+    assistant_turns: int
+    accepted_schema_payload: dict | None
+    other_tool_uses: tuple[str, ...]
+
+
+def _accepted_schema_output(record: object) -> dict | None:
+    """Return the verdict *record* shows the CLI accepted, else None. Never raises."""
+    if not isinstance(record, dict) or record.get('type') != 'attachment':
+        return None
+    attachment = record.get('attachment')
+    if not isinstance(attachment, dict) or attachment.get('type') != _SCHEMA_OUTPUT_ATTACHMENT:
+        return None
+    data = attachment.get('data')
+    return data if isinstance(data, dict) else None
+
+
+def _tool_use_names(record: dict) -> list[str]:
+    """Return the name of every well-formed tool_use block in *record*."""
+    return [
+        block['name'] for block in _content_blocks(record)
+        if isinstance(block, dict)
+        and block.get('type') == 'tool_use'
+        and isinstance(block.get('name'), str)
+    ]
+
+
+def transcript_evidence(records: list[dict]) -> TranscriptEvidence:
+    """Summarise transcript *records* as :class:`TranscriptEvidence`.
+
+    Recovers evidence from a run whose stdout never arrived (a killed
+    process), so it complements ``_parse_claude_output``'s stdout-based
+    ``schema_salvaged`` path rather than duplicating it. The payload is taken
+    from the CLI's acceptance record, never from the model's tool_use input.
+    Pure: whether to trust a recovered payload is the caller's decision. Only
+    assistant records count as turns, and malformed records and blocks are
+    skipped without raising.
+    """
+    assistant_turns = 0
+    accepted_schema_payload: dict | None = None
+    other_tool_uses: list[str] = []
+    for record in records:
+        accepted = _accepted_schema_output(record)
+        if accepted is not None:
+            accepted_schema_payload = accepted
+            continue
+        if not _is_assistant_turn(record):
+            continue
+        assistant_turns += 1
+        other_tool_uses += [
+            name for name in _tool_use_names(record) if name != _SCHEMA_OUTPUT_TOOL
+        ]
+    return TranscriptEvidence(assistant_turns, accepted_schema_payload, tuple(other_tool_uses))
+
+
+def transcript_evidence_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> TranscriptEvidence | None:
+    """Return :func:`transcript_evidence` for *session_id*'s on-disk transcript.
+
+    Delegates all I/O to ``read_transcript_records``. Returns None when no
+    transcript can be read, so a missing transcript is never reported as
+    empty evidence. Never raises.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    if records is None:
+        return None
+    return transcript_evidence(records)
 
 
 def is_zero_output_timeout(result: AgentResult) -> bool:
@@ -1743,6 +2081,25 @@ async def invoke_with_cap_retry(
     account switches.  If resume itself fails (non-cap-hit error), falls
     back to a fresh invocation with the original prompt.
 
+    Resume eligibility is a TWO-PART rule, and both parts require a
+    *config_dir* (without one there is no correct place to glob for the
+    transcript, so nothing can be proven and the resume proceeds unchecked):
+
+    1. REACHABLE — a Claude CLI session is a local JSONL file at
+       ``<config_dir>/projects/*/<session_id>.jsonl`` and ``--resume`` replays
+       it, so a session whose transcript is gone resumes into an effectively
+       empty one (``transcript_exists``).
+    2. NON-EMPTY — the transcript must record work to CONTINUE: at least one
+       assistant tool call, or more than one assistant turn
+       (``resumable_progress_for_session``).  Otherwise
+       ``CAP_HIT_RESUME_PROMPT`` ("continue where you left off") would point
+       at nowhere.
+
+    Failing either part retries FRESH, which replays the real task prompt.
+    Both guards fire only on affirmative proof; every ambiguous or unreadable
+    transcript resumes, because a wrong downgrade discards real agent work.
+    The specific reason is named in the cap-hit warning (``resume_or_fresh``).
+
     *cap_wait_sanity_secs* is the outer wall-clock bound for cap-hit patience.
     When total elapsed time since the first cap hit exceeds this value,
     ``AllAccountsCappedException`` is raised so the caller can escalate.
@@ -2331,11 +2688,40 @@ async def invoke_with_cap_retry(
                     # orchestrator's own resume-eligibility guard
                     # (harness.py, 'no_transcript').
                     #
+                    # ...but reachability is NECESSARY, not SUFFICIENT (task
+                    # 4274).  A session capped before it made any tool call has
+                    # a perfectly reachable transcript holding only a statement
+                    # of intent, and resuming it injects CAP_HIT_RESUME_PROMPT
+                    # ("continue where you left off") pointing at nowhere — a
+                    # continuity claim the transcript does not support, and a
+                    # retry spent re-deriving context that never existed.
+                    #
+                    # That failure mode was NAMED by legibility census
+                    # 2026-08-16 §1.2 (session 4396db7a), but 4274 does NOT
+                    # close that finding and must not be read as closing it.
+                    # The census specimen was an Agent-tool SUB-AGENT kill: its
+                    # parent's transcript — the only one reachable here — carries
+                    # the Task/Agent tool_use that spawned it, so the guard below
+                    # returns True on it by construction (see
+                    # detect_resumable_progress's SCOPE note for the
+                    # measurement).  Census §4 explicitly declined to file a task
+                    # for 1.2 and left the remedy with task 2561's runner-side
+                    # persistence protocol.  What 4274 covers is the adjacent
+                    # class: a TOP-LEVEL session capped before its first tool
+                    # call.  So
+                    # eligibility asks TWO questions: can I reach the transcript,
+                    # AND does it record work to continue
+                    # (resumable_progress_for_session)?  That second guard only
+                    # ever downgrades resume -> fresh and a wrong downgrade
+                    # DISCARDS REAL WORK, so it fires only on affirmatively
+                    # proven emptiness; every ambiguity resumes.
+                    #
                     # config_dir is None -> resume as today: without a concrete
                     # directory there is no correct place to glob (the process
                     # default ~/.claude would be wrong for any caller under an
-                    # isolated CLAUDE_CONFIG_DIR), so the veto is scoped to "we
-                    # have a directory and the transcript is provably not in it".
+                    # isolated CLAUDE_CONFIG_DIR), so both vetoes are scoped to
+                    # "we have a directory and can PROVE the transcript is not
+                    # in it / carries nothing".
                     #
                     # resume_or_fresh carries the REASON, not just the verdict:
                     # it is interpolated into both cap-hit warnings below, so a
@@ -2358,6 +2744,19 @@ async def invoke_with_cap_retry(
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
                         await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh (transcript unreachable)'
+                    elif config_dir is not None and not resumable_progress_for_session(
+                        config_dir.path, result.session_id
+                    ):
+                        logger.warning(
+                            f'{label}: capped session {result.session_id} recorded no work '
+                            f'to continue (no tool calls, at most one assistant turn) — '
+                            f'retrying FRESH instead of resuming, because '
+                            f'CAP_HIT_RESUME_PROMPT would tell the agent to continue from '
+                            f'nowhere',
+                        )
+                        _reset_for_fresh_retry(invoke_kwargs, original_prompt)
+                        await _rebuild_fresh_prompt()
+                        resume_or_fresh = 'fresh (no resumable progress)'
                     else:
                         invoke_kwargs['resume_session_id'] = result.session_id
                         invoke_kwargs['prompt'] = CAP_HIT_RESUME_PROMPT
@@ -2738,19 +3137,12 @@ def build_claude_argv(
 
         if allowed_tools:
             cmd.extend(['--allowed-tools', *allowed_tools])
+        if output_schema and disallowed_tools and '*' in disallowed_tools:
+            # The '*' would also deny the schema's StructuredOutput tool; the
+            # registry filter keeps only that tool.  See _SCHEMA_OUTPUT_TOOL.
+            cmd.extend(['--tools', ''])
+            disallowed_tools = [t for t in disallowed_tools if t != '*']
         if disallowed_tools:
-            # CLI 2.1.168: ``--json-schema`` is delivered via a synthetic
-            # ``StructuredOutput`` tool that a ``'*'`` deny wildcard would block,
-            # failing every structured-output call.  When a schema IS requested,
-            # expand the wildcard into an explicit real-builtins deny-list that omits
-            # ``StructuredOutput`` — keeping "no real tool access" while letting the
-            # schema tool through.  A caller that passes no output_schema keeps
-            # ``'*'`` verbatim, so all tools stay blocked.  See the deny-list
-            # constant above for the keep-in-sync caveat.
-            if output_schema and '*' in disallowed_tools:
-                disallowed_tools = [
-                    t for t in disallowed_tools if t != '*'
-                ] + _REAL_BUILTIN_TOOLS_DENYLIST
             cmd.extend(['--disallowed-tools', *disallowed_tools])
 
         if mcp_config:
@@ -3043,7 +3435,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     # synthetic schema tool itself was blocked — a systemic config break, not a
     # flaky candidate.  We deliberately do NOT salvage to success: ``success``
     # stays False and ``schema_tool_denied`` is flagged so callers raise a loud,
-    # un-suppressed escalation to get the cli_invoke deny-list fixed.  Priority is
+    # un-suppressed escalation to get build_claude_argv's tool scoping fixed.  Priority is
     # "get it fixed"; silent recovery is exactly the trap that hid the outage.
     schema_tool_denied = False
     if not is_success and not isinstance(structured, dict):
@@ -3248,6 +3640,24 @@ def _materialize_stdin(stdin_data: bytes) -> IO[bytes]:
     return ro
 
 
+def _warn_if_transcript_read_slow(read_secs: float, site: str, model: str) -> None:
+    """Make executor saturation on the off-loop transcript reads observable (task 3925).
+
+    The watchdog is a LIVENESS mechanism, and since its transcript reads moved to
+    ``asyncio.to_thread`` its cadence depends on the shared default executor's
+    availability (see the EXECUTOR DEPENDENCY note in ``_run_subprocess``).  A
+    queued read delays the wedge / idle / absolute-cap kill decision by however
+    long the pool makes it wait.  That degradation is otherwise invisible; log it.
+    """
+    if read_secs >= _WATCHDOG_SLOW_READ_WARN_SECS:
+        logger.warning(
+            f'Off-loop transcript read took {read_secs:.1f}s at the {site} '
+            f'(warn threshold={_WATCHDOG_SLOW_READ_WARN_SECS}s, model={model}) — the shared '
+            f'default ThreadPoolExecutor is likely saturated, delaying watchdog kill '
+            f'decisions by that much.'
+        )
+
+
 async def _run_subprocess(
     cmd: list[str],
     cwd: Path,
@@ -3364,6 +3774,55 @@ async def _run_subprocess(
             # valid, since there is no PIPE for it to try to re-write.
             comm_task = asyncio.ensure_future(proc.communicate())
 
+            # ── INVARIANT (task 3925): every transcript read below is OFF-LOOP ─
+            # THE authoritative statement of this invariant.  The four call
+            # sites below point back here with one-liners instead of restating
+            # it; keep it that way — duplicated prose drifts independently.
+            #
+            # WHAT.  All four transcript reads in _run_subprocess (the two
+            # watchdog polls in this loop, the one-shot re-read in the
+            # except-TimeoutError handler, and the normal-exit read after it) go
+            # through `await asyncio.to_thread(...)`.
+            #
+            # WHY.  Each is a blocking whole-file read — glob + open +
+            # json.loads per line, 1.0-1.3 MB for a mature session — and the
+            # orchestrator runs EVERY role of EVERY concurrent task on ONE event
+            # loop (orchestrator/src/orchestrator/cli.py, `asyncio.run(_main())`),
+            # so an inline read stalls every other agent's I/O for its whole
+            # duration.  Sibling offloads of the same shape: `run_substrate_recheck`
+            # and `write_heartbeat` in orchestrator/src/orchestrator/harness.py.
+            # The deliberate COUNTER-example is the `archive_task_transcripts`
+            # hook in workflow.py's `_invoke` finally, kept synchronous on
+            # purpose: it is a WRITE whose in-flight transcripts a cancellation
+            # point would lose.  These four are side-effect-free READS, so that
+            # argument does not transfer.
+            #
+            # HOW TO SPELL IT.  Bare positional reference —
+            # `asyncio.to_thread(count_transcript_turns, config_dir, session_id)`.
+            # Do NOT hoist a functools.partial or a module-scope alias: that
+            # binds the real function at import time and silently defeats every
+            # `patch('shared.cli_invoke.count_transcript_turns', ...)` in the
+            # suites, which would then read real (empty) tmp_path dirs and pass
+            # vacuously instead of failing loudly.
+            #
+            # EXECUTOR DEPENDENCY.  to_thread dispatches to the loop's DEFAULT
+            # executor — one process-wide ThreadPoolExecutor
+            # (max_workers = min(32, cpu_count + 4)) shared with every other
+            # offload in the process.  Watchdog poll cadence, and hence how
+            # promptly a wedge / idle / absolute-cap kill DECISION is taken, now
+            # depends on executor availability: worst-case added latency per poll
+            # is the executor QUEUE DEPTH, not the read itself.  Two things bound
+            # that.  (1) The direction is fail-SAFE: saturation DELAYS a kill and
+            # can never manufacture a spurious one — the completion re-check
+            # after the two reads below closes the one window where a slow read
+            # could have turned a finished run into a reported timeout.  (2) It
+            # is observable rather than silent: every poll read is timed and
+            # logged at warning past _WATCHDOG_SLOW_READ_WARN_SECS.  A dedicated
+            # ThreadPoolExecutor for transcript reads was considered and NOT
+            # adopted: a small private pool trades contention with unrelated
+            # offloads for contention among these four reads (the normal-exit one
+            # is paid by every completing agent) and adds a process-global pool
+            # with no shutdown path.  Revisit if that warning ever fires.
             while True:
                 elapsed = time.monotonic() - watchdog_start
                 # Extension engages once liveness is proven (seen_turn) AND the
@@ -3448,7 +3907,12 @@ async def _run_subprocess(
                 # The post-kill transcript_turns re-read in the except block is
                 # unaffected — it is a separate, one-shot read outside this loop.
                 if not seen_turn and config_dir and session_id:
-                    n = count_transcript_turns(config_dir, session_id)
+                    # OFF-LOOP — see the task-3925 INVARIANT block above this loop.
+                    _read_started = time.monotonic()
+                    n = await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
+                    _warn_if_transcript_read_slow(
+                        time.monotonic() - _read_started, 'startup-regime poll', model
+                    )
                     if n is None:
                         if not unreadable_escape_fired:
                             unreadable_escape_fired = note_unreadable_transcript(
@@ -3466,7 +3930,19 @@ async def _run_subprocess(
                             last_progress_turns = n
                             last_progress_monotonic = time.monotonic()
                 elif extension_engaged and config_dir and session_id:
-                    n = count_transcript_turns(config_dir, session_id)
+                    # OFF-LOOP — see the task-3925 INVARIANT block above this loop.
+                    # Site-specific: this is the higher-frequency read in
+                    # production — workflow.py passes BOTH extension params for
+                    # every role, so extension_engaged latches for every agent and
+                    # this fires every _WATCHDOG_WORKING_POLL_SECS for the whole
+                    # (routinely 20-40 min) working lifetime.  The two branches
+                    # stay separate on purpose: a merged read would also fire on
+                    # iterations where neither branch applies.
+                    _read_started = time.monotonic()
+                    n = await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
+                    _warn_if_transcript_read_slow(
+                        time.monotonic() - _read_started, 'working-regime extension poll', model
+                    )
                     if n is None:
                         if not unreadable_escape_fired:
                             unreadable_escape_fired = note_unreadable_transcript(
@@ -3481,6 +3957,26 @@ async def _run_subprocess(
                         if last_progress_turns is None or n > last_progress_turns:
                             last_progress_turns = n
                             last_progress_monotonic = time.monotonic()
+
+                # ── Completion re-check (task 3925) ─────────────────────────
+                # The two reads above are `await`s — a yield point that did NOT
+                # exist while they were synchronous.  comm_task can therefore now
+                # transition to done WHILE a read is in flight (and a read can be
+                # slow — see the EXECUTOR DEPENDENCY note above).  Falling through
+                # to the kill checks below would then cancel an already-finished
+                # task and raise TimeoutError, reporting timed_out=True and
+                # DISCARDING the captured stdout/result envelope for a run that
+                # actually succeeded — on exactly the boundary production runs hit
+                # most often.  Handle it the same way as the `comm_task in done`
+                # branch above: take the result and leave the loop.  result()
+                # re-raises a communicate() exception exactly as it does there, so
+                # the mocked-TimeoutError tests keep routing through the unchanged
+                # kill block.  No-op when neither read ran: with no await in
+                # between, comm_task cannot have completed since asyncio.wait
+                # returned it as pending.
+                if comm_task.done():
+                    stdout, stderr = comm_task.result()
+                    break
 
                 elapsed = time.monotonic() - watchdog_start
                 # Re-derive fresh (not the top-of-loop value) so a seen_turn
@@ -3607,8 +4103,14 @@ async def _run_subprocess(
                     f'Process terminated after {timeout_seconds}s timeout (SIGTERM); ' + stderr_text
                 )
             duration_ms = int(time.monotonic() * 1000) - start_ms
+            # OFF-LOOP — see the task-3925 INVARIANT block above the poll loop.
+            # Site-specific cancellation note: a CancelledError from this
+            # to_thread propagates out of the inner try/except into the outer
+            # `except asyncio.CancelledError:` below, which cancels comm_task and
+            # reaps the process group — the same treatment a cancel landing
+            # anywhere else in the outer try receives.  No new leak path.
             tt = (
-                count_transcript_turns(config_dir, session_id)
+                await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
                 if (config_dir and session_id)
                 else None
             )
@@ -3670,14 +4172,27 @@ async def _run_subprocess(
     #     success→failure downgrade.
     # Both fail safe when the transcript can't be located (records None →
     # transcript_turns None, ended_awaiting_background False).
+    # OFF-LOOP — see the task-3925 INVARIANT block above the poll loop.  This is
+    # the largest of the four reads: it parses the FULL record list, and every
+    # successful run pays it.
+    # Site-specific cancellation note: unlike the other three this read sits
+    # OUTSIDE both try blocks, so a CancelledError here is NOT caught by the
+    # `except asyncio.CancelledError:` handler above and propagates directly.
+    # That is safe and needs no asyncio.shield: comm_task has already completed
+    # (proc.communicate() returned), so the child has exited and been reaped —
+    # there is no process group left to orphan.  The only loss is the
+    # transcript_turns / ended_awaiting_background enrichment on a run that is
+    # being torn down anyway.
     transcript_records = (
-        read_transcript_records(config_dir, session_id) if (config_dir and session_id) else None
+        await asyncio.to_thread(read_transcript_records, config_dir, session_id)
+        if (config_dir and session_id)
+        else None
     )
     if transcript_records is None:
         transcript_turns = None
         ended_awaiting_background = False
     else:
-        transcript_turns = sum(1 for r in transcript_records if r.get('type') == 'assistant')
+        transcript_turns = sum(1 for r in transcript_records if _is_assistant_turn(r))
         ended_awaiting_background = detect_ended_awaiting_background(transcript_records)
 
     return _SubprocessResult(

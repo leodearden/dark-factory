@@ -4,11 +4,11 @@ systemd unit files it installs, and the wrapper their ExecStart names (task
 
 Drives the installer via subprocess with a FAKE `systemctl` shimmed onto PATH
 (records every invocation, minus `--user`, into a shared JSON state file) --
-mirroring test_install_reify_closure_staleness_sweep_timer.py. Real systemd is
+mirroring test_install_reclaim_orphaned_worktrees_timer.py. Real systemd is
 never touched.
 
 The wrapper half is driven with BOTH `*_CMD` seams pointed at fake recorder
-executables, mirroring test_reify_closure_staleness_sweep_wrapper.py, so the
+executables, mirroring test_flag_marker_sweep_wrapper.py, so the
 census never runs against live Qdrant and 3201's retro sweep never touches the
 live corpus.
 
@@ -291,12 +291,11 @@ def _values(directives, section, key) -> list[str]:
 
 
 def test_timer_fires_at_the_next_free_nightly_slot():
-    """05:00, after 03:00 legibility-trickle, 03:30 flag-marker-sweep, the
+    """05:00, after 03:00 legibility-trickle, 03:30 flag-marker-sweep and the
     already-double-booked 04:00 (reclaim-orphaned-worktrees +
-    legibility-transcript-check) and 04:30 reify-closure-staleness-sweep. The
-    stagger is deliberate: these jobs all touch the same machine and, in
-    several cases, the same backing stores -- this one scrolls every point in
-    both live Qdrant collections."""
+    legibility-transcript-check). The stagger is deliberate: these jobs all
+    touch the same machine and, in several cases, the same backing stores --
+    this one scrolls every point in both live Qdrant collections."""
     assert _values(_directives(TIMER_NAME), 'Timer', 'OnCalendar') == [
         '*-*-* 05:00:00']
 
@@ -414,6 +413,40 @@ def test_service_documents_where_the_normative_contract_lives():
 # directly and positively by the OnCalendar tests in this file.
 
 
+# ── ambient git redirection (incident 2026-08-31) ───────────────────────────
+#
+# Every git path in this file is pinned to a tmp dir, and that is NOT sufficient.
+# `git -C <tmp>` only changes DIRECTORY: GIT_DIR and its siblings skip
+# repository discovery outright, so one ambient GIT_DIR sends both this file's
+# own `git config user.*` writes and the wrapper's `git -C "$REPO" commit`
+# into whatever repository that variable names, with -C and $REPO alike inert.
+#
+# That is not hypothetical here. On 2026-08-31 a run of this file wrote
+# `[user] name=Test email=test@example.com` and `commit.gpgsign = false` -- the
+# literal values from _git_repo_harness below -- into the LIVE project_root
+# checkout's .git/config, and committed this file's placeholder artifact
+# content onto its main. GIT_CEILING_DIRECTORIES did not stop it: a ceiling
+# bounds the upward WALK, and an explicit GIT_DIR never walks.
+#
+# GIT_CEILING_DIRECTORIES is the one GIT_* name deliberately KEPT: it is the
+# suite's first-defence containment (df_pytest_isolation._df_git_ceiling_at_basetemp)
+# and dropping it here would hand the subprocess LESS protection, not more.
+#
+# Suite-wide immunity lives in df_pytest_isolation._df_git_env_hermetic. This
+# layer is deliberately redundant with it, because this file is also run
+# directly (`pytest scripts/tests/test_...py`) from rootdirs whose conftest may
+# not wire that fixture, and because the harness -- not the fixture -- is what
+# a future editor of this file will read.
+_KEEP_GIT_ENV = frozenset({'GIT_CEILING_DIRECTORIES'})
+
+
+def _scrub_git_env(env):
+    """Drop every ambient GIT_* that could retarget git away from the path given."""
+    for key in [k for k in env if k.startswith('GIT_') and k not in _KEEP_GIT_ENV]:
+        env.pop(key, None)
+    return env
+
+
 # ── the committed wrapper ───────────────────────────────────────────────────
 
 _FAKE_RECORDER_SRC = '''#!/usr/bin/env python3
@@ -460,13 +493,23 @@ def _git_argv_path(tmp_path):
 
 
 def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
-                     default_prefix=False, record_git=False):
+                     default_prefix=False, record_git=False,
+                     pad_commit_output=0):
     """Point both wrapper seams at fake recorders. Returns (env, state_path).
 
     With `default_prefix=True` the two `*_CMD` seams are left UNSET instead, so
     the wrapper's own `uv run --frozen --project <FM> python` prefix is the
     thing under test, with a fake `uv` recorder on PATH. Every other wrapper
     test overrides both seams and therefore never exercises that prefix at all.
+
+    `pad_commit_output` (bytes, default 0/off) is an opt-in knob on the
+    `record_git=True` shim: when set, the shim's handling of a `commit`
+    invocation captures the REAL git's combined output, replays it VERBATIM
+    first, then appends this many padding bytes, and exits with git's REAL
+    status. git's own behaviour never changes -- only the volume the wrapper
+    must read past does. This is what turns the wrapper's SIGPIPE-under-
+    pipefail misread (see the retry-predicate tests below) from a ~0.6% race
+    at git's natural output size into a deterministic reproduction.
     """
     bin_dir = tmp_path / 'wbin'
     bin_dir.mkdir(exist_ok=True)
@@ -501,20 +544,47 @@ def _wrapper_harness(tmp_path, *, census_exit=0, stamp_exit=0, extra_env=None,
         git_log = _git_argv_path(tmp_path)
         git_log.write_text('')
         shim = bin_dir / 'git'
-        shim.write_text(
-            '#!/usr/bin/env bash\n'
+        record_snippet = (
             f'{sys.executable} -c '
             '\'import json,sys; open(sys.argv[1],"a").write('
             'json.dumps(sys.argv[2:])+"\\n")\' '
             f'{git_log} "$@"\n'
-            f'exec {real_git} "$@"\n'
         )
+        if pad_commit_output:
+            # Only `commit` invocations are padded. Skip any leading `-C
+            # <dir>` pair(s) before checking the subcommand, mirroring
+            # _forbidden_reason's own argv walk below, so this cannot be
+            # fooled by option placement either. Non-commit calls (rev-parse,
+            # status, the scoped add --) fall through to the plain `exec`
+            # branch, untouched.
+            shim.write_text(
+                '#!/usr/bin/env bash\n'
+                + record_snippet +
+                'rest=("$@")\n'
+                'while [ "${rest[0]:-}" = "-C" ] && [ "${#rest[@]}" -ge 2 ]; do\n'
+                '    rest=("${rest[@]:2}")\n'
+                'done\n'
+                'if [ "${rest[0]:-}" = "commit" ]; then\n'
+                f'    out="$({real_git} "$@" 2>&1)"\n'
+                '    rc=$?\n'
+                '    printf \'%s\' "$out"\n'
+                f'    head -c {pad_commit_output} /dev/zero | tr \'\\0\' x\n'
+                '    exit "$rc"\n'
+                'fi\n'
+                f'exec {real_git} "$@"\n'
+            )
+        else:
+            shim.write_text(
+                '#!/usr/bin/env bash\n'
+                + record_snippet +
+                f'exec {real_git} "$@"\n'
+            )
         shim.chmod(0o755)
 
     repo = tmp_path / 'fake-repo'
     (repo / 'fused-memory' / 'scripts').mkdir(parents=True, exist_ok=True)
 
-    env = dict(os.environ)
+    env = _scrub_git_env(dict(os.environ))
     env['PATH'] = f'{bin_dir}{os.pathsep}{env["PATH"]}'
     env['REPO'] = str(repo)
     for key in _SERVICE_ENV_KEYS:
@@ -687,9 +757,14 @@ _ARTIFACTS = (
 
 
 def _git(repo, *args):
+    # env= is load-bearing, not tidiness: these are the calls that wrote
+    # `[user] name=Test` into the live checkout's .git/config on 2026-08-31.
+    # Without the scrub they inherit an ambient GIT_DIR and the `-C` below is
+    # decorative. See the _scrub_git_env block above.
     return subprocess.run(
         ['git', '-C', str(repo), *args],
         capture_output=True, text=True, check=False,
+        env=_scrub_git_env(dict(os.environ)),
     )
 
 
@@ -807,6 +882,100 @@ def test_the_untracked_retry_is_reached_only_because_the_plain_commit_fails(
     assert 'did not match any file' in (proc.stdout + proc.stderr).lower()
 
 
+# Trailing bytes appended AFTER git's real (verbatim) commit output, to force
+# the retry predicate's SIGPIPE misread deterministically rather than at its
+# natural ~0.6%-under-load rate.
+#
+# Mirrors tests/scripts/test_setup_host_probe_pipelines.py::BULK_BYTES
+# (task 4204): that file's 30-trials-per-size measurement records 65536 as
+# FLAKY at 26/30 while 262144 and above are 30/30. Do NOT lower this -- a
+# too-small pad does not make the test flaky, it silently weakens its power to
+# catch a reintroduced `printf | grep -q` pipeline, which is worse because it
+# is invisible. (This task separately measured 200/200 at ~200KB on this box;
+# 262144 is the repo's already-established, better-sampled floor.)
+_PAD_COMMIT_OUTPUT_BYTES = 262144
+
+
+def test_the_untracked_retry_is_decided_by_gits_message_not_its_volume(
+        tmp_path):
+    """The untracked-run retry decision must be read from git's MESSAGE, not
+    manufactured by how much git printed.
+
+    ROOT CAUSE. The retry predicate (wrapper lines ~199-201) is
+
+        printf '%s' "$commit_out" | grep -qi 'did not match any file'
+
+    under `set -uo pipefail` (wrapper line 68). `grep -q` exits the instant
+    it matches, and the match is on line 1 of git's own error message; the
+    `printf` writer can then die of SIGPIPE once `commit_out` exceeds the pipe
+    buffer, `pipefail` promotes the pipeline's status to 141, and a TRUE
+    predicate reads FALSE -- so the scoped `git add --` retry is skipped and
+    the first-ever-run commit silently does not happen, even though the
+    string the grep looks for was genuinely present in `commit_out`.
+
+    MEASURED (this worktree, 2026-09-01, git 2.43.0, bash 5.2.21, fleet load
+    avg ~127/32 cores): 25/4000 (0.6%) misses at git's natural ~270-byte
+    message -- an intermittent flake, not a deterministic failure -- and
+    200/200 once the payload passes the pipe buffer. This test buys the
+    deterministic RED the second way: `pad_commit_output=
+    _PAD_COMMIT_OUTPUT_BYTES` inflates ONLY the volume `commit_out` carries
+    (git's real message is replayed verbatim first, and git's real exit
+    status is preserved) -- never git's message or status -- so a 0.6% race
+    becomes a certainty.
+
+    Already-fixed siblings of this exact defect class, adopted here rather
+    than rediscovered: scripts/setup-host.sh::_parity_verdict and
+    scripts/legibility/install-trickle-timer.sh (task 3527, commit
+    5653ccd4f5) -- both replaced `printf | grep -q` with bash's own `[[ ]]`
+    for the identical SIGPIPE-under-pipefail reason.
+
+    Asserts on the BRANCH THE WRAPPER TOOK -- the recorded argv, the
+    narration, the resulting commit -- never on "did the internal pipeline
+    return 141". Measured: that pipeline returns 141 at every payload size
+    tried, including 4096 bytes; it is only the VERDICT drawn from it that
+    races, so a bare exit-141 check would be green on a healthy wrapper too.
+    """
+    repo = _git_repo_harness(tmp_path, tracked=False)
+    result, _ = _run_wrapper_in_git_repo(
+        tmp_path, repo, record_git=True,
+        pad_commit_output=_PAD_COMMIT_OUTPUT_BYTES,
+    )
+    recorded = [
+        json.loads(line)
+        for line in _git_argv_path(tmp_path).read_text().splitlines() if line
+    ]
+
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr[:400]!r}')
+    # THE HONEST-FAILURE ASSERTION, checked FIRST -- same ordering as the
+    # honest-failure assertion in test_wrapper_never_invokes_a_forbidden_git_verb
+    # below (commit-step confirmed before argv is trusted). On the regression
+    # this test guards against, `commit_out` is padded on EVERY commit
+    # attempt, including the failed first one whose message the wrapper
+    # echoes to stderr on the `failed` branch -- so a stderr TAIL slice on
+    # that failure is a wall of padding, not a diagnostic (confirmed
+    # empirically). The commit-step token names the branch directly instead.
+    observed_step = _commit_step(result)
+    assert observed_step == 'committed', (
+        f'expected commit-step=committed, observed {observed_step!r}; '
+        f'stdout={result.stdout!r} stderr={result.stderr[:400]!r}')
+    # The scoped retry actually fired for THIS run -- the branch under test,
+    # not merely "the script survived". Same substring idiom as the pooled
+    # guard below (' add -- ' padded on both sides so a bare `add` verb never
+    # matches), scoped to this one run's own recorded argv. Checked only once
+    # the commit-step assertion above has confirmed this run actually
+    # committed, so a decline and a missing substring can never again be
+    # conflated into the same failure.
+    flat = [' '.join(a) for a in recorded]
+    assert any(' add -- ' in f'{c} ' for c in flat), (
+        f'the scoped `git add --` retry never fired for this run: {flat!r}')
+    assert 'committed the regenerated artifacts' in result.stdout, result.stdout
+    assert 'commit=0' in result.stdout, result.stdout
+    # All three landed in the one retried commit -- the retry stayed scoped.
+    files = _git(repo, 'show', '--name-only', '--pretty=', 'HEAD').stdout.split()
+    assert sorted(files) == sorted(_ARTIFACTS), files
+
+
 def test_wrapper_commit_is_scoped_and_never_sweeps_unrelated_dirty_state(
         tmp_path):
     """CLAUDE.md's rule for this checkout: `git commit --only <paths>`, never a
@@ -893,6 +1062,99 @@ def test_wrapper_narrates_the_commit_outcome_alongside_the_other_two(tmp_path):
     assert 'commit=0' in combined, combined
 
 
+def _done_line(output):
+    """The wrapper's own final `done (...)` narration line, or '' if absent."""
+    for line in output.splitlines():
+        if line.startswith('memory-metadata-coverage-census: done ('):
+            return line
+    return ''
+
+
+def _parse_commit_step(line):
+    """Pull the `commit-step=<token>` field out of one done(...) line, or None.
+
+    Parses the ISOLATED done-line only, never the whole combined output, so a
+    token appearing merely in earlier prose (or a stray substring match) can
+    never satisfy this.
+    """
+    marker = 'commit-step='
+    idx = line.find(marker)
+    if idx == -1:
+        return None
+    token = line[idx + len(marker):].split(')')[0].strip()
+    return token or None
+
+
+def test_the_wrapper_names_which_commit_step_branch_it_took(tmp_path):
+    """Of the wrapper's five commit-step outcomes, FOUR narrate `commit=0` on
+    the final done(...) line -- which reads as success while nothing was
+    committed. In an unattended nightly whose journal is its only readable
+    surface, "declined" and "committed" being indistinguishable in the
+    summary line is exactly the silent-degradation shape CLAUDE.md's
+    loud-over-silent norm warns about.
+
+    Drives the REAL wrapper into all five branches with the harnesses already
+    established in this file (INV-10 `guards-exercise-behaviour`: no
+    source-text scanning) and asserts every done(...) line carries a
+    `commit-step=<token>` field EQUAL TO the token that branch is contracted
+    to emit -- `scenarios`'s own keys double as the expected tokens, so the
+    mapping assertion below checks each branch against ITSELF, not merely
+    against its neighbours. A pairwise-distinctness check would still pass if
+    two branches emitted each other's token under swapped names (verified by
+    mutation: renaming `skipped:disabled` <-> `skipped:not-a-git-repo`'s
+    tokens left a same-shaped distinctness check green); this catches that.
+    """
+    scenarios = {}
+
+    committed_repo = _git_repo_harness(tmp_path / 'committed')
+    scenarios['committed'], _ = _run_wrapper_in_git_repo(
+        tmp_path / 'committed', committed_repo)
+
+    no_drift_repo = _git_repo_harness(tmp_path / 'no-drift', dirty=False)
+    scenarios['skipped:no-drift'], _ = _run_wrapper_in_git_repo(
+        tmp_path / 'no-drift', no_drift_repo)
+
+    # _wrapper_harness builds `<dir>/wbin` without `parents=True`, so (unlike
+    # the _git_repo_harness-backed scenarios above, whose own `parents=True`
+    # mkdir already creates their subdirectory) these two must create theirs
+    # first.
+    not_a_repo_dir = tmp_path / 'not-a-git-repo'
+    not_a_repo_dir.mkdir()
+    scenarios['skipped:not-a-git-repo'], _ = _run_wrapper(not_a_repo_dir)
+
+    outer_repo = _git_repo_harness(tmp_path / 'outer')
+    inner = outer_repo / 'plans'  # a real subdirectory, not the repo root
+    scenarios['refused:repo-not-toplevel'], _ = _run_wrapper_in_git_repo(
+        tmp_path / 'outer', inner)
+
+    disabled_dir = tmp_path / 'disabled'
+    disabled_dir.mkdir()
+    scenarios['skipped:disabled'], _ = _run_wrapper(
+        disabled_dir, extra_env={'CENSUS_COMMIT': '0'})
+
+    tokens = {}
+    for label, result in scenarios.items():
+        assert result.returncode == 0, (
+            f'{label}: rc={result.returncode} '
+            f'stdout={result.stdout!r} stderr={result.stderr[-2000:]!r}')
+        combined = result.stdout + result.stderr
+        line = _done_line(combined)
+        assert line, (
+            f'{label}: no done(...) narration line found; '
+            f'stdout={result.stdout!r} stderr={result.stderr[-2000:]!r}')
+        token = _parse_commit_step(line)
+        assert token is not None, (
+            f'{label}: done(...) line carries no commit-step= field: '
+            f'{line!r}')
+        tokens[label] = token
+
+    # The MAPPING, not merely distinctness: `scenarios`'s keys are the tokens
+    # each branch is contracted to emit, so this fails if a branch narrates
+    # the wrong (if still distinct) token -- e.g. two branches swapping
+    # tokens under different names, which a pairwise-distinctness check
+    # cannot see (distinctness follows for free here, from distinct keys).
+    assert tokens == {label: label for label in scenarios}, tokens
+
 
 # The forbidden-git-verb guard, asserted on the argv the wrapper ACTUALLY
 # invokes.
@@ -965,6 +1227,66 @@ def test_the_forbidden_reason_helper_actually_fires():
         assert _forbidden_reason(argv) is None, f'{argv!r} false-positived'
 
 
+def _commit_step(result):
+    """The wrapper's own `commit-step=<token>` verdict for one run.
+
+    Parses it out of the wrapper's final `done (...)` narration in
+    `result.stdout + result.stderr`, reusing `_done_line` / `_parse_commit_step`
+    above. Returns the sentinel '<unreported>' -- NEVER raises -- when the
+    done(...) line or the field itself is absent, because this helper's whole
+    job is to make a bad run REPORTABLE rather than to die on an unrelated
+    exception (an IndexError would give a guard failure that names nothing).
+    """
+    combined = result.stdout + result.stderr
+    line = _done_line(combined)
+    token = _parse_commit_step(line) if line else None
+    return token if token is not None else '<unreported>'
+
+
+def test_the_commit_step_reader_reports_a_decline_as_a_decline():
+    """Pin the reader before trusting it, in the shape this file already
+    established for `_forbidden_reason` just above:
+    `test_the_forbidden_reason_helper_actually_fires` pins the detector
+    against cheap SYNTHETIC input, and the real test
+    (`test_wrapper_never_invokes_a_forbidden_git_verb`, below) supplies the
+    subject. `_commit_step` gets the same treatment here -- driven against
+    literal done(...) narration, not real wrapper runs.
+
+    Real-wrapper coverage of these three branches already exists elsewhere:
+    `test_the_wrapper_names_which_commit_step_branch_it_took`'s
+    branch->token mapping assertion, and the honest-failure assertion in
+    `test_wrapper_never_invokes_a_forbidden_git_verb`. Re-driving a real git
+    repo and subprocess three more times here would prove the same behaviour
+    a fourth and fifth time rather than a new one -- `_commit_step` is a
+    six-line pure-string helper (`_done_line` + `_parse_commit_step` + a
+    sentinel), and synthetic input pins its parsing directly.
+    """
+    def _stub(stdout):
+        return subprocess.CompletedProcess(
+            args=['bash'], returncode=0, stdout=stdout, stderr='')
+
+    committed = _stub(
+        'memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 '
+        'commit-step=committed)\n')
+    assert _commit_step(committed) == 'committed'
+
+    refused = _stub(
+        'memory-metadata-coverage-census: done (census=0 stamp=0 commit=1 '
+        'commit-step=refused:repo-not-toplevel)\n')
+    assert _commit_step(refused) == 'refused:repo-not-toplevel'
+
+    no_drift = _stub(
+        'memory-metadata-coverage-census: done (census=0 stamp=0 commit=0 '
+        'commit-step=skipped:no-drift)\n')
+    assert _commit_step(no_drift) == 'skipped:no-drift'
+
+    # A non-wrapper input carrying no narration at all must degrade to the
+    # named sentinel instead of raising -- an IndexError here would make the
+    # guard's own failure unreadable.
+    stub = subprocess.CompletedProcess(args=['x'], returncode=0, stdout='', stderr='')
+    assert _commit_step(stub) == '<unreported>'
+
+
 def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
     """CLAUDE.md's hardest prohibition, on a script that commits UNATTENDED
     into the machine-operated project_root checkout.
@@ -973,13 +1295,31 @@ def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
     every worktree, and the merge worker's advance path also consumes it
     (incident 13674d3c68), so a stash here can be popped out from under an
     unrelated process.
+
+    Each scenario's evidence stays SEPARATE rather than pooled. Pooling used
+    to let an environmental/precondition decline in one iteration hide behind
+    a healthy run in another: the old anti-vacuity check only proved that a
+    scoped commit and the add-- retry happened SOMEWHERE across all three
+    runs, so a run whose retry silently declined (the printf|grep -q SIGPIPE
+    misread pinned elsewhere in this file) could still pass as long as
+    ANOTHER iteration produced that substring -- and if it ever did trip, the
+    failure dumped a saferepr-truncated pooled list naming neither the
+    iteration nor the branch (esc-3647-3). Each iteration now asserts its OWN
+    commit-step branch and, only once that is confirmed, its OWN argv -- so a
+    precondition decline fails HERE, AS a decline, naming which iteration and
+    which branch, instead of surviving to a pooled check it was never meant
+    to satisfy. The anti-vacuity INTENT is unchanged: the guard still proves
+    the scoped-commit path and the add-- retry path were genuinely exercised.
     """
-    seen = []
-    for label, kwargs in (
-        ('already-tracked artifacts', {}),
-        ('first-ever run, untracked (exercises the add-- retry)', {'tracked': False}),
-        ('a quiet night with no drift', {'dirty': False}),
-    ):
+    scenarios = (
+        # (label, _git_repo_harness kwargs, expected commit-step,
+        #  a git-argv substring that scenario's OWN run must contain)
+        ('already-tracked artifacts', {}, 'committed', 'commit --only'),
+        ('first-ever run, untracked (exercises the add-- retry)',
+         {'tracked': False}, 'committed', ' add -- '),
+        ('a quiet night with no drift', {'dirty': False}, 'skipped:no-drift', None),
+    )
+    for label, kwargs, expected_step, expect_substring in scenarios:
         repo = _git_repo_harness(tmp_path / label.split()[0], **kwargs)
         env, _ = _wrapper_harness(tmp_path, record_git=True)
         env['REPO'] = str(repo)
@@ -996,14 +1336,158 @@ def test_wrapper_never_invokes_a_forbidden_git_verb(tmp_path):
         # shape: if the shim recorded nothing the wrapper never reached git and
         # every "no forbidden verb" assertion below would hold vacuously.
         assert recorded, f'{label}: the wrapper invoked git zero times'
-        seen.extend(recorded)
         for argv in recorded:
             reason = _forbidden_reason(argv)
             assert reason is None, f'{label}: `git {" ".join(argv)}` — {reason}'
 
-    # The scoped-commit form is the whole point, and the retry path really was
-    # reached -- so the clean run above is evidence about the git surface that
-    # matters, not about a wrapper that quietly did nothing.
-    flat = [' '.join(a) for a in seen]
-    assert any('commit --only' in c for c in flat), flat
-    assert any(' add -- ' in f'{c} ' for c in flat), flat
+        # THE HONEST-FAILURE ASSERTION. This is what actually flaked -- the
+        # untracked iteration's retry silently skipped under the SIGPIPE
+        # misread -- and it now fails HERE, naming the iteration, the branch
+        # it was built for, and the branch it actually took, rather than
+        # surviving to a pooled check that could not tell a decline in THIS
+        # iteration from a healthy run in a different one.
+        observed_step = _commit_step(result)
+        assert observed_step == expected_step, (
+            f'{label}: expected commit-step={expected_step!r}, observed '
+            f'{observed_step!r}; recorded={recorded!r} '
+            f'stderr={result.stderr[-2000:]!r}')
+
+        if expect_substring is not None:
+            # Only checked once the commit-step assertion above has already
+            # confirmed this iteration actually committed -- so a missing
+            # substring and a declined commit can never again be conflated
+            # into the same failure.
+            flat = [' '.join(a) for a in recorded]
+            assert any(expect_substring in f'{c} ' for c in flat), (
+                f'{label}: no git call recorded containing {expect_substring!r}: '
+                f'{flat!r}')
+
+
+# ── ambient GIT_* can never redirect this job into another repo ──────────────
+#
+# Regression guard for the 2026-08-31 incident, in which a run of THIS FILE
+# committed placeholder content onto main in the live project_root checkout and
+# wrote `[user] name=Test email=test@example.com` + `commit.gpgsign = false`
+# into its real .git/config.
+#
+# The mechanism is not a missing $REPO -- _wrapper_harness has pinned REPO to a
+# tmp dir since the file was written. It is that `git -C "$REPO"` does not mean
+# "act on $REPO": `-C` only changes directory, while GIT_DIR skips repository
+# discovery entirely, so an ambient GIT_DIR overrides BOTH the -C and the $REPO
+# and every git call lands in the repository it names. GIT_CEILING_DIRECTORIES
+# does not cover this -- a ceiling bounds the upward WALK, and GIT_DIR never
+# walks.
+#
+# INV-10 (`guards-exercise-behaviour`): these RUN the real wrapper and the real
+# harness against a decoy repository standing in for the live checkout and
+# assert the decoy is untouched. Nothing here greps the wrapper's text -- a
+# source scan would have stayed green through the entire incident, since the
+# wrapper's `git -C "$REPO"` spelling was never what was wrong.
+
+
+def _decoy_live_repo(tmp_path):
+    """A real repo standing in for the live checkout, with its own identity.
+
+    Carries the same tracked artifact paths as the real thing, so a redirected
+    `commit --only` would SUCCEED here rather than failing on an unknown
+    pathspec -- otherwise the guard could pass for the wrong reason.
+    """
+    decoy = tmp_path / 'decoy-live-checkout'
+    (decoy / 'plans').mkdir(parents=True)
+    _git(decoy, 'init', '-q', '-b', 'main')
+    _git(decoy, 'config', 'user.email', 'real-operator@example.invalid')
+    _git(decoy, 'config', 'user.name', 'Real Operator')
+    for rel in _ARTIFACTS:
+        (decoy / rel).write_text('{"real": true}\n')
+    _git(decoy, 'add', '--', *_ARTIFACTS)
+    _git(decoy, '-c', 'commit.gpgsign=false', 'commit', '-q', '--no-verify',
+         '-m', 'real history')
+    return decoy
+
+
+def _decoy_state(decoy):
+    """The two things the incident actually damaged: identity, and history."""
+    return {
+        'user.email': _git(decoy, 'config', '--local', '--get', 'user.email').stdout,
+        'user.name': _git(decoy, 'config', '--local', '--get', 'user.name').stdout,
+        'gpgsign': _git(decoy, 'config', '--local', '--get', 'commit.gpgsign').stdout,
+        'log': _git(decoy, 'log', '--pretty=%H %s').stdout,
+    }
+
+
+def test_wrapper_cannot_commit_into_a_repo_named_only_by_ambient_git_dir(tmp_path):
+    """THE incident, reproduced end to end against a decoy.
+
+    GIT_DIR is injected via `extra_env`, which _wrapper_harness applies AFTER
+    its own scrub -- deliberately, so this exercises the WRAPPER's own
+    `unset GIT_DIR ...` (the production-side defence, which must hold when the
+    wrapper is run by systemd, a git hook, or any shell this file never touches)
+    rather than the harness's scrub.
+    """
+    decoy = _decoy_live_repo(tmp_path)
+    before = _decoy_state(decoy)
+
+    repo = _git_repo_harness(tmp_path / 'sandbox')
+    result, state = _run_wrapper_in_git_repo(
+        tmp_path, repo, extra_env={'GIT_DIR': str(decoy / '.git')},
+    )
+
+    assert _decoy_state(decoy) == before, (
+        'the wrapper wrote into a repository named only by an ambient GIT_DIR; '
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    # POSITIVE CONTROL: the run must have done its real work in the sandbox.
+    # Without this the assertion above passes just as well when the wrapper
+    # dies on line 1 and touches nothing anywhere.
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    assert [c['who'] for c in state] == ['CENSUS', 'STAMP'], state
+    sandbox_status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
+    assert sandbox_status.strip() == '', (
+        f'the sandbox commit did not happen, so the guard proved nothing: '
+        f'{sandbox_status!r} stdout={result.stdout!r}')
+
+
+def test_harness_git_calls_cannot_be_redirected_by_ambient_git_dir(
+        tmp_path, monkeypatch):
+    """The OTHER half of the incident: the harness's own identity writes.
+
+    `[user] name=Test email=test@example.com` and `commit.gpgsign = false` are
+    _git_repo_harness's literals, and they are what landed in the live
+    checkout's .git/config. Exercises _git/_scrub_git_env, not the wrapper.
+    """
+    decoy = _decoy_live_repo(tmp_path)
+    before = _decoy_state(decoy)
+
+    monkeypatch.setenv('GIT_DIR', str(decoy / '.git'))
+    repo = _git_repo_harness(tmp_path / 'sandbox')
+
+    assert _decoy_state(decoy) == before, (
+        'the harness wrote its fixture identity/commits into a repository '
+        'named only by an ambient GIT_DIR')
+    # POSITIVE CONTROL: the harness really did build its own repo.
+    assert _git(repo, 'config', '--local', '--get', 'user.email').stdout.strip() \
+        == 'test@example.com'
+
+
+def test_wrapper_refuses_to_commit_when_repo_is_not_the_repository_root(tmp_path):
+    """Fail-closed backstop, independent of any GIT_* name.
+
+    The `unset` above removes the KNOWN redirection vars; this pins the
+    residual-case guard -- $REPO resolving to a repository whose root is
+    somewhere else (a nested or symlinked checkout, a $REPO pointed at a
+    subdirectory, or a redirection var git adds in a future release). The
+    wrapper must decline rather than commit into it.
+    """
+    outer = _git_repo_harness(tmp_path / 'outer')
+    before = _git(outer, 'log', '--pretty=%H %s').stdout
+
+    inner = outer / 'plans'  # a real subdirectory of a real repo, not its root
+    result, _ = _run_wrapper_in_git_repo(tmp_path, inner)
+
+    assert 'REFUSING' in result.stderr, result.stderr
+    assert _git(outer, 'log', '--pretty=%H %s').stdout == before, (
+        'the wrapper committed into the enclosing repository it was not told '
+        f'about; stderr={result.stderr!r}')
+    # Still exits 0: a refused commit must not wedge the recurring oneshot.
+    assert result.returncode == 0, result.stderr

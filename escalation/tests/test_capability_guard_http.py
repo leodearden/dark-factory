@@ -38,6 +38,8 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from _escalation_http import escalation_http_call
+from _escalation_seed import seed_escalation
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
 
@@ -59,18 +61,16 @@ from escalation.queue import EscalationQueue
 # once in ``_serve_escalation_mcp_impl``, with its regression test in
 # ``test_serve_escalation_mcp_fixture.py``.
 #
-# DELIBERATELY NOT deduped by task 3736, so the remaining copies below do not
-# read as an oversight: the per-tool call helpers (``_resolve_over_http`` /
-# ``_promote_over_http`` / ``_stamp_triage_over_http``) still have near-twins in
-# ``test_status_authority_gate.py``. Task 3736 scoped itself to the SERVER
-# LIFECYCLE half. Within this module they are now one generic
-# ``_call_over_http`` plus three one-line partials, so the
-# X-Escalation-Levels/X-Escalation-Identity header protocol lives in exactly one
-# place HERE and one place there; folding those last two into a shared conftest
-# fixture is a follow-up, because a conftest helper is reachable only as a
-# fixture (a bare ``from conftest import ...`` is unsafe under
-# ``--import-mode=importlib``) and converting ~90 call sites in these two
-# modules to request it is a mechanical change far larger than this one.
+# Every part of the harness is now shared, none with a second copy (tasks
+# 3736 / 4345 / 4997, per INV-5). The SERVER-LIFECYCLE half comes from
+# ``conftest.py``'s ``serve_escalation_mcp_module``; the CALL half from
+# ``_escalation_http.escalation_http_call``; record seeding from
+# ``_escalation_seed.seed_escalation``. The ``async def`` partials and ``_seed``
+# below survive on purpose: each is a single delegation carrying one
+# per-module fact (per-tool intent in a docstring, or a default summary), so
+# there is nothing left that could drift. The CALL half's single-source
+# property is asserted, not merely asserted-to:
+# ``test_escalation_http_helper.py`` AST-scans this directory for it.
 # ---------------------------------------------------------------------------
 
 
@@ -128,67 +128,24 @@ def _seed(
     *,
     level: int,
     task_id: str,
-    agent_role: str = 'implementer',
+    summary: str | None = None,
     **kw: Any,
 ) -> Escalation:
-    """Seed a pending escalation at *level* directly via ``queue.submit()``.
-
-    Bypasses the MCP tools entirely (mirrors the ``_seed_esc`` helper in
-    test_server.py). ``severity``/``category``/``summary`` default to
-    innocuous values but can be overridden via **kw.
-    """
-    kw.setdefault('severity', 'blocking')
-    kw.setdefault('category', 'scope_violation')
-    kw.setdefault('summary', f'capability-guard test escalation (level={level})')
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=agent_role,
-        level=level,
-        **kw,
-    )
-    queue.submit(esc)
-    return esc
-
-
-async def _call_over_http(
-    base_url: str,
-    tool_name: str,
-    *,
-    levels: str | None = None,
-    identity: str | None = None,
-    **tool_kwargs: Any,
-) -> dict[str, Any]:
-    """Call *tool_name* over real HTTP, optionally with capability headers.
-
-    The SINGLE place in this module that knows the capability-header wire
-    protocol. *levels* / *identity*, when not None, are sent as the literal
-    ``X-Escalation-Levels`` / ``X-Escalation-Identity`` request headers; when
-    None the header is omitted entirely (never sent as an empty string), so a
-    header-less call exercises the exact same default-open path a real
-    header-less client would hit. The three per-tool helpers below are
-    one-liners over this, so the header construction cannot drift between them.
-    """
-    headers: dict[str, str] = {}
-    if levels is not None:
-        headers['X-Escalation-Levels'] = levels
-    if identity is not None:
-        headers['X-Escalation-Identity'] = identity
-    transport = StreamableHttpTransport(f'{base_url}/mcp/', headers=headers)
-    async with Client(transport) as client:
-        result = await client.call_tool(tool_name, tool_kwargs)
-        return result.data
+    """Delegates to ``seed_escalation`` with this module's default summary."""
+    if summary is None:
+        summary = f'capability-guard test escalation (level={level})'
+    return seed_escalation(queue, level=level, task_id=task_id, summary=summary, **kw)
 
 
 async def _resolve_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
     """``resolve_issue`` over real HTTP — the tool the capability guard gates."""
-    return await _call_over_http(base_url, 'resolve_issue', **kwargs)
+    return await escalation_http_call(base_url, 'resolve_issue', **kwargs)
 
 
 async def _promote_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
     """``promote_to_l2`` over real HTTP — used to prove it is never gated by
     X-Escalation-Levels (it is intentionally left ungated)."""
-    return await _call_over_http(base_url, 'promote_to_l2', **kwargs)
+    return await escalation_http_call(base_url, 'promote_to_l2', **kwargs)
 
 
 async def _stamp_triage_over_http(base_url: str, **kwargs: Any) -> dict[str, Any]:
@@ -196,7 +153,7 @@ async def _stamp_triage_over_http(base_url: str, **kwargs: Any) -> dict[str, Any
     X-Escalation-Levels (a triage-ack annotation, not a state transition) while
     ``triaged_by`` is still server-attributed from X-Escalation-Identity when
     present."""
-    return await _call_over_http(base_url, 'stamp_triage', **kwargs)
+    return await escalation_http_call(base_url, 'stamp_triage', **kwargs)
 
 
 # ---------------------------------------------------------------------------

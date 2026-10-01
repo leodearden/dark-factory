@@ -1,5 +1,7 @@
 """Integration tests verifying causation_id flows through all paths."""
 
+import asyncio
+import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -299,3 +301,243 @@ async def test_execute_mem0_write_still_journals_on_success(service, write_journ
     assert row['success'] == 1
     assert row['error'] is None
     assert row['result_summary'] is not None
+
+
+@pytest.mark.asyncio
+async def test_execute_mem0_write_journals_cancellation_as_failure(
+    service, write_journal
+):
+    """A CANCELLED queued mem0 write must never journal as a success.
+
+    The durable queue cancels a write in two ordinary ways: the
+    ``asyncio.wait_for(..., self._write_timeout_seconds)`` around every
+    execute (durable_queue.py), and ``close()`` cancelling its worker tasks.
+    Either way the write provably never executed — so the Layer-1 row must
+    say so. ``success`` was derived from the ABSENCE of a recorded error, and
+    ``asyncio.CancelledError`` is a BaseException that sails past
+    ``except Exception``, so the ``finally`` journalled ``success=True`` for a
+    write that never reached mem0 at all.
+
+    Task 3582's property is preserved, not traded away: the row must still
+    EXIST on the cancellation path. Only its content changes.
+    """
+    op_id = str(uuid.uuid4())
+
+    # A plain hanging coroutine function, deliberately NOT an AsyncMock
+    # side_effect: the await must be a real suspension point so wait_for can
+    # actually cancel it mid-flight.
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    service.mem0.add = _hang
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            service._execute_mem0_write(
+                {
+                    'content': 'a fact cancelled mid-flight',
+                    'project_id': 'test',
+                    '_write_op_id': op_id,
+                    'metadata': {'category': 'preferences_and_norms'},
+                }
+            ),
+            0.2,
+        )
+
+    row = await write_journal.get_write_op(op_id)
+    assert row is not None, 'a cancelled queued mem0 write must still be journaled'
+    assert row['operation'] == 'add_memory'
+    assert row['success'] == 0, 'a cancelled write never landed — it is not a success'
+    assert 'CancelledError' in (row['error'] or '')
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_backend_call_still_leaves_a_layer_2_row(
+    service, write_journal
+):
+    """A cancelled backend call must leave a Layer-2 row, not vanish.
+
+    Every backend write routes through one shared Layer-2 helper, and its
+    handler was ``except Exception``. On a cancellation NEITHER branch ran,
+    so no backend_ops row was written at all — the cancelled call simply
+    disappeared from Layer 2. That is the row an operator is sent to when
+    deciding whether a write landed (DurableWriteQueue.get_dead_items), so a
+    missing one leaves the question unanswerable exactly when it is asked.
+
+    Driven through the public ``add_memory``, whose Mem0 leg is a direct
+    journaled call, and cancelled once that call is in flight — the way a
+    request timeout or a client disconnect cancels it.
+    """
+    cid = str(uuid.uuid4())
+    in_flight = asyncio.Event()
+
+    async def _hang(*_args, **_kwargs):
+        in_flight.set()
+        await asyncio.sleep(30)
+
+    service.mem0.add = _hang
+
+    call = asyncio.create_task(
+        service.add_memory(
+            content='a fact cancelled mid-flight',
+            category='preferences_and_norms',
+            project_id='test',
+            causation_id=cid,
+        )
+    )
+    try:
+        await asyncio.wait_for(in_flight.wait(), 10)
+    finally:
+        call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    mem0_adds = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert len(mem0_adds) == 1, 'a cancelled backend call must still be journaled'
+    assert mem0_adds[0]['success'] == 0
+    assert 'CancelledError' in (mem0_adds[0]['error'] or '')
+
+
+@pytest.mark.asyncio
+async def test_add_episode_journals_cancellation_as_failure(service, write_journal):
+    """A cancelled add_episode enqueue must never journal as a success.
+
+    Per the write_ops schema, a row's ``success`` means "the enqueue was
+    ACCEPTED" — it is stamped the instant durable_queue.enqueue() commits.
+    An enqueue cancelled mid-commit was therefore never accepted, and is by
+    definition not a success.
+
+    This is the same defect as ``_execute_mem0_write``'s (optimistic
+    ``success = True`` initialiser + ``except Exception`` + a ``finally``
+    that journals it) on the far higher-traffic producer: the ``mem0_add``
+    queue operation has no live producer at all, while ``add_episode`` is
+    the hot Layer-1 path. The two are a documented pair — each file's
+    comment already names the other as its mirror — so they are fixed
+    together.
+    """
+    cid = str(uuid.uuid4())
+
+    async def _hang(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    service.durable_queue.enqueue = _hang
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            service.add_episode(
+                content='never enqueued',
+                project_id='test',
+                causation_id=cid,
+            ),
+            0.2,
+        )
+
+    # add_episode mints its write_op_id internally and never returns it, so
+    # causation_id is the only join key available here.
+    ops = await write_journal.get_ops_by_causation(cid)
+    write_ops = [o for o in ops if o['layer'] == 'write_op']
+    assert len(write_ops) == 1, 'a cancelled add_episode must still be journaled'
+    assert write_ops[0]['operation'] == 'add_episode'
+    assert write_ops[0]['success'] == 0, 'an enqueue that never committed is not accepted'
+    assert 'CancelledError' in (write_ops[0]['error'] or '')
+
+
+# ── task 3212: the SECOND copy of the search-telemetry shape ──────────
+#
+# MemoryService.search self-journals whenever causation_id is truthy — the
+# whole reconciliation read path.  Widening only the MCP tool would leave
+# every recon-path row unusable by leaf eta (3213) while LOOKING done, and
+# would leave two copies of one shape free to drift (INV-5).
+
+_LONG_QUERY = (
+    'what did reconciliation actually retrieve for this task event, and did the '
+    'agent that later wrote a near-duplicate memory ever see the canonical it '
+    'duplicated, across a query long enough that the old 200-character cut would '
+    'have discarded the half that carries the question ENDMARKER'
+)
+assert len(_LONG_QUERY) > 200, 'fixture must exceed the old 200-char truncation'
+
+
+def _mem0_hit(memory_id: str, memory: str, score: float) -> dict:
+    return {'id': memory_id, 'memory': memory, 'score': score, 'metadata': {}}
+
+
+@pytest.mark.asyncio
+async def test_write_journal_is_a_public_read_only_accessor(mock_config, write_journal):
+    """ContextAssembler must reach the journal without touching a private attribute."""
+    from _fm_helpers import install_identity_mocks
+
+    svc = MemoryService(mock_config)
+    svc.graphiti = MagicMock()
+    install_identity_mocks(svc.graphiti)
+
+    assert svc.write_journal is None, (
+        'An unwired service must report None so a caller can skip journalling '
+        f'rather than crash, got {svc.write_journal!r}. RED: accessor missing.'
+    )
+
+    svc.set_write_journal(write_journal)
+    assert svc.write_journal is write_journal, (
+        'The public accessor must return the journal wired by set_write_journal — '
+        'reaching across a package boundary into _write_journal is what this '
+        f'property exists to avoid. got {svc.write_journal!r}. RED: accessor missing.'
+    )
+
+
+@pytest.mark.asyncio
+async def test_causation_search_row_carries_the_widened_shape(service, write_journal):
+    """The recon read path must journal the SAME shape as the MCP tool."""
+    cid = str(uuid.uuid4())
+    service.mem0.search = AsyncMock(
+        return_value={
+            'results': [
+                _mem0_hit('mem0-aaa', 'the canonical body', 0.81),
+                _mem0_hit('mem0-bbb', 'a shorter body', 0.42),
+            ]
+        }
+    )
+
+    await service.search(query=_LONG_QUERY, project_id='test', causation_id=cid)
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    rows = [o for o in ops if o.get('operation') == 'search']
+    assert len(rows) == 1, f'Expected one journalled search row, got {ops!r}'
+    summary = json.loads(rows[0]['result_summary'])
+    params = json.loads(rows[0]['params'])
+
+    entries = summary.get('results') or []
+    assert [e['id'] for e in entries] == ['mem0-aaa', 'mem0-bbb'], (
+        'The recon read path must record per-result IDs too — leaf eta reads these '
+        f'rows, not just the MCP ones. got {summary!r}. '
+        "RED: this copy of the shape is still {'count': N}."
+    )
+    assert [e['content_size'] for e in entries] == [
+        len('the canonical body'),
+        len('a shorter body'),
+    ], f'Per-result content sizes must be recorded, got {summary!r}. RED: not widened.'
+    assert all(e['relevance_score'] is not None for e in entries), (
+        f'Per-result relevance scores must be recorded, got {summary!r}. RED: not widened.'
+    )
+    assert summary.get('size_unit') == 'chars', (
+        f'The size unit must be NAMED on this row too, got {summary!r}. RED: not widened.'
+    )
+    assert 'failed_stores' in summary, (
+        'failed_stores was already recorded here and must SURVIVE the widening — a '
+        f'widening that drops a pre-existing fact is a regression. got {summary!r}.'
+    )
+    assert summary.get('degraded') is False, (
+        'The recon producer stamps degraded by the same rule as the other two, so a '
+        f'healthy row says so rather than staying silent. got {summary!r}.'
+    )
+    assert params.get('query') == _LONG_QUERY, (
+        'The full query must be journalled on the recon path as well, '
+        f'got {params.get("query")!r}. RED: still truncated at 200.'
+    )
+    assert params.get('query_truncated') is False, (
+        'The query bound is disclosed on this row too — one contract, three '
+        f'producers. got {params!r}.'
+    )

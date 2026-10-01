@@ -30,6 +30,9 @@ conventions:
   - rule: "merge_request is never called foreground/unbounded at the top level — always pass an explicit bounded wait_secs (≤100s server clamp) and poll merge_status"
     why: "An unbounded foreground call froze a real watch loop >30 min on a reify merge. The invariant is 'never call merge_request at top level'; fixing only the one documented call site leaves improvised paths uncovered. asyncio.shield + the durable-intent waiter mean a submitted merge survives a session drop."
 
+  - rule: "Code quality is judged against docs/code-quality.md — quality is the cost and risk of the next (agent) change. Cite its fourteen heuristics by name in findings, and treat tests that patch a module's private names or read private attributes, and files that cannot be understood in isolation, as interface-design findings rather than style nits"
+    why: "Ratified by Leo 2026-09-03. The mechanical gates (pytest/ruff/pyright) are the floor; that document is the bar and the SINGLE normative copy — do not restate it here (a restated invariant list went stale once already, task 3802). The merge lane is the worked example: merge_queue.py reached 21.5k lines, 55% prose and a cognitive complexity of 245 in one function while three landed refactors were outrun, because tests pinned 79 internal names by dotted path and satellites reached back into the module through function-local imports."
+
   # --- Subsystem rules ---
   - rule: "All task state operations route through fused-memory MCP tools, never Taskmaster directly"
     why: "TaskInterceptor must see every state transition to trigger reconciliation and emit done_provenance; bypassing it causes memory/task desync"

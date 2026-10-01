@@ -43,12 +43,18 @@ from test_merge_queue_concurrent_verify import (
 from test_merge_queue_dispatch_fill_redispatch import (
     _drive_fill,
     _make_real_item,
+    _running_lane,
     _teardown_fill_drive,
 )
+from test_merge_queue_restart_hook import _GatedAdvanceGitOps
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+from orchestrator.merge_queue import (
+    MERGE_WORKER_SHUTDOWN_REASON,
+    ItemLifecycleState,
+    SpeculativeMergeWorker,
+)
 
 # The acceptance criterion for the raw-cancel path is "completes within a SHORT
 # bound", and a hang must surface as a readable diagnostic well inside the 60s
@@ -409,3 +415,122 @@ class TestGetterOnlyCancelPreservesQueueItems:
         )
 
         await _teardown_fill_drive(drive, task, worker)
+
+
+# ---------------------------------------------------------------------------
+# task 5303 (4411): a raw cancel must not leak the persistent getter
+# ---------------------------------------------------------------------------
+
+
+async def _cancel_run(lane) -> None:  # type: ignore[no-untyped-def]
+    """Raw-cancel the lane's run() task -- run()'s own except arm then
+    raw-cancels both loop tasks and gathers them, the production shape."""
+    assert lane.run_task is not None
+    lane.run_task.cancel()
+    await asyncio.wait_for(
+        asyncio.gather(lane.run_task, return_exceptions=True),
+        timeout=_CANCEL_TERMINATION_TIMEOUT,
+    )
+
+
+def _pending_verifier_getters(request_queue: asyncio.Queue) -> list[asyncio.Task]:  # type: ignore[type-arg]
+    """Pending ``Queue.get()`` tasks on any queue but the lane's public request
+    queue -- i.e. the verifier loop's persistent getter.
+
+    Reads the getter coroutine's ``cr_frame`` to tell the two queues apart: a
+    bare before/after set difference of ``asyncio.all_tasks()`` cannot, because
+    the merger's own persistent get on the request queue ALSO survives a raw
+    cancel of run() (only stop() cancels it) and is recreated whenever it
+    harvests a request.
+    """
+    getters = []
+    for t in asyncio.all_tasks():
+        coro = t.get_coro()
+        if t.done() or coro.__qualname__ != 'Queue.get':
+            continue
+        frame = getattr(coro, 'cr_frame', None)
+        if frame is not None and frame.f_locals.get('self') is not request_queue:
+            getters.append(t)
+    return getters
+
+
+@pytest.mark.asyncio
+class TestRawCancelReapsPendingVerifierGetter:
+    """A raw cancel of the verifier loop parked in the QueueEmpty fill-ahead
+    race must not leave its persistent getter pending -- task 5303 (4411).
+
+    ``asyncio.wait`` awaits its own waiter, so the cancel never reaches the
+    getter.  Left pending and unowned it warns on destruction and harvests the
+    next queue item for nobody.  A getter that has ALREADY harvested an item
+    must instead survive the loop's exit, so stop() can resolve that item.
+    """
+
+    async def test_raw_cancel_in_fill_ahead_race_leaves_no_pending_getter(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        async with _running_lane(git_ops, config) as lane:
+            await lane.enqueue('getter-head')
+            await lane.settle(
+                lambda: (
+                    lane.inflight_ids() == {'getter-head'}
+                    and len(_pending_verifier_getters(lane.queue)) == 1
+                ),
+                expected='the head verifying and the loop parked in the fill-ahead race',
+                why=(
+                    'with one host still free and nothing queued, the loop must '
+                    'race a persistent getter against the running verify.'
+                ),
+            )
+
+            await _cancel_run(lane)
+
+            leaked = _pending_verifier_getters(lane.queue)
+            assert leaked == [], (
+                'the persistent verifier getter outlived its loop; it will '
+                f'harvest the next queue item for nobody: {leaked!r}'
+            )
+
+    async def test_item_held_by_a_done_getter_is_resolved_by_stop(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        """The getter harvests X while the loop is finalizing the head, so it
+        is DONE but unconsumed when run() is raw-cancelled.  stop() must still
+        find it and resolve X's merge() Future."""
+        advance_gate = asyncio.Event()
+        gated = _GatedAdvanceGitOps(git_ops, advance_gate)
+        async with _running_lane(gated, config) as lane:  # type: ignore[arg-type]
+            try:
+                await lane.enqueue('harvest-head')
+                await lane.settle(
+                    lambda: len(_pending_verifier_getters(lane.queue)) == 1,
+                    expected='the head verifying and a persistent getter in the race',
+                    why='one host stays free, so the fill-ahead race launches the getter.',
+                )
+                lane.local_gate.set()
+                await lane.settle(
+                    lambda: lane.states().get('harvest-head') == 'finalizing',
+                    expected='the head finalizing, held at the gated advance',
+                    why='its verify passed; the CAS advance is gated.',
+                )
+
+                late = await lane.enqueue('harvest-late')
+                await lane.settle(
+                    lambda: _pending_verifier_getters(lane.queue) == [],
+                    expected='the persistent getter holding the late item',
+                    why='the merger hands the late item to the verifier queue.',
+                )
+
+                await _cancel_run(lane)
+                await lane.worker.stop()
+
+                assert late.result.done(), (
+                    "the late item's merge() Future was stranded: the item its "
+                    'DONE getter held was dropped when the verifier loop exited'
+                )
+                assert late.result.result().reason == MERGE_WORKER_SHUTDOWN_REASON
+            finally:
+                advance_gate.set()

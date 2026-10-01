@@ -1057,7 +1057,11 @@ class TestCeilingFallbackDoesNotBlockDispatch:
     ):
         config.routing.per_model_daily_ceiling_usd = {'opus': self._CEILING_USD}
         assert 'opus' in config.routing.allowed_models
-        assert config.models.implementer != 'opus'  # so a config-layer fallback is observable
+        # Pin the config layer to a model other than the ceiling-pinned one so
+        # the fallback is observable whatever the live project yaml routes the
+        # implementer to (the D4 ruling moved it to opus, esc-main-sweep-105168baceb4-2).
+        config.models.implementer = 'sonnet'
+        assert config.models.implementer != 'opus'
         task_assignment.task['metadata']['model_overrides'] = {'implementer': 'opus'}
 
         cost_store = CostStore(tmp_path / 'costs.db')

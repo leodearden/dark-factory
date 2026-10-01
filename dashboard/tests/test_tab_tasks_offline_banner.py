@@ -24,23 +24,7 @@ from __future__ import annotations
 
 import re
 
-import pytest
-from starlette.testclient import TestClient
-
 _BANNER_SRC = '/static/redux/tasks_offline_banner.js'
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
 
 
 def _script_srcs(body: str) -> list[str]:
@@ -78,7 +62,7 @@ def test_index_html_loads_the_banner_module_with_the_sibling_cache_buster(
 
     siblings = [
         s for s in srcs
-        if s.startswith('/static/redux/task_status_counts.js')
+        if s.startswith('/static/redux/task_snapshot.js')
         or s.startswith('/static/redux/prd_grouping.js')
         or s.startswith('/static/redux/runtime_format.js')
     ]

@@ -12,6 +12,29 @@ Design highlights
   file → empty list **plus** ``journal_corrupt=True`` and a deduped WARNING
   (empty files are treated as corrupt because _save_raw never writes an empty
   string, so an empty file is an anomaly, not a legitimate fresh state).
+* Forward-compatible reads (task 5063): an entry carrying an UNKNOWN field is
+  loaded from its known keys with a WARNING naming the dropped ones, rather
+  than being skipped wholesale.  Read the DIRECTION of that protection
+  precisely, because it is easy to overclaim: the tolerance lives in the
+  READER, so it covers THIS binary and later ones reading a journal written
+  by a NEWER orchestrator.  It does NOT retroactively make a rollback PAST
+  this commit safe — a pre-task-5063 binary reading a journal that carries
+  ``module_prefixes`` still hits ``PersistedMergeRequest(**entry)`` ->
+  ``TypeError`` and still skips every such entry, exactly as before.
+  What bounds THAT case is separate and weaker: ``load()`` never mutates
+  ``_cache``, so a skipped entry stays in the mirror and is written back
+  verbatim by the next ``_save_raw``.  The in-flight merges it names are
+  STALLED for the duration of the rollback (nothing re-enqueues them), not
+  erased — they become recoverable again the moment a tolerant binary reads
+  the journal.  Deliberately one-directional: an entry MISSING a required
+  field is still skipped.
+* Per-entry ENTRY-SHAPE validation (task 5063): a journal whose top level is a
+  JSON object but whose value for one key is not a mapping loses only THAT
+  key — never the whole recovery pass.  ``_load_raw``'s ``isinstance`` check
+  inspects only the top level, so such a value reaches ``load()`` intact, and
+  ``merge_queue_store.py::recover_pending_merges`` calls ``load()`` unguarded:
+  one exception raised there drops every in-flight merge request in the
+  journal, not just the malformed one.
 * Keyed by ``request_id`` so ``record()`` is idempotent on redispatch (updates
   in place) and ``remove()`` is O(1) on terminal.
 """
@@ -21,7 +44,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -33,9 +56,10 @@ from orchestrator.merge_types import (
     QueuedBranch,
     WaiterRecord,
 )
+from orchestrator.module_charter import derive_modules
 
 if TYPE_CHECKING:
-    from orchestrator.config import OrchestratorConfig
+    from orchestrator.config import ModuleConfig, OrchestratorConfig
     from orchestrator.merge_queue import MergeRequest
 
 logger = logging.getLogger(__name__)
@@ -50,9 +74,19 @@ logger = logging.getLogger(__name__)
 class PersistedMergeRequest:
     """Serializable identity subset of a MergeRequest.
 
-    All fields are JSON-safe primitives or None.  Non-serializable fields
-    (result Future, config, module_configs) are excluded — they are
-    re-injected at recovery time.
+    All fields are JSON-safe primitives or None.  The non-serializable fields
+    (result Future, config) are excluded — they are re-injected at recovery
+    time.  ``module_configs`` is a middle case: the ``ModuleConfig`` OBJECTS
+    are not persistable (they hold live command strings, timeouts and env
+    dicts sourced from each subproject's ``orchestrator.yaml``, which go stale
+    the moment an operator edits one), but their PREFIXES are — so the
+    prefixes are journaled here and the objects are re-resolved against the
+    LIVE config at reconstruction by
+    :func:`_reconstruct_module_configs` (task 5063).
+
+    New fields MUST be added last and defaulted: :meth:`MergeQueueStore.load`
+    builds records with ``PersistedMergeRequest(**entry)``, so an older entry
+    lacking the key must still construct.
     """
 
     request_id: str
@@ -65,6 +99,49 @@ class PersistedMergeRequest:
     generation: int
     lane: str
     enqueued_at: float
+    module_prefixes: list[str] | None = None
+    """Prefixes of the request's ``module_configs`` (task 5063).
+
+    ``None`` and ``[]`` are NOT interchangeable, and
+    :func:`_reconstruct_module_configs` branches on the difference:
+
+    * ``None`` — this record was written before the field existed; the module
+      set is UNKNOWN and must be re-derived (from ``task_files``).
+    * ``[]``  — the task genuinely had NO assigned modules; the empty set is
+      correct and is deliberately not widened.
+    """
+
+
+_PERSISTED_FIELDS = frozenset(f.name for f in fields(PersistedMergeRequest))
+"""Field names :meth:`MergeQueueStore.load` will accept from a journal entry.
+
+Derived from the dataclass rather than written out, so the unknown-key filter
+can never drift from the schema it is filtering against.
+"""
+
+
+def _is_prefix_list(value: Any) -> bool:
+    """True when *value* is a well-formed ``module_prefixes`` payload.
+
+    :meth:`MergeQueueStore.load` applies NO type checking to field VALUES — it
+    hands whatever JSON held straight to the dataclass — so a hand-edited or
+    foreign journal can put any type here.  Both failure modes are silent and
+    misleading rather than loud (task 5063 amendment):
+
+    * a bare ``str`` iterates as CHARACTERS in :func:`_resolve_prefixes`,
+      producing a diagnostic that lists single letters, and
+    * a non-str element reaches ``config.for_module(123)`` ->
+      ``123.strip('/')`` -> ``AttributeError``, which is NOT in ``load()``'s
+      ``except (TypeError, KeyError)`` and so escapes
+      :func:`reconstruct_merge_request` entirely.
+
+    This is the value-level sibling of ``load()``'s ``isinstance(entry, dict)``
+    ENTRY-shape guard: same class of defect, one level further down.  A
+    malformed value is treated as UNKNOWN (``None``) by every caller, so the
+    ``task_files`` re-derivation still runs rather than the request silently
+    degrading to the file-scoped gate.
+    """
+    return isinstance(value, list) and all(isinstance(p, str) for p in value)
 
 
 # ---------------------------------------------------------------------------
@@ -126,11 +203,57 @@ class MergeQueueStore:
             generation=req.generation,
             lane=req.lane,
             enqueued_at=req.enqueued_at,
+            # Persist the module PREFIXES, not the ModuleConfig objects: a
+            # prefix is stable identity, re-resolvable against the live config
+            # at reconstruction (task 5063).  `req` is the LIVE MergeRequest,
+            # whose module_configs WorkflowRunner._resolve_module_configs has
+            # already populated, so no new plumbing is needed here.
+            module_prefixes=self._prefixes_to_persist(req),
         )
 
         # Update in-memory mirror first; then flush atomically without re-reading.
         self._cache[req.request_id] = asdict(persisted)
         self._save_raw(self._cache)
+
+    def _prefixes_to_persist(self, req: MergeRequest) -> list[str] | None:  # type: ignore[type-arg]
+        """The ``module_prefixes`` value to journal for *req*.
+
+        Normally just ``[mc.prefix for mc in req.module_configs]``.  The one
+        exception preserves the UNKNOWN encoding across a re-record (task 5063
+        amendment):
+
+        A legacy record whose module set could not be recovered reconstructs
+        to ``[]`` with the loud "unrecoverable" WARNING from
+        :func:`_reconstruct_module_configs`.  That recovered request is then
+        re-journaled by ``merge_queue::SpeculativeMergeWorker.
+        _buffer_owned_request``.  Writing a plain ``[]`` there would rewrite an
+        UNKNOWN module set as an AUTHORITATIVE EMPTY one — collapsing the very
+        ``None``-vs-``[]`` distinction this design rests on — so on the NEXT
+        crash+recovery the ``prefixes == []`` early-return would fire and the
+        request would go on verifying narrower than its original in complete
+        SILENCE.  A degradation that is loud once and mute from the second
+        restart onward is worse than one that is loud every time.
+
+        So an EMPTY live set does not overwrite an UNKNOWN journaled one: the
+        marker is read back out of the journal itself (key absent OR explicitly
+        ``null``, both meaning UNKNOWN) rather than held in process memory, so
+        it survives the restart it exists to describe.  A NON-empty live set
+        always wins — the module set is known again, and a later ``[]`` from a
+        genuinely zero-module request that was already journaled as ``[]``
+        stays ``[]``, since ``[] is not None``.
+        """
+        prefixes = [mc.prefix for mc in req.module_configs]
+        if prefixes:
+            return prefixes
+        previous = self._cache.get(req.request_id)
+        if isinstance(previous, dict) and not _is_prefix_list(
+            previous.get('module_prefixes')
+        ):
+            # Absent, explicitly null, or malformed — every shape
+            # `_reconstruct_module_configs` reads as UNKNOWN reads as UNKNOWN
+            # here too, so the two never disagree about what was journaled.
+            return None
+        return prefixes
 
     def remove(self, request_id: str) -> None:
         """Remove *request_id* from the journal.
@@ -147,11 +270,50 @@ class MergeQueueStore:
         Reads from the in-memory mirror (warmed at construction; kept in sync
         by record/remove).  Returns ``[]`` if the journal is empty or was
         corrupt at startup (fail-open).
+
+        UNKNOWN keys are tolerated (task 5063): an entry carrying a field this
+        binary does not know is constructed from its KNOWN keys alone, and the
+        dropped ones are named in one WARNING.  This is the forward direction
+        of schema evolution — THIS binary and later ones can read a journal
+        written by a NEWER orchestrator.  It does not reach backwards: a
+        binary that predates this tolerance still skips such an entry, and the
+        module docstring records what does and does not bound that case.
+
+        The relaxation is one-directional: an entry MISSING a required field
+        still raises and is still skipped with the message below.
+
+        ENTRY SHAPE is validated per-entry too (task 5063): a value that is
+        not a JSON object is skipped by its journal KEY — the only id such an
+        entry has — rather than dereferenced.  ``recover_pending_merges``
+        calls this method unguarded, so a raise here would cost the whole
+        recovery pass, not just the malformed entry.
         """
         result: list[PersistedMergeRequest] = []
-        for entry in self._cache.values():
+        for request_id, entry in self._cache.items():
+            # Shape guard FIRST: everything below dereferences `entry` as a
+            # mapping, and a non-mapping value must cost only ITSELF.  Named
+            # by journal key because a non-dict entry has no `request_id`
+            # field to read defensively from.
+            if not isinstance(entry, dict):
+                logger.warning(
+                    'merge_queue_store: skipping malformed entry %s'
+                    ' (not a JSON object, got %s)',
+                    request_id,
+                    type(entry).__name__,
+                )
+                continue
+            known = {k: v for k, v in entry.items() if k in _PERSISTED_FIELDS}
+            unknown = sorted(set(entry) - _PERSISTED_FIELDS)
+            if unknown:
+                logger.warning(
+                    'merge_queue_store: entry %s carries unknown field(s) %s;'
+                    ' ignoring them and loading its known fields (a journal'
+                    ' written by a newer orchestrator)',
+                    entry.get('request_id', '<no request_id>'),
+                    unknown,
+                )
             try:
-                result.append(PersistedMergeRequest(**entry))
+                result.append(PersistedMergeRequest(**known))
             except (TypeError, KeyError) as exc:
                 logger.warning('merge_queue_store: skipping malformed entry: %s', exc)
         return result
@@ -209,6 +371,148 @@ class MergeQueueStore:
 # ---------------------------------------------------------------------------
 
 
+def _reconstruct_module_configs(
+    persisted: PersistedMergeRequest,
+    config: OrchestratorConfig,
+) -> list[ModuleConfig]:
+    """Re-resolve *persisted*'s module set against the LIVE config (task 5063).
+
+    Branch precedence — ``None`` and ``[]`` are NOT interchangeable, and this
+    is the one place the difference is decided:
+
+    * ``module_prefixes == []`` (explicitly persisted empty) -> ``[]``.
+      The task genuinely had no assigned modules, so the global-fallback path
+      is the correct gate and
+      ``orchestrator.merge_queue::_merge_boundary_module_configs``' deliberate
+      no-widen policy is preserved.  Deliberately NOT widened to the registry.
+    * ``module_prefixes`` non-empty -> one ``ModuleConfig`` per prefix via
+      ``orchestrator.config::OrchestratorConfig.for_module`` (a longest-prefix
+      inward walk, so a de-registered deep prefix degrades to its parent
+      rather than vanishing), deduped by ``mc.prefix`` preserving first-seen
+      order — mirroring
+      ``orchestrator.workflow::TaskWorkflow._resolve_module_configs``, the
+      function that produced the ORIGINAL request's ``module_configs``.
+      Reproducing its grouping is what makes the reconstructed set equal the
+      original's by construction rather than by coincidence.
+    * ``module_prefixes is None`` (a record written before the field existed,
+      or one whose value failed the :func:`_is_prefix_list` shape check above)
+      -> the module set is UNKNOWN, so it is re-derived from the preserved
+      ``task_files`` by :func:`_modules_from_task_files`.  ``None`` therefore
+      does the OPPOSITE of ``[]`` here, which is why the two encodings must
+      stay distinct — and why
+      :meth:`MergeQueueStore._prefixes_to_persist` refuses to overwrite a
+      journaled UNKNOWN with an authoritative ``[]`` on re-record.
+    * a non-empty ``module_prefixes`` that resolves to ZERO ModuleConfigs
+      (every prefix de-registered) -> re-derive from ``task_files`` too, after
+      a WARNING naming the unresolved prefixes.  A non-empty list is positive
+      evidence the task HAD modules, so degrading it silently to ``[]`` would
+      reintroduce the narrow gate this whole path exists to close.
+    * nothing recoverable at all (unknown set, no re-derivable ``task_files``)
+      -> ``[]`` plus one WARNING naming the ``request_id``.  Widening to the
+      whole registry instead would put every genuinely docs-only legacy record
+      onto a per-module full-suite gate, and would break the ``[]``-is-never-
+      widened policy the zero-module control pins.  The exposure is bounded
+      and transient: the journal holds only in-flight requests, so it turns
+      over completely on the first restart after this lands.
+
+    Prefixes are re-resolved rather than persisted as objects because a
+    ``ModuleConfig`` holds live command strings, timeouts and env dicts from
+    each subproject's ``orchestrator.yaml`` — persisting those would freeze a
+    snapshot that goes stale on the next operator edit or hot reload, while
+    ``reconstruct_merge_request``'s standing contract is that the CURRENT
+    config is always correct.
+    """
+    prefixes = persisted.module_prefixes
+
+    # VALUE-shape guard, before the [] / truthiness branches below both of
+    # which would misread a malformed payload (a bare str is truthy and
+    # iterates as characters; `'' == []` is False and `if ''` is falsy, so an
+    # empty string would silently take the re-derive path for the wrong
+    # reason).  Demoting to the UNKNOWN sentinel keeps the task_files
+    # re-derivation available rather than degrading to the file-scoped gate.
+    if prefixes is not None and not _is_prefix_list(prefixes):
+        logger.warning(
+            'merge_queue_store: %s: persisted module_prefixes is not a list of'
+            ' strings (got %s: %r); treating the module set as UNKNOWN and'
+            ' re-deriving it from task_files',
+            persisted.request_id,
+            type(prefixes).__name__,
+            prefixes,
+        )
+        prefixes = None
+
+    if prefixes == []:
+        return []
+
+    if prefixes:
+        resolved = _resolve_prefixes(prefixes, config)
+        if resolved:
+            return resolved
+        logger.warning(
+            'merge_queue_store: %s: none of the persisted module prefixes %s'
+            ' resolve against the current config; re-deriving from task_files',
+            persisted.request_id,
+            sorted(prefixes),
+        )
+
+    rederived = _modules_from_task_files(persisted.task_files, config)
+    if not rederived:
+        logger.warning(
+            'merge_queue_store: %s: module set is unrecoverable (no persisted'
+            ' prefixes resolved, nothing re-derivable from task_files=%r);'
+            ' this recovered request will verify file-scoped, narrower than'
+            ' its original',
+            persisted.request_id,
+            persisted.task_files,
+        )
+    return rederived
+
+
+def _resolve_prefixes(
+    prefixes: list[str],
+    config: OrchestratorConfig,
+) -> list[ModuleConfig]:
+    """Map *prefixes* onto live ModuleConfigs, deduped by ``mc.prefix``.
+
+    Mirrors ``orchestrator.workflow::TaskWorkflow._resolve_module_configs``'
+    ``seen`` dict keyed by ``mc.prefix``: several prefixes can resolve to the
+    same config (``for_module`` walks inward), and first-seen order is what
+    that function — the producer of the ORIGINAL request's ``module_configs``
+    — preserves.  A prefix that resolves to nothing is dropped here; the
+    caller decides what an all-dropped list means.
+    """
+    seen: dict[str, ModuleConfig] = {}
+    for prefix in prefixes:
+        mc = config.for_module(prefix)
+        if mc is not None:
+            seen[mc.prefix] = mc
+    return list(seen.values())
+
+
+def _modules_from_task_files(
+    task_files: list[str] | None,
+    config: OrchestratorConfig,
+) -> list[ModuleConfig]:
+    """Re-derive ModuleConfigs from *task_files* — the legacy-record path.
+
+    Routes through ``orchestrator.module_charter::derive_modules`` (the single
+    composition of the Contract-1 α-strip -> depth-coarsen pipeline, which
+    exists precisely because divergent inline copies had accumulated) rather
+    than calling ``shared.locking.files_to_modules`` directly, then through
+    the same ``for_module`` + dedupe stage as
+    :func:`_resolve_prefixes`.  That is the identical pipeline
+    ``TaskWorkflow._resolve_module_configs`` ran to build the original set,
+    so the re-derivation reproduces it rather than approximating it.
+
+    Returns ``[]`` when *task_files* is empty/None or nothing resolves — a
+    docs-only task genuinely has no modules and must keep its global-fallback
+    gate.
+    """
+    if not task_files:
+        return []
+    return _resolve_prefixes(derive_modules(task_files, config.lock_depth), config)
+
+
 def reconstruct_merge_request(
     persisted: PersistedMergeRequest,
     config: OrchestratorConfig,
@@ -218,8 +522,8 @@ def reconstruct_merge_request(
     The returned request has:
     * A fresh unresolved ``asyncio.Future`` (the original died with the crash).
     * Preserved ``request_id`` and all identity fields.
-    * ``module_configs=[]`` — re-injecting the full scope is not possible
-      post-restart; [] causes the worker to run the default verification scope.
+    * ``module_configs`` re-resolved from the persisted prefixes against the
+      LIVE config by :func:`_reconstruct_module_configs` (task 5063).
     * ``pre_rebased=False`` — ensures the worker rebases before merging.
     * ``config`` from the live harness (current config is always correct).
     """
@@ -228,21 +532,30 @@ def reconstruct_merge_request(
     loop = asyncio.get_running_loop()
     future: asyncio.Future[Any] = loop.create_future()
 
-    # NOTE — module_configs divergence (suggestion 4):
-    # The original request may have been scoped to a narrower set of verification
-    # modules.  That information is not persisted (it holds live objects).  The
-    # recovered request therefore runs the *default* verification scope ([] means
-    # "all configured modules").  This is intentionally conservative — it errs on
-    # the side of verifying more than the original, never less.  Callers that care
-    # about scope parity should persist a scope hint in task_files (which IS
-    # preserved) and filter inside the verifier.
+    # module_configs (task 5063).  This block previously asserted that leaving
+    # the set EMPTY was "intentionally conservative" because "[] means all
+    # configured modules", and so "errs on the side of verifying more than the
+    # original, never less".  Both claims were FALSE, and the real behaviour is
+    # the exact inverse: `merge_queue::_merge_boundary_module_configs`
+    # deliberately never widens an empty set (task 3787 γ), so the empty set
+    # reached `verify_plan::derive_verify_plan`'s fallback branch and the
+    # recovered merge was verified FILE-SCOPED — narrower than its original, and
+    # silently so, since a file-scoped verify does run and does pass.
+    #
+    # The module PREFIXES are now persisted (`PersistedMergeRequest.
+    # module_prefixes`) and re-resolved here against the live registry, so a
+    # recovered request plans the same merge-role module set its original would
+    # have.  An EXPLICITLY empty set still reconstructs empty: that means the
+    # task genuinely had no assigned modules, for which the global-fallback
+    # gate is correct.  See `_reconstruct_module_configs` for the full branch
+    # precedence, including why `None` and `[]` are not interchangeable.
     return MergeRequest(
         task_id=persisted.task_id,
         branch=QueuedBranch.parse(persisted.branch, config.git.branch_prefix),
         worktree=Path(persisted.worktree),
         pre_rebased=False,
         task_files=persisted.task_files,
-        module_configs=[],
+        module_configs=_reconstruct_module_configs(persisted, config),
         config=config,
         result=future,
         request_id=persisted.request_id,

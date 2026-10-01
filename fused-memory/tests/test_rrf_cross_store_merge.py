@@ -42,7 +42,7 @@ import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import QDRANT_URL, MockEdge, qdrant_skipif
+from _fm_helpers import QDRANT_URL, MockEdge, load_script_module, qdrant_skipif
 from qdrant_client import QdrantClient
 
 from fused_memory.backends.mem0_client import Mem0Backend
@@ -145,7 +145,7 @@ def _service(config, mem0_backend, *, graphiti_edges: int, primary: SourceStore)
 
 
 def test_the_ephemeral_collection_is_one_the_reaper_can_reclaim(
-    monkeypatch, rrf_config, rrf_project_id,
+    rrf_config, rrf_project_id,
 ):
     """A leaked collection under the default `fused` prefix would live forever.
 
@@ -153,22 +153,19 @@ def test_the_ephemeral_collection_is_one_the_reaper_can_reclaim(
     QdrantClient, and this assertion is about a NAME.
     ``mem0_collection_name`` is pure, so ask it directly.
     """
-    import importlib.util as _ilu
-    import sys as _sys
     from pathlib import Path
 
     collection = Scope(project_id=rrf_project_id).mem0_collection_name(
         rrf_config.mem0.collection_prefix,
     )
 
-    path = Path(__file__).resolve().parent.parent / 'scripts' / 'cleanup_test_collections.py'
-    spec = _ilu.spec_from_file_location('cleanup_test_collections', path)
-    assert spec is not None and spec.loader is not None
-    cleanup = _ilu.module_from_spec(spec)
-    # setitem, not a bare assignment: exec_module needs the module visible in
-    # sys.modules, but leaving it there leaks into the rest of the session.
-    monkeypatch.setitem(_sys.modules, 'cleanup_test_collections', cleanup)
-    spec.loader.exec_module(cleanup)
+    # The SAME module object conftest.py's session lease fixture installs under
+    # this key, not a second copy of it: the key is shared, so a local re-exec
+    # is what would have leaked (task 3895).
+    cleanup = load_script_module(
+        Path(__file__).resolve().parent.parent / 'scripts' / 'cleanup_test_collections.py',
+        mod_name='cleanup_test_collections',
+    )
 
     assert collection.startswith(cleanup.PREFIX), (
         f'{collection!r} is not reapable by scripts/cleanup_test_collections.py'

@@ -173,10 +173,16 @@ class TestReservedKeysReachTheWriters:
 #: keeps ``task_kind='deterministic'`` and ``task_kind='predicate'`` out: those
 #: are TASK metadata (see ``docs/task-authoring.md``) and are deliberately not
 #: KIND_REGISTRY members, so matching them would fail this pin spuriously.
+#:
+#: A mapping-form ``'kind'`` whose next key is ``'id'`` is likewise skipped: that
+#: is the ENTITY-REFERENT dict ``{'kind': 'task', 'id': <digits>, ...}`` the
+#: ``entities=`` examples teach (task 3675; shape stated in
+#: ``fused_memory/utils/referent_resolution.py::_declared_referents``),
+#: which names what a record is ABOUT, not the memory kind it carries.
 _KIND_LITERAL_RE = re.compile(
     r"""(?:
-          'kind':\s*'(?P<sq_mapping>[^']+)'
-        | "kind":\s*"(?P<dq_mapping>[^"]+)"
+          'kind':\s*'(?P<sq_mapping>[^']+)'(?!\s*,\s*'id')
+        | "kind":\s*"(?P<dq_mapping>[^"]+)"(?!\s*,\s*"id")
         | (?:metadata\.|record_)kind\s*=\s*'(?P<sq_assign>[^']+)'
         | (?:metadata\.|record_)kind\s*=\s*"(?P<dq_assign>[^"]+)"
         )""",

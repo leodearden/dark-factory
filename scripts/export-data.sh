@@ -50,7 +50,34 @@ fi
 # ---------------------------------------------------------------------------
 info "Flushing FalkorDB to disk"
 
-if docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null | grep -q falkordb; then
+# Read the verdict from the captured LISTING, never from the pipeline's status.
+# `producer | grep -q falkordb` reports the PRODUCER's status under `pipefail`,
+# so the `if` took the else branch on a listing that plainly named the
+# container — skipping the BGSAVE on a LIVE database and exporting a stale
+# dump.rdb. Two ways it happened: `docker compose ps` exiting non-zero for its
+# own reasons after printing the listing, and SIGPIPE, because `grep -q` closes
+# the read end on its first match and a producer still writing dies of signal
+# 13 (pipeline status 141). Size is not a defence — a sub-buffer reply is a
+# low-rate flake, not a safe site.
+#
+# Each rejected alternative was MEASURED, not merely disliked:
+#   - `|| true` is load-bearing. Without it the assignment is a SIMPLE COMMAND,
+#     so `set -e` aborts the whole export the moment docker is unavailable,
+#     where the old pipeline merely took the else branch. That is a regression,
+#     not a fix.
+#   - NOT `|| _running=""`. That is `set -e` safe but DISCARDS a listing the
+#     producer did write, so the wrong verdict survives — it does not fix the bug.
+#   - No pipeline is reintroduced to do the match (`printf ... | grep -q`):
+#     bash's own printf can take EPIPE too, which is the same defect one step
+#     removed.
+#   - `[[ ]]` forks nothing and cannot be signalled, which is why the match
+#     moves into bash rather than staying in grep. `*falkordb*` is exactly the
+#     unanchored substring match `grep -q falkordb` performed, so the matching
+#     semantics are unchanged; only the SOURCE of the verdict moves.
+#
+# The four sibling sites in scripts/import-data.sh back-reference this block.
+_running="$(docker compose -f "$COMPOSE_FILE" ps --status running 2>/dev/null)" || true
+if [[ "$_running" == *falkordb* ]]; then
   BEFORE=$(docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli LASTSAVE 2>/dev/null || echo "0")
   docker compose -f "$COMPOSE_FILE" exec -T falkordb redis-cli BGSAVE &>/dev/null
 

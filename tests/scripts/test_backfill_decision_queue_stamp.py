@@ -30,7 +30,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 from backfill_decision_queue_stamp import (
     EXIT_BAD_ARGS,
     EXIT_NO_QUEUE,

@@ -7,6 +7,7 @@ import logging
 import math
 import re
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,11 +36,49 @@ from shared.invocation_outcome import (
 from orchestrator.agents.invoke import _FALLBACK_PRICE, _rate
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from shared.cli_invoke import AgentResult
 
+    # TYPE_CHECKING only, deliberately: this module must not gain a RUNTIME
+    # import of orchestrator.artifacts. read_decline_artifacts below reaches
+    # the readers by getattr, so it needs the NAME for the signature and
+    # nothing at import time.
+    from orchestrator.artifacts import TaskArtifacts
     from orchestrator.workflow import TaskWorkflow
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Terminal outcome vocabulary (task 4760) — what the architect's LAST statement
+# about the task actually was.
+#
+# ``_DECLINE_READERS`` single-sources the kind <-> artifact correspondence: each
+# key is a member of DECLINE_KINDS, each value the ``TaskArtifacts`` reader that
+# answers "did the architect take that exit?".  It is the ONE place the two
+# vocabularies below and :func:`read_decline_artifacts` all derive from, so a
+# sixth architect exit cannot be half-added.
+# test_eval_terminal_kind.py::test_every_decline_kind_has_a_real_task_artifacts_reader
+# pins every value against the real class, so a rename there fails the suite
+# instead of silently degrading that kind to ``'none'``.
+# ---------------------------------------------------------------------------
+_DECLINE_READERS: dict[str, str] = {
+    'already_done': 'read_already_done',
+    'blocking_dependency': 'read_blocking_dependency',
+    'false_premise': 'read_false_premise',
+    'unactionable': 'read_unactionable_task',
+    'ready_to_merge': 'read_ready_to_merge',
+}
+
+# The five EXPLICIT plan-tools decline exits (plan_tools._report_* →
+# artifacts.TaskArtifacts.write_*), in the fixed order that breaks a
+# same-timestamp tie in :func:`resolve_terminal_kind`.
+DECLINE_KINDS: tuple[str, ...] = tuple(_DECLINE_READERS)
+
+# The CLOSED terminal vocabulary: a scorable plan, the five declines, or
+# neither.  :func:`resolve_terminal_kind` always returns a member of this tuple.
+TERMINAL_KINDS: tuple[str, ...] = ('planned', *DECLINE_KINDS, 'none')
 
 
 @dataclass
@@ -235,6 +274,57 @@ class EvalMetrics:
     # referenceless fixture is loud at run time instead.
     judged_without_reference: bool = False
 
+    # The architect's TERMINAL STATEMENT about this task (task 4760) — a member
+    # of ``TERMINAL_KINDS``, resolved by :func:`resolve_terminal_kind`:
+    #
+    #   ``'planned'``               a scorable plan was the terminal statement.
+    #   ``'already_done'`` |
+    #   ``'blocking_dependency'`` |
+    #   ``'false_premise'`` |
+    #   ``'unactionable'`` |
+    #   ``'ready_to_merge'``        the architect took THAT explicit plan-tools
+    #                               exit (plan_tools._report_* → an artifact on
+    #                               disk), which the prompt tells it to take
+    #                               INSTEAD of planning.
+    #   ``'none'``                  neither a scorable plan nor any decline
+    #                               artifact — the genuine "could not plan"
+    #                               outcome, or an infra failure (read
+    #                               ``invocation_error`` / ``cap_tainted`` to
+    #                               tell those two apart).
+    #
+    # A DECLINE IS NOT A FAILURE. ``plan_steps``, ``produced_a_plan`` and the
+    # report layer's ``plan_rate`` are DELIBERATELY untouched by this field —
+    # planRate keeps its exact historical derivation (``plan_steps > 0``) so
+    # every committed campaign artifact quoting it stays comparable. This field
+    # exists so a ``plan_steps = 0`` cell can be split BY CAUSE without
+    # transcript forensics, which is the whole defect: tranche-1's 47 no-plan
+    # cells were every one of them an explicit, server-accepted decline, and
+    # the readout could not say so because the artifacts were rmtree'd
+    # unread. A plan-then-decline cell persists BOTH facts
+    # (``plan_steps=6, terminal_kind='already_done'``), so neither reading is
+    # destroyed.
+    #
+    # ``None`` means NOT MEASURED: either a non-architect cell (disambiguated by
+    # ``role_under_test``, exactly as ``plan_quality``'s null is) or a cell
+    # persisted before this field existed. A MISSING KEY means the same thing,
+    # and every consumer reads the two ALIKE: :func:`terminal_kind_of` answers
+    # ``None`` for both, and the report layer's ``terminal_kind_unmeasured``
+    # counts both. That is deliberate. Over the architect rows that count ranges
+    # on, the two shapes state ONE fact — nobody resolved this cell's terminal
+    # statement — and giving an explicit null its own silent third arm would
+    # read it back as "measured, did not decline", which is the exact collapse
+    # the counter exists to prevent.
+    #
+    # Do not make the write conditional even so. ``to_dict`` below is a bare
+    # ``asdict``, so every cell written by post-4760 code carries the key
+    # regardless of value; THAT is what keeps ``terminal_kind_unmeasured``
+    # meaning "the instrument did not exist yet" instead of "the instrument
+    # declined to say", and it is the same presence-on-every-cell property
+    # ``judged_without_reference`` depends on. A consumer that ever needs to
+    # separate the two causes can still test key PRESENCE directly — none does
+    # today, and the count above deliberately does not.
+    terminal_kind: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -280,6 +370,195 @@ def produced_a_plan(metrics: dict[str, Any]) -> bool:
     (the empty shape ``len(... or [])`` guards) — both mean "no plan".
     """
     return int(metrics.get('plan_steps') or 0) > 0
+
+
+def terminal_kind_of(metrics: dict[str, Any]) -> str | None:
+    """THE consumer accessor for :attr:`EvalMetrics.terminal_kind` (task 4760).
+
+    Sibling of :func:`produced_a_plan` above: both read ONE persisted field off
+    a metrics dict and nothing else, and both exist so the report layer and the
+    campaign driver consult the same expression rather than two bare ``.get``
+    calls that a later change has to keep in sync.
+
+    Returns ``None`` for BOTH a missing key and an explicit ``None`` — the two
+    are indistinguishable to a consumer that only wants the kind, and both mean
+    UNMEASURED. ``report.build_plan_quality_report``'s
+    ``terminal_kind_unmeasured`` counts them TOGETHER, through this accessor,
+    on purpose: over the architect rows it counts, the two shapes state one
+    fact, and a third arm for the explicit null would read that cell back as
+    "did not decline" — see the field's docstring.
+
+    A caller that genuinely needs to separate "predates the field" from "the
+    field was written null" must test key PRESENCE (``'terminal_kind' in
+    metrics``) itself. That test means something only because the write is
+    never conditional; no caller needs it today.
+
+    Pure: no I/O, no mutation.
+    """
+    return metrics.get('terminal_kind')
+
+
+def _parse_terminal_stamp(value: object) -> datetime | None:
+    """Parse one ISO-8601 terminal-call stamp, or ``None`` if it cannot order.
+
+    Both producers write ``datetime.now(UTC).isoformat()`` — the five
+    ``artifacts.TaskArtifacts.write_*`` decline artifacts stamp ``reported_at``
+    and ``plan_tools._confirm_plan`` stamps ``_finalized_at`` — so the two are
+    directly comparable and no inference is needed. Anything else (absent,
+    empty, not a string, unparseable) returns ``None``, which
+    :func:`resolve_terminal_kind` reads as UNORDERABLE.
+
+    A NAIVE stamp is normalised to UTC rather than rejected: both producers
+    write UTC, so that is the faithful reading, and it keeps the comparison
+    TOTAL — an aware-vs-naive ``>`` raises ``TypeError``, which inside
+    ``run_architect_eval``'s ``finally`` would cost an already-scored cell.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _stamp_of(artifact: object, field: str) -> datetime | None:
+    """``_parse_terminal_stamp`` of ``artifact[field]``, tolerating a non-dict."""
+    if not isinstance(artifact, dict):
+        return None
+    return _parse_terminal_stamp(artifact.get(field))
+
+
+def resolve_terminal_kind(
+    plan: dict | None,
+    declines: Mapping[str, dict | None],
+) -> str:
+    """Resolve the architect's TERMINAL STATEMENT to one ``TERMINAL_KINDS`` member.
+
+    PURE: plain dicts in, a string out. No I/O, and neither argument is
+    mutated. ``plan`` is what ``artifacts.read_plan`` returned; ``declines`` is
+    what :func:`read_decline_artifacts` returned (a possibly-partial map of
+    kind -> artifact-or-``None``).
+
+    **LAST TERMINAL CALL WINS** — the policy, and why it is this one. A cell can
+    carry BOTH a plan and a decline: on reify_task_4026 / run e522b1b0 the
+    architect confirmed a 6-step plan and then, at turn 176, called
+    ``report_task_already_done``. Scoring that as a planning success reports
+    the OPPOSITE of what the model itself concluded, so the LAST of the two
+    statements is the one this function returns. It is decided from timestamps
+    both producers already write (``reported_at`` vs ``_finalized_at``, same
+    format — see :func:`_parse_terminal_stamp`), so it is an exact comparison
+    rather than an inference, and it needs no new plumbing.
+
+    **AMBIGUITY RESOLVES TOWARD THE DECLINE.** A decline artifact exists only
+    because the architect made an explicit, server-accepted terminal tool call
+    that the prompt tells it to make INSTEAD of planning; a plan without
+    ``_finalized_at`` is, by ``workflow._plan``'s own rule, not a terminal
+    statement at all. So the plan wins ONLY when it is confirmed AND provably
+    later. Concretely, the decline side wins whenever: the plan is not scorable,
+    the plan carries no parseable ``_finalized_at``, the winning decline carries
+    no parseable ``reported_at``, or the two stamps are equal.
+
+    Winner selection among SEVERAL declines: the one with the greatest
+    ``reported_at``, with an UNORDERABLE stamp sorting last (i.e. winning),
+    because a decline nobody can place in time is exactly the ambiguity the rule
+    above resolves toward. Ties, and the all-unorderable case, break by the
+    fixed :data:`DECLINE_KINDS` order, so the same input always resolves the
+    same way.
+
+    This changes NO existing metric. ``plan_steps`` still counts the plan's
+    steps and ``produced_a_plan`` still derives planRate from it, so a
+    plan-then-decline cell persists BOTH facts and a downstream reader can
+    bucket it either way. See :attr:`EvalMetrics.terminal_kind`.
+    """
+    # judge.py imports THIS module lazily (inside judge_plan_quality), so a
+    # module-level import here would turn a deliberate one-way function
+    # coupling into a real cycle. Same reason band_for_cell imports
+    # produced_a_plan function-locally.
+    from orchestrator.evals.judge import is_scorable_plan  # noqa: PLC0415
+
+    # Built in DECLINE_KINDS order, so every fallback below (`[0]`, and the
+    # first-match scan) applies the fixed precedence rather than dict order.
+    present = [kind for kind in DECLINE_KINDS if declines.get(kind)]
+    if not present:
+        return 'planned' if is_scorable_plan(plan) else 'none'
+
+    stamps = {k: _stamp_of(declines.get(k), 'reported_at') for k in present}
+    orderable = {k: at for k, at in stamps.items() if at is not None}
+    if len(orderable) < len(present):
+        # At least one present decline cannot be placed in time: it sorts last,
+        # so it wins, and the plan can never be shown to be later than it.
+        winner, winner_at = next(k for k in present if stamps[k] is None), None
+    else:
+        winner_at = max(orderable.values())
+        winner = next(k for k in present if stamps[k] == winner_at)
+
+    if not is_scorable_plan(plan) or winner_at is None:
+        return winner
+    finalized_at = _stamp_of(plan, '_finalized_at')
+    return 'planned' if finalized_at is not None and finalized_at > winner_at else winner
+
+
+def read_decline_artifacts(
+    artifacts: TaskArtifacts | None,
+) -> dict[str, dict | None]:
+    """Read all five decline artifacts off ``artifacts``, best-effort (task 4760).
+
+    Returns a map whose key set is ALWAYS exactly :data:`DECLINE_KINDS` — a kind
+    the architect did not report reads ``None``, and so does a kind that could
+    not be read. A complete key set means a consumer never has to distinguish
+    "not reported" from "not asked".
+
+    PER-KIND DEGRADATION, following ``runner._verdict_cost_usd``'s precedent: an
+    unreadable field costs exactly ONE field's visibility, never the whole eval
+    cell. Each reader is called inside its own ``try/except Exception`` that
+    logs a warning naming the kind, so a corrupt ``already_done.json`` still
+    lets the other four report. EVERY route to ``None``-for-an-unreadable-kind
+    logs — the raise, the missing reader, and a file whose JSON parses but is
+    not an OBJECT (``[]``, ``"x"``, ``3``), which no ``except`` would catch.
+    Only a kind the architect never reported goes quiet, because that ``None``
+    is a measurement, not a degradation. This matters because the SOLE caller
+    is inside ``run_architect_eval``'s ``finally`` block — the only place the
+    artifacts still exist, since the next statement ``rmtree``s the meta root
+    — where a raise would turn an already-scored cell into a lost run.
+
+    ``artifacts is None`` (the harness-error path, where it was never
+    constructed) and an object missing a reader (a legacy or monkeypatched
+    double) both yield the all-``None`` map rather than raising.
+    """
+    out: dict[str, dict | None] = dict.fromkeys(DECLINE_KINDS)
+    if artifacts is None:
+        return out
+    for kind, reader_name in _DECLINE_READERS.items():
+        reader = getattr(artifacts, reader_name, None)
+        if not callable(reader):
+            logger.warning(
+                'decline artifact %s unreadable: %s has no %s()',
+                kind, type(artifacts).__name__, reader_name,
+            )
+            continue
+        try:
+            artifact = reader()
+        except Exception as exc:                       # noqa: BLE001
+            logger.warning(
+                'decline artifact %s unreadable (%s): %s', kind,
+                type(exc).__name__, exc,
+            )
+            continue
+        if artifact is not None and not isinstance(artifact, dict):
+            # A file holding VALID JSON that is not an object (``[]``, ``"x"``,
+            # ``3``) parses cleanly, so neither ``except`` above fires — and
+            # dropping it silently would read downstream as "the architect
+            # never declined", degrading exactly the signal this function
+            # exists to make legible. Loud over silent: same warning shape as
+            # the two above, naming the kind and what was actually seen.
+            logger.warning(
+                'decline artifact %s unreadable: expected a JSON object, got %s',
+                kind, type(artifact).__name__,
+            )
+            continue
+        out[kind] = artifact
+    return out
 
 
 def _is_false_green(m: EvalMetrics, max_iterations: int) -> bool:

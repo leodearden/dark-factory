@@ -38,23 +38,21 @@ echo "${ORCH_CONFIG_PATH:-unset}"
 # If "unset": continue below.
 ```
 
-If unset, find the config file in the target project. Filenames vary across projects (no auto-discovery — every project chose its own name); check all common locations:
+If unset, the config is the target project's `dark-factory-orchestrator.yaml` — the
+canonical, required filename for every factory-operated project (`CLAUDE.md`, "Repo Map";
+it is what the dashboard's escalation-URL discovery keys on):
 
 ```bash
-ls "$TARGET_PROJECT"/dark-factory-orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator-config.yaml \
-   "$TARGET_PROJECT"/config.yaml \
-   "$TARGET_PROJECT"/orchestrator/config.yaml 2>/dev/null
+TARGET_CONFIG="$TARGET_PROJECT"/dark-factory-orchestrator.yaml
+ls "$TARGET_CONFIG"
 ```
 
-Known locations for the three current projects:
-
-| Project | TARGET_CONFIG |
-|---------|---------------|
-| dark-factory | `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` |
-| reify | `/home/leo/src/reify/orchestrator.yaml` |
-| autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` |
+As of 2026-09-29 every project under `DASHBOARD_KNOWN_PROJECT_ROOTS` carries that file.
+The legacy spellings (`orchestrator.yaml`, `orchestrator-config.yaml`, `config.yaml`,
+`orchestrator/config.yaml`) are honoured only as a discovery fallback for a not-yet-migrated
+project, never as a choice for a new one — and a stray legacy file can sit BESIDE the canonical
+one (autopilot-video still has a `config.yaml`, pump-web-ui an `orchestrator.yaml`), so never let a
+glob over the legacy names win over the canonical path when both exist.
 
 Verify the file actually points at the target:
 
@@ -263,6 +261,8 @@ The orchestrator will:
 
 Each task gets its own git worktree and branch (`task/<id>`). Merges use `--no-ff` to preserve history.
 
+That is one landing per verify, which is the stock pipeline. When `merge_deep.chain_cap > 0` and the queue holds 2 or more mergeable items, a single verify instead covers a **chain** of queued items: the chain is built in one lane by merging them onto the head in submission order, only its tip is verified, and on a pass the whole verified prefix is CAS-landed in submission order — so one passing verify lands several tasks. The shipped default `chain_cap=0` disables this entirely, leaving the pipeline exactly as described above. A tip failure lands nothing via the chain and leaves the queue untouched, and the next round halves its target depth (any pass resets it) — see OPERATIONS.md §5 "Deep merge-ahead chains" and `plans/deep-merge-ahead-prd.md` for the full contract.
+
 The **debugger** is a distinct agent role invoked automatically on each verify failure. It receives the failure report (test output, lint errors, type errors) and makes targeted fixes. The verify→debug loop repeats up to `max_verify_attempts` times (default 5) before the task blocks.
 
 After merge, **post-merge verification** re-runs the full verification suite on main. If it fails, the merge is automatically reverted and the task blocks — this catches integration issues that only appear after combining with other tasks' changes.
@@ -321,7 +321,7 @@ If children (agent subprocesses) are orphaned, kill them by PID. Do **not** use 
 
 ## Reload Config (vs Restart)
 
-Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
+Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `dark-factory-orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
 
 ### Why this exists
 
@@ -347,6 +347,7 @@ It takes **no path argument** — it always re-reads the process's own `ORCH_CON
 | Scheduler + starvation-watchdog tuning, loop-pass thresholds (`idle_poll_secs`, `orphan_l0_timeout_secs`, watcher-rotation params) | Reload |
 | `review.*` checkpoint knobs, `unblock_auto.*`, `verify_env` | Reload |
 | `git.offline_lane_*` leaf tunables (test threads, poll interval, red-advance count) | Reload |
+| `merge_deep.chain_cap` — the deep merge-ahead chain cap; `0` is the shipped default and the kill switch (mechanism: OPERATIONS.md §5 "Deep merge-ahead chains") | Reload |
 | `max_concurrent_tasks`, pool sizes / `verify_runners`, `escalation` bind host/port, `sandbox.backend`, `project_root`, merge-lane `git.*` structural fields (`branch_prefix`, `main_branch`, `persistent_merge_worktree`, …) | **Restart** — these are startup-baked (semaphores, pool sizes, bound sockets, module globals); reload reports them in `restart_required` without touching the running process |
 | Any code change (not just YAML) | **Restart** — reload only re-reads config, never code |
 
@@ -387,18 +388,19 @@ The orchestrator resolves `(model, effort, budget_usd, max_turns)` for every LLM
 
 ### Probing model availability
 
-`orchestrator probe-models` exercises every configured pool account (`config.usage_cap.accounts`) × candidate model — default `config.routing.allowed_models` plus the fable candidate model (`claude-fable-5`) — with a cheap 1-turn invocation, and writes a deterministic, committable YAML availability artifact:
+`orchestrator probe-models` exercises every configured pool account (`config.usage_cap.accounts`) × candidate model — default `config.routing.allowed_models` plus the fable candidate model (`routing.FABLE_CANDIDATE_MODEL`) — with a cheap 1-turn invocation, and writes a deterministic, committable YAML availability artifact:
 
 ```bash
 cd /home/leo/src/dark-factory
 uv run --project orchestrator orchestrator probe-models --config "$TARGET_CONFIG" \
-  [--models m1,m2] [--output PATH]
+  [--models m1,m2] [--output PATH] [--budget-usd N]
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `--config` | required (or `ORCH_CONFIG_PATH`) | Same target-project rule as every other subcommand — selects `project_root` and the probed account/model config |
 | `--models` | `routing.allowed_models` + the fable candidate | Comma-separated override for the probed model set |
+| `--budget-usd` | `routing.DEFAULT_PROBE_BUDGET_USD` | Per-invocation USD ceiling for each one-turn probe — must clear one turn of the most expensive probed model, or every pair reports `budget_too_low` |
 | `--output` | `routing.DEFAULT_PROBE_ARTIFACT_PATH` (`config/model-availability.yaml`) | Where to write the rendered artifact |
 
 Per `(account, model)` pair, the artifact records one status (from `routing.classify_probe_outcome`, except `no_token`/`invoke_error` which the probe runner assigns directly around it):
@@ -411,9 +413,12 @@ Per `(account, model)` pair, the artifact records one status (from `routing.clas
 | `capped` | account is at or near its usage cap |
 | `no_token` | account's OAuth token env var is unresolvable — the model was never invoked for it |
 | `invoke_error` | the invocation call itself raised (network/subprocess) |
-| `error` | any other classified failure outcome (not a raised exception — that's `invoke_error`) |
+| `budget_too_low` | the probe turn aborted on the local `--budget-usd` ceiling. The API accepted the request and consumed real tokens, so the model DID resolve for this account — the turn simply never completed. This is a mis-sized budget, NOT unavailability: re-run with a higher `--budget-usd` |
+| `error` | a classified failure outcome matching none of the rows above (not a raised exception — that's `invoke_error`; not a budget abort — that's `budget_too_low`) |
 
-This artifact is the input a future fable-admission gate consumes to decide whether `claude-fable-5` is safe to add to `routing.allowed_models` fleet-wide — running the probe does not itself admit it.
+A mis-sized but *positive* `--budget-usd` clears the parse-time check and still produces an artifact that is uniformly and plausibly wrong, so the command reports budget aborts itself rather than leaving them for whoever opens the YAML: any `budget_too_low` rows raise a stderr warning naming how many pairs aborted and the ceiling in force, and a run in which **every** probed pair aborted exits **non-zero** — it produced no availability evidence at all, so it must not read as a successful probe. The artifact is written either way, before the non-zero exit; `budget_too_low` rows are honest evidence about the budget and are not discarded.
+
+This artifact is the per-`(account, model)` availability evidence an admission decision consumes — including for `routing.FABLE_CANDIDATE_MODEL`, which the probe unions into its target set whether or not a config already admits it. Running the probe does not itself admit anything: admission is a per-config operator edit to that project's `routing.allowed_models`.
 
 ### Reading routing decisions
 
@@ -502,55 +507,40 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
 2. **Diagnose**: read `.task/plan.json`, check test output, review `git log`
 3. **Fix**: make changes directly in the worktree
 4. **Verify**: run the target project's verify commands (look these up in `$TARGET_CONFIG` — Rust projects use `cargo test`/`cargo clippy`, Python projects use `pytest`/`ruff`/`pyright`, etc. — do not assume Python tooling)
-5. **Merge manually** (if the fix is good):
+5. **Merge manually** (if the fix is good) — capture the merge sha **at the moment of the merge**, never by re-reading `HEAD` later:
    ```bash
    cd "$TARGET_PROJECT"
-   git merge --no-ff task/<task-id>
+   branch=$(git symbolic-ref --quiet --short HEAD); echo "on branch=$branch"
+   [ "$branch" = "main" ] \
+     && git merge --no-ff task/<task-id> \
+     && MERGE_SHA=$(git rev-parse HEAD) \
+     && [ "$(git rev-parse -q --verify "$MERGE_SHA^2")" = "$(git rev-parse task/<task-id>)" ] \
+     && echo "MERGE_SHA=$MERGE_SHA"
    ```
+   The `&&` chain is the point, not style. `$TARGET_PROJECT` is a **machine-operated checkout** — the merge worker, the startup reconciler and git hooks all act on it directly — so `main` can advance between this step and step 6, and a `git rev-parse HEAD` read there can return an *unrelated* task's merge. Chaining short-circuits a **conflicted** merge, so `MERGE_SHA` is never set from a merge that failed — resolve the conflict first and re-run the chain. But two paths exit **0 without creating this task's merge commit**, which is why the chain also checks the merge commit's second parent and opens with the branch guard. (a) **`Already up to date.`** — when the branch tip is already an ancestor of `main`, `git merge --no-ff` exits 0 and creates *no* merge commit at all, so `git rev-parse HEAD` returns whatever is on main's tip, which under a live merge worker can be an unrelated task's merge; the second-parent check rejects that, because `$MERGE_SHA^2` is then some other branch's tip (or absent). (b) **not on `main`** — the merge genuinely SUCCEEDS and `MERGE_SHA` points at a real merge commit of this branch that simply is not on main (measured: `git merge-base --is-ancestor "$MERGE_SHA" main` rc=1); the second-parent check *cannot* catch this, since it is a bona-fide merge of this branch, which is why the branch guard is the **first link of the same `&&` chain** — so a non-`main` HEAD short-circuits the chain and `git merge` never runs. Merging onto the wrong branch is itself the damage, not just a bad capture, so the guard has to *abort*, not merely warn: a standalone `[ ... ] || { echo "NOT ON main - stop"; }` before an unchained `git merge` prints its warning and then merges anyway (reproduced on git 2.43.0), and the chain still prints a `MERGE_SHA=` because the second-parent check passes. The `echo "on branch=$branch"` runs unconditionally so the guard's verdict is visible either way rather than being silent short-circuit. Stamp only a `MERGE_SHA=` the chain actually printed.
 6. **Update task status**:
    ```
    set_task_status(id="<task-id>", status="done", project_root="$TARGET_PROJECT", done_provenance={"kind": "merged", "commit": "<merge-commit-sha>"})
    ```
-   `kind` is **required** — `_validate_done_provenance` (`fused-memory/src/fused_memory/middleware/task_interceptor.py`) rejects a kind-less blob with `done_provenance.kind is required`, and `DoneProvenance.kind` (`shared/src/shared/task_metadata.py`) has no default. Use `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge you just performed (the normal case here); use `{"kind": "found_on_main", "commit": "<sha>", "note": "<why>"}` when the work was already on main. Derive the SHA with a **task-scoped** search, not from main's current HEAD:
+   `kind` is **required** — `_validate_done_provenance` (`fused-memory/src/fused_memory/middleware/task_interceptor.py`) rejects a kind-less blob with `done_provenance.kind is required`, and `DoneProvenance.kind` (`shared/src/shared/task_metadata.py`) has no default. Use `{"kind": "merged", "commit": "<sha>"}` when this branch supplied the merge you just performed — **the normal case here**, since step 5 merged by hand; use `{"kind": "found_on_main", "commit": "<sha>", "note": "<why>"}` when the work was already on main.
 
+   **Hand-merge carve-out — read this before reaching for the ladder.** `git merge --no-ff` in step 5 writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does **not** match. So on this path the marker search comes back **empty on a merge that plainly landed** — expected, not a signal. The commit to stamp is the one step 5 captured: `{"kind": "merged", "commit": "$MERGE_SHA"}`. It is attributable because step 5 proved its **second parent is this branch's tip** — that is what makes it a merge commit that brought *this* branch in, not whatever has landed on main since — and it was captured on `main`. **This path is explicitly not subject to the citation gate** in the shared doc below, which governs the fast-forward path only. If step 5's chain printed no `MERGE_SHA=`, this carve-out does **not** apply: fall through to **If `MERGE_SHA` is not in hand** below, which re-derives from the hand-merge subject, proves containment, and already bans a bare `git rev-parse HEAD`.
+
+   **If `MERGE_SHA` is not in hand** — step 6 reached in a fresh shell, a resumed session, or a merge performed earlier — do **not** substitute `git rev-parse HEAD`. Re-derive by the *hand-merge* subject and prove containment first:
    ```bash
-   git log main --fixed-strings --grep="Merge task/<task-id> into main" --max-count=1 --format=%H
+   S="Merge branch 'task/<task-id>'"
+   sha=$(git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+           | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}')
+   echo "hand-merge sha=$sha"
+   [ -n "$sha" ] && { git merge-base --is-ancestor task/<task-id> "$sha"; echo "containment rc=$?"; }
    ```
+   `--fixed-strings` against the full quoted subject is substring-safe — the trailing `'` stops `task/1` matching inside `Merge branch 'task/10'`. The `awk` half selects the newest hit whose **subject** is exactly that, scanning past commits that merely quote it in a body; **do not add `--max-count=1`**, which would stop at the newest *message* match and discard a genuine merge shadowed behind it — see [step 1](../_shared/deriving-landed-sha.md#step-1-subject-check) for the measured population. Stamp `$sha` only when it is **non-empty AND containment rc=0**, which together prove that merge brought *this* branch in — the subject conjunct is already discharged by the selection. The subject conjunct is load-bearing and **containment does not supply it**: `git log --grep` matches the whole commit message, so a commit that merely *quotes* the hand-merge subject in its body is matched too, and containment cannot reject it — containment exists to reject a **stale** marker from a previous incarnation (whose tip is a *descendant*, not an ancestor), but for a branch that genuinely landed earlier, *any* later commit on main has the branch as an ancestor and so passes rc=0. This is the same body-match hole [step 1](../_shared/deriving-landed-sha.md#step-1-subject-check) closes for the orchestrator-shaped marker. rc=1 means it did not (a different or earlier merge), rc=128 means one of the two shas did not resolve, and an empty `$sha` means no commit on main carries the hand-merge subject: on any of those, stamp nothing here and fall through to the ladder below. **Never stamp a bare `git rev-parse HEAD`** — that is main's current tip, not necessarily your merge, and the server's only backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main, so nothing downstream would catch the substitution.
 
-   Non-empty → **not authoritative on its own here.** On this arm the branch ref still exists, and `GitOps.find_merge_marker`'s **branch-existence gate** returns None in exactly that case — it "prevents finding a stale merge marker from a *previous* run of a re-opened task that shared the same branch name". We run the search anyway (it is still the best first candidate), so re-supply that guard: require `git merge-base --is-ancestor task/<task-id> "<marker sha>"` (echo the rc — never the two-outcome `&&` idiom). **rc=0** → this incarnation's true merge commit; stamp it with note "merge commit located by exact-subject marker search; containment-verified against branch tip". **rc=1** → a stale marker owned by a previous incarnation of a re-opened task; do **not** stamp, fall through to the group-merge search below. **rc=128** → neither sha resolved and no verdict was rendered; do not stamp, re-derive. The merge that truly brought this branch in must *contain* the current tip; a previous incarnation's marker predates the recreated ref, so the tip descends from it instead. (The escalation server layers a second guard on the same risk — the marker must not predate the recorded `branch_base_sha`; see `_found_on_main_response`.)
+   **Otherwise** — when the work was already on main and you are deriving rather than recording a merge you performed — derive the sha with the task-scoped ladder, never from main's current HEAD and never from an eyeballed listing: [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the single normative copy (exact-subject marker search, ref-existence gate, containment, the group-merge candidate, the phantom-branch citation gate, and the `DoneProvenance` contract). Run it in full. Two adaptations for this call site: run every command in `$TARGET_PROJECT`, not dark-factory, and the shared doc writes the task id as `<TASK_ID>` where this workflow writes `<task-id>` — same value.
 
-   Empty, but the branch ref still exists → the branch may have been absorbed into a group/train merge under a *tip* branch's subject, which carries no marker of its own. Look for that merge, but **verify it before stamping** — a non-empty result is not authoritative on its own:
+   On the ladder's genuine not-landed outcomes — rc=0's **phantom-branch** exit, and, both **outside** the `coalesce-*` arm, rc=1 and rc=128 with an empty marker search — stamp nothing and report, rather than substituting a convenient sha. A citation gate that is **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict: stamp nothing there either, and report it as un-evaluable rather than as not-landed.
 
-   ```bash
-   c=$(git rev-list --ancestry-path --merges task/<task-id>..main | tail -1)
-   if [ -n "$c" ]; then
-       git merge-base --is-ancestor task/<task-id> "$c^1"
-       echo "contained-before rc=$?"
-   fi
-   ```
-
-   `--ancestry-path task/<task-id>..main` lists every merge that *descends from* this branch — so once the branch is on main it also lists every unrelated merge landed afterwards, and `tail -1` returns the **oldest** of those, i.e. the first unrelated task's merge. The containment check on `$c`'s first parent (main as it stood just before that merge) decides: `contained-before rc=1` → the branch was not in main before `$c`, so `$c` **is** the merge that brought it in — stamp it; `contained-before rc=0` → the branch was already in main, so `$c` is an unrelated later merge — do **not** stamp it, and continue below.
-
-   **No merge commit exists for this branch** (marker empty, and the rev-list candidate either empty or disqualified by the containment check above) → do **not** jump to "NOT landed". Settle it with the ancestry check, because the two outcomes need opposite actions:
-
-   ```bash
-   git merge-base --is-ancestor task/<task-id> main; rc=$?; echo "ancestry rc=$rc"
-   ```
-
-   - **rc=0** → the branch **is** on main; ancestry has proved a landing, so "not landed" is ruled out. There is no merge commit to find in exactly two benign cases: a fast-forward landing (none is ever created), or a merge you performed by hand in step 5 — `git merge --no-ff` writes the subject `Merge branch 'task/<task-id>'`, which the orchestrator-shaped `--grep="Merge task/<task-id> into main"` marker deliberately does not match. Stamp the commit that actually carries the work: the merge commit you just created (`git rev-parse HEAD` on main, for the step-5 manual path — use `{"kind": "merged", "commit": "<sha>"}`, since this branch supplied that merge), or, after a fast-forward, the branch tip — but **only once a landing is positively proved**. (The step-5 hand-merge path is **not** subject to that gate: you created that merge commit yourself this session, so it is self-evidently attributable — stamp it directly under `kind: "merged"`.) For the fast-forward path, rc=0 shows only that the tip is reachable from main, not that this branch carries any work: a branch that never advanced past its creation point has main's own old base commit as its tip and reaches this exact arm, ancestry rc=0 and marker-empty, carrying none of the task's work. Gate on a **positive task citation on main** — the shell form of `GitOps.find_task_citation_commit` (`orchestrator/src/orchestrator/git_ops.py`), which exists for exactly this degenerate case (its docstring: `is_ancestor` "returns True trivially for zero-commit branches whose tip equals the main HEAD at branch-create time... Requiring a positive citation on main rejects that degenerate case"), using `DEFAULT_COMMIT_CITATION_PATTERN` from the same module:
-
-   ```bash
-   git log main --extended-regexp --format='%H %s' \
-       --grep='^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)(\(\b<task-id>\b[):]|.*\btask/<task-id>\b)|^Merge task/<task-id> into |\(#?<task-id>\)|\(task <task-id>\)'
-   ```
-
-   Read each row's `%s` **subject**, not just the count — `--grep` matches the whole message and git applies `^`/`$` per line, so a body line can match spuriously; the function re-tests each candidate's subject alone, and so should you (most-recent-first, first subject match wins). **A subject-matching row exists** → genuine fast-forward, stamp `{"kind": "found_on_main", "commit": "<tip sha from git rev-parse task/<task-id>>", "note": "fast-forward merge, no separate merge commit; landing confirmed by task citation <citing sha> on main"}`. **No subject-matching row** → the **phantom-branch** case, the branch never advanced — do **not** stamp, stop and report as not-landed/phantom-branch. **`git.commit_citation_pattern: ""`** → empty by configuration, proving neither verdict; do **not** stamp, and report the gate as un-evaluable. Do **not** use `git cherry` on this arm — it reports only commits reachable from the branch but not from main, and rc=0 has just proved every branch commit *is* reachable from main, so it prints nothing for a genuine fast-forward and a phantom branch alike (its use on merge-queue/SKILL.md rule 2b's rc=1 arm is correct and unaffected). `kind='found_on_main'` **requires BOTH a `commit` AND a `note`** — `shared/src/shared/task_metadata.py::DoneProvenance` raises on each condition independently, so a note-only payload and a note-less payload are both rejected (`kind='merged'` requires only a commit; the note rule is `found_on_main`'s). Where this gate finds no honest commit, write **nothing at all** rather than substituting a convenient sha. Declining to stamp *is* available here, and on the failing branches it is required.
-   - **rc=1** (branch exists, not an ancestor) → **not a not-landed verdict on its own.** If this task was ever `superseded` by a `coalesce-*` train, rc=1 is the normal and *permanent* post-landing state for a non-tip train member (the tip is rebased before the merge, rewriting shas, and the member's own ref is never advanced), so follow merge-queue/SKILL.md rules 2–3 — tip marker, scheduler status, rule 2b's veto, `git cherry` content proof — and take the **landed-but-not-credited** exit instead of reporting not-landed. **rc=1 is NOT not-landed on the `coalesce-*` arm.** Only outside that arm is rc=1 a genuine not-landed outcome.
-   - **rc=128 with an empty marker search** (branch ref gone, nothing on main cites it) → a genuine not-landed outcome. Treat as NOT landed and stop rather than stamping provenance.
-
-   Do **not** read the SHA from `git log -1 --format=%H`. <!-- provenance-guard: negative --> That is main's *current HEAD*, which is this task's merge commit only when this merge happens to be the newest commit on main — on a live merge queue it usually is not, so you would record an unrelated task's merge as this one's provenance. The server's only backstop is `git merge-base --is-ancestor <sha> main`, which passes for every recent commit on main and would not catch it.
-
-   A note-only `{"note": "<one-sentence explanation>"}` payload is **no longer accepted** — the post-3092 hardening requires a commit on every kind. For a fast-forward merge, or when the work was covered by a sibling task, still cite a commit: `{"kind": "found_on_main", "commit": "<branch tip, or the sibling's landing sha>", "note": "<one-sentence explanation>"}`, derived task-scoped as above.
+   A note-only `{"note": "<one-sentence explanation>"}` payload is **no longer accepted** — the post-3092 hardening requires a commit on every kind. For a fast-forward merge, or when the work was covered by a sibling task, still cite a commit: `{"kind": "found_on_main", "commit": "<the commit on main that cites this task>", "note": "<one-sentence explanation>"}`, derived task-scoped as above.
 7. **Clean up worktree** (from inside `$TARGET_PROJECT`):
    ```bash
    git worktree remove .worktrees/<task-id>

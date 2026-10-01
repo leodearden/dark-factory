@@ -424,6 +424,107 @@ class TestRunMainTipSweepRetryOnFlake:
             f'got {rfv.call_count}'
         )
 
+    def test_run_main_tip_sweep_logs_confirmed_deterministic_drift(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The deterministic-drift exit must SAY SO (2026-09-22 incident).
+
+        On that day this branch was the one actually taken and it logged
+        NOTHING: the last journal line was the first-pass WARNING, the retry
+        then ran for 5h16m, and from outside the process "detected and handed
+        to the harness" was indistinguishable from the outer ``except
+        Exception`` swallow, which also produces no line and returns the "no
+        signal" sentinel.
+        """
+        import logging
+
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            caplog.at_level(logging.WARNING, logger='orchestrator.verify'),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(
+                verify_module, 'run_full_verification',
+                AsyncMock(side_effect=[FAILING_RESULT, FAILING_RESULT]),
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is not None and result[1].passed is False
+        confirmations = [
+            r for r in caplog.records
+            if 'REPRODUCED on retry' in r.getMessage()
+        ]
+        assert len(confirmations) == 1, (
+            f'expected exactly one deterministic-drift confirmation line, got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        msg = confirmations[0].getMessage()
+        assert MAIN_SHA[:12] in msg, f'line must name the swept SHA: {msg!r}'
+        assert confirmations[0].levelno >= logging.WARNING, (
+            'the confirmation must be at WARNING or above, or the journal '
+            'will not carry it'
+        )
+
+    def test_run_main_tip_sweep_swallowed_exception_is_loud(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """The bare ``except Exception`` swallow must log at ERROR.
+
+        It collapses a possibly-real red-main signal into the None "no signal"
+        sentinel, so the harness files nothing and the drift is dropped on the
+        floor.  At DEBUG that was below the journal's effective level and
+        therefore completely invisible.  Control flow is unchanged: the
+        sentinel is still returned.
+        """
+        import logging
+
+        from orchestrator import verify as verify_module
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+
+        async def _fake_run(cmd, **kwargs):
+            return (0, '', '')
+
+        with (
+            caplog.at_level(logging.DEBUG, logger='orchestrator.verify'),
+            patch('orchestrator.git_ops._run', side_effect=_fake_run),
+            patch.object(
+                verify_module, 'run_full_verification',
+                AsyncMock(side_effect=RuntimeError('boom')),
+            ),
+        ):
+            result = asyncio.run(verify_module.run_main_tip_sweep(config, git_ops))
+
+        assert result is None, (
+            f'control flow must be unchanged — still the sentinel, got {result!r}'
+        )
+        swallows = [
+            r for r in caplog.records
+            if 'unexpected error during the main-tip sweep' in r.getMessage()
+        ]
+        assert len(swallows) == 1, (
+            f'expected exactly one swallow line, got '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+        assert swallows[0].levelno >= logging.ERROR, (
+            f'the swallow must be at ERROR or above (it was DEBUG, i.e. '
+            f'invisible in the journal); got {swallows[0].levelname}'
+        )
+        assert MAIN_SHA[:12] in swallows[0].getMessage(), (
+            'the swallow line must name the SHA whose signal was dropped'
+        )
+        assert swallows[0].exc_info is not None, (
+            'the swallow line must carry the traceback'
+        )
+
     def test_run_main_tip_sweep_passes_first_time_no_retry(
         self, tmp_path: Path
     ) -> None:

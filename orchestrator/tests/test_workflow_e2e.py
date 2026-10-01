@@ -1053,8 +1053,9 @@ class TestPostRebaseVerifyFailure:
             verify_call += 1
             # First verify: in-worktree (pass).
             # Second verify: post-rebase (fail) — workflow should still proceed.
-            # Third+ verify: merge queue's own verification (pass).
-            if verify_call <= 1 or verify_call >= 3:
+            # The merge queue runs its own verify through conftest's autouse
+            # passed=True stub and never reaches this function.
+            if verify_call <= 1:
                 return VerifyResult(
                     passed=True, test_output='OK', lint_output='',
                     type_output='', summary='All checks passed',
@@ -1066,10 +1067,16 @@ class TestPostRebaseVerifyFailure:
             )
 
         monkeypatch.setattr('orchestrator.workflow.run_scoped_verification', verify_fn)
-        monkeypatch.setattr('orchestrator.merge_queue.run_scoped_verification', verify_fn)
 
         outcome = (await workflow.run()).outcome
 
+        assert verify_call == 2, (
+            'expected exactly the in-worktree + post-rebase verifies through '
+            f'orchestrator.workflow.run_scoped_verification; got {verify_call}. '
+            'A third call means the merge queue no longer runs its own verify '
+            'through conftest, and this stub is now failing a verify it never '
+            'meant to judge.'
+        )
         # Post-rebase verify failure is non-blocking; merge queue handles it
         assert outcome == WorkflowOutcome.DONE
 
@@ -1134,7 +1141,10 @@ class TestBlastRadiusExpansion:
             async def handle_blast_radius_expansion(
                 self, task_id, current, needed, /, *, persist_files=None
             ):
-                return False  # Can't acquire locks
+                # Can't acquire locks: re-pend like the real acquire-failure
+                # branch of scheduler.py::Scheduler.handle_blast_radius_expansion.
+                await self.set_task_status(task_id, 'pending')
+                return False
 
         stub = ExpandingArchitectStub()
         deny_scheduler = DenyingScheduler()
@@ -2387,13 +2397,6 @@ class TestWipRecoveryNoAdvance:
         monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
         monkeypatch.setattr(
             'orchestrator.workflow.run_scoped_verification',
-            AsyncMock(return_value=VerifyResult(
-                passed=True, test_output='OK', lint_output='',
-                type_output='', summary='All checks passed',
-            )),
-        )
-        monkeypatch.setattr(
-            'orchestrator.merge_queue.run_scoped_verification',
             AsyncMock(return_value=VerifyResult(
                 passed=True, test_output='OK', lint_output='',
                 type_output='', summary='All checks passed',
@@ -5381,14 +5384,19 @@ class TestPlanDoneEarlyReturn:
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
 
         workflow._plan = AsyncMock(return_value=WorkflowOutcome.PLANNED)
+
+        # run()'s SM-2 exit check reads scheduler.get_status back — the real
+        # _execute_verify_review_loop body (which would persist 'blocked')
+        # never runs, so the stub seeds the fake's status history itself, at
+        # call time. Seeding it before run() is overwritten by the dispatch
+        # claim's 'in-progress'.
+        async def fake_loop_blocked(*args, **kwargs):
+            scheduler.statuses.setdefault(workflow.task_id, []).append('blocked')
+            return WorkflowOutcome.BLOCKED
+
         workflow._execute_verify_review_loop = AsyncMock(
-            return_value=WorkflowOutcome.BLOCKED,
+            side_effect=fake_loop_blocked,
         )
-        # run()'s SM-2 exit check reads scheduler.get_status back —
-        # _execute_verify_review_loop is stubbed above (its real body, which
-        # would persist 'blocked', never runs), so seed the fake's status
-        # history to match the forced BLOCKED outcome directly.
-        scheduler.statuses.setdefault(workflow.task_id, []).append('blocked')
 
         outcome = (await workflow.run()).outcome
 

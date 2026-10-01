@@ -22,6 +22,7 @@ subprocesses.
 from __future__ import annotations
 
 import pathlib
+from typing import Literal
 
 import pytest
 from _verify_config_corpus import DF_CONFIG_PATH, load_config_scalar
@@ -290,10 +291,18 @@ class TestRunSegmentedSharedDeadline:
     by the segment count and could wedge the merge queue.
 
     This path is load-bearing, not theoretical. The committed config's own
-    measured table records five of seven segments already costing 1838.60s
-    (orchestrator alone 1366.23s), a hard lower bound because that run timed
-    out before dashboard started — so a real chain can exhaust even the raised
-    3600s ceiling mid-run.
+    measured table records five of eight segments whose sum is the fleet chain
+    floor, dominated by `orchestrator` — re-measured by task 4902 on
+    2026-08-28 — and that floor is a LOWER bound, because dashboard, sampler
+    and cockpit carry no measurement at all. So a real chain can exhaust even
+    the raised warm ceiling mid-run: 4902 recorded green orchestrator runs
+    whose cost alone approaches it, and one attempt has already consumed the
+    full budget and been logged as a false infra_timeout.
+
+    The figures are deliberately NOT copied into this docstring. They live once,
+    in MEASURED_FLEET_SEGMENT_SECS / POST_CAP_ORCHESTRATOR_GREEN_SECS in
+    tests/scripts/test_fallback_verify_config.py; a number restated here would
+    be one more copy to raise in lockstep.
 
     A segment the deadline never reached is `not_run` with ``rc=None``: the
     UNCONFLATABLE encoding. `rc=0` would read as a pass, which is precisely the
@@ -1169,24 +1178,28 @@ class TestTheSerialRecoveryRoundTripStaysUncapped:
 
 
 class TestPerSegmentJunitIsDeliberatelyUnwired:
-    """Per-segment junitxml stays unwired, and says so out loud (task 3478).
+    """Per-segment ATTRIBUTION junit stays unwired, and says so out loud (task 3478).
 
     Task 3338 left the junitxml branch on the segmented path as a recorded
-    follow-up. Reading the two gates rather than the comment shows it is not
-    a deferred feature but STRUCTURALLY UNREACHABLE code:
+    follow-up. For the junit that ATTRIBUTES failures, reading the two gates
+    rather than the comment shows it is not a deferred feature but
+    STRUCTURALLY UNREACHABLE code:
 
-    - ``junit_path`` is computed only when ``role == 'merge'`` and breadth is
-      'full' (verify.py's ``_prepare_junit_report_path`` call site);
+    - an attributing report exists only when ``role == 'merge'`` and breadth
+      is 'full' (verify.py's ``_prepare_junit_report_path`` call site);
     - segmentation is opted into by exactly one call site,
       ``run_scoped_verification``'s fallback, as
       ``segment_chained_test=role != 'merge'``.
 
-    So whenever ``chain_segments`` is not None, ``junit_path`` is None.
-    Wiring per-segment junit today would produce a writer with no consumer:
-    ``_extract_failing_test_ids_from_junit`` runs only ``if junit_path is not
-    None``. The stated motivation — node-id attribution for the triaging
-    agent — is already served here by ``_extract_failing_test_ids``, the
+    The stated motivation for it, node-id attribution for the triaging
+    agent, is already served here by ``_extract_failing_test_ids``, the
     stdout-regex counterpart, over ``_run_segmented``'s aggregate output.
+
+    That claim is narrower than it once was. Since task 5671 a task leg with
+    an archive destination writes a COST-record junit, and a segmented one
+    writes one per segment at distinct paths (see
+    ``TestSegmentedTaskLegsArchivePerSegmentJunit``). Those are archived and
+    never parsed, so they attribute nothing.
 
     A decision that lives only in a comment is one nobody reads, so the
     second half of this class pins the LOUD guard instead: construct the
@@ -1223,14 +1236,16 @@ class TestPerSegmentJunitIsDeliberatelyUnwired:
         return result, calls, runs
 
     @pytest.mark.asyncio
-    async def test_task_role_segmented_run_collects_no_junit_at_all(self, tmp_path):
-        """Status quo, green today and kept honest.
+    async def test_task_role_segmented_run_without_an_archive_collects_no_junit(
+        self, tmp_path,
+    ):
+        """No archive destination, no report of either kind.
 
-        Even with breadth explicitly 'full', a task-role segmented run
-        computes no junit path, writes no report directory, and injects
-        ``--junitxml`` into no segment — because the breadth gate is
-        ``role == 'merge' and ...``. This is the mutual exclusion the
-        decision rests on; if it ever stops holding, this test says so.
+        Even with breadth explicitly 'full', a task-role segmented run writes
+        no attributing report (that gate is ``role == 'merge' and ...``, the
+        mutual exclusion the decision rests on), and this driver passes no
+        ``archive_root``, so it writes no cost-record report either: no
+        report directory, and ``--junitxml`` in no segment.
         """
         _result, calls, _runs = await TestRunVerificationSegmentChainedTestWiring._run(
             tmp_path,
@@ -1510,8 +1525,10 @@ class TestRunVerificationSegmentedAcceptance:
         removing the `&&` short-circuit — the whole point of task 3338 — makes
         budget exhaustion strictly MORE likely, because all 8 segments now
         always run where the shell previously stopped at the first red. The
-        committed config's own measured table already records five of seven
-        segments costing 1838.60s.
+        committed config's own measured table already records five of eight
+        segments whose sum is the fleet chain floor (the figure itself lives
+        once, in MEASURED_FLEET_SEGMENT_SECS in
+        tests/scripts/test_fallback_verify_config.py, not here).
 
         Synthesising `timed_out` on exhaustion would relabel this genuine red as
         an `infra_timeout` (``classify_failure`` guard 2 wins over every output
@@ -1571,8 +1588,20 @@ class TestSegmentsReachThePersistedSummaryJson:
     """
 
     @staticmethod
-    async def _run_persisting(tmp_path, *, red_labels=(), blow_budget_after=None):
-        """Drive the fallback path with ``_persist_attempt_logs`` UNPATCHED."""
+    async def _run_persisting(
+        tmp_path,
+        *,
+        red_labels=(),
+        blow_budget_after=None,
+        test_command=_FLEET_TEST_COMMAND,
+        config_overrides: dict | None = None,
+        role: Literal['merge', 'task', 'background'] = 'task',
+    ):
+        """Drive the fallback path with ``_persist_attempt_logs`` UNPATCHED.
+
+        *config_overrides* is merged over the admission-OFF config, as in
+        ``TestRunVerificationSegmentChainedTestWiring._run``.
+        """
         import json  # noqa: PLC0415
         from unittest.mock import patch  # noqa: PLC0415
 
@@ -1603,19 +1632,24 @@ class TestSegmentsReachThePersistedSummaryJson:
             kwargs['now'] = clock
             return await real_run_segmented(*args, **kwargs)
 
-        config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False)
+        config = OrchestratorConfig(**{
+            'project_root': tmp_path,
+            'verify_admission_enabled': False,
+            **(config_overrides or {}),
+        })
         with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
              patch('orchestrator.verify._run_segmented', side_effect=clocked_run_segmented):
             result = await verify_mod.run_verification(
                 tmp_path,
                 config,
                 TestRunVerificationSegmentChainedTestWiring._fallback_config(
-                    _FLEET_TEST_COMMAND,
+                    test_command,
                 ),
                 attempt_id=1,
                 task_id='3338',
                 max_retries=0,
                 segment_chained_test=True,
+                role=role,
             )
         # The fallback ModuleConfig's `__fallback__` prefix is the filename
         # infix _persist_attempt_logs inserts to keep concurrent per-subproject
@@ -1675,6 +1709,319 @@ class TestSegmentsReachThePersistedSummaryJson:
             entry = self._command_entry(summary, label)
             assert 'segments' in entry, f'{label}: key must be present unconditionally'
             assert entry['segments'] is None
+
+
+class TestEachSegmentRecordsItsOwnXdist:
+    """Each persisted segment says what ``-n`` it actually ran with (task 5671).
+
+    Since task 3478 every structured pytest segment is ``-n`` capped, but the
+    only xdist stamp was the check-level one, which reads ``None`` for an
+    ``&&`` chain (the chain as a whole is not one invocation). So the flag
+    every segment really ran with was recorded nowhere. Each segment dict now
+    carries ``xdist``, the same ``{n_flag, auto_num_workers}`` shape, read
+    off that segment's own rendered command.
+    """
+
+    _CHAIN = (
+        'cd shared && uv run pytest tests/ -q'
+        ' && uv run --project shared pytest tests/scripts/ -q'
+    )
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_worker_count(self, monkeypatch, code_default_config):
+        """Pin ``PYTEST_XDIST_AUTO_NUM_WORKERS`` absent at both of its sources.
+
+        The same pinning, for the same reasons, as
+        test_verify_load_stamp.py::TestTheStampIsTakenOnTheRealPath.
+        """
+        monkeypatch.delenv('PYTEST_XDIST_AUTO_NUM_WORKERS', raising=False)
+
+    @staticmethod
+    def _capped(tmp_path):
+        return {
+            'verify_admission_enabled': True,
+            'verify_admission_pytest_n': '8',
+            'verify_admission_slots_dir': str(tmp_path / 'slots'),
+        }
+
+    @staticmethod
+    def _test_entry(summary):
+        return TestSegmentsReachThePersistedSummaryJson._command_entry(summary, 'test')
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_every_capped_segment_records_the_cap(self, tmp_path):
+        _result, summary = await TestSegmentsReachThePersistedSummaryJson._run_persisting(
+            tmp_path, test_command=self._CHAIN, config_overrides=self._capped(tmp_path),
+        )
+
+        entry = self._test_entry(summary)
+        assert [seg['xdist'] for seg in entry['segments']] == [
+            {'n_flag': '8', 'auto_num_workers': None},
+            {'n_flag': '8', 'auto_num_workers': None},
+        ]
+        assert entry['load']['xdist']['n_flag'] is None, (
+            'the whole chain is not one invocation, so it names no single flag'
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_segment_reads_its_own_command_not_the_config(self, tmp_path):
+        _result, summary = await TestSegmentsReachThePersistedSummaryJson._run_persisting(
+            tmp_path,
+            test_command=(
+                'cd shared && uv run pytest tests/ -q -n 4'
+                ' && uv run --project shared pytest tests/scripts/ -q'
+            ),
+        )
+
+        assert [seg['xdist']['n_flag'] for seg in self._test_entry(summary)['segments']] == [
+            '4', None,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_segment_that_never_ran_ran_with_nothing(self, tmp_path):
+        _result, summary = await TestSegmentsReachThePersistedSummaryJson._run_persisting(
+            tmp_path, blow_budget_after=3,
+        )
+
+        segments = self._test_entry(summary)['segments']
+        not_run = [seg for seg in segments if seg['status'] == 'not_run']
+        assert not_run, 'precondition: the budget clock left segments unrun'
+        assert all(seg['xdist'] is None for seg in not_run)
+        assert all(seg['xdist'] is not None for seg in segments if seg not in not_run)
+
+    @pytest.mark.real_verify_admission
+    @pytest.mark.asyncio
+    async def test_the_fleet_chain_records_every_structured_segments_cap(self, tmp_path):
+        _result, summary = await TestSegmentsReachThePersistedSummaryJson._run_persisting(
+            tmp_path, config_overrides=self._capped(tmp_path),
+        )
+
+        segments = self._test_entry(summary)['segments']
+        assert all('xdist' in seg for seg in segments)
+        by_label = {seg['label']: seg['xdist']['n_flag'] for seg in segments}
+        # Measured: the cockpit subshell parses raw-retained, and _xdist_workers
+        # names no flag for a raw-retained command although its text carries -n 8.
+        assert by_label.pop('root-7') is None
+        assert set(by_label.values()) == {'8'}
+
+
+def _segment_junit_target(cmd: str) -> pathlib.Path | None:
+    """The report path a rendered segment command was told to write, if any."""
+    import shlex  # noqa: PLC0415
+
+    tokens = shlex.split(cmd)
+    for index, token in enumerate(tokens[:-1]):
+        if token == '--junitxml':
+            return pathlib.Path(tokens[index + 1])
+    return None
+
+
+def _segment_report(label: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="utf-8"?><testsuites>'
+        f'<testsuite name="{label}" tests="1" failures="0">'
+        f'<testcase classname="tests.test_{label}" name="test_ok" time="0.01"/>'
+        '</testsuite></testsuites>'
+    )
+
+
+class TestSegmentedTaskLegsArchivePerSegmentJunit:
+    """A segmented task leg archives one junit cost record PER SEGMENT (task 5671).
+
+    The fallback full-suite legs are the most expensive task legs, so leaving
+    them out would miss the population the cost record exists for. Each
+    segment writes to its own path, so the last-writer-wins hazard task 3478
+    warned about cannot arise, and only segments that actually ran are
+    archived.
+    """
+
+    @staticmethod
+    async def _run_archiving(tmp_path, *, blow_budget_after=None):
+        """Drive the segmented fallback with an archive, every segment writing
+        a report naming itself wherever it is told to.
+
+        Returns ``(result, calls, archive_root)``.
+        """
+        from unittest.mock import patch  # noqa: PLC0415
+
+        from orchestrator import verify as verify_mod  # noqa: PLC0415
+        from orchestrator.config import OrchestratorConfig  # noqa: PLC0415
+
+        (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
+        archive_root = tmp_path / 'archive'
+        calls: list[dict] = []
+        clock = _SegmentedBudgetClock(blow_budget_after)
+
+        async def fake_run_cmd(cmd, cwd, timeout, env=None, log_path=None, **_kw):
+            if log_path is None or '.test.' not in log_path.name:
+                return 0, 'ok', False
+            label = log_path.name.split('.test.', 1)[1].removesuffix('.log')
+            calls.append({'cmd': cmd, 'segment': label})
+            clock.tick()
+            target = _segment_junit_target(cmd)
+            if target is not None:
+                target.write_text(_segment_report(label), encoding='utf-8')
+            return 0, f'ok {label}', False
+
+        real_run_segmented = verify_mod._run_segmented
+
+        async def clocked_run_segmented(*args, **kwargs):
+            clock.arm(kwargs['budget_secs'])
+            kwargs['now'] = clock
+            return await real_run_segmented(*args, **kwargs)
+
+        config = OrchestratorConfig(project_root=tmp_path, verify_admission_enabled=False)
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_run_cmd), \
+             patch('orchestrator.verify._run_segmented', side_effect=clocked_run_segmented):
+            result = await verify_mod.run_verification(
+                tmp_path,
+                config,
+                TestRunVerificationSegmentChainedTestWiring._fallback_config(
+                    _FLEET_TEST_COMMAND,
+                ),
+                attempt_id=1,
+                task_id='3338',
+                max_retries=0,
+                segment_chained_test=True,
+                role='task',
+                archive_root=archive_root,
+            )
+        return result, calls, archive_root
+
+    @staticmethod
+    def _archived(archive_root, label):
+        return sorted(
+            (archive_root / '3338').glob(f'attempt-1.__fallback__.{label}.junit-*.xml.gz'),
+        )
+
+    @pytest.mark.asyncio
+    async def test_every_structured_segment_writes_its_own_report(self, tmp_path):
+        _result, calls, _archive = await self._run_archiving(tmp_path)
+
+        targets = {c['segment']: _segment_junit_target(c['cmd']) for c in calls}
+        assert len(targets) == 8
+        # Measured: the cockpit subshell parses raw-retained, which
+        # with_junitxml leaves untouched rather than risk a mis-scoped injection.
+        assert targets.pop('root-7') is None
+        assert None not in targets.values()
+        assert len(set(targets.values())) == len(targets), (
+            f'two segments were handed one report path: {targets}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_each_segment_that_wrote_a_report_is_archived_as_itself(self, tmp_path):
+        import gzip  # noqa: PLC0415
+
+        _result, calls, archive_root = await self._run_archiving(tmp_path)
+
+        wrote = [c['segment'] for c in calls if _segment_junit_target(c['cmd'])]
+        assert len(wrote) == 7
+        for label in wrote:
+            archived = self._archived(archive_root, label)
+            assert len(archived) == 1, (label, archived)
+            assert gzip.decompress(archived[0].read_bytes()).decode('utf-8') == (
+                _segment_report(label)
+            )
+        assert len(list((archive_root / '3338').glob('*.junit-*.xml.gz'))) == 7
+
+    @pytest.mark.asyncio
+    async def test_a_segment_that_never_ran_archives_no_stale_report(self, tmp_path):
+        from orchestrator.verify import _task_junit_report_path  # noqa: PLC0415
+
+        (tmp_path / '.task').mkdir(parents=True, exist_ok=True)
+        stale = _task_junit_report_path(tmp_path, 1, '__fallback__', segment_label='root-8')
+        assert stale is not None
+        stale.write_text(_segment_report('an-earlier-pass'), encoding='utf-8')
+
+        _result, calls, archive_root = await self._run_archiving(
+            tmp_path, blow_budget_after=3,
+        )
+
+        assert 'root-8' not in {c['segment'] for c in calls}, (
+            'precondition: the budget clock left root-8 unrun'
+        )
+        assert self._archived(archive_root, 'root-8') == []
+
+    @pytest.mark.asyncio
+    async def test_task_path_attribution_is_unchanged(self, tmp_path):
+        result, _calls, _archive = await self._run_archiving(tmp_path)
+
+        assert result.failing_test_ids is None
+
+    @pytest.mark.asyncio
+    async def test_a_task_path_segmented_run_does_not_warn_about_junit(
+        self, tmp_path, caplog,
+    ):
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            await self._run_archiving(tmp_path)
+
+        loud = [
+            r.getMessage() for r in caplog.records
+            if r.levelno >= logging.WARNING and 'junit' in r.getMessage().lower()
+        ]
+        assert loud == []
+
+    @pytest.mark.asyncio
+    async def test_the_whole_chain_is_not_reported_as_a_suppressed_injection(
+        self, tmp_path, caplog,
+    ):
+        """The per-segment reports ARE collected, so no line may say otherwise.
+
+        The whole ``&&`` chain is pytest but not structured, so offering it the
+        leg-level path logs task 3218's INFO that no report will be collected
+        there. On a segmented leg that is false, and a false line on every
+        fallback verify trains operators to ignore the true ones, such as the
+        cockpit subshell segment's, which really does write none.
+        """
+        import logging  # noqa: PLC0415
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.verify'):
+            await self._run_archiving(tmp_path)
+
+        suppressed = [
+            r.getMessage() for r in caplog.records
+            if 'junitxml injection suppressed' in r.getMessage()
+        ]
+        assert not [m for m in suppressed if 'attempt-1.__fallback__.test.junit.xml' in m]
+        assert [m for m in suppressed if '.test.root-7.junit.xml' in m], (
+            'precondition: the cockpit segment, which truly writes no report, '
+            'still says so'
+        )
+
+    def test_the_archive_name_carries_the_segment_label(self, tmp_path):
+        from orchestrator.verify import _archive_junit_report  # noqa: PLC0415
+
+        report = tmp_path / 'report.xml'
+        report.write_text(_segment_report('orchestrator-3'), encoding='utf-8')
+
+        dest = _archive_junit_report(
+            report, tmp_path / 'archive', '3338', 1,
+            module_prefix='__fallback__', segment_label='orchestrator-3',
+        )
+
+        assert dest is not None
+        assert dest.name.startswith('attempt-1.__fallback__.orchestrator-3.junit-')
+        assert dest.name.endswith('.xml.gz')
+
+    def test_no_segment_label_keeps_the_5670_name(self, tmp_path):
+        import re  # noqa: PLC0415
+
+        from orchestrator.verify import _archive_junit_report  # noqa: PLC0415
+
+        report = tmp_path / 'report.xml'
+        report.write_text(_segment_report('whole'), encoding='utf-8')
+
+        dest = _archive_junit_report(
+            report, tmp_path / 'archive', '3338', 1, module_prefix='__fallback__',
+        )
+
+        assert dest is not None
+        assert re.fullmatch(
+            r'attempt-1\.__fallback__\.junit-\d{8}T\d{6}_\d{6}Z\.xml\.gz', dest.name,
+        ), dest.name
 
 
 class TestMergeRoleFallbackIsNotSegmented:
