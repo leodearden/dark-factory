@@ -423,9 +423,7 @@ def test_the_promotion_is_in_effect_for_this_run(pytestconfig):
 
 # Verify's own budget; why a marker below it inverts rather than loosens: the
 # VERIFY_CLI_PER_TEST_TIMEOUT block in _orch_helpers.py, enforced by
-# test_timeout_marker_inversion_guard.py.  Task 5146 left it unchanged on purpose:
-# it removed this test's load sensitivity on the COST side (see _run_probe_session),
-# and plans/flake-ledger-prd.md §5.5 forbids widening a timeout as a fix.
+# test_timeout_marker_inversion_guard.py.
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
     tmp_path, pytestconfig
@@ -475,13 +473,10 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
     combined = treatment.stdout + treatment.stderr
     assert not (tmp_path / _ESCAPE_MARKER_NAME).exists(), (
         f'PROBE NOT HERMETIC — a probe session imported the conftest.py '
-        f'planted one directory ABOVE its own ({tmp_path / "conftest.py"}). '
-        f'Under -c {ORCH_PYPROJECT}, pytest defaults confcutdir to '
-        f'{ORCH_PYPROJECT.parent}, so every ancestor of the probe that is not '
-        f'also an ancestor of that directory — /tmp included — counts as inside '
-        f'it: pytest imports any conftest.py found there and roots collection '
-        f'at Dir(/tmp), listing the whole fleet-shared /tmp. A contaminated run '
-        f'cannot attribute its outcome to the inifile. Task 5146.'
+        f'planted one directory ABOVE its own ({tmp_path / "conftest.py"}), so '
+        f'the run is contaminated and cannot attribute its outcome to the '
+        f'inifile. Why that happens: _run_probe_session\'s --confcutdir note. '
+        f'Task 5146.'
         f'\noutput:\n{combined}'
     )
     assert treatment.returncode != 0, (
