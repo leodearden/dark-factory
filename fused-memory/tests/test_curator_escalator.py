@@ -649,7 +649,9 @@ _FINDING = DuplicateFinding(
 )
 
 
-def _duplicate_report(root, finding=_FINDING, zot_escalation_id='esc-curator-41'):
+def _duplicate_report(
+    root, finding: DuplicateFinding = _FINDING, zot_escalation_id: str | None = 'esc-curator-41',
+) -> dict[str, Any]:
     return dict(
         project_root=str(root), project_id='proj-dup',
         finding=finding, candidate_title='Re-filed gate fix',

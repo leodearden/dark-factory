@@ -17,6 +17,11 @@ Routing policy (keyed off orchestrator liveness):
   failure so the MCP caller sees a loud error instead of a silent
   curator outage.
 
+* **Post-ZOT duplicate finding** (``report_zot_duplicate``) — one level-1
+  ``curator_zot_duplicate`` record per (new task, near-duplicate) pair,
+  cross-referencing the live zero-output-hang record. Filed only when an
+  orchestrator is running; otherwise logged, never raised.
+
 Liveness is probed via ``flock(LOCK_SH | LOCK_NB)`` on
 ``{project_root}/data/orchestrator/orchestrator.lock`` (the orchestrator
 holds ``LOCK_EX`` on startup). Treat a missing file as "no orchestrator".
@@ -45,6 +50,8 @@ from fused_memory.middleware.task_curator import CuratorFailureError
 if TYPE_CHECKING:
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
 
 # ``escalation`` is a sibling workspace package. The main reconciliation
 # harness also imports it defensively (harness.py:38-46) because historical
@@ -83,6 +90,7 @@ _ZOT_DEDUP_WINDOW_SECS = 60.0
 # recurrence folds into one pending record instead of minting a new L1.
 _ZOT_CATEGORY = 'curator_zero_output_hang'
 _ZOT_ROOT_CAUSE = 'curator-empty-output-pre-turn-hang'
+_ZOT_DUPLICATE_CATEGORY = 'curator_zot_duplicate'
 
 
 def _transcript_evidence_lines(
@@ -482,6 +490,81 @@ class CuratorEscalator:
             escalation.id, project_id, count, self._ESCALATE_FIRST_N,
         )
         return None
+
+    async def report_zot_duplicate(
+        self,
+        *,
+        project_root: str,
+        project_id: str,
+        finding: DuplicateFinding,
+        candidate_title: str,
+        zot_escalation_id: str | None,
+    ) -> None:
+        """File one L1 record for a near-duplicate created under a ZOT degrade.
+
+        Unlike ``report_failure`` this never raises on the no-orchestrator or
+        no-escalation-package gates: it runs after the task already exists, so
+        raising could only turn a missed notice into noise on a successful write.
+        """
+        if not HAS_ESCALATION or not self._orchestrator_running(project_root):
+            logger.warning(
+                'curator_escalator: no orchestrator/escalation queue for project %s; '
+                'post-ZOT duplicate %s ~ %s (score %.3f) not escalated',
+                project_id, finding.task_id, finding.duplicate_task_id, finding.score,
+            )
+            return
+
+        zot_ref = (
+            repr(zot_escalation_id) if zot_escalation_id is not None
+            else 'none filed (breaker-open short-circuit)'
+        )
+        detail_lines = [
+            f'task_id={finding.task_id!r}',
+            f'duplicate_task_id={finding.duplicate_task_id!r}',
+            f'duplicate_title={finding.duplicate_title!r}',
+            f'score={finding.score:.3f}',
+            f'candidate_title={candidate_title!r}',
+            f'project_id={project_id!r}',
+            f'zot_escalation_id={zot_ref}',
+            '',
+            'NOTE: curator dedupe was degraded to create by a zero-output hang. '
+            'The post-ZOT duplicate sweep flagged this pair and did NOT combine, '
+            'cancel or delete anything. The new task carries '
+            'metadata.x_zot_duplicate_candidate. A human should decide whether '
+            'to cancel one of the two as SUPERSEDED.',
+        ]
+
+        queue = self._queue_for(project_root)
+        escalation = Escalation(
+            id=queue.make_id('curator'),
+            task_id='task-curator',
+            agent_role='fused-memory/task-curator',
+            severity='blocking',
+            category=_ZOT_DUPLICATE_CATEGORY,
+            summary=(
+                f'possible duplicate created while curator dedupe was degraded by a '
+                f'zero-output hang: task {finding.task_id} ~ task '
+                f'{finding.duplicate_task_id} (score {finding.score:.3f})'
+            ),
+            detail='\n'.join(detail_lines),
+            level=1,
+        )
+        try:
+            queue.submit(escalation)
+        except Exception:
+            logger.exception(
+                'curator_escalator: failed to submit post-ZOT duplicate escalation '
+                'for project %s',
+                project_id,
+            )
+            return
+
+        logger.warning(
+            'curator_escalator: queued post-ZOT duplicate L1 escalation %s for '
+            'project %s — task %s ~ task %s (score %.3f)',
+            escalation.id, project_id, finding.task_id,
+            finding.duplicate_task_id, finding.score,
+        )
 
     async def _submit_schema_tool_denied(
         self,
