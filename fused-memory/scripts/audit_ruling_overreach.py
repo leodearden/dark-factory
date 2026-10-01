@@ -944,7 +944,7 @@ PRIOR_MEASUREMENT: Mapping[str, Any] = MappingProxyType({
     'overreach_minted': rate(13, 174),
     'overreach_live_ruling_subject': rate(10, 111),
     'overreach_rate_substantive': 0.143,
-    'episode_hit_rate': 0.30,
+    'episode_hit_rate': rate(9, 30),
     'holding_share_upper_bound': 0.40,
     'live_strict_fraction_by_label': {'overreach': 0.923, 'holding': 0.725},
 })

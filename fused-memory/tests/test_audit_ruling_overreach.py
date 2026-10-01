@@ -1040,6 +1040,7 @@ class TestRun:
         assert report['read_population']['dark_factory']['edges']['complete'] is True
         assert report['sample']['unattributed_edges'] == 1
         assert report['prior_measurement']['overreach_minted']['ci'] == [0.0442, 0.1236]
+        assert report['prior_measurement']['episode_hit_rate'] == _rate(9, 30)
 
     def test_the_edge_population_counts_multi_episode_and_expired_only_edges(
         self, tmp_path,
