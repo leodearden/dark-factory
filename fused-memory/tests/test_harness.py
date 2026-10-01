@@ -15574,7 +15574,7 @@ class TestIntegrityGateInputParityWithRenderer:
 
     | consumer                       | status | task_kind | pure_gate | corroborated |
     |--------------------------------|--------|-----------|-----------|--------------|
-    | _render_live_workflow_section   |  yes   |    yes    |    yes    |     yes      |
+    | render_live_workflow_section    |  yes   |    yes    |    yes    |     yes      |
     | recon_write_policy Gate 2       |  yes   |    yes    |    yes    |  NO -> yes   |
     | this integrity gate             |  yes   |    yes    |  NO->yes  |  NO -> yes   |
 
@@ -15840,7 +15840,7 @@ class TestIntegrityGateInputParityWithRenderer:
     # ----- pure_gate (task 3751 rule 5 -> this consumer) -----
     #
     # The last remaining harness-vs-renderer input gap. Task 3751 wired
-    # `pure_gate` into _render_live_workflow_section AND into
+    # `pure_gate` into render_live_workflow_section AND into
     # recon_write_policy.check(), but not into this gate — so a cited PENDING
     # deterministic PURE GATE still disagreed with Live-Workflow Signals, the
     # same class of divergence this task exists to close.
@@ -16117,7 +16117,7 @@ class TestIntegrityGateIsAsyncAndNonBlocking:
         self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
     ):
         """The whole-repo `git worktree list` is invariant across the pass, so
-        the harness hoists it exactly as `_render_live_workflow_section` does
+        the harness hoists it exactly as `render_live_workflow_section` does
         and threads it to every probe — one worktree list per pass, not one per
         cited task. `worktree_index_kwargs`'s bare `{}` means *unknown*: the
         kwarg is then omitted and each probe falls back to its own list, so the

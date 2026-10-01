@@ -2629,7 +2629,7 @@ class TestWorktreeIndexForLogsEveryUnknownLoudly:
 class TestWorktreeIndexKwargs:
     """`worktree_index_kwargs` is the SINGLE home of the hoist wiring.
 
-    Both fan-out call sites (`_render_live_workflow_section` and the harness
+    Both fan-out call sites (`render_live_workflow_section` and the harness
     integrity gate) splat it into `detect_live_workflow`, so the three-valued
     contract — and its fail-safe — lives in one place rather than being spelled
     out twice (task 3778 review, heuristic 11 SPOT).

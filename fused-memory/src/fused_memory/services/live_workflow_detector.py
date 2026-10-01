@@ -428,7 +428,7 @@ async def detect_live_workflow(
             does not pass this kwarg. The verdict is computed by
             :func:`corroboration_for_task` and passed in by the three consumers
             that hold the task dict, which task 2964 made agree with each other:
-            :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._render_live_workflow_section`
+            :func:`~fused_memory.reconciliation.live_workflow_section.render_live_workflow_section`
             (the render-time Live-Workflow Signals section),
             ``recon_write_policy.check``'s Gate 2 (via its
             ``_corroboration_verdict`` helper), and ``reconciliation/harness.py``'s
@@ -439,7 +439,8 @@ async def detect_live_workflow(
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
-            per-task loops (e.g. in :func:`_render_live_workflow_section`).
+            per-task loops (e.g. in
+            ``reconciliation/live_workflow_section.py::render_live_workflow_section``).
             ``None`` (default) triggers a fresh ``is_orchestrator_live_for``
             call.  Tests monkeypatch the module attribute directly; this
             parameter is only for performance hoisting, not test isolation.
@@ -697,7 +698,9 @@ def corroboration_for_task(
 
     then delegates to :func:`has_live_workflow_corroboration`. The *scheduler_state*
     and *orchestrator_started_at* inputs are hoisted once per render by the
-    caller (see :func:`_render_live_workflow_section`) and threaded through.
+    caller (see
+    ``reconciliation/live_workflow_section.py::render_live_workflow_section``)
+    and threaded through.
 
     Returns True when any signal corroborates a live workflow for *task_id*.
     """

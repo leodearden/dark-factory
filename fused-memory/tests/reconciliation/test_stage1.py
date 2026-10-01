@@ -223,8 +223,9 @@ class TestStage1RemediationPayloadIncludesProjectRootDirective:
 # which raises InputValidationError. Task β deleted the BaseStage '' defaults, so
 # no legitimate construction can yield a falsy self.project_root anywhere. The
 # defensive `if not self.project_root:` guard in memory_consolidator's
-# _build_project_root_directive (and the parallel guard in task_knowledge_sync's
-# _render_live_workflow_section) is now dead code; task γ (task 2147) owns any
+# _build_project_root_directive (and the parallel guard in
+# reconciliation/live_workflow_section.py::render_live_workflow_section) is now
+# dead code; task γ (task 2147) owns any
 # cleanup of those branches. These tests exercised an impossible state and are
 # deleted rather than migrated.
 # ---------------------------------------------------------------------------
@@ -2402,10 +2403,11 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
     '### Live-Workflow Signals' section when an active task has a live workflow
     (mirrors Stage 2's TestAssemblePayloadLiveWorkflowSignalsSection, task 1655).
 
-    The renderer (_render_live_workflow_section) is imported into
-    memory_consolidator.py from task_knowledge_sync.py, so tests monkeypatch
-    the detector at its home namespace (tks_module.detect_live_workflow) —
-    the same namespace the renderer's module-level call resolves against.
+    The renderer (render_live_workflow_section) is imported into
+    memory_consolidator.py from reconciliation/live_workflow_section.py, so
+    tests monkeypatch the detector at its home namespace
+    (lws_module.detect_live_workflow) — the same namespace the renderer's
+    module-level call resolves against.
 
     RED until step-2 wires _build_live_workflow_section() into assemble_payload
     (legacy path); the assembled-path cases (test_assembled_path_*) stay RED
@@ -2430,7 +2432,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
     @pytest.mark.asyncio
     async def test_legacy_path_includes_section_for_live_task(self, monkeypatch):
         """Legacy assemble_payload lists the live task id under '### Live-Workflow Signals'."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -2457,7 +2459,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree([live_task, other_task])
@@ -2477,7 +2479,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
     @pytest.mark.asyncio
     async def test_legacy_path_omits_section_when_no_task_live(self, monkeypatch):
         """Section absent when no active task is live (keeps the payload tight)."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         async def _fake_detect(task_id, project_root, **kwargs):
@@ -2490,7 +2492,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree(
@@ -2509,12 +2511,12 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
     # removed (task 2146 / recon-project-scope PRD). It constructed a stage with
     # project_root='' — a state ProjectScope (task α) now rejects at construction,
     # so the "omit section when project_root empty" branch is unreachable dead
-    # code (task γ owns any cleanup of the guard in _render_live_workflow_section).
+    # code (task γ owns any cleanup of the guard in render_live_workflow_section).
 
     @pytest.mark.asyncio
     async def test_legacy_path_omits_section_when_no_filtered_task_tree(self, monkeypatch):
         """Section absent when filtered_task_tree is None (the make_consolidator default)."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         async def _fake_detect(task_id, project_root, **kwargs):
@@ -2527,7 +2529,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         assert stage.filtered_task_tree is None
@@ -2552,7 +2554,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
         RED after step-2 alone: only assemble_payload's legacy branch is wired; the
         assembled path is a separate method that must be wired independently (step-4).
         """
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -2567,7 +2569,7 @@ class TestStage1PayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree(
@@ -2636,7 +2638,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
     @pytest.mark.asyncio
     async def test_remediation_payload_includes_section_for_live_task(self, monkeypatch):
         """Remediation payload lists the live task id under '### Live-Workflow Signals'."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -2663,7 +2665,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         stage.remediation_findings = []
@@ -2684,7 +2686,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
     @pytest.mark.asyncio
     async def test_remediation_payload_omits_section_when_no_task_live(self, monkeypatch):
         """Section absent when no active task is live (keeps the remediation payload tight)."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         async def _fake_detect(task_id, project_root, **kwargs):
@@ -2697,7 +2699,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         stage.remediation_findings = []
@@ -2718,7 +2720,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
         self, monkeypatch
     ):
         """Section absent when filtered_task_tree is None (the make_consolidator default)."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         async def _fake_detect(task_id, project_root, **kwargs):
@@ -2731,7 +2733,7 @@ class TestStage1RemediationPayloadLiveWorkflowSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         stage.remediation_findings = []

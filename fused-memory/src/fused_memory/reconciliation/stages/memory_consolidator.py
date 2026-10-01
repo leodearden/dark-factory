@@ -48,6 +48,9 @@ from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     normalize_gate_owned_suggested_actions,
     stamp_curator_gate_sweep_provenance,
 )
+from fused_memory.reconciliation.live_workflow_section import (
+    render_live_workflow_section,
+)
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     sweep_orphaned_recon_escalations,
 )
@@ -69,9 +72,6 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     track_human_operator_stalls,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
-from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    _render_live_workflow_section,
-)
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY,
     PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
@@ -1822,9 +1822,10 @@ Review the above data and perform memory consolidation:
         is set and ``active_tasks`` is non-empty. A stage is only constructible
         with a validated ``ProjectScope``, so ``self.project_root`` is always a
         non-empty absolute path and is not part of this guard (task 2150).
-        Reuses Stage 2's ``_render_live_workflow_section`` renderer (imported from
-        task_knowledge_sync.py) so both stages emit byte-identical section
-        formatting for the same underlying live-workflow signals (task 1977).
+        Reuses Stage 2's renderer,
+        ``reconciliation/live_workflow_section.py::render_live_workflow_section``,
+        so both stages emit byte-identical section formatting for the same
+        underlying live-workflow signals (task 1977).
         This reuse means detector-layer behavior changes apply here
         automatically with no code change — including the blocked-normal
         bare-orchestrator-signal suppression added in task 2409.
@@ -1834,7 +1835,7 @@ Review the above data and perform memory consolidation:
         """
         if not (self.filtered_task_tree and self.filtered_task_tree.active_tasks):
             return ''
-        section = await _render_live_workflow_section(
+        section = await render_live_workflow_section(
             self.filtered_task_tree.active_tasks,
             self.scope.project_root,
         )

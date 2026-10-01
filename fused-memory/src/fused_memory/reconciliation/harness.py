@@ -5933,8 +5933,8 @@ class ReconciliationHarness:
                 # point: a task the scheduler picked up (or parked) mid-pass would
                 # read as uncorroborated from a t0 snapshot and the gate would file
                 # a stranded-work escalation for a task that is in fact live. The
-                # renderer's identical hoist (_render_live_workflow_section in
-                # reconciliation/stages/task_knowledge_sync.py) is safe at the top of
+                # renderer's identical hoist (render_live_workflow_section in
+                # reconciliation/live_workflow_section.py) is safe at the top of
                 # its call only because its read-to-use gap is microseconds; this
                 # one's is not, so the read moves to the use.
                 #
@@ -5958,7 +5958,7 @@ class ReconciliationHarness:
 
                 # Task 3778: hoist the whole-repo `git worktree list --porcelain`
                 # out of the cited-task fan-out below, the same way
-                # _render_live_workflow_section hoists it out of its per-task
+                # render_live_workflow_section hoists it out of its per-task
                 # loop (and the same way the is_orchestrator_live_for hoist
                 # noted above already works here). It is invariant across every
                 # cited task in this pass, so the doubly-nested loop pays ONE
@@ -6038,7 +6038,7 @@ class ReconciliationHarness:
                             # toward live with no extra check here. This
                             # completes the input parity: this consumer,
                             # recon_write_policy Gate 2 and
-                            # _render_live_workflow_section now all pass
+                            # render_live_workflow_section now all pass
                             # the identical status/task_kind/pure_gate/
                             # corroborated tuple — the invariant task 2964
                             # exists to establish.

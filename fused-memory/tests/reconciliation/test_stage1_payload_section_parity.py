@@ -308,7 +308,7 @@ class TestRenderRequiredSections:
     contracts:
 
     * WHAT IT DISPATCHES TO — driven with a real live-workflow fixture (the
-      detector monkeypatched at its home namespace in ``task_knowledge_sync``,
+      detector monkeypatched at its home namespace in ``live_workflow_section``,
       the established spelling) so the assertion runs against real renderer
       output rather than the empty strings every renderer returns when its
       guard fails.
@@ -332,7 +332,7 @@ class TestRenderRequiredSections:
 
     def _make_live_stage(self, monkeypatch) -> MemoryConsolidator:
         """A consolidator whose every registry section actually renders."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -347,7 +347,7 @@ class TestRenderRequiredSections:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree(
