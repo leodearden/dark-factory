@@ -1038,10 +1038,10 @@ async def test_a_backfilled_dispatch_installs_no_park_and_expires_none():
 async def test_a_pin_blocked_by_a_foreign_park_does_not_dispatch(tmp_path):
     """The pin loop gets no backfill, even when admission would certify it.
 
-    C7 anchors on the scored loop.  Pins already bypass fairness entirely, so
-    admitting them through parks as well would hand the one path with no
-    fairness accounting a second override — and the safety factor exists
-    precisely to bound what the scored loop borrows.
+    C7 anchors on the scored loop.  The pin loop never passes
+    ``admitted_parks``: a lock-blocked head pin RESERVES its modules (task
+    6040), it does not backfill — and the safety factor exists precisely to
+    bound what the scored loop borrows.
 
     A park-blocked pin simply falling through is not assertable on its own:
     the SCORED loop would then pick the same task up and back-fill it there,
@@ -1100,6 +1100,50 @@ async def test_a_pin_blocked_by_a_foreign_park_does_not_dispatch(tmp_path):
         'calling try_acquire with no admitted_parks'
     )
     assert _events(store, 'park_backfill_granted') == []
+
+
+@pytest.mark.asyncio
+async def test_backfill_borrows_through_a_pin_reservation(tmp_path):
+    """D6 (task 6040): a pin reservation lends its gap like a fairness park.
+
+    C7's world with the starver p PINNED and no park installed by hand: the
+    pin phase of the first tick reserves p's modules.  On the next tick the
+    narrow c is admitted through that reservation, and the reservation is
+    left exactly as it was — backfill borrows, it never consumes.
+    """
+    from orchestrator.overrides import OverrideStore
+
+    clock = _Clock()
+    store = _RecordingEventStore()
+    overrides = OverrideStore(tmp_path / 'o.db')
+    overrides.set_override('/proj', 'p', pinned=True)
+    scheduler = _make_scheduler(clock=clock, event_store=store, override_store=overrides)
+    scheduler.finish_startup()
+    scheduler._project_root = '/proj'
+
+    candidate = _task('c', CANDIDATE_FILES)
+    candidate['priority'] = 'low'
+    starver = _task('p', PARK_OWNER_FILES)
+    starver['priority'] = 'high'
+    assert scheduler.lock_table.try_acquire('h', GAP_MODULES)
+    _feed_spans(scheduler, scheduler._get_modules(candidate), list(CANDIDATE_SPANS))
+    _feed_spans(scheduler, GAP_MODULES, list(GAP_SPANS))
+    scheduler._hold_history.observe_acquired(
+        'h', GAP_MODULES, at=FIXED_DT.timestamp() - 100.0
+    )
+
+    scheduler.get_tasks = AsyncMock(return_value=[starver])
+    assert await scheduler.acquire_next() is None, 'p waits on h'
+    before = scheduler.lock_table.snapshot_pin_reservations()
+    assert 'p' in before, "premise: the pin phase reserved p's modules"
+
+    scheduler.get_tasks = AsyncMock(return_value=[candidate, starver])
+    assignment = await scheduler.acquire_next()
+
+    assert assignment is not None and assignment.task_id == 'c'
+    grants = _events(store, 'park_backfill_granted')
+    assert [g['data']['park_owners'] for g in grants] == [['p']]
+    assert scheduler.lock_table.snapshot_pin_reservations()['p'] == before['p']
 
 
 # ===========================================================================
