@@ -1,11 +1,11 @@
 {
   "task_id": "4716",
   "escalation": "esc-4639-1",
-  "git_sha": "ce4a0e6df49cf9cf8dccc965cb4b23dadec57886",
+  "git_sha": "1bd5cbd01f665794d4dca0f859eefc8de6c8fc8c",
   "branch": "task/4716",
-  "swept_at": "2026-10-01T09:01:39.007836+00:00",
-  "started_at": "2026-10-01T09:01:24Z",
-  "finished_at": "2026-10-01T09:03:29Z",
+  "swept_at": "2026-10-01T12:21:55.108306+00:00",
+  "started_at": "2026-10-01T12:20:40Z",
+  "finished_at": "2026-10-01T12:21:56Z",
   "exit_code": 0,
   "cwd": "/home/leo/src/dark-factory/.worktrees/4716/fused-memory",
   "argv": [
@@ -26,25 +26,25 @@
     "dark_factory": {
       "edges": {
         "complete": true,
-        "expected_rows": 20527,
-        "rows_seen": 20527
+        "expected_rows": 20613,
+        "rows_seen": 20613
       },
       "episodes": {
         "complete": true,
-        "expected_rows": 3753,
-        "rows_seen": 3753
+        "expected_rows": 3764,
+        "rows_seen": 3764
       }
     },
     "reify": {
       "edges": {
         "complete": true,
-        "expected_rows": 25979,
-        "rows_seen": 25979
+        "expected_rows": 26323,
+        "rows_seen": 26323
       },
       "episodes": {
         "complete": true,
-        "expected_rows": 4964,
-        "rows_seen": 4964
+        "expected_rows": 5024,
+        "rows_seen": 5024
       }
     },
     "all_complete": true,
@@ -55,7 +55,8 @@
     "report.json is the file the script wrote with --out-dir (json.dumps(indent=2, sort_keys=True)); it was not hand-edited.",
     "EDGE CENSUS FIX BEFORE ANY ARTIFACT RUN (commit a9e1bdf1ad): the first worksheet run used MATCH (a)-[r:RELATES_TO]->(b) RETURN count(*), which FalkorDB evaluates as distinct connected (a, b) node PAIRS when r is unreferenced (dark_factory 19,409 vs count(r) = count(DISTINCT r.uuid) = 20,491; WITH DISTINCT a, b also returns 19,409). That read was complete (rows_seen equalled the true edge count) but the census could not have caught a truncation of up to the multi-edge excess. Every run since, including this one, uses count(r) and reports rows_seen == expected_rows.",
     "SAMPLE STABILITY: the 48-episode / 291-minted-edge sample drawn by the pre-registration worksheet run (before the fix and again after it) is the sample this run re-derived; load_verdicts found 0 missing, 0 out-of-sample and 0 stale verdicts.",
-    "LIVE CORPUS: both graphs were being written during the run (episodes 8,700 at the pre-registration run vs 8,717 here); population counts are a snapshot at swept_at. The frozen sample window ends 2026-10-01T00:00Z, so later writes do not move the sample.",
-    "READ-ONLY: the script issued only GRAPH.RO_QUERY via _paged_ro_query; it has no mutation flag and its tests run it against a double whose query() raises."
+    "READ-ONLY: the script issued only GRAPH.RO_QUERY via _paged_ro_query; it has no mutation flag and its tests run it against a double whose query() raises.",
+    "LIVE CORPUS: both graphs were being written during the run (episodes 8,700 at the pre-registration run, 8,717 at the first artifact run of 2026-10-01T09:01Z, 8,788 here); population counts are a snapshot at swept_at. The frozen sample window ends 2026-10-01T00:00Z, so later writes do not move the sample.",
+    "REGENERATED AFTER REVIEW: the instrument gained edge_population (multi_episode, expired_only per graph), adjudicated.population_weighted, prior_measurement.decisions_category_population and prior_measurement.episode_hit_rate as k/n with its Wilson interval. Re-run at the commit above, against the unchanged verdicts.json; load_verdicts (now also requiring a stale verdict to name a sampled episode) found 0 missing, 0 out-of-sample and 0 stale verdicts. Between the 09:01Z and this run, one adjudicated holding (decision_anchor stratum) gained expired_at with invalid_at still null, moving live_strict for holdings from 116/127 to 115/127; served counts and every label count are unchanged. A run of the same commit at 12:14Z produced identical numbers apart from swept_at."
   ]
 }

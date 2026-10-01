@@ -159,6 +159,38 @@
         }
       }
     },
+    "population_weighted": {
+      "minted_per_day": 95.5,
+      "overreach_per_day": 11.8,
+      "overreach_rate_minted": {
+        "ci": [
+          0.0876,
+          0.1721
+        ],
+        "effective_n": 234.8,
+        "rate": 0.1238
+      },
+      "overreach_rate_substantive": {
+        "ci": [
+          0.0992,
+          0.1931
+        ],
+        "effective_n": 209.8,
+        "rate": 0.1397
+      },
+      "weights": {
+        "dark_factory": {
+          "decision_anchor": 10.125,
+          "other_decisions": 25.625,
+          "ruling_lexeme": 10.625
+        },
+        "reify": {
+          "decision_anchor": 8.125,
+          "other_decisions": 11.25,
+          "ruling_lexeme": 8.625
+        }
+      }
+    },
     "rates": {
       "all": {
         "episode_hit_rate": {
@@ -218,12 +250,12 @@
           },
           "holding": {
             "ci": [
-              0.8515,
-              0.9509
+              0.8421,
+              0.9451
             ],
-            "k": 116,
+            "k": 115,
             "n": 127,
-            "rate": 0.9134
+            "rate": 0.9055
           },
           "misbound": {
             "ci": [
@@ -388,12 +420,12 @@
           },
           "holding": {
             "ci": [
-              0.7975,
-              0.959
+              0.7742,
+              0.9471
             ],
-            "k": 48,
+            "k": 47,
             "n": 53,
-            "rate": 0.9057
+            "rate": 0.8868
           },
           "misbound": {
             "ci": [
@@ -837,26 +869,26 @@
     "EPISODE-ONLY RUBRIC: edges are judged against their source episode text alone, so AUTHORED overreach (specimen c6ac6d99, whose episode states the over-assertion) reads as faithful and is not counted.",
     "MINTED = episodes[0]: graphiti_core appends corroborating episodes on dedupe; only edges an episode minted are adjudicated.",
     "SERVED = invalid_at IS NULL, which is all every read path filters. expired_at alone is the restored shape task 4714 measured, and is reported as live_strict only.",
-    "OUT OF SAMPLE, NOT RANDOM OVER TIME: the window starts the day after the ruling; within it, selection is by sha256(graph:uuid), stratified and capped, so strata are not population-weighted and the \"all\" roll-up is a sample mean, not a corpus rate.",
+    "OUT OF SAMPLE, NOT RANDOM OVER TIME: the window starts the day after the ruling; within it, selection is by sha256(graph:uuid), stratified and capped, so the \"all\" roll-up is a sample mean, not a corpus rate; adjudicated.population_weighted re-weights each (graph, stratum) cell by its window population.",
     "CANDIDATE CLASSIFIERS: the five regex/category predicates are under evaluation, not adopted; per-classifier rates overlap because one episode matches several.",
     "LIVE CORPUS: both graphs are written continuously; counts are a snapshot at swept_at."
   ],
   "classifiers": {
     "category_decisions": {
       "dark_factory": {
-        "population": 2573,
+        "population": 2584,
         "window_per_day": 9.97,
         "window_population": 369
       },
       "reify": {
-        "population": 2652,
+        "population": 2712,
         "window_per_day": 6.05,
         "window_population": 224
       }
     },
     "decision_anchor_head": {
       "dark_factory": {
-        "population": 817,
+        "population": 819,
         "window_per_day": 3.65,
         "window_population": 135
       },
@@ -892,7 +924,7 @@
     },
     "ruling_lexeme_head": {
       "dark_factory": {
-        "population": 196,
+        "population": 197,
         "window_per_day": 2.3,
         "window_population": 85
       },
@@ -910,7 +942,7 @@
         "any_wired": 127,
         "batch_plan": 159,
         "completion_claim": 127,
-        "episodes": 671,
+        "episodes": 672,
         "proposed_resolution": 8,
         "unverified_claim_tag": 0
       },
@@ -919,7 +951,7 @@
         "any_wired": 293,
         "batch_plan": 298,
         "completion_claim": 293,
-        "episodes": 1713,
+        "episodes": 1722,
         "proposed_resolution": 6,
         "unverified_claim_tag": 1
       },
@@ -928,7 +960,7 @@
         "any_wired": 80,
         "batch_plan": 37,
         "completion_claim": 80,
-        "episodes": 196,
+        "episodes": 197,
         "proposed_resolution": 3,
         "unverified_claim_tag": 0
       }
@@ -944,13 +976,13 @@
         "unverified_claim_tag": 0
       },
       "other_decisions": {
-        "any_detector": 435,
-        "any_wired": 269,
-        "batch_plan": 211,
-        "completion_claim": 269,
-        "episodes": 1900,
+        "any_detector": 442,
+        "any_wired": 275,
+        "batch_plan": 213,
+        "completion_claim": 275,
+        "episodes": 1960,
         "proposed_resolution": 10,
-        "unverified_claim_tag": 2
+        "unverified_claim_tag": 4
       },
       "ruling_lexeme": {
         "any_detector": 52,
@@ -963,12 +995,36 @@
       }
     }
   },
+  "edge_population": {
+    "dark_factory": {
+      "edges": 20613,
+      "expired_only": 3195,
+      "multi_episode": 247
+    },
+    "reify": {
+      "edges": 26323,
+      "expired_only": 1746,
+      "multi_episode": 499
+    }
+  },
   "graphs": [
     "dark_factory",
     "reify"
   ],
   "prior_measurement": {
-    "episode_hit_rate": 0.3,
+    "decisions_category_population": {
+      "dark_factory": 2068,
+      "reify": 2354
+    },
+    "episode_hit_rate": {
+      "ci": [
+        0.1666,
+        0.4788
+      ],
+      "k": 9,
+      "n": 30,
+      "rate": 0.3
+    },
     "episodes": 30,
     "holding_share_upper_bound": 0.4,
     "live_strict_fraction_by_label": {
@@ -994,31 +1050,31 @@
       "rate": 0.0747
     },
     "overreach_rate_substantive": 0.143,
-    "source": "task 4639 details (esc-4639-1, ruled 2026-08-24): two complete-coverage passes over 30 ruling episodes"
+    "source": "task 4639 details (esc-4639-1, ruled 2026-08-24): two complete-coverage passes over 30 ruling episodes, and its census of the decisions_and_rationale category"
   },
   "read_population": {
     "dark_factory": {
       "edges": {
         "complete": true,
-        "expected_rows": 20527,
-        "rows_seen": 20527
+        "expected_rows": 20613,
+        "rows_seen": 20613
       },
       "episodes": {
         "complete": true,
-        "expected_rows": 3753,
-        "rows_seen": 3753
+        "expected_rows": 3764,
+        "rows_seen": 3764
       }
     },
     "reify": {
       "edges": {
         "complete": true,
-        "expected_rows": 25979,
-        "rows_seen": 25979
+        "expected_rows": 26323,
+        "rows_seen": 26323
       },
       "episodes": {
         "complete": true,
-        "expected_rows": 4964,
-        "rows_seen": 4964
+        "expected_rows": 5024,
+        "rows_seen": 5024
       }
     }
   },
@@ -1161,15 +1217,15 @@
   "strata": {
     "dark_factory": {
       "decision_anchor": {
-        "population": 671,
+        "population": 672,
         "window_population": 81
       },
       "other_decisions": {
-        "population": 1713,
+        "population": 1722,
         "window_population": 205
       },
       "ruling_lexeme": {
-        "population": 196,
+        "population": 197,
         "window_population": 85
       }
     },
@@ -1179,7 +1235,7 @@
         "window_population": 65
       },
       "other_decisions": {
-        "population": 1900,
+        "population": 1960,
         "window_population": 90
       },
       "ruling_lexeme": {
@@ -1188,7 +1244,7 @@
       }
     }
   },
-  "swept_at": "2026-10-01T09:01:39.007836+00:00",
+  "swept_at": "2026-10-01T12:21:55.108306+00:00",
   "wired_on_add_memory": [
     "completion_claim",
     "unverified_claim_tag"

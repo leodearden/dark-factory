@@ -5,9 +5,9 @@
 
 **§1 and §2 are PRE-REGISTERED.** They were committed before any edge in the
 sample below was labelled, so the rubric could not drift toward the results.
-§3 onward were written after adjudication. Every number in §3–§7 is cited from
-`report.json` in this directory by key path; run provenance is in
-`provenance.json`.
+§3 onward were written after adjudication. Every measured number in §3–§7 is
+cited from `report.json` in this directory by key path; the §3 banner names the
+exceptions. Run provenance is in `provenance.json`.
 
 ## 1. Question
 
@@ -258,9 +258,15 @@ missing, duplicate, out-of-sample or stale verdict (see `report.json`
 
 ---
 
-*§3 onward were written after adjudication. Every number below comes from
-`report.json` (`swept_at` 2026-10-01T09:01:39Z) and is cited by key path; `a.`
-abbreviates `adjudicated.`.*
+*§3 onward were written after adjudication. Every measured number below comes
+from `report.json` (`swept_at` 2026-10-01T12:21:55Z) and is cited by key path;
+`a.` abbreviates `adjudicated.`. The prior figures from task 4639's ruling are
+carried in `prior_measurement`. Two figures are not measurements of this run,
+and each says so where it appears: the §6 per-episode call count (an estimate
+from graphiti_core's call sites) and 4f99fbf2's exposure history (quoted from
+task 4639's details). `report.json` was regenerated after review to add
+`edge_population` and `a.population_weighted`. The frozen sample and its 291
+verdicts are unchanged; population counts moved with the live corpus.*
 
 ## 3. Re-measurement
 
@@ -272,11 +278,11 @@ abbreviates `adjudicated.`.*
 * **What the gate actually did.** The tag is the gate's real output. In the
   full population it is on:
   * 0 `ruling_lexeme` and 0 `decision_anchor` episodes in either graph;
-  * 1 of 1,713 dark_factory and 2 of 1,900 reify `other_decisions` episodes
+  * 1 of 1,722 dark_factory and 4 of 1,960 reify `other_decisions` episodes
     (`detector_census.<graph>.<stratum>.unverified_claim_tag`).
 * **Extraction hits are not tags.** The `completion_claim` column counts
   episodes whose text contains a completion claim that names a ref, for
-  example 80 of 196 dark_factory ruling episodes. Those are only CANDIDATES
+  example 80 of 197 dark_factory ruling episodes. Those are only CANDIDATES
   the gate verifies. It tags only a claim that fails verification.
 * **The tag does not suppress.** It prefixes `source_description`, and
   graphiti extracts edges from a tagged episode exactly as before.
@@ -297,18 +303,22 @@ the measured overreach it fires 0 times, and even its widest possible reach is
 
 | measure | prior (task 4639, 30 episodes) | this pass (`a.rates.all`, 48 episodes) | CIs overlap? |
 |---|---|---|---|
-| overreach / minted | 7.5% [4.4–12.4%] (13/174) | **11.7% [8.5–15.9%]** (34/291) `overreach_rate_minted` | yes (8.5–12.4%) |
+| overreach / minted | 7.5% [4.4–12.4%] (13/174) `prior_measurement.overreach_minted` | **11.7% [8.5–15.9%]** (34/291) `overreach_rate_minted` | yes (8.5–12.4%) |
+| overreach / minted, population-weighted (§3.3) | — | **12.4% [8.8–17.2%]** `a.population_weighted.overreach_rate_minted` | yes (8.8–12.4%) |
 | overreach / substantive | 14.3% | 13.1% [9.5–17.7%] (34/260) `overreach_rate_substantive` | prior CI unpublished; point inside |
-| episodes with ≥1 overreach | 30% (9/30; Wilson [16.7–47.9%]) | 45.8% [32.6–59.7%] (22/48) `episode_hit_rate` | yes |
+| episodes with ≥1 overreach | 30% [16.7–47.9%] (9/30) `prior_measurement.episode_hit_rate` | 45.8% [32.6–59.7%] (22/48) `episode_hit_rate` | yes |
 | holding / minted | "under 40%" | 43.6% [38.1–49.4%] (127/291) `holding_share` | — |
-| still live (`live_strict`): overreach vs holding | 92.3% vs 72.5% | 88.2% (30/34) vs 91.3% (116/127) `live_strict_fraction_by_label` | gap does not replicate |
+| still live (`live_strict`): overreach vs holding | 92.3% vs 72.5% | 88.2% (30/34) vs 90.6% (115/127) `live_strict_fraction_by_label` | gap does not replicate |
 | served (`invalid_at` null): overreach vs holding | — | 97.1% (33/34) vs 97.6% (124/127) `served_fraction_by_label` | — |
 
 * **The rate replicates and does not fall.** Every interval overlaps the
-  prior. The point estimate is higher. One plausible part of that is the
-  pre-registered content-first rule, under which a garbled fact is overreach
-  (ii) (§2.10). Another is that this pass labels every minted edge of 48
-  episodes rather than 30.
+  prior, weighted or not. The point estimate is higher. One plausible part of
+  that is the pre-registered content-first rule, under which a garbled fact is
+  overreach (ii) (§2.10). Another is that this pass labels every minted edge
+  of 48 episodes rather than 30. The unweighted sample mean is the
+  like-for-like comparison, because the prior was itself an unweighted mean
+  over ruling episodes. The weighted rate is the corpus estimate used from §3.3
+  on.
 * **The durability gap does NOT replicate, and that is an age effect, not a
   contradiction.** The window episodes are at most 37 days old, so later
   rulings have had little time to supersede their holdings. The prior's 72.5%
@@ -321,9 +331,9 @@ the measured overreach it fires 0 times, and even its widest possible reach is
 ### 3.3 Population drift and write volume
 
 * **Drift since the ruling.** The 2026-08-24 ruling counted
-  `decisions_and_rationale` at 2,354 reify and 2,068 dark_factory episodes.
-  Today it is 2,652 reify and 2,573 dark_factory
-  (`classifiers.category_decisions.<graph>.population`).
+  `decisions_and_rationale` at 2,354 reify and 2,068 dark_factory episodes
+  (`prior_measurement.decisions_category_population`). Today it is 2,712 reify
+  and 2,584 dark_factory (`classifiers.category_decisions.<graph>.population`).
 * **Write volume** inside the window (`classifiers.<name>.<graph>.window_per_day`,
   dark_factory + reify):
 
@@ -335,19 +345,36 @@ the measured overreach it fires 0 times, and even its widest possible reach is
 | `header_ruling` | 0.46 + 0.70 = 1.2 |
 | `header_ruling_paren` | 0.16 + 0.38 = 0.5 |
 
-At 6.06 minted edges per sampled episode (291/48), the decision class mints
-about **97 edges/day**.
+**Corpus estimates, not sample means.** The sample takes 8 episodes from
+every (graph, stratum) cell whatever the cell's size, so it over-represents
+the ruling strata. `other_decisions` is 295 of the 595 window episodes, but
+only 78 of the 291 sampled edges (§2.8). A rate taken over that mix is a
+sample mean, and a precision taken over it misstates the deployed precision,
+which depends on prevalence. So `a.population_weighted` re-weights each cell
+by window population / sampled episodes, using
+`audit_ruling_overreach.py::weighted_rate` (a ratio estimator with a Wilson
+interval at Kish's effective n). The weights (`a.population_weighted.weights`)
+run from 8.1 to 25.6. They are per cell, not per stratum, because the two
+graphs were sampled at different fractions. The results:
+
+* overreach / minted **12.4% [8.8–17.2%]**, effective n 234.8
+  (`a.population_weighted.overreach_rate_minted`), against the sample mean of
+  11.7%;
+* **95.5 minted edges/day** across the three strata, of which 11.8 are
+  overreach (`a.population_weighted.minted_per_day`, `.overreach_per_day`).
+  The strata are the decision class plus 2 ruling-lexeme window episodes
+  filed under other categories (595 against 593).
 
 ## 4. Q1: the classifier is the structured category
 
 | classifier | population df / reify | window df / reify | specimen recall | adjudicated overreach / minted (`a.per_classifier.<name>`) |
 |---|---|---|---|---|
-| `category_decisions` | 2,573 / 2,652 | 369 / 224 | **4/4** | 11.7% [8.5–15.9%] (34/291) |
-| `decision_anchor_head` | 817 / 727 | 135 / 117 | 4/4 | 13.4% [9.3–19.1%] (25/186) |
-| `ruling_lexeme_head` | 196 / 146 | 85 / 69 | 2/4 | 12.3% [7.3–19.9%] (13/106) |
+| `category_decisions` | 2,584 / 2,712 | 369 / 224 | **4/4** | 11.7% [8.5–15.9%] (34/291) |
+| `decision_anchor_head` | 819 / 727 | 135 / 117 | 4/4 | 13.4% [9.3–19.1%] (25/186) |
+| `ruling_lexeme_head` | 197 / 146 | 85 / 69 | 2/4 | 12.3% [7.3–19.9%] (13/106) |
 | `header_ruling` | 31 / 44 | 17 / 26 | 1/4 | 12.5% [3.5–36.0%] (2/16) |
 | `header_ruling_paren` | 13 / 29 | 6 / 14 | 1/4 | not computed: no sampled episode matched |
-| *stratum* `other_decisions` | 1,713 / 1,900 | 205 / 90 | — | **9.0% [4.4–17.4%]** (7/78) `a.rates.other_decisions` |
+| *stratum* `other_decisions` | 1,722 / 1,960 | 205 / 90 | — | **9.0% [4.4–17.4%]** (7/78) `a.rates.other_decisions` |
 
 The strata are `ruling_lexeme` 12.3% [7.3–19.9%] and `decision_anchor` 13.1%
 [8.0–20.8%] (`a.rates.<stratum>.overreach_rate_minted`).
@@ -390,9 +417,10 @@ bury 61 holdings to remove 34 overreach edges. The 59d2d750 precedent is the
 same: its holdings 2789bcbf and d104c799 sit beside overreach 4f99fbf2. A
 disposition acts only on edges whose `episodes[0]` is the judged episode
 (§2.5). In this sample no minted edge had been corroborated by a later episode
-(`sample.sizes.*.corroborated` = 0), but 744 multi-episode edges exist
-graph-wide (architect's measurement). A provenance guard acting on any listed
-episode would hide facts another episode minted.
+(`sample.sizes.*.corroborated` = 0). Graph-wide, though, 746 edges list more
+than one episode: 247 in dark_factory and 499 in reify
+(`edge_population.<graph>.multi_episode`). A provenance guard acting on any
+listed episode would hide facts another episode minted.
 
 ### 5.1 Why not `invalid_at`
 
@@ -413,11 +441,13 @@ It is already taken:
 
 * Task 4714 is blocked on the measured finding that graphiti_core sets
   `expired_at` only together with `invalid_at`.
-* 3,024 dark_factory edges carry `expired_at` alone because fused-memory
-  restored them.
+* 3,195 dark_factory and 1,746 reify edges are served with `expired_at`
+  alone (`edge_population.<graph>.expired_only`). Task 4714 traced that shape
+  to fused-memory restores (`update_edge clear_invalid_at`).
 * The premise registry holds `valid_edge_query_expired_at_filter_refuted`.
-* This sample shows the same shape: 8 holdings are served but not
-  `live_strict` (124 served vs 116 `live_strict`). Using `expired_at` as the
+* This sample shows the same shape: 9 holdings are served but not
+  `live_strict` (124 served vs 115 `live_strict`,
+  `a.rates.all.{served,live_strict}_fraction_by_label.holding`). Using `expired_at` as the
   marker would hide restored facts.
 
 ### 5.3 Marker on the edge, or a sidecar registry
@@ -471,8 +501,8 @@ branch, not on main: a grep of `src/` at this worktree's base finds no
 
 ## 6. Q3: the lever
 
-Volume: 16.0 decision episodes/day and about 97 minted edges/day (§3.3). The
-model is `llm.model: gpt-4o-mini` (`fused-memory/config/config.yaml`). No
+Volume: 16.0 decision episodes/day and 95.5 minted edges/day, population-weighted
+(§3.3). The model is `llm.model: gpt-4o-mini` (`fused-memory/config/config.yaml`). No
 dollar figure is given, because no price source is cited here. Cost is stated
 relative to the calls graphiti already makes.
 
@@ -492,8 +522,8 @@ the call sites, not a measurement.
 |---|---|---|---|---|---|
 | **O1** `custom_extraction_instructions` for the class | 0 extra calls; longer prompts | none beyond longer prompts | 1 param threaded through `_execute_graphiti_write` → `GraphitiBackend.add_episode` | replay only: re-extract the 48 episodes into a scratch graph and re-adjudicate | unknown until replayed. It cannot remove the vendored licence "clearly stated or unambiguously implied" (`prompts/extract_edges.py::edge`), only counter it, and it is spliced into all three node prompts (`prompts/extract_nodes.py`), changing entity extraction for the whole class |
 | **O2** typed `RULES_ON` via `edge_types`/`edge_type_map` | +1 `extract_attributes` per typed edge with fields | +1 call per typed edge | entity/edge type models plus a map | replay only | **0 suppressed**: an unmatched relation is still minted under a free `relation_type` (`utils/maintenance/edge_operations.py::extract_edges`). It labels holdings at best; it is not a guard |
-| **O3** post-extraction judge over MINTED edges | +1 per class episode ≈ **16/day** (≈97 edges judged) | **0 if run after the lock** (see below); one LLM round trip if run as a tenth `_run_pass` inside it | judge prompt + parser + marker write + the §5 predicate | **deterministic wiring tests** (fake LLM) plus an **offline eval against `verdicts.json`** (291 labelled edges, 34 positive) | directly measurable: the only lever with an offline eval today |
-| **O4** recon-targeted review: a deterministic per-cycle list of edges minted by class episodes, handed to Stage 1 | inside recon's existing Stage 1 budget | none on the write path | list builder + Stage 1 context | list selection deterministic; judgement replay-only inside recon | depends on Stage 1; turns "an LLM stage happening to look" (4639) into always looking. The exposure window is still one cycle (4f99fbf2 lived 5d10h over 28 cycles untargeted) |
+| **O3** post-extraction judge over MINTED edges | +1 per class episode ≈ **16/day** (≈96 edges judged) | **0 if run after the lock** (see below); one LLM round trip if run as a tenth `_run_pass` inside it | judge prompt + parser + marker write + the §5 predicate | **deterministic wiring tests** (fake LLM) plus an **offline eval against `verdicts.json`** (291 labelled edges, 34 positive) | directly measurable: the only lever with an offline eval today |
+| **O4** recon-targeted review: a deterministic per-cycle list of edges minted by class episodes, handed to Stage 1 | inside recon's existing Stage 1 budget | none on the write path | list builder + Stage 1 context | list selection deterministic; judgement replay-only inside recon | depends on Stage 1; turns "an LLM stage happening to look" (4639) into always looking. The exposure window is still one cycle (4f99fbf2 lived 5d10h over 28 cycles untargeted, per task 4639's details) |
 | **O5** authoring-side lint | 0 | none | a write-time warning | deterministic | **0 by construction**: all 34 labelled overreach edges are extraction-side. It reaches only AUTHORED overreach (c6ac6d99), which the rubric cannot see |
 
 **Lock placement.** `_identity_lock_for` serialises ALL Graphiti writes for a
@@ -523,19 +553,30 @@ only. Ship it in SHADOW first, with O4 as the shadow's consumer.**
   1. **Offline.** On `verdicts.json`: precision ≥ 0.80 with a Wilson lower
      bound ≥ 0.65, and recall ≥ 0.50. At precision 0.80, at most one true fact
      is hidden for every four overreach edges hidden. For scale, 28 correct of
-     34 flagged gives [0.66–0.92].
+     34 flagged gives [0.66–0.92] unweighted. Weighting shrinks the effective
+     n, which widens that interval.
   2. **Online.** On a fresh shadow window of at least 200 minted edges,
      sampled per §2.4 with a new frozen window and adjudicated under §2.6, the
      same precision bounds hold.
+
+  **Both precision and recall are population-weighted**, never the plain
+  sample ratio. Each judged edge carries its (graph, stratum) cell's weight,
+  and the ratio and its Wilson bound come from
+  `audit_ruling_overreach.py::weighted_rate`. Offline, the weights are
+  `a.population_weighted.weights`; online, they are the fresh window's own.
+  The sample is enriched in ruling-shaped episodes while the judge acts on
+  every category write, and precision depends on prevalence, so an unweighted
+  precision would overstate the deployed one.
 
   If (1) fails, the judge never leaves shadow. Re-open the lever choice, with
   O1 measured by replay of the same 48 episodes.
 * **Revisit clause, after enforcement.** Return to shadow if either holds:
   * 30 days after enforcing, a re-run of `audit_ruling_overreach.py` on a new
-    adjudicated window does not show the SERVED overreach rate at least halved
-    against 11.7%;
-  * the judge's flag rate on minted class edges exceeds 2 × the measured
-    overreach rate, that is more than 23% of minted edges, in any 7-day span.
+    adjudicated window does not show the population-weighted SERVED
+    overreach rate at least halved against 12.4%
+    (`a.population_weighted.overreach_rate_minted`);
+  * the judge's flag rate on minted class edges exceeds 2 × that measured
+    overreach rate, that is more than 25% of minted edges, in any 7-day span.
     That is the signature of a judge hiding holdings.
 
 ## 7. Accepted residuals
@@ -572,7 +613,9 @@ only. Ship it in SHADOW first, with O4 as the shadow's consumer.**
 2. **Judge core, pure, plus offline eval.** The judge prompt and its strict
    parser over (episode body, minted edge facts) emit `LABELS`. Add
    `fused-memory/scripts/eval_overreach_judge.py`, which scores the judge
-   against `docs/ruling-overreach-guard-design-2026-10-01/verdicts.json`.
+   against `docs/ruling-overreach-guard-design-2026-10-01/verdicts.json`,
+   population-weighted through `audit_ruling_overreach.py::weighted_rate`
+   (§6.1). It imports that function and never re-derives it.
    Files: `services/overreach_guard.py`, `tests/test_overreach_guard.py`.
 3. **Shadow wiring.** Make a best-effort call after the lock in
    `services/memory_service.py::MemoryService._execute_graphiti_write`'s caller
@@ -604,7 +647,10 @@ id.
   and revisit clauses verbatim: `tkt_0RV9ERANDWG7CC3N1GFFKHCBY8`. The first
   submission was rejected (`LockCharterViolation`) because its `files` named a
   directory. It was re-filed naming
-  `fused_memory/reconciliation/context_assembler.py`.
+  `fused_memory/reconciliation/context_assembler.py`. **§6.1 was amended
+  after F1 was filed:** precision and recall are now population-weighted, and
+  the revisit thresholds moved from 11.7% / 23% to 12.4% / 25%. This file is
+  authoritative, and the ticket's copy predates the amendment.
 * **F2 (low), consolidate the read-only FalkorDB reader seam** into one src
   module. The seam is duplicated in
   `scripts/audit_wrong_binding_edges.py::EdgeReader`,
