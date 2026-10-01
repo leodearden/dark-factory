@@ -33,16 +33,8 @@ is a behavioural contract while the surrounding justification is not, and
 accordingly **no assertion in this file pins any sentence**.  Step-2's prose may
 be reworded freely.
 
-The same discipline decides what is NOT pinned.  An earlier revision also walked
-paren depth over each ``add_finding(`` call, bounded the span by blank lines and
-a length cap, and asserted ``severity='serious'`` inside it.  Those were layout
-and wording properties, not interface: a blank line in the fenced example or an
-unbalanced ``(`` in a description string turned the suite red with no behavioural
-change, and ``severity`` does not affect whether the finding survives
-suppression.  They were removed.  What remains reads the fenced block that
-carries the category by plain substring, because a block-level check cannot be
-broken by reformatting the call — only by changing the ``actionable`` kwarg, or
-the category, itself.
+The example's layout and its ``severity`` are deliberately not pinned: neither
+decides whether the finding survives suppression.
 
 WHY LAYER (b) IS GREEN FROM THE FIRST COMMIT, BY DESIGN
 -------------------------------------------------------
@@ -81,15 +73,14 @@ _FENCE = '```'
 def _routing_example_blocks() -> list[str]:
     """The fenced blocks of Stage 3's prompt that file a routing finding.
 
-    ``str.split`` on the fence marker yields alternating prose and fenced
-    segments; the worked example is whichever segment carries the category
-    kwarg.  Nothing here parses the call itself, so the prompt's layout (blank
-    lines, parens inside description strings, the example's length) is free to
-    change.  ``STAGE3_SYSTEM_PROMPT`` is an f-string, so this reads the RENDERED
-    prompt the agent sees.
+    Splitting on the fence marker alternates prose and fenced segments, so the
+    odd-indexed ones are the fenced blocks; prose that mentions the category is
+    never mistaken for an example.  Nothing here parses the call itself, so the
+    prompt's layout is free to change.  ``STAGE3_SYSTEM_PROMPT`` is an
+    f-string, so this reads the RENDERED prompt the agent sees.
     """
-    return [segment for segment in STAGE3_SYSTEM_PROMPT.split(_FENCE)
-            if CROSS_PROJECT_ROUTING in segment]
+    fenced_blocks = STAGE3_SYSTEM_PROMPT.split(_FENCE)[1::2]
+    return [block for block in fenced_blocks if CROSS_PROJECT_ROUTING in block]
 
 
 # ---------------------------------------------------------------------------
