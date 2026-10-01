@@ -10,6 +10,15 @@ for cost queries (:mod:`dashboard.data.costs`). Digest and dashboard run in
 different processes with different DB drivers, so the query is written
 twice rather than shared — see plan.json's design_decisions for task 2534.
 
+The window is the CLOSED interval ``[now - days, now]``, both ends inclusive,
+spelled ``BETWEEN ? AND ?`` exactly as
+``orchestrator/src/orchestrator/digest.py::model_role_rollup`` spells it
+(whose ``window_end`` is the harness's wall-clock now). The convention is
+mirrored by reading, never imported (dashboard-alignment decision 1), so a
+future-dated or clock-skewed row is excluded on both sides.
+:mod:`dashboard.data.costs` keeps its own open-ended ``>= since`` lookback,
+so the two Costs-tab datum families differ at the upper bound by design.
+
 Fail-open throughout: a missing/offline DB (``None``) or any query error
 contributes nothing (``with_db``'s ``([], {})`` default flows through to an
 empty ``{'rows': [], 'turn_cap_saturation': {}}`` rollup), matching the
@@ -33,19 +42,14 @@ _DONE_OUTCOME = 'done'
 _BLOCKED_OUTCOME = 'blocked'
 
 
-def _cutoff(days: int, *, now: datetime | None = None) -> str:
-    """Return ISO-format cutoff datetime for the given look-back window.
-
-    Local copy of :func:`dashboard.data.costs._cutoff` — kept independent
-    rather than imported so this module has no cross-module dependency on
-    another data module's private helper (mirrors how the digest-side
-    rollup owns its own ``_query_events_ro`` scaffold).
-    """
-    return (resolve_now(now) - timedelta(days=days)).isoformat()
+def _window_bounds(days: int, *, now: datetime | None = None) -> tuple[str, str]:
+    """Return ``(window_start_iso, window_end_iso)`` for ``[now - days, now]``."""
+    window_end = resolve_now(now)
+    return (window_end - timedelta(days=days)).isoformat(), window_end.isoformat()
 
 
 async def _query_model_role_cells(
-    db: aiosqlite.Connection, since: str,
+    db: aiosqlite.Connection, window_start_iso: str, window_end_iso: str,
 ) -> tuple[list[dict], dict[str, dict]]:
     """Raw per-(model,role) cells + raw per-role saturation counts for one DB.
 
@@ -72,9 +76,9 @@ async def _query_model_role_cells(
         '  FROM invocations i '
         '  LEFT JOIN task_results tr '
         '    ON i.run_id = tr.run_id AND i.task_id = tr.task_id '
-        ' WHERE i.completed_at >= ? '
+        ' WHERE i.completed_at BETWEEN ? AND ? '
         ' GROUP BY i.model, i.role',
-        (_DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME, since),
+        (_DONE_OUTCOME, _BLOCKED_OUTCOME, _DONE_OUTCOME, window_start_iso, window_end_iso),
     )
 
     cells: list[dict] = []
@@ -90,12 +94,14 @@ async def _query_model_role_cells(
             'distinct_done_tasks': int(row['distinct_done_tasks'] or 0),
         })
 
-    saturation_raw = await _compute_turn_cap_saturation_raw(db, since)
+    saturation_raw = await _compute_turn_cap_saturation_raw(
+        db, window_start_iso, window_end_iso,
+    )
     return cells, saturation_raw
 
 
 async def _compute_turn_cap_saturation_raw(
-    db: aiosqlite.Connection, since: str,
+    db: aiosqlite.Connection, window_start_iso: str, window_end_iso: str,
 ) -> dict[str, dict]:
     """Per-role ``{'hits', 'total', 'has_max_turns'}`` from the events table.
 
@@ -109,10 +115,10 @@ async def _compute_turn_cap_saturation_raw(
         "SELECT role, MAX(json_extract(data, '$.max_turns')) AS max_turns "
         '  FROM events '
         " WHERE event_type = 'routing_decision' "
-        '   AND timestamp >= ? '
+        '   AND timestamp BETWEEN ? AND ? '
         '   AND role IS NOT NULL '
         ' GROUP BY role',
-        (since,),
+        (window_start_iso, window_end_iso),
     )
     max_turns_by_role: dict[str, float] = {
         row['role']: row['max_turns'] for row in max_turns_rows
@@ -123,9 +129,9 @@ async def _compute_turn_cap_saturation_raw(
         "SELECT role, json_extract(data, '$.turns') AS turns "
         '  FROM events '
         " WHERE event_type = 'invocation_end' "
-        '   AND timestamp >= ? '
+        '   AND timestamp BETWEEN ? AND ? '
         '   AND role IS NOT NULL',
-        (since,),
+        (window_start_iso, window_end_iso),
     )
 
     raw: dict[str, dict] = {}
@@ -184,11 +190,13 @@ def _finalize_saturation(raw: dict[str, dict]) -> dict[str, float | None]:
 
 
 async def _per_db_cells(
-    db: aiosqlite.Connection | None, since: str,
+    db: aiosqlite.Connection | None, window_start_iso: str, window_end_iso: str,
 ) -> tuple[list[dict], dict[str, dict]]:
     """Fail-open per-DB raw query: ``([], {})`` on a None/offline/erroring DB."""
     return await with_db(
-        db, lambda conn: _query_model_role_cells(conn, since), ([], {}),
+        db,
+        lambda conn: _query_model_role_cells(conn, window_start_iso, window_end_iso),
+        ([], {}),
     )
 
 
@@ -210,22 +218,15 @@ async def get_model_role_rollup(
             'turn_cap_saturation': {role: float | None, ...},
         }
 
-    Numerically identical (same columns, same rate formulas) to
-    :func:`orchestrator.digest.model_role_rollup` given the same runs.db and
-    a window where every row falls at or before ``now`` — the shared-contract
-    cross-check test asserts this using fixture rows timestamped that way.
-    The window BOUND itself is not identical: this module uses an open-ended
-    rolling ``days``-lookback (``completed_at``/``timestamp >= since``, no
-    upper bound — matching the ``dashboard.data.costs`` convention), whereas
-    digest uses a closed ``[window_start, window_end]`` bound. A future-dated
-    or clock-skewed row would be included here but excluded on the digest
-    side; if strict parity is ever required, add an explicit ``< now`` upper
-    bound to this module's queries.
+    Numerically identical (same columns, same rate formulas, same closed
+    window bounds) to :func:`orchestrator.digest.model_role_rollup` given the
+    same runs.db and ``[now - days, now]`` as its ``[window_start,
+    window_end]`` — the shared-contract cross-check test asserts this.
 
     Fail-open: ``db is None`` or any query error returns the empty rollup.
     """
-    since = _cutoff(days, now=now)
-    cells, saturation_raw = await _per_db_cells(db, since)
+    window_start_iso, window_end_iso = _window_bounds(days, now=now)
+    cells, saturation_raw = await _per_db_cells(db, window_start_iso, window_end_iso)
     return {
         'rows': [_finalize_cell(c) for c in cells],
         'turn_cap_saturation': _finalize_saturation(saturation_raw),
@@ -254,12 +255,13 @@ async def aggregate_model_role_rollup(
     A ``None`` or offline DB is skipped (contributes nothing) rather than
     failing the whole aggregate — mirrors ``aggregate_cost_by_role``.
 
-    *now* is resolved once and threaded to every per-DB cutoff so all
+    *now* is resolved once and threaded to every per-DB query so all
     queries share a single window, closing the per-DB clock-skew race.
     """
-    now = resolve_now(now)
-    since = _cutoff(days, now=now)
-    results = await asyncio.gather(*(_per_db_cells(db, since) for db in dbs))
+    window_start_iso, window_end_iso = _window_bounds(days, now=now)
+    results = await asyncio.gather(
+        *(_per_db_cells(db, window_start_iso, window_end_iso) for db in dbs),
+    )
 
     merged_cells: dict[tuple[str, str], dict] = {}
     merged_saturation: dict[str, dict] = {}

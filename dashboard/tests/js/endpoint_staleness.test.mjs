@@ -160,6 +160,19 @@ test('formatAge renders seconds, minutes and hours distinguishably', () => {
   assert.ok(/h/.test(formatAge(19.8 * 3600 * 1000)), formatAge(19.8 * 3600 * 1000));
 });
 
+test('formatAge renders an age of a day or more in days, then whole hours', () => {
+  // An idle project's cards are weeks old; '480h' is a number an operator has
+  // to divide in their head.
+  assert.equal(formatAge(20 * 86_400_000), '20d');
+  assert.equal(formatAge(27 * 3_600_000), '1d 3h');
+  assert.equal(formatAge(48 * 3_600_000), '2d');
+});
+
+test('formatAge keeps hours and minutes for an age under a day', () => {
+  assert.equal(formatAge(19.8 * 3_600_000), '19h 48m');
+  assert.equal(formatAge(23 * 3_600_000 + 59 * 60_000), '23h 59m');
+});
+
 // ── (d) never-succeeded must not fabricate a zero age ──────────────────────
 
 test('an endpoint that never succeeded says NEVER, not "0s ago"', () => {

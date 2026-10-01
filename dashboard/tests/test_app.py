@@ -1479,7 +1479,7 @@ def test_windowed_payload_echoes_the_served_window(client, path, payload_key, ex
     body = resp.json()
     assert body['WINDOW'] == expected_window
     assert payload_key in body
-    if payload_key == 'BURNDOWN':
+    if payload_key in ('BURNDOWN', 'PERFORMANCE'):
         assert 'served_at' in body
 
 
@@ -1613,6 +1613,35 @@ def test_performance_returns_performance(client):
     body = resp.json()
     assert 'PERFORMANCE' in body
     assert isinstance(body['PERFORMANCE'], dict)
+
+
+def test_performance_route_threads_one_now_and_the_window_to_both_aggregates(client):
+    """api_performance must hand the cards and the sparkline history the SAME
+    `now` and the chip's `days`, so both count one window; and it serves that
+    instant as served_at (mirrors test_costs_route_threads_shared_now_to_all_aggregates)."""
+    mocks = {
+        'aggregate_performance_cards': AsyncMock(return_value={}),
+        'aggregate_performance_history': AsyncMock(return_value={}),
+    }
+    with (
+        patch('dashboard.app.aggregate_performance_cards', new=mocks['aggregate_performance_cards']),
+        patch(
+            'dashboard.app.aggregate_performance_history',
+            new=mocks['aggregate_performance_history'],
+        ),
+    ):
+        resp = client.get('/api/v2/dashboard/performance?window=30d')
+
+    assert resp.status_code == 200
+    nows = []
+    for name, mock in mocks.items():
+        assert mock.await_args is not None, f'{name} was never awaited'
+        assert mock.await_args.kwargs['days'] == 30, name
+        now = mock.await_args.kwargs['now']
+        assert now is not None and now.tzinfo is not None, f'{name} received now={now!r}'
+        nows.append(now)
+    assert nows[0] == nows[1]
+    assert resp.json()['served_at'] == nows[0].isoformat()
 
 
 def test_burndown_returns_aggregate_and_per_project(client):
