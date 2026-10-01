@@ -255,3 +255,345 @@ Garbled facts were labelled as follows:
 `verdicts.json` passed `load_verdicts` against the re-derived sample: no
 missing, duplicate, out-of-sample or stale verdict (see `report.json`
 `adjudicated.verdicts` and `adjudicated.stale_verdicts`).
+
+---
+
+*§3 onward were written after adjudication. Every number below comes from
+`report.json` (`swept_at` 2026-10-01T09:01:39Z) and is cited by key path; `a.`
+abbreviates `adjudicated.`.*
+
+## 3. Re-measurement
+
+### 3.1 What 4715 changed: almost nothing in this population
+
+* **What runs on `add_memory`.** `wired_on_add_memory` = `completion_claim`
+  and `unverified_claim_tag`. These are the completion-claim gate and the tag
+  it writes. The two framing detectors stayed unwired (esc-4715-5).
+* **What the gate actually did.** The tag is the gate's real output. In the
+  full population it is on:
+  * 0 `ruling_lexeme` and 0 `decision_anchor` episodes in either graph;
+  * 1 of 1,713 dark_factory and 2 of 1,900 reify `other_decisions` episodes
+    (`detector_census.<graph>.<stratum>.unverified_claim_tag`).
+* **Extraction hits are not tags.** The `completion_claim` column counts
+  episodes whose text contains a completion claim that names a ref, for
+  example 80 of 196 dark_factory ruling episodes. Those are only CANDIDATES
+  the gate verifies. It tags only a claim that fails verification.
+* **The tag does not suppress.** It prefixes `source_description`, and
+  graphiti extracts edges from a tagged episode exactly as before.
+* **On the adjudicated overreach** (`a.detector_catch`), 34 edges:
+  * 0 came from a tagged episode (`by_detector.unverified_claim_tag`);
+  * 4 came from an episode where the gate would have extracted a claim
+    (`by_detector.completion_claim`, `any_wired`);
+  * counting the unwired detectors as well, 9 of 34 (`any_detector`). 6 of
+    those 9 are `batch_plan`, the detector whose hit on specimen cf03f276 is
+    a false positive: it reads "(2026-06-23)" as a task-id range.
+
+**Conclusion: 4715 did not shrink the population a post-extraction guard
+sees.** Its gate labels a different defect (unverified completion claims). On
+the measured overreach it fires 0 times, and even its widest possible reach is
+4/34. Write-time tagging is not a substitute for an overreach guard.
+
+### 3.2 The out-of-sample rates, beside esc-4639-1
+
+| measure | prior (task 4639, 30 episodes) | this pass (`a.rates.all`, 48 episodes) | CIs overlap? |
+|---|---|---|---|
+| overreach / minted | 7.5% [4.4–12.4%] (13/174) | **11.7% [8.5–15.9%]** (34/291) `overreach_rate_minted` | yes (8.5–12.4%) |
+| overreach / substantive | 14.3% | 13.1% [9.5–17.7%] (34/260) `overreach_rate_substantive` | prior CI unpublished; point inside |
+| episodes with ≥1 overreach | 30% (9/30; Wilson [16.7–47.9%]) | 45.8% [32.6–59.7%] (22/48) `episode_hit_rate` | yes |
+| holding / minted | "under 40%" | 43.6% [38.1–49.4%] (127/291) `holding_share` | — |
+| still live (`live_strict`): overreach vs holding | 92.3% vs 72.5% | 88.2% (30/34) vs 91.3% (116/127) `live_strict_fraction_by_label` | gap does not replicate |
+| served (`invalid_at` null): overreach vs holding | — | 97.1% (33/34) vs 97.6% (124/127) `served_fraction_by_label` | — |
+
+* **The rate replicates and does not fall.** Every interval overlaps the
+  prior. The point estimate is higher. One plausible part of that is the
+  pre-registered content-first rule, under which a garbled fact is overreach
+  (ii) (§2.10). Another is that this pass labels every minted edge of 48
+  episodes rather than 30.
+* **The durability gap does NOT replicate, and that is an age effect, not a
+  contradiction.** The window episodes are at most 37 days old, so later
+  rulings have had little time to supersede their holdings. The prior's 72.5%
+  came from older records. Overreach is served at the same rate as holdings
+  (97.1% vs 97.6%), so nothing retires it inside the window either. The design
+  below does not rely on the durability gap.
+* **Misbound** (task 4717's family) is 6 of 291 = 2.1% [0.9–4.4%]
+  (`a.rates.all.misbound_count`). It is kept out of every overreach figure.
+
+### 3.3 Population drift and write volume
+
+* **Drift since the ruling.** The 2026-08-24 ruling counted
+  `decisions_and_rationale` at 2,354 reify and 2,068 dark_factory episodes.
+  Today it is 2,652 reify and 2,573 dark_factory
+  (`classifiers.category_decisions.<graph>.population`).
+* **Write volume** inside the window (`classifiers.<name>.<graph>.window_per_day`,
+  dark_factory + reify):
+
+| classifier | episodes/day |
+|---|---|
+| `category_decisions` | 9.97 + 6.05 = **16.0** |
+| `decision_anchor_head` | 3.65 + 3.16 = 6.8 |
+| `ruling_lexeme_head` | 2.30 + 1.86 = 4.2 |
+| `header_ruling` | 0.46 + 0.70 = 1.2 |
+| `header_ruling_paren` | 0.16 + 0.38 = 0.5 |
+
+At 6.06 minted edges per sampled episode (291/48), the decision class mints
+about **97 edges/day**.
+
+## 4. Q1: the classifier is the structured category
+
+| classifier | population df / reify | window df / reify | specimen recall | adjudicated overreach / minted (`a.per_classifier.<name>`) |
+|---|---|---|---|---|
+| `category_decisions` | 2,573 / 2,652 | 369 / 224 | **4/4** | 11.7% [8.5–15.9%] (34/291) |
+| `decision_anchor_head` | 817 / 727 | 135 / 117 | 4/4 | 13.4% [9.3–19.1%] (25/186) |
+| `ruling_lexeme_head` | 196 / 146 | 85 / 69 | 2/4 | 12.3% [7.3–19.9%] (13/106) |
+| `header_ruling` | 31 / 44 | 17 / 26 | 1/4 | 12.5% [3.5–36.0%] (2/16) |
+| `header_ruling_paren` | 13 / 29 | 6 / 14 | 1/4 | not computed: no sampled episode matched |
+| *stratum* `other_decisions` | 1,713 / 1,900 | 205 / 90 | — | **9.0% [4.4–17.4%]** (7/78) `a.rates.other_decisions` |
+
+The strata are `ruling_lexeme` 12.3% [7.3–19.9%] and `decision_anchor` 13.1%
+[8.0–20.8%] (`a.rates.<stratum>.overreach_rate_minted`).
+
+**Pre-registered rule applied.** The `other_decisions` interval overlaps both
+ruling strata. So the class boundary is **decision records**, and the
+classifier is the STRUCTURED `category == decisions_and_rationale` with no
+prose regex. The writer already holds the category as data
+(`services/memory_service.py::MemoryService.add_memory` resolves it before
+composing `source_description`), so the guard keys on that value in process
+and never parses the stored string (heuristic 12). Recall is 4 of 4
+specimens.
+
+**What a narrower classifier would cost:**
+
+* A ruling-lexeme classifier would miss 2 of 4 specimens (`specimens.recall`).
+* It would also miss `other_decisions`' 7 overreach edges, 7/34 = 21% of
+  those measured.
+* The narrow `RULING (` header the task proposed covers 1 of 4 specimens and
+  0.5 episodes/day.
+
+**What the data does show about ruling shape.** It concentrates *which
+episodes* carry overreach, not the per-edge rate. `ruling_lexeme` episodes hit
+75% [50.5–89.8%] against `other_decisions`' 18.8% [6.6–43.0%]
+(`a.rates.<stratum>.episode_hit_rate`), and those intervals do not overlap. A
+per-edge guard sees the same per-edge rate in both. So the build should log
+the matching classifier names with every judged edge. That keeps a narrower
+activation re-evaluable from shadow data, without a second sampling pass.
+
+The ruling in task 4639 called the category "too broad". Breadth costs volume,
+about 16 episodes/day against 4.2, and §6 shows that volume is affordable. It
+does not cost precision: the per-edge rate is the same across the class.
+
+## 5. Q2: per edge, minted only, an edge-property marker
+
+**Per edge, never per episode.** In episodes that carry any overreach, 40.4%
+of what they minted is holding (61/151,
+`a.rates.all.holding_share_in_hit_episodes`). Quarantining a hit episode would
+bury 61 holdings to remove 34 overreach edges. The 59d2d750 precedent is the
+same: its holdings 2789bcbf and d104c799 sit beside overreach 4f99fbf2. A
+disposition acts only on edges whose `episodes[0]` is the judged episode
+(§2.5). In this sample no minted edge had been corroborated by a later episode
+(`sample.sizes.*.corroborated` = 0), but 744 multi-episode edges exist
+graph-wide (architect's measurement). A provenance guard acting on any listed
+episode would hide facts another episode minted.
+
+### 5.1 Why not `invalid_at`
+
+`invalid_at` means "superseded" to every component that touches it:
+
+* graphiti_core's own contradiction resolution;
+* recon Stage 1's inline invalidations (4f99fbf2 was retired this way);
+* `backends/graphiti_client.py::GraphitiBackend.update_edge`
+  (`invalid_at` / `clear_invalid_at`).
+
+A quarantine written there could not be told apart from a supersession. It
+would feed graphiti's temporal reasoning as if a later fact had replaced it,
+and a later `clear_invalid_at` restore would silently un-quarantine it.
+
+### 5.2 Why not `expired_at`
+
+It is already taken:
+
+* Task 4714 is blocked on the measured finding that graphiti_core sets
+  `expired_at` only together with `invalid_at`.
+* 3,024 dark_factory edges carry `expired_at` alone because fused-memory
+  restored them.
+* The premise registry holds `valid_edge_query_expired_at_filter_refuted`.
+* This sample shows the same shape: 8 holdings are served but not
+  `live_strict` (124 served vs 116 `live_strict`). Using `expired_at` as the
+  marker would hide restored facts.
+
+### 5.3 Marker on the edge, or a sidecar registry
+
+**The read sites** any marker must reach are every valid-edge read:
+
+* `services/memory_service.py::MemoryService._search_graphiti` (a Python-side
+  `invalid_at` check on search results);
+* `services/memory_service.py::MemoryService.get_entity`, whose exact branch is
+  `backends/graphiti_client.py::GraphitiBackend.get_valid_edges_for_node` and
+  whose fuzzy branch is a search;
+* `GraphitiBackend.get_connected_entity_uuids` and
+  `GraphitiBackend.dedup_valid_edges_for_node`;
+* the module-level `_ALL_VALID_EDGES_MATCH` (`get_all_valid_edges`) and
+  `_PROVENANCE_RANK_CLAUSE` in `graphiti_client.py`;
+* downstream, every orchestrator briefing that embeds edge facts
+  (`orchestrator/src/orchestrator/agents/briefing.py`), which reads through
+  search and `get_entity`.
+
+**Edge-property marker** (for example `r.quarantined_at` plus
+`r.quarantine_reason`):
+
+* It lives with the edge, so it survives merges and reassignments that copy
+  edge properties.
+* Every Cypher read can filter it in the same WHERE clause it already uses.
+* Its cost is one predicate added at every read site above.
+* Whether graphiti_core's `EntityEdge` hydration carries an unknown property
+  through search results is NOT verified here. The build's first enforcement
+  leaf must test it.
+
+**Sidecar registry**, mirroring `services/planned_episode_registry.py`:
+
+* It needs no graph write and is reversible by deleting a row.
+* But it is filtered only where someone wires it. The precedent is measured
+  in code: the planned-episode registry is consulted in `_search_graphiti`
+  alone, and neither `get_entity` nor any `graphiti_client.py` accessor sees
+  it.
+* Every Cypher accessor would need a uuid-list parameter or a post-filter,
+  across two stores that can drift.
+
+**Recommendation: the edge-property marker**, enforced through ONE shared
+predicate constant composed into every valid-edge read. Task 4714's pending
+`_ACTIVE_EDGE_PREDICATE` (both stamps null) is the same shape. It is on 4714's
+branch, not on main: a grep of `src/` at this worktree's base finds no
+`_ACTIVE_EDGE_PREDICATE`.
+
+* Whichever task lands first introduces the shared served-edge predicate. The
+  other extends it, so "served" stays one definition (SPOT).
+* Reversibility is a `clear_quarantine` path on `update_edge`, mirroring
+  `clear_invalid_at`.
+
+## 6. Q3: the lever
+
+Volume: 16.0 decision episodes/day and about 97 minted edges/day (§3.3). The
+model is `llm.model: gpt-4o-mini` (`fused-memory/config/config.yaml`). No
+dollar figure is given, because no price source is cited here. Cost is stated
+relative to the calls graphiti already makes.
+
+For scale, graphiti already makes these calls per episode (graphiti_core
+0.28.2):
+
+* one `extract_nodes`;
+* one `dedupe_nodes.nodes`;
+* one `extract_edges.edge`;
+* one `dedupe_edges.resolve_edge` per extracted edge;
+* one `extract_summaries_batch`.
+
+That is about 10 calls for a 6-edge decision episode. This is an estimate from
+the call sites, not a measurement.
+
+| option | LLM calls/day | added latency inside `_identity_lock_for` | code surface | verifiability | expected catch on `verdicts.json` |
+|---|---|---|---|---|---|
+| **O1** `custom_extraction_instructions` for the class | 0 extra calls; longer prompts | none beyond longer prompts | 1 param threaded through `_execute_graphiti_write` → `GraphitiBackend.add_episode` | replay only: re-extract the 48 episodes into a scratch graph and re-adjudicate | unknown until replayed. It cannot remove the vendored licence "clearly stated or unambiguously implied" (`prompts/extract_edges.py::edge`), only counter it, and it is spliced into all three node prompts (`prompts/extract_nodes.py`), changing entity extraction for the whole class |
+| **O2** typed `RULES_ON` via `edge_types`/`edge_type_map` | +1 `extract_attributes` per typed edge with fields | +1 call per typed edge | entity/edge type models plus a map | replay only | **0 suppressed**: an unmatched relation is still minted under a free `relation_type` (`utils/maintenance/edge_operations.py::extract_edges`). It labels holdings at best; it is not a guard |
+| **O3** post-extraction judge over MINTED edges | +1 per class episode ≈ **16/day** (≈97 edges judged) | **0 if run after the lock** (see below); one LLM round trip if run as a tenth `_run_pass` inside it | judge prompt + parser + marker write + the §5 predicate | **deterministic wiring tests** (fake LLM) plus an **offline eval against `verdicts.json`** (291 labelled edges, 34 positive) | directly measurable: the only lever with an offline eval today |
+| **O4** recon-targeted review: a deterministic per-cycle list of edges minted by class episodes, handed to Stage 1 | inside recon's existing Stage 1 budget | none on the write path | list builder + Stage 1 context | list selection deterministic; judgement replay-only inside recon | depends on Stage 1; turns "an LLM stage happening to look" (4639) into always looking. The exposure window is still one cycle (4f99fbf2 lived 5d10h over 28 cycles untargeted) |
+| **O5** authoring-side lint | 0 | none | a write-time warning | deterministic | **0 by construction**: all 34 labelled overreach edges are extraction-side. It reaches only AUTHORED overreach (c6ac6d99), which the rubric cannot see |
+
+**Lock placement.** `_identity_lock_for` serialises ALL Graphiti writes for a
+group. The judge reads only two things: the episode body, and the facts of the
+edges the write just minted. It writes only a marker property; it never creates
+or resolves an entity. So it needs no identity lock. Run it after
+`_execute_graphiti_write` releases the lock, as a best-effort step in the same
+`_run_pass` spirit: a judge failure never fails the committed write. A tenth
+sub-pass inside the lock would add one LLM round trip to every decision write
+for the group, for no consistency gain.
+
+### 6.1 Recommendation, staged, with trigger and revisit clauses
+
+**O3, the judge, keyed on the structured category and acting on minted edges
+only. Ship it in SHADOW first, with O4 as the shadow's consumer.**
+
+* **Stage S (shadow, record-only).**
+  * The judge runs after the lock on every `decisions_and_rationale` write.
+  * It records `(graph, episode, edge, label, rationale, classifier names,
+    judge model, prompt version)` to a sidecar.
+  * It writes NOTHING to the graph, and nothing is filtered.
+  * Its overreach flags go to recon Stage 1 as the O4 targeted list. Stage 1
+    may act through today's status-quo path (`update_edge invalid_at`), so
+    the shadow period still shortens exposure.
+* **Trigger clause, from S to enforce.** The judge writes the §5 marker, which
+  every read site filters, only when BOTH hold:
+  1. **Offline.** On `verdicts.json`: precision ≥ 0.80 with a Wilson lower
+     bound ≥ 0.65, and recall ≥ 0.50. At precision 0.80, at most one true fact
+     is hidden for every four overreach edges hidden. For scale, 28 correct of
+     34 flagged gives [0.66–0.92].
+  2. **Online.** On a fresh shadow window of at least 200 minted edges,
+     sampled per §2.4 with a new frozen window and adjudicated under §2.6, the
+     same precision bounds hold.
+
+  If (1) fails, the judge never leaves shadow. Re-open the lever choice, with
+  O1 measured by replay of the same 48 episodes.
+* **Revisit clause, after enforcement.** Return to shadow if either holds:
+  * 30 days after enforcing, a re-run of `audit_ruling_overreach.py` on a new
+    adjudicated window does not show the SERVED overreach rate at least halved
+    against 11.7%;
+  * the judge's flag rate on minted class edges exceeds 2 × the measured
+    overreach rate, that is more than 23% of minted edges, in any 7-day span.
+    That is the signature of a judge hiding holdings.
+
+## 7. Accepted residuals
+
+* **Authored overreach.** For example c6ac6d99: the episode itself
+  over-asserts. No extraction-side lever and no episode-only judge can see it.
+  It stays the authoring convention task 4639 recorded, unenforced.
+* **Misbound, 2.1%.** This is task 4717's family. A content judge must not
+  absorb it, and §2.6's ordering keeps it separate.
+* **Single adjudicator.** No inter-rater agreement exists for this pass. The
+  online trigger's second adjudication is the first chance to measure it.
+* **Classifier recall.** There is no loss against the specimens (4/4).
+  Ruling-shaped records filed under another category are out of class. All 48
+  sampled episodes were `decisions_and_rationale`, but the population was not
+  split to measure how many ruling-lexeme episodes sit outside the category.
+* **Garbles.** Under the content-first rule, garbled facts count as overreach
+  (ii). A judge prompted only on "scope" may miss them, and its recall on
+  `verdicts.json` will show whether it does.
+* **The durability claim is unconfirmed.** The prior's 92.3% vs 72.5% gap did
+  not replicate inside a young window (§3.2). The case for a guard rests on
+  the rate and the exposure, not on overreach outliving holdings.
+
+## 8. Proposed build (ordered leaves)
+
+1. **Promote the classifier (SPOT).** Add
+   `fused-memory/src/fused_memory/services/overreach_guard.py` exposing the
+   class predicate over the resolved category (the `MemoryCategory` value, not
+   the string). `fused-memory/scripts/audit_ruling_overreach.py` must then
+   IMPORT it for `category_decisions`, as `audit_wrong_binding_edges.py`
+   imports its vocabulary. A test in the style of
+   `tests/test_audit_wrong_binding_edges.py::TestNoSecondVocabulary` pins one
+   copy. The other four candidate classifiers stay in the script as
+   evaluation-only.
+2. **Judge core, pure, plus offline eval.** The judge prompt and its strict
+   parser over (episode body, minted edge facts) emit `LABELS`. Add
+   `fused-memory/scripts/eval_overreach_judge.py`, which scores the judge
+   against `docs/ruling-overreach-guard-design-2026-10-01/verdicts.json`.
+   Files: `services/overreach_guard.py`, `tests/test_overreach_guard.py`.
+3. **Shadow wiring.** Make a best-effort call after the lock in
+   `services/memory_service.py::MemoryService._execute_graphiti_write`'s caller
+   path, for class writes only, over edges whose `episodes[0]` is the written
+   episode. Record to a new sidecar store. The graph is untouched. Files:
+   `memory_service.py`, a new sidecar module, tests.
+4. **O4 handoff.** Each recon cycle hands Stage 1 the shadow flags since the
+   last cycle as a deterministic list. Files: `fused_memory/reconciliation/`
+   (context assembly) plus its tests.
+5. **Measurement gate.** A deterministic, `always_escalates` task evaluates
+   the §6.1 trigger: offline from leaf 2, online from a new frozen window
+   adjudicated under §2.6, using `audit_ruling_overreach.py`.
+6. **Enforcement** (only if leaf 5 passes):
+   * the edge-property marker write;
+   * the shared served-edge predicate at every §5.3 read site, extending 4714's
+     predicate if it has landed;
+   * `update_edge(clear_quarantine=True)`;
+   * a test per read site, plus the `EntityEdge` hydration check.
+
+   Files: `backends/graphiti_client.py`, `services/memory_service.py`, tests.
+
+## 9. Follow-ups filed
+
+Recorded by step 19 of task 4716's plan (below).
