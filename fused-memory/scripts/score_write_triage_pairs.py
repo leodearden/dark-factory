@@ -35,6 +35,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Any, TypeAlias
 
 from fused_memory.server.write_triage import (
@@ -229,6 +230,38 @@ class ScoredCase:
         return self.has_true_link and self.answered_distinct
 
 
+@dataclass(frozen=True)
+class ListPrice:
+    usd_per_mtok_input: float
+    usd_per_mtok_output: float
+
+    def usd(self, prompt_tokens: int, completion_tokens: int) -> float:
+        return (
+            prompt_tokens * self.usd_per_mtok_input
+            + completion_tokens * self.usd_per_mtok_output
+        ) / 1e6
+
+
+LIST_PRICES_AS_OF = '2026-09-30'
+LIST_PRICES_SOURCE = 'https://developers.openai.com/api/docs/pricing'
+LIST_PRICES: Mapping[str, ListPrice] = MappingProxyType({
+    'gpt-4o-mini': ListPrice(0.15, 0.60),
+    'gpt-6-luna': ListPrice(0.10, 0.50),
+    'gpt-5.6-luna': ListPrice(0.20, 1.20),
+    'gpt-5.6-terra': ListPrice(2.00, 12.00),
+    'gpt-6.1-sol': ListPrice(2.00, 10.00),
+    'gpt-5.6-sol': ListPrice(4.00, 20.00),
+    'gpt-6-astra': ListPrice(10.00, 50.00),
+})
+"""USD per million tokens at list price, as of :data:`LIST_PRICES_AS_OF`.
+
+Completion tokens include reasoning tokens, which the chat and Responses APIs
+both bill as output. No cached-input discount is applied, so a cost is an
+upper bound at list price. A model missing here prices as None, never as a
+guess, so refresh the table and its date when an arm records a new model.
+"""
+
+
 def score_pairs(
     cases: Iterable[Mapping[str, Any]],
     verdicts: Sequence[Mapping[str, Any]],
@@ -284,6 +317,20 @@ def score_pairs(
     - ``parse_failures``: judge replies that could not be parsed.
     - ``unrated_pairs``, ``unrated_pair_ids``: pairs this arm named that the
       corpus does not rate.
+
+    ``runtime`` covers the same judge-band rows, one judge call each. A figure
+    that some call cannot support is None, never computed over the rest:
+
+    - ``judge_calls``: judge-band rows.
+    - ``untimed_calls``, ``p50_judge_seconds``, ``p95_judge_seconds``: calls
+      with no ``judge_seconds``, and the nearest-rank latency percentiles.
+    - ``judge_models``: the distinct models that answered.
+    - ``unpriced_calls``, ``cost_per_write_usd``: calls with no token usage or
+      a model missing from :data:`LIST_PRICES`, and the mean list-price cost
+      per call.
+
+    ``list_prices`` is the table those costs were computed from, with its date
+    and source.
     """
     cases_by_arm = _cases_by_arm(cases)
     if reference_arm not in cases_by_arm:
@@ -295,6 +342,7 @@ def score_pairs(
     return {
         'reference_arm': reference_arm,
         'verdict_corpus': _corpus_summary(verdicts, truth),
+        'list_prices': _price_table(),
         'arms': {
             arm: _arm_report(arm_cases, truth, true_link_writes)
             for arm, arm_cases in cases_by_arm.items()
@@ -320,6 +368,7 @@ def _arm_report(
     return {
         'population': {'n_cases': len(cases), 'n_judge_band': len(judged)},
         'quality': _quality(scored, _unrated(judged, truth)),
+        'runtime': _runtime(judged),
     }
 
 
@@ -397,3 +446,43 @@ def _wilson95(hits: int, total: int) -> list[float] | None:
     centre = (share + spread / 2) / (1 + spread)
     half = _WILSON_Z * math.sqrt(share * (1 - share) / total + spread / (4 * total)) / (1 + spread)
     return [round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4)]
+
+
+def _runtime(calls: Sequence[JudgedCase]) -> dict[str, Any]:
+    seconds = sorted(call.judge_seconds for call in calls if call.judge_seconds is not None)
+    costs = [cost for cost in map(_call_cost, calls) if cost is not None]
+    timed = bool(calls) and len(seconds) == len(calls)
+    priced = bool(calls) and len(costs) == len(calls)
+    return {
+        'judge_calls': len(calls),
+        'untimed_calls': len(calls) - len(seconds),
+        'p50_judge_seconds': round(_nearest_rank(seconds, 50), 3) if timed else None,
+        'p95_judge_seconds': round(_nearest_rank(seconds, 95), 3) if timed else None,
+        'judge_models': sorted({call.judge_model for call in calls if call.judge_model}),
+        'unpriced_calls': len(calls) - len(costs),
+        'cost_per_write_usd': round(sum(costs) / len(costs), 6) if priced else None,
+    }
+
+
+def _nearest_rank(sorted_values: Sequence[float], percent: int) -> float:
+    """The smallest observed value with at least *percent*% of values at or below it."""
+    rank = -(-percent * len(sorted_values) // 100)
+    return sorted_values[rank - 1]
+
+
+def _call_cost(call: JudgedCase) -> float | None:
+    price = LIST_PRICES.get(call.judge_model) if call.judge_model else None
+    if price is None or call.prompt_tokens is None or call.completion_tokens is None:
+        return None
+    return price.usd(call.prompt_tokens, call.completion_tokens)
+
+
+def _price_table() -> dict[str, Any]:
+    return {
+        'as_of': LIST_PRICES_AS_OF,
+        'source': LIST_PRICES_SOURCE,
+        'usd_per_million_tokens': {
+            model: {'input': price.usd_per_mtok_input, 'output': price.usd_per_mtok_output}
+            for model, price in LIST_PRICES.items()
+        },
+    }
