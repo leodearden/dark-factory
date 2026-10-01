@@ -53,11 +53,11 @@ recovery_pointer = _mod.recovery_pointer
 _verify_read_back = _mod._verify_read_back
 
 
-# The six ad-hoc keys measured on task 3083's live blob (2026-08-06) that are
-# x_-renameable: none has a code reader anywhere in orchestrator/,
+# The eleven ad-hoc keys measured on task 3083's live blob (2026-10-01) that
+# are x_-renameable: none has a code reader anywhere in orchestrator/,
 # fused-memory/src, shared/src, escalation/, dashboard/, scripts/ or docs/.
-# The seventh unknown_key on that blob, `last_blocked_at`, is deliberately
-# absent here — it IS machine-read, and was promoted to Tier-A instead.
+# `last_blocked_at`, an unknown_key on the 2026-08-06 blob, is deliberately
+# not a target — it IS machine-read, and was promoted to Tier-A instead.
 _TASK_3083_SHAPED_METADATA = {
     # --- legit keys that must survive untouched ---
     'source': 'reconciliation',
@@ -67,7 +67,7 @@ _TASK_3083_SHAPED_METADATA = {
     'files': ['fused-memory/src/fused_memory/server/markup_tripwire.py'],
     'memory_hints': {'entities': ['A'], 'queries': ['q1']},
     'last_blocked_at': '2026-08-01T07:31:13.914220+00:00',
-    # --- the six migration targets ---
+    # --- the eleven migration targets ---
     # Nested-object values with lists inside, matching the real blob's shape:
     # a value-preserving rename must carry these through byte-identically.
     'markup_tripwire_rejections_20260730': {
@@ -75,6 +75,21 @@ _TASK_3083_SHAPED_METADATA = {
     },
     'markup_tripwire_rejections_20260730_burst3': {
         'rejections': [{'tool': 'add_memory', 'count': 1}, {'tool': 'submit_task', 'count': 3}],
+    },
+    'markup_tripwire_rejections_20260807_burst4': {
+        'rejections': [{'tool': 'update_task', 'count': 1}],
+    },
+    'markup_tripwire_rejections_20260809_burst5': {
+        'rejections': [{'tool': 'submit_task', 'count': 2}],
+    },
+    'markup_tripwire_rejections_20260809_burst6': {
+        'rejections': [{'tool': 'add_memory', 'count': 4}],
+    },
+    'markup_tripwire_rejections_20260810_burst7': {
+        'rejections': [{'tool': 'submit_task', 'count': 1}, {'tool': 'update_task', 'count': 2}],
+    },
+    'markup_tripwire_rejections_20260811_burst8': {
+        'rejections': [{'tool': 'add_memory', 'count': 1}],
     },
     'related_reify_memories': ['mem-1'],
     'related_reify_tasks': ['3141', '3083'],
@@ -119,7 +134,7 @@ def test_every_non_target_key_survives_untouched():
         k: v for k, v in _TASK_3083_SHAPED_METADATA.items() if k not in DEFAULT_KEYS
     }
     assert survivors == expected
-    # No key is invented or lost: 18-key blob in, 18-key blob out.
+    # No key is invented or lost: as many keys out as in.
     assert len(out) == len(_TASK_3083_SHAPED_METADATA)
 
 
@@ -202,7 +217,7 @@ def test_migrated_blob_emits_no_unknown_key_warning_for_any_target():
 
     `parse_metadata` is the deterministic oracle this task measures against
     (replacing the PRD's slow journalctl grep). After the transform, neither
-    the six old spellings NOR their x_ forms may emit code=unknown_key.
+    the old spellings NOR their x_ forms may emit code=unknown_key.
 
     Asserted per-key rather than as a global zero: a caller's blob may
     legitimately carry other unrelated unknown keys, and this transform makes
@@ -265,11 +280,28 @@ def test_update_payload_metadata_round_trips_to_the_given_blob():
 
 # --- case 8: default target list + CLI refuses a corpus-wide sweep ----------
 
-def test_default_keys_are_exactly_the_six_measured_targets():
-    """Pinned so a later edit cannot quietly widen the blast radius."""
+_MEASURED_MARKUP_TRIPWIRE_SPELLINGS = (
+    'markup_tripwire_rejections_20260730',
+    'markup_tripwire_rejections_20260730_burst3',
+    'markup_tripwire_rejections_20260807_burst4',
+    'markup_tripwire_rejections_20260809_burst5',
+    'markup_tripwire_rejections_20260809_burst6',
+    'markup_tripwire_rejections_20260810_burst7',
+    'markup_tripwire_rejections_20260811_burst8',
+)
+
+
+def test_default_keys_are_exactly_the_eleven_measured_targets():
+    """Pinned so a later edit cannot quietly widen the blast radius.
+
+    Widened from six to eleven on 2026-10-01 (task 3777), deliberately: task
+    3083's live blob had accreted five later markup_tripwire_rejections bursts
+    since the 2026-08-06 measurement. Re-measured with parse_metadata, the blob
+    carried eleven unknown_key warnings; migrating all eleven leaves zero. The
+    five additions belong to a family already on the list and have no reader.
+    """
     assert sorted(DEFAULT_KEYS) == sorted([
-        'markup_tripwire_rejections_20260730',
-        'markup_tripwire_rejections_20260730_burst3',
+        *_MEASURED_MARKUP_TRIPWIRE_SPELLINGS,
         'related_reify_memories',
         'related_reify_tasks',
         'origin_escalation',
@@ -278,6 +310,33 @@ def test_default_keys_are_exactly_the_six_measured_targets():
     # `last_blocked_at` is NOT a migration target — it was promoted to Tier-A
     # (task 3697 step-2) because the orchestrator writes and reads it.
     assert 'last_blocked_at' not in DEFAULT_KEYS
+
+
+def test_default_keys_cover_every_markup_tripwire_burst_spelling():
+    """Every markup_tripwire_rejections target is one of the measured
+    spellings, and the four non-burst targets task 4302 relies on are still
+    present."""
+    burst_targets = [k for k in DEFAULT_KEYS if k.startswith('markup_tripwire_rejections')]
+    assert set(burst_targets) <= set(_MEASURED_MARKUP_TRIPWIRE_SPELLINGS)
+    for key in (
+        'related_reify_memories', 'related_reify_tasks',
+        'origin_escalation', 'origin_reify_task',
+    ):
+        assert key in DEFAULT_KEYS
+
+
+def test_migrated_3083_shaped_blob_emits_zero_unknown_key_warnings():
+    """The task's user-observable signal as a deterministic oracle: after the
+    stock migration, a 3083-shaped blob carries NO unknown_key warning at all.
+
+    A global zero is legitimate here, unlike in the per-key test's general
+    case, because every non-target fixture key is a blessed or typed key that
+    3083 really carries.
+    """
+    out, _ = plan_x_namespace_migration(_TASK_3083_SHAPED_METADATA, DEFAULT_KEYS)
+
+    _, warnings = parse_metadata(json.dumps(out), direction='write')
+    assert [w.field for w in warnings if w.code == 'unknown_key'] == []
 
 
 # --- tool-level rejection must not read as an accepted write ---------------
