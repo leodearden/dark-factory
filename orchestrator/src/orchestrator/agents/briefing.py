@@ -1528,23 +1528,36 @@ Review any overlap with your plan steps before continuing — file contents may 
             # No limit: _detect_tip_wip_commits is bounded by the contiguous
             # WIP run at HEAD, unlike the architect's whole-branch detector.
             commits_list = _format_commit_bullets(wip_notice)
+            # Attribution protocol and why (task 5177): orchestrator/tests/test_harness_wip_step_detection.py::TestWipSectionStepAttribution
             wip_section = f"""
 ## Already-Committed WIP — Verify Before Re-Implementing
 
 The harness auto-commits uncommitted work as a safety net before a
 rebase/requeue/reclaim. The commit(s) below landed at branch HEAD this way,
-which means the next pending step's implementation may already be sitting
+which means one or more pending steps' implementation may already be sitting
 there, complete, waiting on `mark_step_done`.
 
 {commits_list}
 
-Before writing any new code:
+A step's recorded commit is the commit whose diff carries that step's change.
+Passing tests alone do not identify it: they pass just the same when the
+change was committed earlier on this branch, below the commit(s) above.
+
+Before writing any new code, walk the pending steps in plan order:
 
 1. Run `git show <sha>` for each commit above to see what it contains.
-2. Run the next pending step's tests.
-3. If they already pass, call `mark_step_done(step_id, commit_sha)` with the
-   WIP commit's SHA instead of re-implementing the step.
-4. Only write new code if the step is genuinely unsatisfied by this commit.
+2. For each step, run `git log --oneline -- <path>` over the files it changes
+   to find the commit that carries its change, and run its tests. Only a step
+   whose tests behave as its spec says counts as carried.
+   - **Carried by an earlier, non-WIP commit:** call
+     `mark_step_done(step_id, <that commit's sha>)` and move to the next step.
+   - **Carried by a WIP commit above:** call
+     `mark_step_done(step_id, <that WIP sha>)` and move to the next step.
+     Several steps citing one WIP sha is correct when its diff carries each of
+     them. Do not split, amend or rewrite a WIP commit, and do not make an
+     empty commit to get a distinct sha.
+   - **Only partly carried, or not carried:** the walk ends here. Finish the
+     step normally, commit, and cite that new commit.
 """
 
         return f"""\
