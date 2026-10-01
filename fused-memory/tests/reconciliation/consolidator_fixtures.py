@@ -59,8 +59,15 @@ def make_scope(project_id: str, project_root: str) -> ProjectScope:
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
-def make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
+def make_consolidator(
+    project_root: str = '/tmp/test',
+    recon_report_port: int | None = None,
+) -> MemoryConsolidator:
     """Build a MemoryConsolidator with mocked deps — mirrors test_stages.py ~L1418.
+
+    ``recon_report_port`` is forwarded to the constructor only when given, so the
+    default construction keeps ``BaseStage``'s own port default; the MCP-config
+    wiring tests in ``test_base_stage_cutover.py`` are the callers that set it.
 
     NOTE: callers must pass a non-empty absolute ``project_root``. Passing
     ``project_root=''`` (the pre-task-2146 "unset root" sentinel) raises
@@ -90,6 +97,7 @@ def make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
         return_value=({}, complete_paged_read()),
     )
 
+    port_kwargs = {} if recon_report_port is None else {'recon_report_port': recon_report_port}
     stage = MemoryConsolidator(
         StageId.memory_consolidator,
         memory_mock,
@@ -97,6 +105,7 @@ def make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
         AsyncMock(),  # journal
         config,
         scope=make_scope('test_project', project_root),
+        **port_kwargs,
     )
     stage.episode_limit = 5
     stage.memory_limit = 10
