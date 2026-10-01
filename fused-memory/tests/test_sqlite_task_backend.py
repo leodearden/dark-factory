@@ -1284,6 +1284,50 @@ async def test_update_task_replace_still_rejects_added_and_changed_done_provenan
 
 
 @pytest.mark.asyncio
+async def test_update_task_replace_rejects_dropping_stored_done_provenance(
+    backend, project_root,
+):
+    """Under a whole-blob replace, omission is deletion: a payload that drops
+    the stored done_provenance is refused rather than silently destroying the
+    audit record of a done task."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src'],
+        }),
+    )
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'files': ['src']}),
+            metadata_mode='replace',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == _STORED_DONE_PROVENANCE
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_allows_omitting_absent_done_provenance(
+    backend, project_root,
+):
+    """The deletion arm is scoped to rows that HAVE done_provenance: an
+    ordinary replace on a row without one still lands and still retires the
+    keys it omits."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'stale_key': 1, 'files': ['src']}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['lib']}),
+        metadata_mode='replace',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == {'files': ['lib']}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('metadata_mode', [None, 'merge', 'additive'])
 async def test_update_task_non_replace_modes_reject_done_provenance_unconditionally(
     backend, project_root, metadata_mode,
