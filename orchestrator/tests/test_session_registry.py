@@ -8084,6 +8084,7 @@ def test_main_write_decision_warns_when_a_same_queue_refile_is_held_closed(
     ]
     assert held, 'holding a closed row closed must be logged, not silent'
     assert 'dropped' in held[0].getMessage()  # names the PRESERVED disposition
+    assert 'reopen-decision' in held[0].getMessage()  # ...and a remedy that exists
 
 
 def test_main_write_decision_same_queue_refile_of_an_open_record_is_quiet(
@@ -10849,3 +10850,92 @@ class TestReopenDecision:
         [reread] = sr.list_decisions(root=tmp_path)
         assert reread.state == sr.DecisionState.OPEN
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+class TestReopenDecisionVerb:
+    _PROJECT = 'know_live'
+    _QUEUE = '/a/data/escalations'
+
+    def _argv(self, root: Path, *, project: str = _PROJECT, queue: str = _QUEUE) -> list[str]:
+        return [
+            'reopen-decision', '--id', 'esc-42-1', '--project', project, '--escalations-dir', queue,
+            '--root', str(root),
+        ]
+
+    def _seed(self, root: Path) -> Path:
+        sr.write_decision(
+            _make_decision(
+                id='esc-42-1', project=self._PROJECT, escalations_dir=self._QUEUE,
+                state=sr.DecisionState.DROPPED, closing_evidence=_EVIDENCE,
+            ),
+            root=root,
+        )
+        return sr.decision_path_for_id('esc-42-1', root=root)
+
+    def test_is_registered_in_the_parser(self, tmp_path: Path) -> None:
+        args = sr._build_parser().parse_args(self._argv(tmp_path))
+
+        assert (args.verb, args.id, args.project, args.escalations_dir, args.root) == (
+            'reopen-decision', 'esc-42-1', self._PROJECT, self._QUEUE, str(tmp_path),
+        )
+
+    @pytest.mark.parametrize('dropped', ['--project', '--escalations-dir'])
+    def test_the_verb_requires_both_expectations(self, tmp_path: Path, dropped: str) -> None:
+        argv = self._argv(tmp_path)
+        at = argv.index(dropped)
+        del argv[at:at + 2]
+
+        with pytest.raises(SystemExit) as exited:
+            sr.main(argv)
+
+        assert exited.value.code == 2
+
+    def test_success_prints_the_id_and_exits_0(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        self._seed(tmp_path)
+
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc == 0
+        assert capsys.readouterr().out == 'esc-42-1\n'
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread.state == sr.DecisionState.OPEN
+
+    def test_a_mismatch_exits_nonzero_and_leaves_the_record(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        before = self._seed(tmp_path).read_bytes()
+
+        rc = sr.main(self._argv(tmp_path, project='reify'))
+
+        assert rc != 0
+        err = capsys.readouterr().err
+        assert 'reopen-decision refused' in err
+        assert 'reify' in err
+        assert sr.decision_path_for_id('esc-42-1', root=tmp_path).read_bytes() == before
+
+    def test_an_absent_record_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = sr.main(self._argv(tmp_path))
+
+        assert rc != 0
+        assert 'esc-42-1' in capsys.readouterr().err
+
+    def test_a_held_closed_row_is_reopened_in_place_by_its_printed_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, _recon = _two_queues(tmp_path)
+        filing = {'id': 'esc-5914-1', 'project': 'df', 'text': 'Adopt the reify plan?', 'escalations_dir': str(orch)}
+        capsys.readouterr()
+        assert _file_decision(**filing) == 0
+        printed = capsys.readouterr().out.strip()
+        assert sr.update_decision_state(printed, sr.DecisionState.DROPPED, root=tmp_path) is not None
+        _file_decision(**{**filing, 'text': 'reify? (rephrased)'})
+        assert sr.list_decisions(root=tmp_path)[0].state == sr.DecisionState.DROPPED
+
+        rc = sr.main(
+            ['reopen-decision', '--id', printed, '--project', 'dark_factory', '--escalations-dir', str(orch)]
+        )
+
+        assert rc == 0
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert (reread.id, reread.state) == (printed, sr.DecisionState.OPEN)
