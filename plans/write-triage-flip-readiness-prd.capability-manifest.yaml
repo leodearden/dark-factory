@@ -43,8 +43,8 @@ tasks:
   capabilities:
   - name: pinned-record-enters-band-with-score
     binding: capability→producer — τ; boundary rows 5 and 7; the pattern anchors the
-      call-site argument, not prose. CANCELLED 2026-09-26 (esc-5802-2); block kept as
-      the record
+      call-site argument, not prose. CANCELLED 2026-09-26 (esc-5802-2); block kept
+      as the record
     verdict: PASS
     delivered_check:
       kind: grep
@@ -71,8 +71,8 @@ tasks:
   capabilities:
   - name: thresholds-achievable
     binding: floor — RETIRED by §11 D12 (2026-10-01), not passed or failed; the 0.40
-      line was unresolvable at n=84 and rank-1 stopped deciding the outcome after 5794.
-      Filing-time basis in PRD §9 kept as the record
+      line was unresolvable at n=84 and rank-1 stopped deciding the outcome after
+      5794. Filing-time basis in PRD §9 kept as the record
     verdict: OPEN
     delivered_check:
       kind: manual
@@ -114,7 +114,7 @@ tasks:
       - fused-memory/src/fused_memory/config/reload.py
       expect: present
 - label: iota
-  task_id: null
+  task_id: 6147
   title: Subject-level scorer score_write_triage_pairs.py (C2'')
   capabilities:
   - name: one-definition-of-the-flip-metrics
@@ -135,7 +135,7 @@ tasks:
       kind: manual
       reason: producer is task 6007, upstream; its own signal covers the column
 - label: omega
-  task_id: null
+  task_id: 6148
   title: Frontier judge arm — openai arm on the Responses API, judge_reasoning_effort,
     15 s timeout default
   capabilities:
@@ -159,7 +159,7 @@ tasks:
       - fused-memory/src/fused_memory/config/reload.py
       expect: present
 - label: psi
-  task_id: null
+  task_id: 6149
   title: Policy wording for contests in JUDGE_SYSTEM_PROMPT
   capabilities:
   - name: contests-clause-is-the-ruling
@@ -173,7 +173,7 @@ tasks:
       - fused-memory/src/fused_memory/server/write_triage_judge.py
       expect: present
 - label: chi
-  task_id: null
+  task_id: 6150
   title: Contested consumer — briefing render and recon-marker exemption
   capabilities:
   - name: briefing-renders-contesting-child
@@ -192,16 +192,16 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: the exemption is behaviour under the flag on, covered by boundary row 5's
-        in-process test rather than a grep
+      reason: the exemption is behaviour under the flag on, covered by boundary row
+        5's in-process test rather than a grep
 - label: pi
-  task_id: null
+  task_id: 6151
   title: Fresh population and arm runs for the flip instrument
   capabilities:
   - name: population-large-enough
     binding: floor — D15 n_judge_band ≥ 300; 591 qualifying writes existed on 2026-10-01
-      (327 dark_factory + 264 reify since 09-29) and ≈85% of fixture writes land in the
-      judge band, so ≥ 300 is reachable at freeze time
+      (327 dark_factory + 264 reify since 09-29) and ≈85% of fixture writes land in
+      the judge band, so ≥ 300 is reachable at freeze time
     verdict: PASS
     delivered_check:
       kind: grep
@@ -216,15 +216,16 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: manual
-      reason: provenance rows in the population artifact record the parameters; a grep
-        cannot assert parity
+      reason: provenance rows in the population artifact record the parameters; a
+        grep cannot assert parity
 - label: lambda
-  task_id: null
+  task_id: 6152
   title: Blind rating of the judge-named pairs (operational)
   capabilities:
   - name: every-named-pair-rated
     binding: capability→producer — λ; a human-run session under the committed rater
-      brief; Γ3 requires quality.unrated_pairs ≤ 0 so an incomplete corpus cannot pass
+      brief; Γ3 requires quality.unrated_pairs ≤ 0 so an incomplete corpus cannot
+      pass
     verdict: OPEN
     delivered_check:
       kind: manual
