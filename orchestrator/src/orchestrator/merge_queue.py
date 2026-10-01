@@ -228,6 +228,8 @@ from orchestrator.verify import (
     _derive_task_files_from_git,
     cached_main_baseline_failing_ids,
     diff_new_failures,
+    known_failing_ids_on_main,
+    red_module_prefixes_of,
     run_scoped_verification,
     run_verification,
     seed_main_baseline,
@@ -595,7 +597,7 @@ A trivial pass ran NO test suite, so it is no evidence the red cleared; letting
 it CAS-advance main would persist the red. The gate keys strictly on
 ``verify.trivial`` — a NON-trivial pass (the full merge suite actually ran on
 the merged tree and passed) legitimately heals a red main and is never blocked.
-It is a CACHE-ONLY peek (:func:`verify.cached_main_baseline_failing_ids`) that
+It is a CACHE-ONLY peek (:func:`verify.known_failing_ids_on_main`) that
 never triggers a probe on the critical path (G4, task 2564) and fails OPEN on a
 cold/unknown baseline, matching the task's "known-red" scope. Paired with
 ``MergeFailureDisposition.MAIN_RED``: the break is pre-existing, not this task's
@@ -3640,19 +3642,19 @@ async def _run_post_merge_verify(
                 return main_health_outcome
         detail = verify.failure_report()
         # Task μ (verify-scope-inversion-prd.md): when this failure carries
-        # junit-derived failing_test_ids AND the current-main baseline is
-        # already cache-warm (seeded for free by a prior successful
-        # merge+full gate run — see seed_main_baseline/step-18 — or a prior
-        # cold-start probe), cite only the NEW failing ids (branch - baseline)
-        # instead of the generic category summary (B1). CACHE-ONLY: this
-        # never triggers a probe on the critical path (G4, task 2564) — a
-        # cold cache (not yet seeded) or failing_test_ids=None (OPAQUE/
-        # scoped/degraded) falls back to today's wording unchanged (B3). The
-        # wholly-preexisting case (new_ids empty) is routed to
-        # MAIN_HEALTH_RED separately, above, by _classify_main_health_red /
-        # _run_deferred_main_health_probe (both share the extended probe via
-        # step-16); this enrichment only fires for a genuinely non-empty
-        # new-ids set so it never contradicts that routing.
+        # junit-derived failing_test_ids and main's baseline is cache-warm (a
+        # gate-pass seed or an earlier probe), cite only the NEW failing ids
+        # (branch - baseline) instead of the generic summary (B1). The peek is
+        # COMPLETE for this verify's red modules (the whole tree when its ids
+        # are unattributed) or None, so "not present on main" is never claimed
+        # from a partial baseline; deferred mode reads it before this branch's
+        # own probe has run. CACHE-ONLY: never a probe on the critical path
+        # (G4, task 2564); a cold cache or failing_test_ids=None (OPAQUE/
+        # scoped/degraded) keeps today's wording (B3). The wholly-preexisting
+        # case (new_ids empty) is routed to MAIN_HEALTH_RED by
+        # _classify_main_health_red / _run_deferred_main_health_probe; this
+        # enrichment fires only for a non-empty new-ids set, so it never
+        # contradicts that routing.
         new_ids: frozenset[str] | None = None
         if verify.failing_test_ids is not None:
             try:
@@ -3660,7 +3662,9 @@ async def _run_post_merge_verify(
             except Exception:
                 _current_main_sha = ''
             if _current_main_sha:
-                _cached_baseline = cached_main_baseline_failing_ids(_current_main_sha)
+                _cached_baseline = cached_main_baseline_failing_ids(
+                    _current_main_sha, red_module_prefixes=red_module_prefixes_of(verify),
+                )
                 if _cached_baseline is not None:
                     new_ids = diff_new_failures(verify.failing_test_ids, _cached_baseline)
         if new_ids:
@@ -3795,14 +3799,15 @@ async def _run_post_merge_verify(
     # non-empty) — else the red persists (the reify 2026-07-19 incident:
     # config-only 5247/5249 landed over #5120's red main and re-persisted it).
     #
-    # CACHE-ONLY peek (cached_main_baseline_failing_ids): never a probe on the
-    # critical path (G4, task 2564); fail OPEN when the baseline is green
-    # (empty frozenset) or cold/unknown (None), matching the task's "known-red"
-    # scope. Keyed strictly on verify.trivial: a NON-trivial pass means the
+    # CACHE-ONLY peek (known_failing_ids_on_main): never a probe on the
+    # critical path (G4, task 2564). It names any ids known red at this SHA,
+    # from a seed, a whole-tree probe or a narrowed module probe; empty (none
+    # known) fails OPEN, matching the task's "known-red" scope. Keyed strictly
+    # on verify.trivial: a NON-trivial pass means the
     # full suite ran on the merged tree and passed, which legitimately heals a
     # red main and must NOT be blocked (else main-recovery merges would stall).
     # Mirrors the failure-path idiom above (get_main_sha in a try/except, then
-    # cached_main_baseline_failing_ids).
+    # a cache-only baseline read).
     #
     # getattr default False mirrors the VerifyResult dataclass default
     # (verify.py: ``trivial: bool = False``): a result object lacking the field
@@ -3816,11 +3821,7 @@ async def _run_post_merge_verify(
             _pass_main_sha = await git_ops.get_main_sha()  # type: ignore[union-attr]
         except Exception:
             _pass_main_sha = ''
-        _known_red_ids = (
-            cached_main_baseline_failing_ids(_pass_main_sha)
-            if _pass_main_sha
-            else None
-        )
+        _known_red_ids = known_failing_ids_on_main(_pass_main_sha) if _pass_main_sha else frozenset()
         if _known_red_ids:
             # Distinct operator signal (task 2823 amendment,
             # reviewer_comprehensive robustness finding): emit a dedicated
