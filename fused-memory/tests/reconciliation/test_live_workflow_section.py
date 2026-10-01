@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,14 +24,20 @@ from pathlib import Path
 import pytest
 from _fm_helpers import _init_git_repo
 
+from fused_memory.models.reconciliation import Watermark
 from fused_memory.models.scope import ProjectRoot
 from fused_memory.reconciliation import live_workflow_section as section_module
 from fused_memory.reconciliation.live_workflow_section import (
+    LIVE_WORKFLOW_SECTION_HEADER,
+    NOT_LIVE_TOKEN,
+    LandedToken,
     LiveWorkflowSnapshot,
     build_live_workflow_snapshot,
     render_live_workflow_section,
 )
+from fused_memory.reconciliation.task_filter import FilteredTaskTree
 from fused_memory.services.landed_on_main import LandingEvidence, LandingVerdict
+from fused_memory.services.live_workflow_detector import ClaimantLabel
 
 NOW = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
 #: Outside the detector's recent-commit window, so a commit here is not live.
@@ -214,3 +221,223 @@ class TestLandedOnMainRendering:
 
         rendered = await render_live_workflow_section(tasks, ProjectRoot(str(repo)), now=NOW)
         assert rendered == snapshot.render()
+
+
+_TASK_REF = re.compile(r'task/\d')
+
+
+def _pending_with_worktree(repo: Path, task_id: int, *, when: datetime = STALE) -> None:
+    """A registered worktree on a non-bare branch whose commit is outside the recent window."""
+    _branch_with_commits(repo, task_id, 1, when=when)
+    _git(repo, 'worktree', 'add', '-q', str(repo.parent / f'wt-{task_id}'), f'task/{task_id}')
+
+
+def _hold_project_lock(repo: Path) -> None:
+    """A real orchestrator lock naming THIS process, so the lock genuinely reads as held."""
+    lock = repo / 'data' / 'orchestrator' / 'orchestrator.lock'
+    lock.parent.mkdir(parents=True)
+    lock.write_text(f'PID {os.getpid()} started {(NOW - timedelta(days=3)).isoformat()}\n')
+
+
+def _claimed(task_id: int, *, heartbeat_age: timedelta | None) -> dict:
+    heartbeat = None if heartbeat_age is None else (NOW - heartbeat_age).isoformat()
+    return {
+        **_task(task_id, status='pending'),
+        'claimant_run_id': f'run-a1d3b5dba75a/{task_id}-011fcff1/pid=1807449',
+        'heartbeat_at': heartbeat,
+    }
+
+
+def _unclaimed(task_id: int) -> dict:
+    return {**_task(task_id, status='pending'), 'claimant_run_id': None, 'heartbeat_at': None}
+
+
+def _body_lines(rendered: str) -> list[str]:
+    lines = rendered.splitlines()
+    assert lines and lines[0].startswith(LIVE_WORKFLOW_SECTION_HEADER), rendered
+    return lines[1:]
+
+
+def _project_lines(rendered: str) -> list[str]:
+    return [
+        line for line in _body_lines(rendered)
+        if not line.startswith('- ') and 'orchestrator lock' in line
+    ]
+
+
+def _legend_lines(rendered: str) -> list[str]:
+    return [
+        line for line in _body_lines(rendered)
+        if not line.startswith('- ') and LandedToken.TRUE in line
+    ]
+
+
+def _section_of(payload: str) -> str:
+    start = payload.index(LIVE_WORKFLOW_SECTION_HEADER)
+    end = payload.find('\n#', start + 1)
+    return payload[start:] if end == -1 else payload[start:end]
+
+
+def _tree(tasks: list[dict]) -> FilteredTaskTree:
+    return FilteredTaskTree(
+        active_tasks=tasks,
+        done_tasks=[],
+        cancelled_tasks=[],
+        done_count=0,
+        cancelled_count=0,
+        other_count=0,
+        total_count=len(tasks),
+        max_task_id=max(t['id'] for t in tasks),
+    )
+
+
+def _assert_rows_are_honest(section: str) -> None:
+    rows = [line for line in section.splitlines() if line.startswith('- task/')]
+    assert rows, section
+    assert all('claimant=' in row for row in rows), section
+    assert not any('orchestrator' in row for row in rows), section
+
+
+class TestLiveWorkflowSectionIsHonest:
+    @pytest.mark.asyncio
+    async def test_claimant_discriminates_the_3254_shape_from_the_3879_shape(self, repo: Path) -> None:
+        _hold_project_lock(repo)
+        _pending_with_worktree(repo, 3254)
+        _pending_with_worktree(repo, 3879)
+
+        snapshot = await _snapshot(
+            repo, _unclaimed(3254), _claimed(3879, heartbeat_age=timedelta(seconds=30)),
+        )
+
+        unclaimed, claimed = snapshot.row_for('3254'), snapshot.row_for('3879')
+        assert unclaimed is not None and claimed is not None
+        assert unclaimed.claimant is ClaimantLabel.NONE
+        assert claimed.claimant is ClaimantLabel.LIVE
+        rendered = snapshot.render()
+        unclaimed_line = _line_for(rendered, 'task/3254')
+        claimed_line = _line_for(rendered, 'task/3879')
+        assert unclaimed_line.removeprefix('- task/3254') != claimed_line.removeprefix('- task/3879')
+        assert f'claimant={ClaimantLabel.NONE}' in unclaimed_line
+        assert f'claimant={ClaimantLabel.LIVE}' in claimed_line
+
+    @pytest.mark.asyncio
+    async def test_no_row_carries_the_project_wide_orchestrator_token(self, repo: Path) -> None:
+        _hold_project_lock(repo)
+        _pending_with_worktree(repo, 3254)
+
+        snapshot = await _snapshot(repo, _unclaimed(3254))
+
+        rows = [line for line in snapshot.render().splitlines() if line.startswith('- task/')]
+        assert rows
+        assert not any('orchestrator' in row for row in rows)
+
+    @pytest.mark.asyncio
+    async def test_a_held_lock_is_one_project_line(self, repo: Path) -> None:
+        _hold_project_lock(repo)
+        _pending_with_worktree(repo, 3254)
+        _pending_with_worktree(repo, 3879)
+
+        snapshot = await _snapshot(repo, _unclaimed(3254), _unclaimed(3879))
+
+        assert snapshot.project_orchestrator_live is True
+        project_lines = _project_lines(snapshot.render())
+        assert len(project_lines) == 1, snapshot.render()
+        line = project_lines[0]
+        assert not line.startswith('#'), 'payload tests slice the section on a newline-hash'
+        assert not _TASK_REF.search(line), 'payload tests assert no task/<id> outside its row'
+
+    @pytest.mark.asyncio
+    async def test_an_unheld_lock_renders_no_project_line(self, repo: Path) -> None:
+        _pending_with_worktree(repo, 3254)
+
+        snapshot = await _snapshot(repo, _unclaimed(3254))
+
+        assert snapshot.project_orchestrator_live is False
+        rendered = snapshot.render()
+        assert _project_lines(rendered) == []
+        assert 'claimant=' in _line_for(rendered, 'task/3254')
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lock_hoist_renders_unknown_not_silence(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _pending_with_worktree(repo, 3254)
+
+        def _raising(_root: object) -> bool:
+            raise OSError('lock unreadable')
+
+        monkeypatch.setattr(section_module, 'is_orchestrator_live_for', _raising)
+        snapshot = await _snapshot(repo, _unclaimed(3254))
+
+        assert snapshot.project_orchestrator_live is None
+        project_lines = _project_lines(snapshot.render())
+        assert len(project_lines) == 1 and 'UNKNOWN' in project_lines[0]
+
+    @pytest.mark.asyncio
+    async def test_a_task_listed_only_through_the_lock_says_it_has_no_per_task_signal(
+        self, repo: Path,
+    ) -> None:
+        _hold_project_lock(repo)
+
+        snapshot = await _snapshot(repo, _unclaimed(7001))
+
+        row = snapshot.row_for('7001')
+        assert row is not None and row.is_live is True
+        line = _line_for(snapshot.render(), 'task/7001')
+        assert 'no per-task signal' in line
+        assert not re.search(r'\blive\b', line), 'a lock-only row must not read as live'
+        assert 'orchestrator' not in line
+
+    @pytest.mark.asyncio
+    async def test_one_legend_line_names_every_rendered_token(self, repo: Path) -> None:
+        _pending_with_worktree(repo, 3254)
+
+        rendered = (await _snapshot(repo, _unclaimed(3254))).render()
+
+        legends = _legend_lines(rendered)
+        assert len(legends) == 1, rendered
+        legend = legends[0]
+        assert not legend.startswith('#') and not _TASK_REF.search(legend)
+        for label in ClaimantLabel:
+            assert f'claimant={label}' in legend
+        for token in LandedToken:
+            assert token in legend
+        assert NOT_LIVE_TOKEN in legend
+
+    @pytest.mark.asyncio
+    async def test_a_lingering_claimant_renders_stale(self, repo: Path) -> None:
+        _pending_with_worktree(repo, 3879)
+
+        snapshot = await _snapshot(repo, _claimed(3879, heartbeat_age=timedelta(minutes=45)))
+
+        assert f'claimant={ClaimantLabel.STALE}' in _line_for(snapshot.render(), 'task/3879')
+
+    @pytest.mark.asyncio
+    async def test_stage2_payload_delivers_the_honest_section(self, repo: Path) -> None:
+        from test_stages import _mock_stage_deps, make_configured_task_knowledge_sync_stage
+
+        _hold_project_lock(repo)
+        _pending_with_worktree(repo, 3254, when=datetime.now(UTC) - timedelta(hours=48))
+        stage = make_configured_task_knowledge_sync_stage(
+            _mock_stage_deps(), project_id='dark_factory', project_root=str(repo),
+        )
+        stage.filtered_task_tree = _tree([_unclaimed(3254)])
+
+        payload = await stage.assemble_payload([], Watermark(project_id='dark_factory'), [])
+
+        _assert_rows_are_honest(_section_of(payload))
+
+    @pytest.mark.asyncio
+    async def test_stage1_payload_delivers_the_honest_section(self, repo: Path) -> None:
+        from reconciliation.consolidator_fixtures import make_consolidator
+
+        _hold_project_lock(repo)
+        _pending_with_worktree(repo, 3254, when=datetime.now(UTC) - timedelta(hours=48))
+        stage = make_consolidator(project_root=str(repo))
+        stage.filtered_task_tree = _tree([_unclaimed(3254)])
+
+        payload = await stage.assemble_payload(
+            events=[], watermark=Watermark(project_id='dark_factory'), prior_reports=[],
+        )
+
+        _assert_rows_are_honest(_section_of(payload))
