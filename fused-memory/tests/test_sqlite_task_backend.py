@@ -7933,6 +7933,64 @@ async def test_update_task_unknown_key_patch_tolerates_untouched_invalid_done_pr
 
 
 @pytest.mark.asyncio
+async def test_update_task_replace_passthrough_tolerates_legacy_invalid_done_provenance(
+    tmp_path, project_root,
+):
+    """Under enforce mode, a whole-blob replace that passes a LEGACY (schema-
+    invalid) done_provenance through verbatim is not blamed for it.
+
+    The replace caller is REQUIRED to send the stored done_provenance back, so
+    the field is not this write's responsibility (task 2401's scoping rule).
+    The tolerance is scoped to that one verified key: a CHANGED invalid value
+    still gets the write-authority answer first, and any other invalid field
+    the payload adds is still a ValidationError.
+    """
+    legacy = {'commit': 'abc123'}
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        backend._task_metadata_enforce = False
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({
+                'done_provenance': legacy, 'stale_key': 1, 'files': ['src'],
+            }),
+        )
+        backend._task_metadata_enforce = True
+
+        await backend.update_task(
+            dto['id'], project_root=project_root,
+            metadata=json.dumps({'done_provenance': legacy, 'files': ['src']}),
+            metadata_mode='replace',
+        )
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata']['done_provenance'] == legacy
+        assert 'stale_key' not in task['metadata']
+        assert task['metadata']['files'] == ['src']
+
+        with pytest.raises(DoneProvenanceWriteAuthorityError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({'done_provenance': {'commit': 'zzz'}}),
+                metadata_mode='replace',
+            )
+
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({
+                    'done_provenance': legacy, 'task_kind': 'bogus_kind',
+                }),
+                metadata_mode='replace',
+            )
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'] == {'done_provenance': legacy, 'files': ['src']}
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
 async def test_update_task_unknown_key_patch_still_rejects_invalid_known_field(
     tmp_path, project_root,
 ):
