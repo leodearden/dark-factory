@@ -14027,6 +14027,26 @@ class TestDisableSharedRepoAutoMaintenance:
         assert rc_mt2 == 0
         assert mt_val2.strip() == 'false'
 
+    @pytest.mark.parametrize(
+        ('key', 'value', 'stale'),
+        [('gc.auto', '0', '1'), ('maintenance.auto', 'false', 'true')],
+    )
+    async def test_disable_shared_repo_auto_maintenance_converges_duplicated_key(
+        self, git_ops: GitOps, key: str, value: str, stale: str,
+    ):
+        """A key already holding multiple values (manual ``git config --add``)
+        is converged to exactly one value; a plain ``git config`` would be
+        refused with exit 5 and leave it duplicated."""
+        cwd = git_ops.project_root
+        await _run(['git', 'config', key, stale], cwd=cwd)
+        await _run(['git', 'config', '--add', key, value], cwd=cwd)
+
+        await git_ops.disable_shared_repo_auto_maintenance()
+
+        rc, out, _ = await _run(['git', 'config', '--get-all', key], cwd=cwd)
+        assert rc == 0
+        assert out.splitlines() == [value]
+
     async def test_disable_shared_repo_auto_maintenance_degrades_loudly_on_rc(
         self, git_ops: GitOps, caplog,
     ):
