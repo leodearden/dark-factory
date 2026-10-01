@@ -189,6 +189,67 @@ freshness, because the heartbeat is the file's mtime. `lease-show` prints `state
 `key=value` lines, computed by the same reader `lease-claim` decides with. It is read-only: it never
 bumps the heartbeat.
 
+## Session lifecycle: handover, stop, self-operations
+
+A session ends, but its knowledge should not: the next session starts from what this one knew
+(Leo's rulings of 2026-09-25 on the watcher prompting study, task 5884). The subsections run in
+session order: the file, reading it at launch, stopping, then self-operations.
+
+### The handover file (`l2-handover.md`)
+
+The handover lives at `<project_root>/data/escalations/l2-handover.md`, one per watched project,
+beside the queue it describes. It is runtime state like that queue: never committed (dark-factory
+gitignores `/data/`), and overwritten by each stop. The watcher reacts only to `esc-*.json`, so
+writing it never fires a wake. The sitting preparer reads the same file as ownership `mentions`
+evidence. `scripts/sitting/ownership.py::HANDOVER_CANDIDATES` holds the path and its fallback.
+
+**As of writing.** A handover is written from session knowledge, without re-probing. Every figure
+in it is as of the time it was written and must be re-verified before anyone acts on it.
+
+**Header**, in this order: the UTC time written; the lease slug, from the `slug=` line `lease-claim`
+printed; why the session stopped (Leo's stop, low context, or an announced reboot); the posture at
+stop (attended, or AFK since `<time>`); the pending L2 count; the session's sitting ledger,
+`data/sitting/ledger-<lease-slug>.json`; then the as-of sentence above, stated for this file.
+
+**Sections**, in this order. The shape follows the hand-carried 2026-09-22 handover
+(`plans/l2-watcher-handover-2026-09-22.md`); that file is untracked, so the shape is complete here.
+
+1. **Pins: never close.** Declared pins and veto-pin companions, each with what it protects.
+2. **Under a Leo HOLD**, each with the HOLD's date and what would release it.
+3. **In flight.** Spawned `/unblock` and `/spawn` sessions by slug, terminals Leo has open on an
+   item, background sub-agents still running at stop, and merge requests in flight.
+4. **Untriaged — start here.** Drained but not yet dispositioned.
+5. **Decisions with Leo.** The brief numbers he has seen, the recommendation, and what is still
+   open.
+6. **Rulings this session.** What Leo ruled, and where it is recorded.
+7. **Traps.** What misled this session, each with the probe that exposes it.
+
+An empty section says "none" rather than being dropped, so a reader can tell "nothing" from
+"forgot".
+
+**One item per paragraph.** Each item is its own blank-line-separated paragraph, opening with its
+escalation id and task id. The preparer's handover probe attributes a whole blank-line-separated
+block to every id the block cites, so a bullet list without blank lines makes every item evidence
+for every other: the 2026-09-29 handover put esc-3169-1, esc-3169-2 and esc-3105-3 in one block.
+
+### Reading the predecessor's handover at launch
+
+After `lease-claim` returns `acquired` or `proceed`, and before the first brief:
+
+1. Read the handover file, falling back in the order `HANDOVER_CANDIDATES` gives. If there is none,
+   say so in the first brief.
+2. Every claim in it is second-hand, so H1 applies (see "Disposition before briefing (H1–H6)").
+   Re-verify before acting on or briefing any of it, and never relay one of its figures as current.
+3. Reconcile it against the first drain (Main Loop step 2). For each handover item: is it still
+   pending, changed or gone, and is its named owner still live? For each drained item the handover
+   does not mention: is it new since, or missed? Pins and HOLDs go into the sitting as `standing`
+   records with their release predicates (see "Investigate before you `record`"). Traps stay in
+   mind for the session and carry into your own handover while they still hold.
+4. Open the first brief, posted unprompted at launch (see "When it runs"), with the reconciliation:
+   what carried forward, what the handover missed, and each correction where live state refutes
+   it. Measured: the hand-carried 2026-09-22 handover, reconciled this way, yielded 6 items and 2
+   corrections its successor had missed.
+
 ## The Main Loop
 
 ```
