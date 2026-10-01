@@ -1431,6 +1431,20 @@ class _MainShaBaseline:
     # Module prefix -> that module's failing ids, from narrowed probes.
     by_module: Mapping[str, frozenset[str]] = field(default_factory=dict)
 
+    def complete_for(self, prefixes: frozenset[str] | None) -> frozenset[str] | None:
+        """Main's failing ids, complete for the scope *prefixes* (None: whole tree), or None."""
+        if self.every_module is not None:
+            return self.every_module
+        if prefixes is None or not prefixes <= self.by_module.keys():
+            return None
+        return frozenset().union(*(self.by_module[p] for p in prefixes))
+
+    def known_failing(self) -> frozenset[str]:
+        """Every id known to fail; a lower bound, so empty is not evidence of green."""
+        if self.every_module is not None:
+            return self.every_module
+        return frozenset().union(*self.by_module.values())
+
 
 _BASELINE_CACHE_MAX_SHAS = 16
 _BASELINE_FAILING_IDS_CACHE: OrderedDict[str, _MainShaBaseline] = OrderedDict()
@@ -1517,7 +1531,7 @@ async def main_baseline_failing_ids(
     )
 
 
-def _red_module_prefixes(result: 'VerifyResult') -> frozenset[str] | None:
+def red_module_prefixes_of(result: 'VerifyResult') -> frozenset[str] | None:
     """The modules holding *result*'s red ids; None when they are not all attributed."""
     by_module = result.failing_test_ids_by_module
     if not isinstance(by_module, dict) or result.failing_test_ids is None:
@@ -1536,12 +1550,13 @@ async def _whole_tree_main_baseline(
     from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
 
     _cached = _recall_main_baseline(main_sha, touch=True)
-    if _cached is not None and _cached.every_module is not None:
+    _hit = _cached.complete_for(None) if _cached is not None else None
+    if _hit is not None:
         logger.debug(
             'main_baseline_failing_ids: cache hit (main_sha=%.8s, %d id(s))',
-            main_sha, len(_cached.every_module),
+            main_sha, len(_hit),
         )
-        return _cached.every_module
+        return _hit
 
     try:
         # warm_seed=True: this probe shares the rolling warm-lane CoW base
@@ -1612,23 +1627,22 @@ async def _red_module_main_baseline(
         return await _whole_tree_main_baseline(config, module_configs, git_ops, main_sha)
 
     known = _recall_main_baseline(main_sha, touch=True) or _MainShaBaseline()
-    if known.every_module is not None:
-        return known.every_module
-    by_module = dict(known.by_module)
-    missing = prefixes - by_module.keys()
-    if missing:
-        probed = await _probe_modules_on_main(
-            config, git_ops, main_sha, [registered[p] for p in sorted(missing)],
+    hit = known.complete_for(prefixes)
+    if hit is not None:
+        return hit
+    missing = prefixes - known.by_module.keys()
+    probed = await _probe_modules_on_main(
+        config, git_ops, main_sha, [registered[p] for p in sorted(missing)],
+    )
+    if probed:
+        current = _recall_main_baseline(main_sha, touch=False) or _MainShaBaseline()
+        _remember_main_baseline(
+            main_sha, replace(current, by_module={**current.by_module, **probed}),
         )
-        if probed:
-            current = _recall_main_baseline(main_sha, touch=False) or _MainShaBaseline()
-            _remember_main_baseline(
-                main_sha, replace(current, by_module={**current.by_module, **probed}),
-            )
-            by_module.update(probed)
-        if probed is None or not missing <= probed.keys():
-            return None
-    return frozenset().union(*(by_module[p] for p in prefixes))
+    if probed is None:
+        return None
+    learned = _recall_main_baseline(main_sha, touch=False) or _MainShaBaseline()
+    return learned.complete_for(prefixes)
 
 
 async def _probe_modules_on_main(
@@ -1681,26 +1695,28 @@ async def _probe_modules_on_main(
     return collected
 
 
-def cached_main_baseline_failing_ids(main_sha: str) -> 'frozenset[str] | None':
-    """Cache-ONLY peek at the per-main-SHA failing-id baseline — never probes.
+def cached_main_baseline_failing_ids(
+    main_sha: str, *, red_module_prefixes: frozenset[str] | None = None,
+) -> 'frozenset[str] | None':
+    """Cache-ONLY peek at main's failing ids for a scope — never probes (G4, task 2564).
 
-    Pure, synchronous, side-effect-free (it never reorders the recency
-    bound). Returns the whole-tree id set for *main_sha* when known;
-    otherwise the ids KNOWN to fail across the modules probed so far (a
-    lower bound on main's red); otherwise ``None``. Used by the synchronous
-    branch-block reason enrichment and the task-2823 trivial-pass main-red
-    gate in ``merge_queue._run_post_merge_verify`` (task μ,
-    verify-scope-inversion-prd.md), which must NEVER trigger a probe on the
-    critical path (G4, task 2564).
+    *red_module_prefixes* means what it means to ``main_baseline_failing_ids``:
+    ``None`` is the whole tree, a set is just those modules. The answer is
+    COMPLETE for that scope or ``None``, never partial, so a caller may diff a
+    branch's ids against it. Side-effect-free: it never reorders the recency bound.
     """
     _cached = _recall_main_baseline(main_sha, touch=False)
-    if _cached is None:
-        return None
-    if _cached.every_module is not None:
-        return _cached.every_module
-    if _cached.by_module:
-        return frozenset().union(*_cached.by_module.values())
-    return None
+    return _cached.complete_for(red_module_prefixes) if _cached is not None else None
+
+
+def known_failing_ids_on_main(main_sha: str) -> frozenset[str]:
+    """The ids KNOWN to fail at *main_sha*, from any probe or seed — never probes.
+
+    A lower bound: empty means none known, not green. It answers "is main known
+    red?" (the task-2823 trivial-pass gate) and must never be diffed against.
+    """
+    _cached = _recall_main_baseline(main_sha, touch=False)
+    return _cached.known_failing() if _cached is not None else frozenset()
 
 
 def _worst_category(categories: list[str]) -> str:
@@ -8503,7 +8519,7 @@ async def verify_failure_is_preexisting_on_main(
         if failing_result.failing_test_ids is not None:
             baseline = await main_baseline_failing_ids(
                 config, module_configs, git_ops, main_sha,
-                red_module_prefixes=_red_module_prefixes(failing_result),
+                red_module_prefixes=red_module_prefixes_of(failing_result),
             )
             if baseline is not None:
                 branch_ids = frozenset(failing_result.failing_test_ids)
