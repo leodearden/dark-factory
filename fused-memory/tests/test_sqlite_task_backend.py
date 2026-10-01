@@ -1203,6 +1203,44 @@ async def test_update_task_done_provenance_floor_skips_unparseable_metadata(
     await backend.update_task('1', project_root=project_root, metadata=bad_metadata)
 
 
+_STORED_DONE_PROVENANCE = {'kind': 'merged', 'commit': 'a' * 40}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'passed_through',
+    [
+        {'kind': 'merged', 'commit': 'a' * 40},
+        {'commit': 'a' * 40, 'kind': 'merged'},
+    ],
+    ids=['same-key-order', 'reversed-key-order'],
+)
+async def test_update_task_replace_admits_identical_done_provenance_passthrough(
+    backend, project_root, passed_through,
+):
+    """A whole-blob replace that carries the STORED done_provenance through
+    unchanged is admitted, and it RETIRES every key the payload omits — the
+    one thing merge mode can never do. Identity is on JSON VALUE, not bytes:
+    a get_task -> json.dumps round trip does not preserve inner key order."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'done_provenance': _STORED_DONE_PROVENANCE,
+            'stale_key': 1,
+            'files': ['src'],
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'done_provenance': passed_through, 'files': ['src']}),
+        metadata_mode='replace',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == _STORED_DONE_PROVENANCE
+    assert 'stale_key' not in task['metadata']
+    assert task['metadata']['files'] == ['src']
+
+
 @pytest.mark.asyncio
 async def test_update_task_appends_metadata(backend, project_root):
     await backend.add_task(
