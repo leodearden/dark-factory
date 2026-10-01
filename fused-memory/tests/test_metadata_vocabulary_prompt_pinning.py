@@ -231,6 +231,14 @@ _PROMPT_SOURCES = {
     ),
 }
 
+#: The subset of ``_PROMPT_SOURCES`` whose kind literal is rendered from
+#: ``CYCLE_SUMMARY_KIND`` via ``render_cycle_summary_section``.
+_INTERPOLATING_SOURCES = (
+    'STAGE2_SYSTEM_PROMPT',
+    "build_stage2_system_prompt('dark_factory')",
+    'render_cycle_summary_section()',
+)
+
 
 def _kind_literals(text: str) -> set[str]:
     """Extract the memory-kind literals an agent-facing surface shows.
@@ -274,9 +282,17 @@ class TestReconPromptKindLiteralsPinned:
             f'{sorted(outside)} — recon agents copying these filters would match nothing'
         )
 
-    @pytest.mark.parametrize('source_name', sorted(_PROMPT_SOURCES))
+    @pytest.mark.parametrize('source_name', sorted(_INTERPOLATING_SOURCES))
     def test_cycle_summary_survives_rendering(self, source_name: str) -> None:
-        """Each pinned surface really does carry the shared constant's value."""
+        """Each surface that splices the INTERPOLATED section really carries the
+        shared constant's value.
+
+        Only surfaces that render ``CYCLE_SUMMARY_KIND`` are parametrized. A
+        surface that hand-types its example (stage 1, stage 3, the tool
+        docstring) is covered by ``test_every_kind_literal_is_registered``;
+        asserting ``cycle_summary`` there would pin which registered kind the
+        prose happens to use, not referential integrity.
+        """
         assert CYCLE_SUMMARY_KIND in _kind_literals(_PROMPT_SOURCES[source_name])
 
     def test_cycle_summary_constant_is_registered(self) -> None:
