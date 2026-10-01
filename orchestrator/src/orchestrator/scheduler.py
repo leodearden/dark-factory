@@ -8081,12 +8081,16 @@ class Scheduler:
     def get_state_snapshot(self) -> dict:
         """Return a deep-copy snapshot of current in-memory scheduler state.
 
-        Contains twelve top-level keys:
+        Contains thirteen top-level keys:
         - skip_counts: {task_id: int}
-        - parks: {task_id: {modules: [...], installed_at: str}}
+        - parks: {task_id: {modules: [...], installed_at: str}} — every active
+          top, pin reservations included
         - park_stacks: {module: [{owner, rank, shadowed, installed_at}, ...]} —
           full LIFO stack bottom→top per module (active top + shadowed owners);
           additive sibling to the INV-7 top-only ``parks`` key
+        - pin_reservations: {task_id: {modules: [...], installed_at: str}} —
+          the park entries held at a pin rank (task 6040), top or buried,
+          shown apart from fairness parks
         - effective_priorities: {task_id: str}
         - pin_queue: [{task_id: str, order: int}, ...]
         - overrides: {task_id: {boost_tier, pinned, reserve_now, ttl_until}}
@@ -8181,6 +8185,7 @@ class Scheduler:
             'skip_counts': skip_counts,
             'parks': parks,
             'park_stacks': park_stacks,
+            'pin_reservations': self.lock_table.snapshot_pin_reservations(),
             'effective_priorities': effective_priorities,
             'pin_queue': pin_queue,
             'overrides': overrides,
