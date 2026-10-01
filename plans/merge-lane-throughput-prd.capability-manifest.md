@@ -97,9 +97,10 @@ read-write `sqlite3.connect(args.db_path)` (fixed by task 5125). The convention
 is held by `scripts/merge-deep-canary-predicate.sh` (verified: `mode=ro` URI),
 `scripts/audit_wiped_metadata_files.py`, `scripts/audit_combine_gate_marker_loss.py`,
 `scripts/census_tagger_debris.py` and `scripts/scan_task_toolcall_leaks.py`;
-`scripts/merge_lane_throughput.py` itself should follow those. Consumers of this
-manifest (B, C, D1, E, G, H) cite those scripts, not `analyze_speculation_depth.py`,
-for the read-only open. The § A body is left as written (append-only).
+`scripts/merge_lane_throughput.py` already opens its database with a `mode=ro`
+URI. `analyze_speculation_depth.py` became compliant with task 5125, so from that
+commit on either it or any of the scripts above is a valid precedent citation for
+the read-only open. The § A body is left as written (append-only).
 
 ---
 

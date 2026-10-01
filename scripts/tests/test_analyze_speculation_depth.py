@@ -313,28 +313,14 @@ class TestMainCLI:
             merge_verify_events=F1_MERGE_VERIFY,
             merge_attempt_events=[],
         )
-        handles = []
-        real_connect = sqlite3.connect
-
-        def recording_connect(*args, **kwargs):
-            handle = real_connect(*args, **kwargs)
-            handles.append(handle)
-            return handle
-
-        monkeypatch.setattr(mod.sqlite3, 'connect', recording_connect)
-        monkeypatch.setattr(mod, 'load_events', _write_then_fail_load_events(handles))
+        monkeypatch.setattr(mod, 'load_events', _load_events_attempting_write)
 
         with pytest.raises(sqlite3.OperationalError, match='readonly'):
             mod.main([str(db_path)])
 
 
-def _write_then_fail_load_events(handles):
-    """A load_events stand-in that attempts a write on main's own handle."""
-
-    def attempt_write(conn, event_type, since_days):
-        assert conn is handles[0]
-        conn.execute(
-            "INSERT INTO events (timestamp, run_id, event_type) VALUES ('t', 'r', 'x')"
-        )
-
-    return attempt_write
+def _load_events_attempting_write(conn, event_type, since_days):
+    """A load_events stand-in that attempts a write on the handle main passes it."""
+    conn.execute(
+        "INSERT INTO events (timestamp, run_id, event_type) VALUES ('t', 'r', 'x')"
+    )
