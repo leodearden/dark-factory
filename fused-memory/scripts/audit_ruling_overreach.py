@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -158,3 +158,120 @@ def attribute_edges(edges: Iterable[Edge]) -> Attribution:
         for key in sorted(minted.keys() | corroborated.keys())
     }
     return Attribution(by_episode=MappingProxyType(by_episode), unattributed=unattributed)
+
+
+# --------------------------------------------------------------------------- #
+# Candidate ruling-shape classifiers, under evaluation
+# --------------------------------------------------------------------------- #
+# They live here, not in fused_memory src, until design.md picks one; the
+# build promotes the winner and this script imports it (one copy, SPOT).
+
+HEAD_CHARS = 200
+DECISIONS_CATEGORY = 'decisions_and_rationale'
+_RULING_LEXEME = re.compile(r'\b(ruling|ruled)\b', re.IGNORECASE)
+_DECISION_LEXEME = re.compile(r'\b(ruling|ruled|decision|decisions|decided)\b', re.IGNORECASE)
+_DECISION_ANCHOR = re.compile(r'\besc-\d+-\d+\b|\([^)]*\b\d{4}-\d{2}-\d{2}')
+_RULING_HEADER = re.compile(r'\s*RULING\b', re.IGNORECASE)
+
+
+def _head(episode: Episode) -> str:
+    return (episode.content or '')[:HEAD_CHARS]
+
+
+def _category_decisions(episode: Episode) -> bool:
+    return episode.source.category == DECISIONS_CATEGORY
+
+
+def _header_ruling_paren(episode: Episode) -> bool:
+    return (episode.content or '').lstrip().startswith('RULING (')
+
+
+def _header_ruling(episode: Episode) -> bool:
+    return _RULING_HEADER.match(episode.content or '') is not None
+
+
+def _ruling_lexeme_head(episode: Episode) -> bool:
+    return _RULING_LEXEME.search(_head(episode)) is not None
+
+
+def _decision_anchor_head(episode: Episode) -> bool:
+    head = _head(episode)
+    return bool(_DECISION_LEXEME.search(head) and _DECISION_ANCHOR.search(head))
+
+
+CLASSIFIERS: Mapping[str, Callable[[Episode], bool]] = MappingProxyType({
+    'category_decisions': _category_decisions,
+    'header_ruling_paren': _header_ruling_paren,
+    'header_ruling': _header_ruling,
+    'ruling_lexeme_head': _ruling_lexeme_head,
+    'decision_anchor_head': _decision_anchor_head,
+})
+
+STRATA: tuple[str, ...] = ('ruling_lexeme', 'decision_anchor', 'other_decisions')
+
+
+def stratum_of(episode: Episode) -> str | None:
+    """The first stratum in ``STRATA`` order whose classifiers hold."""
+    if _header_ruling(episode) or _ruling_lexeme_head(episode):
+        return 'ruling_lexeme'
+    if _decision_anchor_head(episode):
+        return 'decision_anchor'
+    if _category_decisions(episode):
+        return 'other_decisions'
+    return None
+
+
+def matching_classifiers(episode: Episode) -> tuple[str, ...]:
+    return tuple(name for name, holds in CLASSIFIERS.items() if holds(episode))
+
+
+@dataclass(frozen=True)
+class Specimen:
+    graph: str
+    episode_uuid: str
+    edge_uuid: str
+    note: str
+
+
+SPECIMENS: tuple[Specimen, ...] = (
+    Specimen(
+        'reify', '59d2d750-4042-4e58-a893-798f5c4fd2c1',
+        '4f99fbf2-3608-4437-aba5-eeeb99ddf991',
+        'Implication not adopted: the ruling narrows orient_exp/transform_exp; '
+        'the edge extends it to sin, which the record weighs as a counter-signal '
+        'and leaves accepting both.',
+    ),
+    Specimen(
+        'reify', '5c0884a3-1572-4afe-b7bc-b4786b1095cd',
+        'c6ac6d99-a98f-4f52-a59d-0bbbbfadd0e1',
+        'AUTHORED overreach: the episode itself states the over-assertion '
+        '(task 4639 details), so the edge is a faithful extraction and no '
+        'extraction-side lever or episode-only rubric can see it.',
+    ),
+    Specimen(
+        'dark_factory', '9b33077f-03a9-49e1-ac80-09de623c3d1b',
+        'b2267a98-49db-49ae-862c-75d42439ddd1',
+        'Dropped qualifiers: "generalizes the rule to live unblock sessions" '
+        'loses the three qualifiers its sibling edge 92a1bbda keeps.',
+    ),
+    Specimen(
+        'dark_factory', 'cf03f276-1351-4861-be67-c7799098f4fb',
+        'df7b7746-066e-4380-b4ea-f684cac1c6d0',
+        'Rejected option stated as adopted: the record reframes recovery as '
+        'rebase-first; the edge keeps "discard and re-dispatch" as the strategy.',
+    ),
+)
+
+
+def specimen_recall(
+    classifier_name: str, episodes: Mapping[EpisodeKey, Episode]
+) -> float | None:
+    """Fraction of the SPECIMENS present in *episodes* that the classifier matches."""
+    present = [
+        episodes[(s.graph, s.episode_uuid)]
+        for s in SPECIMENS if (s.graph, s.episode_uuid) in episodes
+    ]
+    if not present:
+        return None
+    holds = CLASSIFIERS[classifier_name]
+    return round(sum(1 for episode in present if holds(episode)) / len(present), 4)
