@@ -19,7 +19,7 @@ the clock says when the validator happens to run.
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Generic, Protocol, TypeVar, runtime_checkable
 
@@ -233,3 +233,30 @@ def validate_datum(datum: Datum, served_at: datetime) -> None:
                 f'freshness_bound_seconds={datum.freshness_bound_seconds!r}, '
                 f'as_of={datum.as_of!r}, served_at={served_at!r}',
             )
+
+
+def aged_at(datum: Datum[T], served_at: datetime) -> Datum[T]:
+    """*datum* as it reads at *served_at*: ``stale`` once past its freshness bound.
+
+    A producer stamps a measurement once, and a cache or a slow fan-out can
+    carry it past its bound before a payload carrying it is served. That is
+    a fact about the serving instant, not a producer bug, so the datum is
+    re-read here rather than reaching :func:`validate_datum` still claiming to
+    be fresh: same value, same ``as_of``, and a reason naming its age. A datum
+    that is already anything but ``fresh`` keeps its producer's own reason.
+
+    Pure, and *served_at* is injected, so this module still reads no clock.
+    """
+    if datum.state is not DatumState.FRESH or datum.as_of is None:
+        return datum
+    age = (served_at - datum.as_of).total_seconds()
+    if age <= datum.freshness_bound_seconds:
+        return datum
+    return replace(
+        datum,
+        state=DatumState.STALE,
+        reason=(
+            f'measured {int(age)}s before it was served, past the '
+            f'{datum.freshness_bound_seconds}s freshness bound'
+        ),
+    )

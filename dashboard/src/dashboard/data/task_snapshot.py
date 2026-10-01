@@ -58,7 +58,7 @@ from dashboard.data.census import (
     TaskView,
     build_census,
 )
-from dashboard.data.datum import Datum, DatumState, validate_datum
+from dashboard.data.datum import Datum, DatumState, aged_at, validate_datum
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.tasks import (
     fetch_statuses,
@@ -614,23 +614,6 @@ def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
     return SnapshotHealth.OK
 
 
-def _aged(datum: Datum[T], served_at: datetime) -> Datum[T]:
-    """*datum* as it reads at *served_at*: ``stale`` once past its freshness bound."""
-    if datum.state is not DatumState.FRESH or datum.as_of is None:
-        return datum
-    age = (served_at - datum.as_of).total_seconds()
-    if age <= datum.freshness_bound_seconds:
-        return datum
-    return replace(
-        datum,
-        state=DatumState.STALE,
-        reason=(
-            f'measured {int(age)}s before it was served, past the '
-            f'{datum.freshness_bound_seconds}s freshness bound'
-        ),
-    )
-
-
 def as_served(snapshot: TaskSnapshot, served_at: datetime) -> TaskSnapshot:
     """*snapshot* re-read at the instant a payload carrying it is served.
 
@@ -644,8 +627,8 @@ def as_served(snapshot: TaskSnapshot, served_at: datetime) -> TaskSnapshot:
     """
     return replace(
         snapshot,
-        census=_aged(snapshot.census, served_at),
-        rows=_aged(snapshot.rows, served_at),
+        census=aged_at(snapshot.census, served_at),
+        rows=aged_at(snapshot.rows, served_at),
     )
 
 
