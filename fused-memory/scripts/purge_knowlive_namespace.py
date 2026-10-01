@@ -34,9 +34,7 @@ What this script does
 
 This is IRREVERSIBLE for steps 1 and 2 (FalkorDB DETACH DELETE / Qdrant point
 delete are not soft-deletes). Step 3 is reversible via
-``update_edge(..., clear_invalid_at=True)``, which also clears any
-``expired_at`` graphiti-core had set on those edges, not only the
-``invalid_at`` this script writes.
+``update_edge(..., clear_invalid_at=True)``.
 
 Usage
 -----

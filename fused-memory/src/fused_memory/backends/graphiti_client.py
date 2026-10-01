@@ -1912,23 +1912,19 @@ class GraphitiBackend:
         marked superseded as of that timestamp (no re-embedding needed). Both
         may be combined.
 
-        When ``clear_invalid_at=True``, BOTH retirement markers —
-        ``invalid_at`` and ``expired_at`` — are reset to ``None``, restoring
-        the edge to an active (non-superseded) state. graphiti-core sets the
-        two together
-        (``graphiti_core/utils/maintenance/edge_operations.py::resolve_extracted_edge``
-        and ``::resolve_edge_contradictions``), so a restore that cleared only
-        ``invalid_at`` would leave the edge failing ``_ACTIVE_EDGE_PREDICATE``
-        and invisible to every valid-edge read.
+        When ``clear_invalid_at=True``, the edge's ``invalid_at`` field is
+        reset to ``None``, restoring it to an active (non-superseded) state.
         This takes precedence over ``invalid_at`` if both are supplied.
         Compatible with ``fact`` (update text and un-supersede in one call).
         Because graphiti's FalkorDB map-based ``edge.save()`` (``MERGE ... SET
-        e = $edge_data``) does not reliably clear null-valued properties, the
-        clear is force-persisted by one explicit direct-Cypher
-        ``SET e.invalid_at = NULL, e.expired_at = NULL`` write, issued after
-        ``edge.save()`` and before the endpoint summary refresh below (so the
-        restored edge is counted valid by that refresh's
-        ``WHERE e.invalid_at IS NULL AND e.expired_at IS NULL`` filter).
+        e = $edge_data``) does not reliably clear a null-valued property, the
+        clear is force-persisted by an explicit direct-Cypher
+        ``SET e.invalid_at = NULL`` write, issued after ``edge.save()`` and
+        before the endpoint summary refresh below (so the restored edge is
+        counted valid by that refresh's
+        ``WHERE e.invalid_at IS NULL AND e.expired_at IS NULL`` filter — the
+        restored edge must clear BOTH markers to be counted, and clearing
+        ``invalid_at`` alone leaves an ``expired_at``-bearing edge retired).
 
         After saving, both source and target entity node summaries are rebuilt
         from their current valid edges so they stay consistent.
@@ -1945,17 +1941,16 @@ class GraphitiBackend:
             edge.invalid_at = invalid_at
         if clear_invalid_at:
             edge.invalid_at = None
-            edge.expired_at = None
         await asyncio.wait_for(edge.save(driver), timeout=self._write_timeout)
 
         if clear_invalid_at:
-            # edge.save()'s map-based SET does not reliably clear null-valued
-            # properties on FalkorDB — force BOTH retirement markers to NULL.
+            # edge.save()'s map-based SET does not reliably clear a
+            # null-valued property on FalkorDB — force it deterministically.
             graph = self._graph_for(group_id)
             await asyncio.wait_for(
                 graph.query(
                     'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
-                    'SET e.invalid_at = NULL, e.expired_at = NULL',
+                    'SET e.invalid_at = NULL',
                     {'uuid': edge_uuid},
                 ),
                 timeout=self._write_timeout,
@@ -4731,15 +4726,13 @@ class GraphitiBackend:
         return (row[0] or '', row[1] or '')
 
     @_canonicalize_group_args
-    async def get_edge_retirement_markers(self, uuid: str, *, group_id: str) -> tuple[Any, Any]:
-        """Return the raw stored ``(invalid_at, expired_at)`` for a RELATES_TO edge.
+    async def get_edge_invalid_at(self, uuid: str, *, group_id: str) -> Any:
+        """Return the raw stored ``invalid_at`` for the RELATES_TO edge with the given UUID.
 
-        Returns ``(None, None)`` when the edge is fully active — an edge is
-        active only when BOTH markers are null, matching
-        ``_ACTIVE_EDGE_PREDICATE``. Values are returned verbatim (no parsing) —
+        Returns ``None`` when the property is null or absent (i.e. the edge is
+        active/non-superseded). The value is returned verbatim (no parsing) —
         used by MemoryService.update_edge to verify that a clear_invalid_at
-        write actually persisted, independent of the fact-text readback. Both
-        markers are read in one query so they are observed at one instant.
+        write actually persisted, independent of the fact-text readback.
 
         Uses ro_query since no writes are performed.
 
@@ -4749,13 +4742,12 @@ class GraphitiBackend:
         graph = self._graph_for(group_id)
         cypher = (
             'MATCH ()-[e:RELATES_TO {uuid: $uuid}]->() '
-            'RETURN e.invalid_at, e.expired_at'
+            'RETURN e.invalid_at'
         )
         result = await graph.ro_query(cypher, {'uuid': uuid})
         if not result.result_set:
             raise EdgeNotFoundError(f'RELATES_TO edge not found: {uuid}')
-        row = result.result_set[0]
-        return (row[0], row[1])
+        return result.result_set[0][0]
 
     @_canonicalize_group_args
     async def update_node_embedding(self, uuid: str, embedding: list[float], *, group_id: str) -> None:
