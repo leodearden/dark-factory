@@ -406,6 +406,11 @@ def _identity_of(record: sr.DecisionRecord) -> dict[str, str]:
     return {'expected_project': record.project, 'expected_escalations_dir': record.escalations_dir}
 
 
+def _qid(local_id: str, project: str = 'df') -> str:
+    """The stored id write-decision files a CLI ``--id`` under (task 4835)."""
+    return sr.qualify_decision_id(project, local_id)
+
+
 def _names_the_destination_token(message: str) -> bool:
     """True when *message* names ``solar_challenge`` as a token in its OWN
     right -- not merely as the tail of ``my_solar_challenge``.
@@ -1515,7 +1520,9 @@ class TestDecisionHelpersAdoptLock:
         )
 
         assert rc == 0
-        assert 'dec-spy-4' in acquired, f'Expected lock acquisition for dec-spy-4; got {acquired}'
+        assert _qid('dec-spy-4') in acquired, (
+            f'Expected lock acquisition for {_qid("dec-spy-4")}; got {acquired}'
+        )
 
     def test_close_decision_with_evidence_acquires_lock_for_decision_id(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1656,7 +1663,7 @@ def test_main_write_decision_enrichment_span_is_serialized_per_decision_id(
     third.mkdir()
     sr.write_decision(
         _make_decision(
-            id='esc-race-1',
+            id=_qid('esc-race-1'),
             project='df',
             text='Adopt the reify plan?',
             state=sr.DecisionState.OPEN,
@@ -1689,7 +1696,7 @@ def test_main_write_decision_enrichment_span_is_serialized_per_decision_id(
     assert not t1.is_alive(), 'recon-queue write-decision thread did not finish in time'
     assert not t2.is_alive(), 'third-queue write-decision thread did not finish in time'
 
-    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == 'esc-race-1']
+    [reread] = [d for d in sr.list_decisions(root=tmp_path) if d.id == _qid('esc-race-1')]
     # Neither filer's contribution was dropped...
     assert reread.task_id == '5914'
     assert reread.session_id == 'watcher-3'
@@ -5118,7 +5125,7 @@ def test_main_write_decision_files_open_record(
     listed = sr.list_decisions(root=tmp_path)
     assert len(listed) == 1
     rec = listed[0]
-    assert rec.id == 'dec-park-1'
+    assert rec.id == _qid('dec-park-1')
     # Stored CANONICAL, not verbatim: --project is normalized at the CLI
     # boundary (task 3807, see test_main_write_decision_canonicalizes_project).
     assert rec.project == 'dark_factory'
@@ -5229,19 +5236,15 @@ def test_main_write_decision_canonicalizes_an_unaliased_project(
     assert listed[0].project == 'autopilot_video'
 
 
-def test_main_write_decision_project_normalization_never_touches_the_id(
+def test_main_write_decision_qualifies_the_id_by_the_canonical_project_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The ``df-`` prefix belongs to --id, which YOU type; write-decision
-    never derives it from, or rewrites it because of, --project.
-
-    Conflating the two is how the three-way split arose in the first place --
-    a human reading ``df-esc-3524-1`` inferred that ``--project df`` was the
-    right spelling. The id (and therefore the record's filename) must survive
-    project canonicalization byte-for-byte, or every cockpit cross-link to a
-    filed decision would break.
+    """The stored id is ``<canonical project>-<--id>`` with --id carried
+    byte-for-byte (task 4835): the prefix comes from the FOLDED --project, so
+    a raw ``df`` never leaks into the id, and --id is never parsed or
+    rewritten -- not even a legacy hand-typed ``df-`` prefix on it.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
 
@@ -5260,10 +5263,11 @@ def test_main_write_decision_project_normalization_never_touches_the_id(
     )
 
     assert rc == 0
-    assert (tmp_path / 'decisions' / 'df-esc-3524-1.json').is_file()
-    assert 'df-esc-3524-1' in capsys.readouterr().out
+    qualified = 'dark_factory-df-esc-3524-1'
+    assert (tmp_path / 'decisions' / f'{qualified}.json').is_file()
+    assert capsys.readouterr().out.strip() == qualified
     listed = sr.list_decisions(root=tmp_path)
-    assert [(d.id, d.project) for d in listed] == [('df-esc-3524-1', 'dark_factory')]
+    assert [(d.id, d.project) for d in listed] == [(qualified, 'dark_factory')]
 
 
 def test_main_write_decision_logs_a_project_rewrite(
@@ -5749,7 +5753,7 @@ def test_main_write_decision_refiling_same_id_overwrites_not_duplicates(
     assert rc2 == 0
     listed = sr.list_decisions(root=tmp_path)
     assert len(listed) == 1
-    assert listed[0].id == 'dec-park-4'
+    assert listed[0].id == _qid('dec-park-4')
     assert listed[0].text == 'second?'
 
 
@@ -7682,7 +7686,7 @@ def test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_its_st
 
     assert rc == 0
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
-    assert listed['esc-5914-1'] == sr.DecisionState.OPEN
+    assert listed[_qid('esc-5914-1')] == sr.DecisionState.OPEN
 
 
 def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
@@ -7863,7 +7867,7 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
     # An operator triages the cockpit between the two filings: boosts the row
     # to the top of the queue. The watcher then restarts and re-files.
     filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
-    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
+    assert sr.set_manual_boost(_qid('esc-5914-1'), 9, root=tmp_path) is not None
     _file_decision(
         id='esc-5914-1',
         project='df',
@@ -7873,7 +7877,7 @@ def test_main_write_decision_same_queue_refile_still_fully_overwrites(
     )
 
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == [_qid('esc-5914-1')]
     assert listed[0].text == 'reify? (rephrased)'
     assert listed[0].severity == 'info'
     assert listed[0].task_id is None
@@ -7935,8 +7939,8 @@ def test_main_write_decision_same_queue_refile_does_not_resurrect_a_closed_recor
     filed_at = sr.list_decisions(root=tmp_path)[0].filed_at
     # The operator triages the row in the cockpit: boosts it, then dismisses
     # it. Same two helpers cockpit/app.py's C5b drop action calls.
-    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
-    assert sr.update_decision_state('esc-5914-1', closed_state, root=tmp_path) is not None
+    assert sr.set_manual_boost(_qid('esc-5914-1'), 9, root=tmp_path) is not None
+    assert sr.update_decision_state(_qid('esc-5914-1'), closed_state, root=tmp_path) is not None
 
     # ...and the watcher restarts, re-filing its own id from its own queue.
     rc2 = _file_decision(
@@ -7950,7 +7954,7 @@ def test_main_write_decision_same_queue_refile_does_not_resurrect_a_closed_recor
     assert rc1 == 0
     assert rc2 == 0
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == [_qid('esc-5914-1')]
     survivor = listed[0]
     assert survivor.state == closed_state  # the operator's disposition STICKS
     assert survivor.manual_boost == 9  # ...as does their boost
@@ -8000,8 +8004,8 @@ def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwri
         severity='critical',
         escalations_dir=str(orch),
     )
-    assert sr.set_manual_boost('esc-5914-1', 9, root=tmp_path) is not None
-    assert sr.update_decision_state('esc-5914-1', closed_state, root=tmp_path) is not None
+    assert sr.set_manual_boost(_qid('esc-5914-1'), 9, root=tmp_path) is not None
+    assert sr.update_decision_state(_qid('esc-5914-1'), closed_state, root=tmp_path) is not None
 
     # A DIFFERENT queue files the same id -- possibly an unrelated new ask.
     rc = _file_decision(
@@ -8014,7 +8018,7 @@ def test_main_write_decision_cross_queue_refile_of_a_closed_record_still_overwri
 
     assert rc == 0
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == [_qid('esc-5914-1')]
     survivor = listed[0]
     assert survivor.state == sr.DecisionState.OPEN  # re-opened: a new ask
     assert survivor.manual_boost == 0
@@ -8057,7 +8061,7 @@ def test_main_write_decision_warns_when_a_same_queue_refile_is_held_closed(
         escalations_dir=str(orch),
     )
     assert (
-        sr.update_decision_state('esc-5914-1', sr.DecisionState.DROPPED, root=tmp_path)
+        sr.update_decision_state(_qid('esc-5914-1'), sr.DecisionState.DROPPED, root=tmp_path)
         is not None
     )
     capsys.readouterr()  # discard the first filing's stdout
@@ -8072,7 +8076,7 @@ def test_main_write_decision_warns_when_a_same_queue_refile_is_held_closed(
         )
 
     assert rc == 0
-    assert capsys.readouterr().out.strip() == 'esc-5914-1'  # the id still lands
+    assert capsys.readouterr().out.strip() == _qid('esc-5914-1')  # the id still lands
     held = [
         r
         for r in caplog.records
@@ -8342,7 +8346,7 @@ def test_main_write_decision_enriches_a_legacy_unstamped_record(
     orch, _recon = _two_queues(tmp_path)
     sr.write_decision(
         _make_decision(
-            id='esc-5914-1',
+            id=_qid('esc-5914-1'),
             project='df',
             text='Adopt the reify plan?',
             state=sr.DecisionState.OPEN,
@@ -8366,7 +8370,7 @@ def test_main_write_decision_enriches_a_legacy_unstamped_record(
     )
 
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == [_qid('esc-5914-1')]
     assert listed[0].escalations_dir == sr.normalize_escalations_dir(orch)
     assert listed[0].text == 'Adopt the reify plan?'  # enriched, not clobbered
 
@@ -10307,7 +10311,7 @@ class TestClosedAt:
         filing = {'id': 'dec-close', 'project': 'dark_factory', 'text': 'approve?', 'escalations_dir': queue}
         _file_decision(**filing)
         closed = sr.close_decision_with_evidence(
-            'dec-close', sr.DecisionState.ANSWERED, _EVIDENCE, root=tmp_path,
+            _qid('dec-close'), sr.DecisionState.ANSWERED, _EVIDENCE, root=tmp_path,
             expected_project='dark_factory', expected_escalations_dir=queue,
         )
         assert closed is not None and closed.closed_at

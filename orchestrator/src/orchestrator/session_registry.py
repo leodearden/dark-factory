@@ -4545,7 +4545,7 @@ def _run_lease_reap() -> list[ReapedLease]:
 
 
 def _run_write_decision(
-    decision_id: str,
+    local_id: str,
     project: str,
     text: str,
     task_id: str | None,
@@ -4590,11 +4590,10 @@ def _run_write_decision(
     into an availability dependency. A rewrite is logged at WARNING so it
     stays LOUD rather than silent.
 
-    NOTE that ``decision_id`` is untouched by that normalization: the ``df-``
-    prefix on an id like ``df-esc-3524-1`` is part of ``--id``, which the
-    caller types, and is never derived from or rewritten because of
-    ``--project``. Conflating the two is how the three-way project split
-    arose.
+    ``local_id`` (``--id``) is project-LOCAL (task 4835): the record is
+    filed under ``qualify_decision_id(canonical project, local_id)``, so the
+    same escalation id in two projects lands on two rows, while both queues
+    of ONE project still share a row (the MODE-2 collapse below).
 
     ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
     to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
@@ -4621,13 +4620,15 @@ def _run_write_decision(
     UPSERT, NOT A BLIND OVERWRITE (task 3559). Against an existing record at
     the same id, three cases are told apart:
 
-    - DIFFERENT project -- an id COLLISION, not one gate seen twice, since
-      DecisionRecords are fleet-global while ``esc-<taskid>-<n>`` task
-      numbering restarts per project. REFUSED (loud, fail-soft, nothing
-      written): merging would hide this ask inside the other project's row
-      and overwriting would delete that row. Scoped to an OPEN incumbent --
-      a closed row in another project is a question already dealt with, so a
-      filing there starts a new ask.
+    - DIFFERENT project -- an id COLLISION, not one gate seen twice. Since
+      task 4835 qualifies the id by project, this is reachable only when the
+      qualified id is itself held by another project's record: a legacy
+      hand-prefixed id such as the live ``recon-esc-7459-1`` held by project
+      reify. REFUSED (loud, fail-soft, nothing written): merging would hide
+      this ask inside the other project's row and overwriting would delete
+      that row. Scoped to an OPEN incumbent -- a closed row in another
+      project is a question already dealt with, so a filing there starts a
+      new ask.
     - DIFFERENT queue stamp -- the second watcher observing the same human
       gate through another queue (the observed esc-5914-1 MODE-2 shape), so
       the filing is folded in via merge_decision_enrichment rather than
@@ -4704,7 +4705,7 @@ def _run_write_decision(
             'normalized to nothing. A DecisionRecord is fleet-global but an '
             'esc-<taskid>-<n> id is unique only within one queue, so a queue-less '
             'record is cross-queue-ambiguous. Pass the SAME queue dir you reap with.',
-            decision_id,
+            local_id,
         )
         return
     if stamp == UNKNOWN_QUEUE:
@@ -4714,7 +4715,7 @@ def _run_write_decision(
             'reaper will ever close a decision stamped with it -- only a human could. '
             'A watcher knows its own queue by construction; pass the real queue dir '
             'you also reap with.',
-            decision_id,
+            local_id,
             UNKNOWN_QUEUE,
         )
         return
@@ -4738,6 +4739,7 @@ def _run_write_decision(
     if declined_hint is not None:
         logger.warning('write-decision: %s', declined_hint)
 
+    decision_id = qualify_decision_id(canonical_project, local_id)
     incoming = DecisionRecord(
         id=decision_id,
         project=canonical_project,
@@ -4782,14 +4784,14 @@ def _run_write_decision(
             if existing is not None:
                 if normalize_project_token(existing.project) != canonical_project:
                     # SAME id, DIFFERENT project: an id COLLISION, not a
-                    # MODE-2 collapse. Both SKILL.md files tell a watcher to
-                    # use the escalation id as the decision id, and
-                    # esc-<taskid>-<n> task numbering RESTARTS per project,
-                    # so 'esc-42-1' in dark_factory and 'esc-42-1' in reify
-                    # are two unrelated gates. Two projects also always have
-                    # different queue dirs, so without this guard every such
-                    # collision lands in the enrichment branch below and gets
-                    # folded into the OTHER project's row -- one cockpit row
+                    # MODE-2 collapse. The id is project-qualified (task
+                    # 4835), so this is reachable only when the qualified id
+                    # is held by a LEGACY hand-prefixed record of another
+                    # project (the live 'recon-esc-7459-1' held by reify is
+                    # the shape). Two projects also always have different
+                    # queue dirs, so without this guard such a collision
+                    # lands in the enrichment branch below and gets folded
+                    # into the OTHER project's row -- one cockpit row
                     # claiming to be project A's ask while B's human gate is
                     # invisible and unreapable by B's reaper.
                     #
@@ -4823,17 +4825,16 @@ def _run_write_decision(
                     if existing.state == DecisionState.OPEN:
                         logger.error(
                             'write-decision refusing to file %s for project %s: an OPEN '
-                            'decision already exists at that id for a DIFFERENT project '
-                            '(%s). DecisionRecords are fleet-global while '
-                            'esc-<taskid>-<n> ids restart per project, so this is an id '
+                            'decision already exists at that project-qualified id for a '
+                            'DIFFERENT project (%s) -- a legacy hand-prefixed id filed '
+                            'before ids were qualified by project. This is an id '
                             'COLLISION, not a MODE-2 cross-queue collapse of one human '
                             'gate -- merging would hide this ask inside the other '
                             'project\'s cockpit row and overwriting would delete that '
                             'row, so neither is safe. The existing row is left intact '
                             'and THIS ask did not reach the cockpit; it is still '
                             'carried by the in-session note / afk-digest line this '
-                            'filing accompanies. Re-file it under an id that is unique '
-                            'fleet-wide.',
+                            'filing accompanies. Re-file it under a different --id.',
                             decision_id,
                             project,
                             existing.project,
@@ -5217,7 +5218,14 @@ def _build_parser() -> argparse.ArgumentParser:
         'write-decision',
         help='file an OPEN DecisionRecord (Fleet Cockpit C8: park-to-registry)',
     )
-    write_decision_p.add_argument('--id', required=True, help="this decision's id")
+    write_decision_p.add_argument(
+        '--id',
+        required=True,
+        help=(
+            "this decision's id LOCAL to --project (usually the escalation id); "
+            'filed fleet-unique as <project>-<id>, which is printed'
+        ),
+    )
     write_decision_p.add_argument(
         '--project',
         required=True,

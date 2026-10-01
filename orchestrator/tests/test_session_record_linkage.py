@@ -1134,6 +1134,7 @@ class TestWriteDecisionRecordSlug:
     _PID = 4_237_600
     _RESTARTED_PID = 4_237_700
     _ID = 'esc-4237-1'
+    _FILED_ID = sr.qualify_decision_id('dark_factory', _ID)
 
     def _file(
         self,
@@ -1155,7 +1156,7 @@ class TestWriteDecisionRecordSlug:
             ]
         )
         assert rc == 0
-        path = sr.decision_path_for_id(self._ID, root=root)
+        path = sr.decision_path_for_id(self._FILED_ID, root=root)
         return capsys.readouterr().out, sr.DecisionRecord.from_json(path.read_text())
 
     def test_the_filers_own_record_is_stamped_beside_its_session_id(
@@ -1189,7 +1190,7 @@ class TestWriteDecisionRecordSlug:
 
         out, decision = self._file(tmp_path, capsys)
 
-        assert out == f'{self._ID}\n'
+        assert out == f'{self._FILED_ID}\n'
         assert decision.record_slug == ''
         assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
