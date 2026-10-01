@@ -21,6 +21,7 @@ supported a specific worker-count cap on this host.
 from __future__ import annotations
 
 import shlex
+from pathlib import Path
 from typing import Literal
 from unittest.mock import patch
 
@@ -241,6 +242,18 @@ class TestApplyPytestNumprocessesSerialRecoveryCollision:
         assert '-n 16' not in rendered
 
 
+def armed_admission_config(tmp_path: Path, pytest_n: str) -> OrchestratorConfig:
+    """A config with verify admission armed: ``verify_admission_enabled`` is
+    pinned, so an operator edit to the yaml cannot silently disarm the
+    ``-n`` injection site these wiring tests observe."""
+    return OrchestratorConfig(
+        verify_admission_enabled=True,
+        verify_admission_slots_dir=str(tmp_path / 'slots'),
+        verify_admission_task_slots=1,
+        verify_admission_pytest_n=pytest_n,
+    )
+
+
 class TestPytestNWiring:
     """Wiring into ``_run_or_skip_timed``: the test-leg-only, role-gated
     (task/background, not merge) `-n` rewrite, injected before the
@@ -258,12 +271,7 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -288,13 +296,7 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_enabled=True,  # pinned: the yaml must not disarm the control
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -332,12 +334,7 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='auto',
-        )
+        config = armed_admission_config(tmp_path, 'auto')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -417,12 +414,7 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -457,12 +449,7 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -507,13 +494,7 @@ class TestPytestNWiring:
                 return 0, '', False
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_enabled=True,  # pinned: the yaml must not disarm the control
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
