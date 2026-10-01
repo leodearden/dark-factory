@@ -37,7 +37,7 @@ the slate on which step-2's claim is false.
 
 Six results at cosine `0.90 - i/100` (the cosine lives in
 `metadata['store_score']`, which is what
-`near_duplicate_guard::cosine_of` reads — `relevance_score` is post-RRF and is
+`near_duplicate_guard::_cosine_of` reads — `relevance_score` is post-RRF and is
 NOT the cosine), plus one `child-1` at `0.60` stamped
 `{PARENT_ID_KEY: 'parent-1'}`. Then
 `select_judge_candidates(results, 3, canonical_id='parent-1')`:
