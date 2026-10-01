@@ -11,6 +11,9 @@ from pathlib import Path
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.reconciliation import task_filter
+from fused_memory.services import completion_claim_gate
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_ruling_overreach.py'
 
 mod = load_script_module(SCRIPT_PATH, mod_name='audit_ruling_overreach')
@@ -269,3 +272,97 @@ class TestSpecimens:
 
     def test_recall_with_no_specimen_read_is_not_computed(self) -> None:
         assert mod.specimen_recall('ruling_lexeme_head', {}) is None
+
+
+# --------------------------------------------------------------------------- #
+# Counterfactual census of the write-time detectors (step 5)
+# --------------------------------------------------------------------------- #
+
+# Positive controls, each copied from the detector's OWN suite, so a detector
+# that never fires is distinguishable from a mis-invoked one.
+POSITIVE_CONTROLS = {
+    # tests/test_completion_claim_gate.py::TestClauseBoundaryIsolation::test_plain_completion_claim_still_extracts
+    'completion_claim': 'Task 777 has landed.',
+    # tests/test_task_filter.py::TestIsProposedResolutionFraming::test_positive_proposed_fix_phrase
+    'proposed_resolution': 'Proposed fix: move the transition after the await.',
+    # tests/test_task_filter.py::TestIsBatchPlanFraming::test_positive_decompose_and_queue_with_range
+    'batch_plan': 'PRD decomposed into tasks 1985-2002 and queued',
+}
+# tests/test_completion_claim_gate.py::TestClauseBoundaryIsolation::test_plain_pending_statement_is_still_not_a_claim
+NEGATIVE_CONTROL = 'Task 888 is still pending.'
+
+
+class TestDetectorsAreTheSharedOnes:
+    def test_framing_predicates_are_imported_not_copied(self) -> None:
+        assert mod.is_proposed_resolution_framing is task_filter.is_proposed_resolution_framing
+        assert mod.is_batch_plan_framing is task_filter.is_batch_plan_framing
+
+    def test_completion_claim_extraction_is_imported_not_copied(self) -> None:
+        assert mod.extract_completion_claims is completion_claim_gate.extract_completion_claims
+
+    def test_the_tag_vocabulary_is_imported_not_copied(self) -> None:
+        assert mod.UNVERIFIED_CLAIM_TAG is completion_claim_gate.UNVERIFIED_CLAIM_TAG
+
+
+class TestDetectorHits:
+    def test_detectors_are_named_in_report_order(self) -> None:
+        assert mod.DETECTORS == (
+            'unverified_claim_tag', 'completion_claim', 'proposed_resolution', 'batch_plan',
+        )
+
+    @pytest.mark.parametrize('detector', sorted(POSITIVE_CONTROLS))
+    def test_each_content_detector_fires_on_its_own_positive_control(self, detector) -> None:
+        hits = mod.detector_hits(_episode(POSITIVE_CONTROLS[detector]))
+        assert detector in hits
+
+    def test_the_tag_detector_reads_the_parsed_source_tags(self) -> None:
+        episode = _episode(
+            NEGATIVE_CONTROL, source='[unverified_claim] add_memory:decisions_and_rationale',
+        )
+        assert mod.detector_hits(episode) == frozenset({'unverified_claim_tag'})
+
+    def test_nothing_fires_on_the_negative_control(self) -> None:
+        assert mod.detector_hits(_episode(NEGATIVE_CONTROL)) == frozenset()
+
+    def test_nothing_fires_on_the_specimens(self) -> None:
+        """The four known overreach episodes: the census baseline, measured, not assumed."""
+        for episode in _specimen_episodes().values():
+            assert mod.detector_hits(episode) == frozenset(), episode.uuid
+
+    def test_odd_content_never_raises(self) -> None:
+        episode = mod.Episode(
+            graph='reify', uuid='u', created_at='2026-09-01T00:00:00+00:00',
+            source=mod.parse_source_description(None), content=None,  # type: ignore[arg-type]
+        )
+        assert mod.detector_hits(episode) == frozenset()
+
+    def test_completion_claims_resolve_against_the_episode_graph(self) -> None:
+        hits = mod.detector_hits(
+            _episode('reify task 777 has landed.', graph='dark_factory'),
+            known_project_ids=frozenset({'dark_factory', 'reify'}),
+        )
+        assert 'completion_claim' in hits
+
+
+class TestWiredOnAddMemory:
+    def test_only_the_completion_gate_and_its_tag_are_wired_after_4715(self) -> None:
+        assert frozenset({'unverified_claim_tag', 'completion_claim'}) == mod.WIRED_ON_ADD_MEMORY
+
+    def test_the_wired_set_is_a_subset_of_the_detectors(self) -> None:
+        assert set(mod.DETECTORS) >= mod.WIRED_ON_ADD_MEMORY
+
+
+class TestDetectorCensus:
+    def test_census_counts_hits_and_episodes_per_stratum(self) -> None:
+        census = mod.detector_census({
+            'ruling_lexeme': [
+                _episode(POSITIVE_CONTROLS['completion_claim'], uuid='a'),
+                _episode(NEGATIVE_CONTROL, uuid='b'),
+            ],
+            'other_decisions': [],
+        })
+        assert census['ruling_lexeme'] == {
+            'episodes': 2, 'unverified_claim_tag': 0, 'completion_claim': 1,
+            'proposed_resolution': 0, 'batch_plan': 0,
+        }
+        assert census['other_decisions']['episodes'] == 0
