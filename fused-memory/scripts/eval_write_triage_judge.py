@@ -361,7 +361,7 @@ def _case(
     candidates: list[str],
     expected_class: str,
     acceptable: frozenset[str],
-    attach_target_id: str | None,
+    band_winner_id: str | None,
     band: str,
     similarity: float | None,
     canonical_present: bool | None,
@@ -381,7 +381,7 @@ def _case(
         'candidates': candidates,
         'expected_class': expected_class,
         'acceptable_outcomes': acceptable,
-        'attach_target_id': attach_target_id,
+        'band_winner_id': band_winner_id,
         'band': band,
         'similarity': similarity,
         'canonical_present': canonical_present,
@@ -408,7 +408,7 @@ def _seeded_case(
         candidates=slate,
         expected_class=expected_class,
         acceptable=acceptable,
-        attach_target_id=slate[0] if slate else None,
+        band_winner_id=slate[0] if slate else None,
         band=OUTCOME_JUDGE,
         similarity=None,
         canonical_present=None,
@@ -603,7 +603,7 @@ def plan_from_slates(
             candidates=[str(c['memory_id']) for c in slate.candidates],
             expected_class=str(record['label']),
             acceptable=_acceptable_for(str(record['label'])),
-            attach_target_id=slate.attach_target_id,
+            band_winner_id=slate.attach_target_id,
             band=slate.band,
             similarity=slate.similarity,
             canonical_present=slate.canonical_present,
@@ -928,6 +928,28 @@ def _attachable_id(record: Mapping[str, Any]) -> str:
     return str(record.get('canonical_id') or record['memory_id'])
 
 
+def _judged_candidate_id(
+    case: Mapping[str, Any],
+    answer: JudgeAnswer,
+    shown: Mapping[str, Mapping[str, Any]],
+) -> str | None:
+    """The record the verdict named, hoisted as production attaches to it.
+
+    *shown* is the case's own slate by memory id. A named id off it RAISES:
+    production fails such a write open to `stored`, so scoring it as an attach
+    would publish one production never makes.
+    """
+    if answer.candidate_id is None:
+        return None
+    record = shown.get(answer.candidate_id)
+    if record is None:
+        raise ValueError(
+            f'case {case["memory_id"]!r}: the verdict named '
+            f'{answer.candidate_id!r}, which is not on its slate {sorted(shown)}',
+        )
+    return _attachable_id(record)
+
+
 def case_row(
     index: int,
     case: Mapping[str, Any],
@@ -945,8 +967,9 @@ def case_row(
     JSON-serializable verbatim: this is the line appended to the cases file as
     each case completes, so a run interrupted partway keeps what it paid for.
     """
-    target_id = case['attach_target_id']
     shown = {str(record['memory_id']): record for record in candidate_records}
+    judged = _judged_candidate_id(case, answer, shown)
+    target_id = judged if judged is not None else case['band_winner_id']
     target = (
         (fixture_by_id.get(str(target_id)) or shown.get(str(target_id))) if target_id else None
     )
@@ -962,6 +985,9 @@ def case_row(
         'expected_class': case['expected_class'],
         'acceptable_outcomes': sorted(case['acceptable_outcomes']),
         'candidates': list(case['candidates']),
+        'band_winner_id': case['band_winner_id'],
+        'verdict_candidate_id': answer.candidate_id,
+        'judged_candidate_id': judged,
         'attach_target_id': target_id,
         'attach_target_cluster_id': target.get('cluster_id') if target else None,
         'attach_target_category': target.get('category') if target else None,
@@ -1638,7 +1664,7 @@ def _ask_judge(
     slate: Sequence[Any],
     *,
     outcome: str,
-    attach_target_id: str | None,
+    band_winner_id: str | None,
     similarity: float | None,
     recorded: Sequence[Any],
 ) -> JudgeAnswer:
@@ -1668,7 +1694,7 @@ def _ask_judge(
         project_id=_EVAL_PROJECT_ID,
         decision=BandDecision(
             outcome=OUTCOME_JUDGE,
-            canonical_id=attach_target_id,
+            canonical_id=band_winner_id,
             similarity=similarity,
             t_high=None,
             t_low=None,
@@ -1729,7 +1755,7 @@ def build_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
             str(case['content']),
             slate,
             outcome=OUTCOME_JUDGE,
-            attach_target_id=slate[0].id if slate else None,
+            band_winner_id=slate[0].id if slate else None,
             similarity=_SYNTHETIC_TOP_SCORE,
             recorded=recorded,
         )
@@ -1760,7 +1786,7 @@ def build_retrieved_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
             str(case['content']),
             slate,
             outcome=str(case['band']),
-            attach_target_id=case['attach_target_id'],
+            band_winner_id=case['band_winner_id'],
             similarity=case['similarity'],
             recorded=recorded,
         )
