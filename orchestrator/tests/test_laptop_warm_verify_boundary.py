@@ -78,6 +78,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from click.testing import CliRunner
+from df_pytest_isolation import load_scaled_grace
 from escalation.queue import EscalationQueue
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
 from test_merge_queue_multihost_wiring import (  # noqa: F401 -- reused cross-module
@@ -1342,7 +1343,18 @@ def test_row_watchdog_window_tracks_the_baselined_production_window():
 # ---------------------------------------------------------------------------
 
 
-def test_row_discovery_ceiling_scales_with_load_and_clamps():
+def _inject_load(monkeypatch, loadavg: float, cpu_count: int = 32) -> None:
+    """Patch the load signal on the ``os`` MODULE, where every reader sees it."""
+    monkeypatch.setattr(os, 'getloadavg', lambda: (loadavg, loadavg, loadavg))
+    monkeypatch.setattr(os, 'cpu_count', lambda: cpu_count)
+
+
+def _unpinned_ceiling_at(monkeypatch, loadavg: float) -> float:
+    _inject_load(monkeypatch, loadavg)
+    return row_discovery_ceiling_secs(_override=None)
+
+
+def test_row_discovery_ceiling_scales_with_load_and_clamps(monkeypatch):
     """The discovery ceiling widens with per-core load and is bounded at both ends.
 
     This is a WEDGE DETECTOR, not a speed assertion -- the rows assert THAT
@@ -1358,20 +1370,20 @@ def test_row_discovery_ceiling_scales_with_load_and_clamps():
         past the pytest timeout that is DERIVED from that clamp;
     (d) the mapping is monotone -- more load never yields a tighter deadline.
     """
-    idle = row_discovery_ceiling_secs(_override=None, _loadavg=0.1, _cpu_count=32)
+    idle = _unpinned_ceiling_at(monkeypatch, 0.1)
     assert idle == ROW_DISCOVERY_CEILING_BASE_SECS, (
         f'an idle box must pay exactly the base ceiling '
         f'({ROW_DISCOVERY_CEILING_BASE_SECS}); got {idle}'
     )
 
-    loaded = row_discovery_ceiling_secs(_override=None, _loadavg=96.0, _cpu_count=32)
+    loaded = _unpinned_ceiling_at(monkeypatch, 96.0)
     assert loaded > ROW_DISCOVERY_CEILING_BASE_SECS, (
         f'at 3x per-core load -- the BOTTOM of the measured dilation envelope -- '
         f'the ceiling must widen past base; got {loaded}'
     )
 
     unpinned_clamp = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
-    absurd = row_discovery_ceiling_secs(_override=None, _loadavg=6400.0, _cpu_count=32)
+    absurd = _unpinned_ceiling_at(monkeypatch, 6400.0)
     assert absurd == unpinned_clamp, (
         f'a runaway load must clamp to {unpinned_clamp} -- that clamp is what '
         f'ROW_DISCOVERY_CEILING_MAX_SECS, and in turn the import-time pytest '
@@ -1379,7 +1391,7 @@ def test_row_discovery_ceiling_scales_with_load_and_clamps():
     )
 
     ladder = [
-        row_discovery_ceiling_secs(_override=None, _loadavg=load, _cpu_count=32)
+        _unpinned_ceiling_at(monkeypatch, load)
         for load in (0.0, 1.0, 32.0, 64.0, 96.0, 200.0, 1000.0, 6400.0)
     ]
     assert ladder == sorted(ladder), (
@@ -1390,7 +1402,37 @@ def test_row_discovery_ceiling_scales_with_load_and_clamps():
     )
 
 
-def test_discovery_ceiling_env_override_parses_and_pins():
+def test_row_discovery_ceiling_is_the_shared_load_scaler(monkeypatch):
+    """The ceiling's load scaling IS ``df_pytest_isolation.load_scaled_grace``.
+
+    The shared scaler is the oracle, so this pins the delegation without
+    re-deriving its arithmetic. The 33.0 rung is a non-integer per-core
+    factor, where a local copy that skips the whole-second rounding diverges.
+    """
+    shared_cap = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
+    for load in (0.0, 16.0, 33.0, 64.0, 96.0, 200.0, 6400.0):
+        ours = _unpinned_ceiling_at(monkeypatch, load)
+        shared = load_scaled_grace(ROW_DISCOVERY_CEILING_BASE_SECS, cap_secs=shared_cap)
+        assert ours == shared, (
+            f'at loadavg {load} on 32 cores the discovery ceiling is {ours} but '
+            f'the shared scaler gives {shared}: the ceiling has its own scaler again'
+        )
+
+
+def test_row_discovery_ceiling_fails_safe_without_loadavg(monkeypatch):
+    """A platform with no loadavg gets the base deadline, never a crash at the call site."""
+    def _raise_oserror():
+        raise OSError('getloadavg not supported on this platform')
+
+    def _raise_attributeerror():
+        raise AttributeError('os has no getloadavg on this platform')
+
+    for no_loadavg in (_raise_oserror, _raise_attributeerror):
+        monkeypatch.setattr(os, 'getloadavg', no_loadavg)
+        assert row_discovery_ceiling_secs(_override=None) == ROW_DISCOVERY_CEILING_BASE_SECS
+
+
+def test_discovery_ceiling_env_override_parses_and_pins(monkeypatch):
     """ORCH_TEST_DISCOVERY_CEILING_SECS parses safely and beats load scaling.
 
     Two halves, both deterministic -- the parser takes an environ MAPPING
@@ -1453,8 +1495,10 @@ def test_discovery_ceiling_env_override_parses_and_pins():
             f'looks like on the far side of the derivation'
         )
 
-    assert row_discovery_ceiling_secs(_override=7.5, _loadavg=6400.0, _cpu_count=32) == 7.5
-    assert row_discovery_ceiling_secs(_override=7.5, _loadavg=0.0, _cpu_count=32) == 7.5
+    _inject_load(monkeypatch, 6400.0)
+    assert row_discovery_ceiling_secs(_override=7.5) == 7.5
+    _inject_load(monkeypatch, 0.0)
+    assert row_discovery_ceiling_secs(_override=7.5) == 7.5
 
 
 def test_row_per_test_timeout_still_covers_the_max_discovery_ceiling():
