@@ -37,7 +37,9 @@ from _park_test_helpers import (
     park_world,
 )
 from _recording_event_store import _RecordingEventStore
+from shared.psi import PsiSample
 
+from orchestrator.config import PsiAdmissionConfig, apply_reload
 from orchestrator.scheduler import Scheduler
 
 
@@ -332,3 +334,184 @@ async def test_disabled_switch_is_the_old_pin_loop(tmp_path):
     assert w.scheduler.lock_table.snapshot_pin_reservations() == {}
     assert _reservation_events(w.store, 'P1') == []
     assert not any(event_matches(t, 'pin_blocked') for t, _ in w.store.events)
+
+
+# ---------------------------------------------------------------------------
+# Acceptance 4 (first and third bullets) — the pin phase releases and bounds
+# ---------------------------------------------------------------------------
+
+
+def _reload(scheduler: Scheduler, **changes: object) -> None:
+    """Hot-apply *changes* to the LIVE config through the real ``apply_reload``.
+
+    The fresh config is the live one with *changes* on top, so exactly those
+    leaves differ and nothing else is re-applied.
+    """
+    result = apply_reload(scheduler.config, scheduler.config.model_copy(update=changes))
+    assert result['reloaded'] is True, result
+    assert set(changes) <= set(result['applied']), result
+
+
+async def _reserved_3659_world(tmp_path, **config_overrides) -> ParkWorld:
+    """The 3659 world after tick 1: P holds a pin reservation over C on w."""
+    w = _3659_world(tmp_path, **config_overrides)
+    assert await w.scheduler.acquire_next() is None
+    assert _owners(w.scheduler, 'w.py') == ['C', 'P'], 'premise: P reserved over C'
+    w.store.events.clear()
+    return w
+
+
+@pytest.mark.asyncio
+async def test_unpinning_releases_within_one_tick(tmp_path):
+    w = await _reserved_3659_world(tmp_path)
+
+    assert w.overrides.clear_override(w.root, 'P', field='pinned')
+    await w.scheduler.acquire_next()
+
+    assert event_data_for(w.store, 'reservation_expired', 'P') == [
+        {'reason': 'unpinned', 'source': 'pin'},
+    ]
+    assert {'restored_owner': 'C', 'modules': ['w.py'], 'source': 'fairness'} in [
+        e['data'] for e in event_payloads(w.store, 'reservation_restored')
+    ]
+    assert w.scheduler.lock_table.snapshot_pin_reservations() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_gated_pin_is_released(tmp_path):
+    w = await _reserved_3659_world(tmp_path)
+
+    w.scheduler._landed_outbox_gate = AsyncMock(side_effect=lambda tid: tid == 'P')
+    await w.scheduler.acquire_next()
+
+    assert event_data_for(w.store, 'reservation_expired', 'P') == [
+        {'reason': 'gated', 'source': 'pin'},
+    ]
+    assert w.scheduler.lock_table.snapshot_pin_reservations() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_lower_order_pin_displaces_the_head(tmp_path):
+    """D5c: P1 outranks the reserved P2 the tick its dependency lands."""
+    w = park_world(tmp_path, pinned=('P1', 'P2'))
+    assert w.scheduler.lock_table.try_acquire('H', ['a.py'])
+    p1 = make_task('P1', 'medium', ['a.py'])
+    p1['dependencies'] = ['D']
+    others = [
+        make_task('P2', 'medium', ['a.py']),
+        make_task('H', 'low', ['a.py'], status='in-progress'),
+    ]
+    w.scheduler.get_tasks = AsyncMock(
+        return_value=[p1, make_task('D', 'low', ['d.py'], status='in-progress'), *others]
+    )
+    assert await w.scheduler.acquire_next() is None
+    assert list(w.scheduler.lock_table.snapshot_pin_reservations()) == ['P2'], (
+        'premise: P1 waits on D, so P2 is the head'
+    )
+
+    w.scheduler.get_tasks = AsyncMock(
+        return_value=[p1, make_task('D', 'low', ['d.py'], status='done'), *others]
+    )
+    await w.scheduler.acquire_next()
+
+    assert list(w.scheduler.lock_table.snapshot_pin_reservations()) == ['P1']
+    assert event_data_for(w.store, 'reservation_expired', 'P2') == [
+        {'reason': 'pin_displaced', 'source': 'pin'},
+    ]
+    assert _owners(w.scheduler, 'a.py')[-1] == 'P1', 'P1 tops the shared module'
+
+
+@pytest.mark.asyncio
+async def test_reloading_max_active_down_releases_the_excess(tmp_path):
+    w = park_world(tmp_path, pinned=('P1', 'P2'), pin_reservation_max_active=2)
+    assert w.scheduler.lock_table.try_acquire('H1', ['a.py'])
+    assert w.scheduler.lock_table.try_acquire('H2', ['b.py'])
+    w.scheduler.get_tasks = AsyncMock(return_value=[
+        make_task('P1', 'medium', ['a.py']),
+        make_task('P2', 'medium', ['b.py']),
+        make_task('H1', 'low', ['a.py'], status='in-progress'),
+        make_task('H2', 'low', ['b.py'], status='in-progress'),
+    ])
+    assert await w.scheduler.acquire_next() is None
+    assert sorted(w.scheduler.lock_table.snapshot_pin_reservations()) == ['P1', 'P2']
+
+    _reload(w.scheduler, pin_reservation_max_active=1)
+    await w.scheduler.acquire_next()
+
+    assert list(w.scheduler.lock_table.snapshot_pin_reservations()) == ['P1']
+    assert event_data_for(w.store, 'reservation_expired', 'P2') == [
+        {'reason': 'pin_displaced', 'source': 'pin'},
+    ]
+    assert event_data_for(w.store, 'reservation_expired', 'P1') == []
+
+
+@pytest.mark.asyncio
+async def test_hot_reload_toggles_the_kill_switch(tmp_path):
+    w = await _reserved_3659_world(tmp_path)
+
+    _reload(w.scheduler, pin_reservations_enabled=False)
+    await w.scheduler.acquire_next()
+
+    assert event_data_for(w.store, 'reservation_expired', 'P') == [
+        {'reason': 'pin_reservations_disabled', 'source': 'pin'},
+    ]
+    assert {'restored_owner': 'C', 'modules': ['w.py'], 'source': 'fairness'} in [
+        e['data'] for e in event_payloads(w.store, 'reservation_restored')
+    ]
+    assert event_payloads(w.store, 'reservation_installed') == []
+    assert w.scheduler.lock_table.snapshot_pin_reservations() == {}
+
+    _reload(w.scheduler, pin_reservations_enabled=True)
+    await w.scheduler.acquire_next()
+
+    assert 'P' in w.scheduler.lock_table.snapshot_pin_reservations()
+
+
+@pytest.mark.asyncio
+async def test_psi_held_tick_neither_grants_nor_revokes(tmp_path):
+    """A held tick tries no acquire, so it has no evidence to revoke a head on.
+
+    F is a free task that dispatches on tick 1, putting one task in flight so
+    the hold's anti-deadlock floor does not suppress it.
+    """
+    w = _3659_world(tmp_path, psi_admission=PsiAdmissionConfig())
+    w.scheduler.get_tasks = AsyncMock(
+        return_value=[*_3659_tasks(), make_task('F', 'low', ['f.py'])]
+    )
+    result = await w.scheduler.acquire_next()
+    assert result is not None and result.task_id == 'F', 'premise: F is in flight'
+    before = w.scheduler.lock_table.snapshot_pin_reservations()
+    assert 'P' in before, 'premise: P reserved'
+    w.store.events.clear()
+
+    w.scheduler._read_psi_sample = lambda: PsiSample(
+        cpu_some10=99.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True
+    )
+    assert await w.scheduler.acquire_next() is None
+
+    assert event_payloads(w.store, 'dispatch_deferred'), 'premise: the tick was held'
+    assert w.scheduler.lock_table.snapshot_pin_reservations() == before
+    assert event_payloads(w.store, 'reservation_expired') == []
+
+
+@pytest.mark.parametrize(
+    ('facts', 'reason'),
+    [
+        ({'enabled': False, 'reservable': True}, 'pin_reservations_disabled'),
+        ({'reservable': True}, 'pin_displaced'),
+        ({'pinned': False, 'gated': True}, 'unpinned'),
+        ({'gated': True, 'deterministic': True}, 'gated'),
+        ({'deterministic': True}, 'deterministic'),
+        ({}, 'ineligible'),
+    ],
+)
+def test_pin_release_reason_precedence(facts, reason):
+    """disabled → displaced → unpinned → gated → deterministic → ineligible."""
+    from orchestrator.pin_reservation import pin_release_reason
+
+    defaults = {
+        'enabled': True, 'reservable': False, 'pinned': True,
+        'gated': False, 'deterministic': False,
+    }
+
+    assert pin_release_reason(**(defaults | facts)) == reason
