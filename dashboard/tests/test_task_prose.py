@@ -13,6 +13,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 from urllib.parse import quote
 
 import httpx
@@ -25,10 +26,13 @@ from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import project_roots_for_label, task_uid
 from dashboard.data.memory import reset_sessions
 from dashboard.data.tasks import (
+    DEFAULT_PER_CALL_TIMEOUT,
     TaskNotFound,
     TaskProse,
     TaskReadOffline,
+    fetch_task,
     fetch_task_prose,
+    fetch_tasks,
 )
 
 _URL_1 = 'http://127.0.0.1:9101'
@@ -238,6 +242,124 @@ class TestFetchTaskProse:
         prose = TaskProse(description='d', details='t')
 
         assert prose.to_wire() == {'description': 'd', 'details': 't'}
+
+
+_RAW_ROW = {
+    'id': '19',
+    'title': 'merge attempts as one datum',
+    'description': 'd',
+    'details': 'not part of the row',
+    'status': 'done',
+    'priority': 'high',
+    'dependencies': ['3', '4'],
+    'metadata': {'files': ['a.py']},
+    'updatedAt': '2026-09-30T12:00:00+00:00',
+    'claimant_run_id': 'run-7',
+    'heartbeat_at': '2026-09-30T11:59:00+00:00',
+    'testStrategy': 'dropped',
+}
+"""One raw fused-memory row: a string id, and fields the dashboard drops."""
+
+
+async def _read_row(fused_memory: _FusedMemory, config: DashboardConfig, root: Path, task_id: int):
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fused_memory)) as client:
+        return await fetch_task(client, config, root, task_id)
+
+
+class TestFetchTask:
+    """One task's dashboard row, read through fused-memory's get_task."""
+
+    async def test_the_row_is_the_one_fetch_tasks_shapes(self, tmp_path):
+        root, config = _project(tmp_path, _URL_1)
+        fused_memory = _FusedMemory({9101: _RAW_ROW})
+
+        row = await _read_row(fused_memory, config, root, 19)
+
+        tree_read = AsyncMock(return_value={'tasks': [_RAW_ROW]})
+        with patch('dashboard.data.tasks.mcp_tool_call', new=tree_read):
+            [tree_row] = await fetch_tasks(None, config, root, cached=False)  # type: ignore[arg-type]
+        assert row == tree_row
+        assert row == {
+            'id': 19,
+            'title': 'merge attempts as one datum',
+            'description': 'd',
+            'status': 'done',
+            'priority': 'high',
+            'dependencies': [3, 4],
+            'metadata': {'files': ['a.py']},
+            'updated_at': '2026-09-30T12:00:00+00:00',
+            'claimant_run_id': 'run-7',
+            'heartbeat_at': '2026-09-30T11:59:00+00:00',
+        }
+
+    async def test_one_get_task_call_names_the_id_and_root(self, tmp_path):
+        root, config = _project(tmp_path, _URL_1)
+        fused_memory = _FusedMemory({9101: _RAW_ROW})
+
+        await _read_row(fused_memory, config, root, 19)
+
+        [call] = fused_memory.tool_calls()
+        assert call.params is not None
+        assert call.params['name'] == 'get_task'
+        assert call.params['arguments'] == {'id': '19', 'project_root': str(root)}
+
+    async def test_a_missing_task_is_a_definitive_answer_not_an_outage(self, tmp_path):
+        root, config = _project(tmp_path, _URL_1, _URL_2)
+        message = 'No tasks found for ID(s): 19'
+        fused_memory = _FusedMemory({
+            9101: {'error': message, 'error_type': 'TaskNotFoundError'},
+            9102: _RAW_ROW,
+        })
+
+        read = await _read_row(fused_memory, config, root, 19)
+
+        assert isinstance(read, TaskNotFound)
+        assert message in read.detail
+        assert 9102 not in fused_memory.ports_contacted()
+
+    @pytest.mark.parametrize('answer', [
+        {'error': 'boom', 'error_type': 'TaskmasterError'},
+        {},
+        {'id': 'not-a-number', 'title': 'x'},
+    ], ids=['tool-error', 'empty', 'unparseable-id'])
+    async def test_a_soft_failure_on_every_url_is_offline_naming_each(self, tmp_path, answer):
+        root, config = _project(tmp_path, _URL_1, _URL_2)
+        fused_memory = _FusedMemory({9101: answer, 9102: answer})
+
+        read = await _read_row(fused_memory, config, root, 19)
+
+        assert isinstance(read, TaskReadOffline)
+        assert _URL_1 in read.detail
+        assert _URL_2 in read.detail
+
+    async def test_a_soft_failure_falls_through_to_the_next_url(self, tmp_path):
+        root, config = _project(tmp_path, _URL_1, _URL_2)
+        fused_memory = _FusedMemory({
+            9101: {'error': 'boom', 'error_type': 'TaskmasterError'},
+            9102: _RAW_ROW,
+        })
+
+        row = await _read_row(fused_memory, config, root, 19)
+
+        assert isinstance(row, dict)
+        assert row['id'] == 19
+
+    @pytest.mark.parametrize('kwargs, expected', [
+        ({}, DEFAULT_PER_CALL_TIMEOUT),
+        ({'timeout': 0.5}, 0.5),
+    ], ids=['default', 'tightened'])
+    async def test_the_timeout_reaches_the_post_as_the_per_request_budget(
+        self, tmp_path, kwargs, expected,
+    ):
+        """AsyncMock, as test_tasks.py does: MockTransport never sees the kwarg."""
+        root, config = _project(tmp_path, _URL_1)
+        mock_mcp = AsyncMock(return_value=_RAW_ROW)
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            await fetch_task(None, config, root, 19, **kwargs)  # type: ignore[arg-type]
+
+        [call] = mock_mcp.call_args_list
+        assert call.kwargs.get('timeout') == expected
 
 
 class TestTaskProseRoute:
