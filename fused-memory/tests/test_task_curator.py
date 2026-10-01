@@ -984,6 +984,44 @@ class TestUnexpectedExceptionArmReports:
         assert exc_name in kwargs['justification']
         assert exc_name in kwargs['subtype']
 
+    @pytest.mark.asyncio
+    async def test_report_failure_raise_propagates_and_leaves_nothing_behind(self):
+        """With no orchestrator to escalate to, report_failure raises
+        CuratorFailureError. From this arm, as from the CuratorFailureError
+        arm, that raise reaches the caller as a loud failure instead of a
+        create, and leaves no degraded decision behind: none cached for the
+        payload, none counted toward the streak."""
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(
+            side_effect=CuratorFailureError('no orchestrator running'),
+        )
+        escalator.report_consecutive_degraded = AsyncMock(return_value=None)
+        curator = TaskCurator(
+            config=_make_config(), taskmaster=None, escalator=escalator,
+        )
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+        healthy = CuratorDecision(action='drop', target_id='42', justification='dup')
+        call_llm = AsyncMock(side_effect=[RuntimeError('llm down'), healthy])
+        candidate = CandidateTask(title='T')
+
+        with patch.object(curator, '_build_corpus', side_effect=empty_corpus), \
+             patch.object(curator, '_call_llm', new=call_llm):
+            with pytest.raises(CuratorFailureError, match='no orchestrator running'):
+                await curator.curate(candidate, project_id='p', project_root='/x')
+            assert _streak(curator).count == 0
+
+            # The identical payload again: had the first call cached its
+            # degraded create, this would be served from cache without
+            # reaching the LLM.
+            result = await curator.curate(candidate, project_id='p', project_root='/x')
+
+        assert call_llm.await_count == 2
+        assert result.action == 'drop'
+        escalator.report_consecutive_degraded.assert_not_awaited()
+
 
 def _seed_streak(
     curator: TaskCurator, *, count: int, alarm_fired: bool = False,
