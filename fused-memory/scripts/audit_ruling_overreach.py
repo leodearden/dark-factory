@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -451,3 +451,152 @@ def worksheet_rows(
             'minted': [_edge_row(e) for e in sorted(edges.minted, key=lambda e: e.uuid)],
             'corroborated_count': len(edges.corroborated),
         }
+
+
+# --------------------------------------------------------------------------- #
+# The adjudicated verdict file, validated fail-closed
+# --------------------------------------------------------------------------- #
+
+LABELS: tuple[str, ...] = (
+    'holding', 'bookkeeping', 'context', 'overreach', 'misbound', 'unjudgeable',
+)
+"""The pre-registered vocabulary; definitions in design.md §2."""
+
+EdgeKey = tuple[str, str]
+"""``(graph, edge_uuid)``."""
+
+
+class VerdictError(ValueError):
+    """A verdict file the report must not be built from."""
+
+    def __init__(self, message: str, edge_uuids: Iterable[str] = ()) -> None:
+        super().__init__(message)
+        self.edge_uuids: tuple[str, ...] = tuple(sorted(set(edge_uuids)))
+
+
+class MalformedVerdicts(VerdictError):
+    pass
+
+
+class SampleMismatch(VerdictError):
+    pass
+
+
+class UnknownLabel(VerdictError):
+    pass
+
+
+class MissingRationale(VerdictError):
+    pass
+
+
+class DuplicateVerdict(VerdictError):
+    pass
+
+
+class OutOfSampleVerdict(VerdictError):
+    pass
+
+
+class MissingVerdicts(VerdictError):
+    pass
+
+
+@dataclass(frozen=True)
+class Verdict:
+    graph: str
+    episode_uuid: str
+    edge_uuid: str
+    fact: str
+    label: str
+    rationale: str
+
+    @property
+    def key(self) -> EdgeKey:
+        return (self.graph, self.edge_uuid)
+
+    def sort_key(self) -> tuple[str, str, str]:
+        return (self.graph, self.episode_uuid, self.edge_uuid)
+
+    def to_dict(self) -> dict[str, str]:
+        return {name: getattr(self, name) for name in _VERDICT_FIELDS}
+
+
+_VERDICT_FIELDS = ('graph', 'episode_uuid', 'edge_uuid', 'fact', 'label', 'rationale')
+
+
+@dataclass(frozen=True)
+class VerdictSet:
+    definition: SampleDefinition
+    verdicts: tuple[Verdict, ...]
+    stale: tuple[Verdict, ...]
+    """Verdicts whose edge no longer exists (merged or deleted): counted, never rated."""
+
+    @property
+    def by_edge(self) -> Mapping[EdgeKey, str]:
+        return MappingProxyType({v.key: v.label for v in self.verdicts})
+
+    def to_dict(self) -> dict[str, Any]:
+        every = sorted(self.verdicts + self.stale, key=Verdict.sort_key)
+        return {'sample': self.definition.to_dict(), 'verdicts': [v.to_dict() for v in every]}
+
+
+def _parse_definition(raw: Any) -> SampleDefinition:
+    try:
+        return SampleDefinition.from_dict(raw)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise MalformedVerdicts(f'the sample block is not a SampleDefinition: {exc}') from exc
+
+
+def _parse_verdict(raw: Any) -> Verdict:
+    if not isinstance(raw, Mapping) or not all(
+        isinstance(raw.get(name), str) for name in _VERDICT_FIELDS
+    ):
+        raise MalformedVerdicts(f'a verdict must carry string fields {_VERDICT_FIELDS}: {raw!r}')
+    return Verdict(**{name: raw[name] for name in _VERDICT_FIELDS})
+
+
+def _reject(error: type[VerdictError], offenders: list[Verdict], problem: str) -> None:
+    if offenders:
+        uuids = [v.edge_uuid for v in offenders]
+        raise error(f'{len(set(uuids))} verdict(s) {problem}: {sorted(set(uuids))}', uuids)
+
+
+def load_verdicts(
+    obj: Any,
+    *,
+    expected_edges: Mapping[EdgeKey, str],
+    existing_edges: Iterable[EdgeKey],
+    definition: SampleDefinition,
+) -> VerdictSet:
+    """Validate a parsed verdict file against the re-derived sample.
+
+    *expected_edges* maps each sampled minted edge to its episode uuid;
+    *existing_edges* is every edge the graph still holds.
+    """
+    if not isinstance(obj, Mapping) or not isinstance(obj.get('verdicts'), list):
+        raise MalformedVerdicts("a verdict file is {'sample': {...}, 'verdicts': [...]}")
+    if _parse_definition(obj.get('sample')) != definition:
+        raise SampleMismatch(
+            f'the file was adjudicated under {obj["sample"]!r}, not {definition.to_dict()!r}'
+        )
+    verdicts = [_parse_verdict(raw) for raw in obj['verdicts']]
+    _reject(UnknownLabel, [v for v in verdicts if v.label not in LABELS], f'outside {LABELS}')
+    _reject(MissingRationale, [v for v in verdicts if not v.rationale.strip()], 'lack a rationale')
+    judgements = Counter(v.key for v in verdicts)
+    _reject(DuplicateVerdict, [v for v in verdicts if judgements[v.key] > 1], 'judge one edge twice')
+
+    existing = set(existing_edges)
+    stale = [v for v in verdicts if v.key not in expected_edges and v.key not in existing]
+    in_sample = [v for v in verdicts if expected_edges.get(v.key) == v.episode_uuid]
+    stray = [v for v in verdicts if v not in stale and v not in in_sample]
+    _reject(OutOfSampleVerdict, stray, 'judge an edge the sample did not offer')
+    judged = {v.key for v in in_sample}
+    missing = [edge_uuid for graph, edge_uuid in expected_edges if (graph, edge_uuid) not in judged]
+    if missing:
+        raise MissingVerdicts(f'{len(missing)} sampled edge(s) have no verdict', missing)
+    return VerdictSet(
+        definition=definition,
+        verdicts=tuple(sorted(in_sample, key=Verdict.sort_key)),
+        stale=tuple(sorted(stale, key=Verdict.sort_key)),
+    )
