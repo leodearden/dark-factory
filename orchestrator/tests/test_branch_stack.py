@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 
 from orchestrator.branch_stack import (
     StackBaseLedger,
@@ -106,7 +107,7 @@ class Stacked:
         return self.git_ops.worktree_base / 'P'
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def stacked(tmp_path: Path) -> Stacked:
     repo = tmp_path / 'repo'
     repo.mkdir()
@@ -139,6 +140,7 @@ async def _cut(s: Stacked, *, tip: str, base: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestStackBaseLedger:
     async def test_record_then_base_of_round_trips(self, stacked: Stacked) -> None:
         ledger = StackBaseLedger(stacked.repo, _run)
@@ -187,6 +189,7 @@ class TestStackBaseLedger:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestForeignCommitCut:
     async def test_intact_stack_cuts_at_base_tip(self, stacked: Stacked) -> None:
         cut = await _cut(stacked, tip=stacked.m_tip, base=stacked.p_tip)
@@ -246,6 +249,7 @@ class TestForeignCommitCut:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 class TestBaseOwners:
     async def test_names_the_branch_pointing_at_the_base(
         self, stacked: Stacked,
