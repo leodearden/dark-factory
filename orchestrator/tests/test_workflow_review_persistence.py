@@ -19,7 +19,9 @@ These tests drive the loop with ``_execute_iterations`` /
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
 
@@ -28,6 +30,7 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.workflow import (
     TaskWorkflow,
     WorkflowOutcome,
@@ -403,3 +406,78 @@ class TestLifetimeCounters:
         wf._replan.assert_not_called()
         assert wf.artifacts is not None
         assert wf.artifacts.get_review_cycles_total() >= 1
+
+    async def test_cap_exit_suppresses_suggestions_settled_in_a_prior_amendment_round(
+        self, tmp_path: Path
+    ):
+        # A prior dispatch spent the amendment round and the review cycle, so
+        # this blocking review hits the cap exit with a re-flag of a concern
+        # that round settled.  The cap exit must suppress it exactly as the
+        # DONE exit would, rather than file it again and count it.
+        wf = _make_workflow(tmp_path=tmp_path, max_review_cycles=1)
+        wf.config.suppress_resettled_review_suggestions = True
+        assert wf.artifacts is not None
+        wf.artifacts.set_review_counters(amendment_rounds_total=1, review_cycles_total=1)
+        settled = {
+            'severity': 'suggestion',
+            'location': 'src/foo/helpers.py:3',
+            'category': 'naming',
+            'description': 'helper name hides its side effect',
+            'suggested_fix': 'rename helper',
+        }
+        archive = wf.artifacts.root / 'reviews-amend-1'
+        archive.mkdir()
+        (archive / 'analyst.json').write_text(
+            json.dumps({'verdict': 'ISSUES_FOUND', 'issues': [settled]})
+        )
+        reflag = {
+            **settled,
+            'reviewer': 'analyst',
+            'description': 'helper is still named as if it were pure',
+        }
+        fresh = {
+            'reviewer': 'analyst',
+            'severity': 'suggestion',
+            'location': 'src/foo/batch.py:9',
+            'category': 'coverage',
+            'description': 'no test covers the empty batch',
+            'suggested_fix': 'add an empty-batch test',
+        }
+        wf._review = AsyncMock(
+            return_value=ReviewAggregation(
+                has_blocking_issues=True,
+                blocking_issues=[{
+                    'reviewer': 'analyst',
+                    'category': 'bug',
+                    'description': 'boom',
+                }],
+                suggestions=[reflag, fresh],
+                reviews={'analyst': {}},
+            )
+        )
+        wf._invoke = AsyncMock(
+            return_value=SimpleNamespace(
+                success=True,
+                timed_out=False,
+                structured_output={'decisions': [
+                    {'index': 0, 'decision': 'settled'},
+                    {'index': 1, 'decision': 'not_settled'},
+                ]},
+            )
+        )
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-2749-1'
+        wf.escalation_queue = queue
+        route = cast(AsyncMock, wf._route_review_suggestions_to_curator)
+        route.return_value = SuggestionDisposition.CURATOR
+
+        outcome = await wf._execute_verify_review_loop()
+
+        assert outcome == WorkflowOutcome.ESCALATED
+        route.assert_awaited_once()
+        assert route.await_args is not None
+        assert route.await_args.args[0].suggestions == [fresh]
+        esc = queue.submit.call_args[0][0]
+        assert fresh['description'] in esc.detail
+        assert reflag['description'] not in esc.detail
+        assert '1 suggestion(s)' in esc.summary

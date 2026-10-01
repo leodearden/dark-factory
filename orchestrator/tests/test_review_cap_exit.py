@@ -281,3 +281,45 @@ async def test_blocking_then_done_reentry_reuses_item_keys(tmp_path: Path):
     run_2_b, run_2_c = (r4_key(body) for body in posted_bodies[2:])
     assert run_2_b == run_1_b
     assert run_2_c not in {run_1_a, run_1_b}
+
+
+async def test_post_amendment_cap_exit_applies_amendment_delta_scope(tmp_path: Path):
+    """After an amendment round the cap exit scopes to the amendment delta,
+    as the DONE exit does: out-of-delta suggestions go to the curator on
+    their own, and the escalation inlines (and counts) only the in-delta ones.
+    """
+    queue = MagicMock()
+    queue.make_id.return_value = f'esc-{TASK_ID}-1'
+    wf = _make_cap_workflow(
+        tmp_path, max_amendment_rounds=1, max_review_cycles=1, escalation_queue=queue,
+    )
+    s_in_scope = _sugg(1)
+    s_in_delta = {**_sugg(2), 'location': 'src/a.py:10'}
+    s_out_of_delta = {**_sugg(3), 'location': 'src/z.py:900'}
+    wf._suggestions_in_scope = lambda s: list(s)  # type: ignore[method-assign]
+    wf._amend = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    wf._commit_amendment_wip = AsyncMock()  # type: ignore[method-assign]
+    wf._get_head_commit = AsyncMock(return_value='pre-amend')  # type: ignore[method-assign]
+    wf._review = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            _non_blocking([s_in_scope]),
+            _blocking([s_in_delta, s_out_of_delta]),
+        ],
+    )
+    wf.git_ops.get_new_side_changed_line_ranges = AsyncMock(
+        return_value={'src/a.py': [(1, 50)]},
+    )
+    route = AsyncMock(return_value=SuggestionDisposition.CURATOR)
+    wf._route_review_suggestions_to_curator = route  # type: ignore[method-assign]
+
+    outcome = await wf._execute_verify_review_loop()
+
+    assert outcome == WorkflowOutcome.ESCALATED
+    assert [c.args[0].suggestions for c in route.await_args_list] == [
+        [s_out_of_delta],
+        [s_in_delta],
+    ]
+    esc = queue.submit.call_args[0][0]
+    assert s_in_delta['description'] in esc.detail
+    assert s_out_of_delta['description'] not in esc.detail
+    assert '1 suggestion(s)' in esc.summary
