@@ -2254,24 +2254,25 @@ _LIVE_ENTRY_RETRY = {
 }
 
 
-def _proj_raw() -> dict:
-    """A minimal build_per_project_merge_queue output for one project."""
+def _proj_raw(*roots: str) -> dict:
+    """A minimal build_per_project_merge_queue output for each root."""
     return {
-        _PROJ_ROOT: {
+        root: {
             'depth_timeseries': {'labels': [], 'values': []},
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
             'speculative': {},
             'train_events': [],
-        },
+        }
+        for root in roots or (_PROJ_ROOT,)
     }
 
 
-def _merge_queue_body(client, live_map: dict) -> dict:
+def _merge_queue_body(client, live_map: dict, raw: dict | None = None) -> dict:
     with (
         patch('dashboard.api.merge_queue.build_per_project_merge_queue',
-              new=AsyncMock(return_value=_proj_raw())),
+              new=AsyncMock(return_value=raw or _proj_raw())),
         patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
         patch('dashboard.api.merge_queue.fetch_live_merge_queues',
               new=AsyncMock(return_value=live_map)),
@@ -2355,9 +2356,33 @@ def test_merge_queue_failed_probe_serves_the_last_sample_stale(client, sampled_q
     assert datetime.fromisoformat(in_queue['as_of']) == sampled_queue
     assert 'connect refused' in in_queue['reason']
     assert proj['active'] == []
+    assert proj['live_probe_configured'] is True
     assert datetime.fromisoformat(in_queue['as_of']) <= (
         datetime.fromisoformat(body['served_at'])
     )
+
+
+def test_merge_queue_marks_a_project_with_no_configured_probe(client):
+    """One project unprobed, the other fresh: the payload says which is which.
+
+    A configured root may legitimately run no orchestrator, so it has no
+    escalation URL and no live probe. Its own in_queue is unknown and says
+    why, and ``live_probe_configured`` is false, which is what keeps it out
+    of the fleet total merge_queue.js sums (merge_queue.test.mjs pins that
+    half). The probed project beside it reads exactly as it would alone.
+    """
+    raw = _proj_raw(_PROJ_ROOT, '/home/test/proj-b')
+    live_map = {_PROJ_LABEL: {'reachable': True, 'entries': [_LIVE_ENTRY_4H]}}
+
+    body = _merge_queue_body(client, live_map, raw)
+
+    probed, unprobed = body['MERGE_QUEUE'][_PROJ_LABEL], body['MERGE_QUEUE']['proj-b']
+    assert probed['live_probe_configured'] is True
+    assert (probed['in_queue']['state'], probed['in_queue']['value']) == ('fresh', 1)
+    assert unprobed['live_probe_configured'] is False
+    assert unprobed['in_queue']['state'] == 'unknown'
+    assert 'proj-b' in unprobed['in_queue']['reason']
+    assert unprobed['active'] == []
 
 
 def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):

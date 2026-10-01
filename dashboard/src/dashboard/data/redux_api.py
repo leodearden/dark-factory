@@ -461,7 +461,10 @@ def shape_merge_queue(
     and ``without_duration`` sum to the outcomes total), ``recent``,
     ``recent_total`` (how many merges the window holds; ``recent`` is capped),
     ``speculative``, ``active`` (the live probe's entries), ``in_queue``,
-    ``active_spark``, ``halt``, ``train_events``.
+    ``live_probe_configured`` (false keeps the project out of the client's
+    multi-project in-queue totals), ``active_spark``, ``halt``,
+    ``train_events``. ``in_queue`` and ``live_probe_configured`` are required:
+    the route resolves both for every project.
 
     ``in_queue`` and every ``recent``/``active`` row's ``title`` are Datums the
     route resolved, each aged to *served_at*, validated against it and
@@ -508,6 +511,7 @@ def shape_merge_queue(
             'speculative': dict(data.get('speculative') or {}),
             'active': _titled(data.get('active'), f'{label}.active'),
             'in_queue': _served(data.get('in_queue'), f'{label}.in_queue'),
+            'live_probe_configured': bool(data['live_probe_configured']),
             'active_spark': {
                 'labels': list(spark.get('labels') or []),
                 'values': list(spark.get('values') or []),

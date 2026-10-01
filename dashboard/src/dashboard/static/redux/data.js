@@ -175,7 +175,8 @@ window.DF_DATA = {
   },
   // MERGE_QUEUE: {project_label: {depth, outcomes, latency: {p50, p95, p99,
   //   mean_ms, with_duration, without_duration}, recent, recent_total,
-  //   speculative, active, in_queue: Datum, active_spark, halt, train_events:
+  //   speculative, active, in_queue: Datum, live_probe_configured, active_spark,
+  //   halt, train_events:
   //   [{event_type, task_id, run_id, timestamp, data: {train_id,
   //   member_task_ids, ...event-specific keys}}]}}; every recent and active
   //   row's title is a Datum. The payload's top-level served_at is the receipt

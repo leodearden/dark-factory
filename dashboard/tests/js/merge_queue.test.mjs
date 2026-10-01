@@ -60,7 +60,19 @@ function inQueue(state, value, overrides) {
 
 // One MERGE_QUEUE[label] entry: the keys these readers touch.
 function entryWith(served, spark) {
-  return { in_queue: served, active: [], active_spark: spark || { labels: [], values: [] } };
+  return {
+    in_queue: served,
+    live_probe_configured: true,
+    active: [],
+    active_spark: spark || { labels: [], values: [] },
+  };
+}
+
+// A project the server has no live probe for: data/merge_queue.py::resolve_active
+// serves it unknown, with live_probe_configured false.
+function unprobedEntry(label, spark) {
+  const reason = 'no live get_merge_queue probe is configured for ' + label;
+  return { ...entryWith(inQueue('unknown', null, { reason }), spark), live_probe_configured: false };
 }
 
 function mqData(entries, receipt = RECEIPT) {
@@ -177,6 +189,34 @@ test('inQueueOver: one unknown project makes the total unknown, and names it', (
   assert.match(total.reason, /\bb: /);
 });
 
+test('inQueueOver: a project with no live probe configured is outside the total, not a hole in it', () => {
+  // A configured root may run no orchestrator at all. It has no queue this
+  // dashboard can read, now or ever, so it must not blank every other
+  // project's count for good. Contrast the case above: a PROBED project that
+  // cannot be read is still a hole.
+  const data = mqData({ ...TWO_FRESH().MERGE_QUEUE, c: unprobedEntry('c') });
+
+  const total = inQueueOver(data, null);
+
+  assert.equal(total.state, 'fresh');
+  assert.equal(total.value, 3);
+  assert.equal(inQueueOver(data, ['a', 'c']).value, 2);
+});
+
+test('inQueueOver: a scope of only unprobed projects has no total, and says why', () => {
+  const total = inQueueOver(mqData({ c: unprobedEntry('c') }), null);
+
+  assert.equal(total.state, 'unknown');
+  assert.match(total.reason, /probe/);
+});
+
+test('projectInQueue: an unprobed project still reads its own served datum', () => {
+  const served = projectInQueue(mqData({ c: unprobedEntry('c') }), 'c');
+
+  assert.equal(served.state, 'unknown');
+  assert.match(served.reason, /no live get_merge_queue probe is configured for c/);
+});
+
 test('inQueueOver: before the first payload, the total is not yet fetched', () => {
   const total = inQueueOver(mqData({}, null), null);
   assert.equal(total.state, 'unknown');
@@ -199,6 +239,15 @@ test('inQueueHistory: several projects sum label-wise, only where every one samp
   });
   assert.deepEqual(inQueueHistory(data, ['a', 'b']), [5, 3]);
   assert.deepEqual(inQueueHistory(data, null), [5, 3]);
+});
+
+test('inQueueHistory: an unprobed project is outside the spark too', () => {
+  const data = mqData({
+    a: entryWith(inQueue('fresh', 2), { labels: [T1, T2], values: [4, 3] }),
+    c: unprobedEntry('c'),
+  });
+  assert.deepEqual(inQueueHistory(data, null), [4, 3]);
+  assert.deepEqual(inQueueHistory(data, ['a', 'c']), [4, 3]);
 });
 
 test('inQueueHistory: a project in scope with no samples leaves no shared label', () => {

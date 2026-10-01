@@ -874,11 +874,15 @@ class ActiveQueue:
     """One project's "In queue now": the count as a Datum, and the live entries.
 
     ``entries`` is what the probe returned and nothing else — empty whenever
-    the count is not a live reading.
+    the count is not a live reading. ``probe_configured`` is false for a
+    project no live ``get_merge_queue`` probe exists for: it has no queue the
+    dashboard can read, so it is outside every multi-project in-queue total
+    rather than a permanent hole in one.
     """
 
     in_queue: Datum[int]
     entries: list[dict]
+    probe_configured: bool
 
 
 def resolve_active(
@@ -890,24 +894,34 @@ def resolve_active(
 ) -> ActiveQueue:
     """*label*'s queue: the live probe, else its own history's last sample.
 
-    A reachable probe is a ``fresh`` count at *now*, the probe instant. A
-    failed or absent probe serves the last ``merge_snapshots`` sample in
-    *history* (``get_merge_active_series``, which records this same probe)
-    ``stale`` at the sample's own instant, with the probe's error verbatim as
-    the reason. With no parseable sample the count is ``unknown``.
+    *live_map* holds one answer per configured probe
+    (:func:`fetch_live_merge_queues`). A reachable probe is a ``fresh`` count
+    at *now*, the probe instant. A failed probe serves the last
+    ``merge_snapshots`` sample in *history* (``get_merge_active_series``,
+    which records this same probe) ``stale`` at the sample's own instant, with
+    the probe's error verbatim as the reason. With no parseable sample the
+    count is ``unknown``. A label with no probe configured is ``unknown`` and
+    reads no history: the sampler records only probes, so it has none.
     """
     live = live_map.get(label)
-    if live is not None and live.get('reachable'):
+    if live is None:
+        return ActiveQueue(
+            unknown_datum(
+                f'no live get_merge_queue probe is configured for {label}',
+                LIVE_QUEUE_FRESHNESS_BOUND_SECONDS,
+            ),
+            [],
+            probe_configured=False,
+        )
+    if live.get('reachable'):
         entries = list(live.get('entries') or [])
         return ActiveQueue(
             Datum(len(entries), now, DatumState.FRESH, None, LIVE_QUEUE_FRESHNESS_BOUND_SECONDS),
             entries,
+            probe_configured=True,
         )
-    why = (
-        f'no live get_merge_queue probe exists for {label}' if live is None
-        else f'the live get_merge_queue probe for {label} failed: {live.get("error")}'
-    )
-    return ActiveQueue(_last_sample(history, why), [])
+    why = f'the live get_merge_queue probe for {label} failed: {live.get("error")}'
+    return ActiveQueue(_last_sample(history, why), [], probe_configured=True)
 
 
 def _last_sample(history: Mapping[str, Sequence[Any]], why: str) -> Datum[int]:

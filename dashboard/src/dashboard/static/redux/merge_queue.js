@@ -20,6 +20,12 @@
 // stale and saying why. The only envelopes built here are datum.js's own: a
 // receipt stamp, an unknown placeholder, and a combined total in which a hole
 // anywhere is a hole in the sum.
+//
+// A TOTAL'S SCOPE IS THE PROBED PROJECTS. A project the server serves with
+// `live_probe_configured: false` has no queue this dashboard can read (a
+// configured root may run no orchestrator), so it is outside every total and
+// spark rather than a hole that blanks them for good. A probed project that
+// cannot be read IS a hole: its own datum says why.
 
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
@@ -43,9 +49,14 @@ function queueEntries(data) {
   return data.MERGE_QUEUE || {};
 }
 
-// `projects` null means every project the payload carries.
+// `projects` null means every project the payload carries. A project the
+// payload does not carry stays in scope, so a total over it is a hole.
 function queueScope(data, projects) {
-  return projects === null ? Object.keys(queueEntries(data)) : projects;
+  const entries = queueEntries(data);
+  return (projects === null ? Object.keys(entries) : projects).filter(project => {
+    const entry = entries[project];
+    return !entry || entry.live_probe_configured !== false;
+  });
 }
 
 function projectInQueue(data, project) {
@@ -61,7 +72,7 @@ function inQueueOver(data, projects) {
   return combineInQueueDatums(
     queueScope(data, projects).map(project => [project, projectInQueue(data, project)]),
     counts => counts.reduce((sum, n) => sum + n, 0),
-    'no project in scope',
+    'no project in scope has a live get_merge_queue probe configured',
   );
 }
 

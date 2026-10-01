@@ -96,6 +96,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
             'recent': enrich_merges_with_titles(data['recent'], pid, lookup),
             'active': enrich_merges_with_titles(queues[pid].entries, pid, lookup),
             'in_queue': queues[pid].in_queue,
+            'live_probe_configured': queues[pid].probe_configured,
             # ι=1894: the live metrics the probe carried, stashed for shaping
             'live_metrics': live_map.get(project_label(pid), {}).get('metrics'),
         }

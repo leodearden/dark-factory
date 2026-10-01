@@ -568,7 +568,10 @@ def test_shape_recon_no_verdict_returns_none():
 MQ_SERVED_AT = datetime(2026, 10, 1, 12, 0, 30, tzinfo=UTC)
 """The serving instant every shape_merge_queue case ages and validates against."""
 
-_MQ_MEASURED_QUEUE = {'in_queue': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30)}
+_MQ_MEASURED_QUEUE = {
+    'in_queue': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30),
+    'live_probe_configured': True,
+}
 """The queue fields the route resolves for every project: here, a measured empty queue."""
 
 
@@ -2124,6 +2127,10 @@ class TestShapeMergeQueueServedDatums:
                    'with_duration': 3, 'without_duration': 2}
 
         assert _shaped(latency=latency)['latency'] == latency
+
+    @pytest.mark.parametrize('configured', [True, False])
+    def test_live_probe_configured_is_carried_verbatim(self, configured):
+        assert _shaped(live_probe_configured=configured)['live_probe_configured'] is configured
 
     def test_there_is_no_active_approximate_key(self):
         assert 'active_approximate' not in _shaped(active_approximate=True)

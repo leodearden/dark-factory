@@ -2152,6 +2152,7 @@ class TestResolveActive:
         assert queue.in_queue.state is DatumState.FRESH
         assert (queue.in_queue.value, queue.in_queue.as_of) == (2, QUEUE_NOW)
         assert queue.entries == entries
+        assert queue.probe_configured is True
         validate_datum(queue.in_queue, QUEUE_NOW)
 
     def test_a_reachable_empty_queue_is_an_authoritative_zero(self):
@@ -2172,17 +2173,24 @@ class TestResolveActive:
         assert queue.in_queue.reason is not None
         assert 'connect refused' in queue.in_queue.reason
         assert queue.entries == []
+        assert queue.probe_configured is True, 'a failed probe is still a configured one'
         validate_datum(queue.in_queue, QUEUE_NOW)
 
-    def test_no_probe_for_the_label_serves_the_last_sample_stale(self):
+    def test_a_label_with_no_configured_probe_is_unknown_and_says_so(self):
+        """No probe means no queue this dashboard reads, so no history to fall back on.
+
+        The sampler records only the live probe, so any sample under such a
+        project predates it. ``probe_configured`` is false, which keeps the
+        project out of every multi-project total instead of a permanent hole.
+        """
         queue = resolve_active('myproj', {}, _HISTORY, now=QUEUE_NOW)
 
-        assert queue.in_queue.state is DatumState.STALE
-        assert (queue.in_queue.value, queue.in_queue.as_of) == (1, _SAMPLED_AT)
+        assert queue.in_queue.state is DatumState.UNKNOWN
         assert queue.in_queue.reason is not None
         assert 'myproj' in queue.in_queue.reason
-        assert 'probe' in queue.in_queue.reason
+        assert 'configured' in queue.in_queue.reason
         assert queue.entries == []
+        assert queue.probe_configured is False
         validate_datum(queue.in_queue, QUEUE_NOW)
 
     def test_a_failed_probe_with_no_sample_is_unknown(self):
