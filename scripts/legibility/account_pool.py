@@ -17,14 +17,14 @@ while six live accounts sat idle — and the deferral was indistinguishable
 from a genuinely exhausted fleet.
 
 THE NARROW INTERFACE IT CONSUMES, and the only reason it can live outside
-``shared``: seven gate members, all synchronous — ``try_lease`` (the sync,
+``shared``: gate members that are all synchronous — ``try_lease`` (the sync,
 non-blocking selection knob added for exactly this caller),
-``account_count`` and ``active_account_name`` (how the exhaustion reason
-says WHICH exhaustion), and
-``detect_cap_hit`` / ``confirm_account_ok`` / ``on_agent_complete`` /
-``release_probe_slot`` (reached through the real ``InvokeSlot``, whose
-constructor is a plain ``def``; ``UsageGate.invoke_slot`` is async only
-because it awaits ``before_invoke``). No event loop is created or needed.
+``account_count``, ``active_account_name`` and ``auth_failed_account_names``
+(how the exhaustion reason says WHICH exhaustion), ``release_probe_slot``,
+and the settle surface reached through the real ``InvokeSlot`` —
+``detect_cap_hit`` / ``report`` / ``confirm`` — whose constructor is a plain
+``def`` (``UsageGate.invoke_slot`` is async only because it awaits
+``before_invoke``). No event loop is created or needed.
 
 WHY IT IS ITS OWN FILE rather than code in coder.py or nightly.py.
 ``coder.py``'s docstring makes its dependency-light character a
@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -68,6 +69,7 @@ from dotenv import load_dotenv  # noqa: E402
 # by its bare name) must reach it by this same spelling.
 from legibility import coder  # noqa: E402
 from shared.config_models import UsageCapConfig  # noqa: E402
+from shared.invocation_outcome import classify_text_auth_rejection  # noqa: E402
 from shared.usage_gate import InvokeSlot, UsageGate  # noqa: E402
 
 logger = logging.getLogger("legibility.account_pool")
@@ -229,30 +231,50 @@ def _exhaustion_reason(gate, tried) -> str:
     )
 
 
-_ROUTE_NONZERO_EXIT = "the CLI exited non-zero with a banner the gate confirmed"
-_ROUTE_ZERO_EXIT = "the CLI exited 0 with a banner instead of a verdict"
-"""The two ways the CLI declines, named so the journal can tell them apart.
+@dataclass(frozen=True)
+class _Rotation:
+    """Why an account did not complete a digest: what the gate now holds
+    against it (*recorded*) and how the CLI declined (*route*).
 
-Structured constants rather than a phrase assembled at each call site
-(heuristic 12): "which route rotated" is a two-valued fact about the run, and
-the only reason it is ever rendered as text is that a journal line is the
-medium. The task record's 2026-09-19 measurement could count the non-zero
-route (46 firings on one night) but could not establish whether the exit-0
-route had ever fired, because both arms said the same thing — so these
-spellings are what make the route greppable.
-"""
+    Structured rather than a phrase assembled at each call site (heuristic
+    12): "which route rotated" is a fact about the run, and the only reason it
+    is ever rendered as text is that a journal line is the medium. The task
+    record's 2026-09-19 measurement could count the non-zero route (46
+    firings on one night) but could not establish whether the exit-0 route
+    had ever fired, because both arms said the same thing — so these
+    spellings are what make each route greppable. *recorded* varies because
+    an auth rejection is not a cap (task 5947).
+    """
+
+    recorded: str
+    route: str
 
 
-def _log_rotation(slot, route) -> None:
+_CAP_SIGNAL = "a cap signal"
+_ROUTE_NONZERO_EXIT = _Rotation(
+    _CAP_SIGNAL, "the CLI exited non-zero with a banner the gate confirmed",
+)
+_ROUTE_ZERO_EXIT = _Rotation(
+    _CAP_SIGNAL, "the CLI exited 0 with a banner instead of a verdict",
+)
+
+
+def _auth_rejection_route(status: int) -> _Rotation:
+    return _Rotation(
+        f"an auth failure (HTTP {status})",
+        "the CLI rejected this account's credentials",
+    )
+
+
+def _log_rotation(slot, rotation: _Rotation) -> None:
     """Record that *slot*'s account did not complete this digest, naming
-    *route*.
+    *rotation*'s route and what the gate recorded.
 
-    ONE helper called from both arms, not two ``logger.info`` calls, so the
-    shared half of the wording cannot drift between the routes (heuristic 11)
-    while the route clause remains the only thing that differs. The sentence
-    itself is unchanged from the single route-blind line this replaces, so an
-    operator's existing greps and the 2026-09-19 measurement's baseline keep
-    working.
+    ONE helper called from every arm, not one ``logger.info`` per arm, so the
+    shared half of the wording cannot drift between the routes (heuristic 11).
+    The two cap-route lines are byte-identical to the single route-blind line
+    this replaced, so an operator's existing greps and the 2026-09-19
+    measurement's baseline keep working.
 
     INFO, because a rotation is normal operating weather — the pool exists to
     absorb exactly this — and that is how the line it replaces already treated
@@ -260,10 +282,36 @@ def _log_rotation(slot, route) -> None:
     ``_exhaustion_reason`` reports on a raised ``CoderCapExhausted``.
     """
     logger.info(
-        "account %s did not complete this digest and the gate recorded a cap "
-        "signal against it (route: %s) — retrying this digest on the next "
-        "account in the pool", slot.account_name, route,
+        "account %s did not complete this digest and the gate recorded %s "
+        "against it (route: %s) — retrying this digest on the next account "
+        "in the pool", slot.account_name, rotation.recorded, rotation.route,
     )
+
+
+def _account_declined(slot, exc) -> bool:
+    """Did *slot*'s account decline this failed invocation in a way the gate
+    has now recorded? True means rotate; False means *exc* is an ordinary
+    failure the caller re-raises.
+
+    Auth first, mirroring ``classify_invocation``'s AuthFailed-before-CapHit
+    precedence. A stream that opens with a measured rejection is reported
+    through ``InvokeSlot.report``, which moves the account to AUTH_FAILED;
+    with no event loop no re-probe can start, so it stays out for the rest of
+    the run. Otherwise only a ``CoderCapExhausted`` — the loose per-digest
+    matcher fired — is put to the gate's STRICT detector, which settles the
+    slot on any True verdict. Which transition that took (a CapHit caps, a
+    NearCap only annotates) is the gate's business, which is why the caller's
+    retry is bounded by ``tried`` rather than by an assumption about it.
+    """
+    outcome = classify_text_auth_rejection(exc.stdout, exc.stderr)
+    if outcome is not None:
+        slot.report(outcome)
+        _log_rotation(slot, _auth_rejection_route(outcome.status))
+        return True
+    if isinstance(exc, coder.CoderCapExhausted) and slot.detect_cap_hit(exc.stderr, exc.stdout):
+        _log_rotation(slot, _ROUTE_NONZERO_EXIT)
+        return True
+    return False
 
 
 def _banner_instead_of_verdict(slot, reply) -> bool:
@@ -359,19 +407,26 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     next lease, and is bounded the same way. Which route the CLI takes is
     the CLI's choice and not the pool's, so rotating on one and confirming
     on the other left one bannering account able to lose a whole night.
-    ``_log_rotation`` names which of the two fired, so the journal can count
+    ``_log_rotation`` names which route fired, so the journal can count
     them separately.
+
+    AN AUTH REJECTION ROTATES TOO (task 5947), as a third route. A failure
+    whose stream opens with a measured text-mode 401/403 rejection
+    (``shared.invocation_outcome.classify_text_auth_rejection``) is reported
+    through ``InvokeSlot.report``; the gate marks the account AUTH_FAILED for
+    the rest of the run, and the same prompt moves to the next lease, bounded
+    by the same ``tried``. ``_account_declined`` holds the arms' ordering.
 
     TERMINATION is bounded by the caller's ``tried`` set, passed as
     ``exclude=``, not by the gate's cap transitions: a near-cap verdict
     only annotates an account, so re-asking the gate could return it
     forever. ``tried`` grows by one per pass, so ``try_lease`` returns None
     within ``account_count`` passes. Do not re-classify streams here to
-    decide anything the gate decides (heuristic 11).
+    decide anything the gate or ``shared``'s classifiers decide (heuristic 11).
 
     The ``finally`` calls ``release_probe_slot`` on every exit path,
-    unconditionally (a guarded no-op when ``confirm`` or ``detect_cap_hit``
-    already released it): a leaked PROBE_IN_FLIGHT claim makes that account
+    unconditionally (a guarded no-op when ``confirm``, ``report`` or
+    ``detect_cap_hit`` already released it): a leaked PROBE_IN_FLIGHT claim makes that account
     inadmissible for the rest of the process.
     """
 
@@ -391,17 +446,9 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
             slot = InvokeSlot(gate, lease)
             try:
                 reply = invoke(prompt, model, oauth_token=slot.token)
-            except coder.CoderCapExhausted as exc:
-                # The loose per-digest gate fired. Ask the STRICT detector
-                # what the GATE makes of it; on any True verdict it settles
-                # the slot and releases the probe claim. WHICH transition it
-                # took is the gate's business and not knowable from here — a
-                # CapHit caps the account, a NearCap only annotates it — which
-                # is exactly why the retry is bounded by `tried` rather than
-                # by an assumption about what just happened.
-                if not slot.detect_cap_hit(exc.stderr, exc.stdout):
+            except coder.CoderInvocationError as exc:
+                if not _account_declined(slot, exc):
                     raise
-                _log_rotation(slot, _ROUTE_NONZERO_EXIT)
             else:
                 # THE OTHER CAP ROUTE. The CLI can decline by PRINTING its
                 # banner and exiting 0, so a cap arrives as a RETURNED reply
