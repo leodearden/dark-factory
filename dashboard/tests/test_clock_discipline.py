@@ -43,6 +43,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 _EXEMPT_MARKER = '# clock-exempt:'
 _DEFERRED_CONSOLIDATION_TAG = f'{_EXEMPT_MARKER} deferred-consolidation'
 
@@ -153,6 +155,121 @@ def test_aliased_module_import_fires():
 
 
 # ---------------------------------------------------------------------------
+# SQL-side datetime() guard: checker unit tests (fixtures, not the real tree)
+# ---------------------------------------------------------------------------
+
+# Implicit concatenation folds these adjacent fragments into ONE literal
+# (starting on line 4) that calls datetime(), while no physical line does:
+# the split falls between `date` and `time(`.
+_FOLDED_SQL_SOURCE = '''
+def q():
+    return (
+        "SELECT project_id FROM task_results "
+        "WHERE completed_at >= date"
+        "time('now', ? || ' days')"
+    )
+'''
+
+_SINGLE_QUOTED_NOW_SOURCE = '''
+def q():
+    return "SELECT 1 FROM t WHERE completed_at >= datetime('now', ? || ' days')"
+'''
+
+_DOUBLE_QUOTED_NOW_SOURCE = """
+def q():
+    return 'SELECT 1 FROM t WHERE completed_at >= datetime("now", ? || " days")'
+"""
+
+_COLUMN_ANCHORED_SOURCE = '''
+def q():
+    return "SELECT project_id, datetime(MAX(completed_at), '-7 days') AS cutoff FROM task_results GROUP BY project_id"
+'''
+
+_UPPERCASE_SOURCE = '''
+def q():
+    return "SELECT 1 FROM t WHERE completed_at >= DATETIME('now', '-7 days')"
+'''
+
+_PROSE_DOCSTRING_SOURCE = '''
+"""Module prose explaining why datetime('now', ...) must not reach SQLite."""
+
+
+def q():
+    """Function prose naming datetime("now", ...) the same way."""
+    return 'SELECT 1'
+'''
+
+_PROSE_COMMENT_SOURCE = '''
+# Comment naming datetime('now', ? || ' days') in prose.
+def q():
+    return 'SELECT 1'  # and datetime("now", ...) named again here
+'''
+
+_BUCKETING_SOURCE = '''
+def q():
+    return (
+        "SELECT strftime('%Y-%m-%dT%H:00', completed_at) AS hour, "
+        "date(completed_at) AS day FROM task_results"
+    )
+'''
+
+_PYTHON_DATETIME_CONSTRUCTOR_SOURCE = 'epoch = datetime(1970, 1, 1, tzinfo=UTC)\n'
+
+
+def test_sql_datetime_folded_literal_fires():
+    """A folded multi-line SQL literal is flagged at the line its concatenation starts."""
+    violations = find_sql_datetime_violations(_FOLDED_SQL_SOURCE)
+
+    assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
+    assert violations[0][0] == 4
+    assert "datetime('now'" in violations[0][1], (
+        f'expected the excerpt to carry the folded literal value, got {violations[0][1]!r}'
+    )
+    assert not any(_SQL_DATETIME_CALL.search(line) for line in _FOLDED_SQL_SOURCE.splitlines()), (
+        'fixture is no longer a folded literal: some physical line now matches '
+        'on its own, so it would no longer discriminate an AST-literal report '
+        'from a physical-line re-scan'
+    )
+
+
+@pytest.mark.parametrize(
+    'source',
+    [
+        pytest.param(_SINGLE_QUOTED_NOW_SOURCE, id='single-quoted-now'),
+        pytest.param(_DOUBLE_QUOTED_NOW_SOURCE, id='double-quoted-now'),
+        pytest.param(_COLUMN_ANCHORED_SOURCE, id='column-anchored'),
+        pytest.param(_UPPERCASE_SOURCE, id='uppercase'),
+    ],
+)
+def test_sql_datetime_single_line_literal_fires(source: str):
+    """Every spelling of a one-line SQL datetime() call is flagged at its line."""
+    violations = find_sql_datetime_violations(source)
+
+    assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
+    assert violations[0][0] == 3
+
+
+def test_sql_datetime_docstring_mention_ignored():
+    """Module and function docstrings naming datetime() in prose are not queries."""
+    assert find_sql_datetime_violations(_PROSE_DOCSTRING_SOURCE) == []
+
+
+def test_sql_datetime_comment_mention_ignored():
+    """A `#` comment naming datetime() is not a query."""
+    assert find_sql_datetime_violations(_PROSE_COMMENT_SOURCE) == []
+
+
+def test_sql_date_and_strftime_bucketing_ignored():
+    """The data layer's `date()` / `strftime()` bucket labels are not datetime() calls."""
+    assert find_sql_datetime_violations(_BUCKETING_SOURCE) == []
+
+
+def test_python_datetime_constructor_ignored():
+    """A Python `datetime(...)` constructor is a Call node, not a SQL string literal."""
+    assert find_sql_datetime_violations(_PYTHON_DATETIME_CONSTRUCTOR_SOURCE) == []
+
+
+# ---------------------------------------------------------------------------
 # Acceptance tests: the real tree (data layer + composition layer)
 # ---------------------------------------------------------------------------
 
@@ -259,4 +376,33 @@ def test_no_bare_clock_reads_in_extracted_route_and_loop_modules():
     assert not violations, (
         'Bare datetime.now() reads found in the modules extracted from '
         'app.py (missing a `# clock-exempt:` tag):\n' + '\n'.join(violations)
+    )
+
+
+def test_no_sql_datetime_calls_in_dashboard_modules():
+    """No scanned module hands SQLite a `datetime()` call to compare against."""
+    scanned = (
+        sorted(_DATA_DIR.glob('*.py'))
+        + [_APP_PY]
+        + sorted(_API_DIR.glob('*.py'))
+        + [_LOOPS_PY]
+    )
+
+    assert _DATA_DIR / 'performance.py' in scanned, (
+        f'{_DATA_DIR / "performance.py"} is missing from the scan list; a check '
+        'that quietly stops checking is indistinguishable from a passing one'
+    )
+
+    violations: list[str] = []
+    for path in scanned:
+        rel = path.relative_to(_DATA_DIR.parent.parent)
+        for lineno, excerpt in find_sql_datetime_violations(path.read_text()):
+            violations.append(f'{rel}:{lineno}: {excerpt}')
+
+    assert not violations, (
+        "SQL-side datetime() call(s) found. SQLite's datetime() renders "
+        "'YYYY-MM-DD HH:MM:SS' (space-separated, no UTC offset), so a lexical "
+        'TEXT comparison against an ISO-with-offset column is wrong on the '
+        'boundary day. Bind a Python-computed cutoff instead (see '
+        'dashboard.data.performance._cutoff):\n' + '\n'.join(violations)
     )
