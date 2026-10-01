@@ -871,8 +871,8 @@ never submit a second merge for a `task_id` that already has one in flight. The 
 
 When the human will be away for an extended period (hours to days) and cannot adjudicate 3b
 decisions, switch posture from "stall and ask" to "keep the pipeline moving, defer the judgement,
-and leave a clean trail." Confirm AFK mode with the human if you can; otherwise infer it from an
-explicit "I'll be away" or a long silence after one. Three behavioural shifts:
+and leave a clean trail." The posture needs no confirmation; "AFK by silence" below says when it
+switches on and off. Three behavioural shifts:
 
 1. **Defer, don't wedge.** For a 3b item (ambiguous AND consequential), stalling the whole queue for
    days helps no one. Where the decision can be safely *postponed* without baking anything in:
@@ -913,6 +913,31 @@ explicit "I'll be away" or a long silence after one. Three behavioural shifts:
    Decisions to the Cockpit Registry (C8)" below. If
    phone push is configured (`--ntfy-url` on the watcher command), a born-at-L2 `critical`/`urgent`
    still pushes immediately — those are the only items worth interrupting an AFK human for.
+
+### AFK by silence
+
+**On.** Either of two triggers switches AFK posture on, and neither needs a confirmation question:
+an explicit "I'll be away", at once; or 4 hours with no human turn. Leo is away for up to 48 hours,
+weekends included, without saying so, and no watcher session in 2026-08-22..09-23 entered AFK mode
+on the explicit trigger alone (Leo, 2026-09-25, task 5884).
+
+**Measuring the silence.** A human turn is a message Leo types. A watcher fire, a `CEILING` tick
+and a background sub-agent completion are not human turns. Note `date -u +%FT%TZ` at each human
+turn and compare against it at each wake. A quiet queue still wakes you once per slice (the
+Bash-tool timeout contract in "Starting the watcher"), so the switch lags the 4-hour mark by at
+most one slice.
+
+**What changes.** The three shifts above: defer, don't wedge; no unattended interactive terminals;
+a DecisionRecord and the brief instead of per-item pings. The 3b reminder cadence also stops.
+
+**What keeps running.** Pre-investigation sub-agents are not terminals. Keep launching the
+ownership and in-flight checks of "Investigate before you `record`" and the H1–H3 and H6 seats of
+"Disposition before briefing (H1–H6)", so items are ready to brief on return. A `/spawn` for a
+multi-turn conversation with Leo (see "Sub-agent or `/spawn`") waits for his return; meanwhile a
+sub-agent takes the item to "ready to discuss".
+
+**Off.** The next human turn ends AFK posture. That turn is a return: post the unprompted brief
+(see "When it runs") and say when AFK posture began.
 
 ### Low-risk auto-unblock gate (B3)
 
@@ -1416,8 +1441,8 @@ project root as `uv run --frozen --project shared python scripts/sitting/prepare
   undated, not dropped.
 - **On demand**, whenever Leo asks for it.
 - **Unprompted**, at three points: on watcher launch; on every return, meaning a human turn after 2h
-  or more of silence, or any status or "what do you need" question; and after each applied ruling
-  batch.
+  or more of silence, the human turn that ends AFK posture (see "AFK by silence"), or any status or
+  "what do you need" question; and after each applied ruling batch.
 
 #### The sitting and its numbers
 
