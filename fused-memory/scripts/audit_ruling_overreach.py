@@ -45,7 +45,7 @@ import os
 import re
 import sys
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -336,16 +336,20 @@ def detector_hits(
 
 
 def detector_census(
-    episodes_by_stratum: Mapping[str, Iterable[Episode]],
+    hits_by_stratum: Mapping[str, Iterable[frozenset[str]]],
 ) -> dict[str, dict[str, int]]:
-    """Per stratum: how many episodes, and how many each detector fires on."""
+    """Per stratum, from each episode's :func:`detector_hits`: how many episodes,
+    how many each detector fires on, how many any detector fires on, and how
+    many a detector wired on add_memory fires on."""
     census: dict[str, dict[str, int]] = {}
-    for stratum, episodes in episodes_by_stratum.items():
-        counts = dict.fromkeys(('episodes', *DETECTORS), 0)
-        for episode in episodes:
+    for stratum, episode_hits in hits_by_stratum.items():
+        counts = dict.fromkeys(('episodes', *DETECTORS, 'any_detector', 'any_wired'), 0)
+        for hits in episode_hits:
             counts['episodes'] += 1
-            for name in detector_hits(episode):
+            for name in hits:
                 counts[name] += 1
+            counts['any_detector'] += int(bool(hits))
+            counts['any_wired'] += int(bool(hits & WIRED_ON_ADD_MEMORY))
         census[stratum] = counts
     return census
 
@@ -580,13 +584,17 @@ def load_verdicts(
     obj: Any,
     *,
     expected_edges: Mapping[EdgeKey, str],
+    sampled_episodes: Iterable[EpisodeKey],
     existing_edges: Iterable[EdgeKey],
     definition: SampleDefinition,
 ) -> VerdictSet:
     """Validate a parsed verdict file against the re-derived sample.
 
     *expected_edges* maps each sampled minted edge to its episode uuid;
-    *existing_edges* is every edge the graph still holds.
+    *sampled_episodes* is every sampled episode, whether it minted or not;
+    *existing_edges* is every edge the graph still holds. A verdict on an edge
+    the graph no longer holds is stale only if it names a sampled episode: a
+    mistyped uuid on any other episode is out of sample, never silently stale.
     """
     if not isinstance(obj, Mapping) or not isinstance(obj.get('verdicts'), list):
         raise MalformedVerdicts("a verdict file is {'sample': {...}, 'verdicts': [...]}")
@@ -600,8 +608,12 @@ def load_verdicts(
     judgements = Counter(v.key for v in verdicts)
     _reject(DuplicateVerdict, [v for v in verdicts if judgements[v.key] > 1], 'judge one edge twice')
 
-    existing = set(existing_edges)
-    stale = [v for v in verdicts if v.key not in expected_edges and v.key not in existing]
+    sampled, existing = set(sampled_episodes), set(existing_edges)
+    stale = [
+        v for v in verdicts
+        if v.key not in expected_edges and v.key not in existing
+        and (v.graph, v.episode_uuid) in sampled
+    ]
     in_sample = [v for v in verdicts if expected_edges.get(v.key) == v.episode_uuid]
     stray = [v for v in verdicts if v not in stale and v not in in_sample]
     _reject(OutOfSampleVerdict, stray, 'judge an edge the sample did not offer')
@@ -627,14 +639,38 @@ Row = Mapping[str, Any]
 """A worksheet row, as :func:`worksheet_rows` yields it."""
 
 
-def wilson_interval(k: int, n: int) -> tuple[float, float] | None:
-    if n <= 0:
-        return None
-    p, z2 = k / n, WILSON_Z ** 2
+def _wilson(p: float, n: float) -> tuple[float, float]:
+    z2 = WILSON_Z ** 2
     denominator = 1 + z2 / n
     centre = (p + z2 / (2 * n)) / denominator
     half = WILSON_Z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / denominator
     return (round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4))
+
+
+def wilson_interval(k: int, n: int) -> tuple[float, float] | None:
+    return _wilson(k / n, n) if n > 0 else None
+
+
+WeightedStratum = tuple[float, int, int]
+"""``(w, k, n)``: k of the stratum's n sampled units hit, each standing for w population units."""
+
+
+def weighted_rate(strata: Iterable[WeightedStratum]) -> dict[str, Any]:
+    """``Σw·k / Σw·n``, with a Wilson interval at Kish's effective n, ``(Σw·n)² / Σw²·n``.
+
+    Equal-count sampling of unequal strata makes ``Σk / Σn`` a sample mean;
+    this is the population rate. Equal weights reduce it to :func:`rate`.
+    """
+    cells = [(w, k, n) for w, k, n in strata if n]
+    weighted_n = sum(w * n for w, _, n in cells)
+    if not weighted_n:
+        return {'rate': None, 'ci': None, 'effective_n': None}
+    p = sum(w * k for w, k, _ in cells) / weighted_n
+    effective_n = weighted_n ** 2 / sum(w * w * n for w, _, n in cells)
+    return {
+        'rate': round(p, 4), 'ci': list(_wilson(p, effective_n)),
+        'effective_n': round(effective_n, 1),
+    }
 
 
 def rate(k: int, n: int) -> dict[str, Any]:
@@ -712,6 +748,47 @@ def per_classifier_rates(rows: Iterable[Row], verdicts: VerdictSet) -> dict[str,
         full = _rates_over([r for r in rows if name in r['classifiers']], labels)
         rates[name] = {key: full[key] for key in _PER_CLASSIFIER_KEYS}
     return rates
+
+
+def population_weighted_rates(
+    rows: Iterable[Row],
+    verdicts: VerdictSet,
+    window_population: Mapping[str, Mapping[str, int]],
+    window_days: float,
+) -> dict[str, Any]:
+    """The adjudicated sample re-weighted to the window it was drawn from.
+
+    The sample takes up to ``cap`` episodes from each (graph, stratum) cell
+    whatever the cell's size, so each sampled episode of a cell, and each edge
+    it minted, stands for ``window_population / sampled`` of the window. These
+    are corpus estimates for the window; the ``'all'`` roll-up is a sample mean.
+    *window_population* is graph -> stratum -> window episodes.
+    """
+    rows, labels = list(rows), verdicts.by_edge
+    weights: dict[str, dict[str, float]] = {}
+    minted: list[WeightedStratum] = []
+    substantive: list[WeightedStratum] = []
+    for graph, by_stratum in window_population.items():
+        weights[graph] = {}
+        for stratum, population in by_stratum.items():
+            cell = [r for r in rows if r['graph'] == graph and r['stratum'] == stratum]
+            if not cell:
+                continue
+            weight = population / len(cell)
+            measured = _rates_over(cell, labels)
+            overreach = measured['label_counts']['overreach']
+            weights[graph][stratum] = round(weight, 4)
+            minted.append((weight, overreach, measured['minted']))
+            substantive.append((weight, overreach, measured['overreach_rate_substantive']['n']))
+    window_minted = sum(w * n for w, _, n in minted)
+    window_overreach = sum(w * k for w, k, _ in minted)
+    return {
+        'overreach_rate_minted': weighted_rate(minted),
+        'overreach_rate_substantive': weighted_rate(substantive),
+        'minted_per_day': round(window_minted / window_days, 1) if window_days else None,
+        'overreach_per_day': round(window_overreach / window_days, 1) if window_days else None,
+        'weights': weights,
+    }
 
 
 def detector_catch(
@@ -860,7 +937,9 @@ async def read_corpus(graphs: Iterable[str], make_reader: Callable[[str], Any]) 
 
 PRIOR_MEASUREMENT: Mapping[str, Any] = MappingProxyType({
     'source': 'task 4639 details (esc-4639-1, ruled 2026-08-24): two complete-coverage '
-              'passes over 30 ruling episodes',
+              'passes over 30 ruling episodes, and its census of the '
+              'decisions_and_rationale category',
+    'decisions_category_population': {'dark_factory': 2068, 'reify': 2354},
     'episodes': 30,
     'overreach_minted': rate(13, 174),
     'overreach_live_ruling_subject': rate(10, 111),
@@ -881,8 +960,9 @@ CAVEATS: tuple[str, ...] = (
     'SERVED = invalid_at IS NULL, which is all every read path filters. expired_at alone '
     'is the restored shape task 4714 measured, and is reported as live_strict only.',
     'OUT OF SAMPLE, NOT RANDOM OVER TIME: the window starts the day after the ruling; '
-    'within it, selection is by sha256(graph:uuid), stratified and capped, so strata are '
-    'not population-weighted and the "all" roll-up is a sample mean, not a corpus rate.',
+    'within it, selection is by sha256(graph:uuid), stratified and capped, so the "all" '
+    'roll-up is a sample mean, not a corpus rate; adjudicated.population_weighted '
+    're-weights each (graph, stratum) cell by its window population.',
     'CANDIDATE CLASSIFIERS: the five regex/category predicates are under evaluation, not '
     'adopted; per-classifier rates overlap because one episode matches several.',
     'LIVE CORPUS: both graphs are written continuously; counts are a snapshot at swept_at.',
@@ -895,19 +975,30 @@ class Measurement:
     definition: SampleDefinition
     attribution: Attribution
     rows: tuple[Mapping[str, Any], ...]
+    hits: Mapping[EpisodeKey, frozenset[str]]
+    """Every read episode's :func:`detector_hits`, computed once."""
 
     @classmethod
     def of(cls, corpus: Corpus, definition: SampleDefinition) -> Measurement:
         attribution = attribute_edges(corpus.edges)
         rows = tuple(worksheet_rows(definition.select(corpus.episodes), attribution))
-        return cls(corpus, definition, attribution, rows)
+        hits = MappingProxyType({(e.graph, e.uuid): detector_hits(e) for e in corpus.episodes})
+        return cls(corpus, definition, attribution, rows, hits)
 
     def expected_edges(self) -> dict[EdgeKey, str]:
         return {(r['graph'], m['edge_uuid']): r['uuid'] for r in self.rows for m in r['minted']}
 
+    def sampled_episodes(self) -> set[EpisodeKey]:
+        return {(r['graph'], r['uuid']) for r in self.rows}
+
     def window_episodes(self) -> list[Episode]:
         d = self.definition
         return [e for e in self.corpus.episodes if in_window(e, d.window_start, d.window_end)]
+
+    def window_population(self) -> dict[str, dict[str, int]]:
+        """graph -> stratum -> episodes in the sample window."""
+        window = _by_graph_and_stratum(self, self.window_episodes())
+        return {g: {s: len(episodes) for s, episodes in by_s.items()} for g, by_s in window.items()}
 
 
 def _window_days(definition: SampleDefinition) -> float:
@@ -941,7 +1032,7 @@ def _specimen_block(m: Measurement) -> dict[str, Any]:
             'note': s.note, 'episode_read': episode is not None,
             'classifiers': list(matching_classifiers(episode)) if episode else [],
             'stratum': stratum_of(episode) if episode else None,
-            'detectors': sorted(detector_hits(episode)) if episode else [],
+            'detectors': sorted(m.hits[(s.graph, s.episode_uuid)]) if episode else [],
             'edge_read': edge is not None,
             'edge_served': edge.served if edge else None,
             'edge_live_strict': edge.live_strict if edge else None,
@@ -962,24 +1053,34 @@ def _by_graph_and_stratum(m: Measurement, episodes: Iterable[Episode]) -> dict[s
 
 
 def _strata_block(m: Measurement) -> dict[str, Any]:
-    everything = _by_graph_and_stratum(m, m.corpus.episodes)
-    window = _by_graph_and_stratum(m, m.window_episodes())
+    everything, window = _by_graph_and_stratum(m, m.corpus.episodes), m.window_population()
     return {
-        g: {s: {'population': len(everything[g][s]), 'window_population': len(window[g][s])}
+        g: {s: {'population': len(everything[g][s]), 'window_population': window[g][s]}
             for s in STRATA}
         for g in m.corpus.graphs
     }
 
 
 def _detector_block(m: Measurement) -> dict[str, Any]:
-    block: dict[str, Any] = {}
-    for graph, by_stratum in _by_graph_and_stratum(m, m.corpus.episodes).items():
-        census = detector_census(by_stratum)
-        for stratum, episodes in by_stratum.items():
-            hits = [detector_hits(e) for e in episodes]
-            census[stratum]['any_detector'] = sum(1 for h in hits if h)
-            census[stratum]['any_wired'] = sum(1 for h in hits if h & WIRED_ON_ADD_MEMORY)
-        block[graph] = census
+    return {
+        graph: detector_census({
+            stratum: [m.hits[(e.graph, e.uuid)] for e in episodes]
+            for stratum, episodes in by_stratum.items()
+        })
+        for graph, by_stratum in _by_graph_and_stratum(m, m.corpus.episodes).items()
+    }
+
+
+def _edge_population_block(m: Measurement) -> dict[str, Any]:
+    """Per graph, over every edge read: how many more than one episode lists (a
+    guard acting on any listed episode would reach facts another one minted),
+    and how many are served with ``expired_at`` alone (the restored shape)."""
+    block = {g: {'edges': 0, 'multi_episode': 0, 'expired_only': 0} for g in m.corpus.graphs}
+    for edge in m.corpus.edges:
+        cell = block[edge.graph]
+        cell['edges'] += 1
+        cell['multi_episode'] += int(len(set(edge.episodes)) > 1)
+        cell['expired_only'] += int(edge.served and not edge.live_strict)
     return block
 
 
@@ -999,13 +1100,13 @@ def _sample_block(m: Measurement) -> dict[str, Any]:
 
 
 def _adjudicated_block(m: Measurement, verdicts: VerdictSet) -> dict[str, Any]:
-    sampled = {(e.graph, e.uuid): e for e in m.corpus.episodes}
-    hits = {(r['graph'], r['uuid']): detector_hits(sampled[(r['graph'], r['uuid'])])
-            for r in m.rows}
     return {
         'rates': adjudicated_rates(m.rows, verdicts),
+        'population_weighted': population_weighted_rates(
+            m.rows, verdicts, m.window_population(), _window_days(m.definition),
+        ),
         'per_classifier': per_classifier_rates(m.rows, verdicts),
-        'detector_catch': detector_catch(m.rows, verdicts, hits),
+        'detector_catch': detector_catch(m.rows, verdicts, m.hits),
         'verdicts': len(verdicts.verdicts),
         'stale_verdicts': len(verdicts.stale),
     }
@@ -1024,6 +1125,7 @@ def build_report(m: Measurement, verdicts: VerdictSet | None, *, swept_at: str) 
         'swept_at': swept_at,
         'graphs': list(m.corpus.graphs),
         'read_population': _read_block(m.corpus),
+        'edge_population': _edge_population_block(m),
         'classifiers': _classifier_block(m),
         'specimens': _specimen_block(m),
         'strata': _strata_block(m),
@@ -1088,7 +1190,7 @@ def _load_verdict_file(path: str, m: Measurement) -> VerdictSet:
     except (OSError, json.JSONDecodeError) as exc:
         raise MalformedVerdicts(f'cannot read {path}: {exc}') from exc
     return load_verdicts(
-        obj, expected_edges=m.expected_edges(),
+        obj, expected_edges=m.expected_edges(), sampled_episodes=m.sampled_episodes(),
         existing_edges={(e.graph, e.uuid) for e in m.corpus.edges}, definition=m.definition,
     )
 
@@ -1152,8 +1254,19 @@ async def _run(
     return EXIT_OK
 
 
+def run(
+    argv: Sequence[str] | None = None, *, reader_factory: Callable[[str], Any] | None = None
+) -> int:
+    """Parse *argv* (default ``sys.argv[1:]``) and run.
+
+    *reader_factory* maps a graph name to an object with async ``fetch_episodes``
+    and ``fetch_edges``, as :class:`GraphReader` has; the default opens FalkorDB.
+    """
+    return asyncio.run(_run(_build_parser().parse_args(argv), reader_factory=reader_factory))
+
+
 def main() -> int:
-    return asyncio.run(_run(_build_parser().parse_args()))
+    return run()
 
 
 if __name__ == '__main__':

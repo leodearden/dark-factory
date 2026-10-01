@@ -361,14 +361,15 @@ class TestDetectorCensus:
     def test_census_counts_hits_and_episodes_per_stratum(self) -> None:
         census = mod.detector_census({
             'ruling_lexeme': [
-                _episode(POSITIVE_CONTROLS['completion_claim'], uuid='a'),
-                _episode(NEGATIVE_CONTROL, uuid='b'),
+                mod.detector_hits(_episode(POSITIVE_CONTROLS['completion_claim'], uuid='a')),
+                mod.detector_hits(_episode(POSITIVE_CONTROLS['batch_plan'], uuid='b')),
+                mod.detector_hits(_episode(NEGATIVE_CONTROL, uuid='c')),
             ],
             'other_decisions': [],
         })
         assert census['ruling_lexeme'] == {
-            'episodes': 2, 'unverified_claim_tag': 0, 'completion_claim': 1,
-            'proposed_resolution': 0, 'batch_plan': 0,
+            'episodes': 3, 'unverified_claim_tag': 0, 'completion_claim': 1,
+            'proposed_resolution': 0, 'batch_plan': 1, 'any_detector': 2, 'any_wired': 1,
         }
         assert census['other_decisions']['episodes'] == 0
 
@@ -509,6 +510,7 @@ class TestWorksheetRows:
 # --------------------------------------------------------------------------- #
 
 EXPECTED_EDGES = {('reify', 'e1'): 'E', ('reify', 'e2'): 'E', ('dark_factory', 'e3'): 'F'}
+SAMPLED_EPISODES = frozenset({('reify', 'E'), ('dark_factory', 'F'), ('reify', 'MINTED-NOTHING')})
 EXISTING_EDGES = frozenset(EXPECTED_EDGES) | {('reify', 'outside')}
 
 
@@ -534,8 +536,8 @@ def _file(*verdicts, sample=None):
 
 def _load(obj):
     return mod.load_verdicts(
-        obj, expected_edges=EXPECTED_EDGES, existing_edges=EXISTING_EDGES,
-        definition=mod.SampleDefinition(),
+        obj, expected_edges=EXPECTED_EDGES, sampled_episodes=SAMPLED_EPISODES,
+        existing_edges=EXISTING_EDGES, definition=mod.SampleDefinition(),
     )
 
 
@@ -601,6 +603,21 @@ class TestLoadVerdicts:
         verdicts = _load(obj)
         assert [v.edge_uuid for v in verdicts.stale] == ['merged-away']
         assert ('reify', 'merged-away') not in verdicts.by_edge
+
+    def test_a_vanished_edge_of_a_sampled_episode_that_minted_nothing_is_stale(self) -> None:
+        obj = _file(_verdict('reify', 'e1'), _verdict('reify', 'e2'),
+                    _verdict('dark_factory', 'e3'),
+                    _verdict('reify', 'merged-away', episode_uuid='MINTED-NOTHING'))
+        assert [v.edge_uuid for v in _load(obj).stale] == ['merged-away']
+
+    def test_a_nonexistent_edge_on_an_unsampled_episode_is_out_of_sample(self) -> None:
+        """A mistyped edge uuid must not pass silently as stale."""
+        obj = _file(_verdict('reify', 'e1'), _verdict('reify', 'e2'),
+                    _verdict('dark_factory', 'e3'),
+                    _verdict('reify', 'no-such-edge', episode_uuid='never-sampled'))
+        with pytest.raises(mod.OutOfSampleVerdict) as caught:
+            _load(obj)
+        assert caught.value.edge_uuids == ('no-such-edge',)
 
     def test_a_verdict_for_an_existing_edge_outside_the_sample(self) -> None:
         obj = _file(_verdict('reify', 'e1'), _verdict('reify', 'e2'),
@@ -679,6 +696,7 @@ def _rate_verdicts():
          'label': label, 'rationale': 'r'} for (g, e), label in RATE_LABELS.items()
     ]}
     return mod.load_verdicts(obj, expected_edges=rows, existing_edges=rows,
+                             sampled_episodes={(r['graph'], r['uuid']) for r in RATE_ROWS},
                              definition=mod.SampleDefinition())
 
 
@@ -744,6 +762,59 @@ class TestPerClassifierRates:
         assert rates['category_decisions']['overreach_rate_minted'] == _rate(2, 8)
 
 
+class TestWeightedRate:
+    def test_equal_weights_reduce_to_the_unweighted_rate(self) -> None:
+        weighted = mod.weighted_rate([(3.0, 13, 100), (3.0, 0, 74)])
+        assert weighted == {'rate': _rate(13, 174)['rate'], 'ci': _rate(13, 174)['ci'],
+                            'effective_n': 174.0}
+
+    def test_unequal_weights_move_the_rate_and_shrink_the_effective_n(self) -> None:
+        weighted = mod.weighted_rate([(10.0, 2, 4), (30.0, 0, 4)])
+        assert weighted['rate'] == 0.125
+        assert weighted['effective_n'] == 6.4
+
+    @pytest.mark.parametrize('strata', [[], [(5.0, 0, 0)], [(0.0, 1, 4)]])
+    def test_no_weighted_denominator_is_not_computed(self, strata) -> None:
+        assert mod.weighted_rate(strata) == {'rate': None, 'ci': None, 'effective_n': None}
+
+
+WINDOW_POPULATION = {
+    'reify': {'ruling_lexeme': 10, 'decision_anchor': 0, 'other_decisions': 0},
+    'dark_factory': {'ruling_lexeme': 0, 'decision_anchor': 0, 'other_decisions': 30},
+}
+
+
+class TestPopulationWeightedRates:
+    """RATE_ROWS samples one episode per cell, so the weights are the populations."""
+
+    def _weighted(self) -> dict:
+        return mod.population_weighted_rates(
+            RATE_ROWS, _rate_verdicts(), WINDOW_POPULATION, window_days=10.0,
+        )
+
+    def test_each_cell_is_weighted_by_its_window_population(self) -> None:
+        assert self._weighted()['weights'] == {
+            'reify': {'ruling_lexeme': 10.0}, 'dark_factory': {'other_decisions': 30.0},
+        }
+
+    def test_the_weighted_rate_differs_from_the_sample_mean(self) -> None:
+        weighted = self._weighted()
+        assert weighted['overreach_rate_minted'] == mod.weighted_rate([(10.0, 2, 4), (30.0, 0, 4)])
+        assert weighted['overreach_rate_minted']['rate'] == 0.125
+        sample_mean = mod.adjudicated_rates(RATE_ROWS, _rate_verdicts())['all']
+        assert sample_mean['overreach_rate_minted']['rate'] == 0.25
+
+    def test_substantive_drops_bookkeeping_and_unjudgeable(self) -> None:
+        assert self._weighted()['overreach_rate_substantive'] == mod.weighted_rate(
+            [(10.0, 2, 3), (30.0, 0, 3)],
+        )
+
+    def test_window_volume_per_day(self) -> None:
+        weighted = self._weighted()
+        assert weighted['minted_per_day'] == 16.0
+        assert weighted['overreach_per_day'] == 2.0
+
+
 class TestDetectorCatch:
     def test_counts_adjudicated_overreach_by_the_detectors_on_its_episode(self) -> None:
         hits = {('reify', 'A'): frozenset({'batch_plan'}),
@@ -779,25 +850,38 @@ class _FakeResult:
 class _FakeGraph:
     """Serves SKIP/LIMIT pages of an episode and an edge corpus, each with a census.
 
-    ``query`` raises: the instrument may only ever issue ``ro_query``.
+    The census follows FalkorDB: over an edge pattern, ``count(*)`` with ``r``
+    unreferenced counts connected (source, target) PAIRS, so multi-edges
+    collapse; ``count(r)`` counts edges. ``truncate_at`` makes the pages serve
+    only that many rows of a corpus, as a short read would. ``query`` raises:
+    the instrument may only ever issue ``ro_query``.
     """
 
     def __init__(self, episodes: list[list], edges: list[list], *,
-                 census_override: dict[str, int] | None = None, cap: int = 5):
+                 census_override: dict[str, int] | None = None,
+                 truncate_at: dict[str, int] | None = None, cap: int = 5):
         self.corpora = {'episodes': episodes, 'edges': edges}
         self.census_override = census_override or {}
+        self.truncate_at = truncate_at or {}
         self.cap = cap
         self.queries: list[str] = []
+
+    def _census(self, which: str, counted: str) -> int:
+        corpus = self.corpora[which]
+        if which == 'edges' and counted == '*':
+            return len({(row[2], row[3]) for row in corpus})
+        return len(corpus)
 
     async def ro_query(self, cypher: str, params: dict | None = None) -> _FakeResult:
         self.queries.append(cypher)
         which = 'episodes' if ':Episodic' in cypher else 'edges'
-        corpus = self.corpora[which]
-        if _CENSUS_RE.search(cypher.strip()):
-            return _FakeResult([[self.census_override.get(which, len(corpus))]])
+        if census := _CENSUS_RE.search(cypher.strip()):
+            count = self.census_override.get(which, self._census(which, census.group(1)))
+            return _FakeResult([[count]])
         match = _SKIP_LIMIT_RE.search(cypher)
         assert match, cypher
         skip, limit = int(match.group(1)), int(match.group(2))
+        corpus = self.corpora[which][: self.truncate_at.get(which)]
         return _FakeResult(corpus[skip: skip + limit][: self.cap])
 
     async def query(self, cypher: str, params: dict | None = None):
@@ -812,9 +896,9 @@ EPISODE_ROWS = [
     ['E4', DECISION_SOURCE, '2026-08-01T10:00:00+00:00', RULING_HEAD],
     ['E5', 'add_memory:entities_and_relations', '2026-09-04T10:00:00+00:00', 'x uses y'],
 ]
-EDGE_ROWS = [
+EDGE_ROWS = [  # x1 and x2 are a multi-edge: both A -> B
     ['x1', 'holding fact', 'A', 'B', ['E1'], None, None],
-    ['x2', 'overreach fact', 'A', 'C', ['E1', 'E2'], None, '2026-09-05T00:00:00+00:00'],
+    ['x2', 'overreach fact', 'A', 'B', ['E1', 'E2'], None, '2026-09-05T00:00:00+00:00'],
     ['x3', 'anchor fact', 'D', 'E', ['E2'], '2026-09-06T00:00:00+00:00', None],
     ['x4', 'plain fact', 'F', 'G', ['E3'], None, None],
     ['x5', 'orphan fact', 'H', 'I', [], None, None],
@@ -835,15 +919,14 @@ def _factory(graphs):
     )
 
 
-def _args(*argv: str):
-    return mod._build_parser().parse_args(['--graph', 'dark_factory', '--graph', 'reify', *argv])
+def _run(*argv: str, graphs=None, reader_factory=None) -> int:
+    return mod.run(['--graph', 'dark_factory', '--graph', 'reify', *argv],
+                   reader_factory=reader_factory or _factory(graphs or _graphs()))
 
 
-async def _worksheet(tmp_path, graphs=None) -> list[dict]:
+def _worksheet(tmp_path, graphs=None) -> list[dict]:
     path = tmp_path / 'worksheet.jsonl'
-    code = await mod._run(_args('--emit-worksheet', str(path)),
-                          reader_factory=_factory(graphs or _graphs()))
-    assert code == 0
+    assert _run('--emit-worksheet', str(path), graphs=graphs) == 0
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
@@ -879,15 +962,23 @@ class TestGraphReader:
         assert read.complete and read.rows_seen == 6
         assert edges[1] == mod.Edge(
             graph='dark_factory', uuid='x2', fact='overreach fact', source_name='A',
-            target_name='C', episodes=('E1', 'E2'), invalid_at=None,
+            target_name='B', episodes=('E1', 'E2'), invalid_at=None,
             expired_at='2026-09-05T00:00:00+00:00',
         )
         assert edges[2].served is False
 
-    def test_the_edge_census_counts_edges_not_node_pairs(self) -> None:
-        """FalkorDB's bare-pattern count(*) collapses multi-edges between one node pair."""
-        match_clause = mod.EDGE_PAGE_CYPHER.split('RETURN')[0]
-        assert f'{match_clause}RETURN count(r)' == mod.EDGE_CENSUS_CYPHER
+    @pytest.mark.asyncio
+    async def test_a_read_short_by_the_multi_edge_excess_is_incomplete(self) -> None:
+        """A node-pair census would equal this short read and pass it as complete."""
+        node_pairs = len({(row[2], row[3]) for row in EDGE_ROWS})
+        assert node_pairs < len(EDGE_ROWS)
+        graph = _FakeGraph(EPISODE_ROWS, EDGE_ROWS, truncate_at={'edges': node_pairs})
+        reader = mod.GraphReader(graph=graph, graph_name='dark_factory', page_size=2,
+                                 resultset_size=5)
+        edges, read = await reader.fetch_edges()
+        assert len(edges) == read.rows_seen == node_pairs
+        assert read.complete is False
+        assert read.expected_rows == len(EDGE_ROWS)
 
     def test_the_edge_read_never_projects_the_embedding_or_filters_liveness(self) -> None:
         assert 'fact_embedding' not in mod.EDGE_PAGE_CYPHER
@@ -897,31 +988,26 @@ class TestGraphReader:
 
 
 class TestRun:
-    @pytest.mark.asyncio
-    async def test_an_incomplete_read_exits_one_and_writes_nothing(self, tmp_path, capsys) -> None:
+    def test_an_incomplete_read_exits_one_and_writes_nothing(self, tmp_path, capsys) -> None:
         graphs = _graphs(census_override={'edges': 99})
         worksheet, out_dir = tmp_path / 'ws.jsonl', tmp_path / 'out'
-        code = await mod._run(
-            _args('--emit-worksheet', str(worksheet), '--out-dir', str(out_dir), '--json'),
-            reader_factory=_factory(graphs),
-        )
+        code = _run('--emit-worksheet', str(worksheet), '--out-dir', str(out_dir), '--json',
+                    graphs=graphs)
         assert code == 1
         assert capsys.readouterr().out == ''
         assert not worksheet.exists()
         assert not out_dir.exists()
 
-    @pytest.mark.asyncio
-    async def test_a_failing_reader_exits_one_and_writes_nothing(self, tmp_path) -> None:
+    def test_a_failing_reader_exits_one_and_writes_nothing(self, tmp_path) -> None:
         def explode(name):
             raise RuntimeError('FalkorDB unreachable')
 
         out_dir = tmp_path / 'out'
-        assert await mod._run(_args('--out-dir', str(out_dir)), reader_factory=explode) == 1
+        assert _run('--out-dir', str(out_dir), reader_factory=explode) == 1
         assert not out_dir.exists()
 
-    @pytest.mark.asyncio
-    async def test_the_worksheet_is_the_sample_rows_as_jsonl(self, tmp_path) -> None:
-        rows = await _worksheet(tmp_path)
+    def test_the_worksheet_is_the_sample_rows_as_jsonl(self, tmp_path) -> None:
+        rows = _worksheet(tmp_path)
         assert [(r['graph'], r['uuid']) for r in rows] == [
             ('dark_factory', 'E1'), ('dark_factory', 'E2'), ('dark_factory', 'E3'),
             ('reify', 'E1'), ('reify', 'E2'),
@@ -930,76 +1016,92 @@ class TestRun:
         assert [m['edge_uuid'] for m in df_e1['minted']] == ['x1', 'x2']
         assert rows[1]['corroborated_count'] == 1
 
-    @pytest.mark.asyncio
-    async def test_a_verdict_run_writes_the_full_report(self, tmp_path) -> None:
-        rows = await _worksheet(tmp_path)
+    def test_a_verdict_run_writes_the_full_report(self, tmp_path) -> None:
+        rows = _worksheet(tmp_path)
         verdict_path = tmp_path / 'verdicts.json'
         verdict_path.write_text(json.dumps(_verdicts_for(rows)))
         out_dir = tmp_path / 'out'
-        code = await mod._run(_args('--verdicts', str(verdict_path), '--out-dir', str(out_dir)),
-                              reader_factory=_factory(_graphs()))
-        assert code == 0
+        assert _run('--verdicts', str(verdict_path), '--out-dir', str(out_dir)) == 0
         report = json.loads((out_dir / 'report.json').read_text())
         assert set(report) == {
-            'swept_at', 'graphs', 'read_population', 'classifiers', 'specimens', 'strata',
-            'detector_census', 'wired_on_add_memory', 'sample', 'adjudicated',
-            'prior_measurement', 'caveats',
+            'swept_at', 'graphs', 'read_population', 'edge_population', 'classifiers',
+            'specimens', 'strata', 'detector_census', 'wired_on_add_memory', 'sample',
+            'adjudicated', 'prior_measurement', 'caveats',
         }
         adjudicated = report['adjudicated']
         assert adjudicated['rates']['all']['minted'] == 7
         assert adjudicated['rates']['all']['holding_share']['rate'] == 1.0
-        assert set(adjudicated) >= {'rates', 'per_classifier', 'detector_catch', 'stale_verdicts'}
+        assert set(adjudicated) >= {
+            'rates', 'population_weighted', 'per_classifier', 'detector_catch', 'stale_verdicts',
+        }
+        weighted = adjudicated['population_weighted']
+        assert weighted['overreach_rate_minted']['rate'] == 0.0
+        assert weighted['minted_per_day'] == round(7 / report['sample']['window_days'], 1)
         assert report['read_population']['dark_factory']['edges']['complete'] is True
         assert report['sample']['unattributed_edges'] == 1
         assert report['prior_measurement']['overreach_minted']['ci'] == [0.0442, 0.1236]
 
-    @pytest.mark.asyncio
-    async def test_without_verdicts_adjudicated_is_null(self, tmp_path) -> None:
+    def test_the_edge_population_counts_multi_episode_and_expired_only_edges(
+        self, tmp_path,
+    ) -> None:
         out_dir = tmp_path / 'out'
-        assert await mod._run(_args('--out-dir', str(out_dir)),
-                              reader_factory=_factory(_graphs())) == 0
+        assert _run('--out-dir', str(out_dir)) == 0
+        report = json.loads((out_dir / 'report.json').read_text())
+        assert report['edge_population'] == {
+            'dark_factory': {'edges': 6, 'multi_episode': 1, 'expired_only': 1},
+            'reify': {'edges': 3, 'multi_episode': 1, 'expired_only': 1},
+        }
+
+    def test_the_detector_census_counts_any_and_wired_per_stratum(self, tmp_path) -> None:
+        out_dir = tmp_path / 'out'
+        assert _run('--out-dir', str(out_dir)) == 0
+        census = json.loads((out_dir / 'report.json').read_text())['detector_census']
+        assert set(census['dark_factory']) == set(mod.STRATA)
+        assert set(census['dark_factory']['ruling_lexeme']) == {
+            'episodes', *mod.DETECTORS, 'any_detector', 'any_wired',
+        }
+        assert census['dark_factory']['ruling_lexeme']['episodes'] == 2
+
+    def test_without_verdicts_adjudicated_is_null(self, tmp_path) -> None:
+        out_dir = tmp_path / 'out'
+        assert _run('--out-dir', str(out_dir)) == 0
         assert json.loads((out_dir / 'report.json').read_text())['adjudicated'] is None
 
-    @pytest.mark.asyncio
-    async def test_two_runs_are_byte_identical_but_for_swept_at(self, tmp_path) -> None:
+    def test_two_runs_are_byte_identical_but_for_swept_at(self, tmp_path) -> None:
         blobs = []
         for i in range(2):
             out_dir = tmp_path / f'out{i}'
-            assert await mod._run(_args('--out-dir', str(out_dir)),
-                                  reader_factory=_factory(_graphs())) == 0
+            assert _run('--out-dir', str(out_dir)) == 0
             report = json.loads((out_dir / 'report.json').read_text())
             report.pop('swept_at')
             blobs.append(json.dumps(report, sort_keys=True))
         assert blobs[0] == blobs[1]
 
-    @pytest.mark.asyncio
-    async def test_the_report_file_has_sorted_keys(self, tmp_path) -> None:
+    def test_the_report_file_has_sorted_keys(self, tmp_path) -> None:
         out_dir = tmp_path / 'out'
-        await mod._run(_args('--out-dir', str(out_dir)), reader_factory=_factory(_graphs()))
+        _run('--out-dir', str(out_dir))
         text = (out_dir / 'report.json').read_text()
         assert text == json.dumps(json.loads(text), indent=2, sort_keys=True) + '\n'
 
-    @pytest.mark.asyncio
-    async def test_a_verdict_error_exits_two_and_writes_no_report(self, tmp_path) -> None:
-        rows = await _worksheet(tmp_path)
+    def test_a_verdict_error_exits_two_and_writes_no_report(self, tmp_path) -> None:
+        rows = _worksheet(tmp_path)
         bad = _verdicts_for(rows)
         bad['verdicts'].pop()
         verdict_path = tmp_path / 'verdicts.json'
         verdict_path.write_text(json.dumps(bad))
         out_dir = tmp_path / 'out'
-        code = await mod._run(_args('--verdicts', str(verdict_path), '--out-dir', str(out_dir)),
-                              reader_factory=_factory(_graphs()))
-        assert code == 2
+        assert _run('--verdicts', str(verdict_path), '--out-dir', str(out_dir)) == 2
         assert not out_dir.exists()
 
-    @pytest.mark.asyncio
-    async def test_an_unreadable_verdict_file_exits_two(self, tmp_path) -> None:
+    def test_an_unreadable_verdict_file_exits_two(self, tmp_path) -> None:
         verdict_path = tmp_path / 'verdicts.json'
         verdict_path.write_text('{not json')
-        code = await mod._run(_args('--verdicts', str(verdict_path)),
-                              reader_factory=_factory(_graphs()))
-        assert code == 2
+        assert _run('--verdicts', str(verdict_path)) == 2
 
-    def test_the_parser_offers_no_mutation_flag(self) -> None:
-        flags = {opt for action in mod._build_parser()._actions for opt in action.option_strings}
+    def test_the_cli_offers_no_mutation_flag(self, capsys) -> None:
+        with pytest.raises(SystemExit) as exited:
+            mod.run(['--help'])
+        assert exited.value.code == 0
+        flags = set(re.findall(r'--[a-z][a-z-]*', capsys.readouterr().out))
+        assert {'--graph', '--verdicts', '--out-dir'} <= flags
         assert not flags & {'--apply', '--invalidate', '--delete', '--repair', '--quarantine'}
