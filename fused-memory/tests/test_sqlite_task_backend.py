@@ -6237,6 +6237,44 @@ async def test_update_task_refuses_to_clobber_corrupt_metadata(
 
 
 @pytest.mark.asyncio
+async def test_update_task_replace_on_corrupt_stored_blob_done_provenance_arms(
+    backend, project_root,
+):
+    """On a row whose stored blob does not parse, done_provenance identity
+    cannot be established: (a) a replace payload CARRYING done_provenance is
+    refused, so a corrupted row cannot launder a done_provenance write, while
+    (b) a replace payload OMITTING it is still the sanctioned corrupt-row
+    repair and lands verbatim."""
+    await backend.add_task(project_root=project_root, title='carries')
+    await backend.add_task(project_root=project_root, title='omits')
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id IN (1, 2)', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({
+                'done_provenance': {'kind': 'merged', 'commit': 'a' * 40},
+            }),
+            metadata_mode='replace',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    cursor = await conn.execute('SELECT metadata FROM tasks WHERE id = 1')
+    assert (await cursor.fetchone())['metadata'] == _CORRUPT_BLOB
+
+    await backend.update_task(
+        '2', project_root=project_root,
+        metadata=json.dumps({'files': ['src']}),
+        metadata_mode='replace',
+    )
+    repaired = await backend.get_task('2', project_root=project_root)
+    assert repaired['metadata'] == {'files': ['src']}
+
+
+@pytest.mark.asyncio
 async def test_stamp_audit_metadata_refuses_to_clobber_corrupt_metadata(
     backend, project_root, caplog,
 ):
