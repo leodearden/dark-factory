@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import functools
 import json
+import subprocess
+import sys
 import types
 from pathlib import Path
 from typing import Any
@@ -577,6 +579,94 @@ class TestRowContract:
     def test_an_unknown_reference_arm_is_refused_listing_the_arms(self) -> None:
         with pytest.raises(ValueError, match=r"(?s)'cand'.*'ref'"):
             _score(SYNTH_CASES, SYNTH_VERDICTS, reference_arm='nope')
+
+
+def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> Path:
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    return path
+
+
+class TestCli:
+    @staticmethod
+    def _main(*argv: object) -> int:
+        return _mod().main([str(arg) for arg in argv])
+
+    @pytest.fixture
+    def cases_file(self, tmp_path: Path) -> Path:
+        return _write_jsonl(tmp_path / 'cases.jsonl', SYNTH_CASES)
+
+    @pytest.fixture
+    def verdicts_file(self, tmp_path: Path) -> Path:
+        return _write_jsonl(tmp_path / 'verdicts.jsonl', SYNTH_VERDICTS)
+
+    def test_prints_the_score_pairs_result_as_json(
+        self, cases_file: Path, verdicts_file: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        code = self._main('--cases', cases_file, '--verdicts', verdicts_file,
+                          '--reference-arm', 'ref')
+        printed = json.loads(capsys.readouterr().out)
+        assert code == 0
+        assert printed == _synth_result()
+        assert all(set(arm['quality']) == QUALITY_KEYS for arm in printed['arms'].values())
+        assert set(printed['arms']['cand']['paired_vs_reference']) == PAIRED_ERRORS
+
+    def test_out_also_writes_the_same_json(
+        self, tmp_path: Path, cases_file: Path, verdicts_file: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        out = tmp_path / 'sub' / 'report.json'
+        code = self._main('--cases', cases_file, '--verdicts', verdicts_file,
+                          '--reference-arm', 'ref', '--out', out)
+        assert code == 0
+        assert json.loads(out.read_text()) == json.loads(capsys.readouterr().out)
+
+    def test_cases_and_verdicts_may_span_several_files(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        per_arm = [
+            _write_jsonl(tmp_path / f'{arm}.jsonl', [r for r in SYNTH_CASES if r['arm'] == arm])
+            for arm in ('ref', 'cand')
+        ]
+        split_verdicts = [
+            _write_jsonl(tmp_path / 'seed.jsonl', SYNTH_VERDICTS[:5]),
+            _write_jsonl(tmp_path / 'later.jsonl', SYNTH_VERDICTS[5:]),
+        ]
+        code = self._main('--cases', *per_arm, '--verdicts', *split_verdicts,
+                          '--reference-arm', 'ref')
+        assert code == 0
+        assert json.loads(capsys.readouterr().out) == _synth_result()
+
+    def test_an_incomplete_corpus_exits_non_zero_naming_the_pairs_and_writes_nothing(
+        self, tmp_path: Path, cases_file: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        verdicts = _write_jsonl(
+            tmp_path / 'partial.jsonl', _without(SYNTH_VERDICTS, ('w6', 't6')),
+        )
+        out = tmp_path / 'report.json'
+        code = self._main('--cases', cases_file, '--verdicts', verdicts,
+                          '--reference-arm', 'ref', '--out', out)
+        captured = capsys.readouterr()
+        assert code == 1
+        assert captured.out == ''
+        assert 'incomplete' in captured.err
+        assert 'w6' in captured.err and 't6' in captured.err
+        assert not out.exists()
+
+    def test_the_reference_arm_is_required(
+        self, cases_file: Path, verdicts_file: Path,
+    ) -> None:
+        with pytest.raises(SystemExit) as caught:
+            self._main('--cases', cases_file, '--verdicts', verdicts_file)
+        assert caught.value.code == 2
+
+    def test_runs_as_a_script(self, cases_file: Path, verdicts_file: Path) -> None:
+        completed = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), '--cases', str(cases_file),
+             '--verdicts', str(verdicts_file), '--reference-arm', 'ref'],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert set(json.loads(completed.stdout)['arms']) == {'ref', 'cand'}
 
 
 class TestSeedRegression:
