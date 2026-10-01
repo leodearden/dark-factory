@@ -6,11 +6,12 @@ attribute such a member on its OWN delta.  These tests drive the lane through
 its public seams against real temp git repositories:
 
 * ``TestAdmissionUnstacks`` calls the module function ``classify_and_merge``
-  (the single-request merge core) directly.
-* ``TestDerailRedriveUnstacks`` pushes a coalesce ``GroupMergeRequest``
-  through the real merger loop (``queue.put`` + ``worker.run()``), with the
-  real ``_do_train_merge``: nothing in ``orchestrator.merge_queue`` is
-  patched.
+  (the single-request merge core) directly.  A train tip handed to it keeps
+  its co-members' commits.
+* ``TestDerailRedriveUnstacks`` and ``TestTrainLanding`` push a coalesce
+  ``GroupMergeRequest`` through the real merger loop (``queue.put`` +
+  ``worker.run()``), with the real ``_do_train_merge``: nothing in
+  ``orchestrator.merge_queue`` is patched.
 
 Base fixture: main has shared.txt and other.txt.  Stacking is done with the
 production ``GitOps.stack_train_branches``.  After stacking, main advances
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -29,6 +31,7 @@ import pytest
 from orchestrator.branch_stack import (
     STACKED_ON_UNLANDED_BASE_REASON_PREFIX,
     StackBaseLedger,
+    UnstackResult,
 )
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -166,17 +169,28 @@ async def _stack_m_on_unlanded_p(
 # ---------------------------------------------------------------------------
 
 
-async def _admit(
-    git_ops: GitOps, config: OrchestratorConfig, task_id: str, worktree: Path,
-) -> MergedOk | Decided:
+async def _classify(git_ops: GitOps, request: MergeRequest) -> MergedOk | Decided:
     worker = SpeculativeMergeWorker(git_ops, asyncio.Queue())
     return await classify_and_merge(
         worker,
-        _make_request(task_id, worktree, config),
+        request,
         await git_ops.get_main_sha(),
         speculative=False,
         started_monotonic=None,
     )
+
+
+async def _admit(
+    git_ops: GitOps, config: OrchestratorConfig, task_id: str, worktree: Path,
+) -> MergedOk | Decided:
+    return await _classify(git_ops, _make_request(task_id, worktree, config))
+
+
+async def _merged_files(git_ops: GitOps, base: str, result: MergedOk) -> set[str]:
+    merge_commit = result.merge_result.merge_commit
+    assert merge_commit is not None
+    changed = await _git(git_ops.project_root, 'diff', '--name-only', base, merge_commit)
+    return set(changed.split())
 
 
 async def _cleanup(git_ops: GitOps, result: MergedOk | Decided) -> None:
@@ -203,12 +217,7 @@ class TestAdmissionUnstacks:
 
         try:
             assert isinstance(result, MergedOk), result
-            merge_commit = result.merge_result.merge_commit
-            assert merge_commit is not None
-            changed = await _git(
-                git_ops.project_root, 'diff', '--name-only', main_sha, merge_commit,
-            )
-            assert set(changed.split()) == {'m.txt'}
+            assert await _merged_files(git_ops, main_sha, result) == {'m.txt'}
             assert await _ledger(git_ops).base_of('task/M') is None
         finally:
             await _cleanup(git_ops, result)
@@ -249,10 +258,83 @@ class TestAdmissionUnstacks:
         finally:
             await _cleanup(git_ops, result)
 
+    async def test_train_tip_keeps_its_co_members_commits(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        await _member(git_ops, 'A', {'a.txt': 'a\n'})
+        await _member(git_ops, 'T', {'t.txt': 't\n'})
+        await _stack(git_ops, 'A', 'T')
+        main_sha = await git_ops.get_main_sha()
+        train = _coalesce_train(git_ops, config, members=['A', 'T'], statuses={})
+
+        result = await _classify(git_ops, train.request)
+
+        try:
+            assert isinstance(result, MergedOk), result
+            assert await _merged_files(git_ops, main_sha, result) == {'a.txt', 't.txt'}
+            assert await _ledger(git_ops).base_of('task/T') == await _sha(git_ops, 'task/A')
+        finally:
+            await _cleanup(git_ops, result)
+
 
 # ---------------------------------------------------------------------------
-# Coalesce-derail redrive through the real merger loop
+# Coalesce trains through the real merger loop
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Train:
+    request: GroupMergeRequest
+    mark_member_done: AsyncMock
+    redrive_member: AsyncMock
+
+
+def _coalesce_train(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    *,
+    members: list[str],
+    statuses: dict[str, str],
+) -> _Train:
+    tip = members[-1]
+    mark_member_done = AsyncMock()
+    redrive_member = AsyncMock()
+    request = GroupMergeRequest(
+        task_id=tip,
+        branch=QueuedBranch.parse(tip, config.git.branch_prefix),
+        worktree=git_ops.worktree_base / tip,
+        pre_rebased=False,
+        task_files=None,
+        module_configs=[],
+        config=config,
+        result=asyncio.get_running_loop().create_future(),
+        train_id=f'coalesce-{tip}-test',
+        member_task_ids=members,
+        tip_branch=QueuedBranch.parse(tip, config.git.branch_prefix),
+        tip_task_id=tip,
+        status_check=AsyncMock(return_value=statuses),
+        mark_member_done=mark_member_done,
+        redrive_member=redrive_member,
+    )
+    return _Train(request, mark_member_done, redrive_member)
+
+
+async def _run_through_merger(
+    git_ops: GitOps, train: _Train, tmp_path: Path,
+) -> MergeOutcome:
+    queue: asyncio.Queue = asyncio.Queue()
+    worker = SpeculativeMergeWorker(
+        git_ops, queue,
+        event_store=EventStore(db_path=tmp_path / 'events.db', run_id='unstack-train'),
+    )
+    await queue.put(train.request)
+    worker_task = asyncio.create_task(worker.run())
+    try:
+        return await asyncio.wait_for(train.request.result, timeout=30)
+    finally:
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
 
 
 async def _derail_coalesce_train(
@@ -264,47 +346,21 @@ async def _derail_coalesce_train(
     statuses: dict[str, str],
 ) -> AsyncMock:
     """Run one coalesce train through the real merger loop; return redrive_member."""
-    tip = members[-1]
-    redrive_member = AsyncMock()
-    group_future: asyncio.Future[MergeOutcome] = (
-        asyncio.get_running_loop().create_future()
-    )
-    group = GroupMergeRequest(
-        task_id=tip,
-        branch=QueuedBranch.parse(tip, config.git.branch_prefix),
-        worktree=git_ops.worktree_base / tip,
-        pre_rebased=False,
-        task_files=None,
-        module_configs=[],
-        config=config,
-        result=group_future,
-        train_id=f'coalesce-{tip}-test',
-        member_task_ids=members,
-        tip_branch=QueuedBranch.parse(tip, config.git.branch_prefix),
-        tip_task_id=tip,
-        status_check=AsyncMock(return_value=statuses),
-        mark_member_done=AsyncMock(),
-        redrive_member=redrive_member,
-    )
-    queue: asyncio.Queue = asyncio.Queue()
-    worker = SpeculativeMergeWorker(
-        git_ops, queue,
-        event_store=EventStore(db_path=tmp_path / 'events.db', run_id='unstack-derail'),
-    )
-    await queue.put(group)
-    worker_task = asyncio.create_task(worker.run())
-    try:
-        outcome = await asyncio.wait_for(group_future, timeout=30)
-        assert outcome.status == 'blocked', outcome
-    finally:
-        await worker.stop()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
-    return redrive_member
+    train = _coalesce_train(git_ops, config, members=members, statuses=statuses)
+    outcome = await _run_through_merger(git_ops, train, tmp_path)
+    assert outcome.status == 'blocked', outcome
+    return train.redrive_member
 
 
 def _redriven(redrive_member: AsyncMock) -> list[tuple]:
     return [call.args for call in redrive_member.await_args_list]
+
+
+class _UnstackRaises(GitOps):
+    """A GitOps whose un-stack fails with an exception it does not type."""
+
+    async def unstack_from_unlanded_base(self, full_branch: str) -> UnstackResult:
+        raise OSError(f'git could not be spawned to un-stack {full_branch}')
 
 
 @pytest.mark.asyncio
@@ -367,3 +423,62 @@ class TestDerailRedriveUnstacks:
         assert ('T', False, None) in _redriven(redrive_member)
         assert await _sha(git_ops, 'task/T') == t_tip
         assert await _ledger(git_ops).base_of('task/T') == a_tip
+
+    async def test_unstack_raising_does_not_block_redrive(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        await _member(git_ops, 'A', {'shared.txt': 'a\n'})
+        await _member(git_ops, 'T', {'t.txt': 't\n'})
+        await _stack(git_ops, 'A', 'T')
+        await _advance_main(git_ops, {'shared.txt': 'main\n'})
+
+        redrive_member = await _derail_coalesce_train(
+            _UnstackRaises(git_ops.config, git_ops.project_root), config, tmp_path,
+            members=['A', 'T'],
+            statuses={'A': 'merge-deferred', 'T': 'merge-deferred'},
+        )
+
+        assert sorted(_redriven(redrive_member)) == [
+            ('A', False, None), ('T', False, None),
+        ]
+
+
+# ---------------------------------------------------------------------------
+# A stacked train that lands
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_op_verify_config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
+    return OrchestratorConfig(
+        project_root=git_repo,
+        git=git_config,
+        test_command='true',
+        lint_command='true',
+        type_check_command='true',
+    )
+
+
+@pytest.mark.asyncio
+class TestTrainLanding:
+    async def test_stacked_train_lands_every_members_files(
+        self, git_ops: GitOps, no_op_verify_config: OrchestratorConfig, tmp_path: Path,
+    ) -> None:
+        await _member(git_ops, 'A', {'a.txt': 'a\n'})
+        await _member(git_ops, 'T', {'t.txt': 't\n'})
+        await _stack(git_ops, 'A', 'T')
+        main_before = await _advance_main(git_ops, {'other.txt': 'main\n'})
+        train = _coalesce_train(
+            git_ops, no_op_verify_config,
+            members=['A', 'T'],
+            statuses={'A': 'merge-deferred', 'T': 'merge-deferred'},
+        )
+
+        outcome = await _run_through_merger(git_ops, train, tmp_path)
+
+        assert outcome.status == 'done', outcome
+        landed = await _git(git_ops.project_root, 'diff', '--name-only', main_before, 'main')
+        assert set(landed.split()) == {'a.txt', 't.txt'}
+        assert sorted(
+            call.args[0] for call in train.mark_member_done.await_args_list
+        ) == ['A', 'T']

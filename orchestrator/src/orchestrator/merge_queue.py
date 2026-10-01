@@ -6080,15 +6080,14 @@ async def _unstack_before_merge(git_ops: GitOps, req: MergeRequest) -> Decided |
 
     Returns the terminal ``blocked`` decision when the branch cannot be
     un-stacked, None when the merge may proceed on the branch's own delta.
+    A train is never un-stacked: its tip's recorded base is a co-member, and
+    stripping that base would drop the co-member from the landing.
     """
+    if isinstance(req, GroupMergeRequest):
+        return None
     result = await git_ops.unstack_from_unlanded_base(req.branch.full_name)
     if result.outcome is UnstackOutcome.UNSTACKED:
-        logger.warning(
-            'Task %s: branch %s was stacked on unlanded base %s (%s) — '
-            'un-stacked onto main before merging',
-            req.task_id, req.branch.full_name, result.base,
-            ', '.join(result.base_owners) or 'no live branch points at it',
-        )
+        logger.info('Task %s: merging its own delta after un-stacking', req.task_id)
     if not result.stops_merge:
         return None
     reason = result.merge_block_reason()
@@ -6159,10 +6158,7 @@ async def classify_and_merge(
     if guard is not None:
         return Decided(guard)
 
-    # 1b. Un-stack from an unlanded base.  Only single requests get here:
-    # _merger_loop hands every GroupMergeRequest to _do_train_merge first,
-    # and a train tip must keep its co-members' commits — so stripping a
-    # recorded stack base here never splits a train.
+    # 1b. Un-stack a single request from an unlanded base (task 5618).
     unstacked = await _unstack_before_merge(git_ops, req)
     if unstacked is not None:
         return unstacked
@@ -15191,18 +15187,26 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     async def _unstack_redriven_member(self, train_id: str, mid: str) -> None:
         """Strip an unlanded stack base from a derailed member before re-drive.
 
-        Never raises.  A member that cannot be un-stacked is re-driven anyway:
-        its record survives, so its solo merge admission blocks with the
-        attributed reason.
+        Never raises, so the re-drive that follows always runs: a member left
+        merge-deferred with no workflow is stranded.  A member that cannot be
+        un-stacked is re-driven anyway; its solo merge admission un-stacks it
+        again, and blocks with the attributed reason if it still cannot.
         """
-        result = await self._git_ops.unstack_from_unlanded_base(
-            f'{self._git_ops.config.branch_prefix}{mid}',
-        )
+        try:
+            result = await self._git_ops.unstack_from_unlanded_base(
+                f'{self._git_ops.config.branch_prefix}{mid}',
+            )
+        except Exception:
+            logger.exception(
+                'Coalesce train %s: un-stacking member %s raised — re-driving '
+                'it anyway; its solo merge admission un-stacks it again',
+                train_id, mid,
+            )
+            return
         if result.outcome is UnstackOutcome.UNSTACKED:
-            logger.warning(
-                'Coalesce train %s: member %s was stacked on unlanded base %s '
-                '— un-stacked onto main before re-drive',
-                train_id, mid, result.base,
+            logger.info(
+                'Coalesce train %s: member %s un-stacked before re-drive',
+                train_id, mid,
             )
         elif result.stops_merge:
             logger.warning(
