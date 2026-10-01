@@ -22,6 +22,7 @@ import pytest
 from escalation.queue import EscalationQueue
 
 from fused_memory.middleware.curator_escalator import CuratorEscalator
+from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
 from fused_memory.middleware.task_curator import CuratorFailureError
 
 
@@ -638,6 +639,98 @@ class TestReportFailureReturnsZotEscalationId:
             assert failed is None
             assert follow_up is None
             assert _pending_records(tmp_path) == []
+        finally:
+            handle.close()
+
+
+
+_FINDING = DuplicateFinding(
+    task_id='7416', duplicate_task_id='7383', duplicate_title='Existing gate fix', score=0.6812,
+)
+
+
+def _duplicate_report(root, finding=_FINDING, zot_escalation_id='esc-curator-41'):
+    return dict(
+        project_root=str(root), project_id='proj-dup',
+        finding=finding, candidate_title='Re-filed gate fix',
+        zot_escalation_id=zot_escalation_id,
+    )
+
+
+class TestReportZotDuplicate:
+    """Task 5491: each post-ZOT duplicate finding files its own L1 record."""
+
+    @pytest.mark.asyncio
+    async def test_files_one_record_carrying_the_finding(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+
+            [record] = _pending_records(tmp_path)
+            assert record['category'] == 'curator_zot_duplicate'
+            assert record['level'] == 1
+            assert record['severity'] == 'blocking'
+            detail = record['detail']
+            for value in ('7416', '7383', '0.681', 'Re-filed gate fix', 'proj-dup', 'esc-curator-41'):
+                assert value in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_absent_zot_id_still_files_without_a_fake_id(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_zot_duplicate(
+                **_duplicate_report(tmp_path, zot_escalation_id=None),
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['category'] == 'curator_zot_duplicate'
+            assert 'esc-' not in record['detail']
+            assert "zot_escalation_id='None'" not in record['detail']
+            assert 'zot_escalation_id=None' not in record['detail']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_returns_quietly(self, tmp_path):
+        _make_orchestrator_layout(tmp_path, hold_lock=False)
+
+        await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+
+        assert not list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+
+    @pytest.mark.asyncio
+    async def test_queue_failure_is_swallowed(self, tmp_path, monkeypatch):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            def _broken_submit(self, escalation):
+                raise OSError('queue dir unwritable')
+
+            monkeypatch.setattr(EscalationQueue, 'submit', _broken_submit)
+
+            await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_distinct_findings_file_distinct_records(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_zot_duplicate(**_duplicate_report(tmp_path))
+            await escalator.report_zot_duplicate(**_duplicate_report(
+                tmp_path,
+                finding=DuplicateFinding(
+                    task_id='6583', duplicate_task_id='5436',
+                    duplicate_title='Other', score=0.9,
+                ),
+            ))
+
+            records = _pending_records(tmp_path)
+            assert len(records) == 2
+            assert {r['category'] for r in records} == {'curator_zot_duplicate'}
+            assert all(r['dedupe_count'] == 0 for r in records)
         finally:
             handle.close()
 
