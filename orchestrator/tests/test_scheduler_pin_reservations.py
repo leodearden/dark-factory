@@ -24,6 +24,7 @@ candidates.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -667,3 +668,25 @@ async def test_a_shorter_reloaded_interval_applies_next_tick(tmp_path):
     await w.scheduler.acquire_next()
 
     assert len(event_data_for(w.store, 'pin_blocked', 'P1')) == 2
+
+
+# ---------------------------------------------------------------------------
+# D7iii — the state snapshot shows pin reservations apart from fairness parks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_snapshot_lists_pin_reservations_apart_from_fairness_parks(tmp_path):
+    w = _3659_world(tmp_path)
+    assert await w.scheduler.acquire_next() is None
+
+    snapshot = w.scheduler.get_state_snapshot()
+
+    pin_reservations = snapshot['pin_reservations']
+    assert list(pin_reservations) == ['P'], "C's fairness park is not a pin reservation"
+    assert pin_reservations['P']['modules'] == ['w.py', 'x.py']
+    assert isinstance(pin_reservations['P']['installed_at'], str)
+    assert pin_reservations['P']['installed_at']
+    assert 'P' in snapshot['parks'], '`parks` still reports every active top (INV-7)'
+    on_disk = json.loads(w.scheduler._build_snapshot_payload())
+    assert on_disk['pin_reservations'] == pin_reservations
