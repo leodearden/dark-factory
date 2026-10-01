@@ -264,9 +264,9 @@ SLATE_SEEDED = 'seeded'
 SLATE_RETRIEVED = 'retrieved'
 SLATE_MODES: tuple[str, ...] = (SLATE_SEEDED, SLATE_RETRIEVED)
 
-#: The outcomes under which ``triage_write`` files the write against
-#: ``decision.canonical_id``. ``stored`` is the one that attaches to nothing
-#: (write_triage.py: ``canonical_id = None if verdict == OUTCOME_STORED``).
+#: The outcomes under which ``triage_write`` attaches the write at all.
+#: ``stored`` is the one that attaches to nothing
+#: (``write_triage.py::_apply_judge_verdict`` nulls its ``canonical_id``).
 ATTACH_OUTCOMES: frozenset[str] = frozenset({
     OUTCOME_RESTATED, OUTCOME_AMENDED, OUTCOME_CONTESTED,
 })
@@ -361,7 +361,7 @@ def _case(
     candidates: list[str],
     expected_class: str,
     acceptable: frozenset[str],
-    attach_target_id: str | None,
+    band_winner_id: str | None,
     band: str,
     similarity: float | None,
     canonical_present: bool | None,
@@ -381,7 +381,7 @@ def _case(
         'candidates': candidates,
         'expected_class': expected_class,
         'acceptable_outcomes': acceptable,
-        'attach_target_id': attach_target_id,
+        'band_winner_id': band_winner_id,
         'band': band,
         'similarity': similarity,
         'canonical_present': canonical_present,
@@ -398,7 +398,7 @@ def _seeded_case(
 ) -> dict[str, Any]:
     """A case whose slate is CONSTRUCTED rather than retrieved.
 
-    The lead record is the attach target and the band is the middle one — the
+    The lead record is the band winner and the band is the middle one — the
     only band that reaches a judge — because that is what `build_judge_fn`
     synthesizes. Similarity and canonical liveness are unmeasured here, and
     `None` says so rather than claiming a figure.
@@ -408,7 +408,7 @@ def _seeded_case(
         candidates=slate,
         expected_class=expected_class,
         acceptable=acceptable,
-        attach_target_id=slate[0] if slate else None,
+        band_winner_id=slate[0] if slate else None,
         band=OUTCOME_JUDGE,
         similarity=None,
         canonical_present=None,
@@ -584,7 +584,7 @@ def plan_from_slates(
     (default: *records*), so a ``--limit`` run describes a target exactly as
     the full run does.
 
-    The expected class stays the fixture's label. The slate, the attach target
+    The expected class stays the fixture's label. The slate, the band winner
     and the band come from the retrieval — including for a record whose
     canonical is no longer in the corpus, which is kept in the population and
     flagged rather than dropped.
@@ -603,7 +603,7 @@ def plan_from_slates(
             candidates=[str(c['memory_id']) for c in slate.candidates],
             expected_class=str(record['label']),
             acceptable=_acceptable_for(str(record['label'])),
-            attach_target_id=slate.attach_target_id,
+            band_winner_id=slate.attach_target_id,
             band=slate.band,
             similarity=slate.similarity,
             canonical_present=slate.canonical_present,
@@ -633,6 +633,9 @@ class JudgeAnswer:
 
     The elision flags and ``usage`` are ``None`` for the same reason: nothing
     was rendered and nothing was spent.
+
+    ``candidate_id`` is the slate id the verdict named, and ``None`` when no
+    judge was asked or its verdict named nothing.
     """
 
     outcome: str
@@ -640,6 +643,18 @@ class JudgeAnswer:
     entry_elided: bool | None = None
     candidates_elided: Mapping[str, bool] | None = None
     usage: Mapping[str, int] | None = None
+    candidate_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.candidate_id is None:
+            return
+        if self.verdict is None or self.outcome not in ATTACH_OUTCOMES:
+            raise ValueError(
+                f'candidate_id {self.candidate_id!r} named with verdict '
+                f'{self.verdict!r} and outcome {self.outcome!r}: only a judge '
+                f'verdict that attaches (one of {sorted(ATTACH_OUTCOMES)}) names '
+                f'a candidate',
+            )
 
 
 def _as_answer(value: Any) -> JudgeAnswer:
@@ -774,11 +789,11 @@ def score_attachments(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     scores the attach target, so a case can answer `amended` — correct for its
     label — while attaching the write to an unrelated record.
 
-    The target scored is each row's `attach_target_id`: the band winner,
-    `decision.canonical_id`. A deterministic `restated` attaches there; a
-    judged attach does not, because `triage_write` files it against the
-    candidate the judge named, which the rows do not carry. For the middle
-    band these counts describe the band winner, not production's attach.
+    The target scored is each row's `attach_target_id`, the record production
+    files the write against: for a middle-band attach, the candidate the judge
+    named, hoisted to its canonical; otherwise the band winner. Rows from a
+    judge that named no candidate (before task 5794) carry the band winner,
+    which is where production attached them then.
 
     Pure counting over the per-case dump. Every rule is a field of a row;
     nothing is recomputed from the cases here.
@@ -913,6 +928,33 @@ def _attachable_id(record: Mapping[str, Any]) -> str:
     return str(record.get('canonical_id') or record['memory_id'])
 
 
+def _judged_candidate_id(
+    case: Mapping[str, Any],
+    answer: JudgeAnswer,
+    shown: Mapping[str, Mapping[str, Any]],
+) -> str | None:
+    """The record the verdict named, hoisted as production attaches to it.
+
+    *shown* is the case's own slate by memory id. A named id off it RAISES
+    rather than being scored as an attach production never makes, or as the
+    `stored` production would fail it open to. Neither shipped edge can reach
+    it: each hands `judge_write` exactly these records, and
+    `parse_judge_verdict` refuses an id off what it rendered from them. So
+    reaching it means a `judge_fn` answered about records it was not shown, a
+    defect every later judged attach would repeat; stopping at the first costs
+    one call where failing open would buy a whole run of meaningless rows.
+    """
+    if answer.candidate_id is None:
+        return None
+    record = shown.get(answer.candidate_id)
+    if record is None:
+        raise ValueError(
+            f'case {case["memory_id"]!r}: the verdict named '
+            f'{answer.candidate_id!r}, which is not on its slate {sorted(shown)}',
+        )
+    return _attachable_id(record)
+
+
 def case_row(
     index: int,
     case: Mapping[str, Any],
@@ -927,11 +969,19 @@ def case_row(
     fixture record, so a null cluster or label means it is not one, and
     otherwise from its row on this slate.
 
+    The attach target is where production files the write: the candidate the
+    verdict named when it named one, otherwise ``band_winner_id``.
+    ``verdict_candidate_id`` is the raw slate id the verdict named and
+    ``judged_candidate_id`` is that id HOISTED (PRD
+    ``plans/write-triage-flip-readiness-prd.md`` §11 C2''), unlike
+    ``BandDecision.judged_candidate_id``, which is the raw id.
+
     JSON-serializable verbatim: this is the line appended to the cases file as
     each case completes, so a run interrupted partway keeps what it paid for.
     """
-    target_id = case['attach_target_id']
     shown = {str(record['memory_id']): record for record in candidate_records}
+    judged = _judged_candidate_id(case, answer, shown)
+    target_id = judged if judged is not None else case['band_winner_id']
     target = (
         (fixture_by_id.get(str(target_id)) or shown.get(str(target_id))) if target_id else None
     )
@@ -947,6 +997,9 @@ def case_row(
         'expected_class': case['expected_class'],
         'acceptable_outcomes': sorted(case['acceptable_outcomes']),
         'candidates': list(case['candidates']),
+        'band_winner_id': case['band_winner_id'],
+        'verdict_candidate_id': answer.candidate_id,
+        'judged_candidate_id': judged,
         'attach_target_id': target_id,
         'attach_target_cluster_id': target.get('cluster_id') if target else None,
         'attach_target_category': target.get('category') if target else None,
@@ -1069,7 +1122,7 @@ MODE_CAVEATS: dict[str, tuple[str, ...]] = {
         'the corpus. Those are KEPT in the population, because production '
         'meets them.',
         'Every figure here is measured over the population production would '
-        'actually route: the slate, the attach target and the band all come '
+        'actually route: the slate, the band winner and the band all come '
         'from a live retrieval through `retrieve_candidates` / `decide_band` / '
         '`select_judge_candidates` at this config\'s `candidate_k`, `t_high` '
         'and `t_low`, and the judge was asked ONLY for the middle band. So '
@@ -1080,11 +1133,13 @@ MODE_CAVEATS: dict[str, tuple[str, ...]] = {
         'ANOTHER RECORD, which `per_class` cannot show. '
         '`production_shape.duplicate_attach.strict` and '
         '`production_shape.wrong_record_attach` score `attach_target_id`, the '
-        'band winner `decision.canonical_id`. A deterministic `restated` '
-        'attaches there, but a judged one does NOT: `triage_write` files a '
-        'middle-band attach against the candidate the judge NAMED, which this '
-        'report does not yet record (task 6007). For the middle band those two '
-        'figures describe the band winner, not production\'s attach.',
+        'record production files the write against. For a middle-band attach '
+        'that is the candidate the judge NAMED, hoisted to its canonical '
+        '(`judged_candidate_id`); otherwise it is the band winner '
+        '(`band_winner_id`). So for the middle band `strict` is recall at '
+        '`judge_candidate_count`, not at 1. An artifact from a judge that named '
+        'no candidate (before task 5794) attached every judged write to the '
+        'band winner, and its rows carry no `judged_candidate_id`.',
     ),
 }
 
@@ -1420,7 +1475,7 @@ def _record_slate_widths(
 #: one, so a slate carrying no scores would arrive at the model empty.
 #:
 #: Descending by slate position, which preserves the order
-#: ``build_judge_cases`` chose — the attach target first. These numbers never
+#: ``build_judge_cases`` chose — the band winner first. These numbers never
 #: reach the model: ``build_judge_prompt`` renders id and text only, no
 #: metadata at all (PRD C1). They exist solely to survive the selector.
 _SYNTHETIC_TOP_SCORE = 0.90
@@ -1623,7 +1678,7 @@ def _ask_judge(
     slate: Sequence[Any],
     *,
     outcome: str,
-    attach_target_id: str | None,
+    band_winner_id: str | None,
     similarity: float | None,
     recorded: Sequence[Any],
 ) -> JudgeAnswer:
@@ -1653,7 +1708,7 @@ def _ask_judge(
         project_id=_EVAL_PROJECT_ID,
         decision=BandDecision(
             outcome=OUTCOME_JUDGE,
-            canonical_id=attach_target_id,
+            canonical_id=band_winner_id,
             similarity=similarity,
             t_high=None,
             t_low=None,
@@ -1666,6 +1721,7 @@ def _ask_judge(
         entry_elided=entry_elided,
         candidates_elided=candidates_elided,
         usage=_usage_of(recorded[before:]),
+        candidate_id=verdict.candidate_id,
     )
 
 
@@ -1713,7 +1769,7 @@ def build_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
             str(case['content']),
             slate,
             outcome=OUTCOME_JUDGE,
-            attach_target_id=slate[0].id if slate else None,
+            band_winner_id=slate[0].id if slate else None,
             similarity=_SYNTHETIC_TOP_SCORE,
             recorded=recorded,
         )
@@ -1724,7 +1780,7 @@ def build_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
 def build_retrieved_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
     """The RETRIEVED live edge: the case already carries production's routing.
 
-    The slate, the attach target, the band and the similarity all came from
+    The slate, the band winner, the band and the similarity all came from
     ``decide_band``/``select_judge_candidates`` over a real retrieval, so this
     only rebuilds the records and defers to the same judge edge. The candidate
     metadata is passed through whole because it carries the cosine the shipped
@@ -1744,7 +1800,7 @@ def build_retrieved_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
             str(case['content']),
             slate,
             outcome=str(case['band']),
-            attach_target_id=case['attach_target_id'],
+            band_winner_id=case['band_winner_id'],
             similarity=case['similarity'],
             recorded=recorded,
         )
@@ -2000,8 +2056,8 @@ def main() -> int:
     parser.add_argument('--slate-mode', dest='slate_mode', default=SLATE_SEEDED,
                         choices=SLATE_MODES,
                         help='seeded: the cluster canonical is placed at slate '
-                             'position 0. retrieved: the slate, the attach '
-                             'target and the band all come from a real '
+                             'position 0. retrieved: the slate, the band '
+                             'winner and the band all come from a real '
                              'retrieval against the live store, as production '
                              'would produce them (default: seeded)')
     parser.add_argument('--project-id', dest='project_id', default='reify',
@@ -2023,7 +2079,8 @@ def main() -> int:
                              'attach to the canonical (default: none)')
     parser.add_argument('--cases-path', dest='cases_path', default=None,
                         help='append one JSON line per case as it completes: '
-                             'slate, attach target, band, verdict, outcome and '
+                             'slate, band winner, the candidate the verdict '
+                             'named, attach target, band, verdict, outcome and '
                              'elision flags (default: no per-case dump)')
     return _run(parser.parse_args())
 

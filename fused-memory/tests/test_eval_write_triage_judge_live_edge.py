@@ -25,6 +25,7 @@ from _write_triage_store_fake import FakeMemoryService
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server.write_triage import (
+    OUTCOME_AMENDED,
     OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
@@ -79,18 +80,18 @@ def _user_turn(messages: list[dict]) -> str:
     return next(m['content'] for m in messages if m['role'] == 'user')
 
 
-def _openai(word: str) -> MagicMock:
+def _openai(word: str, *, named: int = 0) -> MagicMock:
     """A fake `AsyncOpenAI` that is its own async context manager, as the SDK is.
 
-    Every completion answers *word* about the FIRST candidate its own prompt
-    names (an attach verdict must name one; `distinct` names none) and bills
-    :data:`_USAGE`. The response is plain namespaces because a MagicMock
+    Every completion answers *word* about the candidate at position *named* of
+    its own prompt (an attach verdict must name one; `distinct` names none) and
+    bills :data:`_USAGE`. The response is plain namespaces because a MagicMock
     `usage` would hand `int()` a 1.
     """
     async def _complete(**kwargs) -> types.SimpleNamespace:
         answer = {VERDICT_KEY: word}
         if JUDGE_VERDICTS[word] != OUTCOME_STORED:
-            answer[CANDIDATE_ID_KEY] = _ID_LINE.findall(_user_turn(kwargs['messages']))[0]
+            answer[CANDIDATE_ID_KEY] = _ID_LINE.findall(_user_turn(kwargs['messages']))[named]
         return types.SimpleNamespace(
             choices=[types.SimpleNamespace(
                 message=types.SimpleNamespace(content=json.dumps(answer)),
@@ -155,6 +156,7 @@ class TestTheSeededLiveEdge:
         with patch('openai.AsyncOpenAI', return_value=_openai('amends')):
             answer = _mod().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
         assert (answer.outcome, answer.verdict) == (JUDGE_VERDICTS['amends'],) * 2
+        assert answer.candidate_id == case['candidates'][0]
 
     def test_a_recorded_run_reports_what_the_provider_billed(self) -> None:
         plan = self._plan()
@@ -228,6 +230,7 @@ class TestTheRetrievedLiveEdge:
         with patch('openai.AsyncOpenAI', return_value=client):
             answer = _mod().build_retrieved_judge_fn(_judge_config())(case, candidates)
         assert (answer.outcome, answer.verdict) == (band, None)
+        assert answer.candidate_id is None
         client.chat.completions.create.assert_not_awaited()
 
     def test_a_middle_band_case_is_one_completion(self) -> None:
@@ -238,6 +241,25 @@ class TestTheRetrievedLiveEdge:
             answer = _mod().build_retrieved_judge_fn(_judge_config())(case, candidates)
         assert client.chat.completions.create.await_count == 1
         assert (answer.outcome, answer.verdict) == (JUDGE_VERDICTS['amends'],) * 2
+
+    def test_the_answer_carries_the_candidate_the_verdict_named(self) -> None:
+        plan = _shipped_plan(
+            [_rec('canon', 'canon', 'canonical'), _rec('dup', 'canon', 'duplicate')],
+            {'content of dup': [_hit('canon', 0.8), _hit('other', 0.7)]},
+        )
+        [case] = plan.cases
+        assert case['band'] == OUTCOME_JUDGE, 'precondition: the shipped bands routed it'
+        assert case['candidates'] == ['canon', 'other'], 'precondition: the retrieval order'
+        with patch('openai.AsyncOpenAI', return_value=_openai('amends', named=1)):
+            answer = _mod().build_retrieved_judge_fn(_judge_config())(case, _resolved(plan, 0))
+        assert (answer.outcome, answer.candidate_id) == (OUTCOME_AMENDED, 'other')
+
+    def test_a_distinct_verdict_names_no_candidate(self) -> None:
+        case, candidates = self._case(0.7)
+        assert case['band'] == OUTCOME_JUDGE, 'precondition: the shipped bands routed it'
+        with patch('openai.AsyncOpenAI', return_value=_openai('distinct')):
+            answer = _mod().build_retrieved_judge_fn(_judge_config())(case, candidates)
+        assert (answer.outcome, answer.candidate_id) == (OUTCOME_STORED, None)
 
 
 class TestEachPromptRendersItsOwnRetrieval:
