@@ -435,20 +435,10 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
         _cleanup(temp_files)
 
 
-# ── ARG_MAX / no-positional-prompt guard (task 3147) ─────────────────────────
-
-# Flags this builder emits with NO value of their own.  The walk below needs
-# arity knowledge only for these — every other flag opens a value run.  Kept
-# deliberately tiny and explicit; a newly-added boolean flag must be listed
-# here or the walk fails loudly, which is the intended forcing function.
 # ── argv[0] binary resolution (task 4448) ─────────────────────────────────────
-# argv[0] used to be the hardcoded bare name 'claude', left for the kernel to
-# resolve against whatever PATH the spawning process inherited. On
-# 2026-08-13→08-18 the fused-memory systemd unit's inherited PATH lacked
-# ~/.local/bin, every curator LLM call raised FileNotFoundError, and nothing
-# named the binary. These two tests pin both halves of the fix: resolution
-# happens here and is visible in argv, and an unresolvable spec degrades to a
-# warning rather than an exception.
+# argv[0] is resolved by the builder, not left to whatever PATH the spawning
+# process inherits: the absolute path when the spec resolves, otherwise the
+# bare spec plus a WARNING naming it — never an exception.
 
 
 def _minimal_argv(**overrides):
@@ -502,6 +492,12 @@ def test_build_claude_argv_falls_back_to_spec_and_warns_when_unresolvable(
         _cleanup(temp_files)
 
 
+# ── ARG_MAX / no-positional-prompt guard (task 3147) ─────────────────────────
+
+# Flags this builder emits with NO value of their own.  The walk below needs
+# arity knowledge only for these — every other flag opens a value run.  Kept
+# deliberately tiny and explicit; a newly-added boolean flag must be listed
+# here or the walk fails loudly, which is the intended forcing function.
 _BOOLEAN_FLAGS = {'--print', '--strict-mcp-config'}
 
 MAX_ARG_STRLEN = 131072  # Linux per-argument limit (128 KiB)
