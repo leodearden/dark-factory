@@ -56,6 +56,7 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectScope
+from fused_memory.reconciliation import live_workflow_section as section_module
 from fused_memory.reconciliation.curator_gate_resolution_sweep import (
     GATE_RESOLUTION_FLAG_TYPE,
 )
@@ -73,6 +74,8 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
 )
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
+from fused_memory.services.landed_on_main import LandingVerdict
+from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
 # make_consolidator/make_scope used to be defined here as _make_consolidator/
 # _scope. They moved to a shared non-test module (task 4708) once the
@@ -5753,3 +5756,184 @@ class TestStage1LiveStateFreshnessSection:
         assert not missing, (
             f'the section must name every documented sweep deleter; missing {missing!r}'
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 4874 (#3935): reify run 6aa50844 deferred a disposition because "task/5891
+# is live (worktree, orchestrator)" while its own payload's Live-Workflow Signals
+# section listed nothing. Stage 1 annotates such a finding, never drops it.
+# ---------------------------------------------------------------------------
+
+_CITATION_INCIDENT = (
+    'Live-Workflow Signals show task/5891 is live (worktree, orchestrator); '
+    'deferring disposition'
+)
+_CITATION_STAT = 'stage1_live_workflow_citation_contradictions'
+_CITATION_ANNOTATION = 'live_workflow_citation_contradictions'
+
+
+def _citing_flag(description: str) -> dict:
+    return {
+        'task_id': '5891',
+        'flag_type': 'deferred_disposition',
+        'severity': 'info',
+        'description': description,
+    }
+
+
+def _unrelated_flag() -> dict:
+    return {
+        'task_id': '100',
+        'flag_type': 'missing_deliverable',
+        'severity': 'info',
+        'description': 'Task 100 has no deliverable',
+    }
+
+
+def _active_tree(*task_ids: int) -> FilteredTaskTree:
+    return FilteredTaskTree(
+        active_tasks=[{'id': task_id, 'status': 'in-progress'} for task_id in task_ids],
+        total_count=len(task_ids),
+        max_task_id=max(task_ids),
+    )
+
+
+def _stub_live_workflow_probes(
+    monkeypatch: pytest.MonkeyPatch, *, worktree_live: frozenset[str] = frozenset(),
+) -> None:
+    """Nothing has landed; only the tasks in *worktree_live* have a live worktree."""
+
+    async def detect(task_id, project_root, **_kwargs):
+        live = task_id in worktree_live
+        return WorkflowLiveness(
+            is_live=live, worktree_registered=live, recent_commit=False,
+            orchestrator_live=False, branch=f'task/{task_id}', last_commit_at=None,
+        )
+
+    async def probe(project_root, queries):
+        return {query.task_id: LandingVerdict.not_landed() for query in queries}
+
+    monkeypatch.setattr(section_module, 'detect_live_workflow', detect)
+    monkeypatch.setattr(section_module, 'probe_landing', probe)
+
+
+async def _run_assembling_payload(stage: MemoryConsolidator, flags: list[dict]) -> StageReport:
+    """Run Stage 1 with BaseStage.run doing what the real one does before the LLM."""
+
+    async def assemble_then_report(self, events, watermark, prior_reports, run_id, **_kwargs):
+        await self.assemble_payload(events, watermark, prior_reports)
+        return StageReport(
+            stage=StageId.memory_consolidator,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[dict(flag) for flag in flags],
+            stats={},
+        )
+
+    async def dedup_passthrough(*, flags, **_kwargs):
+        return flags
+
+    with (
+        patch.object(BaseStage, 'run', new=assemble_then_report),
+        patch(
+            'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+            new=dedup_passthrough,
+        ),
+    ):
+        return await stage.run(
+            events=[],
+            watermark=Watermark(project_id='test_project'),
+            prior_reports=[],
+            run_id='run-6aa50844',
+        )
+
+
+def _annotation_for(report: StageReport, task_id: str) -> list | None:
+    flag = next(f for f in report.items_flagged if f.get('task_id') == task_id)
+    return flag.get(_CITATION_ANNOTATION)
+
+
+class TestMemoryConsolidatorLiveWorkflowCitationGuard:
+    @pytest.fixture
+    def stage(self, tmp_path: Path) -> MemoryConsolidator:
+        return make_consolidator(project_root=str(tmp_path))
+
+    @pytest.mark.asyncio
+    async def test_the_incident_citation_is_counted_and_annotated(self, stage, monkeypatch):
+        _stub_live_workflow_probes(monkeypatch)
+        stage.filtered_task_tree = _active_tree(5891, 100)
+
+        report = await _run_assembling_payload(
+            stage, [_citing_flag(_CITATION_INCIDENT), _unrelated_flag()],
+        )
+
+        assert report.stats[_CITATION_STAT] == 1
+        annotation = _annotation_for(report, '5891')
+        assert annotation is not None
+        assert [record['task_id'] for record in annotation] == ['5891']
+        assert _annotation_for(report, '100') is None
+
+    @pytest.mark.asyncio
+    async def test_annotating_drops_nothing_and_rewrites_no_description(
+        self, stage, monkeypatch, tmp_path,
+    ):
+        _stub_live_workflow_probes(monkeypatch)
+        flags = [_citing_flag(_CITATION_INCIDENT), _unrelated_flag()]
+        stage.filtered_task_tree = _active_tree(5891, 100)
+        guarded = await _run_assembling_payload(stage, flags)
+        inert = await _run_assembling_payload(
+            make_consolidator(project_root=str(tmp_path)), flags,
+        )
+
+        assert guarded.stats[_CITATION_STAT] == 1
+        assert inert.stats[_CITATION_STAT] == 0
+        assert len(guarded.items_flagged) == len(inert.items_flagged) == len(flags)
+        assert [f['description'] for f in guarded.items_flagged] == [
+            f['description'] for f in inert.items_flagged
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_citation_the_section_carries_is_not_annotated(self, stage, monkeypatch):
+        _stub_live_workflow_probes(monkeypatch, worktree_live=frozenset({'5891'}))
+        stage.filtered_task_tree = _active_tree(5891)
+
+        report = await _run_assembling_payload(
+            stage, [_citing_flag('Live-Workflow Signals show task/5891 is live (worktree)')],
+        )
+
+        assert report.stats[_CITATION_STAT] == 0
+        assert _annotation_for(report, '5891') is None
+
+    @pytest.mark.asyncio
+    async def test_a_remediation_pass_is_guarded_too(self, stage, monkeypatch):
+        _stub_live_workflow_probes(monkeypatch)
+        stage.filtered_task_tree = _active_tree(5891)
+        stage.remediation_findings = [{'description': 'fix this'}]
+
+        report = await _run_assembling_payload(stage, [_citing_flag(_CITATION_INCIDENT)])
+
+        assert report.stats[_CITATION_STAT] == 1
+        assert _annotation_for(report, '5891') is not None
+
+    @pytest.mark.asyncio
+    async def test_no_rendered_section_leaves_the_guard_inert(self, stage, monkeypatch):
+        _stub_live_workflow_probes(monkeypatch)
+
+        report = await _run_assembling_payload(stage, [_citing_flag(_CITATION_INCIDENT)])
+
+        assert report.stats[_CITATION_STAT] == 0
+        assert _annotation_for(report, '5891') is None
+
+    @pytest.mark.asyncio
+    async def test_a_run_never_compares_against_a_previous_runs_section(
+        self, stage, monkeypatch,
+    ):
+        _stub_live_workflow_probes(monkeypatch, worktree_live=frozenset({'5891'}))
+        stage.filtered_task_tree = _active_tree(5891)
+        await _run_assembling_payload(stage, [])
+        stage.filtered_task_tree = None
+
+        report = await _run_assembling_payload(stage, [_citing_flag(_CITATION_INCIDENT)])
+
+        assert report.stats[_CITATION_STAT] == 0
+        assert _annotation_for(report, '5891') is None
