@@ -767,8 +767,7 @@ class TestTheJournalPathIsAnchoredOnTheMainCheckout:
 
         The regression guard against over-relativizing: a journal parked
         outside the tree is genuinely checkout-independent and must stay
-        identifiable.  Contrast `bake_off_storage_shape.py::_repo_relative`,
-        whose fallback is `resolved.name`.
+        identifiable.
         """
         _main, lane = _seed_checkout_with_harvest_copy(tmp_path)
         journal = _standard_journal(tmp_path)

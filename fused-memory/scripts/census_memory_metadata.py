@@ -138,14 +138,11 @@ def _repo_relative(path: str) -> str:
     Paths outside the repo are returned resolved-absolute: they are genuinely
     checkout-independent, and shortening them is not this function's job.
 
-    Sibling copies `fused-memory/scripts/harvest_production_queries.py::_repo_relative`
-    (main-checkout anchor, absolute fallback) and
-    `fused-memory/scripts/bake_off_storage_shape.py::_repo_relative`
-    (running-checkout anchor, bare-name fallback).  This one stays on the
-    RUNNING checkout deliberately: what it records (registry fixture, history
-    file) is tracked in every checkout and read back against the reader's
-    own, whereas a main anchor would record a lane default as
-    ``.worktrees/<id>/...``.
+    Anchored on the RUNNING checkout: what it records (registry fixture,
+    history file) is tracked in every checkout and read back against the
+    reader's own.  Sibling copies differ on anchor and fallback: see
+    `fused-memory/scripts/harvest_production_queries.py::_repo_relative` and
+    `fused-memory/scripts/bake_off_storage_shape.py::_repo_relative`.
 
     RECORDING side. *path* is whatever the CLI was handed, so it is resolved
     with the process's CWD semantics -- the same way the run itself

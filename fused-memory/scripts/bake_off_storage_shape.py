@@ -2327,18 +2327,16 @@ def _repo_relative(path: str | Path) -> str:
     Shared by :func:`fixture_provenance` and the regrowth block so the two
     cannot name the same file differently.  An artifact naming somebody's
     absolute checkout is neither reproducible nor readable by anyone else,
-    and it leaks the worktree the run happened in.  Falls back to the bare
-    filename for a path outside the repo, rather than emitting the absolute
-    one.
+    and it leaks the worktree the run happened in.
 
-    Sibling copies `fused-memory/scripts/harvest_production_queries.py::_repo_relative`
-    (main-checkout anchor) and
-    `fused-memory/scripts/census_memory_metadata.py::_repo_relative` both
-    fall back to the resolved ABSOLUTE path.  This one differs because its
-    values are published fixture NAMES and the `path -> sha256` keys
-    :func:`_check_fixture_digests` compares: fixtures are tracked files in
-    every checkout, so the running checkout is the right anchor, and an
+    Anchored on the RUNNING checkout, since fixtures are tracked files in
+    every checkout.  A path outside it falls back to the bare filename, not
+    the absolute path: these values are published fixture NAMES and the
+    `path -> sha256` keys :func:`_check_fixture_digests` compares, and an
     out-of-repo fixture is a run-specific tmp path that must not leak.
+    Sibling copies differ on anchor and fallback: see
+    `fused-memory/scripts/harvest_production_queries.py::_repo_relative` and
+    `fused-memory/scripts/census_memory_metadata.py::_repo_relative`.
     """
     resolved = Path(path).resolve()
     try:

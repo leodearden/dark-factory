@@ -74,7 +74,8 @@ and writes no fixture: a silently-empty sample would read downstream as
 
 USAGE
 -----
-    ./harvest_production_queries.py \
+    uv run --project fused-memory python \
+        fused-memory/scripts/harvest_production_queries.py \
         --journal /home/leo/src/dark-factory/data/reconciliation/write_journal.db \
         --out fused-memory/tests/fixtures/production_query_sample.jsonl
 
@@ -432,19 +433,13 @@ def _repo_relative(path: Path | str) -> str:
     `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`
     already states.  Anchored on the MAIN checkout (`_main_checkout_root`);
     a path outside it stays RESOLVED-ABSOLUTE so a journal parked elsewhere
-    remains identifiable.
+    remains identifiable.  Nothing reads `journal_path` back.
 
-    Three private copies of this helper differ on anchor and fallback, so
-    copy deliberately rather than by proximity:
-    `fused-memory/scripts/census_memory_metadata.py::_repo_relative`
-    (running-checkout anchor, absolute fallback, read back by
-    `census_memory_metadata.py::_resolved_repo_path`) and
-    `fused-memory/scripts/bake_off_storage_shape.py::_repo_relative`
-    (running-checkout anchor, bare-name fallback).  Those record tracked
-    files present in every checkout, so a main anchor would record
-    `.worktrees/<id>/...`; this one's input exists only in the main
-    checkout.  Nothing reads `journal_path` back.  Each copy stays private:
-    these scripts load via `_fm_helpers.load_script_module`, not as a package.
+    Sibling copies stay private (these scripts load via
+    `_fm_helpers.load_script_module`, not as a package) and differ on anchor
+    and fallback, so copy deliberately rather than by proximity: see
+    `fused-memory/scripts/census_memory_metadata.py::_repo_relative` and
+    `fused-memory/scripts/bake_off_storage_shape.py::_repo_relative`.
     """
     resolved = Path(path).resolve()
     try:
