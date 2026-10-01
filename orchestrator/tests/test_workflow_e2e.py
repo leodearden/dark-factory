@@ -8394,6 +8394,7 @@ class TestBuildAgentEnvCpuGovern:
     ):
         """cpu_governance disabled by default: ARCHITECT does not get DF_AGENT_CPU_GOVERN,
         even when exec_path and shim_dir resolve."""
+        from orchestrator.config import CpuGovernConfig
         scripts = tmp_path / 'scripts'
         scripts.mkdir()
         exec_file = scripts / 'cpu-governed-exec.sh'
@@ -8404,16 +8405,15 @@ class TestBuildAgentEnvCpuGovern:
         workflow = self._make_workflow(config, git_ops, task_assignment)
         workflow.worktree = tmp_path
         paths = dict(exec_path='scripts/cpu-governed-exec.sh', shim_dir='scripts/agent-bin')
-        ambient = workflow.config.cpu_governance
 
-        workflow.config.cpu_governance = ambient.model_copy(update={**paths, 'enabled': True})
+        workflow.config.cpu_governance = CpuGovernConfig(**paths, enabled=True)
         control_env = workflow._build_agent_env(ARCHITECT) or {}
         assert control_env.get('DF_AGENT_CPU_GOVERN') == str(exec_file.resolve()), (
             'control: with enabled=True these paths must resolve to DF_AGENT_CPU_GOVERN, so its '
             'absence below is due to governance being disabled, not resolution failing open'
         )
 
-        workflow.config.cpu_governance = ambient.model_copy(update=paths)
+        workflow.config.cpu_governance = CpuGovernConfig(**paths)
         env = workflow._build_agent_env(ARCHITECT)
         assert 'DF_AGENT_CPU_GOVERN' not in (env or {})
 
