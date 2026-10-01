@@ -1253,10 +1253,12 @@ _PROVENANCE_RANK_ORDER = 'ORDER BY provenance_rank DESC, n.created_at ASC, n.uui
 
 
 def _derive_registered_graph_ids(config: FusedMemoryConfig) -> frozenset[str]:
-    """The project registry's ids, derived exactly as ``server/main.py`` derives its map.
+    """The project registry's ids: ``build_known_projects_map`` over its two inputs.
 
-    Same builder, same two inputs (the taskmaster project_root and
-    DASHBOARD_KNOWN_PROJECT_ROOTS), so both snapshots of the registry agree.
+    The inputs are the taskmaster project_root and DASHBOARD_KNOWN_PROJECT_ROOTS,
+    the builder and inputs ``server/main.py`` uses for its own map.  The
+    primary-root normalisation below restates main.py's; nothing shared enforces
+    that the two stay equal.
     """
     primary = config.taskmaster.project_root if config.taskmaster else ''
     if primary:
