@@ -596,4 +596,19 @@ only. Ship it in SHADOW first, with O4 as the shadow's consumer.**
 
 ## 9. Follow-ups filed
 
-Recorded by step 19 of task 4716's plan (below).
+Both were filed through `submit_task` with `spawned_from: 4716` and
+`escalation_id: agent-followup-4716`. Each id is a curator ticket, not a task
+id.
+
+* **F1 (medium), build the guard per §8**, carrying §6.1's staging, trigger
+  and revisit clauses verbatim: `tkt_0RV9ERANDWG7CC3N1GFFKHCBY8`. The first
+  submission was rejected (`LockCharterViolation`) because its `files` named a
+  directory. It was re-filed naming
+  `fused_memory/reconciliation/context_assembler.py`.
+* **F2 (low), consolidate the read-only FalkorDB reader seam** into one src
+  module. The seam is duplicated in
+  `scripts/audit_wrong_binding_edges.py::EdgeReader`,
+  `scripts/audit_unverified_completion_claims.py::EpisodeReader` and
+  `scripts/local_memory_models_eval/build_corpus.py::EpisodeReader`, and the
+  migration also covers `scripts/audit_ruling_overreach.py::GraphReader`. The
+  ticket carries the edge-census `count(r)` gotcha: `tkt_0RV9EQ11QMC9WK79B74XBJ549H`.
