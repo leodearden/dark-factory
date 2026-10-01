@@ -542,6 +542,8 @@ class EventType(StrEnum):
     # Scheduler fairness
     task_skipped = 'task_skipped'
     # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
+    # Every emitted reservation_* event carries data.source in {pin, fairness}
+    # (task 6040): an operator pin's reservation, or the automatic machinery's.
     reservation_installed = 'reservation_installed'
     reservation_install_blocked = 'reservation_install_blocked'
     reservation_expired = 'reservation_expired'
@@ -551,6 +553,13 @@ class EventType(StrEnum):
     reservation_used = 'reservation_used'
     reservation_force_evicted = 'reservation_force_evicted'
     reservation_force_evict_refused = 'reservation_force_evict_refused'
+    # A pinned task failed to take its module locks (task 6040).  Producer:
+    # scheduler.py::Scheduler._phase_select_pins.  Payload: {task_id,
+    # pin_order, head, blockers: [{module, owner, kind: held|parked}]}, with
+    # the blockers named BEFORE the head's own reservation installs.  Emitted
+    # when the pin becomes blocked, then at most once per
+    # pin_blocked_emit_interval_secs while it stays blocked.
+    pin_blocked = 'pin_blocked'
     # Emitted once per acquire_next tick when the fused-memory task read
     # FAILED (distinct from a genuinely empty project) and the park-eviction
     # drain was therefore SKIPPED (fail-safe, survey finding C3).
