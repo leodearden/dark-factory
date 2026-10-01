@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _review_fixtures import review_aggregation, review_issue
 from shared import safe_io
 
 from orchestrator.artifacts import (
@@ -1108,22 +1109,10 @@ class TestReviews:
         assert 'c.py:10' in text
 
     @staticmethod
-    def _issue(tag: str, severity: str) -> dict:
-        return {
-            'reviewer': f'reviewer-{tag}',
-            'severity': severity,
-            'location': f'{tag}.py:{len(tag)}',
-            'category': f'category-{tag}',
-            'description': f'description-{tag}',
-            'suggested_fix': f'fix-{tag}',
-        }
-
-    def _aggregation(self, suggestion_tags: list[str]) -> ReviewAggregation:
-        return ReviewAggregation(
-            has_blocking_issues=True,
-            blocking_issues=[self._issue('blocker', 'blocking')],
-            suggestions=[self._issue(tag, 'suggestion') for tag in suggestion_tags],
-            reviews={},
+    def _aggregation(suggestion_tags: list[str]) -> ReviewAggregation:
+        return review_aggregation(
+            [review_issue('blocker', 'blocking')],
+            [review_issue(tag) for tag in suggestion_tags],
         )
 
     def test_format_for_escalation_inlines_every_suggestion(self):

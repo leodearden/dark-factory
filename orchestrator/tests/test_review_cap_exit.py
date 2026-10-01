@@ -18,11 +18,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _mcp_transport_harness import RecordingClientFactory, RecordingMcpServer
-from _orch_helpers import pydantic_spec
+from _review_fixtures import review_aggregation, review_issue
+from _workflow_helpers import _make
 from escalation.queue import EscalationQueue
 
-from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
-from orchestrator.config import OrchestratorConfig
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
@@ -30,49 +29,23 @@ pytestmark = pytest.mark.asyncio
 
 TASK_ID = '3415'
 
+_BLOCKER = review_issue('blocker', 'blocking')
+
 
 def _make_cap_workflow(
     tmp_path: Path,
     *,
-    max_review_cycles: int = 1,
     max_amendment_rounds: int = 1,
     escalation_queue: EscalationQueue | MagicMock | None = None,
 ) -> TaskWorkflow:
     """A workflow whose next blocking review reaches the review-cycle cap."""
-    assignment = MagicMock()
-    assignment.task_id = TASK_ID
-    assignment.task = {'id': TASK_ID, 'title': 'T', 'description': 'd'}
-    assignment.modules = ['src']
-
-    config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
-    config.fused_memory.project_id = 'dark_factory'
-    config.fused_memory.url = 'http://localhost:8002'
-    config.max_review_cycles = max_review_cycles
-    config.max_amendment_rounds = max_amendment_rounds
-    config.lock_depth = 2
-    config.project_root = tmp_path / 'proj'
-    config.models = MagicMock()
-    config.models.reviewer = 'sonnet'
-    config.suppress_resettled_review_suggestions = True
-
-    mcp = MagicMock()
-    mcp.url = 'http://localhost:8002'
-
-    wf = TaskWorkflow(
-        assignment=assignment,
-        config=config,
-        git_ops=MagicMock(),
-        scheduler=MagicMock(),
-        briefing=MagicMock(),
-        mcp=mcp,
-        escalation_queue=escalation_queue,
-    )
-    worktree = tmp_path / 'wt'
-    worktree.mkdir(parents=True, exist_ok=True)
-    artifacts = TaskArtifacts(worktree)
-    artifacts.init(TASK_ID, 'T', 'd')
-    wf.artifacts = artifacts
-    wf.worktree = worktree
+    wf = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', task_id=TASK_ID).wf
+    wf.config.max_review_cycles = 1
+    wf.config.max_amendment_rounds = max_amendment_rounds
+    wf.config.suppress_resettled_review_suggestions = True
+    wf.config.models.reviewer = 'sonnet'
+    wf.escalation_queue = escalation_queue
+    wf.mcp.url = 'http://localhost:8002'
 
     wf._execute_iterations = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
     wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
@@ -84,43 +57,12 @@ def _make_cap_workflow(
     return wf
 
 
-def _sugg(i: int) -> dict:
-    return {
-        'reviewer': f'reviewer{i}',
-        'severity': 'suggestion',
-        'location': f'src/module{i}.py:{i * 11}',
-        'category': f'category{i}',
-        'description': f'suggestion {i}: widget{i} lacks a guard',
-        'suggested_fix': f'guard widget{i} before use',
-    }
+def _blocking(suggestions: list[dict]):
+    return review_aggregation([_BLOCKER], suggestions)
 
 
-_BLOCKER = {
-    'reviewer': 'analyst',
-    'severity': 'blocking',
-    'location': 'src/core.py:1',
-    'category': 'bug',
-    'description': 'blocking: the core loop loses writes',
-    'suggested_fix': 'flush before returning',
-}
-
-
-def _blocking(suggestions: list[dict], n_blocking: int = 1) -> ReviewAggregation:
-    return ReviewAggregation(
-        has_blocking_issues=True,
-        blocking_issues=[dict(_BLOCKER) for _ in range(n_blocking)],
-        suggestions=list(suggestions),
-        reviews={'analyst': {}},
-    )
-
-
-def _non_blocking(suggestions: list[dict]) -> ReviewAggregation:
-    return ReviewAggregation(
-        has_blocking_issues=False,
-        blocking_issues=[],
-        suggestions=list(suggestions),
-        reviews={'analyst': {}},
-    )
+def _non_blocking(suggestions: list[dict]):
+    return review_aggregation([], suggestions)
 
 
 def _spy_on_router(wf: TaskWorkflow) -> list[SuggestionDisposition]:
@@ -138,7 +80,7 @@ def _spy_on_router(wf: TaskWorkflow) -> list[SuggestionDisposition]:
 
 async def test_routes_then_escalates_with_the_reported_disposition(tmp_path: Path):
     wf = _make_cap_workflow(tmp_path)
-    reviews = _blocking([_sugg(1)])
+    reviews = _blocking([review_issue('s1')])
     wf._review = AsyncMock(return_value=reviews)  # type: ignore[method-assign]
     manager = MagicMock()
     route = AsyncMock(return_value=SuggestionDisposition.CURATOR)
@@ -175,7 +117,7 @@ async def test_no_suggestions_escalates_with_none(tmp_path: Path):
 
 async def test_routing_failure_still_files_the_escalation(tmp_path: Path, caplog):
     wf = _make_cap_workflow(tmp_path)
-    reviews = _blocking([_sugg(1)])
+    reviews = _blocking([review_issue('s1')])
     wf._review = AsyncMock(return_value=reviews)  # type: ignore[method-assign]
     wf._route_review_suggestions_to_curator = AsyncMock(  # type: ignore[method-assign]
         side_effect=TypeError('not JSON serializable'),
@@ -205,7 +147,7 @@ async def test_esc_4223_1_shape_one_blocking_eight_suggestions(tmp_path: Path):
     carried none of them, and none reached the curator."""
     queue = EscalationQueue(tmp_path / 'esc')
     wf = _make_cap_workflow(tmp_path, escalation_queue=queue)
-    suggestions = [_sugg(i) for i in range(1, 9)]
+    suggestions = [review_issue(f's{i}') for i in range(1, 9)]
     wf._review = AsyncMock(return_value=_blocking(suggestions))  # type: ignore[method-assign]
     server = RecordingMcpServer()
 
@@ -234,7 +176,7 @@ async def test_esc_4223_1_shape_one_blocking_eight_suggestions(tmp_path: Path):
 async def test_same_instance_identical_reentry_is_deduped(tmp_path: Path):
     wf = _make_cap_workflow(tmp_path)
     wf._review = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[_blocking([_sugg(1)]), _blocking([_sugg(1)])],
+        side_effect=[_blocking([review_issue('s1')]), _blocking([review_issue('s1')])],
     )
     dispositions = _spy_on_router(wf)
 
@@ -257,7 +199,7 @@ async def test_blocking_then_done_reentry_reuses_item_keys(tmp_path: Path):
     suggestion_hash) pair.  A REWORDED b would get a new key and is left to the
     curator's semantic dedup, so this test does not claim to cover it.
     """
-    a, b, c = _sugg(1), _sugg(2), _sugg(3)
+    a, b, c = review_issue('s1'), review_issue('s2'), review_issue('s3')
     wf = _make_cap_workflow(tmp_path)
     wf._review = AsyncMock(  # type: ignore[method-assign]
         side_effect=[_blocking([a, b]), _non_blocking([dict(b), c])],
@@ -294,12 +236,10 @@ async def test_post_amendment_cap_exit_applies_amendment_delta_scope(tmp_path: P
     """
     queue = MagicMock()
     queue.make_id.return_value = f'esc-{TASK_ID}-1'
-    wf = _make_cap_workflow(
-        tmp_path, max_amendment_rounds=1, max_review_cycles=1, escalation_queue=queue,
-    )
-    s_in_scope = _sugg(1)
-    s_in_delta = {**_sugg(2), 'location': 'src/a.py:10'}
-    s_out_of_delta = {**_sugg(3), 'location': 'src/z.py:900'}
+    wf = _make_cap_workflow(tmp_path, max_amendment_rounds=1, escalation_queue=queue)
+    s_in_scope = review_issue('s1')
+    s_in_delta = {**review_issue('s2'), 'location': 'src/a.py:10'}
+    s_out_of_delta = {**review_issue('s3'), 'location': 'src/z.py:900'}
     wf._suggestions_in_scope = lambda s: list(s)  # type: ignore[method-assign]
     wf._amend = AsyncMock(return_value=True)  # type: ignore[method-assign]
     wf._commit_amendment_wip = AsyncMock()  # type: ignore[method-assign]

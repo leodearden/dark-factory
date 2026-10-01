@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _review_fixtures import review_aggregation, review_issue
 from shared.cli_invoke import AllAccountsCappedException
 
 from orchestrator.agents.triage import suggestion_hash
@@ -997,26 +998,6 @@ class TestDoneBranchCallSiteViaWorkflow:
 # ---------------------------------------------------------------------------
 
 class TestEscalateReviewIssues:
-    @staticmethod
-    def _issue(tag: str, severity: str) -> dict:
-        return {
-            'reviewer': f'reviewer-{tag}',
-            'severity': severity,
-            'location': f'src/{tag}.py:{len(tag)}',
-            'category': f'category-{tag}',
-            'description': f'description-{tag}',
-            'suggested_fix': f'fix-{tag}',
-        }
-
-    @staticmethod
-    def _reviews(blocking_issues: list[dict], suggestions: list[dict]) -> ReviewAggregation:
-        return ReviewAggregation(
-            has_blocking_issues=bool(blocking_issues),
-            blocking_issues=blocking_issues,
-            suggestions=suggestions,
-            reviews={},
-        )
-
     def _queue(self):
         queue = MagicMock()
         queue.make_id.return_value = 'esc-42-5'
@@ -1027,7 +1008,7 @@ class TestEscalateReviewIssues:
         wf = _make_workflow(escalation_queue=queue)
         wf.state = MagicMock(value='review')
 
-        reviews = self._reviews(
+        reviews = review_aggregation(
             blocking_issues=[{'description': 'bug'}, {'description': 'crash'}],
             suggestions=[{'description': 'style'}],
         )
@@ -1045,7 +1026,7 @@ class TestEscalateReviewIssues:
 
     def test_noop_without_queue(self):
         wf = _make_workflow(escalation_queue=None)
-        reviews = self._reviews(blocking_issues=[{'description': 'bug'}], suggestions=[])
+        reviews = review_aggregation(blocking_issues=[{'description': 'bug'}], suggestions=[])
         wf._escalate_review_issues(  # Should not raise
             reviews, suggestion_disposition=SuggestionDisposition.NONE, n_suggestions_raw=0,
         )
@@ -1054,9 +1035,9 @@ class TestEscalateReviewIssues:
         queue = self._queue()
         wf = _make_workflow(escalation_queue=queue)
         wf.state = MagicMock(value='review')
-        reviews = self._reviews(
-            blocking_issues=[self._issue('bug', 'blocking'), self._issue('crash', 'blocking')],
-            suggestions=[self._issue('style', 'suggestion'), self._issue('naming', 'suggestion')],
+        reviews = review_aggregation(
+            blocking_issues=[review_issue('bug', 'blocking'), review_issue('crash', 'blocking')],
+            suggestions=[review_issue('style', 'suggestion'), review_issue('naming', 'suggestion')],
         )
 
         wf._escalate_review_issues(
@@ -1080,9 +1061,9 @@ class TestEscalateReviewIssues:
         wf.state = MagicMock(value='review')
         store = _RecordingEventStore()
         wf.event_store = store  # type: ignore[assignment]
-        reviews = self._reviews(
-            blocking_issues=[self._issue('bug', 'blocking')],
-            suggestions=[self._issue('style', 'suggestion'), self._issue('naming', 'suggestion')],
+        reviews = review_aggregation(
+            blocking_issues=[review_issue('bug', 'blocking')],
+            suggestions=[review_issue('style', 'suggestion'), review_issue('naming', 'suggestion')],
         )
 
         wf._escalate_review_issues(
@@ -1102,7 +1083,7 @@ class TestEscalateReviewIssues:
         queue = self._queue()
         wf = _make_workflow(escalation_queue=queue)
         wf.state = MagicMock(value='review')
-        reviews = self._reviews(blocking_issues=[self._issue('bug', 'blocking')], suggestions=[])
+        reviews = review_aggregation(blocking_issues=[review_issue('bug', 'blocking')], suggestions=[])
 
         wf._escalate_review_issues(
             reviews, suggestion_disposition=SuggestionDisposition.NONE, n_suggestions_raw=0,
@@ -1121,9 +1102,9 @@ class TestEscalateReviewIssues:
         wf.state = MagicMock(value='review')
         store = _RecordingEventStore()
         wf.event_store = store  # type: ignore[assignment]
-        reviews = self._reviews(
-            blocking_issues=[self._issue('bug', 'blocking')],
-            suggestions=[self._issue('style', 'suggestion')],
+        reviews = review_aggregation(
+            blocking_issues=[review_issue('bug', 'blocking')],
+            suggestions=[review_issue('style', 'suggestion')],
         )
 
         wf._escalate_review_issues(
