@@ -152,7 +152,6 @@ CLUSTER_PATHS: tuple[str, ...] = (
     # Empty until PRD task zeta1 creates the package. A glob matching nothing is
     # NOT a failure; a literal matching nothing is.
     'orchestrator/src/orchestrator/merge_lane/**/*.py',
-    'orchestrator/tests/_serial_merge_worker.py',
     'orchestrator/tests/_merge_queue_harness.py',
     'orchestrator/tests/conftest.py',
 )

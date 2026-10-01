@@ -51,7 +51,7 @@ cannot be silently dropped.
 Flat, underscore-prefixed test helper: no ``__init__.py`` in ``tests/``, imported
 by bare module name (``from _role_splice_contract import SpliceContract``) off the
 ``sys.path`` entry ``conftest.py`` inserts. Same convention as
-``_orch_helpers.py``, ``_workflow_helpers.py`` and ``_serial_merge_worker.py``.
+``_orch_helpers.py``, ``_workflow_helpers.py`` and ``_merge_lane_fakes.py``.
 The leading underscore also keeps pytest from collecting it as a test module.
 """
 

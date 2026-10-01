@@ -749,10 +749,9 @@ also fail ``test_merge_queue.py::TestHaltAdvanceResults::
 test_contains_expected_results``, which asserts EXACT frozenset equality
 against a literal 5-element set.
 
-Shared between :class:`SpeculativeMergeWorker` and the retired serial
-worker's test-local reference (see :class:`_TrainMergeHost`) to avoid
-silent divergence: if the set of halt-triggering results ever changes,
-updating this single constant propagates to both automatically."""
+Shared by the single-branch and train advance paths to avoid silent
+divergence: if the set of halt-triggering results ever changes, updating
+this single constant propagates to both automatically."""
 
 
 _ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')
@@ -1375,7 +1374,7 @@ class _MainHealthProbeHandles:
 
     Only the production ``SpeculativeMergeWorker._run_inflight_verify`` call
     site passes a live instance (task 2564 step-16).  The solo-reverify,
-    train, and merge_gates module-level callers — and any bare test-local
+    train, and merge_gates module-level callers — and any bare test
     caller — pass ``None`` (the default), so ``_run_post_merge_verify`` keeps
     running the main-health probe SYNCHRONOUSLY exactly as it did before
     this task.
@@ -2583,17 +2582,12 @@ async def _run_post_merge_verify(
 ) -> MergeOutcome | None:
     """Run post-merge verification for a single task.
 
-    Shared by :class:`SpeculativeMergeWorker` and the retired serial worker's
-    test-local reference (see :class:`_TrainMergeHost`).
-
     Returns ``None`` when verification passes; returns a ``MergeOutcome``
     (and cleans up *merge_wt*) when it fails via a controlled path (disk
     guard, verify-not-passed).  Does **not** contain a ``try/except`` — any
-    exception from ``run_scoped_verification`` propagates to the caller.
-    The test-local ``MergeWorker`` reference calls this bare (exceptions
-    reach ``_process``); ``SpeculativeMergeWorker`` wraps the call in its
-    existing ``try/except`` that maps a raised verify to a
-    ``'Verification error: ...'`` outcome.
+    exception from ``run_scoped_verification`` propagates to the caller;
+    ``SpeculativeMergeWorker`` wraps the call in a ``try/except`` that maps a
+    raised verify to a ``'Verification error: ...'`` outcome.
 
     Args:
         task_client: Optional task client (``submit_task`` / ``get_statuses`` /
@@ -2665,8 +2659,8 @@ async def _run_post_merge_verify(
             blocking rather than born-at-L2 (task 2886 amendment — bound the
             halt blast radius; DriftDetector Invariant 5).  Only the
             production ``SpeculativeMergeWorker._run_inflight_verify`` call
-            site passes ``self.operator_halt``; every other (module-level,
-            test-local) caller omits it (default ``None`` → no halt), keeping
+            site passes ``self.operator_halt``; every other (module-level or
+            test) caller omits it (default ``None`` → no halt), keeping
             them byte-identical.  With ``verify_cross_check_remote_green`` on
             (default True) the cross-check is a BLOCKING pre-land local
             re-verify, NOT a trailing detector; the halt is synchronous purely
@@ -4675,9 +4669,9 @@ def _emit_merge_queued(
     """Emit a merge_queued event.  No-op when *event_store* is None.
 
     Centralises the emit payload so every caller produces the same record
-    shape — currently :func:`enqueue_merge_request` and the retired
-    worker's CAS-retry re-enqueue path (a historical fixture; see
-    :class:`_TrainMergeHost`).  If
+    shape — currently only :func:`enqueue_merge_request`; the CAS-retry
+    re-enqueue that passed *reason* and *position* went with the serial worker
+    (see :class:`_TrainMergeHost`).  If
     *reason* is provided (e.g. ``'cas_retry'``) it is stored in ``data``.
 
     *queue_depth* (when provided) records how deep the main queue was at the
@@ -4820,8 +4814,7 @@ async def _maybe_auto_chain_generation(
     # there would reset the MAX_AUTO_CHAINED_GENERATIONS bound to 0 every
     # generation.  This is a SECOND, independent add_done_callback alongside
     # the retention _on_finalized registered by enqueue_merge_request — both
-    # coexist on gen_next.result.  The callback fires regardless of which
-    # worker (the test-local MergeWorker reference or SpeculativeMergeWorker)
+    # coexist on gen_next.result.  The callback fires whichever path
     # finalizes gen_next.
     _branch = req.branch.bare_id  # close over the bare branch name (dict key)
     def _cleanup_chain_counter(fut: asyncio.Future) -> None:  # noqa: ANN001
@@ -5864,34 +5857,12 @@ _COALESCE_DERAIL_TTL = timedelta(days=7)
 class _TrainMergeHost(Protocol):
     """Narrow Protocol exposing per-worker state required by ``_do_train_merge``.
 
-    The sole PRODUCTION implementer is :class:`SpeculativeMergeWorker`, which
-    inherits :class:`_WipHaltMixin` and defines every attribute / constant
-    listed here.  The legacy serial worker once named ``MergeWorker`` is
-    retired from production (MQ-refactor task nu, R7b); its readable-reference
-    role now lives as a frozen test-local fixture
-    (``orchestrator/tests/_serial_merge_worker.py``), which also satisfies this
-    Protocol — kept structural (rather than inlined to ``SpeculativeMergeWorker``)
-    so ``_do_train_merge`` stays reusable by that fixture without a
-    production-side dependency on test code.
-
-    This is the CANONICAL note on the retired serial worker's test-local
-    reference; other docstrings/comments in this module that mention it
-    point back here instead of repeating the file path, so there is a single
-    place to update if the fixture is ever moved or renamed.
-
-    The fixture is a TEST DOUBLE and a historical artifact of the R7b
-    retirement — not a normative behavioral spec.  :class:`SpeculativeMergeWorker`
-    is the sole production implementer and the sole behavioral authority for
-    this Protocol; other docstrings/comments in this module that describe
-    shared logic in terms also satisfied by the fixture are describing the
-    CURRENT shared behavior — the fixture still exercises that same code
-    path (so it keeps working), but it does not define what that code path
-    is supposed to do.
-
-    The surface is intentionally narrow — only the state that the shared
-    train-merge pipeline actually touches.  Adding new attributes here does
-    NOT require touching ``_WipHaltMixin``; both implementers already
-    define them in their own ``__init__``.
+    The only implementer is :class:`SpeculativeMergeWorker`, which inherits
+    :class:`_WipHaltMixin` and defines every attribute / constant listed here.
+    A second implementer, a frozen test-local copy of the serial worker that
+    MQ-refactor task nu (R7b) retired from production, was discarded by task
+    5034 (PRD plans/merge-lane-quality-prd.md task δ). The Protocol stays as
+    the narrow statement of what the train pipeline touches.
     """
 
     # ── Git / event dependencies ──────────────────────────────────────────
@@ -6113,9 +6084,8 @@ async def classify_and_merge(
 ) -> MergedOk | Decided:
     """Shared pre-merge guard + merge + drop-guard pipeline (MQ-refactor kappa).
 
-    The shared core used by all three current callers: the retired serial
-    worker's test-local reference (``_do_merge``; a historical fixture, see
-    :class:`_TrainMergeHost`), ``SpeculativeMergeWorker._merger_loop``, and
+    The shared core used by both callers,
+    ``SpeculativeMergeWorker._merger_loop`` and
     ``SpeculativeMergeWorker._remerge``: branch-presence guard →
     already-merged detection → merge → conflict / non-conflict-failure →
     drop-guard.  Returns :class:`MergedOk` on success or :class:`Decided`
@@ -6132,10 +6102,9 @@ async def classify_and_merge(
       gates the drift-bookkeeping (``_note_conflict_detected``) and the rich
       failure diagnostic (``_build_merge_failure_diagnostic`` +
       ``_render_failure_diagnostic``).  A non-``SpeculativeMergeWorker``
-      caller (currently only the retired worker's test-local ``_do_merge``)
-      gets neither, so its blocked outcomes stay a plain
-      ``MergeOutcome('blocked', reason=details)`` — gated by capability, not
-      special-cased for that caller.
+      caller would get neither -- a plain ``MergeOutcome('blocked',
+      reason=details)``.  The serial worker's test-local copy was the last
+      such caller; task 5034 discarded it, so that branch is now unreachable.
 
     ``req.snapshot_tip`` (an orthogonal per-request field, not a parameter of
     this function) is honored uniformly for already-merged detection
@@ -6272,8 +6241,7 @@ async def classify_and_merge(
 
     # 3. Merge (speculative or normal).  speculative=True is only ever passed
     # for a SpeculativeMergeWorker caller; the isinstance check is a static-
-    # typing narrowing (the test-local MergeWorker reference has no
-    # _emit_speculative), not a behavioural gate.
+    # typing narrowing, not a behavioural gate.
     if speculative and isinstance(worker, SpeculativeMergeWorker):
         # NOTE: _emit_speculative str-converts every data value (see its
         # `{k: str(v) ...}` coercion below), so depth lands here as a str
@@ -7068,9 +7036,8 @@ async def _do_train_merge(
     worker: _TrainMergeHost,
     req: GroupMergeRequest,
 ) -> MergeOutcome:
-    """Atomic train-merge pipeline shared by SpeculativeMergeWorker and the
-    retired serial worker's test-local reference (see :class:`_TrainMergeHost`,
-    the ``worker`` parameter's type above).
+    """Atomic train-merge pipeline run by SpeculativeMergeWorker (typed by
+    :class:`_TrainMergeHost`, the ``worker`` parameter's type above).
 
     BEHAVIOUR-ADDING (task 1596): trains now inherit the full shared post-merge
     core already used by single-branch merges — specifically:
@@ -7473,8 +7440,7 @@ async def _do_train_merge(
     # for the whole train attempt, not just the post-advance window.
     #
     # PRD D9: trains are bit-identical, multi-waiter merges — γ2 auto-chaining
-    # applies ONLY to single-branch MergeRequest paths (the test-local
-    # MergeWorker reference / SpeculativeMergeWorker).  chain_ctx=None is
+    # applies ONLY to single-branch MergeRequest paths.  chain_ctx=None is
     # passed explicitly here so the invariant is visible at the call site and
     # not left implicit.
     outcome = await _finalize_advanced_merge(
@@ -7561,8 +7527,7 @@ class _WipHaltMixin:
 
     Provides the halt-owner methods that :class:`SpeculativeMergeWorker` (the
     sole production implementer) exposes as public API to ``workflow.py`` and
-    ``harness.py``.  The retired serial worker's test-local reference (see
-    :class:`_TrainMergeHost`) also subclasses this mixin.
+    ``harness.py``.
 
     Per-lane halt state: each lane in MERGE_LANES has an independent
     asyncio.Event (set = not halted; cleared = halted) and an optional owner
@@ -7650,9 +7615,7 @@ class _WipHaltMixin:
     def _signal_resume(self) -> None:
         """Set the resume signal if the concrete worker has one (SpeculativeMergeWorker).
 
-        The mixin is also shared with the retired serial worker's test-local
-        reference, which has no _resume_signal; the hasattr guard makes the
-        call a no-op there.
+        The getattr guard keeps the mixin usable by a subclass without one.
         """
         sig = getattr(self, '_resume_signal', None)
         if sig is not None:
@@ -10003,16 +9966,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         #       per verify and already exempt from prune/find_inflight
         #       (git_ops.py:2075) — guard in _register_owned_merge_worktree keeps
         #       it out.
-        #   (b) The retired serial worker's test-local reference (see
-        #       _TrainMergeHost) holds ≤1 worktree whose build activity
-        #       refreshes mtime — out of ledger scope.
-        #   (c) Cold-shadow (_run_cold_shadow_verify :7670) and drift-check
+        #   (b) Cold-shadow (_run_cold_shadow_verify :7670) and drift-check
         #       (_run_drift_check :7912) _merge-* creators are short-lived local
         #       executions — out of ledger scope.
-        #   (d) reverify_member_solo's _solo-* worktrees (git_ops.materialize_
+        #   (c) reverify_member_solo's _solo-* worktrees (git_ops.materialize_
         #       member_solo) use a different prefix the reaper never scans
         #       (git_ops.py:2069) — out of ledger scope.
-        #   (e) Coalesced GroupMergeRequest merge worktrees ARE in scope;
+        #   (d) Coalesced GroupMergeRequest merge worktrees ARE in scope;
         #       registered automatically at _merger_loop handoff (:5703).
         self._owned_merge_worktrees: set[Path] = set()
         # task 3148: resolved-string memo for the ledger above, maintained by

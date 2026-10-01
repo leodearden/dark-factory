@@ -122,7 +122,7 @@ async def _drain_leaked_tasks():
 
 @pytest_asyncio.fixture(autouse=True)
 async def _reap_leaked_merge_workers(_drain_leaked_tasks):
-    """Gracefully stop any MergeWorker orphaned onto the test event loop (task 1907).
+    """Gracefully stop any merge worker orphaned onto the test event loop (task 1907).
 
     A merge-queue test that raises before its own ``await worker.stop()`` leaks
     the worker's ``run()`` task and its background loops, which do real ``git``
@@ -791,9 +791,9 @@ def _clear_probe_cache():
 def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
-    MergeWorker hardcodes orchestrator.merge_queue.run_scoped_verification in its
-    internal calls; tests that create a live MergeWorker need this patched or
-    pytest/ruff/pyright (not in PATH in test environments) cause BLOCKED outcomes.
+    A lane on the production verifier (``ports.py::ProductionVerifier``) resolves
+    orchestrator.merge_queue.run_scoped_verification on every call; tests that run
+    one need it patched or pytest/ruff/pyright cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
 

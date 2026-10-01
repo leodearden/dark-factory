@@ -7,8 +7,9 @@ hand-advanced clock whose ``sleep`` advances it instead of waiting;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
-that owns its worker never falls back to a production adapter by omission,
-and ``drive_merge`` plays the merger for a caller that enqueues onto a queue
+that owns its worker never falls back to a production adapter by omission;
+``merge_through_lane`` runs such a lane until it resolves one request; and
+``drive_merge`` plays the merger for a caller that enqueues onto a queue
 nothing is draining. ``main_health_probe_spawned`` reads off a red
 ``MergeOutcome`` whether it left a detached main-health probe running, and
 ``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
@@ -390,6 +391,31 @@ def make_lane(
         clock=FakeClock() if clock is None else clock,
         **kwargs,
     )
+
+
+async def merge_through_lane(
+    lane: MergeLane,
+    queue: asyncio.Queue[Any],
+    request: Any,
+    *,
+    timeout: float = 120.0,
+) -> MergeOutcome:
+    """Run *lane* until it resolves *request*, then stop it; return the outcome.
+
+    *queue* is the one *lane* was built on. The request -- a single
+    ``MergeRequest`` or a train's ``GroupMergeRequest`` -- goes in through the
+    lane's queue like any submission, so it takes the production dispatch
+    route rather than a test-chosen internal entry point. The lane is
+    stopped and its ``run()`` awaited on the way out, whatever happened.
+    """
+    run = asyncio.create_task(lane.run())
+    try:
+        await queue.put(request)
+        return await asyncio.wait_for(asyncio.shield(request.result), timeout)
+    finally:
+        await lane.stop()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait_for(run, timeout)
 
 
 @dataclasses.dataclass(frozen=True)

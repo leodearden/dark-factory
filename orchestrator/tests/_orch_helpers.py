@@ -190,15 +190,15 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 #   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
 #     (test_merge_queue_reachback_patch_guard), 6.70s
 #     (test_event_loop_antipattern_guard), 6.46s
-#     (test_serial_merge_worker_import_guard);
-#   * the SAME serial_merge_worker guard measured 17.85 / 21.32 / 30.75s per
+#     (the serial-worker import guard, deleted with its fixture by task 5034);
+#   * the SAME serial-worker guard measured 17.85 / 21.32 / 30.75s per
 #     call at loadavg 120-176 under `-n auto` -- ~4.8x load inflation;
 #   * xdist worker deaths were then observed at loadavg 250-423, one further
 #     inflation step past the 60s default THEN IN FORCE (esc-3980-1 on branch
 #     task/3980, esc-3787-1 on branch task/3787).
 #   THREE members crashed that way -- test_event_loop_antipattern_guard.py,
-#   test_merge_queue_reachback_patch_guard.py and
-#   test_serial_merge_worker_import_guard.py -- which is what makes this a
+#   test_merge_queue_reachback_patch_guard.py and the serial-worker import
+#   guard -- which is what makes this a
 #   FAMILY defect rather than three accidents, and why the rest are marked
 #   preemptively: a marked-but-fast test costs nothing, while an
 #   unmarked-and-slow one costs a whole session.

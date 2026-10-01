@@ -253,7 +253,6 @@ _APPENDIX_A_SRC = (
 )
 _GIT_OPS = 'orchestrator/src/orchestrator/git_ops.py'
 _APPENDIX_A_TESTS = (
-    'orchestrator/tests/_serial_merge_worker.py',
     'orchestrator/tests/_merge_queue_harness.py',
     'orchestrator/tests/conftest.py',
 )
@@ -1440,8 +1439,7 @@ class TestReportEnumerationSplitsTheTwoHalves:
     ) -> None:
         # THE HEADLINE PROPERTY, executably: the only orchestrator/tests paths
         # left in any list are CLUSTER_PATHS literals. Measured today: exactly
-        # the 3 that live there (conftest.py, _merge_queue_harness.py,
-        # _serial_merge_worker.py).
+        # the 2 that live there (conftest.py, _merge_queue_harness.py).
         assert _test_tree_strays(enumeration) == {}, (
             'the live report still carries per-path test-tree entries'
         )

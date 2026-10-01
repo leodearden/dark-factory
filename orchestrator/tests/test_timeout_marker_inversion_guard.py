@@ -2480,15 +2480,15 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
 #: Without them a broken sweep reports zero offenders and passes, which is
 #: indistinguishable from a clean tree.  The house pattern for exactly this
 #: risk: test_whole_tree_scan_timeout_guard.py::_MIN_EXPECTED_TEST_FILES,
-#: test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES,
-#: test_serial_merge_worker_import_guard.py::test_allowlist_has_no_stale_entries.
+#: test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES.
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_MARKER_SITES = 100
 
 #: The pre-existing in-band sites: 61 across 18 modules at 90/120/150/180s
 #: when MEASURED at authorship time; 52 across 17 since task 5582 migrated
 #: test_merge_queue_deep_landing.py's nine off a grandfathered 180s onto a
-#: measured DEEP_LANDING_SCENE_TEST_TIMEOUT.  Entries may only ever be
+#: measured DEEP_LANDING_SCENE_TEST_TIMEOUT; 50 since task 5034 deleted two
+#: serial-worker tests.  Entries may only ever be
 #: REMOVED, never added -- a new marker in the band is what this module exists
 #: to reject, and `test_no_new_inverting_timeout_marker`'s failure message
 #: says so outright.
@@ -2533,9 +2533,7 @@ _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     # test_marker_registration_drift.py -- 2 sites at 120s
     ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_every_marker_applied_under_tests_is_registered'),
     ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_the_sweep_is_not_vacuous'),
-    # test_merge_queue.py -- 12 sites at 90s/120s
-    ('test_merge_queue.py', 'TestMergeWorker::test_cas_retry_limit_exhausted'),
-    ('test_merge_queue.py', 'TestMergeWorker::test_merge_worker_emits_duration_ms_on_non_done_outcomes'),
+    # test_merge_queue.py -- 10 sites at 90s/120s
     ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_speculative_chain_invalidation_propagates'),
     ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_speculative_merger_phase_emits_duration_ms'),
     ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_speculative_follower_chain_invalidated_after_pickup_rebase'),
@@ -2758,8 +2756,7 @@ def test_grandfather_allowlist_has_no_stale_entries() -> None:
     The ratchet self-tightens: as the follow-up migration raises these markers,
     their entries stop matching and must be deleted, so the list can never rot
     into a permanent blanket exemption that silently re-admits a site someone
-    later re-adds under the same name.  Same shape, and same reason, as
-    test_serial_merge_worker_import_guard.py::test_allowlist_has_no_stale_entries.
+    later re-adds under the same name.
     """
     broken = _sweep_is_healthy(_tree_scan())
     assert not broken, f'{broken}, so EVERY allowlist entry would read as stale.'
