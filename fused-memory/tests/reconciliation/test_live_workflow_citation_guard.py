@@ -9,13 +9,22 @@ no citation, because a false annotation is itself a false signal.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from fused_memory.reconciliation.live_workflow_citation_guard import (
     LiveWorkflowCitation,
+    check_live_workflow_citations,
     extract_live_workflow_citations,
 )
-from fused_memory.reconciliation.live_workflow_section import LiveSignal
+from fused_memory.reconciliation.live_workflow_section import (
+    LiveSignal,
+    LiveWorkflowRow,
+    LiveWorkflowSnapshot,
+)
+from fused_memory.services.landed_on_main import LandingEvidence, LandingVerdict
+from fused_memory.services.live_workflow_detector import ClaimantLabel
 
 INCIDENT = (
     'Live-Workflow Signals show task/5891 is live (worktree, orchestrator); '
@@ -141,3 +150,158 @@ class TestExtractLiveWorkflowCitations:
     )
     def test_malformed_or_unscanned_input_yields_no_citation(self, flag):
         assert extract_live_workflow_citations(flag) == ()
+
+
+ANNOTATION = 'live_workflow_citation_contradictions'
+
+
+def _row(
+    task_id: str,
+    *signals: LiveSignal,
+    is_live: bool = True,
+    landing: LandingVerdict | None = None,
+) -> LiveWorkflowRow:
+    return LiveWorkflowRow(
+        task_id=task_id,
+        branch=f'task/{task_id}',
+        is_live=is_live,
+        signals=signals,
+        claimant=ClaimantLabel.NONE,
+        landing=landing or LandingVerdict.not_landed(),
+    )
+
+
+def _snapshot(*rows: LiveWorkflowRow, lock_held: bool | None = False) -> LiveWorkflowSnapshot:
+    return LiveWorkflowSnapshot(rows=rows, project_orchestrator_live=lock_held)
+
+
+def _citing(task_id: str, *signals: str) -> dict:
+    return {
+        'task_id': task_id,
+        'flag_type': 'task_stranded',
+        'description': f'Live-Workflow Signals show task/{task_id} is live ({", ".join(signals)})',
+    }
+
+
+class _ExplodingFlag(dict):
+    def get(self, key, default=None):
+        raise RuntimeError('a flag whose accessor fails')
+
+
+class TestCheckLiveWorkflowCitations:
+    def test_the_incident_a_citation_against_an_empty_section_is_annotated(self):
+        flag = {'task_id': '5891', 'description': INCIDENT}
+
+        flags, contradictions = check_live_workflow_citations([flag], _snapshot())
+
+        assert contradictions == 1
+        assert flags[0] is not flag
+        assert flags[0][ANNOTATION] == [
+            {'task_id': '5891', 'cited_signals': ['orchestrator', 'worktree'], 'rendered_signals': None},
+        ]
+
+    def test_a_citation_matching_its_live_row_is_consistent(self):
+        flag = _citing('6122', 'worktree', 'recent-commit')
+        snapshot = _snapshot(_row('6122', LiveSignal.WORKTREE, LiveSignal.RECENT_COMMIT))
+
+        flags, contradictions = check_live_workflow_citations([flag], snapshot)
+
+        assert contradictions == 0
+        assert ANNOTATION not in flags[0]
+
+    def test_a_citation_beyond_its_rows_signals_is_annotated_with_what_was_rendered(self):
+        flag = _citing('6122', 'worktree', 'recent-commit')
+        snapshot = _snapshot(_row('6122', LiveSignal.WORKTREE))
+
+        flags, contradictions = check_live_workflow_citations([flag], snapshot)
+
+        assert contradictions == 1
+        assert flags[0][ANNOTATION] == [
+            {'task_id': '6122', 'cited_signals': ['recent-commit', 'worktree'], 'rendered_signals': ['worktree']},
+        ]
+
+    @pytest.mark.parametrize(
+        ('lock_held', 'expected'),
+        [
+            pytest.param(True, 0, id='lock-held'),
+            pytest.param(False, 1, id='lock-not-held'),
+            pytest.param(None, 1, id='lock-unknown'),
+        ],
+    )
+    def test_an_orchestrator_citation_for_a_live_row_needs_the_project_lock_held(
+        self, lock_held, expected,
+    ):
+        snapshot = _snapshot(_row('6122', LiveSignal.WORKTREE), lock_held=lock_held)
+
+        _, contradictions = check_live_workflow_citations(
+            [_citing('6122', 'worktree', 'orchestrator')], snapshot,
+        )
+
+        assert contradictions == expected
+
+    def test_any_liveness_citation_against_a_landed_only_row_is_annotated(self):
+        landed = LandingVerdict.landed_by(LandingEvidence.MERGE_MARKER, 'a' * 40)
+        snapshot = _snapshot(_row('7001', is_live=False, landing=landed), lock_held=True)
+
+        flags, contradictions = check_live_workflow_citations(
+            [_citing('7001', 'orchestrator')], snapshot,
+        )
+
+        assert contradictions == 1
+        assert flags[0][ANNOTATION][0]['rendered_signals'] == []
+
+    def test_no_snapshot_makes_the_guard_inert(self):
+        flag = {'description': INCIDENT}
+
+        flags, contradictions = check_live_workflow_citations([flag], None)
+
+        assert contradictions == 0
+        assert flags == [flag]
+        assert flags[0] is flag
+
+    def test_a_flag_with_no_citation_passes_through_as_the_same_object(self):
+        flag = {'description': 'task/5891 needs attention'}
+
+        flags, _ = check_live_workflow_citations([flag], _snapshot())
+
+        assert flags[0] is flag
+
+    def test_nothing_is_dropped_reordered_or_rewritten(self):
+        inputs = [
+            {'task_id': '1', 'description': 'unrelated finding'},
+            {'task_id': '5891', 'description': INCIDENT, 'suggested_action': INCIDENT},
+            {'task_id': '6122', 'description': 'task/6122 is live (worktree)'},
+        ]
+        originals = [dict(flag) for flag in inputs]
+        snapshot = _snapshot(_row('6122', LiveSignal.WORKTREE))
+
+        flags, contradictions = check_live_workflow_citations(inputs, snapshot)
+
+        assert contradictions == 1
+        assert [flag['task_id'] for flag in flags] == ['1', '5891', '6122']
+        for flag, original in zip(flags, originals, strict=True):
+            assert flag['description'] == original['description']
+        assert inputs == originals
+
+    def test_each_contradiction_is_logged_once_at_warning(self, caplog):
+        flags = [_citing('5891', 'worktree'), _citing('6122', 'worktree', 'recent-commit')]
+        snapshot = _snapshot(_row('6122', LiveSignal.WORKTREE))
+
+        with caplog.at_level(logging.WARNING):
+            _, contradictions = check_live_workflow_citations(flags, snapshot)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert contradictions == 2
+        assert len(warnings) == 2
+        assert '5891' in warnings[0] and 'worktree' in warnings[0] and 'None' in warnings[0]
+        assert '6122' in warnings[1] and 'recent-commit' in warnings[1]
+
+    def test_a_flag_that_fails_extraction_passes_through_and_is_logged(self, caplog):
+        flag = _ExplodingFlag(description=INCIDENT)
+
+        with caplog.at_level(logging.WARNING):
+            flags, contradictions = check_live_workflow_citations([flag], _snapshot())
+
+        assert contradictions == 0
+        assert flags[0] is flag
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
