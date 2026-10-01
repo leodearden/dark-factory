@@ -9,6 +9,7 @@ import dataclasses
 import hashlib
 import json
 import random
+import re
 from pathlib import Path
 
 import pytest
@@ -760,3 +761,240 @@ class TestDetectorCatch:
         hits = {('reify', 'A'): frozenset({'unverified_claim_tag'})}
         catch = mod.detector_catch(RATE_ROWS, _rate_verdicts(), hits)
         assert catch['any_wired'] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Reader, report and CLI end to end, against a graph double (step 13)
+# --------------------------------------------------------------------------- #
+
+_SKIP_LIMIT_RE = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
+_CENSUS_RE = re.compile(r'RETURN\s+count\(\*\)\s*$', re.IGNORECASE)
+
+
+class _FakeResult:
+    def __init__(self, result_set: list[list]):
+        self.result_set = result_set
+
+
+class _FakeGraph:
+    """Serves SKIP/LIMIT pages of an episode and an edge corpus, each with a census.
+
+    ``query`` raises: the instrument may only ever issue ``ro_query``.
+    """
+
+    def __init__(self, episodes: list[list], edges: list[list], *,
+                 census_override: dict[str, int] | None = None, cap: int = 5):
+        self.corpora = {'episodes': episodes, 'edges': edges}
+        self.census_override = census_override or {}
+        self.cap = cap
+        self.queries: list[str] = []
+
+    async def ro_query(self, cypher: str, params: dict | None = None) -> _FakeResult:
+        self.queries.append(cypher)
+        which = 'episodes' if ':Episodic' in cypher else 'edges'
+        corpus = self.corpora[which]
+        if _CENSUS_RE.search(cypher.strip()):
+            return _FakeResult([[self.census_override.get(which, len(corpus))]])
+        match = _SKIP_LIMIT_RE.search(cypher)
+        assert match, cypher
+        skip, limit = int(match.group(1)), int(match.group(2))
+        return _FakeResult(corpus[skip: skip + limit][: self.cap])
+
+    async def query(self, cypher: str, params: dict | None = None):
+        raise AssertionError('the instrument is read-only: it may never issue query()')
+
+
+DECISION_SOURCE = 'add_memory:decisions_and_rationale'
+EPISODE_ROWS = [
+    ['E1', DECISION_SOURCE, '2026-09-01T10:00:00+00:00', RULING_HEAD],
+    ['E2', DECISION_SOURCE, '2026-09-02T10:00:00+00:00', ANCHOR_HEAD],
+    ['E3', DECISION_SOURCE, '2026-09-03T10:00:00+00:00', PLAIN_DECISION],
+    ['E4', DECISION_SOURCE, '2026-08-01T10:00:00+00:00', RULING_HEAD],
+    ['E5', 'add_memory:entities_and_relations', '2026-09-04T10:00:00+00:00', 'x uses y'],
+]
+EDGE_ROWS = [
+    ['x1', 'holding fact', 'A', 'B', ['E1'], None, None],
+    ['x2', 'overreach fact', 'A', 'C', ['E1', 'E2'], None, '2026-09-05T00:00:00+00:00'],
+    ['x3', 'anchor fact', 'D', 'E', ['E2'], '2026-09-06T00:00:00+00:00', None],
+    ['x4', 'plain fact', 'F', 'G', ['E3'], None, None],
+    ['x5', 'orphan fact', 'H', 'I', [], None, None],
+    ['x6', 'old fact', 'J', 'K', ['E4'], None, None],
+]
+
+
+def _graphs(**over):
+    return {
+        'dark_factory': _FakeGraph(EPISODE_ROWS, EDGE_ROWS, **over),
+        'reify': _FakeGraph(EPISODE_ROWS[:2], EDGE_ROWS[:3]),
+    }
+
+
+def _factory(graphs):
+    return lambda name: mod.GraphReader(
+        graph=graphs[name], graph_name=name, page_size=2, resultset_size=5,
+    )
+
+
+def _args(*argv: str):
+    return mod._build_parser().parse_args(['--graph', 'dark_factory', '--graph', 'reify', *argv])
+
+
+async def _worksheet(tmp_path, graphs=None) -> list[dict]:
+    path = tmp_path / 'worksheet.jsonl'
+    code = await mod._run(_args('--emit-worksheet', str(path)),
+                          reader_factory=_factory(graphs or _graphs()))
+    assert code == 0
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _verdicts_for(rows: list[dict], label: str = 'holding') -> dict:
+    return {'sample': mod.SampleDefinition().to_dict(), 'verdicts': [
+        {'graph': row['graph'], 'episode_uuid': row['uuid'], 'edge_uuid': m['edge_uuid'],
+         'fact': m['fact'], 'label': label, 'rationale': 'quotes "the holding"'}
+        for row in rows for m in row['minted']
+    ]}
+
+
+class TestGraphReader:
+    @pytest.mark.asyncio
+    async def test_reads_every_episode_across_pages(self) -> None:
+        graph = _FakeGraph(EPISODE_ROWS, EDGE_ROWS)
+        reader = mod.GraphReader(graph=graph, graph_name='dark_factory', page_size=2,
+                                 resultset_size=5)
+        episodes, read = await reader.fetch_episodes()
+        assert [e.uuid for e in episodes] == ['E1', 'E2', 'E3', 'E4', 'E5']
+        assert read.complete and read.rows_seen == 5
+        assert episodes[0] == mod.Episode(
+            graph='dark_factory', uuid='E1', created_at='2026-09-01T10:00:00+00:00',
+            source=mod.parse_source_description(DECISION_SOURCE), content=RULING_HEAD,
+        )
+        assert sum(1 for q in graph.queries if _SKIP_LIMIT_RE.search(q)) >= 3
+
+    @pytest.mark.asyncio
+    async def test_reads_every_edge_live_or_not(self) -> None:
+        graph = _FakeGraph(EPISODE_ROWS, EDGE_ROWS)
+        reader = mod.GraphReader(graph=graph, graph_name='dark_factory', page_size=2,
+                                 resultset_size=5)
+        edges, read = await reader.fetch_edges()
+        assert read.complete and read.rows_seen == 6
+        assert edges[1] == mod.Edge(
+            graph='dark_factory', uuid='x2', fact='overreach fact', source_name='A',
+            target_name='C', episodes=('E1', 'E2'), invalid_at=None,
+            expired_at='2026-09-05T00:00:00+00:00',
+        )
+        assert edges[2].served is False
+
+    def test_the_edge_read_never_projects_the_embedding_or_filters_liveness(self) -> None:
+        assert 'fact_embedding' not in mod.EDGE_PAGE_CYPHER
+        assert 'invalid_at IS NULL' not in mod.EDGE_PAGE_CYPHER
+        assert 'ORDER BY r.uuid' in mod.EDGE_PAGE_CYPHER
+        assert 'ORDER BY e.uuid' in mod.EPISODE_PAGE_CYPHER
+
+
+class TestRun:
+    @pytest.mark.asyncio
+    async def test_an_incomplete_read_exits_one_and_writes_nothing(self, tmp_path, capsys) -> None:
+        graphs = _graphs(census_override={'edges': 99})
+        worksheet, out_dir = tmp_path / 'ws.jsonl', tmp_path / 'out'
+        code = await mod._run(
+            _args('--emit-worksheet', str(worksheet), '--out-dir', str(out_dir), '--json'),
+            reader_factory=_factory(graphs),
+        )
+        assert code == 1
+        assert capsys.readouterr().out == ''
+        assert not worksheet.exists()
+        assert not out_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_reader_exits_one_and_writes_nothing(self, tmp_path) -> None:
+        def explode(name):
+            raise RuntimeError('FalkorDB unreachable')
+
+        out_dir = tmp_path / 'out'
+        assert await mod._run(_args('--out-dir', str(out_dir)), reader_factory=explode) == 1
+        assert not out_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_the_worksheet_is_the_sample_rows_as_jsonl(self, tmp_path) -> None:
+        rows = await _worksheet(tmp_path)
+        assert [(r['graph'], r['uuid']) for r in rows] == [
+            ('dark_factory', 'E1'), ('dark_factory', 'E2'), ('dark_factory', 'E3'),
+            ('reify', 'E1'), ('reify', 'E2'),
+        ]
+        df_e1 = rows[0]
+        assert [m['edge_uuid'] for m in df_e1['minted']] == ['x1', 'x2']
+        assert rows[1]['corroborated_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_run_writes_the_full_report(self, tmp_path) -> None:
+        rows = await _worksheet(tmp_path)
+        verdict_path = tmp_path / 'verdicts.json'
+        verdict_path.write_text(json.dumps(_verdicts_for(rows)))
+        out_dir = tmp_path / 'out'
+        code = await mod._run(_args('--verdicts', str(verdict_path), '--out-dir', str(out_dir)),
+                              reader_factory=_factory(_graphs()))
+        assert code == 0
+        report = json.loads((out_dir / 'report.json').read_text())
+        assert set(report) == {
+            'swept_at', 'graphs', 'read_population', 'classifiers', 'specimens', 'strata',
+            'detector_census', 'wired_on_add_memory', 'sample', 'adjudicated',
+            'prior_measurement', 'caveats',
+        }
+        adjudicated = report['adjudicated']
+        assert adjudicated['rates']['all']['minted'] == 7
+        assert adjudicated['rates']['all']['holding_share']['rate'] == 1.0
+        assert set(adjudicated) >= {'rates', 'per_classifier', 'detector_catch', 'stale_verdicts'}
+        assert report['read_population']['dark_factory']['edges']['complete'] is True
+        assert report['sample']['unattributed_edges'] == 1
+        assert report['prior_measurement']['overreach_minted']['ci'] == [0.0442, 0.1236]
+
+    @pytest.mark.asyncio
+    async def test_without_verdicts_adjudicated_is_null(self, tmp_path) -> None:
+        out_dir = tmp_path / 'out'
+        assert await mod._run(_args('--out-dir', str(out_dir)),
+                              reader_factory=_factory(_graphs())) == 0
+        assert json.loads((out_dir / 'report.json').read_text())['adjudicated'] is None
+
+    @pytest.mark.asyncio
+    async def test_two_runs_are_byte_identical_but_for_swept_at(self, tmp_path) -> None:
+        blobs = []
+        for i in range(2):
+            out_dir = tmp_path / f'out{i}'
+            assert await mod._run(_args('--out-dir', str(out_dir)),
+                                  reader_factory=_factory(_graphs())) == 0
+            report = json.loads((out_dir / 'report.json').read_text())
+            report.pop('swept_at')
+            blobs.append(json.dumps(report, sort_keys=True))
+        assert blobs[0] == blobs[1]
+
+    @pytest.mark.asyncio
+    async def test_the_report_file_has_sorted_keys(self, tmp_path) -> None:
+        out_dir = tmp_path / 'out'
+        await mod._run(_args('--out-dir', str(out_dir)), reader_factory=_factory(_graphs()))
+        text = (out_dir / 'report.json').read_text()
+        assert text == json.dumps(json.loads(text), indent=2, sort_keys=True) + '\n'
+
+    @pytest.mark.asyncio
+    async def test_a_verdict_error_exits_two_and_writes_no_report(self, tmp_path) -> None:
+        rows = await _worksheet(tmp_path)
+        bad = _verdicts_for(rows)
+        bad['verdicts'].pop()
+        verdict_path = tmp_path / 'verdicts.json'
+        verdict_path.write_text(json.dumps(bad))
+        out_dir = tmp_path / 'out'
+        code = await mod._run(_args('--verdicts', str(verdict_path), '--out-dir', str(out_dir)),
+                              reader_factory=_factory(_graphs()))
+        assert code == 2
+        assert not out_dir.exists()
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_verdict_file_exits_two(self, tmp_path) -> None:
+        verdict_path = tmp_path / 'verdicts.json'
+        verdict_path.write_text('{not json')
+        code = await mod._run(_args('--verdicts', str(verdict_path)),
+                              reader_factory=_factory(_graphs()))
+        assert code == 2
+
+    def test_the_parser_offers_no_mutation_flag(self) -> None:
+        flags = {opt for action in mod._build_parser()._actions for opt in action.option_strings}
+        assert not flags & {'--apply', '--invalidate', '--delete', '--repair', '--quarantine'}
