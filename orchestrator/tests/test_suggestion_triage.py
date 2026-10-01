@@ -13,8 +13,10 @@ import pytest
 from _orch_helpers import pydantic_spec
 from shared.cli_invoke import AllAccountsCappedException
 
+from orchestrator.agents.triage import suggestion_hash
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.workflow import StewardInterrupted, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -275,8 +277,6 @@ class TestRouteReviewSuggestionsToCurator:
     @pytest.mark.asyncio
     async def test_payload_fields(self):
         """Each POST payload has the required fields per the spec."""
-        from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
-
         suggestions = self._suggestions()
         wf = _make_workflow()
 
@@ -293,7 +293,6 @@ class TestRouteReviewSuggestionsToCurator:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
         assert len(posted_bodies) == len(suggestions)
-        content_hash = review_suggestion_payload_hash(suggestions)
         task_id = wf.task_id
 
         for _i, (body, suggestion) in enumerate(zip(posted_bodies, suggestions, strict=True)):
@@ -310,7 +309,7 @@ class TestRouteReviewSuggestionsToCurator:
             assert meta['spawned_from'] == task_id
             assert meta['spawn_context'] == 'review_suggestions'
             assert meta['escalation_id'] == f'review-suggestions-{task_id}'
-            assert meta['suggestion_hash'] == content_hash
+            assert meta['suggestion_hash'] == suggestion_hash(suggestion)
 
             # title: [<cat>] <loc>: <desc[:60]>
             cat = suggestion.get('category', '')
@@ -324,6 +323,50 @@ class TestRouteReviewSuggestionsToCurator:
 
             # project_root is passed
             assert 'project_root' in args
+
+        item_hashes = [b['params']['arguments']['metadata']['suggestion_hash'] for b in posted_bodies]
+        assert len(set(item_hashes)) == len(suggestions)
+
+    @pytest.mark.asyncio
+    async def test_overlapping_batches_reuse_per_item_keys(self):
+        """A suggestion re-raised in a different batch keeps its R4 key.
+
+        The in-instance scalar cache only absorbs a byte-identical whole set,
+        so [a, b] then [b, c] posts b twice.  The curator R4 gate can absorb
+        the second b only if both tickets carry the same
+        (escalation_id, suggestion_hash) pair.
+        """
+        a, b = self._suggestions()
+        b_copy = dict(b)
+        c = {
+            'reviewer': 'security',
+            'severity': 'suggestion',
+            'location': 'src/auth.py:5',
+            'category': 'security',
+            'description': 'Validate input before use',
+            'suggested_fix': 'Add input validation',
+        }
+        wf = _make_workflow()
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            await wf._route_review_suggestions_to_curator(_fake_reviews([a, b]))
+            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
+            await wf._route_review_suggestions_to_curator(_fake_reviews([b_copy, c]))
+            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
+
+        def r4_key(body):
+            meta = body['params']['arguments']['metadata']
+            return (meta['escalation_id'], meta['suggestion_hash'])
+
+        assert len(posted_bodies) == 4
+        first_a, first_b, second_b, second_c = (r4_key(body) for body in posted_bodies)
+        assert second_b == first_b
+        assert second_c[1] not in {first_a[1], first_b[1]}
 
     @pytest.mark.asyncio
     async def test_escalation_queue_never_touched(self):
@@ -659,6 +702,97 @@ class TestRouteReviewSuggestionsToCurator:
             'the drop branch must not cache the hash — repeated drops must remain '
             'auditable.'
         )
+
+
+class TestRouteReviewSuggestionsDisposition:
+    """The router reports which sink it handed the suggestions to (task 3415)."""
+
+    def _suggestions(self):
+        return [
+            {
+                'reviewer': 'analyst',
+                'severity': 'suggestion',
+                'location': 'src/foo.py:10',
+                'category': 'coverage',
+                'description': 'Missing edge case for branch X',
+                'suggested_fix': 'Add a test covering branch X',
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_suggestions_returns_none(self):
+        wf = _make_workflow()
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            disposition = await wf._route_review_suggestions_to_curator(_fake_reviews([]))
+        assert disposition == SuggestionDisposition.NONE
+
+    @pytest.mark.asyncio
+    async def test_curator_path_returns_curator(self):
+        wf = _make_workflow()
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            disposition = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
+        assert disposition == SuggestionDisposition.CURATOR
+
+    @pytest.mark.asyncio
+    async def test_identical_second_call_returns_deduped(self):
+        wf = _make_workflow()
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            first = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+            second = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
+        assert (first, second) == (SuggestionDisposition.CURATOR, SuggestionDisposition.DEDUPED)
+
+    @pytest.mark.asyncio
+    async def test_mcp_none_with_queue_returns_escalation_queue(self):
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-42-0'
+        queue.get_by_task.return_value = []
+        wf = _make_workflow(escalation_queue=queue)
+        wf.mcp = None
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            disposition = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+        assert disposition == SuggestionDisposition.ESCALATION_QUEUE
+        queue.submit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mcp_none_without_queue_returns_dropped(self):
+        wf = _make_workflow(escalation_queue=None)
+        wf.mcp = None
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            disposition = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+        assert disposition == SuggestionDisposition.DROPPED
+
+    @pytest.mark.asyncio
+    async def test_scheduling_failure_returns_error_without_a_scheduled_log(self, caplog):
+        wf = _make_workflow()
+        # A non-coroutine makes asyncio.create_task raise TypeError, which
+        # exercises the router's except arm without patching asyncio globally.
+        wf._post_submit_tasks = MagicMock(return_value=None)  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+            disposition = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+
+        assert disposition == SuggestionDisposition.ERROR
+        scheduled_logs = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.workflow'
+            and r.levelno == logging.INFO
+            and 'scheduled' in r.getMessage()
+        ]
+        assert scheduled_logs == []
 
 
 # ---------------------------------------------------------------------------
