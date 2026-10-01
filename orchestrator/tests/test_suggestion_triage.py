@@ -1071,7 +1071,8 @@ class TestEscalateReviewIssues:
 
         wf = _make_workflow(escalation_queue=self._queue())
         wf.state = MagicMock(value='review')
-        wf.event_store = _RecordingEventStore()  # type: ignore[assignment]
+        store = _RecordingEventStore()
+        wf.event_store = store  # type: ignore[assignment]
         reviews = self._reviews(
             blocking_issues=[self._issue('bug', 'blocking')],
             suggestions=[self._issue('style', 'suggestion'), self._issue('naming', 'suggestion')],
@@ -1080,7 +1081,7 @@ class TestEscalateReviewIssues:
         wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.CURATOR)
 
         [data] = [
-            payload['data'] for event_type, payload in wf.event_store.events
+            payload['data'] for event_type, payload in store.events
             if event_type == 'escalation_created'
         ]
         assert data['n_blocking'] == 1

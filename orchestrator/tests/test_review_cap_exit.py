@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -154,7 +155,7 @@ async def test_routes_then_escalates_with_the_reported_disposition(tmp_path: Pat
     escalate.assert_called_once_with(
         reviews, suggestion_disposition=SuggestionDisposition.CURATOR,
     )
-    wf._replan.assert_not_called()
+    cast(AsyncMock, wf._replan).assert_not_called()
 
 
 async def test_no_suggestions_escalates_with_none(tmp_path: Path):
@@ -260,7 +261,7 @@ async def test_blocking_then_done_reentry_reuses_item_keys(tmp_path: Path):
     )
     posted_bodies: list[dict] = []
 
-    async def capture_post(url, *, json=None, **kwargs):
+    async def capture_post(url, *, json: dict, **kwargs):
         posted_bodies.append(json)
         return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
 
