@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
 from _merge_lane_verifier_doubles import ScriptedVerifier
 from _orch_helpers import make_placeholder_future, wait_responsive
 
@@ -365,19 +366,13 @@ class TestPersistentWorktreeVerifyRouting:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
-        worker_task = asyncio.create_task(worker.run())
-
-        # try/finally, not straight-line: wait_responsive gives up by raising
-        # _pytest.outcomes.Failed, a BaseException, so an unguarded stop call
-        # would be skipped and leak a live worker into teardown (esc-3980-4).
-        try:
+        async with running_merge_worker(worker):
             await queue.put(req)
             outcome = await wait_responsive(
-                req.result, label='warm-test merge outcome (knob ON, warm _merge-verify)'
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='warm-test merge outcome (knob ON, warm _merge-verify)',
             )
-        finally:
-            await worker.stop()
-            await worker_task
 
         assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
@@ -411,18 +406,13 @@ class TestPersistentWorktreeVerifyRouting:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
-        worker_task = asyncio.create_task(worker.run())
-
-        # try/finally for the same reason as test_verify_in_warm_worktree_when_knob_on:
-        # a wait_responsive give-up is a BaseException.
-        try:
+        async with running_merge_worker(worker):
             await queue.put(req)
             outcome = await wait_responsive(
-                req.result, label='cold-test merge outcome (knob OFF, ephemeral _merge-<uuid>)'
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='cold-test merge outcome (knob OFF, ephemeral _merge-<uuid>)',
             )
-        finally:
-            await worker.stop()
-            await worker_task
 
         assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
@@ -540,18 +530,13 @@ class TestSafetyValveIntegration:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
-        worker_task = asyncio.create_task(worker.run())
-
-        # try/finally for the same reason as test_verify_in_warm_worktree_when_knob_on:
-        # a wait_responsive give-up is a BaseException.
-        try:
+        async with running_merge_worker(worker):
             await queue.put(req)
             outcome = await wait_responsive(
-                req.result, label='valve-test merge outcome (safety_valve_every_n=1, ephemeral)'
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='valve-test merge outcome (safety_valve_every_n=1, ephemeral)',
             )
-        finally:
-            await worker.stop()
-            await worker_task
 
         assert outcome.status == 'done', f'Expected done; got: {outcome}'
 

@@ -303,6 +303,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT
 from _merge_lane_fakes import (
     FakeVerifier,
     RecordingEscalations,
@@ -1317,6 +1318,7 @@ class TestFiveThreeTwoSixReplayGate:
             release.set()
             outcome = await wait_responsive(
                 winner.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
                 label='5326 replay gate: recovered merge outcome after the gated verify is released',
             )
 

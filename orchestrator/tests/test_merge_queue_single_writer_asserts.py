@@ -59,6 +59,7 @@ from types import SimpleNamespace
 from typing import Literal, cast
 
 import pytest
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
 from _merge_lane_fakes import FakeVerifier
 from _orch_helpers import wait_responsive
 
@@ -599,29 +600,26 @@ class TestDebugAssertsSuiteWideAndConformance:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(e2e_git_ops, queue, verifier=FakeVerifier())
-        worker_task = asyncio.create_task(worker.run())
 
         req_n = _make_e2e_request('sw-e2e-n', 'sw-e2e-n', wt_n, e2e_config)
         req_n1 = _make_e2e_request('sw-e2e-n1', 'sw-e2e-n1', wt_n1, e2e_config)
 
-        # try/finally, not straight-line: wait_responsive gives up by raising
-        # _pytest.outcomes.Failed, a BaseException, so an unguarded stop call
-        # would be skipped and leak a live worker into teardown (esc-3980-4).
-        try:
+        async with running_merge_worker(worker):
             # Submit both before the worker processes them, matching
             # test_speculative_basic_throughput's real-pipeline shape.
             await queue.put(req_n)
             await queue.put(req_n1)
 
             outcome_n = await wait_responsive(
-                req_n.result, label='sw-e2e-n (N) merge outcome, debug asserts ON'
+                req_n.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='sw-e2e-n (N) merge outcome, debug asserts ON',
             )
             outcome_n1 = await wait_responsive(
-                req_n1.result, label='sw-e2e-n1 (N+1) merge outcome, debug asserts ON'
+                req_n1.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='sw-e2e-n1 (N+1) merge outcome, debug asserts ON',
             )
 
             assert outcome_n.status == 'done', f'N failed: {outcome_n}'
             assert outcome_n1.status == 'done', f'N+1 failed: {outcome_n1}'
-        finally:
-            await worker.stop()
-            await worker_task

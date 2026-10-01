@@ -40,6 +40,7 @@ from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _live_merge_worker import running_merge_worker
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.artifacts import TaskArtifacts
@@ -1017,11 +1018,7 @@ class TestPathEquivalence:
             worker1, '_bounce_conflicting_suffix_items',
             AsyncMock(return_value=None),
         )
-        worker1_task = asyncio.create_task(worker1.run())
-        # try/finally, not straight-line: wait_responsive gives up by raising
-        # _pytest.outcomes.Failed, a BaseException, so an unguarded stop call
-        # would be skipped and leak a live worker into teardown (esc-3980-4).
-        try:
+        async with running_merge_worker(worker1):
             await queue.put(merger_req)
             merger_outcome = await wait_responsive(
                 merger_req.result,
@@ -1030,9 +1027,6 @@ class TestPathEquivalence:
                     'classify_and_merge equivalence scenario'
                 ),
             )
-        finally:
-            await worker1.stop()
-            await worker1_task
 
         # ── Drive the REMERGE path ──────────────────────────────────────────
         es_remerge = _make_event_store(tmp_path / 'remerge')
