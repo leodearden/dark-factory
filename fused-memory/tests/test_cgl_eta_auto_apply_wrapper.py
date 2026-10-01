@@ -42,6 +42,7 @@ import pytest
 _FM = Path(__file__).resolve().parents[1]
 WRAPPER = _FM / "scripts" / "cgl_eta_auto_apply.sh"
 CHECK_WRAPPER = _FM.parent / "scripts" / "fused-memory-flag-marker-check.sh"
+SWEEP_WRAPPER = _FM.parent / "scripts" / "fused-memory-flag-marker-sweep.sh"
 
 # Resolved in the PARENT: the tests below hand the child an empty PATH, and
 # subprocess looks argv[0] up in the CHILD's env, so a bare "bash" would be
@@ -295,30 +296,31 @@ def _code_line_of(src, needle, label, path):
     )
 
 
-def test_both_wrappers_resolve_uv_after_sourcing_dotenv():
+def test_every_wrapper_resolves_uv_after_sourcing_dotenv():
     """Task 4591 amendment (review suggestion 4). Pins the ORDER, which is
-    load-bearing and was asymmetric in this file's first cut: uv must be
-    resolved AFTER `set -a; source "$REPO/.env"`, in BOTH wrappers.
+    load-bearing: each wrapper's require_uv_bin CALL must come AFTER
+    `set -a; source "$REPO/.env"`.
 
     Resolving first would ignore a PATH or UV_BIN set in .env -- which is
     precisely the remedy an operator reaches for after a minimal-boot-PATH
-    127 -- so this wrapper would have failed where its sibling succeeded.
-    Asserted structurally because this wrapper hardcodes REPO and so cannot
-    be pointed at a fake .env at runtime. Cheap insurance against a future
-    tidy-up silently reintroducing the asymmetry.
+    127 -- so one wrapper would fail where its siblings succeed. The line
+    that sources scripts/lib/resolve_uv.sh may sit anywhere: it only defines
+    functions, so the invocation point is the invariant. Asserted
+    structurally because this wrapper hardcodes REPO and so cannot be pointed
+    at a fake .env at runtime.
     """
-    for path in (WRAPPER, CHECK_WRAPPER):
+    for path in (WRAPPER, CHECK_WRAPPER, SWEEP_WRAPPER):
         src = path.read_text()
         source_line = _code_line_of(
             src, 'source "$REPO/.env"', "`source .env`", path,
         )
         resolve_line = _code_line_of(
-            src, "resolve_uv_bin() {", "resolve_uv_bin() definition", path,
+            src, "require_uv_bin", "require_uv_bin call", path,
         )
         assert source_line < resolve_line, (
-            f"{path.name} resolves uv BEFORE sourcing $REPO/.env. That makes a "
-            f"PATH or UV_BIN set in .env invisible to the resolution -- the "
-            f"exact operator remedy for the boot-PATH 127 this ladder exists "
-            f"for -- and desynchronises it from its sibling wrapper. Move the "
-            f"resolve_uv_bin definition and its guard below the `set +a` block."
+            f"{path.name} calls require_uv_bin BEFORE sourcing $REPO/.env. That "
+            f"makes a PATH or UV_BIN set in .env invisible to the resolution -- "
+            f"the exact operator remedy for the boot-PATH 127 this ladder exists "
+            f"for -- and desynchronises it from its sibling wrappers. Move the "
+            f"require_uv_bin call below the `set +a` block."
         )

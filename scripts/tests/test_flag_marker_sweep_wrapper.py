@@ -399,6 +399,54 @@ def test_wrapper_fails_loud_when_uv_cannot_be_resolved(tmp_path):
     )
 
 
+def test_wrapper_fails_loud_when_uv_bin_is_set_but_not_executable(tmp_path):
+    """An explicit UV_BIN pin that does not resolve must fail LOUDLY, never
+    fall through to the uv on PATH: that would run a DIFFERENT uv than the
+    one named. Mirrors the check wrapper's row of the same name -- this
+    wrapper used to be the one copy of the ladder that fell through.
+
+    A good fake uv sits on PATH, so a fall-through exits 0 having invoked it;
+    the assertions below distinguish the two behaviours."""
+    uv_bin_dir, state_path = _fake_uv(tmp_path)
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+
+    bad_uv = tmp_path / "bad-uv"
+    bad_uv.write_text("#!/bin/sh\nexit 0\n")
+    bad_uv.chmod(0o644)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{uv_bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin"
+    env["FAKE_SWEEP_STATE"] = str(state_path)
+    env["REPO"] = str(fake_repo)
+    env["UV_BIN"] = str(bad_uv)
+    env["FLAG_MARKER_SWEEP_PROJECT_IDS"] = "dark_factory"
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        ["bash", str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode != 0, (
+        f"Expected a non-zero exit when UV_BIN is set but not executable; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "ERROR:" in result.stderr, (
+        f"Expected the wrapper's own ERROR:-prefixed diagnostic; "
+        f"stderr={result.stderr!r}"
+    )
+    assert str(bad_uv) in result.stderr, (
+        f"Expected the diagnostic to name the bad UV_BIN path; "
+        f"stderr={result.stderr!r}"
+    )
+    assert _recorded_calls(state_path) == [], (
+        f"Expected NO uv invocation: falling through to the uv on PATH runs a "
+        f"different uv than the one pinned. calls={_recorded_calls(state_path)!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # step-9: RED -- the per-project sweep loop (task 2917 EDIT 1)
 # ---------------------------------------------------------------------------
