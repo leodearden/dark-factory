@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -50,11 +51,25 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'GitignoredDeliverableFinding',
+    'gitignored_deliverable_enforced',
     'gitignored_deliverable_finding',
+    'gitignored_deliverable_reject',
+    'gitignored_deliverable_warning',
     'make_gitignore_probe',
 ]
 
 _GIT_PROBE_TIMEOUT_SECS = 10.0
+
+_ENFORCE_ENV_VAR = 'FUSED_GITIGNORED_DELIVERABLE_ENFORCE'
+_TRUTHY_ENV_VALUES: frozenset[str] = frozenset({'1', 'true', 'yes', 'on'})
+
+_ROUTING_HINT = (
+    "This is likely task_kind='deterministic' work, which has no commit "
+    'requirement: point metadata.before_done at a committed script for a '
+    'scripted action, or set metadata.always_escalates=True for a human gate. '
+    'If a code deliverable really is intended, declare at least one '
+    'committable path in metadata.files.'
+)
 
 _EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(
     c for c in EXECUTION_CLASSES if c != 'code_tdd'
@@ -155,3 +170,52 @@ def make_gitignore_probe(project_root: str | Path) -> GitignoreProbe:
         return frozenset(p for p in result.stdout.split('\0') if p)
 
     return probe
+
+
+def _undeliverable_detail(finding: GitignoredDeliverableFinding) -> str:
+    paths = ', '.join(finding.ignored_paths)
+    return (
+        'Every declared metadata.files path is gitignored in the target '
+        f"project ({paths}), so a task_kind='normal' task can never produce a "
+        'commit for it. confirm_plan only requires a non-empty plan.files '
+        'declaration, but the merge-time plan-files-touched gate '
+        '(OutcomeKind.plan_files_not_touched) and done_provenance require the '
+        'work to be backed by a real commit on main, which a gitignored path '
+        'can never be.'
+    )
+
+
+def gitignored_deliverable_reject(finding: GitignoredDeliverableFinding) -> dict[str, Any]:
+    """Hard-reject payload, used when :func:`gitignored_deliverable_enforced` is ``True``."""
+    return {
+        'error': _undeliverable_detail(finding),
+        'error_type': 'ValidationError',
+        'hint': _ROUTING_HINT,
+    }
+
+
+def gitignored_deliverable_warning(finding: GitignoredDeliverableFinding) -> dict[str, Any]:
+    """Non-blocking advisory to merge into a successful submit result.
+
+    Also logs the ``gitignored_deliverable_lint.flagged`` census line whose
+    rate is the signal for flipping the enforce switch.
+    """
+    logger.warning(
+        'gitignored_deliverable_lint.flagged task_kind=normal paths=%s',
+        ','.join(finding.ignored_paths),
+    )
+    return {
+        'gitignored_deliverable_warning': {
+            'ignored_paths': list(finding.ignored_paths),
+            'detail': _undeliverable_detail(finding),
+            'hint': (
+                f'{_ROUTING_HINT} Set {_ENFORCE_ENV_VAR}=1 to hard-reject such '
+                'submissions instead of warning.'
+            ),
+        },
+    }
+
+
+def gitignored_deliverable_enforced() -> bool:
+    """``True`` only when the enforce env var holds a recognised truthy value."""
+    return os.environ.get(_ENFORCE_ENV_VAR, '').strip().lower() in _TRUTHY_ENV_VALUES
