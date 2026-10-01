@@ -156,6 +156,38 @@ def _subset(block: dict[str, Any], expected: dict[str, Any]) -> dict[str, Any]:
     return {key: block[key] for key in expected}
 
 
+def _replaced(cases: list[dict[str, Any]], arm: str, memory_id: str,
+              **changes: Any) -> list[dict[str, Any]]:
+    return [
+        {**row, **changes} if (row['arm'], row['memory_id']) == (arm, memory_id) else row
+        for row in cases
+    ]
+
+
+PAIRED_ERRORS = {
+    'misfile', 'contested_decision_error', 'missed_contradiction', 'false_contested',
+    'true_link_answered_distinct',
+}
+
+
+def _paired_block(
+    n_common: int, only_arm: int, only_reference: int, mcnemar_p: float,
+    sign_test: tuple[int, int, float],
+) -> dict[str, Any]:
+    favouring_arm, favouring_reference, sign_p = sign_test
+    return {
+        'n_common': n_common,
+        'only_arm': only_arm,
+        'only_reference': only_reference,
+        'mcnemar_p': mcnemar_p,
+        'parent_sign_test': {
+            'groups_favouring_arm': favouring_arm,
+            'groups_favouring_reference': favouring_reference,
+            'p': sign_p,
+        },
+    }
+
+
 def _read_fixture(name: str) -> list[dict[str, Any]]:
     with (FIXTURES / name).open() as fh:
         return [json.loads(line) for line in fh if line.strip()]
@@ -413,6 +445,39 @@ class TestRuntime:
         assert per_model['gpt-6.1-sol'] == {'input': 2.00, 'output': 10.00}
 
 
+class TestPairedVsReference:
+    def test_the_reference_arm_is_not_paired_with_itself(self) -> None:
+        assert _synth_result()['arms']['ref']['paired_vs_reference'] is None
+
+    def test_every_per_write_error_is_paired(self) -> None:
+        assert set(_synth_result()['arms']['cand']['paired_vs_reference']) == PAIRED_ERRORS
+
+    @pytest.mark.parametrize(('error', 'expected'), [
+        ('misfile', _paired_block(6, 0, 1, 1.0, (1, 0, 1.0))),
+        ('contested_decision_error', _paired_block(6, 0, 2, 0.5, (2, 0, 0.5))),
+        ('missed_contradiction', _paired_block(6, 0, 1, 1.0, (1, 0, 1.0))),
+        ('false_contested', _paired_block(6, 0, 1, 1.0, (1, 0, 1.0))),
+        ('true_link_answered_distinct', _paired_block(6, 0, 1, 1.0, (1, 0, 1.0))),
+    ])
+    def test_paired_counts_and_exact_tests(self, error: str, expected: dict[str, Any]) -> None:
+        assert _synth_result()['arms']['cand']['paired_vs_reference'][error] == expected
+
+    def test_a_write_judged_in_only_one_arm_is_outside_the_pairing(self) -> None:
+        cases = [
+            *SYNTH_CASES,
+            _case('cand', 'w8', 'amended', 't8', band_winner='p5', **CAND_RUNTIME),
+        ]
+        result = _score(cases, [*SYNTH_VERDICTS, _vote('w8', 't8', 'SAME', 'a')])
+        cand = result['arms']['cand']
+        assert cand['population']['n_judge_band'] == 7
+        assert {block['n_common'] for block in cand['paired_vs_reference'].values()} == {6}
+
+    def test_a_band_winner_that_differs_between_arms_is_refused(self) -> None:
+        cases = _replaced(SYNTH_CASES, 'cand', 'w1', band_winner_id='p9')
+        with pytest.raises(ValueError, match='w1'):
+            _score(cases, SYNTH_VERDICTS)
+
+
 class TestSeedRegression:
     def test_verdict_corpus(self) -> None:
         assert _seed_result()['verdict_corpus'] == {
@@ -489,3 +554,14 @@ class TestSeedRegression:
         assert runtime['p50_judge_seconds'] == pytest.approx(p50, abs=5e-4)
         assert runtime['p95_judge_seconds'] == pytest.approx(p95, abs=5e-4)
         assert runtime['cost_per_write_usd'] == pytest.approx(cost, abs=5e-7)
+
+    @pytest.mark.parametrize(('error', 'expected'), [
+        ('misfile', _paired_block(73, 3, 5, 0.7266, (5, 3, 0.7266))),
+        ('contested_decision_error', _paired_block(73, 1, 4, 0.375, (4, 1, 0.375))),
+        ('missed_contradiction', _paired_block(73, 1, 2, 1.0, (2, 1, 1.0))),
+        ('false_contested', _paired_block(73, 0, 2, 0.5, (2, 0, 0.5))),
+        ('true_link_answered_distinct', _paired_block(73, 0, 2, 0.5, (2, 0, 0.5))),
+    ])
+    def test_paired(self, error: str, expected: dict[str, Any]) -> None:
+        paired = _seed_result()['arms'][SEED_CANDIDATE]['paired_vs_reference']
+        assert paired[error] == expected
