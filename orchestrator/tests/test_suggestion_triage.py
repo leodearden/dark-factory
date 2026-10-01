@@ -997,18 +997,42 @@ class TestDoneBranchCallSiteViaWorkflow:
 # ---------------------------------------------------------------------------
 
 class TestEscalateReviewIssues:
-    def test_creates_blocking_escalation(self):
+    @staticmethod
+    def _issue(tag: str, severity: str) -> dict:
+        return {
+            'reviewer': f'reviewer-{tag}',
+            'severity': severity,
+            'location': f'src/{tag}.py:{len(tag)}',
+            'category': f'category-{tag}',
+            'description': f'description-{tag}',
+            'suggested_fix': f'fix-{tag}',
+        }
+
+    @staticmethod
+    def _reviews(blocking_issues: list[dict], suggestions: list[dict]) -> ReviewAggregation:
+        return ReviewAggregation(
+            has_blocking_issues=bool(blocking_issues),
+            blocking_issues=blocking_issues,
+            suggestions=suggestions,
+            reviews={},
+        )
+
+    def _queue(self):
         queue = MagicMock()
         queue.make_id.return_value = 'esc-42-5'
+        return queue
+
+    def test_creates_blocking_escalation(self):
+        queue = self._queue()
         wf = _make_workflow(escalation_queue=queue)
         wf.state = MagicMock(value='review')
 
-        reviews = _fake_reviews(
+        reviews = self._reviews(
             blocking_issues=[{'description': 'bug'}, {'description': 'crash'}],
             suggestions=[{'description': 'style'}],
         )
 
-        wf._escalate_review_issues(reviews)
+        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.CURATOR)
 
         queue.submit.assert_called_once()
         esc = queue.submit.call_args[0][0]
@@ -1019,8 +1043,62 @@ class TestEscalateReviewIssues:
 
     def test_noop_without_queue(self):
         wf = _make_workflow(escalation_queue=None)
-        reviews = _fake_reviews(blocking_issues=[{'description': 'bug'}])
-        wf._escalate_review_issues(reviews)  # Should not raise
+        reviews = self._reviews(blocking_issues=[{'description': 'bug'}], suggestions=[])
+        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.NONE)  # Should not raise
+
+    def test_detail_inlines_every_suggestion(self):
+        queue = self._queue()
+        wf = _make_workflow(escalation_queue=queue)
+        wf.state = MagicMock(value='review')
+        reviews = self._reviews(
+            blocking_issues=[self._issue('bug', 'blocking'), self._issue('crash', 'blocking')],
+            suggestions=[self._issue('style', 'suggestion'), self._issue('naming', 'suggestion')],
+        )
+
+        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.CURATOR)
+
+        esc = queue.submit.call_args[0][0]
+        assert esc.detail == reviews.format_for_escalation()
+        for suggestion in reviews.suggestions:
+            for key in ('description', 'location', 'suggested_fix'):
+                assert suggestion[key] in esc.detail
+        assert '2 blocking issue(s)' in esc.summary
+        assert '2 suggestion(s)' in esc.summary
+        assert esc.summary.endswith('[suggestions → curator]')
+
+    def test_event_payload_carries_disposition(self):
+        from _recording_event_store import _RecordingEventStore
+
+        wf = _make_workflow(escalation_queue=self._queue())
+        wf.state = MagicMock(value='review')
+        wf.event_store = _RecordingEventStore()  # type: ignore[assignment]
+        reviews = self._reviews(
+            blocking_issues=[self._issue('bug', 'blocking')],
+            suggestions=[self._issue('style', 'suggestion'), self._issue('naming', 'suggestion')],
+        )
+
+        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.CURATOR)
+
+        [data] = [
+            payload['data'] for event_type, payload in wf.event_store.events
+            if event_type == 'escalation_created'
+        ]
+        assert data['n_blocking'] == 1
+        assert data['n_suggestions'] == 2
+        assert data['suggestion_disposition'] == 'curator'
+
+    def test_no_suggestions_has_no_suffix_or_section(self):
+        queue = self._queue()
+        wf = _make_workflow(escalation_queue=queue)
+        wf.state = MagicMock(value='review')
+        reviews = self._reviews(blocking_issues=[self._issue('bug', 'blocking')], suggestions=[])
+
+        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.NONE)
+
+        esc = queue.submit.call_args[0][0]
+        assert '[suggestions' not in esc.summary
+        assert '# Review Feedback — Suggestions' not in esc.detail
+        assert esc.detail == reviews.format_for_replan()
 
 
 # ---------------------------------------------------------------------------
