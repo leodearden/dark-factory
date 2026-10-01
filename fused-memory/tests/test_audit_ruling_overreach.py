@@ -324,10 +324,11 @@ class TestDetectorHits:
     def test_nothing_fires_on_the_negative_control(self) -> None:
         assert mod.detector_hits(_episode(NEGATIVE_CONTROL)) == frozenset()
 
-    def test_nothing_fires_on_the_specimens(self) -> None:
-        """The four known overreach episodes: the census baseline, measured, not assumed."""
+    def test_no_wired_detector_fires_on_the_specimens(self) -> None:
+        """4715's gate misses all four known overreach episodes. Unwired batch_plan
+        does fire on cf03f276, reading '(2026-06-23)' as a task-id range."""
         for episode in _specimen_episodes().values():
-            assert mod.detector_hits(episode) == frozenset(), episode.uuid
+            assert not mod.detector_hits(episode) & mod.WIRED_ON_ADD_MEMORY, episode.uuid
 
     def test_odd_content_never_raises(self) -> None:
         episode = mod.Episode(

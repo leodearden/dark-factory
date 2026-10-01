@@ -41,6 +41,15 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from fused_memory.reconciliation.task_filter import (
+    is_batch_plan_framing,
+    is_proposed_resolution_framing,
+)
+from fused_memory.services.completion_claim_gate import (
+    UNVERIFIED_CLAIM_TAG,
+    extract_completion_claims,
+)
+
 # --------------------------------------------------------------------------- #
 # Records
 # --------------------------------------------------------------------------- #
@@ -275,3 +284,50 @@ def specimen_recall(
         return None
     holds = CLASSIFIERS[classifier_name]
     return round(sum(1 for episode in present if holds(episode)) / len(present), 4)
+
+
+# --------------------------------------------------------------------------- #
+# Counterfactual census of the write-time detectors — IMPORTED, never re-derived
+# --------------------------------------------------------------------------- #
+
+DETECTORS: tuple[str, ...] = (
+    'unverified_claim_tag', 'completion_claim', 'proposed_resolution', 'batch_plan',
+)
+
+WIRED_ON_ADD_MEMORY: frozenset[str] = frozenset({'unverified_claim_tag', 'completion_claim'})
+"""What actually runs on the add_memory path after task 4715: the completion-claim
+gate and the tag it writes. The two framing detectors were deliberately left
+unwired (esc-4715-5), so their columns are counterfactual."""
+
+KNOWN_PROJECT_IDS: frozenset[str] = frozenset({'dark_factory', 'reify'})
+
+
+def detector_hits(
+    episode: Episode, known_project_ids: frozenset[str] = KNOWN_PROJECT_IDS
+) -> frozenset[str]:
+    content = episode.content or ''
+    fired = {
+        'unverified_claim_tag': UNVERIFIED_CLAIM_TAG in episode.source.tags,
+        'completion_claim': bool(extract_completion_claims(
+            content, default_project_id=episode.graph,
+            known_project_ids=known_project_ids,
+        )),
+        'proposed_resolution': is_proposed_resolution_framing(content),
+        'batch_plan': is_batch_plan_framing(content),
+    }
+    return frozenset(name for name in DETECTORS if fired[name])
+
+
+def detector_census(
+    episodes_by_stratum: Mapping[str, Iterable[Episode]],
+) -> dict[str, dict[str, int]]:
+    """Per stratum: how many episodes, and how many each detector fires on."""
+    census: dict[str, dict[str, int]] = {}
+    for stratum, episodes in episodes_by_stratum.items():
+        counts = dict.fromkeys(('episodes', *DETECTORS), 0)
+        for episode in episodes:
+            counts['episodes'] += 1
+            for name in detector_hits(episode):
+                counts[name] += 1
+        census[stratum] = counts
+    return census
