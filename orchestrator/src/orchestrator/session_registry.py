@@ -4544,6 +4544,48 @@ def _run_lease_reap() -> list[ReapedLease]:
     return reap_stale_leases()
 
 
+def _read_decision_or_none(decision_id: str) -> DecisionRecord | None:
+    """The record at *decision_id*, or None when it is absent, unreadable or corrupt."""
+    try:
+        return DecisionRecord.from_json(decision_path_for_id(decision_id).read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+@contextlib.contextmanager
+def _locked_filing_target(
+    canonical_project: str, local_id: str
+) -> Iterator[tuple[str, DecisionRecord | None]]:
+    """Lock and read the record a write-decision filing of *local_id* lands on.
+
+    That is the project-qualified id, unless only a bare-keyed record filed
+    before task 4835 exists at *local_id* for the SAME project: the filing
+    then continues that record in place, keeping its custody and any
+    held-closed state. Migration is lazy and ids are never rewritten, as in
+    migrate_decision_project_tokens. Locks go qualified-then-legacy, and the
+    legacy one only when its file exists, so a fresh filing leaves no orphan
+    sidecar. See plans/4835-decision-plumbing-decisions.md.
+    """
+    qualified = qualify_decision_id(canonical_project, local_id)
+    with decision_id_lock(qualified):
+        if (
+            local_id != qualified
+            and not decision_path_for_id(qualified).exists()
+            and decision_path_for_id(local_id).exists()
+        ):
+            with decision_id_lock(local_id):
+                legacy = _read_decision_or_none(local_id)
+                if (
+                    legacy is not None
+                    and normalize_project_token(legacy.project) == canonical_project
+                ):
+                    yield local_id, legacy
+                else:
+                    yield qualified, None
+            return
+        yield qualified, _read_decision_or_none(qualified)
+
+
 def _run_write_decision(
     local_id: str,
     project: str,
@@ -4593,7 +4635,9 @@ def _run_write_decision(
     ``local_id`` (``--id``) is project-LOCAL (task 4835): the record is
     filed under ``qualify_decision_id(canonical project, local_id)``, so the
     same escalation id in two projects lands on two rows, while both queues
-    of ONE project still share a row (the MODE-2 collapse below).
+    of ONE project still share a row (the MODE-2 collapse below). A
+    same-project record filed before then under the bare id is continued in
+    place (_locked_filing_target), and the printed id is the one landed on.
 
     ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
     to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
@@ -4739,20 +4783,6 @@ def _run_write_decision(
     if declined_hint is not None:
         logger.warning('write-decision: %s', declined_hint)
 
-    decision_id = qualify_decision_id(canonical_project, local_id)
-    incoming = DecisionRecord(
-        id=decision_id,
-        project=canonical_project,
-        text=text,
-        filed_at=datetime.now(UTC).isoformat(),
-        task_id=task_id,
-        escalation_id=escalation_id,
-        session_id=session_id,
-        severity=severity,
-        escalations_dir=stamp,
-        record_slug=record_slug,
-    )
-
     # WHY THIS IS NOT ROUTED THROUGH _mutate_decision, despite sharing its
     # read-modify-write shape: _mutate_decision is a STRICT read-modify-write
     # -- it does DecisionRecord.from_json(path.read_text()) and fail-softs to
@@ -4771,16 +4801,20 @@ def _run_write_decision(
     # decision_id_lock's own docstring), and INSIDE the try/except so a
     # lock-acquisition fault is absorbed rather than raised at a watcher.
     try:
-        with decision_id_lock(decision_id):
+        with _locked_filing_target(canonical_project, local_id) as (decision_id, existing):
+            incoming = DecisionRecord(
+                id=decision_id,
+                project=canonical_project,
+                text=text,
+                filed_at=datetime.now(UTC).isoformat(),
+                task_id=task_id,
+                escalation_id=escalation_id,
+                session_id=session_id,
+                severity=severity,
+                escalations_dir=stamp,
+                record_slug=record_slug,
+            )
             record = incoming
-            try:
-                existing = DecisionRecord.from_json(
-                    decision_path_for_id(decision_id).read_text()
-                )
-            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-                # Absent (the common first-filing case), unreadable, or
-                # corrupt: all fall through to writing fresh.
-                existing = None
             if existing is not None:
                 if normalize_project_token(existing.project) != canonical_project:
                     # SAME id, DIFFERENT project: an id COLLISION, not a
@@ -4918,7 +4952,12 @@ def _run_write_decision(
             if write_decision(record):
                 print(record.id)
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('write-decision: failed to file %s', decision_id, exc_info=True)
+        logger.error(
+            'write-decision: failed to file %s for project %s',
+            local_id,
+            canonical_project,
+            exc_info=True,
+        )
 
 
 def _run_reap_decisions(project: str, escalations_dir: str) -> None:
