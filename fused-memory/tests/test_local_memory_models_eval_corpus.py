@@ -185,6 +185,48 @@ class TestPayloadKind:
             'add_episode'
         )
 
+    @pytest.mark.parametrize(
+        ('temporal_context', 'unverified_claim'),
+        [(None, True), ('planning', False), ('planning', True)],
+    )
+    def test_classifies_what_the_episode_writer_persists(
+        self, mock_config, monkeypatch, temporal_context, unverified_claim
+    ):
+        """The reader's annotation set tracks the writer's real output, offline.
+
+        ``GraphitiBackend.add_episode`` spells its annotations inline, so the
+        literal pins here and in test_unverified_claim_tag_propagation.py could
+        both be respelled while still agreeing with themselves. Classifying the
+        description the writer actually hands graphiti_core makes a respelling
+        fail in the change that makes it, not later on the live smoke.
+        """
+        from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
+
+        class _RecordingClient:
+            def __init__(self):
+                self.source_descriptions: list[str] = []
+
+            async def add_episode(self, **kwargs):
+                self.source_descriptions.append(kwargs['source_description'])
+
+        client = _RecordingClient()
+        backend = GraphitiBackend(mock_config)
+        monkeypatch.setattr(backend, '_client_for', lambda group_id: client)
+
+        asyncio.run(
+            backend.add_episode(
+                name='e',
+                content='c',
+                group_id='g',
+                source_description='add_memory:decisions_and_rationale',
+                temporal_context=temporal_context,
+                unverified_claim=unverified_claim,
+            )
+        )
+
+        [persisted] = client.source_descriptions
+        assert _mod.payload_kind(persisted) == 'decisions_and_rationale', persisted
+
     @pytest.mark.parametrize('bad', ['', None, 17, '   '])
     def test_unusable_value_raises_naming_the_offender(self, bad):
         with pytest.raises(_mod.CorpusBuildError) as exc:
@@ -3538,13 +3580,12 @@ def test_live_dark_factory_population_smoke(monkeypatch):
         f'sample rather than a census'
     )
 
-    kinds = {_mod.payload_kind(r.source_description) for r in population}
+    classified = [
+        (r.source_description, _mod.payload_kind(r.source_description)) for r in population
+    ]
+    kinds = {kind for _, kind in classified}
     unexpected_descriptions = sorted(
-        {
-            r.source_description
-            for r in population
-            if _mod.payload_kind(r.source_description) not in LIVE_PAYLOAD_KINDS
-        }
+        {description for description, kind in classified if kind not in LIVE_PAYLOAD_KINDS}
     )
     assert kinds == LIVE_PAYLOAD_KINDS, (
         f'the payload axis changed: {kinds ^ LIVE_PAYLOAD_KINDS} '

@@ -203,7 +203,10 @@ stratum instead of landing in its own bogus payload-kind stratum.
 
 The set is deliberately closed: an unrecognised bracket tag stays part of a
 caller string and buckets as :data:`ADD_EPISODE_KIND`. The live smoke's
-payload-axis equality is what catches a new writer annotation.
+payload-axis equality is what catches a new writer annotation; a respelling of
+either existing one is caught offline by
+``fused-memory/tests/test_local_memory_models_eval_corpus.py::TestPayloadKind::test_classifies_what_the_episode_writer_persists``,
+which classifies the description the real writer persists.
 """
 
 STRATIFICATION_DIMENSIONS: tuple[str, ...] = (
