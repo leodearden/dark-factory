@@ -30,7 +30,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Mapping
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -2136,10 +2137,11 @@ def declined_project_token_hint(value: object, action: str = '') -> str | None:
     must land. ``solar_challenge`` -- the token both SKILL.md files recommend
     -- must stay SILENT, or a watcher accrues a warning every Main Loop
     cycle and the signal degrades into noise. Because the check is gated on
-    a one-entry table it has zero false positives; it is deliberately
-    narrower than a generic "your --project matched zero records" warning,
-    which cannot distinguish a token nothing uses from a healthy project
-    with nothing open.
+    a one-entry table it has zero false positives, so it fires on every
+    reap. The general "your --project matched zero records" case is
+    unmatched_project_token_hint, which is OPT-IN (``reap-decisions
+    --expect-matches``) because by count alone a never-filed project cannot
+    be told apart from a mismatched one; this hint takes precedence over it.
 
     WHY IT IS VERB-AWARE. The two callers hit this table for OPPOSITE
     reasons, and one message cannot be true for both. ``reap-decisions`` is
@@ -2198,6 +2200,44 @@ def declined_project_token_hint(value: object, action: str = '') -> str | None:
             ),
         }.get(action, '')
         return f'{core}{consequence} See PROJECT_TOKEN_ALIASES_DECLINED for the evidence.'
+    return None
+
+
+def project_token_census(decisions: Iterable[DecisionRecord]) -> Counter[str]:
+    """How many *decisions*, in any state, carry each folded project token; an unset token is dropped."""
+    return Counter(
+        token for token in (normalize_project_token(d.project) for d in decisions) if token
+    )
+
+
+def unmatched_project_token_hint(value: object, census: Mapping[str, int]) -> str | None:
+    """One-line warning when *value* folds to a token no registry record carries, else None.
+
+    *census* is project_token_census over the whole registry. The line names
+    the tokens that DO exist, most common first, so a mismatched spelling is
+    one glance from its fix.
+    """
+    folded = normalize_project_token(value)
+    if not folded or folded in census:
+        return None
+    present = ', '.join(
+        f'{token}={count}'
+        for token, count in sorted(census.items(), key=lambda item: (-item[1], item[0]))
+    )
+    return (
+        f'--project {folded!r} matches ZERO of {sum(census.values())} decision records in the '
+        f'registry (any state), so this reap can close nothing. Tokens present: '
+        f'{present or "none"}. Re-run with the token whose rows you meant.'
+    )
+
+
+def _reap_scope_hint(reaper_project: str, *, expect_matches: bool) -> str | None:
+    """The one advisory reap-decisions logs: the declined-alias special case first, else the opt-in census."""
+    declined = declined_project_token_hint(reaper_project, action='reap')
+    if declined is not None:
+        return declined
+    if expect_matches:
+        return unmatched_project_token_hint(reaper_project, project_token_census(list_decisions()))
     return None
 
 
@@ -5018,7 +5058,7 @@ def _run_write_decision(
         )
 
 
-def _run_reap_decisions(project: str, escalations_dir: str) -> None:
+def _run_reap_decisions(project: str, escalations_dir: str, *, expect_matches: bool = False) -> None:
     """Run the ``reap-decisions`` verb (Fleet Cockpit C8: close-on-resolve driver).
 
     Builds the production ``escalation_status`` closure for
@@ -5047,8 +5087,14 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
        A ``--project`` naming a DECLINED alias target now WARNS (task 3813,
        see PROJECT_TOKEN_ALIASES_DECLINED), so an operator passing a
        config-declared token that matches zero rows learns it immediately
-       instead of reading a silent no-op as "nothing to reap". Advisory
-       only: it does not change the axis, the scoping, or what gets closed.
+       instead of reading a silent no-op as "nothing to reap". The general
+       case is opt-in: with *expect_matches* (``--expect-matches``, task
+       4835) a token no registry record carries in ANY state warns and
+       names the tokens that do. It is not always on because by count alone
+       a never-filed project cannot be told apart from a mismatched one, and
+       a watcher reaps every Main Loop cycle. Both are advisory, one line
+       per invocation (_reap_scope_hint): neither changes the axis, the
+       scoping, or what gets closed.
     2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
        only WITHIN one queue, and a project can run several: dark_factory
        runs ``data/escalations`` (orchestrator) and
@@ -5103,16 +5149,14 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     reaper_dir = normalize_escalations_dir(escalations_dir)
     reaper_project = normalize_project_token(project)
 
-    # Advisory only (task 3813). Deliberately OUTSIDE _status, so it fires
-    # ONCE per invocation rather than once per record scanned -- a watcher
-    # runs this every Main Loop cycle and a per-record line would flood its
-    # log. It must not touch reaper_project, neither scoping axis, nor what
-    # gets closed: both guards below stay fail-OPEN exactly as documented.
-    # action='reap': this path really is MATCHING, so the zero-row-no-op
-    # consequence is the true one here (contrast _run_write_decision).
-    declined_hint = declined_project_token_hint(reaper_project, action='reap')
-    if declined_hint is not None:
-        logger.warning('reap-decisions: %s', declined_hint)
+    # Advisory only (tasks 3813, 4835). Deliberately OUTSIDE _status, so it
+    # fires ONCE per invocation rather than once per record scanned -- a
+    # watcher runs this every Main Loop cycle and a per-record line would
+    # flood its log. It must not touch reaper_project, neither scoping axis,
+    # nor what gets closed: both guards below stay fail-OPEN as documented.
+    scope_hint = _reap_scope_hint(reaper_project, expect_matches=expect_matches)
+    if scope_hint is not None:
+        logger.warning('reap-decisions: %s', scope_hint)
 
     def _status(decision: DecisionRecord) -> str | None:
         # Axis 1: normalize the decision's OWN stored token at compare time
@@ -5443,6 +5487,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     reap_decisions_p.add_argument('--escalations-dir', required=True)
+    reap_decisions_p.add_argument(
+        '--expect-matches',
+        action='store_true',
+        help=(
+            'opt-in: warn when no registry record, in any state, carries the folded '
+            '--project token, naming the tokens that do; for diagnosis and manual runs, '
+            'not the per-cycle Main Loop reap'
+        ),
+    )
 
     migrate_projects_p = sub.add_parser(
         'migrate-decision-projects',
@@ -5613,7 +5666,9 @@ def main(argv: list[str] | None = None) -> int:
                 record_slug=resolve_own_record_slug() or '',
             )
         elif args.verb == 'reap-decisions':
-            _run_reap_decisions(args.project, args.escalations_dir)
+            _run_reap_decisions(
+                args.project, args.escalations_dir, expect_matches=args.expect_matches
+            )
         elif args.verb == 'migrate-decision-projects':
             _run_migrate_decision_projects(args.dry_run)
     except Exception:
