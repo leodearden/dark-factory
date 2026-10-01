@@ -1490,8 +1490,8 @@ class GraphitiBackend:
         skip_maintenance: when True, skip both startup maintenance blocks
         (the registered-graph index provisioning sweep and the W6-ε startup
         identity scan, which REPAIRS dup-uuid edges — a write). Default False
-        preserves current behavior. Intended for lean, read-only callers (e.g. the ζ
-        migrate_cross_graph_leak.py dry-run/census) that need a
+        preserves current behavior. Intended for lean, read-only callers (e.g.
+        the ζ migrate_cross_graph_leak.py dry-run/census) that need a
         driver/client-wired backend without mutating on init or contending
         with a running service's maintenance sweep.
         """
@@ -1633,6 +1633,7 @@ class GraphitiBackend:
                 does not resolve. Chained from graphiti_core's own, whose
                 message names only the caller's own input.
         """
+        await self._ensure_indices(group_id)
         client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
         if uuid is not None and content:
@@ -4042,6 +4043,7 @@ class GraphitiBackend:
                 more nodes share this name. Carries the conflicting uuids as
                 structured data, so the caller can name the duplicate group.
         """
+        await self._ensure_indices(group_id)
         # Only the RESOLVE half forks — the two resolvers share one `str | None`
         # contract, so the short-circuit below and the whole mint/embedding block
         # stay a single unforked site.
