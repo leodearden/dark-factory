@@ -34,6 +34,7 @@ CALLERS = (
     "scripts/fused-memory-flag-marker-sweep.sh",
     "scripts/fused-memory-flag-marker-check.sh",
     "fused-memory/scripts/cgl_eta_auto_apply.sh",
+    "scripts/sync-orchestrator-env.sh",
 )
 
 STUB_MARKER = "STUB-RESOLVER-CALLED"
