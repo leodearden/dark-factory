@@ -327,6 +327,7 @@ def test_aged_at_turns_a_fresh_datum_past_its_bound_stale():
     assert aged.state is DatumState.STALE
     assert (aged.value, aged.as_of) == (5, as_of)
     assert aged.freshness_bound_seconds == BOUND_SECONDS
+    assert aged.reason is not None
     assert f'{BOUND_SECONDS + 15}s' in aged.reason
     assert f'{BOUND_SECONDS}s freshness bound' in aged.reason
 
