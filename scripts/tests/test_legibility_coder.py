@@ -1761,6 +1761,12 @@ def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
             # digest the pool merely refused.
             return None
 
+        @property
+        def auth_failed_account_names(self):
+            # None of the seven is auth-failed, so this stays an all-CAPPED
+            # pool: a deferral, not an auth outage.
+            return ()
+
     def must_not_run(*args, **kwargs):  # pragma: no cover - guard
         raise AssertionError(
             "the CLI must never be invoked once the pool is exhausted"

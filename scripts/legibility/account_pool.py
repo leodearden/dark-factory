@@ -184,50 +184,66 @@ CLI printed; this one is not a banner at all -- it is the gate reporting
 that no account remains -- and saying so is the honest spelling."""
 
 
-def _exhaustion_reason(gate, tried) -> str:
-    """Say WHICH exhaustion this is, because the three need different
-    operator responses.
+def _exhaustion_error(gate, tried) -> coder.CoderInvocationError:
+    """The exception to raise when no account is left — typed as well as
+    worded, because each exhaustion needs a different operator response.
 
-    "all N pool accounts capped" self-clears at the weekly reset and is
-    expected weather (task 4503). "no pool accounts resolved" is a config
-    fault that will never clear on its own -- it is the state
-    ``UsageGate._init_accounts`` degrades to when no token env var resolves,
-    which is also the state whose silent fallback to ``~/.claude`` this task
-    exists to remove. Folding either into the other would send an operator
-    to wait for a reset that never comes.
+    ===============================  ====================  ======================
+    gate state (public predicates)   raised                clears on its own?
+    ===============================  ====================  ======================
+    ``account_count == 0``           CoderCapExhausted     no — config fault
+    ``active_account_name`` set      CoderCapExhausted     no — not a cap at all
+    every account auth-failed        CoderInvocationError  no — operator action
+    some auth-failed, rest capped    CoderCapExhausted     only the capped ones
+    all capped                       CoderCapExhausted     yes — weekly reset
+    ===============================  ====================  ======================
 
-    THE THIRD STATE exists only because termination is enforced by the
-    caller's exclusion set rather than by the gate's cap transitions: every
-    account refused this digest while the gate still considers one usable.
-    Nothing is capped, so "all N pool accounts capped" would be false — and
-    false in the costly direction, since it names a weekly reset that will
-    never arrive because there is nothing to reset. The account the gate
-    still calls usable is named, because that fact is what makes "capped"
-    the wrong word.
+    The all-auth-failed pool must NOT be a ``CoderCapExhausted``:
+    ``coder.is_cap_deferral`` would turn a majority of those into an exit-0
+    DEFERRED night, which is reserved for weather that clears at the reset
+    (task 4503). As a plain failure it trips the storm, so the night exits 1
+    with an ERROR escalation (task 5947).
 
-    WHICH state it is, is read off the gate's PUBLIC predicates.
-    ``active_account_name`` is already the gate's answer to "is any account
-    still usable" (None iff no non-capped, non-auth-failed account remains);
-    recomputing it by walking ``gate._accounts`` would reach past a
-    published answer into another module's internals to derive what it
-    already says.
+    Read only off the gate's PUBLIC predicates; walking ``gate._accounts``
+    would reach past published answers into another module's internals.
     """
     count = gate.account_count
     if not count:
-        return (
+        return _pool_exhausted(
             "no pool accounts resolved — check that the unit's EnvironmentFile "
             "supplies the CLAUDE_OAUTH_TOKEN_* vars named in "
             "config/usage-accounts.yaml"
         )
     live = gate.active_account_name
-    if live is None:
-        return f"all {count} pool accounts capped"
-    return (
-        f"no account in the pool completed this digest ({len(tried)} of "
-        f"{count} tried) and the gate still considers {live} usable — so "
-        f"this is not a capacity limit and will not clear at the weekly "
-        f"reset; the run's per-digest failures say what each account "
-        f"reported"
+    if live is not None:
+        return _pool_exhausted(
+            f"no account in the pool completed this digest ({len(tried)} of "
+            f"{count} tried) and the gate still considers {live} usable — so "
+            f"this is not a capacity limit and will not clear at the weekly "
+            f"reset; the run's per-digest failures say what each account "
+            f"reported"
+        )
+    auth_failed = gate.auth_failed_account_names
+    if len(auth_failed) == count:
+        return coder.CoderInvocationError(
+            f"legibility trickle: every one of the {count} pool accounts had "
+            f"its credentials rejected (HTTP 401/403): {', '.join(auth_failed)} "
+            f"— this is not a capacity limit and will not clear at the weekly "
+            f"reset; those accounts' access or tokens need operator action"
+        )
+    if auth_failed:
+        return _pool_exhausted(
+            f"all {count} pool accounts unavailable — {count - len(auth_failed)} "
+            f"capped, which clears at the weekly reset, and "
+            f"{', '.join(auth_failed)} with credentials rejected (HTTP 401/403), "
+            f"which will not clear without operator action"
+        )
+    return _pool_exhausted(f"all {count} pool accounts capped")
+
+
+def _pool_exhausted(reason) -> coder.CoderCapExhausted:
+    return coder.CoderCapExhausted(
+        f"legibility trickle: {reason}", marker=_EXHAUSTED_MARKER,
     )
 
 
@@ -279,7 +295,7 @@ def _log_rotation(slot, rotation: _Rotation) -> None:
     INFO, because a rotation is normal operating weather — the pool exists to
     absorb exactly this — and that is how the line it replaces already treated
     it. The escalation-worthy event is the pool running OUT, which
-    ``_exhaustion_reason`` reports on a raised ``CoderCapExhausted``.
+    ``_exhaustion_error`` reports.
     """
     logger.info(
         "account %s did not complete this digest and the gate recorded %s "
@@ -377,9 +393,10 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     The returned closure is what goes through the legibility ``invoke=``
     seam, so ``coder``'s control flow — the never-fabricate contract, the
     storm threshold, the taint-and-exclude rule, task 4736's whole deferral
-    chain — is inherited unchanged. The only new input it ever produces is a
-    ``CoderCapExhausted`` that now means the POOL is exhausted rather than
-    one login.
+    chain — is inherited unchanged. The only new input it ever produces is
+    ``_exhaustion_error``'s: a ``CoderCapExhausted`` that now means the POOL
+    is exhausted rather than one login, or a plain ``CoderInvocationError``
+    when every account's credentials were rejected.
 
     *reverse* defaults to True: the trickle drains the roster h→b so its
     one-shots do not contend with the orchestrator's b→h first-available
@@ -389,8 +406,8 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     FAILOVER HAPPENS WITHIN A DIGEST. When the CLI fails with a cap banner
     and the gate's strict ``slot.detect_cap_hit`` (prefix AND confirm)
     agrees, the SAME prompt is retried on the next account;
-    ``CoderCapExhausted`` escapes only when no account is left, carrying
-    ``_exhaustion_reason``'s account of which exhaustion it was. Never
+    exhaustion escapes only when no account is left, typed and worded by
+    ``_exhaustion_error`` to say which exhaustion it was. Never
     mark a digest ``capped`` for one account's banner: ``capped`` means "no
     headroom left anywhere", and weakening it would let a night with live
     accounts trip nightly's majority rule and read as DEFERRED. When the
@@ -438,10 +455,7 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
         while True:
             lease = gate.try_lease(reverse=reverse, exclude=tried)
             if lease is None:
-                raise coder.CoderCapExhausted(
-                    f"legibility trickle: {_exhaustion_reason(gate, tried)}",
-                    marker=_EXHAUSTED_MARKER,
-                )
+                raise _exhaustion_error(gate, tried)
             tried.add(lease.name)
             slot = InvokeSlot(gate, lease)
             try:
