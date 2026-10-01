@@ -793,7 +793,7 @@ def code_digests(
     TWO CONSUMERS, VERY DIFFERENT VOLUMES — and everything above is the
     TRICKLE's argument. ``nightly.run_nightly`` codes exactly ONE small
     batch per night, so its worst case is a handful of lines.
-    ``census.run_mining`` calls this once per MINED BATCH, in a loop that
+    ``census.mine_to_saturation`` calls this once per MINED BATCH, in a loop that
     runs until novelty saturates or the batch source exhausts — and a storm
     batch explicitly does NOT stop mining. So under a SYSTEMIC failure (the
     ENOENT-on-``claude`` shape) a census emits one WARNING per failed digest
@@ -803,16 +803,16 @@ def code_digests(
     unit's stderr and the volume lands in the same
     ``journalctl --user -u legibility-trickle@<project>`` an operator reads.
 
-    That volume is ACCEPTED here rather than fixed here, deliberately.
+    That volume is bounded CALLER-SIDE rather than here, deliberately.
     Bounding it inside this function cannot work: the flood comes from the
     batch COUNT, which only the mining loop knows, and a per-batch cap would
-    buy nothing when a batch is already only a handful of digests. The fix,
-    if it ever bites, belongs to ``run_mining``, which already computes
-    ``BatchStats.failed`` per batch and could surface ONE per-batch line
-    naming the DISTINCT reasons — preserving the
-    38-ENOENTs-vs-38-model-errors property without a line per digest. Filed
-    as a follow-up out of task 4511's review (census.py is outside that
-    task's lock). Do NOT instead silence this line or drop it to DEBUG: that
+    buy nothing when a batch is already only a handful of digests. The fix
+    EXISTS in ``scripts/legibility/census.py::mine_to_saturation``: it caps
+    the per-digest WARNINGs of its own ``code_digests`` call with a
+    ``logging.Filter`` removed in a ``finally``, and emits ONE aggregated
+    per-batch WARNING naming the DISTINCT failure reasons — preserving the
+    38-ENOENTs-vs-38-model-errors property without a line per digest. Do NOT
+    silence this line or drop it to DEBUG: that
     restores the sub-storm blind spot above for EVERY caller, including the
     trickle, to spare a flood only one of them can produce.
 
