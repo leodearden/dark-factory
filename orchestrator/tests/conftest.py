@@ -325,10 +325,10 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     state.  Pin ``project_root`` (via the ``ORCH_`` env prefix) to this test's
     ``tmp_path`` so those writes land in tmp instead.
 
-    Precedence keeps this safe: ``init_settings`` (explicit ``project_root=...``
-    kwargs) still win over the env, and ``env_settings`` only overrides
-    ``project_root`` — every other field still loads from config.yaml/defaults,
-    so tests that depend on config values (e.g. lock_depth) are unaffected.
+    Precedence keeps this safe: explicit kwargs still win over the env, and the
+    env overrides only ``project_root`` plus the live yaml's laptop runner and
+    ``prefer_remote`` (task 5053: pinned ``[]``/``prefer_local``, so a bare config
+    never ssh's the laptop); all else loads from config.yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
@@ -337,8 +337,6 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
-    # Live yaml's laptop runner + prefer_remote (task 5053): env beats yaml, kwargs
-    # beat env -> bare configs stay single-host/local-first, never ssh the laptop.
     monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
     monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
 
@@ -376,6 +374,8 @@ def code_default_config(monkeypatch, tmp_path):
     rely on it.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
+    monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_HOST_POLICY", raising=False)
 
 
 #: Guaranteed-absent path for the autouse warm-lane script-dir pin below.
