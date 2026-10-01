@@ -76,6 +76,7 @@ from test_merge_queue_concurrent_verify import (
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import MergeLane
+from orchestrator.verify_runner import HostAllocator, HostLease, RunnerUnavailable
 
 #: The item whose verify fails, triggering the head-failure cascade.
 HEAD = 'rd-head'
@@ -129,7 +130,10 @@ class _Lane:
     head_gate: asyncio.Event
     local_gate: asyncio.Event
     remote_gate: asyncio.Event
+    allocator: HostAllocator
+    remote: Any
     requests: dict[str, Any] = dataclasses.field(default_factory=dict)
+    run_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
     async def enqueue(self, task_id: str) -> Any:
         """Commit a one-file branch for *task_id* and submit it on the public queue."""
@@ -177,8 +181,15 @@ class _Lane:
 
 
 @contextlib.asynccontextmanager
-async def _running_lane(git_ops: GitOps, config: OrchestratorConfig) -> AsyncIterator[_Lane]:
+async def _running_lane(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    *,
+    remote: Callable[[asyncio.Event], Any] = _hanging_remote,
+) -> AsyncIterator[_Lane]:
     """Start a two-host lane with scripted verifies; stop it on the way out.
+
+    *remote* builds the second host's runner from the lane's ``remote_gate``.
 
     Teardown releases every gate before stopping, so a failing test leaves no
     verify hanging and no dangling task behind, and goes through
@@ -200,12 +211,15 @@ async def _running_lane(git_ops: GitOps, config: OrchestratorConfig) -> AsyncIte
     )
     queue: asyncio.Queue = asyncio.Queue()
     worker = MergeLane(git_ops, queue, speculation_depth=2, verifier=verifier)
-    _inject_two_host_allocator(worker, _hanging_remote(remote_gate))
+    remote_runner = remote(remote_gate)
+    allocator = _inject_two_host_allocator(worker, remote_runner)
     lane = _Lane(
         worker=worker, queue=queue, git_ops=git_ops, config=config,
         head_gate=head_gate, local_gate=local_gate, remote_gate=remote_gate,
+        allocator=allocator, remote=remote_runner,
     )
     worker_task = asyncio.ensure_future(worker.run())
+    lane.run_task = worker_task
     try:
         yield lane
     finally:
@@ -428,3 +442,252 @@ class TestCascadeAntiDeadlockPreserved:
                 )
 
             assert outcome.status == 'done', f'expected a done outcome, got {outcome!r}'
+
+
+# ---------------------------------------------------------------------------
+# task 5303 (3277 + 4929): a host that becomes usable while the head verifies
+# ---------------------------------------------------------------------------
+
+#: A head whose local verify hangs until ``local_gate``, which these tests never
+#: release -- so any dispatch they observe happened while it was still verifying.
+LONG_HEAD = 'hf-head'
+#: The item waiting for the second host.
+WAITER = 'hf-waiter'
+#: Short enough that "within one poll slice" is far inside MERGE_RESULT_TIMEOUT.
+_FAST_POLL_SECS = 0.05
+
+
+def _remote_lease(lane: _Lane) -> HostLease:
+    return HostLease(name=lane.remote.name, runner=lane.remote, is_local=False)
+
+
+def _hosts_of(lane: _Lane) -> dict[str, list[str]]:
+    return lane.worker.snapshot()['occupancy']['inflight_by_host']
+
+
+def _unavailable_once_remote(release: asyncio.Event, name: str = 'laptop') -> MagicMock:
+    """A fake RemoteRunner whose FIRST verify raises RunnerUnavailable once the
+    runner's ``unavailable_gate`` is set; every later verify hangs until
+    *release*, like :func:`_hanging_remote`.
+    """
+    calls = 0
+    unavailable_gate = asyncio.Event()
+
+    async def _run_merge_verify(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await unavailable_gate.wait()
+            raise RunnerUnavailable('laptop dropped off the network')
+        await release.wait()
+        return passes().result
+
+    runner = _hanging_remote(release, name)
+    runner.run_merge_verify = AsyncMock(side_effect=_run_merge_verify)
+    runner.unavailable_gate = unavailable_gate
+    return runner
+
+
+async def _assert_still_waiting(lane: _Lane, task_id: str) -> None:
+    """*task_id* stays off every host across several poll slices."""
+    for _ in range(10):
+        await asyncio.sleep(_FAST_POLL_SECS)
+        assert task_id not in lane.inflight_ids(), (
+            f'{task_id} was dispatched although no host was acquirable; '
+            f'{lane.observed()}'
+        )
+
+
+@pytest.mark.asyncio
+class TestHostFreedWhileHeadVerifies:
+    """A host that becomes usable mid-head-verify is used within one poll
+    slice, not after the head's verify finishes -- task 5303 (3277, 4929).
+
+    Every head here verifies on local and is never released, so a dispatch
+    observed at all is a dispatch bounded by ``VERIFY_ABANDON_POLL_SECS``
+    rather than by the head's verify.
+    """
+
+    async def test_cleared_quarantine_dispatches_waiting_item_beside_verifying_head(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        async with _running_lane(git_ops, config) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            await lane.allocator.quarantine_and_release(_remote_lease(lane))
+
+            await lane.enqueue(LONG_HEAD)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [LONG_HEAD]},
+                expected=f'{LONG_HEAD} verifying on local',
+                why='the second host is quarantined, so the head must take local.',
+            )
+            await lane.enqueue(WAITER)
+            await lane.settle(
+                lambda: lane.states().get(WAITER) in ('awaiting_verify', 'awaiting_host'),
+                expected=f'{WAITER} merged and waiting for a host',
+                why='the merger merges ahead while the head verifies.',
+            )
+            await _assert_still_waiting(lane, WAITER)
+
+            lane.allocator.clear_quarantine(lane.remote.name)
+
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [WAITER],
+                expected=f'{WAITER} dispatched to the un-quarantined second host',
+                why=(
+                    'FINALIZE-HEAD is waiting out the head verify without '
+                    're-entering DISPATCH-FILL, so a host that becomes usable '
+                    'mid-verify idles until the head finishes.'
+                ),
+            )
+            assert lane.states()[LONG_HEAD] == 'verifying', lane.observed()
+            assert not lane.requests[LONG_HEAD].result.done(), lane.observed()
+
+    async def test_parked_item_dispatched_when_readmitted_host_frees_mid_head_verify(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """The awaiting_host shape: prefer_remote puts LONG_HEAD on the laptop
+        and WAITER on local; the laptop's verify raises RunnerUnavailable, so
+        LONG_HEAD's finalize quarantines the laptop and the cascade parks both.
+        LONG_HEAD re-dispatches to local and WAITER parks ``awaiting_host``
+        until the reprobe primitive readmits the laptop.
+        """
+        prefer_remote = config.model_copy(update={'verify_host_policy': 'prefer_remote'})
+        async with _running_lane(
+            git_ops, prefer_remote, remote=_unavailable_once_remote,
+        ) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            await lane.enqueue(LONG_HEAD)
+            await lane.enqueue(WAITER)
+            await lane.settle(
+                lambda: _hosts_of(lane) == {lane.remote.name: [LONG_HEAD], 'local': [WAITER]},
+                expected=f'{LONG_HEAD} on the laptop and {WAITER} on local',
+                why='prefer_remote fills the laptop first, then overflows to local.',
+            )
+
+            lane.remote.unavailable_gate.set()
+            await lane.settle(
+                lambda: (
+                    _hosts_of(lane) == {'local': [LONG_HEAD]}
+                    and lane.states().get(WAITER) == 'awaiting_host'
+                ),
+                expected=f'{LONG_HEAD} re-dispatched to local, {WAITER} parked awaiting_host',
+                why='RunnerUnavailable quarantines the laptop and the cascade parks WAITER.',
+            )
+            await _assert_still_waiting(lane, WAITER)
+
+            lane.allocator.readmit(lane.remote.name)
+
+            await lane.settle(
+                lambda: _hosts_of(lane).get(lane.remote.name) == [WAITER],
+                expected=f'{WAITER} dispatched from the park to the readmitted laptop',
+                why=(
+                    'nothing drains the redispatch park while FINALIZE-HEAD waits '
+                    'out the head verify.'
+                ),
+            )
+            assert lane.states()[LONG_HEAD] == 'verifying', lane.observed()
+
+    async def test_parked_item_dispatched_when_host_frees_with_nothing_in_flight(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """Nothing in flight: the laptop is quarantined and local is held
+        through the public allocator, as merge_drift.py::_run_drift_check
+        holds it.  The single item parks ``awaiting_host``; returning local
+        must dispatch it with no further submission to wake the loop.
+        """
+        async with _running_lane(git_ops, config) as lane:
+            lane.worker.VERIFY_ABANDON_POLL_SECS = _FAST_POLL_SECS
+            await lane.allocator.quarantine_and_release(_remote_lease(lane))
+            drift_check_lease = lane.allocator.acquire_local(lambda: lane.remote)
+            assert drift_check_lease is not None
+
+            await lane.enqueue(WAITER)
+            await lane.settle(
+                lambda: lane.states().get(WAITER) == 'awaiting_host',
+                expected=f'{WAITER} parked awaiting_host',
+                why='no host is acquirable, so the dispatch attempt must park it.',
+            )
+            assert lane.inflight_ids() == set(), lane.observed()
+            await _assert_still_waiting(lane, WAITER)
+
+            await lane.allocator.release(drift_check_lease)
+
+            await lane.settle(
+                lambda: _hosts_of(lane) == {'local': [WAITER]},
+                expected=f'{WAITER} dispatched to the returned local slot',
+                why=(
+                    'with nothing in flight the loop is blocked on the verifier '
+                    'queue, so a host freeing up never wakes it.'
+                ),
+            )
+
+    async def test_stop_ends_the_parked_item_poll_promptly(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """stop() during the parked-item poll must not wait out a poll slice.
+
+        The default VERIFY_ABANDON_POLL_SECS (10 s) outlasts stop()'s 5 s
+        shutdown wait, after which stop()'s re-drain consumes the None
+        sentinel -- so a poll that only notices stop() at its next slice
+        leaves the verifier blocked on an empty queue for good.
+        """
+        async with _running_lane(git_ops, config) as lane:
+            await lane.allocator.quarantine_and_release(_remote_lease(lane))
+            assert lane.allocator.acquire_local(lambda: lane.remote) is not None
+            await lane.enqueue(WAITER)
+            await lane.settle(
+                lambda: lane.states().get(WAITER) == 'awaiting_host',
+                expected=f'{WAITER} parked awaiting_host with nothing in flight',
+                why='no host is acquirable, so the dispatch attempt must park it.',
+            )
+            assert lane.inflight_ids() == set(), lane.observed()
+            assert lane.run_task is not None
+
+            await lane.worker.stop()
+
+            try:
+                await asyncio.wait_for(asyncio.shield(lane.run_task), timeout=5.0)
+            except TimeoutError:
+                pytest.fail(
+                    'the lane never finished after stop(): the verifier loop '
+                    'slept through stop() in the parked-item poll and is now '
+                    'blocked on a verifier queue whose sentinel was drained.'
+                )
+
+    async def test_no_dispatch_once_stop_is_requested(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """stop() owns the park once it is requested: a host freeing inside
+        stop()'s drain must not dispatch a parked item behind the drain,
+        where nothing resolves its Future or releases its lease."""
+        async with _running_lane(git_ops, config) as lane:
+            await lane.allocator.quarantine_and_release(_remote_lease(lane))
+            drift_check_lease = lane.allocator.acquire_local(lambda: lane.remote)
+            assert drift_check_lease is not None
+            first = await lane.enqueue('stop-first')
+            second = await lane.enqueue('stop-second')
+            await lane.settle(
+                lambda: (
+                    lane.states().get('stop-first') == 'awaiting_host'
+                    and lane.states().get('stop-second') == 'awaiting_host'
+                ),
+                expected='both items parked awaiting_host with nothing in flight',
+                why='no host is acquirable, so each dispatch attempt parks its item.',
+            )
+            assert lane.run_task is not None
+
+            stop_task = asyncio.ensure_future(lane.worker.stop())
+            await asyncio.sleep(0)
+            await lane.allocator.release(drift_check_lease)
+            await stop_task
+            try:
+                await asyncio.wait_for(asyncio.shield(lane.run_task), timeout=5.0)
+            except TimeoutError:
+                pytest.fail(f'the lane never finished after stop(); {lane.observed()}')
+
+            assert first.result.done() and second.result.done(), (
+                'a parked item was dispatched after stop() drained the park, so '
+                f'its merge() Future was never resolved; {lane.observed()}'
+            )
+            assert _hosts_of(lane) == {}, lane.observed()

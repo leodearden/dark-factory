@@ -1079,12 +1079,16 @@ def _id_liveness_fake_runner(
 def _inject_two_host_allocator(
     worker: SpeculativeMergeWorker,
     fake_remote: Any,
+    *,
+    allocator_cls: type[HostAllocator] = HostAllocator,
 ) -> HostAllocator:
     """Inject a two-host HostAllocator (local + fake_remote) onto a worker.
 
-    Returns the allocator so callers can introspect slot state or verify calls.
+    *allocator_cls* lets a test substitute a HostAllocator subclass that
+    models a concurrent acquirer.  Returns the allocator so callers can
+    introspect slot state or verify calls.
     """
-    allocator = HostAllocator([fake_remote], quarantine=worker._runner_quarantine)
+    allocator = allocator_cls([fake_remote], quarantine=worker._runner_quarantine)
     worker._host_allocator = allocator
     return allocator
 
@@ -5624,6 +5628,23 @@ class _FakeEscalationQueue:
         self.submitted.append(esc)
 
 
+class _DriftCheckTakesRemoteAllocator(HostAllocator):
+    """A HostAllocator where a concurrent drift check wins the remote slot.
+
+    The first ``acquire()`` made while local is busy finds the remote already
+    taken through the public ``acquire_remote()`` — what
+    ``merge_drift.py::_run_drift_check`` does from its own task — so it
+    returns None after the caller's ``free_host_count()`` guard passed.
+    """
+
+    drift_check_lease: HostLease | None = None
+
+    async def acquire(self, local_factory: Any, *, policy: Any) -> HostLease | None:
+        if self.drift_check_lease is None and self.is_busy(self.local_name):
+            self.drift_check_lease = self.acquire_remote()
+        return await super().acquire(local_factory, policy=policy)
+
+
 @pytest.mark.asyncio
 @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 65s worst case, includes a loop.time() + 15.0 deadline-bounded poll loop (~4670-4672) invisible to the automated scan -- a deliberate over-mark the guard alone would not have demanded
 class TestRedispatchSpeculativeConservation:
@@ -5633,28 +5654,21 @@ class TestRedispatchSpeculativeConservation:
     pipeline — not just in the hand-constructed unit tests in
     test_merge_queue_resource_audit.py.
 
-    MECHANISM — why a quarantined remote, not a literal single host:
-    ``_dispatch_item``'s fast-path host check is ``if allocator.
-    free_host_count() == 0: return None`` (merge_queue.py, DISPATCH-FILL).
-    On a literal single-host worker this branch is structurally
-    unreachable: dispatch and finalize are always in lockstep, so by the
-    time DISPATCH-FILL tries the next item, finalize has already released
-    the one host. ``HostAllocator.free_host_count()`` (verify_runner.py)
-    counts slots marked FREE with NO regard to quarantine, while
-    ``acquire_remote()`` skips quarantined names even when FREE. Injecting
-    a two-host allocator (local + 1 remote) and quarantining the remote up
-    front makes ``free_host_count()`` report 1 (the quarantined remote,
-    nominally free) while NO slot is actually acquirable once local is
-    busy — the exact "verify hosts < speculation_depth" condition, reached
-    deterministically through the real DISPATCH-FILL code path rather than
-    by poking ``_redispatch`` directly.
+    MECHANISM — the production route to a speculative item on
+    ``_redispatch``: ``_dispatch_item`` passes its ``free_host_count()``
+    guard, then a concurrent non-loop acquirer takes the free slot before its
+    ``acquire()``.  That acquirer is
+    ``orchestrator/src/orchestrator/merge_drift.py::_run_drift_check``, which
+    takes slots from its own task through the public ``acquire_local`` /
+    ``acquire_remote``.  :class:`_DriftCheckTakesRemoteAllocator` models it
+    deterministically: the first ``acquire()`` made while local is busy finds
+    the remote already taken, so the dispatch returns None and B parks,
+    STILL ``speculative=True``.
 
     SCENARIO: A's local verify is gated then FAILS. While gated, the merger
     speculatively merges B against A's tentative commit and hands it to the
-    verifier; DISPATCH-FILL's attempt to dispatch B finds
-    free_host_count() > 0 (the quarantined remote) but the real acquire()
-    fails (local busy, remote quarantined) — B parks on ``_redispatch``,
-    STILL ``speculative=True``. When A's gate releases (A fails), the
+    verifier; dispatching B loses the remote to the modelled drift check and
+    B parks on ``_redispatch``. When A's gate releases (A fails), the
     existing 'previous_failed' chain-invalidation path re-merges B against
     actual main (speculative -> False) and re-dispatches it; B's second
     local verify passes -> 'done'.
@@ -5700,9 +5714,9 @@ class TestRedispatchSpeculativeConservation:
         worker.RESOURCE_AUDIT_ESCALATION_STREAK = 1
 
         fake_remote = _make_fake_remote('laptop')
-        _inject_two_host_allocator(worker, fake_remote)
-        # Nominally FREE (never acquired) but unusable — see class docstring.
-        worker._runner_quarantine.add('laptop')
+        _inject_two_host_allocator(
+            worker, fake_remote, allocator_cls=_DriftCheckTakesRemoteAllocator,
+        )
 
         recorded_violations: list[list[str]] = []
         _orig_violations = worker.speculation_accounting_violations
@@ -5736,6 +5750,11 @@ class TestRedispatchSpeculativeConservation:
             f'Expected exactly one speculative item parked on _redispatch '
             f'while A is gated (proves the fix is actually exercised); '
             f'got {parked!r}.'
+        )
+        inflight_speculative = worker.snapshot()['speculation']['inflight_speculative']
+        assert inflight_speculative == 1, (
+            f'the parked speculative B must stay counted as verifier-owned; '
+            f'snapshot speculation.inflight_speculative={inflight_speculative}'
         )
 
         # NOTE(test-determinism): from here on this test calls

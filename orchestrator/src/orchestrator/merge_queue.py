@@ -9568,6 +9568,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Internal pipeline: Merger → Verifier
         self._verifier_queue: asyncio.Queue[SpeculativeItem | None] = asyncio.Queue()
         self._running = True
+        # Set by stop() so _await_host_for_parked_item returns at once.
+        self._stop_requested = asyncio.Event()
         self._cas_retries: dict[str, int] = {}
         # Per-task gate-iteration counter for rebased_pending_reverify results.
         # Separate from _cas_retries so that disjoint rebases (where no extra
@@ -10528,9 +10530,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``_live_items``, if any (merge-queue-reliability PRD scope-4 kappa-b
         / task 2435).
 
-        ``_finalize_inflight`` pops its entry from ``self._inflight`` via
-        ``popleft()`` before the (possibly long) ``await entry.verify_task``
-        that finalizes it — during that window the entry is off the deque
+        ``_verifier_loop`` pops the head off ``self._inflight`` via
+        ``popleft()`` once its verify is done (or, in the shutdown-sentinel
+        drain, before awaiting it) and then runs ``_finalize_inflight`` —
+        during that window the entry is off the deque
         but still tracked in ``_live_items`` (registry-non-terminal, per the
         deferred VERIFYING -> FINALIZING hop documented at the top of
         ``_finalize_inflight``). The ordering invariant (at most one entry
@@ -14386,7 +14389,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             task: asyncio.Task = asyncio.create_task(self._merger_loop())  # type: ignore[type-arg]
             self._merger_task = task
         elif name == 'verifier':
-            task = asyncio.create_task(self._verifier_loop())  # type: ignore[type-arg]
+            task = asyncio.create_task(self._run_verifier_loop())  # type: ignore[type-arg]
             self._verifier_task = task
         else:
             raise ValueError(f'Unknown loop name: {name!r}')
@@ -14650,6 +14653,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     async def stop(self) -> None:
         """Graceful shutdown: drain queues and resolve all pending Futures."""
         self._running = False
+        self._stop_requested.set()
         shutdown = MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
         # Release speculation-depth permits, all lane halts, and merge-ahead cap
         # so the merger doesn't hang waiting at any synchronisation point.
@@ -14662,14 +14666,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             self._lane_halt[ln].set()
         self._merge_ahead_ledger.release_for_shutdown(self._speculation_depth + 1)
 
-        # task 2788: resolve the popped-for-finalize VERIFYING request BEFORE
-        # this coroutine's first `await` below. _finalize_inflight pops its
-        # entry off self._inflight (via _inflight_popleft) BEFORE the long
-        # `await entry.verify_task` that finalizes it -- during that window
-        # the entry is off the deque (invisible to the _inflight drain a few
-        # lines down) but not yet at registry MERGING (invisible to
-        # _resolve_merging_requests too), so without this block its request
-        # Future is NEVER given a terminal outcome here. If the in-progress
+        # task 2788: resolve the submission-order head's VERIFYING request
+        # BEFORE this coroutine's first `await` below. That head is either
+        # popped for finalize (invisible to the _inflight drain a few lines
+        # down and to _resolve_merging_requests) or still at _inflight[0]
+        # while _verifier_loop waits on its verify -- where the drain would
+        # reach it only after the awaits above it, and the loop can finalize
+        # it during any of them. If the in-progress
         # verify then resolves to any non-shutdown terminal during one of
         # this coroutine's later await windows, _on_terminal's REMOVE arm
         # deletes the durable journal record out from under it. Setting the
@@ -14696,6 +14699,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # outcome within the `asyncio.wait(tasks_to_wait, timeout)` shutdown
         # window a few lines down.
         _fh_entry = self._finalizing_head_entry()
+        if _fh_entry is None and self._inflight:
+            _fh_entry = self._inflight[0]
         if (
             _fh_entry is not None
             and _fh_entry.verify_task is not None
@@ -14724,6 +14729,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if _fh_entry.lease is not None and self._host_allocator is not None:
                 with contextlib.suppress(BaseException):
                     await self._cancel_and_release_tracked(_fh_entry.lease)
+                    # A deque head meets the drain below again; a second
+                    # remote cancel could PARK a healthy slot.
+                    _fh_entry.lease = None
             if _fh_entry.permit is not None:
                 self._speculation_ledger.release(_fh_entry.permit)
 
@@ -16376,6 +16384,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._assert_single_writer(self._verifier_task, '_inflight')
         self._inflight.clear()
 
+    async def _run_verifier_loop(self) -> None:
+        """The verifier loop task: run :meth:`_verifier_loop`, and on any
+        exception exit (CancelledError included) cancel and reap a
+        still-PENDING persistent getter so it cannot outlive the loop and
+        harvest a queue item nobody resolves.  Cancelling it loses nothing:
+        ``asyncio.Queue.get()`` takes its item only after its await returns.
+        A DONE getter is left in place for stop() to harvest -- it holds an
+        item whose merge() Future stop() must resolve.
+        """
+        try:
+            await self._verifier_loop()
+        except BaseException:
+            getter = self._pending_verifier_get
+            if getter is not None and not getter.done():
+                self._pending_verifier_get = None
+                getter.cancel()
+                await asyncio.gather(getter, return_exceptions=True)
+            raise
+
     async def _verifier_loop(self) -> None:
         """Verify and CAS-advance for each SpeculativeItem from the Merger.
 
@@ -16385,9 +16412,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           (a) DISPATCH-FILL: drain self._redispatch then _verifier_queue.get_nowait()
               while a host slot is free (or item is a passthrough).  Each item is
               dispatched via _dispatch_item → InflightEntry appended to self._inflight.
-          (b) FINALIZE-HEAD: await self._inflight.popleft() via _finalize_inflight,
-              advancing main in submission order.  If _inflight is empty, block on
-              _verifier_queue.get() to avoid busy-looping.
+          (b) FINALIZE-HEAD: wait on the head's verify in VERIFY_ABANDON_POLL_SECS
+              slices with the head still on the deque, going back to (a) whenever
+              a host is free for ready work; once the verify is done, popleft()
+              and _finalize_inflight, advancing main in submission order.  If
+              _inflight is empty, poll for a host while _redispatch holds a
+              parked item and the queue is empty, else block on
+              _verifier_queue.get().
 
         NONE SENTINEL: when the queue yields None, drain the remaining _inflight
         entries (all background verify tasks complete) and return.
@@ -16415,9 +16446,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         while True:
             # ── (a) DISPATCH-FILL ──────────────────────────────────────────────
-            # Fill self._inflight as long as host slots are available.
+            # Fill self._inflight as long as host slots are available.  Once
+            # stop() is requested it owns _redispatch, the verifier queue and
+            # _inflight, so no new dispatch starts.
             fill_done = False
-            while not fill_done:
+            while not fill_done and not self._stop_requested.is_set():
                 # Get next item: front-priority _redispatch first, then queue nowait
                 item: SpeculativeItem | None = None
                 if self._redispatch:
@@ -16482,7 +16515,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 {self._pending_verifier_get, *_running},
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
-                            if self._pending_verifier_get.done():
+                            if (
+                                not self._stop_requested.is_set()
+                                and self._pending_verifier_get.done()
+                            ):
                                 # A new item arrived first → dispatch it.
                                 # Guard against cancelled getter (stop() race):
                                 # treat cancelled as nothing-arrived → fall
@@ -16496,9 +16532,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 is_from_verifier_queue = True
                                 # Fall through with item (None handled below).
                             else:
-                                # A verify finished first → stop filling and proceed
-                                # to FINALIZE-HEAD.  The getter persists to the next
-                                # DISPATCH-FILL iteration so no queue item is lost.
+                                # A verify finished first, or stop() was requested
+                                # (it harvests a done getter) → stop filling and
+                                # proceed to FINALIZE-HEAD.  The getter persists to
+                                # the next DISPATCH-FILL iteration so no queue item
+                                # is lost.
                                 fill_done = True
                                 break
                         else:
@@ -16653,6 +16691,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             # ── (b) FINALIZE-HEAD ──────────────────────────────────────────────
             if self._inflight:
+                if await self._await_head_verify_or_refill():
+                    continue
                 head = self._inflight_popleft()
                 _head_advanced = False
                 try:
@@ -16913,6 +16953,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # Signal dispatch that any not-yet-dispatched followers also
                     # need re-merge (chain_invalidated guard in _dispatch_item).
                     self._remerge_occurred = True
+            elif (
+                self._redispatch
+                and self._verifier_queue.empty()
+                and not self._stop_requested.is_set()
+            ):
+                await self._await_host_for_parked_item()
             else:
                 # Nothing dispatched (no items in queue or no host yet free after
                 # putting item back).  Block on the next item from the queue.
@@ -17027,6 +17073,67 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # free_host_count()==0) → FINALIZE-HEAD processes the head.
                 self._inflight_append(entry)
                 continue  # restart outer loop
+
+    async def _await_head_verify_or_refill(self) -> bool:
+        """Wait on the deque head's running verify in VERIFY_ABANDON_POLL_SECS slices.
+
+        True sends the loop back to DISPATCH-FILL with the head still on the
+        deque: the deque changed under the wait (stop() drains it), or
+        :meth:`_dispatch_opportunity_exists`.  Keeping the head on the deque is
+        what keeps ``_dispatch_item``'s ``_has_inflight_verify`` gate true, so a
+        dispatch here is the same one the QueueEmpty fill-ahead race makes.
+        False means the head's verify is done and it is ready to finalize.
+        A raw cancel of the loop leaves the head's verify running, owned by the
+        deque.
+        """
+        head = self._inflight[0]
+        while (verify := head.verify_task) is not None and not verify.done():
+            await asyncio.wait({verify}, timeout=self.VERIFY_ABANDON_POLL_SECS)
+            if next(iter(self._inflight), None) is not head:
+                return True
+            if not verify.done() and self._dispatch_opportunity_exists():
+                return True
+        return False
+
+    async def _await_host_for_parked_item(self) -> None:
+        """Poll until a host is free for the parked ``_redispatch`` item, the
+        park is empty, the queue holds something (a None sentinel must still
+        reach the blocking get), or stop() has been called -- the caller then
+        takes the blocking get, which stop()'s sentinel ends.
+
+        Nothing is in flight, so no verify completion will wake the loop.  The
+        queue getter is deliberately left alone: while the queue is empty that
+        keeps a newer item from being appendleft-ed ahead of the parked one
+        (the blocking-get arm still does that once the queue is non-empty).
+        """
+        while True:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._stop_requested.wait(), self.VERIFY_ABANDON_POLL_SECS,
+                )
+            if (
+                self._stop_requested.is_set()
+                or not self._redispatch
+                or not self._verifier_queue.empty()
+                or self._dispatch_opportunity_exists()
+            ):
+                return
+
+    def _dispatch_opportunity_exists(self) -> bool:
+        """True when DISPATCH-FILL could start a verify now: stop() has not been
+        requested, an acquirable host is free and an item is ready for it (a
+        None sentinel counts; the fill's sentinel path handles it)."""
+        allocator = self._host_allocator
+        getter = self._pending_verifier_get
+        item_ready = (
+            getter.done() if getter is not None else not self._verifier_queue.empty()
+        )
+        host_free = allocator is None or allocator.free_host_count() > 0
+        return (
+            not self._stop_requested.is_set()
+            and host_free
+            and (bool(self._redispatch) or item_ready)
+        )
 
     async def _build_merge_failure_diagnostic(
         self,
@@ -19231,12 +19338,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # on that flag.
                 #
                 # THE HEAD CANCEL (PRD decision #3), fired HERE rather than in
-                # the finalize half for one reason: the head's own
-                # `_finalize_inflight` is, in the common topology, ALREADY
-                # parked on `await entry.verify_task` and will stay parked
-                # until something cancels it.  Deferring the cancel to a
-                # finalize that cannot start until that park ends would
-                # deadlock.  See `_adopt_head_on_tip_authority` for which
+                # the finalize half for one reason: the loop finalizes the
+                # head only once the head's own verify is done, so deferring
+                # the cancel to that finalize would wait out the very verdict
+                # the tip just made redundant.  See `_adopt_head_on_tip_authority` for which
                 # entry counts as the head, why the tip's verdict covers it,
                 # and the two lease axes the teardown must leave idle.
                 await self._adopt_head_on_tip_authority(
@@ -19484,17 +19589,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             here arranges that: the ``_inflight`` deque already finalizes in
             submission order, and the head was appended first.
 
-        WHERE THE HEAD IS.  Two topologies, and the common one is the second:
+        WHERE THE HEAD IS.  Two topologies, and the common one is the first:
 
-          1. Still on the deque — ``self._inflight[0]``, dispatch-fill has run
-             but FINALIZE-HEAD has not.
+          1. Still on the deque — ``self._inflight[0]``, while FINALIZE-HEAD
+             waits on its verify (``_await_head_verify_or_refill``).
           2. ALREADY POPPED for finalize and parked on
-             ``await entry.verify_task`` — invisible to the deque and
-             reachable only through :meth:`_finalizing_head_entry`
-             (merge_queue.py:13504-13508 records that ``_inflight[0]`` is the
+             ``await entry.verify_task`` (the shutdown-sentinel drain) —
+             invisible to the deque and reachable only through
+             :meth:`_finalizing_head_entry` (``snapshot()``'s
+             verify_in_progress comment records that ``_inflight[0]`` is the
              SECOND entry during that window).  A δ that only read the deque
-             would silently skip the cancel in exactly the case that matters,
-             leaving the finalize parked on a verdict it no longer needs.
+             would silently skip the cancel there, leaving the finalize parked
+             on a verdict it no longer needs.
 
         Either way the TIP'S OWN entry is excluded explicitly: in production it
         sits on ``_inflight`` behind the head, and reading it as "the head"
@@ -19589,11 +19695,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             )
             return None
 
-        # Set BEFORE the teardown, and that ordering is load-bearing: the
-        # cancel below is what resumes a `_finalize_inflight` already parked at
-        # `await entry.verify_task`, and this flag is the only thing that tells
-        # it the CancelledError it receives is δ's doing rather than a
-        # shutdown.  No await intervenes, so the window is not observable.
+        # Set BEFORE the teardown, and that ordering is load-bearing: in
+        # topology 2, or if the loop pops the head between the cancel and
+        # `verify_task = None` below, the cancel resumes a `_finalize_inflight`
+        # parked at `await entry.verify_task`, and this flag is the only thing
+        # that tells it the CancelledError it receives is δ's doing rather
+        # than a shutdown.  No await intervenes, so the window is not
+        # observable.
         head.chain_adopted = True
 
         if not head.verify_task.done():
@@ -19608,9 +19716,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # for the three concrete harms).
             #
             # Written BEFORE the teardown for the same reason `chain_adopted`
-            # is: the cancel can resume a `_finalize_inflight` already parked at
-            # `await entry.verify_task`, and after that point this entry is no
-            # longer ours to mutate.
+            # is: in topology 2 or the pop race, the cancel resumes a
+            # `_finalize_inflight` parked at `await entry.verify_task`, and
+            # after that point this entry is no longer ours to mutate.
             if head.verify_wt is not None and head.verify_wt.merge_wt is not None:
                 head.merge_wt = head.verify_wt.merge_wt
                 head.spec_warm = head.verify_wt.spec_warm
@@ -20082,12 +20190,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     vr = await entry.verify_task
                 except asyncio.CancelledError:
                     # ── task 3186 (PRD δ): THE ADOPTED HEAD'S TORN-DOWN VERIFY ──
-                    # This is the COMMON deep topology, not an edge case: the
-                    # head is popped for finalize and parked right here while
-                    # the speculative slot verifies the chain tip, so when the
-                    # tip goes green `_adopt_head_on_tip_authority` cancels
-                    # this very task and the cancellation surfaces at this
-                    # await.  `chain_adopted` is set immediately before that
+                    # When the tip goes green `_adopt_head_on_tip_authority`
+                    # cancels this very task; if the loop popped the head after
+                    # that cancel but before adoption nulled verify_task, or
+                    # the head was popped by the shutdown-sentinel drain, the
+                    # cancellation surfaces at this await.  `chain_adopted` is set immediately before that
                     # cancel, with no await in between, and by nothing else —
                     # so it is exactly the discriminator between "δ decided to
                     # land this head on the tip's authority" and a genuine
@@ -21289,10 +21396,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         lease = await allocator.acquire(_local_factory, policy=req.config.verify_host_policy)
         if lease is None:
-            # Should not happen (free_host_count > 0 was checked above with no
-            # intervening await that could yield to a concurrent dispatch — asyncio
-            # is single-threaded and _dispatch_item is the only acquirer).
-            # Return None defensively so the caller puts the item back.
+            # Reachable: the awaits since the free_host_count() guard let other
+            # tasks run, and merge_drift.py::_run_drift_check takes slots too
+            # (acquire_local/acquire_remote).  The caller parks the item on
+            # _redispatch.
             return None
 
         # ── LEASE/PERMIT LEAK GUARD (task 3185 amend, robustness) ────────────

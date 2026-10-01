@@ -547,6 +547,186 @@
           "current": 6641
         }
       ]
+    },
+    {
+      "task_id": "5303",
+      "reason": "host-free wakeup: FINALIZE-HEAD re-enters DISPATCH-FILL while the head verifies and an empty lane polls for a host for a parked item, and stop() pre-empts a deque head (3277/4929)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 2134,
+          "current": 2156
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_verifier_loop",
+          "baseline": 245,
+          "current": 250
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::stop",
+          "baseline": 109,
+          "current": 111
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21640,
+          "current": 21701
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12344,
+          "current": 12369
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4730,
+          "current": 4752
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56271,
+          "current": 56332
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31571,
+          "current": 31596
+        }
+      ]
+    },
+    {
+      "task_id": "5303",
+      "reason": "getter-leak fix (4411): the verifier loop task (_run_verifier_loop) cancels and reaps a still-pending persistent getter on any exception exit",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 2156,
+          "current": 2160
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21701,
+          "current": 21720
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12369,
+          "current": 12377
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4752,
+          "current": 4756
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56332,
+          "current": 56351
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31596,
+          "current": 31604
+        }
+      ]
+    },
+    {
+      "task_id": "5303",
+      "reason": "review fix: stop() wakes the parked-item poll at once so the verifier loop exits on its sentinel instead of sleeping through stop()",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21720,
+          "current": 21736
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12377,
+          "current": 12383
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56351,
+          "current": 56367
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31604,
+          "current": 31610
+        }
+      ]
+    },
+    {
+      "task_id": "5303",
+      "reason": "review fix: once stop() is requested the verifier loop starts no new dispatch, so a host freeing inside stop()'s drain cannot strand a parked item behind it",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 2160,
+          "current": 2163
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_dispatch_opportunity_exists",
+          "baseline": 4,
+          "current": 5
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_verifier_loop",
+          "baseline": 250,
+          "current": 252
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21736,
+          "current": 21747
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12383,
+          "current": 12387
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4756,
+          "current": 4759
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56367,
+          "current": 56378
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31610,
+          "current": 31614
+        }
+      ]
     }
   ]
 }
