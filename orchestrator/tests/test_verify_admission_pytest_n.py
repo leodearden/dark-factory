@@ -296,19 +296,29 @@ class TestPytestNWiring:
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
-        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+        async def run_and_capture_test_leg(role: str) -> str:
+            captured_cmds.clear()
             await run_verification(
                 worktree=worktree,
                 config=config,
                 module_config=admission_module_config(),
-                role='merge',
+                role=role,
                 attempt_id=None,
             )
+            return next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
 
-        test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
-        assert '-n 16' not in test_cmd, (
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            gated_test_cmd = await run_and_capture_test_leg('task')
+            merge_test_cmd = await run_and_capture_test_leg('merge')
+
+        assert '-n 16' in gated_test_cmd, (
+            f'control: a gated role under this same config must be -n-capped, '
+            f'else the injection site was never armed and the merge absence '
+            f'below proves nothing; got {gated_test_cmd!r}'
+        )
+        assert '-n 16' not in merge_test_cmd, (
             f"merge's test leg must never be -n-capped (bypasses admission "
-            f'slot-counting, latency-critical); got {test_cmd!r}'
+            f'slot-counting, latency-critical); got {merge_test_cmd!r}'
         )
 
     @pytest.mark.real_verify_admission
@@ -513,6 +523,12 @@ class TestPytestNWiring:
                 attempt_id=None,
             )
 
+        original_test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
+        assert '-n 16' in original_test_cmd, (
+            f'control: the original test leg must be -n-capped, else the '
+            f'injection site was never armed and the absence on the recovery '
+            f're-run proves nothing; got {original_test_cmd!r}'
+        )
         # The recovery re-run is the (only) test-leg command carrying the
         # serial marker.
         recovered = next(c for c in captured_cmds if 'no:xdist' in c)
