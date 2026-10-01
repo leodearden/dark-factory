@@ -474,7 +474,7 @@ async def test_no_tool_calls_propagates_cli_warning_origin(origin_token):
 
     async def mock_llm(messages, tool_schemas):
         return _CLIResponseAdapter(
-            {'thinking': '', 'tool_calls': [], 'warning': origin_token},
+            {'tool_calls': [], 'warning': origin_token},
             session_id='sess-1',
         )
 
@@ -546,7 +546,7 @@ async def test_no_tool_calls_drops_unknown_warning_origin(agent_warning):
 
     async def mock_llm(messages, tool_schemas):
         return _CLIResponseAdapter(
-            {'thinking': '', 'tool_calls': [], 'warning': agent_warning},
+            {'tool_calls': [], 'warning': agent_warning},
             session_id='sess-1',
         )
 
@@ -1301,7 +1301,7 @@ async def test_call_claude_cli_passes_a_workable_max_turns():
         success=True,
         output='',
         session_id='sess-1',
-        structured_output={'thinking': 'reasoning', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1340,7 +1340,7 @@ async def test_call_claude_cli_threads_session_id_across_turns():
     fake_gate = make_gate_mock()
     config = _make_cli_config()
     tools: list = []
-    structured = {'thinking': '', 'tool_calls': []}
+    structured = {'tool_calls': []}
 
     first_result = AgentResult(
         success=True, output='', session_id='sess-A', structured_output=structured
@@ -1396,7 +1396,7 @@ async def test_call_claude_cli_clears_session_id_on_exception(raised_exc):
     fake_gate = make_gate_mock()
     config = _make_cli_config()
     tools: list = []
-    structured = {'thinking': '', 'tool_calls': []}
+    structured = {'tool_calls': []}
 
     first_result = AgentResult(
         success=True, output='', session_id='sess-A', structured_output=structured
@@ -1452,7 +1452,7 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
         success=True,
         output='',
         session_id='sess-cwd',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     # Patch at the level below invoke_with_cap_retry — this exercises the
@@ -1510,7 +1510,7 @@ async def test_agent_loop_explicit_cwd_overrides_config_explore_root(tmp_path):
         success=True,
         output='',
         session_id='sess-cwd-explicit',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1562,7 +1562,7 @@ async def test_agent_loop_cwd_defaults_to_config_explore_root(tmp_path):
         success=True,
         output='',
         session_id='sess-cwd-default',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1610,7 +1610,7 @@ async def test_explicit_cwd_survives_forwarding_to_invoke_claude_agent(tmp_path)
         success=True,
         output='',
         session_id='sess-cwd-fwd',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1659,7 +1659,7 @@ async def test_call_claude_cli_scopes_mcp_to_no_servers():
         success=True,
         output='',
         session_id='sess-mcp',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1722,7 +1722,7 @@ async def test_call_claude_cli_forwards_mcp_scoping_to_invoke_claude_agent(tmp_p
         success=True,
         output='',
         session_id='sess-mcp-deep',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     # autospec (not a bare AsyncMock): validates every kwarg against the real
@@ -1791,7 +1791,6 @@ def _two_turn_my_tool_fixture():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'calling my_tool',
             'tool_calls': [{'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}}],
         },
     )
@@ -1801,7 +1800,6 @@ def _two_turn_my_tool_fixture():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'done',
             'tool_calls': [
                 {'id': 'tc2', 'name': 'stage_complete', 'input': {'report': {'result': 14}}}
             ],
@@ -1976,7 +1974,6 @@ async def test_run_threads_parallel_tool_results_with_double_newline_joiner():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'calling two tools',
             'tool_calls': [
                 {'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}},
                 {'id': 'tc2', 'name': 'other_tool', 'input': {'x': 5}},
@@ -1989,7 +1986,6 @@ async def test_run_threads_parallel_tool_results_with_double_newline_joiner():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'done',
             'tool_calls': [
                 {'id': 'tc3', 'name': 'stage_complete', 'input': {'report': {'ok': True}}}
             ],
@@ -2110,7 +2106,7 @@ class TestAgentLoopCapWaitSanityBound:
         empty_result = AgentResult(
             success=True,
             output='',
-            structured_output={'thinking': '', 'tool_calls': []},
+            structured_output={'tool_calls': []},
         )
         mock = AsyncMock(return_value=empty_result)
         with patch(
@@ -2190,7 +2186,7 @@ async def test_call_claude_cli_legitimate_empty_calls_no_warning(caplog):
         success=True,
         output='',
         session_id='s',
-        structured_output={'thinking': 'x', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -2316,8 +2312,8 @@ def _cli_agent_with_terminal_tool() -> AgentLoop:
 
 @pytest.mark.asyncio
 async def test_cli_invocation_requests_no_reasoning_emission():
-    """Task 6022 measured that a required reasoning field ('thinking' plus an
-    instruction to 'explain your reasoning' in it) gets verify refused by the
+    """Task 6022 measured that a required reasoning field (a "thinking" field
+    plus an instruction to "explain your reasoning" in it) gets verify refused by the
     API's reasoning_extraction classifier.  Any new schema property must be
     re-probed with fused-memory/scripts/probe_schema_max_turns.py first.
     """
