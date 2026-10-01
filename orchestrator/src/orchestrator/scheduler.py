@@ -54,6 +54,7 @@ from orchestrator.pin_reservation import (
     Blocker,
     BlockerKind,
     ParkPriority,
+    PinOrder,
     ReservationSource,
     is_pin_rank,
     park_rank,
@@ -975,6 +976,21 @@ class TickOutcome:
     """
 
     assignment: TaskAssignment | None
+
+
+@dataclass(frozen=True)
+class _PinCandidate:
+    """One pinned task that passed the pin queue's static filters this tick.
+
+    ``tier`` is its effective priority, ``signal`` the dispatch-cooldown
+    signal :meth:`Scheduler._eligible_for_dispatch` returned with it.
+    """
+
+    task_id: str
+    task: dict
+    pin_order: int
+    tier: str
+    signal: str | None
 
 
 @dataclass(frozen=True)
@@ -5476,6 +5492,7 @@ class Scheduler:
         tier: str,
         *,
         skip_count: int,
+        pin_order: int | None = None,
     ) -> None:
         """The park completion rule (task 5308): park whatever is still unparked.
 
@@ -5497,14 +5514,24 @@ class Scheduler:
         blocked-attempt streak, which any attempt that leaves nothing
         blocked resets, as does the owner's dispatch
         (:meth:`_settle_fairness_on_dispatch`).
+
+        With *pin_order* set, this is the head pin's reservation (task 6040):
+        it installs at ``PinOrder(pin_order)``, its remainder also counts the
+        owner's own weaker entries as unparked so they are lifted to the pin
+        rank, and every event carries ``source`` pin plus ``pin_order``.
+        Without it, the fairness behaviour above is unchanged.
         """
         streak = self._streak_park_install_blocked
-        source = ReservationSource.FAIRNESS
-        remainder = self.lock_table.unparked_modules(task_id, modules)
+        pin = None if pin_order is None else PinOrder(pin_order)
+        source = ReservationSource.FAIRNESS if pin is None else ReservationSource.PIN
+        pin_fields = {} if pin is None else {'pin_order': pin_order}
+        remainder = self.lock_table.unparked_modules(task_id, modules, priority=pin)
         if not remainder:
             streak.clear(task_id)
             return
-        installed, shadowed_pairs = self.lock_table.install_parks(task_id, remainder, tier)
+        installed, shadowed_pairs = self.lock_table.install_parks(
+            task_id, remainder, pin or tier
+        )
         blocked = [m for m in remainder if m not in installed]
         if installed:
             logger.info(
@@ -5514,7 +5541,12 @@ class Scheduler:
             self._emit_reservation(
                 EventType.reservation_installed,
                 task_id,
-                {'modules': installed, 'skip_count': skip_count, 'priority': tier},
+                {
+                    'modules': installed,
+                    'skip_count': skip_count,
+                    'priority': tier,
+                    **pin_fields,
+                },
                 source=source,
             )
             # Emit reservation_shadowed (non-destructive shadow) for each
@@ -5530,6 +5562,7 @@ class Scheduler:
                         'preempted_by': task_id,
                         'preempted_by_priority': tier,
                         'victim': victim,
+                        **pin_fields,
                     },
                     source=source,
                 )
@@ -5554,6 +5587,7 @@ class Scheduler:
                 'attempts': attempts,
                 'skip_count': skip_count,
                 'priority': tier,
+                **pin_fields,
             },
             source=source,
         )
@@ -7524,87 +7558,119 @@ class Scheduler:
         ``ctx.effective_priorities``.
         Writes: none on ctx (dispatch bookkeeping lives on ``self``).
         Pinned candidates bypass scoring entirely but still respect lock
-        availability and eligibility checks (status, deps, cooldown). On
-        lock conflict, falls through to the next pinned candidate without
-        touching skip counters or arming parks: a pin never ACCRUES fairness
-        state from this loop, but a pin dispatch settles whatever it earned
-        as a scored candidate (``_settle_fairness_on_dispatch``).
+        availability and eligibility checks (status, deps, cooldown).  A pin
+        never ACCRUES a skip count from this loop, but a pin dispatch settles
+        whatever it earned as a scored candidate
+        (``_settle_fairness_on_dispatch``).
+
+        On a lock conflict the loop falls through to the next pin.  The first
+        ``pin_reservation_max_active`` lock-blocked, non-deterministic pins
+        are HEADS: each reserves its modules at its pin rank through
+        :meth:`_complete_parks` (task 6040), inline, so a later pin or scored
+        candidate this tick cannot take a module the head is waiting for.
+        This is the bounded exception described in
+        ``orchestrator/pin_reservation.py``'s module docstring.
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
         else ``_CONTINUE`` to fall through to the scored loop.
         """
-        if self._override_store:
-            pin_queue: list[tuple[str, OverrideRow]] = sorted(
-                ((tid, row) for tid, row in ctx.overrides.items() if row.pinned),
-                key=lambda x: (x[1].pin_order if x[1].pin_order is not None else 0),
-            )
-            for pin_tid, _pin_row in pin_queue:
-                if pin_tid not in ctx.tasks_by_id:
-                    continue
-                pin_task = ctx.tasks_by_id[pin_tid]
-                # Re-use the same eligibility helper as the scored-candidate
-                # loop to keep both paths in sync.  A future gate addition only
-                # needs to be added to _eligible_for_dispatch.
-                eligible, pin_signal = self._eligible_for_dispatch(
-                    pin_task, pin_tid, ctx.status_map, ctx.tasks_by_id,
-                    external_status_cache=ctx.external_cache,
-                    external_resolver_failed=ctx.external_resolver_failed,
-                    delivered_check_cache=ctx.delivered_check_cache,
-                    terminal_dep_records=ctx.terminal_dep_records,
+        if not self._override_store:
+            return _CONTINUE
+        heads = 0
+        for pin in self._pin_queue(ctx):
+            if ctx.psi_hold and not self.is_deterministic(pin.task):
+                # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
+                # doesn't reduce host load, so a pinned HEAVY candidate is
+                # deferred exactly like a scored one — deterministic pins
+                # remain exempt.  ctx.psi_hold and _note_heavy_deferral are
+                # the SAME once-per-tick decision/helper the scored loop
+                # uses below, so both loops share one hold and one event.
+                self._note_heavy_deferral(ctx, pin.task_id)
+                continue
+            modules = self._get_modules(pin.task)
+            if self.lock_table.try_acquire(pin.task_id, modules):
+                return await self._dispatch_pin(pin, modules)
+            if (
+                self.config.pin_reservations_enabled
+                and not self.is_deterministic(pin.task)
+                and heads < self.config.pin_reservation_max_active
+            ):
+                heads += 1
+                self._complete_parks(
+                    pin.task_id,
+                    modules,
+                    pin.tier,
+                    skip_count=self._skip_count.get(pin.task_id, 0),
+                    pin_order=pin.pin_order,
                 )
-                if not eligible:
-                    continue
-                if pin_tid in ctx.gated_ids:
-                    # Landed-outbox gate (task 2156, SD-1/B5): this pinned
-                    # task's merge already landed on main and is being driven
-                    # to done inline — skip it here too so the pin loop and
-                    # the scored loop share the one gated_ids source of truth.
-                    continue
-                if ctx.psi_hold and not self.is_deterministic(pin_task):
-                    # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
-                    # doesn't reduce host load, so a pinned HEAVY candidate is
-                    # deferred exactly like a scored one — deterministic pins
-                    # remain exempt.  ctx.psi_hold and _note_heavy_deferral are
-                    # the SAME once-per-tick decision/helper the scored loop
-                    # uses below, so both loops share one hold and one event.
-                    self._note_heavy_deferral(ctx, pin_tid)
-                    continue
-                # Eligible pinned candidate — try to acquire its modules.
-                pin_modules = self._get_modules(pin_task)
-                if self.lock_table.try_acquire(pin_tid, pin_modules):
-                    self._dispatched.add(pin_tid)
-                    # Starvation-watchdog resolve (task 1880): if a pinned task
-                    # had an open INFO escalation, self-resolve it now.
-                    # Wrapped in try/except so a resolve failure can NEVER abort
-                    # a successful dispatch (PROPERTY 1).
-                    try:
-                        await self._resolve_starvation_escalation(pin_tid)
-                    except Exception:
-                        logger.warning(
-                            'Starvation watchdog resolve for pin_tid=%s raised — '
-                            'dispatch continues normally',
-                            pin_tid,
-                            exc_info=True,
-                        )
-                    if pin_signal is not None:
-                        self._last_dispatch_at[pin_tid] = self._time_source()
-                    pin_pri = ctx.effective_priorities.get(
-                        pin_tid, coerce_tier(pin_task.get('priority'))
-                    )
-                    self._dispatched_priority[pin_tid] = pin_pri
-                    self._settle_fairness_on_dispatch(pin_tid, pin_modules, pin_pri)
-                    self._emit_lock_event(
-                        EventType.lock_acquired,
-                        task_id=pin_tid,
-                        modules=pin_modules,
-                        priority=pin_pri,
-                    )
-                    await self._write_snapshot_best_effort()
-                    return TickOutcome(TaskAssignment(
-                        task_id=pin_tid, task=pin_task, modules=pin_modules
-                    ))
-                # Lock conflict — fall through to next pinned candidate.
-                # No skip-bookkeeping for pinned tasks (pins bypass fairness).
         return _CONTINUE
+
+    def _pin_queue(self, ctx: TickContext) -> list[_PinCandidate]:
+        """Pinned tasks that may dispatch this tick, in pin_order ASC.
+
+        A pin is queued when its override row is pinned, its task is in
+        ``ctx.tasks_by_id``, it passes :meth:`_eligible_for_dispatch` (the
+        same helper as the scored loop, so a new gate reaches both paths)
+        and it is not landed-outbox gated.
+        """
+        queue: list[_PinCandidate] = []
+        for tid, row in ctx.overrides.items():
+            if not row.pinned or tid not in ctx.tasks_by_id:
+                continue
+            task = ctx.tasks_by_id[tid]
+            eligible, signal = self._eligible_for_dispatch(
+                task, tid, ctx.status_map, ctx.tasks_by_id,
+                external_status_cache=ctx.external_cache,
+                external_resolver_failed=ctx.external_resolver_failed,
+                delivered_check_cache=ctx.delivered_check_cache,
+                terminal_dep_records=ctx.terminal_dep_records,
+            )
+            if not eligible:
+                continue
+            if tid in ctx.gated_ids:
+                # Landed-outbox gate (task 2156, SD-1/B5): this pinned
+                # task's merge already landed on main and is being driven
+                # to done inline — skip it here too so the pin loop and
+                # the scored loop share the one gated_ids source of truth.
+                continue
+            queue.append(_PinCandidate(
+                task_id=tid,
+                task=task,
+                pin_order=row.pin_order if row.pin_order is not None else 0,
+                tier=ctx.effective_priorities.get(tid, coerce_tier(task.get('priority'))),
+                signal=signal,
+            ))
+        return sorted(queue, key=lambda pin: (pin.pin_order, pin.task_id))
+
+    async def _dispatch_pin(self, pin: _PinCandidate, modules: list[str]) -> TickOutcome:
+        """Book a pin whose ``try_acquire`` just succeeded, and end the tick."""
+        self._dispatched.add(pin.task_id)
+        # Starvation-watchdog resolve (task 1880): if a pinned task
+        # had an open INFO escalation, self-resolve it now.
+        # Wrapped in try/except so a resolve failure can NEVER abort
+        # a successful dispatch (PROPERTY 1).
+        try:
+            await self._resolve_starvation_escalation(pin.task_id)
+        except Exception:
+            logger.warning(
+                'Starvation watchdog resolve for pin_tid=%s raised — '
+                'dispatch continues normally',
+                pin.task_id,
+                exc_info=True,
+            )
+        if pin.signal is not None:
+            self._last_dispatch_at[pin.task_id] = self._time_source()
+        self._dispatched_priority[pin.task_id] = pin.tier
+        self._settle_fairness_on_dispatch(pin.task_id, modules, pin.tier)
+        self._emit_lock_event(
+            EventType.lock_acquired,
+            task_id=pin.task_id,
+            modules=modules,
+            priority=pin.tier,
+        )
+        await self._write_snapshot_best_effort()
+        return TickOutcome(TaskAssignment(
+            task_id=pin.task_id, task=pin.task, modules=modules
+        ))
 
     async def _phase_select_scored(self, ctx: TickContext) -> object:
         """Score each candidate and dispatch the best available.
