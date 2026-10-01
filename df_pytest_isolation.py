@@ -1378,7 +1378,8 @@ def load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
     failing the caller outright would trade an inert budget for a red suite.
 
     LOAD-PER-CORE, not worker count, is the right signal for the two test
-    roots that use this, and it STAYS right now that they run under xdist.
+    roots that use this and for ``orchestrator/tests``' row discovery ceiling,
+    which delegates here, and it STAYS right now that they run under xdist.
     Task 5408 put ``-n auto --dist loadgroup`` on the ``scripts`` module's
     test_command, which is the command that runs both ``tests/scripts/`` and
     ``scripts/tests/``, so the clause this paragraph used to carry -- "they run

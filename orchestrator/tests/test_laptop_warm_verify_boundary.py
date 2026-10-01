@@ -1105,7 +1105,7 @@ ROW_MARKER_CEILING_SECS: float = 20.0
 #: 1/2/3 pass the resolved ceiling explicitly at their call sites below
 #: (instead of relying on the bare default) so this value and those defaults
 #: cannot silently drift apart.
-ROW_DISCOVERY_CEILING_BASE_SECS: float = 20.0
+ROW_DISCOVERY_CEILING_BASE_SECS: int = 20
 
 #: Task 4014.  Top of the measured per-core dilation envelope, NOT a guess.
 #: Every dilation figure this repo has actually measured is expressed in
@@ -1116,7 +1116,12 @@ ROW_DISCOVERY_CEILING_BASE_SECS: float = 20.0
 #: Scaling keys on loadavg-per-core rather than PSI because this suite's
 #: autouse _hermetic_psi_reader fixture injects a stub PSI reader suite-wide,
 #: so /proc/pressure readings are deliberately untrustworthy here.
-_DISCOVERY_CEILING_MAX_SCALE: float = 6.0
+_DISCOVERY_CEILING_MAX_SCALE: int = 6
+
+#: The widest load-scaled ceiling, i.e. the clamp before any operator pin.
+_ROW_DISCOVERY_CEILING_UNPINNED_MAX_SECS: int = (
+    ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
+)  # 120
 
 #: Operator knob: pin the discovery ceiling outright (e.g. to reproduce a
 #: discovery timeout quickly instead of waiting out a load-scaled deadline).
@@ -1180,13 +1185,11 @@ _DISCOVERY_CEILING_OVERRIDE_SECS: float | None = _resolve_ceiling_override(os.en
 ROW_DISCOVERY_CEILING_MAX_SECS: float = (
     _DISCOVERY_CEILING_OVERRIDE_SECS
     if _DISCOVERY_CEILING_OVERRIDE_SECS is not None
-    else ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
-)  # 120.0 unpinned
+    else _ROW_DISCOVERY_CEILING_UNPINNED_MAX_SECS
+)  # 120 unpinned
 
 
-def row_discovery_ceiling_secs(
-    *, _loadavg=None, _cpu_count=None, _override=_DISCOVERY_CEILING_OVERRIDE_SECS
-) -> float:
+def row_discovery_ceiling_secs(*, _override=_DISCOVERY_CEILING_OVERRIDE_SECS) -> float:
     """Resolve the discovery ceiling for a wait that is starting NOW.
 
     A WEDGE DETECTOR, not a speed assertion: the rows assert THAT a tree was
@@ -1208,20 +1211,19 @@ def row_discovery_ceiling_secs(
     box.  It is safe against the clamp invariant because
     :data:`ROW_DISCOVERY_CEILING_MAX_SECS` folds the same pin in.
 
-    *_loadavg* / *_cpu_count* / *_override* are private injectable seams for
-    deterministic coverage, defaulting to the real readers.
+    The scaling is :func:`df_pytest_isolation.load_scaled_grace`'s (floor at
+    base, ceil to whole seconds, clamp, fail-safe to base without loadavg);
+    only the operator pin is decided here.
     """
     if _override is not None:
         return _override
-    loadavg = os.getloadavg()[0] if _loadavg is None else _loadavg
-    cpu_count = (os.cpu_count() or 1) if _cpu_count is None else _cpu_count
-    scaled = ROW_DISCOVERY_CEILING_BASE_SECS * (loadavg / max(cpu_count, 1))
     # Clamp against the UNPINNED bound, not ROW_DISCOVERY_CEILING_MAX_SECS:
     # the latter folds an operator pin in, and a pin is already returned above.
     # Reading it here would make a low pin silently re-clamp the scaled branch
     # too, so the `_override=None` seam would not mean "as if unpinned".
-    unpinned_max = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
-    return min(unpinned_max, max(ROW_DISCOVERY_CEILING_BASE_SECS, scaled))
+    return load_scaled_grace(
+        ROW_DISCOVERY_CEILING_BASE_SECS, cap_secs=_ROW_DISCOVERY_CEILING_UNPINNED_MAX_SECS,
+    )
 
 
 #: Worst-case BOUNDED work in a row on the failure path, at the WIDEST
@@ -1339,7 +1341,8 @@ def test_row_watchdog_window_tracks_the_baselined_production_window():
 
 # ---------------------------------------------------------------------------
 # Task 4014 -- deterministic coverage for the load-scaled discovery ceiling.
-# Pure function, injected seams: no clock, no /proc, no subprocess.
+# Pure function, no clock, no /proc, no subprocess: load is injected by
+# patching os.getloadavg/os.cpu_count.
 # ---------------------------------------------------------------------------
 
 
@@ -1382,10 +1385,9 @@ def test_row_discovery_ceiling_scales_with_load_and_clamps(monkeypatch):
         f'the ceiling must widen past base; got {loaded}'
     )
 
-    unpinned_clamp = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
     absurd = _unpinned_ceiling_at(monkeypatch, 6400.0)
-    assert absurd == unpinned_clamp, (
-        f'a runaway load must clamp to {unpinned_clamp} -- that clamp is what '
+    assert absurd == _ROW_DISCOVERY_CEILING_UNPINNED_MAX_SECS, (
+        f'a runaway load must clamp to {_ROW_DISCOVERY_CEILING_UNPINNED_MAX_SECS} -- that clamp is what '
         f'ROW_DISCOVERY_CEILING_MAX_SECS, and in turn the import-time pytest '
         f'timeout, are derived from; got {absurd}'
     )
@@ -1409,10 +1411,11 @@ def test_row_discovery_ceiling_is_the_shared_load_scaler(monkeypatch):
     re-deriving its arithmetic. The 33.0 rung is a non-integer per-core
     factor, where a local copy that skips the whole-second rounding diverges.
     """
-    shared_cap = ROW_DISCOVERY_CEILING_BASE_SECS * _DISCOVERY_CEILING_MAX_SCALE
     for load in (0.0, 16.0, 33.0, 64.0, 96.0, 200.0, 6400.0):
         ours = _unpinned_ceiling_at(monkeypatch, load)
-        shared = load_scaled_grace(ROW_DISCOVERY_CEILING_BASE_SECS, cap_secs=shared_cap)
+        shared = load_scaled_grace(
+            ROW_DISCOVERY_CEILING_BASE_SECS, cap_secs=_ROW_DISCOVERY_CEILING_UNPINNED_MAX_SECS,
+        )
         assert ours == shared, (
             f'at loadavg {load} on 32 cores the discovery ceiling is {ours} but '
             f'the shared scaler gives {shared}: the ceiling has its own scaler again'
