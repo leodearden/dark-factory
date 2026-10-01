@@ -523,6 +523,80 @@ class TestBuildImplementerPromptWipNotice:
         assert 'Verify Before Re-Implementing' not in prompt
 
 
+def _wip_section(prompt: str) -> str:
+    assert '## Already-Committed WIP' in prompt
+    after_heading = prompt.split('## Already-Committed WIP', 1)[1]
+    return after_heading.split('# Session Startup Protocol', 1)[0]
+
+
+@pytest.mark.asyncio
+class TestWipSectionStepAttribution:
+    """A step's ``commit`` names the commit whose diff carries the step's change.
+
+    Task 5177 chose option (a): several steps citing one WIP safety-commit is
+    truthful when its diff carries each of them. A consumer tells that apart
+    from a step's own commit with no stored marker, because
+    orchestrator/src/orchestrator/git_ops.py::is_wip_safety_commit recognises
+    the cited commit's subject. Rejected:
+      (b) splitting or rewriting the WIP commit — it dangles shas already
+          recorded against it;
+      (c) a stored "shared" marker — a second copy of what the subject already
+          says (SPOT);
+      (d) an empty per-step completing commit — its sha passes the
+          unbacked-step check while carrying none of the step's change.
+    What the protocol does close is the old sufficient condition
+    "tests pass => cite the WIP sha".
+    """
+
+    async def _render_wip_section(self, briefing: BriefingAssembler, plan: dict) -> str:
+        prompt = await briefing.build_implementer_prompt(
+            plan, context='', wip_notice=[
+                {'sha': 'abcdef1234567890', 'subject': 'chore: save WIP before inter-iteration rebase'},
+            ],
+        )
+        return _wip_section(prompt)
+
+    async def test_attribution_finds_the_commit_that_carries_each_step(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        section = await self._render_wip_section(briefing, minimal_plan)
+
+        why = (
+            'passing tests alone cite the WIP sha for a step whose own commit sits '
+            'below the WIP run (docs/legibility/confusion-codebook.yaml cand-20260918-15)'
+        )
+        assert 'git log --oneline -- ' in section, why
+        assert '**Carried by an earlier, non-WIP commit:**' in section, why
+
+    async def test_several_steps_may_cite_one_wip_sha(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        section = await self._render_wip_section(briefing, minimal_plan)
+
+        why = 'agents improvise splitting or empty commits when sharing one WIP sha is not sanctioned'
+        assert '**Carried by a WIP commit above:**' in section, why
+        assert 'one WIP sha' in section, why
+
+    async def test_partly_carried_step_ends_the_walk_with_its_own_commit(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        section = await self._render_wip_section(briefing, minimal_plan)
+
+        assert '**Only partly carried, or not carried:**' in section, (
+            'a half-done step would be cited at a WIP sha that does not carry its whole change'
+        )
+
+    async def test_walk_covers_every_pending_step(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        section = await self._render_wip_section(briefing, minimal_plan)
+
+        assert 'walk the pending steps in plan order' in section, (
+            'TaskWorkflow._detect_tip_wip_commits hides a WIP sha once any done step '
+            'cites it, so this notice may be the only sighting'
+        )
+
+
 # ---------------------------------------------------------------------------
 # task-2279 RED: mandatory git status/diff pre-flight always renders,
 # independent of wip_notice — covers the broader "uncommitted, never
