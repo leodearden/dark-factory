@@ -36,6 +36,7 @@ failed validation (nothing is written).
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -600,3 +601,119 @@ def load_verdicts(
         verdicts=tuple(sorted(in_sample, key=Verdict.sort_key)),
         stale=tuple(sorted(stale, key=Verdict.sort_key)),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Rates
+# --------------------------------------------------------------------------- #
+
+WILSON_Z = 1.959963984540054
+"""Two-sided 95%; reproduces esc-4639-1's published intervals exactly."""
+
+Row = Mapping[str, Any]
+"""A worksheet row, as :func:`worksheet_rows` yields it."""
+
+
+def wilson_interval(k: int, n: int) -> tuple[float, float] | None:
+    if n <= 0:
+        return None
+    p, z2 = k / n, WILSON_Z ** 2
+    denominator = 1 + z2 / n
+    centre = (p + z2 / (2 * n)) / denominator
+    half = WILSON_Z * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n)) / denominator
+    return (round(max(0.0, centre - half), 4), round(min(1.0, centre + half), 4))
+
+
+def rate(k: int, n: int) -> dict[str, Any]:
+    """``k/n`` with its Wilson interval; both None when ``n`` is 0, never 0%."""
+    interval = wilson_interval(k, n)
+    return {
+        'k': k, 'n': n, 'rate': round(k / n, 4) if n else None,
+        'ci': list(interval) if interval else None,
+    }
+
+
+def _judged(rows: Iterable[Row], labels: Mapping[EdgeKey, str]) -> list[tuple[Row, Row, str]]:
+    """``(row, minted_edge, label)`` for every minted edge that carries a verdict."""
+    return [
+        (row, minted, labels[(row['graph'], minted['edge_uuid'])])
+        for row in rows for minted in row['minted']
+        if (row['graph'], minted['edge_uuid']) in labels
+    ]
+
+
+def _fraction_by_label(judged: list[tuple[Row, Row, str]], flag: str) -> dict[str, Any]:
+    return {
+        label: rate(
+            sum(1 for _, minted, lab in judged if lab == label and minted[flag]),
+            sum(1 for _, _, lab in judged if lab == label),
+        )
+        for label in LABELS
+    }
+
+
+def _rates_over(rows: list[Row], labels: Mapping[EdgeKey, str]) -> dict[str, Any]:
+    judged = _judged(rows, labels)
+    counts = Counter(label for _, _, label in judged)
+    minted = len(judged)
+    hit_keys = {(row['graph'], row['uuid']) for row, _, lab in judged if lab == 'overreach'}
+    hit_rows = [r for r in rows if (r['graph'], r['uuid']) in hit_keys]
+    in_hit = _judged(hit_rows, labels)
+    substantive = minted - counts['bookkeeping'] - counts['unjudgeable']
+    return {
+        'episodes': len(rows),
+        'minted': minted,
+        'label_counts': {label: counts[label] for label in LABELS},
+        'overreach_rate_minted': rate(counts['overreach'], minted),
+        'overreach_rate_substantive': rate(counts['overreach'], substantive),
+        'episode_hit_rate': rate(len(hit_rows), len(rows)),
+        'holding_share': rate(counts['holding'], minted),
+        'holding_share_in_hit_episodes': rate(
+            sum(1 for _, _, lab in in_hit if lab == 'holding'), len(in_hit),
+        ),
+        'served_fraction_by_label': _fraction_by_label(judged, 'served'),
+        'live_strict_fraction_by_label': _fraction_by_label(judged, 'live_strict'),
+        'misbound_count': counts['misbound'],
+    }
+
+
+def adjudicated_rates(rows: Iterable[Row], verdicts: VerdictSet) -> dict[str, Any]:
+    """The esc-4639-1 measures, per stratum and rolled up under ``'all'``."""
+    rows, labels = list(rows), verdicts.by_edge
+    rates = {s: _rates_over([r for r in rows if r['stratum'] == s], labels) for s in STRATA}
+    rates['all'] = _rates_over(rows, labels)
+    return rates
+
+
+_PER_CLASSIFIER_KEYS = (
+    'episodes', 'minted', 'overreach_rate_minted', 'overreach_rate_substantive',
+    'episode_hit_rate',
+)
+
+
+def per_classifier_rates(rows: Iterable[Row], verdicts: VerdictSet) -> dict[str, Any]:
+    """Overreach over the sampled episodes each classifier matches (they overlap)."""
+    rows, labels = list(rows), verdicts.by_edge
+    rates = {}
+    for name in CLASSIFIERS:
+        full = _rates_over([r for r in rows if name in r['classifiers']], labels)
+        rates[name] = {key: full[key] for key in _PER_CLASSIFIER_KEYS}
+    return rates
+
+
+def detector_catch(
+    rows: Iterable[Row],
+    verdicts: VerdictSet,
+    hits_by_episode: Mapping[EpisodeKey, frozenset[str]],
+) -> dict[str, Any]:
+    """Of the adjudicated overreach edges, how many a detector fires on the episode of."""
+    sources = [
+        hits_by_episode.get((row['graph'], row['uuid']), frozenset())
+        for row, _, label in _judged(rows, verdicts.by_edge) if label == 'overreach'
+    ]
+    return {
+        'overreach_edges': len(sources),
+        'by_detector': {d: sum(1 for hits in sources if d in hits) for d in DETECTORS},
+        'any_detector': sum(1 for hits in sources if hits),
+        'any_wired': sum(1 for hits in sources if hits & WIRED_ON_ADD_MEMORY),
+    }
