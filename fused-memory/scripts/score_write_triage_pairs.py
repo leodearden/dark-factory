@@ -36,14 +36,34 @@ other than TIED. Otherwise :func:`score_pairs` raises
 that named it, and scores nothing, because a partial corpus must not read as
 a result. A write that no arm attached needs no rating (D14). Neither does a
 corpus pair that no arm named.
+
+Usage
+-----
+Run from ``fused-memory/``. This scores the committed seed, the gpt-4o-mini
+09-29 reference runs at slate widths 5 and 20::
+
+    uv run python scripts/score_write_triage_pairs.py \
+        --cases tests/fixtures/write_triage_pair_cases_seed.jsonl \
+        --verdicts tests/fixtures/write_triage_pair_verdicts_seed.jsonl \
+        --reference-arm gpt-4o-mini@5 --out /tmp/write-triage-pairs.json
+
+``--cases`` and ``--verdicts`` each take one or more JSONL files. The verdict
+corpus that new ratings land in is ``calibration/write_triage_pair_verdicts.jsonl``.
+The report is printed to stdout, and also written to ``--out`` when given. An
+incomplete corpus exits 1, prints one stderr line per unrated or tied pair,
+and writes nothing.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
@@ -651,3 +671,65 @@ def _mcnemar_exact(only_first: int, only_second: int) -> float:
         return 1.0
     tail = sum(math.comb(discordant, k) for k in range(min(only_first, only_second) + 1))
     return round(min(1.0, 2 * tail / 2 ** discordant), 4)
+
+
+def _read_jsonl(paths: Sequence[Path]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        with path.open() as lines:
+            for number, line in enumerate(lines, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f'{path}:{number}: not a JSON object line ({exc.msg})') from exc
+    return rows
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Score write-triage arms by the pairs their judges attached writes to, read"
+            " against a blind verdict corpus (flip-readiness PRD C2''). The corpus new"
+            ' ratings land in is fused-memory/calibration/write_triage_pair_verdicts.jsonl;'
+            ' pass it explicitly.'
+        ),
+    )
+    parser.add_argument(
+        '--cases', type=Path, nargs='+', required=True, metavar='PATH',
+        help='JSONL case rows, in one or more files; every row names its arm',
+    )
+    parser.add_argument(
+        '--verdicts', type=Path, nargs='+', required=True, metavar='PATH',
+        help='JSONL verdict files, read together as one corpus',
+    )
+    parser.add_argument(
+        '--reference-arm', required=True, metavar='NAME',
+        help='the arm every other arm is paired against',
+    )
+    parser.add_argument('--out', type=Path, metavar='PATH', help='also write the report here')
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        result = score_pairs(
+            _read_jsonl(args.cases),
+            _read_jsonl(args.verdicts),
+            reference_arm=args.reference_arm,
+        )
+    except IncompleteCorpusError as refusal:
+        print(refusal, file=sys.stderr)
+        return 1
+    report = json.dumps(result, indent=2)
+    print(report)
+    if args.out is not None:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(report + '\n')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
