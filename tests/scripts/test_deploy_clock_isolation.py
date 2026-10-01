@@ -29,7 +29,6 @@ from __future__ import annotations
 import importlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -44,6 +43,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # docstring exists to prevent.
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
+
+from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
@@ -1250,20 +1251,6 @@ class TestGuardIsLiveInThisRun:
 # though every test passed", because a fixture cannot fail its own session.
 # ---------------------------------------------------------------------------
 
-# Minimal ini so the nested run's rootdir is the tmp tree and NOT this repo:
-# without it pytest walks up looking for an inifile and would inherit this
-# repo's addopts (`--import-mode=importlib -m 'not smoke ...'`).
-_NESTED_INI = '[pytest]\n'
-
-_NESTED_CONFTEST = '''\
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from df_pytest_isolation import _df_deploy_clocks_unwritten  # noqa: F401
-'''
-
 _NESTED_STAMP_TS = 1786033966
 _NESTED_STAMP_ISO = '2026-08-06T16:32:46+00:00'
 # The pre-4823 body: no provenance, hence unattributable, hence a violation.
@@ -1351,16 +1338,10 @@ def _nested_run(tmp_path: Path, *, scenario: str) -> subprocess.CompletedProcess
     than of inheritance.
     """
     assert scenario in _NESTED_SCENARIOS, scenario
-    root = tmp_path / scenario
-    root.mkdir()
-    shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
-    (root / 'pytest.ini').write_text(_NESTED_INI)
-    (root / 'conftest.py').write_text(_NESTED_CONFTEST)
-    (root / 'test_forgetful.py').write_text(_nested_test_source(scenario=scenario))
-    return subprocess.run(
-        [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
-        cwd=root, capture_output=True, text=True, timeout=300,
-    )
+    return run_nested_pytest(tmp_path / scenario, {
+        'conftest.py': binding_conftest(_GUARD_NAME),
+        'test_forgetful.py': _nested_test_source(scenario=scenario),
+    })
 
 
 class TestTheGuardFailsTheRunEndToEnd:
