@@ -17,6 +17,7 @@ from shared import safe_io
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ArtifactWriteError,
+    ReviewAggregation,
     TaskArtifacts,
     _normalize_plan,
 )
@@ -1105,6 +1106,48 @@ class TestReviews:
         assert 'missing_test' in text
         assert 'No test for empty input' in text
         assert 'c.py:10' in text
+
+    @staticmethod
+    def _issue(tag: str, severity: str) -> dict:
+        return {
+            'reviewer': f'reviewer-{tag}',
+            'severity': severity,
+            'location': f'{tag}.py:{len(tag)}',
+            'category': f'category-{tag}',
+            'description': f'description-{tag}',
+            'suggested_fix': f'fix-{tag}',
+        }
+
+    def _aggregation(self, suggestion_tags: list[str]) -> ReviewAggregation:
+        return ReviewAggregation(
+            has_blocking_issues=True,
+            blocking_issues=[self._issue('blocker', 'blocking')],
+            suggestions=[self._issue(tag, 'suggestion') for tag in suggestion_tags],
+            reviews={},
+        )
+
+    def test_format_for_escalation_inlines_every_suggestion(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        text = agg.format_for_escalation()
+        for suggestion in agg.suggestions:
+            for key in ('location', 'category', 'description', 'suggested_fix'):
+                assert suggestion[key] in text
+        blocking_at = text.index('# Review Feedback — Blocking Issues')
+        assert text.index('# Review Feedback — Suggestions') > blocking_at
+
+    def test_format_for_escalation_begins_with_the_replan_rendering(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        assert agg.format_for_escalation().startswith(agg.format_for_replan())
+
+    def test_format_for_escalation_without_suggestions_equals_replan(self):
+        agg = self._aggregation([])
+        assert agg.format_for_escalation() == agg.format_for_replan()
+
+    def test_format_for_replan_stays_blocking_only(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        text = agg.format_for_replan()
+        for suggestion in agg.suggestions:
+            assert suggestion['description'] not in text
 
     def test_aggregate_reviews_error_filtered(self, artifacts: TaskArtifacts):
         artifacts.write_review('reviewer1', {
