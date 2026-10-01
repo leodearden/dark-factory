@@ -3316,8 +3316,9 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
+            done_provenance_passed_through = False
             if metadata_mode == 'replace':
-                _assert_done_provenance_passthrough(
+                done_provenance_passed_through = _assert_done_provenance_passthrough(
                     row['metadata'], parsed_metadata, task_id,
                 )
 
@@ -3425,7 +3426,10 @@ class SqliteTaskBackend:
                 # row. Falls back to None (enforce-all) when the payload
                 # isn't a JSON object — _merge_metadata already treats a
                 # non-dict incoming blob as last-write-wins, so there is no
-                # narrower "responsibility" to scope to here.
+                # narrower "responsibility" to scope to here. Under replace, a
+                # done_provenance the passthrough check admitted is not this
+                # write's responsibility either: the caller had to send it
+                # back unchanged.
                 incoming_keys: set[str] | None = None
                 try:
                     _loaded_incoming = json.loads(metadata)
@@ -3434,6 +3438,8 @@ class SqliteTaskBackend:
                 else:
                     if isinstance(_loaded_incoming, dict):
                         incoming_keys = set(_loaded_incoming.keys())
+                if done_provenance_passed_through and incoming_keys is not None:
+                    incoming_keys.discard('done_provenance')
                 await self._validate_metadata_on_write(
                     new_metadata, project_root=project_root, tag=tag, task_id=tid,
                     incoming_keys=incoming_keys,
@@ -4175,7 +4181,7 @@ def _merge_values(old: object, new: object) -> object:
 
 def _assert_done_provenance_passthrough(
     stored_raw: str | None, incoming: dict | None, task_id: str,
-) -> None:
+) -> bool:
     """Refuse a whole-blob replace that would move ``metadata.done_provenance``.
 
     The contract: update_task may never ADD, CHANGE or REMOVE
@@ -4207,9 +4213,13 @@ def _assert_done_provenance_passthrough(
       one omitting it is the corrupt-row repair replace mode exists for.
     * Otherwise the key's presence and value must match the stored row
       exactly: an ADD, a CHANGE and a drop-by-omission are all refused.
+
+    Returns True exactly when the payload carried a done_provenance and it
+    was admitted as a passthrough — the licence update_task needs to exclude
+    that key from enforce-mode responsibility.
     """
     if incoming is None:
-        return
+        return False
     try:
         stored = json.loads(stored_raw) if stored_raw is not None else None
     except (TypeError, ValueError):
@@ -4217,10 +4227,11 @@ def _assert_done_provenance_passthrough(
     if not isinstance(stored, dict):
         if 'done_provenance' in incoming:
             raise DoneProvenanceWriteAuthorityError(task_id)
-        return
+        return False
     absent = object()
     if stored.get('done_provenance', absent) != incoming.get('done_provenance', absent):
         raise DoneProvenanceWriteAuthorityError(task_id)
+    return 'done_provenance' in incoming
 
 
 def _merge_metadata(
