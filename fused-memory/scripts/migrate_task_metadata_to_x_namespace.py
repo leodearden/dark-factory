@@ -7,15 +7,17 @@ timestamped metadata keys (an evidence log parked under
 ``origin_*``/``related_*`` annotations). None of them is a typed
 ``TaskMetadata`` field or a Tier-A blessed key, so every write touching that
 task emits a ``code=unknown_key`` schema warning per key — measured at SEVEN
-on 3083's live blob (2026-08-06).
+on 3083's live blob on 2026-08-06, and at ELEVEN on 2026-10-01 after the blob
+accreted five more ``markup_tripwire_rejections`` bursts (2026-08-07 to
+2026-08-11). Re-measure before any re-run.
 
 Per the Tier-C rule in ``docs/task-authoring.md`` §8, an ad-hoc key with no
 code reader is retired by renaming it under ``x_``, which the schema treats
 as an explicitly-namespaced escape hatch and does not warn about. Verified
 by grep across ``orchestrator/``, ``fused-memory/src``, ``shared/src``,
-``escalation/``, ``dashboard/``, ``scripts/`` and ``docs/``: the six default
-targets have no reader anywhere. (The seventh warning on 3083,
-``last_blocked_at``, is NOT migrated — the orchestrator both writes and reads
+``escalation/``, ``dashboard/``, ``scripts/`` and ``docs/``: the eleven
+default targets have no reader anywhere. (``last_blocked_at``, a warning on
+the 2026-08-06 blob, is NOT migrated — the orchestrator both writes and reads
 it, so it was promoted to Tier-A ``_BLESSED_METADATA_KEYS`` instead.)
 
 WHY ``metadata_mode='replace'`` AND NOT ``'merge'``
@@ -30,6 +32,11 @@ persist. ``update_task``'s own docstring names ``metadata_mode='replace'``
 reached the same conclusion for the same reason: merge "does NOT retroactively
 self-heal existing rows".
 
+As of task 3777, replace is usable on a done task: ``update_task``'s
+done_provenance floor admits a whole-blob replace that carries the stored
+``done_provenance`` through verbatim, which is exactly what
+:func:`build_update_payload` sends, since it writes back the blob it just read.
+
 The thing merge was protecting — sibling metadata keys must survive — is
 achieved here by construction (the full blob that was just read is written
 back, so siblings survive) and then PROVEN by a mandatory read-back diff of
@@ -39,8 +46,8 @@ SAFETY
 ------
 The write payload carries ONLY ``{id, project_root, metadata, metadata_mode}``.
 ``update_task`` rewrites exactly the columns it is handed, and task 3083's
-``description`` (6269 B) and ``details`` (13965 B) hold a one-of-a-kind
-hand-curated evidence log. ``build_update_payload`` is the single place that
+``description`` and ``details`` hold a one-of-a-kind hand-curated evidence
+log that keeps growing (``details`` was 47074 B on 2026-10-01). ``build_update_payload`` is the single place that
 payload is constructed, and
 ``tests/test_migrate_task_metadata_to_x_namespace.py`` asserts each dangerous
 column absent by name. The post-write read-back additionally verifies the
@@ -122,12 +129,21 @@ _BACKUP_NAME_TEMPLATE = 'task-{task_id}-metadata-before-{stamp}.json'
 # directory fails loudly (as a refusal, before any write) instead of spinning.
 _MAX_BACKUP_DISAMBIGUATIONS = 10
 
-# The six ad-hoc keys measured on task 3083's live blob (2026-08-06) that have
-# no code reader anywhere in the repo. `last_blocked_at` is deliberately NOT
-# here: it is machine-written and machine-read, and was promoted to Tier-A.
+# The ad-hoc keys on task 3083's live blob that have no code reader anywhere in
+# the repo. Six were measured on 2026-08-06; eleven on 2026-10-01, the five
+# additions being later bursts of a markup_tripwire_rejections family already
+# listed, equally unread. The blob demonstrably accreted keys between
+# 2026-08-06 and 2026-08-11, so re-measure before any re-run and pass `--keys`
+# for a key this constant lacks. `last_blocked_at` is deliberately NOT here: it
+# is machine-written and machine-read, and was promoted to Tier-A.
 DEFAULT_KEYS: tuple[str, ...] = (
     'markup_tripwire_rejections_20260730',
     'markup_tripwire_rejections_20260730_burst3',
+    'markup_tripwire_rejections_20260807_burst4',
+    'markup_tripwire_rejections_20260809_burst5',
+    'markup_tripwire_rejections_20260809_burst6',
+    'markup_tripwire_rejections_20260810_burst7',
+    'markup_tripwire_rejections_20260811_burst8',
     'related_reify_memories',
     'related_reify_tasks',
     'origin_escalation',
@@ -301,12 +317,14 @@ def assert_write_accepted(result: object, *, tool: str = 'update_task') -> None:
     the caller cannot tell the two apart, which is how a refused write reads
     as an accepted one.
 
-    Known rejection that applies to this migration: ``update_task`` refuses
-    any metadata payload containing ``done_provenance``
-    (``error='done_provenance_via_update_task'``) — a presence-only
-    write-authority floor that fires before ``metadata_mode`` is resolved. It
-    therefore rejects a whole-blob ``replace`` of ANY done/merged task, since
-    those all carry that key.
+    Known rejection that applies to this migration
+    (``error='done_provenance_via_update_task'``): since task 3777, a
+    whole-blob ``replace`` of a done task is ACCEPTED provided its
+    ``done_provenance`` is carried through unchanged, which this script's
+    payload always does. What is still refused is an add, change or drop of
+    that key, and the old-server case: a server not yet restarted onto task
+    3777's code refuses any payload carrying the key, cleanly, with nothing
+    written.
     """
     if not isinstance(result, dict):
         return

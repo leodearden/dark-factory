@@ -344,10 +344,10 @@ def test_migrated_3083_shaped_blob_emits_zero_unknown_key_warnings():
 def test_done_provenance_rejection_is_detected():
     """The VERBATIM rejection observed against the live server on 2026-08-06.
 
-    `update_task` refuses any metadata payload containing `done_provenance`
-    (sqlite_task_backend.py, presence-only write-authority floor, checked
-    BEFORE metadata_mode is resolved) — and returns that refusal inside a
-    normal JSON-RPC success envelope. The shared client only raises on an
+    At the time `update_task` refused any metadata payload containing
+    `done_provenance` (a presence-only floor, narrowed by task 3777 to refuse
+    only an add, change or drop under replace) — and it returns such a
+    refusal inside a normal JSON-RPC success envelope. The shared client only raises on an
     envelope-level error, so without this assertion the script printed
     'write submitted' for a write that never happened.
     """
