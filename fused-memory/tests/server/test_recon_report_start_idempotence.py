@@ -13,6 +13,8 @@ Covers:
 - TestStartReportPreservesExistingEntryDurable — step-1(e) (RED until step-2)
 - TestStartReportResultIsUnambiguous — step-3 (RED until step-4)
 - TestStartReportActivePointerAndPersistence — step-5 (RED until step-6)
+- TestStartReportUnknownStageGuard — task 4865 step-1 (RED until step-2)
+- TestStartReportUnknownStageGuardIsWiredInProduction — task 4865 step-3 (RED until step-4)
 """
 
 import logging
@@ -662,3 +664,196 @@ class TestStartReportActivePointerAndPersistence:
 
         result = state.start_report(run_id='r1', stage='s1', project_id='dark_factory')
         assert result['already_started'] is False
+
+
+# ---------------------------------------------------------------------------
+# task 4865 step-1: an opt-in known-stage vocabulary rejects a stage name
+# outside it — RED until step-2 adds the `known_stages` guard.
+# ---------------------------------------------------------------------------
+
+_KNOWN_STAGES = frozenset({'memory_consolidator', 'task_knowledge_sync', 'integrity_check'})
+
+
+def _file_finding(state, run_id, description):
+    result = state.add_finding(
+        run_id=run_id, severity='low', category='cat', description=description,
+        suggested_action='a', task_id=description, flag_type='f',
+    )
+    assert 'finding_id' in result, result
+    return result['finding_id']
+
+
+def _flagged_ids(state, run_id, stage):
+    report = state.get_assembled_report(run_id, stage)
+    assert report is not None, (run_id, stage)
+    return {item['finding_id'] for item in report['flagged_items']}
+
+
+class TestStartReportUnknownStageGuard:
+    """A stage name outside a configured vocabulary is never accepted.
+
+    Without a vocabulary, an unknown stage takes the fresh-create path and
+    re-points the run's active stage onto a phantom entry, so every later
+    unqualified mutator lands there instead of in the real live stage.
+    """
+
+    def _make_state(self, *, store=None, known_stages: frozenset[str] | None = _KNOWN_STAGES):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        return ReconReportState(
+            ttl_seconds=300, clock=lambda: t[0], store=store, known_stages=known_stages,
+        )
+
+    def test_without_vocabulary_any_stage_still_opens_and_takes_the_pointer(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        assert state.start_report(run_id='r1', stage='s1', project_id='p')['already_started'] is False
+        assert state.start_report(run_id='r1', stage='s2', project_id='p')['already_started'] is False
+
+        finding_id = _file_finding(state, 'r1', 'after-s2')
+
+        assert _flagged_ids(state, 'r1', 's2') == {finding_id}
+        assert _flagged_ids(state, 'r1', 's1') == set()
+
+    @pytest.mark.parametrize('bogus_stage', ['memory-consolidator', 'stage1'])
+    def test_unknown_stage_is_rejected_and_the_live_stage_keeps_receiving_findings(
+        self, bogus_stage,
+    ):
+        state = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='p')
+        before_id = _file_finding(state, 'r1', 'before')
+
+        result = state.start_report(run_id='r1', stage=bogus_stage, project_id='p')
+
+        assert result == {
+            'error': 'unknown_stage',
+            'error_type': 'ReconReportUnknownStage',
+            'stage': bogus_stage,
+            'known_stages': sorted(_KNOWN_STAGES),
+        }
+        assert state.get_assembled_report('r1', bogus_stage) is None
+
+        after_id = _file_finding(state, 'r1', 'after')
+        assert _flagged_ids(state, 'r1', 'memory_consolidator') == {before_id, after_id}
+
+    def test_rejection_logs_a_warning_naming_stage_run_and_active_stage(self, caplog):
+        state = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='p')
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.server.recon_report'):
+            state.start_report(run_id='r1', stage='memory-consolidator', project_id='p')
+
+        messages = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'fused_memory.server.recon_report' and r.levelno == logging.WARNING
+        ]
+        assert len(messages) == 1, messages
+        assert "'memory-consolidator'" in messages[0]
+        assert "'r1'" in messages[0]
+        assert "'memory_consolidator'" in messages[0]
+
+    def test_known_stage_still_opens_while_another_is_in_progress(self):
+        state = self._make_state()
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='p')
+        _file_finding(state, 'r1', 'stage-one')
+
+        result = state.start_report(run_id='r1', stage='task_knowledge_sync', project_id='p')
+
+        assert result['already_started'] is False
+        finding_id = _file_finding(state, 'r1', 'stage-two')
+        assert _flagged_ids(state, 'r1', 'task_knowledge_sync') == {finding_id}
+
+    def test_guard_runs_before_the_existing_entry_branch_across_a_restart(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        store.open()
+        try:
+            state_a = self._make_state(store=store, known_stages=None)
+            state_a.start_report(run_id='r1', stage='bogus', project_id='p')
+            _file_finding(state_a, 'r1', 'legacy')
+            report_before = state_a.get_assembled_report('r1', 'bogus')
+
+            state_b = self._make_state(store=store)
+            state_b.hydrate_from_store()
+            result = state_b.start_report(run_id='r1', stage='bogus', project_id='p')
+
+            assert result['error'] == 'unknown_stage', result
+            assert state_b.get_assembled_report('r1', 'bogus') == report_before
+        finally:
+            store.close()
+
+    def test_rejection_performs_zero_store_writes(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        real_store = ReconReportStore(tmp_path / 'recon_report_state.db')
+        real_store.open()
+        try:
+            store = _CountingStore(real_store)
+            state = self._make_state(store=store)
+            state.start_report(run_id='r1', stage='memory_consolidator', project_id='p')
+            _file_finding(state, 'r1', 'd')
+            calls_before = store.upsert_many_calls
+            assert calls_before > 0
+
+            state.start_report(run_id='r1', stage='memory-consolidator', project_id='p')
+
+            assert store.upsert_many_calls == calls_before
+            assert {r['stage'] for r in real_store.load_all()} == {'memory_consolidator'}
+        finally:
+            real_store.close()
+
+
+# ---------------------------------------------------------------------------
+# task 4865 step-3: the production factory turns the guard ON — RED until
+# step-4 passes the vocabulary in `_build_recon_report_components`.
+# ---------------------------------------------------------------------------
+
+
+def _production_state():
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig, ServerConfig
+    from fused_memory.server.main import _build_recon_report_components
+
+    config = FusedMemoryConfig(
+        server=ServerConfig(recon_report_port=8003, host='127.0.0.1'),
+        reconciliation=ReconciliationConfig(
+            recon_report_state_ttl_seconds=300, recon_report_persist_enabled=False,
+        ),
+    )
+    state, _mcp, _uv = _build_recon_report_components(config)
+    return state
+
+
+class TestStartReportUnknownStageGuardIsWiredInProduction:
+    """The guard is enforced where the hole exists, not merely available."""
+
+    @pytest.mark.asyncio
+    async def test_production_state_rejects_a_misspelled_stage(self):
+        state = _production_state()
+
+        result = state.start_report(run_id='r', stage='memory-consolidator', project_id='dark_factory')
+
+        assert result['error'] == 'unknown_stage', result
+
+    @pytest.mark.asyncio
+    async def test_production_state_accepts_the_real_stage(self):
+        state = _production_state()
+
+        result = state.start_report(run_id='r', stage='memory_consolidator', project_id='dark_factory')
+
+        assert result['already_started'] is False, result
+
+    @pytest.mark.asyncio
+    async def test_production_state_accepts_every_pipeline_stage(self):
+        from fused_memory.models.reconciliation import StageId
+
+        state = _production_state()
+
+        for stage in StageId:
+            result = state.start_report(
+                run_id=f'run-{stage.value}', stage=stage.value, project_id='dark_factory',
+            )
+            assert result['already_started'] is False, (stage, result)
