@@ -760,6 +760,70 @@ async def test_stop_resolves_finalizing_head_verifying_to_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_stop_resolves_deque_head_verifying_before_its_first_await(
+    git_ops: GitOps, config: OrchestratorConfig,
+) -> None:
+    """stop() must resolve the head's VERIFYING request before its first
+    `await` even while the head is still at _inflight[0] (task 5303).
+
+    FINALIZE-HEAD waits on a running head verify with the head still on the
+    deque, so the _inflight drain would reach it only after stop()'s earlier
+    awaits -- here the worktree cleanup of an item awaiting verify -- and the
+    verifier loop can finalize it during any of them.
+    """
+    head_wt = await _make_branch_with_file(
+        git_ops, 'deque-head-shutdown', 'deque_head.py', 'h = 1\n',
+    )
+    waiter_wt = await _make_branch_with_file(
+        git_ops, 'deque-waiter-shutdown', 'deque_waiter.py', 'w = 1\n',
+    )
+    head = _make_request('deque-head-shutdown', 'deque-head-shutdown', head_wt, config)
+    waiter = _make_request(
+        'deque-waiter-shutdown', 'deque-waiter-shutdown', waiter_wt, config,
+    )
+
+    block_event = asyncio.Event()
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, verifier=FakeVerifier(default=hangs_until(block_event)),
+    )
+    worker_task = asyncio.create_task(worker.run())
+    await queue.put(head)
+    await queue.put(waiter)
+
+    for _ in range(200):
+        snap = worker.snapshot()
+        vip = snap['verify_in_progress']
+        states = {e['task_id']: e['state'] for e in snap['entries']}
+        if (
+            vip is not None and vip['task_id'] == head.task_id
+            and states.get(waiter.task_id) == 'awaiting_verify'
+        ):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail(f'never reached head verifying + waiter queued: {worker.snapshot()!r}')
+
+    stop_task = asyncio.ensure_future(worker.stop())
+    await asyncio.sleep(0)
+
+    try:
+        assert head.result.done(), (
+            "stop()'s first await was reached with the deque head's Future "
+            'still pending'
+        )
+        assert head.result.result() == MergeOutcome(
+            'blocked', reason=MERGE_WORKER_SHUTDOWN_REASON,
+        )
+    finally:
+        block_event.set()
+        await stop_task
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+
+
+@pytest.mark.asyncio
 async def test_verifying_merge_survives_graceful_restart_and_recovers(
     git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
 ) -> None:

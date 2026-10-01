@@ -547,6 +547,60 @@
           "current": 6641
         }
       ]
+    },
+    {
+      "task_id": "5303",
+      "reason": "host-free wakeup: FINALIZE-HEAD re-enters DISPATCH-FILL while the head verifies and an empty lane polls for a host for a parked item, and stop() pre-empts a deque head (3277/4929)",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 2134,
+          "current": 2156
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_verifier_loop",
+          "baseline": 245,
+          "current": 250
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::stop",
+          "baseline": 109,
+          "current": 111
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21640,
+          "current": 21701
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12344,
+          "current": 12369
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4730,
+          "current": 4752
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56271,
+          "current": 56332
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31571,
+          "current": 31596
+        }
+      ]
     }
   ]
 }
