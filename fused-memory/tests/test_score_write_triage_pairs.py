@@ -109,20 +109,26 @@ SYNTH_VERDICTS = [
     _vote('w6', 't6', 'EXTENDS', 'a'),
 ]
 
+CAND_RUNTIME: dict[str, Any] = {
+    'judge_seconds': 2.0,
+    'judge_model': 'gpt-6.1-sol',
+    'usage': {'prompt_tokens': 1000, 'completion_tokens': 500},
+}
+
 SYNTH_CASES = [
-    _judged('ref', 'w1', 'amended', 't1'),
-    _judged('ref', 'w2', 'amended', 't2'),
-    _judged('ref', 'w3', 'restated', 't3'),
-    _judged('ref', 'w4', 'contested', 't4'),
-    _judged('ref', 'w5', 'amended', 't5'),
-    _judged('ref', 'w6', 'stored'),
+    _judged('ref', 'w1', 'amended', 't1', judge_seconds=1.0),
+    _judged('ref', 'w2', 'amended', 't2', judge_seconds=2.0),
+    _judged('ref', 'w3', 'restated', 't3', judge_seconds=3.0),
+    _judged('ref', 'w4', 'contested', 't4', judge_seconds=4.0),
+    _judged('ref', 'w5', 'amended', 't5', judge_seconds=5.0),
+    _judged('ref', 'w6', 'stored', judge_seconds=6.0),
     _deterministic('ref'),
-    _judged('cand', 'w1', 'restated', 't1'),
-    _judged('cand', 'w2', 'contested', 't2'),
-    _judged('cand', 'w3', 'stored', parse_failure=True),
-    _judged('cand', 'w4', 'amended', 't4'),
-    _judged('cand', 'w5', 'stored'),
-    _judged('cand', 'w6', 'amended', 't6'),
+    _judged('cand', 'w1', 'restated', 't1', **CAND_RUNTIME),
+    _judged('cand', 'w2', 'contested', 't2', **CAND_RUNTIME),
+    _judged('cand', 'w3', 'stored', parse_failure=True, **CAND_RUNTIME),
+    _judged('cand', 'w4', 'amended', 't4', **CAND_RUNTIME),
+    _judged('cand', 'w5', 'stored', **CAND_RUNTIME),
+    _judged('cand', 'w6', 'amended', 't6', **CAND_RUNTIME),
     _deterministic('cand'),
 ]
 
@@ -347,6 +353,66 @@ class TestQuality:
         assert set(_synth_result()['arms'][arm]['quality']) == QUALITY_KEYS
 
 
+class TestRuntime:
+    def test_reference_arm_runtime(self) -> None:
+        assert _synth_result()['arms']['ref']['runtime'] == {
+            'judge_calls': 6,
+            'untimed_calls': 0,
+            'p50_judge_seconds': 3.0,
+            'p95_judge_seconds': 6.0,
+            'judge_models': ['gpt-4o-mini'],
+            'unpriced_calls': 0,
+            'cost_per_write_usd': 0.00021,
+        }
+
+    def test_candidate_arm_runtime(self) -> None:
+        expected = {
+            'p50_judge_seconds': 2.0,
+            'p95_judge_seconds': 2.0,
+            'judge_models': ['gpt-6.1-sol'],
+            'cost_per_write_usd': 0.007,
+        }
+        assert _subset(_synth_result()['arms']['cand']['runtime'], expected) == expected
+
+    @pytest.mark.parametrize('arm', ['ref', 'cand'])
+    def test_deterministic_band_rows_are_never_judge_calls(self, arm: str) -> None:
+        report = _synth_result()['arms'][arm]
+        assert report['runtime']['judge_calls'] == report['population']['n_judge_band']
+
+    @pytest.mark.parametrize('degraded', [
+        {'judge_model': 'gpt-9-unpriced'},
+        {'usage': None},
+    ])
+    def test_an_unpriced_call_nulls_the_cost_rather_than_averaging_the_rest(
+        self, degraded: dict[str, Any],
+    ) -> None:
+        cases = [
+            _judged('solo', 'w1', 'amended', 't1', **degraded),
+            _judged('solo', 'w6', 'stored'),
+        ]
+        runtime = _score(cases, SYNTH_VERDICTS, reference_arm='solo')['arms']['solo']['runtime']
+        assert (runtime['unpriced_calls'], runtime['cost_per_write_usd']) == (1, None)
+
+    def test_an_untimed_call_nulls_both_percentiles(self) -> None:
+        cases = [
+            _judged('solo', 'w1', 'amended', 't1', judge_seconds=None),
+            _judged('solo', 'w6', 'stored'),
+        ]
+        runtime = _score(cases, SYNTH_VERDICTS, reference_arm='solo')['arms']['solo']['runtime']
+        expected = {'untimed_calls': 1, 'p50_judge_seconds': None, 'p95_judge_seconds': None}
+        assert _subset(runtime, expected) == expected
+
+    def test_the_result_carries_the_dated_list_price_table(self) -> None:
+        prices = _synth_result()['list_prices']
+        assert set(prices) == {'as_of', 'source', 'usd_per_million_tokens'}
+        assert (prices['as_of'], prices['source']) == (
+            '2026-09-30', 'https://developers.openai.com/api/docs/pricing',
+        )
+        per_model = prices['usd_per_million_tokens']
+        assert per_model['gpt-4o-mini'] == {'input': 0.15, 'output': 0.60}
+        assert per_model['gpt-6.1-sol'] == {'input': 2.00, 'output': 10.00}
+
+
 class TestSeedRegression:
     def test_verdict_corpus(self) -> None:
         assert _seed_result()['verdict_corpus'] == {
@@ -408,3 +474,18 @@ class TestSeedRegression:
     ])
     def test_quality(self, arm: str, expected: dict[str, Any]) -> None:
         assert _subset(_seed_result()['arms'][arm]['quality'], expected) == expected
+
+    @pytest.mark.parametrize(('arm', 'p50', 'p95', 'cost'), [
+        (SEED_REFERENCE, 0.872, 1.059, 0.000349),
+        (SEED_CANDIDATE, 0.959, 1.263, 0.000954),
+    ])
+    def test_runtime(self, arm: str, p50: float, p95: float, cost: float) -> None:
+        runtime = _seed_result()['arms'][arm]['runtime']
+        counts = {
+            'judge_calls': 73, 'untimed_calls': 0, 'unpriced_calls': 0,
+            'judge_models': ['gpt-4o-mini'],
+        }
+        assert _subset(runtime, counts) == counts
+        assert runtime['p50_judge_seconds'] == pytest.approx(p50, abs=5e-4)
+        assert runtime['p95_judge_seconds'] == pytest.approx(p95, abs=5e-4)
+        assert runtime['cost_per_write_usd'] == pytest.approx(cost, abs=5e-7)
