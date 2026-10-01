@@ -71,6 +71,7 @@ async def test_an_empty_install_emits_no_reservation_installed_and_one_blocked_e
         'attempts': 1,
         'skip_count': 1,
         'priority': 'high',
+        'source': 'fairness',
     }, 'empty install: blocked payload'
     assert 'T' not in scheduler.lock_table.snapshot_parks(), 'empty install: T parks nothing'
 

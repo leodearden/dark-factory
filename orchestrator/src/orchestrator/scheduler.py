@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, MutableSet, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, overload, runtime_checkable
 
@@ -5424,22 +5425,48 @@ class Scheduler:
         self._streak_park_install_blocked.clear(task_id)
         if not self.lock_table.has_parks(task_id):
             return
+        source = self.lock_table.reservation_source(task_id)
         restored_pairs = self.lock_table.clear_parks_for(task_id)
-        if not self.event_store:
-            return
-        self.event_store.emit(
+        self._emit_reservation(
             EventType.reservation_used,
-            task_id=task_id,
-            data={'modules': modules, 'priority': priority},
+            task_id,
+            {'modules': modules, 'priority': priority},
+            source=source,
         )
-        for restored_owner, restored_modules in restored_pairs:
+        self._emit_reservations_restored(restored_pairs)
+
+    def _emit_reservation(
+        self,
+        event_type: EventType,
+        task_id: str,
+        data: dict[str, Any],
+        *,
+        source: ReservationSource,
+    ) -> None:
+        """Emit one ``reservation_*`` event, stamped with its ``source`` (task 6040).
+
+        Every reservation event goes through here, so ``data.source`` is
+        present on all of them and its absence never has to mean anything.
+        """
+        if self.event_store:
             self.event_store.emit(
+                event_type, task_id=task_id, data=data | {'source': source.value}
+            )
+
+    def _emit_reservations_restored(
+        self, restored_pairs: list[tuple[str, list[str]]]
+    ) -> None:
+        """``reservation_restored`` for each owner a park removal re-exposed.
+
+        Called AFTER the removal: the source is the restored owner's own,
+        read from the table as it now stands.
+        """
+        for restored_owner, restored_modules in restored_pairs:
+            self._emit_reservation(
                 EventType.reservation_restored,
-                task_id=restored_owner,
-                data={
-                    'restored_owner': restored_owner,
-                    'modules': restored_modules,
-                },
+                restored_owner,
+                {'restored_owner': restored_owner, 'modules': restored_modules},
+                source=self.lock_table.reservation_source(restored_owner),
             )
 
     def _complete_parks(
@@ -5472,6 +5499,7 @@ class Scheduler:
         (:meth:`_settle_fairness_on_dispatch`).
         """
         streak = self._streak_park_install_blocked
+        source = ReservationSource.FAIRNESS
         remainder = self.lock_table.unparked_modules(task_id, modules)
         if not remainder:
             streak.clear(task_id)
@@ -5483,31 +5511,28 @@ class Scheduler:
                 'Task %s reserved modules %s (skip_count=%d, tier=%s)',
                 task_id, installed, skip_count, tier,
             )
-            if self.event_store:
-                self.event_store.emit(
-                    EventType.reservation_installed,
-                    task_id=task_id,
-                    data={
-                        'modules': installed,
-                        'skip_count': skip_count,
-                        'priority': tier,
+            self._emit_reservation(
+                EventType.reservation_installed,
+                task_id,
+                {'modules': installed, 'skip_count': skip_count, 'priority': tier},
+                source=source,
+            )
+            # Emit reservation_shadowed (non-destructive shadow) for each
+            # lower-priority owner whose park was pushed beneath task_id.
+            # reservation_evicted is RETAINED as an enum member for historical
+            # event-log back-compat but is no longer emitted on preemption.
+            for victim, victim_modules in shadowed_pairs:
+                self._emit_reservation(
+                    EventType.reservation_shadowed,
+                    task_id,
+                    {
+                        'modules': victim_modules,
+                        'preempted_by': task_id,
+                        'preempted_by_priority': tier,
+                        'victim': victim,
                     },
+                    source=source,
                 )
-                # Emit reservation_shadowed (non-destructive shadow) for each
-                # lower-priority owner whose park was pushed beneath task_id.
-                # reservation_evicted is RETAINED as an enum member for historical
-                # event-log back-compat but is no longer emitted on preemption.
-                for victim, victim_modules in shadowed_pairs:
-                    self.event_store.emit(
-                        EventType.reservation_shadowed,
-                        task_id=task_id,
-                        data={
-                            'modules': victim_modules,
-                            'preempted_by': task_id,
-                            'preempted_by_priority': tier,
-                            'victim': victim,
-                        },
-                    )
         if not blocked:
             streak.clear(task_id)
             return
@@ -5519,19 +5544,19 @@ class Scheduler:
             'park holds them (attempt %d, skip_count=%d, tier=%s)',
             task_id, blocked, attempts, skip_count, tier,
         )
-        if self.event_store:
-            self.event_store.emit(
-                EventType.reservation_install_blocked,
-                task_id=task_id,
-                data={
-                    'requested': remainder,
-                    'installed': installed,
-                    'blocked': blocked,
-                    'attempts': attempts,
-                    'skip_count': skip_count,
-                    'priority': tier,
-                },
-            )
+        self._emit_reservation(
+            EventType.reservation_install_blocked,
+            task_id,
+            {
+                'requested': remainder,
+                'installed': installed,
+                'blocked': blocked,
+                'attempts': attempts,
+                'skip_count': skip_count,
+                'priority': tier,
+            },
+            source=source,
+        )
 
     # --- Value/h scoring helpers (P1/P2/P3) -----------------------------
 
@@ -5906,13 +5931,14 @@ class Scheduler:
             return
         for task_id in self._park_eviction_store.drain(self._project_root):
             # D4 guard: refuse eviction of a live, dispatchable owner.
+            source = self.lock_table.reservation_source(task_id)
             if self._owner_is_live_dispatchable(task_id, status_map, tasks_by_id):
-                if self.event_store:
-                    self.event_store.emit(
-                        EventType.reservation_force_evict_refused,
-                        task_id=task_id,
-                        data={'reason': 'live_owner'},
-                    )
+                self._emit_reservation(
+                    EventType.reservation_force_evict_refused,
+                    task_id,
+                    {'reason': 'live_owner'},
+                    source=source,
+                )
                 continue
             modules, restored = self.lock_table.force_clear(task_id)
             self._skip_count.pop(task_id, None)
@@ -5926,22 +5952,14 @@ class Scheduler:
             # was actually cleared.  Operators who see no event after enqueueing
             # can infer the park was already gone.  See design decision
             # §"Emit reservation_force_evicted only when … modules non-empty".
-            if modules and self.event_store:
-                self.event_store.emit(
+            if modules:
+                self._emit_reservation(
                     EventType.reservation_force_evicted,
-                    task_id=task_id,
-                    data={'owner': task_id, 'modules': modules},
+                    task_id,
+                    {'owner': task_id, 'modules': modules},
+                    source=source,
                 )
-            if self.event_store:
-                for restored_owner, restored_mods in restored:
-                    self.event_store.emit(
-                        EventType.reservation_restored,
-                        task_id=restored_owner,
-                        data={
-                            'restored_owner': restored_owner,
-                            'modules': restored_mods,
-                        },
-                    )
+            self._emit_reservations_restored(restored)
 
     def _note_fm_read_failure(self) -> None:
         """Record one more consecutive fm-read-failure tick (survey C3).
@@ -6443,41 +6461,52 @@ class Scheduler:
         missing / deps-unsatisfied has no reason to keep blocking other
         tasks, so it's evicted now. Always continues.
         """
-        def _park_gc(tid: str) -> bool:
-            status = ctx.status_map.get(tid)
-            if status in TERMINAL_STATUSES:
-                return True
-            if tid not in ctx.tasks_by_id:
-                return True
-            return not self._deps_satisfied(ctx.tasks_by_id[tid], ctx.status_map, ctx.tasks_by_id)
-
-        gc_evicted, gc_restored = self.lock_table.prune_owners(_park_gc)
-        for owner in gc_evicted:
+        for owner in self._expire_parks(partial(self._park_gc_reason, ctx)):
             self._skip_count.pop(owner, None)
-            if self.event_store:
-                owner_status = ctx.status_map.get(owner)
-                if owner_status in TERMINAL_STATUSES:
-                    reason = f'terminal:{owner_status}'
-                elif owner not in ctx.tasks_by_id:
-                    reason = 'missing'
-                else:
-                    reason = 'deps_unsatisfied'
-                self.event_store.emit(
-                    EventType.reservation_expired,
-                    task_id=owner,
-                    data={'reason': reason},
-                )
-        if self.event_store:
-            for restored_owner, restored_modules in gc_restored:
-                self.event_store.emit(
-                    EventType.reservation_restored,
-                    task_id=restored_owner,
-                    data={
-                        'restored_owner': restored_owner,
-                        'modules': restored_modules,
-                    },
-                )
         return _CONTINUE
+
+    def _park_gc_reason(self, ctx: TickContext, owner: str) -> str | None:
+        """Why park GC expires *owner*'s parks, or None to keep them.
+
+        ``'terminal:<status>'``, ``'missing'`` (absent from the task read) or
+        ``'deps_unsatisfied'`` — an owner in any of these has no reason to keep
+        blocking other tasks.
+        """
+        status = ctx.status_map.get(owner)
+        if status in TERMINAL_STATUSES:
+            return f'terminal:{status}'
+        if owner not in ctx.tasks_by_id:
+            return 'missing'
+        if not self._deps_satisfied(ctx.tasks_by_id[owner], ctx.status_map, ctx.tasks_by_id):
+            return 'deps_unsatisfied'
+        return None
+
+    def _expire_parks(self, reason_of: Callable[[str], str | None]) -> list[str]:
+        """Remove every park owner *reason_of* names a reason for; return them.
+
+        THE one place ``reservation_expired`` is built.  Each evicted owner's
+        reason and source are captured while ``prune_owners`` evaluates the
+        predicate, i.e. before any owner is removed, then ``reservation_expired``
+        is emitted per evicted owner, followed by ``reservation_restored`` for
+        every shadow the removals exposed.
+        """
+        expiring: dict[str, tuple[str, ReservationSource]] = {}
+
+        def _expires(owner: str) -> bool:
+            reason = reason_of(owner)
+            if reason is None:
+                return False
+            expiring[owner] = (reason, self.lock_table.reservation_source(owner))
+            return True
+
+        evicted, restored = self.lock_table.prune_owners(_expires)
+        for owner in evicted:
+            reason, source = expiring[owner]
+            self._emit_reservation(
+                EventType.reservation_expired, owner, {'reason': reason}, source=source
+            )
+        self._emit_reservations_restored(restored)
+        return evicted
 
     async def _phase_stale_sweep(self, ctx: TickContext) -> object:
         """Hygiene: sweep stale per-task bookkeeping + streak counters.
@@ -8593,16 +8622,7 @@ class Scheduler:
         # has been recorded above, so the hold this judges is the one the
         # predictor just closed.
         self._settle_backfill_grant(task_id)
-        if self.event_store:
-            for restored_owner, restored_modules in restored_pairs:
-                self.event_store.emit(
-                    EventType.reservation_restored,
-                    task_id=restored_owner,
-                    data={
-                        'restored_owner': restored_owner,
-                        'modules': restored_modules,
-                    },
-                )
+        self._emit_reservations_restored(restored_pairs)
 
     # --- Public liveness accessors (task 2235, W10-α) ---
     # Replace the Harness's direct reach-ins into Scheduler-private liveness
