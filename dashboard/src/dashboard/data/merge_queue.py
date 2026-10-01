@@ -18,7 +18,9 @@ import asyncio
 import json
 import logging
 import math
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TypedDict
 
@@ -236,129 +238,91 @@ async def queue_depth_timeseries(
 
 
 # ---------------------------------------------------------------------------
-# 2. Outcome distribution
+# 2. Merge attempts — one window read behind the outcome chart and the latency
 # ---------------------------------------------------------------------------
 
-async def outcome_distribution(
+@dataclass(frozen=True, slots=True)
+class MergeAttempts:
+    """Every merge_attempt of one window, read once.
+
+    The outcome chart and the latency block are two projections of this one
+    row set, so the chart's total always equals ``with_duration +
+    without_duration`` — a headline can never count a subset of what the
+    donut beside it counts (PRD dashboard-one-datum-one-path, sketch #9).
+
+    Attributes:
+        outcomes: Every attempt counted by outcome; an unrecorded outcome
+            counts as ``'unknown'``.
+        durations: The attempts' positive ``duration_ms`` values, sorted
+            ascending. Attempts with a NULL or zero duration are counted in
+            :attr:`outcomes` and absent here.
+    """
+
+    outcomes: Mapping[str, int] = field(default_factory=dict)
+    durations: tuple[float, ...] = ()
+
+    def outcome_chart(self) -> ChartData:
+        """Outcomes by count descending, ties alphabetical, zero counts omitted."""
+        ordered = sorted(
+            ((label, count) for label, count in self.outcomes.items() if count),
+            key=lambda item: (-item[1], item[0]),
+        )
+        return {
+            'labels': [label for label, _ in ordered],
+            'values': [count for _, count in ordered],
+        }
+
+    def latency(self) -> dict:
+        """Centiles and mean over the timed attempts, and the timed/untimed split."""
+        with_duration = len(self.durations)
+        without_duration = sum(self.outcomes.values()) - with_duration
+        if not self.durations:
+            return {
+                'p50': 0, 'p95': 0, 'p99': 0, 'mean_ms': 0.0,
+                'with_duration': 0, 'without_duration': without_duration,
+            }
+        return {
+            'p50': round(percentile(self.durations, 50)),
+            'p95': round(percentile(self.durations, 95)),
+            'p99': round(percentile(self.durations, 99)),
+            'mean_ms': sum(self.durations) / with_duration,
+            'with_duration': with_duration,
+            'without_duration': without_duration,
+        }
+
+
+async def merge_attempts(
     db: aiosqlite.Connection | None,
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> ChartData:
-    """Count merge_attempt events by outcome within the window.
-
-    Returns ChartData with outcomes ordered by count descending; ties are
-    broken alphabetically. Outcomes with no events in the window are omitted
-    (count=0 entries are dropped).
+) -> MergeAttempts:
+    """Read every merge_attempt in the window with ONE query.
 
     Args:
-        db: aiosqlite connection, or None (returns empty ChartData).
+        db: aiosqlite connection, or None (returns an empty record).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
-            is used. Pass an explicit value to get deterministic results or to
-            share a single timestamp across concurrent per-DB calls.
+            is used. Pass an explicit value to share a timestamp with sibling calls.
     """
     if db is None:
-        return {'labels': [], 'values': []}
+        return MergeAttempts()
 
-    async def _query(conn: aiosqlite.Connection) -> ChartData:
-        since = _cutoff_iso(hours, now=now)
+    async def _query(conn: aiosqlite.Connection) -> MergeAttempts:
         rows = await conn.execute_fetchall(
-            "SELECT json_extract(data, '$.outcome') AS outcome, COUNT(*) AS cnt "
+            "SELECT json_extract(data, '$.outcome') AS outcome, duration_ms "
             "FROM events "
-            "WHERE event_type = 'merge_attempt' AND timestamp >= ? "
-            "GROUP BY outcome",
-            (since,),
+            "WHERE event_type = 'merge_attempt' AND timestamp >= ?",
+            (_cutoff_iso(hours, now=now),),
         )
-
-        counts: dict[str, int] = {}
-        for row in rows:
-            outcome = row['outcome'] or 'unknown'
-            counts[outcome] = row['cnt']
-
-        if not counts:
-            return {'labels': [], 'values': []}
-
-        # Count descending; ties broken alphabetically.
-        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-        labels: list[str] = [k for k, _ in ordered]
-        values: list[int | float] = [v for _, v in ordered]
-
-        return {'labels': labels, 'values': values}
-
-    return await with_db(db, _query, {'labels': [], 'values': []})
-
-
-# ---------------------------------------------------------------------------
-# 3. Latency stats
-# ---------------------------------------------------------------------------
-
-async def _get_durations(
-    db: aiosqlite.Connection | None,
-    *,
-    hours: int = 24,
-    now: datetime | None = None,
-) -> list[float]:
-    """Return sorted list of non-null merge_attempt duration_ms values.
-
-    Args:
-        db: aiosqlite connection, or None (returns empty list).
-        hours: Look-back window in hours (default 24).
-        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
-            is used. Pass an explicit value to share a timestamp with sibling calls.
-    """
-    if db is None:
-        return []
-
-    async def _query(conn: aiosqlite.Connection) -> list[float]:
-        since = _cutoff_iso(hours, now=now)
-        rows = await conn.execute_fetchall(
-            "SELECT duration_ms FROM events "
-            "WHERE event_type = 'merge_attempt' "
-            "  AND timestamp >= ? "
-            "  AND duration_ms IS NOT NULL "
-            "  AND duration_ms > 0 "
-            "ORDER BY duration_ms",
-            (since,),
+        outcomes = Counter(row['outcome'] or 'unknown' for row in rows)
+        durations = sorted(
+            float(row['duration_ms']) for row in rows
+            if row['duration_ms'] is not None and row['duration_ms'] > 0
         )
-        return [float(row['duration_ms']) for row in rows]
+        return MergeAttempts(outcomes=dict(outcomes), durations=tuple(durations))
 
-    return await with_db(db, _query, [])
-
-
-def _compute_latency_stats(durations: list[float]) -> dict:
-    """Compute latency stats dict from a sorted list of durations."""
-    if not durations:
-        return {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
-    return {
-        'p50': round(percentile(durations, 50)),
-        'p95': round(percentile(durations, 95)),
-        'p99': round(percentile(durations, 99)),
-        'count': len(durations),
-        'mean_ms': sum(durations) / len(durations),
-    }
-
-
-async def latency_stats(
-    db: aiosqlite.Connection | None,
-    *,
-    hours: int = 24,
-    now: datetime | None = None,
-) -> dict:
-    """P50/P95/P99 latency and count for merge_attempt events.
-
-    Returns {'p50': int, 'p95': int, 'p99': int, 'count': int,
-             'mean_ms': float}.
-    When no rows have non-null duration_ms, returns all zeros with count=0.
-
-    Args:
-        db: aiosqlite connection, or None (returns all-zeros dict).
-        hours: Look-back window in hours (default 24).
-        now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
-            is used. Pass an explicit value to share a timestamp with sibling calls.
-    """
-    durations = await _get_durations(db, hours=hours, now=now)
-    return _compute_latency_stats(durations)
+    return await with_db(db, _query, MergeAttempts())
 
 
 # ---------------------------------------------------------------------------
@@ -963,17 +927,14 @@ async def build_per_project_merge_queue(
         Dict ``{pid: {depth_timeseries, outcomes, latency, recent, recent_total, speculative, active, train_events, train_throughput}}``.
     """
     _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
-    _DEFAULT_OUTCOMES: ChartData = {'labels': [], 'values': []}
-    _DEFAULT_LATENCY = {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
     _DEFAULT_SPEC = {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
     _DEFAULT_RECENT: RecentMerges = {'rows': [], 'total': 0}
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
         try:
-            depth_r, outcomes_r, latency_r, recent_r, spec_r, active_r, train_r, throughput_r = await asyncio.gather(
+            depth_r, attempts_r, recent_r, spec_r, active_r, train_r, throughput_r = await asyncio.gather(
                 queue_depth_timeseries(db, hours=hours, now=now),
-                outcome_distribution(db, hours=hours, now=now),
-                latency_stats(db, hours=hours, now=now),
+                merge_attempts(db, hours=hours, now=now),
                 recent_merges(db, limit=RECENT_MERGES_CAP, hours=hours, now=now),
                 speculative_stats(db, hours=hours, now=now),
                 active_queued_merges(db, ttl_minutes=30, now=now),
@@ -982,8 +943,7 @@ async def build_per_project_merge_queue(
                 return_exceptions=True,
             )
             depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
-            outcomes = safe_gather_result(outcomes_r, _DEFAULT_OUTCOMES, f'{pid}/outcomes')
-            latency = safe_gather_result(latency_r, _DEFAULT_LATENCY, f'{pid}/latency')
+            attempts = safe_gather_result(attempts_r, MergeAttempts(), f'{pid}/attempts')
             recent = safe_gather_result(recent_r, _DEFAULT_RECENT, f'{pid}/recent')
             spec = safe_gather_result(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
             active_list = safe_gather_result(active_r, [], f'{pid}/active')
@@ -991,8 +951,8 @@ async def build_per_project_merge_queue(
             train_throughput = safe_gather_result(throughput_r, dict(_TRAIN_THROUGHPUT_DEFAULT), f'{pid}/train_throughput')
             return pid, {
                 'depth_timeseries': depth,
-                'outcomes': outcomes,
-                'latency': latency,
+                'outcomes': attempts.outcome_chart(),
+                'latency': attempts.latency(),
                 'recent': recent['rows'],
                 'recent_total': recent['total'],
                 'speculative': spec,
@@ -1008,8 +968,8 @@ async def build_per_project_merge_queue(
             )
             return pid, {
                 'depth_timeseries': _DEFAULT_DEPTH,
-                'outcomes': _DEFAULT_OUTCOMES,
-                'latency': _DEFAULT_LATENCY,
+                'outcomes': MergeAttempts().outcome_chart(),
+                'latency': MergeAttempts().latency(),
                 'recent': [],
                 'recent_total': 0,
                 'speculative': _DEFAULT_SPEC,
