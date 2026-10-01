@@ -36,10 +36,16 @@
 # we just stopped, mid-sync), then the services; sync; then services; then the
 # timer last. The watchdog only port-probes — it does NOT repair a missing/stale
 # venv, so a unit must be pre-synced by THIS script before it can start.
+#
+# uv is resolved via scripts/lib/resolve_uv.sh::require_uv_bin BEFORE anything is
+# stopped, so a missing uv aborts with the fleet still up rather than after it is
+# all down.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UV=/home/leo/.local/bin/uv
+# shellcheck source=lib/resolve_uv.sh
+source "$REPO_ROOT/scripts/lib/resolve_uv.sh" || { echo "${0##*/}: ERROR: cannot load the shared uv resolver $REPO_ROOT/scripts/lib/resolve_uv.sh -- refusing to stop the fleet without a uv to rebuild it with." >&2; exit 127; }
+UV="$(require_uv_bin)" || exit $?
 
 # Every committed scripts/orchestrator-*.service unit EXCEPT orchestrator-watchdog
 # (the probe, whose TIMER is stopped first and started last below). All of them run
