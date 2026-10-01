@@ -8113,14 +8113,7 @@ class TaskWorkflow:
                     logger.info('Task %s: archived reviews to %s', self.task_id, archive_dir.name)
 
             if review_cycle >= self.config.max_review_cycles:
-                self._escalate_review_issues(
-                    reviews,
-                    suggestion_disposition=(
-                        SuggestionDisposition.DROPPED if reviews.suggestions
-                        else SuggestionDisposition.NONE
-                    ),
-                )
-                return WorkflowOutcome.ESCALATED
+                return await self._exit_review_cycles_exhausted(reviews)
 
             # Re-plan based on review feedback
             logger.info(
@@ -17021,6 +17014,26 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'Task {self.task_id}: submitted {len(suggestions)} suggestions '
             f'for steward triage ({esc.id})'
         )
+
+    async def _exit_review_cycles_exhausted(
+        self, reviews: ReviewAggregation,
+    ) -> WorkflowOutcome:
+        """The review-cap exit: route suggestions like the DONE exit, then escalate.
+
+        Routing is best-effort; the blocking escalation is mandatory and
+        inlines the suggestion content whatever the routing outcome.
+        """
+        try:
+            disposition = await self._route_review_suggestions_to_curator(reviews)
+        except Exception:
+            logger.warning(
+                'Task %s: suggestion routing failed at the review-cap exit; '
+                'escalating with the content inlined',
+                self.task_id, exc_info=True,
+            )
+            disposition = SuggestionDisposition.ERROR
+        self._escalate_review_issues(reviews, suggestion_disposition=disposition)
+        return WorkflowOutcome.ESCALATED
 
     def _escalate_review_issues(
         self,
