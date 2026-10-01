@@ -349,6 +349,88 @@ class TestClosureSupersedes:
         assert _closure(members).closed is True
 
 
+class TestClosureRoutesProbeConfirmedClaims:
+    """A claimed-absorbed id the existence probe found LIVE is a false closure
+    claim, so it is ``absorbed_member_still_live`` — not an unstamped stray.
+
+    The probe hands such ids in through *unstamped_live_ids* because the topic
+    scroll cannot see them; the sole canonical's claim decides which of them
+    are a contradicted absorption rather than an unstamped member.
+    """
+
+    _CLAIMED = _uuid(42)
+
+    def _claiming(self, claim):
+        return [_member(_uuid(1), canonical=True, supersedes=claim), _member(_uuid(2))]
+
+    def _named(self, verdict, code):
+        return [r for r in verdict.reasons if r['code'] == code]
+
+    def test_a_probe_confirmed_claimed_id_is_absorbed_member_still_live(self):
+        x = self._CLAIMED
+        verdict = _closure(self._claiming([x]), unstamped_live_ids=[x])
+        assert verdict.closed is False
+        assert _codes(verdict) == ['absorbed_member_still_live']
+        assert self._named(verdict, 'absorbed_member_still_live')[0]['ids'] == [x]
+        assert 'unstamped_cluster_member' not in _codes(verdict)
+
+    def test_scroll_and_probe_hits_share_one_reason(self):
+        a, b = _uuid(3), _uuid(4)
+        members = [_member(_uuid(1), canonical=True, supersedes=[a, b]), _member(a)]
+        verdict = _closure(members, unstamped_live_ids=[b])
+        named = self._named(verdict, 'absorbed_member_still_live')
+        assert len(named) == 1
+        assert named[0]['ids'] == [a, b]
+        assert 'unstamped_cluster_member' not in _codes(verdict)
+
+    def test_a_probe_confirmed_claim_survives_truncation(self):
+        """Presence-based: the store proved the id exists, so a partial scroll
+        cannot make the contradiction unprovable."""
+        x = self._CLAIMED
+        codes = _codes(
+            _closure(
+                self._claiming([x]),
+                unstamped_live_ids=[x],
+                scroll_truncated=True,
+                scroll_total=2,
+            )
+        )
+        assert 'scroll_incomplete' in codes
+        assert 'absorbed_member_still_live' in codes
+
+    def test_routing_is_case_insensitive(self):
+        mixed = 'abcdef00-0000-4000-8000-00000000004a'
+        assert mixed.upper() != mixed
+        verdict = _closure(
+            self._claiming([mixed.upper()]), unstamped_live_ids=[mixed]
+        )
+        named = self._named(verdict, 'absorbed_member_still_live')
+        assert named and named[0]['ids'] == [mixed.upper()]
+        assert 'unstamped_cluster_member' not in _codes(verdict)
+
+    def test_without_a_sole_canonical_a_probed_id_stays_unstamped(self):
+        x = self._CLAIMED
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=[x]),
+            _member(_uuid(2), canonical=True),
+        ]
+        codes = _codes(_closure(members, unstamped_live_ids=[x]))
+        assert 'multiple_canonicals' in codes
+        assert 'unstamped_cluster_member' in codes
+        assert 'absorbed_member_still_live' not in codes
+
+    def test_a_waiver_reaches_a_probe_confirmed_claim(self):
+        x = self._CLAIMED
+        verdict = _closure(
+            self._claiming([x]),
+            gate_block={'topic': _TOPIC, 'considered_and_kept': [_waiver(x)]},
+            unstamped_live_ids=[x],
+        )
+        assert verdict.closed is True
+        assert [w['id'] for w in verdict.waived] == [x]
+        assert 'stale_waiver' not in _codes(verdict)
+
+
 def _waiver(mid, note='curator judged this entry a legitimate separate claim'):
     return {
         'id': mid,
