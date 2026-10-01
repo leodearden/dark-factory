@@ -195,7 +195,7 @@ def find_trailing_slash_mcp_urls(source: str, *, filename: str) -> list[tuple[in
     # vs 6.2s for the equivalent sub-walk form. (Parsing those files costs
     # ~7s on top of either, so this is a real but not dominant share; the
     # guard's actual fix for wall clock is caching the walk — see
-    # ``_sweep_hits``.)
+    # ``test_mcp_post_transport.py::_sweep_findings``.)
     nested: set[int] = set()
     for node in ast.walk(tree):
         # A suppressed node's descendants are suppressed too; a tail-owning

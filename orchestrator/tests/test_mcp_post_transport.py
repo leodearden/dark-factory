@@ -30,7 +30,7 @@ from _mcp_transport_harness import (
     RecordingClientFactory,
     RecordingMcpServer,
 )
-from _mcp_url_scan import find_trailing_slash_mcp_urls
+from _mcp_url_scan import SweepFindings, sweep_source
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.workflow import TaskWorkflow
@@ -404,45 +404,7 @@ SWEEP_DIRS = (
 #: makes the sweep check THIS worktree, the copy the task's verify run gates on.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-#: LINES that legitimately build a slashed URL and are NOT raw POSTs, keyed
-#: ``(relpath, stripped_source_line)``.
-#:
-#: PER-LINE, NOT PER-FILE.  A whole-file exemption for
-#: ``fused_memory/server/main.py`` — a ~1200-line module that IS the MCP
-#: server — would make a genuine raw POST added anywhere in it invisible to
-#: the guard, which is the opposite of what an exclusion list is for.
-#:
-#: Keyed on the source TEXT rather than a line number on purpose: the two
-#: ``main.py`` lines below moved from :1083/:1149 to :1118/:1188 in a single
-#: unrelated rebase during this task, so line-pinned entries would fail the
-#: guard on edits that have nothing to do with MCP URLs.  The text is what
-#: makes the entry specific; the file alone is not.
-#:
-#: (An inline ``# mcp-url-sweep: allow <reason>`` marker on each offending
-#: source line would be better still — the justification would live next to
-#: the code and could not silently widen — but adding those markers means
-#: editing ``fused-memory/src/...``, which task 4023 holds no locks for.
-#: Filed as follow-up rather than reached for here.)
-SWEEP_EXCLUSIONS = {
-    # An MCP *config* entry consumed by the Claude CLI's own MCP client, which
-    # follows redirects natively.  A different risk class from a raw POST.
-    (
-        'fused-memory/src/fused_memory/reconciliation/stages/base.py',
-        "'url': f'http://127.0.0.1:{self._recon_report_port}/mcp/',",
-    ),
-    # Display/log strings in ``main.py::run_server``, not URLs ever fetched.
-    (
-        'fused-memory/src/fused_memory/server/main.py',
-        "logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')",
-    ),
-    (
-        'fused-memory/src/fused_memory/server/main.py',
-        "'  Recon Report Endpoint: http://%s:%d/mcp/',",
-    ),
-}
-
-
-#: Co-location tag for the two tests that call ``_sweep_hits``.
+#: Co-location tag for the two tests that call ``_sweep_findings``.
 #:
 #: MEASURED.  The walk reads and ``ast.parse``s 553 files: ~13s of pure work,
 #: 20.5s wall on a machine already running the fleet.  Its timeout budget is
@@ -457,30 +419,28 @@ SWEEP_GROUP = 'mcp_url_sweep'
 
 
 @functools.lru_cache(maxsize=1)
-def _sweep_hits() -> dict[str, tuple[tuple[int, str], ...]]:
-    """Return ``{relpath: hits}`` for every swept file that builds a slashed URL.
+def _sweep_findings() -> dict[str, SweepFindings]:
+    """Return ``{relpath: findings}`` for every swept file with anything to report.
 
-    Shared by the guard and the stale-exclusion check below so both read the
-    same walk — an exclusion list and the sweep it applies to must never be
-    able to disagree about what the tree contains.
+    Shared by the guard and the allow-marker check below so both read the
+    same walk — the markers and the sweep they exempt from must never be able
+    to disagree about what the tree contains.
 
-    CACHED, and returning tuples so the cached value cannot be mutated by
-    either caller.  The walk parses 553 files (measured); it ran twice for a
-    byte-identical result, and each run is the dominant cost of this whole
-    file — against a per-test timeout that only gets tighter under
+    CACHED, and returning frozen findings so the cached value cannot be
+    mutated by either caller.  The walk parses 553 files (measured); it ran
+    twice for a byte-identical result, and each run is the dominant cost of
+    this whole file — against a per-test timeout that only gets tighter under
     ``-n auto`` contention.  Nothing in the tree
     changes between the two calls within a session, so the second is pure
     waste: measured at 0.000004s from cache.
     """
-    found: dict[str, tuple[tuple[int, str], ...]] = {}
+    found: dict[str, SweepFindings] = {}
     for rel_dir in SWEEP_DIRS:
         for path in sorted((REPO_ROOT / rel_dir).rglob('*.py')):
             rel = path.relative_to(REPO_ROOT).as_posix()
-            hits = find_trailing_slash_mcp_urls(
-                path.read_text(encoding='utf-8'), filename=rel
-            )
-            if hits:
-                found[rel] = tuple(hits)
+            findings = sweep_source(path.read_text(encoding='utf-8'), filename=rel)
+            if findings != SweepFindings():
+                found[rel] = findings
     return found
 
 
@@ -523,51 +483,58 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
     MEASURED both directions, against real historical source: run over
     ``git show 2633a244a6:<path>`` the detector fires on exactly the 8 pre-fix
     defect sites (workflow.py 15173/15215/15247/15286, merge_queue.py 16031,
-    and the three operator scripts); run over this tree it flags only the
-    three excluded LINES below.  A guard that cannot fail on the defect it was
-    written for is worth nothing.
+    and the three operator scripts); run over this tree it flags only three
+    deliberate lines, each exempted by an inline
+    ``# mcp-url-sweep: allow <reason>`` marker on the line itself.  A guard
+    that cannot fail on the defect it was written for is worth nothing.
     """
     offenders = [
         f'{rel}:{lineno}: {text}'
-        for rel, hits in sorted(_sweep_hits().items())
-        for lineno, text in hits
-        if (rel, text) not in SWEEP_EXCLUSIONS
+        for rel, findings in sorted(_sweep_findings().items())
+        for lineno, text in findings.offenders
     ]
 
     assert offenders == [], (
         'these build an MCP URL with a trailing slash; the server 307-redirects '
         'it and a bare httpx client discards the payload silently. Use '
-        'shared.mcp_post.post_mcp_tool_call (or mcp_endpoint_url) instead:\n  '
+        'shared.mcp_post.post_mcp_tool_call (or mcp_endpoint_url) instead. If a '
+        'line is genuinely not a fetched URL (an MCP config entry for a '
+        'redirect-following client, or a display/log string), put '
+        '"# mcp-url-sweep: allow <reason>" on that same line:\n  '
         + '\n  '.join(offenders)
     )
 
 
 @pytest.mark.xdist_group(SWEEP_GROUP)
-def test_every_sweep_exclusion_still_earns_its_place():
-    """An exclusion that outlives its offending line must fail, not lurk.
+def test_every_sweep_allow_marker_earns_its_place():
+    """An allow marker that outlives its offending line must fail, not lurk.
 
-    Each entry in ``SWEEP_EXCLUSIONS`` is a hole in the guard above.  If the
-    line that justified one is fixed or reworded, the hole stays open and
-    silently covers whatever a future edit puts in its place.  Requiring every
-    exclusion to still match a LIVE hit turns that into a failing test the
-    moment it goes stale — the entry gets removed instead of masking a
+    Each ``# mcp-url-sweep: allow <reason>`` marker is a hole in the guard
+    above.  If the line that justified one is fixed, the hole stays open and
+    silently covers whatever a future edit puts there.  Requiring every
+    marker to still sit on a LIVE hit turns that into a failing test the
+    moment it goes stale — the marker gets removed instead of masking a
     regression.
 
-    Because the entries are ``(relpath, source_text)`` this also fails when an
-    excluded line is merely REWORDED, which a per-file exemption would have
-    absorbed silently.  Measured today: all three still hit.
+    A malformed marker is reported here too: it exempts nothing, so the guard
+    above already fails on its line, and this names the marker as the reason.
     """
-    live = {
-        (rel, text)
-        for rel, hits in _sweep_hits().items()
-        for _lineno, text in hits
-    }
+    stale = [
+        f'{rel}:{lineno}: {comment}'
+        for rel, findings in sorted(_sweep_findings().items())
+        for lineno, comment in findings.stale_markers
+    ]
+    malformed = [
+        f'{rel}:{lineno}: {comment}'
+        for rel, findings in sorted(_sweep_findings().items())
+        for lineno, comment in findings.malformed_markers
+    ]
 
-    stale = sorted(SWEEP_EXCLUSIONS - live)
-
-    assert stale == [], (
-        'these lines no longer build a slashed MCP URL (moved, reworded or '
-        'deleted), so excluding them from the sweep guard now only hides future '
-        'regressions. Delete the entry from SWEEP_EXCLUSIONS:\n  '
-        + '\n  '.join(f'{rel}: {text}' for rel, text in stale)
+    assert (stale, malformed) == ([], []), (
+        'STALE markers sit on a line that no longer builds a slashed MCP URL, so '
+        'they now only hide future regressions. Delete them:\n  '
+        + '\n  '.join(stale)
+        + '\nMALFORMED markers must read "# mcp-url-sweep: allow <reason>" with a '
+        'non-empty reason; until they do they exempt nothing:\n  '
+        + '\n  '.join(malformed)
     )
