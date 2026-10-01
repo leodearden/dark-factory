@@ -40,7 +40,12 @@ from _merge_lane_fakes import (
     raises,
 )
 from _merge_queue_harness import drive_verify_and_advance
-from _orch_helpers import MERGE_RESULT_TIMEOUT, make_placeholder_future, pydantic_spec
+from _orch_helpers import (
+    MERGE_RESULT_TIMEOUT,
+    make_placeholder_future,
+    pydantic_spec,
+    wait_responsive,
+)
 from _serial_merge_worker import MergeWorker
 from test_merge_queue_concurrent_verify import _fake_verify_result
 
@@ -5154,8 +5159,8 @@ class TestSpeculativeMergeWorker:
             # pre_rebased=True: task-1724 removed the build-time skip_verify=True fast path
             req_n1 = _make_request('rb-n1', 'rb-n1', wt_n1, config, pre_rebased=True)
             await queue.put(req_n1)
-            outcome_n1 = await asyncio.wait_for(
-                req_n1.result, timeout=MERGE_RESULT_TIMEOUT,
+            outcome_n1 = await wait_responsive(
+                req_n1.result, label='pickup_rebase_pre_rebased N+1 result',
             )
 
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
