@@ -9,10 +9,9 @@ physical source line nor part of `resolve_now`'s own definition (the
 sanctioned single clock-read site).
 
 `dashboard/src/dashboard/app.py` — the route/composition layer sitting on
-top of the data layer — is scanned too (see
-`test_no_bare_clock_reads_in_app_composition_layer` below). A future
-regression there (e.g. a route reverting to a per-leg `datetime.now(UTC)`
-instead of one shared capture) would reintroduce exactly the cross-DB
+top of the data layer — is scanned too. A future regression there (e.g. a
+route reverting to a per-leg `datetime.now(UTC)` instead of one shared
+capture) would reintroduce exactly the cross-DB
 clock-skew race this guard exists to prevent, so the route layer needs the
 same protection as the data layer. Route handlers legitimately read the
 clock once per request — there is nothing upstream to inject a `now` from,
@@ -25,7 +24,9 @@ once locally (e.g. a ticket-age computation). Each such site is tagged
 data layer plus every module the composition layer was split into (task
 5586 moved two tagged single-capture routes, `api_burndown` and
 `api_merge_queue`, out of `app.py` into `dashboard/api/`, and the guard
-follows them rather than quietly shedding the coverage). No module beyond
+follows them rather than quietly shedding the coverage). `_scanned_modules`
+is the one definition of that set: every real-tree test below reads it, and
+it fails loudly when any part of the set goes missing. No module beyond
 those is scanned by either guard; that boundary is intentional, not an
 oversight.
 
@@ -50,8 +51,10 @@ flags the function whatever its arguments or letter case. SQL `date()` and
 `strftime()` are not flagged: the data layer uses them for bucket labels and
 integer-epoch arithmetic, never for a lexically compared cutoff. A Python
 `datetime(...)` constructor is a Call node, not a string literal, so it is
-never inspected. The fix is always a cutoff computed in Python and bound as
-a parameter.
+never inspected. A real query's fix is always a cutoff computed in Python
+and bound as a parameter. A literal that only names the function in prose
+(a log or exception message, say) takes the same `# clock-exempt:` tag as a
+`.now()` read, on the line where the literal starts.
 """
 
 from __future__ import annotations
@@ -66,6 +69,11 @@ import pytest
 _EXEMPT_MARKER = '# clock-exempt:'
 _DEFERRED_CONSOLIDATION_TAG = f'{_EXEMPT_MARKER} deferred-consolidation'
 _SQL_DATETIME_CALL = re.compile(r'\bdatetime\s*\(', re.IGNORECASE)
+
+
+def _line_is_exempt(lines: list[str], lineno: int) -> bool:
+    """True when 1-based physical line *lineno* carries the ``# clock-exempt:`` tag."""
+    return _EXEMPT_MARKER in lines[lineno - 1]
 
 
 def find_clock_violations(source: str) -> list[tuple[int, str]]:
@@ -97,12 +105,9 @@ def find_clock_violations(source: str) -> list[tuple[int, str]]:
         if not (isinstance(func, ast.Attribute) and func.attr == 'now'):
             continue
         lineno = func.value.lineno
-        line_text = lines[lineno - 1] if 0 < lineno <= len(lines) else ''
-        if _EXEMPT_MARKER in line_text:
+        if _line_is_exempt(lines, lineno) or _in_resolve_now(lineno):
             continue
-        if _in_resolve_now(lineno):
-            continue
-        violations.append((lineno, line_text))
+        violations.append((lineno, lines[lineno - 1]))
     return violations
 
 
@@ -137,13 +142,16 @@ def find_sql_datetime_violations(source: str) -> list[tuple[int, str]]:
 
     A match is reported off the AST literal, never off a physical line,
     because implicitly concatenated SQL folds into one literal that no
-    single line contains. The excerpt's whitespace is collapsed so a
-    triple-quoted literal cannot put newlines into a joined failure message.
+    single line contains. A literal is exempt when the line it starts on
+    carries ``# clock-exempt:`` — the same escape hatch the ``.now()`` guard
+    honors. The excerpt's whitespace is collapsed so a triple-quoted literal
+    cannot put newlines into a joined failure message.
     """
+    lines = source.splitlines()
     return [
         (lineno, ' '.join(value.split())[:120])
         for lineno, value in _iter_non_docstring_string_literals(ast.parse(source))
-        if _SQL_DATETIME_CALL.search(value)
+        if _SQL_DATETIME_CALL.search(value) and not _line_is_exempt(lines, lineno)
     ]
 
 
@@ -275,6 +283,12 @@ def q():
 
 _PYTHON_DATETIME_CONSTRUCTOR_SOURCE = 'epoch = datetime(1970, 1, 1, tzinfo=UTC)\n'
 
+_PROSE_MESSAGE_TAG = '  # clock-exempt: prose message, not SQL'
+_TAGGED_PROSE_MESSAGE_SOURCE = f'''
+def check():
+    raise TypeError('expected a datetime(...) value'){_PROSE_MESSAGE_TAG}
+'''
+
 
 def test_sql_datetime_folded_literal_fires():
     """A folded multi-line SQL literal is flagged at the line its concatenation starts."""
@@ -329,28 +343,60 @@ def test_python_datetime_constructor_ignored():
     assert find_sql_datetime_violations(_PYTHON_DATETIME_CONSTRUCTOR_SOURCE) == []
 
 
+def test_sql_datetime_exempt_tag_on_start_line_passes():
+    """The `.now()` guard's `# clock-exempt:` escape hatch silences the SQL guard too."""
+    untagged = _TAGGED_PROSE_MESSAGE_SOURCE.replace(_PROSE_MESSAGE_TAG, '')
+
+    assert len(find_sql_datetime_violations(untagged)) == 1, (
+        'fixture no longer fires untagged, so the tagged case proves nothing'
+    )
+    assert find_sql_datetime_violations(_TAGGED_PROSE_MESSAGE_SOURCE) == []
+
+
 # ---------------------------------------------------------------------------
 # Acceptance tests: the real tree (data layer + composition layer)
 # ---------------------------------------------------------------------------
 
-_DATA_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'data'
-_APP_PY = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'app.py'
-_API_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'api'
-_LOOPS_PY = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'loops.py'
+_SRC_ROOT = Path(__file__).resolve().parent.parent / 'src'
+_DATA_DIR = _SRC_ROOT / 'dashboard' / 'data'
+_APP_PY = _SRC_ROOT / 'dashboard' / 'app.py'
+_API_DIR = _SRC_ROOT / 'dashboard' / 'api'
+_LOOPS_PY = _SRC_ROOT / 'dashboard' / 'loops.py'
 
 # Seven route modules plus the package marker. A rename or a further split
 # must fail loudly here rather than silently shrinking the scan.
 _MIN_API_MODULES = 8
 
 
-def test_no_bare_clock_reads_in_data_modules():
-    """No `dashboard/src/dashboard/data/*.py` module has an untagged bare clock read."""
-    violations: list[str] = []
-    for path in sorted(_DATA_DIR.glob('*.py')):
-        source = path.read_text()
-        rel = path.relative_to(_DATA_DIR.parent.parent)
-        for lineno, text in find_clock_violations(source):
-            violations.append(f'{rel}:{lineno}: {text.strip()}')
+def _scanned_modules() -> list[Path]:
+    """Every module the guards scan: the one definition of their shared boundary.
+
+    Raises rather than returning a shorter list when a glob comes up empty
+    or short, or a fixed target is missing, because a check that quietly
+    stops checking is indistinguishable from a passing one.
+    """
+    data_files = sorted(_DATA_DIR.glob('*.py'))
+    api_files = sorted(_API_DIR.glob('*.py'))
+
+    assert data_files, f'no modules found under {_DATA_DIR}'
+    assert len(api_files) >= _MIN_API_MODULES, (
+        f'only {len(api_files)} modules found under {_API_DIR} '
+        f'({[p.name for p in api_files]}) — fewer than the '
+        f'{_MIN_API_MODULES} that existed when this guard was written'
+    )
+    for fixed_target in (_APP_PY, _LOOPS_PY):
+        assert fixed_target.is_file(), f'scan target is missing: {fixed_target}'
+
+    return data_files + [_APP_PY] + api_files + [_LOOPS_PY]
+
+
+def test_no_bare_clock_reads_in_scanned_modules():
+    """No scanned module has an untagged bare clock read outside `resolve_now`."""
+    violations = [
+        f'{path.relative_to(_SRC_ROOT)}:{lineno}: {text.strip()}'
+        for path in _scanned_modules()
+        for lineno, text in find_clock_violations(path.read_text())
+    ]
 
     assert not violations, (
         'Bare datetime.now() reads found (missing resolve_now() or a '
@@ -359,7 +405,7 @@ def test_no_bare_clock_reads_in_data_modules():
 
 
 def test_no_deferred_consolidation_markers_remain():
-    """No data module carries the `deferred-consolidation` grandfather tag (task 2281).
+    """No scanned module carries the `deferred-consolidation` grandfather tag (task 2281).
 
     Task 2192 grandfather-tagged 24 pre-existing bare clock reads across the 7
     data modules with `# clock-exempt: deferred-consolidation (task 2281)` to
@@ -369,12 +415,12 @@ def test_no_deferred_consolidation_markers_remain():
     tag. This is the outer double-loop acceptance test: RED until the final
     module's marker is removed.
     """
-    violations: list[str] = []
-    for path in sorted(_DATA_DIR.glob('*.py')):
-        rel = path.relative_to(_DATA_DIR.parent.parent)
-        for lineno, text in enumerate(path.read_text().splitlines(), start=1):
-            if _DEFERRED_CONSOLIDATION_TAG in text:
-                violations.append(f'{rel}:{lineno}: {text.strip()}')
+    violations = [
+        f'{path.relative_to(_SRC_ROOT)}:{lineno}: {text.strip()}'
+        for path in _scanned_modules()
+        for lineno, text in enumerate(path.read_text().splitlines(), start=1)
+        if _DEFERRED_CONSOLIDATION_TAG in text
+    ]
 
     assert not violations, (
         'deferred-consolidation clock-exempt markers still present (task 2281 '
@@ -383,86 +429,20 @@ def test_no_deferred_consolidation_markers_remain():
     )
 
 
-def test_no_bare_clock_reads_in_app_composition_layer():
-    """`app.py` route handlers must tag or thread every clock read too.
-
-    This is the layer that calls into the data layer's aggregate functions
-    (e.g. `aggregate_burndown_series`, `aggregate_cost_summary`) — a route
-    that silently reverted to reading the clock per fan-out leg instead of
-    capturing `now` once and threading it through would reintroduce the
-    same clock-skew race this guard blocks in the data layer, just one
-    level up the call stack. See the module docstring for the
-    `single-capture route` tag convention this test enforces.
-    """
-    source = _APP_PY.read_text()
-    violations = [f'{_APP_PY.name}:{lineno}: {text.strip()}' for lineno, text in find_clock_violations(source)]
-
-    assert not violations, (
-        'Bare datetime.now() reads found in app.py (missing a '
-        '`# clock-exempt:` tag):\n' + '\n'.join(violations)
-    )
-
-
-def test_no_bare_clock_reads_in_extracted_route_and_loop_modules():
-    """The modules split out of `app.py` carry the same clock discipline.
-
-    Task 5586 moved six route handlers and the two background samplers out
-    of `app.py`. Two of those handlers (`api_burndown`, `api_merge_queue`)
-    read the clock once per request under a `# clock-exempt: single-capture
-    route` tag, so scanning only `app.py` after the move would drop their
-    coverage without a single test turning red — the exact way a guard rots.
-    The member count is asserted first so a later rename or split fails
-    loudly instead of quietly emptying the scan.
-    """
-    api_files = sorted(_API_DIR.glob('*.py'))
-
-    assert len(api_files) >= _MIN_API_MODULES, (
-        f'only {len(api_files)} modules found under {_API_DIR} '
-        f'({[p.name for p in api_files]}) — fewer than the '
-        f'{_MIN_API_MODULES} that existed when this guard was written; '
-        'a check that quietly stops checking is indistinguishable from a '
-        'passing one'
-    )
-    assert _LOOPS_PY.is_file(), f'scan target is missing: {_LOOPS_PY}'
-
-    scanned = api_files + [_LOOPS_PY]
-
-    violations: list[str] = []
-    for path in scanned:
-        rel = path.relative_to(_API_DIR.parent.parent)
-        for lineno, text in find_clock_violations(path.read_text()):
-            violations.append(f'{rel}:{lineno}: {text.strip()}')
-
-    assert not violations, (
-        'Bare datetime.now() reads found in the modules extracted from '
-        'app.py (missing a `# clock-exempt:` tag):\n' + '\n'.join(violations)
-    )
-
-
-def test_no_sql_datetime_calls_in_dashboard_modules():
+def test_no_sql_datetime_calls_in_scanned_modules():
     """No scanned module hands SQLite a `datetime()` call to compare against."""
-    scanned = (
-        sorted(_DATA_DIR.glob('*.py'))
-        + [_APP_PY]
-        + sorted(_API_DIR.glob('*.py'))
-        + [_LOOPS_PY]
-    )
-
-    assert _DATA_DIR / 'performance.py' in scanned, (
-        f'{_DATA_DIR / "performance.py"} is missing from the scan list; a check '
-        'that quietly stops checking is indistinguishable from a passing one'
-    )
-
-    violations: list[str] = []
-    for path in scanned:
-        rel = path.relative_to(_DATA_DIR.parent.parent)
-        for lineno, excerpt in find_sql_datetime_violations(path.read_text()):
-            violations.append(f'{rel}:{lineno}: {excerpt}')
+    violations = [
+        f'{path.relative_to(_SRC_ROOT)}:{lineno}: {excerpt}'
+        for path in _scanned_modules()
+        for lineno, excerpt in find_sql_datetime_violations(path.read_text())
+    ]
 
     assert not violations, (
         "SQL-side datetime() call(s) found. SQLite's datetime() renders "
         "'YYYY-MM-DD HH:MM:SS' (space-separated, no UTC offset), so a lexical "
         'TEXT comparison against an ISO-with-offset column is wrong on the '
         'boundary day. Bind a Python-computed cutoff instead (see '
-        'dashboard.data.performance._cutoff):\n' + '\n'.join(violations)
+        'dashboard.data.performance._cutoff), or tag a literal that is prose '
+        'rather than SQL `# clock-exempt:` on its start line:\n'
+        + '\n'.join(violations)
     )
