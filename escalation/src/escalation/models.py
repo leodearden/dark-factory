@@ -341,6 +341,16 @@ BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
 # rather than silently misrouting escalations.
 KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_SEVERITIES
 
+
+def normalised_severity(severity: str | None) -> str:
+    """The form every severity classifier compares against KNOWN_SEVERITIES.
+
+    Case- and whitespace-insensitive.  A null reads as ``''`` because an
+    ``Escalation`` rehydrated from JSON on disk can carry a null ``severity``
+    despite the ``str`` annotation.
+    """
+    return str(severity or '').strip().lower()
+
 # Urgency ordering over KNOWN_SEVERITIES, used by every severity FOLD in the
 # system (dedupe-child promotion, L2 member inheritance, the L2 update-path
 # floor).  Alphabetical comparison is wrong ('blocking' < 'info'), so the rank

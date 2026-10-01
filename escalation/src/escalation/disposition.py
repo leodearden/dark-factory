@@ -17,7 +17,7 @@ from enum import StrEnum
 from typing import ClassVar, assert_never
 
 from escalation.classify import info_l0_mechanical_class
-from escalation.models import Escalation
+from escalation.models import Escalation, normalised_severity
 
 __all__ = [
     'Addressed',
@@ -113,8 +113,7 @@ class Defer:
 
 Disposition = Addressed | ObservationConsumed | StatusInfo | ConvertViaCurator | PromoteWithHint | Defer
 
-# Reads the author's own declaration, not prose: 48.5% of agent info L0s open
-# suggested_action with one, while detail never leads with it (archive, n=966).
+# The author's own no-action declaration, matched only where it leads suggested_action.
 _NO_ACTION_DECLARATION = re.compile(
     r'\s*(no\s+(further\s+)?action\b|none\s+(required|needed)\b|nothing\s+(to\s+do|required|needed)\b)',
     re.IGNORECASE,
@@ -156,8 +155,7 @@ def route_info_l0(
 
 
 def _require_info_l0(record: Escalation) -> None:
-    severity = str(record.severity or '').strip().lower()
-    if severity != 'info' or record.level != 0:
+    if normalised_severity(record.severity) != 'info' or record.level != 0:
         raise ValueError(
             f'route_info_l0 routes info-severity L0s only; {record.id!r} has '
             f'severity={record.severity!r} level={record.level!r}'

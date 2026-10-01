@@ -56,7 +56,7 @@ import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES
+from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, normalised_severity
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -247,9 +247,7 @@ def _classify_record(
     live_claimant_id: str | None,
 ) -> PinClass:
     """Map one open escalation to its :class:`PinClass` (see the chain above)."""
-    # Normalise once.  `or ''` is load-bearing: an `Escalation` rehydrated from
-    # JSON on disk can carry a null `severity` despite the `str` annotation.
-    sev = str(record.severity or '').strip().lower()
+    sev = normalised_severity(record.severity)
 
     # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Since
     # task 3976, `escalation.server.promote_to_l2`'s inherited

@@ -20,6 +20,7 @@ from escalation.models import (
     LateResolution,
     TrainState,
     max_severity,
+    normalised_severity,
 )
 
 
@@ -41,6 +42,23 @@ class TestBornAtL2Severities:
     def test_constant_contains_exactly_critical_and_urgent(self):
         """BORN_AT_L2_SEVERITIES contains exactly {'critical', 'urgent'} — no extras."""
         assert frozenset({'critical', 'urgent'}) == BORN_AT_L2_SEVERITIES
+
+
+class TestNormalisedSeverity:
+    """The one severity normalisation every severity classifier compares against."""
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            ('info', 'info'),
+            (' Info ', 'info'),
+            ('BLOCKING', 'blocking'),
+            ('', ''),
+            (None, ''),
+        ],
+    )
+    def test_folds_case_whitespace_and_null(self, raw: str | None, expected: str):
+        assert normalised_severity(raw) == expected
 
 
 class TestEscalationLevelDefault:
