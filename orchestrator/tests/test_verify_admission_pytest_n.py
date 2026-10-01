@@ -289,6 +289,7 @@ class TestPytestNWiring:
 
         slots_dir = tmp_path / 'slots'
         config = OrchestratorConfig(
+            verify_admission_enabled=True,  # pinned: the yaml must not disarm the control
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
             verify_admission_pytest_n='16',
@@ -507,6 +508,7 @@ class TestPytestNWiring:
 
         slots_dir = tmp_path / 'slots'
         config = OrchestratorConfig(
+            verify_admission_enabled=True,  # pinned: the yaml must not disarm the control
             verify_admission_slots_dir=str(slots_dir),
             verify_admission_task_slots=1,
             verify_admission_pytest_n='16',
