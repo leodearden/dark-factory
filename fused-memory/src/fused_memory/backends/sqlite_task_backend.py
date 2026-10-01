@@ -3194,26 +3194,40 @@ class SqliteTaskBackend:
         # ceiling (2026-05-08 forensics). set_task_status is the only
         # sanctioned writer for status AND metadata.done_provenance — it
         # enforces the terminal-exit, phantom-done, and done-provenance
-        # gates. Both floors reject unconditionally, before ensure_connected()
-        # and the task SELECT, so a write-authority rejection takes
-        # precedence over any existence or connection error.
+        # gates — so update_task may never ADD, CHANGE or REMOVE
+        # metadata.done_provenance. The status floor, and the done_provenance
+        # floor in every mode except 'replace', reject unconditionally before
+        # ensure_connected() and the task SELECT, so a write-authority
+        # rejection takes precedence over any existence or connection error.
+        # Only metadata_mode='replace' defers: a whole-blob replace must
+        # carry the STORED done_provenance through verbatim, which can only
+        # be judged against the row, so _assert_done_provenance_passthrough
+        # checks it inside the transaction below. The gate reads the RAW
+        # metadata_mode because _resolve_metadata_mode can itself raise, and
+        # resolving first would change which error a bad call surfaces.
         if status is not None:
             raise StatusWriteAuthorityError(task_id, status)
+        parsed_metadata: dict | None = None
         if metadata is not None:
-            # Mirror the interceptor's _reject_done_provenance_in_update_metadata:
-            # accept an already-parsed dict directly before falling back to
+            # Accept an already-parsed dict directly before falling back to
             # json.loads. A caller that bypasses the documented ``str | None``
             # signature and passes a dict would otherwise hit
             # ``json.loads(dict)`` -> TypeError -> parsed_metadata=None,
             # silently permitting a done_provenance write past this floor.
             if isinstance(metadata, dict):
-                parsed_metadata: dict | None = metadata
+                parsed_metadata = metadata
             else:
                 try:
-                    parsed_metadata = json.loads(metadata)
+                    loaded_metadata = json.loads(metadata)
                 except (ValueError, TypeError):
-                    parsed_metadata = None
-            if isinstance(parsed_metadata, dict) and 'done_provenance' in parsed_metadata:
+                    loaded_metadata = None
+                if isinstance(loaded_metadata, dict):
+                    parsed_metadata = loaded_metadata
+            if (
+                parsed_metadata is not None
+                and 'done_provenance' in parsed_metadata
+                and metadata_mode != 'replace'
+            ):
                 raise DoneProvenanceWriteAuthorityError(task_id)
             # Same floor family, different remedy (task 3816 review
             # remediation): the wait-anchor keys are MACHINE-authored, so a
@@ -3246,7 +3260,11 @@ class SqliteTaskBackend:
         # connection errors, and so a call tripping BOTH this guard and
         # _resolve_metadata_mode's merge+append carve-out surfaces the
         # content-loss message rather than the metadata one (the description
-        # wipe is the hazard that was silent). See
+        # wipe is the hazard that was silent). Under metadata_mode='replace'
+        # the done_provenance half of the floors is the in-transaction
+        # passthrough check, which runs after this guard: a replace call
+        # tripping both surfaces AppendUnsupportedFieldError, and either way
+        # nothing is written. See
         # sqlite_task_backend.py::_reject_append_on_replace_only_fields.
         _reject_append_on_replace_only_fields(
             append, title=title, description=description, priority=priority,
@@ -3297,6 +3315,10 @@ class SqliteTaskBackend:
                 raise TaskmasterError(
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
+                )
+            if metadata_mode == 'replace':
+                _assert_done_provenance_passthrough(
+                    row['metadata'], parsed_metadata, task_id,
                 )
 
             # Build the SET clause from non-None structured fields plus
@@ -4143,6 +4165,48 @@ def _merge_values(old: object, new: object) -> object:
         return merged
     # Scalar collision or type mismatch — OLD wins.
     return old
+
+
+def _assert_done_provenance_passthrough(
+    stored_raw: str | None, incoming: dict | None, task_id: str,
+) -> None:
+    """Refuse a whole-blob replace that would move ``metadata.done_provenance``.
+
+    update_task calls this inside its transaction, against the row it just
+    SELECTed, so the stored value cannot change before the UPDATE and a raise
+    rolls back with nothing written. The caller's own copy of the stored
+    value is never trusted.
+
+    Identity is JSON VALUE equality (deep ``==`` on the parsed values), not
+    byte identity: inner key order and whitespace do not survive a
+    get_task -> json.dumps round trip, which is exactly how a
+    read-modify-write caller builds its payload.
+
+    * ``incoming`` is None (unparseable or non-dict payload): no check, the
+      same fail-open the pre-connect floor applies.
+    * The stored blob is absent or not a JSON object: identity cannot be
+      established, so a payload carrying done_provenance is refused, while
+      one omitting it is the corrupt-row repair replace mode exists for.
+    * Stored without the key, payload with it: refused (an ADD).
+    * Both carry it with different values: refused (a CHANGE).
+    """
+    if incoming is None:
+        return
+    try:
+        stored = json.loads(stored_raw) if stored_raw is not None else None
+    except (TypeError, ValueError):
+        stored = None
+    if not isinstance(stored, dict):
+        if 'done_provenance' in incoming:
+            raise DoneProvenanceWriteAuthorityError(task_id)
+        return
+    if 'done_provenance' not in incoming:
+        return
+    if (
+        'done_provenance' not in stored
+        or stored['done_provenance'] != incoming['done_provenance']
+    ):
+        raise DoneProvenanceWriteAuthorityError(task_id)
 
 
 def _merge_metadata(
