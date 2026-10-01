@@ -43,12 +43,17 @@ from test_merge_queue_concurrent_verify import (
 from test_merge_queue_dispatch_fill_redispatch import (
     _drive_fill,
     _make_real_item,
+    _running_lane,
     _teardown_fill_drive,
 )
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_queue import ItemLifecycleState, SpeculativeMergeWorker
+from orchestrator.merge_queue import (
+    MERGE_WORKER_SHUTDOWN_REASON,
+    ItemLifecycleState,
+    SpeculativeMergeWorker,
+)
 
 # The acceptance criterion for the raw-cancel path is "completes within a SHORT
 # bound", and a hang must surface as a readable diagnostic well inside the 60s
@@ -409,3 +414,89 @@ class TestGetterOnlyCancelPreservesQueueItems:
         )
 
         await _teardown_fill_drive(drive, task, worker)
+
+
+# ---------------------------------------------------------------------------
+# task 5303 (4411): a raw cancel must not leak the persistent getter
+# ---------------------------------------------------------------------------
+
+
+def _verifier_loop_tasks() -> list[asyncio.Task]:  # type: ignore[type-arg]
+    return [
+        t for t in asyncio.all_tasks()
+        if not t.done()
+        and t.get_coro().__qualname__ == 'SpeculativeMergeWorker._run_verifier_loop'
+    ]
+
+
+def _pending_verifier_getters(request_queue: asyncio.Queue) -> list[asyncio.Task]:  # type: ignore[type-arg]
+    """Pending ``Queue.get()`` tasks on any queue but the lane's public request
+    queue -- i.e. the verifier loop's persistent getter (the merger's own
+    persistent get is on the request queue)."""
+    getters = []
+    for t in asyncio.all_tasks():
+        coro = t.get_coro()
+        if t.done() or coro.__qualname__ != 'Queue.get':
+            continue
+        frame = getattr(coro, 'cr_frame', None)
+        if frame is not None and frame.f_locals.get('self') is not request_queue:
+            getters.append(t)
+    return getters
+
+
+@pytest.mark.asyncio
+class TestRawCancelReapsPendingVerifierGetter:
+    """A raw cancel of the verifier loop task (``_run_verifier_loop``, what
+    ``_spawn_loop`` creates and ``run()`` raw-cancels) parked in the QueueEmpty
+    fill-ahead race must not leave its persistent getter pending -- task 5303
+    (4411).
+
+    ``asyncio.wait`` awaits its own waiter, so the cancel never reaches the
+    getter.  Left pending and unowned it warns on destruction and harvests the
+    next queue item for nobody.
+    """
+
+    async def test_raw_cancel_in_fill_ahead_race_leaves_no_pending_getter(
+        self,
+        git_ops: GitOps,
+        config: OrchestratorConfig,
+    ) -> None:
+        async with _running_lane(git_ops, config) as lane:
+            await lane.enqueue('getter-head')
+            await lane.settle(
+                lambda: (
+                    lane.inflight_ids() == {'getter-head'}
+                    and len(_pending_verifier_getters(lane.queue)) == 1
+                ),
+                expected='the head verifying and the loop parked in the fill-ahead race',
+                why=(
+                    'with one host still free and nothing queued, the loop must '
+                    'race a persistent getter against the running verify.'
+                ),
+            )
+            [loop_task] = _verifier_loop_tasks()
+
+            loop_task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(loop_task, return_exceptions=True),
+                timeout=_CANCEL_TERMINATION_TIMEOUT,
+            )
+
+            assert loop_task.cancelled(), 'the raw cancel must propagate'
+            leaked = _pending_verifier_getters(lane.queue)
+            assert leaked == [], (
+                'the persistent verifier getter outlived its loop; it will '
+                f'harvest the next queue item for nobody: {leaked!r}'
+            )
+
+            late = await lane.enqueue('getter-late')
+            await lane.settle(
+                lambda: lane.states().get('getter-late') == 'awaiting_verify',
+                expected='the late item merged and waiting in the verifier queue',
+                why='the merger is still running; only the verifier loop was cancelled.',
+            )
+
+            await lane.worker.stop()
+
+            assert late.result.done(), "the late item's merge() Future was stranded"
+            assert late.result.result().reason == MERGE_WORKER_SHUTDOWN_REASON

@@ -601,6 +601,48 @@
           "current": 31596
         }
       ]
+    },
+    {
+      "task_id": "5303",
+      "reason": "getter-leak fix (4411): the verifier loop task (_run_verifier_loop) cancels and reaps a still-pending persistent getter on any exception exit",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 2156,
+          "current": 2160
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21701,
+          "current": 21720
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12369,
+          "current": 12377
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4752,
+          "current": 4756
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56332,
+          "current": 56351
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31596,
+          "current": 31604
+        }
+      ]
     }
   ]
 }

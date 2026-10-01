@@ -14387,7 +14387,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             task: asyncio.Task = asyncio.create_task(self._merger_loop())  # type: ignore[type-arg]
             self._merger_task = task
         elif name == 'verifier':
-            task = asyncio.create_task(self._verifier_loop())  # type: ignore[type-arg]
+            task = asyncio.create_task(self._run_verifier_loop())  # type: ignore[type-arg]
             self._verifier_task = task
         else:
             raise ValueError(f'Unknown loop name: {name!r}')
@@ -16380,6 +16380,25 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         self._assert_single_writer(self._verifier_task, '_inflight')
         self._inflight.clear()
+
+    async def _run_verifier_loop(self) -> None:
+        """The verifier loop task: run :meth:`_verifier_loop`, and on any
+        exception exit (CancelledError included) cancel and reap a
+        still-PENDING persistent getter so it cannot outlive the loop and
+        harvest a queue item nobody resolves.  Cancelling it loses nothing:
+        ``asyncio.Queue.get()`` takes its item only after its await returns.
+        A DONE getter is left in place for stop() to harvest -- it holds an
+        item whose merge() Future stop() must resolve.
+        """
+        try:
+            await self._verifier_loop()
+        except BaseException:
+            getter = self._pending_verifier_get
+            if getter is not None and not getter.done():
+                self._pending_verifier_get = None
+                getter.cancel()
+                await asyncio.gather(getter, return_exceptions=True)
+            raise
 
     async def _verifier_loop(self) -> None:
         """Verify and CAS-advance for each SpeculativeItem from the Merger.
