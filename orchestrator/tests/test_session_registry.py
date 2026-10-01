@@ -591,6 +591,40 @@ def test_decision_path_for_id_sanitizes_unsafe_id(tmp_path: Path) -> None:
     assert '/' not in path.name
 
 
+def test_qualify_decision_id_prefixes_the_canonical_project() -> None:
+    assert sr.qualify_decision_id('dark_factory', 'esc-42-1') == 'dark_factory-esc-42-1'
+
+
+@pytest.mark.parametrize('project', ['df', 'Dark-Factory', '  DARK_FACTORY '])
+def test_qualify_decision_id_folds_the_project(project: str) -> None:
+    assert sr.qualify_decision_id(project, 'esc-42-1') == 'dark_factory-esc-42-1'
+
+
+def test_qualify_decision_id_is_injective_across_projects() -> None:
+    assert sr.qualify_decision_id('dark_factory', 'esc-42-1') != sr.qualify_decision_id(
+        'reify', 'esc-42-1'
+    )
+    # Canonical tokens never contain '-', so the separator cannot be smuggled
+    # in from the project side of the join.
+    assert sr.qualify_decision_id('a', 'b-c') != sr.qualify_decision_id('a_b', 'c')
+
+
+@pytest.mark.parametrize(
+    ('project', 'local_id'),
+    [('dark_factory', 'esc-42-1'), ('reify', 'recon-esc-7459-1'), ('df', 'watcher-lease-orphan-df')],
+)
+def test_qualify_decision_id_survives_the_path_sanitizer(
+    tmp_path: Path, project: str, local_id: str
+) -> None:
+    qualified = sr.qualify_decision_id(project, local_id)
+    assert sr.decision_path_for_id(qualified, root=tmp_path).stem == qualified
+
+
+@pytest.mark.parametrize('project', [None, '', '  '])
+def test_qualify_decision_id_leaves_an_unset_project_unqualified(project: object) -> None:
+    assert sr.qualify_decision_id(project, 'esc-42-1') == 'esc-42-1'
+
+
 # ---------------------------------------------------------------------------
 # Step-3: identity, paths, transcript encoding
 # ---------------------------------------------------------------------------
