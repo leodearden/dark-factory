@@ -60,6 +60,7 @@ from orchestrator.pin_reservation import (
     is_pin_rank,
     park_rank,
     pin_release_reason,
+    priority_payload,
 )
 from orchestrator.recovery_emission import (
     LeaveReason,
@@ -1096,7 +1097,9 @@ class ModuleLockTable:
         # destroying it.  Restoration happens when the top entry is removed.
         # INV-3: every stack is strictly rank-decreasing top-ward (top has the
         # lowest rank / highest priority), so depth is bounded by the 5 priority
-        # tiers plus the bounded number of pin reservations (task 6040).
+        # tiers plus the bounded number of pin reservations (task 6040).  An
+        # owner holds at most one entry per stack in each band (tier, pin), and
+        # its pin entry sits above its own tier entry.
         self._parked: dict[str, list[tuple[str, int]]] = {}
         # task_id -> ISO8601 timestamp of first install_parks call for that owner
         self._park_install_at: dict[str, str] = {}
@@ -1362,15 +1365,22 @@ class ModuleLockTable:
         """
         return bool(self._owned_ranks(task_id))
 
-    def reservation_source(self, owner: str) -> ReservationSource:
+    def reservation_source(
+        self, owner: str, modules: Iterable[str] | None = None
+    ) -> ReservationSource:
         """Why *owner*'s parks exist, derived from their ranks (task 6040).
 
         PIN if any of the owner's entries, top or buried, sits in the pin band;
-        otherwise FAIRNESS.  An owner with no parks at all also reads FAIRNESS,
-        so callers that ask after a removal get the automatic default rather
-        than an error.
+        otherwise FAIRNESS.  *modules* (normalized keys) narrows the question
+        to the owner's best entry on each of those keys — a restore exposes
+        one specific entry, and an owner holding a pin reservation elsewhere
+        can have a fairness entry exposed here.  An owner with no matching
+        parks reads FAIRNESS, so callers that ask after a removal get the
+        automatic default rather than an error.
         """
-        if any(is_pin_rank(rank) for rank in self._owned_ranks(owner).values()):
+        owned = self._owned_ranks(owner)
+        keys = owned.keys() if modules is None else owned.keys() & set(modules)
+        if any(is_pin_rank(owned[key]) for key in keys):
             return ReservationSource.PIN
         return ReservationSource.FAIRNESS
 
@@ -1386,18 +1396,19 @@ class ModuleLockTable:
         keys, de-duplicates, and subtracts every key the owner already parks
         at ANY stack level.  Sorted.
 
-        With *priority* None, an entry at ANY rank counts as owned — a buried
-        entry included — because fairness completion fills coverage gaps and
-        never re-ranks.  With a *priority*, a key counts as owned only at
-        ``park_rank(priority)`` or better, so a pin's completion (task 6040)
-        also lifts the owner's own weaker entries to the pin rank.
+        For a tier *priority*, or none, an entry at ANY rank counts as owned —
+        a buried entry and a pin entry included — because fairness completion
+        fills coverage gaps and never re-ranks.  For a :class:`PinOrder`, a
+        key counts as owned only at that pin rank or better (task 6040): the
+        owner's own fairness entry does not cover its pin reservation, which
+        :meth:`install_parks` then stacks above it.
         """
         depth = self._config.lock_depth
         owned = self._owned_ranks(task_id)
-        rank = None if priority is None else park_rank(priority)
+        floor = park_rank(priority) if isinstance(priority, PinOrder) else None
         requested = {normalize_lock(m, depth) for m in modules}
         return sorted(
-            m for m in requested if m and not self._covers(owned.get(m), rank)
+            m for m in requested if m and not self._covers(owned.get(m), floor)
         )
 
     def install_parks(
@@ -1419,10 +1430,14 @@ class ModuleLockTable:
         skipped, and so is a second input normalizing to a key this call
         already handled.  A key it parks at a LOWER priority is a rank
         upgrade: it runs the same conflict scan at the new rank and, unless
-        blocked, the owner's old entry is replaced by one on top at the new
-        rank and the key is reported in *installed*; a blocked upgrade keeps
-        the old entry.  Either way the owner holds at most one entry per
-        stack, so it can never shadow itself, and it is never downgraded.
+        blocked, a new entry goes on top at the new rank and the key is
+        reported in *installed*; a blocked upgrade keeps the old entry.  The
+        upgrade replaces the owner's old entry in the SAME band
+        (:func:`is_pin_rank`).  A pin reservation leaves the owner's tier
+        entry in place beneath it (task 6040), so releasing the pin restores
+        that fairness park as it was.  Either way the owner holds at most one
+        entry per band per stack, never reports shadowing itself, and is
+        never downgraded.
 
         Cross-tier preemption (INV-1): if the active TOP of a conflicting stack
         has ``existing_rank > new_rank`` (strictly lower priority), the new entry
@@ -1483,9 +1498,11 @@ class ModuleLockTable:
                 shadow_acc[victim_owner].append(parked_m)
 
             # Push task_id onto the top of the (possibly freshly created)
-            # stack, dropping the lower-rank entry a rank upgrade replaces.
+            # stack, dropping the same-band entry a rank upgrade replaces.
             stack = [
-                entry for entry in self._parked.get(normalized, []) if entry[0] != task_id
+                (owner, entry_rank)
+                for owner, entry_rank in self._parked.get(normalized, [])
+                if owner != task_id or is_pin_rank(entry_rank) != is_pin_rank(rank)
             ]
             stack.append((task_id, rank))
             self._parked[normalized] = stack
@@ -1507,12 +1524,19 @@ class ModuleLockTable:
             )
         return installed, shadowed
 
-    def _remove_owner(self, task_id: str) -> list[tuple[str, list[str]]]:
+    def _remove_owner(
+        self, task_id: str, *, source: ReservationSource | None = None
+    ) -> list[tuple[str, list[str]]]:
         """Remove *task_id* from every stack at any level and return restored pairs.
 
-        For each module stack where *task_id* was the ACTIVE TOP: after removal
+        With *source*, only the owner's entries of that source go (task 6040):
+        releasing a pin reservation leaves the owner's fairness parks where
+        they are.
+
+        For each module stack whose ACTIVE TOP was removed: after removal
         the new last element (if any) becomes the active top and is reported as a
-        ``(owner, sorted_modules)`` restored pair.  Removing a buried (non-top)
+        ``(owner, sorted_modules)`` restored pair — with *source*, possibly
+        the owner's own remaining entry.  Removing a buried (non-top)
         entry leaves the top unchanged and is NOT reported as a restore (INV-4).
 
         Drops ``_park_install_at[task_id]`` only when task_id has no remaining
@@ -1534,16 +1558,19 @@ class ModuleLockTable:
         newly-unblocked entries on every removal.  Exact-match shadows (same
         key) always produce a restore pair; hierarchical shadows do not.
         """
-        # Track which modules had task_id as their ACTIVE TOP before removal.
-        was_top: set[str] = set()
-        for m, stack in self._parked.items():
-            if stack and stack[-1][0] == task_id:
-                was_top.add(m)
+        def removed(entry: tuple[str, int]) -> bool:
+            owner, rank = entry
+            return owner == task_id and (
+                source is None or ReservationSource.source_of_rank(rank) is source
+            )
 
-        # Rebuild stacks without task_id.
+        # Track which modules had a removed entry as their ACTIVE TOP.
+        was_top = {m for m, stack in self._parked.items() if stack and removed(stack[-1])}
+
+        # Rebuild stacks without the removed entries.
         new_parked: dict[str, list[tuple[str, int]]] = {}
         for m, stack in self._parked.items():
-            new_stack = [(o, r) for o, r in stack if o != task_id]
+            new_stack = [entry for entry in stack if not removed(entry)]
             if new_stack:
                 new_parked[m] = new_stack
         self._parked = new_parked
@@ -1584,25 +1611,32 @@ class ModuleLockTable:
         return self._remove_owner(task_id)
 
     def prune_owners(
-        self, predicate: Callable[[str], bool]
+        self,
+        predicate: Callable[[str], bool],
+        *,
+        source: ReservationSource | None = None,
     ) -> tuple[list[str], list[tuple[str, list[str]]]]:
         """Evict every park whose owner satisfies *predicate* at ANY stack level.
 
         Iterates unique owners across all levels of all stacks (deduped,
         first-seen order), calls ``predicate(owner_id)`` at most once per
         owner, and removes all entries for matching owners via ``_remove_owner``.
+        With *source*, only owners holding an entry of that source are asked,
+        and only those entries are removed (task 6040).
 
         Returns ``(evicted_owners, restored_pairs)`` where *evicted_owners* is
         the list of removed owner IDs in first-seen order and *restored_pairs*
-        is a flattened list of ``(owner, sorted_modules)`` for all stacks whose
-        newly-exposed tops belong to non-evicted owners.  The Scheduler's
-        ``_park_gc`` sweep loop uses restored_pairs to emit
-        ``reservation_restored`` events (step-8).
+        is a flattened list of ``(owner, sorted_modules)`` for every stack
+        whose newly-exposed top is still the top once the whole sweep is
+        done.  The Scheduler's ``_park_gc`` sweep loop uses restored_pairs to
+        emit ``reservation_restored`` events (step-8).
         """
         # Collect unique owners in first-seen order across all stack levels.
         seen: dict[str, bool] = {}
         for stack in self._parked.values():
-            for owner, _rank in stack:
+            for owner, rank in stack:
+                if source is not None and ReservationSource.source_of_rank(rank) is not source:
+                    continue
                 if owner not in seen:
                     seen[owner] = predicate(owner)
         # Build evicted list.
@@ -1611,7 +1645,7 @@ class ModuleLockTable:
         all_restored_acc: dict[str, list[str]] = {}  # deduplicate across calls
         all_restored_order: list[str] = []
         for owner in evicted:
-            for restored_owner, mods in self._remove_owner(owner):
+            for restored_owner, mods in self._remove_owner(owner, source=source):
                 if restored_owner not in all_restored_acc:
                     all_restored_acc[restored_owner] = list(mods)
                     all_restored_order.append(restored_owner)
@@ -1619,20 +1653,23 @@ class ModuleLockTable:
                     # Merge modules for the same restored owner across multiple calls.
                     merged = sorted(set(all_restored_acc[restored_owner]) | set(mods))
                     all_restored_acc[restored_owner] = merged
-        # Filter out any owner that is itself being evicted in this same sweep.
-        # When removing top Z exposes lower Y (recorded in all_restored), but Y
-        # also matches the predicate and is later evicted, the caller would
-        # otherwise emit a spurious reservation_restored for a task whose parks
-        # are all gone.  Filtering against the evicted set removes that noise
-        # without any state-correctness impact (the removal itself already
-        # happened via _remove_owner).
-        evicted_set = set(evicted)
+        # Keep only restores that survived the rest of the sweep.  When
+        # removing top Z exposes lower Y, but a later removal in this sweep
+        # takes Y's entry too, the caller would otherwise emit a spurious
+        # reservation_restored for an entry that is gone.  Asking the stacks
+        # rather than the evicted set keeps a source-scoped sweep right: there
+        # an evicted owner's other-source entry can be the surviving top.
         all_restored = [
-            (owner, all_restored_acc[owner])
+            (owner, survivors)
             for owner in all_restored_order
-            if owner not in evicted_set
+            if (survivors := [m for m in all_restored_acc[owner] if self._top_owner(m) == owner])
         ]
         return evicted, all_restored
+
+    def _top_owner(self, module: str) -> str | None:
+        """The owner of *module*'s active top entry, or None for no stack."""
+        stack = self._parked.get(module)
+        return stack[-1][0] if stack else None
 
     def force_clear(
         self, owner: str
@@ -5481,32 +5518,38 @@ class Scheduler:
     ) -> None:
         """``reservation_restored`` for each owner a park removal re-exposed.
 
-        Called AFTER the removal: the source is the restored owner's own,
-        read from the table as it now stands.
+        Called AFTER the removal: the source is that of the restored entries
+        themselves, read from the table as it now stands.
         """
         for restored_owner, restored_modules in restored_pairs:
             self._emit_reservation(
                 EventType.reservation_restored,
                 restored_owner,
                 {'restored_owner': restored_owner, 'modules': restored_modules},
-                source=self.lock_table.reservation_source(restored_owner),
+                source=self.lock_table.reservation_source(restored_owner, restored_modules),
             )
 
     def _complete_parks(
         self,
         task_id: str,
         modules: list[str],
-        tier: str,
+        priority: ParkPriority,
         *,
         skip_count: int,
-        pin_order: int | None = None,
     ) -> None:
         """The park completion rule (task 5308): park whatever is still unparked.
 
+        *priority* is the park's priority: the owner's tier for a fairness
+        park, or a :class:`PinOrder` for the head pin's reservation (task
+        6040).  It alone decides the install rank, the remainder rule
+        (:meth:`ModuleLockTable.unparked_modules`), each event's ``source``
+        and how the events name the priority (:func:`priority_payload`).
+
         The remainder is every key of *modules* that *task_id* does not
-        already park at any stack level.  An empty remainder is a fully
-        parked owner: no attempt, no event.  Otherwise the remainder is
-        installed and exactly one emission decision follows:
+        already park, at any stack level, in a way that covers *priority*.
+        An empty remainder is a fully parked owner: no attempt, no event.
+        Otherwise the remainder is installed and exactly one emission decision
+        follows:
 
         - ``reservation_installed`` only when something was NEWLY parked,
           carrying just that increment (plus ``reservation_shadowed`` per
@@ -5521,29 +5564,21 @@ class Scheduler:
         blocked-attempt streak, which any attempt that leaves nothing
         blocked resets, as does the owner's dispatch
         (:meth:`_settle_fairness_on_dispatch`).
-
-        With *pin_order* set, this is the head pin's reservation (task 6040):
-        it installs at ``PinOrder(pin_order)``, its remainder also counts the
-        owner's own weaker entries as unparked so they are lifted to the pin
-        rank, and every event carries ``source`` pin plus ``pin_order``.
-        Without it, the fairness behaviour above is unchanged.
         """
         streak = self._streak_park_install_blocked
-        pin = None if pin_order is None else PinOrder(pin_order)
-        source = ReservationSource.FAIRNESS if pin is None else ReservationSource.PIN
-        pin_fields = {} if pin is None else {'pin_order': pin_order}
-        remainder = self.lock_table.unparked_modules(task_id, modules, priority=pin)
+        source = ReservationSource.source_of_rank(park_rank(priority))
+        remainder = self.lock_table.unparked_modules(task_id, modules, priority)
         if not remainder:
             streak.clear(task_id)
             return
         installed, shadowed_pairs = self.lock_table.install_parks(
-            task_id, remainder, pin or tier
+            task_id, remainder, priority
         )
         blocked = [m for m in remainder if m not in installed]
         if installed:
             logger.info(
-                'Task %s reserved modules %s (skip_count=%d, tier=%s)',
-                task_id, installed, skip_count, tier,
+                'Task %s reserved modules %s (skip_count=%d, priority=%s)',
+                task_id, installed, skip_count, priority,
             )
             self._emit_reservation(
                 EventType.reservation_installed,
@@ -5551,8 +5586,7 @@ class Scheduler:
                 {
                     'modules': installed,
                     'skip_count': skip_count,
-                    'priority': tier,
-                    **pin_fields,
+                    **priority_payload(priority),
                 },
                 source=source,
             )
@@ -5567,9 +5601,8 @@ class Scheduler:
                     {
                         'modules': victim_modules,
                         'preempted_by': task_id,
-                        'preempted_by_priority': tier,
                         'victim': victim,
-                        **pin_fields,
+                        **priority_payload(priority, tier_key='preempted_by_priority'),
                     },
                     source=source,
                 )
@@ -5581,8 +5614,8 @@ class Scheduler:
             return
         logger.info(
             'Task %s could not reserve modules %s: a same-or-higher-priority '
-            'park holds them (attempt %d, skip_count=%d, tier=%s)',
-            task_id, blocked, attempts, skip_count, tier,
+            'park holds them (attempt %d, skip_count=%d, priority=%s)',
+            task_id, blocked, attempts, skip_count, priority,
         )
         self._emit_reservation(
             EventType.reservation_install_blocked,
@@ -5593,8 +5626,7 @@ class Scheduler:
                 'blocked': blocked,
                 'attempts': attempts,
                 'skip_count': skip_count,
-                'priority': tier,
-                **pin_fields,
+                **priority_payload(priority),
             },
             source=source,
         )
@@ -6522,14 +6554,24 @@ class Scheduler:
             return 'deps_unsatisfied'
         return None
 
-    def _expire_parks(self, reason_of: Callable[[str], str | None]) -> list[str]:
-        """Remove every park owner *reason_of* names a reason for; return them.
+    def _expire_parks(
+        self,
+        reason_of: Callable[[str], str | None],
+        *,
+        source: ReservationSource | None = None,
+    ) -> list[str]:
+        """Remove the parks of every owner *reason_of* names a reason for; return them.
 
-        THE one place ``reservation_expired`` is built.  Each evicted owner's
-        reason and source are captured while ``prune_owners`` evaluates the
-        predicate, i.e. before any owner is removed, then ``reservation_expired``
-        is emitted per evicted owner, followed by ``reservation_restored`` for
-        every shadow the removals exposed.
+        THE one place ``reservation_expired`` is built.  Without *source*,
+        every entry of each named owner goes, and the event carries the
+        owner's own source as it stood before the removal.  With *source*,
+        only the owner's entries of that source go (task 6040: a released pin
+        reservation leaves its owner's fairness parks in place), and the
+        event names that source.  Reasons and sources are captured while
+        ``prune_owners`` evaluates the predicate, i.e. before any owner is
+        removed; then ``reservation_expired`` is emitted per evicted owner,
+        followed by ``reservation_restored`` for every shadow the removals
+        exposed.
         """
         expiring: dict[str, tuple[str, ReservationSource]] = {}
 
@@ -6537,14 +6579,14 @@ class Scheduler:
             reason = reason_of(owner)
             if reason is None:
                 return False
-            expiring[owner] = (reason, self.lock_table.reservation_source(owner))
+            expiring[owner] = (reason, source or self.lock_table.reservation_source(owner))
             return True
 
-        evicted, restored = self.lock_table.prune_owners(_expires)
+        evicted, restored = self.lock_table.prune_owners(_expires, source=source)
         for owner in evicted:
-            reason, source = expiring[owner]
+            reason, owner_source = expiring[owner]
             self._emit_reservation(
-                EventType.reservation_expired, owner, {'reason': reason}, source=source
+                EventType.reservation_expired, owner, {'reason': reason}, source=owner_source
             )
         self._emit_reservations_restored(restored)
         return evicted
@@ -7588,11 +7630,9 @@ class Scheduler:
         if not self._override_store:
             return _CONTINUE
         queue = self._pin_queue(ctx)
-        reservable = {
-            pin.task_id: pin.pin_order
-            for pin in queue
-            if not self.is_deterministic(pin.task)
-        }
+        reservable = tuple(
+            pin.task_id for pin in queue if not self.is_deterministic(pin.task)
+        )
         self._pin_blocked.retain(pin.task_id for pin in queue)
         self._bound_pin_reservations(ctx, reservable)
         heads = 0
@@ -7621,9 +7661,8 @@ class Scheduler:
                 self._complete_parks(
                     pin.task_id,
                     modules,
-                    pin.tier,
+                    PinOrder(pin.pin_order),
                     skip_count=self._skip_count.get(pin.task_id, 0),
-                    pin_order=pin.pin_order,
                 )
                 self._bound_pin_reservations(ctx, reservable)
         return _CONTINUE
@@ -7658,32 +7697,36 @@ class Scheduler:
             )
 
     def _bound_pin_reservations(
-        self, ctx: TickContext, reservable: dict[str, int]
+        self, ctx: TickContext, reservable: Sequence[str]
     ) -> None:
         """Release every pin reservation the pin phase no longer keeps.
 
-        *reservable* maps each non-deterministic pin-queue entry to its
-        pin_order.  The kept owners are the first ``pin_reservation_max_active``
-        reservation owners still reservable, in (pin_order, task_id) order —
-        none when the kill switch is off.  Every other pin owner is released
-        through :meth:`_expire_parks` with its :func:`pin_release_reason`.
+        *reservable* lists the non-deterministic pin-queue entries in queue
+        order.  The kept owners are the first ``pin_reservation_max_active``
+        reservation owners in that order — none when the kill switch is off.
+        Every other pin owner loses its pin reservation through
+        :meth:`_expire_parks`, with its :func:`pin_release_reason`.  Only the
+        pin entries go: the owner's fairness parks stay where they were, and
+        an owner whose skips have earned fairness parks completes them at once
+        (:meth:`_complete_earned_fairness_parks`).
 
         Order inside the loop is safe: when a head reserves, every reservable
-        pin with a lower pin_order has already been tried this tick, so the
-        cap keeps this tick's heads first, and a displaced pin is already
-        outranked by the head's pin rank on every key they share.  Terminal,
-        missing and deps-unsatisfied owners are park GC's, earlier in the tick.
+        pin ahead of it in the queue has already been tried this tick, so the
+        cap keeps this tick's heads first, and a displaced pin is outranked by
+        the head's pin rank on every key they share.  (Pins with no stored
+        pin_order tie at one rank, so there the shared key waits for the
+        head's next completion.)  Terminal, missing and deps-unsatisfied
+        owners are park GC's, earlier in the tick.
         """
         owners = self.lock_table.snapshot_pin_reservations()
         if not owners:
             return
         enabled = self.config.pin_reservations_enabled
         cap = self.config.pin_reservation_max_active if enabled else 0
-        kept = sorted(
-            (owner for owner in owners if owner in reservable),
-            key=lambda owner: (reservable[owner], owner),
-        )[:cap]
-        released = owners.keys() - set(kept)
+        kept = [owner for owner in reservable if owner in owners][:cap]
+        released = sorted(owners.keys() - set(kept))
+        if not released:
+            return
 
         def _release_reason(owner: str) -> str | None:
             if owner not in released:
@@ -7698,8 +7741,29 @@ class Scheduler:
                 deterministic=task is not None and self.is_deterministic(task),
             )
 
-        if released:
-            self._expire_parks(_release_reason)
+        self._expire_parks(_release_reason, source=ReservationSource.PIN)
+        for owner in released:
+            self._complete_earned_fairness_parks(ctx, owner)
+
+    def _complete_earned_fairness_parks(self, ctx: TickContext, task_id: str) -> None:
+        """Apply the fairness completion rule to a just-released pin owner.
+
+        While a pin reservation covered a module, the owner's top-skips parked
+        nothing more there: the pin entry already covered it
+        (:meth:`ModuleLockTable.unparked_modules`).  Once the pin reservation
+        is gone, an owner whose skip count has reached its tier's threshold
+        completes those fairness parks now, through the ordinary rule, rather
+        than leaving the modules open until it is next top-skipped.  An owner
+        below the threshold, or absent from this tick's tasks, is left alone.
+        """
+        task = ctx.tasks_by_id.get(task_id)
+        if task is None:
+            return
+        tier = ctx.effective_priorities.get(task_id, coerce_tier(task.get('priority')))
+        skip_count = self._skip_count.get(task_id, 0)
+        if skip_count < self.config.fairness.skip_threshold_for(tier):
+            return
+        self._complete_parks(task_id, self._get_modules(task), tier, skip_count=skip_count)
 
     def _pin_queue(self, ctx: TickContext) -> list[_PinCandidate]:
         """Pinned tasks that may dispatch this tick, in pin_order ASC.
@@ -7707,7 +7771,10 @@ class Scheduler:
         A pin is queued when its override row is pinned, its task is in
         ``ctx.tasks_by_id``, it passes :meth:`_eligible_for_dispatch` (the
         same helper as the scored loop, so a new gate reaches both paths)
-        and it is not landed-outbox gated.
+        and it is not landed-outbox gated.  A row with no stored pin_order
+        counts as 0; ties keep the override store's row order, as they did
+        before task 6040.  This order is the only one the pin phase uses:
+        it picks the heads and the reservations the cap keeps.
         """
         queue: list[_PinCandidate] = []
         for tid, row in ctx.overrides.items():
@@ -7736,7 +7803,7 @@ class Scheduler:
                 tier=ctx.effective_priorities.get(tid, coerce_tier(task.get('priority'))),
                 signal=signal,
             ))
-        return sorted(queue, key=lambda pin: (pin.pin_order, pin.task_id))
+        return sorted(queue, key=lambda pin: pin.pin_order)
 
     async def _dispatch_pin(self, pin: _PinCandidate, modules: list[str]) -> TickOutcome:
         """Book a pin whose ``try_acquire`` just succeeded, and end the tick."""

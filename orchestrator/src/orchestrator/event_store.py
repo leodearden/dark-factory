@@ -544,6 +544,9 @@ class EventType(StrEnum):
     # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
     # Every emitted reservation_* event carries data.source in {pin, fairness}
     # (task 6040): an operator pin's reservation, or the automatic machinery's.
+    # Pin-sourced installed / shadowed / install_blocked carry pin_order in
+    # place of the tier fields (priority, preempted_by_priority): a pin rank
+    # lies above every tier, so no tier describes it.
     reservation_installed = 'reservation_installed'
     reservation_install_blocked = 'reservation_install_blocked'
     reservation_expired = 'reservation_expired'

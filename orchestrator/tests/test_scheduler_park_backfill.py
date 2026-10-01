@@ -1116,10 +1116,11 @@ async def test_backfill_borrows_through_a_pin_reservation(tmp_path):
     clock = _Clock()
     store = _RecordingEventStore()
     overrides = OverrideStore(tmp_path / 'o.db')
-    overrides.set_override('/proj', 'p', pinned=True)
-    scheduler = _make_scheduler(clock=clock, event_store=store, override_store=overrides)
+    scheduler = _make_scheduler(
+        clock=clock, event_store=store, override_store=overrides, project_root=tmp_path
+    )
+    overrides.set_override(str(scheduler.config.project_root), 'p', pinned=True)
     scheduler.finish_startup()
-    scheduler._project_root = '/proj'
 
     candidate = _task('c', CANDIDATE_FILES)
     candidate['priority'] = 'low'

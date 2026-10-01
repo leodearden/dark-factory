@@ -19,6 +19,7 @@ from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.overrides import OverrideStore
+from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.scheduler import Scheduler
 
 
@@ -34,6 +35,8 @@ def park_world(
     *,
     pinned: tuple[str, ...] = (),
     time_source: Callable[[], float] | None = None,
+    park_eviction_store: ParkEvictionRequestStore | None = None,
+    state_snapshot_path: Path | None = None,
     **config_overrides: Any,
 ) -> ParkWorld:
     """A started Scheduler whose top parks on its first skip.
@@ -41,7 +44,9 @@ def park_world(
     One holder per module, ``lock_depth=2`` and ``project_root=tmp_path``,
     with *config_overrides* applied on top.  Each id in *pinned* is pinned in
     the given order, so its pin_order is its 1-based position.  *time_source*
-    is the Scheduler's monotonic clock (the real one when None).
+    is the Scheduler's monotonic clock (the real one when None);
+    *park_eviction_store* and *state_snapshot_path* go to the Scheduler
+    constructor unchanged.
     """
     config = OrchestratorConfig(**{
         'max_per_module': 1,
@@ -60,6 +65,8 @@ def park_world(
         event_store=store,  # type: ignore[arg-type]
         override_store=overrides,
         time_source=time_source,
+        park_eviction_store=park_eviction_store,
+        state_snapshot_path=state_snapshot_path,
     )
     scheduler.finish_startup()
     return ParkWorld(scheduler, store, overrides, root)

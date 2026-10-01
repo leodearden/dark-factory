@@ -532,19 +532,26 @@ a critical fairness park on it, while a medium task took its other module.
   and is ordered by `pin_order`. It installs inline in the pin loop, so a later pin or
   scored candidate in the same tick cannot take a module the head is waiting for. It
   shadows any fairness park, critical included, and restores it when used or released.
-  It never preempts a HELD lock. A dispatch consumes it, and EASY-backfill borrows
-  through it as through a fairness park. It is derived state, so the first tick after a
-  restart rebuilds it. A pin still accrues no skip count.
+  The pin owner's own fairness park on a module stays beneath its pin reservation, so a
+  release by the pin phase leaves that park exactly where it was; an owner whose skip
+  count has reached its tier's threshold also completes, at release, the fairness parks
+  the pin reservation had made redundant. It never preempts a HELD lock. A dispatch
+  consumes it, and EASY-backfill borrows through it as through a fairness park. It is
+  derived state, so the first tick after a restart rebuilds it. A pin still accrues no
+  skip count from the pin loop.
 - **`data.source` on every `reservation_*` event**: `'pin'` or `'fairness'`, derived
   from the park's rank. `reserve_now` parks read `'fairness'`. This is the only new key
   on `reservation_used`, `reservation_restored`, `reservation_expired`,
   `reservation_force_evicted` and `reservation_force_evict_refused`. Pin-sourced
   `reservation_installed`, `reservation_shadowed` and `reservation_install_blocked`
-  also carry `pin_order`.
+  carry `pin_order` IN PLACE OF the tier fields `priority` / `preempted_by_priority`:
+  a pin rank lies above every tier, so the owner's tier would misdescribe it. On
+  `reservation_restored`, `source` is that of the restored entries themselves.
 - **New `reservation_expired` reasons** for releases decided in the pin phase:
   `unpinned`, `gated`, `ineligible`, `deterministic`, `pin_displaced` (outranked by a
-  lower `pin_order` or past the cap) and `pin_reservations_disabled`. Terminal,
-  missing and deps-unsatisfied pins are released by park GC with its existing reasons.
+  lower `pin_order` or past the cap) and `pin_reservations_disabled`. These remove only
+  the owner's pin entries. Terminal, missing and deps-unsatisfied pins are released by
+  park GC with its existing reasons, which remove every park the owner holds.
 - **New `pin_blocked` event**, payload `{task_id, pin_order, head, blockers: [{module,
   owner, kind: held|parked}]}`. The blockers are read before the head's own
   reservation installs. It fires when a pin becomes blocked, then at most once per

@@ -1129,23 +1129,75 @@ class TestPinReservationRank:
         assert lt.try_acquire('Z', ['w.py']) is False, "P's reservation must refuse Z"
         assert lt.try_acquire('P', ['w.py']) is True
 
-    def test_the_rank_aware_remainder_lifts_the_owners_own_lower_entry(self):
+    def test_a_pin_reservation_stacks_above_the_owners_own_fairness_entry(self):
         lt = _lt()
         lt.install_parks('P', ['w.py'], 'high')
 
         assert lt.unparked_modules('P', ['w.py', 'x.py']) == ['x.py'], (
             'without a priority the 5308 remainder never re-ranks'
         )
+        assert lt.unparked_modules('P', ['w.py', 'x.py'], priority='critical') == ['x.py'], (
+            'a tier completion never re-ranks either'
+        )
         assert lt.unparked_modules('P', ['w.py', 'x.py'], priority=PinOrder(1)) == [
             'w.py', 'x.py',
-        ], 'a high entry is not owned at the pin rank'
+        ], 'a high entry does not cover a pin reservation'
 
-        lt.install_parks('P', ['w.py'], PinOrder(1))
+        installed, shadowed = lt.install_parks('P', ['w.py'], PinOrder(1))
 
-        assert _stack(lt, 'w.py') == [('P', PinOrder(1).rank)], (
-            'the upgrade must leave exactly one P entry, at the pin rank'
-        )
+        assert (installed, shadowed) == (['w.py'], []), 'P never reports shadowing itself'
+        assert _stack(lt, 'w.py') == [
+            ('P', PRIORITY_RANK['high']),
+            ('P', PinOrder(1).rank),
+        ], "the pin entry must sit above P's own fairness entry, which stays"
         assert lt.unparked_modules('P', ['w.py'], priority=PinOrder(1)) == []
+        assert lt.unparked_modules('P', ['w.py']) == [], (
+            'fairness completion counts the pin entry as coverage'
+        )
+
+    def test_a_better_pin_order_replaces_the_owners_worse_pin_entry(self):
+        lt = _lt()
+        lt.install_parks('P', ['w.py'], 'high')
+        lt.install_parks('P', ['w.py'], PinOrder(3))
+
+        installed, _ = lt.install_parks('P', ['w.py'], PinOrder(1))
+
+        assert installed == ['w.py']
+        assert _stack(lt, 'w.py') == [
+            ('P', PRIORITY_RANK['high']),
+            ('P', PinOrder(1).rank),
+        ], 'one pin entry per owner per stack, at the better order'
+
+    def test_pruning_pin_entries_keeps_the_owners_fairness_parks(self):
+        lt = _lt()
+        lt.install_parks('L', ['w.py'], 'low')
+        lt.install_parks('P', ['w.py', 'x.py'], 'high')  # shadows L on w
+        lt.install_parks('P', ['w.py', 'x.py', 'y.py'], PinOrder(1))
+
+        evicted, restored = lt.prune_owners(
+            lambda owner: owner == 'P', source=ReservationSource.PIN
+        )
+
+        assert evicted == ['P']
+        assert restored == [('P', ['w.py', 'x.py'])], (
+            "P's own fairness entries are the active tops again"
+        )
+        assert _stack(lt, 'w.py') == [('L', PRIORITY_RANK['low']), ('P', PRIORITY_RANK['high'])]
+        assert _stack(lt, 'y.py') == [], 'a pin-only key is cleared'
+        assert lt.snapshot_pin_reservations() == {}
+        assert lt.reservation_source('P') is ReservationSource.FAIRNESS
+
+    def test_a_pin_scoped_prune_never_asks_about_fairness_only_owners(self):
+        lt = _lt()
+        lt.install_parks('F', ['w.py'], 'critical')
+        asked: list[str] = []
+
+        evicted, restored = lt.prune_owners(
+            lambda owner: asked.append(owner) or True, source=ReservationSource.PIN
+        )
+
+        assert (asked, evicted, restored) == ([], [], [])
+        assert _stack(lt, 'w.py') == [('F', PRIORITY_RANK['critical'])]
 
     def test_reservation_source_is_derived_from_the_rank(self):
         lt = _lt()
@@ -1155,6 +1207,15 @@ class TestPinReservationRank:
         assert lt.reservation_source('P') is ReservationSource.PIN
         assert lt.reservation_source('F') is ReservationSource.FAIRNESS
         assert lt.reservation_source('nobody') is ReservationSource.FAIRNESS
+
+    def test_reservation_source_can_be_scoped_to_modules(self):
+        lt = _lt()
+        lt.install_parks('P', ['w.py'], 'high')
+        lt.install_parks('P', ['x.py'], PinOrder(1))
+
+        assert lt.reservation_source('P') is ReservationSource.PIN
+        assert lt.reservation_source('P', ['w.py']) is ReservationSource.FAIRNESS
+        assert lt.reservation_source('P', ['w.py', 'x.py']) is ReservationSource.PIN
 
     def test_snapshot_pin_reservations_lists_only_pin_ranked_owners(self):
         lt = ModuleLockTable(

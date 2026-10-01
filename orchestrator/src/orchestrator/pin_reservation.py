@@ -11,6 +11,9 @@ pin_order.  Everything else falls out of the existing park machinery:
 - a pin reservation SHADOWS any fairness park, critical included, and the
   shadowed park is restored (task 1865's LIFO stacks) when the pin dispatches
   or is released;
+- the pin owner's OWN fairness park on a key stays beneath its pin
+  reservation rather than being replaced by it, so releasing the pin
+  reservation hands the key back to exactly the fairness park it had;
 - among pins, the lower pin_order outranks the higher one on a shared key;
 - a HELD lock is never preempted: ``try_acquire``'s live held-lock gate runs
   before the park gate and knows nothing of pins.
@@ -81,6 +84,20 @@ def park_rank(priority: ParkPriority) -> int:
 def is_pin_rank(rank: int) -> bool:
     """True iff *rank* lies in the pin band, i.e. beats every priority tier."""
     return rank < _BEST_TIER_RANK
+
+
+def priority_payload(
+    priority: ParkPriority, *, tier_key: str = 'priority'
+) -> dict[str, str | int]:
+    """How a ``reservation_*`` event names the priority a park was installed at.
+
+    A tier park reports its tier under *tier_key*.  A pin reservation reports
+    ``pin_order`` and no tier at all: its rank lies above every tier, so the
+    owner's tier would misdescribe the park it holds.
+    """
+    if isinstance(priority, PinOrder):
+        return {'pin_order': priority.value}
+    return {tier_key: priority}
 
 
 class ReservationSource(StrEnum):
