@@ -133,6 +133,7 @@ class _Lane:
     allocator: HostAllocator
     remote: Any
     requests: dict[str, Any] = dataclasses.field(default_factory=dict)
+    run_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
     async def enqueue(self, task_id: str) -> Any:
         """Commit a one-file branch for *task_id* and submit it on the public queue."""
@@ -218,6 +219,7 @@ async def _running_lane(
         allocator=allocator, remote=remote_runner,
     )
     worker_task = asyncio.ensure_future(worker.run())
+    lane.run_task = worker_task
     try:
         yield lane
     finally:
@@ -618,4 +620,44 @@ class TestHostFreedWhileHeadVerifies:
                     'with nothing in flight the loop is blocked on the verifier '
                     'queue, so a host freeing up never wakes it.'
                 ),
+            )
+
+    async def test_stop_ends_the_parked_item_poll_promptly(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """stop() during the parked-item poll must not wait out a poll slice.
+
+        The default VERIFY_ABANDON_POLL_SECS (10 s) outlasts stop()'s 5 s
+        shutdown wait, after which stop()'s re-drain consumes the None
+        sentinel -- so a poll that only notices stop() at its next slice
+        leaves the verifier blocked on an empty queue for good.
+        """
+        async with _running_lane(git_ops, config) as lane:
+            await lane.allocator.quarantine_and_release(_remote_lease(lane))
+            assert lane.allocator.acquire_local(lambda: lane.remote) is not None
+            await lane.enqueue(WAITER)
+            await lane.settle(
+                lambda: lane.states().get(WAITER) == 'awaiting_host',
+                expected=f'{WAITER} parked awaiting_host with nothing in flight',
+                why='no host is acquirable, so the dispatch attempt must park it.',
+            )
+            assert lane.inflight_ids() == set(), lane.observed()
+            assert lane.run_task is not None
+
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            await lane.worker.stop()
+            stop_secs = loop.time() - started
+
+            try:
+                await asyncio.wait_for(asyncio.shield(lane.run_task), timeout=5.0)
+            except TimeoutError:
+                pytest.fail(
+                    'the lane never finished after stop(): the verifier loop '
+                    'slept through stop() in the parked-item poll and is now '
+                    'blocked on a verifier queue whose sentinel was drained.'
+                )
+            assert stop_secs < 4.0, (
+                f'stop() took {stop_secs:.2f}s -- it waited out its shutdown '
+                'timeout instead of the verifier loop exiting on its sentinel'
             )

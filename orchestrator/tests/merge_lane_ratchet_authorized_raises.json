@@ -643,6 +643,36 @@
           "current": 31604
         }
       ]
+    },
+    {
+      "task_id": "5303",
+      "reason": "review fix: stop() wakes the parked-item poll at once so the verifier loop exits on its sentinel instead of sleeping through stop()",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21720,
+          "current": 21736
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12377,
+          "current": 12383
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56351,
+          "current": 56367
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31604,
+          "current": 31610
+        }
+      ]
     }
   ]
 }
