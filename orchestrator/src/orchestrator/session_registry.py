@@ -440,13 +440,15 @@ class DecisionRecord:
         hold before; packing it into ``text`` (the cockpit's one-line
         question) would bury a structured fact in prose. Written only by
         close_decision_with_evidence, which the sitting preparer's apply step
-        drives through the ``close-decision`` verb. Defaults to '' (not
+        drives through the ``close-decision`` verb, and cleared only by
+        reopen_decision. Defaults to '' (not
         closed with evidence, or filed before this field existed). CUSTODY,
         like ``state``: a watcher's re-file never changes it.
     closed_at: the ISO-8601 UTC instant close_decision_with_evidence recorded
         the close -- on the reap-decisions-got-there-first path, when the
         evidence was attached. Written only by close_decision_with_evidence,
-        in the same write as ``closing_evidence``, and CUSTODY like it. It
+        in the same write as ``closing_evidence``, cleared with it by
+        reopen_decision, and CUSTODY like it. It
         exists because the return brief windows its autonomous-closes section
         on when a close happened, and ``filed_at`` is the wrong clock for
         that: a carve-out close targets an L2 that has been open a while.
@@ -461,11 +463,12 @@ class DecisionRecord:
     are up -- scripts/backfill_decision_queue_stamp.py (via
     set_decision_escalations_dir), the ``write-decision`` verb itself
     (task 3559), whose enrichment path folds a SECOND watcher's filing into
-    an existing open record, and -- for task 5376's sitting preparer -- the
-    ``close-decision`` verb (via close_decision_with_evidence). The
+    an existing open record, -- for task 5376's sitting preparer -- the
+    ``close-decision`` verb (via close_decision_with_evidence), and the
+    ``reopen-decision`` verb (via reopen_decision, task 4835). The
     ``write-decision`` verb is the only mutator that may CREATE the record
     rather than merely mutate an existing one, so it races on a path where
-    nothing exists on disk yet. All five serialize their
+    nothing exists on disk yet. All six serialize their
     read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
     1609's escalation_id_lock), so a concurrent state-update, boost-update,
@@ -474,7 +477,7 @@ class DecisionRecord:
     read+mutate+write span is serialized against other callers on the same
     id. See update_decision_state/set_manual_boost/
     set_decision_escalations_dir/_run_write_decision/
-    close_decision_with_evidence for the caller-facing note.
+    close_decision_with_evidence/reopen_decision for the caller-facing note.
     """
 
     id: str
@@ -1116,7 +1119,8 @@ def _mutate_decision(
 
     The single implementation of the field-setter body shared by
     update_decision_state, set_manual_boost, set_decision_escalations_dir
-    (task 3640 amendment) and close_decision_with_evidence (task 5376). Those
+    (task 3640 amendment), close_decision_with_evidence (task 5376) and
+    reopen_decision (task 4835). Those
     are the public, caller-facing names and keep their own docstrings; this holds the parts that MUST NOT diverge
     between them -- the lock placement, the read, the write, and the
     fail-soft except-tuple.
@@ -1247,6 +1251,29 @@ def set_decision_escalations_dir(
 CLOSING_DECISION_STATES = frozenset({DecisionState.ANSWERED, DecisionState.DROPPED})
 
 
+def _decision_identity(project: object, escalations_dir: str | Path) -> tuple[str, str]:
+    """The folded (project, queue stamp) pair a caller names a fleet-global decision record by."""
+    return normalize_project_token(project), normalize_escalations_dir(escalations_dir)
+
+
+def _refuse_unless_named_record(
+    decision_id: str,
+    record: DecisionRecord,
+    wanted: tuple[str, str],
+    refused: type[Exception],
+    *,
+    action: str,
+) -> None:
+    """Raise *refused* unless *record* is the one *wanted* names: the compare-and-swap of close and reopen."""
+    found = _decision_identity(record.project, record.escalations_dir)
+    if found != wanted:
+        raise refused(
+            f'{decision_id} is project {found[0]!r} in queue {found[1]!r}, not the record the '
+            f'caller named (project {wanted[0]!r} in queue {wanted[1]!r}); decision ids are '
+            f'fleet-global, so another project\'s or queue\'s record is never {action}'
+        )
+
+
 class DecisionCloseRefused(Exception):
     """close_decision_with_evidence refused; the record is untouched and the message names why.
 
@@ -1302,16 +1329,10 @@ def close_decision_with_evidence(
             f'{decision_id}: closing evidence is empty; quote the deciding evidence verbatim'
         )
 
-    wanted = (normalize_project_token(expected_project), normalize_escalations_dir(expected_escalations_dir))
+    wanted = _decision_identity(expected_project, expected_escalations_dir)
 
     def _close(record: DecisionRecord) -> None:
-        found = (normalize_project_token(record.project), normalize_escalations_dir(record.escalations_dir))
-        if found != wanted:
-            raise DecisionCloseRefused(
-                f'{decision_id} is project {found[0]!r} in queue {found[1]!r}, not the record the '
-                f'caller named (project {wanted[0]!r} in queue {wanted[1]!r}); decision ids are '
-                'fleet-global, so another project\'s or queue\'s record is never closed'
-            )
+        _refuse_unless_named_record(decision_id, record, wanted, DecisionCloseRefused, action='closed')
         if record.closing_evidence:
             raise DecisionCloseRefused(
                 f'{decision_id} already carries closing evidence; refusing to overwrite it'
@@ -1328,6 +1349,46 @@ def close_decision_with_evidence(
     return _mutate_decision(
         decision_id, _close, caller='close_decision_with_evidence', root=root
     )
+
+
+class DecisionReopenRefused(Exception):
+    """reopen_decision refused; the record is untouched and the message names why.
+
+    Not a ValueError, for DecisionCloseRefused's reason: _mutate_decision
+    absorbs ValueError, and a refusal must reach its caller.
+    """
+
+
+def reopen_decision(
+    decision_id: str,
+    root: Path | str | None = None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str | Path,
+) -> DecisionRecord | None:
+    """Re-open *decision_id* IN PLACE, in ONE locked read-modify-write.
+
+    The caller names the record it means exactly as for
+    close_decision_with_evidence, and any other record at that id raises
+    DecisionReopenRefused. Clears ``closing_evidence`` and ``closed_at``,
+    because a close never overwrites evidence, so a re-opened gate could
+    otherwise never be closed with evidence again. Every other field is kept,
+    ``filed_at`` and ``manual_boost`` included (custody). It is reopen-only
+    rather than a generic state setter, which would bypass the evidence-quoting
+    close; see plans/4835-decision-plumbing-decisions.md.
+
+    Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
+    missing file, a corrupt body, a lock fault or a write failure.
+    """
+    wanted = _decision_identity(expected_project, expected_escalations_dir)
+
+    def _reopen(record: DecisionRecord) -> None:
+        _refuse_unless_named_record(decision_id, record, wanted, DecisionReopenRefused, action='reopened')
+        record.state = DecisionState.OPEN
+        record.closing_evidence = ''
+        record.closed_at = ''
+
+    return _mutate_decision(decision_id, _reopen, caller='reopen_decision', root=root)
 
 
 def _merge_queue_and_escalation_id(
