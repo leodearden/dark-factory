@@ -31,7 +31,8 @@ the crash-survivable, reattachable **tmux lane** by default: spawn with `CLAUDE_
 (see `skills/spawn/spawn-claude.sh`'s header) so the session gets a `display.kind=tmux`
 session-registry record and a `tmux attach`-reattachable window whose record persists across a
 crash. Interactive one-off skills this watcher spawns (e.g. `/unblock` sessions) stay as ordinary
-WM terminal windows, unchanged.
+WM terminal windows, unchanged. tmux stays the default; running in the foreground instead is a
+self-operation, decided without asking (see "Self-operations need no permission").
 
 ## Claiming the Watcher Lease (single-owner-per-role)
 
@@ -305,9 +306,12 @@ always-ask list ("Bypasses" in "Always ask — keyed on record content").
 
 ```
 1. Start the watcher (background task, filtered to L2); confirm its process is alive
-2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up)
-3. Handle each drained escalation: standing facts → self-execute tier → briefing disposition
-   (see "Before an item reaches Leo")
+2. Drain pending L2 escalations — only NOW, with the watcher confirmed up (drain-after-up); on
+   the first pass, also reconcile the predecessor's handover (see "Reading the predecessor's
+   handover at launch")
+3. Handle each drained escalation in the current posture (attended, or AFK — see "AFK by
+   silence"): standing facts → self-execute tier → briefing disposition (see "Before an item
+   reaches Leo")
 4. Wait for a wake signal: the watcher firing (it exits on the first new L2 escalation), or — if
    an auto-unblock sub-agent (B3) is in flight — that sub-agent completing. Handle whichever arrives.
 5. Read the escalation from the watcher output — this is the wake signal; the drain in
@@ -586,9 +590,8 @@ carries the brief. Check "Always ask — keyed on record content" below first: i
    already-verifiable fact and close it, with no option to choose. Verify the fact yourself first.
 7. Executing a ruling Leo already gave, when the record names it and the originating session has
    ended. The same carve-out's gates 1, 2 and 4 are the test.
-8. Watcher self-operations: loop cadence, lease release on an announced reboot, writing and reading
-   the handover. Task 5884 owns their mechanics. Force lease release stays forbidden (see
-   "Claiming the Watcher Lease").
+8. Watcher self-operations, listed in "Self-operations need no permission" together with the one
+   lease operation that stays forbidden.
 9. Launching a retain-and-tag, zero-deletion `/curate-fused-memories` sitting for consolidation
    gates (ratified 2026-09-25).
 
@@ -2072,7 +2075,8 @@ A class adopts only when task 3346 has landed **and** it has met the threshold i
 ## Context Conservation
 
 You're in a long-running session — conserve your context window aggressively. Over a multi-day AFK
-window this is the difference between one durable session and repeated restarts.
+window this is the difference between one durable session and repeated restarts. When context runs
+low anyway, stop (see "Stopping"): the handover carries forward what the next session needs.
 
 **Read compact, expand lazily:**
 - Drain with `get_pending_escalations(level=2, compact=True)` — never pull full dicts just to triage.
