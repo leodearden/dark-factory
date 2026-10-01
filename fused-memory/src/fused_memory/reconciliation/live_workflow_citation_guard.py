@@ -25,14 +25,13 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 from fused_memory.reconciliation.live_workflow_section import (
+    CITATION_CONTRADICTIONS_KEY,
     LiveSignal,
     LiveWorkflowRow,
     LiveWorkflowSnapshot,
 )
 
 logger = logging.getLogger(__name__)
-
-CONTRADICTIONS_KEY = 'live_workflow_citation_contradictions'
 
 #: ``content`` is the structured-JSON fallback key of a finding.
 _SCANNED_FIELDS = ('description', 'suggested_action', 'content')
@@ -131,7 +130,7 @@ def _annotate(flag: dict, snapshot: LiveWorkflowSnapshot) -> tuple[dict, int]:
         return flag, 0
     if not records:
         return flag, 0
-    return {**flag, CONTRADICTIONS_KEY: records}, len(records)
+    return {**flag, CITATION_CONTRADICTIONS_KEY: records}, len(records)
 
 
 def _rendered_signals(row: LiveWorkflowRow, snapshot: LiveWorkflowSnapshot) -> frozenset[LiveSignal]:

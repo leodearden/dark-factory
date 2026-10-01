@@ -52,6 +52,7 @@ from fused_memory.reconciliation.live_workflow_citation_guard import (
     check_live_workflow_citations,
 )
 from fused_memory.reconciliation.live_workflow_section import (
+    CITATION_CONTRADICTIONS_STAT,
     LiveWorkflowSnapshot,
     build_live_workflow_snapshot,
 )
@@ -462,9 +463,9 @@ class MemoryConsolidator(BaseStage):
         # citing a signal THIS run's section did not render (rationale: the module
         # docstring of live_workflow_citation_guard).  Above the remediation
         # early-return, like the guard above, so both passes are covered.
-        report.stats['stage1_live_workflow_citation_contradictions'] = 0
+        report.stats[CITATION_CONTRADICTIONS_STAT] = 0
         try:
-            report.items_flagged, report.stats['stage1_live_workflow_citation_contradictions'] = (
+            report.items_flagged, report.stats[CITATION_CONTRADICTIONS_STAT] = (
                 check_live_workflow_citations(report.items_flagged or [], self._live_workflow_snapshot)
             )
         except Exception:

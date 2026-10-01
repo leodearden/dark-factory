@@ -58,6 +58,11 @@ PROJECT_LOCK_UNKNOWN = 'Project-wide: orchestrator lock UNKNOWN'
 #: How much of a landing commit's sha a row quotes.
 _COMMIT_ABBREV = 10
 
+#: Where a Stage 1 finding citing a signal this section did not render is
+#: annotated (``live_workflow_citation_guard``), and the stat counting them.
+CITATION_CONTRADICTIONS_KEY = 'live_workflow_citation_contradictions'
+CITATION_CONTRADICTIONS_STAT = 'stage1_live_workflow_citation_contradictions'
+
 
 class LiveSignal(StrEnum):
     WORKTREE = 'worktree'
@@ -90,6 +95,7 @@ def render_live_workflow_authority_rules() -> str:
     ``## Live-Workflow Authority`` region is sliced at the next ``## `` heading.
     """
     claimant = {label: f'`{CLAIMANT_FIELD}{label}`' for label in ClaimantLabel}
+    signals = ' / '.join(f'`{signal}`' for signal in LiveSignal)
     return (
         f'{LIVE_WORKFLOW_RULES_HEADING}\n'
         f'Each row reads `- task/<id>: <per-task signals>; {CLAIMANT_FIELD}<label>; '
@@ -139,7 +145,18 @@ def render_live_workflow_authority_rules() -> str:
         f"`get_task`) is the merge lane's landing record, and it outranks any branch "
         f'state. Never set a done task back to pending or in-progress on branch-state '
         f'grounds. A refused reopen is not grounds to escalate; record an info '
-        f'finding instead (the task-3838 reopen storm).'
+        f'finding instead (the task-3838 reopen storm).\n\n'
+        f'Never assert or cite a live-workflow signal ({signals}) for a task unless '
+        f"that task has a row in THIS payload's `{LIVE_WORKFLOW_SECTION_HEADER}` "
+        f'section. The section rendered in this payload is the sole authority for '
+        f"this cycle: a signal quoted from a prior cycle's Stage 3 findings, a "
+        f'buffered episode or a Mem0 memory is not evidence of current liveness. If a '
+        f'task has no row, say that its signals are absent rather than describing '
+        f'them. A `{NOT_LIVE_TOKEN}` row carries no liveness signal at all. A Stage 1 '
+        f'finding that contradicts the section is detected after the fact, annotated '
+        f'`{CITATION_CONTRADICTIONS_KEY}`, and counted in '
+        f'`{CITATION_CONTRADICTIONS_STAT}` (reify run 6aa50844 cited task/5891 as '
+        f'live while its section listed nothing).'
     )
 
 
