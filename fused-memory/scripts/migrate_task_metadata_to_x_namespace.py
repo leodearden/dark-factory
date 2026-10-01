@@ -150,21 +150,34 @@ DEFAULT_KEYS: tuple[str, ...] = (
     'origin_reify_task',
 )
 
-# `SqliteTaskBackend.update_task` runs `_strip_reserved_control_keys` over the
-# INCOMING metadata payload for EVERY mode, replace included, before the write
-# lands. So a stored blob that already carried a leaked `append` (exactly the
-# task-2682/2735 defect class that `strip_leaked_control_keys.py` exists to
-# repair, and which lives in this same corpus) comes back one key lighter than
-# the blob we sent. That is the backend doing the right thing, NOT a corrupted
-# write, so the read-back must report it as information rather than raising a
-# false corruption alarm after an already-committed write.
+# `SqliteTaskBackend.update_task` strips two families of key from the INCOMING
+# metadata payload in EVERY mode, replace included, before the write lands. So
+# a stored blob carrying one comes back lighter than the blob we sent. That is
+# the backend doing the right thing, NOT a corrupted write, so the read-back
+# must report it as information rather than raising a false corruption alarm
+# after an already-committed write.
 #
-# Source of truth: `_RESERVED_METADATA_CONTROL_KEYS` in
-# fused_memory/backends/sqlite_task_backend.py. Duplicated as a literal here
-# (rather than imported) to keep the heavy backend package off this module's
-# import path — the same reason `_load_sibling_client` is lazy. The test suite
-# imports the backend constant and asserts these two stay in lockstep.
-BACKEND_STRIPPED_KEYS: frozenset[str] = frozenset({'append', 'metadata_mode'})
+# - Leaked call-flags (task 2682; source of truth
+#   `_RESERVED_METADATA_CONTROL_KEYS`): the task-2682/2735 defect class that
+#   `strip_leaked_control_keys.py` exists to repair, in this same corpus. The
+#   stored blob was carrying a leak and is now clean.
+# - Wait anchors (task 3816; source of truth `_MACHINE_AUTHORED_METADATA_KEYS`):
+#   machine-authored keys only the status chokepoints and the v4->v5 back-fill
+#   may write. A replace deliberately drops the stored anchor, and the status
+#   chokepoints re-stamp it on the next pending transition.
+#
+# Both live in fused_memory/backends/sqlite_task_backend.py. Duplicated as
+# literals here (rather than imported) to keep the heavy backend package off
+# this module's import path — the same reason `_load_sibling_client` is lazy.
+# The test suite imports the backend constants and asserts they stay in
+# lockstep.
+BACKEND_STRIPPED_CONTROL_KEYS: frozenset[str] = frozenset({'append', 'metadata_mode'})
+BACKEND_STRIPPED_WAIT_ANCHOR_KEYS: frozenset[str] = frozenset(
+    {'pending_since', 'pending_since_backfilled'},
+)
+BACKEND_STRIPPED_KEYS: frozenset[str] = (
+    BACKEND_STRIPPED_CONTROL_KEYS | BACKEND_STRIPPED_WAIT_ANCHOR_KEYS
+)
 
 
 class WriteRejectedError(RuntimeError):
@@ -574,17 +587,27 @@ def _verify_read_back(
         if key in after_meta:
             problems.append(f'(b) old spelling {key} still present')
 
-    # The backend drops its own call-flag key names from any incoming payload,
-    # so those are expected to be absent from the read-back even though we sent
+    # The backend drops both strip families from any incoming payload, so those
+    # keys are expected to be absent from the read-back even though we sent
     # them. Discount them before the key-set comparison instead of reporting a
-    # write that did the right thing as corruption.
-    stripped = sorted(set(expected_meta) & BACKEND_STRIPPED_KEYS)
-    if stripped:
+    # write that did the right thing as corruption — one note per family, so a
+    # sweep log tells a leaked flag from a dropped anchor at a glance.
+    stripped_control = sorted(set(expected_meta) & BACKEND_STRIPPED_CONTROL_KEYS)
+    if stripped_control:
         notes.append(
-            f'(i) backend stripped its reserved control key(s) {stripped} from the '
-            f'written blob — expected: update_task removes these from every incoming '
-            f'payload (sqlite_task_backend._RESERVED_METADATA_CONTROL_KEYS). The '
-            f'stored blob was carrying a leaked control key and is now clean.'
+            f'(i) backend stripped its reserved control key(s) {stripped_control} '
+            f'from the written blob — expected: update_task removes these from every '
+            f'incoming payload (sqlite_task_backend._RESERVED_METADATA_CONTROL_KEYS). '
+            f'The stored blob was carrying a leaked control key and is now clean.'
+        )
+    stripped_anchors = sorted(set(expected_meta) & BACKEND_STRIPPED_WAIT_ANCHOR_KEYS)
+    if stripped_anchors:
+        notes.append(
+            f'(i) backend dropped the stored wait-anchor key(s) {stripped_anchors} — '
+            f'expected: update_task strips machine-authored keys from every incoming '
+            f'payload (sqlite_task_backend._MACHINE_AUTHORED_METADATA_KEYS), so a '
+            f'replace drops the stored anchor; the status chokepoints re-stamp it on '
+            f'the next pending transition.'
         )
     expected_keys = set(expected_meta) - BACKEND_STRIPPED_KEYS
 

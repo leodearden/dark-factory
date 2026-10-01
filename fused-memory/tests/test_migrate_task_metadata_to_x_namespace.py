@@ -42,6 +42,8 @@ build_update_payload = _mod.build_update_payload
 build_parser = _mod.build_parser
 DEFAULT_KEYS = _mod.DEFAULT_KEYS
 BACKEND_STRIPPED_KEYS = _mod.BACKEND_STRIPPED_KEYS
+BACKEND_STRIPPED_CONTROL_KEYS = _mod.BACKEND_STRIPPED_CONTROL_KEYS
+BACKEND_STRIPPED_WAIT_ANCHOR_KEYS = _mod.BACKEND_STRIPPED_WAIT_ANCHOR_KEYS
 MigrationCollisionError = _mod.MigrationCollisionError
 assert_write_accepted = _mod.assert_write_accepted
 WriteRejectedError = _mod.WriteRejectedError
@@ -547,6 +549,24 @@ def test_backend_stripped_keys_match_the_backend_source_of_truth():
     assert BACKEND_STRIPPED_KEYS == (
         _RESERVED_METADATA_CONTROL_KEYS | _MACHINE_AUTHORED_METADATA_KEYS
     )
+    assert BACKEND_STRIPPED_CONTROL_KEYS == _RESERVED_METADATA_CONTROL_KEYS
+    assert BACKEND_STRIPPED_WAIT_ANCHOR_KEYS == _MACHINE_AUTHORED_METADATA_KEYS
+
+
+def test_read_back_reports_each_strip_family_in_its_own_note():
+    """A blob carrying both a leaked control key and a wait anchor gets one
+    note per family, so an operator can tell them apart without parsing."""
+    problems, notes = _run_verify(
+        extra_before={'append': True, 'pending_since': '2026-09-04T14:42:35.252Z'},
+        mutate=lambda m: (m.pop('append'), m.pop('pending_since')),
+    )
+
+    assert problems == [], problems
+    assert len(notes) == 2
+    assert all(note.startswith('(i)') for note in notes)
+    control_note, anchor_note = notes
+    assert 'append' in control_note and 'pending_since' not in control_note
+    assert 'pending_since' in anchor_note and 'append' not in anchor_note
 
 
 # --- case 10: --keys safety validation --------------------------------------
