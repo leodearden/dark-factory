@@ -628,3 +628,135 @@ class TestLoadVerdicts:
     def test_a_malformed_file(self, obj) -> None:
         with pytest.raises(mod.MalformedVerdicts):
             _load(obj)
+
+
+# --------------------------------------------------------------------------- #
+# Rates (step 11)
+# --------------------------------------------------------------------------- #
+
+class TestWilsonInterval:
+    @pytest.mark.parametrize(('k', 'n', 'interval'), [
+        (13, 174, (0.0442, 0.1236)),  # esc-4639-1 '7.5% [4.4-12.4%]'
+        (10, 111, (0.0497, 0.1579)),  # esc-4639-1 '9.0% [5.0-15.8%]'
+        (0, 20, (0.0, 0.1611)),
+    ])
+    def test_reproduces_the_published_intervals(self, k, n, interval) -> None:
+        assert mod.wilson_interval(k, n) == interval
+
+    def test_an_empty_denominator_is_not_computed(self) -> None:
+        assert mod.wilson_interval(0, 0) is None
+
+
+def _minted(uuid: str, *, served: bool = True, live_strict: bool = True) -> dict:
+    return {'edge_uuid': uuid, 'fact': f'fact of {uuid}', 'source_name': 'S',
+            'target_name': 'T', 'served': served, 'live_strict': live_strict}
+
+
+RATE_ROWS = (
+    {'graph': 'reify', 'uuid': 'A', 'stratum': 'ruling_lexeme',
+     'classifiers': list(mod.CLASSIFIERS), 'created_at': '2026-09-01T00:00:00+00:00',
+     'category': DECISIONS, 'content': RULING_HEAD, 'corroborated_count': 0,
+     'minted': [_minted('a1'), _minted('a2', live_strict=False), _minted('a3'),
+                _minted('a4', served=False, live_strict=False)]},
+    {'graph': 'dark_factory', 'uuid': 'B', 'stratum': 'other_decisions',
+     'classifiers': ['category_decisions'], 'created_at': '2026-09-01T00:00:00+00:00',
+     'category': DECISIONS, 'content': PLAIN_DECISION, 'corroborated_count': 2,
+     'minted': [_minted('b1'), _minted('b2'), _minted('b3'), _minted('b4')]},
+)
+RATE_LABELS = {
+    ('reify', 'a1'): 'holding', ('reify', 'a2'): 'overreach',
+    ('reify', 'a3'): 'bookkeeping', ('reify', 'a4'): 'overreach',
+    ('dark_factory', 'b1'): 'holding', ('dark_factory', 'b2'): 'context',
+    ('dark_factory', 'b3'): 'unjudgeable', ('dark_factory', 'b4'): 'misbound',
+}
+
+
+def _rate_verdicts():
+    rows = {(r['graph'], m['edge_uuid']): r['uuid'] for r in RATE_ROWS for m in r['minted']}
+    obj = {'sample': mod.SampleDefinition().to_dict(), 'verdicts': [
+        {'graph': g, 'episode_uuid': rows[(g, e)], 'edge_uuid': e, 'fact': f'fact of {e}',
+         'label': label, 'rationale': 'r'} for (g, e), label in RATE_LABELS.items()
+    ]}
+    return mod.load_verdicts(obj, expected_edges=rows, existing_edges=rows,
+                             definition=mod.SampleDefinition())
+
+
+def _rate(k: int, n: int) -> dict:
+    return {'k': k, 'n': n, 'rate': round(k / n, 4) if n else None,
+            'ci': list(mod.wilson_interval(k, n)) if n else None}
+
+
+class TestAdjudicatedRates:
+    def test_ruling_lexeme_stratum(self) -> None:
+        rates = mod.adjudicated_rates(RATE_ROWS, _rate_verdicts())['ruling_lexeme']
+        assert rates['episodes'] == 1
+        assert rates['minted'] == 4
+        assert rates['overreach_rate_minted'] == _rate(2, 4)
+        assert rates['overreach_rate_substantive'] == _rate(2, 3)
+        assert rates['episode_hit_rate'] == _rate(1, 1)
+        assert rates['holding_share'] == _rate(1, 4)
+        assert rates['holding_share_in_hit_episodes'] == _rate(1, 4)
+        assert rates['served_fraction_by_label']['overreach'] == _rate(1, 2)
+        assert rates['served_fraction_by_label']['holding'] == _rate(1, 1)
+        assert rates['live_strict_fraction_by_label']['overreach'] == _rate(0, 2)
+        assert rates['misbound_count'] == 0
+        assert rates['label_counts'] == {
+            'holding': 1, 'bookkeeping': 1, 'context': 0, 'overreach': 2,
+            'misbound': 0, 'unjudgeable': 0,
+        }
+
+    def test_misbound_is_counted_and_excluded_from_overreach(self) -> None:
+        rates = mod.adjudicated_rates(RATE_ROWS, _rate_verdicts())['other_decisions']
+        assert rates['misbound_count'] == 1
+        assert rates['overreach_rate_minted'] == _rate(0, 4)
+        assert rates['overreach_rate_substantive'] == _rate(0, 3)
+        assert rates['episode_hit_rate'] == _rate(0, 1)
+        assert rates['holding_share_in_hit_episodes'] == _rate(0, 0)
+
+    def test_the_all_roll_up(self) -> None:
+        rates = mod.adjudicated_rates(RATE_ROWS, _rate_verdicts())['all']
+        assert rates['episodes'] == 2
+        assert rates['minted'] == 8
+        assert rates['overreach_rate_minted'] == _rate(2, 8)
+        assert rates['overreach_rate_substantive'] == _rate(2, 6)
+        assert rates['episode_hit_rate'] == _rate(1, 2)
+        assert rates['holding_share'] == _rate(2, 8)
+
+    def test_an_empty_stratum_reports_none_not_zero(self) -> None:
+        rates = mod.adjudicated_rates(RATE_ROWS, _rate_verdicts())['decision_anchor']
+        assert rates['episodes'] == 0
+        assert rates['overreach_rate_minted'] == _rate(0, 0)
+        assert rates['overreach_rate_minted']['rate'] is None
+        assert rates['served_fraction_by_label']['overreach']['rate'] is None
+
+    def test_every_stratum_and_the_roll_up_are_present(self) -> None:
+        assert set(mod.adjudicated_rates(RATE_ROWS, _rate_verdicts())) == {*mod.STRATA, 'all'}
+
+
+class TestPerClassifierRates:
+    def test_rates_are_restricted_to_the_episodes_each_classifier_matches(self) -> None:
+        rates = mod.per_classifier_rates(RATE_ROWS, _rate_verdicts())
+        assert set(rates) == set(mod.CLASSIFIERS)
+        assert rates['header_ruling_paren']['episodes'] == 1
+        assert rates['header_ruling_paren']['overreach_rate_minted'] == _rate(2, 4)
+        assert rates['category_decisions']['episodes'] == 2
+        assert rates['category_decisions']['overreach_rate_minted'] == _rate(2, 8)
+
+
+class TestDetectorCatch:
+    def test_counts_adjudicated_overreach_by_the_detectors_on_its_episode(self) -> None:
+        hits = {('reify', 'A'): frozenset({'batch_plan'}),
+                ('dark_factory', 'B'): frozenset({'completion_claim'})}
+        catch = mod.detector_catch(RATE_ROWS, _rate_verdicts(), hits)
+        assert catch == {
+            'overreach_edges': 2,
+            'by_detector': {'unverified_claim_tag': 0, 'completion_claim': 0,
+                            'proposed_resolution': 0, 'batch_plan': 2},
+            'any_detector': 2,
+            'any_wired': 0,
+        }
+
+    def test_a_wired_detector_on_the_episode_counts_as_wired(self) -> None:
+        hits = {('reify', 'A'): frozenset({'unverified_claim_tag'})}
+        catch = mod.detector_catch(RATE_ROWS, _rate_verdicts(), hits)
+        assert catch['any_wired'] == 2
