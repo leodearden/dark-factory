@@ -29,6 +29,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
+from shared.eval_lane import eval_lane_provenance
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
 from shared.systemd_listeners import take_systemd_listeners
@@ -13938,6 +13939,24 @@ class Harness:
             except (ValueError, TypeError):
                 continue
             if age_secs < timeout:
+                continue
+
+            eval_lane_reason = eval_lane_provenance(esc.task_id, esc.worktree)
+            if eval_lane_reason is not None:
+                self._escalation_queue.resolve(
+                    esc.id,
+                    (
+                        'Dismissed by orphan reaper — eval-lane artifact '
+                        f'({eval_lane_reason}); eval-lane escalations are '
+                        'contained to the eval harness and never promoted to L1/L2'
+                    ),
+                    dismiss=True,
+                    resolved_by='harness-orphan-reaper',
+                )
+                logger.info(
+                    'Orphan L0 reaper: dismissed eval-lane orphan for task_id=%s (%s)',
+                    esc.task_id, eval_lane_reason,
+                )
                 continue
 
             # The task row, fetched AT MOST ONCE per record and shared by the
