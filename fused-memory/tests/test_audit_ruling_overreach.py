@@ -768,7 +768,7 @@ class TestDetectorCatch:
 # --------------------------------------------------------------------------- #
 
 _SKIP_LIMIT_RE = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
-_CENSUS_RE = re.compile(r'RETURN\s+count\(\*\)\s*$', re.IGNORECASE)
+_CENSUS_RE = re.compile(r'RETURN\s+count\((\*|r)\)\s*$', re.IGNORECASE)
 
 
 class _FakeResult:
@@ -883,6 +883,11 @@ class TestGraphReader:
             expired_at='2026-09-05T00:00:00+00:00',
         )
         assert edges[2].served is False
+
+    def test_the_edge_census_counts_edges_not_node_pairs(self) -> None:
+        """FalkorDB's bare-pattern count(*) collapses multi-edges between one node pair."""
+        match_clause = mod.EDGE_PAGE_CYPHER.split('RETURN')[0]
+        assert mod.EDGE_CENSUS_CYPHER == f'{match_clause}RETURN count(r)'
 
     def test_the_edge_read_never_projects_the_embedding_or_filters_liveness(self) -> None:
         assert 'fact_embedding' not in mod.EDGE_PAGE_CYPHER

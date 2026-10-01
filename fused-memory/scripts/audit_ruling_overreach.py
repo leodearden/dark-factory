@@ -753,7 +753,10 @@ EDGE_PAGE_CYPHER = (
 """ALL edges, live or not: durability is a measured output. No embedding projected.
 The directed pattern yields one row per edge, so ``r.uuid`` is a total order (see
 graphiti_client.py::_paged_ro_query on why that is load-bearing)."""
-EDGE_CENSUS_CYPHER = _EDGE_MATCH + 'RETURN count(*)'
+EDGE_CENSUS_CYPHER = _EDGE_MATCH + 'RETURN count(r)'
+"""``count(r)``, not ``count(*)``: with ``r`` unreferenced FalkorDB counts connected
+(a, b) PAIRS, so multi-edges vanish (2026-10-01, dark_factory: 19,409 vs 20,491
+edges) and a census that low would pass a read truncated by the difference."""
 
 
 def _text(value: Any) -> str | None:
