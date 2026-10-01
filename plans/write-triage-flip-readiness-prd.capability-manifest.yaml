@@ -43,7 +43,8 @@ tasks:
   capabilities:
   - name: pinned-record-enters-band-with-score
     binding: capability→producer — τ; boundary rows 5 and 7; the pattern anchors the
-      call-site argument, not prose
+      call-site argument, not prose. CANCELLED 2026-09-26 (esc-5802-2); block kept as
+      the record
     verdict: PASS
     delivered_check:
       kind: grep
@@ -69,28 +70,27 @@ tasks:
   title: 'Gate: reranker verdict (predicate)'
   capabilities:
   - name: thresholds-achievable
-    binding: floor — home is the gate task's before_done.args; filing-time basis in
-      PRD §9 (cosine rank-1 0.19, recall@20 0.79); provisional
+    binding: floor — RETIRED by §11 D12 (2026-10-01), not passed or failed; the 0.40
+      line was unresolvable at n=84 and rank-1 stopped deciding the outcome after 5794.
+      Filing-time basis in PRD §9 kept as the record
     verdict: OPEN
     delivered_check:
       kind: manual
-      reason: numeric threshold; the gate escalation carries observed values for re-basing
+      reason: retired gate; no dispatch
 - label: rho2
   task_id: 5805
   title: Integrate rerank_candidates behind write_triage.reranker with a band_signal
     knob
   capabilities:
   - name: reranker-fail-open-counted
-    binding: rejection-mechanism (INV-4) — shares TriageFailOpenCounter; Γ2's fail
-      branch removes the μ←ρ2 edge before cancelling ρ2 so this check never withholds
-      μ
-    verdict: PASS
+    binding: rejection-mechanism (INV-4) — NOT BUILT, §11 D12 (2026-10-01); the μ←ρ2
+      edge was removed before the cancel so this check never withholds μ. The grep
+      below is retained only as the record of what the binding was
+    verdict: OPEN
     delivered_check:
-      kind: grep
-      pattern: ^def rerank_candidates\(
-      paths:
-      - fused-memory/src/fused_memory/server/write_triage_rerank.py
-      expect: present
+      kind: manual
+      reason: leaf cancelled by D12; the former grep (rerank_candidates present) must
+        not be copied onto any producer
 - label: sigma
   task_id: 5806
   title: Judge-specific endpoint knob write_triage.judge_api_url
@@ -113,48 +113,167 @@ tasks:
       paths:
       - fused-memory/src/fused_memory/config/reload.py
       expect: present
-- label: mu
-  task_id: 5807
-  title: Configuration matrix and best_config for the flip
+- label: iota
+  task_id: null
+  title: Subject-level scorer score_write_triage_pairs.py (C2'')
   capabilities:
-  - name: best-config-artifact
-    binding: capability→producer — μ copies score_attachments output verbatim (C2')
+  - name: one-definition-of-the-flip-metrics
+    binding: capability→producer — ι; score_pairs is the single home Γ3's keys are
+      computed by; refuses on unrated pairs rather than scoring around them
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: '"residual":'
+      pattern: ^def score_pairs\(
+      paths:
+      - fused-memory/scripts/score_write_triage_pairs.py
+      expect: present
+  - name: judged-candidate-column-exists
+    binding: capability→producer — task 6007 (upstream dep) carries JudgeVerdict.candidate_id
+      into the per-case rows; ι reads it, never derives it
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: producer is task 6007, upstream; its own signal covers the column
+- label: omega
+  task_id: null
+  title: Frontier judge arm — openai arm on the Responses API, judge_reasoning_effort,
+    15 s timeout default
+  capabilities:
+  - name: openai-arm-posts-responses-api
+    binding: capability→producer — ω; verified 2026-09-30 that gpt-6-luna/gpt-5.6-terra/gpt-6.1-sol
+      reject max_tokens (400) and answer on the Responses API
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: responses\.create\(
+      paths:
+      - fused-memory/src/fused_memory/server/write_triage_judge.py
+      expect: present
+  - name: reasoning-effort-hot-reloadable
+    binding: capability→producer — ω registers the leaf in RELOADABLE_FIELDS
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: write_triage\.judge_reasoning_effort
+      paths:
+      - fused-memory/src/fused_memory/config/reload.py
+      expect: present
+- label: psi
+  task_id: null
+  title: Policy wording for contests in JUDGE_SYSTEM_PROMPT
+  capabilities:
+  - name: contests-clause-is-the-ruling
+    binding: capability→producer — ψ; the clause is the one home (JUDGE_SYSTEM_PROMPT);
+      measured on 359 hand links that the wording is the lever jointly with the model
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: wrong, outdated or different
+      paths:
+      - fused-memory/src/fused_memory/server/write_triage_judge.py
+      expect: present
+- label: chi
+  task_id: null
+  title: Contested consumer — briefing render and recon-marker exemption
+  capabilities:
+  - name: briefing-renders-contesting-child
+    binding: capability→producer — χ; render_memory_results has no contested branch
+      on main 1e6a7074c0 (the word 'contest' does not occur in briefing.py)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: contest
+      paths:
+      - orchestrator/src/orchestrator/agents/briefing.py
+      expect: present
+  - name: recon-marker-writes-exempt-from-triage
+    binding: capability→producer — χ; write_triage.py::declares_attach_keys exists
+      on main; the marker writes gain the kind it reads
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the exemption is behaviour under the flag on, covered by boundary row 5's
+        in-process test rather than a grep
+- label: pi
+  task_id: null
+  title: Fresh population and arm runs for the flip instrument
+  capabilities:
+  - name: population-large-enough
+    binding: floor — D15 n_judge_band ≥ 300; 591 qualifying writes existed on 2026-10-01
+      (327 dark_factory + 264 reify since 09-29) and ≈85% of fixture writes land in the
+      judge band, so ≥ 300 is reachable at freeze time
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"n_judge_band":'
+      paths:
+      - fused-memory/calibration/write_triage_population.json
+      expect: present
+  - name: slates-frozen-at-production-parameters
+    binding: capability→producer — eval_write_triage_retrieval.py::prefetch_retrievals
+      takes an arbitrary record list (κ1 landed); arms run through the shipped _call_llm
+      after ω/ψ (upstream deps)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: provenance rows in the population artifact record the parameters; a grep
+        cannot assert parity
+- label: lambda
+  task_id: null
+  title: Blind rating of the judge-named pairs (operational)
+  capabilities:
+  - name: every-named-pair-rated
+    binding: capability→producer — λ; a human-run session under the committed rater
+      brief; Γ3 requires quality.unrated_pairs ≤ 0 so an incomplete corpus cannot pass
+    verdict: OPEN
+    delivered_check:
+      kind: manual
+      reason: operational leaf; completeness is asserted by ι at μ, not by a grep
+- label: mu
+  task_id: 5807
+  title: best_config on the subject-level instrument (rescoped in place, §11)
+  capabilities:
+  - name: best-config-artifact
+    binding: capability→producer — μ copies ι's quality block verbatim (C2''); the
+      former residual key is retired with the residual rule
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '"false_contested_rate":'
       paths:
       - fused-memory/calibration/write_triage_best_config.json
       expect: present
 - label: gamma3
   task_id: 5808
-  title: 'Gate: flip readiness (predicate)'
+  title: 'Gate: flip readiness (predicate; re-based 2026-10-01)'
   capabilities:
   - name: thresholds-achievable-and-jointly-feasible
     binding: floor — home is the gate task's before_done.args; filing-time basis in
-      PRD §9 (0.79 × 0.653 = 0.516; 38 strict of 75 with ≤ 76 attaches); provisional
+      PRD §11 D15 (misfile ≤ 0.08 vs baseline 0.057; recall ≥ 0.60 vs measured 0.86–0.91;
+      false contested ≤ 0.10 vs 0.08–0.16; p95 ≤ 8 s vs 4.6–6.4; cost ≤ 0.01 vs 0.006);
+      provisional
     verdict: OPEN
     delivered_check:
       kind: manual
       reason: numeric threshold; the gate escalation carries observed values for re-basing
 - label: nu
   task_id: null
-  title: Jev provider arm for the write-triage judge (deferred)
+  title: Jev provider arm for the write-triage judge (RETIRED 2026-10-01, D13)
   capabilities:
   - name: third-provider-arm
-    binding: capability→producer — ν; vendor API verified from docs; filed deferred,
-      promoted only by Γ3's fail branch
+    binding: capability→producer — RETIRED by §11 D13; Jev's label gain is dominated
+      by Sol and Opus under the policy wording; 5809 cancelled
     verdict: OPEN
     delivered_check:
       kind: manual
-      reason: deferred leaf; no dispatch gate until promoted
+      reason: retired leaf; no dispatch
 - label: gamma4
   task_id: 5810
   title: 'Gate: flip preconditions on the refreshed tree (predicate)'
   capabilities:
   - name: flip-predicate-passes
     binding: capability→producer — scripts/check_write_triage_flip_preconditions.sh
-      (4810/4949), run by the gate itself
+      (4810/4949), run by the gate itself; args re-pointed 2026-10-01 at population.n_judge_band
     verdict: PASS
     delivered_check:
       kind: manual
