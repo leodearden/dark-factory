@@ -1,39 +1,26 @@
-"""Structural guards on how ``TaskCurator.curate()`` handles a failed curation.
+"""Structural guards on how ``task_curator.py`` fails open.
 
-Two invariants, both structural, both about the same hazard: a degraded
-curation that no signal distinguishes from a healthy one.
+All three guard one hazard: a degraded curation that no signal distinguishes
+from a healthy one, which returns ``action='create'`` exactly as a healthy
+create does.
 
-1. Every exception arm around the LLM call routes through ``report_failure``.
-2. ``curate()`` constructs no ``CuratorDecision`` directly — every degraded
-   decision leaves through the ``_degraded_create`` funnel that counts it —
-   and no other ``TaskCurator`` method builds an ``action='create'`` decision
-   itself either, so the batch path cannot fail open uncounted (esc-4448-11).
+1. Every exception arm around ``TaskCurator.curate()``'s LLM call routes
+   through ``report_failure``.
+2. No ``TaskCurator`` method builds an ``action='create'`` decision except the
+   ``_degraded_create`` funnel, which is what advances the degraded streak.
+3. Every ``CuratorDecision(action='create', ...)`` in the module states its
+   ``degraded=`` classification explicitly, as a literal.
 
-``TaskCurator.curate()`` wraps its LLM call in one ``try`` with three handlers.
-Two of them escalate; the third — the catch-all — did not, and that asymmetry
-is what let the 2026-08-13 to 08-18 outage run for five days: a
-``FileNotFoundError`` for the ``claude`` binary landed in the silent arm, which
-logged at WARNING and returned ``action='create'``, a decision shape
-indistinguishable downstream from a healthy create.
-
-The behavioural halves of the fix are asserted in test_task_curator.py by
-TestUnexpectedExceptionArmReports and TestConsecutiveDegradedAlarm. Those tests
-pin the paths that exist TODAY, and neither can fail for a path added TOMORROW
-— a fourth ``except`` clause, or a sixth degraded branch building its own
-decision, reintroduces the original defect while every behavioural test stays
-green, because no test drives a failure nobody has thought of yet. These guards
-assert over the shapes themselves, so the requirements land on any new arm or
-branch without anyone remembering to extend a list.
-
-Asserted over the PARSED module, not its text, so prose that merely mentions
-``report_failure`` — a comment in a handler explaining why it does not need to
-report — cannot satisfy the check.
+The behavioural halves live in test_task_curator.py. Those pin the paths that
+exist today; these assert over the shapes themselves, so the requirements land
+on an arm or branch added tomorrow without anyone remembering to extend a list.
+Asserted over the PARSED module, so prose that merely mentions a name cannot
+satisfy a check.
 
 Deliberately NOT asserted: which exception types the arms catch, their order,
-what each passes to ``report_failure``, or what ``_degraded_create`` does with
-the decision it builds. Those are design choices the code is free to revise;
-the invariants are only that no arm is silent and no degraded decision is
-uncounted.
+what each passes to ``report_failure``, or which way a branch is classified.
+Those are design choices; the invariants are only that no arm is silent, no
+create is uncounted, and no fail-open leaves its classification to a default.
 """
 
 from __future__ import annotations
@@ -136,13 +123,8 @@ def test_every_llm_exception_arm_reports_failure():
 
 
 def test_curate_constructs_no_decision_directly():
-    """Degraded decisions leave through one funnel, not five constructions.
-
-    This is what makes the streak alarm hole-free BY CONSTRUCTION rather than
-    by an enumerated list of degraded reasons. A future sixth degraded path
-    that builds its own CuratorDecision would not be counted, and — exactly
-    like the silent arm this task started from — nothing would look wrong.
-    """
+    """Degraded decisions leave through one funnel, so the streak alarm needs
+    no enumerated list of degraded reasons to stay hole-free."""
     direct = calls_named(_curate_def(), DECISION_TYPE)
     assert not direct, (
         f'{CURATOR_CLASS}.{CURATE_METHOD} constructs {DECISION_TYPE} directly at '
@@ -175,9 +157,7 @@ def _is_create_construction(call: ast.Call) -> bool:
 def test_no_curator_method_but_the_funnel_builds_a_create():
     """The whole class, not just curate(): a create the curator builds for
     itself — rather than parsing from a model response — is by definition a
-    fail-open, so it must be counted. esc-4448-11 found the batch path's
-    breaker-open short-circuit building its own creates, which filed every
-    batch candidate without dedupe while the streak stood still."""
+    fail-open, so it must be counted, on the batch path as on the single one."""
     methods = _curator_methods()
     assert any(m.name == DEGRADED_FUNNEL for m in methods), (
         f'{CURATOR_CLASS} has no {DEGRADED_FUNNEL}() — re-point this guard.'
@@ -198,191 +178,54 @@ def test_no_curator_method_but_the_funnel_builds_a_create():
     )
 
 
-# --- Invariant 3: _parse_decision_dict's fail-open returns are classified ----
+# --- Invariant 3: every fail-open create states its classification ---------
 #
-# The same hazard as invariant 2, one function away. _parse_decision_dict
-# cannot use the _degraded_create funnel (it is a module-level parser with no
-# curator to count against), so it marks degradation with the `degraded=`
-# field instead — and whether each fail-open branch sets it was, until
-# esc-4448-9, decided by whoever wrote the branch. Five of the eight branches
-# were payload failures and two of those shipped unmarked, which held the
-# streak at 0 through a total dedupe bypass.
-#
-# So this guard asserts the classification is DELIBERATE rather than
-# defaulted: every fail-open return must either set `degraded=` explicitly,
-# or be named in the state-veto allowlist below. Adding a branch without
-# doing one or the other fails here, which is the only place a reader is
-# forced to answer the question the field's contract asks.
-PARSE_FN = '_parse_decision_dict'
-
-# Branches whose verdict turns on POOL STATE, not on the response — the model
-# rendered a usable decision and a downstream guard declined to act on it.
-# Routine on a healthy curator, so deliberately NOT degraded. Keyed by the
-# justification marker each branch emits. See CuratorDecision.degraded.
-STATE_VETO_MARKERS = (
-    'invalid-target',
-    'unknown-status-target',
-    'invalid-combine-target',
-)
+# Module-level parsers have no curator to count against, so they mark
+# degradation on the decision itself and the caller counts it. Whether a
+# branch is degraded is therefore part of the data each branch writes, never
+# a default nobody chose.
 
 
-def _parse_decision_dict_def() -> ast.FunctionDef:
-    tree = parse_python_module(TASK_CURATOR)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == PARSE_FN:
-            return node
-    raise AssertionError(
-        f'{TASK_CURATOR.name}: no def {PARSE_FN}() — this guard has lost its '
-        f'subject and is asserting nothing; re-point it rather than deleting it.'
-    )
+def _module_create_constructions() -> list[ast.Call]:
+    return [
+        call
+        for call in calls_named(parse_python_module(TASK_CURATOR), DECISION_TYPE)
+        if _is_create_construction(call)
+    ]
 
 
-def _fail_open_returns() -> list[ast.Call]:
-    """Every ``return CuratorDecision(action='create', ...)`` in the parser.
-
-    The terminal ``return`` carries the parsed action through a variable, so
-    keying on the literal ``'create'`` selects exactly the fail-open branches
-    and never the success path.
-    """
-    found = []
-    for node in ast.walk(_parse_decision_dict_def()):
-        if not isinstance(node, ast.Return):
-            continue
-        for call in calls_named(node, DECISION_TYPE):
-            action = next(
-                (kw.value for kw in call.keywords if kw.arg == 'action'), None
-            )
-            if isinstance(action, ast.Constant) and action.value == 'create':
-                found.append(call)
-    return found
+def _declares_degradedness(call: ast.Call) -> bool:
+    degraded = next((kw.value for kw in call.keywords if kw.arg == 'degraded'), None)
+    return isinstance(degraded, ast.Constant) and isinstance(degraded.value, bool)
 
 
-def _marker_text(call: ast.Call) -> str:
+def _justification_text(call: ast.Call) -> str:
     justification = next(
         (kw.value for kw in call.keywords if kw.arg == 'justification'), None
     )
-    return ast.unparse(justification) if justification is not None else ''
+    return ast.unparse(justification) if justification is not None else '<none>'
 
 
-def test_every_fail_open_parse_branch_declares_degradedness():
-    unclassified = [
-        call
-        for call in _fail_open_returns()
-        if not any(kw.arg == 'degraded' for kw in call.keywords)
-        and not any(marker in _marker_text(call) for marker in STATE_VETO_MARKERS)
-    ]
+def test_every_fail_open_create_declares_degradedness():
+    creates = _module_create_constructions()
+    assert creates, (
+        f'no {DECISION_TYPE}(action=\'create\') in {TASK_CURATOR.name} — this '
+        f'guard has lost its subject; re-point it rather than deleting it.'
+    )
+    unclassified = [call for call in creates if not _declares_degradedness(call)]
     assert not unclassified, (
-        f'{PARSE_FN}() has fail-open branch(es) at line(s) '
-        f'{sorted(call.lineno for call in unclassified)} that neither set '
-        f'degraded= nor match a known state veto '
-        f'({", ".join(STATE_VETO_MARKERS)}): '
-        + ', '.join(_marker_text(call) or '<no justification>' for call in unclassified)
-        + '. Classify it by what the verdict DEPENDS ON: if only the response '
-        'was consulted, the model broke the output contract and the branch is '
-        'degraded=True; if pool state declined an otherwise usable decision, '
-        'add its marker to STATE_VETO_MARKERS. Leaving it defaulted makes a '
-        'sustained dedupe bypass read as health (esc-4448-9).'
-    )
-
-
-def test_state_veto_allowlist_still_matches_real_branches():
-    """A marker that no longer matches any branch would silently widen the
-    allowlist past its subject, letting a future payload failure inherit an
-    exemption written for a veto that no longer exists."""
-    markers = [_marker_text(call) for call in _fail_open_returns()]
-    orphaned = [
-        veto for veto in STATE_VETO_MARKERS
-        if not any(veto in marker for marker in markers)
-    ]
-    assert not orphaned, (
-        f'STATE_VETO_MARKERS entries match no branch in {PARSE_FN}(): '
-        f'{orphaned}. Remove them rather than leaving a dead exemption.'
-    )
-
-
-# --- Invariant 4: a state veto is state-gated in EVERY disjunct -------------
-#
-# Invariant 3 keys its exemption on the justification marker, and a return
-# carries exactly one marker however many causes reach it. So a condition that
-# ORs two sufficient causes hands whichever cause the author was not thinking
-# of the other one's classification, invisibly: esc-4448-10 found
-# `not is_within_batch_drop and (not target_id or target_id not in valid_ids)`
-# returning ONE 'invalid-target' create for both "the model named no target"
-# (payload failure — nothing outside the response consulted) and "the named
-# target is not in the pool" (state veto). The first was schema-legal
-# ({'action': 'drop', 'justification': 'dup'} — target_id is nullable and in
-# neither schema's `required`), returned degraded=False, and so cleared the
-# streak on every candidate. Invariant 3 passed it because the marker was
-# allowlisted.
-#
-# This closes that by construction: for a branch to claim the state-veto
-# exemption, every alternative cause that can reach it must consult pool
-# state. A disjunct referencing none of these names is a payload test
-# sharing a veto's return, which is the defect.
-POOL_STATE_NAMES = frozenset({'valid_ids', 'target_entry', 'pool'})
-
-
-def _referenced_names(node: ast.AST) -> set[str]:
-    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
-
-
-def _is_state_gated(node: ast.AST) -> bool:
-    """Does every alternative cause in *node* consult pool state?
-
-    ``or`` introduces alternative sufficient causes, so EVERY operand must be
-    gated. ``and`` is one combined cause, so ONE gated conjunct suffices to
-    gate the whole of it.
-    """
-    if isinstance(node, ast.BoolOp):
-        if isinstance(node.op, ast.Or):
-            return all(_is_state_gated(v) for v in node.values)
-        return any(_is_state_gated(v) for v in node.values)
-    return bool(_referenced_names(node) & POOL_STATE_NAMES)
-
-
-def _veto_branch_conditions() -> list[tuple[ast.If, ast.Call]]:
-    """Each ``if`` whose body directly returns an allowlisted fail-open create.
-
-    Keyed on the return being DIRECTLY in the ``if`` body so a wrapping
-    ``if`` whose body holds only nested ``if``s is not mistaken for the guard
-    of a return two levels down.
-    """
-    exempt = []
-    for node in ast.walk(_parse_decision_dict_def()):
-        if not isinstance(node, ast.If):
-            continue
-        for stmt in node.body:
-            if not isinstance(stmt, ast.Return):
-                continue
-            for call in calls_named(stmt, DECISION_TYPE):
-                if any(kw.arg == 'degraded' for kw in call.keywords):
-                    continue
-                if any(m in _marker_text(call) for m in STATE_VETO_MARKERS):
-                    exempt.append((node, call))
-    return exempt
-
-
-def test_state_veto_branches_are_state_gated_in_every_disjunct():
-    exempt = _veto_branch_conditions()
-    assert exempt, (
-        f'no state-veto branch found in {PARSE_FN}() — this guard has lost '
-        f'its subject; re-point it rather than deleting it.'
-    )
-    leaky = [
-        (branch, call) for branch, call in exempt
-        if not _is_state_gated(branch.test)
-    ]
-    assert not leaky, (
-        'state-veto branch(es) in '
-        f'{PARSE_FN}() have an alternative cause that consults no pool state '
-        f'({", ".join(sorted(POOL_STATE_NAMES))}): '
-        + '; '.join(
-            f'line {branch.lineno}: if {ast.unparse(branch.test)} -> '
-            f'{_marker_text(call)}'
-            for branch, call in leaky
+        f'{TASK_CURATOR.name} builds fail-open create(s) without a literal '
+        'degraded=True/False: '
+        + ', '.join(
+            f'line {call.lineno} ({_justification_text(call)})'
+            for call in unclassified
         )
-        + '. One return carries one marker however many causes reach it, so a '
-        'payload failure ORed into a veto branch inherits degraded=False and '
-        'clears the streak on every candidate (esc-4448-10). Split the causes '
-        'into separate branches with separate markers and classify each.'
+        + '. Classify each by what its verdict DEPENDS ON. degraded=True when '
+        'no usable decision was obtained, or only the RESPONSE was consulted '
+        '(the model broke the output contract): sustained, that is an outage '
+        'the streak alarm must see. degraded=False when POOL STATE declined an '
+        'otherwise usable decision: routine on a healthy curator, so counting '
+        'it would fire the alarm on a working service. Give each cause its own '
+        'branch — a condition ORing a payload failure into a state veto hands '
+        'the payload failure the veto\'s classification.'
     )

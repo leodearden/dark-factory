@@ -41,6 +41,7 @@ from fused_memory.middleware.task_curator import (
     CuratorDecision,
     CuratorFailureError,
     TaskCurator,
+    _DegradedStreak,
     _parse_batch_decisions,
     _parse_decision,
     _parse_decision_dict,
@@ -984,11 +985,27 @@ class TestUnexpectedExceptionArmReports:
         assert exc_name in kwargs['subtype']
 
 
+def _seed_streak(
+    curator: TaskCurator, *, count: int, alarm_fired: bool = False,
+    project_id: str = 'p',
+) -> None:
+    """Start *project_id*'s degraded streak mid-run, as if *count* had elapsed."""
+    curator._degraded_streaks[project_id] = _DegradedStreak(
+        count=count, alarm_fired=alarm_fired,
+    )
+
+
+def _streak(curator: TaskCurator, project_id: str = 'p') -> _DegradedStreak:
+    """*project_id*'s degraded streak; a never-started or reset one reads as zero."""
+    return curator._degraded_streaks.get(project_id, _DegradedStreak())
+
+
 class TestConsecutiveDegradedAlarm:
     """Part B: a run of degraded curations is itself the alarm, whatever caused it.
 
-    Every degraded arm counts toward one streak — capped accounts, a reported
-    LLM failure, an unexpected exception, a corpus failure, an open breaker.
+    Every degraded arm counts toward the project's one streak — capped
+    accounts, a reported LLM failure, an unexpected exception, a corpus
+    failure, an open breaker.
     That is deliberate: a curator degrading for days is the same outage to the
     fleet no matter which arm it came out of, and an alarm that enumerated
     causes would have the same hole per-class instrumentation always has.
@@ -1087,6 +1104,34 @@ class TestConsecutiveDegradedAlarm:
         assert kwargs['project_id'] == 'p'
         assert kwargs['project_root'] == '/x'
         assert 'corpus-failed' in kwargs['last_justification']
+
+    @pytest.mark.asyncio
+    async def test_streak_is_kept_per_project(self):
+        """One curator serves every project. Project B's healthy curations,
+        interleaved with project A's degradations, must neither reset nor mask
+        A's streak, and the alarm is filed against A."""
+        curator, escalator = self._curator_with_escalator()
+        healthy = CuratorDecision(action='drop', target_id='42', justification='dup')
+        outcomes = []
+        for i in range(5):
+            outcomes += [RuntimeError(f'project a down #{i}'), healthy]
+
+        with patch.object(curator, '_build_corpus', side_effect=self._empty_corpus), \
+             patch.object(curator, '_call_llm', side_effect=outcomes):
+            for i in range(5):
+                await curator.curate(
+                    CandidateTask(title=f'A{i}'), project_id='a', project_root='/a',
+                )
+                await curator.curate(
+                    CandidateTask(title=f'B{i}'), project_id='b', project_root='/b',
+                )
+
+        escalator.report_consecutive_degraded.assert_awaited_once()
+        kwargs = escalator.report_consecutive_degraded.await_args.kwargs
+        assert kwargs['project_id'] == 'a'
+        assert kwargs['project_root'] == '/a'
+        assert kwargs['streak'] == 5
+        assert _streak(curator, 'b').count == 0
 
 
 class TestStartupSelfCheck:
@@ -1914,8 +1959,7 @@ class TestDegradedStreakBatchReset:
         # Seed a streak that has already fired, so this pins both halves of
         # the reset: a counter cleared but a latch left armed would silence
         # the NEXT outage entirely.
-        curator._consecutive_degraded = 3
-        curator._degraded_alarm_fired = True
+        _seed_streak(curator, count=3, alarm_fired=True)
 
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
         healthy = self._healthy_batch_result(2)
@@ -1934,8 +1978,8 @@ class TestDegradedStreakBatchReset:
         # path rather than _parse_batch_decisions's batch-item-missing
         # degradation, which would also produce 2 (degraded) decisions.
         assert [d.justification for d in decisions] == ['ok', 'ok']
-        assert curator._consecutive_degraded == 0
-        assert curator._degraded_alarm_fired is False
+        assert _streak(curator).count == 0
+        assert _streak(curator).alarm_fired is False
 
     @pytest.mark.asyncio
     async def test_healthy_batches_between_degradations_do_not_fire_alarm(self):
@@ -1966,7 +2010,7 @@ class TestDegradedStreakBatchReset:
                    new=AsyncMock(return_value=healthy)):
             for i in range(4):
                 await degrade(i)
-            assert curator._consecutive_degraded == 4
+            assert _streak(curator).count == 4
 
             for _ in range(20):
                 await curator._call_llm_batch(
@@ -1981,7 +2025,7 @@ class TestDegradedStreakBatchReset:
             await degrade(4)
 
         escalator.report_consecutive_degraded.assert_not_awaited()
-        assert curator._consecutive_degraded == 1
+        assert _streak(curator).count == 1
 
     @pytest.mark.asyncio
     async def test_healthy_batch_through_curate_batch_prepared_resets_streak(self):
@@ -1991,8 +2035,7 @@ class TestDegradedStreakBatchReset:
         from fused_memory.middleware.task_curator import PreparedCandidate
 
         curator, _escalator = self._curator_with_escalator()
-        curator._consecutive_degraded = 3
-        curator._degraded_alarm_fired = True
+        _seed_streak(curator, count=3, alarm_fired=True)
 
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
         c1 = CandidateTask(title='Prepared candidate Gamma', description='gamma task details')
@@ -2010,8 +2053,8 @@ class TestDegradedStreakBatchReset:
             )
 
         assert [d.justification for d in decisions] == ['ok', 'ok']
-        assert curator._consecutive_degraded == 0
-        assert curator._degraded_alarm_fired is False
+        assert _streak(curator).count == 0
+        assert _streak(curator).alarm_fired is False
 
     @pytest.mark.asyncio
     async def test_failed_batch_does_not_reset_degraded_streak(self):
@@ -2021,8 +2064,7 @@ class TestDegradedStreakBatchReset:
         backend's own failed batches would clear the streak they cause and the
         alarm could never fire from the batch-dominant path at all."""
         curator, _escalator = self._curator_with_escalator()
-        curator._consecutive_degraded = 3
-        curator._degraded_alarm_fired = True
+        _seed_streak(curator, count=3, alarm_fired=True)
 
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
         zot = self._zot_result()
@@ -2038,8 +2080,8 @@ class TestDegradedStreakBatchReset:
                 project_root='/x',
             )
 
-        assert curator._consecutive_degraded == 3
-        assert curator._degraded_alarm_fired is True
+        assert _streak(curator).count == 3
+        assert _streak(curator).alarm_fired is True
 
     @pytest.mark.asyncio
     async def test_decisionless_success_grows_streak_and_fires_alarm(self):
@@ -2056,8 +2098,7 @@ class TestDegradedStreakBatchReset:
         curator, escalator = self._curator_with_escalator()
         # Seeded just below threshold (5), so a reset that survives anywhere on
         # this path shows up as an alarm that never fires.
-        curator._consecutive_degraded = 4
-        curator._degraded_alarm_fired = False
+        _seed_streak(curator, count=4, alarm_fired=False)
 
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
         # Well-formed, prompt, success=True — and structurally unusable.
@@ -2081,8 +2122,8 @@ class TestDegradedStreakBatchReset:
         ]
         assert all(d.degraded for d in decisions)
         # Both items counted: 4 + 2.
-        assert curator._consecutive_degraded == 6
-        assert curator._degraded_alarm_fired is True
+        assert _streak(curator).count == 6
+        assert _streak(curator).alarm_fired is True
         escalator.report_consecutive_degraded.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2092,7 +2133,7 @@ class TestDegradedStreakBatchReset:
         job; the other item's degradation is the designed per-item fail-open,
         and counting it would make a routine partial parse read as an outage."""
         curator, escalator = self._curator_with_escalator()
-        curator._consecutive_degraded = 4
+        _seed_streak(curator, count=4)
 
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
         partial = AgentResult(
@@ -2113,7 +2154,7 @@ class TestDegradedStreakBatchReset:
             )
 
         assert [d.degraded for d in decisions] == [False, True]
-        assert curator._consecutive_degraded == 0
+        assert _streak(curator).count == 0
         escalator.report_consecutive_degraded.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -2138,21 +2179,19 @@ class TestDegradedStreakBatchReset:
                 assert decision.action == 'create'
                 assert decision.degraded is True
 
-        assert curator._consecutive_degraded == 5
+        assert _streak(curator).count == 5
         escalator.report_consecutive_degraded.assert_awaited_once()
 
 
 class TestPayloadFailureDegradedness:
-    """esc-4448-9: a fail-open whose cause is the RESPONSE, not the pool.
+    """A fail-open whose cause is the RESPONSE, not the pool, is degraded.
 
     `_parse_decision_dict` fails open to action='create' from eight branches.
     Three turn on pool state (a usable decision a guard declined — routine, and
     correctly uncounted). The other five turn on the payload alone: the model
-    did not honour the output contract. Sustained, that is precisely the
-    model/schema regression the streak alarm was chartered against, so leaving
-    them undegraded did not merely blind the alarm — each such call took
-    curate()'s `else: self._reset_degraded_streak()` branch and actively
-    cleared a streak accumulated from other arms, the same shape as esc-4448-8.
+    did not honour the output contract. Sustained, that is the model/schema
+    regression the streak alarm exists for; left undegraded, each such call
+    would also reset a streak accumulated from other arms.
     """
 
     @staticmethod
@@ -2205,14 +2244,13 @@ class TestPayloadFailureDegradedness:
                 assert 'missing-target' in decision.justification
                 assert decision.degraded is True
 
-        assert curator._consecutive_degraded == 8
+        assert _streak(curator).count == 8
         escalator.report_consecutive_degraded.assert_awaited_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('marker,payload', PAYLOAD_FAILURES)
     async def test_single_path_counts_payload_failure(self, marker, payload):
-        """The reviewer's reproducer: 8 consecutive out-of-enum actions used to
-        give degraded=False and _consecutive_degraded == 0 throughout."""
+        """Eight consecutive out-of-enum actions are eight degraded curations."""
         curator, escalator = self._curator_with_escalator()
         result = AgentResult(success=True, output='', cost_usd=0.01,
                              structured_output=payload)
@@ -2227,7 +2265,7 @@ class TestPayloadFailureDegradedness:
                 assert marker in decision.justification
                 assert decision.degraded is True
 
-        assert curator._consecutive_degraded == 8
+        assert _streak(curator).count == 8
         escalator.report_consecutive_degraded.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2236,7 +2274,7 @@ class TestPayloadFailureDegradedness:
         """Batch resets on `any(not d.degraded ...)`, so an all-payload-failure
         batch used to reset too — the esc-4448-8 hole, re-entered by cause."""
         curator, escalator = self._curator_with_escalator()
-        curator._consecutive_degraded = 4
+        _seed_streak(curator, count=4)
 
         empty_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
         batch = AgentResult(
@@ -2258,7 +2296,7 @@ class TestPayloadFailureDegradedness:
 
         assert all(d.action == 'create' and d.degraded for d in decisions)
         assert all(marker in d.justification for d in decisions)
-        assert curator._consecutive_degraded == 6
+        assert _streak(curator).count == 6
         escalator.report_consecutive_degraded.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2295,7 +2333,7 @@ class TestPayloadFailureDegradedness:
                 assert 'invalid-combine-target' in decision.justification
                 assert decision.degraded is False
 
-        assert curator._consecutive_degraded == 0
+        assert _streak(curator).count == 0
         escalator.report_consecutive_degraded.assert_not_awaited()
 
 

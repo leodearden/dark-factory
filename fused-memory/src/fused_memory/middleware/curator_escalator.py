@@ -598,9 +598,11 @@ class CuratorEscalator:
             'five days, costing >=80h of fleet-wide dedupe. This path is the '
             'backstop that bounds the next one at `threshold` curations.',
             '',
-            'Every curation since the streak began returned action=create '
-            'WITHOUT consulting the LLM, so duplicate tasks filed in that '
-            'window were never deduped and may need a sweep.',
+            f'Every curation for project {project_id!r} since the streak began '
+            'returned action=create WITHOUT a usable dedupe judgement, so '
+            'duplicate tasks filed in that window were never deduped and may '
+            'need a sweep. The streak is counted per project; other projects '
+            'served by the same curator may be healthy.',
         ])
 
         queue = self._queue_for(project_root)

@@ -333,52 +333,11 @@ class CuratorDecision:
     # candidate in the same batch (neither yet materialised as a task).
     # The worker substitutes the sibling's resulting task_id at dispatch time.
     batch_target_index: int | None = None
-    # True when this is a fail-open create that no dedupe judgement stands
-    # behind — the response carried nothing decidable for this candidate, so
-    # the curation degraded rather than decided.  Carried as a field rather
-    # than inferred from a ``justification`` prefix so that a degraded path
-    # added later is counted by construction instead of by whoever remembers
-    # to extend a list of marker strings; the whole of task 4448 is what an
-    # uncounted degradation costs.
-    #
-    # The line _parse_decision_dict's fail-open returns are sorted on is
-    # WHAT THE VERDICT DEPENDS ON — ask it of any branch added later rather
-    # than matching the branch against a list:
-    #
-    #   POOL STATE said no  →  degraded=False. The model rendered a usable
-    #     decision and a downstream guard declined to act on it because of
-    #     data outside the response: 'invalid-target' (id not in pool),
-    #     'unknown-status-target' (RC3 create-safe), 'invalid-combine-target'
-    #     (target not pending). All routine on a perfectly healthy curator —
-    #     a pool holding no combine-eligible entry produces them forever —
-    #     so counting them would fire the alarm on a working service, the
-    #     opposite failure from the one it exists to catch.
-    #
-    #   THE RESPONSE ITSELF was unusable  →  degraded=True. Nothing outside
-    #     the payload is consulted; the model simply did not honour the
-    #     output contract: 'invalid-action' (action outside the enum);
-    #     'missing-target' (an action that requires a target named none);
-    #     'ambiguous-drop' (target_id and batch_target_index, which are
-    #     mutually exclusive, both set); and the three combine-rewrite
-    #     failures 'combine-missing-rewrite', 'rewrite-parse-failed' and
-    #     'rewrite-empty-title-or-details' (prompt and schema both make
-    #     rewritten_task mandatory for combine, so a combine without a
-    #     usable one decides nothing actionable).
-    #     Sustained, this IS the model/schema regression the streak alarm was
-    #     chartered against, and it is indistinguishable from health unless
-    #     counted — esc-4448-9 measured 8 consecutive out-of-enum actions
-    #     holding the streak at 0 while every candidate bypassed dedupe.
-    #
-    # The line is drawn per CAUSE, not per return statement. A single return
-    # whose condition ORs two sufficient causes hands whichever cause the
-    # author was not thinking of the other one's classification, and no
-    # marker-keyed check can see it because the return carries one marker:
-    # that is how 'missing-target' hid inside 'invalid-target' until
-    # esc-4448-10. Give each cause its own branch and its own marker.
-    #
-    # The list above is exhaustive as written, deliberately with no trailing
-    # '…': a reader adding a branch must classify it, not append to prose.
-    # test_curator_arm_instrumentation_guard.py enforces that structurally.
+    # True for a fail-open create that no dedupe judgement stands behind: the
+    # response itself was unusable, or the curator never got one. False for a
+    # usable decision that POOL STATE vetoed. Every fail-open create states it
+    # explicitly, as enforced (with the classification rule spelled out) by
+    # fused-memory/tests/test_curator_arm_instrumentation_guard.py.
     degraded: bool = False
 
     def to_log_fields(self) -> dict[str, Any]:
@@ -618,6 +577,19 @@ def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float
     return min(base + per_entry * size, cap)
 
 
+@dataclass
+class _DegradedStreak:
+    """One project's run of consecutive degraded curations.
+
+    ``alarm_fired`` latches so a streak escalates once, not once per curation
+    past the threshold; the whole record is discarded on that project's next
+    usable decision.
+    """
+
+    count: int = 0
+    alarm_fired: bool = False
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 
@@ -679,16 +651,13 @@ class TaskCurator:
         self._consecutive_zero_output_timeouts: int = 0
         # monotonic() time until which the breaker is open (None = closed).
         self._zero_output_breaker_open_until: float | None = None
-        # Class-agnostic degraded streak (task 4448). DISTINCT from the ZOT
-        # counter above in both what it counts and why: that one counts only
-        # zero-output timeouts, to stop paying 180s per hung call; this one
-        # counts degraded DECISIONS of every cause, to make a sustained outage
-        # visible. They must not be merged — the ZOT counter's semantics carry
-        # task 3995C's breaker contract and task 4143's batch-reset fix.
-        self._consecutive_degraded: int = 0
-        # One-shot latch: a streak escalates once, not once per curation after
-        # the threshold. Cleared with the counter on the next LLM success.
-        self._degraded_alarm_fired: bool = False
+        # Degraded-curation streaks by project_id (task 4448). Distinct from
+        # the ZOT counter above: that one counts hung calls in order to stop
+        # paying for them; these count degraded decisions of every cause, in
+        # order to make a sustained outage visible. Keyed by project because
+        # one curator serves every project, so a shared count would let one
+        # project's healthy curations mask another's outage.
+        self._degraded_streaks: dict[str, _DegradedStreak] = {}
 
     # ------------------------------------------------------------------
     # Zero-output-timeout circuit breaker (task 1743)
@@ -1461,17 +1430,11 @@ class TaskCurator:
     async def startup_self_check(self, project_id: str, project_root: str) -> bool:
         """Report whether the curator's backend CLI binary resolves. Never raises.
 
-        The 2026-08-13 outage was diagnosable from its first curation — the
-        binary was not there — and what was missing was anyone asking. Asking
-        once, at wiring time, converts five days of silent degradation into one
-        escalation before the first candidate is filed.
-
-        Returns a verdict rather than raising, and the caller treats it as
-        information rather than a precondition: a curator whose binary is
-        missing still degrades to ``action='create'``, which is strictly better
-        than a curator that refuses to construct. The interceptor wraps
-        construction in ``except Exception -> return None``, so raising here
-        would silently disable dedupe outright.
+        An unresolvable binary degrades every curation; asking once at wiring
+        time escalates it before the first candidate is filed. A verdict, not
+        a precondition: a curator without its binary still fails open to
+        ``action='create'``, whereas raising would reach the interceptor's
+        ``except Exception -> return None`` and disable dedupe outright.
         """
         spec = claude_binary_spec()
         resolved = resolve_claude_binary()
@@ -1502,10 +1465,9 @@ class TaskCurator:
     # Class-agnostic degraded-streak alarm (task 4448)
     # ------------------------------------------------------------------
 
-    def _reset_degraded_streak(self) -> None:
-        """Clear the streak and re-arm the alarm. Called on LLM success only."""
-        self._consecutive_degraded = 0
-        self._degraded_alarm_fired = False
+    def _reset_degraded_streak(self, project_id: str) -> None:
+        """Clear *project_id*'s streak and re-arm its alarm, on a usable decision."""
+        self._degraded_streaks.pop(project_id, None)
 
     async def _degraded_create(
         self,
@@ -1519,19 +1481,12 @@ class TaskCurator:
     ) -> CuratorDecision:
         """Build a degraded ``action='create'`` decision and count it.
 
-        The single exit every degraded path in :meth:`curate` and every
-        breaker-open short-circuit in :meth:`curate_batch_prepared` takes,
-        which is
-        what lets the streak be counted without enumerating the reasons a
-        curation can degrade. A path that built its own
-        :class:`CuratorDecision` would be invisible here and, like the silent
-        exception arm that motivated task 4448, would look like nothing was
-        wrong; tests/test_curator_arm_instrumentation_guard.py holds that
-        structurally.
-
-        Degrading is not itself a failure — it is the designed fail-open
-        behaviour — so this neither raises nor changes the decision. It only
-        notices when degrading has stopped being occasional.
+        The only ``TaskCurator`` method that builds a create of its own, which
+        is what lets the streak be counted without enumerating why a curation
+        can degrade; fused-memory/tests/test_curator_arm_instrumentation_guard.py
+        enforces that. Degrading is the designed fail-open, so this neither
+        raises nor alters the decision; it only notices when degrading has
+        stopped being occasional.
         """
         decision = CuratorDecision(
             action='create',
@@ -1556,30 +1511,31 @@ class TaskCurator:
         project_root: str,
         candidate_title: str,
     ) -> None:
-        """Advance the streak for one degraded curation, firing the alarm once.
+        """Advance *project_id*'s streak by one degraded curation, alarming once.
 
         Shared by :meth:`_degraded_create` (single-candidate paths) and by
         :meth:`_call_llm_batch` (items a successful round-trip nonetheless
         failed to decide).  The alarm is class-agnostic by construction: it
         takes only the fact that a curation degraded, never the reason.
         """
-        self._consecutive_degraded += 1
+        streak = self._degraded_streaks.setdefault(project_id, _DegradedStreak())
+        streak.count += 1
         threshold = self._config.curator.degraded_streak_threshold
-        if self._consecutive_degraded < threshold or self._degraded_alarm_fired:
+        if streak.count < threshold or streak.alarm_fired:
             return
 
-        self._degraded_alarm_fired = True
+        streak.alarm_fired = True
         logger.error(
             'task_curator: %d consecutive degraded curations for project %s '
             '(threshold %d) — every candidate in that run was filed without '
             'dedupe. Last: %s',
-            self._consecutive_degraded, project_id, threshold, justification,
+            streak.count, project_id, threshold, justification,
         )
         if self._escalator is not None:
             await self._escalator.report_consecutive_degraded(
                 project_root=project_root,
                 project_id=project_id,
-                streak=self._consecutive_degraded,
+                streak=streak.count,
                 threshold=threshold,
                 last_justification=justification,
                 candidate_title=candidate_title,
@@ -1703,14 +1659,9 @@ class TaskCurator:
             )
             # Success: reset the consecutive-ZOT counter so a single hung call
             # that was followed by a healthy one doesn't accumulate toward open.
-            # Keyed on the round-trip completing, which is what that breaker
-            # asserts about — see the matching reset in _call_llm_batch.
             self._reset_zero_output_breaker()
-            # The streak asserts something narrower: that curation is still
-            # producing dedupe judgements. _parse_decision degrades an
-            # unparseable payload to action='create' without raising, so a
-            # completed call is not by itself evidence of that (esc-4448-8
-            # measured the same hole on the batch path).
+            # A completed call can still carry no usable decision (the parser
+            # fails open without raising), so the streak keys on the decision.
             if decision.degraded:
                 await self._count_degraded(
                     justification=decision.justification,
@@ -1719,7 +1670,7 @@ class TaskCurator:
                     candidate_title=candidate.title,
                 )
             else:
-                self._reset_degraded_streak()
+                self._reset_degraded_streak(project_id)
         except AllAccountsCappedException as exc:
             logger.warning(
                 'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
@@ -1780,11 +1731,9 @@ class TaskCurator:
                 project_root=project_root,
             )
         except Exception as exc:
-            # An exception class nobody anticipated. It degrades exactly like
-            # the named arms above, and it reports exactly like them too: a
-            # silent arm here returns action='create', which downstream cannot
-            # tell from a healthy create (the 2026-08-13 to 08-18 outage ran
-            # five days on a FileNotFoundError landing right here).
+            # An exception class nobody anticipated: degrade AND report, like
+            # the named arms. A silent create here is indistinguishable
+            # downstream from a healthy one.
             logger.warning(
                 'task_curator: LLM call failed with unexpected %s, '
                 'falling through to create: %s',
@@ -1793,9 +1742,9 @@ class TaskCurator:
                 exc_info=True,
             )
             if self._escalator is not None:
-                # No defensive try/except: the escalator's no-orchestrator
-                # re-raise must propagate here for the same reason it already
-                # does from the CuratorFailureError arm.
+                # Unguarded on purpose, as in the CuratorFailureError arm: with
+                # no orchestrator to escalate to, report_failure raises
+                # CuratorFailureError and the caller sees a loud failure.
                 await self._escalator.report_failure(
                     project_root=project_root,
                     project_id=project_id,
@@ -3023,29 +2972,13 @@ class TaskCurator:
             latency_ms=latency_ms,
         )
 
-        # The degraded streak asserts something strictly narrower than the
-        # breaker above: not 'the backend answers' but 'curation is still
-        # producing dedupe judgements'. A completed round-trip is NOT evidence
-        # of that. _parse_batch_decisions degrades items to action='create'
-        # ('batch-item-missing', 'batch-item-parse-failed', 'batch-cycle', …)
-        # on a SUCCESSFUL agent_result, raising nothing and so never reaching
-        # the bisect/serial curate() fallback that counts degradations
-        # elsewhere. Resetting on agent_result.success alone therefore made the
-        # alarm unreachable in exactly the case it was chartered for: a model
-        # or schema regression answering promptly with a well-formed response
-        # carrying no usable decision would bypass dedupe indefinitely while
-        # actively clearing the counter that exists to notice (esc-4448-8,
-        # measured 20/20 create at streak 0 over 10 such calls).
-        #
-        # So the evidence is a usable DECISION. One suffices: a batch that
-        # decided anything at all is a curator still doing its job, and the
-        # partially-degraded items are the designed per-item fail-open.
+        # The streak, unlike the breaker, needs a usable DECISION rather than a
+        # completed round-trip: _parse_batch_decisions fails items open to
+        # action='create' without raising. One usable decision suffices — the
+        # other items' degradation is then the designed per-item fail-open.
         if any(not d.degraded for d in decisions):
-            self._reset_degraded_streak()
+            self._reset_degraded_streak(project_id)
         else:
-            # strict=: _parse_batch_decisions returns exactly len(pools)
-            # decisions and pools is per-candidate, so a length mismatch is a
-            # broken invariant worth raising over, not silently truncating.
             for candidate, decision in zip(candidates, decisions, strict=True):
                 await self._count_degraded(
                     justification=decision.justification,
@@ -3376,7 +3309,7 @@ def _parse_decision_dict(
 
     Called by both :func:`_parse_decision` (single-item) and
     :func:`_parse_batch_decisions` (per-item inside a batch).  The function
-    **never raises**: every malformed-input path returns a degraded
+    **never raises**: every malformed-input path fails open to
     ``CuratorDecision(action='create', ...)`` instead of propagating an
     exception.  Per-item isolation in the batch path is provided by the
     ``try/except`` wrapper in :func:`_parse_batch_decisions`, not by
@@ -3442,16 +3375,9 @@ def _parse_decision_dict(
             and target_id is None
         )
         if not is_within_batch_drop:
-            # Two causes, deliberately NOT sharing one return: they fall on
-            # opposite sides of the degraded line (see CuratorDecision.degraded)
-            # and a compound condition would silently give the payload failure
-            # the state veto's classification — esc-4448-10, where
-            # {'action': 'drop', 'justification': 'dup'} (schema-legal, since
-            # target_id is nullable and not in either schema's `required`) was
-            # reported as 'invalid-target ... not in pool' with degraded=False.
+            # Two causes, two branches: they fall on opposite sides of the
+            # degraded line (see CuratorDecision.degraded).
             if not target_id:
-                # Nothing outside the payload is consulted: the model chose an
-                # action that REQUIRES a target and named none.
                 return CuratorDecision(
                     action='create',
                     justification=(
@@ -3463,8 +3389,6 @@ def _parse_decision_dict(
                     degraded=True,
                 )
             if target_id not in valid_ids:
-                # Turns on pool state: the id may have been trimmed from the
-                # pool, or completed, between prompt construction and here.
                 return CuratorDecision(
                     action='create',
                     justification=(
@@ -3474,6 +3398,7 @@ def _parse_decision_dict(
                     pool_sizes=pool_sizes,
                     latency_ms=latency_ms,
                     cost_usd=cost_usd,
+                    degraded=False,
                 )
         # RC3 create-safe guard: never drop/combine against a pool entry whose
         # status is unconfirmable ('unknown' — e.g. a thin fallback entry built
@@ -3493,6 +3418,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=False,
             )
         # combine-only tasks must also be combine_eligible (pending status).
         if action == 'combine' and target_entry is not None and not target_entry.combine_eligible:
@@ -3505,6 +3431,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=False,
             )
 
     rewritten: RewrittenTask | None = None
