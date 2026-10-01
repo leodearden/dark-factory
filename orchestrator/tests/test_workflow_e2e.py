@@ -8404,16 +8404,19 @@ class TestBuildAgentEnvCpuGovern:
 
         workflow = self._make_workflow(config, git_ops, task_assignment)
         workflow.worktree = tmp_path
-        paths = dict(exec_path='scripts/cpu-governed-exec.sh', shim_dir='scripts/agent-bin')
+        def governance(**overrides: bool) -> CpuGovernConfig:
+            return CpuGovernConfig(
+                exec_path='scripts/cpu-governed-exec.sh', shim_dir='scripts/agent-bin', **overrides,
+            )
 
-        workflow.config.cpu_governance = CpuGovernConfig(**paths, enabled=True)
+        workflow.config.cpu_governance = governance(enabled=True)
         control_env = workflow._build_agent_env(ARCHITECT) or {}
         assert control_env.get('DF_AGENT_CPU_GOVERN') == str(exec_file.resolve()), (
             'control: with enabled=True these paths must resolve to DF_AGENT_CPU_GOVERN, so its '
             'absence below is due to governance being disabled, not resolution failing open'
         )
 
-        workflow.config.cpu_governance = CpuGovernConfig(**paths)
+        workflow.config.cpu_governance = governance()
         env = workflow._build_agent_env(ARCHITECT)
         assert 'DF_AGENT_CPU_GOVERN' not in (env or {})
 

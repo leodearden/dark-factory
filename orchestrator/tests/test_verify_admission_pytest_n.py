@@ -21,6 +21,7 @@ supported a specific worker-count cap on this host.
 from __future__ import annotations
 
 import shlex
+from typing import Literal
 from unittest.mock import patch
 
 import pytest
@@ -297,7 +298,7 @@ class TestPytestNWiring:
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
-        async def run_and_capture_test_leg(role: str) -> str:
+        async def run_and_capture_test_leg(role: Literal['task', 'merge']) -> str:
             captured_cmds.clear()
             await run_verification(
                 worktree=worktree,
