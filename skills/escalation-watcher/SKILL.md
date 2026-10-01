@@ -250,6 +250,57 @@ After `lease-claim` returns `acquired` or `proceed`, and before the first brief:
    it. Measured: the hand-carried 2026-09-22 handover, reconciled this way, yielded 6 items and 2
    corrections its successor had missed.
 
+### Stopping
+
+These triggers are all handled the same way, and none gets a confirmation question (no "are you
+sure?", no "shall I write a handover?"):
+
+- Leo says "stop", "stop watching" or "release the lease".
+- Leo announces a reboot, or another host action that will end this session.
+- Remaining context is low: a harness context warning, or your own judgement that the session is
+  near its limit. Write the handover while the knowledge is still in context; after a compaction
+  it carries only what the summary kept.
+
+"Release the lease" means the whole stop, never a lease-only release. A session that keeps looping
+un-leased is the duplicate-watcher condition the lease exists to prevent (see the "`result=absent`
+on a heartbeat" paragraph in "Starting the watcher").
+
+Four steps, in this order:
+
+1. **Tidy.** Stop the watcher arm you started, through its background task and never by pattern
+   ("Process safety" in "Starting the watcher"). Run `reap-decisions` once (Main Loop step 6).
+   Note every background sub-agent, spawned session and merge request still in flight; they go
+   into the handover's in-flight section. A B3 `unblock-low-risk` sub-agent cut off by the stop is
+   not relaunched by a successor: its `record-launch` marker makes `check` report
+   `already_attempted`.
+2. **Write the handover** (see "The handover file (`l2-handover.md`)"). It goes before the release,
+   so a successor that claims the freed lease finds it complete.
+3. **Release the lease** with the `lease-release` verb under "Heartbeat + release" in "Claiming the
+   Watcher Lease". `applied` and `absent` both finish the step. Report `refused` in the closing
+   message; never retry it with `--force`.
+4. **Run `/reflect`.**
+
+Close with one message: the handover path, the lease result and, when the session stops in AFK
+posture, that the queue is unwatched until a successor launches.
+
+### Self-operations need no permission
+
+These are the session's own mechanics: do them without asking (Leo, 2026-09-25). They are item 8
+of the self-execute tier, so report them the way that tier says.
+
+- Loop mechanism and cadence: how you arm and re-arm, and the slice length, within the Bash-tool
+  timeout contract in "Starting the watcher".
+- Releasing the lease on an announced reboot, which is a stop (see "Stopping").
+- Writing and reading handovers.
+- Running in the tmux lane or in the foreground of the terminal you were started in (see
+  "Launching this watcher (default lane: tmux)").
+
+Still forbidden, and not a self-operation: forcing a lease takeover on a pid probe, whether by
+`--force` or by treating `holder_liveness=orphaned` as yours. "Claiming the Watcher Lease
+(single-owner-per-role)" keeps that rule after the 2026-08-08 duplicate-spawn incident, and task
+4237 owns the second signal that could one day change it. Forcing a release is also on the
+always-ask list ("Bypasses" in "Always ask — keyed on record content").
+
 ## The Main Loop
 
 ```
