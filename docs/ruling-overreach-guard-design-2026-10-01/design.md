@@ -233,3 +233,25 @@ unknown label, a missing rationale, a duplicate, an out-of-sample edge, a
 missing edge or a mismatched sample definition each aborts the report. The
 worksheet itself is not committed: it carries full episode bodies and is
 regenerable from the frozen window.
+
+### 2.10 How the adjudication was done (added after labelling)
+
+The work was not split. One adjudicator, the implementing agent for task 4716,
+labelled all 291 minted edges in a single pass, one stratum at a time
+(`ruling_lexeme`, then `decision_anchor`, then `other_decisions`). It read
+each episode's full body beside its minted edges and applied §2.6 verbatim. No
+sub-agents were used. It is therefore a **single-adjudicator** pass, against
+the prior figure's two independent passes, and no inter-rater agreement can be
+reported.
+
+Garbled facts were labelled as follows:
+
+* An inverted causal link, a misattributed actor, or a quantity assigned to
+  the wrong thing asserts something the record did not state, so it is
+  labelled `overreach` (ii) under the content-first ordering.
+* A faithful fact whose endpoint node is an entity the episode never names, or
+  the wrong one, is labelled `misbound`.
+
+`verdicts.json` passed `load_verdicts` against the re-derived sample: no
+missing, duplicate, out-of-sample or stale verdict (see `report.json`
+`adjudicated.verdicts` and `adjudicated.stale_verdicts`).
