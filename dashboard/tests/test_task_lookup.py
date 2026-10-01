@@ -12,17 +12,17 @@ import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
-import dashboard.data.task_lookup as task_lookup
 import pytest
 from _canned_mcp import CannedMCP, _raw_row
+
+import dashboard.data.task_lookup as task_lookup
+from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.task_lookup import (
     LOOKUP_CONCURRENCY,
     LOOKUP_MISS_CAP,
     TaskRef,
     lookup_tasks,
 )
-
-from dashboard.data.datum import DatumState, validate_datum
 
 NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
 """The one injected instant every lookup is stamped against."""
