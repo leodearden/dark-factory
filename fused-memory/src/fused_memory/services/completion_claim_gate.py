@@ -94,6 +94,8 @@ VerdictStatus = Literal['verified', 'mismatch', 'unverifiable']
 #: never persists its ``metadata`` argument, so a metadata key could not carry
 #: it; and the harm in the motivating incident was the DERIVED edges, not the
 #: tool response, so a response-only tag would have labelled none of it.
+#: ``add_memory`` carries it too (task 4715): the same payload key on its
+#: Graphiti leg, and this key in the Mem0 record's own metadata.
 UNVERIFIED_CLAIM_TAG: str = 'unverified_claim'
 
 
@@ -758,7 +760,11 @@ def emit_unverified_claim_escalation(
     escalation for this ``(project_root, ref)`` (dedup) — or ``None`` when
     filing is impossible or fails.
 
-    NEVER raises. The episode is already ingested and tagged by the time this
+    Call it only once the service has accepted the write, as
+    ``server/tools.py::create_mcp_server``'s ``_report_unverified_claims``
+    does: the record it files tells the operator the write was ingested.
+
+    NEVER raises. The write is already ingested and tagged by the time this
     runs, so escalation is purely ADDITIVE: every failure mode degrades to
     ``None`` plus a log line rather than changing the write's outcome.
 
@@ -770,7 +776,7 @@ def emit_unverified_claim_escalation(
     The anchor is per-REF rather than per-project (the markup sibling's choice):
     two different false claims are two different findings and each deserves its
     own record, while a writer repeating the SAME claim collapses onto the one
-    open escalation instead of minting a new one per episode.
+    open escalation instead of minting a new one per write.
     """
     entries = (flag or {}).get('claims') or []
     if not entries:
@@ -794,12 +800,13 @@ def emit_unverified_claim_escalation(
         ]
         + [
             '',
-            'An episode was ingested carrying a completion claim that the live '
+            'A write was ingested carrying a completion claim that the live '
             'authority CONTRADICTS (verdict=mismatch) or could not confirm '
-            '(verdict=unverifiable). The episode was TAGGED, not rejected: its '
-            "Graphiti source_description is prefixed '[unverified_claim] ' and "
-            "every derived Mem0 fact carries metadata['unverified_claim']=True, "
-            'so the derived edges are labelled at the point of harm.',
+            '(verdict=unverifiable). It was TAGGED, not rejected: its Graphiti '
+            "episode's source_description is prefixed '[unverified_claim] ' and "
+            'its Mem0 record (or, for add_episode, every derived Mem0 fact) '
+            "carries metadata['unverified_claim']=True, so what it stored is "
+            'labelled at the point of harm.',
             '',
             'Check the claim against the authority named above. If it is false, '
             'the derived facts need correcting at the source — a tag marks them, '
@@ -818,7 +825,7 @@ def emit_unverified_claim_escalation(
         anchor_task_id=anchor,
         agent_role=_AGENT_ROLE,
         category=_CATEGORY,
-        # 'info', not 'blocking': nothing is stuck. The episode landed, the
+        # 'info', not 'blocking': nothing is stuck. The write landed, the
         # tag is on it, and this record exists so the claim gets checked —
         # filing it as blocking would put routine write-path noise in front
         # of work that genuinely cannot proceed.

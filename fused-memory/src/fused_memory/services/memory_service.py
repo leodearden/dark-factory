@@ -92,6 +92,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.server.storm_counter import StormCounter
+from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
 from fused_memory.services.memory_metadata_census import (
     UnknownKeyStormDetector,
@@ -555,6 +556,21 @@ def _normalize_task_id_metadata(meta: dict) -> None:
     """
     if 'task_id' in meta and meta['task_id'] is not None:
         meta['task_id'] = str(meta['task_id'])
+
+
+def _stamp_unverified_claim(meta: dict, unverified_claim: bool) -> None:
+    """Make the completion-claim gate the ONLY writer of ``UNVERIFIED_CLAIM_TAG``.
+
+    The key is server-stamped, like ``category``, so a caller-supplied value
+    is discarded rather than trusted: a write can neither forge the tag nor
+    persist it as False, and an untagged record carries no key at all.
+    Shared by add_memory and add_system_record, the two seams whose metadata
+    reaches the validator that lists the key in ``SERVER_STAMPED_KEYS`` and so
+    no longer censuses it as unknown (task 4715).
+    """
+    meta.pop(UNVERIFIED_CLAIM_TAG, None)
+    if unverified_claim:
+        meta[UNVERIFIED_CLAIM_TAG] = True
 
 
 async def _apply_memory_metadata_validation(
@@ -6355,10 +6371,18 @@ class MemoryService:
         metadata: dict | None = None,
         dual_write: bool = False,
         causation_id: str | None = None,
+        unverified_claim: bool = False,
         _source: str = 'mcp_tool',
         declared_referents: list[dict] | None = None,
     ) -> AddMemoryResponse:
         """Lightweight classified write — skip extraction pipeline.
+
+        ``unverified_claim`` (task 4715) is a LABEL set by the tool-layer
+        completion-claim gate, never a rejection: the write lands either way.
+        On the Graphiti leg it rides the queue payload exactly as add_episode's
+        does; on the Mem0 leg it is stamped into the record's metadata under
+        the same key episode-derived facts carry, and omitted when untagged.
+        Only this parameter sets it: the same key in ``metadata`` is discarded.
 
         ``declared_referents`` (task 3669, PRD leaf delta) is the caller's
         EXPLICIT statement of which referents this write is about — the
@@ -6434,6 +6458,7 @@ class MemoryService:
         stores_written: list[SourceStore] = []
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
+        _stamp_unverified_claim(meta, unverified_claim)
 
         # Normalize metadata.task_id to str at this shared write boundary
         # (task 2620, sibling of task 2454's flag_dedup-specific fix; shared
@@ -6533,6 +6558,10 @@ class MemoryService:
                         '_write_op_id': write_op_id,
                         # Popped and decoded by _execute_graphiti_write.
                         'referents': _encode_referents(resolution),
+                        # Popped by _execute_graphiti_write exactly as on
+                        # add_episode's payload, which prefixes the episodic
+                        # source_description with '[unverified_claim] '.
+                        'unverified_claim': unverified_claim,
                     },
                     callback_type='refresh_entity_summaries',
                 )
@@ -6842,6 +6871,8 @@ class MemoryService:
 
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
+        # No completion-claim gate runs on this path, so it never tags.
+        _stamp_unverified_claim(meta, False)
 
         # Same task_id normalization add_memory applies (task 2620 amendment
         # review): this Mem0-only path shares add_memory's exact-match read

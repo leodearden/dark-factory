@@ -573,7 +573,7 @@ KIND_REGISTRY: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 
 #: Keys this server stamps onto metadata itself.  They are NOT all stamped at
-#: the same layer, and a reviewer must not read these as three write-seam
+#: the same layer, and a reviewer must not read these as four write-seam
 #: stamps:
 #:
 #: * ``category``   -- stamped at the write seam:
@@ -586,6 +586,17 @@ KIND_REGISTRY: frozenset[str] = frozenset({
 #:                     ``:2921``, read back at ``:2962``).  It is listed here
 #:                     so that a round-tripped search result re-written as
 #:                     metadata does not census-warn on the server's own field.
+#: * ``unverified_claim`` -- stamped at the add_memory write seam
+#:                     (``services/memory_service.py::MemoryService.add_memory``)
+#:                     when the completion-claim gate
+#:                     (``services/completion_claim_gate.py::UNVERIFIED_CLAIM_TAG``)
+#:                     flags the write.  Episode-derived facts get it from
+#:                     ``MemoryService._execute_mem0_classify_and_add``, which
+#:                     does not pass through this validator.  Unlike the
+#:                     census, which only stops warning about it, both seams
+#:                     DISCARD a caller-supplied value
+#:                     (``services/memory_service.py::_stamp_unverified_claim``),
+#:                     so a caller can neither forge the tag nor persist False.
 #:
 #: DELIBERATELY ABSENT: ``run_id``.  It *is* server-stamped, by the same
 #: ``_apply_cycle_summary_metadata_tagging`` helper (``memory_service.py:389``)
@@ -599,6 +610,7 @@ SERVER_STAMPED_KEYS: frozenset[str] = frozenset({
     'category',
     'recon_pool',
     'planned',
+    'unverified_claim',
 })
 
 #: The five keys this PRD reserves and gives shape rules to (V1).  Every one
