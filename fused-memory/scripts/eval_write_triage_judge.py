@@ -633,6 +633,9 @@ class JudgeAnswer:
 
     The elision flags and ``usage`` are ``None`` for the same reason: nothing
     was rendered and nothing was spent.
+
+    ``candidate_id`` is the slate id the verdict named, and ``None`` when no
+    judge was asked or its verdict named nothing.
     """
 
     outcome: str
@@ -640,6 +643,18 @@ class JudgeAnswer:
     entry_elided: bool | None = None
     candidates_elided: Mapping[str, bool] | None = None
     usage: Mapping[str, int] | None = None
+    candidate_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.candidate_id is None:
+            return
+        if self.verdict is None or self.outcome not in ATTACH_OUTCOMES:
+            raise ValueError(
+                f'candidate_id {self.candidate_id!r} named with verdict '
+                f'{self.verdict!r} and outcome {self.outcome!r}: only a judge '
+                f'verdict that attaches (one of {sorted(ATTACH_OUTCOMES)}) names '
+                f'a candidate',
+            )
 
 
 def _as_answer(value: Any) -> JudgeAnswer:
@@ -1666,6 +1681,7 @@ def _ask_judge(
         entry_elided=entry_elided,
         candidates_elided=candidates_elided,
         usage=_usage_of(recorded[before:]),
+        candidate_id=verdict.candidate_id,
     )
 
 
