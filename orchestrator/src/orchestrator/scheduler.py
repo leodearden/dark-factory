@@ -49,6 +49,14 @@ from orchestrator.mcp_lifecycle import mcp_call
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.pin_reservation import (
+    Blocker,
+    BlockerKind,
+    ParkPriority,
+    ReservationSource,
+    is_pin_rank,
+    park_rank,
+)
 from orchestrator.recovery_emission import (
     LeaveReason,
     RecoverySite,
@@ -1068,7 +1076,8 @@ class ModuleLockTable:
         # higher-priority owner PUSHES (shadows) the lower entry instead of
         # destroying it.  Restoration happens when the top entry is removed.
         # INV-3: every stack is strictly rank-decreasing top-ward (top has the
-        # lowest rank / highest priority), so depth ≤ 5 (number of priority tiers).
+        # lowest rank / highest priority), so depth is bounded by the 5 priority
+        # tiers plus the bounded number of pin reservations (task 6040).
         self._parked: dict[str, list[tuple[str, int]]] = {}
         # task_id -> ISO8601 timestamp of first install_parks call for that owner
         self._park_install_at: dict[str, str] = {}
@@ -1257,6 +1266,30 @@ class ModuleLockTable:
                 result[module] = holders
         return result
 
+    def blockers(self, task_id: str, modules: list[str]) -> list[Blocker]:
+        """Every holder and active park that would make ``try_acquire`` refuse.
+
+        Composed from :meth:`blocking_holders` and
+        :meth:`_iter_blocking_park_owners` over the same normalized keys the
+        gate tests, so it names exactly what the gate honours (INV-5): never
+        a buried park, never the requester's own.  Sorted and de-duplicated;
+        empty means the acquire would succeed.  A READ.
+        """
+        depth = self._config.lock_depth
+        found: set[Blocker] = {
+            Blocker(module, holder, BlockerKind.HELD)
+            for module, holders in self.blocking_holders(
+                modules, exclude_task=task_id
+            ).items()
+            for holder in holders
+        }
+        for module in {normalize_lock(m, depth) for m in modules}:
+            found.update(
+                Blocker(module, owner, BlockerKind.PARKED)
+                for owner in self._iter_blocking_park_owners(module, task_id)
+            )
+        return sorted(found)
+
     def _is_parked_blocks(
         self,
         module: str,
@@ -1292,6 +1325,16 @@ class ModuleLockTable:
                 owned[module] = min(ranks)
         return owned
 
+    @staticmethod
+    def _covers(held_rank: int | None, rank: int | None) -> bool:
+        """True iff an owner entry at *held_rank* already covers a request at *rank*.
+
+        *held_rank* None means the owner has no entry on the key.  *rank* None
+        means "at any rank".  An entry covers a request at its own rank or any
+        weaker one; it never covers a stronger one, which is a re-rank.
+        """
+        return held_rank is not None and (rank is None or held_rank <= rank)
+
     def has_parks(self, task_id: str) -> bool:
         """Return True if *task_id* owns any reservation at ANY stack level (INV-5).
 
@@ -1300,21 +1343,46 @@ class ModuleLockTable:
         """
         return bool(self._owned_ranks(task_id))
 
-    def unparked_modules(self, task_id: str, modules: list[str]) -> list[str]:
+    def reservation_source(self, owner: str) -> ReservationSource:
+        """Why *owner*'s parks exist, derived from their ranks (task 6040).
+
+        PIN if any of the owner's entries, top or buried, sits in the pin band;
+        otherwise FAIRNESS.  An owner with no parks at all also reads FAIRNESS,
+        so callers that ask after a removal get the automatic default rather
+        than an error.
+        """
+        if any(is_pin_rank(rank) for rank in self._owned_ranks(owner).values()):
+            return ReservationSource.PIN
+        return ReservationSource.FAIRNESS
+
+    def unparked_modules(
+        self,
+        task_id: str,
+        modules: list[str],
+        priority: ParkPriority | None = None,
+    ) -> list[str]:
         """The completion rule's remainder (task 5308): keys *task_id* has not parked.
 
         Normalizes *modules* exactly as :meth:`install_parks` does, drops empty
         keys, de-duplicates, and subtracts every key the owner already parks
-        at ANY stack level and ANY rank — a buried entry counts as owned,
-        because completion fills coverage gaps and never re-ranks.  Sorted.
+        at ANY stack level.  Sorted.
+
+        With *priority* None, an entry at ANY rank counts as owned — a buried
+        entry included — because fairness completion fills coverage gaps and
+        never re-ranks.  With a *priority*, a key counts as owned only at
+        ``park_rank(priority)`` or better, so a pin's completion (task 6040)
+        also lifts the owner's own weaker entries to the pin rank.
         """
         depth = self._config.lock_depth
         owned = self._owned_ranks(task_id)
+        rank = None if priority is None else park_rank(priority)
         requested = {normalize_lock(m, depth) for m in modules}
-        return sorted(m for m in requested if m and m not in owned)
+        return sorted(
+            m for m in requested if m and not self._covers(owned.get(m), rank)
+        )
 
     def install_parks(
-        self, task_id: str, modules: list[str], priority: str
+        self, task_id: str, modules: list[str], priority: ParkPriority
     ) -> tuple[list[str], list[tuple[str, list[str]]]]:
         """Install reservations on the normalized form of *modules* for *task_id*.
 
@@ -1323,6 +1391,9 @@ class ModuleLockTable:
         top by this call and *shadowed* is a list of
         ``(owner_id, modules_shadowed)`` for any lower-priority parks that
         were PUSHED beneath the new reservation (retained, not destroyed).
+
+        *priority* is a tier name or a :class:`PinOrder`; :func:`park_rank`
+        resolves either to the stack rank (task 6040).
 
         Idempotent per owner (task 5308): a key *task_id* already parks at
         *priority* or better, at any stack level (:meth:`_owned_ranks`), is
@@ -1347,7 +1418,7 @@ class ModuleLockTable:
         restorable after the preemptor clears (step-12 fix).
         """
         depth = self._config.lock_depth
-        rank = PRIORITY_RANK[coerce_tier(priority)]
+        rank = park_rank(priority)
         installed: list[str] = []
         # Accumulate shadows: victim_owner -> list of original module keys shadowed.
         shadow_acc: dict[str, list[str]] = {}
@@ -1356,8 +1427,7 @@ class ModuleLockTable:
         owned = self._owned_ranks(task_id)
         for m in modules:
             normalized = normalize_lock(m, depth)
-            held_rank = owned.get(normalized)
-            if not normalized or (held_rank is not None and held_rank <= rank):
+            if not normalized or self._covers(owned.get(normalized), rank):
                 continue
             # Scan only the ACTIVE TOP of each conflicting stack (INV-2).
             to_shadow: list[tuple[str, str]] = []  # (parked_m_key, victim_owner)
@@ -1656,7 +1726,8 @@ class ModuleLockTable:
 
         Each entry dict contains:
         - ``owner``: str — task id
-        - ``rank``: int — PRIORITY_RANK value (lower = higher priority, INV-3)
+        - ``rank``: int — :func:`park_rank` value: a PRIORITY_RANK tier, or a
+          negative pin rank (task 6040); lower = higher priority, INV-3
         - ``shadowed``: bool — True for every entry except the active top
         - ``installed_at``: str — ISO8601 timestamp from ``_park_install_at``,
           or ``''`` if the owner has no recorded install timestamp
@@ -1680,6 +1751,28 @@ class ModuleLockTable:
                     'installed_at': self._park_install_at.get(owner, ''),
                 })
             result[module] = entries
+        return result
+
+    def snapshot_pin_reservations(self) -> dict[str, dict]:
+        """``{owner: {modules, installed_at}}`` for every pin-ranked park entry.
+
+        Unlike :meth:`snapshot_parks`, a buried pin entry is listed too: this
+        is "which modules does each pin hold a reservation on" (task 6040),
+        not "who tops each stack".  Tier-ranked owners never appear.  Fresh
+        dicts, sorted modules.
+        """
+        result: dict[str, dict] = {}
+        for module, stack in self._parked.items():
+            for owner, rank in stack:
+                if not is_pin_rank(rank):
+                    continue
+                entry = result.setdefault(owner, {
+                    'modules': [],
+                    'installed_at': self._park_install_at.get(owner, ''),
+                })
+                entry['modules'].append(module)
+        for entry in result.values():
+            entry['modules'].sort()
         return result
 
     def snapshot_holders(self) -> dict[str, str]:
