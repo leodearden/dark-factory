@@ -12,7 +12,7 @@ import ast
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from _fm_helpers import load_script_module
@@ -1718,13 +1718,18 @@ def _live_rule_c_debt_entry() -> tuple[str, int]:
 
     Chosen at runtime rather than named, so no future shrink can strand a test on a
     migrated file; callers keep their arithmetic relative to the returned budget.
+
+    Fails rather than skips on an empty baseline: a skip would leave the debt
+    machinery and its tests dormant, unnoticed among thousands of passes.
     """
     debt = _checker._WALL_CLOCK_DEADLINE_DEBT
     if not debt:
-        pytest.skip(
-            'the Rule C debt baseline is empty: every file is migrated, so the debt '
-            'machinery (_WALL_CLOCK_DEADLINE_DEBT, _debt_budget, _apply_debt_budget) '
-            'should be retired together with the tests that exercise it'
+        pytest.fail(
+            'the Rule C debt baseline is empty: every file is migrated. Retire the '
+            'debt machinery in this same change: _WALL_CLOCK_DEADLINE_DEBT, '
+            '_debt_budget, _apply_debt_budget and _wall_clock_overrun_msg in '
+            'check_bare_magicmock_config.py, and the tests that call '
+            '_live_rule_c_debt_entry here'
         )
     return max(debt.items(), key=lambda item: item[1])
 
@@ -1833,6 +1838,18 @@ class TestWallClockDeadlineDebtBaseline:
             f'filename={absolute!r}'
         )
 
+        entry, budget = _live_rule_c_debt_entry()
+        assert budget >= 2, (
+            f'the find_violations leg drives a two-violation source and expects silence '
+            f'under {entry}, so it needs a budget of at least 2; got {budget}'
+        )
+        live_absolute = str(_REPO_ROOT / entry)
+        assert _rule_c(_RULE_C_SOURCE, live_absolute) == [], (
+            'find_violations must hand an absolute filename to the baseline lookup '
+            f'unchanged, so a debt file is suppressed for pytest callers too; '
+            f'filename={live_absolute!r}'
+        )
+
     def test_matching_is_path_component_aware_not_substring(self):
         """Trailing-COMPONENT matching: a substring match must not grandfather an unrelated file."""
         assert _checker._debt_budget('evil/' + _SYNTHETIC_DEBT_ENTRY, _SYNTHETIC_RULE_C_DEBT) == 2, (
@@ -1847,6 +1864,15 @@ class TestWallClockDeadlineDebtBaseline:
         assert _checker._debt_budget(bare, _SYNTHETIC_RULE_C_DEBT) is None, (
             'a bare basename at another root shares only ONE trailing component and '
             'must not be grandfathered'
+        )
+
+        entry, _budget = _live_rule_c_debt_entry()
+        live = PurePosixPath(entry)
+        live_substring = str(live.with_name('not_' + live.name))
+        flagged = _rule_c(_RULE_C_SOURCE, live_substring)
+        assert len(flagged) == 2, (
+            f'through find_violations, {live_substring} merely CONTAINS the debt '
+            f'filename {live.name} and must be reported in full; got {flagged!r}'
         )
 
     def test_debt_file_is_silent_at_budget_and_reports_the_overrun_above_it(self):
