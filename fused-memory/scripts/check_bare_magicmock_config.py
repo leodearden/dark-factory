@@ -629,10 +629,6 @@ _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_queue_request_liveness.py': 4,
     'orchestrator/tests/test_coalesce_integration_gate.py': 4,
     'orchestrator/tests/test_merge_queue_coalesce.py': 8,
-    'orchestrator/tests/test_merge_queue_persistent_worktree.py': 6,
-    'orchestrator/tests/test_merge_queue_single_writer_asserts.py': 4,
-    'orchestrator/tests/test_merge_guard_pipeline.py': 2,
-    'orchestrator/tests/test_merge_queue_supervisor.py': 2,
 }
 
 

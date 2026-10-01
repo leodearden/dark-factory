@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pytest
 from _merge_lane_fakes import FakeClock, FakeVerifier, RecordingEscalations
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -685,69 +686,76 @@ async def test_real_merger_crash_preserves_verifier_and_pipeline(
 
     run_task = asyncio.create_task(worker.run())
 
-    # Poll up to ~2s until run() spawns both loop tasks.
-    deadline = asyncio.get_running_loop().time() + 2.0
-    while (
-        (worker._merger_task is None or worker._verifier_task is None)
-        and asyncio.get_running_loop().time() < deadline
-    ):
-        await asyncio.sleep(0.02)
+    # try/finally, not straight-line: wait_responsive gives up by raising
+    # _pytest.outcomes.Failed, a BaseException, so an unguarded stop call
+    # would be skipped and leak a live worker into teardown (esc-3980-4).
+    try:
+        # Poll up to ~2s until run() spawns both loop tasks.
+        deadline = asyncio.get_running_loop().time() + 2.0
+        while (
+            (worker._merger_task is None or worker._verifier_task is None)
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.02)
 
-    assert worker._merger_task is not None, 'merger_task should be set after run() starts'
-    assert worker._verifier_task is not None, 'verifier_task should be set after run() starts'
-    verifier_task_before = worker._verifier_task
+        assert worker._merger_task is not None, 'merger_task should be set after run() starts'
+        assert worker._verifier_task is not None, 'verifier_task should be set after run() starts'
+        verifier_task_before = worker._verifier_task
 
-    # Poll up to ~3s for the merger death escalation.
-    deadline = asyncio.get_running_loop().time() + 3.0
-    while len(eq.filed) == 0 and asyncio.get_running_loop().time() < deadline:
-        await asyncio.sleep(0.02)
+        # Poll up to ~3s for the merger death escalation.
+        deadline = asyncio.get_running_loop().time() + 3.0
+        while len(eq.filed) == 0 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.02)
 
-    # ── Assert 3: escalation emitted for merger death ─────────────────────
-    assert len(eq.filed) >= 1, (
-        f'Expected at least 1 escalation, got {len(eq.filed)}'
-    )
-    merger_esc = eq.filed[0]
-    assert merger_esc.level == 1, f'Expected level 1, got {merger_esc.level}'
-    assert merger_esc.severity == 'blocking', (
-        f'Expected severity blocking, got {merger_esc.severity!r}'
-    )
-    assert 'merge_worker_loop_died' in merger_esc.summary, (
-        f'summary missing merge_worker_loop_died: {merger_esc.summary!r}'
-    )
-    assert 'merger' in merger_esc.summary, (
-        f'summary missing "merger": {merger_esc.summary!r}'
-    )
+        # ── Assert 3: escalation emitted for merger death ─────────────────────
+        assert len(eq.filed) >= 1, (
+            f'Expected at least 1 escalation, got {len(eq.filed)}'
+        )
+        merger_esc = eq.filed[0]
+        assert merger_esc.level == 1, f'Expected level 1, got {merger_esc.level}'
+        assert merger_esc.severity == 'blocking', (
+            f'Expected severity blocking, got {merger_esc.severity!r}'
+        )
+        assert 'merge_worker_loop_died' in merger_esc.summary, (
+            f'summary missing merge_worker_loop_died: {merger_esc.summary!r}'
+        )
+        assert 'merger' in merger_esc.summary, (
+            f'summary missing "merger": {merger_esc.summary!r}'
+        )
 
-    # Give the event loop time for the supervisor to restart the merger.
-    await asyncio.sleep(0.1)
+        # Give the event loop time for the supervisor to restart the merger.
+        await asyncio.sleep(0.1)
 
-    # Submit the post-crash request.
-    req = _make_request('crash-test', 'crash-test', wt, config)
-    await queue.put(req)
+        # Submit the post-crash request.
+        req = _make_request('crash-test', 'crash-test', wt, config)
+        await queue.put(req)
 
-    # ── Assert 1: end-to-end liveness — restarted merger + surviving verifier ──
-    outcome = await asyncio.wait_for(req.result, timeout=15.0)
+        # ── Assert 1: end-to-end liveness — restarted merger + surviving verifier ──
+        outcome = await wait_responsive(
+            req.result,
+            label='post-crash request through the restarted merger and surviving verifier',
+        )
 
-    assert outcome.status == 'done', (
-        f'Expected outcome.status="done" but got {outcome.status!r}'
-    )
+        assert outcome.status == 'done', (
+            f'Expected outcome.status="done" but got {outcome.status!r}'
+        )
 
-    # ── Assert 2: verifier is the SAME task (never retired/replaced) ─────────
-    assert worker._verifier_task is verifier_task_before, (
-        'Verifier task must be the SAME object — it must not have been retired/replaced'
-    )
-    assert not worker._verifier_task.done(), (
-        'Verifier task should still be running (not retired)'
-    )
+        # ── Assert 2: verifier is the SAME task (never retired/replaced) ─────────
+        assert worker._verifier_task is verifier_task_before, (
+            'Verifier task must be the SAME object — it must not have been retired/replaced'
+        )
+        assert not worker._verifier_task.done(), (
+            'Verifier task should still be running (not retired)'
+        )
 
-    # ── Assert 4: merger was restarted (fresh, not-done task) ────────────────
-    assert worker._merger_task is not None
-    assert not worker._merger_task.done(), 'Restarted merger task should still be running'
-
-    # ── Cleanup ──────────────────────────────────────────────────────────────
-    await worker.stop()
-    with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-        await asyncio.wait_for(run_task, timeout=2.0)
+        # ── Assert 4: merger was restarted (fresh, not-done task) ────────────────
+        assert worker._merger_task is not None
+        assert not worker._merger_task.done(), 'Restarted merger task should still be running'
+    finally:
+        # ── Cleanup ──────────────────────────────────────────────────────────
+        await worker.stop()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await asyncio.wait_for(run_task, timeout=2.0)
 
 
 # ---------------------------------------------------------------------------
