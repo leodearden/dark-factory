@@ -11,7 +11,47 @@ renders.  That rule lives only in :func:`event_matches`.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any, NamedTuple
+
 from _recording_event_store import _RecordingEventStore
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.overrides import OverrideStore
+from orchestrator.scheduler import Scheduler
+
+
+class ParkWorld(NamedTuple):
+    scheduler: Scheduler
+    store: _RecordingEventStore
+    overrides: OverrideStore
+    root: str
+
+
+def park_world(
+    tmp_path: Path, *, pinned: tuple[str, ...] = (), **config_overrides: Any
+) -> ParkWorld:
+    """A started Scheduler whose top parks on its first skip.
+
+    One holder per module, ``lock_depth=2`` and ``project_root=tmp_path``,
+    with *config_overrides* applied on top.  Each id in *pinned* is pinned in
+    the given order, so its pin_order is its 1-based position.
+    """
+    config = OrchestratorConfig(**{
+        'max_per_module': 1,
+        'lock_depth': 2,
+        'project_root': tmp_path,
+        **config_overrides,
+    })
+    config.fairness.skip_threshold = 1
+    root = str(config.project_root)
+    overrides = OverrideStore(tmp_path / 'o.db')
+    for tid in pinned:
+        overrides.set_override(root, tid, pinned=True)
+    store = _RecordingEventStore()
+    scheduler = Scheduler(config, event_store=store, override_store=overrides)  # type: ignore[arg-type]
+    scheduler.finish_startup()
+    return ParkWorld(scheduler, store, overrides, root)
 
 
 def make_task(tid: str, priority: str, files: list[str], *, status: str = 'pending') -> dict:
