@@ -1700,10 +1700,6 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_request_liveness.py',
     'orchestrator/tests/test_coalesce_integration_gate.py',
     'orchestrator/tests/test_merge_queue_coalesce.py',
-    'orchestrator/tests/test_merge_queue_persistent_worktree.py',
-    'orchestrator/tests/test_merge_queue_single_writer_asserts.py',
-    'orchestrator/tests/test_merge_guard_pipeline.py',
-    'orchestrator/tests/test_merge_queue_supervisor.py',
 })
 
 # A SYNTHETIC debt mapping for the path-matching tests, which drive the pure
