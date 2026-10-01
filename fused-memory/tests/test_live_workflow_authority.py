@@ -8,13 +8,18 @@ identifiers an agent must act on, never the prose wording.
 
 from __future__ import annotations
 
+import pytest
+
 from fused_memory.reconciliation.live_workflow_section import (
+    CLAIMANT_FIELD,
+    PROJECT_LOCK_HELD,
     LandedToken,
     render_live_workflow_authority_rules,
 )
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+from fused_memory.services.live_workflow_detector import ClaimantLabel
 
 
 def _paragraphs_containing(text: str, needle: str) -> list[str]:
@@ -48,3 +53,18 @@ class TestLandedRuleInStagePrompts:
         assert any('escalat' in paragraph for paragraph in paragraphs), (
             'the done-task rule must name done_provenance and forbid escalating a refused reopen'
         )
+
+
+class TestTieBreakerRule:
+    @pytest.mark.parametrize('identifier', ['get_task', 'claimant_run_id', 'heartbeat_at'])
+    def test_names_the_authoritative_check(self, identifier: str) -> None:
+        assert identifier in render_live_workflow_authority_rules(), (
+            'the tie-breaker must name the tool and both record fields that settle liveness'
+        )
+
+    @pytest.mark.parametrize('label', list(ClaimantLabel))
+    def test_quotes_every_claimant_token_the_section_renders(self, label: ClaimantLabel) -> None:
+        assert f'{CLAIMANT_FIELD}{label}' in render_live_workflow_authority_rules()
+
+    def test_quotes_the_project_line_the_section_renders(self) -> None:
+        assert PROJECT_LOCK_HELD in render_live_workflow_authority_rules()
