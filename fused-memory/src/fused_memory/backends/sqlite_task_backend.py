@@ -3401,7 +3401,10 @@ class SqliteTaskBackend:
                 # TaskmasterError if the stored blob is corrupt — preventing a
                 # silent clobber.  The _txn wrapper rolls back, leaving the
                 # original bytes intact.  To repair a corrupt row, pass
-                # metadata_mode='replace' (bypasses the guard intentionally).
+                # metadata_mode='replace' (bypasses the guard intentionally);
+                # the repair payload may not carry a done_provenance, since
+                # passthrough identity cannot be established against a blob
+                # that does not parse (_assert_done_provenance_passthrough).
                 new_metadata = _merge_metadata(
                     row['metadata'], metadata,
                     mode=resolved_mode,
@@ -4232,7 +4235,11 @@ def _merge_metadata(
     :func:`_resolve_metadata_mode`:
 
     * ``'replace'`` — return ``incoming`` verbatim; bypasses the corrupt-blob
-      guard (the sanctioned path to repair a corrupt row).
+      guard (the sanctioned path to repair a corrupt row). One restriction
+      applies upstream, in update_task: on a row whose stored blob does not
+      parse, the repair payload may not carry a done_provenance, because
+      passthrough identity cannot be established. The authority is
+      :func:`_assert_done_provenance_passthrough`.
     * ``'merge'`` — shallow last-write-wins: ``{**existing, **incoming}``.
       Omitted keys are preserved; every supplied key (scalar **or** list)
       overwrites wholesale.  Falls back to ``incoming`` when either side is
