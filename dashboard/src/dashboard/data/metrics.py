@@ -1,7 +1,7 @@
 """Periodic metrics-snapshot collection and chart queries.
 
 Records sparse-history signals (orchestrator running count, fused-memory
-store sizes, write queue depth, reconciliation state, merge queue active
+store sizes, write queue depth, reconciliation state, live merge-queue
 depth) into a dedicated SQLite database so they can be rendered as time
 series even though the underlying sources are point-in-time only.
 
@@ -41,13 +41,14 @@ from dashboard.data.memory import (
     get_queue_stats,
     mcp_tool_call,
 )
-from dashboard.data.merge_queue import active_queued_merges
+from dashboard.data.merge_queue import fetch_live_merge_queues
 from dashboard.data.orchestrator import (
     _read_project_root_from_config,
     _resolve_project_root,
     find_running_orchestrators,
 )
 from dashboard.data.reconciliation import get_buffer_stats, get_burst_state, partition_burst_state
+from dashboard.data.redux_api import _project_label
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now, safe_gather_result
 
@@ -633,17 +634,23 @@ async def collect_metrics_snapshot(
         with contextlib.suppress(Exception):
             await conn.rollback()
 
-    # Merge queue (per-project active count from runs.db events).
+    # Merge queue: the live get_merge_queue probe the "In queue now" tile
+    # reads, so this table is that datum's history. Only a reachable probe is
+    # a measurement; an unreachable or unprobed project writes no row (PRD
+    # dashboard-one-datum-one-path, decisions 5 and 11).
     try:
-        for pid, db in merge_dbs:
-            try:
-                merges = await active_queued_merges(db)
-            except Exception:
-                logger.debug('merge sampler failed for %s', pid, exc_info=True)
+        live_map = await fetch_live_merge_queues(http_client, config.escalation_urls)
+        for pid, _db in merge_dbs:
+            live = live_map.get(_project_label(pid))
+            if live is None or not live.get('reachable'):
+                logger.debug(
+                    'merge sampler: no live queue reading for %s: %s',
+                    pid, 'no probe' if live is None else live.get('error'),
+                )
                 continue
             await conn.execute(
                 'INSERT INTO merge_snapshots (ts, project_id, active_count) VALUES (?, ?, ?)',
-                (now, pid, len(merges)),
+                (now, pid, len(live['entries'])),
             )
         await conn.commit()
     except Exception:
