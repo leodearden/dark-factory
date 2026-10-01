@@ -1288,6 +1288,11 @@ class GraphitiBackend:
         self._driver: FalkorDriver | None = None
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
+        # First-write provisioning runs INSIDE the triggering write's own budget
+        # (the durable queue's whole-write wait_for), so it gets the read budget:
+        # spending the write budget there would let a hung index read time out
+        # the very write it must never fail.
+        self._index_provision_timeout: float = self._read_timeout
         self._indexed_graphs: set[str] = set()
         self._cloned_drivers: dict[str, GraphDriver] = {}
         self._identity_locks: dict[str, asyncio.Lock] = {}
@@ -1442,7 +1447,7 @@ class GraphitiBackend:
           δ's drift detector owns a persistent gap.
         * When it RAISES or times out, it is logged and left uncached, so the next
           write or sweep retries.
-        * The lock hold is bounded by the write timeout.
+        * The lock hold is bounded by the provisioning budget (see ``__init__``).
         * No OPERATIONAL barrier (INV-7).
 
         See docs/prds/falkordb-index-provisioning.md D4-D6.
@@ -1459,7 +1464,8 @@ class GraphitiBackend:
                 return
             try:
                 await asyncio.wait_for(
-                    self._ensure_indices_locked(group_id), timeout=self._write_timeout,
+                    self._ensure_indices_locked(group_id),
+                    timeout=self._index_provision_timeout,
                 )
             except Exception as exc:
                 logger.warning(
@@ -1479,7 +1485,25 @@ class GraphitiBackend:
         is left to its first write.  Safe to call at any time (idempotent, and
         cached per process).  A listing failure propagates; a failure on one
         graph does not (see :meth:`_ensure_indices`).
+
+        The WHOLE sweep shares one provisioning budget, so a hung FalkorDB
+        delays ``initialize()`` by at most that budget rather than by one budget
+        per registered graph.  Graphs the sweep did not reach stay uncached and
+        are provisioned by their first write.
         """
+        try:
+            await asyncio.wait_for(
+                self._provision_existing_registered_graphs(),
+                timeout=self._index_provision_timeout,
+            )
+        except TimeoutError:
+            logger.warning(
+                'Index provisioning sweep exceeded its %ss budget; registered graphs '
+                'it did not reach are left to their first write',
+                self._index_provision_timeout,
+            )
+
+    async def _provision_existing_registered_graphs(self) -> None:
         existing = await self._require_falkor_client().list_graphs()
         for graph_name in sorted(set(existing) & self._registered_graph_ids):
             await self._ensure_indices(graph_name)

@@ -135,6 +135,32 @@ class TestStartupSweep:
         ), 'a graph whose provisioning raised must be named in a WARNING'
 
     @pytest.mark.asyncio
+    async def test_a_hung_falkordb_delays_the_sweep_by_one_budget_not_one_per_graph(
+        self, mock_config, make_backend, make_graph_mock, caplog,
+    ):
+        config = mock_config.model_copy(deep=True)
+        config.queue.backend_read_timeout_seconds = budget = 0.1
+        names = [f'reg_{i}' for i in range(10)]
+        backend = make_backend(config, registered_graph_ids=names)
+        never = asyncio.Event()
+
+        async def _hung_read(*args, **kwargs):
+            await never.wait()
+
+        graphs = {name: make_graph_mock([], header=LIVE_HEADER) for name in names}
+        for graph in graphs.values():
+            graph.ro_query = AsyncMock(side_effect=_hung_read)
+        _route(backend, graphs, names)
+
+        with caplog.at_level(logging.WARNING, logger=_LOGGER):
+            await asyncio.wait_for(backend.provision_registered_graphs(), budget * 3)
+
+        assert any(
+            r.name == _LOGGER and r.levelno == logging.WARNING and 'sweep' in r.getMessage()
+            for r in caplog.records
+        ), 'a sweep cut short by its budget must say so'
+
+    @pytest.mark.asyncio
     async def test_a_graph_whose_provisioning_raised_is_retried_on_the_next_sweep(
         self, mock_config, make_backend, make_graph_mock,
     ):
@@ -325,11 +351,19 @@ class TestFirstWriteProvisioning:
         assert graph.ro_query.await_count == 2, 'an uncached graph must be retried'
 
     @pytest.mark.asyncio
-    async def test_a_hung_provisioning_read_is_bounded_and_releases_the_lock(
+    async def test_a_hung_provisioning_read_leaves_the_write_its_budget_and_releases_the_lock(
         self, mock_config, make_backend, make_graph_mock,
     ):
+        """Provisioning runs inside the durable queue's whole-write ``wait_for``.
+
+        So the write is driven under that same outer budget here: a provisioning
+        bound equal to the write budget would let the outer one cancel the write.
+        """
         config = mock_config.model_copy(deep=True)
-        config.queue.backend_write_timeout_seconds = 0.05
+        config.queue.backend_read_timeout_seconds = 0.05
+        config.queue.backend_write_timeout_seconds = 0.5
+        config.queue.write_timeout_seconds = 0.5
+        write_budget = config.queue.write_timeout_seconds
         backend = make_backend(config, registered_graph_ids={'reg'})
         graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
         healthy_read = graph.ro_query.side_effect
@@ -346,10 +380,10 @@ class TestFirstWriteProvisioning:
         graph.ro_query = AsyncMock(side_effect=_ro_query)
         events = self._wire(backend, graph, listing=['reg'])
 
-        await asyncio.wait_for(self._write(backend), 2)
+        await asyncio.wait_for(self._write(backend), write_budget)
         assert events == ['upstream'], 'the write must proceed past a hung provisioning read'
 
-        await asyncio.wait_for(self._write(backend), 2)
+        await asyncio.wait_for(self._write(backend), write_budget)
         assert events == ['upstream', *_plan_for(_TRAP_PRESENT), 'upstream']
 
     @pytest.mark.asyncio
