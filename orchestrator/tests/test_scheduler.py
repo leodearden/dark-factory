@@ -8422,7 +8422,9 @@ class TestParkStopTrip:
         """Once paused, additional blocked transitions must not fire the callback again."""
         config = OrchestratorConfig(
             max_per_module=1,
+            park_stop_enabled=True,  # pinned: the yaml must not disarm the control
             park_stop_parked_threshold=3,
+            park_stop_parked_window_hours=1.0,
         )
         scheduler = Scheduler(config)
         scheduler.finish_startup()
@@ -8462,7 +8464,9 @@ class TestParkStopTrip:
         """Below-threshold transitions must never invoke the callback."""
         config = OrchestratorConfig(
             max_per_module=1,
+            park_stop_enabled=True,  # pinned: the yaml must not disarm the control
             park_stop_parked_threshold=5,
+            park_stop_parked_window_hours=1.0,
         )
         scheduler = Scheduler(config)
         scheduler.finish_startup()
