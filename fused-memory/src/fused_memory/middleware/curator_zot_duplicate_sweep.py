@@ -19,11 +19,19 @@ yields no finding.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import logging
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Protocol
 
 from shared.task_statuses import TaskStatus
+
+from fused_memory.middleware.task_curator import embedding_text
+
+logger = logging.getLogger(__name__)
+
+DUPLICATE_METADATA_KEY = 'x_zot_duplicate_candidate'
 
 _FLAGGABLE_STATUSES = frozenset(TaskStatus) - {TaskStatus.CANCELLED}
 
@@ -76,3 +84,73 @@ def select_near_duplicate(
                 score=score,
             )
     return best
+
+
+class CorpusSearcher(Protocol):
+    async def search_corpus(
+        self,
+        query: str,
+        project_id: str,
+        *,
+        limit: int = ...,
+        score_threshold: float = ...,
+    ) -> list[dict[str, Any]]: ...
+
+
+async def sweep_zot_duplicate(
+    curator: CorpusSearcher,
+    *,
+    project_id: str,
+    task_id: str,
+    title: str,
+    description: str,
+    files_to_modify: list[str],
+    read_statuses: Callable[[list[str]], Awaitable[Mapping[str, str]]],
+    threshold: float,
+    limit: int,
+) -> DuplicateFinding | None:
+    """Search the curator corpus for a near-duplicate of a ZOT-degraded create.
+
+    Statuses are read only for the non-self hit ids, so a sweep with nothing
+    to flag performs no status read. Any error other than cancellation yields
+    ``None``: an errored read is never evidence of a duplicate.
+    """
+    try:
+        hits = await curator.search_corpus(
+            embedding_text(title, description, files_to_modify),
+            project_id,
+            limit=limit,
+            score_threshold=threshold,
+        )
+        candidate_ids = sorted({
+            str(hit['task_id'])
+            for hit in hits
+            if hit.get('task_id') and str(hit['task_id']) != str(task_id)
+        })
+        if not candidate_ids:
+            return None
+        statuses = await read_statuses(candidate_ids)
+    except Exception:
+        logger.warning(
+            'zot duplicate sweep failed for project=%s task=%s; reporting no finding',
+            project_id, task_id, exc_info=True,
+        )
+        return None
+    return select_near_duplicate(
+        hits, self_task_id=task_id, statuses=statuses, threshold=threshold,
+    )
+
+
+def build_duplicate_metadata(
+    finding: DuplicateFinding, *, zot_escalation_id: str | None,
+) -> dict[str, dict[str, Any]]:
+    """Return the ``metadata`` patch that stamps a finding onto the new task."""
+    return {
+        DUPLICATE_METADATA_KEY: {
+            'duplicate_task_id': finding.duplicate_task_id,
+            'duplicate_title': finding.duplicate_title,
+            'score': float(finding.score),
+            'zot_escalation_id': zot_escalation_id,
+            'flagged_at': datetime.now(UTC).isoformat(),
+        },
+    }
