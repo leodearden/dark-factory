@@ -15424,7 +15424,7 @@ class TestZotDuplicateSweepWiring:
 
     async def _run(
         self, *, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
-        scores, cfg=None, interceptor_config='same', search_error=None,
+        scores, cfg=None, wire_config=True, search_error=None,
         decision=None,
     ):
         cfg = cfg if cfg is not None else _curator_cfg()
@@ -15433,7 +15433,7 @@ class TestZotDuplicateSweepWiring:
         curator = await self._real_curator(cfg, stub_escalator, corpus, monkeypatch, project_id)
         interceptor = TaskInterceptor(
             zot_taskmaster, reconciler, event_buffer,
-            config=cfg if interceptor_config == 'same' else interceptor_config,
+            config=cfg if wire_config else None,
             escalator=stub_escalator,
         )
         candidate = CandidateTask(title='Re-filed gate fix', description='same fix again')
@@ -15543,7 +15543,7 @@ class TestZotDuplicateSweepWiring:
         corpus, _decision, outcome = await self._run(
             zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
             stub_escalator=stub_escalator, monkeypatch=monkeypatch,
-            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0}, interceptor_config=None,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0}, wire_config=False,
         )
         defaults = CuratorConfig()
         assert outcome[0] == 'created'
