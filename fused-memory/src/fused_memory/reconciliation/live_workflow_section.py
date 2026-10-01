@@ -23,7 +23,9 @@ from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
 from fused_memory.services.landed_on_main import LandingQuery, LandingVerdict, probe_landing
 from fused_memory.services.live_workflow_detector import (
     DEFAULT_BRANCH_PREFIX,
+    ClaimantLabel,
     WorkflowLiveness,
+    claimant_label,
     corroboration_for_task,
     detect_live_workflow,
     is_pure_gate_metadata,
@@ -41,6 +43,17 @@ LIVE_WORKFLOW_SECTION_HEADER = '### Live-Workflow Signals'
 #: A listed task with no live signal: it is listed only because its work landed.
 NOT_LIVE_TOKEN = 'not live'
 
+#: A live task none of whose own signals fired: it is listed only through the
+#: project-wide orchestrator lock, which is not per-task evidence.
+NO_PER_TASK_SIGNAL_TOKEN = 'no per-task signal'
+
+CLAIMANT_FIELD = 'claimant='
+
+#: The project line's distinguishing prefixes; the lock is project-wide, so it is
+#: rendered once for the section, never per task.
+PROJECT_LOCK_HELD = 'Project-wide: orchestrator lock HELD'
+PROJECT_LOCK_UNKNOWN = 'Project-wide: orchestrator lock UNKNOWN'
+
 #: How much of a landing commit's sha a row quotes.
 _COMMIT_ABBREV = 10
 
@@ -49,6 +62,10 @@ class LiveSignal(StrEnum):
     WORKTREE = 'worktree'
     RECENT_COMMIT = 'recent-commit'
     ORCHESTRATOR = 'orchestrator'
+
+
+#: The signals a row can carry; ORCHESTRATOR belongs to the project line.
+PER_TASK_SIGNALS = (LiveSignal.WORKTREE, LiveSignal.RECENT_COMMIT)
 
 
 class LandedToken(StrEnum):
@@ -94,6 +111,29 @@ def render_live_workflow_authority_rules() -> str:
     )
 
 
+def _project_line(project_orchestrator_live: bool | None) -> str | None:
+    if project_orchestrator_live is None:
+        return f'{PROJECT_LOCK_UNKNOWN} (probe failed)'
+    if project_orchestrator_live:
+        return (
+            f'{PROJECT_LOCK_HELD} — it fires for every task in this project, '
+            f'so it is not per-task evidence'
+        )
+    return None
+
+
+def _legend() -> str:
+    signals = ' | '.join(PER_TASK_SIGNALS)
+    claimants = ' | '.join(f'{CLAIMANT_FIELD}{label}' for label in ClaimantLabel)
+    landed = ' | '.join(LandedToken)
+    return (
+        f'Legend: per-task signals are {signals}, or "{NO_PER_TASK_SIGNAL_TOKEN}" when '
+        f'only the project-wide lock lists the task; {claimants} is the task '
+        f"record's claimant heartbeat; {landed} says whether the work is already on "
+        f'main; a "{NOT_LIVE_TOKEN}" row is listed only because its work landed.'
+    )
+
+
 def _landed_token(verdict: LandingVerdict) -> str:
     if verdict.landed is None:
         return LandedToken.UNKNOWN
@@ -109,19 +149,27 @@ def _landed_token(verdict: LandingVerdict) -> str:
 class LiveWorkflowRow:
     """One listed task: live, or not live with its work landed on main.
 
-    *signals* are the live signals that fired, and are empty for a row that is
-    not live.
+    *signals* are the per-task live signals that fired, and are empty for a row
+    that is not live or is live only through the project-wide lock.
     """
 
     task_id: str
     branch: str
     is_live: bool
     signals: tuple[LiveSignal, ...]
+    claimant: ClaimantLabel
     landing: LandingVerdict
 
     def render(self) -> str:
-        state = (', '.join(self.signals) or 'live') if self.is_live else NOT_LIVE_TOKEN
-        return f'- {self.branch}: {state}; {_landed_token(self.landing)}'
+        return (
+            f'- {self.branch}: {self._state()}; {CLAIMANT_FIELD}{self.claimant}; '
+            f'{_landed_token(self.landing)}'
+        )
+
+    def _state(self) -> str:
+        if not self.is_live:
+            return NOT_LIVE_TOKEN
+        return ', '.join(self.signals) or NO_PER_TASK_SIGNAL_TOKEN
 
 
 @dataclass(frozen=True)
@@ -142,11 +190,17 @@ class LiveWorkflowSnapshot:
         return next((row for row in self.rows if row.task_id == task_id), None)
 
     def render(self) -> str:
-        """The section text, or ``''`` when no task is listed."""
+        """The section text, or ``''`` when no task is listed.
+
+        Neither the project line nor the legend starts with ``#`` or ``- `` or
+        names a ``task/<id>``, so the rows stay the only per-task lines.
+        """
         if not self.rows:
             return ''
         header = LIVE_WORKFLOW_SECTION_HEADER + self._header_scope()
-        return '\n'.join([header, *(row.render() for row in self.rows)]) + '\n'
+        project_line = _project_line(self.project_orchestrator_live)
+        preamble = [header, *([project_line] if project_line else []), _legend()]
+        return '\n'.join([*preamble, *(row.render() for row in self.rows)]) + '\n'
 
     def _header_scope(self) -> str:
         if self.total_active <= self.probed:
@@ -177,15 +231,23 @@ async def build_live_workflow_snapshot(
 ) -> LiveWorkflowSnapshot:
     """Probe *tasks* and return the '### Live-Workflow Signals' snapshot.
 
-    Each listed task is rendered with the live signals that fired, so the stage
-    LLM can see which evidence contributed to the live designation, and with
-    its landing verdict:
+    Each listed task is rendered with the per-task live signals that fired, so
+    the stage LLM can see which evidence contributed to the live designation,
+    with its claimant label and with its landing verdict.  The project-wide
+    orchestrator lock is one project line, and a legend names every token:
 
     ```
     ### Live-Workflow Signals
-    - task/4321: worktree, recent-commit; landed=false
-    - task/4322: not live; landed=true (merge-marker 1a2b3c4d5e)
+    Project-wide: orchestrator lock HELD — it fires for every task in this ...
+    Legend: per-task signals are worktree | recent-commit, or ...
+    - task/4321: worktree, recent-commit; claimant=live; landed=false
+    - task/4322: not live; claimant=none; landed=true (merge-marker 1a2b3c4d5e)
     ```
+
+    The claimant label (:func:`claimant_label`, computed from the task dict
+    already in hand) and the project line are display-only: they change no
+    ``is_live`` verdict, detector gate or ``recon_write_policy`` behaviour, so
+    task 2964's render/Gate-2 agreement holds by construction (task 4430).
 
     Each task's ``status``, ``metadata.task_kind``, pure-gate shape
     (:func:`is_pure_gate_metadata`) and, for an in-progress task, its
@@ -299,13 +361,18 @@ async def build_live_workflow_snapshot(
     probed = [
         (str(task['id']), task) for task in _clip_to_cap(tasks) if task.get('id') is not None
     ]
+    now_eff = now or datetime.now(UTC)
     (project_orchestrator_live, livenesses), landings = await asyncio.gather(
-        _detect_liveness(probed, project_root, now),
+        _detect_liveness(probed, project_root, now, now_eff),
         _landing_verdicts(project_root, probed),
     )
     rows = (
-        _row(task_id, liveness, landings.get(task_id, LandingVerdict.unknown()))
-        for (task_id, _task), liveness in zip(probed, livenesses, strict=True)
+        _row(
+            task_id, liveness,
+            landing=landings.get(task_id, LandingVerdict.unknown()),
+            claimant=claimant_label(task, now=now_eff),
+        )
+        for (task_id, task), liveness in zip(probed, livenesses, strict=True)
     )
     return LiveWorkflowSnapshot(
         rows=tuple(row for row in rows if row is not None),
@@ -371,6 +438,7 @@ async def _detect_liveness(
     probed: Sequence[tuple[str, dict]],
     project_root: ProjectRoot,
     now: datetime | None,
+    now_eff: datetime,
 ) -> tuple[bool | None, list[WorkflowLiveness | None]]:
     """The hoisted project-wide lock check, and each probed task's liveness (None on error)."""
     project_orch_live, scheduler_state, orch_started = await asyncio.to_thread(
@@ -382,7 +450,6 @@ async def _detect_liveness(
     # worktree_index_kwargs owns the whole three-valued contract: fail-safe,
     # logging, and the unknown -> omit-the-kwarg rule.
     kwargs.update(await worktree_index_kwargs(str(project_root)))
-    now_eff = now or datetime.now(UTC)
 
     livenesses: list[WorkflowLiveness | None] = []
     for task_id, task in probed:
@@ -469,17 +536,20 @@ async def _landing_verdicts(
         return {}
 
 
-def _signals(liveness: WorkflowLiveness) -> tuple[LiveSignal, ...]:
+def _per_task_signals(liveness: WorkflowLiveness) -> tuple[LiveSignal, ...]:
     fired = (
         (liveness.worktree_registered, LiveSignal.WORKTREE),
         (liveness.recent_commit, LiveSignal.RECENT_COMMIT),
-        (liveness.orchestrator_live, LiveSignal.ORCHESTRATOR),
     )
     return tuple(signal for is_set, signal in fired if is_set)
 
 
 def _row(
-    task_id: str, liveness: WorkflowLiveness | None, landing: LandingVerdict,
+    task_id: str,
+    liveness: WorkflowLiveness | None,
+    *,
+    landing: LandingVerdict,
+    claimant: ClaimantLabel,
 ) -> LiveWorkflowRow | None:
     """A row iff the task is live or its work positively landed."""
     live = liveness if liveness is not None and liveness.is_live else None
@@ -489,6 +559,7 @@ def _row(
         task_id=task_id,
         branch=liveness.branch if liveness is not None else f'{DEFAULT_BRANCH_PREFIX}{task_id}',
         is_live=live is not None,
-        signals=_signals(live) if live is not None else (),
+        signals=_per_task_signals(live) if live is not None else (),
+        claimant=claimant,
         landing=landing,
     )

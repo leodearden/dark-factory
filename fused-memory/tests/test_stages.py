@@ -46,6 +46,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.live_workflow_section import NO_PER_TASK_SIGNAL_TOKEN
 from fused_memory.reconciliation.prompts import (
     ESCALATION_BOUNDARY_NOTE,
     render_escalation_boundary_note,
@@ -13887,8 +13888,8 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
 
         result = await self._render(tmp_path, task, monkeypatch)
 
-        assert f'- {self._BRANCH}: orchestrator' in result, (
-            f"Expected {self._BRANCH} STILL listed with the orchestrator signal "
+        assert f'- {self._BRANCH}: {NO_PER_TASK_SIGNAL_TOKEN}' in result, (
+            f"Expected {self._BRANCH} STILL listed through the project-wide lock "
             f"(before_done disqualifies the pure-gate shape); got:\n{result!r}"
         )
 
@@ -13903,7 +13904,7 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
 
         result = await self._render(tmp_path, task, monkeypatch)
 
-        assert f'- {self._BRANCH}: orchestrator' in result, (
+        assert f'- {self._BRANCH}: {NO_PER_TASK_SIGNAL_TOKEN}' in result, (
             f"Expected pending NORMAL task {self._BRANCH} STILL listed — rule 5 is "
             f"deterministic-only; got:\n{result!r}"
         )
