@@ -428,18 +428,17 @@ class TestCascadeAntiDeadlockPreserved:
             lane.remote_gate.set()
 
             try:
-                outcome = await asyncio.wait_for(
-                    lane.requests[FOLLOWER].result, timeout=MERGE_RESULT_TIMEOUT
+                outcome = await wait_responsive(
+                    lane.requests[FOLLOWER].result,
+                    label=(
+                        f"{FOLLOWER}'s result after its verify completed, with "
+                        'nothing ready behind it the whole time. FINALIZE-HEAD was '
+                        'never reached -- the anti-deadlock property the original '
+                        'guard was written to provide has been lost'
+                    ),
                 )
-            except TimeoutError:
-                pytest.fail(
-                    f"{FOLLOWER}'s result was never resolved within "
-                    f'{MERGE_RESULT_TIMEOUT}s of its verify completing, with '
-                    'nothing ready behind it the whole time. FINALIZE-HEAD was '
-                    'never reached -- the anti-deadlock property the original '
-                    f'guard was written to provide has been lost. '
-                    f'last observation: {lane.observed()}'
-                )
+            except pytest.fail.Exception as give_up:
+                pytest.fail(f'{give_up} -- last observation: {lane.observed()}')
 
             assert outcome.status == 'done', f'expected a done outcome, got {outcome!r}'
 

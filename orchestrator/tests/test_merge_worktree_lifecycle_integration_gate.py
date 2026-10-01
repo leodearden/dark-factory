@@ -309,7 +309,7 @@ from _merge_lane_fakes import (
     hangs_until,
     make_lane,
 )
-from _orch_helpers import make_placeholder_future
+from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -1315,7 +1315,10 @@ class TestFiveThreeTwoSixReplayGate:
 
             # (4) Release the gated verify; await the recovered merge.
             release.set()
-            outcome = await asyncio.wait_for(winner.result, timeout=60)
+            outcome = await wait_responsive(
+                winner.result,
+                label='5326 replay gate: recovered merge outcome after the gated verify is released',
+            )
 
             assert outcome.status == 'done', f'Expected done, got: {outcome}'
             full_branch = f'{harness.config.git.branch_prefix}5326'

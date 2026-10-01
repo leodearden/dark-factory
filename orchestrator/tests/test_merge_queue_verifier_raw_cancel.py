@@ -26,7 +26,7 @@ import asyncio
 import contextlib
 
 import pytest
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 
 # Reuse the γ multi-host test harness (established cross-test-module import
 # pattern -- orchestrator/tests/ has no __init__.py; precedent:
@@ -208,14 +208,16 @@ class TestRawCancelTerminatesParkedVerifierLoop:
         # survives, and FINALIZE-HEAD finalizes the head.
         drive.gate.set()
         try:
-            await asyncio.wait_for(item.request.result, timeout=MERGE_RESULT_TIMEOUT)
-        except TimeoutError:
-            await _hang_safe_teardown(drive, task, worker)
-            pytest.fail(
-                "the head item's result Future was never resolved within "
-                f'{MERGE_RESULT_TIMEOUT}s of its gated verify completing -- '
-                'FINALIZE-HEAD was never reached.'
+            await wait_responsive(
+                item.request.result,
+                label=(
+                    "the head item's result Future after its gated verify "
+                    'completed -- FINALIZE-HEAD was never reached'
+                ),
             )
+        except pytest.fail.Exception:
+            await _hang_safe_teardown(drive, task, worker)
+            raise
 
         parked = await _poll_until(
             lambda: worker._pending_verifier_get is None and not task.done()
@@ -361,14 +363,16 @@ class TestGetterOnlyCancelPreservesQueueItems:
 
         drive.gate.set()
         try:
-            await asyncio.wait_for(item_a.request.result, timeout=MERGE_RESULT_TIMEOUT)
-        except TimeoutError:
-            await _teardown_fill_drive(drive, task, worker)
-            pytest.fail(
-                "item_a's result Future was never resolved within "
-                f'{MERGE_RESULT_TIMEOUT}s of its gated verify completing -- '
-                'FINALIZE-HEAD was never reached.'
+            await wait_responsive(
+                item_a.request.result,
+                label=(
+                    "item_a's result Future after its gated verify completed -- "
+                    'FINALIZE-HEAD was never reached'
+                ),
             )
+        except pytest.fail.Exception:
+            await _teardown_fill_drive(drive, task, worker)
+            raise
 
         parked = await _poll_until(
             lambda: worker._pending_verifier_get is None and not task.done()
