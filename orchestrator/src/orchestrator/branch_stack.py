@@ -23,13 +23,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple
 
-from orchestrator.rebase_recovery import AbortRunner
+from orchestrator.rebase_recovery import AbortRunner, guarded_abort
 
 logger = logging.getLogger(__name__)
 
 STACK_BASE_REF_NAMESPACE = 'refs/dark-factory/stack-base/'
+
+STACKED_ON_UNLANDED_BASE_REASON_PREFIX = 'Branch is stacked on an unlanded base'
 
 #: The injected ``(cmd, cwd=...) -> (rc, stdout, stderr)`` runner.  It is the
 #: same callable :func:`orchestrator.rebase_recovery.guarded_abort` is handed,
@@ -151,3 +155,113 @@ async def base_owners(run: GitRunner, repo_root: Path, base: str) -> tuple[str, 
     if rc != 0:
         return ()
     return tuple(sorted(line.strip() for line in out.splitlines() if line.strip()))
+
+
+class UnstackOutcome(StrEnum):
+    NOT_STACKED = 'not_stacked'
+    UNSTACKED = 'unstacked'
+    CONFLICT = 'conflict'
+    BLOCKED = 'blocked'
+
+
+@dataclass(frozen=True)
+class UnstackResult:
+    """Verdict of stripping an unlanded stack base from *branch*.
+
+    ``base`` is set whenever a record was found, and ``cut`` whenever the
+    foreign prefix was computed.  BLOCKED may lack a cut: an inspection
+    error can stop the decision before the cut is known.
+    """
+
+    outcome: UnstackOutcome
+    branch: str
+    main_branch: str
+    base: str | None = None
+    cut: str | None = None
+    base_owners: tuple[str, ...] = ()
+    conflicted_paths: tuple[str, ...] = ()
+    detail: str = ''
+
+    def __post_init__(self) -> None:
+        if self.outcome is not UnstackOutcome.NOT_STACKED and self.base is None:
+            raise ValueError(f'{self.outcome} result for {self.branch} needs a base')
+        needs_cut = self.outcome in (UnstackOutcome.UNSTACKED, UnstackOutcome.CONFLICT)
+        if needs_cut and self.cut is None:
+            raise ValueError(f'{self.outcome} result for {self.branch} needs a cut')
+
+    @property
+    def stops_merge(self) -> bool:
+        return self.outcome in (UnstackOutcome.CONFLICT, UnstackOutcome.BLOCKED)
+
+    def merge_block_reason(self) -> str:
+        """The one attributed reason a stopped merge carries."""
+        if not self.stops_merge:
+            raise ValueError(f'a {self.outcome} result does not stop a merge')
+        return ' '.join((
+            f'{STACKED_ON_UNLANDED_BASE_REASON_PREFIX}:',
+            f'{self.branch} carries commits of base {self._base_sha()[:12]}',
+            f'({self._owner_clause()}), which never landed on {self.main_branch};',
+            self._outcome_clause(),
+            self._remedy_clause(),
+        ))
+
+    def _base_sha(self) -> str:
+        if self.base is None:
+            raise ValueError(f'{self.outcome} result for {self.branch} has no base')
+        return self.base
+
+    def _owner_clause(self) -> str:
+        if not self.base_owners:
+            return 'no live branch points at it any more'
+        return f'branch {", ".join(self.base_owners)}'
+
+    def _outcome_clause(self) -> str:
+        if self.outcome is UnstackOutcome.CONFLICT:
+            return (
+                f'un-stacking its own delta onto {self.main_branch} conflicts in: '
+                f'{", ".join(self.conflicted_paths)}. These conflicts are the '
+                "branch's own; the base's commits are NOT part of this merge and "
+                'must not be resolved into it.'
+            )
+        return f'it could not be un-stacked automatically: {self.detail}.'
+
+    def _remedy_clause(self) -> str:
+        if self.cut is None:
+            return (
+                f'Remedy: find the cut with git cherry -v {self._base_sha()} '
+                f'{self.branch} {self.main_branch}'
+            )
+        return f'Remedy: git rebase --onto {self.main_branch} {self.cut} {self.branch}'
+
+
+class OwnDeltaRebase(NamedTuple):
+    ok: bool
+    conflicted_paths: tuple[str, ...]
+    stderr: str
+
+
+async def rebase_own_delta(
+    run: GitRunner, worktree: Path, *, onto: str, cut: str,
+) -> OwnDeltaRebase:
+    """Replay the commits after *cut* onto *onto*, in *worktree*.
+
+    On failure the conflicted paths are collected BEFORE the guarded abort,
+    because the abort erases them.
+    """
+    rc, _, err = await run(['git', 'rebase', '--onto', onto, cut], cwd=worktree)
+    if rc == 0:
+        return OwnDeltaRebase(ok=True, conflicted_paths=(), stderr='')
+    conflicted = await _conflicted_paths(run, worktree)
+    await guarded_abort('rebase', worktree, run)
+    return OwnDeltaRebase(ok=False, conflicted_paths=conflicted, stderr=err)
+
+
+async def _conflicted_paths(run: GitRunner, worktree: Path) -> tuple[str, ...]:
+    _, out, _ = await run(
+        [
+            'git', '-c', 'core.quotePath=false', 'diff', '--name-only', '-z',
+            '--diff-filter=U',
+        ],
+        cwd=worktree,
+    )
+    return tuple(path for path in out.split('\x00') if path)
