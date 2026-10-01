@@ -777,9 +777,11 @@ class TestRouteReviewSuggestionsDisposition:
     @pytest.mark.asyncio
     async def test_scheduling_failure_returns_error_without_a_scheduled_log(self, caplog):
         wf = _make_workflow()
-        # A non-coroutine makes asyncio.create_task raise TypeError, which
-        # exercises the router's except arm without patching asyncio globally.
-        wf._post_submit_tasks = MagicMock(return_value=None)  # type: ignore[method-assign]
+        # A synchronous MagicMock, not an AsyncMock: it must raise while the
+        # submit coroutine is being built, before anything is scheduled.
+        wf._post_submit_tasks = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('cannot schedule submits'),
+        )
 
         with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
             disposition = await wf._route_review_suggestions_to_curator(
