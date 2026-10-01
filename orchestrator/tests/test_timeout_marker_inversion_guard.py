@@ -1007,10 +1007,7 @@ class TestSpawnBoundSizingModel:
         }
         for py_file in sorted(_TESTS_DIR.rglob('*.py')):
             module = py_file.relative_to(_TESTS_DIR).as_posix()
-            try:
-                source = py_file.read_text(encoding='utf-8')
-            except (UnicodeDecodeError, OSError):
-                continue
+            source = py_file.read_text(encoding='utf-8')
             for pattern, found in homes.items():
                 found.extend(
                     (module, source.count('\n', 0, match.start()) + 1, match.group(0))
