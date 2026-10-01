@@ -27,6 +27,15 @@ Cases and metrics
 it reports. Only judge-band writes are scored. A write in a deterministic band
 was attached to its band winner before any judge ran, so it is the same in
 every arm and no rater is asked about it.
+
+Refusal
+-------
+Every pair that any arm's judge attached a write to must resolve to something
+other than TIED. Otherwise :func:`score_pairs` raises
+:class:`IncompleteCorpusError`, naming each unrated or tied pair and the arms
+that named it, and scores nothing, because a partial corpus must not read as
+a result. A write that no arm attached needs no rating (D14). Neither does a
+corpus pair that no arm named.
 """
 from __future__ import annotations
 
@@ -127,9 +136,44 @@ def _binary(yes: int, votes: int) -> bool | None:
     return 2 * yes > votes
 
 
+@dataclass(frozen=True, order=True)
+class JudgedPair:
+    """A pair some arm's judge attached a write to, with every arm that named it."""
+
+    entry_id: str
+    target_id: str
+    arms: tuple[str, ...]
+
+
+class IncompleteCorpusError(ValueError):
+    """The verdict corpus leaves judge-named pairs unrated or tied, so nothing is scored."""
+
+    def __init__(self, unrated: tuple[JudgedPair, ...], tied: tuple[JudgedPair, ...]) -> None:
+        self.unrated = unrated
+        self.tied = tied
+        header = (
+            f'verdict corpus is incomplete: {len(unrated)} unrated and {len(tied)} tied'
+            ' judge-named pairs'
+        )
+        lines = [_describe_pair('unrated', pair) for pair in unrated]
+        lines += [_describe_pair('tied', pair) for pair in tied]
+        super().__init__('\n'.join([header, *lines]))
+
+
+def _describe_pair(kind: str, pair: JudgedPair) -> str:
+    return f'{kind} {pair.entry_id} {pair.target_id} named by {", ".join(pair.arms)}'
+
+
+def _case_label(arm: object, memory_id: object) -> str:
+    return f'case row arm={arm!r} memory_id={memory_id!r}'
+
+
 @dataclass(frozen=True)
 class JudgedCase:
-    """One arm's answer for one write: a validated row of :func:`score_pairs`' *cases*."""
+    """One arm's answer for one write: a row of :func:`score_pairs`' *cases*.
+
+    Construction refuses a row the shipped judge could not have produced.
+    """
 
     arm: str
     memory_id: str
@@ -143,15 +187,33 @@ class JudgedCase:
     prompt_tokens: int | None
     completion_tokens: int | None
 
+    def __post_init__(self) -> None:
+        violation = self._contract_violation()
+        if violation is not None:
+            raise ValueError(f'{_case_label(self.arm, self.memory_id)}: {violation}')
+
+    def _contract_violation(self) -> str | None:
+        if self.outcome not in TRIAGE_OUTCOMES:
+            return f'outcome {self.outcome!r} is not one of {sorted(TRIAGE_OUTCOMES)}'
+        if not self.attached and self.judged_candidate_id is not None:
+            return f'a {self.outcome!r} write names judged_candidate_id {self.judged_candidate_id!r}'
+        if not self.in_judge_band:
+            return None
+        if self.attached and self.judged_candidate_id is None:
+            return (
+                f'a judge-band {self.outcome!r} attach names no judged_candidate_id, a verdict'
+                ' write_triage_judge.py::parse_judge_verdict refuses'
+            )
+        if self.band_winner_id is None:
+            return 'a judge-band write has no band_winner_id to group it by'
+        return None
+
     @classmethod
     def from_row(cls, row: Mapping[str, Any]) -> JudgedCase:
-        where = f'case row arm={row.get("arm")!r} memory_id={row.get("memory_id")!r}'
         missing = [key for key in _REQUIRED_CASE_KEYS if key not in row]
         if missing:
-            raise ValueError(f'{where} lacks {", ".join(missing)}')
-        if row['outcome'] not in TRIAGE_OUTCOMES:
             raise ValueError(
-                f'{where}: outcome {row["outcome"]!r} is not one of {sorted(TRIAGE_OUTCOMES)}'
+                f'{_case_label(row.get("arm"), row.get("memory_id"))} lacks {", ".join(missing)}'
             )
         usage = row.get('usage') or {}
         return cls(
@@ -326,7 +388,8 @@ def score_pairs(
       and "filed contested" disagree.
     - ``parse_failures``: judge replies that could not be parsed.
     - ``unrated_pairs``, ``unrated_pair_ids``: pairs this arm named that the
-      corpus does not rate.
+      corpus does not rate. Both are always empty in a returned result,
+      because an unrated pair raises :class:`IncompleteCorpusError` instead.
 
     ``runtime`` covers the same judge-band rows, one judge call each. A figure
     that some call cannot support is None, never computed over the rest:
@@ -359,6 +422,9 @@ def score_pairs(
             f'reference arm {reference_arm!r} is not among the arms {sorted(cases_by_arm)}'
         )
     truth = resolve_verdicts(verdicts)
+    unrated, tied = _incomplete(_judged_pairs(cases_by_arm), truth)
+    if unrated or tied:
+        raise IncompleteCorpusError(unrated, tied)
     true_link_writes = frozenset(entry for (entry, _), r in truth.items() if r.belongs)
     scored = {
         arm: [_scored(case, truth, true_link_writes) for case in arm_cases if case.in_judge_band]
@@ -373,7 +439,7 @@ def score_pairs(
                 cases_by_arm[arm],
                 scored[arm],
                 None if arm == reference_arm else scored[reference_arm],
-                truth,
+                tuple(pair for pair in unrated if arm in pair.arms),
             )
             for arm in cases_by_arm
         },
@@ -381,23 +447,43 @@ def score_pairs(
 
 
 def _cases_by_arm(rows: Iterable[Mapping[str, Any]]) -> dict[str, list[JudgedCase]]:
-    by_arm: defaultdict[str, list[JudgedCase]] = defaultdict(list)
+    by_arm: defaultdict[str, dict[str, JudgedCase]] = defaultdict(dict)
     for row in rows:
         case = JudgedCase.from_row(row)
-        by_arm[case.arm].append(case)
-    return {arm: by_arm[arm] for arm in sorted(by_arm)}
+        if case.memory_id in by_arm[case.arm]:
+            raise ValueError(f'{_case_label(case.arm, case.memory_id)} appears twice')
+        by_arm[case.arm][case.memory_id] = case
+    return {arm: list(by_arm[arm].values()) for arm in sorted(by_arm)}
+
+
+def _judged_pairs(cases_by_arm: Mapping[str, Sequence[JudgedCase]]) -> dict[Pair, tuple[str, ...]]:
+    named_by: defaultdict[Pair, set[str]] = defaultdict(set)
+    for arm, cases in cases_by_arm.items():
+        for case in cases:
+            if case.in_judge_band and case.pair is not None:
+                named_by[case.pair].add(arm)
+    return {pair: tuple(sorted(arms)) for pair, arms in named_by.items()}
+
+
+def _incomplete(
+    judged_pairs: Mapping[Pair, tuple[str, ...]], truth: Mapping[Pair, Resolution],
+) -> tuple[tuple[JudgedPair, ...], tuple[JudgedPair, ...]]:
+    named = sorted(JudgedPair(entry, target, arms) for (entry, target), arms in judged_pairs.items())
+    unrated = tuple(p for p in named if (p.entry_id, p.target_id) not in truth)
+    tied = tuple(p for p in named if truth.get((p.entry_id, p.target_id)) is Resolution.TIED)
+    return unrated, tied
 
 
 def _arm_report(
     cases: Sequence[JudgedCase],
     scored: Sequence[ScoredCase],
     reference: Sequence[ScoredCase] | None,
-    truth: Mapping[Pair, Resolution],
+    unrated: Sequence[JudgedPair],
 ) -> dict[str, Any]:
     judged = [s.case for s in scored]
     return {
         'population': {'n_cases': len(cases), 'n_judge_band': len(judged)},
-        'quality': _quality(scored, _unrated(judged, truth)),
+        'quality': _quality(scored, unrated),
         'runtime': _runtime(judged),
         'paired_vs_reference': None if reference is None else _paired(scored, reference),
     }
@@ -409,14 +495,9 @@ def _scored(
     pair = case.pair
     return ScoredCase(
         case=case,
-        resolution=truth.get(pair) if case.attached and pair is not None else None,
+        resolution=None if pair is None else truth[pair],
         has_true_link=case.memory_id in true_link_writes,
     )
-
-
-def _unrated(judged: Iterable[JudgedCase], truth: Mapping[Pair, Resolution]) -> list[Pair]:
-    named = {case.pair for case in judged if case.attached}
-    return sorted(pair for pair in named if pair is not None and pair not in truth)
 
 
 def _corpus_summary(
@@ -431,7 +512,7 @@ def _corpus_summary(
     }
 
 
-def _quality(scored: Sequence[ScoredCase], unrated: Sequence[Pair]) -> dict[str, Any]:
+def _quality(scored: Sequence[ScoredCase], unrated: Sequence[JudgedPair]) -> dict[str, Any]:
     attached = [s for s in scored if s.case.attached]
     decided = sum(s.decided for s in attached)
     misfiles = sum(s.misfile for s in attached)
@@ -460,7 +541,7 @@ def _quality(scored: Sequence[ScoredCase], unrated: Sequence[Pair]) -> dict[str,
         'contested_decision_errors': sum(s.contested_decision_error for s in scored),
         'parse_failures': sum(s.case.parse_failure for s in scored),
         'unrated_pairs': len(unrated),
-        'unrated_pair_ids': [list(pair) for pair in unrated],
+        'unrated_pair_ids': [[pair.entry_id, pair.target_id] for pair in unrated],
     }
 
 
