@@ -170,7 +170,8 @@ class UnstackResult:
 
     ``base`` is set whenever a record was found, and ``cut`` whenever the
     foreign prefix was computed.  BLOCKED may lack a cut: an inspection
-    error can stop the decision before the cut is known.
+    error can stop the decision before the cut is known.  CONFLICT names at
+    least one conflicted path; a rebase that fails without one is BLOCKED.
     """
 
     outcome: UnstackOutcome
@@ -188,6 +189,8 @@ class UnstackResult:
         needs_cut = self.outcome in (UnstackOutcome.UNSTACKED, UnstackOutcome.CONFLICT)
         if needs_cut and self.cut is None:
             raise ValueError(f'{self.outcome} result for {self.branch} needs a cut')
+        if self.outcome is UnstackOutcome.CONFLICT and not self.conflicted_paths:
+            raise ValueError(f'conflict result for {self.branch} names no conflicted path')
 
     @property
     def stops_merge(self) -> bool:

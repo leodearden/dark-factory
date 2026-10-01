@@ -94,12 +94,14 @@ async def _diff_vs_main(repo: Path, branch: str) -> set[str]:
     return {line.strip() for line in out.splitlines() if line.strip()}
 
 
+async def _git_path(wt: Path, name: str) -> Path:
+    path = Path((await _git(wt, 'rev-parse', '--git-path', name)).strip())
+    return path if path.is_absolute() else wt / path
+
+
 async def _assert_clean_and_not_rebasing(wt: Path) -> None:
     assert (await _git(wt, 'status', '--porcelain')).strip() == ''
-    rebase_merge = Path((await _git(wt, 'rev-parse', '--git-path', 'rebase-merge')).strip())
-    if not rebase_merge.is_absolute():
-        rebase_merge = wt / rebase_merge
-    assert not rebase_merge.exists()
+    assert not (await _git_path(wt, 'rebase-merge')).exists()
 
 
 @dataclass(frozen=True)
@@ -264,6 +266,22 @@ class TestUnstackFromUnlandedBase:
         assert f'git rebase --onto main {result.cut} task/M' in reason
         assert 'shared.txt' not in reason
 
+    async def test_rebase_failure_without_a_conflict_blocks(self, repo: Repo) -> None:
+        await _stack_p_and_m(repo)
+        tip_before = await repo.sha('task/M')
+        (await _git_path(repo.wt('M'), 'index.lock')).touch()
+
+        result = await repo.git_ops.unstack_from_unlanded_base('task/M')
+
+        assert result.outcome is UnstackOutcome.BLOCKED
+        assert result.conflicted_paths == ()
+        assert 'index.lock' in result.detail
+        assert await repo.sha('task/M') == tip_before
+        assert await repo.ledger.base_of('task/M') == await repo.sha('task/P')
+        reason = result.merge_block_reason()
+        assert 'index.lock' in reason
+        assert 'conflicts in' not in reason
+
     async def test_dirty_worktree_blocks(self, repo: Repo) -> None:
         await _stack_p_and_m(repo)
         tip_before = await repo.sha('task/M')
@@ -292,6 +310,16 @@ class TestUnstackResultInvariant:
         with pytest.raises(ValueError):
             UnstackResult(
                 outcome=UnstackOutcome.UNSTACKED, branch='task/X', main_branch='main',
+            )
+
+    def test_conflict_without_a_conflicted_path_is_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            UnstackResult(
+                outcome=UnstackOutcome.CONFLICT,
+                branch='task/X',
+                main_branch='main',
+                base='a' * 40,
+                cut='b' * 40,
             )
 
     def test_not_stacked_has_no_block_reason(self) -> None:

@@ -10069,7 +10069,8 @@ class GitOps:
         ``git rebase --onto <main> <cut>`` inside the worktree that holds the
         branch, and only when that tree is clean.
 
-        Never raises.  A failed git read, a dirty tree or no holding worktree
+        Never raises.  A failed git read, a dirty tree, no holding worktree or
+        a rebase that fails without a conflicted path (a contended lock, say)
         is BLOCKED; a conflict in the branch's OWN delta is CONFLICT.  Both
         keep the record, and their ``merge_block_reason()`` attributes the
         stop to the base.
@@ -10144,11 +10145,17 @@ class GitOps:
             )
         foreign_count = await self.get_rebase_distance(main_sha, cut)
         rebased = await rebase_own_delta(_run, wt, onto=main_sha, cut=cut)
-        if not rebased.ok:
+        if rebased.conflicted_paths:
             return verdict(
                 outcome=UnstackOutcome.CONFLICT,
                 conflicted_paths=rebased.conflicted_paths,
                 detail=rebased.stderr,
+            )
+        if not rebased.ok:
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail='git rebase --onto failed without a conflict: '
+                + ' '.join(rebased.stderr.split()),
             )
         await ledger.forget(full_branch)
         result = verdict(outcome=UnstackOutcome.UNSTACKED)
