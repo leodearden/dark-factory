@@ -2158,8 +2158,9 @@ class TestRunStdinWatchdog:
 class TestFireWatchdogKill:
     """fire_watchdog_kill(pgid, ...) — SIGTERM descendants, grace, SIGKILL survivors, exit."""
 
-    def test_signals_only_descendants_grace_then_sigkill_then_exit(self):
+    def test_signals_only_descendants_grace_then_sigkill_then_exit(self, monkeypatch):
         """(a)-(d): descendants only, grace between passes, SIGKILL survivors, exit is final."""
+        import os
         import signal
 
         from orchestrator.verify_cancel import WatchdogTrigger, fire_watchdog_kill
@@ -2183,6 +2184,8 @@ class TestFireWatchdogKill:
         def fake_killpg(pgid, sig):
             killpg_calls.append((pgid, sig))
 
+        monkeypatch.setattr(os, 'killpg', fake_killpg)
+
         def fake_sleep(secs):
             events.append(('sleep', secs))
 
@@ -2195,7 +2198,6 @@ class TestFireWatchdogKill:
             grace_secs=5.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
-            killpg=fake_killpg,
             sleep=fake_sleep,
             exit_fn=fake_exit,
         )
@@ -2219,7 +2221,7 @@ class TestFireWatchdogKill:
 
         # Design decision: the watchdog signals only descendants and never
         # killpg's its own group (it runs inside the target group, unlike
-        # cancel_request) -- killpg is accepted for signature symmetry only.
+        # cancel_request), so it has no killpg seam at all.
         assert killpg_calls == []
 
     def test_dead_descendant_process_lookup_error_tolerated(self):
@@ -2231,9 +2233,6 @@ class TestFireWatchdogKill:
 
         def fake_kill(pid, sig):
             raise ProcessLookupError()
-
-        def fake_killpg(pgid, sig):
-            raise AssertionError('fire_watchdog_kill must not killpg its own group')
 
         def fake_sleep(secs):
             pass
@@ -2248,7 +2247,6 @@ class TestFireWatchdogKill:
             grace_secs=0.0,
             ppid_map_provider=lambda: ppid_map,
             kill=fake_kill,
-            killpg=fake_killpg,
             sleep=fake_sleep,
             exit_fn=fake_exit,
         )
@@ -2307,7 +2305,6 @@ def _fire_with_recording_stderr(trigger, events, *, stderr=None):
         grace_secs=5.0,
         ppid_map_provider=lambda: {200: 100, 300: 200, 999: 1},  # 999 is unrelated
         kill=fake_kill,
-        killpg=lambda pgid, sig: events.append(('killpg', pgid)),
         sleep=lambda secs: events.append(('sleep', secs)),
         exit_fn=lambda code: events.append(('exit', code)),
         stderr=stderr if stderr is not None else _RecordingStderr(events),
@@ -2372,7 +2369,6 @@ class TestFireWatchdogKillTriggerLine:
         assert all(events.index(('term', pid)) < sleep_idx for pid in (200, 300))
         assert all(events.index(('kill', pid)) > sleep_idx for pid in (200, 300))
 
-        assert [e for e in events if e[0] == 'killpg'] == []
         assert len([e for e in events if e[0] == 'exit']) == 1
 
     @pytest.mark.parametrize(
@@ -2404,9 +2400,10 @@ class TestFireWatchdogKillTriggerLine:
         ids=['first', 'second'],
     )
     def test_a_failed_snapshot_is_reported_and_still_self_exits(
-        self, good_snapshots, expected_term
+        self, good_snapshots, expected_term, monkeypatch
     ):
         """A raising /proc snapshot is diagnosed on stderr and never skips the self-exit."""
+        import os
         import signal
 
         from orchestrator.verify_cancel import (
@@ -2424,6 +2421,8 @@ class TestFireWatchdogKillTriggerLine:
             return snapshot
 
         events = []
+        # No killpg fallback for a failed walk: the group is the watchdog's own.
+        monkeypatch.setattr(os, 'killpg', lambda pgid, sig: events.append(('killpg', pgid)))
         fire_watchdog_kill(
             100,
             trigger=WatchdogTrigger.HEARTBEAT_STARVATION,
@@ -2432,7 +2431,6 @@ class TestFireWatchdogKillTriggerLine:
             kill=lambda pid, sig: events.append(
                 ('term' if sig == signal.SIGTERM else 'kill', pid)
             ),
-            killpg=lambda pgid, sig: events.append(('killpg', pgid)),
             sleep=lambda secs: events.append(('sleep', secs)),
             exit_fn=lambda code: events.append(('exit', code)),
             stderr=_RecordingStderr(events),
@@ -2477,7 +2475,6 @@ class TestFireWatchdogKillTriggerLine:
             grace_secs=0.0,
             ppid_map_provider=dict,
             kill=lambda pid, sig: None,
-            killpg=lambda pgid, sig: None,
             sleep=lambda secs: None,
             exit_fn=lambda code: None,
         )

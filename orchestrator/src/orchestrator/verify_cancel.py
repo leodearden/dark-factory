@@ -1163,11 +1163,10 @@ def fire_watchdog_kill(
     *,
     trigger: WatchdogTrigger,
     grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
-    ppid_map_provider=read_ppid_map,
-    kill=os.kill,
-    killpg=os.killpg,
-    sleep=time.sleep,
-    exit_fn=os._exit,
+    ppid_map_provider: Callable[[], dict[int, int]] = read_ppid_map,
+    kill: Callable[[int, int], None] = os.kill,
+    sleep: Callable[[float], None] = time.sleep,
+    exit_fn: Callable[[int], None] = os._exit,
     exit_code: int = 1,
     stderr=None,
 ) -> None:
@@ -1187,9 +1186,9 @@ def fire_watchdog_kill(
       already excludes the root) -- never *pgid* itself / the calling
       process.  A ``killpg(pgid, ...)`` here would signal the watchdog's own
       process before it could finish the SIGTERM -> grace -> SIGKILL
-      escalation or reach a controlled exit, so *killpg* is accepted for
-      signature symmetry with :func:`cancel_request` but is intentionally
-      never called.
+      escalation or reach a controlled exit, so unlike
+      :func:`cancel_request` there is no ``killpg`` backstop -- not even as
+      a fallback when the descendant walk fails.
     * It ends by unconditionally calling ``exit_fn(exit_code)`` -- a
       controlled non-zero self-exit -- rather than returning, so the
       abandoned verify-merge leader always terminates (freeing its flock and
@@ -1237,7 +1236,14 @@ def fire_watchdog_kill(
     exit_fn(exit_code)
 
 
-def _signal_descendants(pgid: int, *, grace_secs, ppid_map_provider, kill, sleep) -> None:
+def _signal_descendants(
+    pgid: int,
+    *,
+    grace_secs: float,
+    ppid_map_provider: Callable[[], dict[int, int]],
+    kill: Callable[[int, int], None],
+    sleep: Callable[[float], None],
+) -> None:
     """SIGTERM every descendant of *pgid*, sleep *grace_secs*, SIGKILL the survivors.
 
     Each pass takes a fresh ``/proc`` PPID snapshot.  ``ProcessLookupError``
