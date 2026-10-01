@@ -8375,6 +8375,216 @@ def test_main_write_decision_enriches_a_legacy_unstamped_record(
     assert listed[0].text == 'Adopt the reify plan?'  # enriched, not clobbered
 
 
+# ---------------------------------------------------------------------------
+# Lazy adoption of bare-keyed decisions filed before task 4835
+# ---------------------------------------------------------------------------
+
+
+def _seed_legacy_decision(root: Path, **overrides: object) -> Path:
+    """Write a bare-keyed record, as write-decision filed it before task 4835."""
+    record = _make_decision(
+        **{
+            'id': 'esc-5914-1',
+            'project': 'df',
+            'text': 'Adopt the reify plan?',
+            'state': sr.DecisionState.OPEN,
+            **overrides,
+        }
+    )
+    sr.write_decision(record, root=root)
+    return sr.decision_path_for_id(record.id, root=root)
+
+
+def _decision_files(root: Path) -> list[str]:
+    return sorted(path.name for path in sr.decisions_dir(root).glob('*.json'))
+
+
+def test_main_write_decision_continues_a_same_project_legacy_record_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A same-queue re-file of a pre-4835 bare-keyed record lands ON that record,
+    keeping its custody, rather than opening a second, qualified row.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    _seed_legacy_decision(tmp_path, manual_boost=4, escalations_dir=str(orch))
+    capsys.readouterr()
+
+    rc = _file_decision(
+        id='esc-5914-1',
+        project='dark_factory',
+        text='reify? (rephrased)',
+        escalations_dir=str(orch),
+    )
+
+    assert rc == 0
+    assert _decision_files(tmp_path) == ['esc-5914-1.json']
+    assert capsys.readouterr().out.strip() == 'esc-5914-1'
+    [survivor] = sr.list_decisions(root=tmp_path)
+    assert survivor.text == 'reify? (rephrased)'
+    assert survivor.manual_boost == 4
+    assert survivor.filed_at == _make_decision().filed_at
+
+
+def test_main_write_decision_holds_a_dropped_legacy_record_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Task 3872's guarantee survives the id-format change: the first
+    post-deploy restart of a watcher must not undo an operator's dismissal of
+    a row filed under the old bare id.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    _seed_legacy_decision(
+        tmp_path, state=sr.DecisionState.DROPPED, escalations_dir=str(orch)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        rc = _file_decision(
+            id='esc-5914-1',
+            project='dark_factory',
+            text='reify? (rephrased)',
+            escalations_dir=str(orch),
+        )
+
+    assert rc == 0
+    assert _decision_files(tmp_path) == ['esc-5914-1.json']
+    [survivor] = sr.list_decisions(root=tmp_path)
+    assert survivor.state == sr.DecisionState.DROPPED
+    held = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and 'dropped' in r.getMessage()
+    ]
+    assert held and 'esc-5914-1' in held[0]
+
+
+def test_main_write_decision_enriches_a_same_project_legacy_record_from_the_other_queue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """MODE-2 holds across the transition: the second queue's filing folds into
+    the legacy row instead of opening a qualified twin beside it.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    _seed_legacy_decision(tmp_path, severity='critical', escalations_dir=str(orch))
+
+    rc = _file_decision(
+        id='esc-5914-1',
+        project='dark_factory',
+        text='reify?',
+        severity='info',
+        escalations_dir=str(recon),
+    )
+
+    assert rc == 0
+    assert _decision_files(tmp_path) == ['esc-5914-1.json']
+    [survivor] = sr.list_decisions(root=tmp_path)
+    assert survivor.severity == 'critical'
+    assert survivor.text == 'Adopt the reify plan?'
+    assert survivor.escalations_dir == sr.normalize_escalations_dir(orch)
+
+
+def test_main_write_decision_ignores_another_projects_legacy_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    legacy = _seed_legacy_decision(
+        tmp_path, id='esc-42-1', project='dark_factory', escalations_dir=str(orch)
+    )
+    before = legacy.read_bytes()
+
+    with caplog.at_level(logging.ERROR):
+        rc = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            escalations_dir=str(recon),
+        )
+
+    assert rc == 0
+    assert _decision_files(tmp_path) == ['esc-42-1.json', 'reify-esc-42-1.json']
+    assert legacy.read_bytes() == before
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_main_write_decision_prefers_the_qualified_record_over_a_legacy_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, _recon = _two_queues(tmp_path)
+    legacy = _seed_legacy_decision(
+        tmp_path, id='esc-7-1', project='dark_factory', escalations_dir=str(orch)
+    )
+    _seed_legacy_decision(
+        tmp_path, id='dark_factory-esc-7-1', project='dark_factory', escalations_dir=str(orch)
+    )
+    before = legacy.read_bytes()
+
+    rc = _file_decision(
+        id='esc-7-1',
+        project='dark_factory',
+        text='reify? (rephrased)',
+        escalations_dir=str(orch),
+    )
+
+    assert rc == 0
+    rows = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+    assert rows['dark_factory-esc-7-1'].text == 'reify? (rephrased)'
+    assert legacy.read_bytes() == before
+
+
+class TestLegacyAdoptionLocks:
+    @staticmethod
+    def _spy_on_locks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        real_lock = sr.decision_id_lock
+        acquired: list[str] = []
+
+        @contextlib.contextmanager
+        def recording_lock(decision_id: str, root: Path | str | None = None):
+            acquired.append(decision_id)
+            with real_lock(decision_id, root=root):
+                yield
+
+        monkeypatch.setattr(sr, 'decision_id_lock', recording_lock)
+        return acquired
+
+    def test_adoption_locks_the_qualified_key_then_the_legacy_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, _recon = _two_queues(tmp_path)
+        _seed_legacy_decision(tmp_path, escalations_dir=str(orch))
+        acquired = self._spy_on_locks(monkeypatch)
+
+        _file_decision(
+            id='esc-5914-1', project='dark_factory', text='q', escalations_dir=str(orch)
+        )
+
+        assert acquired == ['dark_factory-esc-5914-1', 'esc-5914-1']
+
+    def test_a_fresh_filing_locks_only_the_qualified_key(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        orch, _recon = _two_queues(tmp_path)
+        acquired = self._spy_on_locks(monkeypatch)
+
+        _file_decision(id='esc-9-1', project='dark_factory', text='q', escalations_dir=str(orch))
+
+        assert acquired == ['dark_factory-esc-9-1']
+        assert not (sr.decisions_dir(tmp_path) / 'esc-9-1.json.lock').exists()
+
+
 def test_main_reap_decisions_fail_soft_on_bad_escalations_dir(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
