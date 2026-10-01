@@ -193,6 +193,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
 from shared.git_async import run_git
@@ -714,6 +715,43 @@ def corroboration_for_task(
         routing_latest_decided_at=routing_latest_decided_at,
         orchestrator_started_at=orchestrator_started_at,
     )
+
+
+class ClaimantLabel(StrEnum):
+    LIVE = 'live'
+    STALE = 'stale'
+    NONE = 'none'
+    UNKNOWN = 'unknown'
+
+
+def claimant_label(
+    task: object,
+    *,
+    now: datetime,
+    heartbeat_ttl: timedelta = DEFAULT_HEARTBEAT_TTL,
+) -> ClaimantLabel:
+    """Label *task*'s claimant for display; total, and it changes no ``is_live`` verdict.
+
+    STALE (a claimant whose heartbeat is old, missing or unparseable) is the
+    killed-but-lingering shape the task-2963 corroboration gate exists for.
+    UNKNOWN (an unreadable task) is never collapsed into NONE, so absence of
+    evidence never renders as evidence of absence.
+    """
+    if not isinstance(task, Mapping):
+        return ClaimantLabel.UNKNOWN
+    claimant = task.get('claimant_run_id')
+    # The "no claimant" predicate of shared/task_claimant.py::_claimant_liveness_stranded.
+    if claimant is None or (isinstance(claimant, str) and not claimant.strip()):
+        return ClaimantLabel.NONE
+    try:
+        is_live = has_live_claimant(task, now, heartbeat_ttl)
+    except Exception:
+        logger.warning(
+            'live_workflow_detector.claimant_label: claimant liveness unreadable for %r',
+            claimant, exc_info=True,
+        )
+        return ClaimantLabel.UNKNOWN
+    return ClaimantLabel.LIVE if is_live else ClaimantLabel.STALE
 
 
 def is_pure_gate_metadata(metadata: object) -> bool:
