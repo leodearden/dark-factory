@@ -11,6 +11,7 @@ renders.  That rule lives only in :func:`event_matches`.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -29,13 +30,18 @@ class ParkWorld(NamedTuple):
 
 
 def park_world(
-    tmp_path: Path, *, pinned: tuple[str, ...] = (), **config_overrides: Any
+    tmp_path: Path,
+    *,
+    pinned: tuple[str, ...] = (),
+    time_source: Callable[[], float] | None = None,
+    **config_overrides: Any,
 ) -> ParkWorld:
     """A started Scheduler whose top parks on its first skip.
 
     One holder per module, ``lock_depth=2`` and ``project_root=tmp_path``,
     with *config_overrides* applied on top.  Each id in *pinned* is pinned in
-    the given order, so its pin_order is its 1-based position.
+    the given order, so its pin_order is its 1-based position.  *time_source*
+    is the Scheduler's monotonic clock (the real one when None).
     """
     config = OrchestratorConfig(**{
         'max_per_module': 1,
@@ -49,7 +55,12 @@ def park_world(
     for tid in pinned:
         overrides.set_override(root, tid, pinned=True)
     store = _RecordingEventStore()
-    scheduler = Scheduler(config, event_store=store, override_store=overrides)  # type: ignore[arg-type]
+    scheduler = Scheduler(
+        config,
+        event_store=store,  # type: ignore[arg-type]
+        override_store=overrides,
+        time_source=time_source,
+    )
     scheduler.finish_startup()
     return ParkWorld(scheduler, store, overrides, root)
 

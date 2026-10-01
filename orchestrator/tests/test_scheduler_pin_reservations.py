@@ -59,6 +59,13 @@ def _owners(scheduler: Scheduler, module: str) -> list[str]:
     return [entry['owner'] for entry in stacks.get(module, [])]
 
 
+def _psi_sample(*, cpu_some10: float) -> PsiSample:
+    """A readable PSI sample: saturated when *cpu_some10* is past 85, else idle."""
+    return PsiSample(
+        cpu_some10=cpu_some10, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True
+    )
+
+
 def _3659_tasks() -> list[dict]:
     return [
         make_task('P', 'high', ['w.py', 'x.py']),
@@ -485,9 +492,7 @@ async def test_psi_held_tick_neither_grants_nor_revokes(tmp_path):
     assert 'P' in before, 'premise: P reserved'
     w.store.events.clear()
 
-    w.scheduler._read_psi_sample = lambda: PsiSample(
-        cpu_some10=99.0, mem_some10=0.0, mem_full10=0.0, io_some10=0.0, read_ok=True
-    )
+    w.scheduler._read_psi_sample = lambda: _psi_sample(cpu_some10=99.0)
     assert await w.scheduler.acquire_next() is None
 
     assert event_payloads(w.store, 'dispatch_deferred'), 'premise: the tick was held'
@@ -514,3 +519,151 @@ def test_pin_release_reason_precedence(facts, reason):
     }
 
     assert pin_release_reason(**(defaults | facts)) == reason
+
+
+# ---------------------------------------------------------------------------
+# Acceptance 7 / D7ii — pin_blocked names a blocked pin's blockers
+# ---------------------------------------------------------------------------
+
+
+class _Clock:
+    """A settable monotonic clock: the Scheduler's ``time_source``."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _two_blocked_pins_world(tmp_path, clock: _Clock) -> ParkWorld:
+    """P1 waits on H's a; P2 waits on a too and on H2's b."""
+    w = park_world(tmp_path, pinned=('P1', 'P2'), time_source=clock)
+    assert w.scheduler.lock_table.try_acquire('H', ['a.py'])
+    assert w.scheduler.lock_table.try_acquire('H2', ['b.py'])
+    w.scheduler.get_tasks = AsyncMock(return_value=[
+        make_task('P1', 'medium', ['a.py']),
+        make_task('P2', 'medium', ['a.py', 'b.py']),
+        make_task('H', 'low', ['a.py'], status='in-progress'),
+        make_task('H2', 'low', ['b.py'], status='in-progress'),
+    ])
+    return w
+
+
+def _one_blocked_pin_world(
+    tmp_path, clock: _Clock, *extra: dict, **config_overrides
+) -> ParkWorld:
+    """P1 waits on H's a; *extra* tasks join the task list."""
+    w = park_world(tmp_path, pinned=('P1',), time_source=clock, **config_overrides)
+    assert w.scheduler.lock_table.try_acquire('H', ['a.py'])
+    w.scheduler.get_tasks = AsyncMock(return_value=[
+        make_task('P1', 'medium', ['a.py']),
+        make_task('H', 'low', ['a.py'], status='in-progress'),
+        *extra,
+    ])
+    return w
+
+
+@pytest.mark.asyncio
+async def test_pin_blocked_names_each_pins_blockers_on_transition(tmp_path):
+    """The head's blockers are read BEFORE it reserves, so it never names itself."""
+    w = _two_blocked_pins_world(tmp_path, _Clock())
+
+    assert await w.scheduler.acquire_next() is None
+
+    assert event_data_for(w.store, 'pin_blocked', 'P1') == [{
+        'task_id': 'P1',
+        'pin_order': 1,
+        'head': True,
+        'blockers': [{'module': 'a.py', 'owner': 'H', 'kind': 'held'}],
+    }]
+    assert event_data_for(w.store, 'pin_blocked', 'P2') == [{
+        'task_id': 'P2',
+        'pin_order': 2,
+        'head': False,
+        'blockers': [
+            {'module': 'a.py', 'owner': 'H', 'kind': 'held'},
+            {'module': 'a.py', 'owner': 'P1', 'kind': 'parked'},
+            {'module': 'b.py', 'owner': 'H2', 'kind': 'held'},
+        ],
+    }]
+
+
+@pytest.mark.asyncio
+async def test_pin_blocked_is_rate_limited_per_pin(tmp_path):
+    clock = _Clock()
+    w = _two_blocked_pins_world(tmp_path, clock)
+    interval = w.scheduler.config.pin_blocked_emit_interval_secs
+    assert await w.scheduler.acquire_next() is None
+
+    clock.now += interval - 1
+    await w.scheduler.acquire_next()
+
+    assert len(event_payloads(w.store, 'pin_blocked')) == 2, 'inside the interval: silent'
+
+    clock.now += 2
+    await w.scheduler.acquire_next()
+
+    assert len(event_data_for(w.store, 'pin_blocked', 'P1')) == 2
+    assert len(event_data_for(w.store, 'pin_blocked', 'P2')) == 2
+
+
+@pytest.mark.asyncio
+async def test_pin_blocked_fires_again_after_a_dispatch(tmp_path):
+    """A dispatch ends the blocked episode; the next block is a new transition."""
+    w = _one_blocked_pin_world(tmp_path, _Clock())
+    assert await w.scheduler.acquire_next() is None
+    _drop(w, 'H')
+    result = await w.scheduler.acquire_next()
+    assert result is not None and result.task_id == 'P1', 'premise: P1 dispatched'
+
+    w.scheduler.release('P1')
+    assert w.scheduler.lock_table.try_acquire('H3', ['a.py'])
+    w.scheduler.get_tasks = AsyncMock(return_value=[
+        make_task('P1', 'medium', ['a.py']),
+        make_task('H3', 'low', ['a.py'], status='in-progress'),
+    ])
+    assert await w.scheduler.acquire_next() is None
+
+    assert [d['blockers'] for d in event_data_for(w.store, 'pin_blocked', 'P1')] == [
+        [{'module': 'a.py', 'owner': 'H', 'kind': 'held'}],
+        [{'module': 'a.py', 'owner': 'H3', 'kind': 'held'}],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_psi_held_tick_neither_emits_nor_resets_pin_blocked(tmp_path):
+    """F dispatches on tick 1 so one task is in flight and the hold can engage."""
+    w = _one_blocked_pin_world(
+        tmp_path, _Clock(), make_task('F', 'low', ['f.py']),
+        psi_admission=PsiAdmissionConfig(),
+    )
+    result = await w.scheduler.acquire_next()
+    assert result is not None and result.task_id == 'F', 'premise: F is in flight'
+    assert len(event_data_for(w.store, 'pin_blocked', 'P1')) == 1
+
+    w.scheduler._read_psi_sample = lambda: _psi_sample(cpu_some10=99.0)
+    await w.scheduler.acquire_next()
+
+    assert event_payloads(w.store, 'dispatch_deferred'), 'premise: the tick was held'
+    assert len(event_data_for(w.store, 'pin_blocked', 'P1')) == 1
+
+    w.scheduler._read_psi_sample = lambda: _psi_sample(cpu_some10=0.0)
+    await w.scheduler.acquire_next()
+
+    assert len(event_data_for(w.store, 'pin_blocked', 'P1')) == 1, (
+        'still blocked, still inside the interval: the hold did not reset it'
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_shorter_reloaded_interval_applies_next_tick(tmp_path):
+    clock = _Clock()
+    w = _one_blocked_pin_world(tmp_path, clock)
+    assert await w.scheduler.acquire_next() is None
+
+    clock.now += 100
+    _reload(w.scheduler, pin_blocked_emit_interval_secs=50.0)
+    await w.scheduler.acquire_next()
+
+    assert len(event_data_for(w.store, 'pin_blocked', 'P1')) == 2
