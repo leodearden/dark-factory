@@ -27,11 +27,17 @@ from _usage_gate_test_helpers import spawn_fault as _spawn_fault
 from shared import invocation_outcome
 from shared.cli_invoke import AgentResult
 from shared.config_models import AccountConfig, UsageCapConfig
-from shared.invocation_outcome import AuthFailed, auth_failure_reason, classify_invocation
+from shared.invocation_outcome import (
+    AuthFailed,
+    CapHit,
+    auth_failure_reason,
+    classify_invocation,
+)
 from shared.usage_gate import (
     _SPAWN_FAULT_THRESHOLD,
     AccountPhase,
     AccountState,
+    InvokeSlot,
     UsageGate,
 )
 
@@ -569,6 +575,65 @@ class TestIsPausedIncludesAuthFailed:
         gate._accounts[0].capped = True
         gate._accounts[1].auth_failed = True
         assert gate.is_paused is True
+
+
+_ROSTER = ['acct-1', 'acct-2', 'acct-3']
+_ORG_DISABLED = AuthFailed(
+    status=403, body='Your organization has disabled Claude subscription access',
+)
+
+
+def _settle_only(gate: UsageGate, name: str, outcome) -> None:
+    lease = gate.try_lease(exclude=[other for other in _ROSTER if other != name])
+    assert lease is not None and lease.name == name
+    InvokeSlot(gate, lease).report(outcome)
+
+
+def _leasable_names(gate: UsageGate) -> list[str]:
+    seen: list[str] = []
+    while (lease := gate.try_lease(exclude=seen)) is not None:
+        seen.append(lease.name)
+    return seen
+
+
+class TestAuthFailedAccountNames:
+    """``auth_failed_account_names`` lets a loop-less caller (the legibility
+    trickle, task 5947) tell an all-auth-failed pool, which never clears on its
+    own, from an all-capped one, which clears at the reset. State is driven
+    only through try_lease + InvokeSlot.report, the trickle's own route.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_running_event_loop(self):
+        with pytest.raises(RuntimeError):
+            asyncio.get_running_loop()
+
+    def test_a_fresh_gate_names_no_one(self):
+        assert _make_gate(_ROSTER).auth_failed_account_names == ()
+
+    def test_a_reported_rejection_is_named_and_never_leased_again(self):
+        gate = _make_gate(_ROSTER)
+        lease = gate.try_lease(exclude={'acct-1'})
+        assert lease is not None and lease.name == 'acct-2'
+
+        InvokeSlot(gate, lease).report(_ORG_DISABLED)
+
+        assert gate.auth_failed_account_names == ('acct-2',)
+        assert _leasable_names(gate) == ['acct-1', 'acct-3']
+
+    def test_names_come_in_roster_order_not_report_order(self):
+        gate = _make_gate(_ROSTER)
+        _settle_only(gate, 'acct-3', _ORG_DISABLED)
+        _settle_only(gate, 'acct-1', _ORG_DISABLED)
+
+        assert gate.auth_failed_account_names == ('acct-1', 'acct-3')
+
+    def test_a_capped_account_is_not_named(self):
+        gate = _make_gate(_ROSTER)
+        _settle_only(gate, 'acct-1', CapHit(resets_at=None, reason="You've hit your limit"))
+        _settle_only(gate, 'acct-2', _ORG_DISABLED)
+
+        assert gate.auth_failed_account_names == ('acct-2',)
 
 
 @pytest.mark.asyncio
