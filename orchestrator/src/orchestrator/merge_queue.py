@@ -749,9 +749,9 @@ also fail ``test_merge_queue.py::TestHaltAdvanceResults::
 test_contains_expected_results``, which asserts EXACT frozenset equality
 against a literal 5-element set.
 
-Shared by the single-branch and train advance paths to avoid silent
-divergence: if the set of halt-triggering results ever changes, updating
-this single constant propagates to both automatically."""
+Shared by ``SpeculativeMergeWorker._finalize_inflight`` and
+``_land_chain_prefix`` to avoid silent divergence: if the set of
+halt-triggering results ever changes, this one constant updates both."""
 
 
 _ENOSPC_MARKERS = ('no space left on device', 'os error 28', 'enospc')

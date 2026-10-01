@@ -727,6 +727,36 @@
           "current": 31614
         }
       ]
+    },
+    {
+      "task_id": "5034",
+      "reason": "Net-additive test isolation inside a PRD phase task (5034 is task delta, so decision 8's 'never raise' scope applies and this entry says why it is not a refactor that grew): conftest gains one autouse fixture, _isolated_merge_provenance, that rebinds the process-global MergeProvenance to a fresh empty outbox per test. The same task moved the workflow end-to-end set onto the production lane, whose constructor binds its landed outbox process-wide with no unbind, so a row one test's lane recorded answered a later test's lookup (reviewer finding F1; reproduced 10 of 12 failing, 12 of 12 passing after). The fixture is defined in conftest rather than imported into it, so reexport_names does not move. The cluster nets down: lines 56378 -> 55961 against main.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1242,
+          "current": 1258
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 770,
+          "current": 779
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55945,
+          "current": 55961
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31441,
+          "current": 31450
+        }
+      ]
     }
   ]
 }

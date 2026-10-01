@@ -2803,7 +2803,7 @@ class TestMarkBlockedFalseDoneGuard:
 
         # 2. Build workflow with escalation queue, wire up worktree and artifacts
         #    (no iterations.jsonl → _has_prior_implementation() returns False)
-        #    Use the no-merge-worker variant to avoid leaking the MergeWorker task.
+        #    Use the no-merge-worker variant to avoid leaking the merge lane task.
         stub = AgentStub()
         workflow, scheduler, queue = _build_workflow_no_merge_worker(
             config, git_ops, task_assignment, stub, tmp_path,

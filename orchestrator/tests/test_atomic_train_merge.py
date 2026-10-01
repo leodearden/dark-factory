@@ -18,17 +18,16 @@ Scaffolding stubs defined here are completed in step-2.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import shutil
 import subprocess
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import make_lane, merge_through_lane
+from _merge_lane_fakes import make_lane, merge_through_lane, running_lane, times_out
 from _orch_helpers import wire_scheduler_liveness_mock
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -1286,9 +1285,10 @@ class TestScenario7TrainResume:
         assert req7.train_id == "T7"
         assert req7.member_task_ids == ["alpha7", "beta7", "gamma7"]
 
-        # Drive the request through the production lane (verify is a passing fake;
-        # no cargo run in this scenario). The lane resolves req7.result itself,
-        # which unblocks _maybe_enqueue_group_merge.
+        # Drive the request through the production lane. Verify passes on the
+        # conftest autouse stub, not on make_lane's FakeVerifier, which a train
+        # ignores (task 6160); no cargo runs. The lane resolves req7.result
+        # itself, which unblocks _maybe_enqueue_group_merge.
         worker_q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = make_lane(git_ops7, worker_q)
         await merge_through_lane(lane, worker_q, req7)
@@ -2017,18 +2017,6 @@ def _make_passing_verify_result() -> VerifyResult:
     )
 
 
-@contextlib.asynccontextmanager
-async def _running(lane: MergeLane) -> AsyncIterator[MergeLane]:
-    """Run *lane* for a test that inspects it between submissions, then stop it."""
-    run = asyncio.create_task(lane.run())
-    try:
-        yield lane
-    finally:
-        await lane.stop()
-        with contextlib.suppress(BaseException):
-            await asyncio.wait_for(run, 60)
-
-
 async def _setup_gate_train(
     tmp_path: Path,
     *,
@@ -2168,13 +2156,6 @@ class TestGate01TrainDiskGuard:
 # ---------------------------------------------------------------------------
 
 
-def _timed_out_verify_result() -> VerifyResult:
-    return VerifyResult(
-        passed=False, test_output="", lint_output="", type_output="",
-        summary="Verification timed out", timed_out=True,
-    )
-
-
 @pytest.mark.asyncio
 class TestGate03TrainVerifyTimeoutLoopBreaker:
     """step-03 RED: _do_train_merge has no loop-breaker short-circuit.
@@ -2207,17 +2188,17 @@ class TestGate03TrainVerifyTimeoutLoopBreaker:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = MergeLane(git_ops, queue)
-        verify = AsyncMock(return_value=_timed_out_verify_result())
+        verify = AsyncMock(return_value=times_out().result)
 
         with patch("orchestrator.merge_queue.run_scoped_verification", verify):
-            async with _running(lane):
+            async with running_lane(lane) as run:
                 # Submissions 1..MAX run merge + verify and surface the timeout.
                 requests = [first_req]
                 for attempt in range(lane.MAX_POST_MERGE_VERIFY_TIMEOUTS):
                     if attempt:
                         requests.append(resubmission())
                     await queue.put(requests[-1])
-                    outcome = await asyncio.wait_for(requests[-1].result, timeout=60)
+                    outcome = await run.outcome(requests[-1], timeout=60)
                     assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
                 assert verify.await_count == lane.MAX_POST_MERGE_VERIFY_TIMEOUTS
 
@@ -2227,7 +2208,7 @@ class TestGate03TrainVerifyTimeoutLoopBreaker:
                     git_ops, "merge_to_main", wraps=git_ops.merge_to_main,
                 ) as spy_merge:
                     await queue.put(final_req)
-                    outcome = await asyncio.wait_for(final_req.result, timeout=60)
+                    outcome = await run.outcome(final_req, timeout=60)
 
         # (1) Outcome is blocked with the ABANDONED prefix.
         assert outcome.status == "blocked", f"expected blocked, got: {outcome!r}"
@@ -2458,9 +2439,9 @@ class TestGate09TrainWipOverlapHalt:
             git_ops, "advance_main",
             side_effect=_wip_overlap_advance,
         ):
-            async with _running(lane):
+            async with running_lane(lane) as run:
                 await queue.put(req)
-                outcome = await asyncio.wait_for(req.result, timeout=60)
+                outcome = await run.outcome(req, timeout=60)
                 # Read the halt while the lane is still running: stopping a lane
                 # releases its halts.
                 lane_halted = lane.is_wip_halted

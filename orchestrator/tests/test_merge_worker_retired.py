@@ -21,17 +21,18 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 import orchestrator.merge_lane as merge_lane
 import orchestrator.merge_queue as mq
 
-# test_no_copy_of_the_serial_worker_in_the_test_tree reads every *.py under
-# this directory; test_whole_tree_scan_timeout_guard.py says why such a sweep
-# carries this mark.
+# test_no_copy_of_the_serial_worker_anywhere reads every *.py under the tests
+# and the production package; see _orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _RETIRED_CLASS = 'MergeWorker'
 _TESTS_DIR = Path(__file__).resolve().parent
+_SRC_DIR = Path(mq.__file__).resolve().parent
 
-#: Anti-vacuity floor (600+ files today): a sweep that silently reads nothing
-#: must fail rather than report a clean tree.
-_MIN_EXPECTED_TEST_FILES = 400
+#: Anti-vacuity floors, one per swept tree (630 test files and 155 source
+#: files today): a sweep that silently reads nothing must fail rather than
+#: report a clean tree.
+_MIN_EXPECTED_FILES = {_TESTS_DIR: 400, _SRC_DIR: 100}
 
 
 def _defines_retired_class(source: str) -> bool:
@@ -48,11 +49,7 @@ def _defines_retired_class(source: str) -> bool:
     )
 
 
-def test_the_production_lane_is_the_only_merge_worker() -> None:
-    assert not hasattr(mq, _RETIRED_CLASS), (
-        'the serial MergeWorker was retired from orchestrator.merge_queue; '
-        'the production worker is SpeculativeMergeWorker'
-    )
+def test_the_lane_facade_exports_the_production_worker() -> None:
     assert merge_lane.MergeLane is mq.SpeculativeMergeWorker
 
 
@@ -65,13 +62,14 @@ def test_detector_sees_a_definition_and_not_a_mention() -> None:
     )
 
 
-def test_no_copy_of_the_serial_worker_in_the_test_tree() -> None:
-    sources = sorted(_TESTS_DIR.rglob('*.py'))
-    assert len(sources) >= _MIN_EXPECTED_TEST_FILES, (
-        f'swept only {len(sources)} files under {_TESTS_DIR}'
-    )
+def test_no_copy_of_the_serial_worker_anywhere() -> None:
+    sources: list[Path] = []
+    for root, floor in _MIN_EXPECTED_FILES.items():
+        swept = sorted(root.rglob('*.py'))
+        assert len(swept) >= floor, f'swept only {len(swept)} files under {root}'
+        sources += swept
     copies = [
-        path.relative_to(_TESTS_DIR).as_posix()
+        path.as_posix()
         for path in sources
         if _defines_retired_class(path.read_text(encoding='utf-8'))
     ]

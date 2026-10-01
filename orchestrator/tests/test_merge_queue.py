@@ -29,6 +29,8 @@ from _merge_lane_fakes import (
     merge_through_lane,
     passes,
     raises,
+    running_lane,
+    times_out,
 )
 from _merge_queue_harness import drive_verify_and_advance
 from _orch_helpers import (
@@ -5861,26 +5863,12 @@ def _mock_verify_timeout():
     return _fake
 
 
-def _timed_out_verify() -> VerifyScript:
-    return VerifyScript(result=VerifyResult(
-        passed=False, test_output='', lint_output='', type_output='',
-        summary='Verification timed out', timed_out=True,
-    ))
-
-
-async def _submit_and_wait(
-    queue: asyncio.Queue[MergeRequest], req: MergeRequest,
-) -> MergeOutcome:
-    await queue.put(req)
-    return await asyncio.wait_for(req.result, timeout=30)
-
-
 @pytest.mark.asyncio
 class TestMergeVerifyTimeoutLoopBreaker:
     async def test_speculative_worker_abandons_after_threshold(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """SpeculativeMergeWorker loop-breaker — same contract as MergeWorker."""
+        """SpeculativeMergeWorker loop-breaker: abandon after the timeout threshold."""
         from orchestrator.merge_queue import ABANDONED_REASON_PREFIX
 
         wt = await _make_branch_with_file(
@@ -5947,15 +5935,14 @@ class TestMergeVerifyTimeoutLoopBreaker:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         verifier = FakeVerifier(default=fails(category='test_failure', summary='tests failed'))
         lane = make_lane(git_ops, queue, verifier=verifier)
-        lane_task = asyncio.create_task(lane.run())
 
-        try:
+        async with running_lane(lane) as run:
             # More submissions than the abandon threshold: none may abandon.
             for _ in range(lane.MAX_POST_MERGE_VERIFY_TIMEOUTS + 1):
                 entries_before = verifier.entered_count
-                outcome = await _submit_and_wait(
-                    queue, _make_request('rf-task', 'loop-real-fail', wt, config),
-                )
+                req = _make_request('rf-task', 'loop-real-fail', wt, config)
+                await queue.put(req)
+                outcome = await run.outcome(req, timeout=30)
                 assert outcome.status == 'blocked'
                 assert 'verification failed' in outcome.reason.lower()
                 assert not outcome.reason.startswith(ABANDONED_REASON_PREFIX), (
@@ -5965,9 +5952,6 @@ class TestMergeVerifyTimeoutLoopBreaker:
                 assert verifier.entered_count > entries_before, (
                     'every submission must run verify when failures are real'
                 )
-        finally:
-            await lane.stop()
-            await lane_task
 
     async def test_success_resets_counter(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -5990,39 +5974,32 @@ class TestMergeVerifyTimeoutLoopBreaker:
         verifier = FakeVerifier()
         lane = make_lane(git_ops, queue, verifier=verifier)
         assert lane.MAX_POST_MERGE_VERIFY_TIMEOUTS == 2
-        lane_task = asyncio.create_task(lane.run())
 
-        try:
-            verifier.default = _timed_out_verify()
-            r1 = await _submit_and_wait(
-                queue, _make_request('reset-task', 'reset-fail', wt_fail, config),
-            )
+        async with running_lane(lane) as run:
+            async def submit(branch: str, wt: Path) -> MergeOutcome:
+                req = _make_request('reset-task', branch, wt, config)
+                await queue.put(req)
+                return await run.outcome(req, timeout=30)
+
+            verifier.default = times_out()
+            r1 = await submit('reset-fail', wt_fail)
             assert r1.status == 'blocked'
 
             verifier.default = passes()
-            r2 = await _submit_and_wait(
-                queue, _make_request('reset-task', 'reset-ok', wt_ok, config),
-            )
+            r2 = await submit('reset-ok', wt_ok)
             assert r2.status == 'done'
 
-            verifier.default = _timed_out_verify()
-            r3 = await _submit_and_wait(
-                queue, _make_request('reset-task', 'reset-fail', wt_fail, config),
-            )
+            verifier.default = times_out()
+            r3 = await submit('reset-fail', wt_fail)
             assert r3.status == 'blocked'
             assert not r3.reason.startswith(ABANDONED_REASON_PREFIX)
 
             entries_before = verifier.entered_count
-            r4 = await _submit_and_wait(
-                queue, _make_request('reset-task', 'reset-fail', wt_fail, config),
-            )
+            r4 = await submit('reset-fail', wt_fail)
             assert not r4.reason.startswith(ABANDONED_REASON_PREFIX), (
                 f'the success must have reset the timeout count; got {r4.reason!r}'
             )
             assert verifier.entered_count > entries_before
-        finally:
-            await lane.stop()
-            await lane_task
 
 
 # ---------------------------------------------------------------------------
@@ -7465,9 +7442,11 @@ class TestCasRetryStaysInLane:
           merge_attempt(cas_retry)
           merge_attempt(done)
 
-        Both attempts carry duration_ms; the already_merged and conflict emit
-        sites are covered by
-        TestSpeculativeMergeWorker.test_speculative_merger_phase_emits_duration_ms.
+        Both attempts carry duration_ms. The already_merged emit site is
+        covered by
+        TestSpeculativeMergeWorker.test_speculative_merger_phase_emits_duration_ms,
+        the conflict one by
+        TestSpeculativeMergeWorker.test_speculative_remerge_preserves_duration_ms.
         """
         from orchestrator.merge_queue import enqueue_merge_request
 
@@ -7480,7 +7459,6 @@ class TestCasRetryStaysInLane:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = make_lane(git_ops, queue, event_store=event_store)
-        lane_task = asyncio.create_task(lane.run())
 
         original_advance = git_ops.advance_main
         call_count = 0
@@ -7492,14 +7470,11 @@ class TestCasRetryStaysInLane:
                 return AdvanceOutcome('cas_failed')
             return await original_advance(*args, **kwargs)
 
-        try:
+        async with running_lane(lane) as run:
             with patch.object(git_ops, 'advance_main', side_effect=_fail_once):
                 req = _make_request('cas-evt', 'cas-evt', wt, config)
                 await enqueue_merge_request(queue, req, event_store)
-                outcome = await asyncio.wait_for(req.result, timeout=30)
-        finally:
-            await lane.stop()
-            await lane_task
+                outcome = await run.outcome(req, timeout=30)
 
         assert outcome.status == 'done'
         assert call_count == 2
