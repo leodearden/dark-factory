@@ -1826,11 +1826,14 @@ they carry a different unit name, and a re-armed sweep would merely fail
 
 **Which accounts it uses.** Every invocation of the night — each digest the
 coder codes, and the census subprocess when the trigger fires — is drawn from
-the shared account pool in `config/usage-accounts.yaml` (`max-b`..`max-h`),
-through the same `shared.usage_gate.UsageGate` the orchestrator uses. The
-trickle drains the roster from the **end** (h→b) while the orchestrator takes
-first-available (b→h), so the two only contend when the pool is nearly
-exhausted anyway. Before task 5488 the trickle had no pool at all: it rode
+the shared seven-account pool in `config/usage-accounts.yaml`, through the
+same `shared.usage_gate.UsageGate` the orchestrator uses. The trickle drains
+the roster from the **end**, in the order it is listed, while the orchestrator
+takes first-available from the **start**, so the two only contend when the
+pool is nearly exhausted anyway. Since 2026-09-29 the roster lists its
+org-disabled accounts last, so the trickle meets them first, and each costs
+one rejected call before the gate marks it AUTH_FAILED for the rest of the
+night (task 5947). Before task 5488 the trickle had no pool at all: it rode
 whatever login `~/.claude` happened to hold, so one capped account deferred a
 whole night while six live ones sat idle.
 
@@ -1904,6 +1907,35 @@ legibility-trickle@<project>`):
   nothing is capped. Read the run's per-digest failures for what each account
   actually reported — a fleet-wide near-cap warning and a backend fault both
   land here.
+- `account max-h did not complete this digest and the gate recorded an auth
+  failure (HTTP 403) against it (route: the CLI rejected this account's
+  credentials) — retrying this digest on the next account in the pool`: the
+  account's credentials were rejected (e.g. `Your organization has disabled
+  Claude subscription access ...`). The digest is retried on the next account,
+  the gate marks the account AUTH_FAILED (look for its own `Account max-h
+  AUTH-FAILED: HTTP 403: ...` WARNING alongside), and the trickle skips it for
+  the rest of the night. This is **not** weather: the account needs an
+  operator or billing decision, and retiring it means editing
+  `config/usage-accounts.yaml` (cf. task 5944).
+- `legibility trickle: every one of the 7 pool accounts had its credentials
+  rejected (HTTP 401/403): max-d, ... — this is not a capacity limit and will
+  not clear at the weekly reset; those accounts' access or tokens need operator
+  action` — every digest fails with this, so the night is a `legibility
+  trickle coder storm: N/N digests failed` that exits **1** with an ERROR
+  escalation. That is deliberate. It is never a DEFERRED night, because
+  nothing here clears at the weekly reset.
+- `legibility trickle: all 7 pool accounts unavailable — 4 capped, which
+  clears at the weekly reset, and max-b, max-c, max-h with credentials
+  rejected (HTTP 401/403), which will not clear without operator action` — a
+  mixed exhaustion. The night is DEFERRED as for an all-capped pool, but the
+  reason names the auth-failed accounts that will not come back with the rest.
+
+Only the measured text-mode 403 wordings are recognised as an auth rejection.
+The one list sits beside
+`shared/src/shared/invocation_outcome.py::classify_text_auth_rejection`, and a
+stream must *open* with one of them. A new wording still
+fails loudly per digest, unrotated, until an entry citing its transcript is
+added there.
 
 ### Legibility trickle health probe (04:30)
 
