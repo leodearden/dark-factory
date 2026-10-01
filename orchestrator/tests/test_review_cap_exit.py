@@ -45,7 +45,9 @@ def _make_cap_workflow(
     wf.config.suppress_resettled_review_suggestions = True
     wf.config.models.reviewer = 'sonnet'
     wf.escalation_queue = escalation_queue
-    wf.mcp.url = 'http://localhost:8002'
+    mcp = MagicMock()
+    mcp.url = 'http://localhost:8002'
+    wf.mcp = mcp
 
     wf._execute_iterations = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
     wf._verify_debugfix_loop = AsyncMock(return_value=WorkflowOutcome.DONE)  # type: ignore[method-assign]
