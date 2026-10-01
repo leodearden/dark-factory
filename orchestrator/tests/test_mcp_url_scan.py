@@ -337,16 +337,58 @@ def test_reasoned_marker_on_a_line_with_no_slashed_url_is_stale():
     assert findings.malformed_markers == ()
 
 
-def test_marker_on_a_neighbouring_line_does_not_exempt():
-    """The marker belongs on the line the guard names, never the one above it."""
-    findings = _sweep("""\
-        # mcp-url-sweep: allow covers the next line
-        resp = client.post(f'{b}/mcp/')
-        """)
+@pytest.mark.parametrize(
+    ('source', 'hit_line', 'marker_line'),
+    [
+        ("# mcp-url-sweep: allow covers it\nresp = client.post(f'{b}/mcp/')\n", 2, 1),
+        ("resp = client.post(f'{b}/mcp/')\n# mcp-url-sweep: allow covers it\n", 1, 2),
+    ],
+    ids=['line-above', 'line-below'],
+)
+def test_marker_on_a_neighbouring_line_does_not_exempt(source, hit_line, marker_line):
+    """A marker exempts only the expression it sits on, never a neighbouring line's."""
+    findings = _sweep(source)
 
-    assert findings.offenders == ((2, "resp = client.post(f'{b}/mcp/')"),)
-    assert findings.stale_markers == ((1, '# mcp-url-sweep: allow covers the next line'),)
+    assert findings.offenders == ((hit_line, "resp = client.post(f'{b}/mcp/')"),)
+    assert findings.stale_markers == ((marker_line, '# mcp-url-sweep: allow covers it'),)
     assert findings.malformed_markers == ()
+
+
+def test_marker_after_a_multiline_triple_quoted_literal_exempts_it():
+    """A string spanning lines can only carry a comment after its closing quotes.
+
+    The guard reports the line the string OPENS on, and that line ends inside
+    the string, so a rule demanding the marker on exactly the reported line
+    would leave this site impossible to exempt.
+    """
+    unmarked = _sweep('''\
+        url = """http://host
+        /mcp/"""
+        ''')
+    marked = _sweep('''\
+        url = """http://host
+        /mcp/"""  # mcp-url-sweep: allow fixture text, never fetched
+        ''')
+
+    assert unmarked.offenders == ((1, 'url = """http://host'),)
+    assert marked == SweepFindings()
+
+
+@pytest.mark.parametrize('marked_line', [1, 2], ids=['opening-line', 'literal-line'])
+def test_marker_on_any_line_of_a_multiline_slashed_expression_exempts_it(marked_line):
+    """``base +\\n '/mcp/'`` is reported where the ``+`` expression begins.
+
+    That is the ``base`` line, not the literal's, so the policy accepts a
+    marker on any line the flagged expression spans rather than making the
+    author guess which of them the guard means.
+    """
+    lines = ['url = (base +', "       '/mcp/')"]
+    unmarked = _sweep('\n'.join(lines) + '\n')
+    lines[marked_line - 1] += '  # mcp-url-sweep: allow fixture text, never fetched'
+    marked = _sweep('\n'.join(lines) + '\n')
+
+    assert unmarked.offenders == ((1, 'url = (base +'),)
+    assert marked == SweepFindings()
 
 
 def test_marker_text_inside_a_string_or_docstring_is_not_a_marker():

@@ -163,12 +163,27 @@ def _owns_child_tail(node: ast.AST) -> bool:
 def find_trailing_slash_mcp_urls(source: str, *, filename: str) -> list[tuple[int, str]]:
     """Return ``(lineno, stripped_source_line)`` for every ``/mcp/``-tailed literal.
 
-    Raises ``AssertionError`` naming *filename* if *source* does not parse.
-    Swallowing ``SyntaxError`` into an empty result is the one failure mode
-    that would let the sweep guard silently stop covering a file while staying
-    green, so every failure at this boundary IS a finding — the same reasoning
-    ``_verify_config_corpus.load_config_scalar`` re-raises on.
+    *lineno* is where the outermost expression ending in the slashed literal
+    begins. Raises ``AssertionError`` naming *filename* if *source* does not
+    parse. Swallowing ``SyntaxError`` into an empty result is the one failure
+    mode that would let the sweep guard silently stop covering a file while
+    staying green, so every failure at this boundary IS a finding — the same
+    reasoning ``_verify_config_corpus.load_config_scalar`` re-raises on.
     """
+    lines = source.splitlines()
+    return sorted(
+        _reported_line(lines, first)
+        for first, _ in _slashed_url_spans(source, filename=filename)
+    )
+
+
+def _reported_line(lines: list[str], lineno: int) -> tuple[int, str]:
+    text = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ''
+    return lineno, text
+
+
+def _slashed_url_spans(source: str, *, filename: str) -> list[tuple[int, int]]:
+    """Return ``(first_line, last_line)`` of each outermost slashed-URL expression."""
     try:
         tree = ast.parse(source, filename=filename)
     except SyntaxError as exc:
@@ -204,20 +219,13 @@ def find_trailing_slash_mcp_urls(source: str, *, filename: str) -> list[tuple[in
             for child in ast.iter_child_nodes(node):
                 nested.add(id(child))
 
-    lines = source.splitlines()
-    hits: list[tuple[int, str]] = []
-    for node in ast.walk(tree):
-        if id(node) in nested:
-            continue
-        if not isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp)):
-            continue
-        if not _literal_tail(node).endswith(SLASHED_TAIL):
-            continue
-        lineno = node.lineno
-        text = lines[lineno - 1].strip() if 0 < lineno <= len(lines) else ''
-        hits.append((lineno, text))
-
-    return sorted(hits)
+    return [
+        (node.lineno, node.end_lineno or node.lineno)
+        for node in ast.walk(tree)
+        if id(node) not in nested
+        and isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp))
+        and _literal_tail(node).endswith(SLASHED_TAIL)
+    ]
 
 
 def _marker_comments(source: str) -> dict[int, str]:
@@ -239,13 +247,16 @@ def _marker_comments(source: str) -> dict[int, str]:
 def sweep_source(source: str, *, filename: str) -> SweepFindings:
     """Apply the inline allow-marker policy to the raw hits in *source*.
 
-    A ``# mcp-url-sweep: allow <reason>`` comment exempts only a hit on its own
-    line: the line the guard reports, which is where the slashed literal
-    begins. A marker with no reason never exempts anything, so it cannot be a
-    silent mute. Raises ``AssertionError`` naming *filename* if *source* does
-    not parse, exactly as :func:`find_trailing_slash_mcp_urls` does.
+    A ``# mcp-url-sweep: allow <reason>`` comment exempts a hit when it sits on
+    any line the flagged expression spans. The guard reports the line where
+    the outermost expression ending in the slashed literal begins, and that
+    line always works unless it ends inside a string running over several
+    lines, where the only place a comment can go is after the closing quotes.
+    A marker with no reason never exempts anything, so it cannot be a silent
+    mute. Raises ``AssertionError`` naming *filename* if *source* does not
+    parse, exactly as :func:`find_trailing_slash_mcp_urls` does.
     """
-    hits = find_trailing_slash_mcp_urls(source, filename=filename)
+    spans = _slashed_url_spans(source, filename=filename)
     allowed: list[tuple[int, str]] = []
     malformed: list[tuple[int, str]] = []
     for lineno, comment in _marker_comments(source).items():
@@ -253,7 +264,12 @@ def sweep_source(source: str, *, filename: str) -> SweepFindings:
         bucket.append((lineno, comment))
 
     allowed_lines = {lineno for lineno, _ in allowed}
-    hit_lines = {lineno for lineno, _ in hits}
-    offenders = [hit for hit in hits if hit[0] not in allowed_lines]
-    stale = [marker for marker in allowed if marker[0] not in hit_lines]
+    spanned_lines = {line for first, last in spans for line in range(first, last + 1)}
+    lines = source.splitlines()
+    offenders = sorted(
+        _reported_line(lines, first)
+        for first, last in spans
+        if allowed_lines.isdisjoint(range(first, last + 1))
+    )
+    stale = [marker for marker in allowed if marker[0] not in spanned_lines]
     return SweepFindings(tuple(offenders), tuple(sorted(stale)), tuple(sorted(malformed)))

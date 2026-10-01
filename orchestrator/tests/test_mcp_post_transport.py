@@ -500,7 +500,8 @@ def test_no_raw_post_builds_a_trailing_slash_mcp_url():
         'shared.mcp_post.post_mcp_tool_call (or mcp_endpoint_url) instead. If a '
         'line is genuinely not a fetched URL (an MCP config entry for a '
         'redirect-following client, or a display/log string), put '
-        '"# mcp-url-sweep: allow <reason>" on that same line:\n  '
+        '"# mcp-url-sweep: allow <reason>" on that same line, or after the '
+        'closing quotes of a string that spans several lines:\n  '
         + '\n  '.join(offenders)
     )
 
