@@ -9,6 +9,7 @@ const { SchedulerTab } = window.DF_SCHEDULER;
 const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
+const { inQueueOver } = window.DF_MERGE_QUEUE;
 const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
 const DD = window.DF_DATA;
 
@@ -137,7 +138,7 @@ function App() {
     // the badge permanently nonzero on a healthy system. In-flight runs get
     // their own tile on the tab rather than inflating this number.
     recon: reconAttentionCount(reconRunCounts(DD.RECON_STATE.runs)),
-    merge: Object.values(DD.MERGE_QUEUE).reduce((s, d) => s + d.active.length, 0),
+    merge: <DatumReading datum={inQueueOver(DD, null)} />,
     esc: DD.ESCALATIONS?.summary?.by_status?.pending ?? 0,
   };
 

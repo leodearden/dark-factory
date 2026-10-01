@@ -31,6 +31,7 @@ const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRow
 const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
+const { projectInQueue, inQueueOver, inQueueHistory, latencyCaption } = window.DF_MERGE_QUEUE;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -909,11 +910,10 @@ function MergeTab({ projectFilter }) {
   const [openMap, toggle, setAll] = useOpenSet(projIds, true, 'df.open.merge');
   const allOpen = projIds.every(p => openMap[p]);
   const totals = projects.reduce((acc, [_, d]) => ({
-    count: acc.count + d.latency.count,
+    count: acc.count + sumOf(d.outcomes.values),
     hits: acc.hits + d.speculative.hit_count,
     discards: acc.discards + d.speculative.discard_count,
-    active: acc.active + d.active.length,
-  }), { count: 0, hits: 0, discards: 0, active: 0 });
+  }), { count: 0, hits: 0, discards: 0 });
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
@@ -939,22 +939,8 @@ function MergeTab({ projectFilter }) {
           <div className="col-span-12 grid cols-4">
             <ST label="Merges (window)" datum={plainDatum(totals.count, EP.mergeQueue)}
                 history={aggDepth} sparkColor={CP.accent} />
-            {(() => {
-              // Aggregate the per-project active_spark series by label.
-              const labelMap = {};
-              projects.forEach(([, d]) => {
-                const sp = d.active_spark || { labels: [], values: [] };
-                (sp.labels || []).forEach((lbl, i) => {
-                  labelMap[lbl] = (labelMap[lbl] || 0) + ((sp.values || [])[i] || 0);
-                });
-              });
-              const activeSpark = Object.keys(labelMap).sort().map(k => labelMap[k]).slice(-30);
-              return (
-                <ST label="In queue now" datum={plainDatum(totals.active, EP.mergeQueue)}
-                    hint={`${projects.filter(([_,d])=>d.active.length>0).length} projects`}
-                    history={activeSpark} sparkColor={CP.warn} />
-              );
-            })()}
+            <ST label="In queue now" datum={inQueueOver(DF, projIds)}
+                history={inQueueHistory(DF, projIds).slice(-30)} sparkColor={CP.warn} />
             <ST label="Speculative hit rate"
                 datum={derivedDatum(hitPct, EP.mergeQueue, 'no speculative attempts')} unit={hitPct != null ? '%' : ''}
                 hint={`${totals.hits}/${totals.hits + totals.discards} attempts`}
@@ -974,16 +960,8 @@ function MergeTab({ projectFilter }) {
         const summary = (
           <>
             <HaltPill halt={d.halt} />
-            <Pip datum={plainDatum(d.latency.count, EP.mergeQueue)} color={CP.accent} label="attempts" />
-            <Pip datum={plainDatum(d.active.length, EP.mergeQueue)} color={CP.warn} label="queued" />
-            {/* The approximate-data warning belongs on the SUMMARY STRIP, not
-                inside the "Currently queued" panel: the strip renders whether
-                or not the group is collapsed AND regardless of
-                d.active.length, so the warning is now visible in exactly the
-                case that matters — orchestrator unreachable and the
-                event-derived fallback empty, where "0 queued" previously read
-                as a confident zero. */}
-            {d.active_approximate && <span className="badge warn">approx · event-derived</span>}
+            <Pip datum={plainDatum(sumOf(d.outcomes.values), EP.mergeQueue)} color={CP.accent} label="attempts" />
+            <Pip datum={projectInQueue(DF, pid)} color={CP.warn} label="queued" />
             <Pip datum={plainDatum(d.latency.p50, EP.mergeQueue)} color={CP.ok} format={fmtMs} label="p50" />
             <span style={{ color: 'var(--fg-3)' }}>· {hitPct}% spec hit</span>
           </>
@@ -1014,7 +992,7 @@ function MergeTab({ projectFilter }) {
                 </div>
 
                 <div className="col-span-6 panel">
-                  <div className="panel-head"><span className="title">Latency centiles</span></div>
+                  <div className="panel-head"><span className="title">Latency centiles</span><span className="meta">{latencyCaption(d.latency)}</span></div>
                   <div className="panel-body" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12 }}>
                     {[['p50',d.latency.p50],['p95',d.latency.p95],['p99',d.latency.p99],['mean',d.latency.mean_ms]].map(([l,v]) => (
                       <div key={l}><div className="mono" style={{ fontSize: 18 }}>{fmtMs(v)}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{l}</div></div>
@@ -1059,19 +1037,14 @@ function MergeTab({ projectFilter }) {
 
                 {d.active.length > 0 && (
                   <div className="col-span-6 panel">
-                    <div className="panel-head">
-                      <span className="title">Currently queued</span>
-                      {/* The approx · event-derived badge moved to the summary
-                          strip above — rendering it here too would double up
-                          the same warning whenever this panel is shown. */}
-                    </div>
+                    <div className="panel-head"><span className="title">Currently queued</span></div>
                     <div className="panel-body flush">
                       <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>State</th><th>Branch</th><th className="num">Age</th><th className="num">Pos</th><th>Waiter</th><th className="num">When</th></tr></thead>
                         <tbody>
                           {d.active.map((row, i) => (
                             <tr key={i}>
                               <td className="mono">{row.task_id}</td>
-                              <td>{row.title}</td>
+                              <td><DatumReading datum={servedDatum(row.title, EP.mergeQueue, 'this merge row carries no title Datum')} /></td>
                               <td><span className={`badge ${row.state === 'in_flight' ? 'warn' : 'info'}`}>{row.state}</span></td>
                               <td className="mono" style={{ color: 'var(--fg-3)', fontSize: 11 }}>{row.branch}</td>
                               <td className="num" style={{ color: 'var(--fg-3)' }}>{row.age_secs != null ? fmtAgeSecs(row.age_secs) : '—'}</td>
@@ -1094,7 +1067,7 @@ function MergeTab({ projectFilter }) {
                         {d.recent.map((row, i) => (
                           <tr key={i}>
                             <td className="mono">{row.task_id}</td>
-                            <td>{row.title}</td>
+                            <td><DatumReading datum={servedDatum(row.title, EP.mergeQueue, 'this merge row carries no title Datum')} /></td>
                             <td><span className={`badge ${row.outcome === 'done' ? 'ok' : row.outcome === 'conflict' ? 'warn' : row.outcome === 'blocked' ? 'bad' : 'info'}`}>{row.outcome}</span></td>
                             <td className="num">{fmtMs(row.duration_ms)}</td>
                             <td className="num" style={{ color: 'var(--fg-3)' }}>{window.DF_SHELL.fmtDateTime(row.timestamp)}</td>
