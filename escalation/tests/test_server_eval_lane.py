@@ -3,15 +3,19 @@
 An eval-lane filing (an eval fixture task id, or a filing from an eval worktree
 — ``shared/src/shared/eval_lane.py``) is never a production signal. The server
 files it already-resolved, so it never goes pending and never reaches the
-orphan reaper, the auto-watcher or a human L2.
+orphan reaper, the auto-watcher or a human L2; ``promote_to_l2`` refuses an
+eval-lane cluster outright, on both its create and its fold path.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _escalation_http import escalation_http_call
+from _escalation_seed import seed_escalation
 from _filing_tools import call_blocker, call_info
 
 from escalation.queue import EscalationQueue
@@ -186,3 +190,108 @@ class TestProductionFilingsStillQueue:
 
         assert result['status'] == 'queued', result
         assert [e.id for e in queue.get_pending()] == [result['id']]
+
+
+async def _promote(server, **kwargs: Any) -> dict[str, Any]:
+    tool = await server.get_tool('promote_to_l2')
+    return await tool.fn(**kwargs)
+
+
+def _promote_args(task_id: str, member_ids: list[str], root_cause: str) -> dict[str, Any]:
+    return {
+        'task_id': task_id,
+        'agent_role': 'escalation-watcher-auto',
+        'member_ids': member_ids,
+        'root_cause': root_cause,
+        'evidence': 'implementer refused the seeded wrong step',
+        'options': ['A: close the member L1s'],
+        'summary': 'eval fixture refusal cluster',
+    }
+
+
+def _queue_files(queue: EscalationQueue) -> set[str]:
+    return {p.name for p in queue.queue_dir.rglob('*.json')}
+
+
+def _assert_refused(result: dict[str, Any], task_id: str) -> None:
+    assert result.get('code') == 'eval_lane_contained', result
+    assert 'id' not in result
+    assert f'fixture-task-id:{task_id}' in result['error']
+    assert "resolve_issue(action='close_only', resolution_class='benign')" in result['error']
+
+
+class TestPromoteToL2RefusesEvalLane:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('task_id', [ADV_FIXTURE_ID, SHADOW_FIXTURE_ID])
+    async def test_eval_lane_promote_mints_and_mutates_nothing(self, queue, task_id):
+        server = create_server(queue, startup_sweep=False)
+        member = seed_escalation(queue, level=1, task_id=task_id)
+        files_before = _queue_files(queue)
+        member_before = queue.get(member.id).to_dict()
+
+        result = await _promote(
+            server,
+            **_promote_args(
+                task_id,
+                [member.id],
+                f'eval-fixture-adversarial-wrong-step-correctly-refused:{task_id}',
+            ),
+        )
+
+        _assert_refused(result, task_id)
+        assert _queue_files(queue) == files_before
+        assert [r for r in queue.get_by_task(task_id) if r.level == 2] == []
+        assert queue.get(member.id).to_dict() == member_before
+
+    @pytest.mark.asyncio
+    async def test_eval_lane_promote_never_folds_into_a_production_l2(self, queue):
+        server = create_server(queue, startup_sweep=False)
+        prod_member = seed_escalation(queue, level=1, task_id='3096')
+        created = await _promote(
+            server, **_promote_args('3096', [prod_member.id], 'shared-root-cause')
+        )
+        assert created['status'] == 'created', created
+        prod_l2_before = queue.get(created['id'])
+        eval_member = seed_escalation(queue, level=1, task_id=ADV_FIXTURE_ID)
+
+        result = await _promote(
+            server, **_promote_args(ADV_FIXTURE_ID, [eval_member.id], 'shared-root-cause')
+        )
+
+        _assert_refused(result, ADV_FIXTURE_ID)
+        prod_l2_after = queue.get(created['id'])
+        assert prod_l2_after.members == prod_l2_before.members
+        assert prod_l2_after.amendments == prod_l2_before.amendments
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('task_id', ['3096', 'task-path-guard'])
+    async def test_production_promote_still_creates(self, queue, task_id):
+        server = create_server(queue, startup_sweep=False)
+        member = seed_escalation(queue, level=1, task_id=task_id)
+
+        result = await _promote(
+            server, **_promote_args(task_id, [member.id], f'production-cause-{task_id}')
+        )
+
+        assert result['status'] == 'created', result
+        assert queue.get(result['id']).level == 2
+
+    @pytest.fixture
+    def served(self, tmp_path: Path, serve_escalation_mcp) -> tuple[str, EscalationQueue]:
+        """Started from a sync fixture: the factory drives its own event loop."""
+        base_url, _port, served_queue = serve_escalation_mcp(tmp_path / 'esc')
+        return base_url, served_queue
+
+    @pytest.mark.asyncio
+    async def test_identity_gate_still_wins(self, served):
+        base_url, served_queue = served
+        member = seed_escalation(served_queue, level=1, task_id=ADV_FIXTURE_ID)
+
+        result = await escalation_http_call(
+            base_url,
+            'promote_to_l2',
+            identity='not-a-promote-identity',
+            **_promote_args(ADV_FIXTURE_ID, [member.id], 'eval-cluster'),
+        )
+
+        assert result.get('code') == 'level_forbidden', result
