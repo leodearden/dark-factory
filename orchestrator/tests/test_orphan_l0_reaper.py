@@ -1765,3 +1765,89 @@ class TestThePromotedRecordSaysWhichArmPromotedIt:
         assert refreshed is not None
         assert refreshed.resolution is not None
         assert 'no active workflow' in refreshed.resolution
+
+
+_EVAL_WORKTREE = '/home/leo/src/dark-factory-eval-worktrees/df_task_2339/run-ac3ab562'
+
+
+def _reaper_l1s(queue: EscalationQueue) -> list[Escalation]:
+    return [
+        e for e in (queue.get(p.stem) for p in queue.queue_dir.glob('esc-*.json'))
+        if e is not None and e.level == 1 and e.agent_role == 'harness-orphan-reaper'
+    ]
+
+
+@pytest.mark.asyncio
+class TestEvalLaneOrphansAreDismissed:
+    """An eval-lane L0 (``shared/src/shared/eval_lane.py``) is dismissed, never
+    promoted, and costs no taskmaster or liveness read."""
+
+    def _assert_dismissed(self, harness: Harness, esc: Escalation, reason: str) -> None:
+        queue = _bound_queue(harness)
+        refreshed = queue.get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert refreshed.resolved_by == 'harness-orphan-reaper'
+        assert refreshed.resolution_class == 'benign'
+        assert reason in (refreshed.resolution or '')
+        assert _reaper_l1s(queue) == []
+        harness.scheduler.get_task.assert_not_awaited()
+
+    @pytest.mark.parametrize('task_id', ['df_task_2430_adv_plan', 'shadow_5383_01JCELL'])
+    async def test_aged_fixture_id_l0_is_dismissed(self, harness: Harness, task_id: str) -> None:
+        esc = _submit_aged(_bound_queue(harness), task_id, seconds_ago=120.0)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        self._assert_dismissed(harness, esc, f'fixture-task-id:{task_id}')
+
+    async def test_numeric_id_from_eval_worktree_is_dismissed(self, harness: Harness) -> None:
+        esc = _submit_aged(
+            _bound_queue(harness), '2339', seconds_ago=120.0, worktree=_EVAL_WORKTREE,
+        )
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        self._assert_dismissed(harness, esc, f'eval-worktree:{_EVAL_WORKTREE}')
+
+    async def test_dismissed_ahead_of_the_liveness_arm(self, harness: Harness) -> None:
+        """Production 2339 looks live; the eval-worktree record is still
+        dismissed, not deferred on its unstamped filing identity."""
+        esc = _submit_aged(
+            _bound_queue(harness), '2339', seconds_ago=120.0, worktree=_EVAL_WORKTREE,
+        )
+        harness.scheduler.is_actively_held = MagicMock(return_value=True)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        self._assert_dismissed(harness, esc, f'eval-worktree:{_EVAL_WORKTREE}')
+
+    async def test_young_eval_lane_l0_is_left_pending(self, harness: Harness) -> None:
+        esc = _submit_aged(_bound_queue(harness), 'df_task_2430_adv_plan', seconds_ago=10.0)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        refreshed = _bound_queue(harness).get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'pending'
+
+    @pytest.mark.parametrize(
+        ('task_id', 'worktree'),
+        [
+            ('3096', '/home/leo/src/dark-factory/.worktrees/3096'),
+            ('task-path-guard', None),
+        ],
+    )
+    async def test_production_orphan_is_still_promoted(
+        self, harness: Harness, task_id: str, worktree: str | None,
+    ) -> None:
+        queue = _bound_queue(harness)
+        esc = _submit_aged(queue, task_id, seconds_ago=120.0, worktree=worktree)
+
+        assert await harness._reap_orphan_l0_escalations() == 1
+
+        assert [l1.task_id for l1 in _reaper_l1s(queue)] == [task_id]
+        refreshed = queue.get(esc.id)
+        assert refreshed is not None
+        assert refreshed.status == 'dismissed'
+        assert 'Auto-promoted to level 1' in (refreshed.resolution or '')
