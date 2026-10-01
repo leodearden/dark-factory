@@ -411,6 +411,70 @@ async def test_update_task_rejects_metadata_done_provenance_json_string(
 
 
 @pytest.mark.asyncio
+async def test_update_task_replace_retires_a_key_on_a_done_task_across_surfaces(
+    real_task_stack, tmp_path,
+):
+    """Through the MCP tool, a whole-blob replace on a done task that carries
+    the stamped done_provenance verbatim is accepted and retires the omitted
+    key; dropping done_provenance is refused with the same canonical dict the
+    interceptor returns. Metadata is sent as a dict, so the tool's own
+    json.dumps coercion is on the path."""
+    from _fm_helpers import _init_git_repo
+
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    server, interceptor = real_task_stack
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    sha = _init_git_repo(repo)
+    root = str(repo)
+    await interceptor.taskmaster.add_task(
+        project_root=root, title='T',
+        metadata=json.dumps({'files': ['x.py'], 'stale_key': 1}),
+    )
+    done = await interceptor.set_task_status(
+        '1', 'done', root, done_provenance={'kind': 'merged', 'commit': sha},
+    )
+    assert 'error' not in done, done
+    stamped = (await interceptor.get_task('1', root))['metadata']
+
+    without_done_provenance = {
+        key: value for key, value in stamped.items()
+        if key not in ('stale_key', 'done_provenance')
+    }
+    refused_tools = await server._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': root,
+            'metadata': without_done_provenance, 'metadata_mode': 'replace',
+        },
+    )
+    refused_interceptor = await interceptor.update_task(
+        '1', root,
+        metadata=json.dumps(without_done_provenance), metadata_mode='replace',
+    )
+    assert refused_tools == done_provenance_via_update_task_error('1')
+    assert refused_tools == refused_interceptor
+
+    passthrough = {key: value for key, value in stamped.items() if key != 'stale_key'}
+    accepted = await server._tool_manager.call_tool(
+        'update_task',
+        {
+            'id': '1', 'project_root': root,
+            'metadata': passthrough, 'metadata_mode': 'replace',
+        },
+    )
+    assert interceptor_write_succeeded(accepted), accepted
+
+    task = await interceptor.get_task('1', root)
+    assert task['status'] == 'done'
+    assert 'stale_key' not in task['metadata']
+    assert task['metadata']['done_provenance'] == stamped['done_provenance']
+    assert task['metadata']['files'] == ['x.py']
+
+
+@pytest.mark.asyncio
 async def test_update_task_allows_unrelated_metadata(
     mcp_server_with_tasks, task_interceptor,
 ):

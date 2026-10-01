@@ -5968,6 +5968,73 @@ async def test_update_task_rejects_metadata_done_provenance(event_buffer, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_update_task_replace_retires_a_key_on_a_done_task(event_buffer, tmp_path):
+    """The public write path can RETIRE a key from a done task's metadata: a
+    whole-blob replace that carries the stamped done_provenance through
+    verbatim is accepted, and the same replace with done_provenance omitted is
+    refused with the canonical rejection dict rather than raising.
+
+    Drives a live backend because a bare AsyncMock cannot enforce the floor.
+    The wait-anchor keys are machine-authored and stripped from any
+    caller-supplied payload (sqlite_task_backend.py::strip_machine_authored_metadata),
+    so under replace they do not survive the round trip either.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+    from fused_memory.config.schema import TaskmasterConfig
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    project_root = str(tmp_path)
+    sha = _init_git_repo(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(
+            project_root=project_root, title='T',
+            metadata=json.dumps({'files': ['x.py'], 'stale_key': 1}),
+        )
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        done = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={'kind': 'merged', 'commit': sha},
+        )
+        assert 'error' not in done, done
+        stamped = (await backend.get_task('1', project_root=project_root))['metadata']
+        assert stamped['done_provenance']['commit'] == sha
+
+        without_done_provenance = {
+            key: value for key, value in stamped.items()
+            if key not in ('stale_key', 'done_provenance')
+        }
+        refused = await interceptor.update_task(
+            '1', project_root,
+            metadata=json.dumps(without_done_provenance),
+            metadata_mode='replace',
+        )
+        assert refused == done_provenance_via_update_task_error('1')
+
+        passthrough = {key: value for key, value in stamped.items() if key != 'stale_key'}
+        accepted = await interceptor.update_task(
+            '1', project_root,
+            metadata=json.dumps(passthrough),
+            metadata_mode='replace',
+        )
+        assert interceptor_write_succeeded(accepted), accepted
+
+        task = await backend.get_task('1', project_root=project_root)
+        assert task['status'] == 'done'
+        wait_anchor_keys = {'pending_since', 'pending_since_backfilled'}
+        assert task['metadata'] == {
+            key: value for key, value in passthrough.items()
+            if key not in wait_anchor_keys
+        }
+        assert 'stale_key' not in task['metadata']
+        assert task['metadata']['done_provenance'] == stamped['done_provenance']
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
 async def test_update_task_allows_other_metadata(taskmaster, reconciler, event_buffer):
     """The done_provenance and directory-lock blocks do not affect other metadata writes."""
     taskmaster.update_task.return_value = {'success': True}
