@@ -15,6 +15,7 @@ from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import Field, ValidationError
 from shared.branch_names import canonical_queued_branch_name
+from shared.eval_lane import eval_lane_provenance
 
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
@@ -1494,6 +1495,9 @@ def create_server(
         """Auto-resolve *esc* if the target task is already terminal, else submit normally.
 
         Gate order (first match wins, all others fall through to _submit_or_dedupe):
+          0. eval-lane provenance (shared.eval_lane) → contain: file as resolved
+               via submit_resolved before ANY other gate or lookup, so no
+               argument can mint it pending or at L2
           1. terminal_state_is_the_bug=True  → bypass (submit normally)
           2. category == 'review_suggestions' → bypass (A4b owns this category)
           3. task_status_lookup is None       → bypass (chokepoint disabled)
@@ -1504,15 +1508,41 @@ def create_server(
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
-        # Task 3550 — stamp the FILING incarnation, ABOVE everything else.
+        eval_lane_reason = eval_lane_provenance(esc.task_id, esc.worktree)
+        if eval_lane_reason is not None:
+            logger.warning(
+                'Eval-lane containment: filing %s as resolved (%s); task_id=%r '
+                'agent_role=%r severity=%r level=%r',
+                esc.id, eval_lane_reason, esc.task_id, esc.agent_role,
+                esc.severity, esc.level,
+            )
+            contained = queue.submit_resolved(
+                esc,
+                f'contained: eval-lane artifact ({eval_lane_reason}); not a '
+                'production signal, the eval measurement is scored from the '
+                'cell result artifacts',
+                resolved_by='escalation-eval-lane-containment',
+                resolution_class='benign',
+            )
+            return {
+                'id': contained.id,
+                'status': contained.status,
+                'resolution': contained.resolution,
+                'resolved_by': contained.resolved_by,
+                'level': contained.level,
+            }
+
+        # Task 3550 — stamp the FILING incarnation, ABOVE everything else that
+        # can leave a record OPEN.
         #
         # Placement is the whole design: this runs before the C4/D3 downgrade,
         # before the born-at-L2 `esc.level = 2` assignment, and before all four
-        # gates, so EVERY exit path carries the identity — the two bypass
-        # gates, the lookup-disabled gate, _submit_or_dedupe, the fail-open
-        # except branch below, and the terminal-task submit_resolved
-        # auto-resolve.  No gate can lose it, so those cases need no
-        # special-casing.
+        # numbered gates, so every exit path that can leave a record open
+        # carries the identity — the two bypass gates, the lookup-disabled
+        # gate, _submit_or_dedupe, the fail-open except branch below — and so
+        # does the terminal-task submit_resolved auto-resolve.  Only Gate 0
+        # above precedes it: a contained record is filed resolved, and
+        # `escalation.pins.classify_pins` reads only open records.
         #
         # `escalation.pins` Link 4 reads this to tell a LIVE agent handoff from
         # one filed by a dead incarnation.  None means UNKNOWN, which pins
@@ -1660,6 +1690,9 @@ def create_server(
         *severity* defaults to ``'info'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
         bypasses the auto-watcher and routes directly to a human.
+        Eval-lane filings (an eval fixture task id or an eval-worktree path, see
+        ``shared/src/shared/eval_lane.py``) are filed already-resolved whatever
+        the severity, and never reach L1/L2.
 
         *severity* must be one of ``models.KNOWN_SEVERITIES``
         (``'info'``, ``'blocking'``, ``'critical'``, ``'urgent'``).  Unknown values
@@ -1753,6 +1786,9 @@ def create_server(
         *severity* defaults to ``'blocking'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
         bypasses the auto-watcher and routes directly to a human.
+        Eval-lane filings (an eval fixture task id or an eval-worktree path, see
+        ``shared/src/shared/eval_lane.py``) are filed already-resolved whatever
+        the severity or *level*, and never reach L1/L2.
 
         *severity* must be one of ``models.KNOWN_SEVERITIES``
         (``'info'``, ``'blocking'``, ``'critical'``, ``'urgent'``).  Unknown values
