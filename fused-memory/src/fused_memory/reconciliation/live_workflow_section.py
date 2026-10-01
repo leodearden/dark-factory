@@ -23,6 +23,7 @@ from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
 from fused_memory.services.landed_on_main import LandingQuery, LandingVerdict, probe_landing
 from fused_memory.services.live_workflow_detector import (
     DEFAULT_BRANCH_PREFIX,
+    DEFAULT_HEARTBEAT_TTL,
     ClaimantLabel,
     WorkflowLiveness,
     claimant_label,
@@ -76,7 +77,9 @@ class LandedToken(StrEnum):
     UNKNOWN = 'landed=unknown'
 
 
-LANDED_COLUMN_RULES_HEADING = '### Reading the landed column'
+LIVE_WORKFLOW_RULES_HEADING = '### Reading the Live-Workflow Signals section'
+
+_HEARTBEAT_TTL_MINUTES = int(DEFAULT_HEARTBEAT_TTL.total_seconds() // 60)
 
 
 def render_live_workflow_authority_rules() -> str:
@@ -86,11 +89,40 @@ def render_live_workflow_authority_rules() -> str:
     block uses ``###`` headings only, because each stage's
     ``## Live-Workflow Authority`` region is sliced at the next ``## `` heading.
     """
+    claimant = {label: f'`{CLAIMANT_FIELD}{label}`' for label in ClaimantLabel}
     return (
-        f'{LANDED_COLUMN_RULES_HEADING}\n'
-        f'Every row of `{LIVE_WORKFLOW_SECTION_HEADER}` ends with a `landed=` field '
-        f"saying whether the task's work is already on main. A row that reads "
-        f'`{NOT_LIVE_TOKEN}` is listed only because its work landed.\n\n'
+        f'{LIVE_WORKFLOW_RULES_HEADING}\n'
+        f'Each row reads `- task/<id>: <per-task signals>; {CLAIMANT_FIELD}<label>; '
+        f'landed=<...>`. The per-task signals are `{LiveSignal.WORKTREE}` and '
+        f'`{LiveSignal.RECENT_COMMIT}`. The orchestrator lock is project-wide: when it '
+        f'is held the section says so once, on its own `{PROJECT_LOCK_HELD}` line, and '
+        f'that line is project context, never evidence about any one task. A row '
+        f'reading `{NO_PER_TASK_SIGNAL_TOKEN}` is listed only through that lock. A '
+        f'registered worktree survives task completion, so it does not prove a task '
+        f'is running either.\n\n'
+        f'A listed row is a HINT that triggers the authoritative check. It never '
+        f'substitutes for that check, and on its own it is never grounds for '
+        f'suppressing a write. The authoritative per-task liveness test is '
+        f'`mcp__fused-memory__get_task(task_id)`: the top-level `claimant_run_id` is '
+        f'non-null AND `heartbeat_at` is fresh (within about {_HEARTBEAT_TTL_MINUTES} '
+        f'minutes). Both are required. When the record disagrees with the listing, '
+        f'the RECORD WINS: perform the write, or emit the finding, that you would '
+        f'otherwise have made, and record in it that the tie-breaker was applied and '
+        f'what `get_task` returned. The live-task rules in this section apply only '
+        f'once the record confirms the listing. This tie-breaker settles liveness '
+        f'only; it never overrides the `landed=` rules below. Task 3254 rendered '
+        f'`worktree, orchestrator` for 3+ cycles while `get_task` read pending with a '
+        f'null claimant and a null heartbeat, and a suppressed write stalled a '
+        f'decision task.\n\n'
+        f'The `{CLAIMANT_FIELD}` field is that same test precomputed at render time. '
+        f'{claimant[ClaimantLabel.NONE]} (no claimant) and '
+        f'{claimant[ClaimantLabel.STALE]} (a claimant whose heartbeat is old, missing '
+        f'or unreadable) are grounds to proceed; {claimant[ClaimantLabel.LIVE]} is '
+        f'grounds to hold; {claimant[ClaimantLabel.UNKNOWN]} means the task record '
+        f'could not be read. A `get_task` read settles any of them.\n\n'
+        f'Every row ends with a `landed=` field saying whether the task\'s work is '
+        f'already on main. A row that reads `{NOT_LIVE_TOKEN}` is listed only because '
+        f'its work landed.\n\n'
         f"`{LandedToken.TRUE}` means the task's work is already on main: either its "
         f'branch is gone and a fresh `Merge task/<id> into main` marker is on main, or '
         f'every commit on its branch has a rebased twin on main. The evidence is named '

@@ -815,11 +815,12 @@ the same defence-in-depth principle on the Stage 2 emission side.
 
 ## Live-Workflow Authority
 The payload may include a `### Live-Workflow Signals` section. When present, it lists \
-tasks whose branch `task/<id>` has at least one live-workflow signal: a registered \
-git worktree, a recent branch commit (within the last 6 hours), or an active \
-orchestrator process holding the project lock. These signals indicate that a live \
+tasks whose branch `task/<id>` has a per-task live-workflow signal (a registered git \
+worktree, or a recent branch commit within the last 6 hours), tasks that are live only \
+through the project-wide orchestrator lock (stated once, on the section's own project \
+line), and tasks whose work has already landed on main. A live listing suggests that a \
 pipeline — typically the reify-build orchestrator — is actively driving that task's \
-lifecycle.
+lifecycle; the rules below say how to confirm it.
 
 {render_live_workflow_authority_rules()}
 
@@ -860,13 +861,14 @@ lifecycle.
    whose carrier is still non-terminal.
 
 **Only act on stranded / complete-but-unmerged findings when NO live signal is present** \
-— i.e., the task is absent from `### Live-Workflow Signals` (all three signals are \
-False: no worktree, no recent commits, no active orchestrator). That is the genuinely \
-stranded case (e.g. esc-3803: orchestrator crashed, worktree abandoned) that legitimately \
-needs operator attention.
+— i.e., the task is absent from `### Live-Workflow Signals`, or it is listed but \
+`get_task` shows no live claimant (the tie-breaker above), and its work has not landed. \
+That is the genuinely stranded case (e.g. esc-3803: orchestrator crashed, worktree \
+abandoned) that legitimately needs operator attention.
 
-If `### Live-Workflow Signals` is absent from the payload, all three signals are False \
-for every task; no live-workflow suppression applies.
+If `### Live-Workflow Signals` is absent from the payload, no task is live this cycle — \
+neither through a per-task signal nor through the project-wide lock — and none has \
+landing evidence; no live-workflow suppression applies.
 """
 
 

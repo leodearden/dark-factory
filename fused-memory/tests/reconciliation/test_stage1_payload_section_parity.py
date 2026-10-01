@@ -15,8 +15,9 @@ tells the model to draw an inference from that section's ABSENCE**. Today that
 set has exactly one member, ``### Live-Workflow Signals``, because
 ``prompts/stage1.py`` says:
 
-    "If `### Live-Workflow Signals` is absent from the payload, all three
-     signals are False for every task; no live-workflow suppression applies …"
+    "If `### Live-Workflow Signals` is absent from the payload, no task is live
+     this cycle — neither through a per-task signal nor through the project-wide
+     lock — and none has landing evidence; no live-workflow suppression applies …"
 
 That sentence makes absence load-bearing: a builder that omits the section is
 not merely terser, it makes the model conclude something FALSE. That — not
@@ -287,7 +288,7 @@ class TestRequiredSectionsRegistry:
             f"RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'); "
             f'got {[(s.header, s.renderer) for s in registry]!r}. This is the one '
             f'section prompts/stage1.py draws an absence-inference from, so a builder '
-            f'omitting it makes the model conclude all three liveness signals are False.'
+            f'omitting it makes the model conclude no task is live or landed.'
         )
 
     def test_every_registry_renderer_resolves_to_a_method(self):

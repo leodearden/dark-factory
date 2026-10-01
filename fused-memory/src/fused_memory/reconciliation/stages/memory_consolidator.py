@@ -173,10 +173,11 @@ class MemoryConsolidator(BaseStage):
     # INCLUSION CRITERION — a section belongs here iff the shipped Stage-1 prompt
     # tells the model to draw an inference from that section's ABSENCE. Today
     # prompts/stage1.py says: "If `### Live-Workflow Signals` is absent from the
-    # payload, all three signals are False for every task; no live-workflow
-    # suppression applies …". That makes absence load-bearing: a payload builder
-    # that omits the section does not merely produce a terser payload, it makes
-    # the model conclude something FALSE. Every builder therefore renders these
+    # payload, no task is live this cycle — neither through a per-task signal nor
+    # through the project-wide lock — and none has landing evidence; no
+    # live-workflow suppression applies …". That makes absence load-bearing: a
+    # payload builder that omits the section does not merely produce a terser
+    # payload, it makes the model conclude something FALSE. Every builder therefore renders these
     # via _render_required_sections() — adding a section is ONE edit here, not
     # one edit per builder. Enforced by
     # tests/reconciliation/test_stage1_payload_section_parity.py.
