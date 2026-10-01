@@ -48,9 +48,7 @@ from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     normalize_gate_owned_suggested_actions,
     stamp_curator_gate_sweep_provenance,
 )
-from fused_memory.reconciliation.live_workflow_citation_guard import (
-    check_live_workflow_citations,
-)
+from fused_memory.reconciliation.live_workflow_citation_guard import check_live_workflow_citations
 from fused_memory.reconciliation.live_workflow_section import (
     CITATION_CONTRADICTIONS_STAT,
     LiveWorkflowSnapshot,

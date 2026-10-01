@@ -212,7 +212,7 @@ class TestLandedOnMainRendering:
         ), 'a failed landing probe is logged at WARNING naming the project root'
 
     @pytest.mark.asyncio
-    async def test_render_live_workflow_section_is_the_snapshot_rendered(self, repo: Path) -> None:
+    async def test_the_rendered_section_is_the_snapshot_rendered(self, repo: Path) -> None:
         _landed_by_marker(repo, 101)
         _live_with_worktree(repo, 102)
         tasks = [_task(101), _task(102)]
