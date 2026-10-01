@@ -887,7 +887,7 @@ class TestGraphReader:
     def test_the_edge_census_counts_edges_not_node_pairs(self) -> None:
         """FalkorDB's bare-pattern count(*) collapses multi-edges between one node pair."""
         match_clause = mod.EDGE_PAGE_CYPHER.split('RETURN')[0]
-        assert mod.EDGE_CENSUS_CYPHER == f'{match_clause}RETURN count(r)'
+        assert f'{match_clause}RETURN count(r)' == mod.EDGE_CENSUS_CYPHER
 
     def test_the_edge_read_never_projects_the_embedding_or_filters_liveness(self) -> None:
         assert 'fact_embedding' not in mod.EDGE_PAGE_CYPHER
