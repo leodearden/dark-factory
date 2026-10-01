@@ -204,6 +204,45 @@ pathlib.Path(__file__).with_name({_ESCAPE_MARKER_NAME!r}).write_text(
 '''
 
 
+def _run_probe_session(probe: Path, inifile: Path) -> subprocess.CompletedProcess[str]:
+    """Run ``probe`` in a child pytest governed by ``inifile`` and nothing else.
+
+    Both arms of the end-to-end pin go through here, so they differ ONLY in
+    ``inifile``.
+
+    ``-o addopts=`` clears the inifile's own addopts so the probe does not drag
+    in ``-n auto --dist loadgroup -m 'not warm_lane_bash'``; ``-p
+    no:cacheprovider`` keeps the child from writing a .pytest_cache.
+
+    ``--confcutdir`` pins both conftest discovery and the collection root to
+    the probe's own directory. Without it, the orchestrator inifile makes
+    confcutdir orchestrator/, so /tmp counts as "inside" it: pytest imports any
+    conftest.py above the probe and walks the whole fleet-shared /tmp. The E2E
+    test's PROBE NOT HERMETIC assertion is the executable check.
+
+    ``sanitized_probe_env`` strips PYTHONWARNINGS along with the git and
+    PYTEST_* pointers: an ambient warning-filter env var is applied by CPython
+    ahead of the inifile and would contaminate BOTH arms — an inherited
+    ``PYTHONWARNINGS=error`` fails the CONTROL arm (reading as a broken
+    harness) and can pass the TREATMENT arm for a reason that has nothing to do
+    with orchestrator/pyproject.toml.
+    """
+    return subprocess.run(
+        [
+            sys.executable, '-m', 'pytest', str(probe),
+            '-c', str(inifile),
+            '-o', 'addopts=',
+            '-p', 'no:cacheprovider',
+            '--confcutdir', str(probe.parent),
+            '-q',
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(probe.parent),
+        env=sanitized_probe_env(),
+    )
+
+
 def _require_apply_warning_filters():
     """Return ``_pytest.config.apply_warning_filters``, or fail LOUDLY.
 
@@ -382,20 +421,11 @@ def test_the_promotion_is_in_effect_for_this_run(pytestconfig):
     )
 
 
-# task 5147.  MEASURED 15.27s unloaded for this test's two full pytest
-# subprocesses (the module: `8 passed in 17.72s`); at this suite's recorded
-# ~4.8x load inflation that is ~73s, so the previous `timeout(120)` left only
-# 61% headroom with the loadavg step at which xdist workers actually DIE still
-# ahead of it.  VERIFY_CLI_PER_TEST_TIMEOUT leaves ~19.6x.
-#
-# NOT deleted, deliberately: the ini default is 60, so removing the marker
-# would leave this 15.27s two-subprocess test on a 60s budget under a bare
-# local `pytest` -- strictly worse than the bug being fixed.  The marker is
-# raised to the verify budget instead, which is a no-op under verify and a
-# genuine loosening locally.  Why a marker between those two budgets inverts
-# rather than loosens: see the VERIFY_CLI_PER_TEST_TIMEOUT comment block in
-# _orch_helpers.py, the single home of that rationale.  Enforced by
-# test_timeout_marker_inversion_guard.py.
+# Verify's own budget; why a marker below it inverts rather than loosens: the
+# VERIFY_CLI_PER_TEST_TIMEOUT block in _orch_helpers.py, enforced by
+# test_timeout_marker_inversion_guard.py.  Task 5146 left it unchanged on purpose:
+# it removed this test's load sensitivity on the COST side (see _run_probe_session),
+# and plans/flake-ledger-prd.md §5.5 forbids widening a timeout as a fix.
 @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
     tmp_path, pytestconfig
@@ -417,7 +447,9 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
     orchestrator/pyproject.toml must FAIL, and the CONTROL run under a
     ``filterwarnings``-free inifile must PASS. The control is what attributes
     the treatment failure to the promotion entry rather than to anything
-    ambient. Precedent for a live subprocess non-vacuity probe:
+    ambient. Both arms must also stay inside their own directory, which the
+    sentinel conftest one level up checks (see ``_run_probe_session``).
+    Precedent for a live subprocess non-vacuity probe:
     test_warm_lane_bash_bucket_placement.py's ``--collect-only`` probe, cited
     approvingly by test_marker_registration_drift.py::test_the_sweep_is_not_vacuous.
     """
@@ -431,31 +463,7 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
     control_inifile.write_text(_CONTROL_INIFILE_SOURCE)
     (tmp_path / 'conftest.py').write_text(_ESCAPE_SENTINEL_SOURCE)
 
-    def _run(inifile: Path) -> subprocess.CompletedProcess:
-        # ``-o addopts=`` clears the inifile's own addopts so the probe does
-        # not drag in ``-n auto --dist loadgroup -m 'not warm_lane_bash'``;
-        # ``-p no:cacheprovider`` keeps the child from writing a .pytest_cache.
-        # ``sanitized_probe_env`` strips PYTHONWARNINGS along with the git and
-        # PYTEST_* pointers: an ambient warning-filter env var is applied by
-        # CPython ahead of the inifile and would contaminate BOTH arms — an
-        # inherited ``PYTHONWARNINGS=error`` fails the CONTROL arm (reading as
-        # a broken harness) and can pass the TREATMENT arm for a reason that
-        # has nothing to do with orchestrator/pyproject.toml.
-        return subprocess.run(
-            [
-                sys.executable, '-m', 'pytest', str(probe),
-                '-c', str(inifile),
-                '-o', 'addopts=',
-                '-p', 'no:cacheprovider',
-                '-q',
-            ],
-            capture_output=True,
-            text=True,
-            cwd=str(probe_dir),
-            env=sanitized_probe_env(),
-        )
-
-    control = _run(control_inifile)
+    control = _run_probe_session(probe, control_inifile)
     assert control.returncode == 0, (
         f'CONTROL ARM BROKEN — the probe was expected to PASS under a '
         f'filterwarnings-free inifile, but exited {control.returncode}. The '
@@ -463,7 +471,7 @@ def test_a_thread_exception_actually_fails_a_test_under_this_projects_inifile(
         f'attribute anything. stdout:\n{control.stdout}\nstderr:\n{control.stderr}'
     )
 
-    treatment = _run(ORCH_PYPROJECT)
+    treatment = _run_probe_session(probe, ORCH_PYPROJECT)
     combined = treatment.stdout + treatment.stderr
     assert not (tmp_path / _ESCAPE_MARKER_NAME).exists(), (
         f'PROBE NOT HERMETIC — a probe session imported the conftest.py '
