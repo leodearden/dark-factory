@@ -85,39 +85,19 @@ def _documented_lint_command(markdown_text: str) -> str:
     normalisation: the exact-equality assertion downstream depends on not
     silently canonicalising away a real difference.
     """
-    begin_count = markdown_text.count(MIRROR_BEGIN)
-    assert begin_count == 1, (
-        f"expected exactly one {MIRROR_BEGIN!r} marker, found {begin_count} "
-        f"(task 3558). This marker delimits the Lint bullet in CONTRIBUTING.md "
-        f"that mirrors the `ruff check` leg of dark-factory-orchestrator.yaml's "
-        f"lint_command. If it was deleted, restore it around that bullet; if it "
-        f"was duplicated, one of the two mirrors is unpinned and free to drift."
-    )
-    end_count = markdown_text.count(MIRROR_END)
-    assert end_count == 1, (
-        f"expected exactly one {MIRROR_END!r} marker to close {MIRROR_BEGIN!r} in "
-        f"CONTRIBUTING.md, found {end_count} (task 3558) — restore the closing "
-        f"marker below the Lint bullet"
-    )
-
-    # Inverted markers yield an empty slice, so the next assertion catches that
-    # too, loudly and with the same remedy.
-    marked = markdown_text[markdown_text.index(MIRROR_BEGIN):markdown_text.index(MIRROR_END)]
-    spans: list[str] = _MARKED_LINT_COMMAND.findall(marked)
-    assert len(spans) == 1, (
-        f"expected exactly one ``- **Lint**: `<command>``` bullet between "
-        f"{MIRROR_BEGIN!r} and {MIRROR_END!r} in CONTRIBUTING.md, found "
-        f"{len(spans)}: {spans!r} (task 3558). The marker must wrap that bullet "
-        f"and nothing else; if the bullet was relabelled or the markers were "
-        f"inverted, move the marker back around the copy-pasteable lint command."
-    )
-
-    command = spans[0].strip()
-    assert command, (
-        f"the command between {MIRROR_BEGIN!r} and {MIRROR_END!r} in "
-        f"CONTRIBUTING.md is empty (task 3558)"
-    )
-    return command
+    return vci.marked_span(
+        markdown_text,
+        begin=MIRROR_BEGIN,
+        end=MIRROR_END,
+        pattern=_MARKED_LINT_COMMAND,
+        what="`- **Lint**: `<command>`` bullet",
+        source="CONTRIBUTING.md",
+        label=(
+            "the Lint bullet in CONTRIBUTING.md that mirrors the `ruff check` leg "
+            "of dark-factory-orchestrator.yaml's lint_command"
+        ),
+        task="3558",
+    ).strip()
 
 
 # Extractor fixtures are hand-written markdown, never the real CONTRIBUTING.md,
