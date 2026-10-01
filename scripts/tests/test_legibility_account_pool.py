@@ -8,16 +8,18 @@ pool turns the gate's roster into the ``(prompt, model) -> str`` callable
 the seam already speaks.
 
 THE FAKE GATE IS THE POINT, not a shortcut. ``account_pool`` depends on
-seven members of the real 3004-line ``UsageGate`` — ``try_lease``,
+eight members of the real 3004-line ``UsageGate`` — ``try_lease``,
 ``detect_cap_hit``, ``confirm_account_ok``, ``on_agent_complete``,
-``release_probe_slot``, ``account_count`` and ``active_account_name`` — and
-stating exactly those here is how the test
-says what the interface IS rather than reaching through it into gate
+``release_probe_slot``, ``account_count``, ``active_account_name`` and
+``auth_failed_account_names`` — and stating exactly those here is how the
+test says what the interface IS rather than reaching through it into gate
 internals (docs/code-quality.md: tests that reach a module's internals are
 an interface-design smell). The leases it hands out are REAL
 ``AccountLease`` objects and the slot wrapping them is the REAL
 ``InvokeSlot``, so the probe-claim discipline under test is the production
-one, not a lookalike.
+one, not a lookalike. The auth route settles through ``InvokeSlot.report``
+into the gate's private auth handler, so its tests (task 5947) use a REAL
+gate from ``build_pool`` instead of teaching the fake that hook.
 
 The LLM is ALWAYS mocked here: every test injects an ``invoke`` stub. The
 one test that drives a real ``claude`` is marked ``integration`` and is
@@ -69,10 +71,11 @@ def _restore_environ():
 
 
 class FakeAccount:
-    def __init__(self, name, token, *, capped=False):
+    def __init__(self, name, token, *, capped=False, auth_failed=False):
         self.name = name
         self.token = token
         self.capped = capped
+        self.auth_failed = auth_failed
         # Annotation-only, exactly as on the real AccountState: a near-cap
         # account is NOT capped and keeps serving turns. The two flags are
         # separate here because the whole near-cap defect below lives in the
@@ -82,7 +85,7 @@ class FakeAccount:
 
 
 class FakeGate:
-    """Exactly the seven members ``account_pool`` calls, and nothing else.
+    """Exactly the eight members ``account_pool`` calls, and nothing else.
 
     ``try_lease`` reproduces the real gate's first-fit walk and its
     ``reverse`` / ``exclude`` knobs; ``detect_cap_hit`` reproduces the STRICT
@@ -122,7 +125,7 @@ class FakeGate:
         })
         roster = reversed(self.accounts) if reverse else self.accounts
         for acct in roster:
-            if acct.capped:
+            if acct.capped or acct.auth_failed:
                 continue
             if exclude and acct.name in exclude:
                 continue
@@ -164,9 +167,16 @@ class FakeGate:
         private roster would be the interface smell, not a shortcut.
         """
         for acct in self.accounts:
-            if not acct.capped:
+            if not acct.capped and not acct.auth_failed:
                 return acct.name
         return None
+
+    @property
+    def auth_failed_account_names(self):
+        """The accounts whose credentials were rejected, in roster order —
+        how the exhaustion reason tells a pool that will never clear on its
+        own from one that clears at the weekly reset."""
+        return tuple(acct.name for acct in self.accounts if acct.auth_failed)
 
     # -- settle surface ----------------------------------------------------
     def confirm_account_ok(self, oauth_token):
@@ -793,9 +803,10 @@ class _OpaqueGate:
     caught it — both spellings produce the same words.
     """
 
-    def __init__(self, *, account_count, active_account_name):
+    def __init__(self, *, account_count, active_account_name, auth_failed_account_names=()):
         self._count = account_count
         self._active = active_account_name
+        self._auth_failed = tuple(auth_failed_account_names)
         self.lease_calls = []
 
     def try_lease(self, *, scope=None, reverse=False, exclude=None):
@@ -812,6 +823,10 @@ class _OpaqueGate:
     @property
     def active_account_name(self):
         return self._active
+
+    @property
+    def auth_failed_account_names(self):
+        return self._auth_failed
 
 
 def _reason_from(gate, invoke=None):
@@ -1969,6 +1984,90 @@ def test_an_auth_rejected_night_is_not_lost_end_to_end(real_pool, tmp_path):
     assert coder_mod.is_cap_deferral(result) is False
     assert calls.read_text().split() == ['tok-d', 'tok-c', 'tok-c', 'tok-c']
     assert real_pool.auth_failed_account_names == ('max-d',)
+
+
+# An all-auth-failed pool never clears on its own, so it must be LOUD: a plain
+# CoderInvocationError that code_digests counts as a real failure (storm, exit
+# 1, ERROR escalation), never a CoderCapExhausted that coder.is_cap_deferral
+# would turn into a quiet exit-0 DEFERRED night. A mixed pool still defers —
+# its capped accounts do clear — but must not claim every account is capped.
+
+def _every_account_rejecting():
+    return _RecordingInvoke(raises={
+        token: _cli_exit_1(_AUTH_REJECTION) for token in ('tok-b', 'tok-c', 'tok-d')
+    })
+
+
+def test_a_pool_whose_every_account_rejects_its_credentials_fails_loud_not_deferred(
+    real_pool,
+):
+    invoke = _every_account_rejecting()
+    call = mod.pool_invoke(real_pool, invoke=invoke)
+
+    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+        call('prompt', 'haiku')
+
+    exc = excinfo.value
+    assert not isinstance(exc, coder_mod.CoderCapExhausted), exc
+    message = str(exc)
+    for name in ('max-b', 'max-c', 'max-d'):
+        assert name in message, message
+    assert 'capped' not in message.lower(), message
+    assert 'will not clear at the weekly reset' in message, message
+    assert len(invoke.calls) == 3
+
+    with pytest.raises(coder_mod.CoderInvocationError) as second:
+        call('the next digest prompt', 'haiku')
+
+    assert not isinstance(second.value, coder_mod.CoderCapExhausted), second.value
+    assert len(invoke.calls) == 3, (
+        'every account is already AUTH_FAILED, so the next digest must not '
+        'spend a single CLI call finding that out again'
+    )
+
+
+def test_the_all_auth_failed_decision_comes_from_the_gates_public_predicates():
+    gate = _OpaqueGate(
+        account_count=3, active_account_name=None,
+        auth_failed_account_names=('max-b', 'max-c', 'max-d'),
+    )
+
+    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+        mod.pool_invoke(gate, invoke=_RecordingInvoke())('prompt', 'haiku')
+
+    assert not isinstance(excinfo.value, coder_mod.CoderCapExhausted), excinfo.value
+
+
+def test_a_partly_auth_failed_pool_defers_without_claiming_every_account_is_capped():
+    gate = _OpaqueGate(
+        account_count=3, active_account_name=None, auth_failed_account_names=('max-b',),
+    )
+
+    message = _reason_from(gate)
+
+    assert 'max-b' in message, message
+    assert 'all 3 pool accounts capped' not in message, message
+    assert 'will not clear' in message, (
+        f'the auth-failed account must not be promised back at the reset; '
+        f'got {message!r}'
+    )
+
+
+@pytest.mark.timeout(60)
+def test_an_all_auth_failed_night_is_a_storm_not_a_deferral_end_to_end(real_pool):
+    result = coder_mod.code_digests(
+        [_digest_text(f"auth-sess-{i}") for i in range(3)], _codebook(),
+        project="dark_factory", model="haiku",
+        invoke=mod.pool_invoke(real_pool, invoke=_every_account_rejecting()),
+    )
+
+    assert result.capped == 0
+    assert result.failed == 3
+    assert result.status == "failure"
+    assert coder_mod.is_cap_deferral(result) is False, (
+        "the storm path is what makes nightly exit 1 with an ERROR escalation; "
+        "a deferral would hide a pool that never comes back on its own"
+    )
 
 
 # ---------------------------------------------------------------------------
