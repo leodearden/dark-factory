@@ -264,9 +264,9 @@ SLATE_SEEDED = 'seeded'
 SLATE_RETRIEVED = 'retrieved'
 SLATE_MODES: tuple[str, ...] = (SLATE_SEEDED, SLATE_RETRIEVED)
 
-#: The outcomes under which ``triage_write`` files the write against
-#: ``decision.canonical_id``. ``stored`` is the one that attaches to nothing
-#: (write_triage.py: ``canonical_id = None if verdict == OUTCOME_STORED``).
+#: The outcomes under which ``triage_write`` attaches the write at all.
+#: ``stored`` is the one that attaches to nothing
+#: (``write_triage.py::_apply_judge_verdict`` nulls its ``canonical_id``).
 ATTACH_OUTCOMES: frozenset[str] = frozenset({
     OUTCOME_RESTATED, OUTCOME_AMENDED, OUTCOME_CONTESTED,
 })
@@ -398,7 +398,7 @@ def _seeded_case(
 ) -> dict[str, Any]:
     """A case whose slate is CONSTRUCTED rather than retrieved.
 
-    The lead record is the attach target and the band is the middle one — the
+    The lead record is the band winner and the band is the middle one — the
     only band that reaches a judge — because that is what `build_judge_fn`
     synthesizes. Similarity and canonical liveness are unmeasured here, and
     `None` says so rather than claiming a figure.
@@ -584,7 +584,7 @@ def plan_from_slates(
     (default: *records*), so a ``--limit`` run describes a target exactly as
     the full run does.
 
-    The expected class stays the fixture's label. The slate, the attach target
+    The expected class stays the fixture's label. The slate, the band winner
     and the band come from the retrieval — including for a record whose
     canonical is no longer in the corpus, which is kept in the population and
     flagged rather than dropped.
@@ -789,11 +789,11 @@ def score_attachments(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     scores the attach target, so a case can answer `amended` — correct for its
     label — while attaching the write to an unrelated record.
 
-    The target scored is each row's `attach_target_id`: the band winner,
-    `decision.canonical_id`. A deterministic `restated` attaches there; a
-    judged attach does not, because `triage_write` files it against the
-    candidate the judge named, which the rows do not carry. For the middle
-    band these counts describe the band winner, not production's attach.
+    The target scored is each row's `attach_target_id`, the record production
+    files the write against: for a middle-band attach, the candidate the judge
+    named, hoisted to its canonical; otherwise the band winner. Rows from a
+    judge that named no candidate (before task 5794) carry the band winner,
+    which is where production attached them then.
 
     Pure counting over the per-case dump. Every rule is a field of a row;
     nothing is recomputed from the cases here.
@@ -964,6 +964,13 @@ def case_row(
     fixture record, so a null cluster or label means it is not one, and
     otherwise from its row on this slate.
 
+    The attach target is where production files the write: the candidate the
+    verdict named when it named one, otherwise ``band_winner_id``.
+    ``verdict_candidate_id`` is the raw slate id the verdict named and
+    ``judged_candidate_id`` is that id HOISTED (PRD
+    ``plans/write-triage-flip-readiness-prd.md`` §11 C2''), unlike
+    ``BandDecision.judged_candidate_id``, which is the raw id.
+
     JSON-serializable verbatim: this is the line appended to the cases file as
     each case completes, so a run interrupted partway keeps what it paid for.
     """
@@ -1110,7 +1117,7 @@ MODE_CAVEATS: dict[str, tuple[str, ...]] = {
         'the corpus. Those are KEPT in the population, because production '
         'meets them.',
         'Every figure here is measured over the population production would '
-        'actually route: the slate, the attach target and the band all come '
+        'actually route: the slate, the band winner and the band all come '
         'from a live retrieval through `retrieve_candidates` / `decide_band` / '
         '`select_judge_candidates` at this config\'s `candidate_k`, `t_high` '
         'and `t_low`, and the judge was asked ONLY for the middle band. So '
@@ -1121,11 +1128,13 @@ MODE_CAVEATS: dict[str, tuple[str, ...]] = {
         'ANOTHER RECORD, which `per_class` cannot show. '
         '`production_shape.duplicate_attach.strict` and '
         '`production_shape.wrong_record_attach` score `attach_target_id`, the '
-        'band winner `decision.canonical_id`. A deterministic `restated` '
-        'attaches there, but a judged one does NOT: `triage_write` files a '
-        'middle-band attach against the candidate the judge NAMED, which this '
-        'report does not yet record (task 6007). For the middle band those two '
-        'figures describe the band winner, not production\'s attach.',
+        'record production files the write against. For a middle-band attach '
+        'that is the candidate the judge NAMED, hoisted to its canonical '
+        '(`judged_candidate_id`); otherwise it is the band winner '
+        '(`band_winner_id`). So for the middle band `strict` is recall at '
+        '`judge_candidate_count`, not at 1. An artifact from a judge that named '
+        'no candidate (before task 5794) attached every judged write to the '
+        'band winner, and its rows carry no `judged_candidate_id`.',
     ),
 }
 
@@ -1461,7 +1470,7 @@ def _record_slate_widths(
 #: one, so a slate carrying no scores would arrive at the model empty.
 #:
 #: Descending by slate position, which preserves the order
-#: ``build_judge_cases`` chose — the attach target first. These numbers never
+#: ``build_judge_cases`` chose — the band winner first. These numbers never
 #: reach the model: ``build_judge_prompt`` renders id and text only, no
 #: metadata at all (PRD C1). They exist solely to survive the selector.
 _SYNTHETIC_TOP_SCORE = 0.90
@@ -1766,7 +1775,7 @@ def build_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
 def build_retrieved_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
     """The RETRIEVED live edge: the case already carries production's routing.
 
-    The slate, the attach target, the band and the similarity all came from
+    The slate, the band winner, the band and the similarity all came from
     ``decide_band``/``select_judge_candidates`` over a real retrieval, so this
     only rebuilds the records and defers to the same judge edge. The candidate
     metadata is passed through whole because it carries the cosine the shipped
@@ -2042,8 +2051,8 @@ def main() -> int:
     parser.add_argument('--slate-mode', dest='slate_mode', default=SLATE_SEEDED,
                         choices=SLATE_MODES,
                         help='seeded: the cluster canonical is placed at slate '
-                             'position 0. retrieved: the slate, the attach '
-                             'target and the band all come from a real '
+                             'position 0. retrieved: the slate, the band '
+                             'winner and the band all come from a real '
                              'retrieval against the live store, as production '
                              'would produce them (default: seeded)')
     parser.add_argument('--project-id', dest='project_id', default='reify',
@@ -2065,7 +2074,8 @@ def main() -> int:
                              'attach to the canonical (default: none)')
     parser.add_argument('--cases-path', dest='cases_path', default=None,
                         help='append one JSON line per case as it completes: '
-                             'slate, attach target, band, verdict, outcome and '
+                             'slate, band winner, the candidate the verdict '
+                             'named, attach target, band, verdict, outcome and '
                              'elision flags (default: no per-case dump)')
     return _run(parser.parse_args())
 
