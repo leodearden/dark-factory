@@ -1,4 +1,4 @@
-"""Clock-discipline guard: no bare `datetime.now()` reads in the data layer.
+"""Clock-discipline guards: no bare `.now()` reads, no SQL-side `datetime()` calls.
 
 Request-scoped code must resolve `now` once (via
 :func:`dashboard.data.utils.resolve_now`) and thread it through, rather than
@@ -26,7 +26,8 @@ data layer plus every module the composition layer was split into (task
 5586 moved two tagged single-capture routes, `api_burndown` and
 `api_merge_queue`, out of `app.py` into `dashboard/api/`, and the guard
 follows them rather than quietly shedding the coverage). No module beyond
-those is scanned; that boundary is intentional, not an oversight.
+those is scanned by either guard; that boundary is intentional, not an
+oversight.
 
 The matcher intentionally does not require the receiver to be a bare
 `datetime` name: it flags any `.now(...)` attribute call, so an aliased
@@ -36,17 +37,35 @@ evade the guard. This trades a slightly higher false-positive rate (any
 unrelated `.now()`-named method would also be flagged) for closing that
 coverage gap; false positives are handled the same way as everything else
 — an explicit `# clock-exempt:` tag.
+
+The second guard flags every non-docstring string literal that calls
+SQLite's `datetime()`, over the same module boundary. That function renders
+`'YYYY-MM-DD HH:MM:SS'` — a space separator and no UTC offset — while the
+columns it gets compared against hold ISO text with a `T` and an offset, so
+a lexical TEXT comparison misplaces rows on the cutoff's own calendar date.
+Two shapes have shipped: `datetime('now', ...)` (task 4624) and the
+column-anchored `datetime(MAX(completed_at), '-N days')` (removed by task
+5594; this guard broadened to catch it by task 5155). The matcher therefore
+flags the function whatever its arguments or letter case. SQL `date()` and
+`strftime()` are not flagged: the data layer uses them for bucket labels and
+integer-epoch arithmetic, never for a lexically compared cutoff. A Python
+`datetime(...)` constructor is a Call node, not a string literal, so it is
+never inspected. The fix is always a cutoff computed in Python and bound as
+a parameter.
 """
 
 from __future__ import annotations
 
 import ast
+import re
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 _EXEMPT_MARKER = '# clock-exempt:'
 _DEFERRED_CONSOLIDATION_TAG = f'{_EXEMPT_MARKER} deferred-consolidation'
+_SQL_DATETIME_CALL = re.compile(r'\bdatetime\s*\(', re.IGNORECASE)
 
 
 def find_clock_violations(source: str) -> list[tuple[int, str]]:
@@ -85,6 +104,47 @@ def find_clock_violations(source: str) -> list[tuple[int, str]]:
             continue
         violations.append((lineno, line_text))
     return violations
+
+
+def _iter_non_docstring_string_literals(tree: ast.AST) -> Iterator[tuple[int, str]]:
+    """Yield ``(lineno, value)`` for every string literal in *tree* except docstrings.
+
+    Comments never reach the AST; docstrings do, and are excluded because
+    prose naming a forbidden SQL spelling is not a query that reaches SQLite.
+    """
+    docstring_ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                docstring_ids.add(id(body[0].value))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstring_ids
+        ):
+            yield node.lineno, node.value
+
+
+def find_sql_datetime_violations(source: str) -> list[tuple[int, str]]:
+    """Return ``(line, excerpt)`` for every non-docstring literal calling SQL ``datetime()``.
+
+    A match is reported off the AST literal, never off a physical line,
+    because implicitly concatenated SQL folds into one literal that no
+    single line contains. The excerpt's whitespace is collapsed so a
+    triple-quoted literal cannot put newlines into a joined failure message.
+    """
+    return [
+        (lineno, ' '.join(value.split())[:120])
+        for lineno, value in _iter_non_docstring_string_literals(ast.parse(source))
+        if _SQL_DATETIME_CALL.search(value)
+    ]
 
 
 # ---------------------------------------------------------------------------
