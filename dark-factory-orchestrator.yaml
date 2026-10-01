@@ -1604,12 +1604,15 @@ merge_verify_max_concurrent_modules: 1
 
 # ── Lever C (multi-host post-merge verify): laptop runner, prefer_remote ──────
 # ENABLED 2026-09-30 (task 5053 = D1; plans/merge-lane-throughput-prd.md). leo-laptop
-# joins this project's merge-verify pool; the restart that activates it is task 5054
-# (D2) — landing this block alone changes nothing at runtime. Measured 2026-09-03:
-# the laptop verifies ~2.5x faster than this workstation (p50 17.4 vs 43.4 min) and
-# sits 78-88% idle while this host's CPU is the lane bottleneck. Fail-safe: an
-# unreachable laptop falls back to local, never stalls. df_checkout_path turns on the
-# INV-2 auto-sync of the laptop's DF checkout (stale tree = stale verify-merge, #5120).
+# joins this project's merge-verify pool. It takes effect at the next orchestrator
+# restart of ANY kind (coordinator, staleness backstop, liveness revive); task 5054
+# (D2) is the deliberate one. Measured 2026-09-03 on reify's workload: the laptop
+# verifies ~2.5x faster than this workstation (p50 17.4 vs 43.4 min) and sits
+# 78-88% idle while this host's CPU is the lane bottleneck. DF's own measurement,
+# 2026-09-30: the laptop ran DF's full 9-module gate in ~12.7 min against 57-75 min
+# locally. Fail-safe: an unreachable laptop falls back to local, never stalls.
+# df_checkout_path turns on the INV-2 auto-sync of the laptop's DF checkout (stale
+# tree = stale verify-merge, #5120).
 # Laptop-side knobs live on leo-laptop, not here: its dark-factory-laptop.yaml sets
 # merge_verify_max_concurrent_modules: 1 and verify_use_cgroup_scope: true, and a systemd
 # drop-in caps each verify scope at MemoryMax=24G (a memory kill reports RED, not a
@@ -1621,8 +1624,9 @@ merge_verify_max_concurrent_modules: 1
 # leases BOTH hosts and runs both legs, so 1-in-10 gives back a little local CPU.
 # verify_cross_check_remote_green is deliberately NOT set (2026-09-30): the code
 # default TRUE applies — every non-trivial remote green gets a blocking local
-# re-verify — for the 3-day parity window that opens at the 5054 restart. Task 5416
-# runs the window and owns the OFF step (reload), so there is nothing to edit here.
+# re-verify — for the 3-day parity window that opens when this block first goes live
+# (the next restart of any kind; deliberately 5054's). Task 5416 runs the window and
+# owns the OFF step (reload), so there is nothing to edit here.
 # ROLLBACK: verify_host_policy: prefer_local (green tier, mcp__escalation__reload_config);
 # enabled: false, or dropping this block, needs a restart (verify_runners and
 # verify_drift_check_every_n_lands are restart-only).

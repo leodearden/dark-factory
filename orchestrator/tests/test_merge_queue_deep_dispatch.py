@@ -153,7 +153,6 @@ def _make_config(
         project_root=repo,
         git=git_config or _make_spec_git_config(),
         merge_deep=MergeDeepConfig(chain_cap=chain_cap),
-        verify_runners=[],
     )
 
 
