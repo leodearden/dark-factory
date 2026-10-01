@@ -564,12 +564,16 @@ async def test_no_tool_calls_drops_unknown_warning_origin(agent_warning):
 def test_cli_warning_origins_matches_the_tokens_call_llm_cli_synthesises():
     """The closed vocabulary must not drift from its only producer.
 
-    _call_llm_cli builds {'warning': 'cli_output_unparseable'} and
-    {'warning': 'cli_output_empty'} as literals; if either is renamed without
-    updating CLI_WARNING_ORIGINS, run() would silently start dropping a real
-    diagnosis.  Pin the set.
+    _call_llm_cli builds {'warning': 'cli_output_unparseable'},
+    {'warning': 'cli_output_empty'} and (task 6022) {'warning': 'api_refusal'}
+    as literals; if any is renamed without updating CLI_WARNING_ORIGINS, run()
+    would silently start dropping a real diagnosis.  Pin the set.
     """
-    assert set(CLI_WARNING_ORIGINS) == {'cli_output_unparseable', 'cli_output_empty'}, (
+    assert set(CLI_WARNING_ORIGINS) == {
+        'cli_output_unparseable',
+        'cli_output_empty',
+        'api_refusal',
+    }, (
         f'CLI_WARNING_ORIGINS drifted from _call_llm_cli: {CLI_WARNING_ORIGINS!r}'
     )
 
@@ -1124,7 +1128,7 @@ def _cli_result_json(structured_output: dict, session_id: str = 'sess-1') -> byt
 async def test_claude_cli_response_adapter():
     """_CLIResponseAdapter produces correct _TextBlock/_ToolUseBlock."""
     structured = {
-        'thinking': 'I should consolidate memories.',
+        'text': 'I should consolidate memories.',
         'tool_calls': [
             {'id': 'tc1', 'name': 'search_memory', 'input': {'query': 'test'}},
             {'id': 'tc2', 'name': 'delete_memory', 'input': {'id': 'mem-1'}},
@@ -1146,10 +1150,10 @@ async def test_claude_cli_response_adapter():
 
 
 @pytest.mark.asyncio
-async def test_claude_cli_response_adapter_no_thinking():
-    """_CLIResponseAdapter handles empty thinking."""
+async def test_claude_cli_response_adapter_no_text():
+    """_CLIResponseAdapter handles empty text."""
     structured = {
-        'thinking': '',
+        'text': '',
         'tool_calls': [{'id': 'tc1', 'name': 'stage_complete', 'input': {}}],
     }
     adapter = _CLIResponseAdapter(structured)
@@ -1195,7 +1199,7 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     """_call_claude_cli delegates to invoke_with_cap_retry instead of managing subprocess.
 
     Confirms that the new interface passes `prompt` and `tools` kwargs and that
-    the returned adapter exposes `.thinking`, `.tool_calls`, and `.session_id`.
+    the returned adapter exposes `.text`, `.tool_calls`, and `.session_id`.
     The dead `response` field has been dropped from both the schema and the
     adapter (Task 899 step-1/step-2).
     """
@@ -1212,7 +1216,7 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'reasoning',
+            'text': 'reasoning',
             'tool_calls': [],
         },
     )
@@ -1263,8 +1267,8 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     else:
         assert call_positional[0] is fake_gate
 
-    # Adapter must expose direct attribute access for thinking/tool_calls/session_id.
-    assert result.thinking == 'reasoning'
+    # Adapter must expose direct attribute access for text/tool_calls/session_id.
+    assert result.text == 'reasoning'
     assert result.tool_calls == []
     assert result.session_id == 'sess-1'
 
@@ -2259,3 +2263,118 @@ async def test_call_claude_cli_empty_structured_output_emits_warning(
         f'Expected adapter.warning == "cli_output_empty", got {adapter.warning!r}'
     )
     assert adapter.tool_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Task 6022: API usage-policy refusals (reasoning_extraction)
+# ---------------------------------------------------------------------------
+
+_MEASURED_REFUSAL_OUTPUT = (
+    "API Error: Sonnet 5.5's safeguards flagged this message "
+    '(https://www.anthropic.com/legal/aup). This sometimes happens with safe, '
+    "normal conversations. Claude Code can't respond to this message with "
+    'Sonnet 5.5.\n\nRequest ID: req_x'
+)
+
+
+def _refused_cli_result() -> AgentResult:
+    return AgentResult(
+        success=False,
+        output=_MEASURED_REFUSAL_OUTPUT,
+        subtype='success',
+        stop_reason='refusal',
+        session_id='sess-r',
+    )
+
+
+def _terminal_cli_result() -> AgentResult:
+    return AgentResult(
+        success=True,
+        output='',
+        session_id='sess-ok',
+        structured_output={
+            'tool_calls': [{'id': 'tc1', 'name': 'stage_complete', 'input': {}}],
+        },
+    )
+
+
+def _cli_agent_with_terminal_tool() -> AgentLoop:
+    return AgentLoop(
+        config=_make_cli_config(),
+        system_prompt='Test system prompt',
+        tools={
+            'stage_complete': ToolDefinition(
+                name='stage_complete',
+                description='Complete',
+                parameters={'type': 'object', 'properties': {}},
+                function=lambda **kw: kw,
+            ),
+        },
+        terminal_tool='stage_complete',
+    )
+
+
+@pytest.mark.asyncio
+async def test_cli_invocation_requests_no_reasoning_emission():
+    """Task 6022 measured that a required reasoning field ('thinking' plus an
+    instruction to 'explain your reasoning' in it) gets verify refused by the
+    API's reasoning_extraction classifier.  Any new schema property must be
+    re-probed with fused-memory/scripts/probe_schema_max_turns.py first.
+    """
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = _terminal_cli_result()
+        await _cli_agent_with_terminal_tool().run('p')
+
+    call_kwargs = mock_invoke.call_args.kwargs
+    output_schema = call_kwargs['output_schema']
+    assert set(output_schema['properties']) == {'tool_calls'}
+    assert output_schema['required'] == ['tool_calls']
+    assert '"thinking"' not in call_kwargs['system_prompt']
+    assert 'explain your reasoning' not in call_kwargs['system_prompt']
+
+
+@pytest.mark.asyncio
+async def test_api_refusal_ends_run_with_structured_origin(caplog):
+    """A refused call ends the run as a no-tool-call exit whose origin is the
+    closed-vocabulary token 'api_refusal', instead of raising — so verify()
+    writes an audited agent_failed row rather than a prose-only error row.
+    The refused session is never resumed: the CLI says it cannot continue.
+    """
+    agent = _cli_agent_with_terminal_tool()
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.side_effect = [_refused_cli_result(), _terminal_cli_result()]
+
+        with caplog.at_level(logging.WARNING):
+            payload, _entries = await agent.run('p')
+        await agent.run('p2')
+
+    assert payload.get('warning') == 'no_tool_calls'
+    assert payload.get('warning_origin') == 'api_refusal'
+
+    warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any('api_refusal' in m and 'req_x' in m for m in warning_messages), (
+        f'Expected a WARNING naming api_refusal and the request id, got: {warning_messages}'
+    )
+
+    assert mock_invoke.call_args_list[1].kwargs['resume_session_id'] is None
+
+
+@pytest.mark.asyncio
+async def test_non_refusal_cli_failure_still_raises():
+    """Only a refusal is converted; every other CLI failure still raises."""
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = AgentResult(
+            success=False, output='', subtype='error_max_turns', stop_reason=None
+        )
+        with pytest.raises(RuntimeError):
+            await _cli_agent_with_terminal_tool().run('p')
