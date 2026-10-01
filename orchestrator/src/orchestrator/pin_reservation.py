@@ -26,7 +26,7 @@ is one task's footprint; and C7 backfill still borrows through it exactly as
 it borrows through a fairness park.
 
 This module holds the vocabulary and pure policy only — rank, source, blocker
-naming — and imports nothing from the scheduler.
+naming, release reasons — and imports nothing from the scheduler.
 """
 
 from __future__ import annotations
@@ -115,3 +115,46 @@ class Blocker:
 
     def as_payload(self) -> dict[str, str]:
         return {'module': self.module, 'owner': self.owner, 'kind': self.kind.value}
+
+
+class PinReleaseReason(StrEnum):
+    """Why the pin phase released a pin reservation: ``reservation_expired``'s ``reason``.
+
+    Owner-state releases (terminal, missing, deps unsatisfied) belong to park
+    GC and keep its vocabulary; these are the ones only the pin phase can see.
+    """
+
+    UNPINNED = 'unpinned'
+    GATED = 'gated'
+    INELIGIBLE = 'ineligible'
+    DETERMINISTIC = 'deterministic'
+    DISPLACED = 'pin_displaced'
+    DISABLED = 'pin_reservations_disabled'
+
+
+def pin_release_reason(
+    *,
+    enabled: bool,
+    reservable: bool,
+    pinned: bool,
+    gated: bool,
+    deterministic: bool,
+) -> PinReleaseReason:
+    """Why a pin reservation the pin phase is not keeping gets released.
+
+    *reservable* means the owner is still a non-deterministic entry of this
+    tick's pin queue, so a reservable owner being released was pushed out by
+    the ``pin_reservation_max_active`` cap.  The first matching fact wins:
+    disabled, displaced, unpinned, gated, deterministic, else ineligible.
+    """
+    if not enabled:
+        return PinReleaseReason.DISABLED
+    if reservable:
+        return PinReleaseReason.DISPLACED
+    if not pinned:
+        return PinReleaseReason.UNPINNED
+    if gated:
+        return PinReleaseReason.GATED
+    if deterministic:
+        return PinReleaseReason.DETERMINISTIC
+    return PinReleaseReason.INELIGIBLE

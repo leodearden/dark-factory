@@ -40,6 +40,7 @@ from _recording_event_store import _RecordingEventStore
 from shared.psi import PsiSample
 
 from orchestrator.config import PsiAdmissionConfig, apply_reload
+from orchestrator.pin_reservation import pin_release_reason
 from orchestrator.scheduler import Scheduler
 
 
@@ -507,8 +508,6 @@ async def test_psi_held_tick_neither_grants_nor_revokes(tmp_path):
 )
 def test_pin_release_reason_precedence(facts, reason):
     """disabled → displaced → unpinned → gated → deterministic → ineligible."""
-    from orchestrator.pin_reservation import pin_release_reason
-
     defaults = {
         'enabled': True, 'reservable': False, 'pinned': True,
         'gated': False, 'deterministic': False,

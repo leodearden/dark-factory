@@ -58,6 +58,7 @@ from orchestrator.pin_reservation import (
     ReservationSource,
     is_pin_rank,
     park_rank,
+    pin_release_reason,
 )
 from orchestrator.recovery_emission import (
     LeaveReason,
@@ -7570,13 +7571,22 @@ class Scheduler:
         candidate this tick cannot take a module the head is waiting for.
         This is the bounded exception described in
         ``orchestrator/pin_reservation.py``'s module docstring.
+        :meth:`_bound_pin_reservations` enforces that bound at phase start
+        (so a PSI-held tick still applies it) and after each head reserves.
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
         else ``_CONTINUE`` to fall through to the scored loop.
         """
         if not self._override_store:
             return _CONTINUE
+        queue = self._pin_queue(ctx)
+        reservable = {
+            pin.task_id: pin.pin_order
+            for pin in queue
+            if not self.is_deterministic(pin.task)
+        }
+        self._bound_pin_reservations(ctx, reservable)
         heads = 0
-        for pin in self._pin_queue(ctx):
+        for pin in queue:
             if ctx.psi_hold and not self.is_deterministic(pin.task):
                 # Dispatch-admission gate (task 2328, DA3/DA-D5): a pin
                 # doesn't reduce host load, so a pinned HEAVY candidate is
@@ -7602,7 +7612,52 @@ class Scheduler:
                     skip_count=self._skip_count.get(pin.task_id, 0),
                     pin_order=pin.pin_order,
                 )
+                self._bound_pin_reservations(ctx, reservable)
         return _CONTINUE
+
+    def _bound_pin_reservations(
+        self, ctx: TickContext, reservable: dict[str, int]
+    ) -> None:
+        """Release every pin reservation the pin phase no longer keeps.
+
+        *reservable* maps each non-deterministic pin-queue entry to its
+        pin_order.  The kept owners are the first ``pin_reservation_max_active``
+        reservation owners still reservable, in (pin_order, task_id) order —
+        none when the kill switch is off.  Every other pin owner is released
+        through :meth:`_expire_parks` with its :func:`pin_release_reason`.
+
+        Order inside the loop is safe: when a head reserves, every reservable
+        pin with a lower pin_order has already been tried this tick, so the
+        cap keeps this tick's heads first, and a displaced pin is already
+        outranked by the head's pin rank on every key they share.  Terminal,
+        missing and deps-unsatisfied owners are park GC's, earlier in the tick.
+        """
+        owners = self.lock_table.snapshot_pin_reservations()
+        if not owners:
+            return
+        enabled = self.config.pin_reservations_enabled
+        cap = self.config.pin_reservation_max_active if enabled else 0
+        kept = sorted(
+            (owner for owner in owners if owner in reservable),
+            key=lambda owner: (reservable[owner], owner),
+        )[:cap]
+        released = owners.keys() - set(kept)
+
+        def _release_reason(owner: str) -> str | None:
+            if owner not in released:
+                return None
+            row = ctx.overrides.get(owner)
+            task = ctx.tasks_by_id.get(owner)
+            return pin_release_reason(
+                enabled=enabled,
+                reservable=owner in reservable,
+                pinned=row is not None and row.pinned,
+                gated=owner in ctx.gated_ids,
+                deterministic=task is not None and self.is_deterministic(task),
+            )
+
+        if released:
+            self._expire_parks(_release_reason)
 
     def _pin_queue(self, ctx: TickContext) -> list[_PinCandidate]:
         """Pinned tasks that may dispatch this tick, in pin_order ASC.
