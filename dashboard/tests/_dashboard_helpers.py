@@ -14,16 +14,20 @@ import re
 import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
+from unittest.mock import patch
 
 import aiosqlite
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from dashboard.config import DashboardConfig
+from dashboard.data.db import DbPool
+from dashboard.loops import _metrics_loop, _MetricsStore
 
 
 def live_aiosqlite_worker_threads() -> list[threading.Thread]:
@@ -235,6 +239,74 @@ async def drain(*tasks: asyncio.Task[Any]) -> None:
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# _metrics_loop driving harness (task 5095)
+#
+# ONE definition of "run the real _metrics_loop against a recorded
+# collect_metrics_snapshot until the caller has seen enough", shared by every
+# test that drives the loop directly.  Its contract is pinned by
+# test_metrics_loop_harness.py.
+# ---------------------------------------------------------------------------
+
+
+async def yielding_noop_sleep(*_args: object, **_kwargs: object) -> None:
+    """Stand-in for ``dashboard.loops._sleep_to_aligned_tick`` that suspends.
+
+    It MUST actually suspend.  A plain ``AsyncMock`` never yields, so the loop
+    spins synchronously and starves the event loop: an ``Event.set()`` waiter
+    (scheduled via ``call_soon``) never runs and ``asyncio.wait_for`` cannot
+    even time out.
+    """
+    await asyncio.sleep(0)
+
+
+async def drive_metrics_loop(
+    store: _MetricsStore,
+    app: FastAPI,
+    *,
+    pool: DbPool,
+    http_client: httpx.AsyncClient,
+    until: asyncio.Event,
+    on_collect: Callable[[dict[str, Any]], None] | None = None,
+    timeout: float = 2.0,
+) -> list[dict[str, Any]]:
+    """Run ``_metrics_loop`` until *until* is set; return each collect call's kwargs.
+
+    *pool* and *http_client* are passed to the loop explicitly, and
+    ``app.state`` is never read or written here -- the binding tests depend on
+    the caller's ``app.state`` staying exactly as it built it.
+
+    The caller sets *until* from wherever its observable lives: an *on_collect*
+    hook, a checkpoint mock.  *timeout* is a backstop that is SUPPRESSED, so
+    assert a positive witness (``until.is_set()``, non-empty calls) before any
+    upper-bound or absence assertion.  *on_collect* runs INSIDE the loop's
+    ``_run_once``, whose ``except Exception`` swallows whatever it raises, so a
+    hook should record and signal, never assert.
+
+    The loop task never outlives this call.
+    """
+    calls: list[dict[str, Any]] = []
+
+    async def _record(*_args: object, **kwargs: Any) -> None:
+        calls.append(kwargs)
+        if on_collect is not None:
+            on_collect(kwargs)
+
+    with (
+        patch('dashboard.loops.collect_metrics_snapshot', new=_record),
+        patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
+    ):
+        task = asyncio.create_task(_metrics_loop(store, app, pool=pool, http_client=http_client))
+        try:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(until.wait(), timeout=timeout)
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+    return calls
 
 
 # ---------------------------------------------------------------------------
