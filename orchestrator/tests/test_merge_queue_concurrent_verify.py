@@ -52,9 +52,7 @@ from _orch_helpers import (
     # task 4215 moved this constant to _orch_helpers.py, where a runtime
     # `tomllib` read of orchestrator/pyproject.toml now pins it against the
     # real `[tool.pytest.ini_options].timeout`
-    # (test_whole_tree_scan_timeout_guard.py).  It is re-exported through this
-    # module's namespace, which is how test_merge_speculation.py keeps
-    # importing it from here unchanged.
+    # (test_whole_tree_scan_timeout_guard.py).
     PYPROJECT_DEFAULT_TIMEOUT,
     RESPONSIVE_WAIT_STRETCH,
     RESPONSIVE_WAIT_WALL_CAP,
@@ -710,23 +708,33 @@ def _timeout_mark_offenders(
     budgets: dict[str, float],
     resolve: Callable[[str], object | None],
 ) -> list[str]:
-    """Pure offender-accumulation for the timeout-mark coverage guard.
+    """Pure offender-accumulation for the timeout-mark coverage guard: every
+    class's computed worst-case per-method *budget* must be cleared by the
+    timeout it actually runs under.
 
-    For each ``class_name -> budget`` pair at or above
-    ``PYPROJECT_DEFAULT_TIMEOUT``, resolve *class_name* via *resolve* and
-    check it carries a ``timeout`` mark whose value clears *budget*.
+    For each ``class_name -> budget`` pair, in sorted order:
+
+    - a budget <= 0 has nothing to cover and is skipped;
+    - a *class_name* that *resolve* cannot look up is an offender;
+    - a class carrying a ``timeout`` mark runs under THAT mark, whatever
+      the ambient budget -- a mark replaces it rather than raising a floor
+      under it -- so it is an offender iff the mark value is None or below
+      *budget*, at any budget;
+    - an unmarked class runs under ``_AMBIENT_TEST_TIMEOUT``, so it is an
+      offender iff *budget* reaches it.
+
     Returns one formatted offender string per failing class; an empty list
-    means every heavy class is adequately marked.
+    means every class is adequately covered.
 
     Extracted as a pure function (independent of ``globals()`` and this
-    module's real classes) so its three failure branches -- unresolvable
-    class name, missing mark, mark value too tight -- are each directly
-    testable with synthetic stubs, rather than only ever exercised by the
-    happy path over this module's own (now fully-marked) classes.
+    module's real classes) so its failure branches -- unresolvable class
+    name, missing mark, mark value too tight -- are each directly testable
+    with synthetic stubs, rather than only ever exercised by the happy path
+    over this module's own (now fully-marked) classes.
     """
     offenders: list[str] = []
     for class_name, budget in sorted(budgets.items()):
-        if budget < PYPROJECT_DEFAULT_TIMEOUT:
+        if budget <= 0:
             continue
 
         cls = resolve(class_name)
@@ -743,12 +751,16 @@ def _timeout_mark_offenders(
             None,
         )
         if mark is None:
+            if budget < _AMBIENT_TEST_TIMEOUT:
+                continue
             offenders.append(
                 f'{class_name}: computed worst-case per-method wait '
-                f'budget is {budget}s (>= the '
-                f'{PYPROJECT_DEFAULT_TIMEOUT}s pyproject default), but '
-                f'the class carries no @pytest.mark.timeout mark at '
-                f'all.'
+                f'budget is {budget}s, reaching the '
+                f'{_AMBIENT_TEST_TIMEOUT}s an unmarked class runs under '
+                f'(the tighter of the {PYPROJECT_DEFAULT_TIMEOUT}s ini '
+                f'default and verify\'s --timeout='
+                f'{VERIFY_CLI_PER_TEST_TIMEOUT}), but the class carries '
+                f'no @pytest.mark.timeout mark at all.'
             )
             continue
 
@@ -7264,9 +7276,10 @@ class TestTimeoutMarkOffenders:
 
 
 class TestTimeoutMarkCoverage:
-    """Enforced invariant: every class in THIS module whose computed
-    worst-per-method wait budget clears the pyproject default timeout must
-    carry a `@pytest.mark.timeout` mark whose value clears that budget.
+    """Enforced invariant: every class in THIS module must have its computed
+    worst-case per-method wait budget cleared by the timeout it actually
+    runs under -- its own `@pytest.mark.timeout` mark if it has one, else
+    the ambient budget (see `_timeout_mark_offenders`).
 
     This is what stops the recurrence task 3492 exists to fix: task 2350
     widened a wait region without adding a mark, task 2376 widened five more
@@ -7283,8 +7296,9 @@ class TestTimeoutMarkCoverage:
     """
 
     def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
-        """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
-        carry a `timeout` mark whose value clears its own computed budget.
+        """Every Test* class's computed worst-case per-method wait budget
+        must be cleared by the timeout it actually runs under (its own mark
+        if it has one, else the ambient budget).
 
         First run (task 3492 step-3, before step-4 added marks) flagged six
         classes computing >= 60s with no timeout mark at all --
@@ -7301,12 +7315,10 @@ class TestTimeoutMarkCoverage:
         offenders = _timeout_mark_offenders(budgets, globals().get)
 
         assert not offenders, (
-            'The following classes have a worst-case per-method wait '
-            f'budget at or above the pyproject default timeout '
-            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see the '
-            f'[tool.pytest.ini_options].timeout setting in '
-            f'orchestrator/pyproject.toml) but lack an adequate '
-            f'@pytest.mark.timeout mark:\n'
+            'The following classes have a computed worst-case per-method '
+            'wait budget that the timeout they actually run under (their '
+            'own mark if they have one, else the ambient budget) does not '
+            'clear:\n'
             + '\n'.join(f'  - {offender}' for offender in offenders)
             + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
             'the xdist worker under --max-worker-restart=0, so a '

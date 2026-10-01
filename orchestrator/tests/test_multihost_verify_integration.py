@@ -73,7 +73,6 @@ from _merge_lane_fakes import (
 from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
     HEAVY_BARRIER_TEST_TIMEOUT,
-    PYPROJECT_DEFAULT_TIMEOUT,
     _inject_two_host_allocator,
     _make_branch_with_file,
     _timeout_mark_offenders,
@@ -2906,9 +2905,10 @@ class TestIndeterminateLocalLegDoesNotVeto:
 
 
 class TestTimeoutMarkCoverage:
-    """Enforced invariant: every class in THIS module whose computed
-    worst-per-method wait budget clears the pyproject default timeout must
-    carry a ``@pytest.mark.timeout`` mark whose value clears that budget.
+    """Enforced invariant: every class in THIS module must have its computed
+    worst-case per-method wait budget cleared by the timeout it actually
+    runs under -- its own ``@pytest.mark.timeout`` mark if it has one, else
+    the ambient budget (see ``_timeout_mark_offenders``).
 
     Task 3492 built this guard, and task 5030 gave test_merge_speculation.py
     its own copy -- but both resolve ``Path(__file__)`` against their own
@@ -2934,8 +2934,9 @@ class TestTimeoutMarkCoverage:
     """
 
     def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
-        """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
-        carry a ``timeout`` mark whose value clears its own computed budget.
+        """Every Test* class's computed worst-case per-method wait budget
+        must be cleared by the timeout it actually runs under (its own mark
+        if it has one, else the ambient budget).
 
         Recomputes from source; no figure written anywhere in this file is
         load-bearing for the assertion.  (For orientation only, current at the
@@ -2948,12 +2949,10 @@ class TestTimeoutMarkCoverage:
         offenders = _timeout_mark_offenders(budgets, globals().get)
 
         assert not offenders, (
-            'The following classes have a worst-case per-method wait '
-            f'budget at or above the pyproject default timeout '
-            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see the '
-            f'[tool.pytest.ini_options].timeout setting in '
-            f'orchestrator/pyproject.toml) but lack an adequate '
-            f'@pytest.mark.timeout mark:\n'
+            'The following classes have a computed worst-case per-method '
+            'wait budget that the timeout they actually run under (their '
+            'own mark if they have one, else the ambient budget) does not '
+            'clear:\n'
             + '\n'.join(f'  - {offender}' for offender in offenders)
             + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
             'the xdist worker under --max-worker-restart=0, so a '
