@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from shared.task_statuses import TaskStatus
 
+from dashboard.data import datum as datum_module
 from dashboard.data.census import build_census
 from dashboard.data.datum import (
     Datum,
@@ -348,6 +349,14 @@ def test_an_aged_datum_passes_validation_at_the_instant_it_was_aged_for():
     as_of = SERVED_AT - timedelta(seconds=BOUND_SECONDS * 3)
 
     validate_datum(aged_at(datum_measured_at(as_of), SERVED_AT), SERVED_AT)
+
+
+def test_unknown_datum_builds_the_triad_validate_accepts():
+    built = datum_module.unknown_datum('the probe failed', 45)
+
+    assert (built.value, built.as_of, built.state) == (None, None, DatumState.UNKNOWN)
+    assert (built.reason, built.freshness_bound_seconds) == ('the probe failed', 45)
+    validate_datum(built, SERVED_AT)
 
 
 # ---------------------------------------------------------------------------

@@ -21,7 +21,7 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Generic, Protocol, TypeVar, runtime_checkable
+from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
 T = TypeVar('T')
 
@@ -140,12 +140,18 @@ class DatumInvariant(enum.StrEnum):
 
     Carried as a structured field so a caller recovers WHICH rule broke
     without parsing the message — the message is free to be reworded.
+
+    ``DATUM_REQUIRED`` is a payload's rule rather than the envelope's: a field
+    the payload declares as a ``Datum`` holds one. A shaper raises it instead
+    of inventing an ``unknown`` placeholder, because a field its route never
+    filled is a wiring bug, not a measurement.
     """
 
     UNKNOWN_TRIAD = 'unknown_triad'
     TZ_AWARE = 'tz_aware'
     REASON_REQUIRED = 'reason_required'
     FRESHNESS_BOUND = 'freshness_bound'
+    DATUM_REQUIRED = 'datum_required'
 
 
 class DatumContractError(ValueError):
@@ -158,6 +164,16 @@ class DatumContractError(ValueError):
     def __init__(self, invariant: DatumInvariant, message: str) -> None:
         super().__init__(message)
         self.invariant = invariant
+
+
+def unknown_datum(reason: str, freshness_bound_seconds: int) -> Datum[Any]:
+    """A datum with no measurement: no value, no ``as_of``, and *reason* saying why.
+
+    The one constructor of the ``unknown`` triad, so every producer builds it
+    the way :func:`validate_datum` checks it. ``datum.js``'s ``unknownDatum``
+    is its client twin.
+    """
+    return Datum(None, None, DatumState.UNKNOWN, reason, freshness_bound_seconds)
 
 
 def validate_datum(datum: Datum, served_at: datetime) -> None:

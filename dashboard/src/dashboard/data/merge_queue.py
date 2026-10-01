@@ -28,7 +28,7 @@ import aiosqlite
 import httpx
 
 from dashboard.data.chart_utils import ChartData
-from dashboard.data.datum import Datum, DatumState
+from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.db import with_db
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.stats_utils import percentile
@@ -702,7 +702,7 @@ def enrich_merges_with_titles(
 
 
 def _unknown_title(reason: str) -> Datum[str]:
-    return Datum(None, None, DatumState.UNKNOWN, reason, FETCHED_ROW_FRESHNESS_BOUND_SECONDS)
+    return unknown_datum(reason, FETCHED_ROW_FRESHNESS_BOUND_SECONDS)
 
 
 async def build_per_project_merge_queue(
@@ -913,15 +913,13 @@ def resolve_active(
 def _last_sample(history: Mapping[str, Sequence[Any]], why: str) -> Datum[int]:
     labels, values = history.get('labels') or (), history.get('values') or ()
     if not labels or not values:
-        return Datum(
-            None, None, DatumState.UNKNOWN,
+        return unknown_datum(
             f'{why}; no sample in the history window', LIVE_QUEUE_FRESHNESS_BOUND_SECONDS,
         )
     try:
         sampled_at = parse_utc(labels[-1])
     except (TypeError, ValueError):
-        return Datum(
-            None, None, DatumState.UNKNOWN,
+        return unknown_datum(
             f'{why}; the last sample has no readable instant ({labels[-1]!r})',
             LIVE_QUEUE_FRESHNESS_BOUND_SECONDS,
         )

@@ -58,7 +58,7 @@ from dashboard.data.census import (
     TaskView,
     build_census,
 )
-from dashboard.data.datum import Datum, DatumState, aged_at, validate_datum
+from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum, validate_datum
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.tasks import (
     fetch_statuses,
@@ -375,16 +375,13 @@ def _datum(
     reason = half.reason or 'read failed'
     previous = _last_good.get(project_root, {}).get(name)
     if previous is None:
-        return Datum(
-            None, None, DatumState.UNKNOWN, reason, FRESHNESS_BOUND_SECONDS,
-        )
+        return unknown_datum(reason, FRESHNESS_BOUND_SECONDS)
     age = (now - previous.as_of).total_seconds()
     if age > _RETENTION_BOUND_SECONDS:
         # Past the bound a last good stops being evidence about the present.
         # Serving it would put a day-old census behind a stale badge that
         # reads the same as a twenty-second-old one.
-        return Datum(
-            None, None, DatumState.UNKNOWN,
+        return unknown_datum(
             f'{reason} (last good is {int(age)}s old, past the '
             f'{_RETENTION_BOUND_SECONDS}s retention bound)',
             FRESHNESS_BOUND_SECONDS,
@@ -566,7 +563,7 @@ def unmeasured_snapshot(
     so its last good is still honest evidence.
     """
     return _assemble(
-        Datum(None, None, DatumState.UNKNOWN, reason, FRESHNESS_BOUND_SECONDS),
+        unknown_datum(reason, FRESHNESS_BOUND_SECONDS),
         _HalfRead(None, failure, reason),
         failure=failure, now=now, project_root=str(project_root),
     )
@@ -735,8 +732,7 @@ async def acquire_terminal_window(
     completing between the two shifts the window by a row.
     """
     if terminal_total is None:
-        return Datum(
-            None, None, DatumState.UNKNOWN,
+        return unknown_datum(
             'the terminal window cannot be positioned without a measured '
             'terminal count, and an unpositioned window serves the OLDEST '
             'rows rather than the newest',
@@ -765,10 +761,7 @@ async def acquire_terminal_window(
         label='terminal window',
     )
     if half.value is None:
-        return Datum(
-            None, None, DatumState.UNKNOWN, half.reason or 'read failed',
-            FRESHNESS_BOUND_SECONDS,
-        )
+        return unknown_datum(half.reason or 'read failed', FRESHNESS_BOUND_SECONDS)
     return Datum(
         half.value, now, DatumState.LOWER_BOUND,
         (

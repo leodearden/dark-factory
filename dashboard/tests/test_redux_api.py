@@ -8,7 +8,7 @@ import pytest
 
 from dashboard import loops
 from dashboard.data import burndown, census, redux_api
-from dashboard.data.datum import Datum, DatumContractError, DatumState
+from dashboard.data.datum import Datum, DatumContractError, DatumInvariant, DatumState
 from dashboard.data.performance import PerformanceCards
 
 # ---------------------------------------------------------------------------
@@ -568,6 +568,15 @@ def test_shape_recon_no_verdict_returns_none():
 MQ_SERVED_AT = datetime(2026, 10, 1, 12, 0, 30, tzinfo=UTC)
 """The serving instant every shape_merge_queue case ages and validates against."""
 
+_MQ_MEASURED_QUEUE = {'in_queue': Datum(0, MQ_SERVED_AT, DatumState.FRESH, None, 30)}
+"""The queue fields the route resolves for every project: here, a measured empty queue."""
+
+
+def _mq_titled(task_id: str) -> dict:
+    """A merge row whose title the route already looked up."""
+    title = Datum(f'task {task_id}', MQ_SERVED_AT, DatumState.FRESH, None, 1200)
+    return {'task_id': task_id, 'title': title}
+
 
 def _task_ids(rows):
     return [row['task_id'] for row in rows]
@@ -579,9 +588,10 @@ def test_shape_merge_queue_relabels_and_renames_depth():
             'depth_timeseries': {'labels': [0, 1], 'values': [3, 4]},
             'outcomes': {'labels': ['done'], 'values': [12]},
             'latency': {'p50': 6000},
-            'recent': [{'task_id': '17'}],
+            'recent': [_mq_titled('17')],
             'speculative': {'hit_rate': 0.75},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
@@ -595,7 +605,7 @@ def test_shape_merge_queue_relabels_and_renames_depth():
 
 def test_shape_merge_queue_carries_the_recent_window_total():
     """recent_total is the window's merge count, which the capped recent rows may not reach."""
-    recent = [{'task_id': str(i)} for i in range(200)]
+    recent = [_mq_titled(str(i)) for i in range(200)]
     raw = {
         '/home/leo/src/dark-factory': {
             'depth_timeseries': {'labels': [], 'values': []},
@@ -605,6 +615,7 @@ def test_shape_merge_queue_carries_the_recent_window_total():
             'recent_total': 228,
             'speculative': {},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
         },
         '/home/leo/src/reify': {
             'depth_timeseries': {'labels': [], 'values': []},
@@ -613,6 +624,7 @@ def test_shape_merge_queue_carries_the_recent_window_total():
             'recent': [],
             'speculative': {},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
         },
     }
     mq = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)['MERGE_QUEUE']
@@ -630,6 +642,7 @@ def test_shape_merge_queue_injects_halt_status_per_project():
             'recent': [],
             'speculative': {'hit_rate': 0.0},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
         },
         '/home/leo/src/know-live': {
             'depth_timeseries': {'labels': [], 'values': []},
@@ -638,6 +651,7 @@ def test_shape_merge_queue_injects_halt_status_per_project():
             'recent': [],
             'speculative': {'hit_rate': 0.0},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
         },
         '/home/leo/src/dark-factory': {
             'depth_timeseries': {'labels': [], 'values': []},
@@ -646,6 +660,7 @@ def test_shape_merge_queue_injects_halt_status_per_project():
             'recent': [],
             'speculative': {'hit_rate': 0.0},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
         },
     }
     halt_status = {
@@ -672,6 +687,7 @@ def test_shape_merge_queue_includes_train_events():
             'recent': [],
             'speculative': {'hit_rate': 0.0},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
             'train_events': [
                 {
                     'event_type': 'train_started',
@@ -699,6 +715,7 @@ def test_shape_merge_queue_includes_train_events():
             'recent': [],
             'speculative': {'hit_rate': 0.0},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
             # no 'train_events' key
         },
     }
@@ -732,6 +749,7 @@ def test_shape_merge_queue_attaches_outcome_colors():
             'recent': [],
             'speculative': {},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
@@ -758,6 +776,7 @@ def test_shape_merge_queue_empty_outcomes_yields_empty_colors():
             'recent': [],
             'speculative': {},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
         },
     }
     body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
@@ -2023,6 +2042,7 @@ def _mq_project(**overrides) -> dict:
         'recent': [],
         'speculative': {},
         'active': [],
+        **_MQ_MEASURED_QUEUE,
         'train_events': [],
     }
     data.update(overrides)
@@ -2068,12 +2088,15 @@ class TestShapeMergeQueueServedDatums:
 
         assert (wire['state'], wire['reason']) == ('stale', 'connect refused')
 
-    def test_a_missing_in_queue_is_unknown_with_a_reason(self):
-        wire = _shaped()['in_queue']
+    def test_a_project_without_an_in_queue_datum_is_a_wiring_bug(self):
+        project = _mq_project()
+        del project['in_queue']
 
-        assert wire['state'] == 'unknown'
-        assert wire['value'] is None
-        assert wire['reason']
+        with pytest.raises(DatumContractError) as excinfo:
+            redux_api.shape_merge_queue({'/proj/myproj': project}, served_at=MQ_SERVED_AT)
+
+        assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
+        assert 'myproj' in str(excinfo.value)
 
     def test_every_row_title_is_a_wire_datum(self):
         found = Datum('Fix X', MQ_SERVED_AT - timedelta(seconds=5), DatumState.FRESH, None, 1200)
@@ -2087,12 +2110,14 @@ class TestShapeMergeQueueServedDatums:
         assert section['recent'] == [{'task_id': '7', 'title': found.to_wire()}]
         assert section['active'] == [{'task_id': '8', 'title': unread.to_wire()}]
 
-    def test_a_row_with_no_lookup_has_an_unknown_title(self):
-        section = _shaped(recent=[{'task_id': '7'}], active=[{'task_id': '8', 'title': ''}])
+    @pytest.mark.parametrize('table', ['recent', 'active'])
+    @pytest.mark.parametrize('row', [{'task_id': '7'}, {'task_id': '7', 'title': ''}])
+    def test_a_row_without_a_title_datum_is_a_wiring_bug(self, table, row):
+        with pytest.raises(DatumContractError) as excinfo:
+            _shaped(**{table: [row]})
 
-        for row in (*section['recent'], *section['active']):
-            assert row['title']['state'] == 'unknown'
-            assert row['title']['reason']
+        assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
+        assert table in str(excinfo.value)
 
     def test_latency_carries_the_timed_and_untimed_split(self):
         latency = {'p50': 100, 'p95': 200, 'p99': 300, 'mean_ms': 150.0,
@@ -2142,6 +2167,7 @@ def test_shape_merge_queue_includes_train_throughput():
             'recent': [],
             'speculative': {'hit_rate': 0.0},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
             'train_events': [],
             'train_throughput': throughput_payload,
         },
@@ -2166,6 +2192,7 @@ def test_shape_merge_queue_includes_train_throughput():
             'recent': [],
             'speculative': {'hit_rate': 0.0},
             'active': [],
+            **_MQ_MEASURED_QUEUE,
             'train_events': [],
             # no 'train_throughput' key
         },
@@ -2188,6 +2215,7 @@ def _mq_project_base() -> dict:
         'recent': [],
         'speculative': {'hit_rate': 0.0},
         'active': [],
+        **_MQ_MEASURED_QUEUE,
     }
 
 

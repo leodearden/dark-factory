@@ -37,7 +37,7 @@ import httpx
 from shared.task_statuses import TERMINAL
 
 from dashboard.config import DashboardConfig
-from dashboard.data.datum import Datum, DatumState
+from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.task_snapshot import acquire_snapshot
 from dashboard.data.tasks import (
@@ -109,7 +109,7 @@ def _lookup_cache_clear() -> None:
 
 
 def _unknown(reason: str) -> Datum[dict]:
-    return Datum(None, None, DatumState.UNKNOWN, reason, FETCHED_ROW_FRESHNESS_BOUND_SECONDS)
+    return unknown_datum(reason, FETCHED_ROW_FRESHNESS_BOUND_SECONDS)
 
 
 def _datum_of(ref: TaskRef, fetched: _Fetched) -> Datum[dict]:

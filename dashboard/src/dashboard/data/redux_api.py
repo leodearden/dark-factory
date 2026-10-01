@@ -26,14 +26,19 @@ from dashboard.data.burndown import (
     compute_parity_alarm,
     compute_window_completion,
 )
-from dashboard.data.datum import Datum, DatumState, aged_at, validate_datum
+from dashboard.data.datum import (
+    Datum,
+    DatumContractError,
+    DatumInvariant,
+    DatumState,
+    aged_at,
+    validate_datum,
+)
 from dashboard.data.escalations import resolve_owning_project
 from dashboard.data.mcp_fanout import project_label
-from dashboard.data.merge_queue import LIVE_QUEUE_FRESHNESS_BOUND_SECONDS
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceCards
 from dashboard.data.stats_utils import percentile
-from dashboard.data.task_lookup import FETCHED_ROW_FRESHNESS_BOUND_SECONDS
 from dashboard.data.utils import resolve_now
 
 # ---------------------------------------------------------------------------
@@ -458,9 +463,10 @@ def shape_merge_queue(
     ``speculative``, ``active`` (the live probe's entries), ``in_queue``,
     ``active_spark``, ``halt``, ``train_events``.
 
-    ``in_queue`` and every ``recent``/``active`` row's ``title`` are Datums,
-    each aged to *served_at*, validated against it and rendered to the wire.
-    A Datum that breaks its contract there is a shaper bug, and the
+    ``in_queue`` and every ``recent``/``active`` row's ``title`` are Datums the
+    route resolved, each aged to *served_at*, validated against it and
+    rendered to the wire. A field that is not a Datum, or a Datum that breaks
+    its contract there, is a wiring or shaper bug, and the
     :class:`~dashboard.data.datum.DatumContractError` propagates.
 
     ``active_sparks`` (optional) is ``in_queue``'s sampled history, keyed by
@@ -471,17 +477,19 @@ def shape_merge_queue(
     projects fall back to ``{offline: True}`` so the UI can render an Offline
     pill on every panel.
     """
-    def _served(datum: Datum[Any]) -> dict[str, object]:
-        aged = aged_at(datum, served_at)
+    def _served(candidate: object, field: str) -> dict[str, object]:
+        if not isinstance(candidate, Datum):
+            raise DatumContractError(
+                DatumInvariant.DATUM_REQUIRED,
+                f'MERGE_QUEUE {field} must be a Datum, got {candidate!r}',
+            )
+        aged = aged_at(candidate, served_at)
         validate_datum(aged, served_at)
         return aged.to_wire()
 
-    def _titled(rows: Iterable[Mapping[str, Any]] | None) -> list[dict[str, Any]]:
+    def _titled(rows: Iterable[Mapping[str, Any]] | None, table: str) -> list[dict[str, Any]]:
         return [
-            {**row, 'title': _served(_datum_or_unknown(
-                row.get('title'), 'no task lookup for this row',
-                FETCHED_ROW_FRESHNESS_BOUND_SECONDS,
-            ))}
+            {**row, 'title': _served(row.get('title'), f'{table} row title')}
             for row in rows or ()
         ]
 
@@ -495,14 +503,11 @@ def shape_merge_queue(
             'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
             'outcomes': _shape_outcomes(data.get('outcomes')),
             'latency': dict(data.get('latency') or {}),
-            'recent': _titled(data.get('recent')),
+            'recent': _titled(data.get('recent'), f'{label}.recent'),
             'recent_total': int(data.get('recent_total') or 0),
             'speculative': dict(data.get('speculative') or {}),
-            'active': _titled(data.get('active')),
-            'in_queue': _served(_datum_or_unknown(
-                data.get('in_queue'), 'no in-queue reading for this project',
-                LIVE_QUEUE_FRESHNESS_BOUND_SECONDS,
-            )),
+            'active': _titled(data.get('active'), f'{label}.active'),
+            'in_queue': _served(data.get('in_queue'), f'{label}.in_queue'),
             'active_spark': {
                 'labels': list(spark.get('labels') or []),
                 'values': list(spark.get('values') or []),
@@ -514,12 +519,6 @@ def shape_merge_queue(
             'metrics': dict(data.get('live_metrics') or {}),
         }
     return {'MERGE_QUEUE': out, 'served_at': served_at.isoformat()}
-
-
-def _datum_or_unknown(candidate: object, reason: str, bound: int) -> Datum[Any]:
-    if isinstance(candidate, Datum):
-        return candidate
-    return Datum(None, None, DatumState.UNKNOWN, reason, bound)
 
 
 # ---------------------------------------------------------------------------
