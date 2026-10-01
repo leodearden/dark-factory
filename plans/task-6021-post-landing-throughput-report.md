@@ -392,3 +392,96 @@ WHERE event_type = 'merge_flake_suppressed' AND timestamp >= :t AND timestamp < 
 
 Each of the three `passes_in_isolation` rows has a matching suppression. Each of those merges
 then passed on attempt 0 and landed: 6036 at 07:48:17, 5460 at 13:32:55, 4880 at 16:58:09.
+
+## 6. Tail check since the cut: [2026-10-01T05:48Z, 06:46:53Z]
+
+The same landing, gap, `merge_verify`, junit and flake queries were re-run over [CUT, now], with
+the gap anchored on the last landing before the cut (4855 at 05:46:26). These numbers stand
+apart from §§2-5, which stay as measured for the fixed window.
+
+- **Landings: 1.** 5125 landed at 06:38:41 (`merge_finalized` done, 1e6a7074c0). Its laptop
+  verify passed at 05:57:12 (764 s, attempt 0). The local parity verify followed, with
+  `verdict_parity_ok` at 06:36:45.
+- **Gaps: none over 60 min.** 05:46:26 → 06:38:41 is 52 min. Heartbeat depth was 1 and
+  `verify_in_progress` was 5125 on all 11 heartbeats in that gap. As of 06:46:53 no request has
+  been queued since 06:38:41, and no heartbeat has been emitted, which means depth 0: the lane is
+  empty, not stalled.
+- **Merge verifies: 1**, passed.
+- **Orchestrator legs: 1.** 5125's `attempt-1.orchestrator.junit-20261001T061929_601697Z.xml.gz`
+  shows 23,293 tests, 0 failures, 0 errors, 650.7 s.
+- **Flakes: 0** `flake_occurrence` rows and 0 `merge_flake_suppressed` events since the cut.
+- The run is unchanged: all events since the cut come from `run-cf328df0190f`.
+
+No new qualifying stall, so no `escalate_blocker` was filed.
+
+## Verdict
+
+Rule (task 6021, WORK 5). **REVERT** only if some gap of 60 minutes or more after T meets all
+three conditions:
+
+- **(a)** merge-heartbeat depth was at least 1 throughout the gap;
+- **(b)** the gap contains an orchestrator-leg red, meaning a junit with failures + errors > 0
+  that was not absorbed as a flake, or an orchestrator-leg timeout;
+- **(c)** that red or timeout is what kept the gap from closing.
+
+| gap (UTC) | (a) depth ≥ 1 throughout | (b) unabsorbed orchestrator red or timeout | (c) | qualifies |
+|---|---|---|---|---|
+| 09-29 23:32 → 00:54 | nominally (16-18), but no runnable work for 55 min | no: 6029 leg 0 failures | — | no |
+| 09-30 01:23 → 02:41 | nominally (16-17), but no runnable work for 49 min | no: 4780 leg 0 failures | — | no |
+| 09-30 09:09 → 10:17 | **no**: 33.4 min heartbeat silence, so depth 0 | no: 5100 merge verify passed; no junit archived | — | no |
+| 09-30 12:26 → 13:32 | **no**: 30.4 min heartbeat silence, so depth 0 | no: 5460 leg's 1 failure absorbed (`passes_in_isolation`, `merge_flake_suppressed`) | — | no |
+| 09-30 14:56 → 16:26 | nominally (2-5), but no runnable work for 57 min | no: 5068 leg 0 failures | — | no |
+| 09-30 18:18 → 19:27 | nominally (2-4), but no runnable work for 39 min | no: 5974 leg 0 failures | — | no |
+| 10-01 04:42 → 05:44 | yes (3-11) | no: the 6015, 4855 and 4715 orchestrator legs all had 0 failures. The red was 6015's `tests_scripts` leg (rc 143) | — | no |
+
+There are no orchestrator-leg timeouts in the window or the tail. The only two failed merge
+verifies are 3056, a `shared` leg, real failure, and 6015, a `tests_scripts` leg.
+
+**Verdict: NO REVERT.** The merge gate did not stall after 5677 landed:
+
+- landings ran at 1.35 per hour over the 31.15 h window, above the task's "about 1 per hour"
+  and above every one of the seven prior days (0.46-1.04 per hour);
+- all 40 orchestrator merge-gate legs ran 23,129-23,295 tests in 268.6-757.5 s, with none over
+  1,000 s;
+- the two orchestrator-leg flakes were absorbed by the isolated re-run without failing a merge;
+- the tail check since the cut adds one landing, one 650.7 s leg and no new stall.
+
+`git revert -m 1 10907428b1` is not needed.
+
+**Recorded, not reverted** (WORK 5):
+
+- **Arrival-limited gaps, 1-6.** Each one is an idle lane: 33-57 min with nothing runnable. In
+  gaps 3 and 4 the pipeline was empty. In gaps 1, 2, 5 and 6 the heartbeat's depth counted only
+  stale, non-runnable registry entries (4792 at about 110 h, and 5590's blocked first request
+  after 5590 had landed). Each gap closed on the first arrival's single passing attempt-0 verify,
+  1,580-2,133 s.
+  - The stale entries are reported as recurrence evidence for task 3860 (phantom `queued`
+    head-of-line) in `esc-6021-1`.
+- **Gap 7, 04:42 → 05:44: infra.** The orchestrator restarted between 05:00:55 and 05:01:38
+  (run `run-357d1ceb138e` → `run-cf328df0190f`). 6015's `tests_scripts` leg ended at about
+  05:00:49 with rc 143, and the merge worker blocked 4855, 5125 and 4715 as `Merge worker
+  shutting down`. All three re-queued at 05:01:41; 4715 and 4855 then landed in the gap
+  (05:44:25, 05:46:26) and 5125 after the cut (06:38:41).
+  - Hypothesis: the restart SIGTERMed 6015's leg; rc 143 = 128 + 15.
+  - Separately, 4715 landed 30 min after its laptop verify passed, because the local parity
+    verify runs first. 5125 shows the same pattern in the tail: a 764 s laptop pass, then a
+    41-min wait to landing.
+
+## Caveats
+
+- **The rate is set by arrivals as well as by the gate.** In gaps 1-6 the lane waited for work,
+  so 1.35 per hour shows the gate is not the bottleneck. It does not by itself measure a gate
+  speed-up, and the per-day baselines are not controlled for arrivals or host load.
+- **The window includes 5677's own train at T.** Without it, the window has 41 landings at
+  1.32 per hour.
+- **The junit archive covers only legs the merge gate archived.** 4 of the 43 `merge_verify`
+  rows (5100, 4172, 5883, 5884, all passed) have no `data/verify-logs/<task>/` directory, and the
+  cause was not determined. Because every leg of a passed verify passed, the missing archives
+  hide no red. But four leg times are unmeasured. Follow-up filed as ticket
+  `tkt_0RV9AEB6J2MV4ZY7VJH6C41HH9`.
+- **Heartbeat depth overstates runnable work** (task 3860). Condition (a) was therefore judged
+  from heartbeat silences, `verify_in_progress`, `occupancy.inflight_total` and `merge_queued`
+  `queue_depth`, not from `depth` alone.
+- **`merge_verify.duration_ms` is the whole multi-module gate**, 767-2,748 s in the window with a
+  median of 1,836 s. It is not the orchestrator leg; per-leg times come from the junit `time`
+  attribute.
