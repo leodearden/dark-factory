@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -6920,6 +6921,99 @@ def test_main_reap_decisions_warns_on_a_declined_alias_target(
     # one. All the hint does is make the zero-match visible.
     listed = {d.id: d.state for d in sr.list_decisions(root=tmp_path)}
     assert listed['dec-solar'] == sr.DecisionState.OPEN
+
+
+def test_project_token_census_counts_every_state_under_the_folded_token() -> None:
+    decisions = [
+        _make_decision(id='a', project='df', state=sr.DecisionState.OPEN),
+        _make_decision(id='b', project='dark-factory', state=sr.DecisionState.ANSWERED),
+        _make_decision(id='c', project='dark_factory', state=sr.DecisionState.DROPPED),
+        _make_decision(id='d', project='reify', state=sr.DecisionState.OPEN),
+    ]
+
+    assert sr.project_token_census(decisions) == Counter({'dark_factory': 3, 'reify': 1})
+
+
+class TestReapExpectMatches:
+    """``reap-decisions --expect-matches`` names a --project no registry record carries (task 4835)."""
+
+    @staticmethod
+    def _seed(root: Path) -> Path:
+        for decision_id, project, state in [
+            ('dec-df-1', 'dark_factory', sr.DecisionState.ANSWERED),
+            ('dec-df-2', 'df', sr.DecisionState.DROPPED),
+            ('dec-reify', 'reify', sr.DecisionState.ANSWERED),
+        ]:
+            sr.write_decision(_make_decision(id=decision_id, project=project, state=state), root=root)
+        return root / 'esc'
+
+    @staticmethod
+    def _reap(queue: Path, project: str, *flags: str) -> int:
+        return sr.main(['reap-decisions', '--project', project, '--escalations-dir', str(queue), *flags])
+
+    @staticmethod
+    def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_token_no_record_carries_warns_once_naming_the_tokens_that_exist(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = self._seed(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            rc = self._reap(queue, 'autopilot_video', '--expect-matches')
+
+        assert rc == 0
+        assert capsys.readouterr().out == ''
+        [warning] = self._warnings(caplog)
+        for named in ('autopilot_video', 'ZERO', 'dark_factory=2', 'reify=1'):
+            assert named in warning
+
+    def test_a_token_with_records_but_nothing_to_reap_is_quiet(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = self._seed(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            assert self._reap(queue, 'reify', '--expect-matches') == 0
+
+        assert self._warnings(caplog) == []
+
+    def test_without_the_flag_an_unmatched_token_is_quiet(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The per-cycle Main Loop reap: a never-filed project must not warn every cycle."""
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = self._seed(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            assert self._reap(queue, 'autopilot_video') == 0
+
+        assert self._warnings(caplog) == []
+
+    def test_a_declined_alias_target_warns_once_with_the_declined_hint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = self._seed(tmp_path)
+
+        with caplog.at_level(logging.WARNING):
+            assert self._reap(queue, 'my_solar_challenge', '--expect-matches') == 0
+
+        [warning] = self._warnings(caplog)
+        assert 'DECLINED' in warning
+
+    def test_the_flag_is_an_opt_in_switch(self) -> None:
+        argv = ['reap-decisions', '--project', 'df', '--escalations-dir', '/q']
+
+        assert sr._build_parser().parse_args(argv).expect_matches is False
+        assert sr._build_parser().parse_args([*argv, '--expect-matches']).expect_matches is True
 
 
 def test_main_reap_decisions_recommended_solar_token_warns_nothing(
