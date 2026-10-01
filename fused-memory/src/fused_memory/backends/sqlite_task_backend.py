@@ -3573,8 +3573,11 @@ class SqliteTaskBackend:
         """Privileged, non-protocol writer of done_provenance/reopen_* audit fields.
 
         Reachable only from :class:`TaskInterceptor` (PRD C-C) — ``update_task``
-        remains the sole PUBLIC metadata writer and unconditionally rejects
-        ``metadata.done_provenance`` (see the floor above). Performs a
+        remains the sole PUBLIC metadata writer and never adds, changes or
+        removes ``metadata.done_provenance`` (see the floor above; its
+        metadata_mode='replace' carve-out admits only a verbatim passthrough,
+        which is not a write). This seam, with ``set_status_and_stamp_audit``,
+        remains the only writer that can CHANGE done_provenance. Performs a
         read-modify-write merge under the same write-lock + txn pattern as
         ``update_task``/``set_task_claimant``: last-write-wins on the supplied
         keys, preserving every omitted sibling key (``memory_hints``, ``files``,

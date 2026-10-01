@@ -9643,7 +9643,12 @@ def create_mcp_server(
                 - ``'additive'`` — recursive list union+dedup, scalar/type-collision
                   OLD-wins. Use for list-append callers (dry_run_proposals, etc.).
                 - ``'replace'`` — whole-blob overwrite. Bypasses the corrupt-blob
-                  guard; the sanctioned repair path.
+                  guard; the sanctioned repair path. This is how you RETIRE a
+                  metadata key: read the task, drop the key, send the complete
+                  remainder back. It works on done/merged tasks, but you must
+                  send back the ``done_provenance`` you just read, unchanged —
+                  adding, changing or dropping it is rejected with
+                  ``error == 'done_provenance_via_update_task'``.
             append: DEPRECATED shim. ``True`` → ``'additive'``. A bare
                 ``append=False`` (no ``metadata_mode``) on a metadata write is
                 now **rejected** by the backend — it used to silently whole-blob

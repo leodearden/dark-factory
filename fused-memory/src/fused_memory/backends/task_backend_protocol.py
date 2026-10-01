@@ -206,7 +206,12 @@ class TaskBackendProtocol(Protocol):
         * ``metadata_mode='additive'`` — recursive list union+dedup,
           scalar/type-collision OLD-wins.  Required by list-append callers.
         * ``metadata_mode='replace'`` — whole-blob overwrite.  Bypasses the
-          corrupt-blob guard; the sanctioned repair path.
+          corrupt-blob guard; the sanctioned repair path.  It is the ONLY mode
+          that can retire a key ('merge'/'additive' have no deletion
+          sentinel).  It is usable on done/merged tasks provided the payload
+          carries the stored ``metadata.done_provenance`` verbatim: adding,
+          changing or dropping it is rejected with
+          ``DoneProvenanceWriteAuthorityError`` (see the MUST below).
         * ``append=True`` (legacy shim) → 'additive'.  A bare ``append=False``
           (no ``metadata_mode``) on a metadata write is **rejected** — it used
           to silently 'replace' and wiped a live in-progress task (the task-2180
@@ -252,6 +257,16 @@ class TaskBackendProtocol(Protocol):
         is the only sanctioned status writer — it enforces the terminal-exit,
         phantom-done, and done-provenance gates.  Accepting ``status`` here
         would silently bypass all three.
+
+        **Implementations MUST NOT let update_task add, change or remove
+        ``metadata.done_provenance``** — ``set_task_status`` is its only
+        sanctioned writer, for the same reason.  In every mode except
+        ``'replace'``, reject a payload carrying the key unconditionally, before
+        the row lookup (``DoneProvenanceWriteAuthorityError``).  Under
+        ``'replace'``, compare against the STORED value read in the same
+        transaction as the write: admit the payload only when the key's presence
+        and JSON value match the stored row exactly, and refuse a payload
+        carrying the key when the stored blob does not parse.
 
         The ``status`` param is kept in the signature as a **reject-trap**: it
         preserves the ``status=None`` passthrough that ``server/tools.py`` and

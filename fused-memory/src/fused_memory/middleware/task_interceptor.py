@@ -5129,8 +5129,11 @@ class TaskInterceptor:
         Gates (run in order; each returns early with a structured error dict on rejection):
 
         1. The SqliteTaskBackend write-authority floor (task C1) — unconditionally
-           rejects non-None ``status`` and ``metadata.done_provenance`` writes by
-           raising :class:`~fused_memory.backends.task_backend_errors.StatusWriteAuthorityError`
+           rejects a non-None ``status``, and rejects any add, change or removal of
+           ``metadata.done_provenance``: unconditionally in merge/additive/default
+           mode, and under ``metadata_mode='replace'`` unless the payload carries
+           the stored value verbatim (checked in-transaction). It raises
+           :class:`~fused_memory.backends.task_backend_errors.StatusWriteAuthorityError`
            / :class:`~fused_memory.backends.task_backend_errors.DoneProvenanceWriteAuthorityError`;
            caught below and converted via ``.to_error_dict()`` into the canonical
            ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task',
@@ -5265,8 +5268,10 @@ class TaskInterceptor:
                 else:
                     result = dict(await _do_update_task_write())
             except (StatusWriteAuthorityError, DoneProvenanceWriteAuthorityError) as e:
-                # SqliteTaskBackend write-authority floor (task C1): status /
-                # metadata.done_provenance writes are unconditionally rejected.
+                # SqliteTaskBackend write-authority floor (task C1): a status
+                # write is always rejected, and so is any add, change or
+                # removal of metadata.done_provenance (under replace, anything
+                # but a verbatim passthrough of the stored value).
                 # _journal_around already logged the failing backend_op row and
                 # re-raised; convert to the canonical rejection dict here so
                 # this surface's long-standing contract — return a dict, never
