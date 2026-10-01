@@ -1546,9 +1546,10 @@ change was committed earlier on this branch, below the commit(s) above.
 Before writing any new code, walk the pending steps in plan order:
 
 1. Run `git show <sha>` for each commit above to see what it contains.
-2. For each step, run `git log --oneline -- <path>` over the files it changes
-   to find the commit that carries its change, and run its tests. Only a step
-   whose tests behave as its spec says counts as carried.
+2. For each step, run `git log --oneline {self.config.git.main_branch}..HEAD -- <path>`
+   over the files it changes to find the commit on this branch that carries
+   its change, and run its tests. Only a step whose tests behave as its spec
+   says counts as carried.
    - **Carried by an earlier, non-WIP commit:** call
      `mark_step_done(step_id, <that commit's sha>)` and move to the next step.
    - **Carried by a WIP commit above:** call
