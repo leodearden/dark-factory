@@ -455,36 +455,64 @@ class TestSeamUnstampedEdgePolicies:
         return [canonical, _member(_uuid(2))]
 
     @pytest.mark.asyncio
-    async def test_the_delete_arm_still_closes(self, interceptor, taskmaster):
-        """ACCEPTANCE 3. An observed id absent from the scroll AND claimed in
-        the canonical\'s ``supersedes`` is a correctly absorbed member, not a
-        stray. Without this, every correctly executed delete-arm consolidation
-        would become permanently uncloseable.
-
-        THIS TEST PINS A DELIBERATE BLIND SPOT, not just a saving. Because the
-        claim is subtracted BEFORE any probe, a claimed id that is still LIVE
-        (arming below) draws neither ``absorbed_member_still_live`` (it is not
-        in the scroll, which is all ``_classify_supersedes`` tests) nor
-        ``unstamped_cluster_member``. Since task 4808 a probe EXISTS, so that
-        case could be routed to ``absorbed_member_still_live`` at the cost of
-        one read per absorbed id — a design change 4808\'s plan froze, filed as
-        follow-up ticket ``tkt_0RTCC7BZFQ4CKJ9F4GJRRTZB0V``. A future agent
-        closing that ticket must flip this expectation CONSCIOUSLY; it is not a
-        bug this test caught."""
+    async def test_a_correctly_executed_delete_arm_closes_after_probing_its_claim(
+        self, interceptor, taskmaster
+    ):
+        """ACCEPTANCE 3. A claimed id that was really deleted probes ABSENT, so
+        a correctly executed delete-arm consolidation stays closeable."""
         absorbed = _uuid(42)
         taskmaster.get_task.return_value = {
             'id': '9001',
             'status': 'pending',
             'metadata': _prov_gate([_uuid(1), absorbed]),
         }
-        # The probe would report it LIVE if asked — proving the SUPPRESSION is
-        # what closes the gate, not a lucky probe result.
-        scroll = _scroll(self._canonical_claiming(absorbed), live_ids=[absorbed])
+        scroll = _scroll(self._canonical_claiming(absorbed), live_ids=[])
         interceptor.set_consolidation_scroll(scroll)
         result = await _set_done(interceptor)
         assert result.get('error') is None
         assert taskmaster.set_task_status.await_count == 1
-        assert scroll.probes == []
+        assert scroll.probes == [(absorbed, resolve_project_id(_PROJECT_ROOT))]
+
+    @pytest.mark.asyncio
+    async def test_a_claimed_id_still_live_refuses_as_absorbed_member_still_live(
+        self, interceptor, taskmaster
+    ):
+        """The canonical claims the id was deleted; the store says it is live.
+        That is a false closure claim even though the id is off-topic."""
+        absorbed = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _prov_gate([_uuid(1), absorbed]),
+        }
+        scroll = _scroll(self._canonical_claiming(absorbed), live_ids=[absorbed])
+        interceptor.set_consolidation_scroll(scroll)
+        result = await _set_done(interceptor)
+        assert result['success'] is False
+        assert result['error'] == 'consolidation_not_closed'
+        assert [r['code'] for r in result['reasons']] == ['absorbed_member_still_live']
+        assert result['reasons'][0]['ids'] == [absorbed]
+        taskmaster.set_task_status.assert_not_called()
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+        # Observed AND claimed, yet one candidate, so one read.
+        assert scroll.probes == [(absorbed, resolve_project_id(_PROJECT_ROOT))]
+
+    @pytest.mark.asyncio
+    async def test_the_claim_is_probed_without_provenance(
+        self, interceptor, taskmaster
+    ):
+        absorbed = _uuid(42)
+        taskmaster.get_task.return_value = {
+            'id': '9001',
+            'status': 'pending',
+            'metadata': _gate_metadata(),
+        }
+        interceptor.set_consolidation_scroll(
+            _scroll(self._canonical_claiming(absorbed), live_ids=[absorbed])
+        )
+        result = await _set_done(interceptor)
+        assert result['success'] is False
+        assert 'absorbed_member_still_live' in [r['code'] for r in result['reasons']]
 
     @pytest.mark.asyncio
     async def test_hard_deleted_but_unclaimed_still_closes(
