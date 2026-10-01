@@ -32,6 +32,7 @@ from orchestrator.rebase_recovery import AbortRunner, guarded_abort
 logger = logging.getLogger(__name__)
 
 STACK_BASE_REF_NAMESPACE = 'refs/dark-factory/stack-base/'
+_BRANCH_REF_NAMESPACE = 'refs/heads/'
 
 STACKED_ON_UNLANDED_BASE_REASON_PREFIX = 'Branch is stacked on an unlanded base'
 
@@ -92,6 +93,39 @@ class StackBaseLedger:
             logger.debug(
                 'Could not clear stack base of %s: %s', full_branch, err.strip(),
             )
+
+    async def prune_orphans(self) -> tuple[str, ...]:
+        """Drop every record whose branch no longer exists; return those branches.
+
+        A record lives no longer than its branch, however the branch ended.
+        Never raises: a failed listing prunes nothing.
+        """
+        rc, out, err = await self.run(
+            [
+                'git', 'for-each-ref', '--format=%(refname)',
+                STACK_BASE_REF_NAMESPACE, _BRANCH_REF_NAMESPACE,
+            ],
+            cwd=self.repo_root,
+        )
+        if rc != 0:
+            logger.warning('Could not list stack-base records: %s', err.strip())
+            return ()
+        orphans = _orphaned_branches(set(out.split()))
+        for full_branch in orphans:
+            await self.forget(full_branch)
+        return orphans
+
+
+def _orphaned_branches(refnames: set[str]) -> tuple[str, ...]:
+    recorded = (
+        refname.removeprefix(STACK_BASE_REF_NAMESPACE)
+        for refname in refnames
+        if refname.startswith(STACK_BASE_REF_NAMESPACE)
+    )
+    return tuple(sorted(
+        full_branch for full_branch in recorded
+        if f'{_BRANCH_REF_NAMESPACE}{full_branch}' not in refnames
+    ))
 
 
 async def foreign_commit_cut(

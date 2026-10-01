@@ -174,6 +174,31 @@ class TestStackRecordsBase:
         assert result.ejected == ['B']
         assert await repo.ledger.base_of('task/B') is None
 
+    async def test_stacking_prunes_records_of_deleted_branches(self, repo: Repo) -> None:
+        await _stack_p_and_m(repo)
+        await _git(repo.root, 'worktree', 'remove', '--force', str(repo.wt('M')))
+        await _git(repo.root, 'branch', '-D', 'task/M')
+        for name in ('A', 'B'):
+            await _add_member(repo.git_ops, name, 'main', {f'{name}.txt': f'{name}\n'})
+
+        result = await repo.git_ops.stack_train_branches(['A', 'B'])
+
+        assert result.survivors == ['A', 'B']
+        assert await repo.ledger.base_of('task/M') is None
+        assert await repo.ledger.base_of('task/B') == await repo.sha('task/A')
+
+    async def test_forget_stack_bases_clears_each_members_record(
+        self, repo: Repo,
+    ) -> None:
+        for name in ('A', 'B', 'C'):
+            await _add_member(repo.git_ops, name, 'main', {f'{name}.txt': f'{name}\n'})
+        await repo.git_ops.stack_train_branches(['A', 'B', 'C'])
+
+        await repo.git_ops.forget_stack_bases(['A', 'B', 'C'])
+
+        for name in ('A', 'B', 'C'):
+            assert await repo.ledger.base_of(f'task/{name}') is None
+
     async def test_restack_sheds_the_earlier_unlanded_base(self, repo: Repo) -> None:
         await _add_member(repo.git_ops, 'P1', 'main', {'p1.txt': 'p1\n'})
         await _add_member(repo.git_ops, 'P2', 'main', {'p2.txt': 'p2\n'})

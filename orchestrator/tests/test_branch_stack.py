@@ -170,6 +170,25 @@ class TestStackBaseLedger:
         await ledger.forget('task/M')
         assert await ledger.base_of('task/M') is None
 
+    async def test_prune_orphans_drops_only_records_of_deleted_branches(
+        self, stacked: Stacked,
+    ) -> None:
+        ledger = StackBaseLedger(stacked.repo, _run)
+        await ledger.record('task/M', stacked.p_tip)
+        await ledger.record('task/P', stacked.p_first)
+        await _git(stacked.repo, 'worktree', 'remove', '--force', str(stacked.m_wt))
+        await _git(stacked.repo, 'branch', '-D', 'task/M')
+
+        assert await ledger.prune_orphans() == ('task/M',)
+
+        assert await ledger.base_of('task/M') is None
+        assert await ledger.base_of('task/P') == stacked.p_first
+
+    async def test_prune_orphans_with_no_records_drops_nothing(
+        self, stacked: Stacked,
+    ) -> None:
+        assert await StackBaseLedger(stacked.repo, _run).prune_orphans() == ()
+
     async def test_record_survives_base_branch_deletion(self, stacked: Stacked) -> None:
         ledger = StackBaseLedger(stacked.repo, _run)
         await ledger.record('task/M', stacked.p_tip)

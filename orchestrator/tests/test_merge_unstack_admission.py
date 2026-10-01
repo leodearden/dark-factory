@@ -482,3 +482,4 @@ class TestTrainLanding:
         assert sorted(
             call.args[0] for call in train.mark_member_done.await_args_list
         ) == ['A', 'T']
+        assert await _ledger(git_ops).base_of('task/T') is None

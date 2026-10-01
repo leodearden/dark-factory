@@ -9978,6 +9978,8 @@ class GitOps:
         the new last-good predecessor for the next member, and the base it
         was stacked onto is recorded (see
         ``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``).
+        Records are only ever written here, so this is also where the
+        records of branches that no longer exist are pruned.
         A member is always stacked from its own delta: before the rebase it
         is un-stacked from any earlier unlanded base, and a member that
         cannot be un-stacked is ejected.
@@ -9998,6 +10000,7 @@ class GitOps:
         """
         if not member_ids:
             return TrainStackResult(survivors=[], ejected=[])
+        await self._stack_ledger().prune_orphans()
 
         anchor_id = member_ids[0]
         survivors: list[str] = [anchor_id]
@@ -10057,6 +10060,13 @@ class GitOps:
 
     def _stack_ledger(self) -> StackBaseLedger:
         return StackBaseLedger(self.project_root, _run)
+
+    async def forget_stack_bases(self, task_ids: Iterable[str]) -> None:
+        """Drop the stack-base records of *task_ids*' branches, e.g. once
+        their train has landed.  A failed delete is logged, not raised."""
+        ledger = self._stack_ledger()
+        for task_id in task_ids:
+            await ledger.forget(f'{self.config.branch_prefix}{task_id}')
 
     async def unstack_from_unlanded_base(self, full_branch: str) -> UnstackResult:
         """Strip the commits of a never-landed stack base from *full_branch*.

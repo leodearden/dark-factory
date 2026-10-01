@@ -6095,6 +6095,22 @@ async def _unstack_before_merge(git_ops: GitOps, req: MergeRequest) -> Decided |
     return Decided(MergeOutcome('blocked', reason=reason))
 
 
+async def _forget_landed_stack_bases(git_ops: GitOps, req: GroupMergeRequest) -> None:
+    """Drop every member's stack-base record once the train has landed (task 5618).
+
+    No landed member is un-stacked again, and a record pins its base commit
+    against gc.  Never raises: main has already advanced, and a record left
+    behind costs one ref.
+    """
+    try:
+        await git_ops.forget_stack_bases(req.member_task_ids)
+    except Exception:
+        logger.warning(
+            "Train %s: could not clear its members' stack-base records",
+            req.train_id, exc_info=True,
+        )
+
+
 async def classify_and_merge(
     worker: _TrainMergeHost,
     req: MergeRequest,
@@ -7152,7 +7168,9 @@ async def _do_train_merge(
     (e) CAS advance — ``advance_main`` atomically updates the main ref.
     (f) Member callbacks — ``req.mark_member_done`` is called for each member
         ONLY after advance + _finalize_advanced_merge succeed (invariant: members
-        flip iff main lands AND post-merge gates pass).
+        flip iff main lands AND post-merge gates pass).  On that same
+        condition, and before any flip, every member's stack-base record is
+        dropped (:func:`_forget_landed_stack_bases`).
     """
     # Unpack worker state so the rest of the function reads like the single-task path.
     git_ops = worker._git_ops
@@ -7494,6 +7512,8 @@ async def _do_train_merge(
             data={'derail_reason': outcome.reason},
         )
         return outcome  # no member flips
+
+    await _forget_landed_stack_bases(git_ops, req)
 
     # outcome.merge_sha: post-rebase advanced SHA resolved by finalize (rebase-robust).
     advanced_sha: str = outcome.merge_sha  # type: ignore[assignment]
