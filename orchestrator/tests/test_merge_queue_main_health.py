@@ -7,6 +7,7 @@ _run_post_merge_verify (the single chokepoint).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from pathlib import Path
 from typing import Literal, cast
@@ -16,7 +17,8 @@ import pytest
 from _merge_lane_fakes import FakeVerifier, VerifyScript
 from _orch_helpers import make_placeholder_future
 
-from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator import verify
+from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import (
@@ -138,6 +140,47 @@ def _seed_probe_verdict(
     _PROBE_CACHE[
         (main_sha, result.category or '', _normalize_cause_hint(result.cause_hint))
     ] = (time.monotonic(), preexisting)
+
+
+def _learn_main_module_baseline(
+    tmp_path: Path, config: OrchestratorConfig, main_ids: dict[str, list[str]],
+) -> None:
+    """Teach the baseline cache what each module of *main_ids* fails at MAIN_SHA.
+
+    Goes through the public narrowed probe, so the cache ends up holding only
+    per-module verdicts and no whole-tree entry.
+    """
+    module_configs = [
+        ModuleConfig(
+            prefix=prefix, test_command=f'pytest {prefix.lower()}/tests',
+            lint_command=None, type_check_command=None,
+        )
+        for prefix in ('A', 'B', 'C')
+    ]
+    probe_dir = tmp_path / 'learn-main-probe'
+    probe_dir.mkdir(exist_ok=True)
+
+    @contextlib.asynccontextmanager
+    async def _ephemeral_worktree(kind, sha, *, warm_seed=False):
+        yield probe_dir
+
+    async def _main_side_run(worktree, _config, module_config=None, **kwargs) -> VerifyResult:
+        assert module_config is not None
+        ids = main_ids[module_config.prefix]
+        return VerifyResult(
+            passed=not ids, test_output='', lint_output='', type_output='',
+            summary='main side', failing_test_ids=ids,
+            failing_test_ids_by_module={module_config.prefix: ids},
+        )
+
+    probe_git_ops = MagicMock()
+    probe_git_ops.ephemeral_worktree = _ephemeral_worktree
+    with patch.object(verify, 'run_verification', side_effect=_main_side_run):
+        learned = asyncio.run(verify.main_baseline_failing_ids(
+            config, module_configs, probe_git_ops, MAIN_SHA,
+            red_module_prefixes=frozenset(main_ids),
+        ))
+    assert learned == frozenset().union(*main_ids.values())
 
 
 async def _drive_verify(
@@ -1207,6 +1250,104 @@ class TestBaselineAttributionOverBlockPath:
         assert '[category: test_failure]' in outcome.reason, (
             f'expected the category suffix preserved; got {outcome.reason!r}'
         )
+
+
+class TestBaselineEnrichmentNeedsACompleteBaseline:
+    """The block reason claims "not present on main" only from a baseline
+    that is complete for the branch's red modules (task 5627). A cache that
+    knows other modules, or only some of the red ones, says nothing about
+    the branch's ids, so the reason keeps its generic wording."""
+
+    @staticmethod
+    def _branch_red(
+        failing_test_ids: list[str], by_module: dict[str, list[str]] | None,
+    ) -> VerifyResult:
+        return VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='',
+            summary='Failures: tests failed', category='test_failure',
+            failing_test_ids=failing_test_ids, failing_test_ids_by_module=by_module,
+        )
+
+    @staticmethod
+    def _sync_config(tmp_path: Path) -> OrchestratorConfig:
+        # escalate_preexisting=False short-circuits _classify_main_health_red,
+        # leaving the enrichment's peek as the only baseline reader.
+        return _make_config(tmp_path, escalate_preexisting=False, merge_verify_breadth='full')
+
+    @staticmethod
+    def _drive_sync(
+        tmp_path: Path, config: OrchestratorConfig, branch: VerifyResult,
+    ) -> MergeOutcome | None:
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('5627', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        return asyncio.run(_drive_verify(req, merge_wt, _make_git_ops(tmp_path), result=branch))
+
+    @staticmethod
+    def _assert_generic_reason(outcome: MergeOutcome | None) -> None:
+        assert outcome is not None
+        assert 'not present on main' not in outcome.reason, outcome.reason
+        assert outcome.reason.startswith(
+            'Post-merge verification failed: Failures: tests failed'
+        ), outcome.reason
+        assert '[category: test_failure]' in outcome.reason, outcome.reason
+
+    def test_a_partial_cache_never_claims_a_red_is_new_on_main(self, tmp_path: Path) -> None:
+        config = self._sync_config(tmp_path)
+        _learn_main_module_baseline(tmp_path, config, {'A': ['a1']})
+        branch = self._branch_red(['b1'], {'A': [], 'B': ['b1']})
+
+        self._assert_generic_reason(self._drive_sync(tmp_path, config, branch))
+
+    def test_unattributed_ids_need_a_whole_tree_baseline(self, tmp_path: Path) -> None:
+        config = self._sync_config(tmp_path)
+        _learn_main_module_baseline(tmp_path, config, {'A': ['a1']})
+        branch = self._branch_red(['b1'], None)
+
+        self._assert_generic_reason(self._drive_sync(tmp_path, config, branch))
+
+    def test_deferred_mode_enrichment_never_claims_a_red_is_new_on_main(
+        self, tmp_path: Path,
+    ) -> None:
+        config = _make_config(tmp_path, merge_verify_breadth='full')
+        _learn_main_module_baseline(tmp_path, config, {'A': ['a1']})
+        branch = self._branch_red(['b1'], {'A': [], 'B': ['b1']})
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        req = _make_req('5627', tmp_path / 'task-wt', config)
+        (tmp_path / 'task-wt').mkdir()
+        handles = _MainHealthProbeHandles(background_tasks=set())
+        never = asyncio.Event()
+
+        # The detached probe parks on its worktree, so it can neither finish
+        # nor touch the baseline cache while the reason is being built.
+        @contextlib.asynccontextmanager
+        async def _parked_worktree(*_args: object, **_kwargs: object):
+            await never.wait()
+            yield tmp_path  # pragma: no cover - never reached in this test
+
+        git_ops.ephemeral_worktree = _parked_worktree
+
+        async def _run() -> MergeOutcome | None:
+            outcome = await asyncio.wait_for(
+                _run_post_merge_verify(
+                    git_ops, req, merge_wt,
+                    timeouts={}, enospc_retries={}, max_timeouts=3, max_enospc=1,
+                    main_health_probe_handles=handles,
+                    verifier=_verifier(branch),
+                ),
+                timeout=5,
+            )
+            for t in handles.background_tasks:
+                t.cancel()
+            return outcome
+
+        outcome = asyncio.run(_run())
+
+        assert outcome is not None
+        assert 'not present on main' not in outcome.reason, outcome.reason
 
 
 # ---------------------------------------------------------------------------

@@ -1089,15 +1089,43 @@ class TestMainBaselineRedModuleProbe:
         assert main_probe.baseline('B') is None
         assert main_probe.probed_prefixes() == ['B', 'B']
 
-    def test_the_peek_surfaces_what_narrowed_probes_learned(
+    def test_the_peek_answers_only_scopes_it_knows_completely(
         self, main_probe: _MainProbeHarness,
     ) -> None:
+        peek = verify_module.cached_main_baseline_failing_ids
         main_probe.main_ids = {'B': ['b1']}
-        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) is None
+        assert peek(MAIN_SHA) is None
+        assert peek(MAIN_SHA, red_module_prefixes=frozenset({'B'})) is None
+        assert verify_module.known_failing_ids_on_main(MAIN_SHA) == frozenset()
 
         main_probe.baseline('B')
 
-        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'b1'})
+        assert peek(MAIN_SHA) is None
+        assert peek(MAIN_SHA, red_module_prefixes=frozenset({'B'})) == frozenset({'b1'})
+        assert peek(MAIN_SHA, red_module_prefixes=frozenset({'B', 'C'})) is None
+        assert peek(MAIN_SHA, red_module_prefixes=frozenset()) == frozenset()
+        assert verify_module.known_failing_ids_on_main(MAIN_SHA) == frozenset({'b1'})
+
+    def test_a_whole_tree_seed_answers_every_scope(self) -> None:
+        peek = verify_module.cached_main_baseline_failing_ids
+        verify_module.seed_main_baseline(MAIN_SHA, frozenset({'w'}))
+
+        assert peek(MAIN_SHA) == frozenset({'w'})
+        assert peek(MAIN_SHA, red_module_prefixes=frozenset({'B'})) == frozenset({'w'})
+        assert peek(MAIN_SHA, red_module_prefixes=frozenset({'B', 'C'})) == frozenset({'w'})
+        assert verify_module.known_failing_ids_on_main(MAIN_SHA) == frozenset({'w'})
+
+    def test_a_degraded_module_leaves_its_scope_unknown(
+        self, main_probe: _MainProbeHarness,
+    ) -> None:
+        peek = verify_module.cached_main_baseline_failing_ids
+        main_probe.main_ids = {'B': None, 'C': ['c1']}
+
+        main_probe.baseline('B', 'C')
+
+        assert peek(MAIN_SHA, red_module_prefixes=frozenset({'B', 'C'})) is None
+        assert peek(MAIN_SHA, red_module_prefixes=frozenset({'C'})) == frozenset({'c1'})
+        assert verify_module.known_failing_ids_on_main(MAIN_SHA) == frozenset({'c1'})
 
     def test_without_red_modules_the_whole_tree_probe_runs(
         self, main_probe: _MainProbeHarness,
@@ -1111,6 +1139,35 @@ class TestMainBaselineRedModuleProbe:
         assert served == frozenset({'w1'})
         assert len(main_probe.whole_tree_runs) == 1
         assert main_probe.module_runs == []
+
+
+class TestRedModulePrefixesOf:
+    """The modules holding a result's red ids, or None when the result's
+    module attribution does not account for every red id."""
+
+    @pytest.mark.parametrize(
+        ('failing_test_ids', 'by_module', 'expected'),
+        [
+            pytest.param(['b1'], {'A': [], 'B': ['b1']}, frozenset({'B'}), id='one-red-module'),
+            pytest.param(['b1'], None, None, id='no-attribution'),
+            pytest.param(None, {'B': ['b1']}, None, id='no-failing-ids'),
+            pytest.param(['b1', 'zz'], {'B': ['b1']}, None, id='an-id-no-module-owns'),
+            pytest.param([], {'A': []}, frozenset(), id='no-red-ids'),
+        ],
+    )
+    def test_red_module_prefixes_of(
+        self,
+        failing_test_ids: list[str] | None,
+        by_module: dict[str, list[str]] | None,
+        expected: frozenset[str] | None,
+    ) -> None:
+        result = VerifyResult(
+            passed=not failing_test_ids, test_output='', lint_output='', type_output='',
+            summary='branch side', failing_test_ids=failing_test_ids,
+            failing_test_ids_by_module=by_module,
+        )
+
+        assert verify_module.red_module_prefixes_of(result) == expected
 
 
 class TestPreexistingForkProbesOnlyRedModules:
