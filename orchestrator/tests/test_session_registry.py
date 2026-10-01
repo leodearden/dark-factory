@@ -5130,6 +5130,37 @@ def test_main_write_decision_files_open_record(
     assert rec.filed_at != ''
 
 
+def test_main_write_decision_files_under_the_project_qualified_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--id is project-LOCAL: the stored, printed id is ``<canonical project>-<--id>``
+    (task 4835), so one escalation id in two projects can never share a row.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+
+    rc = sr.main(
+        [
+            'write-decision',
+            '--id',
+            'esc-42-1',
+            '--project',
+            'df',
+            '--text',
+            'q?',
+            '--escalations-dir',
+            str(tmp_path / 'escalations'),
+        ]
+    )
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == 'dark_factory-esc-42-1'
+    assert [d.id for d in sr.list_decisions(root=tmp_path)] == ['dark_factory-esc-42-1']
+    assert sr.decision_path_for_id('dark_factory-esc-42-1', root=tmp_path).is_file()
+    assert not sr.decision_path_for_id('esc-42-1', root=tmp_path).exists()
+
+
 @pytest.mark.parametrize(
     'raw_project',
     ['df', 'DF', 'dark-factory', 'Dark-Factory', '  DARK_FACTORY '],
@@ -7668,12 +7699,12 @@ def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
     regression of its own.
 
     This design satisfies MODE 2 BY CONSTRUCTION: the queue is recorded as a
-    FIELD on the record and the decision id is left untouched, so a second
-    watcher filing the same question lands on the same id. This case passes
-    both before and after the fix by design -- it is the guard that a future
-    refactor to per-queue decision ids ('recon:esc-5914-1' vs
-    'orch:esc-5914-1') would double-file the same question and must not be
-    adopted. Complements test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
+    FIELD on the record and the decision id is qualified by PROJECT only
+    (task 4835), never by queue, so a second watcher filing the same question
+    lands on the same id. It is the guard that a future refactor to per-queue
+    decision ids ('recon:esc-5914-1' vs 'orch:esc-5914-1') would double-file
+    the same question and must not be adopted. Complements
+    test_main_write_decision_refiling_same_id_overwrites_not_duplicates,
     which pins the same-queue restart case.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
@@ -7713,14 +7744,13 @@ def test_main_write_decision_same_id_from_two_queues_stays_one_decision(
     assert rc1 == 0
     assert rc2 == 0
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == ['dark_factory-esc-5914-1']
     # The discriminator is a FIELD holding a normalized queue path, never a
-    # namespace prefix baked into the id. The field is scalar, so only ONE of
+    # queue prefix baked into the id. The field is scalar, so only ONE of
     # the two queues can survive: the FIRST filer's (task 3559 -- the second
     # filing enriches rather than overwrites), which makes the outcome
     # deterministic instead of "whichever watcher happened to write last".
     assert listed[0].escalations_dir == sr.normalize_escalations_dir(orch)
-    assert listed[0].id == 'esc-5914-1'
 
 
 def _file_decision(**kwargs: str) -> int:
@@ -7779,7 +7809,7 @@ def test_main_write_decision_mode2_second_queue_enriches_and_never_downgrades(
     assert rc1 == 0
     assert rc2 == 0
     listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-5914-1']
+    assert [d.id for d in listed] == ['dark_factory-esc-5914-1']
     survivor = listed[0]
     assert survivor.text == 'Adopt the reify plan?'  # never clobbered
     assert survivor.severity == 'critical'  # never downgraded
@@ -8095,34 +8125,21 @@ def test_main_write_decision_same_queue_refile_of_an_open_record_is_quiet(
     assert not noise, f'the common restart path must be quiet, got: {noise}'
 
 
-def test_main_write_decision_same_id_different_project_is_refused(
+def test_main_write_decision_same_local_id_in_two_projects_files_two_rows(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A cross-PROJECT id collision is not a MODE-2 collapse, and must not merge.
+    """A shared escalation id across PROJECTS is two asks, filed as two rows (task 4835).
 
-    DecisionRecords are fleet-global, both watcher SKILLs tell a watcher to
-    use the escalation id as the decision id, and ``esc-<taskid>-<n>`` task
-    numbering RESTARTS per project -- so 'esc-42-1' in dark_factory and
-    'esc-42-1' in reify are two unrelated human gates that collide. Two
-    projects also always run different queue dirs, so such a collision lands
-    on exactly the queue-differs axis the enrichment branch keys on: without
-    a project check it would be folded into the other project's record,
-    producing ONE cockpit row that claims to be A's ask (A's project, text
-    and filed_at kept, severity maxed up by B) while B's gate is invisible
-    and unreapable by B's reaper.
+    ``esc-<taskid>-<n>`` numbering restarts per project, so 'esc-42-1' in
+    dark_factory and 'esc-42-1' in reify are unrelated human gates. Qualifying
+    the stored id by project gives each its own row, so neither is refused,
+    merged into the other, or overwritten.
 
-    Refused rather than overwritten: overwriting would delete a live row
-    instead, which is the clobber this task exists to stop. Same
-    first-writer-wins policy as a conflicting queue stamp, and loud, so the
-    collision is a log line rather than a silent misfiling.
-
-    Deliberately arranged so the merge is DETECTABLE rather than a no-op:
-    the incumbent is the POORER record (info, no task/session id) and the
-    colliding filing is richer, so enrichment would visibly leak B's
-    severity and ids onto A's row. Asserting only `project`/`text` would be
-    vacuous -- enrichment keeps those from *existing* too.
+    Arranged so a merge would be DETECTABLE: the df incumbent is the POORER
+    record and reify's filing is richer, so any leak of reify's severity or
+    ids onto df's row shows.
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     orch, recon = _two_queues(tmp_path)
@@ -8148,59 +8165,32 @@ def test_main_write_decision_same_id_different_project_is_refused(
         )
 
     assert rc1 == 0
-    assert rc2 == 0  # loud, but fail-soft: never changes spawn-claude.sh's rc
-    listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-42-1']
-    survivor = listed[0]
-    # Untouched in EVERY field -- not merged, not overwritten, not enriched.
-    # 'dark_factory', not the 'df' filed above: write-decision canonicalizes
-    # --project at the CLI boundary (task 3807), so that IS this record's
-    # untouched stored value. The incumbent still has to survive the colliding
-    # filing unchanged, which is what this test pins.
-    assert survivor.project == 'dark_factory'
-    assert survivor.text == 'Adopt the reify plan?'
-    assert survivor.severity == 'info'  # NOT maxed up by the other project
-    assert survivor.task_id is None  # no empty field filled from reify
-    assert survivor.session_id is None
-    assert survivor.escalations_dir == sr.normalize_escalations_dir(orch)
-    refusals = [
-        r
-        for r in caplog.records
-        if r.levelno >= logging.ERROR and 'esc-42-1' in r.getMessage()
-    ]
-    assert refusals, 'the refusal must be logged, not silent'
-    assert 'reify' in refusals[0].getMessage()  # names the refused project
-    # ...and the incumbent, under its canonical stored spelling (task 3807).
-    assert 'dark_factory' in refusals[0].getMessage()
+    assert rc2 == 0
+    rows = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+    assert set(rows) == {'dark_factory-esc-42-1', 'reify-esc-42-1'}
+    df_row = rows['dark_factory-esc-42-1']
+    assert df_row.project == 'dark_factory'
+    assert df_row.text == 'Adopt the reify plan?'
+    assert df_row.severity == 'info'
+    assert df_row.task_id is None
+    assert df_row.session_id is None
+    assert df_row.escalations_dir == sr.normalize_escalations_dir(orch)
+    reify_row = rows['reify-esc-42-1']
+    assert reify_row.project == 'reify'
+    assert reify_row.text == 'an unrelated reify gate that merely shares the id'
+    assert reify_row.severity == 'critical'
+    assert reify_row.task_id == '42'
+    assert reify_row.session_id == 'watcher-reify-1'
+    assert reify_row.escalations_dir == sr.normalize_escalations_dir(recon)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
-def test_main_write_decision_cross_project_filing_over_a_closed_record_overwrites(
+def test_main_write_decision_cross_project_filing_leaves_a_closed_row_closed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The cross-PROJECT refusal keeps its OPEN scoping (task 3872).
-
-    The other half of the test above, and the arm task 3872 left deliberately
-    alone: the refusal fires only while the INCUMBENT is open, because
-    refusing exists to protect a LIVE row (with an operator's boost and
-    disposition on it) from being deleted. A closed incumbent is not such a
-    row, and two projects always run different queue dirs -- so a
-    cross-project collision is by construction a CROSS-queue filing, on the
-    axis where ``esc-<taskid>-<n>`` namespaces genuinely collide and a closed
-    record cannot be shown to be the same gate. Holding it closed there would
-    hide a live gate, the fail-CLOSED direction _run_reap_decisions rules
-    out, so it takes today's plain overwrite instead.
-
-    Pinned at the CLI boundary because the restructured guard in
-    _run_write_decision made ``existing.state == OPEN`` a NEW decision point
-    INSIDE the cross-project arm, whose false branch is this overwrite: with
-    nothing here, tightening that arm to refuse EVERY cross-project filing
-    (including against a closed incumbent) passes the whole decision suite.
-
-    The no-ERROR assert is half the point: a refusal here would be the
-    silent-drop failure -- the row overwritten or not, but this project's ask
-    never reaching the cockpit either way.
+    """Another project's filing of the same local id never touches this project's
+    dismissed row: it lands on its own qualified id as a fresh OPEN ask (task 4835).
     """
     monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
     orch, recon = _two_queues(tmp_path)
@@ -8212,11 +8202,105 @@ def test_main_write_decision_cross_project_filing_over_a_closed_record_overwrite
         severity='info',
         escalations_dir=str(orch),
     )
-    # The operator triages df's row in the cockpit and dismisses it.
-    assert sr.set_manual_boost('esc-42-1', 9, root=tmp_path) is not None
+    assert sr.set_manual_boost('dark_factory-esc-42-1', 9, root=tmp_path) is not None
     assert (
-        sr.update_decision_state('esc-42-1', sr.DecisionState.DROPPED, root=tmp_path)
+        sr.update_decision_state(
+            'dark_factory-esc-42-1', sr.DecisionState.DROPPED, root=tmp_path
+        )
         is not None
+    )
+
+    rc = _file_decision(
+        id='esc-42-1',
+        project='reify',
+        text='an unrelated reify gate that merely shares the id',
+        severity='critical',
+        escalations_dir=str(recon),
+    )
+
+    assert rc == 0
+    rows = {d.id: d for d in sr.list_decisions(root=tmp_path)}
+    assert set(rows) == {'dark_factory-esc-42-1', 'reify-esc-42-1'}
+    assert rows['reify-esc-42-1'].state == sr.DecisionState.OPEN
+    assert rows['reify-esc-42-1'].manual_boost == 0
+    assert rows['dark_factory-esc-42-1'].state == sr.DecisionState.DROPPED
+    assert rows['dark_factory-esc-42-1'].manual_boost == 9
+
+
+def test_main_write_decision_refuses_a_qualified_id_held_open_by_another_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The cross-PROJECT refusal arm survives qualification as defense in depth.
+
+    It is reachable only when the QUALIFIED id is itself held by another
+    project's record: a legacy hand-prefixed id, filed before task 4835, whose
+    prefix spells a different project than the record carries (the live
+    ``recon-esc-7459-1`` held by project reify is the shape). Merging would hide
+    this ask inside that row and overwriting would delete a live row, so the
+    filing is refused, loudly and fail-soft.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='reify-esc-42-1',
+            project='dark_factory',
+            text='Adopt the reify plan?',
+            state=sr.DecisionState.OPEN,
+            escalations_dir=str(orch),
+        ),
+        root=tmp_path,
+    )
+    path = sr.decision_path_for_id('reify-esc-42-1', root=tmp_path)
+    before = path.read_bytes()
+
+    with caplog.at_level(logging.ERROR):
+        rc = _file_decision(
+            id='esc-42-1',
+            project='reify',
+            text='an unrelated reify gate that merely shares the id',
+            severity='critical',
+            escalations_dir=str(recon),
+        )
+
+    assert rc == 0
+    assert path.read_bytes() == before
+    refusals = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert refusals, 'the refusal must be logged, not silent'
+    assert 'reify' in refusals[0].getMessage()
+    assert 'dark_factory' in refusals[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    'closed_state', [sr.DecisionState.DROPPED, sr.DecisionState.ANSWERED]
+)
+def test_main_write_decision_overwrites_a_qualified_id_held_closed_by_another_project(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    closed_state: str,
+) -> None:
+    """The refusal arm keeps its OPEN scoping (task 3872).
+
+    A closed incumbent is a question already dealt with, and a cross-project
+    filing is by construction a cross-queue one, where a closed row cannot be
+    shown to be the same gate. So the filing starts a new ask with a full
+    overwrite, and no ERROR: a refusal here would be a silent drop.
+    """
+    monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+    orch, recon = _two_queues(tmp_path)
+    sr.write_decision(
+        _make_decision(
+            id='reify-esc-42-1',
+            project='dark_factory',
+            text='Adopt the reify plan?',
+            state=closed_state,
+            manual_boost=9,
+            escalations_dir=str(orch),
+        ),
+        root=tmp_path,
     )
 
     with caplog.at_level(logging.ERROR):
@@ -8229,22 +8313,15 @@ def test_main_write_decision_cross_project_filing_over_a_closed_record_overwrite
         )
 
     assert rc == 0
-    listed = sr.list_decisions(root=tmp_path)
-    assert [d.id for d in listed] == ['esc-42-1']
-    survivor = listed[0]
-    # Fully overwritten -- not refused, and no custody held for the other
-    # project's dead row.
+    assert [d.id for d in sr.list_decisions(root=tmp_path)] == ['reify-esc-42-1']
+    survivor = sr.list_decisions(root=tmp_path)[0]
     assert survivor.project == 'reify'
     assert survivor.text == 'an unrelated reify gate that merely shares the id'
     assert survivor.severity == 'critical'
     assert survivor.state == sr.DecisionState.OPEN
     assert survivor.manual_boost == 0
     assert survivor.escalations_dir == sr.normalize_escalations_dir(recon)
-    refusals = [
-        r
-        for r in caplog.records
-        if r.levelno >= logging.ERROR and 'esc-42-1' in r.getMessage()
-    ]
+    refusals = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert not refusals, f'a closed incumbent must not be defended, got: {refusals}'
 
 
