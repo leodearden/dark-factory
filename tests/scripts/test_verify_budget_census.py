@@ -24,10 +24,11 @@ an assertion here. Every assertion below runs against a synthetic `tmp_path`
 corpus whose contents the test controls exactly and whose expected numbers are
 computed by hand.
 
-THE PATH IS THE ONLY SOURCE OF THREE FACTS. A summary.json carries no task id,
-no module prefix and no role, so all three come from where the file sits. That
-makes path parsing load-bearing rather than incidental, and is why it gets its
-own section here.
+THE PATH IS THE ONLY SOURCE OF TWO FACTS, AND THE FALLBACK FOR A THIRD. A
+summary.json carries no task id and no module prefix, so both come from where
+the file sits. Since task 5671 it carries its role; a record written before
+that falls back to the role its path implies. That makes path parsing
+load-bearing rather than incidental, and is why it gets its own section here.
 """
 from __future__ import annotations
 
@@ -642,6 +643,87 @@ class TestTheFullSuiteShapeFilter:
         assert len(selection.legs) == 1
         assert selection.rejected_records == {'role_mismatch': 1}
         assert selection.rejected_entries == {}
+
+
+class TestTheStampedRoleWinsOverThePath:
+    """Since task 5671 a summary names its own role; the path is the fallback.
+
+    The archive path says nothing about which lane wrote a record, so before
+    the stamp every archived record was role-less and a ``--role merge``
+    census selected none of them. Records written before the stamp keep the
+    path inference the classes above describe.
+    """
+
+    @staticmethod
+    def _only_record(root):
+        from verify_budget_census import load_records  # noqa: PLC0415
+
+        corpus = load_records([root])
+        assert len(corpus.records) == 1, corpus
+        return corpus.records[0]
+
+    @staticmethod
+    def _write(path, **top):
+        path.write_text(json.dumps(_summary(_leg(), **top)), encoding='utf-8')
+        return path
+
+    def test_an_archive_record_stamped_merge_is_a_merge_record(self, tmp_path):
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        self._write(
+            _archive_record(
+                tmp_path, '5422', f'attempt-1.orchestrator.summary-{_STAMP_US}.json',
+            ),
+            role='merge',
+        )
+
+        assert self._only_record(tmp_path).role == 'merge'
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            role='merge',
+        )
+        assert len(selection.legs) == 1
+        assert selection.rejected_records == {}
+
+    def test_the_stamp_wins_over_the_lane_the_record_sits_in(self, tmp_path):
+        self._write(
+            _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
+            role='background',
+        )
+
+        assert self._only_record(tmp_path).role == 'background'
+
+    def test_an_unstamped_worktree_record_keeps_its_lane_role(self, tmp_path):
+        self._write(
+            _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
+        )
+
+        assert self._only_record(tmp_path).role == 'task'
+
+    def test_an_unstamped_archive_record_stays_unknown(self, tmp_path):
+        self._write(
+            _archive_record(
+                tmp_path, '5422', f'attempt-1.orchestrator.summary-{_STAMP_US}.json',
+            ),
+        )
+
+        assert self._only_record(tmp_path).role is None
+
+    @pytest.mark.parametrize('stamp', [7, None], ids=['int', 'null'])
+    def test_a_malformed_stamp_falls_back_to_the_path(self, tmp_path, stamp):
+        from verify_budget_census import load_records, select_full_suite_legs  # noqa: PLC0415
+
+        self._write(
+            _worktree_record(tmp_path, '3353', 'attempt-1.orchestrator.summary.json'),
+            role=stamp,
+        )
+
+        assert self._only_record(tmp_path).role == 'task'
+        selection = select_full_suite_legs(
+            load_records([tmp_path]), expected=_FULL_SUITE, prefix='orchestrator',
+            role='task',
+        )
+        assert len(selection.legs) == 1
 
 
 class TestTheExpectedCommandHasOneHome:
@@ -1403,8 +1485,8 @@ class TestTheProducerAndTheConsumerAgreeOnTheLoadShape:
             )
 
         # Exactly two readings, start then end. A third call exhausts the
-        # iterator, which `_load_sample`'s never-raise wrapper turns into an
-        # all-null record — and the assertions below then fail loudly rather
+        # iterator, which `_load_sample`'s never-raise wrapper turns into null
+        # PSI fields — and the assertions below then fail loudly rather
         # than passing on a fabricated reading.
         readings = iter((
             sample(self._START_CPU, 0.5),
