@@ -2263,8 +2263,7 @@ def _persist_attempt_logs(
     worktree: Path,
     attempt_id: int,
     runs: list[dict],
-    category: str,
-    cause_hint: str,
+    summary_record: dict,
     *,
     module_prefix: 'str | None' = None,
 ) -> list[Path]:
@@ -2296,9 +2295,9 @@ def _persist_attempt_logs(
 
     Writes:
     - ``attempt-{N}[.{safe_prefix}].{label}.log`` for every run where ``cmd is not None``
-    - ``attempt-{N}[.{safe_prefix}].summary.json`` with the summary shape described in the
-      task description: top-level keys are from the worst-failing run plus a
-      ``commands`` list containing all per-run sub-dicts.
+    - ``attempt-{N}[.{safe_prefix}].summary.json`` holding *summary_record*, the
+      ``_build_summary_payload`` record the caller built once and also hands
+      to ``_archive_attempt_summary``, so the two copies are one record.
 
     Returns the list of log paths actually written (summary.json excluded
     so callers can pass the list straight to ``_archive_attempt_log``).
@@ -2332,12 +2331,9 @@ def _persist_attempt_logs(
         if path is not None:
             written.append(path)
 
-    # Build summary.json via the shared helper (same shape as merge-path summary).
-    summary_payload = _build_summary_payload(runs, category, cause_hint)
-
     _write_json_artifact(
         verify_dir / f'attempt-{attempt_id}{infix}.summary.json',
-        summary_payload, '_persist_attempt_logs',
+        summary_record, '_persist_attempt_logs',
     )
 
     return written
@@ -2349,10 +2345,15 @@ def _archive_attempt_log(
     task_id: str,
     attempt_id: int,
     category: str,
+    *,
+    stamp: str,
 ) -> list[Path]:
     """Copy worktree logs to the durable archive when ``category`` warrants it.
 
-    Archive target: ``<archive_root>/<task_id>/attempt-{N}-<utc_ts>.log``.
+    Archive target: ``<archive_root>/<task_id>/<worktree log stem>-<stamp>.log``,
+    e.g. ``attempt-{N}[.{safe_prefix}].test-<stamp>.log``.  *stamp* is the
+    attempt's ``_archive_stamp()``, shared with its archived summary so a
+    reader joins a run's logs to its summary by stamp.
 
     Early-returns ``[]`` when:
     - ``archive_root`` is ``None``
@@ -2378,14 +2379,13 @@ def _archive_attempt_log(
         logger.warning('_archive_attempt_log: could not create %s: %s', target_dir, exc)
         return []
 
-    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
     archived: list[Path] = []
     for src in worktree_log_paths:
         src = Path(src)
         # Preserve the source stem to avoid collisions when multiple log files
         # share the same suffix (e.g. attempt-1.test.log and attempt-1.lint.log
         # would both resolve to attempt-1-TS.log without the stem).
-        dest = target_dir / f'{src.stem}-{utc_ts}{src.suffix}'
+        dest = target_dir / f'{src.stem}-{stamp}{src.suffix}'
         try:
             shutil.copy2(src, dest)
             archived.append(dest)
@@ -2514,6 +2514,36 @@ def _persist_verify_plan(
         )
 
 
+def _archive_attempt_summary(
+    summary_record: dict,
+    archive_root: 'Path | None',
+    task_id: str,
+    attempt_id: int,
+    *,
+    module_prefix: 'str | None',
+    stamp: str,
+) -> 'Path | None':
+    """Write one attempt's summary, green or red, directly into the durable archive.
+
+    Ungated on category and on ``passed``: the summary is the record of why an
+    attempt passed, failed or ran a narrower scope, and it is small.  *stamp*
+    keeps a re-run of the same attempt and prefix from overwriting the earlier
+    record.  The name is the one ``scripts/verify_budget_census.py::ARCHIVE_GLOB``
+    selects.  The task path hands this and ``_persist_attempt_logs`` the same
+    *summary_record*, so while the worktree lives the census counts the two
+    copies as one record (``scripts/verify_budget_census.py::load_records``).
+    """
+    if archive_root is None:
+        return None
+    return _write_json_artifact(
+        archive_root / task_id / (
+            f'attempt-{attempt_id}{_make_infix(module_prefix)}.summary-{stamp}.json'
+        ),
+        summary_record,
+        '_archive_attempt_summary',
+    )
+
+
 def _archive_merge_verify_logs(
     runs: list[dict],
     archive_root: 'Path | None',
@@ -2542,7 +2572,8 @@ def _archive_merge_verify_logs(
 
     Filename convention mirrors ``_archive_attempt_log``:
         ``attempt-{N}[.{safe_prefix}].{label}-{utc_ts}.log``
-        ``attempt-{N}[.{safe_prefix}].summary-{utc_ts}.json``
+    The summary is written by ``_archive_attempt_summary``, the single owner
+    of its archived name, with the same ``utc_ts`` so a run's logs join it.
 
     Returns the list of paths actually written (both .log and .json).
     Returns ``[]`` when ``archive_root`` is ``None``.
@@ -2574,11 +2605,10 @@ def _archive_merge_verify_logs(
         if path is not None:
             archived.append(path)
 
-    # Write summary.json using the shared payload builder.
-    summary_path = _write_json_artifact(
-        target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json',
+    summary_path = _archive_attempt_summary(
         _build_summary_payload(runs, category, cause_hint),
-        '_archive_merge_verify_logs',
+        archive_root, task_id, attempt_id,
+        module_prefix=module_prefix, stamp=utc_ts,
     )
     if summary_path is not None:
         archived.append(summary_path)
@@ -6761,16 +6791,23 @@ async def run_verification(
                     'run_verification: merge archival error (non-fatal): %s', exc,
                 )
     elif attempt_id is not None and task_id is not None:
-        # Task path: persist to worktree/.task/verify/ then optionally copy
-        # to the durable archive when category warrants it.
+        # Task path: one summary record and one archive stamp per attempt.
+        # The summary is archived first, green or red, so a failure persisting
+        # to worktree/.task/verify/ cannot suppress it; the logs follow it
+        # into the archive only when the category warrants it.
         try:
+            summary_record = _build_summary_payload(runs, category, cause_hint)
+            stamp = _archive_stamp()
+            _archive_attempt_summary(
+                summary_record, archive_root, task_id, attempt_id,
+                module_prefix=module_prefix, stamp=stamp,
+            )
             wt_paths = _persist_attempt_logs(
-                worktree, attempt_id, runs, category, cause_hint,
-                module_prefix=module_prefix,
+                worktree, attempt_id, runs, summary_record, module_prefix=module_prefix,
             )
             worktree_log_paths = [str(p) for p in wt_paths]
             arch_paths = _archive_attempt_log(
-                wt_paths, archive_root, task_id, attempt_id, category,
+                wt_paths, archive_root, task_id, attempt_id, category, stamp=stamp,
             )
             archive_log_paths = [str(p) for p in arch_paths]
         except Exception as exc:  # noqa: BLE001

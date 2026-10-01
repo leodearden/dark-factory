@@ -181,7 +181,7 @@ async def test_burndown_loop_invokes_periodic_checkpoint(tmp_path: Path):
         return CheckpointResult(0, 0, 0)
 
     checkpoint_mock = AsyncMock(side_effect=_checkpoint_side_effect)
-    store.checkpoint = checkpoint_mock  # type: ignore[method-assign]
+    store.checkpoint = checkpoint_mock
 
     # Build a minimal config (no network needed — collect_snapshot is patched).
     config = DashboardConfig(project_root=tmp_path)
@@ -239,7 +239,7 @@ async def test_burndown_loop_checkpoint_respects_interval_gate(tmp_path: Path):
         checkpoint_count += 1
         return CheckpointResult(0, 0, 0)
 
-    store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)  # type: ignore[method-assign]
+    store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)
 
     config = DashboardConfig(project_root=tmp_path)
 
@@ -307,7 +307,7 @@ async def test_metrics_loop_invokes_periodic_checkpoint(tmp_path: Path):
         return CheckpointResult(0, 0, 0)
 
     checkpoint_mock = AsyncMock(side_effect=_checkpoint_side_effect)
-    store.checkpoint = checkpoint_mock  # type: ignore[method-assign]
+    store.checkpoint = checkpoint_mock
 
     # Minimal app-state stub — pool.get() returns None because collect_metrics_snapshot
     # is patched and never inspects the connections it receives.
@@ -377,7 +377,7 @@ async def test_metrics_loop_checkpoint_respects_interval_gate(tmp_path: Path):
         checkpoint_count += 1
         return CheckpointResult(0, 0, 0)
 
-    store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)  # type: ignore[method-assign]
+    store.checkpoint = AsyncMock(side_effect=_counting_checkpoint)
 
     config = DashboardConfig(project_root=tmp_path)
     mock_pool = MagicMock()

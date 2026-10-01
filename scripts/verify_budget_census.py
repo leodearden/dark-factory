@@ -7,7 +7,8 @@ in the durable archive under `data/verify-logs/<task_id>/`. Together those ARE
 the duration distribution a per-module `verify_command_timeout_secs` should be
 derived from, which is why this task does not run a measurement suite: the
 production corpus already is the measurement, and (since deliverable 1) each
-record carries the host load its command ran under.
+record carries the host load its command ran under. While the worktree lives,
+its copy and the archive copy are ONE record, and `load_records` counts it once.
 
 STRICTLY READ-ONLY. This script opens every file `mode='r'`; it writes nothing,
 files nothing, and emits no events. It is safe to run against a live tree while
@@ -210,7 +211,10 @@ class Record:
 
 @dataclass(frozen=True)
 class Skip:
-    """A file the globs selected and the walker could not use, with the reason.
+    """A file the globs selected and the walker did not count, with the reason.
+
+    Either it could not be used, or the same record is already counted under
+    another path (``duplicate_of_worktree_record``; see ``load_records``).
 
     Carrying the reason BY VALUE is what makes the corpus reconcilable: the
     report prints these counts beside ``n``, so a reader can see that
@@ -282,6 +286,13 @@ def load_records(roots: Iterable[Path]) -> Corpus:
     A root that does not exist contributes nothing and is not an error: the
     archive lives only in a project's main checkout, so a census run from a
     task worktree legitimately finds one corpus and not the other.
+
+    While a task's worktree lives, each attempt sits in both corpora as twins
+    (``_twin_key``). The WORKTREE copy is kept, because its lane names the role
+    (``RecordPath.role``): ``--role task`` keeps seeing live attempts, and a
+    live task looks as it did before task 5199 archived summaries. The archive
+    copy enters the corpus only once its worktree is torn down. The dropped copy
+    is a counted skip, so ``len(records) + len(skipped)`` still reconciles.
     """
     records: list[Record] = []
     skipped: list[Skip] = []
@@ -297,7 +308,46 @@ def load_records(roots: Iterable[Path]) -> Corpus:
                     skipped.append(Skip(path, reason or 'unreadable'))
                     continue
                 records.append(Record(where=where, payload=payload))
-    return Corpus(records=tuple(records), skipped=tuple(skipped))
+    kept, twins = _split_archived_twins(records)
+    return Corpus(records=tuple(kept), skipped=tuple(skipped + twins))
+
+
+def _twin_key(record: Record) -> tuple[str, int, str | None, str]:
+    """Identify "the same attempt record" across the two corpora.
+
+    Twins share task, attempt and module scope and carry identical content,
+    because ``orchestrator/src/orchestrator/verify.py::run_verification`` builds
+    one ``_build_summary_payload`` record and hands that same dict to both
+    writers.
+    Content is part of the key, not just the name: an infra retry reuses the
+    attempt number and overwrites the worktree copy, so only the archived run
+    whose content matches is its twin.
+    """
+    where = record.where
+    return (
+        where.task_id,
+        where.attempt,
+        where.module_prefix,
+        json.dumps(record.payload, sort_keys=True),
+    )
+
+
+def _split_archived_twins(records: Sequence[Record]) -> tuple[list[Record], list[Skip]]:
+    """Drop each ARCHIVE record whose worktree twin is loaded, as a counted skip.
+
+    Only an archive record is ever dropped, and only against a worktree record:
+    two archive records are distinct runs by construction (each carries its own
+    microsecond stamp), so they never de-duplicate against each other.
+    """
+    live = {_twin_key(r) for r in records if r.where.corpus == 'worktree'}
+    kept: list[Record] = []
+    twins: list[Skip] = []
+    for record in records:
+        if record.where.corpus == 'archive' and _twin_key(record) in live:
+            twins.append(Skip(record.where.path, 'duplicate_of_worktree_record'))
+        else:
+            kept.append(record)
+    return kept, twins
 
 
 @dataclass(frozen=True)
