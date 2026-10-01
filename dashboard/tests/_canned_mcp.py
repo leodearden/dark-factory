@@ -9,7 +9,8 @@ module. Its own fidelity tests live in
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Callable, Mapping
 
 import httpx
 
@@ -17,7 +18,7 @@ import httpx
 class CannedMCP:
     """A stand-in for :func:`dashboard.data.memory.mcp_tool_call`.
 
-    Faithful to the two substrate contracts the unit above it depends on,
+    Faithful to the substrate contracts the units above it depend on,
     because a paging loop tested against a non-paging fake tests nothing:
 
     * ``get_tasks`` applies ``statuses`` as a row filter SERVER-side, then
@@ -35,6 +36,11 @@ class CannedMCP:
       total``. That includes serving a page SMALLER than requested, which is
       the case that tells a loop advancing by ``returned`` apart from one
       advancing by the size it asked for.
+    * ``get_task`` answers ONE row by id from the same :attr:`rows`, whatever
+      its status, or — for an id it does not hold — the structured
+      ``TaskNotFoundError`` answer fused-memory gives. It honours a per-id
+      delay, and :attr:`max_in_flight` records the most ``get_task`` calls
+      ever outstanding at once, so a bounded fan-out is assertable.
 
     Args:
         rows: Raw MCP ``get_tasks`` rows (string ids), as
@@ -48,6 +54,8 @@ class CannedMCP:
             smaller of the requested and the server cap. The served count is
             reported in ``pagination['returned']``, like any other page. Zero
             disables it.
+        task_delays: ``{int id: seconds}`` — how long ``get_task`` takes to
+            answer for that id. Absent ids answer at once.
 
     Mutable after construction so one instance can change behaviour between a
     test's two acquisitions. :attr:`fail_when` is a predicate over the
@@ -66,13 +74,17 @@ class CannedMCP:
         *,
         status_page_size: int | None = None,
         short_page_by: int = 0,
+        task_delays: Mapping[int, float] | None = None,
     ) -> None:
         self.rows = [dict(row) for row in rows]
         self.status_map = dict(status_map or {})
         self.status_page_size = status_page_size
         self.short_page_by = short_page_by
+        self.task_delays = dict(task_delays or {})
         self.fail_when: Callable[[dict], bool] = lambda call: False
         self.calls: list[dict] = []
+        self.max_in_flight = 0
+        self._in_flight = 0
 
     def calls_to(self, tool: str) -> list[dict]:
         """Every recorded call to *tool*, in order."""
@@ -90,6 +102,8 @@ class CannedMCP:
             return self._statuses(args)
         if tool == 'get_tasks':
             return self._tasks(args)
+        if tool == 'get_task':
+            return await self._task(args)
         raise AssertionError(f'unexpected tool {tool!r}')
 
     def _statuses(self, args: dict) -> dict:
@@ -124,6 +138,22 @@ class CannedMCP:
             start = args.get('offset') or 0
             selected = selected[start:start + page_size]
         return {'tasks': selected}
+
+    async def _task(self, args: dict) -> dict:
+        task_id = int(args['id'])
+        self._in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self._in_flight)
+        try:
+            await asyncio.sleep(self.task_delays.get(task_id, 0))
+        finally:
+            self._in_flight -= 1
+        for row in self.rows:
+            if int(row['id']) == task_id:
+                return dict(row)
+        return {
+            'error': f'No tasks found for ID(s): {task_id}',
+            'error_type': 'TaskNotFoundError',
+        }
 
 
 def _raw_row(task_id, status, **overrides) -> dict:
