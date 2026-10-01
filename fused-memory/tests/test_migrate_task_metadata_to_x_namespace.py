@@ -508,16 +508,45 @@ def test_verify_read_back_reports_backend_stripped_control_keys_as_info():
     assert notes[0].startswith('(i)')
 
 
+def test_read_back_treats_a_stripped_wait_anchor_as_a_note_not_drift():
+    """A stored wait anchor dropped by the backend must not read as corruption.
+
+    `SqliteTaskBackend.update_task` strips caller-supplied `pending_since` /
+    `pending_since_backfilled` in every mode (task 3816), so a replace write
+    drops the stored anchor by design. Every done task that was pending at the
+    v4->v5 back-fill carries both keys, so this is the common case for a
+    corpus sweep, not an edge.
+    """
+    problems, notes = _run_verify(
+        extra_before={
+            'pending_since': '2026-09-04T14:42:35.252Z',
+            'pending_since_backfilled': True,
+        },
+        mutate=lambda m: (m.pop('pending_since'), m.pop('pending_since_backfilled')),
+    )
+
+    assert problems == [], problems
+    assert len(notes) == 1
+    assert notes[0].startswith('(i)')
+    assert 'pending_since' in notes[0]
+    assert 'pending_since_backfilled' in notes[0]
+
+
 def test_backend_stripped_keys_match_the_backend_source_of_truth():
-    """The literal in the script must not drift from the backend's frozenset.
+    """The literal in the script must not drift from the backend's frozensets.
 
     The script hard-codes the set to keep the heavy backend package off its
-    import path; this is the anti-drift guard that buys that back.
+    import path; this is the anti-drift guard that buys that back. It covers
+    both strip families: leaked call-flags (task 2682) and machine-authored
+    wait anchors (task 3816).
     """
     from fused_memory.backends.sqlite_task_backend import (
+        _MACHINE_AUTHORED_METADATA_KEYS,
         _RESERVED_METADATA_CONTROL_KEYS,
     )
-    assert BACKEND_STRIPPED_KEYS == _RESERVED_METADATA_CONTROL_KEYS
+    assert BACKEND_STRIPPED_KEYS == (
+        _RESERVED_METADATA_CONTROL_KEYS | _MACHINE_AUTHORED_METADATA_KEYS
+    )
 
 
 # --- case 10: --keys safety validation --------------------------------------
