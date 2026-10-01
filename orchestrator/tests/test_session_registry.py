@@ -10713,3 +10713,139 @@ class TestCloseDecisionIdentity:
         assert capsys.readouterr().out.strip() == 'esc-42-1'
         [reread] = sr.list_decisions(root=tmp_path)
         assert (reread.state, reread.closing_evidence) == (sr.DecisionState.ANSWERED, _EVIDENCE)
+
+
+class TestReopenDecision:
+    """reopen_decision re-opens a closed record IN PLACE, under the same compare-and-swap as a close (task 4835)."""
+
+    _A_PROJECT = 'know_live'
+    _A_QUEUE = '/a/data/escalations'
+    _B_PROJECT = 'reify'
+    _B_QUEUE = '/b/data/escalations'
+    _FILED_AT = '2026-07-07T00:00:00+00:00'
+
+    def _seed(self, root: Path, **overrides: object) -> sr.DecisionRecord:
+        fields = {
+            'id': 'esc-42-1', 'project': self._A_PROJECT, 'escalations_dir': self._A_QUEUE,
+            'state': sr.DecisionState.DROPPED, 'closing_evidence': _EVIDENCE,
+            'closed_at': '2026-09-20T09:00:00+00:00', 'manual_boost': 3, 'filed_at': self._FILED_AT,
+            **overrides,
+        }
+        seeded = _make_decision(**fields)
+        sr.write_decision(seeded, root=root)
+        return seeded
+
+    def _path(self, root: Path) -> Path:
+        return sr.decision_path_for_id('esc-42-1', root=root)
+
+    @pytest.mark.parametrize('closed_state', [sr.DecisionState.DROPPED, sr.DecisionState.ANSWERED])
+    def test_a_closed_record_reopens_with_its_closing_fields_cleared(
+        self, tmp_path: Path, closed_state: str
+    ) -> None:
+        seeded = self._seed(tmp_path, state=closed_state)
+
+        reopened = sr.reopen_decision('esc-42-1', root=tmp_path, **_identity_of(seeded))
+
+        [reread] = sr.list_decisions(root=tmp_path)
+        for record in (reopened, reread):
+            assert record is not None
+            assert (record.state, record.closing_evidence, record.closed_at) == (sr.DecisionState.OPEN, '', '')
+            assert (record.filed_at, record.text, record.manual_boost, record.escalations_dir) == (
+                self._FILED_AT, seeded.text, 3, self._A_QUEUE,
+            )
+
+    def test_an_open_record_stays_open(self, tmp_path: Path) -> None:
+        seeded = self._seed(tmp_path, state=sr.DecisionState.OPEN, closing_evidence='', closed_at='')
+
+        reopened = sr.reopen_decision('esc-42-1', root=tmp_path, **_identity_of(seeded))
+
+        assert reopened is not None
+        assert reopened.state == sr.DecisionState.OPEN
+
+    @pytest.mark.parametrize(('project', 'queue'), [
+        (_A_PROJECT, _B_QUEUE),
+        (_B_PROJECT, _A_QUEUE),
+        (_B_PROJECT, _B_QUEUE),
+    ], ids=['queue-only', 'project-only', 'both'])
+    def test_another_projects_record_at_the_same_id_is_refused_and_untouched(
+        self, tmp_path: Path, project: str, queue: str
+    ) -> None:
+        self._seed(tmp_path)
+        before = self._path(tmp_path).read_bytes()
+
+        with pytest.raises(sr.DecisionReopenRefused) as refused:
+            sr.reopen_decision(
+                'esc-42-1', root=tmp_path, expected_project=project, expected_escalations_dir=queue
+            )
+
+        message = str(refused.value)
+        for named in ('esc-42-1', self._A_PROJECT, self._A_QUEUE, project, queue):
+            assert named in message
+        assert self._path(tmp_path).read_bytes() == before
+
+    @pytest.mark.parametrize('stamp', ['', sr.UNKNOWN_QUEUE], ids=['legacy', 'unknown'])
+    def test_a_sentinel_stamp_reopens_under_the_same_sentinel(self, tmp_path: Path, stamp: str) -> None:
+        self._seed(tmp_path, escalations_dir=stamp)
+
+        reopened = sr.reopen_decision(
+            'esc-42-1', root=tmp_path, expected_project=self._A_PROJECT, expected_escalations_dir=stamp
+        )
+
+        assert reopened is not None
+        assert reopened.state == sr.DecisionState.OPEN
+
+    @pytest.mark.parametrize(('stamp', 'queue'), [
+        ('', '/q/data/escalations'),
+        (sr.UNKNOWN_QUEUE, ''),
+        (sr.UNKNOWN_QUEUE, '/q/data/escalations'),
+    ], ids=['legacy-vs-real', 'unknown-vs-legacy', 'unknown-vs-real'])
+    def test_a_sentinel_stamp_is_refused_under_any_other_expectation(
+        self, tmp_path: Path, stamp: str, queue: str
+    ) -> None:
+        self._seed(tmp_path, escalations_dir=stamp)
+        before = self._path(tmp_path).read_bytes()
+
+        with pytest.raises(sr.DecisionReopenRefused, match='esc-42-1'):
+            sr.reopen_decision(
+                'esc-42-1', root=tmp_path, expected_project=self._A_PROJECT, expected_escalations_dir=queue
+            )
+
+        assert self._path(tmp_path).read_bytes() == before
+
+    def test_a_missing_record_is_none(self, tmp_path: Path) -> None:
+        assert sr.reopen_decision(
+            'esc-42-1', root=tmp_path, expected_project=self._A_PROJECT, expected_escalations_dir=self._A_QUEUE
+        ) is None
+
+    def test_a_reopened_record_can_be_closed_with_fresh_evidence(self, tmp_path: Path) -> None:
+        seeded = self._seed(tmp_path)
+        sr.reopen_decision('esc-42-1', root=tmp_path, **_identity_of(seeded))
+
+        closed = sr.close_decision_with_evidence(
+            'esc-42-1', sr.DecisionState.ANSWERED, 'new evidence', root=tmp_path, **_identity_of(seeded)
+        )
+
+        assert closed is not None
+        assert (closed.state, closed.closing_evidence) == (sr.DecisionState.ANSWERED, 'new evidence')
+
+    def test_a_same_queue_refile_after_a_reopen_stays_open_and_quiet(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv('CLAUDE_FLEET_ROOT', str(tmp_path))
+        queue = str(tmp_path / 'data' / 'escalations')
+        filing = {
+            'id': 'esc-5914-1', 'project': 'dark_factory', 'text': 'Adopt the reify plan?', 'escalations_dir': queue,
+        }
+        _file_decision(**filing)
+        filed_id = _qid('esc-5914-1')
+        assert sr.update_decision_state(filed_id, sr.DecisionState.DROPPED, root=tmp_path) is not None
+        assert sr.reopen_decision(
+            filed_id, root=tmp_path, expected_project='dark_factory', expected_escalations_dir=queue
+        ) is not None
+
+        with caplog.at_level(logging.WARNING):
+            _file_decision(**{**filing, 'text': 'reify? (rephrased)'})
+
+        [reread] = sr.list_decisions(root=tmp_path)
+        assert reread.state == sr.DecisionState.OPEN
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
