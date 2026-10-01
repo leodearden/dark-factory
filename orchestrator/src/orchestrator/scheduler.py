@@ -54,6 +54,7 @@ from orchestrator.pin_reservation import (
     Blocker,
     BlockerKind,
     ParkPriority,
+    PinBlockedLimiter,
     PinOrder,
     ReservationSource,
     is_pin_rank,
@@ -2295,6 +2296,9 @@ class Scheduler:
         self._pending_transient_cooldown: dict[str, int] = {}
         # --- Fairness state (see orchestrator.config.FairnessConfig) ---
         self._skip_count: dict[str, int] = {}  # task_id -> consecutive top-skip count
+        # Per-pin pin_blocked cadence (task 6040): a pin's blocked episode
+        # ends when it dispatches or leaves the pin queue.
+        self._pin_blocked = PinBlockedLimiter()
         # Per-tier cap bookkeeping: remember the effective priority of every
         # currently-dispatched task so acquire_next can count slots at-or-below
         # a candidate's tier without re-walking the full task graph.
@@ -5429,8 +5433,9 @@ class Scheduler:
         """End *task_id*'s fairness episode because it just dispatched (task 5308).
 
         THE single place a dispatch settles fairness state, called for EVERY
-        dispatch — pin loop and scored loop, top or not: the skip count and
-        blocked-install streak are dropped, and the task's own parks are
+        dispatch — pin loop and scored loop, top or not: the skip count,
+        blocked-install streak and ``pin_blocked`` episode (task 6040) are
+        dropped, and the task's own parks are
         consumed (``reservation_used``, plus ``reservation_restored`` for each
         shadow the clear exposes).  A running task's park would otherwise
         block same-tier installs (INV-3) until release, which is where
@@ -5440,6 +5445,7 @@ class Scheduler:
         """
         self._skip_count.pop(task_id, None)
         self._streak_park_install_blocked.clear(task_id)
+        self._pin_blocked.forget(task_id)
         if not self.lock_table.has_parks(task_id):
             return
         source = self.lock_table.reservation_source(task_id)
@@ -7573,6 +7579,9 @@ class Scheduler:
         ``orchestrator/pin_reservation.py``'s module docstring.
         :meth:`_bound_pin_reservations` enforces that bound at phase start
         (so a PSI-held tick still applies it) and after each head reserves.
+        Every lock-blocked pin also reports ``pin_blocked``
+        (:meth:`_note_pin_blocked`).  With ``pin_reservations_enabled`` off, a
+        blocked pin neither reserves nor reports, as before task 6040.
         Returns ``TickOutcome(TaskAssignment)`` on a successful dispatch,
         else ``_CONTINUE`` to fall through to the scored loop.
         """
@@ -7584,6 +7593,7 @@ class Scheduler:
             for pin in queue
             if not self.is_deterministic(pin.task)
         }
+        self._pin_blocked.retain(pin.task_id for pin in queue)
         self._bound_pin_reservations(ctx, reservable)
         heads = 0
         for pin in queue:
@@ -7599,11 +7609,14 @@ class Scheduler:
             modules = self._get_modules(pin.task)
             if self.lock_table.try_acquire(pin.task_id, modules):
                 return await self._dispatch_pin(pin, modules)
-            if (
-                self.config.pin_reservations_enabled
-                and not self.is_deterministic(pin.task)
+            if not self.config.pin_reservations_enabled:
+                continue
+            is_head = (
+                pin.task_id in reservable
                 and heads < self.config.pin_reservation_max_active
-            ):
+            )
+            self._note_pin_blocked(pin, modules, head=is_head)
+            if is_head:
                 heads += 1
                 self._complete_parks(
                     pin.task_id,
@@ -7614,6 +7627,35 @@ class Scheduler:
                 )
                 self._bound_pin_reservations(ctx, reservable)
         return _CONTINUE
+
+    def _note_pin_blocked(
+        self, pin: _PinCandidate, modules: list[str], *, head: bool
+    ) -> None:
+        """Emit ``pin_blocked`` for a lock-blocked *pin* when its cadence is due.
+
+        Called before a head reserves, so ``blockers`` names exactly what
+        refused this acquire (:meth:`ModuleLockTable.blockers`), never the
+        pin's own new reservation.  Due on the transition into blocked, then
+        once per ``pin_blocked_emit_interval_secs``, read at tick time.
+        """
+        if not self._pin_blocked.due(
+            pin.task_id,
+            now=self._time_source(),
+            interval=self.config.pin_blocked_emit_interval_secs,
+        ):
+            return
+        blockers = self.lock_table.blockers(pin.task_id, modules)
+        if self.event_store:
+            self.event_store.emit(
+                EventType.pin_blocked,
+                task_id=pin.task_id,
+                data={
+                    'task_id': pin.task_id,
+                    'pin_order': pin.pin_order,
+                    'head': head,
+                    'blockers': [blocker.as_payload() for blocker in blockers],
+                },
+            )
 
     def _bound_pin_reservations(
         self, ctx: TickContext, reservable: dict[str, int]

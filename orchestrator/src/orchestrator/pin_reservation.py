@@ -25,12 +25,14 @@ all operator-chosen; one reservation cannot gridlock with itself; its idle cost
 is one task's footprint; and C7 backfill still borrows through it exactly as
 it borrows through a fairness park.
 
-This module holds the vocabulary and pure policy only — rank, source, blocker
-naming, release reasons — and imports nothing from the scheduler.
+This module holds the vocabulary and policy only — rank, source, blocker
+naming, release reasons, the ``pin_blocked`` cadence — and imports nothing
+from the scheduler.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -158,3 +160,35 @@ def pin_release_reason(
     if deterministic:
         return PinReleaseReason.DETERMINISTIC
     return PinReleaseReason.INELIGIBLE
+
+
+class PinBlockedLimiter:
+    """The per-pin cadence of ``pin_blocked``: on the transition, then per interval.
+
+    A pin's first blocked observation is due at once; later ones are due only
+    once *interval* seconds have passed since the last emission.  The scheduler
+    calls :meth:`forget` when the pin dispatches and :meth:`retain` with the
+    pin queue each tick, so dispatching or leaving the queue ends the episode
+    and the next block is a new transition.  Times are monotonic seconds.
+    """
+
+    def __init__(self) -> None:
+        self._last_emit: dict[str, float] = {}
+
+    def due(self, task_id: str, *, now: float, interval: float) -> bool:
+        """True iff *task_id* should emit now; a True answer records the emission."""
+        last = self._last_emit.get(task_id)
+        if last is not None and now - last < interval:
+            return False
+        self._last_emit[task_id] = now
+        return True
+
+    def forget(self, task_id: str) -> None:
+        """End *task_id*'s blocked episode."""
+        self._last_emit.pop(task_id, None)
+
+    def retain(self, task_ids: Iterable[str]) -> None:
+        """End the episode of every tracked pin not in *task_ids*."""
+        keep = set(task_ids)
+        for task_id in self._last_emit.keys() - keep:
+            del self._last_emit[task_id]
