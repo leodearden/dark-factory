@@ -8441,9 +8441,20 @@ class TestParkStopTrip:
         await scheduler.set_task_status('2', 'blocked')
         scheduler.pause('manual')  # already paused; trip check should be suppressed
         await scheduler.set_task_status('3', 'blocked')
+        await asyncio.sleep(0)
 
         assert callback_count[0] == 0, (
             f'Callback must not fire while already paused; fired {callback_count[0]} time(s)'
+        )
+
+        scheduler.resume()
+        for task_id in ('4', '5', '6'):
+            await scheduler.set_task_status(task_id, 'blocked')
+        await asyncio.sleep(0)
+
+        assert callback_count[0] == 1, (
+            f'control: once resumed, three fresh transitions must trip, else the '
+            f'zero above proves nothing; fired {callback_count[0]} time(s)'
         )
 
     @pytest.mark.asyncio
@@ -8467,9 +8478,18 @@ class TestParkStopTrip:
 
         for i in range(4):
             await scheduler.set_task_status(str(i), 'blocked')
+        await asyncio.sleep(0)
 
         assert callback_count[0] == 0, (
             f'Expected 0 callback invocations (only 4 of 5 threshold); got {callback_count[0]}'
+        )
+
+        await scheduler.set_task_status('4', 'blocked')
+        await asyncio.sleep(0)
+
+        assert callback_count[0] == 1, (
+            f'control: the 5th transition must trip, else the zero above proves '
+            f'nothing; fired {callback_count[0]} time(s)'
         )
 
 
@@ -8607,6 +8627,7 @@ class TestParkStopDisabled:
         await scheduler.set_task_status('1', 'blocked')
         await scheduler.set_task_status('2', 'blocked')
         await scheduler.set_task_status('3', 'blocked')
+        await asyncio.sleep(0)
 
         # Transitions are recorded even when disabled.
         assert len(scheduler._blocked_transitions) == 3, (
