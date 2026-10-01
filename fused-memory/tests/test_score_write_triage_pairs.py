@@ -66,7 +66,7 @@ def _case(
     judged: str | None = None,
     *,
     band: str = 'judge',
-    band_winner: str,
+    band_winner: str | None,
     parse_failure: bool = False,
     judge_seconds: float | None = 1.0,
     judge_model: str | None = 'gpt-4o-mini',
@@ -162,6 +162,16 @@ def _replaced(cases: list[dict[str, Any]], arm: str, memory_id: str,
         {**row, **changes} if (row['arm'], row['memory_id']) == (arm, memory_id) else row
         for row in cases
     ]
+
+
+def _without(verdicts: list[dict[str, Any]], *pairs: tuple[str, str]) -> list[dict[str, Any]]:
+    return [row for row in verdicts if (row['entry_id'], row['target_id']) not in pairs]
+
+
+def _refusal(cases: list[dict[str, Any]], verdicts: list[dict[str, Any]]) -> Any:
+    with pytest.raises(_mod().IncompleteCorpusError) as caught:
+        _score(cases, verdicts)
+    return caught.value
 
 
 PAIRED_ERRORS = {
@@ -476,6 +486,97 @@ class TestPairedVsReference:
         cases = _replaced(SYNTH_CASES, 'cand', 'w1', band_winner_id='p9')
         with pytest.raises(ValueError, match='w1'):
             _score(cases, SYNTH_VERDICTS)
+
+
+class TestRefusal:
+    def test_the_refusal_is_a_value_error(self) -> None:
+        assert issubclass(_mod().IncompleteCorpusError, ValueError)
+
+    def test_an_unrated_judge_named_pair_refuses_and_is_named(self) -> None:
+        err = _refusal(SYNTH_CASES, _without(SYNTH_VERDICTS, ('w6', 't6')))
+        judged_pair = _mod().JudgedPair
+        assert err.unrated == (judged_pair(entry_id='w6', target_id='t6', arms=('cand',)),)
+        assert err.tied == ()
+        assert 'w6' in str(err) and 't6' in str(err)
+
+    def test_a_pair_named_by_both_arms_lists_both_sorted(self) -> None:
+        err = _refusal(SYNTH_CASES, _without(SYNTH_VERDICTS, ('w1', 't1')))
+        assert err.unrated[0].arms == ('cand', 'ref')
+
+    def test_a_tied_judge_named_pair_refuses_like_an_unrated_one(self) -> None:
+        verdicts = [
+            *_without(SYNTH_VERDICTS, ('w1', 't1')),
+            _vote('w1', 't1', 'SAME', 'a'),
+            _vote('w1', 't1', 'RELATED', 'b'),
+        ]
+        err = _refusal(SYNTH_CASES, verdicts)
+        assert err.tied == (_mod().JudgedPair('w1', 't1', ('cand', 'ref')),)
+        assert err.unrated == ()
+
+    def test_unrated_and_tied_pairs_are_reported_together_and_sorted(self) -> None:
+        verdicts = [
+            *_without(SYNTH_VERDICTS, ('w6', 't6'), ('w4', 't4'), ('w1', 't1')),
+            _vote('w1', 't1', 'SAME', 'a'),
+            _vote('w1', 't1', 'RELATED', 'b'),
+        ]
+        err = _refusal(SYNTH_CASES, verdicts)
+        judged_pair = _mod().JudgedPair
+        assert err.unrated == (
+            judged_pair('w4', 't4', ('cand', 'ref')),
+            judged_pair('w6', 't6', ('cand',)),
+        )
+        assert err.tied == (judged_pair('w1', 't1', ('cand', 'ref')),)
+
+    def test_a_corpus_pair_no_arm_named_never_refuses(self) -> None:
+        verdicts = [
+            *SYNTH_VERDICTS,
+            _vote('w9', 't9', 'SAME', 'a'),
+            _vote('w9', 't9', 'RELATED', 'b'),
+        ]
+        result = _score(SYNTH_CASES, verdicts)
+        assert result['verdict_corpus']['resolutions']['tied'] == 1
+        assert result['arms']['cand']['quality']['unrated_pairs'] == 0
+
+    def test_a_deterministic_band_write_never_needs_a_verdict(self) -> None:
+        assert not any(row['entry_id'] == 'w7' for row in SYNTH_VERDICTS)
+        assert _synth_result()['arms']['ref']['quality']['unrated_pairs'] == 0
+
+
+CAND_CASES = [row for row in SYNTH_CASES if row['arm'] == 'cand']
+
+
+class TestRowContract:
+    @staticmethod
+    def _refused(cases: list[dict[str, Any]], *named: str) -> None:
+        with pytest.raises(ValueError) as caught:
+            _score(cases, SYNTH_VERDICTS, reference_arm='cand')
+        assert all(word in str(caught.value) for word in named), str(caught.value)
+
+    def test_a_judge_band_attach_must_name_its_candidate(self) -> None:
+        self._refused(_replaced(CAND_CASES, 'cand', 'w1', judged_candidate_id=None), 'cand', 'w1')
+
+    def test_a_stored_write_must_not_name_a_candidate(self) -> None:
+        self._refused(_replaced(CAND_CASES, 'cand', 'w5', judged_candidate_id='t5'), 'cand', 'w5')
+
+    @pytest.mark.parametrize('outcome', ['judge', 'distinct', 'bogus'])
+    def test_an_outcome_outside_the_ack_vocabulary_is_refused(self, outcome: str) -> None:
+        self._refused(_replaced(CAND_CASES, 'cand', 'w5', outcome=outcome), 'cand', 'w5')
+
+    def test_one_arm_answering_one_write_twice_is_refused(self) -> None:
+        self._refused([*CAND_CASES, CAND_CASES[0]], 'cand', 'w1')
+
+    def test_a_judge_band_write_needs_a_band_winner(self) -> None:
+        self._refused(_replaced(CAND_CASES, 'cand', 'w5', band_winner_id=None), 'cand', 'w5')
+
+    @pytest.mark.parametrize(('missing', 'named'), [('arm', 'w1'), ('memory_id', 'cand')])
+    def test_a_row_without_its_identity_is_refused(self, missing: str, named: str) -> None:
+        cases = [dict(row) for row in CAND_CASES]
+        del cases[0][missing]
+        self._refused(cases, missing, named)
+
+    def test_an_unknown_reference_arm_is_refused_listing_the_arms(self) -> None:
+        with pytest.raises(ValueError, match=r"(?s)'cand'.*'ref'"):
+            _score(SYNTH_CASES, SYNTH_VERDICTS, reference_arm='nope')
 
 
 class TestSeedRegression:
