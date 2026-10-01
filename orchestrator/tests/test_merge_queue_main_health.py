@@ -1307,6 +1307,19 @@ class TestBaselineEnrichmentNeedsACompleteBaseline:
 
         self._assert_generic_reason(self._drive_sync(tmp_path, config, branch))
 
+    def test_a_complete_module_baseline_still_names_only_the_new_ids(
+        self, tmp_path: Path,
+    ) -> None:
+        config = self._sync_config(tmp_path)
+        _learn_main_module_baseline(tmp_path, config, {'B': ['b1']})
+        branch = self._branch_red(['b1', 'b2'], {'B': ['b1', 'b2']})
+
+        outcome = self._drive_sync(tmp_path, config, branch)
+
+        assert outcome is not None
+        assert '1 new failing test(s) not present on main: b2' in outcome.reason, outcome.reason
+        assert 'b1' not in outcome.reason, outcome.reason
+
     def test_deferred_mode_enrichment_never_claims_a_red_is_new_on_main(
         self, tmp_path: Path,
     ) -> None:
@@ -1488,3 +1501,41 @@ class TestTrivialPassMainRedGate:
             f'a NON-trivial pass (full suite ran and passed) must heal a red main, '
             f'not be blocked; got {outcome!r}'
         )
+
+    def test_e_a_red_learned_by_a_narrowed_probe_blocks_trivial_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        """A red known only from one module's probe still blocks a trivial pass."""
+        from orchestrator.merge_queue import (
+            TRIVIAL_PASS_MAIN_RED_REASON_PREFIX,
+            MergeFailureDisposition,
+        )
+
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        _learn_main_module_baseline(tmp_path, config, {'A': [self._RED_ID]})
+
+        outcome = self._drive(tmp_path, git_ops, config, self._trivial_pass(), merge_wt)
+
+        assert outcome is not None, (
+            'a trivial pass over a main known red by a narrowed probe must be blocked'
+        )
+        assert outcome.status == 'blocked', f'expected blocked; got {outcome.status!r}'
+        assert outcome.reason.startswith(TRIVIAL_PASS_MAIN_RED_REASON_PREFIX), outcome.reason
+        assert outcome.disposition == MergeFailureDisposition.MAIN_RED, outcome.disposition
+        cast(AsyncMock, git_ops.cleanup_merge_worktree).assert_awaited_with(merge_wt)
+
+    def test_f_a_narrowed_probe_that_found_main_green_advances(self, tmp_path: Path) -> None:
+        """A module known green says nothing red, so the trivial pass advances."""
+        config = _make_config(tmp_path)
+        git_ops = _make_git_ops(tmp_path)
+        merge_wt = tmp_path / 'merge-wt'
+        merge_wt.mkdir()
+        _learn_main_module_baseline(tmp_path, config, {'A': []})
+
+        outcome = self._drive(tmp_path, git_ops, config, self._trivial_pass(), merge_wt)
+
+        assert outcome is None, f'a known-green module must not withhold; got {outcome!r}'
+        cast(AsyncMock, git_ops.cleanup_merge_worktree).assert_not_awaited()
