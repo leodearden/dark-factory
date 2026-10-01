@@ -50,6 +50,7 @@ class TestVerifyHostPolicyDefault:
     def test_default_is_prefer_local(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        monkeypatch.delenv('ORCH_VERIFY_HOST_POLICY', raising=False)
         cfg = OrchestratorConfig()
         assert cfg.verify_host_policy == 'prefer_local'
 
