@@ -35,11 +35,14 @@ failed validation (nothing is written).
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import MappingProxyType
+from typing import Any
 
 from fused_memory.reconciliation.task_filter import (
     is_batch_plan_framing,
@@ -331,3 +334,120 @@ def detector_census(
                 counts[name] += 1
         census[stratum] = counts
     return census
+
+
+# --------------------------------------------------------------------------- #
+# The deterministic, stratified, out-of-sample adjudication sample
+# --------------------------------------------------------------------------- #
+
+DEFAULT_WINDOW_START = '2026-08-25T00:00:00+00:00'
+"""The day after the esc-4639-1 ruling: disjoint from the 30 episodes adjudicated before it."""
+
+DEFAULT_WINDOW_END = '2026-10-01T00:00:00+00:00'
+"""Frozen, so later writes cannot shift the sample."""
+
+DEFAULT_CAP = 8
+"""Per graph per stratum: at most 48 episodes, roughly 300 minted edges."""
+
+HASH_RULE = 'sha256(graph:uuid)'
+
+
+def sample_key(graph: str, uuid: str) -> str:
+    return hashlib.sha256(f'{graph}:{uuid}'.encode()).hexdigest()
+
+
+def _instant(iso: str) -> datetime:
+    """Parse an ISO timestamp; a naive one is UTC, which is how graphiti writes them."""
+    parsed = datetime.fromisoformat(iso)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _created_instant(episode: Episode) -> datetime | None:
+    try:
+        return _instant(episode.created_at)
+    except (TypeError, ValueError):
+        return None
+
+
+def in_window(episode: Episode, window_start: str, window_end: str) -> bool:
+    at = _created_instant(episode)
+    return at is not None and _instant(window_start) <= at < _instant(window_end)
+
+
+@dataclass(frozen=True)
+class SampledEpisode:
+    episode: Episode
+    stratum: str
+    sample_key: str
+
+
+def select_sample(
+    episodes: Iterable[Episode], *, window_start: str, window_end: str, cap: int
+) -> tuple[SampledEpisode, ...]:
+    """The first *cap* by ``sample_key`` of each (graph, stratum) group in the window."""
+    groups: defaultdict[tuple[str, int], list[SampledEpisode]] = defaultdict(list)
+    for episode in episodes:
+        stratum = stratum_of(episode)
+        if stratum is None or not in_window(episode, window_start, window_end):
+            continue
+        groups[(episode.graph, STRATA.index(stratum))].append(
+            SampledEpisode(episode, stratum, sample_key(episode.graph, episode.uuid))
+        )
+    return tuple(
+        member
+        for group in sorted(groups)
+        for member in sorted(groups[group], key=lambda m: m.sample_key)[:cap]
+    )
+
+
+@dataclass(frozen=True)
+class SampleDefinition:
+    """Everything that fixes the sample; the verdict file carries it."""
+
+    window_start: str = DEFAULT_WINDOW_START
+    window_end: str = DEFAULT_WINDOW_END
+    cap: int = DEFAULT_CAP
+    strata: tuple[str, ...] = STRATA
+    hash_rule: str = HASH_RULE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'window_start': self.window_start, 'window_end': self.window_end,
+            'cap': self.cap, 'strata': list(self.strata), 'hash_rule': self.hash_rule,
+        }
+
+    @classmethod
+    def from_dict(cls, obj: Mapping[str, Any]) -> SampleDefinition:
+        return cls(
+            window_start=str(obj['window_start']), window_end=str(obj['window_end']),
+            cap=int(obj['cap']), strata=tuple(obj['strata']), hash_rule=str(obj['hash_rule']),
+        )
+
+    def select(self, episodes: Iterable[Episode]) -> tuple[SampledEpisode, ...]:
+        return select_sample(
+            episodes, window_start=self.window_start, window_end=self.window_end, cap=self.cap,
+        )
+
+
+def _edge_row(edge: Edge) -> dict[str, Any]:
+    return {
+        'edge_uuid': edge.uuid, 'fact': edge.fact, 'source_name': edge.source_name,
+        'target_name': edge.target_name, 'served': edge.served, 'live_strict': edge.live_strict,
+    }
+
+
+def worksheet_rows(
+    sample: Iterable[SampledEpisode], attribution: Attribution
+) -> Iterator[dict[str, Any]]:
+    """One adjudication row per sampled episode. Only MINTED edges are offered."""
+    for member in sample:
+        episode = member.episode
+        edges = attribution.edges_of(episode.graph, episode.uuid)
+        yield {
+            'graph': episode.graph, 'uuid': episode.uuid, 'stratum': member.stratum,
+            'classifiers': list(matching_classifiers(episode)),
+            'created_at': episode.created_at, 'category': episode.source.category,
+            'content': episode.content,
+            'minted': [_edge_row(e) for e in sorted(edges.minted, key=lambda e: e.uuid)],
+            'corroborated_count': len(edges.corroborated),
+        }

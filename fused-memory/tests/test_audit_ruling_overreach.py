@@ -478,7 +478,7 @@ class TestWorksheetRows:
         (row,) = list(mod.worksheet_rows(sample, attribution))
         assert row == {
             'graph': 'reify', 'uuid': 'E', 'stratum': 'ruling_lexeme',
-            'classifiers': ['category_decisions', 'header_ruling', 'ruling_lexeme_head'],
+            'classifiers': list(mod.CLASSIFIERS),
             'created_at': '2026-09-01T00:00:00+00:00',
             'category': 'decisions_and_rationale', 'content': RULING_HEAD,
             'minted': [{
