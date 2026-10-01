@@ -4172,6 +4172,17 @@ def _assert_done_provenance_passthrough(
 ) -> None:
     """Refuse a whole-blob replace that would move ``metadata.done_provenance``.
 
+    The contract: update_task may never ADD, CHANGE or REMOVE
+    metadata.done_provenance. Under metadata_mode='replace' the payload must
+    carry the stored value verbatim; under every other mode the key must be
+    absent (update_task's pre-connect floor). set_task_status and the
+    privileged stamp_audit_metadata seam remain the only writers of the key.
+    Carrying the whole blob through is the shape the orchestrator's
+    read-modify-write callers already use:
+    orchestrator/src/orchestrator/workflow.py::_clear_merge_retry_pending,
+    orchestrator/src/orchestrator/workflow.py::_clear_merge_phase_entered and
+    orchestrator/src/orchestrator/harness.py::_clear_merge_retry_pending_for_restart.
+
     update_task calls this inside its transaction, against the row it just
     SELECTed, so the stored value cannot change before the UPDATE and a raise
     rolls back with nothing written. The caller's own copy of the stored
@@ -4183,12 +4194,13 @@ def _assert_done_provenance_passthrough(
     read-modify-write caller builds its payload.
 
     * ``incoming`` is None (unparseable or non-dict payload): no check, the
-      same fail-open the pre-connect floor applies.
+      same fail-open the pre-connect floor applies. Known residual: such a
+      payload still replaces the blob and can destroy done_provenance.
     * The stored blob is absent or not a JSON object: identity cannot be
       established, so a payload carrying done_provenance is refused, while
       one omitting it is the corrupt-row repair replace mode exists for.
-    * Stored without the key, payload with it: refused (an ADD).
-    * Both carry it with different values: refused (a CHANGE).
+    * Otherwise the key's presence and value must match the stored row
+      exactly: an ADD, a CHANGE and a drop-by-omission are all refused.
     """
     if incoming is None:
         return
@@ -4200,12 +4212,8 @@ def _assert_done_provenance_passthrough(
         if 'done_provenance' in incoming:
             raise DoneProvenanceWriteAuthorityError(task_id)
         return
-    if 'done_provenance' not in incoming:
-        return
-    if (
-        'done_provenance' not in stored
-        or stored['done_provenance'] != incoming['done_provenance']
-    ):
+    absent = object()
+    if stored.get('done_provenance', absent) != incoming.get('done_provenance', absent):
         raise DoneProvenanceWriteAuthorityError(task_id)
 
 
