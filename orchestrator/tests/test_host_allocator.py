@@ -251,14 +251,17 @@ class TestHostAllocatorQuarantine:
         assert 'remoteA' in shared_q
 
     async def test_quarantine_frees_the_slot(self):
-        """After quarantine_and_release, the remote slot is freed (count increments)."""
+        """After quarantine_and_release the remote slot is freed, but a
+        quarantined slot is not acquirable, so free_host_count() does not rise.
+        """
         alloc = self._make_allocator()
         await alloc.acquire(self._local_factory, policy='prefer_local')           # local
         remote_lease = await alloc.acquire(self._local_factory, policy='prefer_local')   # remoteA
         assert remote_lease is not None
         before = alloc.free_host_count()
         await alloc.quarantine_and_release(remote_lease)
-        assert alloc.free_host_count() == before + 1
+        assert alloc.is_busy('remoteA') is False
+        assert alloc.free_host_count() == before
 
     async def test_quarantined_host_not_acquired(self):
         """A quarantined remote is skipped by acquire_remote()."""
@@ -1536,9 +1539,10 @@ class TestHostAllocatorPreferRemoteFallbackBoundary:
         await alloc.quarantine_and_release(first)
 
         assert 'remoteA' in shared_q
-        # The slot was freed, not leaked: both slots are physically FREE, so the
-        # failure cost the pool no capacity.
-        assert alloc.free_host_count() == 2
+        # The slot was freed, not leaked, but a quarantined remote is not
+        # acquirable, so only local counts.
+        assert alloc.is_busy('remoteA') is False
+        assert alloc.free_host_count() == 1
 
         second = await alloc.acquire(self._local_factory, policy='prefer_remote')
 
@@ -1548,3 +1552,83 @@ class TestHostAllocatorPreferRemoteFallbackBoundary:
         assert second.name == 'local'
         assert second.is_local is True
         assert 'remoteA' in shared_q
+
+
+@pytest.mark.asyncio
+class TestHostAllocatorFreeHostCountMatchesAcquire:
+    """free_host_count() counts exactly the slots acquire() could hand out
+    (task 5303, absorbing 4929 defect 2).
+
+    The merge lane's dispatch fast path trusts this count before paying for a
+    main-SHA read and a re-merge; counting a FREE-but-quarantined remote sent
+    it past the guard into an acquire() that returned None.
+    """
+
+    def _local_factory(self):
+        return _FakeLocalRunner()
+
+    def _make_allocator(self, quarantine: set[str]):
+        from orchestrator.verify_runner import HostAllocator
+
+        return HostAllocator(
+            [_FakeRemoteRunner('remoteA'), _FakeRemoteRunner('remoteB')],
+            quarantine=quarantine,
+        )
+
+    async def _drain(self, alloc, policy) -> list[str]:
+        names = []
+        while (lease := await alloc.acquire(self._local_factory, policy=policy)) is not None:
+            names.append(lease.name)
+        return names
+
+    async def test_free_but_quarantined_remote_is_not_counted(self):
+        alloc = self._make_allocator({'remoteA'})
+        local = await alloc.acquire(self._local_factory, policy='prefer_local')
+        remote_b = await alloc.acquire(self._local_factory, policy='prefer_local')
+        assert local is not None and remote_b is not None
+        assert alloc.is_busy('remoteA') is False, 'precondition: remoteA is FREE'
+
+        assert alloc.free_host_count() == 0
+        assert await alloc.acquire(self._local_factory, policy='prefer_local') is None
+
+    async def test_quarantined_local_name_is_still_counted(self):
+        """Local is the trust anchor: a stray 'local' in the shared set does not
+        stop acquire_local, so it must not stop the count either."""
+        alloc = self._make_allocator({'local', 'remoteA', 'remoteB'})
+
+        assert alloc.free_host_count() == 1
+        assert await self._drain(alloc, 'prefer_local') == ['local']
+
+    @pytest.mark.parametrize('policy', ['prefer_local', 'prefer_remote'])
+    @pytest.mark.parametrize(
+        'quarantine', [set(), {'remoteA'}, {'remoteB'}, {'remoteA', 'remoteB'}],
+    )
+    async def test_count_equals_what_acquire_yields(self, policy, quarantine):
+        alloc = self._make_allocator(set(quarantine))
+        counted = alloc.free_host_count()
+
+        acquired = await self._drain(alloc, policy)
+
+        assert counted == len(acquired), (
+            f'free_host_count()={counted} but acquire() handed out {acquired} '
+            f'under {policy} with quarantine={sorted(quarantine)}'
+        )
+
+    async def test_cleared_quarantine_is_counted_again(self):
+        alloc = self._make_allocator({'remoteA'})
+        assert alloc.free_host_count() == 2
+
+        alloc.clear_quarantine('remoteA')
+
+        assert alloc.free_host_count() == 3
+
+    async def test_readmitted_parked_remote_is_counted_again(self):
+        alloc = self._make_allocator(set())
+        remote = await alloc.acquire(self._local_factory, policy='prefer_remote')
+        assert remote is not None
+        await alloc.quarantine_and_release(remote)
+        assert alloc.free_host_count() == 2
+
+        alloc.readmit(remote.name)
+
+        assert alloc.free_host_count() == 3

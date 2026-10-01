@@ -3403,9 +3403,15 @@ class HostAllocator:
         """All managed host names in declaration order (local first, then remotes)."""
         return list(self._slots.keys())
 
+    def _is_acquirable(self, name: str) -> bool:
+        """FREE, and for a remote also not quarantined (local is the trust anchor)."""
+        if self._slots[name] != _SLOT_FREE:
+            return False
+        return name == self._local_name or name not in self._quarantine
+
     def free_host_count(self) -> int:
-        """Number of FREE slots."""
-        return sum(1 for s in self._slots.values() if s == _SLOT_FREE)
+        """Number of slots :meth:`acquire` could hand out right now."""
+        return sum(1 for name in self._slots if self._is_acquirable(name))
 
     def is_busy(self, name: str) -> bool:
         """True when the slot for *name* is BUSY or PARKED (not FREE)."""
@@ -3413,7 +3419,7 @@ class HostAllocator:
 
     def acquire_local(self, factory: Any) -> HostLease | None:
         """Try to acquire the local slot.  Returns None if the slot is not FREE."""
-        if self._slots[self._local_name] == _SLOT_FREE:
+        if self._is_acquirable(self._local_name):
             runner = factory()
             self._slots[self._local_name] = _SLOT_BUSY
             return HostLease(name=self._local_name, runner=runner, is_local=True)
@@ -3422,7 +3428,7 @@ class HostAllocator:
     def acquire_remote(self) -> HostLease | None:
         """Acquire the first FREE, non-quarantined, non-PARKED remote slot."""
         for name, runner in self._remote_runners.items():
-            if self._slots[name] == _SLOT_FREE and name not in self._quarantine:
+            if self._is_acquirable(name):
                 self._slots[name] = _SLOT_BUSY
                 return HostLease(name=name, runner=runner, is_local=False)
         return None

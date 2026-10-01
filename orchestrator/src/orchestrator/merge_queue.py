@@ -21289,10 +21289,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         lease = await allocator.acquire(_local_factory, policy=req.config.verify_host_policy)
         if lease is None:
-            # Should not happen (free_host_count > 0 was checked above with no
-            # intervening await that could yield to a concurrent dispatch — asyncio
-            # is single-threaded and _dispatch_item is the only acquirer).
-            # Return None defensively so the caller puts the item back.
+            # Reachable: the awaits since the free_host_count() guard let other
+            # tasks run, and merge_drift.py::_run_drift_check takes slots too
+            # (acquire_local/acquire_remote).  The caller parks the item on
+            # _redispatch.
             return None
 
         # ── LEASE/PERMIT LEAK GUARD (task 3185 amend, robustness) ────────────
