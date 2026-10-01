@@ -1242,6 +1242,106 @@ async def test_update_task_replace_admits_identical_done_provenance_passthrough(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('stored', 'payload_done_provenance'),
+    [
+        ({'files': ['src']}, _STORED_DONE_PROVENANCE),
+        (
+            {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
+            {'kind': 'merged', 'commit': 'b' * 40},
+        ),
+        (
+            {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
+            {'kind': 'operational-verified', 'commit': 'a' * 40},
+        ),
+        (
+            {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
+            {**_STORED_DONE_PROVENANCE, 'note': 'drift'},
+        ),
+    ],
+    ids=['add', 'change-commit', 'change-kind', 'change-nested-shape'],
+)
+async def test_update_task_replace_still_rejects_added_and_changed_done_provenance(
+    backend, project_root, stored, payload_done_provenance,
+):
+    """Only the identical passthrough is admitted under replace: a payload
+    that ADDS done_provenance to a row without one, or CHANGES the stored
+    value in any way (deep equality, not a subset check), is refused and the
+    transaction rolls back with the stored blob untouched."""
+    await backend.add_task(
+        project_root=project_root, title='x', metadata=json.dumps(stored),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'done_provenance': payload_done_provenance}),
+            metadata_mode='replace',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('metadata_mode', [None, 'merge', 'additive'])
+async def test_update_task_non_replace_modes_reject_done_provenance_unconditionally(
+    backend, project_root, metadata_mode,
+):
+    """The carve-out is keyed on metadata_mode='replace' and nothing else:
+    every other mode still refuses the very identical-value payload that
+    replace admits, before touching the row."""
+    stored = {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']}
+    await backend.add_task(
+        project_root=project_root, title='x', metadata=json.dumps(stored),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE}),
+            metadata_mode=metadata_mode,
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_merge_mode_done_provenance_rejection_precedes_existence_check(
+    backend, project_root,
+):
+    """Explicit merge mode keeps the pre-connect ordering: the
+    write-authority rejection beats 'No tasks found'."""
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root,
+            metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE}),
+            metadata_mode='merge',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('999')
+    assert 'No tasks found' not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_done_provenance_on_missing_task_reports_not_found(
+    backend, project_root,
+):
+    """The one deliberate ordering difference, confined to replace mode: the
+    passthrough check needs the stored value, so it runs after the SELECT and
+    a missing row reports 'No tasks found'. Both answers are refusals — there
+    is no stored value to pass through on a row that does not exist."""
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root,
+            metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE}),
+            metadata_mode='replace',
+        )
+    assert not isinstance(exc.value, DoneProvenanceWriteAuthorityError)
+    assert 'No tasks found' in exc.value.message
+
+
+@pytest.mark.asyncio
 async def test_update_task_appends_metadata(backend, project_root):
     await backend.add_task(
         project_root=project_root,
