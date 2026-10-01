@@ -56,6 +56,7 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     clip_for_prompt,
+    embedding_text,
     flatten_task_tree,
     is_combine_eligible_status,
     normalize_title,
@@ -252,6 +253,26 @@ class TestClipForPrompt:
     def test_marker_keeps_the_ellipsis_prefix(self):
         clipped = clip_for_prompt('z' * 50, 10)
         assert clipped[10] == '\u2026'
+
+
+class TestEmbeddingText:
+    """`embedding_text` is the single owner of the curator corpus embedding text."""
+
+    def test_title_alone(self):
+        assert embedding_text('Fix the bug', '', []) == 'Fix the bug'
+
+    def test_title_and_description_join_with_blank_line(self):
+        assert embedding_text('T', 'D', []) == 'T\n\nD'
+
+    def test_files_are_their_own_newline_block(self):
+        assert embedding_text('T', 'D', ['a.py', 'b.py']) == 'T\n\nD\n\na.py\nb.py'
+
+    def test_empty_description_contributes_nothing(self):
+        assert embedding_text('T', '', ['a.py']) == 'T\n\na.py'
+
+    def test_delegate_is_byte_identical(self):
+        args = ('Title', 'Some description', ['x/y.py', 'z.py'])
+        assert TaskCurator._embedding_text(*args) == embedding_text(*args)
 
 
 class TestTrimPool:
