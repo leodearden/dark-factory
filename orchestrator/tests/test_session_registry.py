@@ -29,7 +29,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 
 from orchestrator import session_registry as sr
 
