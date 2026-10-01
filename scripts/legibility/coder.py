@@ -806,15 +806,11 @@ def code_digests(
     That volume is bounded CALLER-SIDE rather than here, deliberately.
     Bounding it inside this function cannot work: the flood comes from the
     batch COUNT, which only the mining loop knows, and a per-batch cap would
-    buy nothing when a batch is already only a handful of digests. The fix
-    EXISTS in ``scripts/legibility/census.py::mine_to_saturation``: it caps
-    the per-digest WARNINGs of its own ``code_digests`` call with a
-    ``logging.Filter`` removed in a ``finally``, and emits ONE aggregated
-    per-batch WARNING naming the DISTINCT failure reasons — preserving the
-    38-ENOENTs-vs-38-model-errors property without a line per digest. Do NOT
-    silence this line or drop it to DEBUG: that
-    restores the sub-storm blind spot above for EVERY caller, including the
-    trickle, to spare a flood only one of them can produce.
+    buy nothing when a batch is already only a handful of digests. The bound
+    lives in ``scripts/legibility/census.py::mine_to_saturation`` (see its
+    ``_bounded_coder_warnings``). Do NOT silence this line or drop it to
+    DEBUG: that restores the sub-storm blind spot above for EVERY caller,
+    including the trickle, to spare a flood only one of them can produce.
 
     ``status`` is ``"failure"`` when ``failed/total`` STRICTLY exceeds
     0.5 — a majority-failure storm — else ``"ok"``. Never escalates,
