@@ -153,7 +153,18 @@ async def _resolve(
     *,
     now: datetime,
 ) -> None:
-    """Record into *resolved* each ref's answer as soon as it is known."""
+    """Record into *resolved* each ref's answer as soon as it is known.
+
+    A held answer needs no I/O, so it is recorded BEFORE the snapshot read: a
+    deadline spent there cannot blank it. An active row read afterwards still
+    wins, because a held terminal id may since have been reopened.
+    """
+    held = {
+        ref: fetched for ref in wanted
+        if (fetched := _lookup_cache.get_fresh(ref)) is not None
+    }
+    for ref, fetched in held.items():
+        resolved[ref] = _datum_of(ref, fetched)
     active = await _active_rows(
         client, config, sorted({ref.project_root for ref in wanted}), now=now,
     )
@@ -161,9 +172,7 @@ async def _resolve(
     for ref in wanted:
         if ref in active:
             resolved[ref] = active[ref]
-        elif (held := _lookup_cache.get_fresh(ref)) is not None:
-            resolved[ref] = _datum_of(ref, held)
-        else:
+        elif ref not in held:
             misses.append(ref)
 
     for ref in misses[LOOKUP_MISS_CAP:]:

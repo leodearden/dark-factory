@@ -8,6 +8,7 @@ underneath every assertion.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
@@ -195,6 +196,35 @@ class TestBudget:
             assert served.state is DatumState.UNKNOWN
             assert served.reason is not None
             assert served.reason.startswith('lookup budget')
+
+    async def test_a_held_answer_survives_a_deadline_spent_in_the_snapshot_read(
+        self, root, dashboard_config, dummy_client, monkeypatch,
+    ):
+        import dashboard.data.task_snapshot as snapshot_mod
+        import dashboard.data.tasks as tasks_mod
+
+        canned = _canned((10, 'in-progress'), (3, 'done'))
+        held, unread = TaskRef(root, 3), TaskRef(root, 10)
+        await _lookup(canned, dummy_client, dashboard_config, [held])
+        snapshot_mod._snapshot_cache_clear()
+        tasks_mod._fetch_tasks_cache_clear()
+        monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', 0.2)
+
+        async def _hung_snapshot(client, url, tool, args, **kwargs):
+            if tool != 'get_task':
+                await asyncio.sleep(5.0)
+            return await canned(client, url, tool, args, **kwargs)
+
+        started = time.monotonic()
+        result = await _lookup(_hung_snapshot, dummy_client, dashboard_config, [held, unread])
+
+        assert time.monotonic() - started < 2.0
+        assert result[held].state is DatumState.FRESH
+        assert result[held].value is not None
+        assert result[held].value['title'] == 'task 3'
+        assert result[unread].state is DatumState.UNKNOWN
+        assert result[unread].reason is not None
+        assert result[unread].reason.startswith('lookup budget')
 
     async def test_misses_are_read_at_most_lookup_concurrency_at_a_time(
         self, root, dashboard_config, dummy_client,
