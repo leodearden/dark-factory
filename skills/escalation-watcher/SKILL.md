@@ -201,8 +201,10 @@ session order: the file, reading it at launch, stopping, then self-operations.
 The handover lives at `<project_root>/data/escalations/l2-handover.md`, one per watched project,
 beside the queue it describes. It is runtime state like that queue: never committed (dark-factory
 gitignores `/data/`), and overwritten by each stop. The watcher reacts only to `esc-*.json`, so
-writing it never fires a wake. The sitting preparer reads the same file as ownership `mentions`
-evidence. `scripts/sitting/ownership.py::HANDOVER_CANDIDATES` holds the path and its fallback.
+writing it never fires a wake. `scripts/sitting/ownership.py::HANDOVER_CANDIDATES` holds the path
+and its fallback. The sitting preparer reads only dark-factory's own handover, as ownership
+`mentions` evidence (`scripts/sitting/prepare_sitting.py::handover_file`). Another project's
+handover reaches the next watcher of that project, never the cross-project sitting.
 
 **As of writing.** A handover is written from session knowledge, without re-probing. Every figure
 in it is as of the time it was written and must be re-verified before anyone acts on it.
@@ -248,8 +250,7 @@ After `lease-claim` returns `acquired` or `proceed`, and before the first brief:
    mind for the session and carry into your own handover while they still hold.
 4. Open the first brief, posted unprompted at launch (see "When it runs"), with the reconciliation:
    what carried forward, what the handover missed, and each correction where live state refutes
-   it. Measured: the hand-carried 2026-09-22 handover, reconciled this way, yielded 6 items and 2
-   corrections its successor had missed.
+   it.
 
 ### Stopping
 
@@ -277,8 +278,9 @@ Four steps, in this order:
 2. **Write the handover** (see "The handover file (`l2-handover.md`)"). It goes before the release,
    so a successor that claims the freed lease finds it complete.
 3. **Release the lease** with the `lease-release` verb under "Heartbeat + release" in "Claiming the
-   Watcher Lease". `applied` and `absent` both finish the step. Report `refused` in the closing
-   message; never retry it with `--force`.
+   Watcher Lease". `applied` and `absent` both finish the step. Report `refused` or `faulted` in
+   the closing message, since a faulted release leaves the lease in place until it goes stale and
+   only then can a successor claim it. Never retry either with `--force`.
 4. **Run `/reflect`.**
 
 Close with one message: the handover path, the lease result and, when the session stops in AFK
@@ -1032,15 +1034,15 @@ switches on and off. Three behavioural shifts:
 ### AFK by silence
 
 **On.** Either of two triggers switches AFK posture on, and neither needs a confirmation question:
-an explicit "I'll be away", at once; or 4 hours with no human turn. Leo is away for up to 48 hours,
-weekends included, without saying so, and no watcher session in 2026-08-22..09-23 entered AFK mode
-on the explicit trigger alone (Leo, 2026-09-25, task 5884).
+an explicit "I'll be away", at once; or 4 hours with no human turn. Leo can be away for up to 48
+hours, weekends included, without saying so (Leo, 2026-09-25, task 5884).
 
 **Measuring the silence.** A human turn is a message Leo types. A watcher fire, a `CEILING` tick
-and a background sub-agent completion are not human turns. Note `date -u +%FT%TZ` at each human
-turn and compare against it at each wake. A quiet queue still wakes you once per slice (the
-Bash-tool timeout contract in "Starting the watcher"), so the switch lags the 4-hour mark by at
-most one slice.
+and a background sub-agent completion are not human turns. At launch and at each human turn, write
+`date -u +%FT%TZ` to `<project_root>/data/escalations/l2-last-human-turn`, overwriting it. At each
+wake, compare against that file, not against a time you remember: a compaction can drop it from
+context. A quiet queue still wakes you once per slice (the Bash-tool timeout contract in "Starting
+the watcher"), so the switch lags the 4-hour mark by at most one slice.
 
 **What changes.** The three shifts above: defer, don't wedge; no unattended interactive terminals;
 a DecisionRecord and the brief instead of per-item pings. The 3b reminder cadence also stops.
