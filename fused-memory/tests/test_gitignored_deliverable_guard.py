@@ -9,7 +9,11 @@ import pytest
 from _fm_helpers import _init_git_repo
 
 from fused_memory.middleware.gitignored_deliverable_guard import (
+    GitignoredDeliverableFinding,
+    gitignored_deliverable_enforced,
     gitignored_deliverable_finding,
+    gitignored_deliverable_reject,
+    gitignored_deliverable_warning,
     make_gitignore_probe,
 )
 
@@ -192,3 +196,82 @@ class TestGitignoredDeliverableFindingMatrix:
         )
         assert finding is None
         assert probe.calls == []
+
+
+_FINDING = GitignoredDeliverableFinding(
+    ignored_paths=('tasks.db', '.taskmaster/tasks/tasks.db'),
+)
+_DETERMINISTIC_HINT = "task_kind='deterministic'"
+
+
+def _payload_text(payload) -> str:
+    if isinstance(payload, dict):
+        return ' '.join(_payload_text(v) for v in payload.values())
+    if isinstance(payload, list):
+        return ' '.join(_payload_text(v) for v in payload)
+    return str(payload)
+
+
+class TestGitignoredDeliverablePayloads:
+    """Reject and warning payloads carry an accurate, actionable message."""
+
+    def test_reject_is_a_validation_error_naming_every_path(self):
+        payload = gitignored_deliverable_reject(_FINDING)
+        assert payload['error_type'] == 'ValidationError'
+        for path in _FINDING.ignored_paths:
+            assert path in payload['error']
+
+    def test_reject_names_the_commit_requirement(self):
+        error = gitignored_deliverable_reject(_FINDING)['error']
+        assert 'commit' in error
+        assert 'gitignored' in error
+
+    def test_reject_hint_suggests_deterministic(self):
+        assert _DETERMINISTIC_HINT in gitignored_deliverable_reject(_FINDING)['hint']
+
+    @pytest.mark.parametrize(
+        'build', [gitignored_deliverable_reject, gitignored_deliverable_warning],
+    )
+    def test_confirm_plan_is_only_described_as_a_declaration_check(self, build):
+        text = _payload_text(build(_FINDING))
+        if 'confirm_plan' in text:
+            assert 'declar' in text
+
+    def test_warning_is_a_single_non_error_key(self):
+        payload = gitignored_deliverable_warning(_FINDING)
+        assert set(payload) == {'gitignored_deliverable_warning'}
+        assert 'error' not in payload
+        assert 'error_type' not in payload
+
+    def test_warning_exposes_paths_and_deterministic_hint(self):
+        nested = gitignored_deliverable_warning(_FINDING)['gitignored_deliverable_warning']
+        assert nested['ignored_paths'] == list(_FINDING.ignored_paths)
+        assert _DETERMINISTIC_HINT in nested['hint']
+
+    def test_warning_emits_the_flagged_census_line(self, caplog):
+        with caplog.at_level('WARNING'):
+            gitignored_deliverable_warning(_FINDING)
+        census = [
+            r.getMessage() for r in caplog.records
+            if 'gitignored_deliverable_lint.flagged' in r.getMessage()
+        ]
+        assert census
+        assert 'tasks.db' in census[0]
+
+
+class TestGitignoredDeliverableEnforced:
+    """FUSED_GITIGNORED_DELIVERABLE_ENFORCE parsing: warn by default."""
+
+    @pytest.mark.parametrize('value', ['1', 'true', 'TRUE', 'yes', 'on', ' 1 '])
+    def test_truthy_values_enforce(self, monkeypatch, value):
+        monkeypatch.setenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', value)
+        assert gitignored_deliverable_enforced() is True
+
+    @pytest.mark.parametrize('value', ['', '0', 'maybe'])
+    def test_other_values_warn(self, monkeypatch, value):
+        monkeypatch.setenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', value)
+        assert gitignored_deliverable_enforced() is False
+
+    def test_unset_warns(self, monkeypatch):
+        monkeypatch.delenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', raising=False)
+        assert gitignored_deliverable_enforced() is False
