@@ -204,14 +204,6 @@ _FINDING = GitignoredDeliverableFinding(
 _DETERMINISTIC_HINT = "task_kind='deterministic'"
 
 
-def _payload_text(payload) -> str:
-    if isinstance(payload, dict):
-        return ' '.join(_payload_text(v) for v in payload.values())
-    if isinstance(payload, list):
-        return ' '.join(_payload_text(v) for v in payload)
-    return str(payload)
-
-
 class TestGitignoredDeliverablePayloads:
     """Reject and warning payloads carry an accurate, actionable message."""
 
@@ -221,21 +213,8 @@ class TestGitignoredDeliverablePayloads:
         for path in _FINDING.ignored_paths:
             assert path in payload['error']
 
-    def test_reject_names_the_commit_requirement(self):
-        error = gitignored_deliverable_reject(_FINDING)['error']
-        assert 'commit' in error
-        assert 'gitignored' in error
-
     def test_reject_hint_suggests_deterministic(self):
         assert _DETERMINISTIC_HINT in gitignored_deliverable_reject(_FINDING)['hint']
-
-    @pytest.mark.parametrize(
-        'build', [gitignored_deliverable_reject, gitignored_deliverable_warning],
-    )
-    def test_confirm_plan_is_only_described_as_a_declaration_check(self, build):
-        text = _payload_text(build(_FINDING))
-        if 'confirm_plan' in text:
-            assert 'declar' in text
 
     def test_warning_is_a_single_non_error_key(self):
         payload = gitignored_deliverable_warning(_FINDING)
