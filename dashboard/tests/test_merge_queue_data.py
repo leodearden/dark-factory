@@ -154,14 +154,13 @@ from dashboard.data.merge_queue import (  # noqa: E402
     _align_bucket,
     _bucket_minutes_for_window,
     _cutoff_iso,
-    _get_durations,
     _ts_sort_key,
-    latency_stats,
-    outcome_distribution,
+    merge_attempts,
     queue_depth_timeseries,
     recent_merges,
     speculative_stats,
 )
+from dashboard.data.stats_utils import percentile  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # TestBucketMinutesForWindow
@@ -608,209 +607,191 @@ class TestQueueDepthTimeseries:
 
 
 # ---------------------------------------------------------------------------
-# TestOutcomeDistribution
+# TestMergeAttempts — ONE query feeds the outcome chart and the latency block
 # ---------------------------------------------------------------------------
 
-class TestOutcomeDistribution:
-    @pytest.mark.asyncio
-    async def test_populated(self, merge_events_db):
-        """Outcome counts match inserted data; canonical order; sum correct."""
-        now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        outcomes = ['done'] * 3 + ['conflict'] * 2 + ['blocked'] * 1 + ['already_merged'] * 1
-        for outcome in outcomes:
-            _insert_event(conn_sync, event_type='merge_attempt',
-                          timestamp=now - timedelta(minutes=10),
-                          data={'outcome': outcome, 'attempt': 1})
-        conn_sync.commit()
-        conn_sync.close()
+ATTEMPTS_NOW = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+"""The injected instant every ``merge_attempts`` case reads its window against."""
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await outcome_distribution(db, hours=24)
+ZERO_LATENCY = {
+    'p50': 0, 'p95': 0, 'p99': 0, 'mean_ms': 0.0,
+    'with_duration': 0, 'without_duration': 0,
+}
 
-        assert sum(result['values']) == 7
-        assert 'done' in result['labels']
-        assert 'conflict' in result['labels']
-        assert 'blocked' in result['labels']
-        assert 'already_merged' in result['labels']
 
-        idx_done = result['labels'].index('done')
-        assert result['values'][idx_done] == 3
-        idx_conflict = result['labels'].index('conflict')
-        assert result['values'][idx_conflict] == 2
+def _attempt(minutes_ago, outcome, duration_ms=None):
+    """One merge_attempt event *minutes_ago* before :data:`ATTEMPTS_NOW`.
 
-    @pytest.mark.asyncio
-    async def test_outcome_distribution_count_descending_with_alpha_tiebreak(self, merge_events_db):
-        """Outcomes are ordered by count descending; ties break alphabetically."""
-        now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        outcomes = (
-            ['conflict'] * 3 + ['blocked'] * 2 + ['done'] * 2
-            + ['zzz'] * 1 + ['aaa'] * 1
+    An *outcome* of None writes no ``outcome`` key at all, which is how the
+    substrate spells an attempt whose outcome was never recorded.
+    """
+    return {
+        'event_type': 'merge_attempt',
+        'timestamp': ATTEMPTS_NOW - timedelta(minutes=minutes_ago),
+        'data': {} if outcome is None else {'outcome': outcome},
+        'duration_ms': duration_ms,
+    }
+
+
+FIVE_ATTEMPTS = [
+    _attempt(5, 'done', 300),
+    _attempt(6, 'done', 100),
+    _attempt(7, 'conflict', 200),
+    _attempt(8, 'conflict', None),
+    _attempt(9, 'blocked', 0),
+]
+"""Three attempts with a positive duration, one NULL and one zero."""
+
+
+async def _merge_attempts_over(tmp_path, events, *, hours=24):
+    db_path = _make_db(tmp_path, 'attempts.db', events)
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        return await merge_attempts(conn, hours=hours, now=ATTEMPTS_NOW)
+
+
+class TestMergeAttempts:
+    """``merge_attempts`` reads the window once; the chart and latency agree."""
+
+    async def test_the_chart_counts_every_attempt(self, tmp_path):
+        result = await _merge_attempts_over(tmp_path, FIVE_ATTEMPTS)
+
+        assert result.outcome_chart() == {
+            'labels': ['conflict', 'done', 'blocked'], 'values': [2, 2, 1],
+        }
+
+    async def test_latency_reads_only_the_attempts_with_a_duration(self, tmp_path):
+        result = await _merge_attempts_over(tmp_path, FIVE_ATTEMPTS)
+
+        latency = result.latency()
+        assert latency['with_duration'] == 3
+        assert latency['without_duration'] == 2
+        assert latency['p50'] == 200
+        assert latency['mean_ms'] == pytest.approx(200.0)
+        assert latency['p95'] == round(percentile([100.0, 200.0, 300.0], 95))
+        assert latency['p99'] == round(percentile([100.0, 200.0, 300.0], 99))
+
+    async def test_every_attempt_is_counted_once_in_the_latency_split(self, tmp_path):
+        """Sketch #9: the donut total IS the latency block's attempt total."""
+        result = await _merge_attempts_over(tmp_path, FIVE_ATTEMPTS)
+
+        latency = result.latency()
+        assert sum(result.outcome_chart()['values']) == (
+            latency['with_duration'] + latency['without_duration']
         )
-        for outcome in outcomes:
-            _insert_event(conn_sync, event_type='merge_attempt',
-                          timestamp=now - timedelta(minutes=5),
-                          data={'outcome': outcome})
-        conn_sync.commit()
-        conn_sync.close()
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await outcome_distribution(db, hours=24)
-
-        assert result['labels'] == ['conflict', 'blocked', 'done', 'aaa', 'zzz']
-        assert result['values'] == [3, 2, 2, 1, 1]
-
-    @pytest.mark.asyncio
-    async def test_equal_counts_sorted_alphabetically(self, merge_events_db):
-        """When all counts tie, outcomes are ordered alphabetically."""
-        now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for outcome in ['already_merged', 'done', 'conflict', 'blocked']:
-            _insert_event(conn_sync, event_type='merge_attempt',
-                          timestamp=now - timedelta(minutes=5),
-                          data={'outcome': outcome})
-        conn_sync.commit()
-        conn_sync.close()
-
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await outcome_distribution(db, hours=24)
-
-        # All four counts tie at 1, so order is purely alphabetical.
-        assert result['labels'][:4] == ['already_merged', 'blocked', 'conflict', 'done']
-
-    @pytest.mark.asyncio
-    async def test_unknown_outcome_included(self, merge_events_db):
-        """Unknown outcomes (e.g. 'wip_halted') appear after canonical ones."""
-        now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for outcome in ['done', 'wip_halted', 'done_wip_recovery']:
-            _insert_event(conn_sync, event_type='merge_attempt',
-                          timestamp=now - timedelta(minutes=5),
-                          data={'outcome': outcome})
-        conn_sync.commit()
-        conn_sync.close()
-
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await outcome_distribution(db, hours=24)
-
-        assert 'wip_halted' in result['labels']
-        assert 'done_wip_recovery' in result['labels']
-        # done is first (canonical)
-        assert result['labels'][0] == 'done'
-
-    @pytest.mark.asyncio
-    async def test_none_db(self):
-        result = await outcome_distribution(None, hours=24)
-        assert result == {'labels': [], 'values': []}
-
-    @pytest.mark.asyncio
-    async def test_empty_db(self, empty_merge_events_conn):
-        result = await outcome_distribution(empty_merge_events_conn, hours=24)
-        assert result['labels'] == []
-        assert result['values'] == []
-
-
-# ---------------------------------------------------------------------------
-# TestLatencyStats
-# ---------------------------------------------------------------------------
-
-class TestLatencyStats:
-    @pytest.mark.asyncio
-    async def test_populated(self, merge_events_db):
-        """Percentiles and mean computed correctly for known duration set."""
-        now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        # 10 events: 100, 200, ..., 1000 ms
-        for i, ms in enumerate(range(100, 1100, 100)):
-            _insert_event(conn_sync, event_type='merge_attempt',
-                          timestamp=now - timedelta(minutes=10 + i),
-                          data={'outcome': 'done', 'attempt': 1},
-                          duration_ms=ms)
-        conn_sync.commit()
-        conn_sync.close()
-
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await latency_stats(db, hours=24)
-
-        assert result['count'] == 10
-        assert result['mean_ms'] == pytest.approx(550.0, abs=1e-6)
-        assert result['p50'] == pytest.approx(550.0, abs=1.0)
-        assert result['p95'] > result['p50']
-        assert result['p99'] >= result['p95']
-        assert {'p50', 'p95', 'p99', 'count', 'mean_ms'} == set(result.keys())
-
-    @pytest.mark.asyncio
-    async def test_none_db(self):
-        result = await latency_stats(None, hours=24)
-        assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
-
-    @pytest.mark.asyncio
-    async def test_empty_db(self, empty_merge_events_conn):
-        result = await latency_stats(empty_merge_events_conn, hours=24)
-        assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
-
-    @pytest.mark.asyncio
-    async def test_all_null_durations(self, merge_events_db):
-        """Rows present but duration_ms NULL → count=0, percentiles=0."""
-        now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for i in range(3):
-            _insert_event(conn_sync, event_type='merge_attempt',
-                          timestamp=now - timedelta(minutes=i + 1),
-                          data={'outcome': 'done'}, duration_ms=None)
-        conn_sync.commit()
-        conn_sync.close()
-
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await latency_stats(db, hours=24)
-
-        assert result == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
-
-    @pytest.mark.asyncio
-    async def test_get_durations_returns_sorted(self, merge_events_db):
-        """_get_durations returns a sorted list regardless of insertion order.
-
-        Establishes the sorted-output invariant of _get_durations, which latency_stats
-        relies on to avoid a redundant sorted() call.
-
-        The timestamps are staggered in *reverse* duration order so that if the
-        query were ``ORDER BY timestamp DESC`` (most-recent first) it would return
-        [500, 400, 300, 200, 100].  Because the expected result is [100, 200, 300,
-        400, 500], this proves that ``ORDER BY duration_ms`` is what actually
-        determines the output order — not the timestamp ordering.
-        """
-        now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        # duration_ms → timestamp mapping: higher duration = more recent timestamp
-        # timestamp order (most-recent first): 500, 400, 300, 200, 100
-        # duration_ms order (ascending):       100, 200, 300, 400, 500
+    async def test_durations_are_held_sorted(self, tmp_path):
+        """Timestamps run opposite to durations, so only a sort orders them."""
         events = [
-            (500, now - timedelta(minutes=1)),
-            (100, now - timedelta(minutes=5)),
-            (300, now - timedelta(minutes=3)),
-            (200, now - timedelta(minutes=4)),
-            (400, now - timedelta(minutes=2)),
+            _attempt(1, 'done', 500), _attempt(2, 'done', 400),
+            _attempt(3, 'done', 300), _attempt(4, 'done', 200),
+            _attempt(5, 'done', 100),
         ]
-        for ms, ts in events:
-            _insert_event(conn_sync, event_type='merge_attempt',
-                          timestamp=ts,
-                          data={'outcome': 'done'},
-                          duration_ms=ms)
-        conn_sync.commit()
-        conn_sync.close()
+        result = await _merge_attempts_over(tmp_path, events)
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await _get_durations(db, hours=24)
+        assert result.durations == (100.0, 200.0, 300.0, 400.0, 500.0)
 
-        assert result == [100.0, 200.0, 300.0, 400.0, 500.0]
+    async def test_populated_outcomes(self, tmp_path):
+        outcomes = ['done'] * 3 + ['conflict'] * 2 + ['blocked', 'already_merged']
+        result = await _merge_attempts_over(
+            tmp_path, [_attempt(10, outcome) for outcome in outcomes],
+        )
+
+        chart = result.outcome_chart()
+        assert sum(chart['values']) == 7
+        assert dict(zip(chart['labels'], chart['values'], strict=True)) == {
+            'done': 3, 'conflict': 2, 'blocked': 1, 'already_merged': 1,
+        }
+
+    async def test_count_descending_with_alpha_tiebreak(self, tmp_path):
+        outcomes = (
+            ['conflict'] * 3 + ['blocked'] * 2 + ['done'] * 2 + ['zzz', 'aaa']
+        )
+        result = await _merge_attempts_over(
+            tmp_path, [_attempt(5, outcome) for outcome in outcomes],
+        )
+
+        assert result.outcome_chart() == {
+            'labels': ['conflict', 'blocked', 'done', 'aaa', 'zzz'],
+            'values': [3, 2, 2, 1, 1],
+        }
+
+    async def test_equal_counts_sorted_alphabetically(self, tmp_path):
+        outcomes = ['already_merged', 'done', 'conflict', 'blocked']
+        result = await _merge_attempts_over(
+            tmp_path, [_attempt(5, outcome) for outcome in outcomes],
+        )
+
+        assert result.outcome_chart()['labels'] == [
+            'already_merged', 'blocked', 'conflict', 'done',
+        ]
+
+    async def test_non_canonical_outcomes_are_counted(self, tmp_path):
+        outcomes = ['done', 'done', 'wip_halted', 'done_wip_recovery']
+        result = await _merge_attempts_over(
+            tmp_path, [_attempt(5, outcome) for outcome in outcomes],
+        )
+
+        assert result.outcome_chart() == {
+            'labels': ['done', 'done_wip_recovery', 'wip_halted'],
+            'values': [2, 1, 1],
+        }
+
+    async def test_an_unrecorded_outcome_counts_as_unknown(self, tmp_path):
+        result = await _merge_attempts_over(
+            tmp_path, [_attempt(5, None, 100), _attempt(6, 'done', 200)],
+        )
+
+        assert result.outcome_chart() == {
+            'labels': ['done', 'unknown'], 'values': [1, 1],
+        }
+
+    async def test_ten_durations(self, tmp_path):
+        events = [
+            _attempt(10 + i, 'done', ms) for i, ms in enumerate(range(100, 1100, 100))
+        ]
+        latency = (await _merge_attempts_over(tmp_path, events)).latency()
+
+        assert set(latency) == set(ZERO_LATENCY)
+        assert latency['with_duration'] == 10
+        assert latency['without_duration'] == 0
+        assert latency['mean_ms'] == pytest.approx(550.0, abs=1e-6)
+        assert latency['p50'] == pytest.approx(550.0, abs=1.0)
+        assert latency['p95'] > latency['p50']
+        assert latency['p99'] >= latency['p95']
+
+    async def test_all_null_durations_give_zero_latency_over_every_attempt(self, tmp_path):
+        events = [_attempt(i + 1, 'done', None) for i in range(3)]
+        result = await _merge_attempts_over(tmp_path, events)
+
+        assert result.latency() == {**ZERO_LATENCY, 'without_duration': 3}
+        assert sum(result.outcome_chart()['values']) == 3
+
+    async def test_no_db_is_an_empty_record(self):
+        result = await merge_attempts(None, hours=24, now=ATTEMPTS_NOW)
+
+        assert result.outcome_chart() == {'labels': [], 'values': []}
+        assert result.latency() == ZERO_LATENCY
+
+    async def test_an_empty_db_is_an_empty_record(self, empty_merge_events_conn):
+        result = await merge_attempts(
+            empty_merge_events_conn, hours=24, now=ATTEMPTS_NOW,
+        )
+
+        assert result.outcome_chart() == {'labels': [], 'values': []}
+        assert result.latency() == ZERO_LATENCY
+
+    async def test_attempts_older_than_the_window_are_excluded(self, tmp_path):
+        events = [
+            _attempt(30, 'done', 100),
+            _attempt(90, 'conflict', 200),
+            _attempt(95, 'conflict', None),
+        ]
+        result = await _merge_attempts_over(tmp_path, events, hours=1)
+
+        assert result.outcome_chart() == {'labels': ['done'], 'values': [1]}
+        assert result.latency()['with_duration'] == 1
+        assert result.latency()['without_duration'] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1092,13 +1073,17 @@ class TestCutoffIso:
 
 @pytest.mark.parametrize(
     'fn_under_test',
-    [outcome_distribution, speculative_stats, latency_stats],
+    [merge_attempts, speculative_stats],
     ids=lambda fn: fn.__name__,
 )
 class TestNowThreadingToCutoffIso:
     @pytest.mark.asyncio
     async def test_threads_now_to_cutoff_iso(self, fn_under_test, merge_events_db):
-        """fn_under_test accepts now and passes it through to _cutoff_iso."""
+        """fn_under_test passes now to _cutoff_iso, and reads its window ONCE.
+
+        A single captured ``now`` is the proof that ``merge_attempts`` serves
+        the outcome chart and the latency block from one window read.
+        """
         fixed_now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
         captured_nows: list = []
 
@@ -1693,7 +1678,7 @@ class TestBuildPerProjectMergeQueue:
         assert set(data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
         assert data['depth_timeseries'] == {'labels': [], 'values': []}
         assert data['outcomes'] == {'labels': [], 'values': []}
-        assert data['latency'] == {'p50': 0, 'p95': 0, 'p99': 0, 'count': 0, 'mean_ms': 0.0}
+        assert data['latency'] == ZERO_LATENCY
         assert data['recent'] == []
         assert data['recent_total'] == 0
         assert data['speculative'] == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
@@ -1724,7 +1709,7 @@ class TestBuildPerProjectMergeQueue:
 
         # None-db entry produces defaults without crashing
         none_data = result['/tmp/none']
-        assert none_data['latency']['count'] == 0
+        assert none_data['latency']['with_duration'] == 0
         assert none_data['recent'] == []
         assert none_data['recent_total'] == 0
 
@@ -1732,10 +1717,33 @@ class TestBuildPerProjectMergeQueue:
         real_data = result['/tmp/real']
         assert set(real_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
 
+    async def test_the_outcome_total_is_the_latency_attempt_total(self, tmp_path):
+        """Sketch #9, second half: one row set behind the donut and the latency."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 11, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'split.db', [
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=5),
+             'task_id': 'timed', 'run_id': 'r1', 'data': {'outcome': 'done'}, 'duration_ms': 900},
+            {'event_type': 'merge_attempt', 'timestamp': now - timedelta(minutes=6),
+             'task_id': 'untimed', 'run_id': 'r2', 'data': {'outcome': 'conflict'}, 'duration_ms': None},
+        ])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            result = await build_per_project_merge_queue([('/tmp/A', conn)], hours=24, now=now)
+
+        project = result['/tmp/A']
+        latency = project['latency']
+        assert (latency['with_duration'], latency['without_duration']) == (1, 1)
+        assert sum(project['outcomes']['values']) == (
+            latency['with_duration'] + latency['without_duration']
+        )
+
     async def test_per_project_queries_run_concurrently(self, tmp_path):
         """All N per-project gathers must run concurrently (peak-in-flight == N).
 
-        Patches ``outcome_distribution`` with a fake that:
+        Patches ``merge_attempts`` with a fake that:
         - Increments an in-flight counter on entry and tracks the peak.
         - Sets ``all_entered`` when in_flight reaches N.
         - Blocks on a ``release`` event before returning.
@@ -1756,7 +1764,7 @@ class TestBuildPerProjectMergeQueue:
         counter = [0]        # mutable via list to allow mutation in closure
         max_in_flight = [0]
 
-        async def fake_outcome_distribution(db, *, hours=24, now=None):
+        async def fake_merge_attempts(db, *, hours=24, now=None):
             counter[0] += 1
             if counter[0] > max_in_flight[0]:
                 max_in_flight[0] = counter[0]
@@ -1764,7 +1772,7 @@ class TestBuildPerProjectMergeQueue:
                 all_entered.set()
             await release.wait()
             counter[0] -= 1
-            return {'labels': [], 'values': []}
+            return await merge_attempts(None, hours=hours, now=now)
 
         async with (
             aiosqlite.connect(str(db_paths[0])) as c0,
@@ -1777,8 +1785,8 @@ class TestBuildPerProjectMergeQueue:
             project_dbs = [(f'/tmp/P{i}', c) for i, c in enumerate([c0, c1, c2])]
 
             with patch(
-                'dashboard.data.merge_queue.outcome_distribution',
-                new=fake_outcome_distribution,
+                'dashboard.data.merge_queue.merge_attempts',
+                new=fake_merge_attempts,
             ):
                 task = asyncio.create_task(
                     build_per_project_merge_queue(
