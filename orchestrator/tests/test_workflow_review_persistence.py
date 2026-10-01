@@ -480,4 +480,4 @@ class TestLifetimeCounters:
         esc = queue.submit.call_args[0][0]
         assert fresh['description'] in esc.detail
         assert reflag['description'] not in esc.detail
-        assert '1 suggestion(s)' in esc.summary
+        assert '1 suggestion(s) (+1 scoped out' in esc.summary

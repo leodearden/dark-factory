@@ -153,7 +153,7 @@ async def test_routes_then_escalates_with_the_reported_disposition(tmp_path: Pat
     assert outcome == WorkflowOutcome.ESCALATED
     assert [c[0] for c in manager.mock_calls] == ['route', 'escalate']
     escalate.assert_called_once_with(
-        reviews, suggestion_disposition=SuggestionDisposition.CURATOR,
+        reviews, suggestion_disposition=SuggestionDisposition.CURATOR, n_suggestions_raw=1,
     )
     cast(AsyncMock, wf._replan).assert_not_called()
 
@@ -169,7 +169,7 @@ async def test_no_suggestions_escalates_with_none(tmp_path: Path):
 
     assert outcome == WorkflowOutcome.ESCALATED
     escalate.assert_called_once_with(
-        reviews, suggestion_disposition=SuggestionDisposition.NONE,
+        reviews, suggestion_disposition=SuggestionDisposition.NONE, n_suggestions_raw=0,
     )
 
 
@@ -188,7 +188,9 @@ async def test_routing_failure_still_files_the_escalation(tmp_path: Path, caplog
 
     assert outcome == WorkflowOutcome.ESCALATED
     escalate.assert_called_once()
-    assert escalate.call_args.kwargs == {'suggestion_disposition': SuggestionDisposition.ERROR}
+    assert escalate.call_args.kwargs == {
+        'suggestion_disposition': SuggestionDisposition.ERROR, 'n_suggestions_raw': 1,
+    }
     assert any(
         r.levelno == logging.WARNING
         and r.name == 'orchestrator.workflow'
@@ -215,6 +217,7 @@ async def test_esc_4223_1_shape_one_blocking_eight_suggestions(tmp_path: Path):
     [esc] = [e for e in queue.get_by_task(TASK_ID) if e.category == 'review_issues']
     assert '1 blocking issue(s) and 8 suggestion(s)' in esc.summary
     assert '[suggestions → curator]' in esc.summary
+    assert 'scoped out' not in esc.summary
     assert esc.detail.startswith('# Review Feedback — Blocking Issues')
     assert _BLOCKER['description'] in esc.detail
     for suggestion in suggestions:
@@ -323,4 +326,4 @@ async def test_post_amendment_cap_exit_applies_amendment_delta_scope(tmp_path: P
     esc = queue.submit.call_args[0][0]
     assert s_in_delta['description'] in esc.detail
     assert s_out_of_delta['description'] not in esc.detail
-    assert '1 suggestion(s)' in esc.summary
+    assert '1 suggestion(s) (+1 scoped out' in esc.summary

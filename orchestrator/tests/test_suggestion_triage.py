@@ -1032,7 +1032,9 @@ class TestEscalateReviewIssues:
             suggestions=[{'description': 'style'}],
         )
 
-        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.CURATOR)
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.CURATOR, n_suggestions_raw=1,
+        )
 
         queue.submit.assert_called_once()
         esc = queue.submit.call_args[0][0]
@@ -1044,7 +1046,9 @@ class TestEscalateReviewIssues:
     def test_noop_without_queue(self):
         wf = _make_workflow(escalation_queue=None)
         reviews = self._reviews(blocking_issues=[{'description': 'bug'}], suggestions=[])
-        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.NONE)  # Should not raise
+        wf._escalate_review_issues(  # Should not raise
+            reviews, suggestion_disposition=SuggestionDisposition.NONE, n_suggestions_raw=0,
+        )
 
     def test_detail_inlines_every_suggestion(self):
         queue = self._queue()
@@ -1055,7 +1059,9 @@ class TestEscalateReviewIssues:
             suggestions=[self._issue('style', 'suggestion'), self._issue('naming', 'suggestion')],
         )
 
-        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.CURATOR)
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.CURATOR, n_suggestions_raw=2,
+        )
 
         esc = queue.submit.call_args[0][0]
         assert esc.detail == reviews.format_for_escalation()
@@ -1065,6 +1071,7 @@ class TestEscalateReviewIssues:
         assert '2 blocking issue(s)' in esc.summary
         assert '2 suggestion(s)' in esc.summary
         assert esc.summary.endswith('[suggestions → curator]')
+        assert 'scoped out' not in esc.summary
 
     def test_event_payload_carries_disposition(self):
         from _recording_event_store import _RecordingEventStore
@@ -1078,7 +1085,9 @@ class TestEscalateReviewIssues:
             suggestions=[self._issue('style', 'suggestion'), self._issue('naming', 'suggestion')],
         )
 
-        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.CURATOR)
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.CURATOR, n_suggestions_raw=2,
+        )
 
         [data] = [
             payload['data'] for event_type, payload in store.events
@@ -1087,6 +1096,7 @@ class TestEscalateReviewIssues:
         assert data['n_blocking'] == 1
         assert data['n_suggestions'] == 2
         assert data['suggestion_disposition'] == 'curator'
+        assert data['n_suggestions_raw'] == 2
 
     def test_no_suggestions_has_no_suffix_or_section(self):
         queue = self._queue()
@@ -1094,12 +1104,43 @@ class TestEscalateReviewIssues:
         wf.state = MagicMock(value='review')
         reviews = self._reviews(blocking_issues=[self._issue('bug', 'blocking')], suggestions=[])
 
-        wf._escalate_review_issues(reviews, suggestion_disposition=SuggestionDisposition.NONE)
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.NONE, n_suggestions_raw=0,
+        )
 
         esc = queue.submit.call_args[0][0]
         assert '[suggestions' not in esc.summary
         assert '# Review Feedback — Suggestions' not in esc.detail
         assert esc.detail == reviews.format_for_replan()
+
+    def test_summary_and_event_account_for_suggestions_scoped_out(self):
+        from _recording_event_store import _RecordingEventStore
+
+        queue = self._queue()
+        wf = _make_workflow(escalation_queue=queue)
+        wf.state = MagicMock(value='review')
+        store = _RecordingEventStore()
+        wf.event_store = store  # type: ignore[assignment]
+        reviews = self._reviews(
+            blocking_issues=[self._issue('bug', 'blocking')],
+            suggestions=[self._issue('style', 'suggestion')],
+        )
+
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.CURATOR, n_suggestions_raw=3,
+        )
+
+        esc = queue.submit.call_args[0][0]
+        assert esc.summary == (
+            'Review cycles exhausted with 1 blocking issue(s) and 1 suggestion(s) '
+            '(+2 scoped out: routed separately or settled in a prior round) '
+            '[suggestions → curator]'
+        )
+        [data] = [
+            payload['data'] for event_type, payload in store.events
+            if event_type == 'escalation_created'
+        ]
+        assert (data['n_suggestions'], data['n_suggestions_raw']) == (1, 3)
 
 
 # ---------------------------------------------------------------------------

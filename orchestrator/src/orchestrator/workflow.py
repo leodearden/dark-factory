@@ -17024,7 +17024,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Scoping and routing are best-effort; the blocking escalation is
         mandatory and inlines exactly the set this exit routed — every
-        suggestion when scoping itself failed.
+        suggestion when scoping itself failed — and counts the ones scoping
+        removed, so its total still matches the archived review.
         """
         scoped = reviews
         try:
@@ -17039,7 +17040,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id, exc_info=True,
             )
             disposition = SuggestionDisposition.ERROR
-        self._escalate_review_issues(scoped, suggestion_disposition=disposition)
+        self._escalate_review_issues(
+            scoped,
+            suggestion_disposition=disposition,
+            n_suggestions_raw=len(reviews.suggestions),
+        )
         return WorkflowOutcome.ESCALATED
 
     def _escalate_review_issues(
@@ -17047,11 +17052,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         reviews: ReviewAggregation,
         *,
         suggestion_disposition: SuggestionDisposition,
+        n_suggestions_raw: int,
     ) -> None:
         """Submit remaining review issues as a blocking escalation for the steward.
 
         The detail carries the blocking issues AND the suggestions, so every
         count in the summary is backed by content the steward can read.
+        ``n_suggestions_raw`` is the review's count before suggestion scoping;
+        the summary names any difference so it reconciles with the archive.
         """
         if not self.escalation_queue:
             return
@@ -17065,6 +17073,12 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'Review cycles exhausted with {n_blocking} blocking issue(s) '
             f'and {n_suggestions} suggestion(s)'
         )
+        n_scoped_out = n_suggestions_raw - n_suggestions
+        if n_scoped_out > 0:
+            summary += (
+                f' (+{n_scoped_out} scoped out: routed separately or settled '
+                'in a prior round)'
+            )
         if n_suggestions:
             summary += f' [suggestions → {suggestion_disposition}]'
 
@@ -17089,6 +17103,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 data={'escalation_id': esc.id, 'category': 'review_issues',
                       'severity': 'blocking', 'n_blocking': n_blocking,
                       'n_suggestions': n_suggestions,
+                      'n_suggestions_raw': n_suggestions_raw,
                       'suggestion_disposition': str(suggestion_disposition)},
             )
         logger.info(
