@@ -5154,7 +5154,9 @@ class TestSpeculativeMergeWorker:
             # pre_rebased=True: task-1724 removed the build-time skip_verify=True fast path
             req_n1 = _make_request('rb-n1', 'rb-n1', wt_n1, config, pre_rebased=True)
             await queue.put(req_n1)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n1 = await asyncio.wait_for(
+                req_n1.result, timeout=MERGE_RESULT_TIMEOUT,
+            )
 
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
 
