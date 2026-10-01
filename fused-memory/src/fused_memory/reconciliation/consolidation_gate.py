@@ -254,6 +254,20 @@ def _payload_id(payload: Any) -> str:
     return str(value) if value is not None else ''
 
 
+def _sole_canonical_claim(members: Sequence[Any]) -> list[Any]:
+    """The cluster's absorption claim: the sole canonical's ``supersedes``.
+
+    Only the canonical's claim is the cluster's claim, and only when exactly
+    one strictly-canonical member exists; zero or several yield ``[]``,
+    because there is no single claim to trust.  Normalized through the shared
+    :func:`normalize_supersedes` (INV-5), never a second parser.
+    """
+    canonicals = [p for p in members if _payload_meta(p).get('canonical') is True]
+    if len(canonicals) != 1:
+        return []
+    return normalize_supersedes(_payload_meta(canonicals[0]).get('supersedes'))
+
+
 #: The most existence probes ``resolve_unstamped_live_ids`` will issue for one
 #: gate.  200 MIRRORS ``TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT``: the two
 #: collaborators read the same store for the same cluster, so a cap on one and
@@ -583,11 +597,12 @@ def evaluate_closure(
     why enforcing here subsumes task 3084's proposed auto-close by
     construction.
 
-    *unstamped_live_ids* are cluster members that are LIVE but do not carry
-    the gate's ``metadata.topic``, so the scroll cannot see them.  They are
-    derived by ``consolidation_gate.py::resolve_unstamped_live_ids`` from the
-    gate block's inert provenance, and BOTH production callers pass them as of
-    task 4808 -- the parameter is no longer test-only.
+    *unstamped_live_ids* are LIVE ids absent from the topic scroll, derived by
+    ``consolidation_gate.py::resolve_unstamped_live_ids`` and passed by BOTH
+    production callers.  Those the sole canonical CLAIMS in ``supersedes`` are
+    routed to ``absorbed_member_still_live``, which is presence-based and so
+    survives a truncated scroll.  The rest are ``unstamped_cluster_member``,
+    which is absence-based and so suppressed on one.
 
     It therefore refuses ONLY on cluster malformedness:
 
@@ -690,28 +705,26 @@ def evaluate_closure(
         )
 
     # --- absorbed-actually-gone: the canonical's supersedes claim ---------- #
-    # Only the CANONICAL's claim is the cluster's claim.  A non-canonical
-    # peer's stale supersedes is not what the gate asserted, and reading it
-    # would refuse gates over other clusters' history.
-    if len(canonical_ids) == 1:
-        canonical = next(
-            p for p in members if _payload_meta(p).get('canonical') is True
-        )
-        reasons.extend(
-            _classify_supersedes(
-                _payload_meta(canonical).get('supersedes'),
-                live_ids=live_ids,
-                topic=topic,
-            )
-        )
+    # A non-canonical peer's stale supersedes is not what the gate asserted,
+    # and reading it would refuse gates over other clusters' history.
+    claim = _sole_canonical_claim(members)
+    off_scroll_live = {str(i).lower() for i in unstamped_live_ids if str(i)}
+    reasons.extend(
+        _classify_supersedes(claim, live_ids=live_ids | off_scroll_live, topic=topic)
+    )
 
     # --- unstamped cluster members: the ONE thing provenance may add ------- #
     # A member the detector observed live but which never got stamped into the
     # topic is invisible to the scroll, so it can only reach the predicate this
     # way.  ABSENCE-based (not-stamped is indistinguishable from past-the-cap),
     # so it is suppressed on a truncated view for the same reason
-    # `no_canonical` is.
-    stray = [str(i) for i in unstamped_live_ids if str(i)]
+    # `no_canonical` is.  A claimed id is already named above.
+    claimed = {str(m).lower() for m in claim}
+    stray = [
+        str(i)
+        for i in unstamped_live_ids
+        if str(i) and str(i).lower() not in claimed
+    ]
     if stray and not scroll_truncated:
         reasons.append(
             _reason(
@@ -736,36 +749,35 @@ def evaluate_closure(
 
 
 def _classify_supersedes(
-    raw: Any,
+    claim: Sequence[Any],
     *,
     live_ids: set[str],
     topic: str,
 ) -> list[dict[str, Any]]:
     """Classify each member of the canonical's ``supersedes`` claim.
 
-    Goes through the SHARED :func:`normalize_supersedes` — never a second
-    ``supersedes`` parser (INV-5); that helper's own docstring names this
-    closure predicate as one of its two designated readers.  It accepts
-    ``None`` (nothing absorbed), the legacy SCALAR spelling (81 live records
-    predate 3196's migration) as a one-member list, and a list as itself — so
-    a bare 36-char uuid string is one member here, never 36 characters.
+    *claim* arrives already normalized by :func:`_sole_canonical_claim`, the
+    one place this module calls the SHARED :func:`normalize_supersedes`
+    (INV-5).  That parser reads the legacy SCALAR spelling (81 live records
+    predate 3196's migration) as a one-member list — so a bare 36-char uuid
+    string is one member here, never 36 characters — and it deliberately
+    never DROPS a malformed member, so this function can reject one BY NAME
+    (``malformed_supersedes_member``) rather than raising.  Raising would
+    permanently block exactly the gates whose metadata is already malformed —
+    the census counts 3 short-hex and 8 non-string live.
 
-    It also deliberately never DROPS a malformed member, so this function can
-    reject one BY NAME (``malformed_supersedes_member``) rather than raising.
-    Raising would permanently block exactly the gates whose metadata is
-    already malformed — the census counts 3 short-hex and 8 non-string live.
-
-    Three outcomes per member:
+    *live_ids* are case-folded ids known to be live: those the topic scroll
+    returned plus those the existence probe confirmed.  Three outcomes per
+    member:
 
     * not a canonical full uuid -> ``malformed_supersedes_member``
-    * well-formed and STILL in the live topic scroll ->
-      ``absorbed_member_still_live`` (the curator claimed it was deleted; it
-      is not)
+    * well-formed and STILL live -> ``absorbed_member_still_live`` (the
+      curator claimed it was deleted; it is not)
     * well-formed and absent -> correctly folded, no reason
     """
     malformed: list[Any] = []
     still_live: list[str] = []
-    for member in normalize_supersedes(raw):
+    for member in claim:
         if not is_full_uuid(member):
             malformed.append(member)
         elif str(member).lower() in live_ids:
@@ -779,8 +791,9 @@ def _classify_supersedes(
                 ids=still_live,
                 detail=(
                     f"The canonical of topic {topic!r} claims these ids in "
-                    '`metadata.supersedes`, but the live topic scroll still '
-                    'returns them. Either they were never deleted, or they '
+                    '`metadata.supersedes`, but they are still live in the '
+                    'store (returned by the topic scroll or confirmed by the '
+                    'existence probe). Either they were never deleted, or they '
                     'must not be claimed as superseded.'
                 ),
             )
