@@ -58,6 +58,7 @@ from _orch_helpers import (
     PYPROJECT_DEFAULT_TIMEOUT,
     RESPONSIVE_WAIT_STRETCH,
     RESPONSIVE_WAIT_WALL_CAP,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
     wait_responsive,
 )
 
@@ -696,6 +697,13 @@ _SUPPRESSED_WAIT_DEBT: dict[str, frozenset[str]] = {
         'test_runner_unavailable_quarantine_fallback',
     }),
 }
+
+
+# The per-test budget an UNMARKED class actually runs under: the tighter of
+# the ini default (a bare local run) and the `--timeout` verify passes on its
+# CLI (the merge-gating run).  Why the two differ, and why verify's is the
+# tighter one, is recorded once at `_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT`.
+_AMBIENT_TEST_TIMEOUT = min(PYPROJECT_DEFAULT_TIMEOUT, VERIFY_CLI_PER_TEST_TIMEOUT)
 
 
 def _timeout_mark_offenders(
@@ -7084,18 +7092,18 @@ class TestLoudWaitMigrationRatchet:
 
 
 #: A synthetic per-method wait budget on the GUARDED side of the threshold
-#: `_timeout_mark_offenders` applies -- one second over `PYPROJECT_DEFAULT_TIMEOUT`
-#: -- for the offender-loop unit tests below. Derived rather than written,
-#: mirroring the `PYPROJECT_DEFAULT_TIMEOUT - 1` spelling its sibling
-#: `test_budget_below_threshold_is_skipped_even_with_no_mark` already uses for the
-#: UNGUARDED side, so both sides of the threshold stay pinned to it.
+#: `_timeout_mark_offenders` applies to an unmarked class -- one second over
+#: `_AMBIENT_TEST_TIMEOUT` -- for the offender-loop unit tests below. Derived
+#: rather than written, mirroring the `_AMBIENT_TEST_TIMEOUT - 1` spelling its
+#: sibling `test_budget_below_threshold_is_skipped_even_with_no_mark` uses for
+#: the UNGUARDED side, so both sides of the threshold stay pinned to it.
 #:
 #: WHY IT IS NOT A LITERAL: it was `200.0`, chosen when the ini default was 60.
 #: Raising `[tool.pytest.ini_options].timeout` to 300 (2026-09-12) dropped 200
 #: BELOW the threshold, at which point all three failure branches below stopped
 #: being exercised at all -- they would have gone green by being skipped, which
 #: is the vacuity this whole class exists to prevent.
-_SYNTHETIC_HEAVY_BUDGET = float(PYPROJECT_DEFAULT_TIMEOUT + 1)
+_SYNTHETIC_HEAVY_BUDGET = float(_AMBIENT_TEST_TIMEOUT + 1)
 
 #: A mark value that comfortably clears :data:`_SYNTHETIC_HEAVY_BUDGET`, for the
 #: happy-path case. Derived for the same reason.
@@ -7134,7 +7142,9 @@ class TestTimeoutMarkOffenders:
         real wait profile).
         """
 
-        @pytest.mark.timeout(PYPROJECT_DEFAULT_TIMEOUT)
+        too_tight_mark = _SYNTHETIC_HEAVY_BUDGET - 1
+
+        @pytest.mark.timeout(too_tight_mark)
         class _TooTight:
             pass
 
@@ -7144,7 +7154,7 @@ class TestTimeoutMarkOffenders:
 
         assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
         assert '_TooTight' in offenders[0]
-        assert str(PYPROJECT_DEFAULT_TIMEOUT) in offenders[0]
+        assert str(too_tight_mark) in offenders[0]
 
     def test_unresolvable_class_name_is_one_offender(self) -> None:
         """A budgeted class name that *resolve* cannot look up (e.g. it was
@@ -7177,20 +7187,54 @@ class TestTimeoutMarkOffenders:
         assert offenders == [], f'Expected no offenders, got {offenders!r}.'
 
     def test_budget_below_threshold_is_skipped_even_with_no_mark(self) -> None:
-        """A class computing below `PYPROJECT_DEFAULT_TIMEOUT` is skipped
-        entirely, even carrying no mark at all -- only heavy classes are
-        subject to the guard.
+        """An UNMARKED class computing below `_AMBIENT_TEST_TIMEOUT` yields
+        no offender -- the budget it runs under already clears it.
         """
 
         class _LightNoMark:
             pass
 
         offenders = _timeout_mark_offenders(
-            {'_LightNoMark': PYPROJECT_DEFAULT_TIMEOUT - 1},
+            {'_LightNoMark': _AMBIENT_TEST_TIMEOUT - 1},
             {'_LightNoMark': _LightNoMark}.get,
         )
 
         assert offenders == [], f'Expected no offenders below threshold, got {offenders!r}.'
+
+    def test_marked_class_below_the_ambient_budget_is_still_checked(self) -> None:
+        """A mark REPLACES the ambient budget rather than raising a floor
+        under it (see `_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT`), so a mark
+        below the class's budget is fatal however generous the ambient is.
+        """
+
+        @pytest.mark.timeout(200)
+        class _MarkedTooTight:
+            pass
+
+        offenders = _timeout_mark_offenders(
+            {'_MarkedTooTight': 250.0}, {'_MarkedTooTight': _MarkedTooTight}.get
+        )
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert '_MarkedTooTight' in offenders[0]
+        assert 'too tight' in offenders[0]
+
+    def test_unmarked_class_at_the_verify_cli_budget_is_an_offender(self) -> None:
+        """An unmarked class runs under verify's `--timeout`, not the looser
+        ini default, so a budget reaching it needs a mark.
+        """
+
+        class _UnmarkedAtCli:
+            pass
+
+        offenders = _timeout_mark_offenders(
+            {'_UnmarkedAtCli': float(VERIFY_CLI_PER_TEST_TIMEOUT)},
+            {'_UnmarkedAtCli': _UnmarkedAtCli}.get,
+        )
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert '_UnmarkedAtCli' in offenders[0]
+        assert 'no @pytest.mark.timeout mark' in offenders[0]
 
 
 # ---------------------------------------------------------------------------
