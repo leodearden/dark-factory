@@ -2943,13 +2943,22 @@ def create_server(
         ``_chokepoint_or_submit`` are intentionally bypassed — L2 is set
         explicitly by this tool.  Because that severity→level gate is bypassed
         by design, nothing else reconciles an L2's severity with the records it
-        clusters; the inherited default below is what does it.
+        clusters; the inherited default below is what does it.  The one
+        filing-provenance gate this tool does honour is the eval-lane refusal
+        below.
 
         **Identity gate** (PRD task-status-authority C8/D7): the create side
         is gated by ``escalation.authority.PROMOTE_ALLOWED`` — a connection
         asserting an ``X-Escalation-Identity`` not in that set is denied
         (``{'error': ..., 'code': 'level_forbidden'}``, no L2 minted); a
         header-less connection (no identity asserted) is always allowed.
+
+        **Eval-lane refusal** (task 3096): a *task_id* with eval-lane
+        provenance (``shared/src/shared/eval_lane.py``) is refused with
+        ``code: 'eval_lane_contained'`` right after the identity gate, before
+        any read, so it applies to the create AND the fold path — an eval
+        cluster can never fold into a production L2.  Close its member L1s
+        with ``close_only`` instead.
 
         **Sentinel-bound members** (task 4541): when at least one member
         resolves and EVERY resolved member was filed under a role in
@@ -3076,6 +3085,10 @@ def create_server(
 
             {'error': '<reason>'}
 
+        Eval-lane refusal (see **Eval-lane refusal**)::
+
+            {'error': '<reason and next action>', 'code': 'eval_lane_contained'}
+
         Sentinel-bound refusal (see **Sentinel-bound members**)::
 
             {'error': '<reason>', 'code': 'sentinel_task_id_required',
@@ -3090,6 +3103,27 @@ def create_server(
             return {
                 'error': f'identity {identity!r} is not permitted to mint L2 escalations',
                 'code': 'level_forbidden',
+            }
+
+        # Only task_id can carry the signal here: the tool takes no worktree,
+        # and reaper-minted member L1s carry worktree=None.
+        eval_lane_reason = eval_lane_provenance(task_id)
+        if eval_lane_reason is not None:
+            logger.warning(
+                'promote_to_l2 refused: eval-lane task_id=%r (%s); members=%s '
+                'root_cause=%r',
+                task_id, eval_lane_reason, member_ids, root_cause,
+            )
+            return {
+                'error': (
+                    f'task_id {task_id!r} is an eval-lane artifact '
+                    f'({eval_lane_reason}); eval-lane escalations are contained '
+                    'to the eval harness and never promoted to the human L2 '
+                    'queue. Close the member L1(s) with '
+                    "resolve_issue(action='close_only', resolution_class='benign') "
+                    'instead.'
+                ),
+                'code': 'eval_lane_contained',
             }
 
         # Validate required non-empty fields
