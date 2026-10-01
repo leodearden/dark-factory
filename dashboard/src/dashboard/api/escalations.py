@@ -37,7 +37,7 @@ router = APIRouter()
 
 
 # ---------------------------------------------------------------------------
-# Task-cards TTL cache (mirrors load_task_titles pattern in merge_queue.py)
+# Task-cards TTL cache
 # ---------------------------------------------------------------------------
 
 _TASK_CARDS_TTL_SECONDS = 10.0
@@ -100,8 +100,8 @@ async def _load_task_cards(
     ``async with lock``, and ``__aexit__`` releases it rather than leaking it.
 
     The five-line ``wait_for``/``except TimeoutError``/warn/degrade construct
-    below, and the lock-placement rationale above, are duplicated verbatim at
-    the sibling call site (``merge_queue.load_task_titles``). That duplication is
+    below, enclosing ``get_or_refresh`` for the reason above, recurs at the
+    sibling call site (``task_lookup.lookup_tasks``). That duplication is
     KNOWN and deliberate for now: the mechanism is a property of
     ``TTLCache`` — not of either call site — so the idiom belongs on
     ``dashboard/src/dashboard/data/mcp_fanout.py::TTLCache`` as a

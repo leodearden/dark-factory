@@ -2170,7 +2170,7 @@ def test_shape_merge_queue_includes_train_throughput():
             # no 'train_throughput' key
         },
     }
-    body2 = redux_api.shape_merge_queue(raw_no_throughput)
+    body2 = redux_api.shape_merge_queue(raw_no_throughput, served_at=MQ_SERVED_AT)
     assert body2['MERGE_QUEUE']['dark-factory']['train_throughput'] == {}
 
 

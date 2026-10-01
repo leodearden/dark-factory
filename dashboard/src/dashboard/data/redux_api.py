@@ -26,11 +26,13 @@ from dashboard.data.burndown import (
     compute_parity_alarm,
     compute_window_completion,
 )
-from dashboard.data.datum import Datum, DatumState, validate_datum
+from dashboard.data.datum import Datum, DatumState, aged_at, validate_datum
 from dashboard.data.escalations import resolve_owning_project
+from dashboard.data.merge_queue import LIVE_QUEUE_FRESHNESS_BOUND_SECONDS
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceCards
 from dashboard.data.stats_utils import percentile
+from dashboard.data.task_lookup import FETCHED_ROW_FRESHNESS_BOUND_SECONDS
 from dashboard.data.utils import resolve_now
 
 # ---------------------------------------------------------------------------
@@ -447,28 +449,48 @@ def _shape_outcomes(raw: Mapping[str, Any] | None) -> dict[str, Any]:
 def shape_merge_queue(
     per_project: Mapping[str, Mapping[str, Any]],
     *,
+    served_at: datetime,
     active_sparks: Mapping[str, Mapping[str, list]] | None = None,
     halt_status: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Return ``{MERGE_QUEUE: {project_label: {...}}}``.
+    """Return ``{MERGE_QUEUE: {project_label: {...}}, served_at}``.
 
     The aggregator already returns one entry per project; we relabel the keys
     from absolute project_root paths to short basenames so the React side can
-    match against ``PROJECTS[].name``.  The shape per-project follows the
-    DF_DATA mock: ``depth`` (renamed from ``depth_timeseries``), ``outcomes``,
-    ``latency``, ``recent``, ``recent_total`` (how many merges the window
-    holds; ``recent`` is capped), ``speculative``, ``active``,
+    match against ``PROJECTS[].name``.  Per project: ``depth`` (renamed from
+    ``depth_timeseries``), ``outcomes``, ``latency`` (whose ``with_duration``
+    and ``without_duration`` sum to the outcomes total), ``recent``,
+    ``recent_total`` (how many merges the window holds; ``recent`` is capped),
+    ``speculative``, ``active`` (the live probe's entries), ``in_queue``,
     ``active_spark``, ``halt``, ``train_events``.
 
-    ``active_sparks`` (optional) carries true active-queue depth over time
-    keyed by absolute project_root path; surfaced as ``active_spark`` per
-    project label so the UI tile no longer falls back to attempt-count.
+    ``in_queue`` and every ``recent``/``active`` row's ``title`` are Datums,
+    each aged to *served_at*, validated against it and rendered to the wire.
+    A Datum that breaks its contract there is a shaper bug, and the
+    :class:`~dashboard.data.datum.DatumContractError` propagates.
+
+    ``active_sparks`` (optional) is ``in_queue``'s sampled history, keyed by
+    absolute project_root path, surfaced as ``active_spark`` per label.
 
     ``halt_status`` (optional) is keyed by project basename and carries
     ``{wired, halted, owner_esc_id, offline}`` per orchestrator. Missing
     projects fall back to ``{offline: True}`` so the UI can render an Offline
     pill on every panel.
     """
+    def _served(datum: Datum[Any]) -> dict[str, object]:
+        aged = aged_at(datum, served_at)
+        validate_datum(aged, served_at)
+        return aged.to_wire()
+
+    def _titled(rows: Iterable[Mapping[str, Any]] | None) -> list[dict[str, Any]]:
+        return [
+            {**row, 'title': _served(_datum_or_unknown(
+                row.get('title'), 'no task lookup for this row',
+                FETCHED_ROW_FRESHNESS_BOUND_SECONDS,
+            ))}
+            for row in rows or ()
+        ]
+
     sparks = active_sparks or {}
     halts = halt_status or {}
     out: dict[str, dict] = {}
@@ -479,11 +501,14 @@ def shape_merge_queue(
             'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
             'outcomes': _shape_outcomes(data.get('outcomes')),
             'latency': dict(data.get('latency') or {}),
-            'recent': [dict(r) for r in (data.get('recent') or [])],
+            'recent': _titled(data.get('recent')),
             'recent_total': int(data.get('recent_total') or 0),
             'speculative': dict(data.get('speculative') or {}),
-            'active': [dict(a) for a in (data.get('active') or [])],
-            'active_approximate': bool(data.get('active_approximate', False)),
+            'active': _titled(data.get('active')),
+            'in_queue': _served(_datum_or_unknown(
+                data.get('in_queue'), 'no in-queue reading for this project',
+                LIVE_QUEUE_FRESHNESS_BOUND_SECONDS,
+            )),
             'active_spark': {
                 'labels': list(spark.get('labels') or []),
                 'values': list(spark.get('values') or []),
@@ -494,7 +519,13 @@ def shape_merge_queue(
             # ι=1894: live retries-per-landing + drift-at-detection metrics
             'metrics': dict(data.get('live_metrics') or {}),
         }
-    return {'MERGE_QUEUE': out}
+    return {'MERGE_QUEUE': out, 'served_at': served_at.isoformat()}
+
+
+def _datum_or_unknown(candidate: object, reason: str, bound: int) -> Datum[Any]:
+    if isinstance(candidate, Datum):
+        return candidate
+    return Datum(None, None, DatumState.UNKNOWN, reason, bound)
 
 
 # ---------------------------------------------------------------------------

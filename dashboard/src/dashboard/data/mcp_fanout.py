@@ -131,8 +131,7 @@ _failure_streaks: dict[tuple[str, str], int] = {}
 # _fetch_tasks_cache, but via fetch_tasks called from _load_task_cards — a
 # path with no _TASKS_PER_PROJECT_BUDGET-style wrapper, so the SAME cache
 # can be bound-reachable or not depending on which caller reached it),
-# app._analytics_cache, app._memory_evals_cache, scheduler._scheduler_cache,
-# and merge_queue._task_titles_cache.
+# app._analytics_cache, app._memory_evals_cache and scheduler._scheduler_cache.
 _LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
 
 # A bypass must leave its own journal trace — reusing the SAME
@@ -691,7 +690,7 @@ async def cancel_and_await(tasks: Mapping[asyncio.Task[Any], str], what: str) ->
 
 # Every live TTLCache, enrolled from __init__ so reap_detached_refreshes()
 # below can reach all of them without anyone enumerating the 8 module-level
-# instances spread over 4 modules (app.py, data/tasks.py, data/merge_queue.py,
+# instances spread over 4 modules (app.py, data/tasks.py, data/task_lookup.py,
 # data/scheduler.py). Enrolment is what makes shutdown coverage exhaustive by
 # construction: a ninth cache is reaped with no edit at its call site.
 #

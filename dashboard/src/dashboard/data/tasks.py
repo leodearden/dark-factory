@@ -1075,9 +1075,8 @@ async def fetch_tasks(
     **Server-side narrowing.**  *statuses* is forwarded to the ``get_tasks``
     MCP tool and is added to the arguments dict only when actually requested,
     so a caller that narrows nothing sends a dict byte-identical to the
-    pre-narrowing shape — the four full-tree callers
-    (``app._load_task_cards``, ``data.orchestrator``, ``data.merge_queue``,
-    ``data.burndown``) are unaffected.  It is a REAL server-side row filter —
+    pre-narrowing shape — the full-tree callers
+    (``app._load_task_cards``, ``data.burndown``) are unaffected.  It is a REAL server-side row filter —
     it becomes ``WHERE tag = ? AND status IN (...)`` in SQL, so narrowing with
     it cuts backend work, not just wire bytes.  ``None`` (the default) means
     "no filter"; an EMPTY LIST is a valid, distinct "return nothing" request
