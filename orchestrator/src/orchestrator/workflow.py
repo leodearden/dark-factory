@@ -8113,7 +8113,13 @@ class TaskWorkflow:
                     logger.info('Task %s: archived reviews to %s', self.task_id, archive_dir.name)
 
             if review_cycle >= self.config.max_review_cycles:
-                self._escalate_review_issues(reviews)
+                self._escalate_review_issues(
+                    reviews,
+                    suggestion_disposition=(
+                        SuggestionDisposition.DROPPED if reviews.suggestions
+                        else SuggestionDisposition.NONE
+                    ),
+                )
                 return WorkflowOutcome.ESCALATED
 
             # Re-plan based on review feedback
@@ -17016,16 +17022,31 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'for steward triage ({esc.id})'
         )
 
-    def _escalate_review_issues(self, reviews) -> None:
-        """Submit remaining review issues as a blocking escalation for the steward."""
+    def _escalate_review_issues(
+        self,
+        reviews: ReviewAggregation,
+        *,
+        suggestion_disposition: SuggestionDisposition,
+    ) -> None:
+        """Submit remaining review issues as a blocking escalation for the steward.
+
+        The detail carries the blocking issues AND the suggestions, so every
+        count in the summary is backed by content the steward can read.
+        """
         if not self.escalation_queue:
             return
 
         from escalation.models import Escalation
 
-        detail = reviews.format_for_replan()
+        detail = reviews.format_for_escalation()
         n_blocking = len(reviews.blocking_issues)
         n_suggestions = len(reviews.suggestions)
+        summary = (
+            f'Review cycles exhausted with {n_blocking} blocking issue(s) '
+            f'and {n_suggestions} suggestion(s)'
+        )
+        if n_suggestions:
+            summary += f' [suggestions → {suggestion_disposition}]'
 
         esc = Escalation(
             id=self.escalation_queue.make_id(self.task_id),
@@ -17033,10 +17054,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             agent_role='orchestrator',
             severity='blocking',
             category='review_issues',
-            summary=(
-                f'Review cycles exhausted with {n_blocking} blocking issue(s) '
-                f'and {n_suggestions} suggestion(s)'
-            ),
+            summary=summary,
             detail=detail,
             suggested_action='fix_review_issues',
             worktree=str(self.worktree) if self.worktree else None,
@@ -17050,7 +17068,8 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 task_id=self.task_id, phase=self.state.value,
                 data={'escalation_id': esc.id, 'category': 'review_issues',
                       'severity': 'blocking', 'n_blocking': n_blocking,
-                      'n_suggestions': n_suggestions},
+                      'n_suggestions': n_suggestions,
+                      'suggestion_disposition': str(suggestion_disposition)},
             )
         logger.info(
             f'Task {self.task_id}: escalated {n_blocking} review issues '
