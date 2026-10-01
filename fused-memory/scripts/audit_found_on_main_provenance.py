@@ -209,7 +209,8 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # an analogous subject-anchoring fix for git_ops.py's own citation regex,
 # but not for this script's independent copy.
 CITATION_PATTERN = re.compile(
-    r'^(?:merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
+    r'^(?:merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build'
+    r'|config|perf|revert)'
     r'\(\s*(?P<conv_tid>\d+)\s*[):]'
     r'|\btask/(?P<branch_tid>\d+)\b'
     r'|\(#(?P<paren_tid>\d+)\)'

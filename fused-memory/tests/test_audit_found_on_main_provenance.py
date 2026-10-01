@@ -242,6 +242,18 @@ class TestExtractCitedTaskIdsConventions:
         """A bare `task/{id}` mention anywhere in the message cites the id."""
         assert extract_cited_task_ids('fix: touch task/50 handler') == {'50'}
 
+    @pytest.mark.parametrize('commit_type', ['config', 'perf', 'revert'])
+    def test_less_common_conventional_types_cite_the_task_id(self, commit_type):
+        """`config`/`perf`/`revert` subjects exist on main and must cite; task
+        4517's `config(4456): ...` lost its only citation once the bare-paren
+        alternative was retired (task 4705)."""
+        subject = f'{commit_type}(4456): set verify_admission_pytest_n: "8" (interim)'
+        assert extract_cited_task_ids(subject) == {'4456'}
+
+    def test_unlisted_type_word_does_not_cite(self):
+        """Ad-hoc type words (typos like `pre`) are deliberately not accepted."""
+        assert extract_cited_task_ids('pre(4456): stray subject') == set()
+
     def test_no_citation_returns_empty_set(self):
         """A message with no citation of any kind yields an empty set."""
         assert extract_cited_task_ids('chore: general cleanup, no ticket') == set()
