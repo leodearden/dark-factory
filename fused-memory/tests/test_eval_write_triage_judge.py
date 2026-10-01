@@ -2166,7 +2166,7 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
 # Option C: the per-case dump, the field-width override, the retrieved slate
 # ---------------------------------------------------------------------------
 
-def _slate(memory_id: str, *, candidates, attach_target_id, band,
+def _slate(memory_id: str, *, candidates, band_winner_id, band,
            similarity: float | None = 0.7, canonical_present=True):
     """A `eval_write_triage_retrieval.Slate`-shaped stand-in.
 
@@ -2177,7 +2177,7 @@ def _slate(memory_id: str, *, candidates, attach_target_id, band,
     return types.SimpleNamespace(
         memory_id=memory_id,
         candidates=tuple(candidates),
-        attach_target_id=attach_target_id,
+        attach_target_id=band_winner_id,
         band=band,
         similarity=similarity,
         canonical_present=canonical_present,
@@ -2205,13 +2205,13 @@ def _live(
 _ALIASES = {'old-canon': 'new-canon'}
 
 
-def _aliased_row(candidates, attach_target_id, answer=None) -> dict:
+def _aliased_row(candidates, band_winner_id, answer=None) -> dict:
     """The dump row of a duplicate whose cluster canonical was rotated."""
     records = [
         _rec('old-canon', 'old-canon', 'canonical'),
         _rec('dup', 'old-canon', 'duplicate'),
     ]
-    slate = _slate('dup', candidates=candidates, attach_target_id=attach_target_id,
+    slate = _slate('dup', candidates=candidates, band_winner_id=band_winner_id,
                    band=OUTCOME_JUDGE, canonical_present=False)
     plan = _mod().plan_from_slates(records, [slate], provenance={}, aliases=_ALIASES)
     return _mod().case_row(
@@ -2246,9 +2246,6 @@ class TestAJudgeAnswerNamesOnlyAnAttach:
         with pytest.raises(ValueError):
             _mod().JudgeAnswer(outcome=OUTCOME_RESTATED, verdict=None, candidate_id='x')
 
-    def test_a_bare_word_names_no_candidate(self) -> None:
-        assert _mod()._as_answer(OUTCOME_RESTATED).candidate_id is None
-
 
 class TestTheCasesDump:
     """Per-case evidence, written as it is bought."""
@@ -2282,6 +2279,15 @@ class TestTheCasesDump:
             'outcome', 'band', 'similarity', 'canonical_in_slate',
             'canonical_present', 'entry_elided', 'candidates_elided',
         }
+
+    def test_a_bare_word_names_no_candidate_so_attaches_to_the_band_winner(
+        self, tmp_path: Path,
+    ) -> None:
+        rows = self._dump(tmp_path, judge=_fake_judge(OUTCOME_AMENDED))
+        assert {
+            (row['verdict_candidate_id'], row['judged_candidate_id']) for row in rows
+        } == {(None, None)}
+        assert all(row['attach_target_id'] == row['band_winner_id'] for row in rows)
 
     def test_the_slate_is_recorded_in_prompt_order(self, tmp_path: Path) -> None:
         rows = {r['memory_id']: r for r in self._dump(tmp_path)
@@ -2369,7 +2375,7 @@ class TestTheCasesDump:
             _rec('c1-dup-1', 'c1-canon', 'duplicate'),
         ]
         slate = _slate('c1-dup-1', candidates=[_live('c1-canon'), _live('zz')],
-                       attach_target_id='c1-canon', band=OUTCOME_JUDGE)
+                       band_winner_id='c1-canon', band=OUTCOME_JUDGE)
         plan = _mod().plan_from_slates(records, [slate], provenance={}, aliases=_ALIASES)
         row = _mod().case_row(
             3, plan.cases[0],
@@ -2421,12 +2427,12 @@ class TestTheAttachTargetIsDescribedFromTheFixture:
     )
 
     @classmethod
-    def _dup_a_target(cls, candidates, attach_target_id, *, records=None, **kwargs) -> dict:
+    def _dup_a_target(cls, candidates, band_winner_id, *, records=None, **kwargs) -> dict:
         """How dup-a's dump row describes its attach target."""
         population = list(cls.RECORDS if records is None else records)
         slates = [
             _slate(r['memory_id'], candidates=candidates,
-                   attach_target_id=attach_target_id, band=OUTCOME_JUDGE)
+                   band_winner_id=band_winner_id, band=OUTCOME_JUDGE)
             for r in population if r['label'] != 'canonical'
         ]
         plan = _mod().plan_from_slates(population, slates, provenance={}, **kwargs)
@@ -2480,7 +2486,7 @@ class TestTheAttachTargetIsTheJudgedCandidate:
     @classmethod
     def _row(cls, candidates, band_winner_id, answer) -> dict:
         slate = _slate('c1-dup-1', candidates=candidates,
-                       attach_target_id=band_winner_id, band=OUTCOME_JUDGE)
+                       band_winner_id=band_winner_id, band=OUTCOME_JUDGE)
         plan = _mod().plan_from_slates(list(cls.RECORDS), [slate], provenance={})
         return _mod().case_row(
             1, plan.cases[0], answer, plan.candidate_records[0], plan.fixture_by_id,
@@ -2565,9 +2571,9 @@ class TestTheAttachTargetIsTheJudgedCandidate:
         ]
         slates = [
             _slate('c1-dup-1', candidates=[_live('zz'), _live('c1-canon')],
-                   attach_target_id='zz', band=OUTCOME_JUDGE),
+                   band_winner_id='zz', band=OUTCOME_JUDGE),
             _slate('c2-dup-1', candidates=[_live('zz'), _live('c2-canon')],
-                   attach_target_id='zz', band=OUTCOME_JUDGE),
+                   band_winner_id='zz', band=OUTCOME_JUDGE),
         ]
         named = {'c1-dup-1': 'c1-canon', 'c2-dup-1': 'zz'}
         report = _mod().run_judge_eval(
@@ -2687,9 +2693,9 @@ class TestPlanFromSlates:
     def _slates() -> list:
         return [
             _slate('c1-dup-1', candidates=[_live('c1-canon'), _live('zz')],
-                   attach_target_id='c1-canon', band=OUTCOME_JUDGE),
+                   band_winner_id='c1-canon', band=OUTCOME_JUDGE),
             _slate('c2-distinct', candidates=[_live('zz')],
-                   attach_target_id='zz', band=OUTCOME_RESTATED,
+                   band_winner_id='zz', band=OUTCOME_RESTATED,
                    canonical_present=False),
         ]
 
@@ -2748,9 +2754,9 @@ class TestPlanFromSlates:
         holding only the CHILD still shows the model the match."""
         slates = [
             _slate('c1-dup-1', candidates=[_live('child', canonical_id='c1-canon')],
-                   attach_target_id='c1-canon', band=OUTCOME_JUDGE),
+                   band_winner_id='c1-canon', band=OUTCOME_JUDGE),
             _slate('c2-distinct', candidates=[_live('zz')],
-                   attach_target_id='zz', band=OUTCOME_JUDGE),
+                   band_winner_id='zz', band=OUTCOME_JUDGE),
         ]
         plan = _mod().plan_from_slates(self._records(), slates, provenance={})
         row = _mod().case_row(
@@ -2798,10 +2804,10 @@ class TestEachCaseIsShownItsOwnRetrieval:
         slates = [
             _slate('dup-a', candidates=[_live('canon', store_score=0.80),
                                         _live('other', store_score=0.70)],
-                   attach_target_id='canon', band=OUTCOME_JUDGE),
+                   band_winner_id='canon', band=OUTCOME_JUDGE),
             _slate('dup-b', candidates=[_live('other', store_score=0.85),
                                         _live('canon', store_score=0.75)],
-                   attach_target_id='other', band=OUTCOME_JUDGE),
+                   band_winner_id='other', band=OUTCOME_JUDGE),
         ]
         return _mod().plan_from_slates(records, slates, provenance={}), slates
 
@@ -2894,22 +2900,22 @@ class TestAJudgeBandCaseIsNeverShownAnEmptySlate:
     def test_every_offending_case_is_named(self) -> None:
         with pytest.raises(ValueError) as excinfo:
             self._retrieved(
-                _slate('empty-one', candidates=[], attach_target_id=None, band=OUTCOME_JUDGE),
-                _slate('empty-two', candidates=[], attach_target_id=None, band=OUTCOME_JUDGE),
+                _slate('empty-one', candidates=[], band_winner_id=None, band=OUTCOME_JUDGE),
+                _slate('empty-two', candidates=[], band_winner_id=None, band=OUTCOME_JUDGE),
             )
         message = str(excinfo.value)
         assert 'empty-one' in message and 'empty-two' in message, message
 
     def test_a_judge_band_with_one_candidate_is_accepted(self) -> None:
         plan = self._retrieved(_slate(
-            'd1', candidates=[_live('canon')], attach_target_id='canon', band=OUTCOME_JUDGE,
+            'd1', candidates=[_live('canon')], band_winner_id='canon', band=OUTCOME_JUDGE,
         ))
         assert [c['candidates'] for c in plan.cases] == [['canon']]
 
     def test_a_stored_band_with_an_empty_slate_is_accepted(self) -> None:
         """Production's own novel or degraded path, answered with no judge at all."""
         plan = self._retrieved(_slate(
-            'd1', candidates=[], attach_target_id=None, band=OUTCOME_STORED, similarity=None,
+            'd1', candidates=[], band_winner_id=None, band=OUTCOME_STORED, similarity=None,
         ))
         assert [c['candidates'] for c in plan.cases] == [[]]
 

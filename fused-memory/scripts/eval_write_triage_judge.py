@@ -935,9 +935,14 @@ def _judged_candidate_id(
 ) -> str | None:
     """The record the verdict named, hoisted as production attaches to it.
 
-    *shown* is the case's own slate by memory id. A named id off it RAISES:
-    production fails such a write open to `stored`, so scoring it as an attach
-    would publish one production never makes.
+    *shown* is the case's own slate by memory id. A named id off it RAISES
+    rather than being scored as an attach production never makes, or as the
+    `stored` production would fail it open to. Neither shipped edge can reach
+    it: each hands `judge_write` exactly these records, and
+    `parse_judge_verdict` refuses an id off what it rendered from them. So
+    reaching it means a `judge_fn` answered about records it was not shown, a
+    defect every later judged attach would repeat; stopping at the first costs
+    one call where failing open would buy a whole run of meaningless rows.
     """
     if answer.candidate_id is None:
         return None
