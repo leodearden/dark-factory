@@ -172,7 +172,7 @@ class AgentLoop:
                 #
                 # The membership test is load-bearing, not belt-and-braces:
                 # _CLIResponseAdapter.warning is structured_output['warning'],
-                # which is only OUR synthesised token when _call_llm_cli built
+                # which is only OUR synthesised token when _call_claude_cli built
                 # the dict — on a real turn it is whatever the agent's own JSON
                 # happened to put there.  Propagating that unchecked would let
                 # agent-controlled content (or a non-str) reach
@@ -494,6 +494,10 @@ class AgentLoop:
                 cwd=self.cwd,
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
+            # Counted before the failure guard: a failed or refused result still
+            # reached the model and was billed.
+            self.llm_call_count += 1
+            self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
 
             if not result.success:
                 # schema_salvaged=True implies success=True (see the
@@ -511,8 +515,6 @@ class AgentLoop:
             raise
 
         self._cli_session_id = result.session_id or self._cli_session_id
-        self.llm_call_count += 1
-        self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
 
         structured = result.structured_output
         if isinstance(structured, str):

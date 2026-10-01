@@ -2,7 +2,7 @@
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -534,7 +534,7 @@ async def test_no_tool_calls_drops_unknown_warning_origin(agent_warning):
 
     _CLIResponseAdapter.warning is just structured_output['warning'], so on a
     real turn it holds whatever the agent's own JSON put there — only
-    _call_llm_cli's synthesised dicts carry our tokens.  The value flows to
+    _call_claude_cli's synthesised dicts carry our tokens.  The value flows to
     VerificationResult.failure_token and into the reconciliation.db audit row
     operators GROUP BY, so an arbitrary string would pollute that census and a
     non-str would raise ValidationError inside CodebaseVerifier.verify —
@@ -561,10 +561,10 @@ async def test_no_tool_calls_drops_unknown_warning_origin(agent_warning):
     )
 
 
-def test_cli_warning_origins_matches_the_tokens_call_llm_cli_synthesises():
+def test_cli_warning_origins_matches_the_tokens_call_claude_cli_synthesises():
     """The closed vocabulary must not drift from its only producer.
 
-    _call_llm_cli builds {'warning': 'cli_output_unparseable'},
+    _call_claude_cli builds {'warning': 'cli_output_unparseable'},
     {'warning': 'cli_output_empty'} and (task 6022) {'warning': 'api_refusal'}
     as literals; if any is renamed without updating CLI_WARNING_ORIGINS, run()
     would silently start dropping a real diagnosis.  Pin the set.
@@ -574,7 +574,7 @@ def test_cli_warning_origins_matches_the_tokens_call_llm_cli_synthesises():
         'cli_output_empty',
         'api_refusal',
     }, (
-        f'CLI_WARNING_ORIGINS drifted from _call_llm_cli: {CLI_WARNING_ORIGINS!r}'
+        f'CLI_WARNING_ORIGINS drifted from _call_claude_cli: {CLI_WARNING_ORIGINS!r}'
     )
 
 
@@ -2316,6 +2316,10 @@ async def test_cli_invocation_requests_no_reasoning_emission():
     plus an instruction to "explain your reasoning" in it) gets verify refused by the
     API's reasoning_extraction classifier.  Any new schema property must be
     re-probed with fused-memory/scripts/probe_schema_max_turns.py first.
+
+    The schema's property set is the pin.  The two system-prompt substring
+    checks catch only a revert of the exact removed instruction; a reworded
+    request for the model's reasoning would pass them.
     """
     with patch(
         'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
@@ -2360,6 +2364,25 @@ async def test_api_refusal_ends_run_with_structured_origin(caplog):
     )
 
     assert mock_invoke.call_args_list[1].kwargs['resume_session_id'] is None
+
+
+@pytest.mark.asyncio
+async def test_api_refusal_is_counted_like_any_returned_call():
+    """A refused call reached the model and was billed, so it counts toward
+    llm_call_count and token_count exactly as a successful call does.
+    """
+    refused = replace(_refused_cli_result(), input_tokens=30, output_tokens=12)
+    agent = _cli_agent_with_terminal_tool()
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = refused
+        await agent.run('p')
+
+    assert agent.llm_call_count == 1
+    assert agent.token_count == 30 + 12
 
 
 @pytest.mark.asyncio
