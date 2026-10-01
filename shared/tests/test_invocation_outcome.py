@@ -13,9 +13,11 @@ import pytest
 from shared import cli_invoke as cli_invoke_module
 from shared import invocation_outcome as invocation_outcome_module
 from shared import usage_gate as usage_gate_module
+from shared.cap_markers import REAL_CLI_CAP_MESSAGES
 from shared.cli_invoke import AgentResult
 from shared.invocation_outcome import (
     OK,
+    REAL_CLI_AUTH_REJECTION_MESSAGES,
     AuthFailed,
     CapHit,
     CliLocalError,
@@ -28,6 +30,7 @@ from shared.invocation_outcome import (
     _parse_resets_at,
     auth_failure_reason,
     classify_invocation,
+    classify_text_auth_rejection,
 )
 
 
@@ -689,6 +692,81 @@ class TestClassifyInvocationAuthFailedBodyIsScrubbed:
             outcome = classify_invocation(result, strict_confirm=True)
             assert isinstance(outcome, AuthFailed)
             assert outcome.body == text, f'over-masked: {text!r} -> {outcome.body!r}'
+
+
+class TestClassifyTextAuthRejection:
+    """Text-mode ``claude -p`` carries no api_error_status, so an auth rejection
+    is recognised from the stream text alone (task 5947) — and only when the
+    stream OPENS with a measured rejection sentence, because a failed digest's
+    output can quote that sentence and a false AUTH_FAILED lasts the night.
+    """
+
+    @pytest.mark.parametrize('message', REAL_CLI_AUTH_REJECTION_MESSAGES)
+    def test_a_measured_rejection_on_stdout_is_a_403(self, message):
+        outcome = classify_text_auth_rejection(message, '')
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.status == 403
+        assert outcome.body
+        assert message.startswith(outcome.body)
+
+    @pytest.mark.parametrize('message', REAL_CLI_AUTH_REJECTION_MESSAGES)
+    def test_a_measured_rejection_on_stderr_also_classifies(self, message):
+        outcome = classify_text_auth_rejection('', message)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.status == 403
+        assert message.startswith(outcome.body)
+
+    def test_stdout_is_read_before_stderr(self):
+        first, second = REAL_CLI_AUTH_REJECTION_MESSAGES[:2]
+        outcome = classify_text_auth_rejection(first, second)
+        assert isinstance(outcome, AuthFailed)
+        assert first.startswith(outcome.body)
+
+    def test_a_non_matching_stdout_falls_through_to_stderr(self):
+        message = REAL_CLI_AUTH_REJECTION_MESSAGES[0]
+        outcome = classify_text_auth_rejection('some unrelated chatter', message)
+        assert isinstance(outcome, AuthFailed)
+        assert message.startswith(outcome.body)
+
+    @pytest.mark.parametrize('message', REAL_CLI_AUTH_REJECTION_MESSAGES)
+    def test_surrounding_whitespace_is_stripped(self, message):
+        outcome = classify_text_auth_rejection(f'\n\n  {message}  \n', '')
+        assert isinstance(outcome, AuthFailed)
+        assert message.startswith(outcome.body)
+
+    @pytest.mark.parametrize('message', REAL_CLI_AUTH_REJECTION_MESSAGES)
+    def test_the_lead_matches_case_insensitively(self, message):
+        assert isinstance(classify_text_auth_rejection(message.upper(), ''), AuthFailed)
+        assert isinstance(classify_text_auth_rejection('', message.lower()), AuthFailed)
+
+    @pytest.mark.parametrize('message', REAL_CLI_AUTH_REJECTION_MESSAGES)
+    def test_a_verdict_quoting_the_rejection_is_not_one(self, message):
+        verdict = json.dumps({
+            'matches': [{'code': 'C1', 'evidence_quote': message}],
+            'candidates': [],
+        })
+        assert classify_text_auth_rejection(verdict, '') is None
+        assert classify_text_auth_rejection('', verdict) is None
+
+    @pytest.mark.parametrize('message', REAL_CLI_AUTH_REJECTION_MESSAGES)
+    def test_prose_mentioning_the_rejection_mid_stream_is_not_one(self, message):
+        prose = f'the session failed because {message}'
+        assert classify_text_auth_rejection(prose, prose) is None
+
+    @pytest.mark.parametrize(
+        'text', [*REAL_CLI_CAP_MESSAGES, 'Invalid API key · Please run /login'],
+    )
+    def test_cap_banners_and_unmeasured_401_text_are_not_recognised(self, text):
+        assert classify_text_auth_rejection(text, '') is None
+        assert classify_text_auth_rejection('', text) is None
+
+    @pytest.mark.parametrize('output, stderr', [('', ''), ('   ', '\n\t\n')])
+    def test_empty_streams_are_not_a_rejection(self, output, stderr):
+        assert classify_text_auth_rejection(output, stderr) is None
+
+    def test_is_exported(self):
+        assert 'classify_text_auth_rejection' in invocation_outcome_module.__all__
+        assert 'REAL_CLI_AUTH_REJECTION_MESSAGES' in invocation_outcome_module.__all__
 
 
 class TestClassifyInvocationCliLocalError:
