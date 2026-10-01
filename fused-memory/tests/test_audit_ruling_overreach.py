@@ -501,3 +501,130 @@ class TestWorksheetRows:
         sample = mod.select_sample([ep], cap=8, **WINDOW)
         (row,) = list(mod.worksheet_rows(sample, mod.attribute_edges(edges)))
         assert [m['edge_uuid'] for m in row['minted']] == ['m1', 'm2']
+
+
+# --------------------------------------------------------------------------- #
+# Verdict-file validation, fail closed (step 9)
+# --------------------------------------------------------------------------- #
+
+EXPECTED_EDGES = {('reify', 'e1'): 'E', ('reify', 'e2'): 'E', ('dark_factory', 'e3'): 'F'}
+EXISTING_EDGES = frozenset(EXPECTED_EDGES) | {('reify', 'outside')}
+
+
+def _verdict(graph: str, edge_uuid: str, label: str = 'holding', *,
+             episode_uuid: str | None = None, rationale: str = 'states the holding "x"'):
+    return {
+        'graph': graph,
+        'episode_uuid': episode_uuid or EXPECTED_EDGES.get((graph, edge_uuid), 'E'),
+        'edge_uuid': edge_uuid, 'fact': f'fact of {edge_uuid}', 'label': label,
+        'rationale': rationale,
+    }
+
+
+def _file(*verdicts, sample=None):
+    return {
+        'sample': sample if sample is not None else mod.SampleDefinition().to_dict(),
+        'verdicts': list(verdicts) if verdicts else [
+            _verdict('reify', 'e1'), _verdict('reify', 'e2', 'overreach'),
+            _verdict('dark_factory', 'e3', 'bookkeeping'),
+        ],
+    }
+
+
+def _load(obj):
+    return mod.load_verdicts(
+        obj, expected_edges=EXPECTED_EDGES, existing_edges=EXISTING_EDGES,
+        definition=mod.SampleDefinition(),
+    )
+
+
+class TestLoadVerdicts:
+    def test_the_label_vocabulary_is_closed(self) -> None:
+        assert mod.LABELS == (
+            'holding', 'bookkeeping', 'context', 'overreach', 'misbound', 'unjudgeable',
+        )
+
+    def test_a_valid_file_loads(self) -> None:
+        verdicts = _load(_file())
+        assert dict(verdicts.by_edge) == {
+            ('reify', 'e1'): 'holding', ('reify', 'e2'): 'overreach',
+            ('dark_factory', 'e3'): 'bookkeeping',
+        }
+        assert verdicts.stale == ()
+        assert verdicts.definition == mod.SampleDefinition()
+
+    def test_a_valid_file_round_trips(self) -> None:
+        verdicts = _load(_file())
+        assert _load(json.loads(json.dumps(verdicts.to_dict()))) == verdicts
+
+    def test_the_dict_form_is_sorted(self) -> None:
+        ordered = [(v['graph'], v['episode_uuid'], v['edge_uuid'])
+                   for v in _load(_file()).to_dict()['verdicts']]
+        assert ordered == sorted(ordered)
+
+    def test_the_verdict_set_is_frozen(self) -> None:
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            _load(_file()).stale = ()  # type: ignore[misc]
+
+    def test_unknown_label(self) -> None:
+        obj = _file(_verdict('reify', 'e1', 'wrong'), _verdict('reify', 'e2'),
+                    _verdict('dark_factory', 'e3'))
+        with pytest.raises(mod.UnknownLabel) as caught:
+            _load(obj)
+        assert caught.value.edge_uuids == ('e1',)
+        assert isinstance(caught.value, mod.VerdictError)
+
+    @pytest.mark.parametrize('rationale', ['', '   '])
+    def test_missing_rationale(self, rationale) -> None:
+        obj = _file(_verdict('reify', 'e1', rationale=rationale), _verdict('reify', 'e2'),
+                    _verdict('dark_factory', 'e3'))
+        with pytest.raises(mod.MissingRationale) as caught:
+            _load(obj)
+        assert caught.value.edge_uuids == ('e1',)
+
+    def test_duplicate_verdict(self) -> None:
+        obj = _file(_verdict('reify', 'e1'), _verdict('reify', 'e1', 'context'),
+                    _verdict('reify', 'e2'), _verdict('dark_factory', 'e3'))
+        with pytest.raises(mod.DuplicateVerdict) as caught:
+            _load(obj)
+        assert caught.value.edge_uuids == ('e1',)
+
+    def test_missing_verdicts_lists_every_missing_edge(self) -> None:
+        with pytest.raises(mod.MissingVerdicts) as caught:
+            _load(_file(_verdict('reify', 'e1')))
+        assert caught.value.edge_uuids == ('e2', 'e3')
+
+    def test_a_verdict_for_a_vanished_edge_is_stale_not_an_error(self) -> None:
+        obj = _file(_verdict('reify', 'e1'), _verdict('reify', 'e2'),
+                    _verdict('dark_factory', 'e3'), _verdict('reify', 'merged-away'))
+        verdicts = _load(obj)
+        assert [v.edge_uuid for v in verdicts.stale] == ['merged-away']
+        assert ('reify', 'merged-away') not in verdicts.by_edge
+
+    def test_a_verdict_for_an_existing_edge_outside_the_sample(self) -> None:
+        obj = _file(_verdict('reify', 'e1'), _verdict('reify', 'e2'),
+                    _verdict('dark_factory', 'e3'), _verdict('reify', 'outside'))
+        with pytest.raises(mod.OutOfSampleVerdict) as caught:
+            _load(obj)
+        assert caught.value.edge_uuids == ('outside',)
+
+    def test_a_verdict_naming_the_wrong_episode_is_out_of_sample(self) -> None:
+        obj = _file(_verdict('reify', 'e1', episode_uuid='not-E'), _verdict('reify', 'e2'),
+                    _verdict('dark_factory', 'e3'))
+        with pytest.raises(mod.OutOfSampleVerdict) as caught:
+            _load(obj)
+        assert caught.value.edge_uuids == ('e1',)
+
+    def test_a_sample_block_disagreeing_with_the_definition(self) -> None:
+        sample = mod.SampleDefinition(cap=9).to_dict()
+        with pytest.raises(mod.SampleMismatch):
+            _load(_file(sample=sample))
+
+    @pytest.mark.parametrize('obj', [
+        [], {'verdicts': []}, {'sample': {}, 'verdicts': []},
+        {'sample': mod.SampleDefinition().to_dict(), 'verdicts': {}},
+        {'sample': mod.SampleDefinition().to_dict(), 'verdicts': [{'graph': 'reify'}]},
+    ])
+    def test_a_malformed_file(self, obj) -> None:
+        with pytest.raises(mod.MalformedVerdicts):
+            _load(obj)
