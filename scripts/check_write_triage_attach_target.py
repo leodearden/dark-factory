@@ -172,7 +172,7 @@ class _ReportedWarnings(logging.Handler):
 class _Candidate:
     """A duck-typed ``MemoryResult`` stand-in.
 
-    ``near_duplicate_guard._cosine_of`` — the reader
+    ``near_duplicate_guard.cosine_of`` — the reader
     ``select_judge_candidates`` imports — takes the per-store cosine from
     ``metadata['store_score']``, so ``.id``/``.content``/``.metadata`` is the
     whole contract. Constructing one avoids importing ``MemoryResult``, whose
