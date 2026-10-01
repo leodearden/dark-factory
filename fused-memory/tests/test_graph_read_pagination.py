@@ -874,10 +874,6 @@ class TestGetAllValidEdgesEmittedCypher:
         page = graph.page_queries[0]
         assert 'MATCH (n:Entity)-[e:RELATES_TO]-()' in page
         assert 'e.invalid_at IS NULL' in page
-        # Task 4714: BOTH retirement markers, here and in the census below —
-        # otherwise the two numbers stop describing the same population, which
-        # is the invariant this pair of tests exists to protect.
-        assert 'e.expired_at IS NULL' in page
         assert 'RETURN n.uuid, e.uuid, e.fact, e.name' in page
         assert 'WITH DISTINCT' not in page
         assert 'RETURN DISTINCT' not in page
@@ -904,7 +900,6 @@ class TestGetAllValidEdgesEmittedCypher:
         census = graph.census_queries[0]
         assert 'MATCH (n:Entity)-[e:RELATES_TO]-()' in census
         assert 'e.invalid_at IS NULL' in census
-        assert 'e.expired_at IS NULL' in census  # task 4714 — same population as the page
         assert 'count(*)' in census
         assert 'SKIP' not in census.upper()
 

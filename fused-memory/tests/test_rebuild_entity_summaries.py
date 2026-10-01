@@ -3119,4 +3119,4 @@ class TestBulkAndSingleRefreshShareTheEdgePopulation:
         )
         for predicate in bulk + single:
             assert 'e.invalid_at IS NULL' in predicate, predicate
-            assert 'e.expired_at IS NULL' in predicate, predicate
+            assert 'expired_at' not in predicate, predicate  # restored edges stay (esc-4714-9)

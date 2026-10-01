@@ -1538,18 +1538,11 @@ def _edge_field(edge: Any, name: str) -> Any:
 
 
 def _edge_is_retired(edge: Any) -> bool:
-    """True when the edge carries EITHER retirement marker.
-
-    ``invalid_at`` is set by fused-memory's own recon Stage 1 / update_edge
-    ("superseded"); ``expired_at`` is set independently by graphiti_core's
-    contradiction resolution (graphiti_core/utils/maintenance/edge_operations.py::
-    resolve_extracted_edge).  Either one means the fact is no longer current, so
-    a read answering "what is currently true?" must drop the edge (task 4714).
+    """True when the edge's ``invalid_at`` is set — the Python mirror of
+    backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE, which explains why
+    ``expired_at`` is deliberately not consulted (a restored edge keeps it).
     """
-    return (
-        _edge_field(edge, 'invalid_at') is not None
-        or _edge_field(edge, 'expired_at') is not None
-    )
+    return _edge_field(edge, 'invalid_at') is not None
 
 
 # Defensive: resolve the embedding-provider's RateLimitError class at module
@@ -4724,10 +4717,9 @@ class MemoryService:
         a theoretical one:
 
         * ``get_valid_edges_for_node`` is ``MATCH (n:Entity {uuid:$uuid})
-          -[e:RELATES_TO]-() WHERE e.invalid_at IS NULL AND e.expired_at IS
-          NULL``. It sees ONLY currently-active ``RELATES_TO``, and is blind
-          both to RETIRED ``RELATES_TO`` history and to ``MENTIONS`` from
-          Episodic nodes.
+          -[e:RELATES_TO]-() WHERE e.invalid_at IS NULL``. It sees ONLY
+          currently-valid ``RELATES_TO``, and is blind both to INVALIDATED
+          ``RELATES_TO`` history and to ``MENTIONS`` from Episodic nodes.
         * ``delete_entity_node`` issues a bare ``MATCH (n:Entity {uuid:$uuid})
           DETACH DELETE n``, destroying EVERY relationship — all of the above
           included.
@@ -7584,9 +7576,8 @@ class MemoryService:
         metadata (task 3658):
 
           - ``store_rank``: 1-based rank, contiguous over the SURVIVING edges
-            (an edge dropped for a retirement marker — ``invalid_at`` or
-            ``expired_at`` — or for planned-only provenance does not consume a
-            rank).
+            (an edge dropped for ``invalid_at`` or planned-only provenance does
+            not consume a rank).
           - ``store_score``: always ``None`` — Graphiti's public ``search()``
             exposes no scores, and synthesizing one would be a lie the
             cross-store merge would then act on.
@@ -7613,11 +7604,10 @@ class MemoryService:
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
 
-            # Skip retired edges: `invalid_at` means we superseded the fact
-            # ourselves, `expired_at` means graphiti_core's own contradiction
-            # resolution did.  Either way it is no longer current.  Check this
-            # before anything else to avoid unnecessary work on edges that will
-            # be discarded, and so a dropped edge consumes no rank.
+            # Skip superseded edges (invalid_at set means the fact has been
+            # replaced by a newer edge).  Check this before anything else to
+            # avoid unnecessary work on edges that will be discarded, and so a
+            # dropped edge consumes no rank.
             if _edge_is_retired(edge):
                 continue
 
@@ -7791,26 +7781,25 @@ class MemoryService:
         edge_limit to fetch more, or cross-check completeness via a direct
         search() call. The exact-match branch does NOT use edge_limit: its
         get_valid_edges_for_node traversal returns every valid edge for the
-        resolved node uuid(s), uncapped. Both branches exclude edges retired
-        by EITHER marker — `invalid_at` (superseded by fused-memory) or
-        `expired_at` (contradicted by graphiti_core itself): the exact branch
-        at the Cypher level (backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE,
-        plus a defence-in-depth Python skip in its dedup loop), and the fuzzy
-        branch via `_edge_is_retired` applied to the search() results,
-        mirroring search()'s own drop (task 312) — so neither branch surfaces
-        superseded facts (task 2726) nor expired ones (task 4714).
+        resolved node uuid(s), uncapped. Both branches exclude invalidated
+        edges (invalid_at set): the exact branch at the Cypher level
+        (backends/graphiti_client.py::_ACTIVE_EDGE_PREDICATE, plus a
+        defence-in-depth Python skip in its dedup loop), and the fuzzy branch
+        via `_edge_is_retired` applied to the search() results, mirroring
+        search()'s own drop (task 312) — so neither branch surfaces superseded
+        facts (task 2726). Neither filters on `expired_at`: a restored edge
+        keeps it (task 4714).
 
         EXACT vs. FUZZY edge sets are fundamentally different — TOPOLOGICAL
         vs. SEMANTIC — and comparing them across branches will produce
         false-positive "missing edges" findings. The exact branch's
         get_valid_edges_for_node (graphiti_client.py) runs a plain, uncached
         Cypher MATCH — `MATCH (n:Entity {uuid: $uuid})-[e:RELATES_TO]-()
-        WHERE e.invalid_at IS NULL AND e.expired_at IS NULL` — with no
-        LIMIT and no ranking: it returns every RELATES_TO edge that is
-        graph-connected to the resolved node uuid(s), full stop. The fuzzy
-        branch's graphiti.search() instead does a semantic/relevance search
-        over edge fact TEXT, which can surface edges whose fact merely
-        mentions the entity's name (or is
+        WHERE e.invalid_at IS NULL` — with no LIMIT and no ranking: it
+        returns every RELATES_TO edge that is graph-connected to the
+        resolved node uuid(s), full stop. The fuzzy branch's graphiti.search()
+        instead does a semantic/relevance search over edge fact TEXT, which
+        can surface edges whose fact merely mentions the entity's name (or is
         contextually related) without that edge being RELATES_TO-incident on
         this node at all. So an edge that appears in a search() result for
         this entity's name but is ABSENT from get_entity's exact-branch
@@ -7925,11 +7914,10 @@ class MemoryService:
         edges = cast(list, results[1])
 
         node_data = [_node_to_dict(n) for n in nodes]
-        # Drop retired edges — superseded by us (invalid_at) or contradicted by
-        # graphiti_core itself (expired_at, task 4714) — so the fuzzy/semantic
-        # branch presents the same valid-edge semantics as the exact/topological
-        # branch (get_valid_edges_for_node's Cypher _ACTIVE_EDGE_PREDICATE) and
-        # as search() (task 312) — otherwise an agent resolving via the fuzzy
+        # Drop superseded edges (invalid_at set) so the fuzzy/semantic branch
+        # presents the same valid-edge semantics as the exact/topological branch
+        # (get_valid_edges_for_node's Cypher _ACTIVE_EDGE_PREDICATE) and as
+        # search() (task 312) — otherwise an agent resolving via the fuzzy
         # fallback could silently act on a stale fact (task 2726).
         edge_data = [_edge_to_dict(e) for e in edges if not _edge_is_retired(e)]
 

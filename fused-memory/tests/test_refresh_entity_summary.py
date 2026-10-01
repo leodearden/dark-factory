@@ -329,15 +329,15 @@ class TestGetValidEdgesForNode:
         assert 'invalid_at IS NULL' in cypher, f"Cypher must filter by invalid_at IS NULL: {cypher}"
 
     @pytest.mark.asyncio
-    async def test_filters_both_retirement_markers(
+    async def test_does_not_filter_on_expired_at(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """Query excludes edges retired by EITHER marker (task 4714).
+        """A restored edge — ``invalid_at`` NULL, ``expired_at`` SET — stays active
+        (task 4714, esc-4714-9).
 
-        ``invalid_at`` is written by fused-memory (recon Stage 1 / update_edge);
-        ``expired_at`` is written independently by graphiti_core's own
-        contradiction resolution.  Filtering one and not the other means the
-        other's retirees are served as current facts.
+        The restore hooks clear ``invalid_at`` and keep ``expired_at`` as the
+        restored-edge signature, so an ``expired_at`` clause would hide exactly
+        the edges they restore (3,024 of 15,766 active edges when measured).
         """
         backend = make_backend(mock_config)
         graph = make_graph_mock([])
@@ -349,8 +349,8 @@ class TestGetValidEdgesForNode:
         assert 'e.invalid_at IS NULL' in cypher, (
             f'Cypher must still exclude superseded edges: {cypher}'
         )
-        assert 'e.expired_at IS NULL' in cypher, (
-            f'Cypher must also exclude graphiti_core-expired edges: {cypher}'
+        assert 'expired_at' not in cypher, (
+            f'Cypher must not hide restored edges by filtering expired_at: {cypher}'
         )
         graph.query.assert_not_called()
 
@@ -806,21 +806,25 @@ class TestRefreshEntitySummary:
         backend.update_node_summary.assert_awaited_once_with('node-uuid-1', 'Alice knows Bob', group_id='test')
 
     @pytest.mark.asyncio
-    async def test_regenerates_from_a_population_excluding_both_markers(
+    async def test_regenerates_from_a_population_including_restored_edges(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """The regenerated summary is built from actively-valid edges only (task 4714).
+        """The regenerated summary keeps restored edges (task 4714, esc-4714-9).
 
         Unlike its siblings above, this drives the REAL get_valid_edges_for_node
         rather than stubbing it, because the point is which population the
-        refresh reads: an entity whose summary is rebuilt must not have
-        graphiti_core-expired facts re-concatenated back into it, merely
-        non-superseded ones.
+        refresh reads: superseded facts (``invalid_at`` set) stay out, but a
+        restored fact — ``invalid_at`` cleared, ``expired_at`` kept — must be
+        re-concatenated into the summary like any other active fact.
         """
         backend = make_backend(mock_config)
-        # Only the surviving rows come back — the retired ones are the query's
-        # job to exclude, which is exactly what the Cypher assertion below pins.
-        graph = make_graph_mock([['e1', 'Task 99 depends on Task 98', 'DEPENDS_ON']])
+        # The query's WHERE clause decides the population; the mock returns what
+        # a FalkorDB honouring the Cypher pinned below would: the live edge and
+        # the restored one.
+        graph = make_graph_mock([
+            ['e1', 'Task 99 depends on Task 98', 'DEPENDS_ON'],
+            ['e-restored', 'Task 99 depends on Task 97', 'DEPENDS_ON'],
+        ])
         backend._driver._get_graph = MagicMock(return_value=graph)
         backend.update_node_summary = AsyncMock()
 
@@ -832,12 +836,13 @@ class TestRefreshEntitySummary:
         assert 'e.invalid_at IS NULL' in cypher, (
             f'refresh must keep excluding superseded edges: {cypher}'
         )
-        assert 'e.expired_at IS NULL' in cypher, (
-            'refresh must regenerate from a population that also excludes '
-            f'graphiti_core-expired facts: {cypher}'
+        assert 'expired_at' not in cypher, (
+            f'refresh must not drop restored edges by filtering expired_at: {cypher}'
         )
-        assert result['new_summary'] == 'Task 99 depends on Task 98'
-        assert result['edge_count'] == 1
+        assert result['new_summary'] == (
+            'Task 99 depends on Task 98\nTask 99 depends on Task 97'
+        )
+        assert result['edge_count'] == 2
 
 
 # ---------------------------------------------------------------------------

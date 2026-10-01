@@ -577,18 +577,19 @@ kind, so a future fifth structural path is covered by construction.
 """
 
 
-# An edge is ACTIVE only when NEITHER retirement marker is set.  The two are
-# independent: `invalid_at` is written by fused-memory (recon Stage 1 /
-# update_edge, "superseded"); `expired_at` is written by graphiti_core's own
-# contradiction resolution (graphiti_core/utils/maintenance/edge_operations.py::
-# resolve_extracted_edge).  Filtering only one leaves the other's retirees
-# surfacing as current facts.  A property never written is NULL in Cypher, so
-# legacy edges predating `expired_at` still pass.  (task 4714)
+# An edge is ACTIVE iff `invalid_at` IS NULL.  `expired_at` is deliberately NOT
+# part of it: graphiti_core never sets `expired_at` without also setting
+# `invalid_at` (graphiti_core/utils/maintenance/edge_operations.py::
+# resolve_extracted_edge and ::resolve_edge_contradictions), so it retires
+# nothing `invalid_at` misses — while the restore hooks clear `invalid_at` and
+# keep `expired_at` as the restored-edge signature (redirect_node_edges), so an
+# `expired_at` clause would hide exactly the edges they restore (task 4714,
+# esc-4714-9).
 #
 # Every read answering "what is currently true?" interpolates this constant.
 # Maintenance, audit, and uuid-keyed paths deliberately do NOT — they must see
 # retired edges; `count_foreign_relationships` most emphatically so.
-_ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL AND e.expired_at IS NULL'
+_ACTIVE_EDGE_PREDICATE = 'e.invalid_at IS NULL'
 
 
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
@@ -1921,10 +1922,7 @@ class GraphitiBackend:
         clear is force-persisted by an explicit direct-Cypher
         ``SET e.invalid_at = NULL`` write, issued after ``edge.save()`` and
         before the endpoint summary refresh below (so the restored edge is
-        counted valid by that refresh's
-        ``WHERE e.invalid_at IS NULL AND e.expired_at IS NULL`` filter — the
-        restored edge must clear BOTH markers to be counted, and clearing
-        ``invalid_at`` alone leaves an ``expired_at``-bearing edge retired).
+        counted valid by that refresh's ``WHERE e.invalid_at IS NULL`` filter).
 
         After saving, both source and target entity node summaries are rebuilt
         from their current valid edges so they stay consistent.
@@ -2356,9 +2354,7 @@ class GraphitiBackend:
         """Return all currently-valid RELATES_TO edges for an Entity node.
 
         Matches the node as either source or target (undirected) and excludes
-        edges carrying EITHER retirement marker — ``invalid_at`` (superseded by
-        fused-memory) or ``expired_at`` (contradicted by graphiti_core) — per
-        ``_ACTIVE_EDGE_PREDICATE``.
+        retired edges per ``_ACTIVE_EDGE_PREDICATE`` (``invalid_at`` set).
 
         Deduplicates in Python, keyed on e.uuid. RELATES_TO edge uuids are
         unique graph-wide (task 2207 W6-delta stopped minting copied uuids in
@@ -2417,9 +2413,7 @@ class GraphitiBackend:
         WHAT IT ANSWERS, contrasted with its neighbour above.
         :meth:`get_valid_edges_for_node` answers "does this node still carry
         LIVE FACTS?" — it is typed to ``RELATES_TO`` and filtered to
-        ``_ACTIVE_EDGE_PREDICATE`` (BOTH retirement markers: ``invalid_at``
-        IS NULL AND ``expired_at`` IS NULL).  This one answers a different
-        question:
+        ``_ACTIVE_EDGE_PREDICATE``.  This one answers a different question:
         "would deleting this node DESTROY ANYTHING?"  It is therefore
         deliberately UNTYPED and UNFILTERED, because
         :meth:`delete_entity_node` issues a bare
@@ -2523,10 +2517,8 @@ class GraphitiBackend:
     async def get_connected_entity_uuids(self, uuid: str, *, group_id: str) -> list[str]:
         """Return distinct UUID strings of entities connected to the given node via valid edges.
 
-        Queries all RELATES_TO edges carrying NEITHER retirement marker
-        (``_ACTIVE_EDGE_PREDICATE``: ``invalid_at`` IS NULL AND ``expired_at``
-        IS NULL) and excludes the node itself (self-loops excluded via
-        ``m.uuid <> $uuid``).
+        Queries all active RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``) and
+        excludes the node itself (self-loops excluded via ``m.uuid <> $uuid``).
 
         Collects neighbours BEFORE deletion so the caller can refresh their
         summaries after the target node is removed (edges vanish with DETACH DELETE).
@@ -2731,10 +2723,9 @@ class GraphitiBackend:
         ``resolve_extracted_edges`` fast-path can catch, since those only
         see the edges before they converge onto the same node pair.
 
-        Queries the node's currently-valid incident edges — those carrying
-        neither retirement marker, per ``_ACTIVE_EDGE_PREDICATE`` — undirected,
-        so directed and reverse-directed exact duplicates both collapse;
-        delegates grouping + survivor selection
+        Queries the node's active (``_ACTIVE_EDGE_PREDICATE``) incident
+        edges (undirected, so directed and reverse-directed exact
+        duplicates both collapse), delegates grouping + survivor selection
         to ``_duplicate_edge_uuids``, and deletes any non-survivor uuids via
         ``bulk_remove_edges``.
 
@@ -4211,9 +4202,7 @@ class GraphitiBackend:
         """Regenerate an Entity node's summary from its currently-valid edges.
 
         Fetches the node's current name and summary, queries all valid
-        RELATES_TO edges — neither superseded (``invalid_at``) nor
-        contradicted by graphiti_core (``expired_at``), per
-        ``_ACTIVE_EDGE_PREDICATE`` — deduplicates their facts
+        RELATES_TO edges (``_ACTIVE_EDGE_PREDICATE``), deduplicates their facts
         (preserving order), joins them with newlines, and writes the result
         back to the node's summary property.
 
