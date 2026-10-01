@@ -35,19 +35,19 @@ The contract asserted here has two halves, and the asymmetry is deliberate:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from _dashboard_helpers import drive_metrics_loop
 from fastapi import FastAPI
 from starlette.testclient import TestClient
 
 from dashboard.app import _build_http_limits
 from dashboard.config import DashboardConfig
-from dashboard.loops import _BurndownStore, _metrics_loop, _MetricsStore
+from dashboard.loops import _BurndownStore, _MetricsStore
 
 
 async def _noop_burndown_loop(*args: object, **kwargs: object) -> None:
@@ -329,12 +329,9 @@ async def test_metrics_loop_still_rereads_config_from_app_state_each_cycle(
     This guard is what makes an over-eager "make it consistent" refactor break
     ONE test here instead of ~25 elsewhere.
 
-    Drives ``_metrics_loop`` directly, reusing the harness in
-    test_durability.py::test_metrics_loop_invokes_periodic_checkpoint.
+    Drives ``_metrics_loop`` directly, via
+    dashboard/tests/_dashboard_helpers.py::drive_metrics_loop.
     """
-    store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
-    await store.open()
-
     # Two REAL configs (not MagicMocks -- check_bare_magicmock_config.py Rule A),
     # distinct in both identity and value.
     config_a = DashboardConfig(project_root=tmp_path)
@@ -346,53 +343,26 @@ async def test_metrics_loop_still_rereads_config_from_app_state_each_cycle(
     mock_app = MagicMock()
     mock_app.state.config = config_a
 
-    seen_configs: list[Any] = []
     saw_swapped = asyncio.Event()
 
-    async def _recording_collect(*args: object, **kwargs: Any) -> None:
-        seen = kwargs['config']
-        seen_configs.append(seen)
-        if seen is config_a:
+    def _swap_then_witness(kwargs: dict[str, Any]) -> None:
+        if kwargs['config'] is config_a:
             # Stand in for the mid-test swap those ~25 sites perform.
             mock_app.state.config = config_b
-        elif seen is config_b:
-            # Set from inside the recorder, so the wait below is racefree.
+        elif kwargs['config'] is config_b:
+            # Set from inside the hook, so the wait is racefree.
             saw_swapped.set()
 
-    async def _noop_sleep(*a: object, **kw: object) -> None:
-        # Must actually suspend.  A plain AsyncMock never yields, creating a
-        # tight synchronous loop that starves asyncio.wait_for of event-loop
-        # cycles -- see test_durability.py::test_metrics_loop_invokes_periodic_checkpoint.
-        await asyncio.sleep(0)
-
-    try:
-        with (
-            patch(
-                'dashboard.loops.collect_metrics_snapshot',
-                new=AsyncMock(side_effect=_recording_collect),
-            ),
-            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
-        ):
-            task = asyncio.create_task(
-                _metrics_loop(
-                    store,
-                    mock_app,
-                    pool=mock_pool,
-                    http_client=mock_http_client,
-                )
-            )
-            try:
-                # Suppressed, not raised: on regression the swap never lands and
-                # a bare TimeoutError says nothing.  Falling through lets the
-                # named assertions below explain what actually broke.
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(saw_swapped.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-    finally:
-        await store.close()
+    async with _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000) as store:
+        calls = await drive_metrics_loop(
+            store,
+            mock_app,
+            pool=mock_pool,
+            http_client=mock_http_client,
+            until=saw_swapped,
+            on_collect=_swap_then_witness,
+        )
+    seen_configs = [call['config'] for call in calls]
 
     assert seen_configs, 'task 3771: collect_metrics_snapshot was never called'
     assert seen_configs[0] is config_a, (
@@ -426,12 +396,9 @@ async def test_metrics_loop_uses_the_handles_it_was_passed_not_app_state(
     loop still completes a cycle and the failure lands on a named binding
     assertion rather than an incidental ``TypeError`` in an unrelated test.
 
-    Drives ``_metrics_loop`` directly, reusing the harness in
-    test_durability.py::test_metrics_loop_invokes_periodic_checkpoint.
+    Drives ``_metrics_loop`` directly, via
+    dashboard/tests/_dashboard_helpers.py::drive_metrics_loop.
     """
-    store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
-    await store.open()
-
     # A REAL config, not a MagicMock -- check_bare_magicmock_config.py Rule A.
     config = DashboardConfig(project_root=tmp_path)
 
@@ -453,53 +420,25 @@ async def test_metrics_loop_uses_the_handles_it_was_passed_not_app_state(
     mock_app.state.db = state_pool
     mock_app.state.http_client = state_http_client
 
-    recorded: list[dict[str, Any]] = []
     saw_call = asyncio.Event()
 
-    async def _recording_collect(*args: object, **kwargs: Any) -> None:
-        recorded.append(kwargs)
-        # Set from inside the recorder, so the wait below is racefree.
-        saw_call.set()
-
-    async def _noop_sleep(*a: object, **kw: object) -> None:
-        # Must actually suspend -- see the note in the config test above.
-        await asyncio.sleep(0)
-
-    try:
-        with (
-            patch(
-                'dashboard.loops.collect_metrics_snapshot',
-                new=AsyncMock(side_effect=_recording_collect),
-            ),
-            patch('dashboard.loops._sleep_to_aligned_tick', new=AsyncMock(side_effect=_noop_sleep)),
-        ):
-            task = asyncio.create_task(
-                _metrics_loop(
-                    store,
-                    mock_app,
-                    pool=arg_pool,
-                    http_client=arg_http_client,
-                )
-            )
-            try:
-                # Suppressed, not raised: a bare TimeoutError explains nothing.
-                # Falling through lets the named assertions say what broke.
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(saw_call.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-    finally:
-        await store.close()
+    async with _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000) as store:
+        calls = await drive_metrics_loop(
+            store,
+            mock_app,
+            pool=arg_pool,
+            http_client=arg_http_client,
+            until=saw_call,
+            on_collect=lambda _kwargs: saw_call.set(),
+        )
 
     # Without this every assertion below is vacuous: _run_once swallows any
     # exception from its body into a generic 'Metrics snapshot error' warning.
-    assert recorded, (
+    assert calls, (
         'task 3771: collect_metrics_snapshot was never called -- the loop body never '
         'completed a cycle, so nothing below proves anything'
     )
-    kwargs = recorded[0]
+    kwargs = calls[0]
     assert kwargs['http_client'] is arg_http_client, (
         'task 3771 CROSS-TALK: _run_once forwarded an http_client that is NOT the one '
         '_metrics_loop was passed. The handle must come from the argument, never from '
