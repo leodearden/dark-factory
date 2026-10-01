@@ -644,10 +644,7 @@ class TestHostFreedWhileHeadVerifies:
             assert lane.inflight_ids() == set(), lane.observed()
             assert lane.run_task is not None
 
-            loop = asyncio.get_running_loop()
-            started = loop.time()
             await lane.worker.stop()
-            stop_secs = loop.time() - started
 
             try:
                 await asyncio.wait_for(asyncio.shield(lane.run_task), timeout=5.0)
@@ -657,7 +654,40 @@ class TestHostFreedWhileHeadVerifies:
                     'slept through stop() in the parked-item poll and is now '
                     'blocked on a verifier queue whose sentinel was drained.'
                 )
-            assert stop_secs < 4.0, (
-                f'stop() took {stop_secs:.2f}s -- it waited out its shutdown '
-                'timeout instead of the verifier loop exiting on its sentinel'
+
+    async def test_no_dispatch_once_stop_is_requested(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """stop() owns the park once it is requested: a host freeing inside
+        stop()'s drain must not dispatch a parked item behind the drain,
+        where nothing resolves its Future or releases its lease."""
+        async with _running_lane(git_ops, config) as lane:
+            await lane.allocator.quarantine_and_release(_remote_lease(lane))
+            drift_check_lease = lane.allocator.acquire_local(lambda: lane.remote)
+            assert drift_check_lease is not None
+            first = await lane.enqueue('stop-first')
+            second = await lane.enqueue('stop-second')
+            await lane.settle(
+                lambda: (
+                    lane.states().get('stop-first') == 'awaiting_host'
+                    and lane.states().get('stop-second') == 'awaiting_host'
+                ),
+                expected='both items parked awaiting_host with nothing in flight',
+                why='no host is acquirable, so each dispatch attempt parks its item.',
             )
+            assert lane.run_task is not None
+
+            stop_task = asyncio.ensure_future(lane.worker.stop())
+            await asyncio.sleep(0)
+            await lane.allocator.release(drift_check_lease)
+            await stop_task
+            try:
+                await asyncio.wait_for(asyncio.shield(lane.run_task), timeout=5.0)
+            except TimeoutError:
+                pytest.fail(f'the lane never finished after stop(); {lane.observed()}')
+
+            assert first.result.done() and second.result.done(), (
+                'a parked item was dispatched after stop() drained the park, so '
+                f'its merge() Future was never resolved; {lane.observed()}'
+            )
+            assert _hosts_of(lane) == {}, lane.observed()

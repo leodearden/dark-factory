@@ -16446,9 +16446,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """
         while True:
             # ── (a) DISPATCH-FILL ──────────────────────────────────────────────
-            # Fill self._inflight as long as host slots are available.
+            # Fill self._inflight as long as host slots are available.  Once
+            # stop() is requested it owns _redispatch, the verifier queue and
+            # _inflight, so no new dispatch starts.
             fill_done = False
-            while not fill_done:
+            while not fill_done and not self._stop_requested.is_set():
                 # Get next item: front-priority _redispatch first, then queue nowait
                 item: SpeculativeItem | None = None
                 if self._redispatch:
@@ -16513,7 +16515,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 {self._pending_verifier_get, *_running},
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
-                            if self._pending_verifier_get.done():
+                            if (
+                                not self._stop_requested.is_set()
+                                and self._pending_verifier_get.done()
+                            ):
                                 # A new item arrived first → dispatch it.
                                 # Guard against cancelled getter (stop() race):
                                 # treat cancelled as nothing-arrived → fall
@@ -16527,9 +16532,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                                 is_from_verifier_queue = True
                                 # Fall through with item (None handled below).
                             else:
-                                # A verify finished first → stop filling and proceed
-                                # to FINALIZE-HEAD.  The getter persists to the next
-                                # DISPATCH-FILL iteration so no queue item is lost.
+                                # A verify finished first, or stop() was requested
+                                # (it harvests a done getter) → stop filling and
+                                # proceed to FINALIZE-HEAD.  The getter persists to
+                                # the next DISPATCH-FILL iteration so no queue item
+                                # is lost.
                                 fill_done = True
                                 break
                         else:
@@ -17113,16 +17120,20 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return
 
     def _dispatch_opportunity_exists(self) -> bool:
-        """True when DISPATCH-FILL could start a verify now: an acquirable host
-        is free and an item is ready for it (a None sentinel counts; the fill's
-        sentinel path handles it)."""
+        """True when DISPATCH-FILL could start a verify now: stop() has not been
+        requested, an acquirable host is free and an item is ready for it (a
+        None sentinel counts; the fill's sentinel path handles it)."""
         allocator = self._host_allocator
         getter = self._pending_verifier_get
         item_ready = (
             getter.done() if getter is not None else not self._verifier_queue.empty()
         )
         host_free = allocator is None or allocator.free_host_count() > 0
-        return host_free and (bool(self._redispatch) or item_ready)
+        return (
+            not self._stop_requested.is_set()
+            and host_free
+            and (bool(self._redispatch) or item_ready)
+        )
 
     async def _build_merge_failure_diagnostic(
         self,

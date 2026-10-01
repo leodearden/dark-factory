@@ -673,6 +673,60 @@
           "current": 31610
         }
       ]
+    },
+    {
+      "task_id": "5303",
+      "reason": "review fix: once stop() is requested the verifier loop starts no new dispatch, so a host freeing inside stop()'s drain cannot strand a parked item behind it",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 2160,
+          "current": 2163
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_dispatch_opportunity_exists",
+          "baseline": 4,
+          "current": 5
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_verifier_loop",
+          "baseline": 250,
+          "current": 252
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21736,
+          "current": 21747
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12383,
+          "current": 12387
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4756,
+          "current": 4759
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56367,
+          "current": 56378
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31610,
+          "current": 31614
+        }
+      ]
     }
   ]
 }
