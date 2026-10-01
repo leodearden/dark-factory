@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
@@ -230,6 +230,16 @@ class ScoredCase:
         return self.has_true_link and self.answered_distinct
 
 
+PAIRED_ERRORS: Mapping[str, Callable[[ScoredCase], bool]] = MappingProxyType({
+    'misfile': lambda scored: scored.misfile,
+    'contested_decision_error': lambda scored: scored.contested_decision_error,
+    'missed_contradiction': lambda scored: scored.missed_contradiction,
+    'false_contested': lambda scored: scored.false_contested,
+    'true_link_answered_distinct': lambda scored: scored.true_link_answered_distinct,
+})
+"""The per-write errors each arm is paired against the reference arm on."""
+
+
 @dataclass(frozen=True)
 class ListPrice:
     usd_per_mtok_input: float
@@ -329,6 +339,17 @@ def score_pairs(
       a model missing from :data:`LIST_PRICES`, and the mean list-price cost
       per call.
 
+    ``paired_vs_reference`` is None for the reference arm. Any other arm is
+    paired with it on the writes both judge bands hold (``n_common``). For each
+    error in :data:`PAIRED_ERRORS` it counts the writes only this arm got wrong
+    (``only_arm``) and only the reference got wrong (``only_reference``), with
+    the two-sided exact McNemar p. ``parent_sign_test`` runs the same exact
+    test over parent groups. A write's parent group is its band winner, which
+    is held fixed across arms because the band is decided before the judge
+    runs. A group favours whichever arm erred on fewer of its writes. A write
+    whose band winner differs between the two arms is refused, because the arms
+    were then not run on one population.
+
     ``list_prices`` is the table those costs were computed from, with its date
     and source.
     """
@@ -339,13 +360,22 @@ def score_pairs(
         )
     truth = resolve_verdicts(verdicts)
     true_link_writes = frozenset(entry for (entry, _), r in truth.items() if r.belongs)
+    scored = {
+        arm: [_scored(case, truth, true_link_writes) for case in arm_cases if case.in_judge_band]
+        for arm, arm_cases in cases_by_arm.items()
+    }
     return {
         'reference_arm': reference_arm,
         'verdict_corpus': _corpus_summary(verdicts, truth),
         'list_prices': _price_table(),
         'arms': {
-            arm: _arm_report(arm_cases, truth, true_link_writes)
-            for arm, arm_cases in cases_by_arm.items()
+            arm: _arm_report(
+                cases_by_arm[arm],
+                scored[arm],
+                None if arm == reference_arm else scored[reference_arm],
+                truth,
+            )
+            for arm in cases_by_arm
         },
     }
 
@@ -360,15 +390,16 @@ def _cases_by_arm(rows: Iterable[Mapping[str, Any]]) -> dict[str, list[JudgedCas
 
 def _arm_report(
     cases: Sequence[JudgedCase],
+    scored: Sequence[ScoredCase],
+    reference: Sequence[ScoredCase] | None,
     truth: Mapping[Pair, Resolution],
-    true_link_writes: frozenset[str],
 ) -> dict[str, Any]:
-    judged = [case for case in cases if case.in_judge_band]
-    scored = [_scored(case, truth, true_link_writes) for case in judged]
+    judged = [s.case for s in scored]
     return {
         'population': {'n_cases': len(cases), 'n_judge_band': len(judged)},
         'quality': _quality(scored, _unrated(judged, truth)),
         'runtime': _runtime(judged),
+        'paired_vs_reference': None if reference is None else _paired(scored, reference),
     }
 
 
@@ -486,3 +517,56 @@ def _price_table() -> dict[str, Any]:
             for model, price in LIST_PRICES.items()
         },
     }
+
+
+def _paired(
+    arm: Sequence[ScoredCase], reference: Sequence[ScoredCase],
+) -> dict[str, dict[str, Any]]:
+    reference_by_write = {s.case.memory_id: s for s in reference}
+    common = [
+        (mine, reference_by_write[mine.case.memory_id])
+        for mine in sorted(arm, key=lambda s: s.case.memory_id)
+        if mine.case.memory_id in reference_by_write
+    ]
+    for mine, theirs in common:
+        if mine.case.band_winner_id != theirs.case.band_winner_id:
+            raise ValueError(
+                f'write {mine.case.memory_id!r} has band winner {mine.case.band_winner_id!r}'
+                f' in arm {mine.case.arm!r} but {theirs.case.band_winner_id!r} in'
+                f' reference arm {theirs.case.arm!r}; the arms were not run on one'
+                ' frozen population'
+            )
+    return {name: _paired_error(common, error) for name, error in PAIRED_ERRORS.items()}
+
+
+def _paired_error(
+    common: Sequence[tuple[ScoredCase, ScoredCase]], error: Callable[[ScoredCase], bool],
+) -> dict[str, Any]:
+    only_arm = [mine.case.band_winner_id for mine, theirs in common
+                if error(mine) and not error(theirs)]
+    only_reference = [mine.case.band_winner_id for mine, theirs in common
+                      if error(theirs) and not error(mine)]
+    net_reference_errors = Counter(only_reference)
+    net_reference_errors.subtract(only_arm)
+    favouring_arm = sum(net > 0 for net in net_reference_errors.values())
+    favouring_reference = sum(net < 0 for net in net_reference_errors.values())
+    return {
+        'n_common': len(common),
+        'only_arm': len(only_arm),
+        'only_reference': len(only_reference),
+        'mcnemar_p': _mcnemar_exact(len(only_arm), len(only_reference)),
+        'parent_sign_test': {
+            'groups_favouring_arm': favouring_arm,
+            'groups_favouring_reference': favouring_reference,
+            'p': _mcnemar_exact(favouring_arm, favouring_reference),
+        },
+    }
+
+
+def _mcnemar_exact(only_first: int, only_second: int) -> float:
+    """Two-sided exact McNemar (sign) test p on the discordant counts."""
+    discordant = only_first + only_second
+    if discordant == 0:
+        return 1.0
+    tail = sum(math.comb(discordant, k) for k in range(min(only_first, only_second) + 1))
+    return round(min(1.0, 2 * tail / 2 ** discordant), 4)
