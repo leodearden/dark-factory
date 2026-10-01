@@ -24,7 +24,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import redis.exceptions
-from test_ensure_indices import _EMPTY_KEY_ERROR, _issued, _ro_issued, _rows_for, _StatefulGraph
+from _falkor_index_doubles import (
+    EMPTY_KEY_ERROR,
+    StatefulGraph,
+    rows_for,
+    statements_read,
+    statements_written,
+)
 from test_falkor_indices import _TRAP_PRESENT, LIVE_HEADER
 
 from fused_memory.backends.falkor_indices import expected_index_set, plan_index_statements
@@ -102,12 +108,12 @@ class TestStartupSweep:
         self, mock_config, make_backend, make_graph_mock,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg_a', 'reg_absent'})
-        graphs = {'reg_a': make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)}
+        graphs = {'reg_a': make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)}
         _route(backend, graphs, ['unreg_probe', 'reg_a', 'default_db'])
 
         await backend.provision_registered_graphs()
 
-        assert _issued(graphs['reg_a']) == _plan_for(_TRAP_PRESENT)
+        assert statements_written(graphs['reg_a']) == _plan_for(_TRAP_PRESENT)
         # A registered but ABSENT graph is left to its first write (D6); an
         # unregistered one is never touched, whatever its name looks like (D5).
         assert _requested_graphs(backend) == {'reg_a'}
@@ -121,14 +127,14 @@ class TestStartupSweep:
         broken.ro_query = AsyncMock(side_effect=redis.exceptions.ConnectionError('down'))
         graphs = {
             'reg_a': broken,
-            'reg_b': make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER),
+            'reg_b': make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER),
         }
         _route(backend, graphs, ['reg_a', 'reg_b'])
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
             await backend.provision_registered_graphs()
 
-        assert _issued(graphs['reg_b']) == _plan_for(_TRAP_PRESENT)
+        assert statements_written(graphs['reg_b']) == _plan_for(_TRAP_PRESENT)
         assert any(
             r.name == _LOGGER and r.levelno == logging.WARNING and 'reg_a' in r.getMessage()
             for r in caplog.records
@@ -165,16 +171,16 @@ class TestStartupSweep:
         self, mock_config, make_backend, make_graph_mock,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg_a'})
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
         healthy_read = graph.ro_query.side_effect('CALL db.indexes()')
         graph.ro_query.side_effect = [redis.exceptions.ConnectionError('blip'), healthy_read]
         _route(backend, {'reg_a': graph}, ['reg_a'])
 
         await backend.provision_registered_graphs()
-        assert _issued(graph) == []
+        assert statements_written(graph) == []
 
         await backend.provision_registered_graphs()
-        assert _issued(graph) == _plan_for(_TRAP_PRESENT)
+        assert statements_written(graph) == _plan_for(_TRAP_PRESENT)
 
     @pytest.mark.asyncio
     async def test_a_returned_run_is_cached_even_with_per_statement_failures(
@@ -182,7 +188,7 @@ class TestStartupSweep:
     ):
         """β already WARNs per rejected statement; δ's detector owns the gap (INV-4)."""
         backend = make_backend(mock_config, registered_graph_ids={'reg_a'})
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
         doomed = _plan_for(_TRAP_PRESENT)[0]
 
         async def _query(statement, *args, **kwargs):
@@ -194,11 +200,11 @@ class TestStartupSweep:
         _route(backend, {'reg_a': graph}, ['reg_a'])
 
         await backend.provision_registered_graphs()
-        reads_after_first = len(_ro_issued(graph))
+        reads_after_first = len(statements_read(graph))
         await backend.provision_registered_graphs()
 
         assert reads_after_first == 1
-        assert len(_ro_issued(graph)) == reads_after_first
+        assert len(statements_read(graph)) == reads_after_first
 
     @pytest.mark.asyncio
     async def test_a_second_sweep_over_provisioned_graphs_reads_nothing(
@@ -206,16 +212,16 @@ class TestStartupSweep:
     ):
         """INV-3: the in-process cache skips only redundant WORK."""
         backend = make_backend(mock_config, registered_graph_ids={'reg_a'})
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
         _route(backend, {'reg_a': graph}, ['reg_a'])
 
         await backend.provision_registered_graphs()
-        reads, writes = list(_ro_issued(graph)), list(_issued(graph))
+        reads, writes = list(statements_read(graph)), list(statements_written(graph))
         await backend.provision_registered_graphs()
 
         assert writes == _plan_for(_TRAP_PRESENT)
-        assert _ro_issued(graph) == reads
-        assert _issued(graph) == writes
+        assert statements_read(graph) == reads
+        assert statements_written(graph) == writes
 
     @pytest.mark.asyncio
     async def test_a_sweep_over_fully_provisioned_graphs_claims_nothing(
@@ -223,13 +229,13 @@ class TestStartupSweep:
     ):
         """INV-2: a sweep that changed nothing must not emit a line read as "provisioned"."""
         backend = make_backend(mock_config, registered_graph_ids={'reg_a'})
-        graph = make_graph_mock(_rows_for(expected_index_set()), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(expected_index_set()), header=LIVE_HEADER)
         _route(backend, {'reg_a': graph}, ['reg_a'])
 
         with caplog.at_level(logging.DEBUG, logger=_LOGGER):
             await backend.provision_registered_graphs()
 
-        assert _ro_issued(graph) == ['CALL db.indexes()'], 'the graph must have been examined'
+        assert statements_read(graph) == ['CALL db.indexes()'], 'the graph must have been examined'
         assert [
             r for r in caplog.records if r.name == _LOGGER and r.levelno >= logging.INFO
         ] == []
@@ -278,13 +284,13 @@ class TestFirstWriteProvisioning:
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
         graph = make_graph_mock([], header=LIVE_HEADER)
-        graph.ro_query = AsyncMock(side_effect=_EMPTY_KEY_ERROR)
+        graph.ro_query = AsyncMock(side_effect=EMPTY_KEY_ERROR)
         events = self._wire(backend, graph, listing=[])
 
         result = await self._write(backend)
 
         assert events == _plan_for(set()) + ['upstream']
-        assert _ro_issued(graph) == ['CALL db.indexes()'], 'no readiness poll (INV-7)'
+        assert statements_read(graph) == ['CALL db.indexes()'], 'no readiness poll (INV-7)'
         assert result is self.UPSTREAM_RESULT
 
     @pytest.mark.asyncio
@@ -292,7 +298,7 @@ class TestFirstWriteProvisioning:
         self, mock_config, make_backend, make_graph_mock,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
         events = self._wire(backend, graph, listing=['unreg'])
 
         await self._write(backend, group_id='unreg')
@@ -306,7 +312,7 @@ class TestFirstWriteProvisioning:
         self, mock_config, make_backend,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
-        graph = _StatefulGraph(_TRAP_PRESENT)
+        graph = StatefulGraph(_TRAP_PRESENT)
         self._wire(backend, graph, listing=['reg'])
 
         await asyncio.gather(self._write(backend), self._write(backend))
@@ -319,7 +325,7 @@ class TestFirstWriteProvisioning:
     ):
         """The ``MemoryService._execute_graphiti_write`` shape: the caller already holds it."""
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
         events = self._wire(backend, graph, listing=['reg'])
 
         async with backend._identity_lock_for('reg'):
@@ -365,7 +371,7 @@ class TestFirstWriteProvisioning:
         config.queue.write_timeout_seconds = 0.5
         write_budget = config.queue.write_timeout_seconds
         backend = make_backend(config, registered_graph_ids={'reg'})
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
         healthy_read = graph.ro_query.side_effect
         never = asyncio.Event()
         reads = 0
@@ -391,15 +397,15 @@ class TestFirstWriteProvisioning:
         self, mock_config, make_backend, make_graph_mock,
     ):
         backend = make_backend(mock_config, registered_graph_ids={'reg'})
-        graph = make_graph_mock(_rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
+        graph = make_graph_mock(rows_for(_TRAP_PRESENT), header=LIVE_HEADER)
         self._wire(backend, graph, listing=['reg'])
 
         await self._write(backend)
         await self._write(backend)
         await self._write(backend)
 
-        assert _ro_issued(graph) == ['CALL db.indexes()']
-        assert _issued(graph) == _plan_for(_TRAP_PRESENT)
+        assert statements_read(graph) == ['CALL db.indexes()']
+        assert statements_written(graph) == _plan_for(_TRAP_PRESENT)
 
     @pytest.mark.asyncio
     async def test_ensure_entity_node_on_a_registered_absent_graph_provisions_before_minting(
@@ -410,7 +416,7 @@ class TestFirstWriteProvisioning:
 
         async def _ro_query(statement, *args, **kwargs):
             if 'db.indexes' in statement:
-                raise _EMPTY_KEY_ERROR
+                raise EMPTY_KEY_ERROR
             return MagicMock(result_set=[], header=[])  # the resolve read: no such node
 
         graph.ro_query = AsyncMock(side_effect=_ro_query)
@@ -420,6 +426,6 @@ class TestFirstWriteProvisioning:
 
         await backend.ensure_entity_node('Some Entity', group_id='reg')
 
-        writes = _issued(graph)
+        writes = statements_written(graph)
         mint_at = next(i for i, w in enumerate(writes) if w.startswith('CREATE (n:Entity'))
         assert writes[:mint_at] == _plan_for(set())
