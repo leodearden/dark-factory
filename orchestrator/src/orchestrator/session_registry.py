@@ -1664,15 +1664,10 @@ def merge_same_queue_refile(
     reap_answered_decisions skips a non-open record ("already resolved -- no
     re-close"), so without this the operator's dismissal is undone forever
     and C5b's drop action is inert for exactly the class of row it exists
-    for. The escape hatch for a genuinely NEW ask at a closed id is to FILE
-    IT UNDER A NEW ID -- the remedy that exists on a shipped surface, and the
-    one _run_write_decision's divergence WARNING points a watcher at.
-    Re-opening the row IN PLACE is deliberately not offered as the headline
-    remedy, because today it needs a direct registry write: this module's
-    update_decision_state has no operator-facing caller that re-opens (the
-    cockpit's C5b decision pane writes DROPPED only) and the argparse below
-    exposes write-decision / reap-decisions but no update-decision-state
-    verb. Say "file a new id" until one of those exists.
+    for. When the SAME gate genuinely needs a human again, the row is
+    re-opened in place with the ``reopen-decision`` verb (reopen_decision),
+    which _run_write_decision's divergence WARNING names; a genuinely
+    DIFFERENT ask is filed under a new id.
 
     ADDITIVE-SAFE: ``state`` is copied as an opaque ``str``, never coerced
     through DecisionState -- mirrors DecisionRecord's own no-coercion note,
@@ -4982,18 +4977,20 @@ def _run_write_decision(
                             'already answered or dropped, not a new ask. Your text, '
                             'severity and ids DID land, but the row stays CLOSED and '
                             'will NOT reappear in the cockpit decision queue, which '
-                            'shows only state=open rows. Re-opening it would make an '
-                            'operator\'s cockpit disposition impossible to ever make '
-                            'stick, since a watcher re-files its stable id on every '
+                            'shows only state=open rows. Re-opening it on a re-file would '
+                            'make an operator\'s cockpit disposition impossible to ever '
+                            'make stick, since a watcher re-files its stable id on every '
                             'restart while an item stays parked. ADJUDICATE this rather '
-                            'than re-filing blindly: if the gate is genuinely a NEW ask, '
-                            'file it under a NEW id -- that is the remedy with a shipped '
-                            'surface, since re-opening this row in place currently needs '
-                            'a direct registry write (the cockpit decision pane offers a '
-                            'drop action but no re-open, and there is no '
-                            'update-decision-state CLI verb).',
+                            'than re-filing blindly: if this SAME gate genuinely needs a '
+                            'human again, re-open the row in place with '
+                            '`session_registry.py reopen-decision --id %s --project %s '
+                            '--escalations-dir %s`; file under a NEW id only for a '
+                            'genuinely DIFFERENT ask.',
                             decision_id,
                             str(existing.state),
+                            stamp,
+                            decision_id,
+                            canonical_project,
                             stamp,
                         )
                 elif existing.state == DecisionState.OPEN:
@@ -5166,7 +5163,7 @@ def _run_close_decision(
     expected_project: str,
     expected_escalations_dir: str,
 ) -> int:
-    """Run the ``close-decision`` verb; the one decision verb whose failure is a non-zero exit.
+    """Run the ``close-decision`` verb, whose failure, like ``reopen-decision``'s, is a non-zero exit.
 
     Its caller is an agent executing a pre-built apply payload
     (``scripts/sitting/payloads.py::close_decision_argv``), not
@@ -5187,6 +5184,36 @@ def _run_close_decision(
         return 1
     if record is None:
         print(f'close-decision: {decision_id} has no readable record to close (see the ERROR log)', file=sys.stderr)
+        return 1
+    print(record.id)
+    return 0
+
+
+def _run_reopen_decision(
+    decision_id: str,
+    root: str | None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str,
+) -> int:
+    """Run the ``reopen-decision`` verb; like close-decision, a refusal or an unreadable record exits non-zero.
+
+    Its caller is a human or agent adjudicating a held-closed row, who must
+    see a refusal rather than read it as success. Prints the record's id on
+    success.
+    """
+    try:
+        record = reopen_decision(
+            decision_id,
+            root=root,
+            expected_project=expected_project,
+            expected_escalations_dir=expected_escalations_dir,
+        )
+    except DecisionReopenRefused as exc:
+        print(f'reopen-decision refused: {exc}', file=sys.stderr)
+        return 1
+    if record is None:
+        print(f'reopen-decision: {decision_id} has no readable record to reopen (see the ERROR log)', file=sys.stderr)
         return 1
     print(record.id)
     return 0
@@ -5213,6 +5240,27 @@ def _run_migrate_decision_projects(dry_run: bool) -> None:
     """
     for migrated in migrate_decision_project_tokens(dry_run=dry_run):
         print(f'{migrated.id} {migrated.old_project} -> {migrated.new_project}')
+
+
+def _add_record_identity_args(verb_parser: argparse.ArgumentParser) -> None:
+    """The compare-and-swap expectations close-decision and reopen-decision name a record by."""
+    verb_parser.add_argument(
+        '--project',
+        required=True,
+        help=(
+            "compare-and-swap expectation of the record's CURRENT project, not a stamp "
+            "like write-decision's: a record at --id whose folded project differs is refused"
+        ),
+    )
+    verb_parser.add_argument(
+        '--escalations-dir',
+        required=True,
+        help=(
+            "compare-and-swap expectation of the record's CURRENT queue stamp, not a stamp "
+            "like write-decision's, so '' is a legal expectation for a legacy unstamped record; "
+            'a record at --id whose normalized stamp differs is refused'
+        ),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -5364,24 +5412,18 @@ def _build_parser() -> argparse.ArgumentParser:
     close_decision_p.add_argument('--id', required=True, help="the decision's id")
     close_decision_p.add_argument('--state', required=True, help='answered or dropped')
     close_decision_p.add_argument('--evidence', required=True, help='the deciding evidence, verbatim')
-    close_decision_p.add_argument(
-        '--project',
-        required=True,
-        help=(
-            "compare-and-swap expectation of the record's CURRENT project, not a stamp "
-            "like write-decision's: a record at --id whose folded project differs is refused"
-        ),
-    )
-    close_decision_p.add_argument(
-        '--escalations-dir',
-        required=True,
-        help=(
-            "compare-and-swap expectation of the record's CURRENT queue stamp, not a stamp "
-            "like write-decision's, so '' is a legal expectation for a legacy unstamped record; "
-            'a record at --id whose normalized stamp differs is refused'
-        ),
-    )
+    _add_record_identity_args(close_decision_p)
     close_decision_p.add_argument('--root', default=None, help='fleet root (default: fleet_root())')
+
+    reopen_decision_p = sub.add_parser(
+        'reopen-decision',
+        help='re-open a closed decision in place, clearing its closing evidence (task 4835)',
+    )
+    reopen_decision_p.add_argument(
+        '--id', required=True, help='the record id as stored/printed by write-decision'
+    )
+    _add_record_identity_args(reopen_decision_p)
+    reopen_decision_p.add_argument('--root', default=None, help='fleet root (default: fleet_root())')
 
     # NOTE: --escalations-dir is required on BOTH halves of the file/reap
     # pair. reap-decisions has always required it; write-decision joined it
@@ -5435,8 +5477,9 @@ def main(argv: list[str] | None = None) -> int:
     distinguish from a supplied one) stays fail-soft: ERROR log, nothing
     written, nothing printed, rc 0.
 
-    ``close-decision`` is the one exception, and it is dispatched before the
-    swallowing try/except: see _run_close_decision for why its refusals exit
+    ``close-decision`` and ``reopen-decision`` are the two exceptions, and
+    they are dispatched before the swallowing try/except: see
+    _run_close_decision and _run_reopen_decision for why their refusals exit
     non-zero.
     """
     parser = _build_parser()
@@ -5522,6 +5565,13 @@ def main(argv: list[str] | None = None) -> int:
             args.id,
             args.state,
             args.evidence,
+            args.root,
+            expected_project=args.project,
+            expected_escalations_dir=args.escalations_dir,
+        )
+    if args.verb == 'reopen-decision':
+        return _run_reopen_decision(
+            args.id,
             args.root,
             expected_project=args.project,
             expected_escalations_dir=args.escalations_dir,
