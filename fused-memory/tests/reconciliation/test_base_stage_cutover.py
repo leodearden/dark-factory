@@ -378,8 +378,8 @@ class TestBuildMcpConfigReconReport:
     """_build_mcp_config must inject a recon-report HTTP entry from the configured port."""
 
     def test_recon_report_entry_default_port(self):
-        """recon-report server entry present with default port 8003."""
-        stage = make_consolidator(recon_report_port=8003)
+        """recon-report server entry present with BaseStage's default port 8003."""
+        stage = make_consolidator()
         mcp_config = stage._build_mcp_config()
         servers = mcp_config['mcpServers']
         assert 'recon-report' in servers, 'recon-report must be in mcpServers'
@@ -395,7 +395,7 @@ class TestBuildMcpConfigReconReport:
 
     def test_existing_entries_preserved(self):
         """fused-memory and jcodemunch entries still present after recon-report injection."""
-        stage = make_consolidator(recon_report_port=8003)
+        stage = make_consolidator()
         servers = stage._build_mcp_config()['mcpServers']
         assert 'fused-memory' in servers, 'fused-memory entry must remain'
         assert 'jcodemunch' in servers, 'jcodemunch entry must remain'
