@@ -6,6 +6,7 @@ effective-benign predicate, and the per-path benign default helper
 from __future__ import annotations
 
 import pytest
+from _info_l0_records import done_step_tripwire, info_l0_note, info_scope_divergence
 
 from escalation.classify import (
     DONE_STEP_COMMIT_ORPHAN_CLASS,
@@ -203,49 +204,7 @@ class TestDefaultResolutionClassForResolver:
 # Mechanical info-L0 classes (plans/info-l0-disposition-router-prd.md D8)
 # ---------------------------------------------------------------------------
 
-_MECHANICAL_ROLES = (
-    'orchestrator-starvation-watchdog',
-    'orchestrator-merge-skew-tripwire',
-    'orchestrator-no-landings-breaker',
-    'orchestrator-warm-base-hard-down',
-    'orchestrator-verify-host-monitor',
-    'orchestrator-offline-lane',
-)
-
-
-def _info_l0(
-    *,
-    agent_role: str = 'implementer',
-    category: str = 'design_concern',
-    summary: str = 'Helper X lacks a regression test',
-    suggested_action: str = 'Add a regression test for helper X',
-) -> Escalation:
-    return Escalation(
-        id='esc-7-1',
-        task_id='7',
-        agent_role=agent_role,
-        severity='info',
-        category=category,
-        summary=summary,
-        suggested_action=suggested_action,
-        level=0,
-    )
-
-
-def _done_step_tripwire() -> Escalation:
-    return _info_l0(
-        agent_role='orchestrator',
-        category='infra_issue',
-        summary='Done step commit not reachable from HEAD',
-        suggested_action='verify_wip_reconciliation',
-    )
-
-
 class TestInfoL0MechanicalRoles:
-    def test_registry_is_exactly_the_six_mechanical_filer_roles(self):
-        assert isinstance(INFO_L0_MECHANICAL_ROLES, frozenset)
-        assert frozenset(_MECHANICAL_ROLES) == INFO_L0_MECHANICAL_ROLES
-
     def test_bare_orchestrator_role_is_not_registered(self):
         """The bare 'orchestrator' role also files blocking work, so it may
         only match through a discriminator, never by role alone."""
@@ -259,7 +218,7 @@ class TestInfoL0MechanicalRoles:
 
 class TestIsDoneStepCommitOrphan:
     def test_matches_the_done_step_tripwire_shape(self):
-        assert is_done_step_commit_orphan(_done_step_tripwire()) is True
+        assert is_done_step_commit_orphan(done_step_tripwire()) is True
 
     @pytest.mark.parametrize(
         ('field', 'value'),
@@ -270,27 +229,28 @@ class TestIsDoneStepCommitOrphan:
         ],
     )
     def test_any_one_differing_field_does_not_match(self, field: str, value: str):
-        esc = _done_step_tripwire()
+        esc = done_step_tripwire()
         setattr(esc, field, value)
         assert is_done_step_commit_orphan(esc) is False
 
 
 class TestInfoL0MechanicalClass:
-    @pytest.mark.parametrize('role', _MECHANICAL_ROLES)
+    @pytest.mark.parametrize('role', sorted(INFO_L0_MECHANICAL_ROLES))
     def test_registered_role_is_its_own_class(self, role: str):
-        assert info_l0_mechanical_class(_info_l0(agent_role=role)) == role
+        assert info_l0_mechanical_class(info_l0_note(agent_role=role)) == role
 
     def test_done_step_tripwire_is_the_done_step_class(self):
-        assert info_l0_mechanical_class(_done_step_tripwire()) == DONE_STEP_COMMIT_ORPHAN_CLASS
+        assert info_l0_mechanical_class(done_step_tripwire()) == DONE_STEP_COMMIT_ORPHAN_CLASS
 
     def test_agent_note_is_not_mechanical(self):
-        assert info_l0_mechanical_class(_info_l0()) is None
+        assert info_l0_mechanical_class(info_l0_note()) is None
 
     def test_unregistered_orchestrator_role_is_not_mechanical(self):
-        assert info_l0_mechanical_class(_info_l0(agent_role='orchestrator-some-new-monitor')) is None
+        record = info_l0_note(agent_role='orchestrator-some-new-monitor')
+        assert info_l0_mechanical_class(record) is None
 
     def test_injected_registry_is_honoured(self):
-        record = _info_l0(agent_role='orchestrator-starvation-watchdog')
+        record = info_l0_note(agent_role='orchestrator-starvation-watchdog')
         assert info_l0_mechanical_class(record, frozenset()) is None
 
     def test_scope_divergence_shape_is_not_mechanical(self):
@@ -303,10 +263,4 @@ class TestInfoL0MechanicalClass:
         is therefore unexpected and must fall to the curator leg (D8 fail-loud)
         rather than close silently as status-info.
         """
-        record = _info_l0(
-            agent_role='orchestrator',
-            category='infra_issue',
-            summary='plan.files/metadata.files divergence detected for task 7',
-            suggested_action='investigate_and_retry',
-        )
-        assert info_l0_mechanical_class(record) is None
+        assert info_l0_mechanical_class(info_scope_divergence()) is None

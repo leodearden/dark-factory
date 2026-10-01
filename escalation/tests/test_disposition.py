@@ -9,9 +9,15 @@ variant out.  These tests pin the precedence chain end to end.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, assert_never
+from typing import Any, get_args
 
 import pytest
+from _info_l0_records import (
+    NOTE_DETAIL,
+    done_step_tripwire,
+    info_l0_note,
+    info_scope_divergence,
+)
 
 from escalation.classify import DONE_STEP_COMMIT_ORPHAN_CLASS, INFO_L0_MECHANICAL_ROLES
 from escalation.disposition import (
@@ -31,27 +37,6 @@ from escalation.disposition import (
 )
 from escalation.models import RESOLUTION_CLASSES, Escalation
 
-_DETAIL = (
-    'Helper X in orchestrator/src/orchestrator/foo.py::helper_x has no test\n'
-    'covering its empty-input branch; a regression there would go unnoticed.'
-)
-
-
-def _note(**overrides: Any) -> Escalation:
-    fields: dict[str, Any] = {
-        'id': 'esc-77-3',
-        'task_id': '77',
-        'agent_role': 'implementer',
-        'severity': 'info',
-        'level': 0,
-        'category': 'design_concern',
-        'summary': 'Helper X lacks a regression test',
-        'detail': _DETAIL,
-        'suggested_action': 'Add a regression test for helper X',
-    }
-    fields.update(overrides)
-    return Escalation(**fields)
-
 
 def _route(record: Escalation, **kw: Any) -> Disposition:
     kw.setdefault('task_status', 'done')
@@ -60,44 +45,29 @@ def _route(record: Escalation, **kw: Any) -> Disposition:
     return route_info_l0(record, **kw)
 
 
-def _done_step_tripwire() -> Escalation:
-    return _note(
-        agent_role='orchestrator',
-        category='infra_issue',
-        summary='Done step commit not reachable from HEAD',
-        suggested_action='verify_wip_reconciliation',
-    )
-
-
-def _class_name(d: Disposition) -> str:
-    match d:
-        case Addressed():
-            return 'addressed'
-        case ObservationConsumed():
-            return 'observation-consumed'
-        case StatusInfo():
-            return 'status-info'
-        case ConvertViaCurator():
-            return 'convert-via-curator'
-        case PromoteWithHint():
-            return 'promote-with-hint'
-        case Defer():
-            return 'defer'
-        case _:
-            assert_never(d)
-
+#: One instance of each Disposition variant, with a field to try mutating.
+_ONE_OF_EACH_VARIANT: list[tuple[Disposition, str]] = [
+    (Addressed(), 'resolution_class'),
+    (ObservationConsumed(), 'resolution_class'),
+    (StatusInfo('orchestrator-offline-lane'), 'class_key'),
+    (ConvertViaCurator(CuratorCandidate('t', 'd', 'esc-77-3', '77')), 'payload'),
+    (PromoteWithHint(PromoteReason.NO_CONVERTIBLE_CONTENT), 'reason'),
+    (Defer(DeferReason.REQUEUED_EXIT), 'reason'),
+]
 
 _NON_REQUEUE_KINDS = [kind for kind in ExitKind if kind is not ExitKind.REQUEUED]
 
 #: (id, record, reviewer_disposition) — one representative of each leg that a
 #: requeue must pre-empt.
 _REQUEUE_ROWS = [
-    pytest.param(_note(), None, id='work-note'),
-    pytest.param(_note(suggested_action='No action needed'), None, id='no-action-note'),
+    pytest.param(info_l0_note(), None, id='work-note'),
+    pytest.param(info_l0_note(suggested_action='No action needed'), None, id='no-action-note'),
     pytest.param(
-        _note(agent_role='orchestrator-starvation-watchdog'), None, id='starvation-watchdog',
+        info_l0_note(agent_role='orchestrator-starvation-watchdog'),
+        None,
+        id='starvation-watchdog',
     ),
-    pytest.param(_note(), ReviewerDisposition.ADDRESSED, id='reviewer-addressed'),
+    pytest.param(info_l0_note(), ReviewerDisposition.ADDRESSED, id='reviewer-addressed'),
 ]
 
 
@@ -151,25 +121,26 @@ class TestDeferOnlyOnRequeue:
 
 class TestReviewerDispositionWins:
     def test_addressed(self):
-        assert _route(_note(), reviewer_disposition=ReviewerDisposition.ADDRESSED) == Addressed()
+        disposition = _route(info_l0_note(), reviewer_disposition=ReviewerDisposition.ADDRESSED)
+        assert disposition == Addressed()
 
     def test_no_action_consumes_even_a_work_shaped_note(self):
-        disposition = _route(_note(), reviewer_disposition=ReviewerDisposition.NO_ACTION)
+        disposition = _route(info_l0_note(), reviewer_disposition=ReviewerDisposition.NO_ACTION)
         assert disposition == ObservationConsumed()
 
     def test_work_converts_even_when_the_author_declared_no_action(self):
-        record = _note(suggested_action='No action needed')
+        record = info_l0_note(suggested_action='No action needed')
         disposition = _route(record, reviewer_disposition=ReviewerDisposition.WORK)
         assert isinstance(disposition, ConvertViaCurator)
         assert disposition.payload.escalation_id == record.id
 
     def test_work_without_content_promotes(self):
-        record = _note(summary='', detail='  ')
+        record = info_l0_note(summary='', detail='  ')
         disposition = _route(record, reviewer_disposition=ReviewerDisposition.WORK)
         assert disposition == PromoteWithHint(PromoteReason.NO_CONVERTIBLE_CONTENT)
 
     def test_addressed_beats_the_mechanical_leg(self):
-        record = _note(agent_role='orchestrator-starvation-watchdog')
+        record = info_l0_note(agent_role='orchestrator-starvation-watchdog')
         disposition = _route(record, reviewer_disposition=ReviewerDisposition.ADDRESSED)
         assert disposition == Addressed()
 
@@ -179,11 +150,11 @@ class TestMechanicalLeg:
 
     @pytest.mark.parametrize('role', sorted(INFO_L0_MECHANICAL_ROLES))
     def test_registered_role_is_status_info_keyed_by_role(self, role: str):
-        assert _route(_note(agent_role=role)) == StatusInfo(class_key=role)
+        assert _route(info_l0_note(agent_role=role)) == StatusInfo(class_key=role)
 
     def test_starvation_storm_collapses_to_one_class(self):
         records = [
-            _note(id=f'esc-77-{seq}', agent_role='orchestrator-starvation-watchdog')
+            info_l0_note(id=f'esc-77-{seq}', agent_role='orchestrator-starvation-watchdog')
             for seq in range(489)
         ]
         dispositions = [
@@ -193,10 +164,10 @@ class TestMechanicalLeg:
         assert len(set(dispositions)) == 1
 
     def test_done_step_tripwire_is_its_own_class(self):
-        assert _route(_done_step_tripwire()) == StatusInfo(DONE_STEP_COMMIT_ORPHAN_CLASS)
+        assert _route(done_step_tripwire()) == StatusInfo(DONE_STEP_COMMIT_ORPHAN_CLASS)
 
     def test_mechanical_leg_precedes_the_observation_leg(self):
-        record = _note(
+        record = info_l0_note(
             agent_role='orchestrator-merge-skew-tripwire', suggested_action='No action needed',
         )
         assert _route(record) == StatusInfo('orchestrator-merge-skew-tripwire')
@@ -207,33 +178,20 @@ class TestFailLoud:
     never a silent status-info close (D8)."""
 
     def test_unknown_mechanical_role_converts(self):
-        record = _note(agent_role='orchestrator-some-new-monitor')
+        record = info_l0_note(agent_role='orchestrator-some-new-monitor')
         disposition = _route(record, exit_kind=ExitKind.ORPHAN, task_status=None)
         assert isinstance(disposition, ConvertViaCurator)
         assert disposition.payload.escalation_id == record.id
 
     def test_empty_registry_converts_a_known_role(self):
-        record = _note(agent_role='orchestrator-starvation-watchdog')
+        record = info_l0_note(agent_role='orchestrator-starvation-watchdog')
         disposition = _route(record, mechanical_roles=frozenset())
         assert isinstance(disposition, ConvertViaCurator)
 
     def test_info_scope_divergence_shape_converts(self):
-        """There is no scope-divergence status-info class (esc-5221-3).
-
-        Its only filer,
-        orchestrator/src/orchestrator/workflow.py::TaskWorkflow._escalate_scope_invariant_violation,
-        files severity='blocking' by design (plans/task-escalation-state-graph-prd.md
-        D11), and blocking orphans keep their reaper path (D6).  An INFO record of
-        that shape is unexpected, so D8's fail-loud rule sends it to the curator.
-        """
-        record = _note(
-            agent_role='orchestrator',
-            category='infra_issue',
-            summary='plan.files/metadata.files divergence detected for task 77',
-            suggested_action='investigate_and_retry',
-        )
-        disposition = _route(record)
-        assert isinstance(disposition, ConvertViaCurator)
+        """Not mechanical: see
+        test_classify.py::TestInfoL0MechanicalClass::test_scope_divergence_shape_is_not_mechanical."""
+        assert isinstance(_route(info_scope_divergence()), ConvertViaCurator)
 
 
 class TestObservationLeg:
@@ -251,23 +209,25 @@ class TestObservationLeg:
     def test_author_no_action_declaration_is_consumed(
         self, suggested_action: str, exit_kind: ExitKind,
     ):
-        record = _note(suggested_action=suggested_action)
+        record = info_l0_note(suggested_action=suggested_action)
         assert _route(record, exit_kind=exit_kind) == ObservationConsumed()
 
     @pytest.mark.parametrize(
         ('suggested_action', 'detail'),
         [
             pytest.param(
-                'File a follow-up; no action needed on this branch', _DETAIL, id='not-at-start',
+                'File a follow-up; no action needed on this branch',
+                NOTE_DETAIL,
+                id='not-at-start',
             ),
-            pytest.param('Nonetheless add a test', _DETAIL, id='word-boundary'),
+            pytest.param('Nonetheless add a test', NOTE_DETAIL, id='word-boundary'),
             pytest.param(
                 '', 'Add a regression test for helper X before the next release.', id='blank',
             ),
         ],
     )
     def test_anything_else_goes_to_the_curator(self, suggested_action: str, detail: str):
-        record = _note(suggested_action=suggested_action, detail=detail)
+        record = info_l0_note(suggested_action=suggested_action, detail=detail)
         assert isinstance(_route(record), ConvertViaCurator)
 
 
@@ -278,7 +238,7 @@ class TestConvertPayload:
         return disposition.payload
 
     def test_candidate_identity_fields(self):
-        record = _note()
+        record = info_l0_note()
         payload = self._payload(
             record, exit_kind=ExitKind.MERGE_DEFERRED, task_status='merge-deferred',
         )
@@ -287,7 +247,7 @@ class TestConvertPayload:
         assert payload.spawned_from == '77'
 
     def test_description_stands_alone(self):
-        record = _note()
+        record = info_l0_note()
         payload = self._payload(
             record, exit_kind=ExitKind.MERGE_DEFERRED, task_status='merge-deferred',
         )
@@ -303,17 +263,17 @@ class TestConvertPayload:
             assert fragment in payload.description
 
     def test_unknown_subject_status(self):
-        payload = self._payload(_note(), exit_kind=ExitKind.ORPHAN, task_status=None)
+        payload = self._payload(info_l0_note(), exit_kind=ExitKind.ORPHAN, task_status=None)
         assert 'unknown' in payload.description
 
     def test_blank_summary_titles_from_the_first_non_blank_detail_line(self):
-        record = _note(summary='', detail='\n   \n  First real line  \nSecond line')
+        record = info_l0_note(summary='', detail='\n   \n  First real line  \nSecond line')
         assert self._payload(record).title == 'First real line'
 
 
 class TestTerminus:
     def test_nothing_convertible_promotes(self):
-        record = _note(summary='', detail='   ', suggested_action='Investigate')
+        record = info_l0_note(summary='', detail='   ', suggested_action='Investigate')
         assert _route(record) == PromoteWithHint(PromoteReason.NO_CONVERTIBLE_CONTENT)
 
 
@@ -323,26 +283,30 @@ class TestPrecondition:
         [('blocking', 0), ('info', 1), ('critical', 2)],
     )
     def test_non_info_or_non_l0_raises_naming_the_record(self, severity: str, level: int):
-        record = _note(severity=severity, level=level)
+        record = info_l0_note(severity=severity, level=level)
         with pytest.raises(ValueError, match=record.id):
             _route(record)
 
     def test_severity_is_normalised_like_the_pin_chain(self):
-        assert isinstance(_route(_note(severity=' Info ')), ConvertViaCurator)
+        assert isinstance(_route(info_l0_note(severity=' Info ')), ConvertViaCurator)
 
 
 class TestPurity:
     @pytest.mark.parametrize(
         ('record', 'kw'),
         [
-            pytest.param(_note(), {'exit_kind': ExitKind.REQUEUED}, id='defer'),
+            pytest.param(info_l0_note(), {'exit_kind': ExitKind.REQUEUED}, id='defer'),
             pytest.param(
-                _note(), {'reviewer_disposition': ReviewerDisposition.ADDRESSED}, id='reviewer',
+                info_l0_note(),
+                {'reviewer_disposition': ReviewerDisposition.ADDRESSED},
+                id='reviewer',
             ),
-            pytest.param(_note(agent_role='orchestrator-offline-lane'), {}, id='mechanical'),
-            pytest.param(_note(suggested_action='No action required.'), {}, id='observation'),
-            pytest.param(_note(), {}, id='convert'),
-            pytest.param(_note(summary='', detail=''), {}, id='promote'),
+            pytest.param(info_l0_note(agent_role='orchestrator-offline-lane'), {}, id='mechanical'),
+            pytest.param(
+                info_l0_note(suggested_action='No action required.'), {}, id='observation',
+            ),
+            pytest.param(info_l0_note(), {}, id='convert'),
+            pytest.param(info_l0_note(summary='', detail=''), {}, id='promote'),
         ],
     )
     def test_record_is_not_mutated(self, record: Escalation, kw: dict[str, Any]):
@@ -351,33 +315,14 @@ class TestPurity:
         assert record.to_dict() == before
 
     @pytest.mark.parametrize(
-        ('disposition', 'attr'),
-        [
-            (Addressed(), 'resolution_class'),
-            (ObservationConsumed(), 'resolution_class'),
-            (StatusInfo('orchestrator-offline-lane'), 'class_key'),
-            (
-                ConvertViaCurator(CuratorCandidate('t', 'd', 'esc-77-3', '77')),
-                'payload',
-            ),
-            (PromoteWithHint(PromoteReason.NO_CONVERTIBLE_CONTENT), 'reason'),
-            (Defer(DeferReason.REQUEUED_EXIT), 'reason'),
-            (CuratorCandidate('t', 'd', 'esc-77-3', '77'), 'title'),
-        ],
+        ('value', 'attr'),
+        [*_ONE_OF_EACH_VARIANT, (CuratorCandidate('t', 'd', 'esc-77-3', '77'), 'title')],
     )
-    def test_dispositions_are_frozen(self, disposition: object, attr: str):
+    def test_dispositions_are_frozen(self, value: object, attr: str):
         with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(disposition, attr, 'changed')
+            setattr(value, attr, 'changed')
 
 
 class TestUnionIsClosed:
-    def test_exhaustive_match_names_all_six_variants(self):
-        variants: list[Disposition] = [
-            Addressed(),
-            ObservationConsumed(),
-            StatusInfo('orchestrator-offline-lane'),
-            ConvertViaCurator(CuratorCandidate('t', 'd', 'esc-77-3', '77')),
-            PromoteWithHint(PromoteReason.NO_CONVERTIBLE_CONTENT),
-            Defer(DeferReason.REQUEUED_EXIT),
-        ]
-        assert len({_class_name(v) for v in variants}) == 6
+    def test_frozen_table_covers_every_disposition_variant(self):
+        assert {type(d) for d, _ in _ONE_OF_EACH_VARIANT} == set(get_args(Disposition))
