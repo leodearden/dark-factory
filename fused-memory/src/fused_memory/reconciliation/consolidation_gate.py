@@ -35,7 +35,9 @@ PRODUCTION as of task 4808.  ``consolidation_gate.py::unstamped_candidates``
 narrows the gate's inert ``provenance.observed_members`` to the ids the live
 topic scroll cannot account for, and
 ``consolidation_gate.py::resolve_unstamped_live_ids`` settles each with one
-injected point read.  Both production callers --
+injected point read.  The candidate set also includes the canonical's
+``supersedes`` claim, so a claimed-absorbed id that is still live is refused
+as ``absorbed_member_still_live``.  Both production callers --
 ``middleware/task_interceptor.py::TaskInterceptor._consolidation_closure_error``
 and ``scripts/check_consolidation_closure.py::run`` -- now pass the result to
 ``consolidation_gate.py::evaluate_closure``.  Before 4808 the reader and the
@@ -254,6 +256,35 @@ def _payload_id(payload: Any) -> str:
     return str(value) if value is not None else ''
 
 
+def _scroll_ids(members: Sequence[Any]) -> set[str]:
+    """The case-folded ids the topic scroll returned.
+
+    Case-folded so a rendering difference between the scroll row and the
+    stored metadata cannot manufacture a false refusal (nor hide a real one):
+    ``is_full_uuid`` tolerates case for the same reason — casing is a
+    rendering choice, not a different identifier.
+    """
+    return {_payload_id(p).lower() for p in members if _payload_id(p)}
+
+
+def _observed_members(gate_block: Any) -> Sequence[Any]:
+    """The gate block's inert ``provenance.observed_members``, defensively.
+
+    A non-Mapping block, a missing/non-Mapping ``provenance``, and an
+    ``observed_members`` that is absent, not a Sequence, or a bare
+    ``str``/``bytes`` all yield ``()`` — iterating a bare uuid string would
+    yield 36 characters, none of them an id.
+    """
+    block = gate_block if isinstance(gate_block, Mapping) else {}
+    provenance = block.get('provenance')
+    if not isinstance(provenance, Mapping):
+        return ()
+    observed = provenance.get('observed_members')
+    if not isinstance(observed, Sequence) or isinstance(observed, (str, bytes)):
+        return ()
+    return observed
+
+
 def _sole_canonical_claim(members: Sequence[Any]) -> list[Any]:
     """The cluster's absorption claim: the sole canonical's ``supersedes``.
 
@@ -346,93 +377,48 @@ def unstamped_candidates(
     *,
     members: Sequence[Any],
 ) -> tuple[str, ...]:
-    """The observed ids that must be PROBED before the cluster can be judged.
+    """The ids that must be PROBED before the cluster can be judged.
 
-    PURE — no I/O.  Returns ``provenance.observed_members`` MINUS the live
-    topic-scroll ids MINUS the canonical's ``supersedes`` claim.
+    PURE — no I/O.  Returns the sole canonical's well-formed ``supersedes``
+    claim plus ``provenance.observed_members``, MINUS the live topic-scroll
+    ids.
 
-    THESE ARE NOT "THE UNSTAMPED IDS".  An observed id missing from the topic
-    scroll is AMBIGUOUS: it was either absorbed and deleted (correct), or it
-    is still live and simply never got stamped into the topic (the defect
-    ``consolidation_gate.py::evaluate_closure`` names
-    ``unstamped_cluster_member``).  Nothing readable here can tell those
-    apart, so this function narrows the set and
-    ``consolidation_gate.py::resolve_unstamped_live_ids`` settles it with one
-    point read per survivor.
+    THESE ARE NOT "THE UNSTAMPED IDS".  An id missing from the topic scroll
+    is AMBIGUOUS: it was either absorbed and deleted (correct), or it is
+    still live.  Nothing readable here can tell those apart, so this function
+    narrows the set and ``consolidation_gate.py::resolve_unstamped_live_ids``
+    settles it with one point read per survivor.
 
-    WHY THE CANONICAL'S ``supersedes`` IS SUBTRACTED HERE — AND WHAT THAT
-    NOW COSTS.  A delete-arm consolidation deletes its absorbed members and
-    records them in the canonical's ``supersedes``; every one of those ids is,
-    correctly, absent from the scroll.  Only the CANONICAL's claim counts, and
-    only when exactly one canonical exists, exactly as
-    ``consolidation_gate.py::_classify_supersedes`` rules: a non-canonical
-    peer's stale ``supersedes`` is not what the gate asserted.
+    WHY THE CLAIM IS PROBED.  The canonical's ``supersedes`` asserts its ids
+    are gone, and a still-live claimed id is a false closure claim whether or
+    not it carries the topic; ``consolidation_gate.py::evaluate_closure``
+    routes such a hit to ``absorbed_member_still_live``.  A correctly
+    executed delete arm probes ABSENT (deletes are hard Qdrant deletes), so
+    it stays closeable.  The cost is one point read per claimed id absent
+    from the scroll; retain-arm gates carry an empty ``supersedes`` and cost
+    nothing.  Claims come FIRST so the shared probe cap never drops the
+    closure claim in favour of inert provenance.
 
-    The subtraction's ORIGINAL justification was correctness — before a probe
-    existed, reporting a claimed-absorbed id would have made every correctly
-    executed consolidation permanently uncloseable, the same class of error
-    ``consolidation_gate.py::evaluate_closure`` warns about in its central
-    membership property when it explains why peer COUNT is never a refusal.
-    That argument is STALE as of task 4808: :func:`resolve_unstamped_live_ids`
-    now settles each survivor with a point read, and a correctly executed
-    delete arm probes ABSENT and adds no refusal.  What the subtraction still
-    buys is COST — one Qdrant read per absorbed id, on the ``done`` transition
-    itself — not correctness.
+    Defensive on every shape: an unusable block or provenance contributes no
+    observed members (see :func:`_observed_members`) rather than raising —
+    this predicate's job is to REPORT malformedness, and one that dies on bad
+    input blocks the very gates it exists to adjudicate (the same reasoning
+    as :func:`_payload_meta`).  The claim is read regardless.
 
-    KNOWN BLIND SPOT, stated rather than implied.  An id the canonical claims
-    it absorbed but which is STILL LIVE and never carried the topic stamp
-    yields neither ``absorbed_member_still_live`` (it is not in the scroll,
-    which is all ``_classify_supersedes`` tests) nor
-    ``unstamped_cluster_member`` (it is subtracted here) — the gate closes over
-    a false closure claim.  This is pre-existing and is pinned as intended by
-    ``tests/test_consolidation_closure_seam.py::TestSeamUnstampedEdgePolicies::
-    test_the_delete_arm_still_closes``.  Changing it means routing a live hit
-    on a claimed id to ``absorbed_member_still_live`` and weighing the extra
-    probes, which is a design decision task 4808's plan froze; it is filed as
-    follow-up ticket ``tkt_0RTCC7BZFQ4CKJ9F4GJRRTZB0V``.
-
-    Defensive on every shape.  A ``gate_block`` that is not a Mapping, a
-    missing/non-Mapping ``provenance``, and an ``observed_members`` that is
-    absent, not a Sequence, or a bare ``str``/``bytes`` all yield ``()``
-    rather than raising — this predicate's job is to REPORT malformedness,
-    and one that dies on bad input blocks the very gates it exists to
-    adjudicate (the same reasoning as :func:`_payload_meta`).
-
-    Non-uuid observed ids are dropped: they cannot be probed, so a refusal
-    over them could never be substantiated.  The returned ids keep their
-    ORIGINAL spelling (matching is case-folded, reporting is not) so a
-    refusal names the id exactly as the gate recorded it.
+    Non-uuid ids are dropped: they cannot be probed, so a refusal over them
+    could never be substantiated (a malformed claim member is named by the
+    predicate as ``malformed_supersedes_member`` instead).  The returned ids
+    keep their first-seen ORIGINAL spelling (matching is case-folded,
+    reporting is not) so a refusal names the id exactly as it was recorded.
     """
-    block = gate_block if isinstance(gate_block, Mapping) else {}
-    provenance = block.get('provenance')
-    if not isinstance(provenance, Mapping):
-        return ()
-    observed = provenance.get('observed_members')
-    if not isinstance(observed, Sequence) or isinstance(observed, (str, bytes)):
-        return ()
-
-    # Identical comprehension to `evaluate_closure`'s own `live_ids`, so the
-    # derivation and the predicate cannot disagree about what the scroll saw.
-    live_ids = {_payload_id(p).lower() for p in members if _payload_id(p)}
-
-    # Only the canonical's claim, and only when there is exactly one — with
-    # two canonicals there is no single cluster claim to trust (the gate is
-    # refusing on `multiple_canonicals` regardless).
-    claimed: set[str] = set()
-    canonicals = [p for p in members if _payload_meta(p).get('canonical') is True]
-    if len(canonicals) == 1:
-        claimed = {
-            str(m).lower()
-            for m in normalize_supersedes(_payload_meta(canonicals[0]).get('supersedes'))
-        }
-
+    live_ids = _scroll_ids(members)
     candidates: list[str] = []
     seen: set[str] = set()
-    for raw in observed:
+    for raw in (*_sole_canonical_claim(members), *_observed_members(gate_block)):
         if not is_full_uuid(raw):
             continue
         folded = str(raw).lower()
-        if folded in live_ids or folded in claimed or folded in seen:
+        if folded in live_ids or folded in seen:
             continue
         seen.add(folded)
         candidates.append(str(raw))
@@ -488,7 +474,7 @@ async def resolve_unstamped_live_ids(
     exists: Any,
     project_id: str,
 ) -> tuple[str, ...]:
-    """The observed cluster members that are still LIVE but never got stamped.
+    """The candidate ids that are still LIVE although the topic scroll misses them.
 
     Performs no I/O ITSELF — it awaits what it is GIVEN.  *exists* is an
     injected, project-scoped collaborator
@@ -508,17 +494,20 @@ async def resolve_unstamped_live_ids(
     about which ids are ambiguous.
 
     Sequential rather than ``asyncio.gather``: the candidate list is empty for
-    every well-formed gate (measured 2026-08-28: zero candidates across all
-    four live consolidated topics) and small otherwise, so concurrency would
-    buy nothing and would obscure which probe raised.
+    a retain-arm gate whose observed members are stamped (measured 2026-08-28:
+    zero candidates across all four live consolidated topics) and small
+    otherwise, so concurrency would buy nothing and would obscure which probe
+    raised.
 
     CAPPED AT :data:`_UNSTAMPED_PROBE_LIMIT`, and the cap is DISCLOSED rather
     than silently applied: this loop runs inside
     ``TaskInterceptor._consolidation_closure_error``, i.e. on the ``done``
-    transition itself, while ``provenance.observed_members`` is written
-    verbatim by ``consolidation_gate.py::build_consolidation_gate_task`` with
-    no cap of its own.  Without a cap a gate filed over a pathological cluster
-    would serialise unbounded point reads there.  Overflow WARNS and probes
+    transition itself, while neither input is capped at its source —
+    ``provenance.observed_members`` is written verbatim by
+    ``consolidation_gate.py::build_consolidation_gate_task``, and the
+    canonical's ``supersedes`` is whatever its writer recorded.  Without a cap
+    a gate filed over a pathological cluster would serialise unbounded point
+    reads there.  Overflow WARNS and probes
     the first N rather than refusing, for two reasons.  (i) Proportionality:
     the measured corpus is 2-6 observed members against a cap of 200, so the
     branch is unreachable today and a refusal would be a brand-new brick risk
@@ -621,11 +610,7 @@ def evaluate_closure(
     topic = str(block.get('topic') or '')
 
     reasons: list[dict[str, Any]] = []
-    # Case-folded so a rendering difference between the scroll row and the
-    # stored metadata cannot manufacture a false `absorbed_member_still_live`
-    # (nor hide a real one): `is_full_uuid` tolerates case for the same
-    # reason — casing is a rendering choice, not a different identifier.
-    live_ids = {_payload_id(p).lower() for p in members if _payload_id(p)}
+    live_ids = _scroll_ids(members)
 
     # --- completeness FIRST, and unconditional ----------------------------- #
     # A predicate whose entire job is refuting a false closure claim must not

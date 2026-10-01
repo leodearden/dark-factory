@@ -68,9 +68,9 @@ READ-ONLY. Every database handle this script opens is a read-only SQLite
 URI, and the only store calls are a metadata scroll plus (task 4808) one
 raw point read per unstamped CANDIDATE — ``get_memory_by_id``, a
 non-semantic Qdrant point read. It never writes a task, a memory or a
-status. The candidate list is EMPTY for every well-formed gate (an
-observed member already stamped into the topic is subtracted before any
-read), so the common path costs exactly what it did before.
+status. A retain-arm gate whose observed members are all stamped into the
+topic probes nothing; a delete-arm gate costs one point read per id its
+canonical claims in ``supersedes`` that is absent from the scroll.
 """
 
 from __future__ import annotations
