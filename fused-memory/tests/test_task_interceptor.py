@@ -12,16 +12,20 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
+from shared.cli_invoke import AgentResult
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware import scope_violation_escalator as sve_mod
+from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
+    PreparedCandidate,
     RewrittenTask,
+    TaskCurator,
     is_combine_eligible_status,
 )
 from fused_memory.middleware.task_interceptor import TaskInterceptor
@@ -15294,3 +15298,317 @@ class TestSoftScopeFilelessEndToEnd:
 
         stub.adjudicate.assert_awaited_once()
         assert df_root in stub.adjudicate.await_args.kwargs['description']
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Task 5491: post-ZOT duplicate sweep wiring (end-to-end VERIFY criterion)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _ScoredCorpusCurator(_FakeCorpusCurator):
+    """Fake corpus whose search returns every stored row at a configured score."""
+
+    def __init__(self, scores: dict[str, float], *, search_error: Exception | None = None) -> None:
+        super().__init__()
+        self._scores = scores
+        self._search_error = search_error
+        self.search_calls: list[dict] = []
+
+    async def search_corpus(
+        self,
+        query: str,
+        project_id: str,
+        *,
+        limit: int = 10,
+        score_threshold: float = 0.3,
+    ) -> list[dict]:
+        self.search_calls.append({'limit': limit, 'score_threshold': score_threshold})
+        if self._search_error is not None:
+            raise self._search_error
+        hits = [
+            {
+                'task_id': task_id,
+                'title': candidate.title,
+                'description': candidate.description,
+                'files_to_modify': candidate.files_to_modify,
+                'priority': candidate.priority,
+                'updated_at': None,
+                'score': self._scores[task_id],
+            }
+            for task_id, candidate in self._by_project.get(project_id, {}).items()
+            if self._scores.get(task_id, 0.0) >= score_threshold
+        ]
+        hits.sort(key=lambda hit: hit['score'], reverse=True)
+        return hits[:limit]
+
+
+_ZOT_PROJECT_ROOT = '/project'
+_NEW_TASK_ID = '77'
+_DUP_TASK_ID = '42'
+
+
+def _zot_agent_result() -> AgentResult:
+    return AgentResult(
+        success=False, output='', subtype='error_empty_output',
+        timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+    )
+
+
+def _stamp_calls(tm) -> list:
+    return [
+        call for call in tm.update_task.await_args_list
+        if 'x_zot_duplicate_candidate' in (call.kwargs.get('metadata') or '')
+    ]
+
+
+class TestZotDuplicateSweepWiring:
+    """A create degraded by a curator ZOT is swept for a near-duplicate."""
+
+    @pytest.fixture
+    def stub_escalator(self):
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value='esc-curator-9')
+        escalator.report_zot_duplicate = AsyncMock(return_value=None)
+        return escalator
+
+    @pytest.fixture
+    def status_map(self) -> dict[str, str]:
+        return {_DUP_TASK_ID: 'pending', _NEW_TASK_ID: 'pending'}
+
+    @pytest.fixture
+    def zot_taskmaster(self, taskmaster, status_map):
+        taskmaster.add_task = AsyncMock(
+            return_value={'id': _NEW_TASK_ID, 'title': 'Re-filed gate fix'},
+        )
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=lambda project_root, ids=None, **kw: {
+                i: status_map[i] for i in (ids or []) if i in status_map
+            },
+        )
+        return taskmaster
+
+    @staticmethod
+    async def _real_curator(cfg, stub_escalator, corpus, monkeypatch, project_id):
+        curator = TaskCurator(config=cfg, taskmaster=None, escalator=stub_escalator)
+        monkeypatch.setattr(curator, 'search_corpus', corpus.search_corpus)
+        monkeypatch.setattr(curator, 'record_task', corpus.record_task)
+        await corpus.record_task(
+            _DUP_TASK_ID, CandidateTask(title='Existing gate fix'), project_id,
+        )
+        return curator
+
+    @staticmethod
+    async def _zot_decision(curator: TaskCurator, candidate: CandidateTask, project_id: str):
+        prepared = PreparedCandidate(
+            candidate=candidate, pool=[],
+            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            prompt_tokens=0,
+        )
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_zot_agent_result())):
+            return await curator.curate(
+                candidate, project_id, _ZOT_PROJECT_ROOT, prepared=prepared,
+            )
+
+    async def _dispatch(self, interceptor, curator, candidate, decision, project_id):
+        return await interceptor._dispatch_ticket_decision(
+            ticket_id='tkt-zot',
+            project_root=_ZOT_PROJECT_ROOT,
+            project_id=project_id,
+            candidate=candidate,
+            decision=decision,
+            kwargs={'title': candidate.title},
+            metadata=None,
+            curator=curator,
+        )
+
+    async def _run(
+        self, *, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+        scores, cfg=None, interceptor_config='same', search_error=None,
+        decision=None,
+    ):
+        cfg = cfg if cfg is not None else _curator_cfg()
+        project_id = resolve_project_id(_ZOT_PROJECT_ROOT)
+        corpus = _ScoredCorpusCurator(scores, search_error=search_error)
+        curator = await self._real_curator(cfg, stub_escalator, corpus, monkeypatch, project_id)
+        interceptor = TaskInterceptor(
+            zot_taskmaster, reconciler, event_buffer,
+            config=cfg if interceptor_config == 'same' else interceptor_config,
+            escalator=stub_escalator,
+        )
+        candidate = CandidateTask(title='Re-filed gate fix', description='same fix again')
+        if decision is None:
+            decision = await self._zot_decision(curator, candidate, project_id)
+        outcome = await self._dispatch(interceptor, curator, candidate, decision, project_id)
+        return corpus, decision, outcome
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_zot_flags_the_near_duplicate(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+        )
+        status, task_id, _reason, _result, _degrade = outcome
+
+        assert decision.degraded_by_zot is True
+        assert status == 'created'
+        assert task_id == _NEW_TASK_ID
+        assert zot_taskmaster.update_task.await_count == 1
+        [stamp] = _stamp_calls(zot_taskmaster)
+        assert stamp.kwargs['task_id'] == _NEW_TASK_ID
+        assert stamp.kwargs['metadata_mode'] == 'merge'
+        value = json.loads(stamp.kwargs['metadata'])['x_zot_duplicate_candidate']
+        assert value['duplicate_task_id'] == _DUP_TASK_ID
+        assert value['score'] == pytest.approx(0.80)
+        assert value['zot_escalation_id'] == 'esc-curator-9'
+
+        stub_escalator.report_zot_duplicate.assert_awaited_once()
+        kwargs = stub_escalator.report_zot_duplicate.await_args.kwargs
+        assert kwargs['finding'] == DuplicateFinding(
+            task_id=_NEW_TASK_ID, duplicate_task_id=_DUP_TASK_ID,
+            duplicate_title='Existing gate fix', score=0.80,
+        )
+        assert kwargs['zot_escalation_id'] == 'esc-curator-9'
+        assert kwargs['project_root'] == _ZOT_PROJECT_ROOT
+        assert kwargs['candidate_title'] == 'Re-filed gate fix'
+
+    @pytest.mark.asyncio
+    async def test_control_no_hit_above_threshold_flags_nothing(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.50, _NEW_TASK_ID: 1.0},
+        )
+        assert outcome[0] == 'created'
+        assert len(corpus.search_calls) == 1
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_only_hit_reads_no_statuses(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.0, _NEW_TASK_ID: 1.0},
+        )
+        assert outcome[0] == 'created'
+        assert len(corpus.search_calls) == 1
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+        zot_taskmaster.get_statuses.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_healthy_create_never_searches(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+            decision=CuratorDecision(action='create'),
+        )
+        assert outcome[0] == 'created'
+        assert corpus.search_calls == []
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disabled_sweep_never_searches(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        cfg = _curator_cfg()
+        cfg.curator.zot_duplicate_sweep_enabled = False
+        corpus, decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0}, cfg=cfg,
+        )
+        assert decision.degraded_by_zot is True
+        assert outcome[0] == 'created'
+        assert corpus.search_calls == []
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_config_sweeps_with_curator_config_defaults(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0}, interceptor_config=None,
+        )
+        defaults = CuratorConfig()
+        assert outcome[0] == 'created'
+        assert corpus.search_calls == [{
+            'limit': defaults.zot_duplicate_search_limit,
+            'score_threshold': defaults.zot_duplicate_score_threshold,
+        }]
+        assert len(_stamp_calls(zot_taskmaster)) == 1
+        stub_escalator.report_zot_duplicate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_search_failure_still_created(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        _corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+            search_error=RuntimeError('qdrant down'),
+        )
+        assert outcome[0] == 'created'
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stamp_failure_is_a_post_create_warning(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        async def _update_task(**kwargs):
+            if 'x_zot_duplicate_candidate' in (kwargs.get('metadata') or ''):
+                raise RuntimeError('db locked')
+            return {'success': True}
+
+        zot_taskmaster.update_task = AsyncMock(side_effect=_update_task)
+        _corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+        )
+        status, _task_id, _reason, result_dict, _degrade = outcome
+        assert status == 'created'
+        assert result_dict is not None
+        stages = [w['stage'] for w in result_dict.get('post_create_warnings', [])]
+        assert 'zot_duplicate_stamp' in stages
+        stub_escalator.report_zot_duplicate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_escalation_failure_is_a_post_create_warning(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        stub_escalator.report_zot_duplicate = AsyncMock(side_effect=OSError('queue down'))
+        _corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+        )
+        status, _task_id, _reason, result_dict, _degrade = outcome
+        assert status == 'created'
+        assert result_dict is not None
+        stages = [w['stage'] for w in result_dict.get('post_create_warnings', [])]
+        assert 'zot_duplicate_escalation' in stages
+        assert len(_stamp_calls(zot_taskmaster)) == 1
+
+
+def _curator_cfg() -> FusedMemoryConfig:
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(enabled=True)
+    return cfg
