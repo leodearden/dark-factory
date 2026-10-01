@@ -8,7 +8,10 @@ import subprocess
 import pytest
 from _fm_helpers import _init_git_repo
 
-from fused_memory.middleware.gitignored_deliverable_guard import make_gitignore_probe
+from fused_memory.middleware.gitignored_deliverable_guard import (
+    gitignored_deliverable_finding,
+    make_gitignore_probe,
+)
 
 
 def _require_git() -> None:
@@ -81,3 +84,111 @@ class TestMakeGitignoreProbe:
 
     def test_empty_declaration_yields_empty_set(self, gitignore_repo):
         assert make_gitignore_probe(gitignore_repo)([]) == frozenset()
+
+
+class _FakeProbe:
+    """Answers with a preset ignored set (or ``None``) and records every call."""
+
+    def __init__(self, answer: frozenset[str] | None):
+        self.answer = answer
+        self.calls: list[list[str]] = []
+
+    def __call__(self, paths):
+        self.calls.append(list(paths))
+        return self.answer
+
+
+class TestGitignoredDeliverableFindingMatrix:
+    """Exemption/detection matrix, hermetic via an injected fake probe."""
+
+    def test_all_declared_files_ignored_is_a_finding(self):
+        finding = gitignored_deliverable_finding(
+            task_kind='normal',
+            metadata={'files': ['tasks.db']},
+            probe=_FakeProbe(frozenset({'tasks.db'})),
+        )
+        assert finding is not None
+        assert finding.ignored_paths == ('tasks.db',)
+
+    def test_one_committable_entry_suppresses_the_finding(self):
+        finding = gitignored_deliverable_finding(
+            task_kind='normal',
+            metadata={'files': ['tasks.db', 'src/foo.py']},
+            probe=_FakeProbe(frozenset({'tasks.db'})),
+        )
+        assert finding is None
+
+    def test_deterministic_kind_is_exempt_without_probing(self):
+        probe = _FakeProbe(frozenset({'tasks.db'}))
+        finding = gitignored_deliverable_finding(
+            task_kind='deterministic',
+            metadata={'files': ['tasks.db']},
+            probe=probe,
+        )
+        assert finding is None
+        assert probe.calls == []
+
+    @pytest.mark.parametrize('execution_class', ['operational', 'decision'])
+    def test_non_code_execution_class_is_exempt(self, execution_class):
+        probe = _FakeProbe(frozenset({'tasks.db'}))
+        finding = gitignored_deliverable_finding(
+            task_kind='normal',
+            metadata={'execution_class': execution_class, 'files': ['tasks.db']},
+            probe=probe,
+        )
+        assert finding is None
+        assert probe.calls == []
+
+    @pytest.mark.parametrize('metadata', [{'files': []}, None])
+    def test_no_declared_files_is_exempt_without_probing(self, metadata):
+        probe = _FakeProbe(frozenset({'tasks.db'}))
+        finding = gitignored_deliverable_finding(
+            task_kind='normal', metadata=metadata, probe=probe,
+        )
+        assert finding is None
+        assert probe.calls == []
+
+    def test_hand_set_cross_repo_marker_is_exempt(self):
+        finding = gitignored_deliverable_finding(
+            task_kind='normal',
+            metadata={'cross_repo': True, 'files': ['tasks.db']},
+            probe=_FakeProbe(frozenset({'tasks.db'})),
+        )
+        assert finding is None
+
+    def test_probe_unable_to_answer_fails_open(self):
+        finding = gitignored_deliverable_finding(
+            task_kind='normal',
+            metadata={'files': ['tasks.db']},
+            probe=_FakeProbe(None),
+        )
+        assert finding is None
+
+    def test_json_string_metadata_is_parsed(self):
+        finding = gitignored_deliverable_finding(
+            task_kind='normal',
+            metadata='{"files": ["tasks.db"]}',
+            probe=_FakeProbe(frozenset({'tasks.db'})),
+        )
+        assert finding is not None
+        assert finding.ignored_paths == ('tasks.db',)
+
+    def test_blank_entries_are_not_probed(self):
+        probe = _FakeProbe(frozenset({'tasks.db'}))
+        finding = gitignored_deliverable_finding(
+            task_kind='normal',
+            metadata={'files': ['', 'tasks.db', '   ']},
+            probe=probe,
+        )
+        assert finding is not None
+        assert probe.calls == [['tasks.db']]
+
+    def test_only_blank_entries_is_exempt_without_probing(self):
+        probe = _FakeProbe(frozenset())
+        finding = gitignored_deliverable_finding(
+            task_kind='normal',
+            metadata={'files': ['', '  ']},
+            probe=probe,
+        )
+        assert finding is None
+        assert probe.calls == []
