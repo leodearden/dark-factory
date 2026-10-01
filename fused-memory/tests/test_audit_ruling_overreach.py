@@ -6,6 +6,9 @@ loads its sibling, so ``scripts/`` never lands on ``sys.path``.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
+import random
 from pathlib import Path
 
 import pytest
@@ -367,3 +370,134 @@ class TestDetectorCensus:
             'proposed_resolution': 0, 'batch_plan': 0,
         }
         assert census['other_decisions']['episodes'] == 0
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic stratified out-of-sample sample and worksheet (step 7)
+# --------------------------------------------------------------------------- #
+
+WINDOW = {'window_start': '2026-08-25T00:00:00+00:00', 'window_end': '2026-10-01T00:00:00+00:00'}
+RULING_HEAD = 'RULING (Leo, 2026-09-01): x'
+ANCHOR_HEAD = 'Merge-lane decision (esc-1-2): y'
+PLAIN_DECISION = 'We keep the merge lane serial.'
+
+
+def _sha(graph: str, uuid: str) -> str:
+    return hashlib.sha256(f'{graph}:{uuid}'.encode()).hexdigest()
+
+
+def _population():
+    episodes = []
+    for graph in ('dark_factory', 'reify'):
+        for i in range(5):
+            episodes.append(_episode(RULING_HEAD, graph=graph, uuid=f'r{i}'))
+            episodes.append(_episode(ANCHOR_HEAD, graph=graph, uuid=f'a{i}'))
+        episodes.append(_episode(PLAIN_DECISION, graph=graph, uuid='o0'))
+    return episodes
+
+
+class TestSelectSample:
+    def test_input_order_does_not_change_the_output(self) -> None:
+        episodes = _population()
+        expected = mod.select_sample(episodes, cap=3, **WINDOW)
+        for seed in range(5):
+            shuffled = list(episodes)
+            random.Random(seed).shuffle(shuffled)
+            assert mod.select_sample(shuffled, cap=3, **WINDOW) == expected
+
+    def test_takes_the_first_cap_by_hash_within_each_graph_and_stratum(self) -> None:
+        sample = mod.select_sample(_population(), cap=3, **WINDOW)
+        df_ruling = [s.episode.uuid for s in sample
+                     if s.episode.graph == 'dark_factory' and s.stratum == 'ruling_lexeme']
+        expected = sorted((f'r{i}' for i in range(5)), key=lambda u: _sha('dark_factory', u))[:3]
+        assert df_ruling == expected
+
+    def test_a_group_smaller_than_cap_yields_all_its_members(self) -> None:
+        sample = mod.select_sample(_population(), cap=3, **WINDOW)
+        other = [s for s in sample if s.stratum == 'other_decisions']
+        assert {(s.episode.graph, s.episode.uuid) for s in other} == {
+            ('dark_factory', 'o0'), ('reify', 'o0'),
+        }
+
+    def test_output_is_ordered_by_graph_stratum_then_hash(self) -> None:
+        sample = mod.select_sample(_population(), cap=3, **WINDOW)
+        keys = [(s.episode.graph, mod.STRATA.index(s.stratum), s.sample_key) for s in sample]
+        assert keys == sorted(keys)
+        assert all(s.sample_key == _sha(s.episode.graph, s.episode.uuid) for s in sample)
+        assert isinstance(sample, tuple)
+
+    @pytest.mark.parametrize('created_at', [
+        '2026-08-24T23:59:59+00:00',
+        '2026-10-01T00:00:00+00:00',
+    ])
+    def test_episodes_outside_the_half_open_window_never_appear(self, created_at) -> None:
+        episode = _episode(RULING_HEAD, created_at=created_at)
+        assert mod.select_sample([episode], cap=8, **WINDOW) == ()
+
+    def test_the_window_compares_instants_not_strings(self) -> None:
+        """Each string sorts on the wrong side of the window end from its instant."""
+        episode = _episode(RULING_HEAD, created_at='2026-09-30T23:30:00-02:00')
+        assert mod.select_sample([episode], cap=8, **WINDOW) == ()
+        inside = _episode(RULING_HEAD, created_at='2026-10-01T01:30:00+02:00')
+        assert len(mod.select_sample([inside], cap=8, **WINDOW)) == 1
+
+    def test_episodes_with_no_stratum_never_appear(self) -> None:
+        episode = _episode(PLAIN_DECISION, source='add_memory:entities_and_relations')
+        assert mod.select_sample([episode], cap=8, **WINDOW) == ()
+
+
+class TestSampleDefinition:
+    def test_round_trips_through_a_dict(self) -> None:
+        definition = mod.SampleDefinition(cap=8, **WINDOW)
+        assert mod.SampleDefinition.from_dict(definition.to_dict()) == definition
+
+    def test_defaults_are_the_frozen_window(self) -> None:
+        definition = mod.SampleDefinition()
+        assert definition.window_start == mod.DEFAULT_WINDOW_START == WINDOW['window_start']
+        assert definition.window_end == mod.DEFAULT_WINDOW_END == WINDOW['window_end']
+        assert definition.cap == mod.DEFAULT_CAP == 8
+        assert definition.strata == mod.STRATA
+        assert definition.hash_rule == 'sha256(graph:uuid)'
+
+    def test_the_dict_form_is_plain_json(self) -> None:
+        blob = json.dumps(mod.SampleDefinition().to_dict())
+        assert mod.SampleDefinition.from_dict(json.loads(blob)) == mod.SampleDefinition()
+
+    def test_select_applies_the_definition(self) -> None:
+        definition = mod.SampleDefinition(cap=2, **WINDOW)
+        assert definition.select(_population()) == mod.select_sample(_population(), cap=2, **WINDOW)
+
+
+class TestWorksheetRows:
+    def test_rows_offer_only_minted_edges_and_count_corroborations(self) -> None:
+        ep = _episode(RULING_HEAD, graph='reify', uuid='E')
+        minted = _edge('m1', ('E', 'Z'), expired_at='2026-09-02T00:00:00+00:00')
+        corroborated = _edge('c1', ('Z', 'E'))
+        sample = mod.select_sample([ep], cap=8, **WINDOW)
+        attribution = mod.attribute_edges([minted, corroborated])
+        (row,) = list(mod.worksheet_rows(sample, attribution))
+        assert row == {
+            'graph': 'reify', 'uuid': 'E', 'stratum': 'ruling_lexeme',
+            'classifiers': ['category_decisions', 'header_ruling', 'ruling_lexeme_head'],
+            'created_at': '2026-09-01T00:00:00+00:00',
+            'category': 'decisions_and_rationale', 'content': RULING_HEAD,
+            'minted': [{
+                'edge_uuid': 'm1', 'fact': 'fact of m1', 'source_name': 'S',
+                'target_name': 'T', 'served': True, 'live_strict': False,
+            }],
+            'corroborated_count': 1,
+        }
+
+    def test_an_episode_with_no_minted_edges_still_appears(self) -> None:
+        ep = _episode(ANCHOR_HEAD, graph='reify', uuid='E')
+        sample = mod.select_sample([ep], cap=8, **WINDOW)
+        (row,) = list(mod.worksheet_rows(sample, mod.attribute_edges([])))
+        assert row['minted'] == []
+        assert row['corroborated_count'] == 0
+
+    def test_minted_edges_are_listed_in_uuid_order(self) -> None:
+        ep = _episode(ANCHOR_HEAD, graph='reify', uuid='E')
+        edges = [_edge('m2', ('E',)), _edge('m1', ('E',))]
+        sample = mod.select_sample([ep], cap=8, **WINDOW)
+        (row,) = list(mod.worksheet_rows(sample, mod.attribute_edges(edges)))
+        assert [m['edge_uuid'] for m in row['minted']] == ['m1', 'm2']
