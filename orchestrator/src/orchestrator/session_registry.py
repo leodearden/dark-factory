@@ -792,6 +792,25 @@ def decision_path_for_id(decision_id: str, root: Path | str | None = None) -> Pa
     return decisions_dir(root) / f'{stem}.json'
 
 
+DECISION_ID_PROJECT_SEPARATOR = '-'
+
+
+def qualify_decision_id(project: object, local_id: str) -> str:
+    """The fleet-unique decision key: *local_id* prefixed by the canonical *project*.
+
+    A pure join that never inspects *local_id*. A project that folds to ``''``
+    leaves *local_id* unqualified. ``-`` is the separator because canonical
+    tokens never contain one (so the join is injective), it survives
+    _DECISION_ID_SANITIZE_RE (so the file stem equals the id), and it matches
+    the sitting's existing ``<project>-<esc>`` ids. See
+    plans/4835-decision-plumbing-decisions.md.
+    """
+    folded = normalize_project_token(project)
+    if not folded:
+        return local_id
+    return f'{folded}{DECISION_ID_PROJECT_SEPARATOR}{local_id}'
+
+
 # ---------------------------------------------------------------------------
 # Single-writer atomic write / read / update
 # ---------------------------------------------------------------------------
