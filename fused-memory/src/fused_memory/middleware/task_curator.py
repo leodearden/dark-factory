@@ -726,6 +726,20 @@ def normalize_title(title: str | None) -> str:
     return ' '.join((title or '').strip().lower().split())
 
 
+def embedding_text(title: str, description: str, files_to_modify: list[str]) -> str:
+    """Compose the text every curator corpus embedding is computed over.
+
+    Single owner: a caller comparing cosine scores against stored tasks must
+    compose its query with this, or the scores are not comparable.
+    """
+    parts = [title]
+    if description:
+        parts.append(description)
+    if files_to_modify:
+        parts.append('\n'.join(files_to_modify))
+    return '\n\n'.join(parts)
+
+
 def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float:
     """Compute a scaled LLM budget clamped at ``cap``.
 
@@ -1038,13 +1052,7 @@ class TaskCurator:
     def _embedding_text(
         title: str, description: str, files_to_modify: list[str],
     ) -> str:
-        """Text used for embedding — title + description + file list."""
-        parts = [title]
-        if description:
-            parts.append(description)
-        if files_to_modify:
-            parts.append('\n'.join(files_to_modify))
-        return '\n\n'.join(parts)
+        return embedding_text(title, description, files_to_modify)
 
     # ------------------------------------------------------------------
     # Public API
