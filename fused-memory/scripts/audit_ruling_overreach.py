@@ -35,16 +35,29 @@ failed validation (nothing is written).
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import hashlib
+import json
+import logging
 import math
+import os
 import re
+import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from fused_memory.backends.graphiti_client import (
+    _DEFAULT_READ_PAGE_SIZE,
+    _RESULTSET_SIZE,
+    PagedRead,
+    _paged_ro_query,
+)
 from fused_memory.reconciliation.task_filter import (
     is_batch_plan_framing,
     is_proposed_resolution_framing,
@@ -717,3 +730,428 @@ def detector_catch(
         'any_detector': sum(1 for hits in sources if hits),
         'any_wired': sum(1 for hits in sources if hits & WIRED_ON_ADD_MEMORY),
     }
+
+
+# --------------------------------------------------------------------------- #
+# The read seam: GRAPH.RO_QUERY through the shared paged primitive
+# --------------------------------------------------------------------------- #
+
+DEFAULT_GRAPHS: tuple[str, ...] = ('dark_factory', 'reify')
+
+_EPISODE_MATCH = 'MATCH (e:Episodic) '
+EPISODE_PAGE_CYPHER = (
+    _EPISODE_MATCH + 'RETURN e.uuid, e.source_description, e.created_at, e.content '
+    'ORDER BY e.uuid SKIP {skip} LIMIT {limit}'
+)
+EPISODE_CENSUS_CYPHER = _EPISODE_MATCH + 'RETURN count(*)'
+
+_EDGE_MATCH = 'MATCH (a)-[r:RELATES_TO]->(b) '
+EDGE_PAGE_CYPHER = (
+    _EDGE_MATCH + 'RETURN r.uuid, r.fact, a.name, b.name, r.episodes, r.invalid_at, '
+    'r.expired_at ORDER BY r.uuid SKIP {skip} LIMIT {limit}'
+)
+"""ALL edges, live or not: durability is a measured output. No embedding projected.
+The directed pattern yields one row per edge, so ``r.uuid`` is a total order (see
+graphiti_client.py::_paged_ro_query on why that is load-bearing)."""
+EDGE_CENSUS_CYPHER = _EDGE_MATCH + 'RETURN count(*)'
+
+
+def _text(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _episode_from_row(graph: str, row: list) -> Episode:
+    uuid, source, created_at, content = (list(row) + [None] * 4)[:4]
+    return Episode(
+        graph=graph, uuid=str(uuid), created_at=_text(created_at) or '',
+        source=parse_source_description(_text(source)), content=_text(content) or '',
+    )
+
+
+def _edge_from_row(graph: str, row: list) -> Edge:
+    uuid, fact, source, target, episodes, invalid_at, expired_at = (list(row) + [None] * 7)[:7]
+    return Edge(
+        graph=graph, uuid=str(uuid), fact=_text(fact) or '', source_name=_text(source) or '',
+        target_name=_text(target) or '', episodes=tuple(str(e) for e in episodes or ()),
+        invalid_at=_text(invalid_at), expired_at=_text(expired_at),
+    )
+
+
+class GraphReader:
+    """One graph's episodes and edges, each with its completeness proof.
+
+    Read-only rests on ``_paged_ro_query`` issuing ``ro_query`` (GRAPH.RO_QUERY is
+    server-enforced read-only); the tests' double raises on ``query``. The
+    RO-proxy seam copied into three other scripts is deliberately not copied a
+    fourth time: consolidating it is a filed follow-up.
+    """
+
+    def __init__(
+        self, *, graph: Any | None = None, graph_name: str = DEFAULT_GRAPHS[0],
+        uri: str | None = None, page_size: int = _DEFAULT_READ_PAGE_SIZE,
+        resultset_size: int = _RESULTSET_SIZE,
+    ) -> None:
+        self._graph = graph
+        self.graph_name = graph_name
+        self.uri = uri
+        self.page_size = page_size
+        self.resultset_size = resultset_size
+
+    def _resolve_graph(self) -> Any:
+        """Open a ``falkordb.asyncio`` client lazily, never graphiti's FalkorDriver."""
+        if self._graph is None:
+            from falkordb.asyncio import FalkorDB  # noqa: PLC0415
+
+            client = FalkorDB.from_url(self.uri) if self.uri else FalkorDB()
+            self._graph = client.select_graph(self.graph_name)
+        return self._graph
+
+    async def _read(self, page: str, census: str) -> PagedRead:
+        return await _paged_ro_query(
+            self._resolve_graph(), page, census,
+            page_size=self.page_size, resultset_size=self.resultset_size,
+        )
+
+    async def fetch_episodes(self) -> tuple[list[Episode], PagedRead]:
+        read = await self._read(EPISODE_PAGE_CYPHER, EPISODE_CENSUS_CYPHER)
+        return [_episode_from_row(self.graph_name, row) for row in read.rows], read
+
+    async def fetch_edges(self) -> tuple[list[Edge], PagedRead]:
+        read = await self._read(EDGE_PAGE_CYPHER, EDGE_CENSUS_CYPHER)
+        return [_edge_from_row(self.graph_name, row) for row in read.rows], read
+
+
+@dataclass(frozen=True)
+class Corpus:
+    graphs: tuple[str, ...]
+    episodes: tuple[Episode, ...]
+    edges: tuple[Edge, ...]
+    reads: Mapping[str, Mapping[str, PagedRead]]
+    """graph -> {'episodes' | 'edges': PagedRead}."""
+
+    def incomplete_reads(self) -> list[str]:
+        return [
+            f'{graph}/{kind}: {read.reason}'
+            for graph, by_kind in self.reads.items()
+            for kind, read in by_kind.items() if not read.complete
+        ]
+
+
+async def read_corpus(graphs: Iterable[str], make_reader: Callable[[str], Any]) -> Corpus:
+    episodes: list[Episode] = []
+    edges: list[Edge] = []
+    reads: dict[str, dict[str, PagedRead]] = {}
+    for graph in graphs:
+        reader = make_reader(graph)
+        graph_episodes, episode_read = await reader.fetch_episodes()
+        graph_edges, edge_read = await reader.fetch_edges()
+        episodes.extend(graph_episodes)
+        edges.extend(graph_edges)
+        reads[graph] = {'episodes': episode_read, 'edges': edge_read}
+    return Corpus(tuple(reads), tuple(episodes), tuple(edges), MappingProxyType(reads))
+
+
+# --------------------------------------------------------------------------- #
+# The report
+# --------------------------------------------------------------------------- #
+
+PRIOR_MEASUREMENT: Mapping[str, Any] = MappingProxyType({
+    'source': 'task 4639 details (esc-4639-1, ruled 2026-08-24): two complete-coverage '
+              'passes over 30 ruling episodes',
+    'episodes': 30,
+    'overreach_minted': rate(13, 174),
+    'overreach_live_ruling_subject': rate(10, 111),
+    'overreach_rate_substantive': 0.143,
+    'episode_hit_rate': 0.30,
+    'holding_share_upper_bound': 0.40,
+    'live_strict_fraction_by_label': {'overreach': 0.923, 'holding': 0.725},
+})
+
+CAVEATS: tuple[str, ...] = (
+    'SINGLE ADJUDICATOR: one pass under the pre-registered rubric; the prior figure was '
+    'two independent passes.',
+    'EPISODE-ONLY RUBRIC: edges are judged against their source episode text alone, so '
+    'AUTHORED overreach (specimen c6ac6d99, whose episode states the over-assertion) '
+    'reads as faithful and is not counted.',
+    'MINTED = episodes[0]: graphiti_core appends corroborating episodes on dedupe; only '
+    'edges an episode minted are adjudicated.',
+    'SERVED = invalid_at IS NULL, which is all every read path filters. expired_at alone '
+    'is the restored shape task 4714 measured, and is reported as live_strict only.',
+    'OUT OF SAMPLE, NOT RANDOM OVER TIME: the window starts the day after the ruling; '
+    'within it, selection is by sha256(graph:uuid), stratified and capped, so strata are '
+    'not population-weighted and the "all" roll-up is a sample mean, not a corpus rate.',
+    'CANDIDATE CLASSIFIERS: the five regex/category predicates are under evaluation, not '
+    'adopted; per-classifier rates overlap because one episode matches several.',
+    'LIVE CORPUS: both graphs are written continuously; counts are a snapshot at swept_at.',
+)
+
+
+@dataclass(frozen=True)
+class Measurement:
+    corpus: Corpus
+    definition: SampleDefinition
+    attribution: Attribution
+    rows: tuple[Mapping[str, Any], ...]
+
+    @classmethod
+    def of(cls, corpus: Corpus, definition: SampleDefinition) -> Measurement:
+        attribution = attribute_edges(corpus.edges)
+        rows = tuple(worksheet_rows(definition.select(corpus.episodes), attribution))
+        return cls(corpus, definition, attribution, rows)
+
+    def expected_edges(self) -> dict[EdgeKey, str]:
+        return {(r['graph'], m['edge_uuid']): r['uuid'] for r in self.rows for m in r['minted']}
+
+    def window_episodes(self) -> list[Episode]:
+        d = self.definition
+        return [e for e in self.corpus.episodes if in_window(e, d.window_start, d.window_end)]
+
+
+def _window_days(definition: SampleDefinition) -> float:
+    span = _instant(definition.window_end) - _instant(definition.window_start)
+    return span.total_seconds() / 86400
+
+
+def _classifier_block(m: Measurement) -> dict[str, Any]:
+    window, days = m.window_episodes(), _window_days(m.definition)
+    block: dict[str, Any] = {}
+    for name, holds in CLASSIFIERS.items():
+        block[name] = {}
+        for graph in m.corpus.graphs:
+            in_window_n = sum(1 for e in window if e.graph == graph and holds(e))
+            block[name][graph] = {
+                'population': sum(1 for e in m.corpus.episodes if e.graph == graph and holds(e)),
+                'window_population': in_window_n,
+                'window_per_day': round(in_window_n / days, 2) if days else None,
+            }
+    return block
+
+
+def _specimen_block(m: Measurement) -> dict[str, Any]:
+    episodes = {(e.graph, e.uuid): e for e in m.corpus.episodes}
+    edges = {(e.graph, e.uuid): e for e in m.corpus.edges}
+    members = []
+    for s in SPECIMENS:
+        episode, edge = episodes.get((s.graph, s.episode_uuid)), edges.get((s.graph, s.edge_uuid))
+        members.append({
+            'graph': s.graph, 'episode_uuid': s.episode_uuid, 'edge_uuid': s.edge_uuid,
+            'note': s.note, 'episode_read': episode is not None,
+            'classifiers': list(matching_classifiers(episode)) if episode else [],
+            'stratum': stratum_of(episode) if episode else None,
+            'detectors': sorted(detector_hits(episode)) if episode else [],
+            'edge_read': edge is not None,
+            'edge_served': edge.served if edge else None,
+            'edge_live_strict': edge.live_strict if edge else None,
+            'minted_by_episode': edge.episodes[:1] == (s.episode_uuid,) if edge else None,
+        })
+    return {'recall': {n: specimen_recall(n, episodes) for n in CLASSIFIERS}, 'members': members}
+
+
+def _by_graph_and_stratum(m: Measurement, episodes: Iterable[Episode]) -> dict[str, dict]:
+    grouped: dict[str, dict[str, list[Episode]]] = {
+        g: {s: [] for s in STRATA} for g in m.corpus.graphs
+    }
+    for episode in episodes:
+        stratum = stratum_of(episode)
+        if stratum is not None:
+            grouped[episode.graph][stratum].append(episode)
+    return grouped
+
+
+def _strata_block(m: Measurement) -> dict[str, Any]:
+    everything = _by_graph_and_stratum(m, m.corpus.episodes)
+    window = _by_graph_and_stratum(m, m.window_episodes())
+    return {
+        g: {s: {'population': len(everything[g][s]), 'window_population': len(window[g][s])}
+            for s in STRATA}
+        for g in m.corpus.graphs
+    }
+
+
+def _detector_block(m: Measurement) -> dict[str, Any]:
+    block: dict[str, Any] = {}
+    for graph, by_stratum in _by_graph_and_stratum(m, m.corpus.episodes).items():
+        census = detector_census(by_stratum)
+        for stratum, episodes in by_stratum.items():
+            hits = [detector_hits(e) for e in episodes]
+            census[stratum]['any_detector'] = sum(1 for h in hits if h)
+            census[stratum]['any_wired'] = sum(1 for h in hits if h & WIRED_ON_ADD_MEMORY)
+        block[graph] = census
+    return block
+
+
+def _sample_block(m: Measurement) -> dict[str, Any]:
+    sizes = {g: {s: {'episodes': 0, 'minted': 0, 'corroborated': 0} for s in STRATA}
+             for g in m.corpus.graphs}
+    for row in m.rows:
+        cell = sizes[row['graph']][row['stratum']]
+        cell['episodes'] += 1
+        cell['minted'] += len(row['minted'])
+        cell['corroborated'] += row['corroborated_count']
+    return {
+        'definition': m.definition.to_dict(), 'sizes': sizes,
+        'window_days': _window_days(m.definition),
+        'unattributed_edges': m.attribution.unattributed,
+    }
+
+
+def _adjudicated_block(m: Measurement, verdicts: VerdictSet) -> dict[str, Any]:
+    sampled = {(e.graph, e.uuid): e for e in m.corpus.episodes}
+    hits = {(r['graph'], r['uuid']): detector_hits(sampled[(r['graph'], r['uuid'])])
+            for r in m.rows}
+    return {
+        'rates': adjudicated_rates(m.rows, verdicts),
+        'per_classifier': per_classifier_rates(m.rows, verdicts),
+        'detector_catch': detector_catch(m.rows, verdicts, hits),
+        'verdicts': len(verdicts.verdicts),
+        'stale_verdicts': len(verdicts.stale),
+    }
+
+
+def _read_block(corpus: Corpus) -> dict[str, Any]:
+    return {
+        graph: {kind: {'rows_seen': r.rows_seen, 'expected_rows': r.expected_rows,
+                       'complete': r.complete} for kind, r in by_kind.items()}
+        for graph, by_kind in corpus.reads.items()
+    }
+
+
+def build_report(m: Measurement, verdicts: VerdictSet | None, *, swept_at: str) -> dict[str, Any]:
+    return {
+        'swept_at': swept_at,
+        'graphs': list(m.corpus.graphs),
+        'read_population': _read_block(m.corpus),
+        'classifiers': _classifier_block(m),
+        'specimens': _specimen_block(m),
+        'strata': _strata_block(m),
+        'detector_census': _detector_block(m),
+        'wired_on_add_memory': sorted(WIRED_ON_ADD_MEMORY),
+        'sample': _sample_block(m),
+        'adjudicated': _adjudicated_block(m, verdicts) if verdicts else None,
+        'prior_measurement': dict(PRIOR_MEASUREMENT),
+        'caveats': list(CAVEATS),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+EXIT_OK, EXIT_READ_FAILED, EXIT_BAD_VERDICTS = 0, 1, 2
+
+logger = logging.getLogger('audit_ruling_overreach')
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Read-only: there is no mutation flag of any kind."""
+    parser = argparse.ArgumentParser(
+        prog='audit_ruling_overreach',
+        description='Read-only re-measurement of ruling-scope overreach (task 4716).',
+    )
+    parser.add_argument('--graph', action='append', metavar='GRAPH',
+                        help=f'Repeatable. Default: {" and ".join(DEFAULT_GRAPHS)}.')
+    parser.add_argument('--graph-uri', default=None,
+                        help='FalkorDB URI. Default: env FALKORDB_URI, then config.')
+    parser.add_argument('--window-start', default=DEFAULT_WINDOW_START)
+    parser.add_argument('--window-end', default=DEFAULT_WINDOW_END)
+    parser.add_argument('--cap', type=int, default=DEFAULT_CAP,
+                        help='Episodes per graph per stratum.')
+    parser.add_argument('--emit-worksheet', metavar='PATH',
+                        help='Write the adjudication worksheet as JSONL.')
+    parser.add_argument('--verdicts', metavar='PATH', help='Validate and rate this verdict file.')
+    parser.add_argument('--out-dir', metavar='DIR', help='Write DIR/report.json.')
+    parser.add_argument('--json', action='store_true', help='Print the report on stdout.')
+    return parser
+
+
+def _resolve_uri(args: argparse.Namespace) -> str | None:
+    """--graph-uri, then env FALKORDB_URI, then config (as audit_wrong_binding_edges.py)."""
+    if args.graph_uri:
+        return str(args.graph_uri)
+    if env_uri := os.environ.get('FALKORDB_URI'):
+        return env_uri
+    try:
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+        return getattr(getattr(FusedMemoryConfig().graphiti, 'falkordb', None), 'uri', None)
+    except Exception:
+        logger.warning('no FalkorDB uri from config; using the client default', exc_info=True)
+        return None
+
+
+def _load_verdict_file(path: str, m: Measurement) -> VerdictSet:
+    try:
+        obj = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise MalformedVerdicts(f'cannot read {path}: {exc}') from exc
+    return load_verdicts(
+        obj, expected_edges=m.expected_edges(),
+        existing_edges={(e.graph, e.uuid) for e in m.corpus.edges}, definition=m.definition,
+    )
+
+
+def _emit(args: argparse.Namespace, m: Measurement, report: dict[str, Any]) -> None:
+    if args.emit_worksheet:
+        path = Path(args.emit_worksheet)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(''.join(json.dumps(row, sort_keys=True) + '\n' for row in m.rows))
+    blob = json.dumps(report, indent=2, sort_keys=True)
+    if args.out_dir:
+        out = Path(args.out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'report.json').write_text(blob + '\n')
+    if args.json:
+        print(blob)
+    else:
+        sizes = report['sample']['sizes']
+        sampled = sum(c['episodes'] for g in sizes.values() for c in g.values())
+        print(f'episodes={len(m.corpus.episodes)} edges={len(m.corpus.edges)} '
+              f'sampled={sampled} minted={len(m.expected_edges())} '
+              f'adjudicated={"yes" if report["adjudicated"] else "no"}')
+
+
+def _live_reader_factory(args: argparse.Namespace) -> Callable[[str], GraphReader]:
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format='%(levelname)s %(name)s: %(message)s')
+    uri = _resolve_uri(args)
+    return lambda name: GraphReader(graph_name=name, uri=uri)
+
+
+async def _run(
+    args: argparse.Namespace, *, reader_factory: Callable[[str], Any] | None = None
+) -> int:
+    """Read, validate, then write — nothing is written unless every check passed."""
+    make_reader = reader_factory or _live_reader_factory(args)
+    graphs = tuple(args.graph or DEFAULT_GRAPHS)
+    try:
+        corpus = await read_corpus(graphs, make_reader)
+    except Exception:
+        logger.error('the graph read failed; nothing is written', exc_info=True)
+        return EXIT_READ_FAILED
+    if incomplete := corpus.incomplete_reads():
+        logger.error('incomplete read(s), nothing is written: %s', incomplete)
+        return EXIT_READ_FAILED
+
+    definition = SampleDefinition(
+        window_start=args.window_start, window_end=args.window_end, cap=args.cap,
+    )
+    measurement = Measurement.of(corpus, definition)
+    verdicts = None
+    if args.verdicts:
+        try:
+            verdicts = _load_verdict_file(args.verdicts, measurement)
+        except VerdictError as exc:
+            logger.error('verdict file rejected (%s): %s; edges=%s',
+                         type(exc).__name__, exc, list(exc.edge_uuids))
+            return EXIT_BAD_VERDICTS
+    report = build_report(measurement, verdicts, swept_at=datetime.now(UTC).isoformat())
+    _emit(args, measurement, report)
+    return EXIT_OK
+
+
+def main() -> int:
+    return asyncio.run(_run(_build_parser().parse_args()))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
