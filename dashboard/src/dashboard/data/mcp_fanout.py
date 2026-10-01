@@ -368,13 +368,13 @@ def project_label(project_root: str | os.PathLike[str]) -> str:
     definition of that rule for the fan-out cluster — :func:`fanout_label`
     composes it rather than re-deriving it.
 
-    ``active_tasks._project_label`` and ``redux_api._project_label`` are
-    independent hand-rolled copies of the same rule. They are not imported here
+    ``redux_api``, ``metrics`` and ``api/merge_queue.py`` call this directly
+    (task 5595). ``active_tasks._project_label`` is still an independent
+    hand-rolled copy of the same rule. It is not imported here
     (``active_tasks`` imports from ``tasks``, which imports this module), which
-    also means the delegation can only run the other way: those two can
-    eventually call *this*, collapsing three copies onto one. That cross-module
-    edit is out of task 4133's module lock and is filed as follow-up work; until
-    it lands, the three definitions must be kept string-identical by hand.
+    also means the delegation can only run the other way: it can eventually
+    call *this*, collapsing the last copy. Until it does, the two definitions
+    must be kept string-identical by hand.
     """
     root_str = str(project_root)
     return Path(root_str).name or root_str
@@ -401,10 +401,10 @@ def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
     A collapsed key also erases the diagnosis: the message names only the
     shared URL, so the operator cannot tell *which* project_root is down.
 
-    The discriminator is :func:`project_label` — the basename, deliberately
-    string-identical to ``active_tasks._project_label`` /
-    ``redux_api._project_label`` so operator log labels match the project chips
-    the UI already renders. ``mcp_fanout``, the leaf of this cluster, is the
+    The discriminator is :func:`project_label` — the basename, the same rule
+    ``redux_api`` labels its payloads with and deliberately string-identical
+    to ``active_tasks._project_label``, so operator log labels match the
+    project chips the UI already renders. ``mcp_fanout``, the leaf of this cluster, is the
     helper's home (see :func:`project_label`) and this docstring is the single
     place the convention is written down.
 

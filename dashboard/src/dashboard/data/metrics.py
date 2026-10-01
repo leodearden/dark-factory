@@ -34,6 +34,7 @@ from dashboard.data.mcp_fanout import (
     describe_exc,
     fanout_label,
     first_success,
+    project_label,
 )
 from dashboard.data.memory import (
     get_curator_state,
@@ -48,7 +49,6 @@ from dashboard.data.orchestrator import (
     find_running_orchestrators,
 )
 from dashboard.data.reconciliation import get_buffer_stats, get_burst_state, partition_burst_state
-from dashboard.data.redux_api import _project_label
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now, safe_gather_result
 
@@ -641,7 +641,7 @@ async def collect_metrics_snapshot(
     try:
         live_map = await fetch_live_merge_queues(http_client, config.escalation_urls)
         for pid, _db in merge_dbs:
-            live = live_map.get(_project_label(pid))
+            live = live_map.get(project_label(pid))
             if live is None or not live.get('reachable'):
                 logger.debug(
                     'merge sampler: no live queue reading for %s: %s',

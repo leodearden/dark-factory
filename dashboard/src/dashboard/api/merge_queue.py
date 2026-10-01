@@ -27,6 +27,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data import redux_api
 from dashboard.data.chart_utils import ChartData, trim_leading_zero_buckets
 from dashboard.data.db import DbPool
+from dashboard.data.mcp_fanout import project_label
 from dashboard.data.merge_halt import get_merge_halt_status
 from dashboard.data.merge_queue import (
     build_per_project_merge_queue,
@@ -36,7 +37,6 @@ from dashboard.data.merge_queue import (
     resolve_active,
 )
 from dashboard.data.metrics import get_merge_active_series
-from dashboard.data.redux_api import _project_label
 from dashboard.data.task_lookup import lookup_tasks
 from dashboard.data.utils import resolve_now
 from dashboard.project_dbs import _project_scoped_dbs_labeled
@@ -73,7 +73,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
         for pid in projects_raw
     }
     queues = {
-        pid: resolve_active(_project_label(pid), live_map, active_sparks[pid], now=render_at)
+        pid: resolve_active(project_label(pid), live_map, active_sparks[pid], now=render_at)
         for pid in projects_raw
     }
     lookup = await lookup_tasks(
@@ -97,7 +97,7 @@ async def api_merge_queue(request: Request) -> JSONResponse:
             'active': enrich_merges_with_titles(queues[pid].entries, pid, lookup),
             'in_queue': queues[pid].in_queue,
             # ι=1894: the live metrics the probe carried, stashed for shaping
-            'live_metrics': live_map.get(_project_label(pid), {}).get('metrics'),
+            'live_metrics': live_map.get(project_label(pid), {}).get('metrics'),
         }
         for pid, data in projects_raw.items()
     }

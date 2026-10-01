@@ -28,6 +28,7 @@ from dashboard.data.burndown import (
 )
 from dashboard.data.datum import Datum, DatumState, aged_at, validate_datum
 from dashboard.data.escalations import resolve_owning_project
+from dashboard.data.mcp_fanout import project_label
 from dashboard.data.merge_queue import LIVE_QUEUE_FRESHNESS_BOUND_SECONDS
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceCards
@@ -38,13 +39,6 @@ from dashboard.data.utils import resolve_now
 # ---------------------------------------------------------------------------
 # ORCHESTRATORS + PROJECTS
 # ---------------------------------------------------------------------------
-
-
-def _project_label(value: str | Path) -> str:
-    """Display label for a project root: directory basename, fallback to str."""
-    s = str(value)
-    name = s.rstrip('/').rsplit('/', 1)[-1]
-    return name or s
 
 
 def shape_orchestrators(
@@ -95,8 +89,8 @@ def shape_orchestrators(
         orch_entry: dict = {
             'pid': primary_pid,
             'pids': list(pids),
-            'label': o.get('label') or _project_label(project_root),
-            'project': _project_label(project_root),
+            'label': o.get('label') or project_label(project_root),
+            'project': project_label(project_root),
             'project_root': str(project_root),
             'running': bool(o.get('running')),
             'started': o.get('started') or '',
@@ -116,7 +110,7 @@ def shape_orchestrators(
         if root in seen:
             continue
         seen.add(root)
-        name = _project_label(root)
+        name = project_label(root)
         out_projects.append({
             'id': name,
             'name': name,
@@ -496,7 +490,7 @@ def shape_merge_queue(
     out: dict[str, dict] = {}
     for pid, data in per_project.items():
         spark = sparks.get(pid) or _EMPTY_SERIES
-        label = _project_label(pid)
+        label = project_label(pid)
         out[label] = {
             'depth': dict(data.get('depth_timeseries') or {'labels': [], 'values': []}),
             'outcomes': _shape_outcomes(data.get('outcomes')),
@@ -599,7 +593,7 @@ def shape_costs(
         models_list = list(models)
         sums = _sum_models(models_list)
         by_project_list.append({
-            'project': _project_label(pid),
+            'project': project_label(pid),
             'total': round(sum(sums.values()), 4),
             **{k: round(v, 4) for k, v in sums.items()},
         })
@@ -893,7 +887,7 @@ def shape_performance(
     for pid, datum in cards.items():
         validate_datum(datum, served_at)
         h = history.get(pid) or {}
-        out[_project_label(pid)] = {
+        out[project_label(pid)] = {
             'cards': datum.to_wire(),
             'time_centiles_history': dict(h.get('time_centiles_history') or empty_centiles),
             'one_pass_history': dict(h.get('one_pass_history') or empty_pair),
@@ -1034,7 +1028,7 @@ def shape_burndown(
     aggregate banner is not left hunting for which one.
     """
     served_at = resolve_now(served_at)
-    raw = {_project_label(pid): series for pid, series in series_by_project.items()}
+    raw = {project_label(pid): series for pid, series in series_by_project.items()}
     filled = {pid: _with_split(series) for pid, series in raw.items()}
     completions = {pid: compute_window_completion(series) for pid, series in raw.items()}
     provenance, aggregate_provenance = _burndown_provenance(
