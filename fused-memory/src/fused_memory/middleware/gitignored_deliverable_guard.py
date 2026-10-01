@@ -35,20 +35,86 @@ split inside the interceptor, so that one placement covers both.
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+from fused_memory.middleware.lock_charter_guard import extract_files
+from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    'GitignoredDeliverableFinding',
+    'gitignored_deliverable_finding',
     'make_gitignore_probe',
 ]
 
 _GIT_PROBE_TIMEOUT_SECS = 10.0
 
+_EXEMPT_EXECUTION_CLASSES: frozenset[str] = frozenset(
+    c for c in EXECUTION_CLASSES if c != 'code_tdd'
+)
+
 GitignoreProbe = Callable[[Sequence[str]], frozenset[str] | None]
+
+
+@dataclass(frozen=True)
+class GitignoredDeliverableFinding:
+    """Every declared deliverable is gitignored; ``ignored_paths`` in declaration order."""
+
+    ignored_paths: tuple[str, ...]
+
+
+def _parse_metadata(metadata: Any) -> dict:
+    """Return *metadata* as a dict (best-effort; unknown shapes -> {})."""
+    if metadata is None:
+        return {}
+    if isinstance(metadata, dict):
+        return metadata
+    if isinstance(metadata, str):
+        if not metadata:
+            return {}
+        try:
+            parsed = json.loads(metadata)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def gitignored_deliverable_finding(
+    *,
+    task_kind: str,
+    metadata: str | dict[str, Any] | None,
+    probe: GitignoreProbe,
+) -> GitignoredDeliverableFinding | None:
+    """Return a finding when every declared ``metadata.files`` path is gitignored.
+
+    See the module docstring for the exemptions. *probe* is consulted last,
+    and only with the non-blank declared paths, so an exempt submission
+    never spawns git.
+    """
+    if task_kind != 'normal':
+        return None
+    parsed = _parse_metadata(metadata)
+    if parsed.get('execution_class') in _EXEMPT_EXECUTION_CLASSES:
+        return None
+    if parsed.get('cross_repo'):
+        return None
+    declared = [f.strip() for f in extract_files(metadata) if f.strip()]
+    if not declared:
+        return None
+    ignored = probe(declared)
+    if ignored is None:
+        return None
+    if not all(p in ignored for p in declared):
+        return None
+    return GitignoredDeliverableFinding(ignored_paths=tuple(declared))
 
 
 def make_gitignore_probe(project_root: str | Path) -> GitignoreProbe:
