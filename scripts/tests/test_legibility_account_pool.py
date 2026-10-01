@@ -25,6 +25,7 @@ deselected by default (``addopts = -m 'not integration'``).
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -41,7 +42,7 @@ import pytest
 from legibility import coder as coder_mod
 from shared.usage_gate import AccountLease
 
-from shared import cap_markers
+from shared import cap_markers, invocation_outcome
 from shared import usage_gate as usage_gate_mod
 
 
@@ -1815,6 +1816,159 @@ def test_build_pool_warns_LOUDLY_when_it_falls_back_to_the_default_credential(
     )
     assert any("resolved NO usable accounts" in w for w in warnings), warnings
     assert any("max-b" in w for w in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# task 5947: AN AUTH-REJECTED ACCOUNT IS REPORTED TO THE GATE AND ROTATED.
+#
+# 2026-09-29 ~02:11Z (esc-legibility-trickle-dark_factory-6): max-h's org had
+# disabled subscription access. Text-mode `claude -p` printed the rejection on
+# STDOUT and exited 1 — no banner marker, so the coder raised a plain
+# CoderInvocationError and the pool let it propagate unrotated. The gate was
+# never told, max-h stayed AVAILABLE, and since the pool drains from the end it
+# was drawn first for every digest: 23 of 23 failed beside four live accounts.
+#
+# A REAL gate (build_pool over the b,c,d roster; reverse=True leases max-d
+# first): the AUTH_FAILED transition is InvokeSlot.report's, which FakeGate
+# could only imitate by implementing a private gate hook.
+# ---------------------------------------------------------------------------
+
+_AUTH_REJECTION = invocation_outcome.REAL_CLI_AUTH_REJECTION_MESSAGES[0]
+_EMPTY_VERDICT = '{"matches": [], "candidates": []}'
+
+
+@pytest.fixture
+def real_pool(roster_file, empty_env_file, monkeypatch):
+    _set_pool_tokens(monkeypatch, "B", "C", "D")
+    return mod.build_pool(accounts_file=str(roster_file), env_file=str(empty_env_file))
+
+
+def _cli_exit_1(stdout):
+    return coder_mod.CoderInvocationError(
+        f"claude CLI exited 1 (model='haiku'): stdout={stdout!r} stderr=''",
+        stdout=stdout,
+    )
+
+
+def _loosely_labelled_capped(stdout):
+    return coder_mod.CoderCapExhausted(
+        f"claude CLI exited 1 (model='haiku'): stdout={stdout!r} stderr=''",
+        marker='x', stdout=stdout,
+    )
+
+
+@pytest.mark.parametrize('rejected', [_cli_exit_1, _loosely_labelled_capped])
+def test_an_auth_rejected_account_is_reported_and_the_same_digest_completes_next_door(
+    real_pool, rejected,
+):
+    """Parametrized over the raised type because the arm must key on the
+    STREAMS, not on whichever label coder's loose matcher happened to pick."""
+    invoke = _RecordingInvoke(
+        raises={'tok-d': rejected(_AUTH_REJECTION)},
+        replies={'tok-c': _EMPTY_VERDICT},
+    )
+    call = mod.pool_invoke(real_pool, invoke=invoke)
+
+    out = call('the digest prompt', 'haiku')
+
+    assert out == _EMPTY_VERDICT
+    assert [c['oauth_token'] for c in invoke.calls] == ['tok-d', 'tok-c']
+    assert [c['prompt'] for c in invoke.calls] == ['the digest prompt'] * 2
+    assert real_pool.auth_failed_account_names == ('max-d',)
+
+    call('the next digest prompt', 'haiku')
+
+    assert [c['oauth_token'] for c in invoke.calls] == ['tok-d', 'tok-c', 'tok-c'], (
+        'the incident\'s cure: the rejected account stays out for the NIGHT, '
+        'not just for the digest that found it'
+    )
+
+
+def test_a_failure_that_merely_quotes_the_rejection_is_not_an_auth_failure(real_pool):
+    quoting = json.dumps({
+        'matches': [{'cluster_id': 'org-disabled', 'evidence_quote': _AUTH_REJECTION}],
+    })
+    original = _cli_exit_1(quoting)
+    invoke = _RecordingInvoke(raises={'tok-d': original})
+
+    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+        mod.pool_invoke(real_pool, invoke=invoke)('prompt', 'haiku')
+
+    assert excinfo.value is original
+    assert len(invoke.calls) == 1
+    assert real_pool.auth_failed_account_names == ()
+
+
+def test_the_journal_names_the_auth_route_apart_from_both_cap_routes(real_pool, caplog):
+    invoke = _RecordingInvoke(
+        raises={'tok-d': _cli_exit_1(_AUTH_REJECTION)},
+        replies={'tok-c': _EMPTY_VERDICT},
+    )
+
+    with caplog.at_level(logging.INFO, logger='legibility.account_pool'):
+        mod.pool_invoke(real_pool, invoke=invoke)('prompt', 'haiku')
+
+    rotations = _module_rotations(caplog)
+    assert len(rotations) == 1, rotations
+    (line,) = rotations
+    assert 'max-d' in line and '403' in line, line
+    for cap_route_phrase in ('cap signal', 'non-zero', 'exited 0'):
+        assert cap_route_phrase not in line, (
+            f'{cap_route_phrase!r} belongs to a cap route; a journal grep must '
+            f'be able to count auth rotations separately; got {line!r}'
+        )
+
+
+def _write_fake_claude_rejecting(bin_dir, *, rejected_token):
+    """Fake `claude`: records each caller's token, prints the measured
+    rejection and exits 1 for *rejected_token*, else prints an empty verdict.
+    Payloads travel through sidecar files so the U+00B7 reaches stdout
+    byte-exact (same rationale as test_legibility_coder.py's
+    ``_write_fake_claude_failing_on_both_streams``)."""
+    calls = bin_dir / "calls.txt"
+    rejection = bin_dir / "rejection.txt"
+    verdict = bin_dir / "verdict.txt"
+    rejection.write_text(_AUTH_REJECTION, encoding="utf-8")
+    verdict.write_text(_EMPTY_VERDICT, encoding="utf-8")
+    claude = bin_dir / "claude"
+    claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat > /dev/null\n"
+        f'printf "%s\\n" "$CLAUDE_CODE_OAUTH_TOKEN" >> "{calls}"\n'
+        f'if [ "$CLAUDE_CODE_OAUTH_TOKEN" = "{rejected_token}" ]; then\n'
+        f'  cat "{rejection}"\n'
+        "  exit 1\n"
+        "fi\n"
+        f'cat "{verdict}"\n'
+    )
+    claude.chmod(0o755)
+    return claude, calls
+
+
+@pytest.mark.timeout(60)
+def test_an_auth_rejected_night_is_not_lost_end_to_end(real_pool, tmp_path):
+    """The real chain the task's JSON premise would have missed: text-mode
+    stdout -> coder._invoke_cli's CoderInvocationError -> the pool's
+    classifier -> InvokeSlot.report -> the next lease. ``claude_bin`` is
+    explicit, so the bare-name PATH fallback can never reach a real CLI."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    claude, calls = _write_fake_claude_rejecting(bin_dir, rejected_token='tok-d')
+    invoke = functools.partial(coder_mod._invoke_cli, claude_bin=str(claude), timeout=30)
+
+    result = coder_mod.code_digests(
+        [_digest_text(f"auth-sess-{i}") for i in range(3)], _codebook(),
+        project="dark_factory", model="haiku",
+        invoke=mod.pool_invoke(real_pool, invoke=invoke),
+    )
+
+    assert result.total == 3
+    assert len(result.records) == 3, result.failures
+    assert result.capped == 0
+    assert result.status == "ok"
+    assert coder_mod.is_cap_deferral(result) is False
+    assert calls.read_text().split() == ['tok-d', 'tok-c', 'tok-c', 'tok-c']
+    assert real_pool.auth_failed_account_names == ('max-d',)
 
 
 # ---------------------------------------------------------------------------
