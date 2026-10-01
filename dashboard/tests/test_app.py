@@ -2080,8 +2080,7 @@ async def test_a_concurrent_task_cards_caller_on_the_same_root_is_bounded_too(
 ):
     """Both callers are bounded, not just the one that wins the lock.
 
-    This pins the wrap PLACEMENT, mirroring the merge_queue.load_task_titles
-    test. ``TTLCache.get_or_refresh`` serializes cold callers for one key
+    This pins the wrap PLACEMENT. ``TTLCache.get_or_refresh`` serializes cold callers for one key
     behind a per-key lock and runs the refresh WHILE HOLDING it, so an
     inner-only wrap would leave caller B queued UNBOUNDED for caller A's whole
     budget and then running its own full-budget refresh — the pair costs 2x
@@ -2236,14 +2235,14 @@ def test_load_endpoint_returns_known_metric_shape(client) -> None:
 
 
 # ---------------------------------------------------------------------------
-# api_merge_queue — live fetch integration (task-1606 step-11)
+# api_merge_queue — "In queue now" is one served Datum (task-1606, task 5595)
 # ---------------------------------------------------------------------------
 
 # Fake project root; label = basename('proj-a') = 'proj-a'
 _PROJ_ROOT = '/home/test/proj-a'
 _PROJ_LABEL = 'proj-a'
 
-# A live entry that would be TTL-dropped by the event-derived fallback (4h old)
+# A live entry an event-derived TTL would have dropped (4h old)
 _LIVE_ENTRY_4H = {
     'task_id': '3112', 'branch': 'task/3112', 'state': 'queued',
     'age_secs': 14400.0, 'position': 1, 'waiter_alive': True,
@@ -2253,15 +2252,10 @@ _LIVE_ENTRY_RETRY = {
     'task_id': '3112', 'branch': 'task/3112-retry', 'state': 'queued',
     'age_secs': 300.0, 'position': 2, 'waiter_alive': True,
 }
-# Event-derived fallback entry
-_EVENT_ENTRY = {
-    'task_id': '7', 'branch': 'task/7', 'state': 'queued',
-    'timestamp': '2026-06-04T10:00:00+00:00',
-}
 
 
-def _proj_raw(active: list, *, active_approximate: bool = False) -> dict:
-    """Build a minimal build_per_project_merge_queue output for one project."""
+def _proj_raw() -> dict:
+    """A minimal build_per_project_merge_queue output for one project."""
     return {
         _PROJ_ROOT: {
             'depth_timeseries': {'labels': [], 'values': []},
@@ -2269,19 +2263,59 @@ def _proj_raw(active: list, *, active_approximate: bool = False) -> dict:
             'latency': {},
             'recent': [],
             'speculative': {},
-            'active': active,
-            'active_approximate': active_approximate,
             'train_events': [],
         },
     }
 
 
-def test_merge_queue_live_path_uses_live_entries(client):
-    """Case A: fetch_live_merge_queues reachable → active reflects LIVE entries.
+def _merge_queue_body(client, live_map: dict) -> dict:
+    with (
+        patch('dashboard.api.merge_queue.build_per_project_merge_queue',
+              new=AsyncMock(return_value=_proj_raw())),
+        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
+        patch('dashboard.api.merge_queue.fetch_live_merge_queues',
+              new=AsyncMock(return_value=live_map)),
+        patch('dashboard.api.merge_queue.lookup_tasks', new=AsyncMock(return_value={})),
+    ):
+        resp = client.get('/api/v2/dashboard/merge-queue')
+    assert resp.status_code == 200
+    body = resp.json()
+    assert _PROJ_LABEL in body['MERGE_QUEUE'], (
+        f'{_PROJ_LABEL} missing from MERGE_QUEUE; got {list(body["MERGE_QUEUE"])}'
+    )
+    return body
 
-    AC1: 4h-old entry visible (not TTL-dropped).
+
+@pytest.fixture()
+def sampled_queue(client):
+    """One merge_snapshots row for _PROJ_ROOT in the running app's metrics.db.
+
+    Yields the sample's instant. The metrics db sits under the session-scoped
+    project root every ``client`` shares, so the row is deleted afterwards.
+    """
+    import sqlite3
+    from contextlib import closing
+    from datetime import UTC, timedelta
+
+    sampled_at = datetime.now(UTC) - timedelta(minutes=10)
+    metrics_db = client.app.state.config.metrics_db
+    with closing(sqlite3.connect(metrics_db, timeout=5)) as conn:
+        row_id = conn.execute(
+            'INSERT INTO merge_snapshots (ts, project_id, active_count) VALUES (?, ?, ?)',
+            (sampled_at.isoformat(), _PROJ_ROOT, 3),
+        ).lastrowid
+        conn.commit()
+    yield sampled_at
+    with closing(sqlite3.connect(metrics_db, timeout=5)) as conn:
+        conn.execute('DELETE FROM merge_snapshots WHERE id = ?', (row_id,))
+        conn.commit()
+
+
+def test_merge_queue_live_path_uses_live_entries(client):
+    """Case A: a reachable probe is the queue, FRESH at the probe instant.
+
+    AC1: the 4h-old entry is visible (no event-derived TTL drops it).
     AC2: two same-task entries both appear.
-    active_approximate is False (live data).
     """
     live_map = {
         _PROJ_LABEL: {
@@ -2289,68 +2323,41 @@ def test_merge_queue_live_path_uses_live_entries(client):
             'entries': [_LIVE_ENTRY_4H, _LIVE_ENTRY_RETRY],
         },
     }
-    with (
-        patch('dashboard.api.merge_queue.build_per_project_merge_queue',
-              new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
-        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
-        patch('dashboard.api.merge_queue.load_task_titles', new=AsyncMock(return_value={})),
-        patch('dashboard.api.merge_queue.fetch_live_merge_queues', new=AsyncMock(return_value=live_map)),
-    ):
-        resp = client.get('/api/v2/dashboard/merge-queue')
 
-    assert resp.status_code == 200
-    mq = resp.json()['MERGE_QUEUE']
-    assert _PROJ_LABEL in mq, f'{_PROJ_LABEL} missing from MERGE_QUEUE; got {list(mq)}'
-    proj = mq[_PROJ_LABEL]
+    body = _merge_queue_body(client, live_map)
 
-    active = proj['active']
-    task_ids = [e['task_id'] for e in active]
-    # AC1: long-queued entry is visible
-    assert '3112' in task_ids, (
-        f'AC1: expected task 3112 (4h old) in active; got {task_ids}'
+    proj = body['MERGE_QUEUE'][_PROJ_LABEL]
+    task_ids = [e['task_id'] for e in proj['active']]
+    assert task_ids == ['3112', '3112'], f'AC1/AC2: expected both 3112 rows; got {task_ids}'
+    assert (proj['in_queue']['state'], proj['in_queue']['value']) == ('fresh', 2)
+    assert 'active_approximate' not in proj
+    assert datetime.fromisoformat(proj['in_queue']['as_of']) <= (
+        datetime.fromisoformat(body['served_at'])
     )
-    # AC2: two entries for the same task_id
-    assert task_ids.count('3112') == 2, (
-        f'AC2: expected 2 entries for task_id=3112; got {task_ids}'
-    )
-    # Event-derived fallback entry must NOT appear (live path supersedes it)
-    assert '7' not in task_ids, (
-        f'Expected event-derived task 7 absent when live path is active; got {task_ids}'
-    )
-    assert proj['active_approximate'] is False
 
 
-def test_merge_queue_fallback_path_when_unreachable(client):
-    """Case B: fetch_live_merge_queues unreachable → fallback with active_approximate=True.
+def test_merge_queue_failed_probe_serves_the_last_sample_stale(client, sampled_queue):
+    """Case B: the probe failed, so the headline is its own history's last sample.
 
-    AC3: no fabricated rows; the event-derived list is used and labelled approximate.
+    THE SIGNAL. The tile and its spark are one datum: a failed probe serves
+    the merge_snapshots value at that sample's own instant, marked stale and
+    saying why — never an approximation from another source, and never an
+    entry list the probe did not return.
     """
-    # fetch_live_merge_queues returns {} (no live data) → resolve_active falls back
-    with (
-        patch('dashboard.api.merge_queue.build_per_project_merge_queue',
-              new=AsyncMock(return_value=_proj_raw([_EVENT_ENTRY]))),
-        patch('dashboard.api.merge_queue.get_merge_halt_status', new=AsyncMock(return_value={})),
-        patch('dashboard.api.merge_queue.load_task_titles', new=AsyncMock(return_value={})),
-        patch('dashboard.api.merge_queue.fetch_live_merge_queues', new=AsyncMock(return_value={})),
-    ):
-        resp = client.get('/api/v2/dashboard/merge-queue')
+    live_map = {_PROJ_LABEL: {'reachable': False, 'entries': [], 'error': 'connect refused'}}
 
-    assert resp.status_code == 200
-    mq = resp.json()['MERGE_QUEUE']
-    assert _PROJ_LABEL in mq, f'{_PROJ_LABEL} missing; got {list(mq)}'
-    proj = mq[_PROJ_LABEL]
+    body = _merge_queue_body(client, live_map)
 
-    active = proj['active']
-    task_ids = [e['task_id'] for e in active]
-    # Event-derived entry appears
-    assert '7' in task_ids, (
-        f'Expected event-derived task 7 in fallback active; got {task_ids}'
+    proj = body['MERGE_QUEUE'][_PROJ_LABEL]
+    in_queue = proj['in_queue']
+    assert in_queue['state'] == 'stale', in_queue
+    assert in_queue['value'] == 3
+    assert datetime.fromisoformat(in_queue['as_of']) == sampled_queue
+    assert 'connect refused' in in_queue['reason']
+    assert proj['active'] == []
+    assert datetime.fromisoformat(in_queue['as_of']) <= (
+        datetime.fromisoformat(body['served_at'])
     )
-    # AC3: no fabricated live entries
-    assert '3112' not in task_ids, (
-        f'AC3: live entry 3112 must not appear in fallback path; got {task_ids}'
-    )
-    assert proj['active_approximate'] is True
 
 
 def test_tasks_offline_flag_survives_a_hang_that_degrades_most_roots(client):

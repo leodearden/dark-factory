@@ -565,6 +565,13 @@ def test_shape_recon_no_verdict_returns_none():
 # shape_merge_queue
 # ---------------------------------------------------------------------------
 
+MQ_SERVED_AT = datetime(2026, 10, 1, 12, 0, 30, tzinfo=UTC)
+"""The serving instant every shape_merge_queue case ages and validates against."""
+
+
+def _task_ids(rows):
+    return [row['task_id'] for row in rows]
+
 
 def test_shape_merge_queue_relabels_and_renames_depth():
     raw = {
@@ -577,11 +584,11 @@ def test_shape_merge_queue_relabels_and_renames_depth():
             'active': [],
         },
     }
-    body = redux_api.shape_merge_queue(raw)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
     assert 'dark-factory' in body['MERGE_QUEUE']
     section = body['MERGE_QUEUE']['dark-factory']
     assert section['depth'] == {'labels': [0, 1], 'values': [3, 4]}
-    assert section['recent'] == [{'task_id': '17'}]
+    assert _task_ids(section['recent']) == ['17']
     # Default: no halt_status passed → offline fallback per project.
     assert section['halt'] == {'offline': True}
 
@@ -608,9 +615,9 @@ def test_shape_merge_queue_carries_the_recent_window_total():
             'active': [],
         },
     }
-    mq = redux_api.shape_merge_queue(raw)['MERGE_QUEUE']
+    mq = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)['MERGE_QUEUE']
     assert mq['dark-factory']['recent_total'] == 228
-    assert mq['dark-factory']['recent'] == recent
+    assert _task_ids(mq['dark-factory']['recent']) == _task_ids(recent)
     assert mq['reify']['recent_total'] == 0
 
 
@@ -646,7 +653,7 @@ def test_shape_merge_queue_injects_halt_status_per_project():
         'know-live': {'wired': True, 'halted': False, 'owner_esc_id': None, 'offline': False},
         # dark-factory deliberately absent → offline fallback
     }
-    body = redux_api.shape_merge_queue(raw, halt_status=halt_status)
+    body = redux_api.shape_merge_queue(raw, halt_status=halt_status, served_at=MQ_SERVED_AT)
     mq = body['MERGE_QUEUE']
     assert mq['reify']['halt']['halted'] is True
     assert mq['reify']['halt']['owner_esc_id'] == 'esc-42'
@@ -676,7 +683,7 @@ def test_shape_merge_queue_includes_train_events():
             ],
         },
     }
-    body = redux_api.shape_merge_queue(raw)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
     section = body['MERGE_QUEUE']['dark-factory']
     assert 'train_events' in section, f'Missing train_events in section keys: {list(section.keys())}'
     assert isinstance(section['train_events'], list)
@@ -695,7 +702,7 @@ def test_shape_merge_queue_includes_train_events():
             # no 'train_events' key
         },
     }
-    body2 = redux_api.shape_merge_queue(raw_no_train)
+    body2 = redux_api.shape_merge_queue(raw_no_train, served_at=MQ_SERVED_AT)
     assert body2['MERGE_QUEUE']['dark-factory']['train_events'] == []
 
 
@@ -727,7 +734,7 @@ def test_shape_merge_queue_attaches_outcome_colors():
             'active': [],
         },
     }
-    body = redux_api.shape_merge_queue(raw)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
     outcomes = body['MERGE_QUEUE']['dark-factory']['outcomes']
 
     assert 'colors' in outcomes, f"Expected 'colors' key in outcomes; got keys: {list(outcomes)}"
@@ -753,7 +760,7 @@ def test_shape_merge_queue_empty_outcomes_yields_empty_colors():
             'active': [],
         },
     }
-    body = redux_api.shape_merge_queue(raw)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
     outcomes = body['MERGE_QUEUE']['dark-factory']['outcomes']
     assert outcomes.get('colors') == [], (
         f"Expected colors == [] for empty outcomes, got {outcomes.get('colors')!r}"
@@ -2003,80 +2010,104 @@ class TestShapeEscalations:
 
 
 # ---------------------------------------------------------------------------
-# shape_merge_queue — active_approximate pass-through (task-1606 step-9)
+# shape_merge_queue — served Datums: "In queue now" and row titles (task 5595)
 # ---------------------------------------------------------------------------
 
 
-def _mq_raw(label: str, active_approximate: bool | None = None) -> dict:
-    """Build a minimal per_project entry keyed by absolute path matching label."""
+def _mq_project(**overrides) -> dict:
+    """A minimal per-project aggregate entry; *overrides* replace its keys."""
     data: dict = {
         'depth_timeseries': {'labels': [], 'values': []},
         'outcomes': {'labels': [], 'values': []},
         'latency': {},
         'recent': [],
         'speculative': {},
-        'active': [{'task_id': '1', 'branch': 'task/1', 'state': 'queued'}],
+        'active': [],
         'train_events': [],
     }
-    if active_approximate is not None:
-        data['active_approximate'] = active_approximate
-    # Key by a fake abs-path whose basename == label
-    return {f'/proj/{label}': data}
+    data.update(overrides)
+    return data
 
 
-class TestShapeMergeQueueActiveApproximate:
-    """Tests that shape_merge_queue surfaces active_approximate per project."""
+def _shaped(**overrides) -> dict:
+    body = redux_api.shape_merge_queue(
+        {'/proj/myproj': _mq_project(**overrides)}, served_at=MQ_SERVED_AT,
+    )
+    return body['MERGE_QUEUE']['myproj']
 
-    def test_active_approximate_true_surfaces_in_output(self):
-        """active_approximate=True in per_project → MERGE_QUEUE[label]['active_approximate'] is True."""
-        raw = _mq_raw('myproj', active_approximate=True)
-        body = redux_api.shape_merge_queue(raw)
-        mq = body['MERGE_QUEUE']
-        assert 'myproj' in mq
-        assert mq['myproj']['active_approximate'] is True
 
-    def test_active_approximate_false_surfaces_in_output(self):
-        """active_approximate=False explicitly set → surfaces as False."""
-        raw = _mq_raw('myproj', active_approximate=False)
-        body = redux_api.shape_merge_queue(raw)
-        assert body['MERGE_QUEUE']['myproj']['active_approximate'] is False
+class TestShapeMergeQueueServedDatums:
+    """Every datum on /merge-queue is aged, validated and rendered at served_at."""
 
-    def test_active_approximate_absent_defaults_false(self):
-        """active_approximate absent from per_project data → defaults to False."""
-        raw = _mq_raw('myproj', active_approximate=None)
-        body = redux_api.shape_merge_queue(raw)
-        assert body['MERGE_QUEUE']['myproj']['active_approximate'] is False
+    def test_the_payload_carries_served_at(self):
+        body = redux_api.shape_merge_queue(
+            {'/proj/myproj': _mq_project()}, served_at=MQ_SERVED_AT,
+        )
 
-    def test_active_approximate_per_project_isolated(self):
-        """Two projects with different active_approximate values are kept isolated."""
-        per_project = {
-            '/proj/alpha': {
-                'depth_timeseries': {'labels': [], 'values': []},
-                'outcomes': {'labels': [], 'values': []}, 'latency': {},
-                'recent': [], 'speculative': {}, 'train_events': [],
-                'active': [], 'active_approximate': True,
-            },
-            '/proj/beta': {
-                'depth_timeseries': {'labels': [], 'values': []},
-                'outcomes': {'labels': [], 'values': []}, 'latency': {},
-                'recent': [], 'speculative': {}, 'train_events': [],
-                'active': [],
-                # active_approximate absent → defaults False
-            },
-        }
-        body = redux_api.shape_merge_queue(per_project)
-        mq = body['MERGE_QUEUE']
-        assert mq['alpha']['active_approximate'] is True
-        assert mq['beta']['active_approximate'] is False
+        assert body['served_at'] == MQ_SERVED_AT.isoformat()
 
-    def test_existing_active_list_unchanged(self):
-        """shape_merge_queue adding active_approximate does not break the active list."""
-        raw = _mq_raw('myproj', active_approximate=True)
-        body = redux_api.shape_merge_queue(raw)
-        active = body['MERGE_QUEUE']['myproj']['active']
-        assert isinstance(active, list)
-        assert len(active) == 1
-        assert active[0]['task_id'] == '1'
+    def test_a_fresh_in_queue_is_a_wire_datum(self):
+        in_queue = Datum(2, MQ_SERVED_AT - timedelta(seconds=5), DatumState.FRESH, None, 30)
+
+        assert _shaped(in_queue=in_queue)['in_queue'] == in_queue.to_wire()
+
+    def test_a_fresh_in_queue_past_its_bound_is_served_stale(self):
+        as_of = MQ_SERVED_AT - timedelta(seconds=45)
+
+        wire = _shaped(in_queue=Datum(2, as_of, DatumState.FRESH, None, 30))['in_queue']
+
+        assert wire['state'] == 'stale'
+        assert (wire['value'], wire['as_of']) == (2, as_of.isoformat())
+        assert '30s freshness bound' in wire['reason']
+
+    def test_a_stale_in_queue_keeps_its_own_reason(self):
+        in_queue = Datum(1, MQ_SERVED_AT - timedelta(minutes=10), DatumState.STALE,
+                         'connect refused', 30)
+
+        wire = _shaped(in_queue=in_queue)['in_queue']
+
+        assert (wire['state'], wire['reason']) == ('stale', 'connect refused')
+
+    def test_a_missing_in_queue_is_unknown_with_a_reason(self):
+        wire = _shaped()['in_queue']
+
+        assert wire['state'] == 'unknown'
+        assert wire['value'] is None
+        assert wire['reason']
+
+    def test_every_row_title_is_a_wire_datum(self):
+        found = Datum('Fix X', MQ_SERVED_AT - timedelta(seconds=5), DatumState.FRESH, None, 1200)
+        unread = Datum(None, None, DatumState.UNKNOWN, 'lookup budget: past the cap', 1200)
+
+        section = _shaped(
+            recent=[{'task_id': '7', 'title': found}],
+            active=[{'task_id': '8', 'title': unread}],
+        )
+
+        assert section['recent'] == [{'task_id': '7', 'title': found.to_wire()}]
+        assert section['active'] == [{'task_id': '8', 'title': unread.to_wire()}]
+
+    def test_a_row_with_no_lookup_has_an_unknown_title(self):
+        section = _shaped(recent=[{'task_id': '7'}], active=[{'task_id': '8', 'title': ''}])
+
+        for row in (*section['recent'], *section['active']):
+            assert row['title']['state'] == 'unknown'
+            assert row['title']['reason']
+
+    def test_latency_carries_the_timed_and_untimed_split(self):
+        latency = {'p50': 100, 'p95': 200, 'p99': 300, 'mean_ms': 150.0,
+                   'with_duration': 3, 'without_duration': 2}
+
+        assert _shaped(latency=latency)['latency'] == latency
+
+    def test_there_is_no_active_approximate_key(self):
+        assert 'active_approximate' not in _shaped(active_approximate=True)
+
+    def test_a_broken_datum_is_a_shaper_bug_not_a_degraded_payload(self):
+        broken = Datum(None, MQ_SERVED_AT, DatumState.FRESH, None, 30)
+
+        with pytest.raises(DatumContractError):
+            _shaped(in_queue=broken)
 
 
 # ---------------------------------------------------------------------------
@@ -2115,7 +2146,7 @@ def test_shape_merge_queue_includes_train_throughput():
             'train_throughput': throughput_payload,
         },
     }
-    body = redux_api.shape_merge_queue(raw)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
     section = body['MERGE_QUEUE']['dark-factory']
 
     assert 'train_throughput' in section, (
@@ -2177,7 +2208,7 @@ def test_shape_merge_queue_surfaces_live_metrics():
     proj = _mq_project_base()
     proj['live_metrics'] = _LIVE_METRICS
     raw = {'/home/leo/src/dark-factory': proj}
-    body = redux_api.shape_merge_queue(raw)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
     section = body['MERGE_QUEUE']['dark-factory']
     assert 'metrics' in section, (
         f"shape_merge_queue must emit 'metrics' key per project; "
@@ -2191,7 +2222,7 @@ def test_shape_merge_queue_metrics_defaults_to_empty_when_absent():
     proj = _mq_project_base()
     # no 'live_metrics' key
     raw = {'/home/leo/src/dark-factory': proj}
-    body = redux_api.shape_merge_queue(raw)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
     section = body['MERGE_QUEUE']['dark-factory']
     assert 'metrics' in section, (
         f"'metrics' key must always be present in shaped output; "
@@ -2205,7 +2236,7 @@ def test_shape_merge_queue_metrics_defaults_to_empty_when_none():
     proj = _mq_project_base()
     proj['live_metrics'] = None
     raw = {'/home/leo/src/dark-factory': proj}
-    body = redux_api.shape_merge_queue(raw)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
     section = body['MERGE_QUEUE']['dark-factory']
     assert section['metrics'] == {}
 
@@ -2215,5 +2246,5 @@ def test_shape_merge_queue_metrics_rpl_value():
     proj = _mq_project_base()
     proj['live_metrics'] = {'retries_per_landing': 2.0, 'drift_at_detection': {'last': 5}}
     raw = {'/home/leo/src/dark-factory': proj}
-    body = redux_api.shape_merge_queue(raw)
+    body = redux_api.shape_merge_queue(raw, served_at=MQ_SERVED_AT)
     assert body['MERGE_QUEUE']['dark-factory']['metrics']['retries_per_landing'] == 2.0

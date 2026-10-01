@@ -33,6 +33,10 @@ Three properties keep this probe from quietly stopping checking:
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -42,9 +46,15 @@ _TINY_BUDGET = 0.05
 
 _TARGET_MODULES = {
     'dashboard.api.escalations',
-    'dashboard.data.merge_queue',
+    'dashboard.data.task_lookup',
 }
 """The modules whose hang this probe must actually REACH, or it proves nothing.
+
+``dashboard.data.task_lookup`` stands in for ``dashboard.data.merge_queue``
+(task 5595). /merge-queue no longer fetches a task tree to title its rows: it
+asks ``task_lookup.lookup_tasks`` for the few ids it names, and that module's
+``fetch_task`` binding is the seam /merge-queue now waits on. The hang must
+be reached THERE or the endpoint's bound is unexercised.
 
 ``dashboard.data.orchestrator`` was the third, and is deliberately no longer
 here: task 5587 removed ``discover_orchestrators``' task fetch outright, so it
@@ -87,18 +97,20 @@ def _all_dashboard_get_paths() -> list[str]:
 
 
 @pytest.fixture()
-def hung_mcp(monkeypatch, tmp_path):
-    """Hang every fetch_tasks binding; shrink every budget; clear every cache.
+def hung_mcp(monkeypatch, tmp_path, client):
+    """Hang every task-read binding; shrink every budget; clear every cache.
 
     Returns the ``reached`` list of ``(module_name, project_root)`` pairs the
     stub recorded, so a caller can assert the hang was genuinely exercised.
+    Requests ``client`` so the configured root it seeds is the one the running
+    app reads.
     """
     from dashboard.api.escalations import _task_cards_cache_clear
     from dashboard.app import _analytics_cache_clear
     from dashboard.data import (
         active_tasks,
-        merge_queue,
         orchestrator,
+        task_lookup,
         task_snapshot,
         tasks,
     )
@@ -110,7 +122,7 @@ def hung_mcp(monkeypatch, tmp_path):
         # snapshot unit threads statuses/timeout/cached, the others do not —
         # so one stub can stand in for every call shape without being laxer
         # about the thing under test, which is that the call HANGS.
-        async def _hang(client, config, project_root, **_kwargs):
+        async def _hang(client, config, project_root, *_args, **_kwargs):
             reached.append((module_name, str(project_root)))
             await asyncio.Event().wait()  # nothing ever sets it
 
@@ -126,7 +138,6 @@ def hung_mcp(monkeypatch, tmp_path):
     for module_name in (
         'dashboard.app',
         'dashboard.api.escalations',
-        'dashboard.data.merge_queue',
         # The Tasks tab's binding travelled to the snapshot unit with the read
         # itself (task 5587); active_tasks holds no fetch name at all now.
         'dashboard.data.task_snapshot',
@@ -134,11 +145,20 @@ def hung_mcp(monkeypatch, tmp_path):
         monkeypatch.setattr(
             f'{module_name}.fetch_tasks', _make_stub(module_name),
         )
+    # /merge-queue reads its titles one id at a time (task 5595).
+    monkeypatch.setattr(
+        'dashboard.data.task_lookup.fetch_task',
+        _make_stub('dashboard.data.task_lookup'),
+    )
 
     import dashboard.api.escalations as _esc
 
     monkeypatch.setattr(_esc, '_TASK_CARDS_BUDGET', _TINY_BUDGET)
-    monkeypatch.setattr(merge_queue, '_TASK_TITLES_BUDGET', _TINY_BUDGET)
+    # The lookup's ONE deadline encloses its snapshot read before any
+    # fetch_task miss, and that read pays the shrunk PER_CALL_TIMEOUT below
+    # against the same hang. At _TINY_BUDGET the deadline would expire inside
+    # the snapshot read and the fetch_task seam would never be reached.
+    monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', 4 * _TINY_BUDGET)
     # The Tasks tab is already compliant; shrink it too so it does not
     # dominate the sweep's wall time. PER_CALL_TIMEOUT is shrunk for
     # the same reason and is NOT optional: it was widened to 4.4 s for real
@@ -151,7 +171,7 @@ def hung_mcp(monkeypatch, tmp_path):
     # A warm entry would be served without ever reaching the hang.
     tasks._fetch_tasks_cache_clear()
     task_snapshot._snapshot_cache_clear()
-    merge_queue._task_titles_cache_clear()
+    task_lookup._lookup_cache_clear()
     _task_cards_cache_clear()
     _analytics_cache_clear()
 
@@ -179,15 +199,57 @@ def hung_mcp(monkeypatch, tmp_path):
             ],
         },
     )
+    # /merge-queue looks up only the ids its rows name, so it needs a row.
+    seeded = _seed_merge_attempt(client.app.state.config.project_root)
 
     yield reached
+
+    seeded()
 
     # Leave no hang-stubbed entry behind for the next test in the session.
     tasks._fetch_tasks_cache_clear()
     task_snapshot._snapshot_cache_clear()
-    merge_queue._task_titles_cache_clear()
+    task_lookup._lookup_cache_clear()
     _task_cards_cache_clear()
     _analytics_cache_clear()
+
+
+def _seed_merge_attempt(project_root):
+    """Put one titled-by-lookup merge_attempt in *project_root*'s runs.db.
+
+    The root is the session-scoped one every ``client`` shares, so the return
+    value undoes exactly what this wrote: the file if it created it, else the
+    one row.
+    """
+    runs_db = project_root / 'data' / 'orchestrator' / 'runs.db'
+    created = not runs_db.exists()
+    runs_db.parent.mkdir(parents=True, exist_ok=True)
+    attempted_at = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    with closing(sqlite3.connect(runs_db)) as conn:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS events ('
+            ' id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,'
+            ' run_id TEXT NOT NULL, task_id TEXT, event_type TEXT NOT NULL,'
+            " phase TEXT, role TEXT, data TEXT DEFAULT '{}', cost_usd REAL,"
+            ' duration_ms INTEGER)'
+        )
+        row_id = conn.execute(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase,'
+            ' data, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (attempted_at, 'run-4788', '4788', 'merge_attempt', 'merge',
+             json.dumps({'outcome': 'done', 'branch': 'task/4788'}), 1200),
+        ).lastrowid
+        conn.commit()
+
+    def _undo() -> None:
+        if created:
+            runs_db.unlink(missing_ok=True)
+            return
+        with closing(sqlite3.connect(runs_db)) as conn:
+            conn.execute('DELETE FROM events WHERE id = ?', (row_id,))
+            conn.commit()
+
+    return _undo
 
 
 def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
