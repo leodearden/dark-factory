@@ -42,15 +42,13 @@ async def _init_repo(path: Path) -> None:
     await _run(['git', 'config', 'user.name', 'Test'], cwd=path)
 
 
-async def _commit_all(path: Path, msg: str) -> str:
-    await _run(['git', 'add', '-A'], cwd=path)
-    await _run(['git', 'commit', '-m', msg], cwd=path)
-    return await _rev_parse(path, 'HEAD')
-
-
 async def _commit_file(path: Path, name: str, content: str) -> str:
+    """Write and commit *name* only; a bare ``git add -A`` in the main
+    checkout would stage the nested ``.worktrees/*`` checkouts as gitlinks."""
     (path / name).write_text(content)
-    return await _commit_all(path, f'write {name}')
+    await _run(['git', 'add', '--', name], cwd=path)
+    await _run(['git', 'commit', '-m', f'write {name}'], cwd=path)
+    return await _rev_parse(path, 'HEAD')
 
 
 async def _rev_parse(cwd: Path, ref: str) -> str:

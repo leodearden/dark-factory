@@ -50,9 +50,11 @@ async def _init_repo(path: Path) -> None:
 
 
 async def _commit_files(path: Path, writes: dict[str, str], msg: str) -> str:
+    """Write and commit exactly *writes*; a bare ``git add -A`` in the main
+    checkout would stage the nested ``.worktrees/*`` checkouts as gitlinks."""
     for name, content in writes.items():
         (path / name).write_text(content)
-    await _git(path, 'add', '-A')
+    await _git(path, 'add', '--', *writes)
     await _git(path, 'commit', '-m', msg)
     return await _rev_parse(path, 'HEAD')
 
