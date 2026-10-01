@@ -71,11 +71,14 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from collections import deque
 from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
+
+from shared.proc_group import read_stat_fields
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -179,34 +182,22 @@ def start_own_process_group() -> int:
 
 
 def read_ppid_map() -> dict[int, int]:
-    """Parse ``/proc/*/stat`` and return ``{pid: ppid}`` for every live process.
+    """Return ``{pid: ppid}`` for every live process on the host.
 
-    The ``comm`` field (field 2) may contain spaces and parentheses, so we
-    parse by finding the *last* ``') '`` separator (``rsplit``) rather than
-    splitting on whitespace naïvely.  Vanished or unreadable entries are
-    silently skipped (the process exited between the ``glob`` and the
-    ``read``).
+    This walk covers every process on the host, so no single foreign
+    process may fail it: comm is arbitrary BYTES (``prctl(PR_SET_NAME)``
+    accepts any, and the 15-byte truncation can split a UTF-8 sequence).
+    ``shared/src/shared/proc_group.py::read_stat_fields`` is the single
+    parser of that layout; an entry that vanished or is malformed is skipped.
     """
     ppid_map: dict[int, int] = {}
-    proc = Path('/proc')
-    for entry in proc.iterdir():
+    for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
-        stat_path = entry / 'stat'
-        try:
-            raw = stat_path.read_text()
-        except OSError:
+        fields = read_stat_fields(entry)
+        if fields is None:
             continue
-        # Format: "pid (comm) state ppid ..."
-        # rsplit on ') ' to skip over the comm field safely.
-        try:
-            right = raw.rsplit(') ', 1)[1]
-            fields = right.split()
-            pid = int(entry.name)
-            ppid = int(fields[1])  # field index after stripping pid+comm+state
-            ppid_map[pid] = ppid
-        except (IndexError, ValueError):
-            continue
+        ppid_map[int(entry.name)] = fields.ppid
     return ppid_map
 
 
@@ -1172,11 +1163,10 @@ def fire_watchdog_kill(
     *,
     trigger: WatchdogTrigger,
     grace_secs: float = WATCHDOG_KILL_GRACE_SECS,
-    ppid_map_provider=read_ppid_map,
-    kill=os.kill,
-    killpg=os.killpg,
-    sleep=time.sleep,
-    exit_fn=os._exit,
+    ppid_map_provider: Callable[[], dict[int, int]] = read_ppid_map,
+    kill: Callable[[int, int], None] = os.kill,
+    sleep: Callable[[float], None] = time.sleep,
+    exit_fn: Callable[[int], None] = os._exit,
     exit_code: int = 1,
     stderr=None,
 ) -> None:
@@ -1196,13 +1186,14 @@ def fire_watchdog_kill(
       already excludes the root) -- never *pgid* itself / the calling
       process.  A ``killpg(pgid, ...)`` here would signal the watchdog's own
       process before it could finish the SIGTERM -> grace -> SIGKILL
-      escalation or reach a controlled exit, so *killpg* is accepted for
-      signature symmetry with :func:`cancel_request` but is intentionally
-      never called.
+      escalation or reach a controlled exit, so unlike
+      :func:`cancel_request` there is no ``killpg`` backstop -- not even as
+      a fallback when the descendant walk fails.
     * It ends by unconditionally calling ``exit_fn(exit_code)`` -- a
       controlled non-zero self-exit -- rather than returning, so the
       abandoned verify-merge leader always terminates (freeing its flock and
-      letting sshd reap it) even if some descendant could not be killed.
+      letting sshd reap it) even if some descendant could not be killed, and
+      even if the kill phase itself failed.
 
     *trigger* names the :func:`run_stdin_watchdog` branch that judged the
     channel dead.  It is REPORTED, never acted on -- the kill sequence is
@@ -1213,37 +1204,61 @@ def fire_watchdog_kill(
     no structured return path left, and on a remote verify this stderr is the
     only thing the dispatcher still sees.
 
-    Sequence: snapshot the ``/proc`` PPID map, ``SIGTERM`` every descendant
-    (``ProcessLookupError``/``PermissionError`` suppressed -- already dead or
-    a permission race is fine, this is a best-effort escalation), sleep
-    *grace_secs*, re-snapshot + ``SIGKILL`` every surviving descendant
-    (same suppression), report the trigger on stderr, then
-    ``exit_fn(exit_code)`` as the final action.
+    Sequence: the kill phase (:func:`_signal_descendants`), then report the
+    trigger on stderr, then ``exit_fn(exit_code)`` as the final action.  A
+    failure anywhere in the kill phase (e.g. a raising ``/proc`` snapshot)
+    has its traceback written to stderr and still ends in the trigger line
+    and ``exit_fn``.
     """
-    ppid_map = ppid_map_provider()
-    descendants = collect_descendants(pgid, ppid_map)
-    for pid in descendants:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            kill(pid, signal.SIGTERM)
-
-    sleep(grace_secs)
-
-    ppid_map = ppid_map_provider()
-    survivors = collect_descendants(pgid, ppid_map)
-    for pid in survivors:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            kill(pid, signal.SIGKILL)
+    stream = stderr if stderr is not None else sys.stderr
+    try:
+        _signal_descendants(
+            pgid,
+            grace_secs=grace_secs,
+            ppid_map_provider=ppid_map_provider,
+            kill=kill,
+            sleep=sleep,
+        )
+    except Exception:
+        # Report here: os._exit would discard a propagating exception
+        # unprinted, and the thread excepthook would never run.
+        with contextlib.suppress(Exception):
+            traceback.print_exc(file=stream)
 
     # Flush explicitly: exit_fn is os._exit, which skips stdio flushing, so a
     # buffered line would be dropped.  Suppress everything: a failed
     # diagnostic (broken pipe on a dead ssh channel) must never prevent the
     # self-exit that frees the flock and lets sshd reap the leader.
-    stream = stderr if stderr is not None else sys.stderr
     with contextlib.suppress(Exception):
         stream.write(f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={trigger.value}\n')
         stream.flush()
 
     exit_fn(exit_code)
+
+
+def _signal_descendants(
+    pgid: int,
+    *,
+    grace_secs: float,
+    ppid_map_provider: Callable[[], dict[int, int]],
+    kill: Callable[[int, int], None],
+    sleep: Callable[[float], None],
+) -> None:
+    """SIGTERM every descendant of *pgid*, sleep *grace_secs*, SIGKILL the survivors.
+
+    Each pass takes a fresh ``/proc`` PPID snapshot.  ``ProcessLookupError``
+    and ``PermissionError`` are suppressed per signal: an already-dead target
+    or a permission race is fine, since this is a best-effort escalation.
+    """
+    for pid in collect_descendants(pgid, ppid_map_provider()):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGTERM)
+
+    sleep(grace_secs)
+
+    for pid in collect_descendants(pgid, ppid_map_provider()):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGKILL)
 
 
 def start_stdin_watchdog(
