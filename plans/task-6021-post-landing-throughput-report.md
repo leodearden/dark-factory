@@ -207,7 +207,7 @@ Measured corrections to the plan's expectations:
 - **The queue did not "hold work in every gap".** The plan's expectation is that
   `merge_heartbeat` depth stayed at 1 or more throughout. Gaps 3 and 4 contain 33.4- and
   30.4-minute heartbeat silences, which means depth 0, an empty pipeline.
-- **In gaps 1, 2, 5 and 6 the depth was non-zero but the lane was idle.** For 49-57 minutes,
+- **In gaps 1, 2, 5 and 6 the depth was non-zero but the lane was idle.** For 39-57 minutes,
   `verify_in_progress` was null and `occupancy.inflight_total` was 0. The head-of-line entry
   was 4792, state `queued`, age about 110 h (gaps 1 and 2), or 5590, state `queued`, age 2-6 h
   (gaps 5 and 6). 5590 had already landed at 14:10:50 through a second request. Every
