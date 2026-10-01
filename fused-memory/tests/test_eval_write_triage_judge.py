@@ -2221,6 +2221,35 @@ def _aliased_row(candidates, attach_target_id) -> dict:
     )
 
 
+class TestAJudgeAnswerNamesOnlyAnAttach:
+    """`JudgeAnswer.candidate_id` obeys the rule production's judge contract enforces."""
+
+    def test_an_attach_verdict_carries_the_candidate_it_named(self) -> None:
+        answer = _mod().JudgeAnswer(
+            outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED, candidate_id='x',
+        )
+        assert answer.candidate_id == 'x'
+
+    def test_by_default_nothing_is_named(self) -> None:
+        answer = _mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED)
+        assert answer.candidate_id is None
+
+    def test_a_stored_verdict_naming_a_candidate_is_refused(self) -> None:
+        """Production refuses it too: `stored` attaches to nothing."""
+        with pytest.raises(ValueError):
+            _mod().JudgeAnswer(
+                outcome=OUTCOME_STORED, verdict=OUTCOME_STORED, candidate_id='x',
+            )
+
+    def test_a_band_that_decided_itself_names_nothing(self) -> None:
+        """No judge was asked, so no candidate was named."""
+        with pytest.raises(ValueError):
+            _mod().JudgeAnswer(outcome=OUTCOME_RESTATED, verdict=None, candidate_id='x')
+
+    def test_a_bare_word_names_no_candidate(self) -> None:
+        assert _mod()._as_answer(OUTCOME_RESTATED).candidate_id is None
+
+
 class TestTheCasesDump:
     """Per-case evidence, written as it is bought."""
 
