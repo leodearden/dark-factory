@@ -2205,7 +2205,7 @@ def _live(
 _ALIASES = {'old-canon': 'new-canon'}
 
 
-def _aliased_row(candidates, attach_target_id) -> dict:
+def _aliased_row(candidates, attach_target_id, answer=None) -> dict:
     """The dump row of a duplicate whose cluster canonical was rotated."""
     records = [
         _rec('old-canon', 'old-canon', 'canonical'),
@@ -2216,7 +2216,7 @@ def _aliased_row(candidates, attach_target_id) -> dict:
     plan = _mod().plan_from_slates(records, [slate], provenance={}, aliases=_ALIASES)
     return _mod().case_row(
         0, plan.cases[0],
-        _mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
+        answer or _mod().JudgeAnswer(outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED),
         plan.candidate_records[0], plan.fixture_by_id,
     )
 
@@ -2277,6 +2277,7 @@ class TestTheCasesDump:
         row = self._dump(tmp_path)[0]
         assert set(row) >= {
             'memory_id', 'cluster_id', 'expected_class', 'candidates',
+            'band_winner_id', 'verdict_candidate_id', 'judged_candidate_id',
             'attach_target_id', 'attach_target_is_canonical', 'verdict',
             'outcome', 'band', 'similarity', 'canonical_in_slate',
             'canonical_present', 'entry_elided', 'candidates_elided',
@@ -2383,6 +2384,9 @@ class TestTheCasesDump:
             'expected_class': 'duplicate',
             'acceptable_outcomes': sorted([OUTCOME_AMENDED, OUTCOME_RESTATED]),
             'candidates': ['c1-canon', 'zz'],
+            'band_winner_id': 'c1-canon',
+            'verdict_candidate_id': None,
+            'judged_candidate_id': None,
             'attach_target_id': 'c1-canon',
             'attach_target_cluster_id': 'c1-canon',
             'attach_target_category': 'procedural_knowledge',
@@ -2457,6 +2461,131 @@ class TestTheAttachTargetIsDescribedFromTheFixture:
         assert self._dup_a_target(
             shown, 'dup-b', records=limited, fixture=self.RECORDS,
         ) == self._dup_a_target(shown, 'dup-b')
+
+
+class TestTheAttachTargetIsTheJudgedCandidate:
+    """A judged attach lands on the candidate the verdict NAMED, hoisted.
+
+    `write_triage.py::_apply_judge_verdict` files a middle-band attach against
+    `_canonical_id_of(named record)`, and against the band winner only when
+    the verdict named nothing. The row's `attach_target_*` describe that
+    record, so `score_attachments` scores production's attach.
+    """
+
+    RECORDS = (
+        _rec('c1-canon', 'c1-canon', 'canonical'),
+        _rec('c1-dup-1', 'c1-canon', 'duplicate'),
+    )
+
+    @classmethod
+    def _row(cls, candidates, band_winner_id, answer) -> dict:
+        slate = _slate('c1-dup-1', candidates=candidates,
+                       attach_target_id=band_winner_id, band=OUTCOME_JUDGE)
+        plan = _mod().plan_from_slates(list(cls.RECORDS), [slate], provenance={})
+        return _mod().case_row(
+            1, plan.cases[0], answer, plan.candidate_records[0], plan.fixture_by_id,
+        )
+
+    @staticmethod
+    def _naming(candidate_id: str):
+        return _mod().JudgeAnswer(
+            outcome=OUTCOME_AMENDED, verdict=OUTCOME_AMENDED, candidate_id=candidate_id,
+        )
+
+    def test_the_judge_naming_the_canonical_overrules_the_band_winner(self) -> None:
+        row = self._row([_live('zz'), _live('c1-canon')], 'zz', self._naming('c1-canon'))
+        assert {key: row[key] for key in (
+            'band_winner_id', 'verdict_candidate_id', 'judged_candidate_id',
+            'attach_target_id', 'attach_target_is_canonical', 'attach_target_label',
+        )} == {
+            'band_winner_id': 'zz',
+            'verdict_candidate_id': 'c1-canon',
+            'judged_candidate_id': 'c1-canon',
+            'attach_target_id': 'c1-canon',
+            'attach_target_is_canonical': True,
+            'attach_target_label': 'canonical',
+        }
+
+    def test_a_named_sighting_child_is_hoisted_to_its_canonical(self) -> None:
+        row = self._row(
+            [_live('zz'), _live('child', canonical_id='c1-canon')], 'zz', self._naming('child'),
+        )
+        assert (row['verdict_candidate_id'], row['judged_candidate_id']) == ('child', 'c1-canon')
+        assert row['attach_target_is_canonical'] is True
+        assert row['attach_target_cluster_id'] == 'c1-canon'
+
+    def test_the_judge_can_move_a_correct_band_attach_off_the_canonical(self) -> None:
+        row = self._row([_live('c1-canon'), _live('zz')], 'c1-canon', self._naming('zz'))
+        assert row['attach_target_id'] == 'zz'
+        assert row['attach_target_is_canonical'] is False
+
+    def test_the_alias_rule_applies_to_the_judged_candidate(self) -> None:
+        row = _aliased_row(
+            [_live('zz'), _live('new-canon')], 'zz', self._naming('new-canon'),
+        )
+        assert row['attach_target_is_canonical'] is True
+
+    @pytest.mark.parametrize('answer', [
+        {'outcome': OUTCOME_AMENDED, 'verdict': OUTCOME_AMENDED},
+        {'outcome': OUTCOME_RESTATED},
+    ], ids=['a-verdict-naming-none', 'a-band-that-decided-itself'])
+    def test_naming_nothing_attaches_to_the_band_winner(self, answer: dict) -> None:
+        row = self._row(
+            [_live('zz'), _live('c1-canon')], 'zz', _mod().JudgeAnswer(**answer),
+        )
+        assert (row['verdict_candidate_id'], row['judged_candidate_id']) == (None, None)
+        assert row['attach_target_id'] == row['band_winner_id'] == 'zz'
+
+    def test_a_named_id_off_the_cases_own_slate_raises(self) -> None:
+        """Production fails such a write open to `stored`; it never attaches it."""
+        with pytest.raises(ValueError) as excinfo:
+            self._row([_live('zz'), _live('c1-canon')], 'zz', self._naming('ghost'))
+        message = str(excinfo.value)
+        assert 'c1-dup-1' in message and 'ghost' in message, message
+
+    def test_a_seeded_case_naming_a_distractor_attaches_off_the_canonical(self) -> None:
+        plan = _mod().seeded_plan(_corpus(), distractors=2)
+        index, case = next(
+            (i, c) for i, c in enumerate(plan.cases) if c['expected_class'] == 'duplicate'
+        )
+        distractor = case['candidates'][1]
+        row = _mod().case_row(
+            1, case, self._naming(distractor),
+            plan.candidate_records[index], plan.fixture_by_id,
+        )
+        assert row['judged_candidate_id'] == distractor
+        assert row['attach_target_is_canonical'] is False
+
+    def test_the_production_shape_scores_the_judged_attach(self, tmp_path: Path) -> None:
+        records = [
+            _rec('c1-canon', 'c1-canon', 'canonical'),
+            _rec('c1-dup-1', 'c1-canon', 'duplicate'),
+            _rec('c2-canon', 'c2-canon', 'canonical'),
+            _rec('c2-dup-1', 'c2-canon', 'duplicate'),
+        ]
+        slates = [
+            _slate('c1-dup-1', candidates=[_live('zz'), _live('c1-canon')],
+                   attach_target_id='zz', band=OUTCOME_JUDGE),
+            _slate('c2-dup-1', candidates=[_live('zz'), _live('c2-canon')],
+                   attach_target_id='zz', band=OUTCOME_JUDGE),
+        ]
+        named = {'c1-dup-1': 'c1-canon', 'c2-dup-1': 'zz'}
+        report = _mod().run_judge_eval(
+            plan=_mod().plan_from_slates(records, slates, provenance={}),
+            judge_fn=lambda case, candidates: self._naming(named[case['memory_id']]),
+            report_path=tmp_path / 'report.json', provenance={},
+            cases_path=tmp_path / 'cases.jsonl',
+        )
+        shape = report['production_shape']
+        assert shape['duplicate_attach']['strict'] == 1, 'the band winner would score 0'
+        assert [
+            (case['memory_id'], case['attach_target_id'])
+            for case in shape['wrong_record_attach']['cases']
+        ] == [('c2-dup-1', 'zz')]
+        rows = [
+            json.loads(line) for line in (tmp_path / 'cases.jsonl').read_text().splitlines()
+        ]
+        assert [row['judged_candidate_id'] for row in rows] == ['c1-canon', 'zz']
 
 
 class TestScoreAttachments:
@@ -2581,13 +2710,13 @@ class TestPlanFromSlates:
         plan = self._plan()
         assert [c['expected_class'] for c in plan.cases] == ['duplicate', 'distinct']
 
-    def test_the_band_and_attach_target_come_from_the_retrieval(self) -> None:
+    def test_the_band_and_its_winner_come_from_the_retrieval(self) -> None:
         plan = self._plan()
         judged, deterministic = plan.cases
         assert judged['band'] == OUTCOME_JUDGE
-        assert judged['attach_target_id'] == 'c1-canon'
+        assert judged['band_winner_id'] == 'c1-canon'
         assert deterministic['band'] == OUTCOME_RESTATED
-        assert deterministic['attach_target_id'] == 'zz'
+        assert deterministic['band_winner_id'] == 'zz'
 
     def test_a_record_whose_canonical_is_gone_stays_in_the_population(self) -> None:
         """They are production reality, so dropping them would flatter the run."""
