@@ -540,10 +540,10 @@ async def resolve_unstamped_live_ids(
     candidates = unstamped_candidates(gate_block, members=members)
     if len(candidates) > _UNSTAMPED_PROBE_LIMIT:
         logger.warning(
-            'consolidation closure probe budget exceeded: %d unstamped '
+            'consolidation closure probe budget exceeded: %d off-scroll '
             'candidates > cap %d; probing the first %d only, so this '
-            'derivation may UNDER-report strays for this gate. First '
-            'unprobed id: %s',
+            'derivation may UNDER-report live off-scroll ids (strays or '
+            'still-live claims) for this gate. First unprobed id: %s',
             len(candidates),
             _UNSTAMPED_PROBE_LIMIT,
             _UNSTAMPED_PROBE_LIMIT,
@@ -693,10 +693,8 @@ def evaluate_closure(
     # A non-canonical peer's stale supersedes is not what the gate asserted,
     # and reading it would refuse gates over other clusters' history.
     claim = _sole_canonical_claim(members)
-    off_scroll_live = {str(i).lower() for i in unstamped_live_ids if str(i)}
-    reasons.extend(
-        _classify_supersedes(claim, live_ids=live_ids | off_scroll_live, topic=topic)
-    )
+    known_live = live_ids | {str(i).lower() for i in unstamped_live_ids if str(i)}
+    reasons.extend(_classify_supersedes(claim, live_ids=known_live, topic=topic))
 
     # --- unstamped cluster members: the ONE thing provenance may add ------- #
     # A member the detector observed live but which never got stamped into the
@@ -725,11 +723,7 @@ def evaluate_closure(
         )
 
     # --- the audited escape, applied LAST ---------------------------------- #
-    reasons, waived = _apply_waivers(
-        block,
-        reasons,
-        live_universe=live_ids | {str(i).lower() for i in unstamped_live_ids},
-    )
+    reasons, waived = _apply_waivers(block, reasons, live_universe=known_live)
     return _verdict(topic, reasons, waived=waived)
 
 

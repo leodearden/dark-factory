@@ -507,12 +507,14 @@ class TestSeamUnstampedEdgePolicies:
             'status': 'pending',
             'metadata': _gate_metadata(),
         }
-        interceptor.set_consolidation_scroll(
-            _scroll(self._canonical_claiming(absorbed), live_ids=[absorbed])
-        )
+        scroll = _scroll(self._canonical_claiming(absorbed), live_ids=[absorbed])
+        interceptor.set_consolidation_scroll(scroll)
         result = await _set_done(interceptor)
         assert result['success'] is False
-        assert 'absorbed_member_still_live' in [r['code'] for r in result['reasons']]
+        assert [r['code'] for r in result['reasons']] == ['absorbed_member_still_live']
+        assert result['reasons'][0]['ids'] == [absorbed]
+        taskmaster.set_task_status.assert_not_called()
+        assert scroll.probes == [(absorbed, resolve_project_id(_PROJECT_ROOT))]
 
     @pytest.mark.asyncio
     async def test_hard_deleted_but_unclaimed_still_closes(
