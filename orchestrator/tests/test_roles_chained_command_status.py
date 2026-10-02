@@ -13,6 +13,7 @@ from _role_splice_contract import (
     assert_brace_free,
     assert_nonempty,
 )
+
 from orchestrator.agents.chained_command_guidance import CHAINED_COMMAND_STATUS_GUIDANCE
 
 
