@@ -1052,12 +1052,6 @@ class TaskCurator:
         self._initialized_collections.add(name)
         return name
 
-    @staticmethod
-    def _embedding_text(
-        title: str, description: str, files_to_modify: list[str],
-    ) -> str:
-        return embedding_text(title, description, files_to_modify)
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -2262,7 +2256,7 @@ class TaskCurator:
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
@@ -2378,7 +2372,7 @@ class TaskCurator:
 
         Args:
             query: Free-text query, embedded as-is (NOT passed through
-                ``_embedding_text``, which composes stored-task fields).
+                ``embedding_text``, which composes stored-task fields).
             project_id: Project identifier selecting the collection.
             limit: Max number of hits to return.
             score_threshold: Drop hits below this cosine score server-side.
@@ -2463,7 +2457,7 @@ class TaskCurator:
 
             description = str(task.get('description', '') or '')
             files = _task_files(task)
-            text = self._embedding_text(title, description, files)
+            text = embedding_text(title, description, files)
 
             try:
                 async with sem:
@@ -2721,7 +2715,7 @@ class TaskCurator:
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)

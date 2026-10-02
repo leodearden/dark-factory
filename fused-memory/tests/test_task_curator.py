@@ -35,6 +35,7 @@ from fused_memory.mcp_tools.scheduler_state import (
     effective_lock_depth,
 )
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.task_curator import (
     _CURATOR_PROMPT_HARNESS_VERSION,
     CURATOR_BATCH_OUTPUT_SCHEMA,
@@ -269,10 +270,6 @@ class TestEmbeddingText:
 
     def test_empty_description_contributes_nothing(self):
         assert embedding_text('T', '', ['a.py']) == 'T\n\na.py'
-
-    def test_delegate_is_byte_identical(self):
-        args = ('Title', 'Some description', ['x/y.py', 'z.py'])
-        assert TaskCurator._embedding_text(*args) == embedding_text(*args)
 
 
 class TestTrimPool:
@@ -1547,6 +1544,23 @@ class TestCuratorDecisionZotMarker:
         for decision in decisions:
             assert decision.justification == 'zero-output-breaker-open'
             assert decision.degraded_by_zot is True
+
+    @pytest.mark.asyncio
+    async def test_interactive_path_reraises_with_the_zot_marker(self, tmp_path):
+        curator = TaskCurator(
+            config=_make_config(), taskmaster=None, escalator=CuratorEscalator(),
+        )
+        candidate = CandidateTask(title='ZOT with no orchestrator')
+        with (
+            patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_zot_agent_result())),
+            pytest.raises(CuratorFailureError) as exc_info,
+        ):
+            await curator.curate(
+                candidate, project_id='p', project_root=str(tmp_path),
+                prepared=_prepared(candidate),
+            )
+        assert exc_info.value.zero_output_timeout is True
 
     @pytest.mark.asyncio
     async def test_successful_curate_is_not_marked(self):

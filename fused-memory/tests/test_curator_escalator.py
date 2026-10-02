@@ -22,7 +22,10 @@ import pytest
 from escalation.queue import EscalationQueue
 
 from fused_memory.middleware.curator_escalator import CuratorEscalator
-from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
+from fused_memory.middleware.curator_zot_duplicate_sweep import (
+    DUPLICATE_METADATA_KEY,
+    DuplicateFinding,
+)
 from fused_memory.middleware.task_curator import CuratorFailureError
 
 
@@ -644,18 +647,44 @@ class TestReportFailureReturnsZotEscalationId:
 
 
 
+class TestRaisedFailureKeepsZotMarker:
+    """Task 5491: the interactive-path raise still says whether it was a ZOT."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('gate', ['no-orchestrator', 'no-escalation-package'])
+    @pytest.mark.parametrize('zero_output_timeout', [True, False])
+    async def test_raise_carries_zero_output_timeout(
+        self, tmp_path, monkeypatch, gate, zero_output_timeout,
+    ):
+        if gate == 'no-escalation-package':
+            monkeypatch.setattr(
+                'fused_memory.middleware.curator_escalator.HAS_ESCALATION', False,
+            )
+        with pytest.raises(CuratorFailureError) as exc_info:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='hang', candidate_title='T',
+                zero_output_timeout=zero_output_timeout,
+            )
+        assert exc_info.value.zero_output_timeout is zero_output_timeout
+
+
 _FINDING = DuplicateFinding(
     task_id='7416', duplicate_task_id='7383', duplicate_title='Existing gate fix', score=0.6812,
 )
 
 
 def _duplicate_report(
-    root, finding: DuplicateFinding = _FINDING, zot_escalation_id: str | None = 'esc-curator-41',
+    root,
+    finding: DuplicateFinding = _FINDING,
+    zot_escalation_id: str | None = 'esc-curator-41',
+    *,
+    stamped: bool = True,
 ) -> dict[str, Any]:
     return dict(
         project_root=str(root), project_id='proj-dup',
         finding=finding, candidate_title='Re-filed gate fix',
-        zot_escalation_id=zot_escalation_id,
+        zot_escalation_id=zot_escalation_id, stamped=stamped,
     )
 
 
@@ -675,6 +704,22 @@ class TestReportZotDuplicate:
             detail = record['detail']
             for value in ('7416', '7383', '0.681', 'Re-filed gate fix', 'proj-dup', 'esc-curator-41'):
                 assert value in detail
+            assert f'The new task carries metadata.{DUPLICATE_METADATA_KEY}.' in detail
+            assert 'FAILED' not in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_unstamped_finding_never_claims_the_metadata(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_zot_duplicate(
+                **_duplicate_report(tmp_path, stamped=False),
+            )
+
+            detail = _only_escalation_detail(tmp_path)
+            assert 'The new task carries' not in detail
+            assert f'Stamping metadata.{DUPLICATE_METADATA_KEY} on the new task FAILED' in detail
         finally:
             handle.close()
 

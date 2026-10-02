@@ -43,15 +43,17 @@ import os
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from fused_memory.middleware.curator_zot_duplicate_sweep import (
+    DUPLICATE_METADATA_KEY,
+    DuplicateFinding,
+)
 from fused_memory.middleware.task_curator import CuratorFailureError
 
 if TYPE_CHECKING:
     from escalation.models import Escalation  # type: ignore[import-untyped]
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
-    from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
 
 # ``escalation`` is a sibling workspace package. The main reconciliation
 # harness also imports it defensively (harness.py:38-46) because historical
@@ -104,6 +106,41 @@ def _transcript_evidence_lines(
     turns = 'unknown (transcript unreadable)' if transcript_turns is None else str(transcript_turns)
     tools = 'unknown' if tools_used is None else (','.join(tools_used) or '(none)')
     return [f'transcript_turns={turns}', f'tools_used={tools}']
+
+
+def _curator_escalation(
+    queue: EscalationQueue, *, category: str, summary: str, detail: str, **extra: Any,
+) -> Escalation:
+    """Build a level-1 record in the fixed envelope every curator escalation shares."""
+    return Escalation(
+        id=queue.make_id('curator'),
+        task_id='task-curator',
+        agent_role='fused-memory/task-curator',
+        severity='blocking',
+        category=category,
+        summary=summary,
+        detail=detail,
+        level=1,
+        **extra,
+    )
+
+
+def _submit_logged(
+    queue: EscalationQueue, escalation: Escalation, *, kind: str, project_id: str,
+) -> bool:
+    """Submit ``escalation``; on queue I/O failure log it and return ``False``.
+
+    Never raises: the caller's task write must not fail because the queue broke.
+    """
+    try:
+        queue.submit(escalation)
+    except Exception:
+        logger.exception(
+            'curator_escalator: failed to submit %s escalation for project %s',
+            kind, project_id,
+        )
+        return False
+    return True
 
 
 class CuratorEscalator:
@@ -327,7 +364,9 @@ class CuratorEscalator:
         tools_used: tuple[str, ...] | None = None,
     ) -> str | None:
         """Route a curator failure. Raises :class:`CuratorFailureError` when no
-        orchestrator is running so the MCP caller sees a loud error.
+        orchestrator is running so the MCP caller sees a loud error; the raised
+        error keeps ``zero_output_timeout`` so a caller that degrades to create
+        can still mark the create as ZOT-degraded.
 
         Returns the live ZOT escalation id for a ``zero_output_timeout`` report
         (the pending record a human will find, i.e. the parent when the report
@@ -357,6 +396,7 @@ class CuratorEscalator:
                 f'TaskCurator LLM failed and escalation package is unavailable. '
                 f'No dedupe was applied for project {project_id!r}. '
                 f'justification={justification!r} candidate_title={candidate_title!r}',
+                zero_output_timeout=zero_output_timeout,
             )
 
         if not self._orchestrator_running(project_root):
@@ -364,6 +404,7 @@ class CuratorEscalator:
                 f'TaskCurator LLM failed and no orchestrator is running for '
                 f'project {project_id!r}. No dedupe was applied. '
                 f'justification={justification!r} candidate_title={candidate_title!r}',
+                zero_output_timeout=zero_output_timeout,
             )
 
         if schema_tool_denied:
@@ -460,28 +501,16 @@ class CuratorEscalator:
         detail = '\n'.join(detail_lines)
 
         queue = self._queue_for(project_root)
-        escalation = Escalation(
-            id=queue.make_id('curator'),
-            task_id='task-curator',
-            agent_role='fused-memory/task-curator',
-            severity='blocking',
+        escalation = _curator_escalation(
+            queue,
             category='curator_failure',
             summary=(
                 'TaskCurator LLM failing; dedupe bypassed for this ticket '
                 '(and for further filings while the outage persists).'
             ),
             detail=detail,
-            level=1,
         )
-        try:
-            queue.submit(escalation)
-        except Exception:
-            logger.exception(
-                'curator_escalator: failed to submit escalation for project %s',
-                project_id,
-            )
-            # Do not re-raise — falling through to action='create' is safer
-            # than failing the add_task just because queue I/O broke.
+        if not _submit_logged(queue, escalation, kind='curator-failure', project_id=project_id):
             return None
 
         logger.warning(
@@ -499,8 +528,12 @@ class CuratorEscalator:
         finding: DuplicateFinding,
         candidate_title: str,
         zot_escalation_id: str | None,
+        stamped: bool,
     ) -> None:
         """File one L1 record for a near-duplicate created under a ZOT degrade.
+
+        ``stamped`` says whether the finding landed on the new task's metadata;
+        the record must not point a human at metadata that was never written.
 
         Unlike ``report_failure`` this never raises on the no-orchestrator or
         no-escalation-package gates: it runs after the task already exists, so
@@ -516,7 +549,12 @@ class CuratorEscalator:
 
         zot_ref = (
             repr(zot_escalation_id) if zot_escalation_id is not None
-            else 'none filed (breaker-open short-circuit)'
+            else 'none known (breaker-open short-circuit, or the ZOT submit failed)'
+        )
+        stamp_note = (
+            f'The new task carries metadata.{DUPLICATE_METADATA_KEY}.' if stamped
+            else f'Stamping metadata.{DUPLICATE_METADATA_KEY} on the new task FAILED, '
+            'so this record is the only trace of the finding.'
         )
         detail_lines = [
             f'task_id={finding.task_id!r}',
@@ -529,17 +567,13 @@ class CuratorEscalator:
             '',
             'NOTE: curator dedupe was degraded to create by a zero-output hang. '
             'The post-ZOT duplicate sweep flagged this pair and did NOT combine, '
-            'cancel or delete anything. The new task carries '
-            'metadata.x_zot_duplicate_candidate. A human should decide whether '
-            'to cancel one of the two as SUPERSEDED.',
+            f'cancel or delete anything. {stamp_note} A human should decide '
+            'whether to cancel one of the two as SUPERSEDED.',
         ]
 
         queue = self._queue_for(project_root)
-        escalation = Escalation(
-            id=queue.make_id('curator'),
-            task_id='task-curator',
-            agent_role='fused-memory/task-curator',
-            severity='blocking',
+        escalation = _curator_escalation(
+            queue,
             category=_ZOT_DUPLICATE_CATEGORY,
             summary=(
                 f'possible duplicate created while curator dedupe was degraded by a '
@@ -547,16 +581,8 @@ class CuratorEscalator:
                 f'{finding.duplicate_task_id} (score {finding.score:.3f})'
             ),
             detail='\n'.join(detail_lines),
-            level=1,
         )
-        try:
-            queue.submit(escalation)
-        except Exception:
-            logger.exception(
-                'curator_escalator: failed to submit post-ZOT duplicate escalation '
-                'for project %s',
-                project_id,
-            )
+        if not _submit_logged(queue, escalation, kind='post-ZOT duplicate', project_id=project_id):
             return
 
         logger.warning(
@@ -609,11 +635,8 @@ class CuratorEscalator:
         detail = '\n'.join(detail_lines)
 
         queue = self._queue_for(project_root)
-        escalation = Escalation(
-            id=queue.make_id('curator'),
-            task_id='task-curator',
-            agent_role='fused-memory/task-curator',
-            severity='blocking',
+        escalation = _curator_escalation(
+            queue,
             category='curator_schema_tool_denied',
             summary=(
                 'CRITICAL: schema StructuredOutput tool DENIED — CLI '
@@ -622,19 +645,10 @@ class CuratorEscalator:
                 'until it is fixed.'
             ),
             detail=detail,
-            level=1,
         )
-        try:
-            queue.submit(escalation)
-        except Exception:
-            logger.exception(
-                'curator_escalator: failed to submit schema-tool-denied '
-                'escalation for project %s',
-                project_id,
-            )
-            # Do not re-raise — falling through to action='create' is safer than
-            # failing add_task just because queue I/O broke. The loud escalation
-            # is best-effort; the degrade-to-create still keeps the system limping.
+        if not _submit_logged(
+            queue, escalation, kind='schema-tool-denied', project_id=project_id,
+        ):
             return
 
         logger.error(
@@ -724,11 +738,8 @@ class CuratorEscalator:
         detail = '\n'.join(detail_lines)
 
         queue = self._queue_for(project_root)
-        escalation = Escalation(
-            id=queue.make_id('curator'),
-            task_id='task-curator',
-            agent_role='fused-memory/task-curator',
-            severity='blocking',
+        escalation = _curator_escalation(
+            queue,
             category=_ZOT_CATEGORY,
             summary=(
                 'curator zero-output/full-timeout hang (accepted recurring class, '
@@ -736,7 +747,6 @@ class CuratorEscalator:
                 'here and dedupe_count counts them.'
             ),
             detail=detail,
-            level=1,
             root_cause=_ZOT_ROOT_CAUSE,
             dedupe_fingerprint=compute_content_fingerprint(  # type: ignore[possibly-unbound]
                 _ZOT_CATEGORY, _ZOT_ROOT_CAUSE, affected_ids=[f'project:{project_id}'],

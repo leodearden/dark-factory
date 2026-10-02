@@ -47,6 +47,7 @@ from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
 from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import recon_write_policy
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
+    CorpusSearcher,
     build_duplicate_metadata,
     sweep_zot_duplicate,
 )
@@ -372,6 +373,15 @@ def _format_ticket_result(row: dict) -> dict:
     if row.get('reason') is not None:
         result['reason'] = row['reason']
     return result
+
+
+def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
+    """Degrade a curator failure that escaped ``curate()`` to create.
+
+    Keeps the ZOT marker, so the no-orchestrator path still gets swept and
+    stamped even though no escalation could be filed for it.
+    """
+    return CuratorDecision(action='create', degraded_by_zot=exc.zero_output_timeout)
 
 
 class TaskInterceptor:
@@ -4424,17 +4434,24 @@ class TaskInterceptor:
                     result_dict.setdefault('post_create_warnings', []).append(
                         {'stage': 'record_task', 'error': str(exc)}
                     )
-                if decision is not None and decision.degraded_by_zot:
-                    await self._flag_zot_duplicate(
-                        tm=tm,
-                        project_root=project_root,
-                        project_id=project_id,
-                        task_id=task_id_str,
-                        candidate=candidate,
-                        decision=decision,
-                        curator=curator,
-                        result_dict=result_dict,
-                    )
+
+        if (
+            decision is not None and decision.degraded_by_zot
+            and curator is not None and candidate is not None
+        ):
+            # After the write lock: the task is latched, and the sweep's embed,
+            # corpus query and escalation I/O must not stall every other write.
+            assert task_id is not None and result_dict is not None
+            await self._flag_zot_duplicate(
+                tm=tm,
+                project_root=project_root,
+                project_id=project_id,
+                task_id=task_id,
+                candidate=candidate,
+                decision=decision,
+                curator=curator,
+                result_dict=result_dict,
+            )
 
         return (status, task_id, reason, result_dict, curator_degrade_reason)
 
@@ -4447,13 +4464,14 @@ class TaskInterceptor:
         task_id: str,
         candidate: CandidateTask,
         decision: CuratorDecision,
-        curator: Any,  # TaskCurator
+        curator: CorpusSearcher,
         result_dict: dict,
     ) -> None:
         """Flag a near-duplicate of a create whose curator dedupe a ZOT hang skipped.
 
         Advisory and best-effort: the task already exists, so a failure here is
         a ``post_create_warnings`` entry and never changes the ticket status.
+        Runs outside the write lock; only the stamp itself takes it.
         """
         curator_cfg = self._config.curator if self._config is not None else CuratorConfig()
         if not curator_cfg.zot_duplicate_sweep_enabled:
@@ -4476,15 +4494,18 @@ class TaskInterceptor:
             finding.task_id, finding.duplicate_task_id, finding.score,
             decision.zot_escalation_id,
         )
+        stamped = False
         try:
-            await tm.update_task(
-                task_id=task_id,
-                metadata=json.dumps(build_duplicate_metadata(
-                    finding, zot_escalation_id=decision.zot_escalation_id,
-                )),
-                metadata_mode='merge',
-                project_root=project_root,
-            )
+            async with self._write_lock(project_id):
+                await tm.update_task(
+                    task_id=task_id,
+                    metadata=json.dumps(build_duplicate_metadata(
+                        finding, zot_escalation_id=decision.zot_escalation_id,
+                    )),
+                    metadata_mode='merge',
+                    project_root=project_root,
+                )
+            stamped = True
         except Exception as exc:
             logger.warning(
                 '_flag_zot_duplicate: stamping %s failed', task_id, exc_info=True,
@@ -4501,6 +4522,7 @@ class TaskInterceptor:
                 finding=finding,
                 candidate_title=candidate.title,
                 zot_escalation_id=decision.zot_escalation_id,
+                stamped=stamped,
             )
         except Exception as exc:
             logger.warning(
@@ -4677,7 +4699,7 @@ class TaskInterceptor:
                         # transient LLM failures.  Record the failure so the facade
                         # and callers can see it in result_json.
                         curator_degrade_reason = str(exc)
-                        decision = CuratorDecision(action='create')
+                        decision = _create_after_curator_failure(exc)
 
                 status, task_id, reason, result_dict, _ = await self._dispatch_ticket_decision(
                     ticket_id=ticket_id,
@@ -5005,7 +5027,7 @@ class TaskInterceptor:
                                 project_root,
                             )
                         except CuratorFailureError as e:
-                            rec.decision = CuratorDecision(action='create')
+                            rec.decision = _create_after_curator_failure(e)
                             rec.degrade_reason = str(e)
                     # Refer to exc to satisfy linters; main signal logged above.
                     _ = exc
@@ -5038,7 +5060,7 @@ class TaskInterceptor:
                             project_root,
                         )
                     except CuratorFailureError as exc:
-                        rec.decision = CuratorDecision(action='create')
+                        rec.decision = _create_after_curator_failure(exc)
                         rec.degrade_reason = str(exc)
 
             # ── Topologically-ordered dispatch ────────────────────────────────
