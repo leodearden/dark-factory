@@ -107,9 +107,10 @@ def check_live_workflow_citations(
 ) -> tuple[list[dict], int]:
     """Annotate every flag citing a signal *snapshot* did not render; return them and the count.
 
-    *snapshot* is the section this run's payload carried, and None (no section
-    rendered) leaves the guard inert.  The result has the input's length and
-    order; a flag with no contradiction is returned as the same object.
+    *snapshot* is the section this run's payload carried, empty when it carried
+    none, and None (no task tree to render it from) leaves the guard inert.  The
+    result has the input's length and order; a flag with no contradiction is
+    returned as the same object.
     """
     if snapshot is None:
         return list(flags), 0

@@ -5916,13 +5916,25 @@ class TestMemoryConsolidatorLiveWorkflowCitationGuard:
         assert _annotation_for(report, '5891') is not None
 
     @pytest.mark.asyncio
-    async def test_no_rendered_section_leaves_the_guard_inert(self, stage, monkeypatch):
+    async def test_an_unset_task_tree_leaves_the_guard_inert(self, stage, monkeypatch):
         _stub_live_workflow_probes(monkeypatch)
 
         report = await _run_assembling_payload(stage, [_citing_flag(_CITATION_INCIDENT)])
 
         assert report.stats[_CITATION_STAT] == 0
         assert _annotation_for(report, '5891') is None
+
+    @pytest.mark.asyncio
+    async def test_a_task_tree_with_no_active_task_arms_the_guard(self, stage, monkeypatch):
+        _stub_live_workflow_probes(monkeypatch)
+        stage.filtered_task_tree = FilteredTaskTree()
+
+        report = await _run_assembling_payload(stage, [_citing_flag(_CITATION_INCIDENT)])
+
+        assert report.stats[_CITATION_STAT] == 1, (
+            'an absent section tells Stage 1 no task is live, so citing one contradicts it'
+        )
+        assert _annotation_for(report, '5891') is not None
 
     @pytest.mark.asyncio
     async def test_a_run_never_compares_against_a_previous_runs_section(

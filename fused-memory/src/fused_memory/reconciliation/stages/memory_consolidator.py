@@ -1835,11 +1835,10 @@ Review the above data and perform memory consolidation:
     async def _build_live_workflow_section(self) -> str:
         """Return the Live-Workflow Signals prompt section, or empty string if inapplicable.
 
-        Mirrors Stage 2's guard/source exactly (task 1655): renders over
-        ``self.filtered_task_tree.active_tasks`` when ``self.filtered_task_tree``
-        is set and ``active_tasks`` is non-empty. A stage is only constructible
-        with a validated ``ProjectScope``, so ``self.project_root`` is always a
-        non-empty absolute path and is not part of this guard (task 2150).
+        Renders over Stage 2's source, ``self.filtered_task_tree.active_tasks``
+        (task 1655). A stage is only constructible with a validated
+        ``ProjectScope``, so ``self.project_root`` is always a non-empty
+        absolute path and is not part of this guard (task 2150).
         Reuses Stage 2's snapshot builder,
         ``reconciliation/live_workflow_section.py::build_live_workflow_snapshot``,
         so both stages emit byte-identical section formatting for the same
@@ -1848,12 +1847,14 @@ Review the above data and perform memory consolidation:
         automatically with no code change — including the blocked-normal
         bare-orchestrator-signal suppression added in task 2409.
 
-        Returns '' when the guard fails or no active task is listed — keeps the
-        payload tight, matching _build_task_tree_section's pattern.  The snapshot
-        is retained for :meth:`run`'s citation guard, and stays None when the
-        guard here fails.
+        Returns '' when no task tree is set or no active task is listed — keeps
+        the payload tight, matching _build_task_tree_section's pattern.  The
+        snapshot is retained for :meth:`run`'s citation guard.  A tree with no
+        active task yields a real, empty snapshot, because an absent section
+        tells this stage that no task is live; only an unset tree leaves it
+        None, and the guard inert.
         """
-        if not (self.filtered_task_tree and self.filtered_task_tree.active_tasks):
+        if self.filtered_task_tree is None:
             return ''
         self._live_workflow_snapshot = await build_live_workflow_snapshot(
             self.filtered_task_tree.active_tasks,
