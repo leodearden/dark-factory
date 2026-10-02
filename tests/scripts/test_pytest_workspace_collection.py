@@ -26,8 +26,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).parents[2]
 
-# The four subprojects whose conftests must insert their tests dir.
-_SUBPROJECTS_WITH_CONFTEST = ['dashboard', 'fused-memory', 'orchestrator', 'shared']
+# The subprojects whose conftests must insert their tests dir.
+# `escalation` joined in task 4345: `escalation/tests/_escalation_http.py` is now
+# imported BY NAME from two test modules, so the insert is load-bearing rather than
+# latent — without it a repo-root multi-package run raises ModuleNotFoundError at
+# collection time (another subproject's tests dir wins sys.path[0]).
+_SUBPROJECTS_WITH_CONFTEST = ['dashboard', 'escalation', 'fused-memory', 'orchestrator', 'shared']
 
 # Regex matching either supported sys.path.insert pattern for the tests dir:
 #   fused-memory idiom : sys.path.insert(0, _tests_dir)

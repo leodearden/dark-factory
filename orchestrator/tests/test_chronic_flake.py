@@ -21,13 +21,14 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from importlib import resources as pkg_resources
 from unittest.mock import MagicMock
 
 import pytest
 import yaml
-from _orch_helpers import pydantic_spec
+from _orch_helpers import mcp_tool_envelope, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
 
@@ -781,12 +782,15 @@ class _StubScheduler:
     the real ``Scheduler``, mirroring the module's cross-project scope
     boundary)."""
 
-    def __init__(self, return_value):
+    def __init__(self, return_value, raises: BaseException | None = None):
         self.return_value = return_value
+        self.raises = raises
         self.calls: list[tuple[str, dict, float | None]] = []
 
     async def dispatch_tool(self, name, arguments, *, timeout=15):
         self.calls.append((name, arguments, timeout))
+        if self.raises is not None:
+            raise self.raises
         return self.return_value
 
 
@@ -808,7 +812,13 @@ class TestSchedulerChronicFlakeTaskClient:
         result = await client.submit_task({'title': 't'})
         assert result == 'fix-7'
         assert scheduler.calls[0][0] == 'submit_task'
-        assert scheduler.calls[0][1] == {'title': 't'}
+        # `project_root` is injected when the block omits it (task ζ) — additive, so
+        # the caller's own keys still reach the wire verbatim.  This bare block is not
+        # a shape chronic_flake itself ever sends: `build_chronic_flake_fix_task_arguments`
+        # always sets the key, and `TestSchedulerClientServesTheFlakeLedgerSeam::
+        # test_chronic_flakes_own_block_reaches_the_wire_unchanged` is the byte-identity
+        # guard for that real path.
+        assert scheduler.calls[0][1] == {'title': 't', 'project_root': '/proj'}
 
     @pytest.mark.asyncio
     async def test_submit_task_uses_timeout_30(self):
@@ -837,6 +847,41 @@ class TestSchedulerChronicFlakeTaskClient:
         scheduler, client = await self._client(envelope)
         result = await client.submit_task({'title': 't'})
         assert result == 'tkt_xyz'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('payload', 'expected'),
+        [
+            ({'task_id': '4242', 'status': 'deferred'}, '4242'),
+            ({'ticket': 'tkt_abc123'}, 'tkt_abc123'),
+        ],
+        ids=['planning_mode_task_id', 'two_phase_ticket'],
+    )
+    async def test_submit_task_extracts_from_the_production_jsonrpc_body(
+        self, payload, expected,
+    ):
+        """THE SHAPE PRODUCTION ACTUALLY SENDS — the sibling shape tests above all
+        drive ALREADY-UNWRAPPED spellings, and every one of them passed while this
+        one returned ``''``.
+
+        ``dispatch_tool`` returns ``McpSession._raw_call``'s JSON-RPC body verbatim,
+        so the payload sits TWO layers down (``result`` -> ``structuredContent`` /
+        ``content[].text``), not one.  An empty id here is not cosmetic for the
+        ledger seam: ``flake_ledger::_ensure_owner_task`` treats a falsy id as a
+        FAILED filing and leaves ``owner_task_id`` NULL — while the server really did
+        create the task — so the next suppression of the same test files another, with
+        no rate limit on that path.  Unbounded orphan tasks, and §5.9 never satisfiable
+        in production.
+        """
+        _, client = await self._client(mcp_tool_envelope(payload))
+        assert await client.submit_task({'title': 't'}) == expected
+
+    @pytest.mark.asyncio
+    async def test_search_tasks_extracts_from_the_production_jsonrpc_body(self):
+        """The third parser over the same seam, against the same real body."""
+        rows = [{'title': 'De-flake test_a.sh', 'status': 'pending'}]
+        _, client = await self._client(mcp_tool_envelope({'results': rows}))
+        assert await client.search_tasks('test_a.sh') == rows
 
     @pytest.mark.asyncio
     async def test_submit_task_unrecognised_shape_returns_empty_string(self):
@@ -882,6 +927,358 @@ class TestSchedulerChronicFlakeTaskClient:
         assert result == []
 
 
+class TestSchedulerClientServesTheFlakeLedgerSeam:
+    """The SAME adapter also satisfies ``flake_ledger.FlakeLedgerTaskClient`` (task ζ).
+
+    Deliberately grown in place rather than replaced by a second client: two adapters
+    over one ``dispatch_tool`` seam is exactly the drift this facility exists to avoid,
+    and the ledger consumes it STRUCTURALLY (a locally-declared Protocol), so no import
+    edge is created between the two modules.
+    """
+
+    async def _client(self, return_value, raises=None):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        scheduler = _StubScheduler(return_value, raises)
+        return scheduler, SchedulerChronicFlakeTaskClient(scheduler, '/proj')
+
+    # ── get_statuses ──────────────────────────────────────────────────────────
+    #
+    # The return shape is the ``(statuses, error)`` PAIR that
+    # ``scheduler.py::SchedulerFacade.get_statuses`` already uses for exactly this
+    # reason: ``({id: status}, None)`` on success, ``({}, exception)`` on any failure.
+    # Before the pair, a FAILED read and a CORROBORATED ABSENCE both arrived at the
+    # ledger as ``{}`` — byte-identical — and the ledger acted on the second reading,
+    # filing a duplicate de-flake task per suppression through a transient MCP outage.
+    # The three-way distinction below (known / corroborated-absent / unreadable) is the
+    # whole point of the shape, so each case is pinned separately.
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_dispatches_project_root_and_ids(self):
+        scheduler, client = await self._client({'statuses': {'42': 'pending', '43': 'done'}})
+        statuses, error = await client.get_statuses(['42', '43'])
+        assert scheduler.calls[0][0] == 'get_statuses'
+        assert scheduler.calls[0][1] == {'project_root': '/proj', 'ids': ['42', '43']}
+        assert statuses == {'42': 'pending', '43': 'done'}
+        assert error is None
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_coerces_ids_to_str(self):
+        """The ledger stores ``owner_task_id`` as TEXT but a caller may hold ints; the
+        wire argument must be strings or the tool silently matches nothing."""
+        scheduler, client = await self._client({'statuses': {}})
+        # DELIBERATE type violation: the point of the test is that a caller
+        # holding ints is coerced at the wire, not rejected.
+        await client.get_statuses([42, 43])  # type: ignore[arg-type]
+        assert scheduler.calls[0][1]['ids'] == ['42', '43']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope({'statuses': {'42': 'pending'}}),
+            {'statuses': {'42': 'pending'}},
+            {'structuredContent': {'statuses': {'42': 'pending'}}},
+            {'result': {'statuses': {'42': 'pending'}}},
+            {'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}]},
+        ],
+        ids=[
+            'production_jsonrpc_body',
+            'direct',
+            'structured_content',
+            'result',
+            'content_text_block',
+        ],
+    )
+    async def test_get_statuses_handles_every_envelope_shape(self, envelope):
+        """(a) SUCCESS, ids known.  Every shape ``_unwrap_dispatch_envelope``
+        normalises for id-extraction and search results — one envelope policy, three
+        parsers — reports ``error is None``.
+
+        THE FIRST CASE IS THE ONLY ONE PRODUCTION EVER SENDS, and it is listed first
+        for that reason.  The other four are already-unwrapped spellings this seam
+        tolerates because fakes and the eval-mode ``_StubMcpSession`` produce them;
+        ``{'result': {'statuses': …}}`` in particular is a shape the transport never
+        emits — the real inner ``result`` carries ``content``/``structuredContent``/
+        ``isError``, never the payload keys directly.  A suite made only of those
+        four is what let the one-level unwrapper ship: it passed every one of them
+        and failed the sole shape that matters."""
+        _, client = await self._client(envelope)
+        assert await client.get_statuses(['42']) == ({'42': 'pending'}, None)
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_well_formed_empty_mapping_is_a_corroborated_absence(self):
+        """(b) SUCCESS, ids UNKNOWN.  ``get_statuses`` silently OMITS ids it does not
+        know, so a well-formed ``{'statuses': {}}`` is REAL EVIDENCE that the task is
+        gone — the one case where an empty mapping means something — and it must arrive
+        with ``error is None`` so the ledger still files a replacement."""
+        _, client = await self._client({'statuses': {}})
+        assert await client.get_statuses(['42']) == ({}, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [{'unexpected': 'shape'}, {'statuses': ['not', 'a', 'dict']}, None, ['not', 'a', 'dict']],
+        ids=['unrecognised', 'non_dict_statuses', 'none', 'list'],
+    )
+    async def test_get_statuses_unparseable_envelope_reports_an_error(self, envelope):
+        """(c) FAILURE, envelope half.  An envelope this parser does not recognise is
+        NOT a corroborated absence — nothing was read — so it must be reported in band
+        rather than degrade to the same ``{}`` case (b) produces.  Still never raises."""
+        _, client = await self._client(envelope)
+        statuses, error = await client.get_statuses(['42'])
+        assert statuses == {}
+        assert isinstance(error, Exception)
+
+    @pytest.mark.asyncio
+    async def test_get_statuses_reports_the_raised_object_when_dispatch_raises(self):
+        """(c) FAILURE, raise half.  Never raises — the adapter's siblings
+        ``submit_task``/``commit_planning`` do not either, and consistency there is
+        deliberate — but the CAUGHT OBJECT is handed back so the ledger can log the real
+        cause with ``exc_info`` instead of a synthesised stand-in."""
+        raised = RuntimeError('mcp down')
+        _, client = await self._client(None, raises=raised)
+        statuses, error = await client.get_statuses(['42'])
+        assert statuses == {}
+        assert error is raised
+    # ── commit_planning ───────────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_commit_planning_dispatches_comma_joined_ids(self):
+        """``commit_planning``'s ``task_ids`` is a COMMA-SEPARATED STRING, not a list
+        (fused-memory server/tools.py::commit_planning) — a list would be rejected."""
+        scheduler, client = await self._client({'success': True})
+        await client.commit_planning(['42', '43'])
+        assert scheduler.calls[0][0] == 'commit_planning'
+        assert scheduler.calls[0][1] == {
+            'project_root': '/proj',
+            'task_ids': '42,43',
+            'target_status': 'pending',
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [{'error': 'no such task'}, {'success': False}, None],
+        ids=['error', 'not_successful', 'non_dict'],
+    )
+    async def test_commit_planning_does_not_raise_on_a_failure_envelope(self, envelope, caplog):
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.commit_planning(['42']) is None
+        assert [r for r in caplog.records if r.name == 'orchestrator.chronic_flake']
+
+    @pytest.mark.asyncio
+    async def test_commit_planning_does_not_raise_when_dispatch_raises(self):
+        _, client = await self._client(None, raises=RuntimeError('mcp down'))
+        assert await client.commit_planning(['42']) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [mcp_tool_envelope({'success': True}), {'success': True}],
+        ids=['production_jsonrpc_body', 'legacy_bare_payload'],
+    )
+    async def test_commit_planning_is_SILENT_on_success(self, envelope, caplog):
+        """THE NEGATIVE CONTROL, and the only assertion that can catch a warning which
+        fires unconditionally.
+
+        The failure-envelope test above asserts a warning is PRESENT; nothing asserted it
+        is ABSENT on success, so an implementation that warned every time passed the whole
+        suite.  That was not hypothetical: this confirmation reads ``envelope.get(
+        'success')`` off the SHARED unwrapper, and while that unwrapper took one step it
+        landed on the inner MCP result — whose keys are ``content``/``structuredContent``/
+        ``isError`` — so ``get('success')`` was ``None`` and the "did not confirm success
+        … they may still be deferred" WARNING fired on every SUCCESSFUL commit_planning.
+        A permanent false alarm on a line an operator is meant to act on.
+
+        Parametrized over the real JSON-RPC body FIRST, because that is the shape that was
+        broken; the bare payload is the already-unwrapped spelling the fakes produce.
+        """
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.commit_planning(['42']) is None
+        assert [r for r in caplog.records if r.name == 'orchestrator.chronic_flake'] == [], (
+            'a SUCCESSFUL commit_planning must log nothing: '
+            f'{[r.getMessage() for r in caplog.records]}'
+        )
+
+    # ── submit_task's project_root injection ──────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_submit_task_injects_project_root_when_omitted(self):
+        """``flake_ledger.build_deflake_task_arguments`` omits the key on purpose:
+        ``open_debt`` holds a ``db_path``, not a project root, and deriving one from it
+        would be a silent, position-dependent inversion of ``ledger_db_path``.  The
+        adapter already HOLDS the root, so the injection lives where the fact does."""
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        await client.submit_task({'title': 't'})
+        assert scheduler.calls[0][1]['project_root'] == '/proj'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_does_not_clobber_an_explicit_project_root(self):
+        """``setdefault``, not assignment — which is what keeps chronic_flake's OWN
+        path (``build_chronic_flake_fix_task_arguments`` always sets the key) byte-
+        identical to before this change."""
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        await client.submit_task({'title': 't', 'project_root': '/elsewhere'})
+        assert scheduler.calls[0][1]['project_root'] == '/elsewhere'
+
+    @pytest.mark.asyncio
+    async def test_submit_task_does_not_mutate_the_callers_dict(self):
+        """The caller's argument block is COPIED before injection.  ``open_debt``
+        compares the emitted block against ``build_deflake_task_arguments``' output, and
+        a shared dict mutated here would make that comparison depend on call order."""
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        arguments = {'title': 't'}
+        await client.submit_task(arguments)
+        assert arguments == {'title': 't'}
+
+    @pytest.mark.asyncio
+    async def test_chronic_flakes_own_block_reaches_the_wire_unchanged(self):
+        """Regression guard on the shared path: chronic_flake's own builder sets
+        ``project_root`` explicitly, so the injection must be a no-op for it."""
+        from orchestrator.chronic_flake import (
+            ChronicFlakeEvidence,
+            build_chronic_flake_fix_task_arguments,
+        )
+
+        expected = build_chronic_flake_fix_task_arguments(
+            ChronicFlakeEvidence(
+                test='test_a.sh', count=3, window=20, dates=[], roles=[], entries=[]
+            ),
+            '/proj',
+        )
+        scheduler, client = await self._client({'task_id': 'fix-7'})
+        await client.submit_task(dict(expected))
+        assert scheduler.calls[0][1] == expected
+
+
+_DONE_TASK = {
+    'id': '7',
+    'status': 'done',
+    'metadata': {'done_provenance': {'kind': 'merged', 'commit': 'c0ffee' + '0' * 34}},
+}
+
+_NOT_FOUND = {'error': 'No tasks found for ID(s): 7', 'error_type': 'TaskNotFoundError'}
+
+
+class TestSchedulerClientReadsOneTaskLive:
+    """``get_task``: the live single-task read ``flake_ledger.resolve_debt`` stamps a
+    resolution from (task η).
+
+    The ``(task, error)`` pair carries THREE readings, and the ledger acts on each
+    differently, so each is pinned on its own:
+
+    - ``(task, None)``: a task was read, and only this may close a debt cycle;
+    - ``(None, None)``: a CORROBORATED ABSENCE, the server's structured
+      ``TaskNotFoundError``;
+    - ``(None, exc)``: nothing was read.
+
+    Same construct-don't-raise convention as ``get_statuses``, for the same reason: a
+    failure swallowed into ``None`` would be byte-identical to an absence.
+    """
+
+    async def _client(self, return_value, raises=None):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        scheduler = _StubScheduler(return_value, raises)
+        return scheduler, SchedulerChronicFlakeTaskClient(scheduler, '/proj')
+
+    @pytest.mark.asyncio
+    async def test_dispatches_the_id_and_project_root(self):
+        scheduler, client = await self._client(mcp_tool_envelope(_DONE_TASK))
+        await client.get_task('7')
+        assert [call[:2] for call in scheduler.calls] == [
+            ('get_task', {'id': '7', 'project_root': '/proj'}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_int_id_is_coerced_to_str(self):
+        """The ledger's ``owner_task_id`` column is TEXT, but a caller may hold an
+        int — the same wire coercion ``get_statuses`` applies."""
+        scheduler, client = await self._client(mcp_tool_envelope(_DONE_TASK))
+        # DELIBERATE type violation: the point is coercion at the wire.
+        await client.get_task(7)  # type: ignore[arg-type]
+        assert scheduler.calls[0][1]['id'] == '7'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope(_DONE_TASK),
+            _DONE_TASK,
+            {'data': _DONE_TASK},
+            mcp_tool_envelope({'data': _DONE_TASK}),
+        ],
+        ids=['production_jsonrpc_body', 'bare_task', 'data_wrapper', 'production_data_wrapper'],
+    )
+    async def test_a_read_task_is_returned_with_no_error(self, envelope):
+        """(task, None) across every shape the sibling parsers tolerate, the production
+        JSON-RPC body FIRST because it is the only one the transport emits.  The
+        ``data`` wrapper is the layer ``scheduler.py::Scheduler.get_task`` unwraps."""
+        _, client = await self._client(envelope)
+        assert await client.get_task('7') == (_DONE_TASK, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope(_NOT_FOUND),
+            _NOT_FOUND,
+            {'error': 'any wording at all', 'error_type': 'TaskNotFoundError'},
+        ],
+        ids=['production_jsonrpc_body', 'bare', 'reworded_message'],
+    )
+    async def test_task_not_found_is_a_corroborated_absence(self, envelope):
+        """(None, None).  The server raised its DEFINITIVE zero-row ``TaskNotFoundError``
+        (fused-memory ``backends/task_backend_errors.py::TaskNotFoundError``), which
+        ``mcp_tool_errors`` hands back as a structured ``error_type``.  The discriminator
+        is that type, never the message: a reworded message is still an absence."""
+        _, client = await self._client(envelope)
+        assert await client.get_task('7') == (None, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope({'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}),
+            {'error': 'No tasks found for ID(s): 7', 'error_type': 'TaskmasterError'},
+            {'error': 'No tasks found for ID(s): 7'},
+            {'id': '7', 'title': 'a task shape with no status'},
+            {'data': 'not a dict'},
+            {'unexpected': 'shape'},
+            None,
+            ['not', 'a', 'dict'],
+        ],
+        ids=[
+            'other_error_type',
+            'not_found_wording_without_the_type',
+            'untyped_error',
+            'no_status',
+            'non_dict_data',
+            'unrecognised',
+            'none',
+            'list',
+        ],
+    )
+    async def test_anything_else_is_a_failed_read(self, envelope):
+        """(None, exc).  An error that is not the structured absence, or an answer with
+        no task in it, is not evidence of anything — least of all that a de-flake task
+        finished.  The not-found WORDING under another error type stays a failure, which
+        is what "never on the message text" means."""
+        _, client = await self._client(envelope)
+        task, error = await client.get_task('7')
+        assert task is None
+        assert isinstance(error, Exception)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_dispatch_is_reported_not_raised(self):
+        """The CAUGHT object comes back in the error half, so the ledger's warning can
+        carry the real cause via ``exc_info``."""
+        raised = RuntimeError('mcp down')
+        _, client = await self._client(None, raises=raised)
+        assert await client.get_task('7') == (None, raised)
+
+
 class TestExtractTaskId:
     """``extract_task_id``: self-contained module-level helper (no
     harness/scheduler import) shared by ``SchedulerChronicFlakeTaskClient``
@@ -903,3 +1300,60 @@ class TestExtractTaskId:
     def test_unrecognised_shape_returns_empty_string(self):
         from orchestrator.chronic_flake import extract_task_id
         assert extract_task_id({'unexpected': 'shape'}) == ''
+
+
+class TestExtractStatusesMap:
+    """``_extract_statuses_map``: the ``get_statuses`` response parser, returning the
+    same ``(value, error)`` pair ``scheduler.py::SchedulerFacade.get_statuses`` uses.
+
+    Its whole job is to keep two things that both LOOK like an empty mapping apart:
+    a PRESENT-but-empty ``statuses`` dict (a corroborated absence — the tool answered,
+    and it does not know the id) and an envelope it could not read at all (no answer).
+    Collapsing both to ``{}`` is what let a transient MCP outage read as "the owning
+    task was deleted" one seam away, in ``flake_ledger._ensure_owner_task``.
+    """
+
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            {'statuses': {'42': 'pending'}},
+            {'structuredContent': {'statuses': {'42': 'pending'}}},
+            {'result': {'statuses': {'42': 'pending'}}},
+            {'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}]},
+        ],
+        ids=['direct', 'structured_content', 'result', 'content_text_block'],
+    )
+    def test_present_mapping_parses_with_no_error(self, envelope):
+        from orchestrator.chronic_flake import _extract_statuses_map
+        assert _extract_statuses_map(envelope) == ({'42': 'pending'}, None)
+
+    def test_present_but_empty_mapping_is_not_an_error(self):
+        """The corroborated absence.  ``error is None`` is what tells the ledger this
+        emptiness is evidence rather than a failure to read."""
+        from orchestrator.chronic_flake import _extract_statuses_map
+        assert _extract_statuses_map({'statuses': {}}) == ({}, None)
+
+    def test_keys_and_values_are_coerced_to_str(self):
+        """The tool returns JSON, but a caller may hand ints; the ledger looks the id
+        up as a ``str``."""
+        from orchestrator.chronic_flake import _extract_statuses_map
+        assert _extract_statuses_map({'statuses': {42: 'pending'}}) == ({'42': 'pending'}, None)
+
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            {'unexpected': 'shape'},
+            {'statuses': ['not', 'a', 'dict']},
+            {'statuses': None},
+            None,
+            ['not', 'a', 'dict'],
+        ],
+        ids=['missing_key', 'non_dict_statuses', 'null_statuses', 'none', 'list'],
+    )
+    def test_missing_or_non_dict_statuses_reports_an_error(self, envelope):
+        """A MISSING key or a non-dict value means nothing was read.  Construct-don't-
+        raise, matching ``SchedulerFacade``'s ``({}, exception)`` convention."""
+        from orchestrator.chronic_flake import _extract_statuses_map
+        statuses, error = _extract_statuses_map(envelope)
+        assert statuses == {}
+        assert isinstance(error, Exception)

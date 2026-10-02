@@ -8,6 +8,10 @@ Two units live in that module:
   so no marker sweep can ever take a ``kind='cycle_summary'`` /
   ``record_type='ledger_stamp'`` mirror no matter how loose its Qdrant payload
   filter is.
+- :func:`is_protected_audit_record` — the sibling precision predicate added by
+  task 4375, consulted at the same choke point, so no marker sweep can take a
+  DELIBERATELY-PERMANENT audit-log record (``kind`` in
+  :data:`PROTECTED_AUDIT_KINDS`) that happens to carry the sweep's match key.
 - :func:`record_mem0_deletion_tombstone` — writes the queryable audit row that
   makes a designed eviction distinguishable from silent data loss (the defining
   signature of the recon-gate-165 / esc-165-1 finding).
@@ -24,7 +28,9 @@ import pytest
 
 from fused_memory.reconciliation.mem0_tombstone import (
     MEM0_TOMBSTONE_TTL_DAYS,
+    PROTECTED_AUDIT_KINDS,
     RECORD_KIND_MEM0_TOMBSTONE,
+    is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstone,
     record_mem0_deletion_tombstones,
@@ -117,6 +123,98 @@ class TestIsProtectedMirrorRecord:
             summary_pool.CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
             == recon_pool_map.CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
         )
+
+
+# The exact live metadata shape measured on the autopilot_video records this
+# sweep destroyed (task 4375). It satisfies the ENTIRE Stage-1 relay contract —
+# flag_for_stage2, flag_type, run_id, source, task_id — so it is
+# indistinguishable from a genuine relay marker by every field except ``kind``.
+# That is why the discrimination has to be a ``kind`` predicate and cannot be a
+# payload filter over the relay contract's own keys.
+_LIVE_CADENCE_CHECK_SHAPE = {
+    'kind': 'cadence_check',
+    'flag_for_stage2': True,
+    'flag_type': 'task452_cadence_check_reminder',
+    'run_id': 'r1',
+    'source': 'recon-stage-memory_consolidator',
+    'task_id': '452',
+}
+
+
+class TestIsProtectedAuditRecord:
+    """The sibling audit-record predicate consulted by every marker sweep (task 4375)."""
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            {'kind': 'cadence_check'},
+            # Satisfying the full relay contract does NOT defeat the guard.
+            _LIVE_CADENCE_CHECK_SHAPE,
+        ],
+    )
+    def test_protected_payloads(self, metadata):
+        assert is_protected_audit_record(metadata) is True
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            # The 57%-majority shape: a genuine relay marker with NO ``kind``
+            # key at all (165 of the 288 records this sweep destroyed).
+            {'flag_for_stage2': True, 'task_id': 't1', 'flag_type': 'x', 'run_id': 'r1'},
+            {'kind': 'stage1_flag', 'flag_for_stage2': True, 'task_id': 't1'},
+            {'kind': 'stage1_flag_relay'},
+            {'kind': 'flag_marker'},
+            {'flag_for_stage2': True},
+            {},
+        ],
+    )
+    def test_ordinary_marker_payloads_are_not_protected(self, metadata):
+        assert is_protected_audit_record(metadata) is False
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            None,
+            'not-a-dict',
+            [],
+            42,
+            ['kind', 'cadence_check'],
+            object(),
+            {'kind': 123},
+            {'kind': None},
+            # UNHASHABLE kind. A naive ``metadata.get('kind') in frozenset``
+            # raises TypeError here, which would break the module's documented
+            # never-raises contract from inside the guard that exists to make
+            # the sweep safer. Mem0 metadata is JSON-shaped and nothing at the
+            # add_memory boundary constrains ``kind`` to a scalar.
+            {'kind': []},
+            {'kind': {}},
+        ],
+    )
+    def test_malformed_input_returns_false_without_raising(self, metadata):
+        """A marker sweep must never crash on a weird payload."""
+        assert is_protected_audit_record(metadata) is False
+
+    def test_module_constants(self):
+        assert isinstance(PROTECTED_AUDIT_KINDS, frozenset)
+        assert 'cadence_check' in PROTECTED_AUDIT_KINDS
+
+    def test_the_two_predicates_do_not_subsume_one_another(self):
+        """Each guard keeps its OWN attributable WARNING at the choke point.
+
+        If either predicate answered True for the other's pool, the sweep's
+        skip message would misattribute what it skipped — regressing the
+        diagnostic value task 3041 built the mirror WARNING for.
+        """
+        assert is_protected_audit_record({'kind': 'cycle_summary', 'record_type': 'ledger_stamp'}) is False
+        assert is_protected_mirror_record({'kind': 'cadence_check'}) is False
+        assert is_protected_mirror_record(_LIVE_CADENCE_CHECK_SHAPE) is False
+
+    def test_both_new_names_are_exported(self):
+        from fused_memory.reconciliation import mem0_tombstone
+
+        assert 'is_protected_audit_record' in mem0_tombstone.__all__
+        assert 'PROTECTED_AUDIT_KINDS' in mem0_tombstone.__all__
 
 
 # Probe run in a FRESH interpreter by TestReconPoolMapIsImportFreeLeaf: import
@@ -584,3 +682,100 @@ class TestTheReversePointer:
             )
             is False
         )
+
+
+class TestSweepDeletionGuardReadsRealTombstones:
+    """The sweep-deletion guard against the REAL tombstone substrate (task 5271).
+
+    The trim path's own batched writer puts rows into a REAL ReconLedgerStore,
+    and the guard reads them back through a REAL MemoryService, so a drift
+    between the writer's ``deleter`` payload key and what the guard reads fails
+    here even though every other guard test uses a fake reader.  Heavy imports
+    live inside the test body, keeping this module's own imports light.
+    """
+
+    _PROJECT = 'solar_challenge_platform'
+    _TRIMMED = '445c97ac-14d7-4956-9e46-e4475eecff16'
+    _HAND_SWEPT = '9529e396-761a-4914-93cc-19ec00c74ab8'
+
+    def _flag(self, memory_id: str) -> dict:
+        return {
+            'task_id': '165',
+            'flag_type': 'mem0_evidentiary_anchor_deletion_pattern',
+            'description': f'mem0 {memory_id} deleted +0.065s after the ledger-stamp write',
+        }
+
+    def _deleted(self, memory_id: str):
+        from fused_memory.models.reconciliation import (
+            EventSource,
+            EventType,
+            ReconciliationEvent,
+        )
+
+        return ReconciliationEvent(
+            id=f'evt-{memory_id}',
+            type=EventType.memory_deleted,
+            source=EventSource.agent,
+            project_id=self._PROJECT,
+            timestamp=datetime.now(UTC),
+            payload={'memory_id': memory_id},
+        )
+
+    @pytest.mark.asyncio
+    async def test_trim_tombstone_clears_and_unregistered_deleter_keeps(
+        self, tmp_path, mock_config,
+    ):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+        from fused_memory.reconciliation.sweep_deletion_guard import (
+            filter_benign_sweep_deletion_flags,
+        )
+        from fused_memory.services.memory_service import MemoryService
+
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        try:
+            service = MemoryService(mock_config)
+            service.set_recon_ledger(store)
+            for memory_id, deleter in (
+                (self._TRIMMED, 'stage1_cycle_summary_trim'),
+                (self._HAND_SWEPT, 'unregistered_manual_sweep'),
+            ):
+                written = await record_mem0_deletion_tombstones(
+                    service,
+                    self._PROJECT,
+                    [{'id': memory_id, 'metadata': _VICTIM_METADATA, 'created_at': None}],
+                    deleter=deleter,
+                    deleting_run_id='ea597ad1-f634-4b33-a074-0aa755c40b4a',
+                )
+                assert written == 1
+
+            trimmed_flag = self._flag(self._TRIMMED)
+            hand_swept_flag = self._flag(self._HAND_SWEPT)
+            dropped = await filter_benign_sweep_deletion_flags(
+                service,
+                self._PROJECT,
+                [trimmed_flag],
+                events=[self._deleted(self._TRIMMED)],
+            )
+            kept = await filter_benign_sweep_deletion_flags(
+                service,
+                self._PROJECT,
+                [hand_swept_flag],
+                events=[self._deleted(self._HAND_SWEPT)],
+            )
+        finally:
+            await store.close()
+
+        assert dropped == [], (
+            'the trim path tombstoned the only swept id, so the flag must drop'
+        )
+        assert kept == [hand_swept_flag], (
+            'an undocumented deleter is not a designed sweep, so the flag stays'
+        )
+        swept = hand_swept_flag['sweep_deletion_provenance']['swept']
+        assert swept == [{
+            'memory_id': self._HAND_SWEPT,
+            'deleter': 'unregistered_manual_sweep',
+            'deleting_run_id': 'ea597ad1-f634-4b33-a074-0aa755c40b4a',
+            'classification': 'undocumented_deleter',
+        }]

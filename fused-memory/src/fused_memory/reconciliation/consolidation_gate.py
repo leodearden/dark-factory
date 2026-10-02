@@ -30,6 +30,20 @@ cluster MALFORMEDNESS (wrong canonical count, an "absorbed" id still live, an
 unstamped cluster member) or on a view too incomplete to judge — never on peer
 count.
 
+The "unstamped cluster member" refusal in that list is REACHABLE IN
+PRODUCTION as of task 4808.  ``consolidation_gate.py::unstamped_candidates``
+narrows the gate's inert ``provenance.observed_members`` to the ids the live
+topic scroll cannot account for, and
+``consolidation_gate.py::resolve_unstamped_live_ids`` settles each with one
+injected point read.  The candidate set also includes the canonical's
+``supersedes`` claim, so a claimed-absorbed id that is still live is refused
+as ``absorbed_member_still_live``.  Both production callers --
+``middleware/task_interceptor.py::TaskInterceptor._consolidation_closure_error``
+and ``scripts/check_consolidation_closure.py::run`` -- now pass the result to
+``consolidation_gate.py::evaluate_closure``.  Before 4808 the reader and the
+writer both existed and nothing joined them, so the refusal was unreachable
+outside tests.
+
 ## Import-LEAF, deliberately
 
 ``middleware/task_interceptor.py`` imports this module, so this module's import
@@ -49,7 +63,8 @@ leaf module with a regression test.  Nothing here may import
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import logging
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -60,17 +75,24 @@ from fused_memory.memory_metadata import (
 )
 from fused_memory.utils.validation import is_full_uuid
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     'EXIT_CLOSED',
     'EXIT_NOT_CLOSED',
     'GATE_METADATA_KEY',
+    'HANDROLLED_MEMBER_KEYS',
     'WAIVABLE_REASON_CODES',
     'ClosureVerdict',
     'ConsolidationGateSpec',
     'build_consolidation_gate_task',
+    'closure_exists_probe',
     'evaluate_closure',
+    'handrolled_member_enumeration',
     'render_consolidation_gate_section',
     'render_end_state_brief',
+    'resolve_unstamped_live_ids',
+    'unstamped_candidates',
 ]
 
 # The Tier-C ``x_``-prefixed gate block under which a consolidation gate carries
@@ -234,6 +256,307 @@ def _payload_id(payload: Any) -> str:
     return str(value) if value is not None else ''
 
 
+def _scroll_ids(members: Sequence[Any]) -> set[str]:
+    """The case-folded ids the topic scroll returned.
+
+    Case-folded so a rendering difference between the scroll row and the
+    stored metadata cannot manufacture a false refusal (nor hide a real one):
+    ``is_full_uuid`` tolerates case for the same reason — casing is a
+    rendering choice, not a different identifier.
+    """
+    return {_payload_id(p).lower() for p in members if _payload_id(p)}
+
+
+def _observed_members(gate_block: Any) -> Sequence[Any]:
+    """The gate block's inert ``provenance.observed_members``, defensively.
+
+    A non-Mapping block, a missing/non-Mapping ``provenance``, and an
+    ``observed_members`` that is absent, not a Sequence, or a bare
+    ``str``/``bytes`` all yield ``()`` — iterating a bare uuid string would
+    yield 36 characters, none of them an id.
+    """
+    block = gate_block if isinstance(gate_block, Mapping) else {}
+    provenance = block.get('provenance')
+    if not isinstance(provenance, Mapping):
+        return ()
+    observed = provenance.get('observed_members')
+    if not isinstance(observed, Sequence) or isinstance(observed, (str, bytes)):
+        return ()
+    return observed
+
+
+def _sole_canonical_claim(members: Sequence[Any]) -> list[Any]:
+    """The cluster's absorption claim: the sole canonical's ``supersedes``.
+
+    Only the canonical's claim is the cluster's claim, and only when exactly
+    one strictly-canonical member exists; zero or several yield ``[]``,
+    because there is no single claim to trust.  Normalized through the shared
+    :func:`normalize_supersedes` (INV-5), never a second parser.
+    """
+    canonicals = [p for p in members if _payload_meta(p).get('canonical') is True]
+    if len(canonicals) != 1:
+        return []
+    return normalize_supersedes(_payload_meta(canonicals[0]).get('supersedes'))
+
+
+#: The most existence probes ``resolve_unstamped_live_ids`` will issue for one
+#: gate.  200 MIRRORS ``TaskInterceptor._CONSOLIDATION_SCROLL_LIMIT``: the two
+#: collaborators read the same store for the same cluster, so a cap on one and
+#: none on the other is an asymmetry with no justification.  See that function
+#: for why exceeding it WARNS and proceeds rather than refusing.
+_UNSTAMPED_PROBE_LIMIT = 200
+
+#: Hand-rolled member-enumeration keys observed on real BLOCK-LESS gates.
+#: Measured from the live tasks.db on 2026-08-28 — see
+#: :func:`handrolled_member_enumeration` for the census and the decision.
+HANDROLLED_MEMBER_KEYS = frozenset({'memory_ids', 'related_memory_ids'})
+
+
+def handrolled_member_enumeration(metadata: Any) -> tuple[str, list[Any]] | None:
+    """Detect a consolidation gate that hand-rolled its own member list.
+
+    Returns ``(key, ids)`` when *metadata* declares
+    ``operational_mode == 'gate'``, carries NO :data:`GATE_METADATA_KEY`
+    block, and carries a non-empty :data:`HANDROLLED_MEMBER_KEYS` entry —
+    otherwise ``None``.  PURE, and defensive on every shape.
+
+    THE DECISION THIS ENCODES: FLAG, DO NOT REFUSE.
+
+    (i) ``operational_mode == 'gate'`` is a GENERIC human-gate marker, not a
+    consolidation marker — ``curator_gate_resolution_sweep.py::
+    extract_open_gate_task_ids`` selects on exactly that value across the
+    whole population.  So a blanket seam refusal for a block-less gate is not
+    available: it would brick every unrelated gate.
+
+    (ii) MEASURED BASIS, live tasks.db, 2026-08-28.  127 tasks carry
+    ``operational_mode == 'gate'``.  Only 4 carry a real gate block (4747,
+    4750, 4768, 4774).  Of the 123 that do not, exactly 5 carry a hand-rolled
+    enumeration at metadata top level — 3036 and 3974 under ``memory_ids``,
+    3796, 3809 and 3810 under ``related_memory_ids``.  All 5 are already
+    ``done``; 3 are genuine consolidation gates (3036 is the very gate this
+    module's docstring indicts for inventing ``metadata.memory_ids``) and 2
+    (3796, 3810) are not.  4747 has since been retro-fitted with a real
+    block, so nothing currently open matches.
+
+    (iii) That is a ~40% historical FALSE-POSITIVE rate.  Unacceptable for a
+    refusal; entirely fine for a log line.  Flagging converts a SILENT
+    dormancy into a VISIBLE one at zero brick risk, which is the whole point.
+
+    (iv) The operator-facing half already exists and is unchanged:
+    ``scripts/check_consolidation_closure.py::extract_gate_block`` raises
+    ``UsageError`` (exit 2) for a block-less task, with a message that
+    already says the seam is dormant for it and would let it close untouched.
+
+    (v) ``consolidation_gate.py::build_consolidation_gate_task`` emits a block
+    UNCONDITIONALLY, so the recon filing path is already compliant.  The
+    residual hole is hand-filed gates only, which is why a detector plus a
+    warning is proportionate to what is actually left.
+
+    Key selection is deterministic (sorted, first match) when a task carries
+    more than one, so the emitted warning text is stable across runs.
+    """
+    if not isinstance(metadata, Mapping):
+        return None
+    if metadata.get('operational_mode') != _GATE_OPERATIONAL_MODE:
+        return None
+    if isinstance(metadata.get(GATE_METADATA_KEY), Mapping):
+        return None
+    for key in sorted(HANDROLLED_MEMBER_KEYS):
+        value = metadata.get(key)
+        if (
+            isinstance(value, Sequence)
+            and not isinstance(value, (str, bytes))
+            and len(value) > 0
+        ):
+            return key, list(value)
+    return None
+
+
+def unstamped_candidates(
+    gate_block: Any,
+    *,
+    members: Sequence[Any],
+) -> tuple[str, ...]:
+    """The ids that must be PROBED before the cluster can be judged.
+
+    PURE — no I/O.  Returns the sole canonical's well-formed ``supersedes``
+    claim plus ``provenance.observed_members``, MINUS the live topic-scroll
+    ids.
+
+    THESE ARE NOT "THE UNSTAMPED IDS".  An id missing from the topic scroll
+    is AMBIGUOUS: it was either absorbed and deleted (correct), or it is
+    still live.  Nothing readable here can tell those apart, so this function
+    narrows the set and ``consolidation_gate.py::resolve_unstamped_live_ids``
+    settles it with one point read per survivor.
+
+    WHY THE CLAIM IS PROBED.  The canonical's ``supersedes`` asserts its ids
+    are gone, and a still-live claimed id is a false closure claim whether or
+    not it carries the topic; ``consolidation_gate.py::evaluate_closure``
+    routes such a hit to ``absorbed_member_still_live``.  A correctly
+    executed delete arm probes ABSENT (deletes are hard Qdrant deletes), so
+    it stays closeable.  The cost is one point read per claimed id absent
+    from the scroll; retain-arm gates carry an empty ``supersedes`` and cost
+    nothing.  Claims come FIRST so the shared probe cap never drops the
+    closure claim in favour of inert provenance.
+
+    Defensive on every shape: an unusable block or provenance contributes no
+    observed members (see :func:`_observed_members`) rather than raising —
+    this predicate's job is to REPORT malformedness, and one that dies on bad
+    input blocks the very gates it exists to adjudicate (the same reasoning
+    as :func:`_payload_meta`).  The claim is read regardless.
+
+    Non-uuid ids are dropped: they cannot be probed, so a refusal over them
+    could never be substantiated (a malformed claim member is named by the
+    predicate as ``malformed_supersedes_member`` instead).  The returned ids
+    keep their first-seen ORIGINAL spelling (matching is case-folded,
+    reporting is not) so a refusal names the id exactly as it was recorded.
+    """
+    live_ids = _scroll_ids(members)
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in (*_sole_canonical_claim(members), *_observed_members(gate_block)):
+        if not is_full_uuid(raw):
+            continue
+        folded = str(raw).lower()
+        if folded in live_ids or folded in seen:
+            continue
+        seen.add(folded)
+        candidates.append(str(raw))
+    return tuple(candidates)
+
+
+def closure_exists_probe(memory_service: Any) -> Callable[..., Awaitable[bool]]:
+    """The consolidation-gate existence probe, bound to a real store.
+
+    Returns the ``async (memory_id: str, *, project_id: str) -> bool``
+    collaborator :func:`resolve_unstamped_live_ids` awaits, over
+    ``MemoryService.get_memory_by_id(project_id, memory_id)`` — which returns
+    ``{'id', 'content', 'metadata'}`` or ``None`` on a genuine miss.  Those
+    two outcomes are what distinguish a live-but-unstamped cluster member
+    from one that was absorbed and deleted.
+
+    ONE HOME, TWO CALLERS (INV-5).  ``server/main.py::
+    _wire_closure_collaborators`` and ``scripts/check_consolidation_closure
+    .py::scroll_cluster`` both call this rather than each closing over their
+    own copy.  The thing being single-sourced is the ARGUMENT ORDER:
+    *project_id* is that method's FIRST POSITIONAL argument while the gate
+    passes scope by KEYWORD, and a slip in that adaptation would probe the
+    wrong scope and silently report every candidate as absent — a green
+    "no strays" manufactured out of a mis-wired call.  Two copies of that
+    adaptation is two places for the slip to happen and two test suites that
+    each only cover their own.  This is the FOURTH collaborator the CLI and
+    the seam share, alongside the predicate, the scroll cap and the unstamped
+    derivation.
+
+    *memory_service* is DUCK-TYPED, not imported: only ``get_memory_by_id``
+    is touched, so this module stays the stdlib-only import leaf its module
+    docstring requires and neither caller has to hand over a real
+    ``MemoryService`` in tests.
+
+    A read ``TimeoutError`` is deliberately NOT caught.  ``get_memory_by_id``
+    propagates it rather than collapsing it into ``None`` precisely so a
+    caller can tell "genuinely absent" from "backend timed out", and both
+    production callers already convert it into their own fail-closed outcome
+    (the seam refuses the transition; the CLI exits "could not check").
+    Swallowing it here would let an unreadable store read as "no strays".
+    """
+
+    async def exists(memory_id: str, *, project_id: str) -> bool:
+        return (await memory_service.get_memory_by_id(project_id, memory_id)) is not None
+
+    return exists
+
+
+async def resolve_unstamped_live_ids(
+    gate_block: Any,
+    *,
+    members: Sequence[Any],
+    exists: Any,
+    project_id: str,
+) -> tuple[str, ...]:
+    """The candidate ids that are still LIVE although the topic scroll misses them.
+
+    Performs no I/O ITSELF — it awaits what it is GIVEN.  *exists* is an
+    injected, project-scoped collaborator
+    ``async (memory_id: str, *, project_id: str) -> bool``; the seam binds
+    ``MemoryService.get_memory_by_id`` and the CLI binds the same method, so
+    this module stays the stdlib-only import leaf its module docstring
+    requires.
+
+    DORMANT WHEN UNWIRED.  ``exists=None`` returns ``()`` immediately, before
+    any candidate is derived.  Without a probe we cannot distinguish an
+    absorbed-and-deleted id from a live-but-unstamped one, and guessing
+    "unstamped" would make every delete-arm consolidation permanently
+    uncloseable — the exact regression the derivation exists to avoid.
+
+    Candidate derivation is delegated to :func:`unstamped_candidates`, never
+    re-implemented (INV-5): the CLI and the seam must not be able to disagree
+    about which ids are ambiguous.
+
+    Sequential rather than ``asyncio.gather``: the candidate list is empty for
+    a retain-arm gate whose observed members are stamped (measured 2026-08-28:
+    zero candidates across all four live consolidated topics) and small
+    otherwise, so concurrency would buy nothing and would obscure which probe
+    raised.
+
+    CAPPED AT :data:`_UNSTAMPED_PROBE_LIMIT`, and the cap is DISCLOSED rather
+    than silently applied: this loop runs inside
+    ``TaskInterceptor._consolidation_closure_error``, i.e. on the ``done``
+    transition itself, while neither input is capped at its source —
+    ``provenance.observed_members`` is written verbatim by
+    ``consolidation_gate.py::build_consolidation_gate_task``, and the
+    canonical's ``supersedes`` is whatever its writer recorded.  Without a cap
+    a gate filed over a pathological cluster would serialise unbounded point
+    reads there.  Overflow WARNS and probes
+    the first N rather than refusing, for two reasons.  (i) Proportionality:
+    the measured corpus is 2-6 observed members against a cap of 200, so the
+    branch is unreachable today and a refusal would be a brand-new brick risk
+    bought for nothing — the same FLAG-DON\'T-REFUSE call
+    :func:`handrolled_member_enumeration` records.  (ii) A large candidate set
+    is USUALLY A TRUNCATION ARTEFACT, not a real anomaly: on a truncated
+    scroll every observed member past the cap fails the ``live_ids``
+    subtraction, so refusing on overflow would manufacture an
+    ``scroll_unavailable`` out of a view ``evaluate_closure`` already refuses
+    (and describes more precisely) as ``scroll_incomplete``.  The verdict
+    itself carries no incompleteness marker for a capped probe — that would
+    need a new reason code in ``evaluate_closure``, which this task's plan
+    scopes out; the WARNING is the disclosure, and it is emitted HERE so the
+    CLI and the seam cannot disclose differently.
+
+    Any exception PROPAGATES.  Both production callers already convert a
+    failed store read into their own fail-closed outcome — the seam refuses
+    the transition, the CLI exits "could not check" — so swallowing here would
+    let an unreadable store read as "no strays".
+
+    TRUNCATION IS DELIBERATELY NOT RE-GUARDED HERE.
+    ``consolidation_gate.py::evaluate_closure`` already suppresses
+    ``unstamped_cluster_member`` on a truncated scroll (the reason is
+    absence-based, and past the cap "not stamped" and "not seen" are the same
+    fact), so neither caller needs a second copy of that guard and this
+    function takes no ``scroll_truncated`` argument.
+    """
+    if exists is None:
+        return ()
+    candidates = unstamped_candidates(gate_block, members=members)
+    if len(candidates) > _UNSTAMPED_PROBE_LIMIT:
+        logger.warning(
+            'consolidation closure probe budget exceeded: %d off-scroll '
+            'candidates > cap %d; probing the first %d only, so this '
+            'derivation may UNDER-report live off-scroll ids (strays or '
+            'still-live claims) for this gate. First unprobed id: %s',
+            len(candidates),
+            _UNSTAMPED_PROBE_LIMIT,
+            _UNSTAMPED_PROBE_LIMIT,
+            candidates[_UNSTAMPED_PROBE_LIMIT],
+        )
+        candidates = candidates[:_UNSTAMPED_PROBE_LIMIT]
+    live: list[str] = []
+    for candidate in candidates:
+        if await exists(candidate, project_id=project_id):
+            live.append(candidate)
+    return tuple(live)
+
+
 def evaluate_closure(
     gate_block: Any,
     *,
@@ -263,6 +586,13 @@ def evaluate_closure(
     why enforcing here subsumes task 3084's proposed auto-close by
     construction.
 
+    *unstamped_live_ids* are LIVE ids absent from the topic scroll, derived by
+    ``consolidation_gate.py::resolve_unstamped_live_ids`` and passed by BOTH
+    production callers.  Those the sole canonical CLAIMS in ``supersedes`` are
+    routed to ``absorbed_member_still_live``, which is presence-based and so
+    survives a truncated scroll.  The rest are ``unstamped_cluster_member``,
+    which is absence-based and so suppressed on one.
+
     It therefore refuses ONLY on cluster malformedness:
 
     * ``no_canonical`` / ``multiple_canonicals`` — the canonical count is not
@@ -280,11 +610,7 @@ def evaluate_closure(
     topic = str(block.get('topic') or '')
 
     reasons: list[dict[str, Any]] = []
-    # Case-folded so a rendering difference between the scroll row and the
-    # stored metadata cannot manufacture a false `absorbed_member_still_live`
-    # (nor hide a real one): `is_full_uuid` tolerates case for the same
-    # reason — casing is a rendering choice, not a different identifier.
-    live_ids = {_payload_id(p).lower() for p in members if _payload_id(p)}
+    live_ids = _scroll_ids(members)
 
     # --- completeness FIRST, and unconditional ----------------------------- #
     # A predicate whose entire job is refuting a false closure claim must not
@@ -364,28 +690,24 @@ def evaluate_closure(
         )
 
     # --- absorbed-actually-gone: the canonical's supersedes claim ---------- #
-    # Only the CANONICAL's claim is the cluster's claim.  A non-canonical
-    # peer's stale supersedes is not what the gate asserted, and reading it
-    # would refuse gates over other clusters' history.
-    if len(canonical_ids) == 1:
-        canonical = next(
-            p for p in members if _payload_meta(p).get('canonical') is True
-        )
-        reasons.extend(
-            _classify_supersedes(
-                _payload_meta(canonical).get('supersedes'),
-                live_ids=live_ids,
-                topic=topic,
-            )
-        )
+    # A non-canonical peer's stale supersedes is not what the gate asserted,
+    # and reading it would refuse gates over other clusters' history.
+    claim = _sole_canonical_claim(members)
+    known_live = live_ids | {str(i).lower() for i in unstamped_live_ids if str(i)}
+    reasons.extend(_classify_supersedes(claim, live_ids=known_live, topic=topic))
 
     # --- unstamped cluster members: the ONE thing provenance may add ------- #
     # A member the detector observed live but which never got stamped into the
     # topic is invisible to the scroll, so it can only reach the predicate this
     # way.  ABSENCE-based (not-stamped is indistinguishable from past-the-cap),
     # so it is suppressed on a truncated view for the same reason
-    # `no_canonical` is.
-    stray = [str(i) for i in unstamped_live_ids if str(i)]
+    # `no_canonical` is.  A claimed id is already named above.
+    claimed = {str(m).lower() for m in claim}
+    stray = [
+        str(i)
+        for i in unstamped_live_ids
+        if str(i) and str(i).lower() not in claimed
+    ]
     if stray and not scroll_truncated:
         reasons.append(
             _reason(
@@ -401,45 +723,40 @@ def evaluate_closure(
         )
 
     # --- the audited escape, applied LAST ---------------------------------- #
-    reasons, waived = _apply_waivers(
-        block,
-        reasons,
-        live_universe=live_ids | {str(i).lower() for i in unstamped_live_ids},
-    )
+    reasons, waived = _apply_waivers(block, reasons, live_universe=known_live)
     return _verdict(topic, reasons, waived=waived)
 
 
 def _classify_supersedes(
-    raw: Any,
+    claim: Sequence[Any],
     *,
     live_ids: set[str],
     topic: str,
 ) -> list[dict[str, Any]]:
     """Classify each member of the canonical's ``supersedes`` claim.
 
-    Goes through the SHARED :func:`normalize_supersedes` — never a second
-    ``supersedes`` parser (INV-5); that helper's own docstring names this
-    closure predicate as one of its two designated readers.  It accepts
-    ``None`` (nothing absorbed), the legacy SCALAR spelling (81 live records
-    predate 3196's migration) as a one-member list, and a list as itself — so
-    a bare 36-char uuid string is one member here, never 36 characters.
+    *claim* arrives already normalized by :func:`_sole_canonical_claim`, the
+    one place this module calls the SHARED :func:`normalize_supersedes`
+    (INV-5).  That parser reads the legacy SCALAR spelling (81 live records
+    predate 3196's migration) as a one-member list — so a bare 36-char uuid
+    string is one member here, never 36 characters — and it deliberately
+    never DROPS a malformed member, so this function can reject one BY NAME
+    (``malformed_supersedes_member``) rather than raising.  Raising would
+    permanently block exactly the gates whose metadata is already malformed —
+    the census counts 3 short-hex and 8 non-string live.
 
-    It also deliberately never DROPS a malformed member, so this function can
-    reject one BY NAME (``malformed_supersedes_member``) rather than raising.
-    Raising would permanently block exactly the gates whose metadata is
-    already malformed — the census counts 3 short-hex and 8 non-string live.
-
-    Three outcomes per member:
+    *live_ids* are case-folded ids known to be live: those the topic scroll
+    returned plus those the existence probe confirmed.  Three outcomes per
+    member:
 
     * not a canonical full uuid -> ``malformed_supersedes_member``
-    * well-formed and STILL in the live topic scroll ->
-      ``absorbed_member_still_live`` (the curator claimed it was deleted; it
-      is not)
+    * well-formed and STILL live -> ``absorbed_member_still_live`` (the
+      curator claimed it was deleted; it is not)
     * well-formed and absent -> correctly folded, no reason
     """
     malformed: list[Any] = []
     still_live: list[str] = []
-    for member in normalize_supersedes(raw):
+    for member in claim:
         if not is_full_uuid(member):
             malformed.append(member)
         elif str(member).lower() in live_ids:
@@ -453,8 +770,9 @@ def _classify_supersedes(
                 ids=still_live,
                 detail=(
                     f"The canonical of topic {topic!r} claims these ids in "
-                    '`metadata.supersedes`, but the live topic scroll still '
-                    'returns them. Either they were never deleted, or they '
+                    '`metadata.supersedes`, but they are still live in the '
+                    'store (returned by the topic scroll or confirmed by the '
+                    'existence probe). Either they were never deleted, or they '
                     'must not be claimed as superseded.'
                 ),
             )
@@ -685,7 +1003,12 @@ def build_consolidation_gate_task(
     never stamped into the topic), never grant a pass.  That is what makes
     "inert" a structural property rather than a promise — pinned by the test
     asserting :func:`evaluate_closure` returns an identical verdict with and
-    without it.  Contrast DF gate 3036, whose hand-written enumeration under an
+    without it.  As of task 4808 the ADD half is MECHANICALLY true rather than
+    only intended: the two readers of this provenance are
+    ``middleware/task_interceptor.py::TaskInterceptor._consolidation_closure_error``
+    and ``scripts/check_consolidation_closure.py::run``, both of which route
+    it through ``consolidation_gate.py::resolve_unstamped_live_ids`` -- a path
+    whose only possible output is a refusal reason.  Contrast DF gate 3036, whose hand-written enumeration under an
     invented ``metadata.memory_ids`` key was extended 7 to 8 by a later cycle
     while it still defined "done".
 

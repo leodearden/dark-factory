@@ -1,0 +1,2343 @@
+{
+  "sample": {
+    "cap": 8,
+    "hash_rule": "sha256(graph:uuid)",
+    "strata": [
+      "ruling_lexeme",
+      "decision_anchor",
+      "other_decisions"
+    ],
+    "window_end": "2026-10-01T00:00:00+00:00",
+    "window_start": "2026-08-25T00:00:00+00:00"
+  },
+  "verdicts": [
+    {
+      "edge_uuid": "1f774c6f-e7f3-4dc4-b453-4b4c5553fe22",
+      "episode_uuid": "2364e73d-f985-4445-baa0-a5e551e85cd9",
+      "fact": "Task 2916 existed to record that tightening the OS sandbox from whole-worktree to plan-file granularity fails on representability, not on cost.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The answer recorded: tightening \"fails on REPRESENTABILITY, not on cost\"."
+    },
+    {
+      "edge_uuid": "3038225f-cd05-420b-a7ec-6ca097956439",
+      "episode_uuid": "2364e73d-f985-4445-baa0-a5e551e85cd9",
+      "fact": "Task 4370 recorded that the declared set is structurally unreachable from orchestrator/src/orchestrator/agents/write_set.py.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"the declared set is structurally unreachable from it (as task 4370 recorded ...)\"."
+    },
+    {
+      "edge_uuid": "4402f2ff-6850-4484-86f9-73cba8581a34",
+      "episode_uuid": "2364e73d-f985-4445-baa0-a5e551e85cd9",
+      "fact": "Leo's ruling in task 3147 established that certain unsatisfiable prompt rules do not produce a scope violation from an agent obeying its own prompt.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Inverts the precedent: task 3147 is where \"an unsatisfiable prompt rule produced a self-reported scope_violation from an agent obeying its own prompt\"."
+    },
+    {
+      "edge_uuid": "ba1602e5-a185-45b3-9de3-0293b6a7b60e",
+      "episode_uuid": "2364e73d-f985-4445-baa0-a5e551e85cd9",
+      "fact": "The cancellation of task 2916 is due to the structural issues in dark_factory's declaration not being a threading problem that a bigger change would solve.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Ground for the cancellation, in substance: \"there is NO directory set that expresses the declared file scope. This is not a threading problem a bigger change would solve.\""
+    },
+    {
+      "edge_uuid": "d95353a8-dccc-4f02-924c-a357fbefe88f",
+      "episode_uuid": "2364e73d-f985-4445-baa0-a5e551e85cd9",
+      "fact": "Task 2916 was cancelled as won't fix by Leo on 2026-09-21.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Adds an actor the record does not name: it says only that 2916 \"was CANCELLED won't-fix on 2026-09-21\", not by Leo."
+    },
+    {
+      "edge_uuid": "1e569c37-63c2-4b44-af93-2bbddf41fdeb",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "fact": "The resumed session's ever-growing nature results in genuine exhaustion.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground: \"the ever-growing resumed session, which drives both the artifact and every genuine exhaustion\"."
+    },
+    {
+      "edge_uuid": "38c57b49-6667-4d24-b881-3cc2674af4c5",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "fact": "The artifact drives both the metering issue and every genuine exhaustion in the resumed session.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Inverts the causal claim: the record says the ever-growing resumed session \"drives both the artifact and every genuine exhaustion\", not that the artifact drives them."
+    },
+    {
+      "edge_uuid": "5882abd0-5dfc-49ee-8b17-1994a4266234",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "fact": "The resumed session reports total cost cumulatively since Claude CLI 2.1.277.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful finding: \"since Claude CLI 2.1.277 a resumed session reports total_cost_usd cumulatively\"."
+    },
+    {
+      "edge_uuid": "5d9b218e-93a2-4bb7-879b-ed7f1ca816bf",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "fact": "The steward handles each L0 in a fresh session with rebuilt briefing and prior-resolution digest behind steward_session_mode.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iv) Drops the provisional qualifier the record quotes — \"'for now', with a parallel-shadow eval of both modes\" and a ruling gate 5822 — stating fresh-per-L0 as settled."
+    },
+    {
+      "edge_uuid": "d66488bd-f939-4178-a12d-1b1e2d5b2d9e",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "fact": "Multiple runs are defined as one run per distinct L0, with 99.3% of escalations handled once.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful rationale: \"'multiple runs' is one run per distinct L0 (99.3% of escalations handled once ...)\"."
+    },
+    {
+      "edge_uuid": "e82063b1-e88d-4c0c-ba66-9395dc5f9048",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "fact": "The steward_lifetime_budget stays at 20.0 for now, to be re-derived later.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Ruling (C): \"steward_lifetime_budget stays 20.0 for now, re-derived at 5822\"."
+    },
+    {
+      "edge_uuid": "f86597f2-d0a3-4f06-a9d8-d2181bb1dbd2",
+      "episode_uuid": "24529018-0c2b-4d7c-88e9-f1ec2a9ed70a",
+      "fact": "Leo ruled on the steward budget regarding whether the steward should get multiple runs.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Who ruled on what: \"Leo ruled esc-4895-12 ... (steward budget / 'should the steward get multiple runs')\"."
+    },
+    {
+      "edge_uuid": "17ef0dff-9859-4e49-8a7a-0ca2eb3ceca6",
+      "episode_uuid": "274663b3-f611-497e-af4c-4cfe61a60469",
+      "fact": "Task 3669 has a pin order of 18 as part of the priority override.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status as recorded: \"Set priority override for task 3669: {... 'pin_order': 18}\"."
+    },
+    {
+      "edge_uuid": "478728c4-bd28-4069-b878-9ba19b3cae0d",
+      "episode_uuid": "274663b3-f611-497e-af4c-4cfe61a60469",
+      "fact": "Task 3669 is set to a critical boost tier as part of the priority override.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status as recorded: \"'boost_tier': 'critical'\"."
+    },
+    {
+      "edge_uuid": "519015cf-cf56-4805-af93-b54dbd1511e0",
+      "episode_uuid": "274663b3-f611-497e-af4c-4cfe61a60469",
+      "fact": "Task 3669 has its priority override set to boost tier critical.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status as recorded: \"'boost_tier': 'critical'\"."
+    },
+    {
+      "edge_uuid": "ae0118a5-7f09-473e-a051-1c8214c20987",
+      "episode_uuid": "274663b3-f611-497e-af4c-4cfe61a60469",
+      "fact": "Task 3669 is pinned as part of the priority override.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status as recorded: \"'pinned': True\"."
+    },
+    {
+      "edge_uuid": "383f3299-fc18-4702-afd3-1d664a5930cb",
+      "episode_uuid": "28435636-b2e7-4a1e-b49c-c4e0a9e9c309",
+      "fact": "The long class of tasks, which is 22% of arrivals, is where the merge-lane quality programme lives.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground: \"The long class is 22% of arrivals but 86% of slot work and is where the merge-lane quality programme lives\"."
+    },
+    {
+      "edge_uuid": "3901245c-1fb4-421f-a873-82a9378b53c0",
+      "episode_uuid": "28435636-b2e7-4a1e-b49c-c4e0a9e9c309",
+      "fact": "Task 5413 was cancelled as its remaining scope was carried into plans/verify-admission-fifo-prd.md.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status as recorded: \"Task 5413 was cancelled as superseded (not refuted) after its remaining scope ... was carried into plans/verify-admission-fifo-prd.md\"."
+    },
+    {
+      "edge_uuid": "601ac478-3bcb-40e0-b548-2c8964d78ffe",
+      "episode_uuid": "28435636-b2e7-4a1e-b49c-c4e0a9e9c309",
+      "fact": "Dark Factory operates as a closed loop, and Little's law indicates that mean task residence is invariant under every ordering policy.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iv) Drops the conditions the argument rests on (\"in-flight tasks pinned at max_concurrent_tasks\" and \"the single task-verify slot ~99% utilised\"), so the conditional Little's-law ground becomes an unconditional law."
+    },
+    {
+      "edge_uuid": "b130b72e-8b66-4a91-a6a0-5474f07b08c3",
+      "episode_uuid": "28435636-b2e7-4a1e-b49c-c4e0a9e9c309",
+      "fact": "The short-task prioritisation at the task-verify admission slot is declined as the two-class short-legs-first scheme will not be built.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"short-task prioritisation at the task-verify admission slot is DECLINED — the two-class short-legs-first scheme ... will not be built\"."
+    },
+    {
+      "edge_uuid": "05cd6e45-0a06-4dae-8310-4e8e4c862ed5",
+      "episode_uuid": "287ba962-0248-4bad-bb19-890809870fa0",
+      "fact": "Reify's pre-commit gate ran and passed, validating dark-factory-orchestrator.yaml's verify_env rows against their owning scripts.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful history: \"reify's pre-commit gate ran and passed ... including a parity gate that validates `dark-factory-orchestrator.yaml`'s `verify_env` rows against their owning scripts\"."
+    },
+    {
+      "edge_uuid": "05fbad5f-d8bf-4553-9e42-c95315b79700",
+      "episode_uuid": "287ba962-0248-4bad-bb19-890809870fa0",
+      "fact": "Git commit --only <path> commits only that path despite concurrent dirty state.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful background: \"it commits only that path despite concurrent dirty state\"."
+    },
+    {
+      "edge_uuid": "19697216-713c-4bba-8497-cb26c1d193cf",
+      "episode_uuid": "287ba962-0248-4bad-bb19-890809870fa0",
+      "fact": "A dark-factory session's escalation MCP is wired only to port 8102.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"a dark-factory session's `escalation` MCP is wired only to port 8102\"."
+    },
+    {
+      "edge_uuid": "369d185d-68f5-4966-ab6a-147bf5cbb1d1",
+      "episode_uuid": "287ba962-0248-4bad-bb19-890809870fa0",
+      "fact": "Merge_request for a reify branch mis-routes and returns unknown_branch because reify's server is on port 8100.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iv) Drops \"a dark-factory session's\" — the record says merge_request mis-routes only from a session wired to 8102; stated bare, every reify-branch merge_request mis-routes."
+    },
+    {
+      "edge_uuid": "59b4a192-db78-4ee6-b8fe-23ed50d7bf24",
+      "episode_uuid": "287ba962-0248-4bad-bb19-890809870fa0",
+      "fact": "Reify already lands operator config edits directly, with only 8 of the last 40 main commits being merge requests into main.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground (3): \"only 8 of the last 40 `main` commits were `Merge task/<id> into main`, and recent operator config edits ... all landed direct\"."
+    },
+    {
+      "edge_uuid": "71ae08bf-5176-491b-94f8-168908253c68",
+      "episode_uuid": "287ba962-0248-4bad-bb19-890809870fa0",
+      "fact": "Reify's merge queue runs a full post-merge verify on every submission.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground (1): \"reify's merge queue runs a full post-merge verify on every submission\"."
+    },
+    {
+      "edge_uuid": "eb0b477a-b20d-4003-92d0-be40cf99ce8f",
+      "episode_uuid": "287ba962-0248-4bad-bb19-890809870fa0",
+      "fact": "Merge_request requires task_id plus an existing task/<id> branch.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground (2): \"`merge_request` requires `task_id` plus an existing `task/<id>` branch\"."
+    },
+    {
+      "edge_uuid": "f584d922-52fd-4d14-9e4a-3a577760aac1",
+      "episode_uuid": "287ba962-0248-4bad-bb19-890809870fa0",
+      "fact": "An operator-authored comment/config edit to reify's dark-factory-orchestrator.yaml lands directly to main, not through the merge queue.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"an operator-authored comment/config edit to reify's `dark-factory-orchestrator.yaml` lands DIRECT-TO-MAIN, not through the merge queue\"."
+    },
+    {
+      "edge_uuid": "2fbb3fac-823a-4b54-97f6-9f1aa3aef69a",
+      "episode_uuid": "3c3bd148-cdff-430d-8711-2918802c150a",
+      "fact": "The provisional Q_ceiling for architect-opus-max is set to 0.8900 based on validly-referenced fixtures including df_task_2339_adv_verify.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"provisional Q_ceiling set to 0.8900 — the MEAN plan_quality of the 9 v1 incumbent (`architect-opus-max`) cells\", anchored on this fixture."
+    },
+    {
+      "edge_uuid": "3c6ce949-3be5-4950-8444-afa4bc8cab50",
+      "episode_uuid": "3c3bd148-cdff-430d-8711-2918802c150a",
+      "fact": "df_task_2284_adv_regression and df_task_2430_adv_plan are both adversarial fixtures.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"all three anchor fixtures are ADVERSARIAL fixtures\"."
+    },
+    {
+      "edge_uuid": "abcaf606-af87-4f0d-a00b-b600559375ce",
+      "episode_uuid": "3c3bd148-cdff-430d-8711-2918802c150a",
+      "fact": "df_task_2339_adv_verify and df_task_2430_adv_plan are both adversarial fixtures.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"all three anchor fixtures are ADVERSARIAL fixtures\"."
+    },
+    {
+      "edge_uuid": "ce0e0efe-8e26-4dc8-8390-e0841af951b3",
+      "episode_uuid": "3c3bd148-cdff-430d-8711-2918802c150a",
+      "fact": "The provisional Q_ceiling for architect-opus-max is set to 0.8900 based on validly-referenced fixtures including df_task_2430_adv_plan.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision, anchored on this fixture (see edge 0)."
+    },
+    {
+      "edge_uuid": "d4448c5e-d589-403e-816c-4098a5f7612e",
+      "episode_uuid": "3c3bd148-cdff-430d-8711-2918802c150a",
+      "fact": "df_task_2284_adv_regression and df_task_2339_adv_verify are both adversarial fixtures.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"all three anchor fixtures are ADVERSARIAL fixtures\"."
+    },
+    {
+      "edge_uuid": "e1210437-97f9-42d2-98d9-d5f596c604c0",
+      "episode_uuid": "3c3bd148-cdff-430d-8711-2918802c150a",
+      "fact": "The provisional Q_ceiling for architect-opus-max is set to 0.8900 based on validly-referenced fixtures including df_task_2284_adv_regression.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision, anchored on this fixture (see edge 0)."
+    },
+    {
+      "edge_uuid": "565da40f-132a-45a3-814e-fcf3adf8edf8",
+      "episode_uuid": "58b98b4e-18af-49fc-be04-7d0b2ff3477f",
+      "fact": "Task 5070 was checked and ruled out as an owner for the live verify in the MERGING window.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful history: \"Checked and ruled out as owners first: 5070 (train landing safety ...)\"."
+    },
+    {
+      "edge_uuid": "66593d60-edec-470f-9978-1e05c8d2e9b9",
+      "episode_uuid": "58b98b4e-18af-49fc-be04-7d0b2ff3477f",
+      "fact": "Task 3860 owns the defects related to finalized and blocked merge requests that never retired from the live registry.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The determination the decision rests on: \"task 3860 ... already owns that defect precisely\"."
+    },
+    {
+      "edge_uuid": "857b06f8-6543-4cbc-85b7-e74091cff15a",
+      "episode_uuid": "58b98b4e-18af-49fc-be04-7d0b2ff3477f",
+      "fact": "Task 3275 was checked and ruled out as an owner for the live verify in the MERGING window.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful history: 3275 \"checked and ruled out\"."
+    },
+    {
+      "edge_uuid": "90d2c88d-4219-45e1-882d-601c708f8003",
+      "episode_uuid": "58b98b4e-18af-49fc-be04-7d0b2ff3477f",
+      "fact": "Task 5245 was filed for a live verify in the MERGING window that was invisible to verify_in_progress and occupancy.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"The half that WAS genuinely unowned ... was filed as task 5245\"."
+    },
+    {
+      "edge_uuid": "b88c1619-0f66-4b6b-a712-2e0b37bccb90",
+      "episode_uuid": "58b98b4e-18af-49fc-be04-7d0b2ff3477f",
+      "fact": "Task 2068 was checked and ruled out as an owner for the live verify in the MERGING window.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful history: 2068 \"checked and ruled out\"."
+    },
+    {
+      "edge_uuid": "03645bfe-8b94-4e37-a9a1-1399b6ac3197",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 4574 was re-landed along with task 4887.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status of one of the ten hand re-landed tasks: \"re-land ALL ten dead-train tasks by hand ... All ten landed\", 4887 among them; \"along with\" reads as membership of that set."
+    },
+    {
+      "edge_uuid": "3c02f3fe-006e-4910-9168-6009ea387815",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 4439 was re-landed along with task 4887.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status of one of the ten hand re-landed tasks: \"re-land ALL ten dead-train tasks by hand ... All ten landed\", 4887 among them; \"along with\" reads as membership of that set."
+    },
+    {
+      "edge_uuid": "532e301d-1268-4797-92df-c39dc55e11b8",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 4484 was re-landed along with task 4887.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status of one of the ten hand re-landed tasks: \"re-land ALL ten dead-train tasks by hand ... All ten landed\", 4887 among them; \"along with\" reads as membership of that set."
+    },
+    {
+      "edge_uuid": "710b0e54-fd15-438b-a821-c6126a3bfb66",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 4592 was re-landed along with task 4887.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status of one of the ten hand re-landed tasks: \"re-land ALL ten dead-train tasks by hand ... All ten landed\", 4887 among them; \"along with\" reads as membership of that set."
+    },
+    {
+      "edge_uuid": "8344496f-fef0-45ee-8c95-c03069ef7849",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 4477 was re-landed along with task 4887.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status of one of the ten hand re-landed tasks: \"re-land ALL ten dead-train tasks by hand ... All ten landed\", 4887 among them; \"along with\" reads as membership of that set."
+    },
+    {
+      "edge_uuid": "89d82e13-7fff-4b44-981f-53ceda4c228b",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 4547 was re-landed along with task 4887.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status of one of the ten hand re-landed tasks: \"re-land ALL ten dead-train tasks by hand ... All ten landed\", 4887 among them; \"along with\" reads as membership of that set."
+    },
+    {
+      "edge_uuid": "96b9eb61-5fbe-44a1-871f-12cd405f8b05",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 3771 was re-landed along with task 4887.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status of one of the ten hand re-landed tasks: \"re-land ALL ten dead-train tasks by hand ... All ten landed\", 4887 among them; \"along with\" reads as membership of that set."
+    },
+    {
+      "edge_uuid": "983a161e-6aba-4246-8391-41a3f9a18fd6",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 4723 was re-landed along with task 4887.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status of one of the ten hand re-landed tasks: \"re-land ALL ten dead-train tasks by hand ... All ten landed\", 4887 among them; \"along with\" reads as membership of that set."
+    },
+    {
+      "edge_uuid": "bff49db1-8e22-4ede-8eb0-be0ed3993e81",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 4413 was re-landed along with task 4887.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status of one of the ten hand re-landed tasks: \"re-land ALL ten dead-train tasks by hand ... All ten landed\", 4887 among them; \"along with\" reads as membership of that set."
+    },
+    {
+      "edge_uuid": "db54f7b1-6fe8-473b-b529-43473f772712",
+      "episode_uuid": "64905a27-ba99-4145-ba09-c8ac2818bd43",
+      "fact": "Task 4926 is blocked by task-4953.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) The record never says 4926 is blocked by 4953: 4926 is the live check of the status edge (\"verified live on task 4926 (blocked -> in-progress -> merge-deferred\"), and \"the task-4953 class\" names the stranding defect."
+    },
+    {
+      "edge_uuid": "3e407a8e-1a62-4866-b519-5b81d80409d0",
+      "episode_uuid": "65f894c0-16e5-4ba1-a78b-b7e614de97f9",
+      "fact": "A slug branch does not satisfy the requirements for coalescing, causing it to be absorbed into a train that derails and abandons it.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful rationale: \"a slug branch satisfies neither, so any coalesce absorbs it into a train that derails and then abandons it\"."
+    },
+    {
+      "edge_uuid": "51df8ac7-1a2b-4288-acb1-2b24d486b61a",
+      "episode_uuid": "65f894c0-16e5-4ba1-a78b-b7e614de97f9",
+      "fact": "The decision was applied as carrier task 5427, which landed 97b9d18c0f.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Faithful: \"Applied as carrier task 5427 → landed 97b9d18c0f\"."
+    },
+    {
+      "edge_uuid": "bedf1bd1-7404-4279-b7e0-d534b682b243",
+      "episode_uuid": "65f894c0-16e5-4ba1-a78b-b7e614de97f9",
+      "fact": "The coalesce-train gate requires every member's scheduler status to be merge-deferred.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"the coalesce-train gate (_do_train_merge) requires every member's scheduler status to be merge-deferred\"."
+    },
+    {
+      "edge_uuid": "caf1f706-3040-4058-bb8a-e1c9d675d175",
+      "episode_uuid": "65f894c0-16e5-4ba1-a78b-b7e614de97f9",
+      "fact": "When an interactive session needs the merge lane to land a branch without an orchestrator task, it should set a real task to merge-deferred first.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"set a real task to `merge-deferred` first and submit under that id\"."
+    },
+    {
+      "edge_uuid": "0376eb4b-bbb0-4db7-8a22-e1c563a24cee",
+      "episode_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "fact": "If task 5604's declaration landed first, it would cause an ImportError for task 5578's merged tree.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground: \"If ε1's declaration ... landed first, 5578's merged tree would fail collection with an ImportError\"."
+    },
+    {
+      "edge_uuid": "08d52710-9614-45e2-a739-569043148470",
+      "episode_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "fact": "INV-12 ε1 is instructed not to declare orchestrator/src/orchestrator/verify.py::_KNOWN_LOAD_FLAKE_NODEID_RES.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"INV-12 ε1 (task 5604) is told NOT to declare ..._KNOWN_LOAD_FLAKE_NODEID_RES\"."
+    },
+    {
+      "edge_uuid": "0b2f17c1-1b50-43d0-9990-0bf636373e50",
+      "episode_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "fact": "An in-flight branch deletes the container that task 5604's declaration imports.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: 5578 has \"a queued carrier branch that deletes the list\", the container the declaration imports."
+    },
+    {
+      "edge_uuid": "675f85a6-01b3-4a75-aa9b-2d524a1872a8",
+      "episode_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "fact": "Task 5604's declaration depends on task 5578's status as its live owner.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Loosely faithful link: \"Either the list is already gone when ε1 runs, or 5578 is its live owner in fact\"."
+    },
+    {
+      "edge_uuid": "6d76dc9a-1b89-40fe-bdcd-0c21ca469d04",
+      "episode_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "fact": "In-flight carriers must be checked before declaring against a container in an in-flight branch.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The general rule recorded: \"check the in-flight carriers before declaring against a container\"."
+    },
+    {
+      "edge_uuid": "94d16f53-f5ad-4337-a782-b1e6c0397e6f",
+      "episode_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "fact": "Task 5578 is merge-deferred with a queued carrier branch that deletes the list.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status: \"task 5578 is merge-deferred with a queued carrier branch that deletes the list\"."
+    },
+    {
+      "edge_uuid": "e972afd6-6c8a-4fb9-9e5c-f322a1e0fb4c",
+      "episode_uuid": "6e96ec09-4f64-44f3-8b55-b3d73934d695",
+      "fact": "PRD Appendix A states that Debt(TaskRef(5578)) should be declared if the list still exists.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful, attributed to the PRD: Appendix A says \"Debt(TaskRef(5578)) if the list still exists\"."
+    },
+    {
+      "edge_uuid": "32bcb278-0b34-4a81-9371-0505b72cda46",
+      "episode_uuid": "6f50b219-c479-44a3-a504-8a66c1d8a618",
+      "fact": "Task 5547 is related to the dark_factory project.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful link: R3 gives successor 5547 \"a separate fixture and separate calibration report for --project-id dark_factory\"."
+    },
+    {
+      "edge_uuid": "512c5ea0-c443-4634-a381-1f047f496a28",
+      "episode_uuid": "6f50b219-c479-44a3-a504-8a66c1d8a618",
+      "fact": "Task 5547 amends task 3587.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) \"amend task 3587\" is a separate systemic ruling (\"post-terminal cleanup of info L1/L2 records -> amend task 3587\"); the record never says 5547 amends 3587."
+    },
+    {
+      "edge_uuid": "8865dff2-1517-427d-b245-0ce50ff63568",
+      "episode_uuid": "6f50b219-c479-44a3-a504-8a66c1d8a618",
+      "fact": "The closure class 'scope-not-delivered' is a successor of task 5374.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) The record routes the closure class to a task (\"'scope-not-delivered' closure class -> successor of 5374\"); it does not say the class IS a successor of 5374."
+    },
+    {
+      "edge_uuid": "934bc7e2-7b6f-443c-b685-872233df6b32",
+      "episode_uuid": "6f50b219-c479-44a3-a504-8a66c1d8a618",
+      "fact": "Task 5547 involves the audit_duplicate_memories.py script.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) audit_duplicate_memories.py appears only as HOLD rationale (\"t_high_by_category is consumed only by audit_duplicate_memories.py\"); nothing links it to 5547."
+    },
+    {
+      "edge_uuid": "d67a2625-d506-464f-9c70-d07439be5097",
+      "episode_uuid": "6f50b219-c479-44a3-a504-8a66c1d8a618",
+      "fact": "Pin 5221 is associated with the info-L0 router PRD root.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Faithful reference: \"pin 5221 (info-L0 router PRD root, zero scheduler events in 13 days ...)\"."
+    },
+    {
+      "edge_uuid": "eadfeed6-0ddf-4ac7-8d5a-a44977fa5762",
+      "episode_uuid": "6f50b219-c479-44a3-a504-8a66c1d8a618",
+      "fact": "Task 5547 amends task 4842.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) \"amend task 4842\" belongs to the human-only follow-up ruling, not to 5547."
+    },
+    {
+      "edge_uuid": "f99d8e21-bb02-4b51-8d0d-f634fb713e88",
+      "episode_uuid": "6f50b219-c479-44a3-a504-8a66c1d8a618",
+      "fact": "Task 4811 completes as scoped and leads to the creation of task 5547.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The disposition: \"4811 completes as scoped. Successor task 5547 rewritten as an AGENT extraction task\"."
+    },
+    {
+      "edge_uuid": "47508fe9-d7e4-4657-ad8b-7649729c4edf",
+      "episode_uuid": "7300f93c-d1dc-4efb-a772-e3d3a5dea794",
+      "fact": "The port-8103 recon-escalation WATCHER closes orphaned recon escalations related to the reconciliation_stale_gate_backlog.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The ruling: the WATCHER \"is the closer of orphaned recon escalations (pending reconciliation_stale_gate_backlog / ... records\"."
+    },
+    {
+      "edge_uuid": "5b9c2483-30f5-4bca-854f-a69422de9b77",
+      "episode_uuid": "7300f93c-d1dc-4efb-a772-e3d3a5dea794",
+      "fact": "A timer-driven closer was considered as an alternative to the port-8103 recon-escalation WATCHER but was not chosen.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The choice as decided: \"A timer-driven closer was the alternative and was not chosen.\""
+    },
+    {
+      "edge_uuid": "719847de-aea6-4656-9265-09300061f9d3",
+      "episode_uuid": "7300f93c-d1dc-4efb-a772-e3d3a5dea794",
+      "fact": "The port-8103 recon-escalation WATCHER runs the script fused-memory/scripts/derive_orphaned_recon_escalations.py at loop step 0 and again at step 5 after every wake.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The adopted mechanism: \"runs fused-memory/scripts/derive_orphaned_recon_escalations.py --apply at loop step 0 ... and again at step 5 after every wake\"."
+    },
+    {
+      "edge_uuid": "8e69a9c6-5fd6-413e-b249-d32dfdfa8806",
+      "episode_uuid": "7300f93c-d1dc-4efb-a772-e3d3a5dea794",
+      "fact": "Leo ruled that the port-8103 recon-escalation WATCHER is responsible for closing orphaned recon escalations.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "States the ruling: \"Leo ruled ... that the port-8103 recon-escalation WATCHER ... is the closer of orphaned recon escalations\"."
+    },
+    {
+      "edge_uuid": "fdb00a89-dc3e-4493-ac3d-53942074da4c",
+      "episode_uuid": "7300f93c-d1dc-4efb-a772-e3d3a5dea794",
+      "fact": "The port-8103 recon-escalation WATCHER closes orphaned recon escalations related to the reconciliation_stale_human_operator.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The ruling covers \"reconciliation_stale_human_operator records\" too."
+    },
+    {
+      "edge_uuid": "2245c618-22e9-42ed-95b1-30a1a92098f0",
+      "episode_uuid": "8070eac8-c9c0-4fd2-b596-4354387304cd",
+      "fact": "Ten tasks depend on task/5601, including task 5611.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Faithful dependency: \"Ten tasks (5602-5611) depend on 5601\"."
+    },
+    {
+      "edge_uuid": "633e738b-a9f5-4a85-a757-1b6829a49f09",
+      "episode_uuid": "8070eac8-c9c0-4fd2-b596-4354387304cd",
+      "fact": "The remaining plan steps concern the watchdog liveness clock in relation to task/5601.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"The remaining plan steps 29-34 concern ... the watchdog liveness clock\"."
+    },
+    {
+      "edge_uuid": "64fde031-9521-4a85-a8a7-da6b4c36a10b",
+      "episode_uuid": "8070eac8-c9c0-4fd2-b596-4354387304cd",
+      "fact": "Ten tasks depend on task/5601, including task 5602.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Faithful dependency: \"Ten tasks (5602-5611) depend on 5601\"."
+    },
+    {
+      "edge_uuid": "94a2a04d-a4c3-4f20-828a-43676192e2ad",
+      "episode_uuid": "8070eac8-c9c0-4fd2-b596-4354387304cd",
+      "fact": "The remaining plan steps concern a disposition fault in governed_exceptions.py related to task/5601.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: remaining steps concern \"a disposition fault in governed_exceptions.py\"."
+    },
+    {
+      "edge_uuid": "d7284f7d-2831-46d7-b0c0-d4a7dacf9330",
+      "episode_uuid": "8070eac8-c9c0-4fd2-b596-4354387304cd",
+      "fact": "The remaining plan steps concern a test pin related to task/5601.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: remaining steps concern \"a test pin\"."
+    },
+    {
+      "edge_uuid": "deb6d606-5409-4da1-8def-774e2bdedc26",
+      "episode_uuid": "8070eac8-c9c0-4fd2-b596-4354387304cd",
+      "fact": "Plan.json belongs to the architect, who is responsible for task/5601.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground: \"plan.json belongs to the architect\"; the architect is the one that \"re-planned\" 5601."
+    },
+    {
+      "edge_uuid": "e0ad38ee-b54a-475a-84fd-a3450f0d58e3",
+      "episode_uuid": "8070eac8-c9c0-4fd2-b596-4354387304cd",
+      "fact": "The correction to scripts/inline_suppressions.py goes in a follow-up task rather than a hand edit on branch task/5601.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"the correction to scripts/inline_suppressions.py goes in a FOLLOW-UP task (5724 ...) rather than a hand edit on branch task/5601\"."
+    },
+    {
+      "edge_uuid": "4b5366d9-7eea-4edc-a707-420e4fcb9c0a",
+      "episode_uuid": "8da20213-f1b7-4545-912f-35253242f621",
+      "fact": "Both `prefetched` and `pending_spec_base` are set on every iteration that follows a successful merge.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iv) The record says `prefetched` (deep queue) OR `pending_spec_base` (dry queue) is set, depending on queue state; the edge drops the disjunction and says both are."
+    },
+    {
+      "edge_uuid": "7c750480-77c5-4be8-8c00-1e52d321eead",
+      "episode_uuid": "8da20213-f1b7-4545-912f-35253242f621",
+      "fact": "The call site in SpeculativeMergeWorker was moved from before `take_prefetched()` to straight after it.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"move the call site from before `take_prefetched()` to straight after it\"."
+    },
+    {
+      "edge_uuid": "879b5a4a-f37e-431f-a826-f48fd9e7b8e2",
+      "episode_uuid": "8da20213-f1b7-4545-912f-35253242f621",
+      "fact": "dark-factory merge trains stopped forming on 2026-08-19 because the coalesce gate was accidentally keyed on pipeline ILL-HEALTH.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful diagnosis: \"merge trains stopped forming on 2026-08-19 because the coalesce gate was accidentally keyed on pipeline ILL-HEALTH\"."
+    },
+    {
+      "edge_uuid": "8851819e-d445-444b-afbf-4b86d22811b7",
+      "episode_uuid": "8da20213-f1b7-4545-912f-35253242f621",
+      "fact": "The `is_idle()` function was deliberately left untouched in the Decision.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"`is_idle()` is deliberately left untouched\"."
+    },
+    {
+      "edge_uuid": "bf2b2167-99a0-4a6a-851d-efa6908c2154",
+      "episode_uuid": "8da20213-f1b7-4545-912f-35253242f621",
+      "fact": "The Decision replaced `SpeculationController.is_idle()` with a new sibling predicate `SpeculationController.can_coalesce()`.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iv) Drops \"at ... _merger_loop's coalesce call site\": the record keeps is_idle() as an observability predicate, but the edge says it was replaced outright."
+    },
+    {
+      "edge_uuid": "0f4ed4e4-5c7d-4eed-8465-d6a18ac8af2a",
+      "episode_uuid": "8e3b3985-095a-431f-901a-e78c9ddd6208",
+      "fact": "The steward recommended retiring the entry and its tests due to the refuted verdict.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The disposition: \"The steward recommended retiring the entry and its tests\"."
+    },
+    {
+      "edge_uuid": "450bafbf-580c-4461-b473-80dcac0f7763",
+      "episode_uuid": "8e3b3985-095a-431f-901a-e78c9ddd6208",
+      "fact": "Four TestSeedRegistryRealSource tests pin the live verdict of the entry as refuted, causing them to go red.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"4 TestSeedRegistryRealSource tests pin the live verdict as refuted, so they go red\"."
+    },
+    {
+      "edge_uuid": "ae9f5b67-7c3d-443f-95a9-d338494be985",
+      "episode_uuid": "8e3b3985-095a-431f-901a-e78c9ddd6208",
+      "fact": "When task 4714 was merged with main, the shared _PROVENANCE_RANK_CLAUSE in fused-memory graphiti_client.py was widened from `e.invalid_at IS NULL` to _ACTIVE_EDGE_PREDICATE, allowing both survivor-ranking methods to count only active edges.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: _PROVENANCE_RANK_CLAUSE \"was widened from `e.invalid_at IS NULL` to _ACTIVE_EDGE_PREDICATE ..., so both survivor-ranking methods count only active edges\"."
+    },
+    {
+      "edge_uuid": "c9ac611b-f0d7-4039-8bef-598d7d2c3928",
+      "episode_uuid": "8e3b3985-095a-431f-901a-e78c9ddd6208",
+      "fact": "Main's task 4984 premise-registry entry calls an expired_at filter REFUTED because the restore hooks cleared only invalid_at.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: the entry \"calls an expired_at filter REFUTED because the restore hooks cleared only invalid_at\"."
+    },
+    {
+      "edge_uuid": "d5ca2b93-54ac-47cf-935a-b24b57aab73d",
+      "episode_uuid": "8e3b3985-095a-431f-901a-e78c9ddd6208",
+      "fact": "Task 4714 makes the rationale of the main's task 4984 premise-registry entry false by updating the edge to clear both markers.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful in substance: \"Task 4714 makes that rationale false (update_edge clear_invalid_at=True now clears both markers)\"."
+    },
+    {
+      "edge_uuid": "07e50b36-cc7e-4f97-8630-90c5c275a0d9",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "fact": "Task 5018's description's PEP 696 `TypeVar(default=str)` was rejected by pyright due to version constraints.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"the description's PEP 696 `TypeVar(default=str)` is rejected by pyright because every pyproject pinning `pythonVersion` sits at 3.11 or 3.10\"."
+    },
+    {
+      "edge_uuid": "1efec709-0efa-4d7d-97bb-44bd271f57b2",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "fact": "An architect found task 5088's prescribed pause-tolerant pin unsatisfiable and substituted it, documenting the deviation.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Instance (3) was \"a reviewer's blocking finding\" deleting a pin that was brittle and \"satisfiable by a stale copy-pasted comment\", not an architect finding it unsatisfiable."
+    },
+    {
+      "edge_uuid": "291bae3b-f0ec-4179-bbf9-08098d3c63b2",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "fact": "An architect found task 3488's retirement gate unsatisfiable and substituted it, documenting the deviation.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Instance (4) of the ratified convention: \"a retirement gate literally unsatisfiable\", ruled option A."
+    },
+    {
+      "edge_uuid": "85a62a03-f333-4f98-842d-642dfb369fc7",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "fact": "An architect found task 5018's literal instruction impossible and substituted it, documenting the deviation.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Instance (1) of the ratified convention: task 5018's literal instruction could not typecheck; substitution accepted."
+    },
+    {
+      "edge_uuid": "8c99e22a-dc00-4a18-8afa-270ba5f1c8fc",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "fact": "Task 3488's retirement gate was unsatisfiable because its remaining rows sit in dormant projects.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"its remaining rows sit in dormant projects whose windows never advance\"."
+    },
+    {
+      "edge_uuid": "8e363221-badb-4eb4-9816-b32503cb1e55",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "fact": "An architect found task 4864's frozen acceptance criterion unsatisfiable and substituted it, documenting the deviation.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Instance (2) of the ratified convention: the frozen criterion conflicts with task 4712's invariant."
+    },
+    {
+      "edge_uuid": "90ca27c9-f255-4b4f-8848-8169c6f6a68d",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "fact": "Task 4712's invariant forbids task 4864 from holding a marker payload.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Garbles the conflict: 4712's invariant forbids the MARKER PAYLOAD from holding a citation, not task 4864 from holding a marker payload."
+    },
+    {
+      "edge_uuid": "dfceda37-a0f1-4405-8ced-7833b380756c",
+      "episode_uuid": "a761318b-30cd-41cf-a71f-57d48cec670b",
+      "fact": "Task 5088's prescribed pause-tolerant pin was based on a YAML comment that was brittle to rewording.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: the pin \"could only assert on the PROSE of a YAML comment (brittle to a reword ...)\"."
+    },
+    {
+      "edge_uuid": "0684064c-e089-4185-afdb-3b163496cc96",
+      "episode_uuid": "b5b7b62e-702b-45dd-9b69-fc20cc8e9acf",
+      "fact": "The escalation's options addressed sub-finding C only, while sub-finding B had to be ruled on separately.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful history: \"The escalation's own four options addressed sub-finding C ONLY; B had to be ruled on separately\"."
+    },
+    {
+      "edge_uuid": "5c97f9a0-2b5c-4875-8f62-5bbab69669ab",
+      "episode_uuid": "b5b7b62e-702b-45dd-9b69-fc20cc8e9acf",
+      "fact": "Sub-finding C asked Stage 1 to check a novel cluster against task 3524's no-new-gate-tasks policy.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Restates what struck sub-finding C asked, attributed to C (\"C asked Stage 1 to check a novel cluster against task 3524's no-new-gate-tasks policy\"), not as adopted."
+    },
+    {
+      "edge_uuid": "8e2dc4e5-0e61-42df-901d-39ae6ec8f154",
+      "episode_uuid": "b5b7b62e-702b-45dd-9b69-fc20cc8e9acf",
+      "fact": "Sub-finding B is explicitly not to be re-filed as a follow-up task regarding the duplicate-cluster coverage check.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The ruling: \"the duplicate-cluster coverage check is explicitly NOT to be re-filed as a follow-up task\"."
+    },
+    {
+      "edge_uuid": "af7b8e93-0803-46a5-8ee9-ec6081017f0c",
+      "episode_uuid": "b5b7b62e-702b-45dd-9b69-fc20cc8e9acf",
+      "fact": "Task 3476 now has only sub-finding A after striking sub-findings B and C.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The ruling: \"sub-findings B AND C are both STRUCK; the task is now sub-finding A only\"."
+    },
+    {
+      "edge_uuid": "e9b9eeba-044a-466d-8386-0a4a3120e09e",
+      "episode_uuid": "b5b7b62e-702b-45dd-9b69-fc20cc8e9acf",
+      "fact": "Stage 1 was asked to search filed human-gate tasks for coverage of a cluster's mem0 UUIDs before asserting no task covers it, referencing task 3756 as precedent.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iii) Detaches struck sub-finding B's ask (\"B asked Stage 1 to search filed human-gate tasks ...\") from B, so a rejected proposal reads as an instruction Stage 1 was given."
+    },
+    {
+      "edge_uuid": "61a15ce1-581d-4b84-932e-401759a5e68c",
+      "episode_uuid": "d358e669-c892-4f1c-a905-db7252586bf0",
+      "fact": "An unpinned playwright spec can cause failures due to re-resolving against the registry on every launch, which can lead to issues with the cache directory.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful rationale: \"an unpinned spec re-resolves against the registry on every launch ... a reify killed partway wedges it permanently\"."
+    },
+    {
+      "edge_uuid": "68a8c3a3-b0cf-4d7c-82b3-3c5301e291f9",
+      "episode_uuid": "d358e669-c892-4f1c-a905-db7252586bf0",
+      "fact": "Leo mentioned that pinning the dependency commits the repo to a manual-bump cadence, which is a standing-cost tradeoff.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Attributes the session's own rationale to Leo; the record says pinning \"commits the repo to a manual-bump cadence ... that is the user's call\" — Leo said nothing."
+    },
+    {
+      "edge_uuid": "70efc2ce-39a4-4eb1-83d4-8a247faa52bc",
+      "episode_uuid": "d358e669-c892-4f1c-a905-db7252586bf0",
+      "fact": "Leo recommended pinning the spec to avoid issues with concurrent agents.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(iii) The recommendation was the session's, \"left as a proposal for Leo ... STATUS AT SESSION END: unapplied, undecided\"; the edge makes it Leo's."
+    },
+    {
+      "edge_uuid": "9104c471-bdc4-49c9-9c29-f4ce3934ac41",
+      "episode_uuid": "d358e669-c892-4f1c-a905-db7252586bf0",
+      "fact": "The 2026-09-14 playwright-MCP diagnostic session recommended pinning the playwright spec version in .mcp.json as the durable fix; the change was deliberately left unapplied, as a proposal put to Leo for his decision (the recommendation originated from the session, not from Leo).",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The disposition, faithfully: the durable fix \"was deliberately NOT applied in-session and was left as a proposal for Leo\"."
+    },
+    {
+      "edge_uuid": "d61273fc-200c-44d8-b128-ad5a19344699",
+      "episode_uuid": "d358e669-c892-4f1c-a905-db7252586bf0",
+      "fact": "Leo noted that .mcp.json is a checked-in repo file affecting every agent and session.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Attributes the session's reasoning (\"`.mcp.json` is a checked-in repo file affecting every agent and every session\") to Leo."
+    },
+    {
+      "edge_uuid": "e0516520-6118-44dc-a296-4b5600f350bb",
+      "episode_uuid": "d358e669-c892-4f1c-a905-db7252586bf0",
+      "fact": "Adding @playwright/mcp to dashboard/package.json is an alternative solution to ensure the playwright dependency is owned by cold-preprovision.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "The stated alternative, as an alternative: \"add `@playwright/mcp` to `dashboard/package.json` so the cold-preprovision `npm ci` owns it\"."
+    },
+    {
+      "edge_uuid": "22cbb731-758c-4566-8ea5-1d1aacb980ff",
+      "episode_uuid": "d749f531-937d-4ca6-8789-081c10e60a9b",
+      "fact": "The Progress step counter is a frozen copy of live state in the dark-factory implementer briefing.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful premise: the \"## Progress\" step counter is one of the \"frozen copies of live state in the dark-factory implementer briefing\"."
+    },
+    {
+      "edge_uuid": "34754aea-704b-4e67-8bfe-62473f787124",
+      "episode_uuid": "d749f531-937d-4ca6-8789-081c10e60a9b",
+      "fact": "The build_completion_judge_prompt was excluded because its prompt body contains zero occurrences of iterations.jsonl.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Scope decision with its stated reason: \"build_completion_judge_prompt was EXCLUDED ... its prompt body contains ZERO occurrences of iterations.jsonl\"."
+    },
+    {
+      "edge_uuid": "6b25a0d4-ef70-4615-bd34-fc8fb01f8ded",
+      "episode_uuid": "d749f531-937d-4ca6-8789-081c10e60a9b",
+      "fact": "Leo ruled that both frozen copies of live state in the dark-factory implementer briefing are SPOT violations.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The ruling: \"BOTH frozen copies of live state in the dark-factory implementer briefing are SPOT violations\"."
+    },
+    {
+      "edge_uuid": "8c86f2ec-d023-47d6-9925-6e8f20527d68",
+      "episode_uuid": "d749f531-937d-4ca6-8789-081c10e60a9b",
+      "fact": "The now-unused iteration_log parameter was removed from both in-scope builders.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Decision recorded: \"The now-unused iteration_log parameter was removed from both in-scope builders\"."
+    },
+    {
+      "edge_uuid": "8d60c47e-0b32-489b-ad02-ec2a6902d733",
+      "episode_uuid": "d749f531-937d-4ca6-8789-081c10e60a9b",
+      "fact": "The Recent Iterations render is a frozen copy of live state in the dark-factory implementer briefing.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful premise: the \"## Recent Iterations\" render is the second frozen copy."
+    },
+    {
+      "edge_uuid": "b1c6e38e-09f0-4ad7-972b-a5afe468bad0",
+      "episode_uuid": "d749f531-937d-4ca6-8789-081c10e60a9b",
+      "fact": "The Session Startup Protocol orders the agent to read iterations.jsonl.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"the prompt's own Session Startup Protocol already orders the agent to read .task/plan.json and iterations.jsonl\"."
+    },
+    {
+      "edge_uuid": "da7c3262-9171-4e89-ae82-39f6fb7d1ee5",
+      "episode_uuid": "d749f531-937d-4ca6-8789-081c10e60a9b",
+      "fact": "The build_amender_prompt was included in the changes because it renders the identical block and is the implementer role.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Scope decision: \"build_amender_prompt was INCLUDED ... because it renders the identical block ... and the amender IS the implementer role\"."
+    },
+    {
+      "edge_uuid": "edd356ae-e46e-47d3-8208-e62c411dd112",
+      "episode_uuid": "d749f531-937d-4ca6-8789-081c10e60a9b",
+      "fact": "The Session Startup Protocol orders the agent to read the Progress step counter.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) The protocol orders reading .task/plan.json, of which the Progress counter is the frozen copy being removed; the record never says the protocol orders reading the counter."
+    },
+    {
+      "edge_uuid": "062fd566-7ee2-4c84-aeab-e2f654c4a332",
+      "episode_uuid": "eb572501-f63f-4712-a073-d70a41ff34ff",
+      "fact": "If head-of-line relief is ever wanted, pair task_slots 2 with pytest_n '4'.",
+      "graph": "dark_factory",
+      "label": "misbound",
+      "rationale": "Faithful (\"if head-of-line relief is ever wanted, pair task_slots 2 with pytest_n '4'\") but the target is a node \"task_files\" that the record never names."
+    },
+    {
+      "edge_uuid": "314c25f2-f6c8-4e48-a71b-f578075dfa31",
+      "episode_uuid": "eb572501-f63f-4712-a073-d70a41ff34ff",
+      "fact": "The real ceiling was the scheduler tick.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful finding: \"The real ceiling was the scheduler tick\"."
+    },
+    {
+      "edge_uuid": "5255aeec-a8ca-4298-89ab-c56e4b6ef03a",
+      "episode_uuid": "eb572501-f63f-4712-a073-d70a41ff34ff",
+      "fact": "The engineering budget should be spent on the scheduler tick and on cutting verify cost.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"spend the engineering budget on the scheduler tick and on cutting verify cost\"."
+    },
+    {
+      "edge_uuid": "5f879bba-7513-476e-8e02-259c95003bb5",
+      "episode_uuid": "eb572501-f63f-4712-a073-d70a41ff34ff",
+      "fact": "Cost ceilings are already effectively disabled against a default.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful in substance: \"cost ceilings are already effectively disabled (orch_daily_cost_ceiling_usd raised to 10000 against a 200 default)\"."
+    },
+    {
+      "edge_uuid": "72eb9940-1657-4ec3-8343-5a2661820e63",
+      "episode_uuid": "eb572501-f63f-4712-a073-d70a41ff34ff",
+      "fact": "Token caps accounted for only 1.4% of wall clock and 1.3% of free slot-hours.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful measurement: \"token caps accounted for only 1.4% of wall clock and 1.3% of free slot-hours\"."
+    },
+    {
+      "edge_uuid": "aa8d6795-4f81-44b6-9f27-073501af4459",
+      "episode_uuid": "eb572501-f63f-4712-a073-d70a41ff34ff",
+      "fact": "Keep merge_verify_max_concurrent_modules at 1 and keep verify_admission_task_slots at 1.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The corollary decision: \"keep merge_verify_max_concurrent_modules at 1 and keep verify_admission_task_slots at 1\"."
+    },
+    {
+      "edge_uuid": "bc6189b1-f651-4520-bc7c-ac2f862b6e5d",
+      "episode_uuid": "eb572501-f63f-4712-a073-d70a41ff34ff",
+      "fact": "Leo's reasoning for keeping merge_verify_max_concurrent_modules at 1 was independently confirmed.",
+      "graph": "dark_factory",
+      "label": "misbound",
+      "rationale": "Faithful (\"Leo's reasoning for the former was independently confirmed\", the former being max_concurrent_modules) but it hangs on verify_admission_task_slots."
+    },
+    {
+      "edge_uuid": "02b6b23b-f6e4-468e-a2c2-40005df39143",
+      "episode_uuid": "ed2b4105-82cb-4349-8940-36be6205d9ef",
+      "fact": "A deep queue gives the coalescer two or more waiting singles to build a train from.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground: \"A deep queue is precisely what gives the coalescer two or more waiting singles to build a train from\"."
+    },
+    {
+      "edge_uuid": "06eeb3e2-1fd3-4637-8aa2-8bf92209f28f",
+      "episode_uuid": "ed2b4105-82cb-4349-8940-36be6205d9ef",
+      "fact": "While task 4953 is open, branches should be submitted to the merge lane one at a time into an empty queue.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"while task 4953 is open, submit branches to the merge lane ONE AT A TIME into an empty queue\"."
+    },
+    {
+      "edge_uuid": "33871bd9-f5eb-4fb6-a9d9-01e795a7273f",
+      "episode_uuid": "ed2b4105-82cb-4349-8940-36be6205d9ef",
+      "fact": "A 20-branch backlog creates a long unattended tail in the deep queue.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Misplaces the cost: the long unattended tail is the cost of the one-at-a-time WORKAROUND (\"roughly 30-60 min per landing, so a 20-branch backlog is a long unattended tail\"), not of the deep queue."
+    },
+    {
+      "edge_uuid": "722aa702-ad91-4088-8709-dd268caf3766",
+      "episode_uuid": "ed2b4105-82cb-4349-8940-36be6205d9ef",
+      "fact": "The deep-queue advice was correct for a healthy lane.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"That advice was correct for a HEALTHY lane\"."
+    },
+    {
+      "edge_uuid": "85fa8ae7-8e29-4896-b521-47bab7b643a0",
+      "episode_uuid": "ed2b4105-82cb-4349-8940-36be6205d9ef",
+      "fact": "Coalesce-train members landed 0 of 15 in the merge lane across two separate derail events.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful measurement: \"coalesce-train members landed 0 of 15, across two separate derail events\"."
+    },
+    {
+      "edge_uuid": "8eb1c27e-c5f0-45c6-a3e3-1171c5d58416",
+      "episode_uuid": "ed2b4105-82cb-4349-8940-36be6205d9ef",
+      "fact": "Any train containing an MCP-submitted member can never complete in the merge lane.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful restatement: \"any train containing an MCP-submitted (workflow-less) member can never complete\"."
+    },
+    {
+      "edge_uuid": "1261b12d-7c89-4e85-ad9c-5fdbfaeafe1d",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "Destructive tools remain refuse-only via a declared exempt_tools set.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"Destructive tools (delete_memory etc.) stay refuse-only via a declared exempt_tools set\"."
+    },
+    {
+      "edge_uuid": "1f568cb5-15b7-46d0-922c-82550e61ebc3",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "The update_task and every escalation tool forward unchanged with candidates when an ambiguous match is found.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decided exception: \"except update_task and every escalation tool, which forward unchanged with candidates\"."
+    },
+    {
+      "edge_uuid": "2bd8eeb6-2679-4b3e-aabd-8321c47730f1",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "The shared markup middleware expands a UNIQUE match in place and reports the delta on meta.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The write-side mechanism: a guard \"behind the shared markup middleware expands a UNIQUE match in place and reports the delta on meta\"."
+    },
+    {
+      "edge_uuid": "6a4b6fc1-e870-4af0-a23c-ea1946e4f385",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "Leo chose both Mem0 and Graphiti for both sides of the uuid-prefix resolution.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"Leo chose both Mem0 and Graphiti on both sides\"."
+    },
+    {
+      "edge_uuid": "797e5496-ea76-491d-963c-53a8af4985ad",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "The DF 3936 lost-write hole was chosen to teach the fused-memory shim to consume the shared FORWARD_REPAIR.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Garbles a rejection ground into a choice: the DF 3936 lost-write hole is why REJECT_WITH_REPAIR was rejected; the hole was not \"chosen to teach the fused-memory shim\"."
+    },
+    {
+      "edge_uuid": "9487a5e4-2cef-41d0-a772-42a28a4f9cfd",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "The resolver in shared/ was rejected in favor of a plain HTTP route POST /resolve-prefix on fused-memory.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Rejected alternative as decided: resolver in shared/ rejected — \"chose a plain HTTP route POST /resolve-prefix on fused-memory instead\"."
+    },
+    {
+      "edge_uuid": "a059810f-d3f7-438b-b69a-3a041e81677d",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "The get_memory_by_id function accepts an 8-31 hex prefix, reporting a namespace/tombstone when no match is found.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The read-side decision: get_memory_by_id \"accept[s] an 8-31 hex prefix (... 0 -> typed not-found with namespace/tombstone report)\"."
+    },
+    {
+      "edge_uuid": "b7896228-d370-4ce0-8617-5f2a2b0cf9b0",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "Three quarters of 8-hex tokens are dates/run ids/Graphiti ids/deleted memories, leading to a zero matches report.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground for inertness: \"three quarters of 8-hex tokens are dates/run ids/Graphiti ids/deleted memories\"."
+    },
+    {
+      "edge_uuid": "d132ef85-da87-403d-af1f-16f3f54333ee",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "The uuid-prefix resolution replaces the prompt-discipline-only approach which had no measurable drop in the authoring rate.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: \"replacing the prompt-discipline-only approach ... which ran four months with no measurable drop in the authoring rate\"."
+    },
+    {
+      "edge_uuid": "e5152656-4652-46de-977c-4a3e2134a359",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "The get_entity_by_uuid function accepts an 8-31 hex prefix, reporting a namespace/tombstone when no match is found.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The read-side decision covers get_entity_by_uuid too."
+    },
+    {
+      "edge_uuid": "e6d61b94-c04a-4215-b269-b2bd73728d44",
+      "episode_uuid": "f475206f-cdf4-4471-8881-f93c575c2396",
+      "fact": "Leo decided to build a deterministic uuid-prefix resolution as a two-arm mechanism instead of a per-project resolver.",
+      "graph": "dark_factory",
+      "label": "overreach",
+      "rationale": "(ii) Contradicts the record: the decision is a \"TWO-ARM mechanism OVER one per-project resolver\", not one \"instead of a per-project resolver\"."
+    },
+    {
+      "edge_uuid": "5dc65701-8d20-4954-8921-58fd314e0b13",
+      "episode_uuid": "f980d3f8-b0e1-45f3-a49d-c43e5d4eb1cb",
+      "fact": "The orchestrator verify.py::main_baseline_failing_ids is used by verify_failure_is_preexisting_on_main under merge_verify_breadth='full'.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful: \"verify.py::main_baseline_failing_ids, used by verify_failure_is_preexisting_on_main under merge_verify_breadth='full'\"."
+    },
+    {
+      "edge_uuid": "6eff6353-c351-49af-aedd-ebaf8f07ac80",
+      "episode_uuid": "f980d3f8-b0e1-45f3-a49d-c43e5d4eb1cb",
+      "fact": "The merge-path main-health BASELINE probe should be narrowed to the MODULES that hold the branch's failing test ids.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The decision: the probe \"should be narrowed to the MODULES that hold the branch's failing test ids\"."
+    },
+    {
+      "edge_uuid": "8bac0785-1caa-43eb-a1e6-f0a00b24bccf",
+      "episode_uuid": "f980d3f8-b0e1-45f3-a49d-c43e5d4eb1cb",
+      "fact": "~124 distinct _mainprobe worktrees appeared fleet-wide in syslog over 2026-09-06 to 2026-09-18.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful measurement: \"~124 distinct _mainprobe worktrees appeared fleet-wide in syslog over 2026-09-06→09-18\"."
+    },
+    {
+      "edge_uuid": "b251995e-b7e7-4901-b4a1-5a66dbd298f9",
+      "episode_uuid": "f980d3f8-b0e1-45f3-a49d-c43e5d4eb1cb",
+      "fact": "Each MODULE is already verified by its own independent pytest invocation.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful ground: \"each module is already verified by its own independent pytest invocation\"."
+    },
+    {
+      "edge_uuid": "b7ffcc1d-1a67-49f6-9482-3ea726d7c55e",
+      "episode_uuid": "f980d3f8-b0e1-45f3-a49d-c43e5d4eb1cb",
+      "fact": "The probe's cost note claims pass-path seeding (seed_main_baseline) amortises the cold probe, but _PROBE_CACHE_TTL is 300 s while a DF merge gate runs ~50 min.",
+      "graph": "dark_factory",
+      "label": "context",
+      "rationale": "Faithful finding: \"the probe's cost note claims pass-path seeding ... amortises the cold probe, but _PROBE_CACHE_TTL is 300 s while a DF merge gate runs ~50 min\"."
+    },
+    {
+      "edge_uuid": "156531f3-35b3-4d54-bf4c-44bc4a0c4abb",
+      "episode_uuid": "fe7912cd-538b-4746-b8e9-e7e2af942480",
+      "fact": "Deterministic deploy task 6056 will re-run install-trickle-timer.sh after task 6042 lands.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Decided disposition: \"Deterministic deploy tasks 6055 (dark_factory) and 6056 (reify) re-run install-trickle-timer.sh after 6042 lands\"."
+    },
+    {
+      "edge_uuid": "4b27c730-5093-4d9f-ab12-c3231bc58cde",
+      "episode_uuid": "fe7912cd-538b-4746-b8e9-e7e2af942480",
+      "fact": "Task 6042 is responsible for moving the legibility trickle and census onto the orchestrator's shared session runner.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "The ruling: \"task 6042 is the single owner of moving the legibility trickle and census onto the orchestrator's shared session runner\"."
+    },
+    {
+      "edge_uuid": "52a860ac-c138-4262-9da7-b1ab231e4f15",
+      "episode_uuid": "fe7912cd-538b-4746-b8e9-e7e2af942480",
+      "fact": "Deterministic deploy task 6055 will re-run install-trickle-timer.sh after task 6042 lands.",
+      "graph": "dark_factory",
+      "label": "holding",
+      "rationale": "Same disposition for 6055: \"re-run install-trickle-timer.sh after 6042 lands\"."
+    },
+    {
+      "edge_uuid": "9472fb6b-07a7-4eb2-bc8b-6e8e88668422",
+      "episode_uuid": "fe7912cd-538b-4746-b8e9-e7e2af942480",
+      "fact": "Task 6042 is responsible for moving the legibility trickle and census onto the account pool.",
+      "graph": "dark_factory",
+      "label": "misbound",
+      "rationale": "The fact (moving onto the orchestrator's account pool) is faithful, but it hangs on account_pool.py, whose \"parallel rotation is retired, not kept\" — the opposite entity."
+    },
+    {
+      "edge_uuid": "b28c1f73-bd31-459a-bae3-d19a4dcbdd96",
+      "episode_uuid": "fe7912cd-538b-4746-b8e9-e7e2af942480",
+      "fact": "Task 6041 was cancelled as a duplicate of task 6042.",
+      "graph": "dark_factory",
+      "label": "misbound",
+      "rationale": "Faithful (\"Task 6041 was cancelled as a duplicate\") but the edge hangs on node Task 5515, a different task."
+    },
+    {
+      "edge_uuid": "e2c74f59-60cb-4293-8cad-c1215685acea",
+      "episode_uuid": "fe7912cd-538b-4746-b8e9-e7e2af942480",
+      "fact": "Task 5515 was cancelled as it was covered by task 6042.",
+      "graph": "dark_factory",
+      "label": "bookkeeping",
+      "rationale": "Status as recorded: \"task 5515 was cancelled as covered\"."
+    },
+    {
+      "edge_uuid": "0f0dd4af-4460-4638-a35e-d01d37570633",
+      "episode_uuid": "01e841f5-34fb-4f6f-bb76-838ef155a210",
+      "fact": "Task 6362 is completed, but escalation esc-6362-3 remains open due to its stated close condition not being met.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"chose to leave escalation esc-6362-3 OPEN ... even though task 6362 itself is now done\"."
+    },
+    {
+      "edge_uuid": "196b17c8-ffd0-4f68-83a3-009e52950231",
+      "episode_uuid": "01e841f5-34fb-4f6f-bb76-838ef155a210",
+      "fact": "The closure of escalation esc-6362-3 depends on dark_factory task 4930 landing.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The close condition the decision rests on: \"dark_factory task 4930 landing\"."
+    },
+    {
+      "edge_uuid": "9674633b-9d6b-4883-b848-f9fc096fa812",
+      "episode_uuid": "01e841f5-34fb-4f6f-bb76-838ef155a210",
+      "fact": "Siblings esc-5711-10 carry the same signature for the recurring fault CLASS as escalation esc-6362-3.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"siblings esc-5711-10, esc-5747-6 carry the same signature\"."
+    },
+    {
+      "edge_uuid": "c69c4465-1aca-4889-a95c-89b3f48c683d",
+      "episode_uuid": "01e841f5-34fb-4f6f-bb76-838ef155a210",
+      "fact": "Siblings esc-5747-6 carry the same signature for the recurring fault CLASS as escalation esc-6362-3.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"siblings esc-5711-10, esc-5747-6 carry the same signature\"."
+    },
+    {
+      "edge_uuid": "d441278e-2024-421f-9bb2-f9f750ba8df9",
+      "episode_uuid": "01e841f5-34fb-4f6f-bb76-838ef155a210",
+      "fact": "Escalation esc-6362-3 tracks the recurring fault CLASS across tasks.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"The escalation record tracks the recurring fault CLASS across tasks\"."
+    },
+    {
+      "edge_uuid": "0fc045af-a45d-4b08-91f5-53532074f80e",
+      "episode_uuid": "1f919590-d97c-4ed9-adfc-9109c51ed126",
+      "fact": "The esc-6852-2 ruling states that the churn is accepted as the price of the standing hold and is not to be silenced.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful restatement of the cited prior ruling: \"the churn is accepted as the price of the standing hold, is NOT to be silenced\"."
+    },
+    {
+      "edge_uuid": "1e9de136-72cb-4bc0-8d4e-3185b9def456",
+      "episode_uuid": "1f919590-d97c-4ed9-adfc-9109c51ed126",
+      "fact": "The record of esc-7037-2 is the churn filed as an incident, which the ruling forbids.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful reasoning: \"the record IS the churn filed as an incident, i.e. the thing the ruling forbids\"."
+    },
+    {
+      "edge_uuid": "20ec008e-6ca0-4e95-90f8-95285fa90ede",
+      "episode_uuid": "1f919590-d97c-4ed9-adfc-9109c51ed126",
+      "fact": "On 2026-09-16, the L2 escalation-watcher closed esc-7037-2.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The disposition: \"On 2026-09-16 the L2 escalation-watcher closed esc-7037-2\"."
+    },
+    {
+      "edge_uuid": "4fab751d-5dee-4896-8509-49507b4d6772",
+      "episode_uuid": "1f919590-d97c-4ed9-adfc-9109c51ed126",
+      "fact": "Leo's standing esc-6852-2 ruling from 2026-09-03 was referenced in the closure of esc-7037-2.",
+      "graph": "reify",
+      "label": "bookkeeping",
+      "rationale": "Which ruling the close cited: \"against Leo's own standing esc-6852-2 ruling of 2026-09-03\"."
+    },
+    {
+      "edge_uuid": "6ae4e256-1c3b-425e-97a3-a56da2158dbe",
+      "episode_uuid": "1f919590-d97c-4ed9-adfc-9109c51ed126",
+      "fact": "The per-task veto-streak emission continues to report that real work is parked after closing esc-7037-2.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"the per-task veto-streak emission is untouched and keeps reporting that real work is parked\"."
+    },
+    {
+      "edge_uuid": "7b788752-01ac-498e-b73a-fab1d95671d4",
+      "episode_uuid": "1f919590-d97c-4ed9-adfc-9109c51ed126",
+      "fact": "The structural fix for L2 is dark_factory task 5542, which keys the root_cause by originating pin instead of one generic bucket.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(i) Generalises \"the structural fix\" for this re-minting veto-streak cluster (\"key the root_cause by originating pin\") into \"the structural fix for L2\"."
+    },
+    {
+      "edge_uuid": "fa1165b6-3ee1-4ded-b241-ed9a6f428a46",
+      "episode_uuid": "1f919590-d97c-4ed9-adfc-9109c51ed126",
+      "fact": "Before closing esc-7037-2, it was verified that the recovery_emission knobs were not retuned in reify's config.",
+      "graph": "reify",
+      "label": "bookkeeping",
+      "rationale": "A verification status: \"Verified the ruling was honoured before closing (no recovery_emission retune in reify's config...)\"."
+    },
+    {
+      "edge_uuid": "fa1e5833-aa7f-4bae-8182-126558511674",
+      "episode_uuid": "1f919590-d97c-4ed9-adfc-9109c51ed126",
+      "fact": "esc-7037-2 is part of the recovery-veto-streak-noise-from-pending-l2-pin cluster.",
+      "graph": "reify",
+      "label": "bookkeeping",
+      "rationale": "Identifies the record: esc-7037-2 is \"the 47-member 'recovery-veto-streak-noise-from-pending-l2-pin' cluster\"."
+    },
+    {
+      "edge_uuid": "273b8265-d845-4ae5-8c33-9900422d4fc7",
+      "episode_uuid": "205f7159-d36e-4587-918c-3d454443712d",
+      "fact": "reify's /prd decompose gate workflow uses prd-capability-check.py during the bind step.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful in substance: Enumerate/Prove \"shell the bind step + prd-capability-check.py\"."
+    },
+    {
+      "edge_uuid": "359233a6-edc5-43a7-826a-780dbe496ac7",
+      "episode_uuid": "205f7159-d36e-4587-918c-3d454443712d",
+      "fact": "reify's /prd decompose gate workflow now pins a model for the Synthesize role as 'haiku'.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"Synthesize `model: \"haiku\", effort: \"medium\"`\"."
+    },
+    {
+      "edge_uuid": "58786c08-53a5-4920-95d9-7235f863073e",
+      "episode_uuid": "205f7159-d36e-4587-918c-3d454443712d",
+      "fact": "reify's /prd decompose gate workflow now pins a model for the Enumerate role as 'sonnet'.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"Enumerate `model: \"sonnet\"`\"."
+    },
+    {
+      "edge_uuid": "6a3e9b15-ccab-498e-9717-a0e3e77fe4f0",
+      "episode_uuid": "205f7159-d36e-4587-918c-3d454443712d",
+      "fact": "reify's /prd decompose gate workflow shells the prd-decompose-verify.py synthesize harness.",
+      "graph": "reify",
+      "label": "misbound",
+      "rationale": "Faithful (\"Synthesize only shells the deterministic prd-decompose-verify.py synthesize harness\") but the target node is prd-decompose-verify.mjs itself, not the .py harness."
+    },
+    {
+      "edge_uuid": "6d3c019b-de5e-4f43-ba7c-6fedfb1d4318",
+      "episode_uuid": "205f7159-d36e-4587-918c-3d454443712d",
+      "fact": "The overrides in meta.phases are mirrored per the Workflow contract's phase-level model guidance.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"The overrides are mirrored into `meta.phases` per the Workflow contract's phase-level `model` guidance\"."
+    },
+    {
+      "edge_uuid": "e4c178e0-f691-4684-a397-c4e38359b710",
+      "episode_uuid": "205f7159-d36e-4587-918c-3d454443712d",
+      "fact": "Leo explicitly rejected pinning the top-level session in dark-factory's skills/prd/SKILL.md.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"Leo EXPLICITLY REJECTED pinning the top-level session (no `model:` frontmatter added to dark-factory's skills/prd/SKILL.md)\"."
+    },
+    {
+      "edge_uuid": "1509a2c4-8364-4eca-95ae-7e29611a99f5",
+      "episode_uuid": "2766883f-0422-423c-bcd0-ef0e0deb2bea",
+      "fact": "Leo chose to commit the PRD docs to main despite the merge queue being genuinely live, accepting the reverify cost.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: Leo chose \"commit the PRD docs to main now anyway\", explicitly accepting that 6756 would eat a gate_reverify."
+    },
+    {
+      "edge_uuid": "3e366263-2ec6-40c1-b287-64261912ab9b",
+      "episode_uuid": "2766883f-0422-423c-bcd0-ef0e0deb2bea",
+      "fact": "The PRD docs were committed to main by Leo.",
+      "graph": "reify",
+      "label": "bookkeeping",
+      "rationale": "Status: the PRD docs were committed to main on Leo's choice."
+    },
+    {
+      "edge_uuid": "8e68ae3e-751e-4ebd-aa73-23a1615803fa",
+      "episode_uuid": "2766883f-0422-423c-bcd0-ef0e0deb2bea",
+      "fact": "The design-invariants entries needed to be citable immediately by the two concurrently running sibling design/decompose sessions.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful reason: the entries \"needed to be citable immediately by the two concurrently running sibling design/decompose sessions\"."
+    },
+    {
+      "edge_uuid": "9c312a0d-49d6-4504-9e06-7c5e38ac3bbf",
+      "episode_uuid": "2766883f-0422-423c-bcd0-ef0e0deb2bea",
+      "fact": "Leo ruled that the reverify cost was acceptable for a genuinely docs-only diff when concurrent sessions were blocked on the docs being on main.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The refinement as recorded: \"when concurrent sessions are blocked on the docs being on main, Leo has now twice ruled the reverify cost acceptable for a genuinely docs-only diff\"."
+    },
+    {
+      "edge_uuid": "cd19df64-a925-4820-8fb2-b43f9ffc7b52",
+      "episode_uuid": "2766883f-0422-423c-bcd0-ef0e0deb2bea",
+      "fact": "Task 6756 was 30 minutes into an active verify with the merge queue genuinely live.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful circumstance: \"task 6756 30 min into an active verify, verify_in_progress non-null\"."
+    },
+    {
+      "edge_uuid": "288d1148-7f77-4f9c-9c71-6806979546e5",
+      "episode_uuid": "4648ebdd-253c-4fa2-a063-d8420f716924",
+      "fact": "Cylindrical should not build the structural variant, which would require a new Type variant.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"do NOT build the structural anonymous intersection (<HasAxis & HasRadius>), which would need a new Type variant\"."
+    },
+    {
+      "edge_uuid": "2fc3aff4-6b29-4798-92fa-9fb8eb51fcca",
+      "episode_uuid": "4648ebdd-253c-4fa2-a063-d8420f716924",
+      "fact": "Cylindrical is a named refining trait that includes HasRadius.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"a named refining trait (trait Cylindrical : HasAxis + HasRadius)\"."
+    },
+    {
+      "edge_uuid": "4744269b-52c2-460e-80ad-ac29053fead2",
+      "episode_uuid": "4648ebdd-253c-4fa2-a063-d8420f716924",
+      "fact": "Low-priority tasks in a deep queue effectively never dispatch.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful ground: \"low-priority tasks in a deep queue effectively never dispatch\"."
+    },
+    {
+      "edge_uuid": "5be8d2f0-aa36-4b42-8099-df7af2b9fd66",
+      "episode_uuid": "4648ebdd-253c-4fa2-a063-d8420f716924",
+      "fact": "Cylindrical is a named refining trait that includes HasAxis.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"trait Cylindrical : HasAxis + HasRadius\"."
+    },
+    {
+      "edge_uuid": "7bfd5f2d-4339-4af0-8cd2-56dbe2a025cb",
+      "episode_uuid": "4648ebdd-253c-4fa2-a063-d8420f716924",
+      "fact": "If the feature-to-datum trait bundle cannot attach a refining trait to a kernel-derived realized face, the implementer must escalate with evidence.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The recorded clarifier: \"if the feature-to-datum trait bundle cannot attach a refining trait ..., the implementer must ESCALATE with evidence\"."
+    },
+    {
+      "edge_uuid": "adc24856-4686-45cc-bc25-ada6a09fa7d5",
+      "episode_uuid": "4648ebdd-253c-4fa2-a063-d8420f716924",
+      "fact": "The stale blocker made low-priority tasks effectively never dispatch.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) Invents a cause: the record says the stale blocker made the priority raise \"cheap\" and, separately, that low-priority tasks in a deep queue never dispatch."
+    },
+    {
+      "edge_uuid": "20f5f364-5b7c-4f99-ad9c-0a62373b832f",
+      "episode_uuid": "5d4d1375-b191-4ba7-8709-31ef47f0b053",
+      "fact": "Leo's ruling on the warm-lane reclaim was narrowed on execution because the premise had drifted regarding the number of PINNED lanes.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The disposition: \"LEO'S RULING ON THE WARM-LANE RECLAIM WAS NARROWED ON EXECUTION BECAUSE ITS PREMISE HAD DRIFTED\" (PINNED was 24 not 14)."
+    },
+    {
+      "edge_uuid": "7de85dab-cba1-481e-b176-253458e2ff74",
+      "episode_uuid": "5d4d1375-b191-4ba7-8709-31ef47f0b053",
+      "fact": "The seed-vs-GC race is the measured proximate cause of task 6362's rc=124.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"the seed-vs-GC race is the measured proximate cause of task 6362's rc=124\"."
+    },
+    {
+      "edge_uuid": "824cad5b-68d1-46a1-830c-1c614f317e22",
+      "episode_uuid": "5d4d1375-b191-4ba7-8709-31ef47f0b053",
+      "fact": "The orphan infra worktrees are protected by warm-lane-gc.sh by default.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: orphan infra worktrees \"which warm-lane-gc.sh PROTECTS BY DEFAULT via --protect-glob\"."
+    },
+    {
+      "edge_uuid": "9543fd35-19c5-4ce5-ab93-d851a331fd96",
+      "episode_uuid": "5d4d1375-b191-4ba7-8709-31ef47f0b053",
+      "fact": "The reclaim was run with DEFAULTS rather than reclaiming the PINNED set.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "What was done: \"scripts/warm-lane-gc.sh reclaim was run with DEFAULTS rather than reclaiming the PINNED set\"."
+    },
+    {
+      "edge_uuid": "9cdacc4b-1739-4b47-a52b-5945a93a17b7",
+      "episode_uuid": "5d4d1375-b191-4ba7-8709-31ef47f0b053",
+      "fact": "The live-consumer flock gate preserves lanes independently of the GC.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) The record says \"the GC's own live-consumer flock gate\" protects lanes independently of the PAUSE; the gate is part of the GC, not independent of it."
+    },
+    {
+      "edge_uuid": "4da61f74-07d4-4f42-85e5-9cfb845f051a",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "The Gantry CFRP tube was studied as an equivalent-EI square box due to overload issues in author binaries.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Decision (1): the tube \"studied as an equivalent-EI square box ... because the body-arg solve overload cannot mesh in author binaries\"."
+    },
+    {
+      "edge_uuid": "5590637b-8a16-4973-9d1c-8a82eb6805a5",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "CFRP is considered as isotropic with an axial-dominant Young's modulus of 110GPa.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Decision (1): \"CFRP as isotropic 110GPa axial-dominant (Leo's pick over 60GPa quasi-iso)\"."
+    },
+    {
+      "edge_uuid": "68179b53-2be6-4889-a082-2604b4fb04fc",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "The height of the CFRP tube is derived from the moment of inertia (I_tube).",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) h = (12*I_tube)^(1/4) is the height of the equivalent square BOX that stands in for the tube, not of the CFRP tube."
+    },
+    {
+      "edge_uuid": "92596903-b5d3-4872-8839-ed56e5284192",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "The wall thickness of the AFrame was cut to 66mm to meet the mass limit of the Envelope's frame ceiling.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Decision (5): \"AFrame wall_thickness cut 100mm -> 66mm\" because two walls were \"~520kg against the Envelope's 400kg frame ceiling\"."
+    },
+    {
+      "edge_uuid": "93dca29f-4cfb-4223-b586-74666eb1de88",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "The stiffness (k_SS) of the half-span cantilever is twice that of the cantilever stiffness (k_cant).",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) Mislabels the quantities: k_SS is the simply-supported full-span stiffness and k_cant the half-span cantilever (\"k_SS = 2*k_cant\"), not \"k_SS of the half-span cantilever\"."
+    },
+    {
+      "edge_uuid": "9c3baa6f-35c1-44ab-aefa-a31632ec0e3e",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "The solid steel BearingRod was changed to a new BearingTube CFRP leaf.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(iv) Drops \"X gantry rails\": only the X rails changed to BearingTube, and the record adds \"Y rails stay steel\"."
+    },
+    {
+      "edge_uuid": "b13bcc09-a6fd-4aee-86ea-4b89db0d823e",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "A second FixedSupport in the modal solver silently degrades to a pinned support.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"a second FixedSupport silently degrades to pinned in the modal solver (#6663)\"."
+    },
+    {
+      "edge_uuid": "b88d8cc1-8126-405a-bef6-fa399dffa0e2",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "The panel FEA validates the thinner section with a wall stiffness (k_wall) of 6.57 MN/m and a fundamental frequency (f1) of 58.9Hz.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful measurement: \"the panel FEA then validates the thinner section (k_wall 6.57 MN/m, f1 58.9Hz)\"."
+    },
+    {
+      "edge_uuid": "d39603b6-f1dd-4994-891d-1089003b73c0",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "All per-case algebra is duplicated as typed single solve_elastic_static calls because the multi-case accessors are compile-time untyped.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Decision (6): \"all per-case algebra duplicated as typed single solve_elastic_static calls because the multi-case accessors are compile-time untyped\"."
+    },
+    {
+      "edge_uuid": "daabdc38-d472-459f-bc2e-34fd012c6c87",
+      "episode_uuid": "63fb08ef-3ee3-4ad2-93e2-2b1f604803b7",
+      "fact": "The solve_load_cases are kept solely to feed the GUI FEA case view.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Decision (6): \"solve_load_cases kept SOLELY to feed the GUI FEA case view\"."
+    },
+    {
+      "edge_uuid": "16f5b69f-64d8-46b0-a974-3825ff17aa85",
+      "episode_uuid": "6411166e-e95a-44da-8350-7f13f855d136",
+      "fact": "The process loads OCCT 7.8 directly and 7.9 via libgmsh with full symbol interposition.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"the process loads OCCT 7.8 directly and 7.9 via libgmsh with full symbol interposition\"."
+    },
+    {
+      "edge_uuid": "87eef081-ab31-4082-8ab7-1102dcb20c2e",
+      "episode_uuid": "6411166e-e95a-44da-8350-7f13f855d136",
+      "fact": "SetRunParallel(true) parallelizes the ClassifyFaces jobs that dominate top_deck.ri.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful description of the lever: \"it parallelizes the ~4,603 per-solid ClassifyFaces jobs that dominate top_deck.ri\"."
+    },
+    {
+      "edge_uuid": "880b18a5-8c78-4cfd-91de-030ca60adc4f",
+      "episode_uuid": "6411166e-e95a-44da-8350-7f13f855d136",
+      "fact": "Task 7439 evaluates OCCT SetRunParallel(true) for booleans to improve speed by parallelizing ClassifyFaces jobs.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Filed as decided: \"7439 — evaluate OCCT SetRunParallel(true) for booleans\"."
+    },
+    {
+      "edge_uuid": "a6bf6fca-1401-45ff-ae61-1ed19cfe670c",
+      "episode_uuid": "6411166e-e95a-44da-8350-7f13f855d136",
+      "fact": "Task 7441 verifies whether OCCT's default destructive mode affects reify's cached operands and may adopt SetNonDestructive(true) if necessary.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Filed as decided: \"7441 — verify whether OCCT's default destructive mode ... and adopt SetNonDestructive(true) if so\"."
+    },
+    {
+      "edge_uuid": "efbd214b-9f71-48b7-a103-b95c4a4b423f",
+      "episode_uuid": "6411166e-e95a-44da-8350-7f13f855d136",
+      "fact": "Task 7441 aims to verify if OCCT's default destructive mode causes reify's cached operands to drift.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Filed as decided: 7441 verifies \"whether ... reify's cached operands drift\"."
+    },
+    {
+      "edge_uuid": "0d0afb5a-dfd7-4c7f-af01-75256c57d3f3",
+      "episode_uuid": "6ade5aad-058b-4b36-bdf9-17404265bf2c",
+      "fact": "All priority overrides for task 7739 have been cleared.",
+      "graph": "reify",
+      "label": "bookkeeping",
+      "rationale": "Status as recorded: \"Cleared all priority override(s) for task 7739\"."
+    },
+    {
+      "edge_uuid": "9259e767-3849-4f6e-8daf-70dd820d5fe7",
+      "episode_uuid": "7009536a-1651-4d27-9334-caac7a28354d",
+      "fact": "The accepted cost in the solver-driver-parity PRD is a mass migration of test construction sites.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Deliberately accepted cost of the ruling: \"The accepted cost is a mass migration of test construction sites, which Leo took deliberately\"."
+    },
+    {
+      "edge_uuid": "9e4c3d4e-3558-4834-ba1e-72089809a24b",
+      "episode_uuid": "7009536a-1651-4d27-9334-caac7a28354d",
+      "fact": "The esc-4458-87 inversion was a predictable outcome of the design in the solver-driver-parity PRD.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) The inversion was \"the predictable outcome of a design where solver-free is the free, silent default\" — the OLD design the PRD replaces, not the PRD's design."
+    },
+    {
+      "edge_uuid": "ca0b193f-bd97-4706-bbcc-7ff342d34321",
+      "episode_uuid": "7009536a-1651-4d27-9334-caac7a28354d",
+      "fact": "The constructors that yield solver:None by omission are removed or privatized in the solver-driver-parity PRD.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"the constructors that yield solver:None BY OMISSION are removed or privatised\"."
+    },
+    {
+      "edge_uuid": "d0927360-a9fb-4ba3-82b3-a08b8b92145d",
+      "episode_uuid": "7009536a-1651-4d27-9334-caac7a28354d",
+      "fact": "The solver-driver-parity PRD includes a ResolutionProfile-taking constructor for the engine.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"Engine gets a ResolutionProfile-taking constructor\"."
+    },
+    {
+      "edge_uuid": "f215a924-fdef-44f2-b53b-c326211bab45",
+      "episode_uuid": "7009536a-1651-4d27-9334-caac7a28354d",
+      "fact": "Leo ruled on the TYPE-LEVEL enforcement for the solver wiring in the solver-driver-parity PRD.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "States the ruling: \"Leo ruled TYPE-LEVEL enforcement for the solver wiring\"."
+    },
+    {
+      "edge_uuid": "be674f21-216f-4a3c-b2f3-c916fa86dacb",
+      "episode_uuid": "85fd43a0-0a28-420f-a369-bc56c6791de0",
+      "fact": "Task 7305 has been assigned a critical priority override.",
+      "graph": "reify",
+      "label": "bookkeeping",
+      "rationale": "Status as recorded: \"Set priority override for task 7305: {'boost_tier': 'critical'}\"."
+    },
+    {
+      "edge_uuid": "04ca4634-0dd5-4cd9-bb6c-a5b0b9a33caa",
+      "episode_uuid": "88cdb3d1-e834-4519-a9b2-7fab9e192873",
+      "fact": "The ACTIVE patch is derived at analysis time by the joint from the linearization configuration.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"the ACTIVE patch ... is derived at analysis time by the joint from the linearization configuration\"."
+    },
+    {
+      "edge_uuid": "3af14760-8a97-4a8a-adc2-ff751f9abb5a",
+      "episode_uuid": "88cdb3d1-e834-4519-a9b2-7fab9e192873",
+      "fact": "Declared port regions are defined as contact DOMAINS, which are static and owner-local.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"declared port regions are contact DOMAINS (static, owner-local ...)\"."
+    },
+    {
+      "edge_uuid": "3febe1b3-b9c2-49a8-b087-de50dda2675f",
+      "episode_uuid": "88cdb3d1-e834-4519-a9b2-7fab9e192873",
+      "fact": "The alternative of a port region value depending on the mate's position inverts template encapsulation and routes through cross-sub value reads.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "The rejected alternative restated with its ground for rejection: \"it inverts template encapsulation and routes through cross-sub value reads\"."
+    },
+    {
+      "edge_uuid": "532a4c17-32ac-4720-9b67-419e2f4c25fa",
+      "episode_uuid": "88cdb3d1-e834-4519-a9b2-7fab9e192873",
+      "fact": "Carriage-at-mid-span gives physically different spectra compared to carriage-at-end.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Embraced consequence: \"carriage-at-mid-span vs carriage-at-end give physically different spectra\"."
+    },
+    {
+      "edge_uuid": "8c98b3cf-46a4-4c2a-98b1-d95655d21e57",
+      "episode_uuid": "88cdb3d1-e834-4519-a9b2-7fab9e192873",
+      "fact": "Sweeping configurations is considered legitimate dogfood.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Embraced consequence: \"sweeping configurations is legitimate dogfood\"."
+    },
+    {
+      "edge_uuid": "bf4128e1-db46-4f90-9f5c-27e409a72bcc",
+      "episode_uuid": "88cdb3d1-e834-4519-a9b2-7fab9e192873",
+      "fact": "Assembly modal is configuration-parametric, meaning different configurations give physically different spectra.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Embraced consequence: \"assembly modal is configuration-parametric\"."
+    },
+    {
+      "edge_uuid": "c7d1ccf6-0a20-42e8-9d3c-3e9167d2cad8",
+      "episode_uuid": "88cdb3d1-e834-4519-a9b2-7fab9e192873",
+      "fact": "The ACTIVE patch is projected onto the mating port's footprint posed at the configured position.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(ii) Reverses the adopted mechanism: the record projects \"the mating port's footprint posed at the configured position\" ONTO THE DOMAIN, not the patch onto the footprint."
+    },
+    {
+      "edge_uuid": "0f395d58-0f99-4dab-8ef1-a70ec542678f",
+      "episode_uuid": "a495a965-2386-466e-8b37-3777451a49c0",
+      "fact": "BucklingOptions.mode is now a native .ri enum as per placeholder-type-eradication PRD §epsilon.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"BucklingOptions.mode becomes a native .ri enum, per placeholder-type-eradication PRD §epsilon\"."
+    },
+    {
+      "edge_uuid": "468e4cfa-a46e-49b7-8185-a68be9ec023f",
+      "episode_uuid": "a495a965-2386-466e-8b37-3777451a49c0",
+      "fact": "An invalid mode fails at compile time due to BucklingOptions.mode being a native .ri enum.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful rationale: \"an invalid mode then fails at compile time\"."
+    },
+    {
+      "edge_uuid": "92d733bf-c15e-4e17-8175-f502e03ccbb8",
+      "episode_uuid": "a495a965-2386-466e-8b37-3777451a49c0",
+      "fact": "The E_BucklingInvalidMode validator is superseded by BucklingOptions.mode becoming a native .ri enum.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"This supersedes 7179's String allowlist plus E_BucklingInvalidMode validator\"."
+    },
+    {
+      "edge_uuid": "a508acf6-058c-45ee-a75a-b829b4dfa3a4",
+      "episode_uuid": "a495a965-2386-466e-8b37-3777451a49c0",
+      "fact": "The String allowlist is superseded by BucklingOptions.mode becoming a native .ri enum.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: supersedes \"7179's String allowlist\"."
+    },
+    {
+      "edge_uuid": "2d9d9323-af86-4663-b55d-63bed5913a41",
+      "episode_uuid": "ae5044fd-2f83-4f97-93e5-ffa8cb394d5f",
+      "fact": "Leo decided to bookmark the whole programme as one PRD session instead of a narrow feature.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision applied to this bookmark: \"bookmark the WHOLE programme as one PRD session, not the narrow feature\"."
+    },
+    {
+      "edge_uuid": "4701c9dd-d543-44c8-909d-c125deb9b06a",
+      "episode_uuid": "ae5044fd-2f83-4f97-93e5-ffa8cb394d5f",
+      "fact": "The gate for the PRD session is dep-gated on SUBSTRATE defects.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The consequence adopted: \"the gate is dep-gated on SUBSTRATE defects instead\"."
+    },
+    {
+      "edge_uuid": "5e0a88a1-f797-470e-bb5e-c9efd8f52860",
+      "episode_uuid": "ae5044fd-2f83-4f97-93e5-ffa8cb394d5f",
+      "fact": "The bookmarked PRD session includes generic assemblies and generic chains.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The required coverage: \"B generic assemblies ... + C generic chains\"."
+    },
+    {
+      "edge_uuid": "e9b40f8e-a923-489f-9733-04d5bb5f3037",
+      "episode_uuid": "ae5044fd-2f83-4f97-93e5-ffa8cb394d5f",
+      "fact": "The bookmarked PRD session covers trait-required ports and generic assemblies.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The required coverage: \"A trait-required ports + B generic assemblies\"."
+    },
+    {
+      "edge_uuid": "741e1e0d-0447-43f2-9e71-19071a32e378",
+      "episode_uuid": "b0549cec-f02a-49aa-9a32-a2b3a5ba435c",
+      "fact": "The kernel has no input for BucklingOptions mode/sigma/auto_dense and none is planned, which was rejected as a category error.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "The escalation's rejected reason restated with its rejection (\"which was rejected as a category error\")."
+    },
+    {
+      "edge_uuid": "801e39e6-7259-4193-9e6e-7997e0de1c57",
+      "episode_uuid": "b0549cec-f02a-49aa-9a32-a2b3a5ba435c",
+      "fact": "Element order is defined as having no meaning in a lumped model according to the PRD's worked case.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"Element order has no meaning in a lumped model\" is the PRD's worked case."
+    },
+    {
+      "edge_uuid": "973e73e6-c416-4b39-8724-3ab9d942e8ff",
+      "episode_uuid": "b0549cec-f02a-49aa-9a32-a2b3a5ba435c",
+      "fact": "Warning-severity W_PARAM_NOT_APPLICABLE emits a warning rather than an error, making it a cheaper-looking exit from a gate failure compared to Error-severity E_PARAM_NOT_HONORED.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: `not_applicable` \"emits Warning-severity W_PARAM_NOT_APPLICABLE rather than Error-severity E_PARAM_NOT_HONORED, so it is the cheapest-looking exit\"."
+    },
+    {
+      "edge_uuid": "b2351942-d482-4d58-a0f0-e40d9b16b919",
+      "episode_uuid": "b0549cec-f02a-49aa-9a32-a2b3a5ba435c",
+      "fact": "The classification of BucklingOptions mode/sigma/auto_dense as 'not_applicable' was ruled out as a category error under the PRD's text.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: classifying them as `not_applicable` \"is a CATEGORY ERROR under the PRD's own text, and it was rejected\"."
+    },
+    {
+      "edge_uuid": "2889b1c0-5388-4606-9668-a08a9c781cb6",
+      "episode_uuid": "b0a20771-5720-459e-83b6-6007a6826fc7",
+      "fact": "Task 6638 measured the elasticity morph 63 times slower than a gmsh remesh at approximately 109K tets.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful measurement: \"task 6638 measuring the elasticity morph 63x slower than a gmsh remesh at ~109K tets\"."
+    },
+    {
+      "edge_uuid": "766b262e-abb3-4f4c-a73a-71dccdb51b31",
+      "episode_uuid": "b0a20771-5720-459e-83b6-6007a6826fc7",
+      "fact": "Task 2952 measures the justification for FEA warm-start preservation and stable element connectivity across parameter ticks.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: the justification \"exists as mechanism in code and is measured by task 2952\"."
+    },
+    {
+      "edge_uuid": "77a38770-93ed-4a60-8318-668c7c985872",
+      "episode_uuid": "b0a20771-5720-459e-83b6-6007a6826fc7",
+      "fact": "The PRD's 10-100x wall-clock promise for the elasticity morph has been withdrawn, indicating that even when fixed, it is expected to perform roughly on par with remesh at 100K, not 10 times better.",
+      "graph": "reify",
+      "label": "misbound",
+      "rationale": "The fact is a faithful holding (\"The PRD's 10-100x wall-clock promise is WITHDRAWN ... roughly PAR with remesh at 100K\") but hangs on \"adaptive remesh for shells\", which the episode never mentions."
+    },
+    {
+      "edge_uuid": "95492a9f-a747-4034-b35b-f80e1bd7cb85",
+      "episode_uuid": "b0a20771-5720-459e-83b6-6007a6826fc7",
+      "fact": "Task 7834 is intended to fix the O(n x |bcs|) loop in apply_dirichlet_row_elimination, which accounts for 96% of the cost.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"96% of the cost is a fixable O(n x |bcs|) loop in apply_dirichlet_row_elimination ... (task 7834 fixes it)\"."
+    },
+    {
+      "edge_uuid": "13cbf59f-2ca5-48de-aa73-2a98b1c1e919",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "fact": "The entity '_' may not be combined with 'C' in a match pattern.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "An instance within the ruling's scope: \"`_` may NOT be combined with `|` in a match pattern\", here with variant C."
+    },
+    {
+      "edge_uuid": "2fc238c1-1a1a-4098-8744-396624a44c70",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "fact": "LEO ruled on task 5967 regarding the use of '_' in a match pattern.",
+      "graph": "reify",
+      "label": "bookkeeping",
+      "rationale": "Who ruled on which task: \"RULED BY LEO 2026-09-21 (esc-5967-6, reify task 5967)\"."
+    },
+    {
+      "edge_uuid": "35c4fe12-a1d5-4ae8-960c-d127a9709faf",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "fact": "The pattern '_' is not a variant of the enum 'Kind'.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(iii) Lifts a current diagnostic the ruling rejects (\"match-arm pattern '_' is not a variant of enum 'Kind'\" — \"symptom, not reason\") into a standalone fact, dropping that qualification."
+    },
+    {
+      "edge_uuid": "58713cd3-7be6-4540-bdf0-bc22254f5f3f",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "fact": "The task 5967 was granted the scope to improve the documentation regarding '_' in match patterns.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Scope decision: \"docs/reify-language-spec.md was granted into task 5967's scope for this\"."
+    },
+    {
+      "edge_uuid": "6c9fa3c0-c5ee-409a-9f26-2011a6d64c7f",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "fact": "The entity '_' may not be combined with 'B' in a match pattern.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "An instance within the ruling's scope: `_` may not be an or-slot alternative, here alongside variant B."
+    },
+    {
+      "edge_uuid": "8c90dcf4-a80e-4755-a4d9-de9bfaac00dd",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "fact": "The entity '_' may not be combined with 'A' in a match pattern.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "An instance within the ruling's scope: \"A | _\" is refused."
+    },
+    {
+      "edge_uuid": "b9e329b5-2e4d-4098-8002-78d4e3f25afa",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "fact": "The entity '_' is a bindable ordinary name in the context of structure definitions.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful measurement, narrowed: \"It is a bindable ordinary name (measured: `structure def F { let _ = 3mm }` ...)\"."
+    },
+    {
+      "edge_uuid": "d6e12e3e-f32f-4b66-953d-134b9e30356b",
+      "episode_uuid": "b7f48241-cd4c-4762-a107-64f9a996aad8",
+      "fact": "The documentation must state that '_' may not appear as an or-slot alternative.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Required: \"one explicit normative sentence in docs/reify-language-spec.md ... stating that `_` may not appear as an or-slot alternative\"."
+    },
+    {
+      "edge_uuid": "0960a50a-758b-4ad2-bf1a-2a00442f4839",
+      "episode_uuid": "bf3b7e9a-5b57-4292-a5e9-bb811ee12888",
+      "fact": "The GUI routes verdicts and slack to the ConstraintPanel.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"verdicts + slack to ConstraintPanel\"."
+    },
+    {
+      "edge_uuid": "17948aa7-b5d3-4045-a7e0-71f766ab539b",
+      "episode_uuid": "bf3b7e9a-5b57-4292-a5e9-bb811ee12888",
+      "fact": "The solve record has three renderers: reify explain, GUI, and debug-MCP solve report.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Companion decision: \"ONE engine-produced solve record, THREE renderers (reify explain / GUI / debug-MCP solve_report)\"."
+    },
+    {
+      "edge_uuid": "236b83c9-8e39-4fda-b524-4efeaa5b0e0d",
+      "episode_uuid": "bf3b7e9a-5b57-4292-a5e9-bb811ee12888",
+      "fact": "The GUI routes iteration and residual to the SolverProgressOverlay.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"iteration/residual to SolverProgressOverlay\"."
+    },
+    {
+      "edge_uuid": "59db912d-f352-4921-924d-57ce7706d201",
+      "episode_uuid": "bf3b7e9a-5b57-4292-a5e9-bb811ee12888",
+      "fact": "The GUI routes eval diagnostics to the DiagnosticsPanel under a new solve source chip.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"eval diagnostics to DiagnosticsPanel under a new `solve` source chip\"."
+    },
+    {
+      "edge_uuid": "62a9bc33-5065-4846-878e-214e8d2183b5",
+      "episode_uuid": "bf3b7e9a-5b57-4292-a5e9-bb811ee12888",
+      "fact": "The GUI includes a summary chip in the StatusBar.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"ONE solve-summary chip in StatusBar as the single front door\"."
+    },
+    {
+      "edge_uuid": "6863d530-0076-4dda-83c1-59c6fc6a0ada",
+      "episode_uuid": "bf3b7e9a-5b57-4292-a5e9-bb811ee12888",
+      "fact": "The GUI rejected the alternative of adding a docked Explain panel, as it would duplicate existing panels and leave others dead.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Rejected alternative as decided: \"(a) a docked 'Explain' panel — duplicates two existing panels, leaves three dead surfaces dead\"."
+    },
+    {
+      "edge_uuid": "6c834087-f0eb-4495-aa8f-6cbcd5de44f6",
+      "episode_uuid": "bf3b7e9a-5b57-4292-a5e9-bb811ee12888",
+      "fact": "Leo ruled that the GUI's solver-telemetry surface routes each datum to the panel that already owns its shape, plus one solve-summary chip in the StatusBar as the single front door and drill-in.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "States the ruling verbatim in substance: \"ROUTES EACH DATUM TO THE PANEL THAT ALREADY OWNS ITS SHAPE, plus ONE solve-summary chip in StatusBar\"."
+    },
+    {
+      "edge_uuid": "83891460-2ab2-4a9f-bdb9-5cb1f80c60fb",
+      "episode_uuid": "bf3b7e9a-5b57-4292-a5e9-bb811ee12888",
+      "fact": "The engine produces one solve record.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Companion decision: \"ONE engine-produced solve record\"."
+    },
+    {
+      "edge_uuid": "9f196069-16e8-4473-b7f2-9dd7becee374",
+      "episode_uuid": "bf3b7e9a-5b57-4292-a5e9-bb811ee12888",
+      "fact": "The GUI routes per-auto provenance to the PropertyEditor beside its existing determinacy, freshness, and undef chips.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The ruling: \"per-auto provenance to PropertyEditor beside its existing determinacy/freshness/undef chips\"."
+    },
+    {
+      "edge_uuid": "269e27e9-e67f-4e1a-98f1-56e887301b3b",
+      "episode_uuid": "daedc53a-23f8-4618-9f7a-7020d1b48c6f",
+      "fact": "Task #7078 was cancelled as a duplicate of task #5800.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"#7078 ... was CANCELLED as a duplicate of #5800\"."
+    },
+    {
+      "edge_uuid": "3565fe32-75af-49b5-8d7d-adb6515f6150",
+      "episode_uuid": "daedc53a-23f8-4618-9f7a-7020d1b48c6f",
+      "fact": "Everything that cited task #7078 was repointed at task #5800.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The disposition: \"everything that cited #7078 (#7081 leaf γ, #5802 γ3) was repointed at #5800\"."
+    },
+    {
+      "edge_uuid": "a02a9936-cbc7-43c9-9624-76d242dc2321",
+      "episode_uuid": "daedc53a-23f8-4618-9f7a-7020d1b48c6f",
+      "fact": "The wire-up milestone will be discharged by the PRD authored in task #5800.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: #5800 rewritten as \"author the PRD; then the wire-up milestone discharged by that PRD's leaves\"."
+    },
+    {
+      "edge_uuid": "b51d0d6c-f74d-49f9-a429-23386db81ef7",
+      "episode_uuid": "daedc53a-23f8-4618-9f7a-7020d1b48c6f",
+      "fact": "Task #7078 was filed by the trampoline-param-drop-closure decomposition.",
+      "graph": "reify",
+      "label": "bookkeeping",
+      "rationale": "Provenance: \"#7078 was filed 2026-08-31 by the trampoline-param-drop-closure decomposition\"."
+    },
+    {
+      "edge_uuid": "c6f2aad5-dc92-4f2d-b9b6-cc4ed2b4d1a4",
+      "episode_uuid": "daedc53a-23f8-4618-9f7a-7020d1b48c6f",
+      "fact": "Leaf γ was repointed at task #5800.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The disposition: \"#7081 leaf γ ... was repointed at #5800\"."
+    },
+    {
+      "edge_uuid": "cb28a47e-8e74-4d9d-9b52-b0af3ffbf720",
+      "episode_uuid": "daedc53a-23f8-4618-9f7a-7020d1b48c6f",
+      "fact": "Task #5800 absorbed five design questions from task #7078.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The disposition: #5800 absorbed \"#7078's evidence and five design questions\"."
+    },
+    {
+      "edge_uuid": "d367257f-8155-46b1-a816-c25d6dc3c902",
+      "episode_uuid": "daedc53a-23f8-4618-9f7a-7020d1b48c6f",
+      "fact": "#5802 was repointed at task #5800.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The disposition: \"#5802 γ3 ... was repointed at #5800\"."
+    },
+    {
+      "edge_uuid": "e4b66287-01f0-4e54-a9aa-aa9642b5d5ae",
+      "episode_uuid": "daedc53a-23f8-4618-9f7a-7020d1b48c6f",
+      "fact": "The PRD-authoring scope of task #7078 was folded into task #5800.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"its PRD-authoring scope folded into #5800 as that task's step 1\"."
+    },
+    {
+      "edge_uuid": "eb6d51af-ec66-48c3-b8fc-141e537fe1a7",
+      "episode_uuid": "daedc53a-23f8-4618-9f7a-7020d1b48c6f",
+      "fact": "Task #5800 was filed by the dimension-checked-readers decomposition.",
+      "graph": "reify",
+      "label": "bookkeeping",
+      "rationale": "Provenance: \"#5800 was filed 2026-07-28 by the dimension-checked-readers decomposition\"."
+    },
+    {
+      "edge_uuid": "2903480d-4fb8-4876-970f-cc5ba96f3d4d",
+      "episode_uuid": "dc24d3f4-d4cf-4c4c-845a-1db55c1fe31f",
+      "fact": "Task 6082 carried a merge-main commit 6092b3f14b.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"The branch carried a merge-main commit (6092b3f14b)\"."
+    },
+    {
+      "edge_uuid": "a9c0a7a4-c01e-4493-9793-e625f2d6954e",
+      "episode_uuid": "dc24d3f4-d4cf-4c4c-845a-1db55c1fe31f",
+      "fact": "The reviewer graded .claude/skills/audit/SKILL.md, which is main's own content.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"the reviewer graded ... .claude/skills/audit/SKILL.md, which are main's own content\"."
+    },
+    {
+      "edge_uuid": "ee8fe7d7-d22c-4107-b105-6e390466cbe7",
+      "episode_uuid": "dc24d3f4-d4cf-4c4c-845a-1db55c1fe31f",
+      "fact": "The reviewer graded .claude/skills/prd/project.md, which is main's own content.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"the reviewer graded .claude/skills/prd/project.md ... main's own content\"."
+    },
+    {
+      "edge_uuid": "0ae5b30a-817e-4194-895c-6dac414b634d",
+      "episode_uuid": "e08f8fcc-5d06-461b-acae-5f4af911253a",
+      "fact": "The indefinite-factorization change is owned by the shift-invert-eigensolve PRD.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"one PRD owns the indefinite-factorization change once\"."
+    },
+    {
+      "edge_uuid": "87751264-34fe-40d1-bbb4-6603fa91ecac",
+      "episode_uuid": "e08f8fcc-5d06-461b-acae-5f4af911253a",
+      "fact": "The shift-invert-eigensolve PRD covers the modal ModalOptions.shift_frequency path.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: the PRD \"covers BOTH ... and the modal `ModalOptions.shift_frequency` paths\"."
+    },
+    {
+      "edge_uuid": "91d9a049-7e7b-4681-ab1c-ee6e323bdf92",
+      "episode_uuid": "e08f8fcc-5d06-461b-acae-5f4af911253a",
+      "fact": "The retype amends the retyped surface to cite the shift-invert-eigensolve PRD.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "In substance: \"#6097 was amended to cite #7178 in its 'declared but not yet honored' warning\"."
+    },
+    {
+      "edge_uuid": "9bac0d4b-724a-4679-a01c-3ef037e20f33",
+      "episode_uuid": "e08f8fcc-5d06-461b-acae-5f4af911253a",
+      "fact": "The governing principle forbids the creation of a knowingly-vacuous knob in the shift-invert-eigensolve PRD.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "The governing principle as a ground: it \"forbids\" landing \"A KNOWINGLY-VACUOUS KNOB\"."
+    },
+    {
+      "edge_uuid": "bab61f82-10d7-44b3-8df9-25afc0f30214",
+      "episode_uuid": "e08f8fcc-5d06-461b-acae-5f4af911253a",
+      "fact": "The retype and rename are independent and can land first.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"the retype and rename are independent and can land first\"."
+    },
+    {
+      "edge_uuid": "e2a10517-4787-4070-892e-3c18fc23a1ce",
+      "episode_uuid": "e08f8fcc-5d06-461b-acae-5f4af911253a",
+      "fact": "ModalOptions.sigma is retyped to shift_frequency.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(iii) Drops \"#6097 (pending)\": the retype is a pending task's planned change, stated here as already done."
+    },
+    {
+      "edge_uuid": "e3ab0005-e636-4963-864b-64a2f471b868",
+      "episode_uuid": "e08f8fcc-5d06-461b-acae-5f4af911253a",
+      "fact": "The shift-invert-eigensolve PRD covers the buckling BucklingOptions.sigma path.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: the PRD \"covers BOTH the buckling `BucklingOptions.sigma` ... paths\"."
+    },
+    {
+      "edge_uuid": "08544658-3991-459b-a87d-131bf5c9b818",
+      "episode_uuid": "e121f6cd-1497-4487-bc36-a6e8478cf6ee",
+      "fact": "Design C requires only one additive default GeometryKernel method.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful reason for C: \"it needs only one additive default GeometryKernel method\"."
+    },
+    {
+      "edge_uuid": "096a4a48-9b6b-4dbe-bc0d-260c662429a9",
+      "episode_uuid": "e121f6cd-1497-4487-bc36-a6e8478cf6ee",
+      "fact": "Design C meets the requirement of canceling evaluations uniformly for FEA solves and OCCT booleans (one handle, SPOT).",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful reason for C: \"cancel means 'cancel this evaluation' uniformly for FEA solves and OCCT booleans (one handle, SPOT)\"."
+    },
+    {
+      "edge_uuid": "49cfec29-6d63-4f88-ab64-ad6aae0ae6e2",
+      "episode_uuid": "e121f6cd-1497-4487-bc36-a6e8478cf6ee",
+      "fact": "Design C includes a progress cell.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Chosen design: \"a per-evaluation OpControl {CancellationHandle, progress cell}\"."
+    },
+    {
+      "edge_uuid": "5a2afaba-6ede-4558-b9a2-662edcfe8fdf",
+      "episode_uuid": "e121f6cd-1497-4487-bc36-a6e8478cf6ee",
+      "fact": "Design C was chosen for OCCT boolean progress and cancel.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"chose design C\"."
+    },
+    {
+      "edge_uuid": "87941f8d-46de-4f48-a609-5a060275d94f",
+      "episode_uuid": "e121f6cd-1497-4487-bc36-a6e8478cf6ee",
+      "fact": "Design C costs approximately 1.3 times the voided 22-step plan.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful cost: \"C costs ~1.3x the voided 22-step plan\"."
+    },
+    {
+      "edge_uuid": "bcb8a4a8-0d1c-4388-aa98-632ca32ad171",
+      "episode_uuid": "e121f6cd-1497-4487-bc36-a6e8478cf6ee",
+      "fact": "Design C includes a CancellationHandle.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Chosen design includes a CancellationHandle."
+    },
+    {
+      "edge_uuid": "d1f12b9a-ec7e-498f-b6f9-29232af77deb",
+      "episode_uuid": "e121f6cd-1497-4487-bc36-a6e8478cf6ee",
+      "fact": "Design C uses OpControl with CancellationHandle and progress cell.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Chosen design: \"OpControl {CancellationHandle, progress cell} passed explicitly into every boolean Build\"."
+    },
+    {
+      "edge_uuid": "d2cc8f4a-bf04-4123-9e37-99dba16ded15",
+      "episode_uuid": "e121f6cd-1497-4487-bc36-a6e8478cf6ee",
+      "fact": "Design B owns a progress/cancel port by each OcctKernelHandle.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Describes rejected design B as design B, without presenting it as adopted."
+    },
+    {
+      "edge_uuid": "da584a0a-e962-47cd-aae3-904bf6b98a3e",
+      "episode_uuid": "e121f6cd-1497-4487-bc36-a6e8478cf6ee",
+      "fact": "Design A uses C++ atomics for process-global control.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Describes rejected design A as design A (\"the filed plan's process-global C++ atomics\")."
+    },
+    {
+      "edge_uuid": "03e42c54-21ea-4723-8444-1a0d5df5ad5c",
+      "episode_uuid": "e8a8ac6e-fd9a-4637-a98d-cb7118c8bf56",
+      "fact": "The explicit posture flag follows the MeshContractMode house pattern.",
+      "graph": "reify",
+      "label": "overreach",
+      "rationale": "(iii) The explicit posture flag is the alternative NOT built (\"the honest long-term shape but requires cross-crate plumbing ... outside task 5311\"); the edge states it as an existing flag."
+    },
+    {
+      "edge_uuid": "39f76073-9e01-4e0d-9383-aa6fcf6355d9",
+      "episode_uuid": "e8a8ac6e-fd9a-4637-a98d-cb7118c8bf56",
+      "fact": "The work required for the explicit posture flag belongs to the driver-contract programme.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"That work belongs to the driver-contract programme, not to this leaf\"."
+    },
+    {
+      "edge_uuid": "4d8d1feb-8ba8-425b-ae77-ff193228241e",
+      "episode_uuid": "e8a8ac6e-fd9a-4637-a98d-cb7118c8bf56",
+      "fact": "The LSP's separate `fea-not-evaluated` constraint hint is classified as Severity::Info.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"the LSP's separate `fea-not-evaluated` constraint hint stays Severity::Info\"."
+    },
+    {
+      "edge_uuid": "6a492eb3-0a56-4ebf-b1eb-c07ad6aa7f25",
+      "episode_uuid": "e8a8ac6e-fd9a-4637-a98d-cb7118c8bf56",
+      "fact": "The severity was ruled as Warning, not Info, per INV-SF-1.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: \"severity ruled Warning (not Info) per INV-SF-1\"."
+    },
+    {
+      "edge_uuid": "aed5810a-18dd-4571-8fdf-1841e1568440",
+      "episode_uuid": "e8a8ac6e-fd9a-4637-a98d-cb7118c8bf56",
+      "fact": "Leo decided that the trampoline-missing severity predicate remains as `self.compute_registry.fns.is_empty()` instead of becoming an explicit Engine posture flag.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "The decision: the predicate \"stays `self.compute_registry.fns.is_empty()` rather than becoming an explicit Engine posture flag\"."
+    },
+    {
+      "edge_uuid": "0d9c9ad7-3eb2-4191-873f-1159ce28abfa",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "The Litter-tray bottom deck v3 consists of split halves, each weighing 0.79558 kg.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful measurement: \"0.79558 kg per split half\"."
+    },
+    {
+      "edge_uuid": "1de77640-a31a-4b7e-8273-50e3356e2736",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "Pedestals and hood BLOCKS are unioned onto the hollowed shell of the Litter-tray bottom deck v3 before the edges_at_height fillet chain.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Decision (2): \"pedestals and hood BLOCKS are unioned onto the hollowed shell BEFORE the edges_at_height fillet chain\"."
+    },
+    {
+      "edge_uuid": "30977dc8-f2e7-4a68-920e-93b9c9323272",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "The ledge_width of the Litter-tray bottom deck v3 is 5 mm in all three files.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Decision (4): \"ledge_width 5 mm in all three files\"."
+    },
+    {
+      "edge_uuid": "4e7979da-6e5f-4c74-bc99-1c4044686321",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "The bottom-deck grip is a hooded finger pocket cut into the end wall of the Litter-tray bottom deck v3.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Decision (1): \"the bottom-deck grip is a hooded finger pocket cut INTO the end wall\"."
+    },
+    {
+      "edge_uuid": "6fa04ad9-b78b-4b57-8d9f-c99d3bae3841",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "The bridge of the Litter-tray bottom deck v3 has a height of 22.6 mm.",
+      "graph": "reify",
+      "label": "unjudgeable",
+      "rationale": "The episode says only \"roof = 22.6 mm bridge\"; whether 22.6 mm is a height (as the edge says) or a bridging span cannot be decided from the text."
+    },
+    {
+      "edge_uuid": "846dcd84-dc35-4c82-b8dc-26d17e7e4a6e",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "The finger depth of the Litter-tray bottom deck v3 is 25 mm.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Design parameter of decision (1): \"25 mm finger depth\"."
+    },
+    {
+      "edge_uuid": "967c2389-86d0-47a2-9347-1565e4d5fb3e",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "The U1 bed envelope is already used to 258 mm in x and 263 mm in y, making external grips impossible on the split halves of the Litter-tray bottom deck v3.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful ground for decision (1): \"the U1 bed envelope (265 mm usable) is already used to 258 mm in x ... and 263 mm in y ..., so no lip, flange or handle fits\"."
+    },
+    {
+      "edge_uuid": "c8a844e3-eed5-41b9-9da7-309fdd05a7a3",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "The weight of the monolithic file of the Litter-tray bottom deck v3 is 1.5847 kg.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful measurement: \"1.5847 kg / 6.7203 L monolithic\"."
+    },
+    {
+      "edge_uuid": "c8adacb4-e123-4c19-96c1-f62d50777b7d",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "The spill-proof design of the Litter-tray bottom deck v3 has a capacity cost of approximately 0.1 L per end.",
+      "graph": "reify",
+      "label": "context",
+      "rationale": "Faithful: \"spill-proof when tilted to empty, ~0.1 L capacity cost per end\"."
+    },
+    {
+      "edge_uuid": "f0ef7fd7-8517-4573-b598-bdbed54551fd",
+      "episode_uuid": "ffa1a2de-892d-4725-a990-2372121abee4",
+      "fact": "The roof of the Litter-tray bottom deck v3 sits at z 61, 4 mm under the top deck's floor.",
+      "graph": "reify",
+      "label": "holding",
+      "rationale": "Design parameter of decision (1): the hood's \"roof top sits at z 61, 4 mm under the top deck's floor\"."
+    }
+  ]
+}

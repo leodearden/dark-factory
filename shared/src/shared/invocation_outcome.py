@@ -4,7 +4,9 @@ Consolidates the cap/near-cap/auth-failure/CLI-error/wedge classification
 logic previously scattered across ``shared.usage_gate`` (Claude/Codex/Gemini
 cap string tables, ``detect_cap_hit``) and ``shared.cli_invoke``
 (``NON_CAP_CLI_ERROR_MARKERS``, ``is_zero_output_timeout``) into one total,
-pure classifier: :func:`classify_invocation`.
+pure classifier: :func:`classify_invocation`. Text-mode callers, whose
+streams carry no structured status, get the strict auth-rejection sibling
+:func:`classify_text_auth_rejection`.
 
 This module is additive only — it does not modify ``usage_gate.py`` or
 ``cli_invoke.py``. Rewiring those consumers to call ``classify_invocation``
@@ -52,8 +54,11 @@ __all__ = [
     'ServerError',
     'ZeroOutputWedge',
     'Failure',
+    'REAL_CLI_AUTH_REJECTIONS',
+    'TextAuthRejection',
     'auth_failure_reason',
     'classify_invocation',
+    'classify_text_auth_rejection',
 ]
 
 
@@ -230,31 +235,28 @@ _MONTH_ABBR = {
     'dec': 12,
 }
 
-# NOTE — fork, not drift-guarded: _parse_resets_at and _extract_cap_message
-# below are ported from usage_gate.py (their regex/parsing logic originated
-# there), but unlike CAP_HIT_PREFIXES/CAP_CONFIRM_KEYWORDS/NEAR_CAP_PREFIXES/
-# CODEX_CAP_PATTERNS/GEMINI_CAP_PATTERNS/NON_CAP_CLI_ERROR_MARKERS (single-
-# sourced here with no mirrored copies elsewhere, guarded by
-# TestSingleSourceOwnership in test_invocation_outcome.py), these two
-# functions have NO automated guard keeping them in sync with their
-# usage_gate.py originals — and have already intentionally diverged: this
-# copy of _parse_resets_at returns None on parse failure and accepts an
-# injectable ``now`` (PRD 7.1.a — an unknown reset time must be reported as
-# explicitly unknown, never fabricated, and tests need determinism), whereas
-# usage_gate.py's ``_parse_resets_at(text) -> datetime`` fabricates
-# ``now + 1h`` on parse failure and always reads the real wall clock. Both
-# copies are pure and forked deliberately (this task is additive-only; see
-# the module docstring), so a future edit to one is not expected to be
-# mirrored in the other — but it also won't be caught if it should have
-# been. The beta consumer-rewire collapsed the string tables but
-# deliberately left these two functions forked. Task 4042 then moved
-# usage_gate.py's ONE live _parse_resets_at call site (_handle_auth_failure)
-# onto THIS copy, imported there as _parse_resets_at_strict — so the
-# usage_gate.py fork of _parse_resets_at now has no production callers and
-# survives only as the re-export consumed by
-# orchestrator/src/orchestrator/usage_gate.py and its tests (see the note at
-# its definition). usage_gate.py's _extract_cap_message fork remains a live
-# copy with the divergent semantics described above.
+# ORIGIN — _parse_resets_at and _extract_cap_message below started life in
+# usage_gate.py (their regex/parsing logic originated there) and were for a
+# time forked between the two modules with no drift guard. Task 4357 retired
+# both usage_gate.py copies, so these are now the only ones: there is nothing
+# left to drift out of sync.
+#
+# _parse_resets_at returns None on parse failure and accepts an injectable
+# ``now`` (PRD 7.1.a — an unknown reset time must be reported as explicitly
+# unknown, never fabricated, and tests need determinism). The retired fork
+# fabricated ``now + 1h`` instead, which is why it was deleted rather than
+# repaired: dashboard/src/dashboard/data/costs.py::_extract_resets_at surfaces
+# a persisted reset time verbatim, so an invented one reads as a real recovery
+# ETA.
+#
+# Single ownership is now mechanically enforced, by
+# shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership — a
+# re-fork here or a re-export elsewhere fails it. So this pair is no longer
+# the un-guarded exception to the string tables' TestSingleSourceOwnership
+# coverage (CAP_HIT_PREFIXES / CAP_CONFIRM_KEYWORDS / NEAR_CAP_PREFIXES /
+# CODEX_CAP_PATTERNS / GEMINI_CAP_PATTERNS / NON_CAP_CLI_ERROR_MARKERS,
+# collapsed to this module by the beta consumer-rewire); the two guards
+# together now cover everything this module single-sources.
 
 
 def _parse_resets_at(text: str, *, now: datetime | None = None) -> datetime | None:
@@ -501,10 +503,12 @@ GEMINI_CAP_PATTERNS = [
 def _extract_cap_message(text: str, prefix: str) -> str:
     """Extract the full sentence containing the cap-hit prefix.
 
-    Forked from usage_gate.py, same as ``_parse_resets_at`` above — see the
-    fork/no-drift-guard note by that function's definition. Not covered by
+    Originated in usage_gate.py, same as ``_parse_resets_at`` above — see the
+    ORIGIN note by that function's definition. Not covered by
     TestSingleSourceOwnership, which only asserts the plain string-table
-    constants are single-sourced here with no mirrored copies elsewhere.
+    constants are single-sourced here with no mirrored copies elsewhere;
+    single ownership of this function is covered by
+    ``shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership``.
     """
     lower = text.lower()
     idx = lower.find(prefix.lower())
@@ -677,3 +681,64 @@ def classify_invocation(
         return ZeroOutputWedge()
 
     return Failure(kind='unclassified')
+
+
+@dataclass(frozen=True)
+class TextAuthRejection:
+    """One measured text-mode auth rejection.
+
+    ``message`` is the verbatim text, ``lead`` the opening a stream must start
+    with to count as this rejection, and ``status`` the HTTP status measured
+    for that text.
+    """
+
+    message: str
+    lead: str
+    status: int
+
+    def __post_init__(self) -> None:
+        if not self.lead or not self.message.startswith(self.lead):
+            raise ValueError(
+                f'lead {self.lead!r} must be a non-empty opening of message {self.message!r}'
+            )
+
+
+# The SINGLE source for text-mode auth rejections: the classifier and the
+# shared and scripts tests all read it. Add an entry only with a transcript to
+# cite. Keep the U+00B7 byte-exact.
+REAL_CLI_AUTH_REJECTIONS: tuple[TextAuthRejection, ...] = (
+    # Text-mode stdout at exit 1, 2026-09-29 legibility trickle
+    # (esc-legibility-trickle-dark_factory-6). The same text was the JSON
+    # `result` beside api_error_status 403 on CLI 2.1.168, 2026-06-08.
+    TextAuthRejection(
+        message='Your organization has disabled Claude subscription access for Claude Code'
+        ' · Use an Anthropic API key instead, or ask your admin to enable access',
+        lead='Your organization has disabled Claude subscription access',
+        status=403,
+    ),
+    # Every call from max-b, 2026-04-20.
+    TextAuthRejection(
+        message='Your organization does not have access to Claude',
+        lead='Your organization does not have access to Claude',
+        status=403,
+    ),
+)
+
+
+def classify_text_auth_rejection(output: str, stderr: str) -> AuthFailed | None:
+    """Recognise a measured auth rejection from text-mode ``claude -p`` streams.
+
+    Exists beside :func:`classify_invocation` because text mode carries no
+    ``api_error_status``: the rejection is plain text at exit 1. Matching is
+    anchored at the start of the stripped stream (``output`` first, then
+    ``stderr``) because a failed invocation's stream can QUOTE the sentence,
+    and in a loop-less caller an AUTH_FAILED transition lasts the whole
+    process. Consumer: ``scripts/legibility/account_pool.py::pool_invoke``.
+    """
+    for stream in (output, stderr):
+        text = stream.strip()
+        opening = text.lower()
+        for rejection in REAL_CLI_AUTH_REJECTIONS:
+            if opening.startswith(rejection.lead.lower()):
+                return AuthFailed(status=rejection.status, body=_sanitise_auth_body(text))
+    return None

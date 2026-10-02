@@ -577,7 +577,8 @@ def _esc(
     *,
     task_id: str = 'T1',
     severity: str = 'blocking',
-    level: int = 0,
+    level: int = 1,
+    category: str = 'infra_issue',
     secs_ago: float = 120.0,
 ) -> Escalation:
     """A REAL ``Escalation`` row — the shape ``get_by_task`` actually returns.
@@ -587,13 +588,22 @@ def _esc(
     against the real ``timestamp`` field name (``Escalation`` carries
     ``timestamp``; the emitter reads ``created_at``, so the scheduler must
     normalise — a mismatch there would silently null every age).
+
+    ``level`` DEFAULTS TO 1 since task 3541.  It was 0 while the veto was a
+    bare ``bool(rows)``, under which every level pinned identically.  Now an L0
+    read at this site is a DEAD_L0 — ``is_stranded_blocked`` already proved no
+    incarnation holds the task, so ``classify_pins`` link 4 proves the filer
+    dead — and deliberately does NOT pin.  Every fixture below that means "a
+    record that PINS" therefore needs a queue-backed handoff, which is what an
+    L1 is; the cases that are ABOUT the dead-L0 relaxation pass ``level=0``
+    explicitly.
     """
     return Escalation(
         id=esc_id,
         task_id=task_id,
         agent_role='implementer',
         severity=severity,
-        category='infra_issue',
+        category=category,
         summary=f'{esc_id} summary',
         level=level,
         timestamp=(FIXED_DT - timedelta(seconds=secs_ago)).isoformat(),
@@ -1053,17 +1063,25 @@ class TestBlockedRedispatchQueueAbsent:
 
 @pytest.mark.asyncio
 class TestBlockedRedispatchZeroDispositionChange:
-    """(5) The load-bearing contract: the flip SET is byte-identical.
+    """(5) The flip SET is identical with the emission kill switch on and off.
 
-    The veto predicate stays ``bool(rows)`` verbatim.  ``classify_pins`` is
-    consulted only to bucket ids for the payload — swapping in
-    ``PinReport.pins`` would stop an INFO record vetoing here, which is a real
-    disposition change owned by task eta (3541), not by this task.
+    The EMISSION must never change a disposition.  Which records pin is a
+    separate question, owned by ``recovery_pins.records_pin_blocked_recovery``
+    and asserted in ``TestBlockedRedispatchConsumesTheSharedPredicate`` below;
+    this class only pins that turning the events off changes nothing.
     """
 
-    async def test_an_info_severity_record_still_vetoes(self, tmp_path: Path):
-        """``PinReport.pins`` is False for an info-only record.  If a
-        well-meaning refactor swaps the predicate for it, this trips."""
+    async def test_an_info_severity_record_no_longer_vetoes(self, tmp_path: Path):
+        """PRD boundary #8 — the deliberate INVERSION of this test (task 3541).
+
+        It was written as the guard against a well-meaning refactor swapping
+        ``bool(rows)`` for ``PinReport.pins``, back when that swap was a real
+        disposition change nobody had signed off.  Task eta IS that sign-off:
+        an info record is an ANNOTATION, never a handoff, so it must not hold a
+        stranded task out of redispatch.  The payload already DESCRIBED it as
+        non-pinning while the veto stood — that measurable gap is what closes
+        here.
+        """
         scheduler = _emitting_scheduler(tmp_path)
         scheduler.escalation_queue = _FakeEscalationQueue(  # type: ignore[assignment]
             {'T1': [_esc('esc-1', severity='info')]},
@@ -1073,26 +1091,24 @@ class TestBlockedRedispatchZeroDispositionChange:
             _ctx_with_done_dep(_blocked_task('T1')),
         )
 
-        assert scheduler.set_task_status.await_count == 0, (  # type: ignore[attr-defined]
-            'the predicate is bool(rows); an info record STILL vetoes at this site'
-        )
-        data = _recovery_rows(scheduler)[0]['data']
-        assert data['reason'] == 'escalation_pinned'
-        assert data['escalation_ids']['non_pinning'] == ['esc-1'], (
-            'the payload may DESCRIBE the record as non-pinning — that is the '
-            'measurable gap task eta closes — while the veto still stands'
-        )
+        scheduler.set_task_status.assert_awaited_once_with('T1', 'pending')  # type: ignore[attr-defined]
+        assert [
+            r for r in _recovery_rows(scheduler)
+            if r['data'].get('reason') == 'escalation_pinned'
+        ] == [], 'a redispatched task must not also be reported as pinned'
 
     @pytest.mark.parametrize(
         ('rows_by_task', 'expect_flip'),
         [
             pytest.param({}, True, id='no-open-records-flips'),
-            pytest.param({'T1': [_esc('esc-1')]}, False, id='blocking-l0-vetoes'),
+            pytest.param(
+                {'T1': [_esc('esc-1', level=0)]}, True, id='dead-l0-flips',
+            ),
             pytest.param(
                 {'T1': [_esc('esc-1', level=1)]}, False, id='l1-handoff-vetoes',
             ),
             pytest.param(
-                {'T1': [_esc('esc-1', severity='info')]}, False, id='info-vetoes',
+                {'T1': [_esc('esc-1', severity='info')]}, True, id='info-flips',
             ),
         ],
     )
@@ -1282,3 +1298,228 @@ class TestBlockedRedispatchReleasesItsVetoStreak:
 
         flip: AsyncMock = scheduler.set_task_status  # type: ignore[assignment]
         flip.assert_awaited_once_with('T1', 'pending')
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — THE NAMED DRIFT CLOSES HERE.
+#
+# This sweep and `Harness._reconcile_one_stranded`'s blocked arm decide the
+# SAME question — "do this blocked task's open records pin it against its
+# sweep-side remediation?" — and answered it differently.  The harness relaxed
+# on merge-remediable categories (PRD leaf δ); this sweep kept a bare
+# `bool(rows)`, because the relaxation was a private `Harness` staticmethod it
+# could not import.  Both now call `recovery_pins.records_pin_blocked_recovery`.
+#
+# The two mechanisms still TAKE different actions — the harness re-files or
+# marks done, this sweep re-pends.  What is unified is only the PREDICATE.
+# ---------------------------------------------------------------------------
+
+_REMEDIABLE = 'stranded_blocked'
+
+
+@pytest.mark.asyncio
+class TestBlockedRedispatchConsumesTheSharedPredicate:
+    """Every pin class and the category relaxation, at this site."""
+
+    @staticmethod
+    async def _drive(tmp_path: Path, rows: list) -> Scheduler:
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue({'T1': list(rows)})  # type: ignore[assignment]
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+        return scheduler
+
+    @staticmethod
+    def _flipped(scheduler: Scheduler) -> bool:
+        return any(
+            c.args[:2] == ('T1', 'pending')
+            for c in scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+        )
+
+    async def test_a_lone_stranded_blocked_l1_no_longer_vetoes(self, tmp_path: Path):
+        """THE relaxation this sweep was missing.
+
+        `stranded_blocked` is the reaper's OWN "please re-pend this task"
+        request, and this sweep performs exactly that re-pend.  Letting the
+        request veto its own remediation is the anti-synergy PRD leaf δ already
+        closed on the harness side.
+        """
+        scheduler = await self._drive(
+            tmp_path, [_esc('esc-1', category=_REMEDIABLE)],
+        )
+
+        assert self._flipped(scheduler)
+
+    async def test_a_task_failure_l1_still_vetoes(self, tmp_path: Path):
+        """A human-concern class names a problem re-pending does not fix."""
+        scheduler = await self._drive(
+            tmp_path, [_esc('esc-1', category='task_failure')],
+        )
+
+        assert not self._flipped(scheduler)
+        from orchestrator.recovery_emission import render_shape
+
+        rows = _recovery_rows(scheduler)
+        assert rows[0]['data']['reason'] == 'escalation_pinned'
+        assert rows[0]['data']['shape'] == render_shape(
+            'blocked', False, None, True, None,
+        ), 'the emitted shape is unchanged by the predicate rewiring'
+
+    async def test_a_mixed_record_set_still_vetoes(self, tmp_path: Path):
+        """`only_merge_remediable` is an `all(...)`, and that is load-bearing."""
+        scheduler = await self._drive(tmp_path, [
+            _esc('esc-1', category=_REMEDIABLE),
+            _esc('esc-2', category='task_failure'),
+        ])
+
+        assert not self._flipped(scheduler)
+
+    async def test_a_blocking_l0_no_longer_vetoes(self, tmp_path: Path):
+        """`live_claimant=False` is EXACT here, not assumed.
+
+        `is_stranded_blocked(task)` returned True immediately above the read,
+        so no incarnation holds this task and `classify_pins` link 4 reaches
+        its identity-independent branch: the filer is necessarily dead, and a
+        handoff with no consumer left must not pin.
+        """
+        scheduler = await self._drive(
+            tmp_path, [_esc('esc-1', level=0, category='task_failure')],
+        )
+
+        assert self._flipped(scheduler)
+
+    async def test_an_l2_still_vetoes(self, tmp_path: Path):
+        """Level != 0 is a supervised, queue-backed handoff at any severity."""
+        scheduler = await self._drive(
+            tmp_path, [_esc('esc-1', level=2, category='task_failure')],
+        )
+
+        assert not self._flipped(scheduler)
+
+    async def test_an_unreadable_store_still_skips_and_still_describes(
+        self, tmp_path: Path,
+    ):
+        """UNCHANGED — `records=None` never reaches the predicate here.
+
+        The `except` arm emits and `continue`s before the predicate is called,
+        which is why the shared function's always-pin-on-None branch is a
+        contract this site relies on but never exercises.
+        """
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _RaisingEscalationQueue()  # type: ignore[assignment]
+
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        assert not self._flipped(scheduler)
+        rows = _recovery_rows(scheduler)
+        assert rows[0]['data']['reason'] == 'escalation_store_unavailable'
+
+
+#: The six record shapes the two sites used to disagree about.
+_PARITY_FIXTURES = [
+    ('empty', []),
+    ('lone-remediable', [_esc('esc-1', category=_REMEDIABLE)]),
+    ('lone-human-concern', [_esc('esc-1', category='task_failure')]),
+    ('mixed', [
+        _esc('esc-1', category=_REMEDIABLE),
+        _esc('esc-2', category='task_failure'),
+    ]),
+    ('info-only', [_esc('esc-1', severity='info', category='task_failure')]),
+    ('dead-l0', [_esc('esc-1', level=0, category='task_failure')]),
+]
+_PARITY_IDS = [label for label, _ in _PARITY_FIXTURES]
+
+
+class TestBothSitesNameTheSamePredicate:
+    """Parity, asserted STRUCTURALLY — the half no fixture list can weaken.
+
+    A behavioural comparison only proves the two agreed on the cases it
+    happened to try; function IDENTITY makes disagreement impossible for ANY
+    input, which is what "the drift cannot silently reopen" requires.
+    """
+
+    def test_the_scheduler_imports_the_shared_predicate(self) -> None:
+        from orchestrator import recovery_pins
+        from orchestrator import scheduler as scheduler_mod
+
+        assert (
+            scheduler_mod.records_pin_blocked_recovery
+            is recovery_pins.records_pin_blocked_recovery
+        ), 'the scheduler must import the shared predicate, not keep a local copy'
+
+    def test_the_harness_adapter_wraps_the_shared_predicate(self) -> None:
+        from orchestrator import recovery_pins
+        from orchestrator import task_ground_truth as tgt
+
+        assert (
+            tgt.records_pin_blocked_recovery
+            is recovery_pins.records_pin_blocked_recovery
+        ), 'the harness reaches the same function through report_pins_blocked_recovery'
+
+
+@pytest.mark.asyncio
+class TestHarnessAndSchedulerCannotDriftAgain:
+    """THE parity signal, behavioural half: each side ACTS on that one answer.
+
+    Identity of the predicate (above) is not enough on its own — a site could
+    call it and then ignore the result.  These pin that the disposition each
+    mechanism reaches IS the shared answer, over the six record shapes the two
+    used to disagree about.
+    """
+
+    _FIXTURES = _PARITY_FIXTURES
+
+    @pytest.mark.parametrize('label,rows', _PARITY_FIXTURES, ids=_PARITY_IDS)
+    async def test_the_scheduler_acts_on_exactly_that_answer(
+        self, tmp_path: Path, label: str, rows: list,
+    ) -> None:
+        """The sweep flips iff the shared predicate says the records do NOT pin."""
+        from orchestrator.recovery_pins import records_pin_blocked_recovery
+
+        expected_pin = records_pin_blocked_recovery('T1', rows, live_claimant=False)
+
+        scheduler = _emitting_scheduler(tmp_path)
+        scheduler.escalation_queue = _FakeEscalationQueue({'T1': list(rows)})  # type: ignore[assignment]
+        await scheduler._phase_redispatch_stranded_blocked(
+            _ctx_with_done_dep(_blocked_task('T1')),
+        )
+
+        flipped = any(
+            c.args[:2] == ('T1', 'pending')
+            for c in scheduler.set_task_status.await_args_list  # type: ignore[attr-defined]
+        )
+        assert flipped is not expected_pin, label
+
+    @pytest.mark.parametrize('label,rows', _PARITY_FIXTURES, ids=_PARITY_IDS)
+    async def test_the_harness_adapter_returns_exactly_that_answer(
+        self, label: str, rows: list,
+    ) -> None:
+        """`report_pins_blocked_recovery` is the same answer, report-shaped.
+
+        The harness clauses all require `report.live_claimant is None`, which
+        is the same fact `is_stranded_blocked` establishes for the scheduler —
+        so the two sites pass EQUIVALENT arguments, not merely similar ones.
+        """
+        from orchestrator.recovery_pins import records_pin_blocked_recovery
+        from orchestrator.task_ground_truth import (
+            BranchState,
+            BranchStateKind,
+            TruthReport,
+            report_pins_blocked_recovery,
+        )
+
+        report = TruthReport(
+            db_status='blocked',
+            live_claimant=None,
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'a' * 40),
+            worktree_present=True,
+            open_escalations=list(rows),
+            deploy_phase=None,
+        )
+
+        assert report_pins_blocked_recovery(report) is records_pin_blocked_recovery(
+            'T1', rows, live_claimant=False,
+        ), label

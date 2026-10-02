@@ -36,9 +36,20 @@ merge-base, probe live infra, or call ``get_task``, so it can only require
 that the watcher QUOTED the proof, trusting the read-only watcher to have
 done the check. The denylist (``L2_AUTO_CLOSE_DENY_CATEGORIES`` /
 ``L2_AUTO_CLOSE_DENY_ROLES``) is applied BEFORE the allowlist, guaranteeing
-the born-at-L2 human gates (design_concern / milestone_gate categories, the
+the born-at-L2 human gates (the design_concern / milestone_gate /
+milestone_check_failed / curator_adjudication_missing categories, and the
 ``orchestrator-deterministic`` sentinel role) are never auto-closable even
-when a class predicate would otherwise match.
+when a class predicate would otherwise match. That guarantee belongs to the
+MCP ``resolve_issue`` path. One direct-queue path also auto-closes L2s, gated
+by MEMBERSHIP rather than by class, so the category denylist does not bind it:
+``orchestrator/src/orchestrator/recovery_emission.py::resolve_recovery_veto_streak_escalation``
+resolves an L2 of ANY category whose every member is an already-resolved
+recovery-veto-streak alarm and which carries no blocking declared pin. Such
+a wrapper holds nothing the detector has not itself stood down.
+
+Task 4541 adds ``PROMOTE_SENTINEL_BOUND_ROLES``, keyed on the agent_role of
+the records being PROMOTED rather than on the caller's identity, so unlike
+the tables above it binds header-less callers too.
 """
 
 from __future__ import annotations
@@ -64,6 +75,19 @@ ROLE_LEVEL_ALLOWLIST: dict[str, frozenset[int]] = {
 # callers not in this set.
 PROMOTE_ALLOWED: frozenset[str] = frozenset({_WATCHER_AUTO_IDENTITY})
 
+# MEMBER agent_roles (not caller identities — disjoint from PROMOTE_ALLOWED)
+# whose records live under a SYNTHETIC sentinel task id. An L2 clustering only
+# such records must be minted under one of its members' own task ids: minted
+# under a caller-chosen REAL id, it becomes a record every veto predicate reads
+# on that task, so the alarm about a hold becomes part of the hold
+# (esc-5469-11).
+# Must equal orchestrator.recovery_emission.RECOVERY_VETO_STREAK_ROLE; the full
+# WHY is at orchestrator/src/orchestrator/recovery_emission.py::
+# RECOVERY_VETO_STREAK_SENTINEL_PREFIX. Duplicated (not imported) to preserve
+# the escalation -> orchestrator layer direction; pinned in lockstep by
+# tests/test_authority.py.
+PROMOTE_SENTINEL_BOUND_ROLES: frozenset[str] = frozenset({'orchestrator-recovery-veto-streak'})
+
 
 # ---------------------------------------------------------------------------
 # L2 auto-close carve-out (task 2630) — a narrow, evidence-gated exception
@@ -81,9 +105,32 @@ L2_AUTO_CLOSE_ACTION: str = 'close_only'
 # latter is also covered by L2_AUTO_CLOSE_DENY_ROLES below (both file under
 # agent_role='orchestrator-deterministic'), but is listed here too for
 # defense-in-depth so a future filing under a different role stays blocked.
+# 'curator_adjudication_missing' (filed by ``orchestrator.deterministic_runner``)
+# is the re-ask raised when a 'human_curator_gate' task resumes with no
+# 'human_curator_adjudicated_at' stamp; auto-closing it re-opens the task-3181
+# incident verbatim (esc-3181-1 was auto-resolved by the watcher whose own
+# resolution text said the curator work was "deliberately NOT executed"). Like
+# 'milestone_check_failed' it is ALSO covered today by L2_AUTO_CLOSE_DENY_ROLES
+# (it files under agent_role='orchestrator-deterministic'), and is listed here
+# for that same defense-in-depth reason.
+#
+# CROSS-LAYER PIN (reviewer amendment). The three RUNNER-FILED members below —
+# 'milestone_gate', 'milestone_check_failed', 'curator_adjudication_missing' —
+# are each duplicated from a named constant in
+# ``orchestrator.deterministic_runner`` (MILESTONE_GATE_CATEGORY /
+# MILESTONE_CHECK_FAILED_CATEGORY / CURATOR_ADJUDICATION_MISSING_CATEGORY) and
+# held in lockstep by the function-local orchestrator imports in
+# ``tests/test_authority.py``, per the layer-direction rule in this module's
+# docstring. 'design_concern' is NOT pinned that way, deliberately: it has no
+# single owning constant to import. It is filed as a bare literal from several
+# orchestrator call sites (twice in ``orchestrator.workflow``, once in
+# ``orchestrator.harness``) AND is a member of ``escalation.server``'s
+# operator-facing CATEGORIES vocabulary — a SHARED term, not one module's
+# duplicate, so there is no upstream definition a lockstep test could bind to.
 # Checked BEFORE the allowlist (denylist-first).
 L2_AUTO_CLOSE_DENY_CATEGORIES: frozenset[str] = frozenset(
-    {'design_concern', 'milestone_gate', 'milestone_check_failed'}
+    {'design_concern', 'milestone_gate', 'milestone_check_failed',
+     'curator_adjudication_missing'}
 )
 
 # Agent roles that are NEVER auto-closable regardless of category/evidence —

@@ -9,6 +9,7 @@ raw-YAML-vs-model pass.  These tests pin the pure census engine.
 
 import logging
 import os
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ import orchestrator.config
 from orchestrator.cli import main
 from orchestrator.config import (
     RELOADABLE_FIELDS,
+    CensusIgnoreEntry,
     ConfigIgnoredKey,
     ConfigKeyCensus,
     ConfigKeyCensusConfig,
@@ -29,6 +31,7 @@ from orchestrator.config import (
     config_unknown_keys_signature,
     load_config,
 )
+from orchestrator.config_census_ignore import CENSUS_IGNORE_ENTRY_KEYS
 
 
 def _write_yaml(tmp_path: Path, data, name: str = 'orchestrator.yaml') -> Path:
@@ -811,3 +814,382 @@ def test_check_config_parse_failure_suppresses_the_ignored_section(tmp_path, mon
     assert 'OK:' not in result.output
     assert 'excused from the census' not in result.output
     assert 'x_custom' not in result.output
+
+
+# ===== Reasoned ignore entries (task 3395) ===================================
+#
+# A bare-string ignore entry is an unfalsifiable assertion about a
+# non-OrchestratorConfig consumer that is never re-checked.  These pin the
+# widened {path, reason} grammar, the reason reaching the classified key, and
+# the check-config / load_config surfacing.
+
+
+# --- (a) the model accepts the reasoned form ---------------------------------
+
+
+def test_census_config_accepts_reasoned_entry():
+    # model_validate, not the ctor: the raw mapping is exactly what an operator
+    # writes in YAML, and it is the dict -> CensusIgnoreEntry coercion that is
+    # under test.  The declared field type is ``list[str | CensusIgnoreEntry]``,
+    # so feeding the pre-validation dict through the ctor is a type error even
+    # though pydantic accepts it at runtime.
+    cfg = ConfigKeyCensusConfig.model_validate(
+        {'ignore': ['a.b', {'path': 'c.d', 'reason': 'read by scripts/x.sh'}]}
+    )
+    assert cfg.ignore[0] == 'a.b'
+    assert isinstance(cfg.ignore[0], str)
+    entry = cfg.ignore[1]
+    assert isinstance(entry, CensusIgnoreEntry)
+    assert entry.path == 'c.d'
+    assert entry.reason == 'read by scripts/x.sh'
+
+
+def test_load_config_accepts_reasoned_entry_end_to_end(tmp_path, monkeypatch):
+    """BACK-COMPAT HAZARD: if the model field stayed ``list[str]``, the first
+    operator to adopt the documented reasoned form would hard-fail pydantic
+    validation and take a LIVE unit down at load.  A widened field is not
+    optional — accepting the dict form is the whole point."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            'project_root': str(tmp_path),
+            'config_key_census': {
+                'ignore': [{'path': 'cpu_governance.weights', 'reason': 'r'}]
+            },
+        },
+        name='config.yaml',
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    config = load_config(p)
+    assert config.config_key_census.ignore
+
+
+def test_census_ignore_entry_keys_match_the_raw_parser():
+    """DRIFT GUARD (INV-5).  The entry shape necessarily lives in TWO places —
+    the pydantic model that validates the config, and the raw-tree parser the
+    census actually runs on (which cannot use the validated model, because it
+    must keep working when the config has an unrelated value-level validation
+    error).  They MUST agree byte-for-byte on the key names, so the expectation
+    is DERIVED from the model rather than hardcoded: adding a field to
+    CensusIgnoreEntry without teaching the parser fails right here."""
+    assert set(CensusIgnoreEntry.model_fields) == set(CENSUS_IGNORE_ENTRY_KEYS)
+
+
+def test_widening_ignore_adds_no_new_green_tier_leaf():
+    """Widening the element type must not change the RELOADABLE_FIELDS surface:
+    the field is still named ``ignore``, so _submodel_leaf_paths still yields
+    exactly one leaf and the hot-reload promise above is untouched."""
+    assert 'config_key_census.ignore' in RELOADABLE_FIELDS
+    census_leaves = {f for f in RELOADABLE_FIELDS if f.startswith('config_key_census.')}
+    assert census_leaves == {'config_key_census.ignore'}
+
+
+# --- (b) the reason reaches the classified key --------------------------------
+
+
+def test_reasoned_entry_threads_its_note_onto_the_ignored_key(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {
+                'ignore': [
+                    {
+                        'path': 'cpu_governance.weights',
+                        'reason': 'read verbatim by scripts/cpu-governed-exec.sh',
+                    }
+                ]
+            },
+            'cpu_governance': {'enabled': True, 'weights': {'task': 100}},
+        },
+    )
+    census = census_config_keys(p)
+    assert census.unknown == []
+    assert ConfigIgnoredKey(
+        'cpu_governance.weights',
+        'allowlist',
+        'read verbatim by scripts/cpu-governed-exec.sh',
+    ) in census.ignored
+
+
+def test_bare_entry_yields_no_note(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {'ignore': ['cpu_governance.weights']},
+            'cpu_governance': {'enabled': True, 'weights': {'task': 100}},
+        },
+    )
+    (ik,) = census_config_keys(p).ignored
+    assert ik.path == 'cpu_governance.weights'
+    assert ik.note is None
+
+
+def test_reserved_prefix_key_yields_no_note(tmp_path):
+    """A reserved-prefix key was never claimed by an operator assertion, so it
+    has nothing to justify — note stays None rather than being invented."""
+    p = _write_yaml(tmp_path, {'git': {'x_custom': 1}})
+    (ik,) = census_config_keys(p).ignored
+    assert (ik.path, ik.reason, ik.note) == ('git.x_custom', 'reserved_prefix', None)
+
+
+def test_positional_ignored_key_equality_still_holds(tmp_path):
+    """BACK-COMPAT: ``note`` is appended LAST and DEFAULTED, so every existing
+    two-argument construction and tuple-equality assertion in this suite, in
+    test_harness_config_unknown_keys.py, and in config.py itself stays valid."""
+    p = _write_yaml(
+        tmp_path,
+        {'config_key_census': {'ignore': ['warm_lane_pool']}, 'warm_lane_pool': 8},
+    )
+    assert ConfigIgnoredKey('warm_lane_pool', 'allowlist') in census_config_keys(p).ignored
+
+
+def test_first_matching_entry_supplies_the_note(tmp_path):
+    """fnmatch classification is first-match-wins, so the note must come from
+    the FIRST matching entry — otherwise a broad later glob could silently
+    overwrite a specific entry's justification."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {
+                'ignore': [
+                    {'path': 'cpu_governance.weights', 'reason': 'specific first'},
+                    {'path': 'cpu_governance.*', 'reason': 'broad second'},
+                ]
+            },
+            'cpu_governance': {'enabled': True, 'weights': {'task': 100}},
+        },
+    )
+    (ik,) = census_config_keys(p).ignored
+    assert ik.note == 'specific first'
+
+
+def test_unknown_classification_is_identical_with_and_without_reasons(tmp_path):
+    """The .unknown half — which drives the WARNING, the born-at-L2 and the
+    exit-1 gate — must be byte-identical whether or not entries carry reasons.
+    Adding justifications is a documentation change, not a behaviour change."""
+    bare = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {'ignore': ['cpu_governance.weights']},
+            'cpu_governance': {'weights': {'task': 100}},
+            'bogus_key': 1,
+        },
+        name='bare.yaml',
+    )
+    reasoned = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {
+                'ignore': [{'path': 'cpu_governance.weights', 'reason': 'r'}]
+            },
+            'cpu_governance': {'weights': {'task': 100}},
+            'bogus_key': 1,
+        },
+        name='reasoned.yaml',
+    )
+    assert census_config_keys(bare).unknown == census_config_keys(reasoned).unknown
+    assert [uk.path for uk in census_config_keys(reasoned).unknown] == ['bogus_key']
+
+
+# --- (c) check-config surfaces reasons, findings, and a three-way exit code ---
+
+
+def _seed_done_task(project_root: Path, task_id: int = 111) -> None:
+    """A real task store whose only task is DONE — the orphaned-cite fixture."""
+    db = project_root / '.taskmaster' / 'tasks' / 'tasks.db'
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        'CREATE TABLE tasks (tag TEXT, id INTEGER, status TEXT, metadata TEXT, '
+        'PRIMARY KEY (tag, id))'
+    )
+    conn.execute(
+        'INSERT INTO tasks (tag, id, status, metadata) VALUES (?,?,?,?)',
+        ('master', task_id, 'done', None),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _check_config(p: Path):
+    return CliRunner().invoke(main, ['check-config', '--config', str(p)])
+
+
+def test_check_config_prints_reason_and_debt_marker(tmp_path):
+    """ACCEPTANCE (a): a new un-reasoned entry is VISIBLE as debt, and a
+    reasoned one shows the justification the operator actually wrote."""
+    p = _write_yaml(
+        tmp_path,
+        {
+            'config_key_census': {'ignore': [
+                {'path': 'cpu_governance.weights',
+                 'reason': 'read verbatim by scripts/cpu-governed-exec.sh'},
+                'fairness.scheduler_v2',
+            ]},
+            'cpu_governance': {'weights': {'task': 100}},
+            'fairness': {'scheduler_v2': True},
+        },
+        name='config.yaml',
+    )
+    result = _check_config(p)
+    assert 'read verbatim by scripts/cpu-governed-exec.sh' in result.output
+    assert 'no reason' in result.output.lower()
+
+
+def test_check_config_prints_a_findings_section(tmp_path):
+    p = _write_yaml(
+        tmp_path,
+        {'config_key_census': {'ignore': ['warm_lane_pool']}, 'warm_lane_pool': 8},
+        name='config.yaml',
+    )
+    result = _check_config(p)
+    assert 'unreasoned' in result.output
+    assert 'warm_lane_pool' in result.output
+
+
+def test_check_config_advisory_only_still_exits_zero(tmp_path):
+    """The five grandfathered bare entries must NOT turn a currently-green
+    config red on upgrade — advisory findings are exit-neutral and the existing
+    OK: contract still holds."""
+    p = _write_yaml(tmp_path, _reify_shape(), name='config.yaml')
+    result = _check_config(p)
+    assert result.exit_code == 0, result.output
+    assert 'OK' in result.output
+
+
+def test_check_config_hard_finding_exits_two(tmp_path):
+    """ACCEPTANCE (b): an entry whose cited task has CLOSED is reported loudly
+    with its own exit code, naming the id and the status."""
+    project = tmp_path / 'proj'
+    project.mkdir()
+    _seed_done_task(project)
+    p = _write_yaml(
+        tmp_path,
+        {
+            'project_root': str(project),
+            'config_key_census': {'ignore': [
+                {'path': 'warm_lane_pool', 'reason': 'temporary — pending #111'}
+            ]},
+            'warm_lane_pool': 8,
+        },
+        name='config.yaml',
+    )
+    result = _check_config(p)
+    assert result.exit_code == 2, result.output
+    assert '#111' in result.output
+    assert 'done' in result.output
+    assert 'orphaned' in result.output
+
+
+def test_check_config_unknown_key_still_exits_one(tmp_path):
+    p = _write_yaml(tmp_path, {'bogus_key': 1}, name='config.yaml')
+    assert _check_config(p).exit_code == 1
+
+
+def test_unknown_keys_dominate_a_hard_finding(tmp_path):
+    """Exit 1 keeps its documented meaning — 'at least one genuinely-unknown
+    key' — so a caller can never mistake the two signals for each other."""
+    project = tmp_path / 'proj'
+    project.mkdir()
+    _seed_done_task(project)
+    p = _write_yaml(
+        tmp_path,
+        {
+            'project_root': str(project),
+            'config_key_census': {'ignore': [
+                {'path': 'warm_lane_pool', 'reason': 'temporary — pending #111'}
+            ]},
+            'warm_lane_pool': 8,
+            'bogus_key': 1,
+        },
+        name='config.yaml',
+    )
+    result = _check_config(p)
+    assert result.exit_code == 1, result.output
+
+
+def test_check_config_survives_a_raising_audit(tmp_path, monkeypatch):
+    """A broken lint must never turn a working gate into a crash."""
+    def _boom(_path):
+        raise RuntimeError('audit exploded')
+
+    monkeypatch.setattr('orchestrator.cli.audit_census_ignore_entries', _boom)
+    p = _write_yaml(
+        tmp_path, {'max_concurrent_tasks': 3}, name='config.yaml'
+    )
+    result = _check_config(p)
+    assert result.exit_code == 0, result.output
+    assert 'OK' in result.output
+
+
+# --- (d) load_config warns on hard findings (startup AND hot-reload) ----------
+
+
+def _load_and_capture(tmp_path, monkeypatch, caplog, tree) -> list[str]:
+    p = _write_yaml(tmp_path, tree, name='config.yaml')
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    with caplog.at_level(logging.WARNING, logger='orchestrator.config'):
+        load_config(p)
+    return [rec.getMessage() for rec in caplog.records]
+
+
+def test_load_config_warns_on_a_hard_ignore_finding(tmp_path, monkeypatch, caplog):
+    """Loud-over-silent. This ONE call site covers startup AND hot-reload,
+    because Harness.reload_config obtains its fresh config from load_config."""
+    messages = _load_and_capture(tmp_path, monkeypatch, caplog, {
+        'project_root': str(tmp_path),
+        'config_key_census': {'ignore': [
+            {'path': 'warm_lane_pool', 'reason': 'the orchestrator reads this'}
+        ]},
+        'warm_lane_pool': 8,
+    })
+    assert any('warm_lane_pool' in m and 'self-refuting' in m for m in messages), messages
+
+
+def test_load_config_silent_for_a_clean_config(tmp_path, monkeypatch, caplog):
+    messages = _load_and_capture(tmp_path, monkeypatch, caplog, {
+        'project_root': str(tmp_path),
+        'config_key_census': {'ignore': [
+            {'path': 'warm_lane_pool', 'reason': 'read by scripts/deploy.sh'}
+        ]},
+        'warm_lane_pool': 8,
+    })
+    assert not any('ignore entr' in m for m in messages), messages
+
+
+def test_load_config_silent_for_advisory_only_findings(tmp_path, monkeypatch, caplog):
+    """The five grandfathered bare entries must not make EVERY startup noisy —
+    a warning that always fires is one operators learn to ignore."""
+    messages = _load_and_capture(tmp_path, monkeypatch, caplog, {
+        'project_root': str(tmp_path), **_reify_shape(),
+    })
+    assert not any('ignore entr' in m for m in messages), messages
+
+
+def test_unknown_key_warning_still_fires_independently(tmp_path, monkeypatch, caplog):
+    """The two warnings are independent signals: a config can have a hard
+    finding, an unknown key, or both, and each must still be named."""
+    messages = _load_and_capture(tmp_path, monkeypatch, caplog, {
+        'project_root': str(tmp_path),
+        'config_key_census': {'ignore': [
+            {'path': 'warm_lane_pool', 'reason': 'the orchestrator reads this'}
+        ]},
+        'warm_lane_pool': 8,
+        'spare_warm_lanes': 8,
+    })
+    assert any('unknown key' in m and 'spare_warm_lanes' in m for m in messages), messages
+    assert any('self-refuting' in m for m in messages), messages
+
+
+def test_load_config_survives_a_raising_audit(tmp_path, monkeypatch):
+    """A broken audit must never take down startup OR a hot-reload."""
+    def _boom(_path):
+        raise RuntimeError('audit exploded')
+
+    monkeypatch.setattr('orchestrator.config.audit_census_ignore_entries', _boom)
+    p = _write_yaml(
+        tmp_path, {'project_root': str(tmp_path), 'max_concurrent_tasks': 3},
+        name='config.yaml',
+    )
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(p))
+    assert load_config(p).max_concurrent_tasks == 3

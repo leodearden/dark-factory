@@ -341,7 +341,7 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
             for n in range(3)
         ]
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             return llm_decisions
 
         with (
@@ -419,7 +419,7 @@ class TestCurateBatchPreparedClaimVerificationPerformance:
             for i in range(n)
         ]
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             return llm_decisions
 
         with (
@@ -513,7 +513,7 @@ class TestClaimExtractionSkipsUnneededProbeWork:
             for n in range(3)
         ]
 
-        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root):
+        async def fake_llm_batch(cands, pools, ps_list, start, proj_id, proj_root, **kwargs):
             return llm_decisions
 
         with (

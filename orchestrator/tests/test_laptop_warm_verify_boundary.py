@@ -27,7 +27,10 @@ discovery/assertion split:
 
 * ASSERTIONS -- ``subtree_and_leader_gone``, ``wait_subtree_gone`` -- and the
   descendant set ``wait_subtree_live`` RETURNS still come only from the
-  production walkers ``collect_descendants``/``read_ppid_map``.
+  production walkers ``collect_descendants``/``read_ppid_map``.  A kill
+  verdict on CAPTURED pids goes through ``wait_pids_exited`` (a zombie-aware
+  ``/proc/<pid>/stat`` read, task 5903), but the pids themselves are still
+  discovered only by those walkers.
 * the ARRANGE-phase discovery GATE adds a cheap Linux
   ``/proc/<pid>/task/*/children`` pre-filter (:func:`_read_direct_children`)
   that decides nothing except whether to spend a full rescan on a given poll
@@ -59,12 +62,16 @@ import math
 import os
 import re
 import select
+import shlex
+import signal
 import socket
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import warnings
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock
@@ -144,15 +151,33 @@ def write_verify_config(
 # ---------------------------------------------------------------------------
 
 
-def sleeper_spec(sleep_secs: float = 300.0, *, marker: str = 'target/warm.marker') -> MergeVerifySpec:
+def sleeper_spec(
+    sleep_secs: float = 300.0,
+    *,
+    marker: str = 'target/warm.marker',
+    build_pgid_file: Path | None = None,
+) -> MergeVerifySpec:
     """MergeVerifySpec whose scoped test command touches *marker* then blocks.
 
     Reproduces the real cargo/rustc start_new_session escape (verify.py
     ``_run_cmd``) with trivial /bin/bash -- see module docstring.
+
+    With *build_pgid_file*, the build shell atomically writes its own pid
+    there (which is also its pgid, since ``_run_cmd`` starts a new session)
+    and then execs into the sleeper: the published pid IS the process that
+    blocks, and nothing forks after it is published.
     """
+    blocker = f'sleep {sleep_secs}'
+    if build_pgid_file is not None:
+        tmp = build_pgid_file.parent / (build_pgid_file.name + '.tmp')
+        blocker = (
+            f'echo $$ > {shlex.quote(str(tmp))} && '
+            f'mv {shlex.quote(str(tmp))} {shlex.quote(str(build_pgid_file))} && '
+            f'exec {blocker}'
+        )
     return MergeVerifySpec(
         verify_commands=(
-            VerifyCommand('mod', test_command=f'mkdir -p target && touch {marker} && sleep {sleep_secs}'),
+            VerifyCommand('mod', test_command=f'mkdir -p target && touch {marker} && {blocker}'),
         ),
         unscoped_typecheck=UnscopedTypecheckSpec(
             commands=(VerifyCommand('mod', type_check_command='true'),),
@@ -375,8 +400,26 @@ class HeartbeatWriter:
                 return
 
     def stop_heartbeats(self) -> None:
-        """Stop sending heartbeats WITHOUT closing stdin (Row 3: hard partition)."""
+        """Stop sending heartbeats WITHOUT closing stdin (Row 3: hard partition).
+
+        Joins the writer thread (mirroring close_stdin() below) so a caller
+        that immediately does other teardown -- e.g. kill_holder_tree
+        closing stdin in a finally right after this call -- can never race
+        the writer thread's own write()-after-stop-check window: without
+        the join, the thread could still be between
+        ``self._stop.wait(self._interval)`` returning False and
+        ``self._proc.stdin.write(b'\\n')`` when stdin gets closed out from
+        under it, and ``write()`` on an already-closed BufferedWriter
+        raises ValueError, which ``_run``'s ``except (BrokenPipeError,
+        OSError)`` does not catch -- an unhandled thread exception that
+        pytest promotes to an error (see
+        ``error::pytest.PytestUnhandledThreadExceptionWarning`` in
+        orchestrator/pyproject.toml), possibly failing an unrelated test
+        under xdist. Joining still leaves stdin OPEN (this method's whole
+        contract), it only guarantees the writer has stopped touching it.
+        """
         self._stop.set()
+        self._thread.join(timeout=2)
 
     def close_stdin(self) -> None:
         """Stop heartbeats and close the child's stdin write-end (Row 2: EOF, dispatcher alive)."""
@@ -394,7 +437,10 @@ class HeartbeatWriter:
 
 
 def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: float = 0.05) -> int:
-    """Poll for a pgid file (written by verify-merge --request-id) and return its int value.
+    """Poll for a pgid file and return its int value.
+
+    Written by ``verify-merge --request-id`` or by a :func:`sleeper_spec`
+    build with *build_pgid_file*.
 
     *timeout* defaults to :func:`row_discovery_ceiling_secs`, resolved when
     the wait actually STARTS rather than at import, so a row beginning
@@ -410,7 +456,7 @@ def wait_for_pgid_file(path: Path, *, timeout: float | None = None, interval: fl
     raise AssertionError(f'pgid file {path} did not appear within {timeout}s')
 
 
-def _read_direct_children(pid: int) -> set[int] | None:
+def _read_direct_children(pid: int, *, _proc_root: Path = Path('/proc')) -> set[int] | None:
     """Cheap probe: the DIRECT children of *pid*, from ``/proc/<pid>/task/*/children``.
 
     A ~2700x cheaper stand-in for a full ``read_ppid_map()`` rescan, used ONLY
@@ -434,41 +480,49 @@ def _read_direct_children(pid: int) -> set[int] | None:
       NEGATIVE: the caller can skip the expensive walk this tick.
     * ``{pid, ...}`` -- direct children exist; worth confirming with the
       production walker.
-    * ``None``   -- CANNOT probe.  Either the ``children`` files are absent
-      (a kernel built without ``CONFIG_PROC_CHILDREN``) or ``/proc/<pid>``
-      itself is gone (the leader exited mid-poll).  The caller must fall back
-      to the full walk for that tick; conflating this with the cheap negative
-      would make the poll spin to its timeout on such a kernel, and letting
-      the OSError escape would turn a leader exiting mid-poll into an
-      unhandled error inside the timeout diagnostic.
+    * ``None``   -- CANNOT probe: ``/proc/<pid>`` is gone (the leader has
+      exited), a LIVE thread's ``children`` file cannot be read (a kernel
+      built without ``CONFIG_PROC_CHILDREN``, or fd exhaustion), or no thread
+      was read at all (the leader exited before its first thread was read).
+      The caller must fall back to the full walk for that tick; conflating
+      this with the cheap negative would make the poll spin to its timeout,
+      and letting the OSError escape would turn a leader exiting mid-poll
+      into an unhandled error inside the timeout diagnostic.
 
-    Any OSError anywhere in the read collapses to ``None``.  Distinguishing
-    "no CONFIG_PROC_CHILDREN" from "this thread just exited" would buy
-    nothing: both answers are "don't trust the probe on this tick", and the
-    fallback they select is precisely this helper's pre-4014 behaviour.
+    A failed ``children`` read is judged PER THREAD, because threads exit
+    routinely in the probed processes -- pytest's own per-test faulthandler /
+    pytest-timeout watchdog threads included (task 5945).  If the tid
+    directory is gone, the thread exited after the listing and is skipped; if
+    it still exists, the probe cannot be trusted and answers ``None``.  So one
+    tick can under-report: a child the kernel re-parents from a skipped thread
+    onto a sibling already read is missed, and a leader that exits after some
+    of its threads were read answers the partial set those threads gave
+    (possibly ``set()``), not ``None``.  Either only defers the caller's walk
+    by one poll interval -- the next tick sees the re-parented child, or finds
+    ``/proc/<pid>`` gone and answers ``None`` -- and the kernel documents
+    ``children`` as best-effort anyway.
 
-    The empty-``task``-listing branch below is DEFENSIVE-ONLY, and therefore
-    deliberately uncovered: a live ``/proc/<pid>/task`` always holds at least
-    one tid, and a dead one makes ``iterdir()`` itself raise OSError, which
-    the handler already maps to ``None``.  It is retained rather than deleted
-    because falling THROUGH it would return the cheap negative ``set()`` --
-    "leader is live and has forked nothing" -- for a listing that in fact told
-    us nothing, and that is the single answer which makes the caller skip its
-    walk every tick and spin to the timeout.
+    *_proc_root* is a private injectable seam (defaulting to the real
+    ``/proc``) so the tri-state can be covered against a fake task listing in
+    ``tmp_path``, for the branches (no ``CONFIG_PROC_CHILDREN``, every thread
+    vanished) that this kernel cannot produce on demand.
     """
-    children: set[int] = set()
     try:
-        tid_dirs = list((Path('/proc') / str(pid) / 'task').iterdir())
-        if not tid_dirs:
-            # Defensive only (see docstring): not reachable on a live or a dead
-            # /proc entry, so never trust an empty listing as a cheap negative.
-            return None
-        for tid_dir in tid_dirs:
-            raw = (tid_dir / 'children').read_text()
-            children.update(int(token) for token in raw.split())
+        tid_dirs = list((_proc_root / str(pid) / 'task').iterdir())
     except OSError:
         return None
-    return children
+    children: set[int] = set()
+    any_thread_read = False
+    for tid_dir in tid_dirs:
+        try:
+            raw = (tid_dir / 'children').read_text()
+        except OSError:
+            if tid_dir.exists():
+                return None
+            continue
+        any_thread_read = True
+        children.update(int(token) for token in raw.split())
+    return children if any_thread_read else None
 
 
 def wait_subtree_live(
@@ -513,8 +567,7 @@ def wait_subtree_live(
     It's optional so no existing call site is forced to change semantics.
     *proc_label* names *proc* in the failure message (default ``"leader"``);
     pass e.g. ``proc_label="dispatcher"`` when *proc* is a stand-in process
-    rather than the leader itself (e.g. the SSH dispatcher in the Row 1
-    orchestrator-killed test), so a reader doesn't apply the rc taxonomy
+    rather than the leader itself, so a reader doesn't apply the rc taxonomy
     below to the wrong process.  When *proc* is given, a timeout failure
     names its exit status (``<proc_label> rc=<n|None>``).  For the LEADER
     specifically, that rc distinguishes a watchdog self-kill (rc == 1, no
@@ -685,6 +738,284 @@ def wait_subtree_gone(pgid: int, *, timeout: float, interval: float = 0.1) -> bo
     return subtree_and_leader_gone(pgid)
 
 
+class ProcState(NamedTuple):
+    """A pid's ``/proc/<pid>/stat`` state letter and parent pid."""
+
+    state: str
+    ppid: int
+
+    @property
+    def exited(self) -> bool:
+        """A zombie has terminated and is only awaiting its (possibly reparented) parent's reap."""
+        return self.state in ('Z', 'X')
+
+
+def read_proc_state(pid: int) -> ProcState | None:
+    """*pid*'s :class:`ProcState`, or None when it has no ``/proc`` entry.
+
+    Parsed after the LAST ``') '`` exactly as
+    :func:`orchestrator.verify_cancel.read_ppid_map` does, since ``comm`` may
+    hold spaces or parens.  A malformed stat raises rather than reading as gone.
+    """
+    try:
+        raw = Path(f'/proc/{pid}/stat').read_text()
+    except OSError:
+        return None
+    fields = raw.rsplit(') ', 1)[1].split()
+    return ProcState(state=fields[0], ppid=int(fields[1]))
+
+
+def wait_pids_exited(
+    pids: set[int],
+    *,
+    timeout: float,
+    interval: float = 0.05,
+    _read_state: Callable[[int], ProcState | None] = read_proc_state,
+    _clock: Callable[[], float] = time.monotonic,
+) -> dict[int, ProcState]:
+    """Poll until every pid in *pids* has exited; return the still-RUNNING ones.
+
+    Each survivor maps to its last observed :class:`ProcState`; an empty dict
+    means every pid exited.  A zombie counts as exited: reaping a reparented
+    orphan is its subreaper's job (``systemd --user`` on this fleet), not the
+    code under test's -- the same criterion as
+    ``orchestrator/tests/test_verify_cancel.py::_is_running`` (task 3955).
+
+    The verdict is always the probe of the returning iteration, so a caller
+    descheduled across the deadline never asserts on a stale observation;
+    ``timeout=0`` is exactly one probe.
+    """
+    deadline = _clock() + timeout
+    while True:
+        running = {
+            pid: state for pid in pids
+            if (state := _read_state(pid)) is not None and not state.exited
+        }
+        if not running or _clock() >= deadline:
+            return running
+        time.sleep(interval)
+
+
+def kill_holder_tree(
+    proc: subprocess.Popen,
+    *,
+    timeout: float | None = None,
+    _ppid_map_provider=read_ppid_map,
+    _kill=os.kill,
+    _killpg=os.killpg,
+) -> None:
+    """SIGKILL *proc* and every descendant it forked, including start_new_session escapes.
+
+    Mirrors :func:`orchestrator.verify_cancel.cancel_request`'s algorithm --
+    snapshot the ``/proc`` PPID map before sending any signal, collect
+    descendants, SIGKILL them, SIGKILL the leader, fire a GUARDED
+    ``killpg`` backstop for same-group stragglers while the leader is
+    still an unreaped zombie, and only THEN reap it -- but walks
+    descendants from ``proc.pid`` rather than a recorded pgid, and the
+    ``killpg`` backstop only fires when the holder is provably its own
+    group leader.
+
+    Walking from ``proc.pid`` (rather than
+    ``os.killpg(os.getpgid(proc.pid), SIGKILL)``, the obvious one-liner) is
+    what makes this helper safe at every ``spawn_verify_merge`` call site in
+    this module, including ones that never pass ``--request-id`` (e.g. the
+    lane-lock holder): ``cli.py`` only calls
+    :func:`~orchestrator.verify_cancel.start_own_process_group`
+    (``os.setsid``) inside ``if request_id is not None:``, and
+    ``spawn_verify_merge`` itself passes no ``start_new_session=``, so a
+    holder started without ``--request-id`` stays in the CALLER's (this
+    test process's) own process group -- ``os.getpgid(holder.pid) ==
+    os.getpgid(0)``.  An unconditional ``killpg`` there would SIGKILL the
+    pytest worker running this very test -- see
+    ``test_kill_holder_tree_never_signals_the_callers_own_process_group``.
+    The descendant walk has no such hazard: the caller is always an
+    ANCESTOR of the holder, never a descendant -- the same argument
+    :func:`~orchestrator.verify_cancel.start_own_process_group` makes for
+    ``sshd`` never being a descendant of the pgid ``cancel_request`` walks.
+
+    *timeout* defaults to :data:`ROW5_HOLDER_TEARDOWN_CEILING_SECS`,
+    resolved when the call actually runs rather than at import time -- the
+    same lazy-default convention :func:`wait_for_pgid_file` and
+    :func:`wait_subtree_live` use above, needed here because that constant
+    is defined later in this module.  This is the ONLY blocking wait the
+    helper performs (the descendant sweep is pure signalling, no polling
+    loop), so the budget ``_ROW5_WORST_CASE_FIXED_SECS`` derives from stays
+    valid unchanged.
+
+    *_ppid_map_provider* / *_kill* / *_killpg* are private injectable seams,
+    mirroring :func:`cancel_request`'s own convention, so tests can pin the
+    session-escape reap deterministically with zero risk of signalling
+    anything unintended.
+
+    ALREADY-REAPED SHORT CIRCUIT: an already-reaped leader means
+    ``proc.pid`` is a FREE pid, so the walk below must never run against
+    it.  Several call sites reap the leader with ``wait()`` inside their
+    ``try`` block BEFORE their ``finally`` runs this helper
+    (``test_watchdog_timeout_env_override_fires_fast_without_heartbeat``,
+    ``test_cancel_verify_tree_kills_under_live_watchdog``,
+    ``test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive``,
+    ``test_heartbeat_starved_hard_partition_tree_killed_via_timeout``) --
+    on their GREEN path ``proc.pid`` no longer refers to the holder at all.  ``os.getpgid(proc.pid)`` and
+    ``collect_descendants(proc.pid, ...)`` would then describe whatever
+    process happens to OWN that recycled pid now, and every descendant of
+    that stranger would be SIGKILLed (and killpg'd by the backstop above,
+    if it happened to be its own group leader) -- precisely what "zero
+    risk of signalling anything unintended" above promises never happens.
+    pid recycling is observed on this fleet, not theoretical
+    (verify_cancel.py:313-315: pid_max=4194304, and the laptop's own pid
+    counter demonstrably wrapped on 2026-08-11).  So liveness is captured
+    ONCE, at entry, strictly before the pgid read and the ppid-map
+    snapshot below: an already-reaped leader's descendants have already
+    been reparented to init (or the nearest subreaper) and are no longer
+    reachable from ``proc.pid`` anyway, so the early return forgoes no
+    reachable kill.
+
+    IT IS NOT FREE, THOUGH -- KNOWN RESIDUE (esc-4092-3, measured
+    2026-08-30).  "No longer reachable" is a statement about this helper's
+    ability to FIND the descendants, NOT a claim that something else kills
+    them.  Nothing does.  A session-escaped grandchild (verify.py's
+    ``_run_cmd`` runs every build via
+    ``create_subprocess_shell(..., start_new_session=True)``, so it holds
+    its OWN pgid/sid) is reachable ONLY via the /proc ppid chain, and that
+    chain is severed the instant the leader dies.  When a caller reaps the
+    leader inside its ``try`` -- as the four rows named above do -- the
+    grandchild is already reparented to init by the time this runs, the
+    descendant walk returns EMPTY, and the killpg backstop cannot reach it
+    either (different group).  It then survives to its full ``sleeper_spec``
+    duration.
+
+    MEASURED, not inferred: over 5 instrumented full-module xdist runs, 3
+    leaked exactly one ``sleep 300.0``, each reparented to pid 1940
+    (``systemd --user``) in its own pgid/sid.  The surviving orphan's
+    ``/proc/<pid>/cwd`` resolved to
+    ``.../test_watchdog_timeout_env_over0/repo/.worktrees/_merge-<uuid>``
+    -- i.e. one of the four already-reaped rows, whose logged teardown
+    state was ``returncode=1, /proc entry gone, descendants=[]``.  The two
+    ``_KNOWN_HOLDER_TEARDOWN_ROWS`` anchors did NOT leak: their leaders were
+    logged alive (``returncode=None``, state ``S``) with a NON-EMPTY
+    descendant set containing the real sleeper, which was swept correctly.
+
+    ACCEPTED for now, deliberately: the residue is bounded by the spec's own
+    sleep duration, has no correctness impact on the assertions, and closing
+    it needs a design change this helper cannot make alone (the descendant
+    set must be captured EARLY, while the leader is provably alive, and
+    carried into teardown -- a spawn-time pgid does not suffice, because the
+    grandchild setsid's into a group of its own).  Tracked as a follow-up;
+    do NOT "fix" it by deleting the short circuit, which would reintroduce
+    the free-pid walk described above.
+    """
+    timeout = ROW5_HOLDER_TEARDOWN_CEILING_SECS if timeout is None else timeout
+
+    # An already-reaped leader means proc.pid is a FREE pid -- see the
+    # ALREADY-REAPED SHORT CIRCUIT paragraph above.  Captured once, via
+    # proc.returncode (a pure read of state this Popen already owns, no
+    # waitpid side effect) rather than a fresh proc.poll(), and not
+    # re-read later in this function.  ``proc.poll()`` is deliberately
+    # called NOWHERE in this helper: a poll() after this point would
+    # ``waitpid``-reap a leader that exited in the meantime and FREE
+    # proc.pid, aiming the killpg backstop below at a recycled group --
+    # see the unguarded leader SIGKILL further down for the full argument.
+    if proc.returncode is not None:
+        if proc.stdin is not None:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
+        return
+
+    # Pre-kill snapshot phase -- BOTH reads must happen before any signal is
+    # sent.  Killing the leader first reparents survivors to init and severs
+    # the /proc parent chain, making a session-escaped descendant unfindable
+    # (the same invariant cancel_request documents at
+    # verify_cancel.py:246-250).  The pgid is read only to gate the killpg
+    # backstop below; a leader already gone by now makes getpgid raise
+    # ProcessLookupError, and a permission mismatch or any other OSError
+    # degrades the same way -- "no group to backstop" -- rather than
+    # propagating out of a finally and masking whatever real assertion
+    # failure the caller was cleaning up after.
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    # A /proc read losing a race with process exit degrades to an empty map
+    # rather than propagating -- this helper runs almost exclusively inside
+    # a finally block, where an exception would mask whatever real assertion
+    # failure the caller was cleaning up after.
+    try:
+        ppid_map = _ppid_map_provider()
+    except OSError:
+        ppid_map = {}
+    descendants = collect_descendants(proc.pid, ppid_map)
+
+    # SIGKILL every descendant.  Already-dead and not-ours are both expected
+    # outcomes, not errors.
+    for pid in descendants:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            _kill(pid, signal.SIGKILL)
+
+    # SIGKILL the leader.  UNGUARDED, deliberately: there is no
+    # `if proc.poll() is None:` here, and adding one back would REINTRODUCE
+    # the pid-recycling hazard the backstop below exists to avoid.
+    # ``Popen.poll()`` is not a passive read -- it calls ``_internal_poll()``
+    # -> ``os.waitpid(pid, WNOHANG)``, so if the leader exited at any point
+    # after the entry-time ``proc.returncode is not None`` short circuit
+    # (the Row 5 holder's ``finally`` calls ``stop_heartbeats()`` FIRST,
+    # which arms the CLI's stdin-watchdog self-kill, making exactly that a
+    # DESIGNED behaviour, not an exotic race), a poll() here would REAP it
+    # and FREE proc.pid -- and the backstop below would then evaluate
+    # ``pgid == proc.pid`` against a pgid captured pre-reap and fire
+    # ``killpg`` at a now-free pgid, SIGKILLing a stranger's whole process
+    # group on a shared dev box or CI host.
+    #
+    # Signalling here is safe unguarded and costs nothing: the entry-time
+    # short circuit already established the leader was un-reaped, and this
+    # Popen object is the ONLY thing that can reap it, so with no poll() in
+    # this function the pid stays PINNED (a zombie at worst) until
+    # ``proc.wait()`` below.  SIGKILL to an exited-but-unreaped zombie is a
+    # no-op, and ProcessLookupError/PermissionError are suppressed anyway.
+    # This is what makes the backstop's "still unreaped, pid provably
+    # pinned" premise actually true rather than merely asserted.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        _kill(proc.pid, signal.SIGKILL)
+
+    # Guarded killpg backstop for same-group stragglers -- fires ONLY when
+    # the holder is PROVABLY its own group leader (setsid ran, i.e. the CLI
+    # was invoked with --request-id) AND that group is PROVABLY not the
+    # caller's own.  Both checks are required, not either alone: cli.py's
+    # os.setsid is gated on --request-id and spawn_verify_merge never passes
+    # start_new_session=, so a holder that never setsid'd (e.g. the
+    # lane-lock site) shares this process's own group -- an unguarded
+    # killpg there would SIGKILL the pytest worker itself (see
+    # test_kill_holder_tree_never_signals_the_callers_own_process_group).
+    #
+    # Fired HERE -- immediately after the leader SIGKILL and BEFORE
+    # proc.wait() reaps it below, not after.  While still unreaped the
+    # leader is a zombie that keeps its pid pinned, so pgid provably still
+    # denotes the holder's own group; group members that outlive it are
+    # killed just as effectively.  Firing this AFTER the reap would let a
+    # pid-recycling race aim killpg at a stranger's group instead -- the
+    # exact hazard the ALREADY-REAPED SHORT CIRCUIT above exists to avoid,
+    # and pid recycling is observed on this fleet, not theoretical
+    # (verify_cancel.py:313-315: pid_max=4194304, and the laptop's own pid
+    # counter demonstrably wrapped on 2026-08-11).
+    if pgid is not None and pgid == proc.pid and pgid != os.getpgid(0):
+        with contextlib.suppress(ProcessLookupError, OSError):
+            _killpg(pgid, signal.SIGKILL)
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A leader that will not die must not mask the test's own failure by
+        # raising out of a finally -- surface it loudly instead.
+        warnings.warn(
+            f'kill_holder_tree: leader pid={proc.pid} did not exit within '
+            f'{timeout}s of SIGKILL',
+            stacklevel=2,
+        )
+
+    if proc.stdin is not None:
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+
+
 def worktree_base_for(repo: Path) -> Path:
     """Derive worktree_base exactly as the spawned CLI does: GitOps(config.git, repo).worktree_base."""
     config = OrchestratorConfig(project_root=repo)
@@ -694,13 +1025,16 @@ def worktree_base_for(repo: Path) -> Path:
 # ---------------------------------------------------------------------------
 # Task 4025 (de-flake beta) -- pinned SS9 Row 1/2/3 watchdog window.
 #
-# ROW_WATCHDOG_ENV carries the SAME numbers as today's production constants
-# -- verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS (10.0) and
-# WATCHDOG_KILL_GRACE_SECS (5.0) -- but as PINNED LITERALS, deliberately NOT
-# imported from verify_cancel: task 4195 will retune those constants
-# (deriving the timeout from SSH_SERVER_ALIVE_INTERVAL *
-# SSH_SERVER_ALIVE_COUNT_MAX, toward ~60s+), and tracking them here would
-# silently multiply this module's runtime (Row 3 from ~17s to ~70s).  The
+# ROW_WATCHDOG_ENV carries PINNED LITERALS, deliberately NOT imported from
+# verify_cancel.  They used to equal production; task 4195 has since landed and
+# derived WATCHDOG_HEARTBEAT_TIMEOUT_SECS from the ssh transport's own
+# dead-peer verdict (WATCHDOG_TRANSPORT_HEADROOM 1.5 x SSH_SERVER_ALIVE_INTERVAL
+# 15 x SSH_SERVER_ALIVE_COUNT_MAX 4 = 90.0; the 5.0 kill grace is unchanged),
+# so the pin and production now deliberately DIFFER.  Tracking production here
+# would silently multiply this module's runtime -- Row 3 from ~17s to ~95s and
+# ROW_PER_TEST_TIMEOUT_SECS from 390 to ~650 -- for no coverage, because the
+# rows already drive the real production code path through ROW_WATCHDOG_ENV ->
+# cli.py::_env_float.  The
 # pin is now STRUCTURAL, not just asserted: the literals live on
 # ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS below,
 # and ROW_TREE_KILL_CEILING_SECS / ROW_PER_TEST_TIMEOUT_SECS are computed
@@ -729,6 +1063,13 @@ def worktree_base_for(repo: Path) -> Path:
 ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS: float = 10.0
 ROW_WATCHDOG_KILL_GRACE_SECS: float = 5.0
 
+#: What production read when the divergence above was last DECIDED, not a value
+#: the rows spend.  Its only consumer is
+#: :func:`test_row_watchdog_window_tracks_the_baselined_production_window`,
+#: which fails the day production moves again so the next author re-decides
+#: whether the rows' fast window is still representative.
+BASELINED_PRODUCTION_WATCHDOG_WINDOW: tuple[float, float] = (90.0, 5.0)
+
 #: Worst-case time to fire and finish killing the tree.  Row 3 takes
 #: run_stdin_watchdog's select-TIMEOUT branch and pays the full sum; Rows
 #: 1/2 take the EOF branch and pay only the grace.
@@ -741,7 +1082,7 @@ ROW_WATCHDOG_ENV: dict[str, str] = {
     'ORCH_WATCHDOG_KILL_GRACE_SECS': str(ROW_WATCHDOG_KILL_GRACE_SECS),
 }
 
-#: Ceiling for the rows' child.wait()/wait_subtree_gone() polls: the full
+#: Ceiling for the rows' child.wait()/wait_subtree_gone()/wait_pids_exited() polls: the full
 #: window plus load headroom.  A WEDGE-DETECTOR, not a speed assertion (the
 #: rows assert THAT the tree was killed, never how fast), so on the success
 #: path a wider ceiling costs zero wall-clock and is paid only when the test
@@ -758,7 +1099,8 @@ ROW_TREE_KILL_CEILING_SECS: float = ROW_WATCHDOG_WINDOW_SECS + 15.0  # 30.0
 ROW_MARKER_CEILING_SECS: float = 20.0
 
 #: Base ceiling for the two DISCOVERY waits every row runs BEFORE the
-#: watchdog is even armed -- wait_for_pgid_file and wait_subtree_live.  Rows
+#: watchdog is even armed -- wait_for_pgid_file, then wait_subtree_live (Row
+#: 1: a second wait_for_pgid_file, on the build's own pgid file).  Rows
 #: 1/2/3 pass the resolved ceiling explicitly at their call sites below
 #: (instead of relying on the bare default) so this value and those defaults
 #: cannot silently drift apart.
@@ -916,18 +1258,18 @@ ROW5_WAITER_COMPLETION_CEILING_SECS: float = 60.0
 ROW5_HOLDER_TEARDOWN_CEILING_SECS: float = 5.0
 
 #: Worst-case FIXED (non-load-scaled) work in Row 5: the marker wait, the
-#: waiter subprocess's completion ceiling, and the finally block's holder
-#: teardown.  The marker term is counted TWICE because
-#: :func:`wait_for_marker_stable` spends its timeout on the existence gate and
-#: then a FRESH deadline on the settle loop -- worst case 40s, not 20s, a term
-#: the literal mark this replaced hid entirely.  (Deliberately excludes
-#: _setup_verify_repo's real git work and the in-process consumer half -- both
-#: small next to the headroom below, exactly as for Rows 1-4.)
+#: waiter subprocess's completion ceiling, and the finally block's TWO
+#: holder teardowns (waiter then holder).  The marker term is counted TWICE
+#: because :func:`wait_for_marker_stable` spends its timeout on the existence
+#: gate and then a FRESH deadline on the settle loop -- worst case 40s, not
+#: 20s, a term the literal mark this replaced hid entirely.  (Deliberately
+#: excludes _setup_verify_repo's real git work and the in-process consumer
+#: half -- both small next to the headroom below, exactly as for Rows 1-4.)
 _ROW5_WORST_CASE_FIXED_SECS: float = (
     2 * ROW_MARKER_CEILING_SECS
     + ROW5_WAITER_COMPLETION_CEILING_SECS
-    + ROW5_HOLDER_TEARDOWN_CEILING_SECS
-)  # 105.0
+    + 2 * ROW5_HOLDER_TEARDOWN_CEILING_SECS
+)  # 110.0
 
 #: Row 5's per-test opt-out from the inherited `timeout = 60`, in the same
 #: shape as ROW_PER_TEST_TIMEOUT_SECS above: 2x the FIXED terms (they do not
@@ -938,7 +1280,7 @@ _ROW5_WORST_CASE_FIXED_SECS: float = (
 #: them as well would double-count the same elasticity.
 ROW5_PER_TEST_TIMEOUT_SECS: int = int(
     2 * _ROW5_WORST_CASE_FIXED_SECS + 2 * ROW_DISCOVERY_CEILING_MAX_SECS
-)  # 450
+)  # 460
 # ---------------------------------------------------------------------------
 
 
@@ -954,38 +1296,43 @@ ROW5_PER_TEST_TIMEOUT_SECS: int = int(
 # ---------------------------------------------------------------------------
 
 
-def test_row_watchdog_window_still_matches_production_constants():
-    """Fails the day ROW_WATCHDOG_* stops matching verify_cancel's WATCHDOG_*.
+def test_row_watchdog_window_tracks_the_baselined_production_window():
+    """Fails the day verify_cancel's WATCHDOG_* moves off its baselined value.
 
     task 4025 pinned ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
     ROW_WATCHDOG_KILL_GRACE_SECS as literals specifically so Rows 1/2/3's
     runtime does NOT track verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS /
-    WATCHDOG_KILL_GRACE_SECS -- task 4195 is expected to retune those toward
-    ~60s+.  Today the pinned literals happen to equal production, so this
-    passes; it exists to catch the moment that stops being true.
+    WATCHDOG_KILL_GRACE_SECS.  Those two once happened to be equal; task 4195
+    has since derived the production timeout from the ssh transport (90.0s),
+    so the pin and production now deliberately DIFFER and equality is no
+    longer the thing to assert.
 
-    If this fails: production changed (task 4195 landing is the expected
-    trigger).  Do NOT "fix" it by importing the pinned literals from
-    verify_cancel -- that reintroduces the silent-runtime-multiplication
-    this task exists to prevent.  Instead update the three Row 1/2/3
-    docstrings' "pinned production-equivalent window" wording (it will no
-    longer be accurate), decide afresh whether
-    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS
-    should move, and re-baseline this assert against the new production
-    values.
+    What survives is this test's actual job: tell the next author that
+    production moved AGAIN, so they re-decide whether the rows' fast window is
+    still representative of the behaviour they exercise.
+
+    If this fails: production changed.  Do NOT "fix" it by importing the
+    pinned literals from verify_cancel -- that reintroduces the
+    silent-runtime-multiplication task 4025 built the pin to prevent, and buys
+    no coverage, because the rows already drive the real production code path
+    through ROW_WATCHDOG_ENV -> cli.py::_env_float.  Instead update the three
+    Row 1/2/3 docstrings' window wording, decide afresh whether
+    ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS / ROW_WATCHDOG_KILL_GRACE_SECS should
+    move, and re-baseline BASELINED_PRODUCTION_WATCHDOG_WINDOW.
     """
     from orchestrator import verify_cancel
 
-    pinned = (ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS, ROW_WATCHDOG_KILL_GRACE_SECS)
     production = (
         verify_cancel.WATCHDOG_HEARTBEAT_TIMEOUT_SECS,
         verify_cancel.WATCHDOG_KILL_GRACE_SECS,
     )
-    assert pinned == production, (
-        f'pinned ROW_WATCHDOG_* {pinned} no longer match production '
-        f'verify_cancel.WATCHDOG_* {production} -- the pin intentionally '
-        f'does not track production; update the docstrings\' '
-        f'"production-equivalent" wording and re-baseline this assert.'
+    assert production == BASELINED_PRODUCTION_WATCHDOG_WINDOW, (
+        f'production verify_cancel.WATCHDOG_* {production} no longer matches the '
+        f'baselined {BASELINED_PRODUCTION_WATCHDOG_WINDOW} this module was last '
+        f'reconciled against. The pinned ROW_WATCHDOG_* '
+        f'{(ROW_WATCHDOG_HEARTBEAT_TIMEOUT_SECS, ROW_WATCHDOG_KILL_GRACE_SECS)} '
+        f'intentionally do not track production; re-decide whether they should '
+        f'move, then re-baseline BASELINED_PRODUCTION_WATCHDOG_WINDOW.'
     )
 
 
@@ -1335,7 +1682,8 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
     ``wait_subtree_gone`` kill confirmation -- so it cannot share their
     constant.  Its bounded terms are: two discovery waits (both on the
     load-scaled ceiling), the marker wait, the waiter subprocess's completion
-    ceiling, and the ``finally`` block's holder teardown.
+    ceiling, and the ``finally`` block's TWO holder teardowns (waiter then
+    holder).
 
     The marker term is counted TWICE on purpose:
     :func:`wait_for_marker_stable` spends its ``timeout`` on the
@@ -1351,13 +1699,13 @@ def test_row5_per_test_timeout_covers_its_own_bounded_work():
         2 * ROW_DISCOVERY_CEILING_MAX_SECS
         + 2 * ROW_MARKER_CEILING_SECS
         + ROW5_WAITER_COMPLETION_CEILING_SECS
-        + ROW5_HOLDER_TEARDOWN_CEILING_SECS
+        + 2 * ROW5_HOLDER_TEARDOWN_CEILING_SECS
     )
     assert required <= ROW5_PER_TEST_TIMEOUT_SECS, (
         f'ROW5_PER_TEST_TIMEOUT_SECS ({ROW5_PER_TEST_TIMEOUT_SECS}) does not cover '
         f"Row 5's bounded worst case ({required}) -- both discovery waits at the "
         f'MAX ceiling, the marker existence gate AND its settle loop, the waiter '
-        f"subprocess's completion ceiling, and the holder teardown"
+        f"subprocess's completion ceiling, and both holder teardowns"
     )
 
     applied = [
@@ -1450,6 +1798,389 @@ def test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark(request
     )
 
 
+#: Anti-vacuity floor for the sweep below: an AST matcher that silently stops
+#: matching is a guard reporting PASS while guarding nothing.  "At minimum"
+#: -- the sweep may (and does, e.g. test_watchdog_timeout_env_override_fires_
+#: fast_without_heartbeat) match more holder teardowns than this names; the
+#: assertion below only requires this set to be a SUBSET of what was matched.
+_KNOWN_HOLDER_TEARDOWN_ROWS: frozenset[str] = frozenset({
+    'test_flock_contention_full_two_way_seam_blocks_and_escalates',       # Row 5
+    'test_live_verify_merge_holds_lane_lock_real_subprocess',             # lane lock
+})
+
+
+def _spawn_verify_merge_bound_names(func_node) -> set[str]:
+    """Local names *func_node* binds via a bare ``X = spawn_verify_merge(...)`` call."""
+    names: set[str] = set()
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Assign):
+            continue
+        call = node.value
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == 'spawn_verify_merge'
+        ):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                names.add(target.id)
+    return names
+
+
+def _bare_kill_offenders(func_node, holder_names: set[str]) -> list[str]:
+    """``"func:lineno"`` for every swept holder's raw-kill spelling called directly
+    in a ``try`` handler/finalbody that does NOT also call ``kill_holder_tree``.
+
+    Three raw-kill spellings are matched, each a way a future teardown
+    could reintroduce the exact orphan task 4092 fixed: ``<holder>.kill()``,
+    ``<holder>.terminate()``, and an ``os.kill``/``os.killpg`` call whose
+    argument subtree mentions a swept holder name -- most pointedly the
+    ``os.killpg(os.getpgid(holder.pid), SIGKILL)`` one-liner
+    ``kill_holder_tree``'s own docstring calls out as the dangerous thing a
+    future author would reach for instead.
+
+    Each ``finally``/``except`` body is checked independently: a raw kill
+    in one body is not excused by a ``kill_holder_tree`` call living in a
+    DIFFERENT body of the same ``try``.
+    """
+    offenders: list[str] = []
+    for try_node in ast.walk(func_node):
+        if not isinstance(try_node, ast.Try):
+            continue
+        bodies = [try_node.finalbody] + [handler.body for handler in try_node.handlers]
+        for body in bodies:
+            if not body:
+                continue
+            bare_kill_lines: list[int] = []
+            has_tree_kill = False
+            for stmt in body:
+                for sub in ast.walk(stmt):
+                    if not isinstance(sub, ast.Call):
+                        continue
+                    if (
+                        isinstance(sub.func, ast.Attribute)
+                        and sub.func.attr in ('kill', 'terminate')
+                        and isinstance(sub.func.value, ast.Name)
+                        and sub.func.value.id in holder_names
+                    ) or (
+                        isinstance(sub.func, ast.Attribute)
+                        and isinstance(sub.func.value, ast.Name)
+                        and sub.func.value.id == 'os'
+                        and sub.func.attr in ('kill', 'killpg')
+                        and any(
+                            isinstance(name_node, ast.Name) and name_node.id in holder_names
+                            for arg in sub.args
+                            for name_node in ast.walk(arg)
+                        )
+                    ):
+                        bare_kill_lines.append(sub.lineno)
+                    elif isinstance(sub.func, ast.Name) and sub.func.id == 'kill_holder_tree':
+                        has_tree_kill = True
+            if bare_kill_lines and not has_tree_kill:
+                offenders.extend(
+                    f'{func_node.name}:{lineno}' for lineno in bare_kill_lines
+                )
+    return offenders
+
+
+def _untorn_down_holders(func_node, holder_names: set[str]) -> list[str]:
+    """``"func:holder"`` for every swept holder never passed to a
+    ``kill_holder_tree(...)`` call in a ``try`` handler/finalbody anywhere
+    in *func_node*.
+
+    Scoped to the WHOLE FUNCTION, across ALL of its ``try`` statements --
+    deliberately unlike :func:`_bare_kill_offenders`, which only excuses a
+    raw kill found in the SAME body of the SAME ``try`` -- because the
+    failure this catches is the ABSENCE of any teardown, which no per-``try``
+    rule can see: a holder torn down in a completely different ``try`` from
+    where it was bound is still torn down.
+
+    Only a call inside a ``finally``/``except`` body counts as teardown: a
+    ``kill_holder_tree(holder)`` reachable only along the happy path -- as
+    the last statement of a ``try`` BODY, or a bare statement outside any
+    ``try`` -- would not run if an earlier statement raises, which is
+    exactly the failure this check exists to catch, so it must not be
+    credited.  Only a DIRECT ``ast.Name`` argument of the call (positional
+    or keyword value) counts as teardown; the argument subtree is
+    deliberately not walked, so an indirection such as
+    ``kill_holder_tree(procs[0])`` is reported as a finding rather than
+    silently excused.  Keyword values are included because
+    ``kill_holder_tree``'s first parameter is named ``proc``, making
+    ``kill_holder_tree(proc=holder)`` a legal spelling.
+    """
+    torn_down: set[str] = set()
+    for try_node in ast.walk(func_node):
+        if not isinstance(try_node, ast.Try):
+            continue
+        bodies = [try_node.finalbody] + [handler.body for handler in try_node.handlers]
+        for body in bodies:
+            for stmt in body:
+                for node in ast.walk(stmt):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Name)
+                        and node.func.id == 'kill_holder_tree'
+                    ):
+                        continue
+                    for arg in node.args:
+                        if isinstance(arg, ast.Name):
+                            torn_down.add(arg.id)
+                    for keyword in node.keywords:
+                        if isinstance(keyword.value, ast.Name):
+                            torn_down.add(keyword.value.id)
+    return sorted(f'{func_node.name}:{name}' for name in holder_names - torn_down)
+
+
+def test_every_real_subprocess_holder_teardown_uses_the_tree_killer():
+    """Every spawn_verify_merge-bound holder's teardown goes through kill_holder_tree.
+
+    Enumeration-free sweep of this module's own AST (see the banner above
+    :func:`test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark`).
+    For every ``test_*`` function, collects the local names bound from a
+    bare ``X = spawn_verify_merge(...)`` call, then makes TWO independent
+    claims about every such holder:
+
+    (i) no ``try`` handler/finalbody in that function calls
+    ``<holder>.kill()``, ``<holder>.terminate()``, or ``os.kill``/
+    ``os.killpg`` (with a swept holder name anywhere in the argument
+    subtree) directly unless the SAME body also calls ``kill_holder_tree``
+    -- any of those raw-kill spellings SIGKILLs/terminates only the leader,
+    orphaning any session-escaped descendant (e.g. one of verify.py's
+    ``start_new_session`` build commands) for the rest of its natural life
+    (task 4092); and
+
+    (ii) every swept holder is passed to a ``kill_holder_tree(...)`` call
+    inside a ``try``'s ``finally``/``except`` body SOMEWHERE in that function
+    (:func:`_untorn_down_holders`) -- (i) only judges the quality of a
+    teardown that exists, so a holder with no exception-safe teardown
+    anywhere satisfies (i) vacuously; (ii) closes that silent-pass hole
+    (task 4946), including the narrower case of a ``kill_holder_tree`` call
+    that is textually present but reachable only along the happy path (e.g.
+    the last statement of a ``try`` body, never its ``finally``/``except``).
+
+    Carries the sibling sweep's anti-vacuity discipline: a matcher that
+    silently stops matching is a guard reporting PASS while guarding
+    nothing, so :data:`_KNOWN_HOLDER_TEARDOWN_ROWS` anchors the functions
+    the sweep must always find a spawn_verify_merge-bound holder in,
+    independent of whether their teardown currently passes or fails.
+    """
+    tree = ast.parse(Path(__file__).read_text(encoding='utf-8'))
+    swept: dict[str, set[str]] = {}
+    offenders: list[str] = []
+    untorn: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if not node.name.startswith('test_'):
+            continue
+        holder_names = _spawn_verify_merge_bound_names(node)
+        if not holder_names:
+            continue
+        swept[node.name] = holder_names
+        offenders.extend(_bare_kill_offenders(node, holder_names))
+        untorn.extend(_untorn_down_holders(node, holder_names))
+
+    missing = sorted(_KNOWN_HOLDER_TEARDOWN_ROWS - set(swept))
+    assert not missing, (
+        f'the AST sweep matched no spawn_verify_merge-bound holder in {missing} '
+        f'-- a matcher that silently stops matching is a guard reporting PASS '
+        f'while guarding nothing (matched: {sorted(swept)})'
+    )
+
+    assert not offenders, (
+        'these holder teardown(s) call .kill()/.terminate()/os.kill()/'
+        'os.killpg() directly instead of routing through kill_holder_tree, '
+        'so a session-escaped descendant (e.g. a verify.py '
+        "start_new_session build command) survives the leader's own death "
+        'as an orphan:\n  ' + '\n  '.join(offenders)
+    )
+
+    assert not untorn, (
+        'these spawn_verify_merge-bound holders are never passed to '
+        "kill_holder_tree from inside their test's try finally/except "
+        'bodies, so a raised communicate()/wait() timeout -- or any '
+        'failing assertion before the teardown -- leaks the leader AND '
+        'every session-escaped descendant verify.py started under it; a '
+        'holder with no exception-safe teardown must be a finding, not a '
+        'silent pass (the raw-kill sweep above only sees teardowns that '
+        'exist):\n  ' + '\n  '.join(untorn)
+    )
+
+
+def test_untorn_down_holders_flags_only_holders_never_passed_to_kill_holder_tree():
+    """_untorn_down_holders flags a swept holder iff it never reaches
+    kill_holder_tree from inside a try's finally/except body.
+
+    Deterministic AST-only cases (``ast.parse`` over a ``textwrap.dedent(...)``
+    source, zero subprocesses, zero timing).  ``holder_names`` is supplied
+    directly to each case, so this test pins ONLY the new helper, not
+    :func:`_spawn_verify_merge_bound_names`.
+
+    Case (d) is load-bearing: a matcher that merely asks "does this function
+    call kill_holder_tree anywhere?" would pass cases (a)-(c) AND vacuously
+    green Row 5 (which already calls ``kill_holder_tree(holder, ...)``) while
+    catching nothing -- (d) is the only case that kills that implementation,
+    because ``other``'s teardown must not excuse ``holder``'s absence.
+
+    Case (f) is equally load-bearing, for the finally/except requirement:
+    a matcher that credits a ``kill_holder_tree`` call reachable anywhere in
+    the function -- including the happy path, e.g. the last statement of a
+    ``try`` BODY -- would pass every other case here while still leaving a
+    holder unprotected against an earlier statement in that same body
+    raising before the call is reached.
+
+    Cases (g) and (h) pin two properties this helper's own docstring already
+    claims but that no case previously exercised: (g) that an indirect
+    argument (not a direct ``ast.Name``) is reported as a finding rather
+    than silently excused, and (h) that the whole-function scope credits a
+    teardown living in a completely different ``try`` from where the holder
+    was bound.
+    """
+
+    def parse_func(source: str) -> ast.FunctionDef:
+        tree = ast.parse(textwrap.dedent(source))
+        (func,) = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+        return func
+
+    # (a) holder bound, no kill_holder_tree call at all.
+    func_a = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+    """)
+    assert _untorn_down_holders(func_a, {'holder'}) == ['f:holder'], (
+        'a holder with NO kill_holder_tree call anywhere in its function '
+        'must be flagged'
+    )
+
+    # (b) holder passed positionally in a finally:.
+    func_b = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_b, {'holder'}) == [], (
+        'a holder passed positionally to kill_holder_tree in a finally: '
+        'must not be flagged'
+    )
+
+    # (c) holder passed inside a nested `if holder is not None:` guard
+    # within the finally: -- pins that the helper walks nested bodies; this
+    # is the exact shape step-5 uses for Row 5's `waiter`.
+    func_c = parse_func("""
+        def f():
+            holder = None
+            try:
+                holder = spawn_verify_merge()
+                do_work()
+            finally:
+                if holder is not None:
+                    kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_c, {'holder'}) == [], (
+        'a holder passed to kill_holder_tree inside a nested if-guard '
+        'within the finally: must not be flagged -- the helper must walk '
+        'nested bodies'
+    )
+
+    # (d) ANTI-VACUITY (load-bearing, do not drop): two holders, only
+    # `other` passed to kill_holder_tree -- `holder` must still be flagged.
+    func_d = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            other = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(other, timeout=5)
+    """)
+    assert _untorn_down_holders(func_d, {'holder', 'other'}) == ['f:holder'], (
+        "kill_holder_tree(other) must not excuse holder's absence -- a "
+        'matcher that merely checks "is kill_holder_tree called anywhere?" '
+        'would wrongly return [] here'
+    )
+
+    # (e) keyword spelling: kill_holder_tree's first parameter is named `proc`.
+    func_e = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(proc=holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_e, {'holder'}) == [], (
+        'a holder passed as the proc= keyword must not be flagged -- '
+        "kill_holder_tree's first parameter is named proc"
+    )
+
+    # (f) LOAD-BEARING for the finally/except requirement: kill_holder_tree
+    # is called with `holder`, but only as the last statement of the try
+    # BODY itself -- never inside a finally/except.  An earlier statement in
+    # that same try body raising would skip this call entirely, which is
+    # exactly the failure this whole check exists to catch, so it must
+    # still be flagged even though a kill_holder_tree(holder) call is
+    # textually present in the function.
+    func_f = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+                kill_holder_tree(holder, timeout=5)
+            except RuntimeError:
+                pass
+    """)
+    assert _untorn_down_holders(func_f, {'holder'}) == ['f:holder'], (
+        'a kill_holder_tree call reachable only along the happy path (the '
+        'last statement of a try BODY, not its finally/except) must still '
+        'be flagged -- an earlier statement in the same try body raising '
+        'would skip it entirely'
+    )
+
+    # (g) indirection defeats the matcher: kill_holder_tree(procs[0]) does
+    # not count as tearing down `holder`, even though `procs` holds it at
+    # runtime -- only a DIRECT ast.Name argument counts, so an indirection
+    # is reported as a finding rather than silently excused.
+    func_g = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            procs = [holder]
+            try:
+                do_work()
+            finally:
+                kill_holder_tree(procs[0], timeout=5)
+    """)
+    assert _untorn_down_holders(func_g, {'holder'}) == ['f:holder'], (
+        'kill_holder_tree(procs[0]) is an indirection, not a direct '
+        'ast.Name argument -- it must not excuse holder, even though procs '
+        'holds it at runtime'
+    )
+
+    # (h) whole-function scope: holder is bound before one try and torn down
+    # in a COMPLETELY DIFFERENT, later try's finally -- unlike
+    # _bare_kill_offenders (which is per-try), this check must not flag it.
+    func_h = parse_func("""
+        def f():
+            holder = spawn_verify_merge()
+            try:
+                do_work()
+            except RuntimeError:
+                pass
+            try:
+                do_more_work()
+            finally:
+                kill_holder_tree(holder, timeout=5)
+    """)
+    assert _untorn_down_holders(func_h, {'holder'}) == [], (
+        'a holder torn down in a completely different try from where it '
+        'was bound is still torn down -- this check is scoped to the '
+        'whole function, not per-try'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Task 2819 -- deterministic unit coverage for wait_for_marker_stable, the
 # create+utimensat settle helper that de-flakes the Row 5 marker-retention
@@ -1514,14 +2245,24 @@ def test_wait_for_marker_stable_raises_when_never_settles(tmp_path):
 # Task 4014 -- deterministic unit coverage for wait_subtree_live's descendant
 # discovery poll (the "no descendant appeared within 20.0s" flake).  Every
 # test here injects the two private seams (_probe_children / _ppid_map) and
-# runs with interval=0, so there is ZERO real timing and ZERO real
-# subprocess -- the same task-2819 precedent as the wait_for_marker_stable
-# tests above.  Fixing a flake with a flake is the failure mode to avoid, and
-# the 3689 steward failed to reproduce this one in 19 of 19 attempts
-# (including synthetic pressure at load 100 / ~8000 processes), so a
-# load-based test would be non-deterministic in BOTH directions.  The
-# efficiency property that actually prevents sampling-rate collapse is
-# therefore pinned STRUCTURALLY, by call count, which is exact at any load.
+# runs with interval=0, so the POLL LOOP itself has ZERO real timing -- the
+# same task-2819 precedent as the wait_for_marker_stable tests above.
+# Fixing a flake with a flake is the failure mode to avoid, and the 3689
+# steward failed to reproduce this one in 19 of 19 attempts (including
+# synthetic pressure at load 100 / ~8000 processes), so a load-based test
+# would be non-deterministic in BOTH directions.  The efficiency property
+# that actually prevents sampling-rate collapse is therefore pinned
+# STRUCTURALLY, by call count, which is exact at any load.
+#
+# Deliberate, narrow exceptions to "zero real subprocess" (task 4312,
+# joining test_read_direct_children_sees_a_real_fork_including_off_main_thread
+# and task 5945's
+# test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe
+# below): the two timeout-diagnostic tests spawn a real `proc` because the
+# diagnostic message's CONTENT -- the leader's actual returncode and, where
+# applicable, its stderr tail -- is exactly what is under test.  The poll
+# loop each one drives still runs zero ticks (timeout=0, interval=0), so
+# timing stays zero even there.
 # ---------------------------------------------------------------------------
 
 
@@ -1664,6 +2405,128 @@ def test_wait_subtree_live_falls_back_to_the_full_walk_when_children_unreadable(
     )
 
 
+def test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail():
+    """The timeout diagnostic names the LEADER's real rc and stderr tail (291a75a919).
+
+    291a75a919 ("De-flake alpha: make wait_subtree_live's timeout path
+    self-diagnosing") added the ``proc``/``proc_label`` reporting in the
+    timeout branch above (:func:`wait_subtree_live`, ~:582-603) so a
+    watchdog self-kill (rc == 1, no ``Error:`` line), an exception exit
+    (rc == 1 WITH an ``Error:`` line), and a merely slow leader (rc is
+    None) are distinguishable from the failure message alone -- exactly the
+    signal an incident needs. It shipped with no test (task 4312).
+
+    Deterministic per the task-4014 precedent above: ``_probe_children``
+    always reports no children and ``timeout=0`` so the poll body never
+    executes a single tick -- the timeout branch fires immediately, with
+    zero real timing.  What IS real is *proc*: an actually-spawned,
+    already-``wait()``-ed subprocess with a KNOWN returncode (3) and a
+    KNOWN stderr payload (``SENTINEL-XYZ``), so this pins the diagnostic's
+    CONTENT rather than merely the presence of the words "rc"/"stderr" --
+    the vacuous-guard trap this repo has hit before: a message reporting
+    nothing (e.g. ``rc=None; stderr tail:\n``) would also contain those
+    labels.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'import sys; sys.stderr.write("SENTINEL-XYZ\\n"); sys.exit(3)'],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        proc.wait()
+        assert proc.returncode == 3  # sanity: the known rc actually landed
+
+        with pytest.raises(AssertionError) as exc_info:
+            wait_subtree_live(
+                1234,
+                proc=proc,
+                proc_label='leader',
+                timeout=0,
+                interval=0,
+                _probe_children=lambda _pid: set(),
+                _ppid_map=lambda: {},
+            )
+
+        message = str(exc_info.value)
+        assert 'leader rc=3' in message, (
+            f'expected the leader\'s actual returncode (3), reported under its '
+            f'proc_label, in the timeout message; got: {message!r}'
+        )
+        assert 'SENTINEL-XYZ' in message, (
+            f'expected the leader\'s actual stderr tail content in the timeout '
+            f'message; got: {message!r}'
+        )
+    finally:
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+
+def test_wait_subtree_live_timeout_reports_rc_none_and_omits_stderr_for_a_live_leader():
+    """The rc=None ("merely slow leader") taxonomy branch and its anti-hang guard (291a75a919).
+
+    Sibling of
+    :func:`test_wait_subtree_live_timeout_reports_leader_returncode_and_stderr_tail`
+    above, covering the two properties that rc=3 case cannot reach (task 4312
+    review):
+
+    * the ``rc is None`` taxonomy branch itself -- a leader that is merely
+      slow (still running when the poll gives up) is the case an incident is
+      most likely to actually hit, and it was entirely unpinned.
+    * the load-bearing guard :func:`wait_subtree_live`'s docstring calls out:
+      stderr is read ONLY when ``proc.poll()`` is not ``None``, precisely
+      because a LIVE leader's pipe write end can still be held open by an
+      inherited-fd helper it spawned, and a buffered read on that pipe would
+      block until EOF -- hanging this helper, and the rest of the suite,
+      rather than raising.  A regression that swapped the guarded
+      ``select()``-bounded raw read for an unconditional ``proc.stderr.read()``
+      would still pass every other test in this module while reintroducing
+      exactly that hang.
+
+    *proc* here is a real, still-running subprocess (``time.sleep(300)``, well
+    outside this test's own runtime) so ``proc.poll()`` is genuinely ``None``
+    -- checking that costs one non-blocking ``waitpid(WNOHANG)`` syscall, so
+    this stays zero real TIMING even though *proc* itself is real, same as
+    its rc=3 sibling.  ``stderr=PIPE`` is set (mirroring real call sites) so a
+    guard regression would hang on the open write end rather than raise
+    ``AttributeError`` on a ``None`` pipe, which would make this test pass for
+    the wrong reason.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(AssertionError) as exc_info:
+            wait_subtree_live(
+                1234,
+                proc=proc,
+                proc_label='leader',
+                timeout=0,
+                interval=0,
+                _probe_children=lambda _pid: set(),
+                _ppid_map=lambda: {},
+            )
+
+        message = str(exc_info.value)
+        assert 'leader rc=None' in message, (
+            f'expected the merely-slow-leader taxonomy branch (rc=None, '
+            f'reported under its proc_label) in the timeout message; got: '
+            f'{message!r}'
+        )
+        assert 'stderr tail' not in message, (
+            f'stderr must be read ONLY when proc.poll() is not None -- seeing '
+            f'"stderr tail" here means the anti-hang poll()-gate regressed to '
+            f'an unconditional read, which would hang on a live leader whose '
+            f'pipe write end is still open; got: {message!r}'
+        )
+    finally:
+        proc.kill()
+        proc.wait()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+
 #: A child that stays alive but is never waited on -- killed by the test that
 #: spawns it.  ``sys.executable`` rather than ``sleep`` so nothing depends on
 #: PATH; the probe only needs the fork, not a finished exec.
@@ -1750,6 +2613,795 @@ def test_read_direct_children_sees_a_real_fork_including_off_main_thread():
             off_main.wait()
 
 
+def test_read_direct_children_skips_a_sibling_thread_that_exits_mid_probe():
+    """A sibling thread exiting mid-probe must not make a LIVE process read as "cannot probe".
+
+    The probe lists ``/proc/<pid>/task`` and then reads each tid's
+    ``children``; a thread that exits in between has no ``children`` left to
+    read.  That is routine in any threaded process -- pytest itself brackets
+    every test with faulthandler / pytest-timeout watchdog threads -- and it
+    says nothing about the threads still alive.  Task 5945: the recorded
+    flake of the test above was exactly ``assert None is not None`` on a live
+    xdist worker.
+
+    Two churner threads keep starting and joining no-op threads while this
+    thread probes.  The probe loop is bounded by a CONDITION -- at least
+    ``required_exits`` sibling-thread exits observed while probing -- not by
+    a probe count or a clock, so its power does not depend on scheduler
+    speed.  The ``Event`` waits are handoff barriers, not timing assertions.
+
+    No single exit is guaranteed to land between the listing and a
+    ``children`` read, so this catches the pre-fix collapse only
+    probabilistically; the deterministic regression guard is
+    :func:`test_read_direct_children_tri_state_over_a_fake_task_listing`.  This
+    test confirms, on the real kernel, the behaviour that fake listing models:
+    an exited thread's tid directory is gone, so its failed read is skipped.
+    """
+    required_exits = 200
+    stop = threading.Event()
+    exit_counts = [0, 0]
+    ready = [threading.Event() for _ in exit_counts]
+
+    def churn(slot: int) -> None:
+        while not stop.is_set():
+            sibling = threading.Thread(target=lambda: None)
+            try:
+                sibling.start()
+            except RuntimeError:
+                return  # "can't start new thread" -- fails the exit-count assert
+            sibling.join()
+            exit_counts[slot] += 1
+            ready[slot].set()
+
+    churners = [threading.Thread(target=churn, args=(slot,)) for slot in range(len(exit_counts))]
+    child = subprocess.Popen(_DURABLE_CHILD_ARGV)
+    probes = none_count = missing_count = 0
+    try:
+        for churner in churners:
+            churner.start()
+        for event in ready:
+            assert event.wait(timeout=30.0), 'churner never completed a thread lifecycle'
+        exits_before = sum(exit_counts)
+        while sum(exit_counts) - exits_before < required_exits and any(
+            churner.is_alive() for churner in churners
+        ):
+            probed = _read_direct_children(os.getpid())
+            probes += 1
+            if probed is None:
+                none_count += 1
+            elif child.pid not in probed:
+                missing_count += 1
+        exits_during = sum(exit_counts) - exits_before
+    finally:
+        stop.set()
+        for churner in churners:
+            churner.join(timeout=30.0)
+        child.kill()
+        child.wait()
+
+    assert exits_during >= required_exits, (
+        f'only {exits_during} sibling-thread exits (needed {required_exits}) '
+        f'overlapped {probes} probes -- the churners stopped early, so the churn '
+        f'never overlapped the probes and this test proved nothing'
+    )
+    assert none_count == 0, (
+        f'{none_count} of {probes} probes of this LIVE process reported "cannot '
+        f'probe" across {exits_during} sibling-thread exits -- a thread that exits '
+        f'between the task/ listing and its children read must be skipped, not '
+        f'collapse the whole probe to None'
+    )
+    assert missing_count == 0, (
+        f'{missing_count} of {probes} answered probes missed direct child '
+        f'{child.pid}, forked from this thread -- it must appear in every one'
+    )
+
+
+def _build_fake_task_listing(
+    proc_root: Path,
+    pid: int,
+    *,
+    live: dict[int, list[int]],
+    without_children_file: tuple[int, ...] = (),
+    exited: tuple[int, ...] = (),
+) -> None:
+    task_dir = proc_root / str(pid) / 'task'
+    task_dir.mkdir(parents=True)
+    for tid, kids in live.items():
+        (task_dir / str(tid)).mkdir()
+        (task_dir / str(tid) / 'children').write_text(''.join(f'{kid} ' for kid in kids))
+    for tid in without_children_file:
+        (task_dir / str(tid)).mkdir()
+    for tid in exited:
+        # Listed, yet `children` raises FileNotFoundError and exists() is False: a thread released after the listing.
+        (task_dir / str(tid)).symlink_to(proc_root / 'gone' / str(tid))
+
+
+@pytest.mark.parametrize(
+    ('live', 'without_children_file', 'exited', 'expected', 'consequence'),
+    [
+        pytest.param(
+            {1234: [5678, 9012], 1240: []}, (), (1241,), {5678, 9012},
+            'None would drop wait_subtree_live to the full read_ppid_map walk on '
+            'every tick a sibling thread exits -- the cost task 4014 removed',
+            id='exited-thread-beside-a-live-one-is-skipped',
+        ),
+        pytest.param(
+            {1234: [5678]}, (1238,), (), None,
+            'a live thread whose children cannot be read hides its children, so '
+            'any answer here can be a false cheap negative that makes '
+            'wait_subtree_live skip its walk every tick and spin to its timeout '
+            'on a kernel without CONFIG_PROC_CHILDREN',
+            id='live-thread-without-children-file-cannot-probe',
+        ),
+        pytest.param(
+            {}, (), (1234,), None,
+            'set() here is a false cheap negative for a process that exited '
+            'mid-probe, which makes wait_subtree_live skip its walk instead of '
+            'falling back to it',
+            id='every-listed-thread-exited-cannot-probe',
+        ),
+    ],
+)
+def test_read_direct_children_tri_state_over_a_fake_task_listing(
+    tmp_path, live, without_children_file, exited, expected, consequence,
+):
+    """The probe's tri-state on the branches this kernel cannot produce on demand."""
+    pid = 4321
+    _build_fake_task_listing(
+        tmp_path, pid, live=live, without_children_file=without_children_file, exited=exited,
+    )
+
+    result = _read_direct_children(pid, _proc_root=tmp_path)
+
+    assert result == expected, f'expected {expected!r}, got {result!r} -- {consequence}'
+
+
+def test_read_proc_state_reports_an_unreaped_zombie_as_exited():
+    """A terminated-but-unreaped child reads as EXITED, although signal 0 still answers.
+
+    ``os.waitid(..., WNOWAIT)`` blocks until the child has exited without
+    reaping it, so the zombie is produced by a condition wait, never a sleep.
+    """
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        child.kill()
+        os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+        try:
+            os.kill(child.pid, 0)
+        except ProcessLookupError:
+            pytest.fail(
+                'harness bug: an unreaped zombie must still answer signal 0, or '
+                'this test is not reproducing the state a signal-0 probe counts '
+                'as alive'
+            )
+
+        state = read_proc_state(child.pid)
+        assert state == ProcState(state='Z', ppid=os.getpid())
+        assert state is not None and state.exited is True
+        assert wait_pids_exited({child.pid}, timeout=0) == {}
+
+        child.wait()
+        assert read_proc_state(child.pid) is None
+    finally:
+        if child.returncode is None:
+            child.kill()
+            child.wait()
+
+
+def test_read_proc_state_reports_a_live_child_as_running():
+    """A live child reads as RUNNING, parented to this process, and survives the wait."""
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        state = read_proc_state(child.pid)
+        assert state is not None
+        assert state.ppid == os.getpid()
+        assert state.exited is False
+
+        survivors = wait_pids_exited({child.pid}, timeout=0)
+        assert set(survivors) == {child.pid}
+        assert survivors[child.pid].exited is False
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_wait_pids_exited_decides_on_a_probe_taken_after_its_last_sleep():
+    """A deadline crossed DURING the sleep still gets one fresh probe before the verdict.
+
+    The scripted clock jumps past the deadline while the loop sleeps.  A loop
+    that re-checks the deadline before re-probing returns the stale ``R``
+    observation; the verdict must come from the second probe, which sees ``Z``.
+    """
+    reads: list[int] = []
+
+    def read_state(pid: int) -> ProcState:
+        reads.append(pid)
+        return ProcState('R', 1) if len(reads) == 1 else ProcState('Z', 1)
+
+    ticks = iter([0.0, 0.5])
+
+    survivors = wait_pids_exited(
+        {7}, timeout=1.0, interval=0,
+        _read_state=read_state, _clock=lambda: next(ticks, 99.0),
+    )
+
+    assert survivors == {}
+    assert reads == [7, 7]
+
+
+def test_wait_pids_exited_reports_each_survivor_with_its_last_observed_state():
+    """timeout=0 is exactly one probe; a pid with no /proc entry is not a survivor."""
+    reads: list[int] = []
+
+    def sleeping(pid: int) -> ProcState:
+        reads.append(pid)
+        return ProcState('S', 4242)
+
+    assert wait_pids_exited({7}, timeout=0, _read_state=sleeping) == {7: ProcState('S', 4242)}
+    assert reads == [7]
+
+    states = {7: ProcState('S', 4242), 8: None}
+    assert wait_pids_exited({7, 8}, timeout=0, _read_state=states.__getitem__) == {
+        7: ProcState('S', 4242)
+    }
+
+
+def test_sleeper_spec_build_pgid_file_names_the_blocking_session_leader(tmp_path):
+    """The build pgid file names the build shell's own session, and that pid BECOMES the sleeper.
+
+    Runs the command exactly as verify.py::_run_cmd does on its default
+    (non-cgroup) path: ``/bin/bash -c`` in a new session.  Because the reported
+    pid itself execs into the blocker, nothing forks after the handle is
+    published, so a snapshot taken once the file exists cannot miss the sleeper.
+    """
+    build_pgf = tmp_path / 'build.pgid'
+    cmd = sleeper_spec(30.0, build_pgid_file=build_pgf).verify_commands[0].test_command
+    assert cmd is not None
+    cwd = tmp_path / 'build'
+    cwd.mkdir()
+    proc = subprocess.Popen(['/bin/bash', '-c', cmd], cwd=cwd, start_new_session=True)
+    try:
+        build_pgid = wait_for_pgid_file(build_pgf, timeout=10.0)
+        assert build_pgid == proc.pid, (
+            f'the file must hold the build shell pid {proc.pid}; got {build_pgid}'
+        )
+        assert os.getpgid(proc.pid) == proc.pid, 'the build shell must lead its own pgid'
+
+        comm_path = Path(f'/proc/{build_pgid}/comm')
+        deadline = time.monotonic() + 10.0
+        comm = comm_path.read_text().strip()
+        while comm != 'sleep' and time.monotonic() < deadline:
+            time.sleep(0.02)
+            comm = comm_path.read_text().strip()
+        assert comm == 'sleep', (
+            f'pid {build_pgid} must exec into the blocking sleeper; comm is {comm!r}'
+        )
+    finally:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Task 4092 -- deterministic-ish unit coverage for kill_holder_tree, the
+# shared teardown helper that reaps a spawn_verify_merge holder AND every
+# descendant it forked (including start_new_session escapes -- verify.py's
+# `_run_cmd` runs every build/test command via
+# ``create_subprocess_shell(..., start_new_session=True)``, so a killed
+# leader alone leaves its build orphaned, reparented to init, for up to its
+# full sleep duration).
+#
+# Every test here spawns a lightweight Popen stand-in (never the real CLI,
+# never a git repo) -- the property under test is purely "does a
+# session-escaped descendant get reaped" / "is the caller's own process
+# group ever signalled", both of which this reproduces exactly.  See the
+# plan's design_decisions for why a real verify-merge holder is not used
+# here: it would drag in _setup_verify_repo's git work, config YAML, the
+# ~9s CLI import and the load-scaled discovery waits, fixing a flake with a
+# flake (the module's own task-2819 banner above warns against exactly
+# this).  The two real-CLI call sites remain covered end-to-end by the Row
+# 5 / lane-lock tests below plus their post-run pgrep check.
+# ---------------------------------------------------------------------------
+
+
+def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
+    """kill_holder_tree reaps BOTH the leader and a start_new_session grandchild.
+
+    Reproduces the exact escape verify.py's ``_run_cmd`` produces
+    (``create_subprocess_shell(cmd, start_new_session=True)``) with a
+    lightweight stand-in leader: ``subprocess.Popen`` running a `-c` snippet
+    that forks a ``sleep`` grandchild via ``start_new_session=True`` and
+    then blocks itself for a long time, mirroring ``sleeper_spec``'s shape
+    without needing the real CLI or a throwaway git repo.
+
+    The sleep duration is derived from this test process's own pid so it
+    cannot collide with an unrelated ``sleep`` on a shared dev box -- in
+    particular with this very module's own ``sleeper_spec`` 300s sleeper.
+
+    Asserts BOTH the leader is reaped and every captured grandchild has
+    actually EXITED, not merely been signalled.  A zombie awaiting its
+    subreaper's reap counts as exited -- see :func:`wait_pids_exited`.  It is
+    self-cleaning (a finally that SIGKILLs any surviving captured pid) so a
+    failing/RED run of this test never itself leaks the orphan it exists to
+    pin.
+    """
+    sleep_secs = f'271.{os.getpid() % 1000:03d}'
+    leader = subprocess.Popen([
+        sys.executable, '-c',
+        f'import subprocess, time\n'
+        f'subprocess.Popen(["sleep", "{sleep_secs}"], start_new_session=True)\n'
+        f'time.sleep(300)\n',
+    ])
+    grandchildren: set[int] = set()
+    try:
+        discovery_deadline = time.monotonic() + 10.0
+        while time.monotonic() < discovery_deadline:
+            grandchildren = collect_descendants(leader.pid, read_ppid_map())
+            if grandchildren:
+                break
+            time.sleep(0.05)
+        assert grandchildren, (
+            f'no descendant of leader pid={leader.pid} appeared within 10s -- '
+            f'harness bug (the stand-in leader never forked its sleep '
+            f'grandchild), not a seam defect under test'
+        )
+
+        kill_holder_tree(leader, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+
+        assert leader.poll() is not None, (
+            'kill_holder_tree must reap the leader -- poll() is still None '
+            'after the call returned'
+        )
+
+        survivors = wait_pids_exited(grandchildren, timeout=5.0)
+        state_by_pid = {pid: (st.state, st.ppid) for pid, st in sorted(survivors.items())}
+        assert not survivors, (
+            f'kill_holder_tree left session-escaped descendant(s) of leader '
+            f'pid={leader.pid} running, as {{pid: (state, ppid)}}: {state_by_pid} '
+            f'-- the exact orphan task 4092 exists to fix.  State S/T means '
+            f'SIGKILL never reached it; R/D means it was signalled but has '
+            f'not yet run to exit'
+        )
+    finally:
+        if leader.poll() is None:
+            leader.kill()
+            leader.wait(timeout=5)
+        for pid in grandchildren:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def test_kill_holder_tree_never_signals_the_callers_own_process_group():
+    """kill_holder_tree must NEVER killpg the CALLER's own process group.
+
+    This is the guard that makes this task's literally-prescribed
+    ``os.killpg(os.getpgid(holder.pid), SIGKILL)`` one-liner unwritable.
+    The lane-lock holder
+    (``test_live_verify_merge_holds_lane_lock_real_subprocess``) is spawned
+    WITHOUT ``--request-id``, so ``cli.py`` never calls ``os.setsid`` on it
+    (:func:`~orchestrator.verify_cancel.start_own_process_group` is gated on
+    ``if request_id is not None:``) and the holder stays in THIS process's
+    (pytest's) own group -- ``os.getpgid(holder.pid) == os.getpgid(0)``. A
+    naive killpg backstop there would SIGKILL the pytest worker running
+    this very test.
+
+    Reproduces that exact shape: a leader spawned via plain
+    ``subprocess.Popen`` with no ``start_new_session``.  The precondition
+    assertion proves this test really exercises the shared-group case
+    rather than silently testing nothing.
+
+    kill_holder_tree's guarded killpg backstop (see its own docstring)
+    fires only when the holder is provably its own process-group leader
+    (``pgid == proc.pid``) AND that group is provably not the caller's
+    own (``pgid != os.getpgid(0)``). A holder that never setsid'd -- like
+    this one -- fails the first condition, so the backstop must stay
+    silent. This test pins that guard directly against the SHIPPED
+    (killpg-aware) helper: it fails the moment a future edit drops either
+    condition, or otherwise makes the backstop unconditional.
+    """
+    leader = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        assert os.getpgid(leader.pid) == os.getpgid(0), (
+            'harness bug: a plain subprocess.Popen with no start_new_session '
+            'must inherit the caller\'s own process group, or this test is '
+            'not exercising the shared-group case it exists to guard'
+        )
+
+        killpg_calls: list[tuple[int, int]] = []
+
+        def spy(pgid, sig):
+            killpg_calls.append((pgid, sig))
+
+        kill_holder_tree(
+            leader, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS, _killpg=spy,
+        )
+
+        assert leader.poll() is not None, (
+            'kill_holder_tree must still reap the leader even with the '
+            'killpg backstop suppressed -- a guard satisfied by a helper '
+            'that does nothing at all would be worthless'
+        )
+
+        own_pgid = os.getpgid(0)
+        assert all(pgid != own_pgid for pgid, _sig in killpg_calls), (
+            f"kill_holder_tree called killpg with the CALLER'S OWN process "
+            f'group {own_pgid}: {killpg_calls} -- this would SIGKILL the '
+            f'pytest worker itself'
+        )
+        assert killpg_calls == [], (
+            f'kill_holder_tree must not call killpg at all when the holder '
+            f"shares the caller's process group (never setsid'd): "
+            f'{killpg_calls}'
+        )
+    finally:
+        if leader.poll() is None:
+            leader.kill()
+            leader.wait(timeout=5)
+
+
+def test_kill_holder_tree_killpg_backstop_fires_for_a_setsid_leader():
+    """The guarded killpg backstop's POSITIVE path: it must actually fire.
+
+    test_kill_holder_tree_never_signals_the_callers_own_process_group above
+    only pins the NEGATIVE path -- killpg must stay silent when the holder
+    never setsid'd. Nothing asserts that the backstop actually fires when
+    the holder DID setsid, which is exactly the shape spawn_verify_merge
+    produces when the CLI is launched with ``--request-id`` (cli.py:578-581
+    gates ``start_own_process_group()`` on ``if request_id is not None:``).
+    A regression that made the guard's admission condition unconditionally
+    false -- e.g. inverting the ``pgid == proc.pid`` comparison, or
+    dropping the branch entirely -- would leave both existing
+    kill_holder_tree killpg unit tests green: exactly the "guard reporting
+    PASS while guarding nothing" failure mode this module's anti-vacuity
+    discipline exists to prevent (see
+    test_every_scaled_discovery_wait_is_covered_by_its_test_timeout_mark's
+    banner).
+
+    Reproduces the setsid'd shape directly with ``start_new_session=True``,
+    which is precisely what makes a Popen leader its own process-group
+    leader (``os.getpgid(leader.pid) == leader.pid``). The two precondition
+    assertions below prove BOTH halves of the backstop's admission
+    condition actually hold before kill_holder_tree runs, so a pass here
+    cannot be a vacuous accident of the harness's own process group.
+    """
+    leader = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+        start_new_session=True,
+    )
+    try:
+        leader_pgid = os.getpgid(leader.pid)
+        assert leader_pgid == leader.pid, (
+            'harness bug: start_new_session=True must make the leader its '
+            'own process-group leader, or this test is not exercising the '
+            "killpg backstop's admission condition it exists to guard"
+        )
+        assert leader_pgid != os.getpgid(0), (
+            "harness bug: the setsid'd leader's group must differ from "
+            "the caller's own, or this test is not exercising the killpg "
+            "backstop's admission condition it exists to guard"
+        )
+
+        killpg_calls: list[tuple[int, int]] = []
+
+        def spy(pgid, sig):
+            killpg_calls.append((pgid, sig))
+
+        kill_holder_tree(
+            leader, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS, _killpg=spy,
+        )
+
+        assert leader.poll() is not None, (
+            "kill_holder_tree must reap a setsid'd leader the same as any "
+            'other'
+        )
+        assert killpg_calls == [(leader_pgid, signal.SIGKILL)], (
+            f"kill_holder_tree must killpg a leader that provably setsid'd "
+            f'into its own, non-caller process group -- got {killpg_calls}, '
+            f'expected exactly one call with pgid={leader_pgid}'
+        )
+    finally:
+        if leader.poll() is None:
+            leader.kill()
+            leader.wait(timeout=5)
+
+
+def _wait_until_zombie(pid: int, *, timeout: float = 5.0) -> bool:
+    """Poll ``/proc/<pid>/stat`` until *pid* is a zombie (state ``Z``).
+
+    Deliberately does NOT use ``Popen.wait()``/``poll()``: those reap the
+    process, which is precisely the state transition the caller here needs
+    to NOT happen.  Reads the state via :func:`read_proc_state`.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = read_proc_state(pid)
+        if state is None:
+            return False  # already reaped by someone else, or gone
+        if state.state == 'Z':
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_kill_holder_tree_does_not_reap_a_leader_that_exits_mid_teardown():
+    """A leader that exits DURING teardown must not be reaped before the backstop.
+
+    Closes the window between the entry-time ``proc.returncode is not
+    None`` short circuit and the killpg backstop.  The two existing killpg
+    unit tests only cover the endpoints -- "already reaped at entry"
+    (``test_kill_holder_tree_is_safe_when_the_leader_already_exited``) and
+    "alive throughout"
+    (``test_kill_holder_tree_killpg_backstop_fires_for_a_setsid_leader``)
+    -- and both stay GREEN with a ``poll()`` reintroduced at the leader
+    kill, so neither can catch this.
+
+    THE HAZARD.  ``Popen.poll()`` is not a passive read: it calls
+    ``os.waitpid(pid, WNOHANG)``.  A ``poll()`` at the leader-kill step
+    would therefore REAP a leader that exited since entry and FREE
+    ``proc.pid`` -- after which the backstop's ``pgid == proc.pid`` test
+    compares a pre-reap pgid against a freed pid, and fires
+    ``killpg(pgid, SIGKILL)`` at a group the kernel is free to have
+    reassigned to a stranger.  On a shared dev box or CI host that is an
+    unrelated user's entire process group.
+
+    THIS IS THE ROW 5 HOLDER'S DESIGNED BEHAVIOUR, not an exotic race: its
+    ``finally`` calls ``heartbeat_holder.stop_heartbeats()`` immediately
+    before ``kill_holder_tree``, and stopping heartbeats ARMS the CLI's
+    stdin-watchdog self-kill, so the holder exiting on its own inside the
+    teardown window is exactly what the surrounding code sets up.
+
+    THE ASSERTION.  The ``_ppid_map_provider`` seam is used to land the
+    leader's exit strictly inside the window: the provider SIGKILLs the
+    leader and waits (via ``/proc``, never ``wait()``) until it is a
+    ZOMBIE, so the leader is provably exited-but-unreaped by the time the
+    helper reaches the leader kill.  The killpg spy then records
+    ``proc.returncode`` AT CALL TIME.  Under the fixed helper that is
+    ``None`` -- nothing in the helper reaped it, so the pid is still
+    PINNED and ``pgid`` provably still denotes the holder's own group.
+    Reintroduce the ``poll()`` guard and the spy sees a non-``None``
+    returncode: the pid was freed before the backstop fired, and the test
+    goes RED.
+    """
+    leader = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+        start_new_session=True,
+    )
+    try:
+        leader_pgid = os.getpgid(leader.pid)
+        assert leader_pgid == leader.pid, (
+            'harness bug: start_new_session=True must make the leader its '
+            'own process-group leader, or this test is not exercising the '
+            "killpg backstop's admission condition it exists to guard"
+        )
+        assert leader_pgid != os.getpgid(0), (
+            "harness bug: the setsid'd leader's group must differ from the "
+            "caller's own, or this test is not exercising the killpg "
+            "backstop's admission condition it exists to guard"
+        )
+        assert leader.returncode is None, (
+            'harness bug: the leader must be un-reaped at entry, or '
+            "kill_holder_tree's already-reaped short circuit fires and this "
+            'test exercises nothing'
+        )
+
+        became_zombie: list[bool] = []
+
+        def provider_that_kills_the_leader():
+            """Land the leader's exit strictly inside the teardown window."""
+            os.kill(leader.pid, signal.SIGKILL)
+            became_zombie.append(_wait_until_zombie(leader.pid))
+            return {}  # no descendants; the pid-pinning property is under test
+
+        killpg_calls: list[tuple[int, int, int | None]] = []
+
+        def killpg_spy(pgid, sig):
+            # Record the leader's REAPED-ness as the backstop sees it.
+            killpg_calls.append((pgid, sig, leader.returncode))
+
+        kill_holder_tree(
+            leader,
+            timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS,
+            _ppid_map_provider=provider_that_kills_the_leader,
+            _killpg=killpg_spy,
+        )
+
+        assert became_zombie == [True], (
+            f'harness bug: the leader never became an unreaped zombie inside '
+            f'the teardown window ({became_zombie}) -- this test is not '
+            f'exercising the exit-mid-teardown race it exists to pin'
+        )
+        assert killpg_calls, (
+            'kill_holder_tree must still fire its killpg backstop for a '
+            "leader that setsid'd and then exited mid-teardown -- same-group "
+            'stragglers still need reaping'
+        )
+        assert [(pgid, sig) for pgid, sig, _rc in killpg_calls] == [
+            (leader_pgid, signal.SIGKILL)
+        ], (
+            f'kill_holder_tree must killpg exactly the holder\'s own group -- '
+            f'got {killpg_calls}, expected pgid={leader_pgid}'
+        )
+        assert all(rc is None for _pgid, _sig, rc in killpg_calls), (
+            f'kill_holder_tree REAPED the leader before firing its killpg '
+            f'backstop (returncode at killpg time: '
+            f'{[rc for _p, _s, rc in killpg_calls]}) -- proc.pid was FREED, '
+            f'so pgid={leader_pgid} may already belong to a stranger. This is '
+            f'the pid-recycling hazard the backstop is documented to avoid; '
+            f'a poll()/wait() must not run before the backstop.'
+        )
+        assert leader.poll() is not None, (
+            'kill_holder_tree must still reap the leader by the time it '
+            'returns -- pinning the pid across the backstop is not a licence '
+            'to leak a zombie'
+        )
+    finally:
+        if leader.poll() is None:
+            leader.kill()
+            leader.wait(timeout=5)
+
+
+def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
+    """An already-reaped leader means proc.pid is a FREE pid -- signal NOTHING.
+
+    Four converted call sites reap the leader with ``wait()`` inside their
+    ``try`` block BEFORE the ``finally`` runs ``kill_holder_tree``
+    (``test_watchdog_timeout_env_override_fires_fast_without_heartbeat``,
+    ``test_cancel_verify_tree_kills_under_live_watchdog``,
+    ``test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive``,
+    ``test_heartbeat_starved_hard_partition_tree_killed_via_timeout``) --
+    so on their GREEN path ``proc.pid`` no longer refers to the holder at
+    all by the time this helper runs.
+    ``os.getpgid(proc.pid)`` and ``collect_descendants(proc.pid, ...)``
+    would then describe whatever process happens to OWN that pid now, and
+    every descendant of that stranger would be SIGKILLed (and killpg'd by
+    the backstop, if it happened to be its own group leader).  This is not
+    theoretical: pid recycling is observed on this fleet
+    (verify_cancel.py:313-315 -- pid_max=4194304, and the laptop's own pid
+    counter demonstrably wrapped on 2026-08-11).
+
+    Three cases; (a) and (b) share ONE already-reaped leader:
+
+    (a) REAL-PATH no-signal contract: every seam is spied rather than
+        faked, and NONE may fire -- in particular the ppid-map provider
+        must never be CALLED AT ALL, which is what proves the short
+        circuit lands before the snapshot phase rather than merely seeing
+        a map with no descendants in it.  Also pins that the early-return
+        path still closes stdin, since the lane-lock site
+        (``test_live_verify_merge_holds_lane_lock_real_subprocess``)
+        delegates its stdin cleanup to this helper.
+
+    (b) PID-REUSE MODEL -- the case that makes this RED non-vacuous.
+        Against a reaped leader the REAL ``/proc`` map almost always has
+        no descendants, so asserting against it would pass by luck even
+        without the short circuit.  A SYNTHETIC ppid map gives the reaped
+        (free) pid fabricated children, modeling a stranger process
+        reusing that pid -- ``collect_descendants`` accepts any dict and
+        is cycle-safe (verify_cancel.py:197), and every pid is fake with
+        ``_kill`` spied, so this can never signal a real process even if
+        the guard under test is missing.
+
+    (c) the OSError-degradation coverage (a)/(b) can no longer reach once
+        the short circuit exists, since it never gets far enough to call
+        the ppid-map provider -- moved onto a LIVE leader so the
+        ``except OSError: ppid_map = {}`` branch stays under test.
+    """
+    # (a) + (b): one already-reaped leader, shared.
+    leader = subprocess.Popen([sys.executable, '-c', 'pass'], stdin=subprocess.PIPE)
+    leader.wait(timeout=10)
+
+    # (a) REAL-PATH: every seam spied; none may fire for an already-reaped
+    # leader, and the ppid-map provider must not even be CALLED.
+    kill_calls_a: list[tuple[int, int]] = []
+    killpg_calls_a: list[tuple[int, int]] = []
+    ppid_map_call_count = [0]
+
+    def kill_spy_a(pid, sig):
+        kill_calls_a.append((pid, sig))
+
+    def killpg_spy_a(pgid, sig):
+        killpg_calls_a.append((pgid, sig))
+
+    def ppid_map_spy_a():
+        ppid_map_call_count[0] += 1
+        return {}
+
+    kill_holder_tree(
+        leader,
+        timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS,
+        _ppid_map_provider=ppid_map_spy_a,
+        _kill=kill_spy_a,
+        _killpg=killpg_spy_a,
+    )
+
+    assert kill_calls_a == [], (
+        f'kill_holder_tree signalled pid(s) {kill_calls_a} for an '
+        f'already-reaped leader -- proc.pid is FREE, so this can only '
+        f'reach an unrelated stranger process'
+    )
+    assert killpg_calls_a == [], (
+        f'kill_holder_tree called killpg{killpg_calls_a} for an '
+        f'already-reaped leader'
+    )
+    assert ppid_map_call_count[0] == 0, (
+        'kill_holder_tree consulted the ppid-map provider for an '
+        'already-reaped leader -- the short circuit must land BEFORE the '
+        'snapshot phase, not merely happen to see a map with no '
+        'descendants in it'
+    )
+    assert leader.stdin is not None and leader.stdin.closed, (
+        'kill_holder_tree must still close stdin on the already-reaped '
+        'early-return path -- the lane-lock site '
+        '(test_live_verify_merge_holds_lane_lock_real_subprocess) '
+        'delegates its stdin cleanup to this helper'
+    )
+
+    # (b) PID-REUSE MODEL: a synthetic ppid map gives the reaped (free)
+    # leader pid fabricated children, modeling a stranger process reusing
+    # that pid.  Every pid below is fake and _kill/_killpg stay spied, so
+    # this can never signal a real process.
+    synthetic_ppid_map = {
+        leader.pid: 1,
+        99990001: leader.pid,
+        99990002: 99990001,
+    }
+    kill_calls_b: list[tuple[int, int]] = []
+    killpg_calls_b: list[tuple[int, int]] = []
+
+    def kill_spy_b(pid, sig):
+        kill_calls_b.append((pid, sig))
+
+    def killpg_spy_b(pgid, sig):
+        killpg_calls_b.append((pgid, sig))
+
+    kill_holder_tree(
+        leader,
+        timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS,
+        _ppid_map_provider=lambda: synthetic_ppid_map,
+        _kill=kill_spy_b,
+        _killpg=killpg_spy_b,
+    )
+
+    assert kill_calls_b == [], (
+        f'kill_holder_tree signalled fabricated pid(s) {kill_calls_b}, '
+        f"reachable only through a stranger's reuse of the reaped "
+        f"leader's pid {leader.pid} -- an already-reaped leader must "
+        f'signal NOTHING'
+    )
+    assert killpg_calls_b == [], (
+        f'kill_holder_tree called killpg{killpg_calls_b} against a '
+        f"stranger's fabricated process group for an already-reaped "
+        f'leader'
+    )
+
+    # (c) OSError-degradation coverage, moved onto a LIVE leader: once (a)
+    # short-circuits before ever calling the ppid-map provider, a reaped
+    # leader can no longer exercise the `except OSError: ppid_map = {}`
+    # guard.  _kill is deliberately left as the REAL os.kill here so the
+    # leader is genuinely SIGKILLed and reaped fast, well inside the 5.0s
+    # ceiling -- spying it would leave the process alive for the whole
+    # timeout and emit the "did not exit" warning instead.
+    def raising_ppid_map_provider():
+        raise OSError('simulated /proc read racing process exit')
+
+    live_leader = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+    )
+    try:
+        kill_holder_tree(
+            live_leader,
+            timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS,
+            _ppid_map_provider=raising_ppid_map_provider,
+        )
+        assert live_leader.poll() is not None, (
+            'kill_holder_tree must still reap a LIVE leader when the '
+            'ppid-map provider raises OSError (a /proc read racing '
+            'process exit)'
+        )
+    finally:
+        if live_leader.poll() is None:
+            live_leader.kill()
+            live_leader.wait(timeout=5)
+
+
 # ---------------------------------------------------------------------------
 # Task 3369 -- in-child stopwatch for the flock GATE, replacing task 2921/2941's
 # outer wall-clock subtraction in test_flock_wait_env_override_speeds_up_
@@ -1783,6 +3435,14 @@ def test_read_direct_children_sees_a_real_fork_including_off_main_thread():
 #: Marker token the instrumented bootstrap prints, one line per gate acquire.
 FLOCK_GATE_MARKER = '__FLOCK_GATE__'
 
+#: printf-style line format shared between the bootstrap's child-side print
+#: (embedded below via f-string substitution) and the parser self-test's
+#: synthetic ``emitted`` fixture, mirroring WATCHDOG_GATE_LINE_FMT (amendment
+#: pass) so a field rename is a rename in both places rather than two
+#: hand-written copies that can silently drift apart -- see
+#: test_flock_gate_timing_bootstrap_parses_its_own_marker_lines.
+FLOCK_GATE_LINE_FMT = f'{FLOCK_GATE_MARKER} lock=%s timeout=%r waited=%.4f acquired=%r'
+
 FLOCK_GATE_TIMING_BOOTSTRAP = f"""
 import sys, time
 import orchestrator.cli as _cli
@@ -1793,7 +3453,7 @@ def _timed_acquire(path, timeout_secs, **kwargs):
     _t0 = time.monotonic()
     fd = _real_acquire(path, timeout_secs, **kwargs)
     print(
-        '{FLOCK_GATE_MARKER} lock=%s timeout=%r waited=%.4f acquired=%r'
+        '{FLOCK_GATE_LINE_FMT}'
         % (path.name, timeout_secs, time.monotonic() - _t0, fd is not None),
         file=sys.stderr,
     )
@@ -1814,24 +3474,83 @@ class FlockGateWait(NamedTuple):
     acquired: bool
 
 
+#: Task 5019 (amendment): ``waited`` is bounded to the exact shape its
+#: ``%.4f`` format specifier always produces -- a run of digits, a dot, and
+#: exactly 4 fraction digits, with no exponent notation possible regardless
+#: of magnitude -- mirroring the fix to _WATCHDOG_GATE_RE.  ``timeout``
+#: stays ``\S+``: it is emitted via ``%r`` of a float, whose repr switches
+#: to exponent notation outside [1e-4, 1e16) and can render ``inf``/``nan``,
+#: none of which a digit-shaped group would accept -- and unlike a TRAILING
+#: field, ``timeout`` is an INTERIOR field already delimited by the literal
+#: ``' waited='`` that follows it, so (like ``lock``, delimited by
+#: ``' timeout='``) it was never reachable by the trailing-abutment defect
+#: this task fixes; tightening it would only add a false-negative risk with
+#: no corresponding safety gain.  ``acquired`` stays anchored to the literal
+#: ``True|False`` alternation.
 _FLOCK_GATE_RE = re.compile(
     re.escape(FLOCK_GATE_MARKER)
     + r' lock=(?P<lock>\S+) timeout=(?P<timeout>\S+) '
-    r'waited=(?P<waited>\S+) acquired=(?P<acquired>True|False)'
+    r'waited=(?P<waited>-?\d+\.\d{4}) acquired=(?P<acquired>True|False)'
+)
+
+
+#: Task 5019 (amendment; tempered per step-4): matches just the marker plus
+#: the rest of its line, tempered -- via the negative lookahead below -- to
+#: stop at the next marker occurrence instead of running unbounded to
+#: end-of-line, so :func:`parse_flock_gate_waits` can tell apart THREE cases
+#: rather than two: (1) "marker present but its fields don't conform" (a
+#: genuine corruption -- must fail loudly); (2) "marker's fields matched,
+#: followed by an abutting co-writer's text" (tolerated: _FLOCK_GATE_RE's
+#: bounded groups plus ``.match()`` not requiring end-of-line already handle
+#: it); and (3) "marker's fields matched, followed immediately by a SECOND
+#: marker record with no separating newline" (also tolerated, but only
+#: because tempering stops the region before it can swallow the second
+#: marker's text). An earlier, unbounded ``[^\n]*`` version of this regex
+#: handled (1) and (2) but silently mishandled (3): it swallowed both
+#: abutted records into a single finditer hit, so only the first record's
+#: fields were ever offered to _FLOCK_GATE_RE and the second vanished
+#: without a trace instead of being scanned on its own -- see
+#: test_parse_flock_gate_waits_recovers_both_abutted_marker_records.
+_FLOCK_GATE_LINE_RE = re.compile(
+    re.escape(FLOCK_GATE_MARKER) + r'(?:(?!' + re.escape(FLOCK_GATE_MARKER) + r')[^\n])*'
 )
 
 
 def parse_flock_gate_waits(stderr: str) -> list[FlockGateWait]:
-    """Parse the :data:`FLOCK_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr."""
-    return [
-        FlockGateWait(
-            lock=m.group('lock'),
-            timeout_secs=float(m.group('timeout')),
-            waited_secs=float(m.group('waited')),
-            acquired=m.group('acquired') == 'True',
+    """Parse the :data:`FLOCK_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr.
+
+    Every marker occurrence must have its fields conform to
+    :data:`_FLOCK_GATE_RE` -- a marker line whose fields don't parse raises
+    ``ValueError`` instead of being silently dropped, so a partial
+    corruption can't quietly lower the ``max()`` the ceiling assertions in
+    this module are computed over (task 5019 amendment; mirrors
+    :func:`parse_watchdog_gate_fire_delays`). That guarantee depends on
+    :data:`_FLOCK_GATE_LINE_RE` tempering its line region to stop at the
+    next marker occurrence (task 5019 step-4): an earlier, unbounded version
+    of that regex made the claim true only for non-marker trailing
+    corruption -- a SECOND marker record abutting the first with no
+    separating newline was swallowed into the first's line region and its
+    fields were never even offered to :data:`_FLOCK_GATE_RE`, so it vanished
+    silently instead of raising.
+    """
+    waits = []
+    for line_match in _FLOCK_GATE_LINE_RE.finditer(stderr):
+        line = line_match.group(0)
+        m = _FLOCK_GATE_RE.match(line)
+        if m is None:
+            raise ValueError(
+                'flock gate marker line does not match the expected '
+                f'lock=/timeout=/waited=/acquired= field shape: {line!r}'
+            )
+        waits.append(
+            FlockGateWait(
+                lock=m.group('lock'),
+                timeout_secs=float(m.group('timeout')),
+                waited_secs=float(m.group('waited')),
+                acquired=m.group('acquired') == 'True',
+            )
         )
-        for m in _FLOCK_GATE_RE.finditer(stderr)
-    ]
+    return waits
 
 
 def test_flock_gate_timing_bootstrap_parses_its_own_marker_lines():
@@ -1843,13 +3562,18 @@ def test_flock_gate_timing_bootstrap_parses_its_own_marker_lines():
     test_flock_wait_env_override_speeds_up_contention_result vacuous rather
     than red.  The emit format and this parser are therefore pinned together
     here, with no subprocess involved.
+
+    ``emitted`` is built from FLOCK_GATE_LINE_FMT (amendment-pass fix,
+    mirroring test_watchdog_gate_timing_bootstrap_parses_its_own_marker_lines)
+    -- the SAME format string the bootstrap embeds into the child -- rather
+    than a hand-copied literal, so a field rename in the bootstrap breaks
+    this round-trip by construction instead of relying on two copies staying
+    in sync by discipline.
     """
     emitted = (
-        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
-        'waited=0.0001 acquired=True\n'
+        f'{FLOCK_GATE_LINE_FMT % ("_merge-verify.lock", 0.5, 0.0001, True)}\n'
         'some unrelated stderr chatter\n'
-        f'{FLOCK_GATE_MARKER} lock=.merge_verify.lock timeout=0.5 '
-        'waited=0.5083 acquired=False\n'
+        f'{FLOCK_GATE_LINE_FMT % (".merge_verify.lock", 0.5, 0.5083, False)}\n'
     )
 
     waits = parse_flock_gate_waits(emitted)
@@ -1870,6 +3594,80 @@ def test_parse_flock_gate_waits_returns_empty_for_uninstrumented_stderr():
     an empty list would pass by default.
     """
     assert parse_flock_gate_waits('Traceback (most recent call last):\nboom\n') == []
+
+
+def test_parse_flock_gate_waits_survives_abutting_log_line():
+    """An unrelated co-writer's stderr line landing with no separator must
+    not corrupt the parse.
+
+    Task 5019 amendment -- symmetric coverage for the flock twin of
+    test_parse_watchdog_gate_fire_delays_survives_abutting_log_line.  Unlike
+    the watchdog twin, the flock line's true last field (``acquired``) is
+    already anchored to the ``True|False`` literal alternation, so an
+    abutting line was never able to corrupt it via the exact mechanism
+    observed in production for the watchdog twin (see the _FLOCK_GATE_RE
+    docstring above) -- this test pins that already-correct behaviour so a
+    future regex change can't silently break it.
+    """
+    corrupted = (
+        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
+        'waited=0.5083 acquired=True'
+        '2026-09-01T00:00:00Z some unrelated interleaved log line\n'
+    )
+
+    assert parse_flock_gate_waits(corrupted) == [
+        FlockGateWait('_merge-verify.lock', 0.5, 0.5083, True),
+    ]
+
+
+def test_parse_flock_gate_waits_raises_loudly_on_malformed_marker_line():
+    """A marker line whose fields don't conform must raise, not vanish.
+
+    Task 5019 amendment -- symmetric coverage for the flock twin of
+    test_parse_watchdog_gate_fire_delays_raises_loudly_on_malformed_marker_line.
+    Silently dropping a genuinely-malformed marker line would quietly lower
+    the max() the ceiling assertion in
+    test_flock_wait_env_override_speeds_up_contention_result is computed
+    over instead of surfacing the corruption.
+    """
+    malformed = (
+        f'{FLOCK_GATE_MARKER} lock=_merge-verify.lock timeout=0.5 '
+        'waited=NOT_A_NUMBER acquired=True\n'
+    )
+
+    with pytest.raises(ValueError, match=re.escape(FLOCK_GATE_MARKER)):
+        parse_flock_gate_waits(malformed)
+
+
+def test_parse_flock_gate_waits_recovers_both_abutted_marker_records():
+    """Two marker records landing back-to-back with no separator must both
+    survive the parse.
+
+    Task 5019 step-3 -- the marker-to-marker analogue of
+    test_parse_flock_gate_waits_survives_abutting_log_line's marker-to-log
+    abutment: the same shared stderr fd that lets an unrelated co-writer's
+    text land immediately after a marker's trailing field can just as well
+    let a SECOND marker record land there instead, with no intervening
+    newline. _FLOCK_GATE_LINE_RE's unbounded ``[^\n]*`` line region greedily
+    swallows the whole physical line -- including the second marker's text
+    -- as one hit, so ``_FLOCK_GATE_RE.match()`` only ever sees (and
+    returns) the FIRST record, and the second is silently dropped because
+    finditer never revisits text its first match already consumed. Built
+    from FLOCK_GATE_LINE_FMT (not hand-copied literals) so a field rename
+    breaks this round-trip by construction.
+    """
+    abutted = (
+        f'{FLOCK_GATE_LINE_FMT % ("a", 0.5, 0.0001, True)}'
+        f'{FLOCK_GATE_LINE_FMT % ("b", 0.5, 9.9999, False)}\n'
+    )
+
+    waits = parse_flock_gate_waits(abutted)
+
+    assert len(waits) == 2
+    # The larger wait sits on the SECOND (currently-dropped) record -- if it
+    # silently vanishes, the ceiling assertions this parser feeds would be
+    # computed over a falsely-low max() instead of surfacing the corruption.
+    assert max(w.waited_secs for w in waits) == 9.9999
 
 
 # ---------------------------------------------------------------------------
@@ -2047,21 +3845,75 @@ class WatchdogGateFire(NamedTuple):
     grace_secs: float
 
 
+#: Task 5019: the fraction groups are bounded to exactly 4 digits (rather
+#: than an unbounded ``\S+``) because WATCHDOG_GATE_LINE_FMT's ``%.4f``
+#: always renders exactly 4 fraction digits, and the child's stderr fd is
+#: shared with unrelated writers -- an interleaved log line landing with no
+#: separator right after the trailing field (observed in production,
+#: mr-ccc80440: 'grace=0.2023' + '2026-09-01...' collapsing into
+#: '0.20232026-09-01') must not be absorbed into the match.
 _WATCHDOG_GATE_RE = re.compile(
     re.escape(WATCHDOG_GATE_MARKER)
-    + r' fire_delay=(?P<fire_delay>\S+) grace=(?P<grace>\S+)'
+    + r' fire_delay=(?P<fire_delay>-?\d+\.\d{4}) grace=(?P<grace>-?\d+\.\d{4})'
+)
+
+#: Task 5019 (amendment; tempered per step-4): matches just the marker plus
+#: the rest of its line, tempered -- via the negative lookahead below -- to
+#: stop at the next marker occurrence instead of running unbounded to
+#: end-of-line, so :func:`parse_watchdog_gate_fire_delays` can tell apart
+#: THREE cases rather than two: (1) "marker present but its fields don't
+#: conform" (a genuine corruption -- must fail loudly); (2) "marker's
+#: fields matched, followed by an abutting co-writer's text" (the exact
+#: production defect this task fixes, tolerated because ``.match()``
+#: doesn't require end-of-line -- see
+#: test_parse_watchdog_gate_fire_delays_survives_abutting_log_line); and
+#: (3) "marker's fields matched, followed immediately by a SECOND marker
+#: record with no separating newline" (also tolerated, but only because
+#: tempering stops the region before it can swallow the second marker's
+#: text). An earlier, unbounded ``[^\n]*`` version of this regex handled
+#: (1) and (2) but silently mishandled (3): it swallowed both abutted
+#: records into a single finditer hit, so only the first record's fields
+#: were ever offered to _WATCHDOG_GATE_RE and the second vanished without a
+#: trace instead of being scanned on its own -- see
+#: test_parse_watchdog_gate_fire_delays_recovers_both_abutted_marker_records.
+_WATCHDOG_GATE_LINE_RE = re.compile(
+    re.escape(WATCHDOG_GATE_MARKER) + r'(?:(?!' + re.escape(WATCHDOG_GATE_MARKER) + r')[^\n])*'
 )
 
 
 def parse_watchdog_gate_fire_delays(stderr: str) -> list[WatchdogGateFire]:
-    """Parse the :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr."""
-    return [
-        WatchdogGateFire(
-            fire_delay_secs=float(m.group('fire_delay')),
-            grace_secs=float(m.group('grace')),
+    """Parse the :data:`WATCHDOG_GATE_TIMING_BOOTSTRAP` lines out of a child's stderr.
+
+    Every marker occurrence must have its fields conform to
+    :data:`_WATCHDOG_GATE_RE` -- a marker line whose fields don't parse
+    raises ``ValueError`` instead of being silently dropped, so a partial
+    corruption can't quietly lower the ``max()`` the ceiling assertions in
+    this module are computed over (task 5019 amendment; mirrors
+    :func:`parse_flock_gate_waits`). That guarantee depends on
+    :data:`_WATCHDOG_GATE_LINE_RE` tempering its line region to stop at the
+    next marker occurrence (task 5019 step-4): an earlier, unbounded version
+    of that regex made the claim true only for non-marker trailing
+    corruption -- a SECOND marker record abutting the first with no
+    separating newline was swallowed into the first's line region and its
+    fields were never even offered to :data:`_WATCHDOG_GATE_RE`, so it
+    vanished silently instead of raising.
+    """
+    fires = []
+    for line_match in _WATCHDOG_GATE_LINE_RE.finditer(stderr):
+        line = line_match.group(0)
+        m = _WATCHDOG_GATE_RE.match(line)
+        if m is None:
+            raise ValueError(
+                'watchdog gate marker line does not match the expected '
+                f'fire_delay=/grace= field shape: {line!r}'
+            )
+        fires.append(
+            WatchdogGateFire(
+                fire_delay_secs=float(m.group('fire_delay')),
+                grace_secs=float(m.group('grace')),
+            )
         )
-        for m in _WATCHDOG_GATE_RE.finditer(stderr)
-    ]
+    return fires
 
 
 def test_watchdog_gate_timing_bootstrap_parses_its_own_marker_lines():
@@ -2102,6 +3954,85 @@ def test_parse_watchdog_gate_fire_delays_returns_empty_for_uninstrumented_stderr
     an empty list would pass by default.
     """
     assert parse_watchdog_gate_fire_delays('Traceback (most recent call last):\nboom\n') == []
+
+
+def test_parse_watchdog_gate_fire_delays_survives_abutting_log_line():
+    """An unrelated co-writer's stderr line landing with no separator must
+    not corrupt the parse.
+
+    Task 5019 -- observed in production (mr-ccc80440, task 4537's post-merge
+    verify): the child's stderr fd is shared with anything else that writes
+    to it, and under merge-verify load a timestamped log line landed
+    immediately after the marker line's trailing ``grace=`` field with no
+    intervening whitespace or newline, collapsing the real value (0.2023)
+    and a '2026-09-01...' timestamp into one unbroken token,
+    '0.20232026-09-01'. The old ``\\S+`` field regex swallowed that whole
+    token and ``float()`` raised inside the parser, which the merge worker
+    then mis-dispositioned as "branch_bug" against a branch that never
+    touched this test.
+
+    The fix bounds the numeric groups to the exact shape
+    WATCHDOG_GATE_LINE_FMT's ``%.4f`` can produce -- a run of digits, a dot,
+    and exactly 4 fraction digits -- so an abutting line's digits cannot be
+    absorbed into the match. This test reproduces the exact corrupted shape
+    and must fail against the unbounded ``\\S+`` regex (raises ValueError)
+    and pass once the fraction groups are bounded.
+    """
+    corrupted = (
+        f'{WATCHDOG_GATE_MARKER} fire_delay=0.6931 grace=0.2023'
+        '2026-09-01T00:00:00Z some unrelated interleaved log line\n'
+    )
+
+    assert parse_watchdog_gate_fire_delays(corrupted) == [
+        WatchdogGateFire(fire_delay_secs=0.6931, grace_secs=0.2023),
+    ]
+
+
+def test_parse_watchdog_gate_fire_delays_raises_loudly_on_malformed_marker_line():
+    """A marker line whose fields don't conform must raise, not vanish.
+
+    Task 5019 amendment: bounding the field groups (to reject anything that
+    doesn't match WATCHDOG_GATE_LINE_FMT's exact shape) means a
+    genuinely-malformed marker line -- as opposed to one merely followed by
+    abutting unrelated text, which the abutment test above proves is still
+    tolerated -- no longer matches _WATCHDOG_GATE_RE at all. Silently
+    dropping such a line from the returned list would quietly lower the
+    max() the ceiling assertion in
+    test_watchdog_timeout_env_override_fires_fast_without_heartbeat is
+    computed over instead of surfacing the corruption, cutting against the
+    repo's no-silent-fail-soft / structured-facts-at-failure invariant.
+    """
+    malformed = f'{WATCHDOG_GATE_MARKER} fire_delay=NOT_A_NUMBER grace=0.2023\n'
+
+    with pytest.raises(ValueError, match=re.escape(WATCHDOG_GATE_MARKER)):
+        parse_watchdog_gate_fire_delays(malformed)
+
+
+def test_parse_watchdog_gate_fire_delays_recovers_both_abutted_marker_records():
+    """Two marker records landing back-to-back with no separator must both
+    survive the parse.
+
+    Task 5019 step-3 -- twin of
+    test_parse_flock_gate_waits_recovers_both_abutted_marker_records; see
+    that test's docstring for the mechanism
+    (_WATCHDOG_GATE_LINE_RE's unbounded ``[^\n]*`` swallows the second
+    marker's text into the first's line region, so finditer never revisits
+    it and the second record is silently dropped). Built from
+    WATCHDOG_GATE_LINE_FMT (not hand-copied literals) so a field rename
+    breaks this round-trip by construction.
+    """
+    abutted = (
+        f'{WATCHDOG_GATE_LINE_FMT % (0.6931, 0.2003)}'
+        f'{WATCHDOG_GATE_LINE_FMT % (14.9807, 5.0012)}\n'
+    )
+
+    fires = parse_watchdog_gate_fire_delays(abutted)
+
+    assert len(fires) == 2
+    # The larger fire_delay sits on the SECOND (currently-dropped) record --
+    # if it silently vanishes, the ceiling assertion this parser feeds would
+    # be computed over a falsely-low max() instead of surfacing corruption.
+    assert max(f.fire_delay_secs for f in fires) == 14.9807
 
 
 # ---------------------------------------------------------------------------
@@ -2181,7 +4112,17 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
         # subprocess completion past a short deadline; the discriminating
         # invariant is the FLOCK_WAIT_CEILING_SECS assertion below (task
         # 3369), never this ceiling, which only bounds a wedged child.
-        stdout, stderr = proc.communicate(timeout=60)
+        try:
+            stdout, stderr = proc.communicate(timeout=60)
+        finally:
+            # task 4092/4946: kill_holder_tree so a communicate() timeout
+            # here does not leak the child leader -- and any
+            # start_new_session build command verify.py spawned under it --
+            # while we still hold the flock; a child killed before the
+            # unlock below can never win the lock and proceed.  Free on the
+            # success path: communicate() has already reaped the child, so
+            # the ALREADY-REAPED SHORT CIRCUIT returns at once.
+            kill_holder_tree(proc, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
     finally:
         with contextlib.suppress(OSError):
             fcntl.flock(held_fd, fcntl.LOCK_UN)
@@ -2232,8 +4173,10 @@ def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
 #: catch either override being wired while the OTHER silently regresses to
 #: its production default, e.g. only ORCH_WATCHDOG_KILL_GRACE_SECS stops
 #: being threaded through (0.5s override + 5.0s production grace = ~5.5s) or
-#: only ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS does (10.0s production timeout
-#: + 0.2s override = ~10.2s). 4.0s sits comfortably under the nearer of
+#: only ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS does (90.0s production timeout
+#: + 0.2s override = ~90.2s; it was ~10.2s before task 4195 derived that
+#: constant from the ssh transport, so this axis has only got easier to
+#: discriminate). 4.0s sits comfortably under the nearer of
 #: those two partial-regression cases (5.5s) with room to spare above the
 #: fully-wired case (~0.7s: 0.5s heartbeat timeout + 0.2s kill grace) even
 #: under load, so it discriminates all three broken shapes from the
@@ -2270,7 +4213,8 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     pgid-file wait would leave the remaining wait purely watchdog-bound.
     Task 4248's verify attempt-1 falsified that: under a full-suite xdist
     storm the outer fire_delay came in at 19.75s -- past even the 15.0s
-    production un-wired-override window -- while an isolated rerun at the
+    un-wired-override window production had at the time (90.0s+5.0s since
+    task 4195) -- while an isolated rerun at the
     same HEAD passed in 6.51s. The outer measurement was never purely the
     watchdog's own window: it also carries scheduler latency between the
     watchdog thread actually firing and this PARENT process observing
@@ -2284,9 +4228,10 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     real env, a real watchdog thread racing a real select() on fd 0, real
     SIGTERM/SIGKILL signaling. The bootstrap only wraps the production
     ``start_stdin_watchdog``/``fire_watchdog_kill`` callables in a stopwatch,
-    so an un-wired override still shows up as a ~15s delay (10.0s heartbeat
-    timeout + 5.0s kill grace) -- see WATCHDOG_FIRE_DELAY_CEILING_SECS for
-    the exact discriminant, including the two partial-regression shapes.
+    so an un-wired override still shows up as a ~95s delay (90.0s heartbeat
+    timeout + 5.0s kill grace; it was ~15s before task 4195 derived the
+    timeout from the ssh transport) -- see WATCHDOG_FIRE_DELAY_CEILING_SECS
+    for the exact discriminant, including the two partial-regression shapes.
     Its two failure modes are both closed by non-vacuity assertions below:
     the CLI reaching the watchdog/kill by some path other than the patched
     module-level names (leaving zero observations and a vacuously-true
@@ -2349,12 +4294,27 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
                 'survived fire_watchdog_kill and is still holding a pipe open'
             )
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=5)
-        if proc.stdin is not None:
-            with contextlib.suppress(OSError):
-                proc.stdin.close()
+        # Merge of two independent teardown fixes to this one block; BOTH are
+        # load-bearing and neither subsumes the other.
+        #
+        # (task 4092) kill_holder_tree replaces the former leader-only
+        # ``proc.kill()``.  The holder's build is ``sleep 300`` run by the
+        # real CLI under ``start_new_session=True``, so it does NOT die with
+        # the leader: a leader-only SIGKILL orphaned that sleep to init for
+        # up to five minutes after every run.  kill_holder_tree sweeps the
+        # descendant tree (plus a guarded killpg backstop) and reaps the
+        # leader itself, so it also subsumes the old ``proc.wait(timeout=5)``.
+        # Its ``poll()``-free contract is why no ``if proc.poll() is None``
+        # guard is reintroduced here -- see its docstring's ALREADY-REAPED
+        # SHORT CIRCUIT paragraph for the pid-recycling hazard that adds.
+        #
+        # (commit aa3095175c) closing the pipe fds on EVERY path, including
+        # the wedge/failure path where the ``pytest.fail``s above fire before
+        # proc.communicate() ever runs.  kill_holder_tree closes stdin on
+        # both of its exits but deliberately leaves stdout/stderr alone (it
+        # serves call sites that still read them), so the stdout/stderr
+        # closes must stay HERE rather than migrate into the helper.
+        kill_holder_tree(proc, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
         if proc.stdout is not None:
             with contextlib.suppress(OSError):
                 proc.stdout.close()
@@ -2412,7 +4372,7 @@ def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     assert longest < WATCHDOG_FIRE_DELAY_CEILING_SECS, (
         f'expected the CLI-measured watchdog delay (heartbeat wait + kill '
         f'grace, excluding fire_watchdog_kill\'s /proc walks) to be well '
-        f'under the 15s production window (10s heartbeat timeout + 5s kill '
+        f'under the 95s production window (90s heartbeat timeout + 5s kill '
         f'grace) given the '
         f'{WATCHDOG_HEARTBEAT_OVERRIDE_SECS}s+{WATCHDOG_KILL_GRACE_OVERRIDE_SECS}s '
         f'env overrides -- longest={longest:.2f}s over {len(fires)} fire(s): '
@@ -2591,9 +4551,7 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
         )
     finally:
         heartbeat.stop_heartbeats()
-        if child.poll() is None:
-            child.kill()
-            child.wait(timeout=5)
+        kill_holder_tree(child, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
 
 # ---------------------------------------------------------------------------
@@ -2605,29 +4563,35 @@ def test_cancel_verify_tree_kills_under_live_watchdog(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: pinned 10s+5s fast window (production is 90s+5s) + real subprocesses under full-suite load
 def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
     """SS9 Row 1: dispatcher process killed -> child sees stdin EOF -> tree-killed.
 
     Models "the orchestrator holding the ssh child died": spawns a SEPARATE
     dispatcher process running the REAL ``_default_ssh_heartbeat_run`` against
     a local ``verify-merge --request-id`` argv (small heartbeat_interval so
-    real heartbeats flow while the dispatcher is alive).  Waits for the
-    sleeper subtree to appear, then SIGKILLs the dispatcher process itself --
+    real heartbeats flow while the dispatcher is alive).  Waits for the BUILD
+    itself to publish its session pgid (:func:`sleeper_spec`'s
+    *build_pgid_file* -- not merely any descendant, which is often a
+    transient ``git worktree add``), snapshots the leader's tree while the
+    leader is provably alive, then SIGKILLs the dispatcher process itself --
     when the OS reclaims its file descriptors, ITS end of the child's stdin
     pipe closes, giving the grandchild a clean EOF on fd 0.
 
     ROW_WATCHDOG_ENV is threaded through the dispatcher's own environment
     (:func:`spawn_ssh_heartbeat_dispatcher`'s *extra_env*, ambiently inherited
-    by the grandchild verify-merge) -- the pinned 10s+5s production-equivalent
-    window, not a fast one; see ROW_WATCHDOG_ENV's comment above for the pin
-    rationale.  Per ``run_stdin_watchdog``, EOF fires on the very next
+    by the grandchild verify-merge) -- the pinned 10s+5s window, deliberately
+    NOT production's own (90s+5s since task 4195); see ROW_WATCHDOG_ENV's
+    comment above for the pin rationale.  Per ``run_stdin_watchdog``, EOF fires on the very next
     ``select`` readiness check regardless of *heartbeat_timeout* -- only
     ``grace_secs`` (the SIGTERM->SIGKILL pause in ``fire_watchdog_kill``)
     materially bounds this row's timing (~5s, measured ~7.3s end-to-end).
 
-    Asserts within a bounded T: the full descendant subtree (including the
-    start_new_session sleeper escape) AND the pgid leader are gone.
+    Asserts within a bounded T that every snapshotted pid -- the leader and
+    the start_new_session build escape -- has EXITED.  A zombie awaiting its
+    subreaper counts as exited (see :func:`wait_pids_exited`); a pgid walk
+    from the leader could not judge this, since it goes blind to the escaped
+    build the moment the leader dies.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
@@ -2636,36 +4600,52 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
 
     REQUEST_ID = 'row1-orchestrator-killed'
     pgf = pgid_file(worktree_base, REQUEST_ID)
+    build_pgf = tmp_path / 'row1-build.pgid'
 
     argv = verify_merge_argv(
-        sha=head_sha, spec=sleeper_spec(300.0), cfg_file=cfg_file, request_id=REQUEST_ID,
+        sha=head_sha,
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
+        cfg_file=cfg_file,
+        request_id=REQUEST_ID,
     )
     dispatcher = spawn_ssh_heartbeat_dispatcher(
         argv=argv,
         heartbeat_interval=0.2,
         extra_env=ROW_WATCHDOG_ENV,
     )
+    tree: set[int] = set()
     try:
-        pgid_val = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
-        # Row 1 owns the DISPATCHER process, not the leader -- the leader's
-        # own stdout/stderr aren't piped to this test, so pass the dispatcher.
-        wait_subtree_live(
-            pgid_val, proc=dispatcher, proc_label='dispatcher',
-            timeout=row_discovery_ceiling_secs(),
+        leader = wait_for_pgid_file(pgf, timeout=row_discovery_ceiling_secs())
+        try:
+            build_pgid = wait_for_pgid_file(build_pgf, timeout=row_discovery_ceiling_secs())
+        except AssertionError as exc:
+            # Row 1 owns the DISPATCHER process, not the leader, so the
+            # dispatcher's rc is the exit status this row can report.
+            pytest.fail(f'{exc}; dispatcher rc={dispatcher.poll()}')
+        tree = {leader} | collect_descendants(leader, read_ppid_map())
+        assert build_pgid in tree, (
+            f'harness failure, not a seam defect: build pgid {build_pgid} is not in '
+            f'leader {leader}\'s subtree {sorted(tree)}'
         )
 
         dispatcher.kill()
         dispatcher.wait(timeout=10)
 
-        assert wait_subtree_gone(pgid_val, timeout=ROW_TREE_KILL_CEILING_SECS), (
-            f'pgid {pgid_val}: subtree and/or leader still alive after the '
-            f'dispatcher was killed (EOF-triggered watchdog tree-kill did '
-            f'not fire)'
+        survivors = wait_pids_exited(tree, timeout=ROW_TREE_KILL_CEILING_SECS)
+        rendered = {pid: (s.state, s.ppid) for pid, s in sorted(survivors.items())}
+        assert not survivors, (
+            f'leader={leader} build={build_pgid}: {rendered} (pid: (state, ppid)) '
+            f'still running {ROW_TREE_KILL_CEILING_SECS}s after the dispatcher was '
+            f'killed (EOF-triggered watchdog tree-kill did not finish). S/T means '
+            f'SIGKILL never reached it; R/D means signalled but not yet run to exit'
         )
     finally:
         if dispatcher.poll() is None:
             dispatcher.kill()
             dispatcher.wait(timeout=5)
+        for pid in wait_pids_exited(tree, timeout=0):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
@@ -2679,7 +4659,7 @@ def test_orchestrator_killed_mid_build_tree_killed_via_eof(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: pinned 10s+5s fast window (production is 90s+5s) + real subprocesses under full-suite load
 def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
     """SS9 Row 2: ssh channel closes but the dispatcher stays alive -> EOF tree-kill.
 
@@ -2694,11 +4674,11 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 
     Uses ROW_WATCHDOG_ENV directly on the spawned verify-merge (already an
     in-process dispatcher, so no extra remove is needed, unlike Row 1's
-    separate-process case) -- the pinned 10s+5s production-equivalent
-    window.  Row 2 is an EOF row like Row 1, not a timeout row:
-    ``close_stdin()`` closes the write end, so only ``grace_secs`` bounds it
-    (~5s, measured ~6.7s end-to-end), NOT the ~15s a reader might assume
-    from the heartbeat timeout.
+    separate-process case) -- the pinned 10s+5s window, deliberately NOT
+    production's own (90s+5s since task 4195).  Row 2 is an EOF row like Row
+    1, not a timeout row: ``close_stdin()`` closes the write end, so only
+    ``grace_secs`` bounds it (~5s, measured ~6.7s end-to-end), NOT the ~15s a
+    reader might assume from the pinned heartbeat timeout.
 
     Asserts within a bounded T: the full descendant subtree AND the pgid
     leader are gone, and the verify-merge process itself self-exits non-zero
@@ -2751,9 +4731,7 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
         )
     finally:
         heartbeat.stop_heartbeats()
-        if child.poll() is None:
-            child.kill()
-            child.wait(timeout=5)
+        kill_holder_tree(child, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
 
 # ---------------------------------------------------------------------------
@@ -2765,7 +4743,7 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: production 10s+5s watchdog window + real subprocesses under full-suite load
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)  # task 4025: pinned 10s+5s fast window (production is 90s+5s) + real subprocesses under full-suite load
 def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     """SS9 Row 3: heartbeat starved, stdin stays OPEN -> select-timeout tree-kill.
 
@@ -2778,11 +4756,11 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     ready set) rather than seeing EOF, taking the branch that calls
     ``on_fire`` directly without ever attempting a read.
 
-    Uses ROW_WATCHDOG_ENV -- the pinned production-equivalent window
-    (10.0s heartbeat timeout + 5.0s kill grace) -- directly on the spawned
-    verify-merge, so the assertion window here is ~15s, not fast; see
-    ROW_WATCHDOG_ENV's comment above for the pin rationale and the honest
-    cliff-moved caveat.
+    Uses ROW_WATCHDOG_ENV -- the pinned fast window (10.0s heartbeat timeout
+    + 5.0s kill grace; production is 90.0s+5.0s since task 4195, injected down
+    to this) -- directly on the spawned verify-merge, so the assertion window
+    here is ~15s rather than production's ~95s; see ROW_WATCHDOG_ENV's comment
+    above for the pin rationale and the honest cliff-moved caveat.
 
     Asserts the leader self-exits non-zero and, after reaping it (same
     zombie-avoidance ordering as Row 2 -- ``child`` is again a direct child
@@ -2832,12 +4810,7 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
         )
     finally:
         heartbeat.stop_heartbeats()
-        if child.poll() is None:
-            child.kill()
-            child.wait(timeout=5)
-        if child.stdin is not None:
-            with contextlib.suppress(OSError):
-                child.stdin.close()
+        kill_holder_tree(child, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
 
 # ---------------------------------------------------------------------------
@@ -2900,12 +4873,19 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
     # task 3318: --request-id arms the holder's stdin watchdog (see
     # spawn_verify_merge docstring), but unlike Row 3 this holder was never
     # given a live HeartbeatWriter -- it self-killed at
-    # ~(WATCHDOG_HEARTBEAT_TIMEOUT_SECS + WATCHDOG_KILL_GRACE_SECS) = ~15-17s
+    # ~(WATCHDOG_HEARTBEAT_TIMEOUT_SECS + WATCHDOG_KILL_GRACE_SECS), measured
+    # ~15-17s back when those summed to 15.0 (task 4195 has since derived the
+    # timeout from the ssh transport, so an unpaired holder would now last
+    # ~95s -- this holder gets no ROW_WATCHDOG_ENV)
     # instead of surviving the full 300s sleeper_spec, well inside the
     # waiter's own budget under full-suite xdist load (Python import alone
     # ~9s). Pair it with a live heartbeat, mirroring Row 3, so it survives
     # for the whole span the test needs it.
     heartbeat_holder = HeartbeatWriter(holder, interval=0.2).start()
+    # task 4946: bound before the try so the finally below can tear it down
+    # even if wait_for_pgid_file/wait_subtree_live/wait_for_marker_stable
+    # raises before the waiter is ever spawned.
+    waiter = None
     try:
         holder_pgid_val = wait_for_pgid_file(pgf_holder)
         wait_subtree_live(holder_pgid_val, proc=holder)
@@ -2971,9 +4951,15 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         )
     finally:
         heartbeat_holder.stop_heartbeats()
-        if holder.poll() is None:
-            holder.kill()
-            holder.wait(timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+        # task 4946: a TimeoutExpired from waiter.communicate() above, or
+        # any of the six assertions before this finally failing, previously
+        # left the waiter leader -- and its session-escaped descendants --
+        # alive.  Tear the waiter down BEFORE the holder: it is the process
+        # contending for the lock the holder owns.  Free on the success
+        # path via kill_holder_tree's already-reaped short circuit.
+        if waiter is not None:
+            kill_holder_tree(waiter, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+        kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
 
     # --- Consumer side: feed #2's real discriminant through the real beta
     # consumer (_run_post_merge_verify) with a real EscalationQueue. ---
@@ -3091,9 +5077,4 @@ def test_live_verify_merge_holds_lane_lock_real_subprocess(tmp_path):
             f'lane lock mid-build, got {holder_pgid!r}'
         )
     finally:
-        if holder.poll() is None:
-            holder.kill()
-            holder.wait(timeout=5)
-        if holder.stdin is not None:
-            with contextlib.suppress(OSError):
-                holder.stdin.close()
+        kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)

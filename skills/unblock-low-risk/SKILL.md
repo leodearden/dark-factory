@@ -71,7 +71,7 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
      --worktree <worktree> \
      --project-root <project_root> \
      --category <category> \
-     --config <project_root>/orchestrator/config.yaml
+     --config <project_root>/dark-factory-orchestrator.yaml
    ```
 
    `<category>` is the escalation category already asserted in precondition 4. The gate reads
@@ -123,13 +123,18 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 
 3. **Apply the fix — scoped.** Edit/Write **only** files in `latest['files_referenced']` (and their
    direct test files). The moment the correct fix demands touching a file outside that set — or any
-   of `main`-only paths, CI config, infra, or `orchestrator/config.yaml`/`.mcp.json`/systemd units —
+   of `main`-only paths, CI config, infra, or `dark-factory-orchestrator.yaml`/`.mcp.json`/systemd units —
    the change is no longer low-risk: **ABORT**. Do not commit `.task/`.
 
 4. **Rebase onto main.** `git -C <worktree> rebase main` (main may have moved). On **any conflict** →
+   run [Rebase recovery preflight](#rebase-recovery-preflight) to leave the worktree clean, then
    **ABORT** (a conflict means the change is no longer self-contained).
 
-5. **Verify.** Run the project's full verify suite from `orchestrator/config.yaml` in the worktree —
+   The cleanup is not optional politeness. Aborting the skill while the worktree is still
+   mid-rebase leaves precondition 5 refusing the *next* run for that exact reason, so the task
+   deadlocks: nothing can retry it and nothing cleans it up.
+
+5. **Verify.** Run the project's full verify suite from `<project_root>/dark-factory-orchestrator.yaml` in the worktree —
    `test_command`, then `lint_command`, then `type_check_command` (read them from the file; do not
    hardcode). Any non-zero exit → **ABORT**. (Pipe to a file + check exit status; never trust a
    tail.)
@@ -143,7 +148,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    .venv/bin/python -m orchestrator.b3_gate charge \
      --task-id <task_id> \
      --project-root <project_root> \
-     --config <project_root>/orchestrator/config.yaml
+     --config <project_root>/dark-factory-orchestrator.yaml
    ```
 
    Note: `charge` takes **no `--worktree`** argument — cap state is keyed on `project_root` only.
@@ -178,25 +183,53 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 
    The response shape determines the next action:
 
-   - **TERMINAL (resolved within the bounded window):** `status` ∈ `done` | `conflict` | `blocked`
-     | `already_merged` | `unknown_branch` | `failed`. The call returns a `request_id` in all
+   <!-- merge-state-vocab:begin partition=SUBMIT_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
+   - **TERMINAL (resolved within the bounded window):** `status` ∈ `done` | `conflict`
+     | `blocked` | `already_merged` | `done_wip_recovery` | `unknown_branch`
+     | `unmerged_state` | `stash_failed` | `wip_halted` | `wip_recovery_no_advance`
+     | `error` | `superseded`.
+     <!-- merge-state-vocab:end -->
+     The six worker-internal outcomes (`wip_halted`, `done_wip_recovery`,
+     `wip_recovery_no_advance`, `unmerged_state`, `stash_failed`, `error`) are rare;
+     `merge_status` collapses all of them except `done_wip_recovery` to `blocked` when
+     observed by polling (`escalation/src/escalation/server.py::_map_terminal_state`) —
+     handle them as `blocked`. (`failed`, which this list named until task 4829, is not a
+     value the server ever returns; the real one is `error`.)
+     The call returns a `request_id` in all
      cases except the `already_merged` ancestor fast-path, which short-circuits before entry
      construction (no `request_id`, `commit` is the ancestor sha). The `already_merged`
      worker-path (entry was constructed, merge found already done) does carry a `request_id`
      but may have `commit: null`. Proceed to step 9.
 
-   - **NON-TERMINAL — `status` ∈ `queued` | `attached`:** This is a **successful submission**, not
-     a failure. `queued` means the entry is waiting in the merge queue; `attached` means it was
+   <!-- merge-state-vocab:begin partition=SUBMIT_NON_TERMINAL
+        Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
+        scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+        and this list goes red until it matches. -->
+   - **NON-TERMINAL — `status` ∈ `queued` | `attached`:**
+     <!-- merge-state-vocab:end -->
+     This is a **successful submission**, not a failure. `queued` means the entry is
+     waiting in the merge queue; `attached` means it was
      coalesced with an existing in-flight request. Poll `merge_status` until the entry reaches a
      terminal state:
 
      ```
      deadline = now() + 1200 s          # 20-minute hard ceiling
+     # merge-state-vocab:begin partition=LIVE_STATES
+     #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES. Pinned by
+     #   scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
+     #   and this set goes red until it matches.
      while state ∈ {queued, verifying, gate, finalizing} and now() < deadline:
+     # merge-state-vocab:end
          wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
          sleep(wait)
          result = mcp__escalation__merge_status(request_id)
+     # merge-state-vocab:begin partition=LIVE_STATES
+     #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES (second copy).
      if state ∈ {queued, verifying, gate, finalizing}:   # deadline exceeded, entry still live
+     # merge-state-vocab:end
          mcp__escalation__merge_cancel(request_id)
          ABORT   # leave escalation pending; 'one attempt, abort on doubt'
      ```
@@ -217,10 +250,20 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      - **Fast-path** (ancestor short-circuit): no `request_id`; `commit` is the ancestor sha —
        use `done_provenance={"kind": "merged", "commit": "<commit>"}`.
      - **Worker-path** (entry constructed, merge found already done): carries a `request_id`
-       but `commit` may be `null`. If `commit` is null, run `git log main --oneline -20` to
-       confirm the landed sha and use `done_provenance={"kind": "found_on_main",
-       "commit": "<sha from git log main --oneline -20>",
-       "note": "merge found already done by worker; sha confirmed via git log"}`.
+       but `commit` may be `null`. If `commit` is null, recover the landed sha with the
+       **task-scoped merge-marker search** (see [Deriving the landed
+       sha](#deriving-the-landed-sha) below) and use `done_provenance={"kind": "found_on_main",
+       "commit": "<sha from the merge-marker search>",
+       "note": "merge found already done by worker; sha confirmed via merge-marker search"}`.
+       If the search comes back empty, do **not** abort on that alone — you are holding a
+       server-issued `already_merged` verdict, and a fast-forward or coalesce-absorbed
+       landing carries no marker. Run the ancestry disposition in [Deriving the landed
+       sha](#deriving-the-landed-sha) and follow its arms; ABORT on every arm that terminates
+       without a sha — its rc=1 / rc=128 not-landed outcomes (both only **outside** the
+       `coalesce-*` arm — on that arm neither is not-landed), and rc=0's **phantom-branch** (no
+       subject-matching citation on main) and **gate-un-evaluable**
+       (`git.commit_citation_pattern: ""`) exits. Those yield no sha and must never be stamped:
+       report them rather than proceeding to sub-steps a–d.
        `merge_cancel(request_id)` is a safe no-op (entry is terminal) and may be skipped.
      a. `set_task_status(id=task_id, status="done", project_root=project_root,
         done_provenance=<shape>)`. Choose by HOW `done` was observed:
@@ -228,13 +271,22 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
           `commit` field (the merge sha) — use
           `done_provenance={"kind": "merged", "commit": "<commit field from merge_request response>"}`.
         - **Polled** (`merge_status` returned `done`): the `merge_status` terminal response
-          carries **no `commit` field** — never assume one is present. Run
-          `git log main --oneline -20` to recover the landed sha, then use
+          carries **no `commit` field** — never assume one is present. Recover the landed
+          sha with the **task-scoped merge-marker search** (see [Deriving the landed
+          sha](#deriving-the-landed-sha) below), then use
           `done_provenance={"kind": "merged", "commit": "<recovered sha>"}` (the server
           ancestor-checks it) or `done_provenance={"kind": "found_on_main",
           "commit": "<recovered sha>", "note": "merge completed per polled merge_status;
-          sha recovered from git log"}`. A polled-done sha MUST be recovered from git log;
-          it is never present in the merge_status response.
+          sha recovered via merge-marker search"}`. A polled-done sha MUST be recovered with
+          the task-scoped merge-marker search; it is never present in the merge_status
+          response. An empty search is **not** by itself a not-landed verdict — you are
+          holding a server-issued polled `done`. Run the ancestry disposition in [Deriving
+          the landed sha](#deriving-the-landed-sha) and follow its arms; ABORT on every arm
+          that terminates without a sha — its rc=1 / rc=128 not-landed outcomes (both only
+          **outside** the `coalesce-*` arm — on that arm neither is not-landed), and rc=0's
+          **phantom-branch** (no subject-matching citation on main) and **gate-un-evaluable**
+          (`git.commit_citation_pattern: ""`) exits. Those yield no sha and must never be
+          stamped.
         - **`already_merged` fast-path** and **worker-path**: handled by the sub-case bullets
           above; use the `done_provenance` shape specified there.
      b. **Restore metadata** — `set_task_status` overwrites the metadata blob, nuking
@@ -249,14 +301,168 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      retry, do not direct-merge. (`failed`/`unknown_branch` appear only on the in-window
      `merge_request` path; `abandoned` appears only on the polled `merge_status` path.)
 
+   - **`superseded`:** **not a failure, and never handled as one.** `superseded` is
+     submit-terminal and is not a live state, so it reaches this step either straight from step 8's
+     submission or on the first poll tick that returns it — step 8's loop exits immediately
+     because `superseded ∉ {queued, verifying, gate, finalizing}`. It means your request was
+     replaced by a successor that may still be in flight and whose landing will carry this
+     branch's work. Reporting it as a failure would report a **false failure** and leave the
+     escalation pending on a branch that is about to land.
+     - **Do not call `merge_cancel(request_id)`.** On an absorbed id that call is a no-op which
+       resolves to `unknown` (`escalation/src/escalation/server.py` — "callers holding a coalesced
+       id will resolve to 'unknown' here"), so it buys nothing and muddies the record. There is no
+       cancel path for an in-flight train at all.
+     - **Read `superseded_by`'s shape.** It names one of two mechanisms, and only one of them is a
+       request id:
+       - **`coalesce-*`** → a **train** id, not a request id: this submission was absorbed into a
+         coalesce train (`MergeOutcome('superseded', superseded_by=train_id)`,
+         `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`). Do **not** poll it by `request_id` —
+         that returns an honest `unknown` which never resolves to anything else.
+       - **`mr-*`** → a generation advance: this same branch re-enqueued at a newer generation
+         (`MergeOutcome('superseded', superseded_by=gen_next.request_id, ...)`, same module).
+         Nothing was absorbed, and that id *is* pollable by `request_id`.
+     - **Resolve it by ancestry, not by re-polling the id you already hold.** Run the ancestry
+       disposition in [Deriving the landed sha](#deriving-the-landed-sha) — it already carries the
+       `coalesce-*` carve-outs, so do not restate or improvise any ladder text here. It has three
+       dispositions here, and **two of them are success**:
+       - **A stampable sha** — proceed with sub-steps **a–d** above.
+       - **Resolved, landed and already credited** — the `coalesce-*` arm's `done`-status
+         outcome: signal (a) shows the tip landed, and this task's scheduler status, re-read
+         fresh, already reads `done`. There is **nothing to stamp**, and that is **success, not
+         an abort**: skip sub-step (a), then run sub-steps **(c)** cleanup and **(d)**
+         `resolve_issue`, recording the tip merge sha in the resolution text. Without this
+         disposition a landed, correctly-credited task falls through to the polling exit below
+         and gets abandoned as in-flight — see [Deriving the landed
+         sha](#deriving-the-landed-sha)'s `coalesce-*` bullet for the full two-outcome split.
+       - **Not resolved yet** — the two exits in the next bullet.
+
+       On the `coalesce-*` arm remember both carve-outs: **neither rc=1 nor rc=128-with-an-empty-marker is
+       not-landed**, and **neither arm carries a self-stamp** — the scheduler status decides only
+       which exit applies, never whether a write is permitted.
+     - **If it has not resolved yet, both available exits are non-failures.** Either keep polling
+       the **branch** handle (`mcp__escalation__merge_status(branch="task/<task_id>")`, same
+       clamped cadence) for whatever remains of step 8's 20-minute deadline, re-running the
+       ancestry disposition on each tick; or, once that deadline is spent, **ABORT with an
+       explicitly non-failure disposition** — report the branch as *in flight on a successor*,
+       naming the `superseded_by` value, and leave the escalation pending for a human. In neither
+       case call `merge_cancel`, and in neither case claim a failure: this is **not** the plain
+       abort-as-failure the `conflict` / `blocked` / `abandoned` arm above prescribes. Never
+       resubmit and never direct-merge while the successor is unresolved.
+
    - **`unknown`** (e.g., after an orchestrator restart; `merge_status` carries
-     `hint="check git log main"`): fall back to `git log main --oneline -20` and check whether
-     the task's commit landed on main.
-     - Confirmed on main → success; use `done_provenance={"kind": "found_on_main",
-       "commit": "<sha confirmed on main via git log main --oneline -20>",
-       "note": "confirmed on main after unknown merge_status; sha from git log"}` and proceed
-       with sub-steps a–d above.
-     - Not found → `mcp__escalation__merge_cancel(request_id)` then **ABORT**.
+     `hint="check git log main"`): fall back to the **task-scoped merge-marker search** (see
+     [Deriving the landed sha](#deriving-the-landed-sha) below) to check whether this task's
+     merge landed on main. Do **not** eyeball `git log main --oneline -20`: it is not
+     scoped to this task, so any sha picked from it is likely an unrelated task's merge.
+     - Confirmed on main (search non-empty) → success; use `done_provenance={"kind": "found_on_main",
+       "commit": "<sha from the merge-marker search>",
+       "note": "confirmed on main after unknown merge_status; sha from merge-marker search"}`
+       and proceed with sub-steps a–d above.
+     - Search empty → not yet a verdict: run the ancestry disposition in [Deriving the
+       landed sha](#deriving-the-landed-sha) and follow its arms. Its rc=0 arm yields a sha
+       **only** on the verified-group-merge and positive-citation outcomes — proceed with
+       sub-steps a–d there. Its rc=1 / rc=128 not-landed outcomes (both only **outside** the
+       `coalesce-*` arm — on that arm neither is not-landed; see this section's dispositions
+       below) and rc=0's **phantom-branch** exit are genuine not-landed verdicts →
+       `mcp__escalation__merge_cancel(request_id)` then **ABORT**. rc=0 with the citation gate
+       **un-evaluable** (`git.commit_citation_pattern: ""`) proves neither verdict, so it is
+       **not** a not-landed outcome: **ABORT** and report the gate as un-evaluable, *without*
+       calling `merge_cancel` — this section scopes that call to genuine not-landed outcomes.
+
+### Rebase recovery preflight
+
+`git rebase --abort` is the way out of a conflicted rebase, and it has two measured failure modes
+that leave the worktree wedged with no obvious way forward. Run the preflight first — from the
+**primary dark-factory checkout** (where `.venv/` and `orchestrator/` live — NOT the worktree,
+which has no `.venv`), exactly as precondition 6 invokes `b3_gate`:
+
+```
+.venv/bin/python -m orchestrator.rebase_recovery preflight --worktree <worktree>
+```
+
+Parse JSON stdout; `verdict` is one of `clean | repaired | blocked`.
+
+- `clean` or `repaired` → run the abort itself, **with the guard**:
+  `git -C <worktree> -c rerere.enabled=false rebase --abort`. Use that spelling every time, not
+  the bare `git rebase --abort`: with rerere disabled git never opens `MERGE_RR`, which is what
+  makes the abort survive both failure modes.
+- `blocked` → **ABORT** the skill without running the abort, copying the payload's `unrepaired`
+  entries verbatim into your `reason`. `blocked` means either something the preflight declined to
+  touch — typically a lock file a live process still holds open, and deciding what that process
+  is, is a human's call, not this skill's — or a worktree it could not resolve at all
+  (`resolved: false`), where it inspected nothing, so the empty `dangling`/`locks_*` lists report
+  an absence of looking rather than an absence of damage. Check the path you passed.
+
+Add `--report-only` to inspect without changing anything; it detects and reports, moves nothing,
+and returns `blocked` rather than `clean` when it finds damage it deliberately left in place.
+
+**What it does, so you can read its output.** The preflight moves a suspect `MERGE_RR` aside to a
+`MERGE_RR.quarantined-<timestamp>` sibling — **moved, never deleted**, because a *successful*
+abort deletes that file and it is the only record of which conflict ids the worktree was carrying.
+It also removes `*.lock` files that are both older than an hour **and** held open by no running
+process; a lock with a live holder is retained at any age.
+
+The state it detects is an id present in `MERGE_RR` with no backing `rr-cache/<id>` directory. How
+those directories come to be missing is **not established** — do not repeat any explanation of the
+cause, including in a report; describe only what was observed.
+
+### Deriving the landed sha
+
+The derivation ladder itself — exact-subject marker search, the ref-existence gate, containment,
+the ancestry check, the phantom-branch citation gate, and the `DoneProvenance` contract — is
+[`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the
+single normative copy. Run it in full; do not improvise a shorter version.
+
+This skill enters it **marker-first**: run
+[step 1](../_shared/deriving-landed-sha.md#step-1)'s task-scoped marker search, then
+[step 2](../_shared/deriving-landed-sha.md#step-2)'s `git rev-parse --verify --quiet
+task/<TASK_ID>` ref-existence probe. (Where the call sites above say "run the ancestry
+disposition", that is [step 4](../_shared/deriving-landed-sha.md#step-4), reached from
+[step 3](../_shared/deriving-landed-sha.md#step-3) when the marker search comes back empty.)
+
+**This skill's dispositions on the ladder's verdicts.** Every sha recorded in `done_provenance`
+MUST come from that task-scoped ladder — never from main's current HEAD and never from an
+eyeballed listing.
+
+- **A stampable sha** — the ladder yields one on exactly four outcomes: a non-empty marker with
+  the branch ref **gone**; a marker that passes **containment rc=0**; a group/train merge
+  confirmed by **contained-before rc=1**; and a landing — fast-forward *or* sibling-covered —
+  confirmed by a **subject-matching task citation** on main. Use the sha and the `note` the ladder specifies for
+  that outcome, and proceed with the calling arm's sub-steps a–d above.
+- **A genuine not-landed outcome** — the ladder's three: rc=0's **phantom-branch** exit (nothing
+  on main cites this task), and — both **outside** the `coalesce-*` arm — rc=1, and rc=128 with
+  an empty marker search. On any of these: `mcp__escalation__merge_cancel(request_id)` then
+  **ABORT**. Do not resolve, do not retry, do not direct-merge.
+- **Citation gate un-evaluable** (`git.commit_citation_pattern: ""`) — proves neither verdict, so
+  it is **not** a not-landed outcome: **ABORT** and report the gate as un-evaluable, *without*
+  calling `merge_cancel`. This skill scopes that call to genuine not-landed outcomes **only**.
+- **On the `coalesce-*` arm, neither rc=1 nor rc=128-with-an-empty-marker is a not-landed
+  outcome** — a train merges only the tip branch, so an absorbed non-tip member has neither a
+  marker of its own nor an ancestor relationship to prove. Follow the ladder's pointer into
+  `merge-queue/SKILL.md`: rules 2–3 govern rc=1, rule 2a governs rc=128-with-empty-marker, and
+  **neither arm licenses a write** — never self-stamp on either. Read rule 2 there for the
+  argument rather than restating it; the disposition here is the **same on both arms**, and it
+  turns on re-reading this task's scheduler status **fresh**:
+  - **`done`** — `mark_member_done`'s automatic flip already happened, so the work is landed
+    **and already credited**. There is nothing to write: **skip sub-step (a) entirely** and
+    proceed to sub-steps **(c)** and **(d)**. This is a **success** path — not an abort, and not
+    a landed-but-not-credited report. (Sub-step (c)'s `git branch -d` will refuse on this arm:
+    the member ref is stale-by-rebase and not an ancestor of main. `git branch -D
+    task/<task_id>` is safe once `git cherry main task/<task_id>` is non-empty and every line
+    starts with `-`; leaving the ref in place is also fine.)
+  - **Any other status** — `pending`, `merge-deferred`, anything else, including a status you
+    cannot read — **never write**. Keep polling to step 8's 20-minute ceiling, then take the
+    **landed-but-not-credited** report, citing the tip merge sha and the current status.
+
+  In **neither** case `merge_cancel`, and in neither case report not-landed. This is
+  the one carve-out that most matters here: this skill is fully autonomous, so a wrong
+  not-landed reading cancels and abandons work that actually landed.
+- **No verdict** (containment rc=128) — re-derive per the ladder. Do not stamp, and do not read
+  it as either outcome.
+
+Where the ladder finds no honest commit, write **nothing at all** rather than substituting a
+convenient sha: `kind='found_on_main'` requires both a `commit` and a `note`, and declining to
+stamp is an available option on every failing arm.
 
 ## Merge-stage completion mode (block_class == 'merge_verify_red')
 
@@ -324,6 +530,9 @@ On any ABORT:
 - **Leave the escalation `pending`.** Do not resolve or dismiss it — the human will handle it on
   return, exactly as the normal `task_failure`/`review_issues` path does.
 - Leave the worktree intact (do not remove it) so the human can inspect your partial work.
+  That includes any `MERGE_RR.quarantined-*` file the rebase-recovery preflight left behind: it is
+  preserved evidence of what the worktree was carrying when it wedged, and the human inspecting
+  your partial work is the reader it was preserved for. Do not tidy it away.
 - Return a structured result so the watcher can log it to the digest.
 
 ## Return value (your final message IS the data)

@@ -104,7 +104,9 @@ invisible in the event stream.
 - **62% of DF's and 82% of reify's `reservation_installed` events are no-ops** — every
   requested module was already blocked by a same-or-higher-tier foreign park (INV-3
   install blocking), yet the event fires and `has_parks` stays False, so the attempt
-  re-fires every tick. The fairness mechanism live-locks against itself.
+  re-fires every tick. The fairness mechanism live-locks against itself. Task 5308
+  changed both the emission and the `has_parks` guard behind the re-fire; read historical
+  series against `CHANGELOG.md` rather than under the new meaning.
 - **Only one hold predictor works.** Log2-space R² on a 70/30 time-ordered split:
   global median −0.22 / tier median −0.36 / tier+width −0.31, versus **module-history
   median (last 10 holds on the task's modules) 0.26 (DF) and 0.68 (reify)**. Static task

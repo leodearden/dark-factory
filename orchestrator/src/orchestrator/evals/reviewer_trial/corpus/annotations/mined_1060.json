@@ -40,5 +40,41 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Pin observed wire type for get_task['id'] in test_taskmaster_mcp_contract.py instead of accepting (str, int)",
+      "description": "Replace the permissive `isinstance(task['id'], (str, int))` assertion with a strict isinstance check pinned to the actual type the live JS Taskmaster payload returns, so the integration suite can detect the wire-shape drift it was built to catch.",
+      "test_strategy": "",
+      "details": "Task 1057 added two assertions at `fused-memory/tests/integration/test_taskmaster_mcp_contract.py:120-129`:\n\n```python\nassert str(task['id']) == task_id\nassert isinstance(task['id'], (str, int)), ...\n```\n\nReviewer (`reviewer_comprehensive`) flagged that the second assertion accepts both `str` and `int`, which means a silent flip of `get_task`'s wire shape from one to the other slips past \u2014 defeating the whole purpose of the file (its docstring at lines 11-13 explicitly states it exists to \"catch wire-shape drift between Taskmaster's JS tools and the canned mocks\"). The OR-of-two-types check is no stronger than no isinstance check at all.\n\n**Scope:**\n\n1. Build `taskmaster-ai/dist/mcp-server.js` locally so the integration suite runs (the existing skipif gate currently disables it in fresh worktrees):\n   ```\n   cd taskmaster-ai && npm install && npm run build\n   ```\n2. Run `pytest fused-memory/tests/integration/test_taskmaster_mcp_contract.py -xvs` once and record the actual type of `task['id']` that the JS payload returns (str or int).\n3. Replace the `isinstance(task['id'], (str, int))` assertion with `assert isinstance(task['id'], <observed_type>)`. Keep the failure message that points the reader at `tests/test_taskmaster_client_contract.py` so the canned mock can be updated in lockstep when intentional drift occurs.\n4. Verify the suite still passes after the change, and confirm the canned mock at `tests/test_taskmaster_client_contract.py:78` (currently returns `'taskId': 42` \u2014 int) is consistent with the observed type. If the live wire returns str but the canned mock returns int, surface that as a bug in this same task.\n\n**Files to touch:**\n- `fused-memory/tests/integration/test_taskmaster_mcp_contract.py` (assertion change)\n- Possibly `fused-memory/tests/test_taskmaster_client_contract.py` (only if a canned/live mismatch is discovered during step 4)\n\n**Source:** Escalation `esc-1057-152` from Task 1057 post-merge review.",
+      "authored": false,
+      "id": "1060",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-25T08:39:02.256Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/tests/integration/test_taskmaster_mcp_contract.py",
+      "fused-memory/tests/test_taskmaster_client_contract.py"
+    ],
+    "base_sha": "315551c3fb3b732580cac405f1dfc8a93b7e8959",
+    "branch_sha": "21e481866870671b4d1d4f54e19f207c516fb10a",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "3dc8836867443cff674128069037e871514bf750",
+      "merge_base_sha": "315551c3fb3b732580cac405f1dfc8a93b7e8959",
+      "diff_reproduces_from": "git diff 315551c3fb 3dc8836867",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

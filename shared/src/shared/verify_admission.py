@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     'acquire_task_slot',
+    'is_gated_role',
     'nice_prefix',
 ]
 
@@ -56,6 +57,22 @@ _NICE_TIERS: dict[str, list[str]] = {
     'task': ['nice', '-n', '15', 'ionice', '-c2', '-n7'],
     'background': ['nice', '-n', '19', 'ionice', '-c3'],
 }
+
+_GATED_ROLES = frozenset({'task', 'background'})
+
+
+def is_gated_role(role: str) -> bool:
+    """True if ``acquire_task_slot`` actually attempts acquisition for *role*.
+
+    The single source of truth for which roles are subject to the slot
+    semaphore at all (``task``/``background``) — every other role (``merge``,
+    ``offline``, or an unknown role) always yields ``held=False`` immediately
+    without touching the filesystem (C-merge-priority). Callers that want to
+    skip acquisition machinery entirely for a role guaranteed to no-op (e.g.
+    to avoid queuing work on a shared executor for it) should check this
+    rather than re-deriving the role set (heuristic 11, SPOT).
+    """
+    return role in _GATED_ROLES
 
 
 def nice_prefix(role: str) -> list[str]:
@@ -141,7 +158,7 @@ def acquire_task_slot(
     frees the flock automatically, including when the holder dies without
     cleanup (C-daemonless self-heal; no canary/daemon/atexit involved).
     """
-    if role not in {'task', 'background'}:
+    if not is_gated_role(role):
         yield False
         return
 

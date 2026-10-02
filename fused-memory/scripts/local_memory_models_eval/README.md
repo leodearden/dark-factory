@@ -51,7 +51,7 @@ Exit codes are per failure class, because each has a different remedy:
 | 3 | `hash_drift` | the selection is right, but episode bytes changed |
 | 4 | `missing_episodes` | an id the manifest names is gone from the store |
 | 5 | `bad_manifest` | the artifact is structurally unusable |
-| 1 | — | the run never reached a verdict (store unreachable, unsatisfiable `--n`, or stdout unwritable — a reader closed the pipe early as in `\| head`, or a `>` redirect hit a full disk) |
+| 1 | — | the run never reached a verdict (store unreachable, unsatisfiable `--n`, stdout unwritable — a reader closed the pipe early as in `\| head`, or a `>` redirect hit a full disk — the manifest unwritable at `--out`, or a store defect blocking the check under `--verify`: a duplicated episode uuid or an unparseable `created_at` on a live row) |
 
 Exit `1` is always accompanied by one `error: ...` line on stderr, never a
 traceback. Read it: a pipe that broke on the trailing `manifest: ...` line
@@ -99,7 +99,10 @@ signal is `e.source_description`, which the writers shape as
 `add_memory:<category>` (and `replay_from_mem0:<category>` on the Mem0 replay
 path). A caller-supplied `add_episode` description buckets under a single
 explicit `add_episode` kind rather than fanning the axis into one stratum per
-caller string.
+caller string. The annotations `GraphitiBackend.add_episode` prepends,
+`[unverified_claim] ` and `[temporal:<ctx>] `, are stripped before
+classification, so a tagged write stays in its category's stratum; any other
+leading text is a caller string and buckets as `add_episode`.
 
 Allocation is **min-1 floor + largest-remainder proportional, capped at cell
 size**. The floor is load-bearing, not tidiness: the

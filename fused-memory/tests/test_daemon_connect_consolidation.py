@@ -98,13 +98,13 @@ _DAEMON_CASES = [
     pytest.param(
         lambda tmp: EventBuffer(db_path=tmp / 'eb.db'),  # noqa: ARG005
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='EventBuffer',
     ),
     pytest.param(
         lambda tmp: ReconciliationJournal(data_dir=tmp / 'journal'),  # noqa: ARG005
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='ReconciliationJournal',
     ),
     pytest.param(

@@ -71,10 +71,17 @@ async def _poll_ticket_resolved(
     NOTE: the `task_created` journal event is emitted *after* the terminal
     write (task_interceptor.py:3812 single path / 4190 batch path), so this
     is NOT a barrier for journal assertions — pair it with
-    `_poll_journal_emitted` on the emission itself (see the two callers
-    that do), or — where the caller asserts an *exact* event count — with
-    `poll_until_stable` on the count, as
-    `test_worker_created_path_emits_journal_event` does.
+    `_poll_journal_settled` (a `poll_until_stable` settle barrier on the
+    event count, settle=0.2), as every caller in this file asserting an
+    exact *non-zero* event count now does (task 3697 introduced the
+    pattern; task 4307 swept the two remaining liveness-poll sites onto it
+    and extracted the shared helper). The one exact-count caller that does
+    NOT pair with it, `test_worker_tm_add_task_failure_marks_ticket_failed`,
+    asserts a *zero* count: it needs no second barrier since the emission
+    is guarded by `status == 'created'` (no event is ever built on that
+    path), and it structurally could not use `poll_until_stable`, which
+    treats a falsy (zero) sample as not-yet-ready and would spin for the
+    full timeout.
 
     The 10s default is deliberately well inside the 60s pytest-timeout
     (pyproject.toml), whose thread method os._exit(1)s the whole xdist
@@ -91,33 +98,62 @@ async def _poll_ticket_resolved(
     )
 
 
-async def _poll_journal_emitted(journal_calls, event_type, *, timeout: float = 2.0):
-    """Bounded wait for an *event_type* event to land in *journal_calls*.
+async def _poll_journal_settled(
+    journal_calls: list, event_type, *, settle: float = 0.2, timeout: float = 10.0,
+):
+    """SETTLE barrier for an exact *event_type* count in *journal_calls*.
 
-    Pairs with `_poll_ticket_resolved` as a second, short barrier: the
+    Pairs with `_poll_ticket_resolved` as a second barrier: the
     `task_created` journal event is emitted *after* the ticket's terminal
-    write (task_interceptor.py:3812 single path / 4190 batch path), with
-    `_persist_worker_terminal`'s awaits in between — so
-    `_poll_ticket_resolved` alone can observe a terminal ticket one
-    event-loop hop before `_journal` actually runs. This closes that
-    narrow window: a genuine regression (the event never emitted) still
-    fails fast, in ~`timeout` seconds rather than the row poll's full 10s
-    budget.
+    write (task_interceptor.py:3812 single path / 4190 batch path), so a
+    resolved ticket does not by itself mean the event has landed in
+    *journal_calls* yet.
 
-    Filters on `event_type` explicitly, rather than bare truthiness of
-    `journal_calls`, so a differently-typed event journalled earlier on
-    the same path can't turn this into a silent no-op.
+    SETTLE, not liveness: wait for the *count* to STOP CHANGING, not
+    merely become non-zero. Every caller of this helper goes on to assert
+    an exact, non-zero event count, and a liveness poll (`poll_until`)
+    returns at the *first* matching event — so a duplicate arriving
+    milliseconds later would be structurally invisible. The duplicate is
+    concrete, not hypothetical: `task_created` is emitted from two
+    distinct paths (task_interceptor.py:3786-3795 and 4164-4173), both of
+    which persist the terminal ticket row *before* emitting, so neither a
+    ticket-row predicate nor a first-event predicate closes the emission
+    window — only a settle window does.
 
-    LIVENESS poll, not a settle barrier: it returns at the *first* matching
-    event, so it does not by itself close the window on a duplicate arriving
-    later. `test_worker_created_path_emits_journal_event` uses
-    `poll_until_stable` on the count instead for exactly that reason (task
-    3697); the two callers here retain the liveness form.
+    `settle=0.2` restores exactly the width of the `asyncio.sleep(0.2)`
+    this poll family replaced — but measured from the first matching
+    event rather than from submit_task, so a late-scheduled worker under
+    `-n auto` no longer eats the window. Raising *settle* is the correct
+    response to a suspected missed duplicate (see `poll_until_stable`'s
+    own docstring for the general liveness-vs-settle decision rule).
+
+    Extracted (task 4307) from three call sites that had each grown an
+    identical inline `poll_until_stable` block:
+    `test_worker_created_path_emits_journal_event` (task 3697, the
+    original), `test_worker_post_create_failure_still_resolves_as_created`
+    and `test_worker_record_task_failure_still_resolves_as_created`.
+
+    NOT usable for a *zero*-count assertion: `poll_until_stable` treats a
+    falsy sample as not-yet-ready, so a caller expecting zero events would
+    spin for the full *timeout* every time. See
+    `test_worker_tm_add_task_failure_marks_ticket_failed`, which asserts a
+    zero count and does not use this helper.
+
+    Args:
+        journal_calls: The list a test's `capturing_journal` shim appends
+            `_journal` calls into.
+        event_type: The `EventType` member to count.
+        settle: Forwarded to `poll_until_stable`.
+        timeout: Forwarded to `poll_until_stable`.
+
+    Returns:
+        The settled count (always >= 1 given the zero-count caveat above).
     """
-    return await poll_until(
-        lambda: [e for e in journal_calls if getattr(e, 'type', None) == event_type],
+    return await poll_until_stable(
+        lambda: sum(1 for e in journal_calls if getattr(e, 'type', None) == event_type),
+        settle=settle,
         timeout=timeout,
-        message='ticket resolved but no journal event was emitted',
+        message=f'worker did not journal a {event_type} event',
     )
 
 # ---------------------------------------------------------------------------
@@ -706,27 +742,9 @@ async def test_worker_created_path_emits_journal_event(
         # timeout first.
         await _poll_ticket_resolved(ticket_store, ticket_id)
 
-        # SETTLE barrier, not a liveness poll: wait for the task_created count
-        # to STOP CHANGING, not merely to become non-zero.  The assertion below
-        # is an exact count, and a liveness poll returns at the *first* event —
-        # so a duplicate arriving milliseconds later would be structurally
-        # invisible.  The duplicate is concrete: task_created is emitted from
-        # two distinct paths (task_interceptor.py:3786-3795 and 4164-4173),
-        # both of which persist the terminal ticket row *before* emitting, so
-        # neither a ticket-row predicate nor a first-event predicate closes the
-        # emission window.  settle=0.2 restores exactly the width of the
-        # `asyncio.sleep(0.2)` this poll replaced — but measured from the first
-        # event rather than from submit_task, so a late-scheduled worker under
-        # `-n auto` no longer eats the window.
-        await poll_until_stable(
-            lambda: sum(
-                1 for e in journal_calls
-                if getattr(e, 'type', None) == EventType.task_created
-            ),
-            settle=0.2,
-            timeout=10.0,
-            message='worker did not journal a task_created event',
-        )
+        # SETTLE barrier: see _poll_journal_settled's docstring for why a
+        # liveness poll cannot substitute here.
+        await _poll_journal_settled(journal_calls, EventType.task_created)
 
     # Exactly one task_created event must have been journalled
     task_created_events = [
@@ -1113,10 +1131,11 @@ async def test_worker_post_create_failure_still_resolves_as_created(
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
         ticket_id = result['ticket']
 
-        # See _poll_journal_emitted's docstring for why this second, short
-        # poll is needed in addition to the row-terminality poll.
         row = await _poll_ticket_resolved(ticket_store, ticket_id)
-        await _poll_journal_emitted(journal_calls, EventType.task_created)
+
+        # SETTLE barrier: see _poll_journal_settled's docstring for why a
+        # liveness poll cannot substitute here.
+        await _poll_journal_settled(journal_calls, EventType.task_created)
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
@@ -1192,10 +1211,11 @@ async def test_worker_record_task_failure_still_resolves_as_created(
         assert result.get('ticket', '').startswith('tkt_'), f'Got: {result}'
         ticket_id = result['ticket']
 
-        # See _poll_journal_emitted's docstring for why this second, short
-        # poll is needed in addition to the row-terminality poll.
         row = await _poll_ticket_resolved(ticket_store, ticket_id)
-        await _poll_journal_emitted(journal_calls, EventType.task_created)
+
+        # SETTLE barrier: see _poll_journal_settled's docstring for why a
+        # liveness poll cannot substitute here.
+        await _poll_journal_settled(journal_calls, EventType.task_created)
 
     # (1) tm.add_task was called exactly once
     taskmaster.add_task.assert_called_once()
@@ -2260,34 +2280,44 @@ class TestCuratorWorkerBatchDrain:
     async def test_curator_lock_held_across_entire_batch(
         self, interceptor_with_store, ticket_store, taskmaster,
     ):
-        """The curator_lock is held across the ENTIRE batch — curate_batch + dispatch.
+        """_curator_lock is held across the ENTIRE batch, curate_batch + dispatch.
 
-        While curate_batch is in-flight, a concurrent attempt to acquire
-        _curator_lock should block until the batch (curate_batch + per-ticket
-        dispatch) fully completes.
+        The lock is sampled at each in-batch phase (curate_batch, tm.add_task,
+        note_created, record_task), and a waiter queued while curate_batch is
+        in flight acquires only after record_task has run.
         """
         project_id = 'project'
+        lock = interceptor_with_store._curator_lock(project_id)
+        held_during: dict[str, bool] = {}
 
-        # Event to block curate_batch in the middle of the batch.
-        release_event = asyncio.Event()
-        curate_batch_started = asyncio.Event()
+        curate_batch_entered = asyncio.Event()
+        release_batch = asyncio.Event()
 
         async def blocking_curate_batch(candidates, pid, project_root):
-            curate_batch_started.set()
-            # Block until test releases us.
-            await release_event.wait()
+            held_during['curate_batch'] = lock.locked()
+            curate_batch_entered.set()
+            await release_batch.wait()
             return [CuratorDecision(action='create', justification='ok')
                     for _ in candidates]
+
+        async def recording_add_task(*args, **kwargs):
+            held_during['add_task'] = lock.locked()
+            return {'id': '99', 'title': 'Locked Task'}
+
+        def recording_note_created(*args, **kwargs):
+            held_during['note_created'] = lock.locked()
+
+        async def recording_record_task(*args, **kwargs):
+            held_during['record_task'] = lock.locked()
 
         mock_curator = MagicMock()
         mock_curator.curate_batch = AsyncMock(side_effect=blocking_curate_batch)
         _stub_prepare_candidate(mock_curator)
-        mock_curator.note_created = MagicMock()
-        mock_curator.record_task = AsyncMock()
+        mock_curator.note_created = MagicMock(side_effect=recording_note_created)
+        mock_curator.record_task = AsyncMock(side_effect=recording_record_task)
 
-        taskmaster.add_task = AsyncMock(return_value={'id': '99', 'title': 'Locked Task'})
+        taskmaster.add_task = AsyncMock(side_effect=recording_add_task)
 
-        # Submit one ticket.
         t1 = await ticket_store.submit(project_id, self._make_candidate_json('Locked Task'))
 
         queue = interceptor_with_store._ticket_queues.setdefault(
@@ -2295,48 +2325,62 @@ class TestCuratorWorkerBatchDrain:
         )
         queue.put_nowait(t1)
 
-        # Track whether the competing coroutine acquired the lock.
-        lock_acquired_while_batch_running = False
-        competing_acquired = asyncio.Event()
+        competitor_queued = asyncio.Event()
 
-        async def competing_acquire():
-            nonlocal lock_acquired_while_batch_running
-            # Wait until curate_batch has started so we know the batch lock is held.
-            await curate_batch_started.wait()
-            # Now try to acquire the lock (non-blocking check).
-            lock = interceptor_with_store._curator_lock(project_id)
-            lock_acquired_while_batch_running = lock.locked()
-            # Now try a blocking acquire — it should succeed after batch finishes.
-            await lock.acquire()
-            lock.release()
-            competing_acquired.set()
+        async def competing_acquire() -> int:
+            competitor_queued.set()
+            async with lock:
+                return mock_curator.record_task.await_count
 
-        with patch.object(
-            type(interceptor_with_store), '_get_curator',
-            new=AsyncMock(return_value=mock_curator),
-        ), patch.object(
-            type(interceptor_with_store), '_ensure_taskmaster',
-            new=AsyncMock(return_value=taskmaster),
-        ):
-            interceptor_with_store._start_worker_if_needed(project_id)
+        competitor: asyncio.Task[int] | None = None
+        try:
+            with patch.object(
+                type(interceptor_with_store), '_get_curator',
+                new=AsyncMock(return_value=mock_curator),
+            ), patch.object(
+                type(interceptor_with_store), '_ensure_taskmaster',
+                new=AsyncMock(return_value=taskmaster),
+            ):
+                interceptor_with_store._start_worker_if_needed(project_id)
+                await poll_until(
+                    curate_batch_entered.is_set,
+                    message='worker never entered curate_batch',
+                )
 
-            # Start the competing coroutine.
-            competing_task = asyncio.create_task(competing_acquire())
+                competitor = asyncio.create_task(competing_acquire())
+                await poll_until(
+                    competitor_queued.is_set,
+                    message='competing acquirer never started',
+                )
+                assert not competitor.done(), (
+                    'competing acquirer obtained _curator_lock while '
+                    'curate_batch was in flight'
+                )
 
-            # Wait for curate_batch to be entered.
-            await asyncio.wait_for(curate_batch_started.wait(), timeout=2.0)
+                release_batch.set()
+                row = await _poll_ticket_resolved(ticket_store, t1)
+                await poll_until(
+                    competitor.done,
+                    message='_curator_lock was never released after the batch',
+                )
+        finally:
+            release_batch.set()
+            if competitor is not None and not competitor.done():
+                competitor.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await competitor
 
-            # Release the batch so it can complete.
-            release_event.set()
-
-            # Wait for competing coroutine to finish.
-            await asyncio.wait_for(competing_acquired.wait(), timeout=2.0)
-            await competing_task
-
-        # The lock MUST have been held (locked) when curate_batch was in-flight.
-        assert lock_acquired_while_batch_running, (
-            '_curator_lock was NOT locked during curate_batch — lock not held across batch'
+        assert held_during == {
+            'curate_batch': True, 'add_task': True,
+            'note_created': True, 'record_task': True,
+        }, f'_curator_lock not held across every batch phase: {held_during}'
+        assert competitor.result() == 1, (
+            'hand-off order: a waiter queued on _curator_lock during '
+            'curate_batch must acquire only after the batch ran record_task '
+            '(the in-phase locked() samples cannot see who is handed the '
+            f'lock next); it saw record_task.await_count={competitor.result()}'
         )
+        assert row['status'] == 'created', f'Expected created, got {row["status"]}'
 
     @pytest.mark.asyncio
     async def test_end_to_end_three_tickets_one_llm_call_all_resolve_correctly(

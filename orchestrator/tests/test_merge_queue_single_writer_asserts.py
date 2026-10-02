@@ -43,6 +43,12 @@ lane-buffer mutation call sites.
                 forced on, proving the steps 04/06 wiring never raises a
                 false-positive ``AssertionError`` against the production
                 coroutines.
+
+These real-git cases observe the lane through an injected ``VerifyPort``
+rather than a patch of ``run_scoped_verification``.  What that does and
+does NOT stub of the post-merge gate chain is stated once, with the
+measurement behind it, in ``_merge_lane_verifier_doubles.py``'s module
+docstring.
 """
 
 from __future__ import annotations
@@ -51,9 +57,11 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
+from _merge_lane_fakes import FakeVerifier
+from _orch_helpers import wait_responsive
 
 from orchestrator import merge_queue
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -135,8 +143,12 @@ def _make_worker(git_ops: GitOps) -> SpeculativeMergeWorker:
     Mirrors test_merge_queue_verify_base_invariant.py's helper of the same
     name. ``_merger_task``/``_verifier_task`` default to None (never-started
     loops) and ``_running`` defaults to True (see merge_queue.py ``__init__``).
+
+    ``escalation_queue`` is passed explicitly rather than defaulted: several
+    tests below drive a deliberately-unregistered sentinel request_id, and a
+    non-None queue would make the lifecycle alarm actually submit.
     """
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue())
+    return SpeculativeMergeWorker(git_ops, asyncio.Queue(), escalation_queue=None)
 
 
 def _make_req(
@@ -234,7 +246,6 @@ class TestAssertSingleWriterLaneBufferWiring:
         """(1) Flag OFF: a foreign merger task never raises — zero-overhead no-op."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', False)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._merger_task = await _make_foreign_task()
 
         req = _make_req(config, tmp_path)
@@ -248,7 +259,6 @@ class TestAssertSingleWriterLaneBufferWiring:
         """(2) Flag ON + running + foreign merger task: append raises, naming the structure."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._merger_task = await _make_foreign_task()
 
         req = _make_req(config, tmp_path)
@@ -268,7 +278,6 @@ class TestAssertSingleWriterLaneBufferWiring:
         worker._lane_buffers['normal'].append(req)
 
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
-        worker._running = True
         worker._merger_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_lane_buffers'):
@@ -280,7 +289,6 @@ class TestAssertSingleWriterLaneBufferWiring:
         """(3) Flag ON but no owner task recorded yet: no-op (direct-call / unstarted-loop)."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._merger_task = None
 
         req = _make_req(config, tmp_path)
@@ -308,7 +316,6 @@ class TestAssertSingleWriterLaneBufferWiring:
         """(5) Flag ON + running + the CALLER is the recorded owner: no-op."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._merger_task = asyncio.current_task()
 
         req = _make_req(config, tmp_path)
@@ -337,7 +344,6 @@ class TestAssertSingleWriterInflightWiring:
         """(1) Flag OFF: a foreign verifier task never raises — zero-overhead no-op."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', False)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._verifier_task = await _make_foreign_task()
 
         entry = _sentinel_entry()
@@ -354,7 +360,6 @@ class TestAssertSingleWriterInflightWiring:
         """(2) Flag ON + running + foreign verifier task: append raises, naming the structure."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._verifier_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_inflight'):
@@ -372,7 +377,6 @@ class TestAssertSingleWriterInflightWiring:
         worker._inflight.append(_sentinel_entry())
 
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
-        worker._running = True
         worker._verifier_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_inflight'):
@@ -386,7 +390,6 @@ class TestAssertSingleWriterInflightWiring:
         worker._inflight.append(_sentinel_entry())
 
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
-        worker._running = True
         worker._verifier_task = await _make_foreign_task()
 
         with pytest.raises(AssertionError, match='_inflight'):
@@ -398,7 +401,6 @@ class TestAssertSingleWriterInflightWiring:
         """(3) Flag ON but no owner task recorded yet: no-op (direct-call / unstarted-loop)."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._verifier_task = None
 
         entry = _sentinel_entry()
@@ -429,7 +431,6 @@ class TestAssertSingleWriterInflightWiring:
         """(5) Flag ON + running + the CALLER is the recorded owner: no-op."""
         monkeypatch.setattr(merge_queue, '_DEBUG_ASSERTS', True)
         worker = _make_worker(git_ops)
-        worker._running = True
         worker._verifier_task = asyncio.current_task()
 
         entry = _sentinel_entry()
@@ -489,7 +490,6 @@ class TestSentinelEntryChokePointContract:
         actually submit.
         """
         worker = _make_worker(git_ops)
-        assert worker._escalation_queue is None
 
         entry = _sentinel_entry()
         worker._inflight_append(entry)  # must not raise
@@ -599,26 +599,27 @@ class TestDebugAssertsSuiteWideAndConformance:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(e2e_git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
+        worker = SpeculativeMergeWorker(e2e_git_ops, queue, verifier=FakeVerifier())
 
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            AsyncMock(return_value=MagicMock(passed=True, summary='')),
-        ):
-            req_n = _make_e2e_request('sw-e2e-n', 'sw-e2e-n', wt_n, e2e_config)
-            req_n1 = _make_e2e_request('sw-e2e-n1', 'sw-e2e-n1', wt_n1, e2e_config)
+        req_n = _make_e2e_request('sw-e2e-n', 'sw-e2e-n', wt_n, e2e_config)
+        req_n1 = _make_e2e_request('sw-e2e-n1', 'sw-e2e-n1', wt_n1, e2e_config)
 
+        async with running_merge_worker(worker):
             # Submit both before the worker processes them, matching
             # test_speculative_basic_throughput's real-pipeline shape.
             await queue.put(req_n)
             await queue.put(req_n1)
 
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+            outcome_n = await wait_responsive(
+                req_n.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='sw-e2e-n (N) merge outcome, debug asserts ON',
+            )
+            outcome_n1 = await wait_responsive(
+                req_n1.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='sw-e2e-n1 (N+1) merge outcome, debug asserts ON',
+            )
 
-        assert outcome_n.status == 'done', f'N failed: {outcome_n}'
-        assert outcome_n1.status == 'done', f'N+1 failed: {outcome_n1}'
-
-        await worker.stop()
-        await worker_task
+            assert outcome_n.status == 'done', f'N failed: {outcome_n}'
+            assert outcome_n1.status == 'done', f'N+1 failed: {outcome_n1}'

@@ -53,7 +53,7 @@ class TestParseUtc:
         from dashboard.data.utils import parse_utc
 
         with pytest.raises(TypeError):
-            parse_utc(None)  # type: ignore[arg-type]
+            parse_utc(None)
 
     def test_none_raises_type_error_with_explicit_message(self):
         """TypeError raised for None should have the explicit message 'timestamp is None'."""
@@ -62,7 +62,7 @@ class TestParseUtc:
         from dashboard.data.utils import parse_utc
 
         with pytest.raises(TypeError, match='timestamp is None'):
-            parse_utc(None)  # type: ignore[arg-type]
+            parse_utc(None)
 
     def test_docstring_describes_none_raises_type_error_explicitly(self):
         """parse_utc docstring must document None raising TypeError explicitly."""

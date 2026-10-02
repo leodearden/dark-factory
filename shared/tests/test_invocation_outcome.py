@@ -13,9 +13,11 @@ import pytest
 from shared import cli_invoke as cli_invoke_module
 from shared import invocation_outcome as invocation_outcome_module
 from shared import usage_gate as usage_gate_module
+from shared.cap_markers import REAL_CLI_CAP_MESSAGES
 from shared.cli_invoke import AgentResult
 from shared.invocation_outcome import (
     OK,
+    REAL_CLI_AUTH_REJECTIONS,
     AuthFailed,
     CapHit,
     CliLocalError,
@@ -23,11 +25,13 @@ from shared.invocation_outcome import (
     InvocationOutcome,
     NearCap,
     ServerError,
+    TextAuthRejection,
     ZeroOutputWedge,
     _extract_cap_message,
     _parse_resets_at,
     auth_failure_reason,
     classify_invocation,
+    classify_text_auth_rejection,
 )
 
 
@@ -154,6 +158,13 @@ class TestAuthFailureReason:
         assert 'auth_failure_reason' in invocation_outcome_module.__all__
 
 
+# Reference "now" for the cases ported from the retired usage_gate.py fork
+# (task 4357). Distinct from TestParseResetsAt.FIXED_NOW so the pre-existing
+# cases keep their own measured expectations; mid-January and midday so that
+# both "already past this year" and "still ahead today" branches are reachable.
+_MID_JAN = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+
+
 class TestParseResetsAt:
     """_parse_resets_at: 7.1.a — None on parse failure, never a fabricated now+1h."""
 
@@ -247,6 +258,102 @@ class TestParseResetsAt:
         result = _parse_resets_at('resets in 1h')
         assert result is not None
 
+    # --- Ported from the retired usage_gate.py _parse_resets_at fork (task
+    # 4357). Every expectation below was previously pinned ONLY against that
+    # fork; the fork read the wall clock unconditionally, so its assertions
+    # were wall-clock windows. Here ``now`` is injected, so each is an exact
+    # equality instead. ---
+
+    def test_absolute_with_date_no_comma(self):
+        """'resets Mar 30 6pm (UTC)' — the comma after the day is optional
+        (`,?` in the with-date regex)."""
+        result = _parse_resets_at('resets Mar 30 6pm (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 3, 30, 18, 0, tzinfo=UTC)
+
+    def test_absolute_with_date_non_utc_timezone(self):
+        """A non-UTC tz is honoured, DST included: Mar 31 is inside BST
+        (UTC+1), so 2:30pm London is 13:30 UTC."""
+        result = _parse_resets_at('resets Mar 31, 2:30pm (Europe/London)', now=_MID_JAN)
+        assert result == datetime(2026, 3, 31, 13, 30, tzinfo=UTC)
+
+    def test_relative_is_case_insensitive(self):
+        result = _parse_resets_at('RESETS IN 3H', now=_MID_JAN)
+        assert result == _MID_JAN + timedelta(hours=3)
+
+    def test_relative_zero_hours_is_now_exactly(self):
+        """The zero-delta boundary: 'resets in 0h' is a parse SUCCESS
+        returning `now` itself, not a fall-through to None."""
+        result = _parse_resets_at('resets in 0h', now=_MID_JAN)
+        assert result == _MID_JAN
+
+    def test_relative_embedded_in_longer_text(self):
+        text = "You've hit your limit. Your usage resets in 5h. Please wait."
+        result = _parse_resets_at(text, now=_MID_JAN)
+        assert result == _MID_JAN + timedelta(hours=5)
+
+    def test_absolute_with_date_embedded_in_longer_text(self):
+        text = "You've hit your limit - resets Mar 30, 6pm (Europe/London)"
+        result = _parse_resets_at(text, now=_MID_JAN)
+        assert result == datetime(2026, 3, 30, 17, 0, tzinfo=UTC)
+
+    def test_full_month_name(self):
+        """Full month names parse identically to their 3-letter
+        abbreviations. Regression: the month group was once `[A-Za-z]{3}`,
+        requiring EXACTLY 3 characters, so any 4+ char month name silently
+        fell through — on the old fork, to a fabricated `now + 1h`."""
+        result = _parse_resets_at('resets June 5, 7pm (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 6, 5, 19, 0, tzinfo=UTC)
+
+    def test_full_month_name_april_with_colon_minutes(self):
+        """Same `[A-Za-z]{3}`-once-required regression as above, with a
+        H:MM am time rather than a bare hour."""
+        result = _parse_resets_at('resets April 15, 9:30am (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 4, 15, 9, 30, tzinfo=UTC)
+
+    def test_full_month_name_september_is_the_nine_char_upper_bound(self):
+        """'September' is the longest English month name (9 chars) — the
+        upper bound of the `[A-Za-z]{3,9}` month group. Same regression
+        note as the two cases above."""
+        result = _parse_resets_at('resets September 1, 6am (UTC)', now=_MID_JAN)
+        assert result == datetime(2026, 9, 1, 6, 0, tzinfo=UTC)
+
+    def test_midnight_and_next_year_bump(self):
+        """'12am' parses to hour 0 (not 12), and Jan 1 00:00 is already
+        behind a mid-January `now`, so the with-date branch bumps the
+        year."""
+        result = _parse_resets_at('resets Jan 1, 12am (UTC)', now=_MID_JAN)
+        assert result == datetime(2027, 1, 1, 0, 0, tzinfo=UTC)
+
+    # --- Fall-through arms of the two absolute branches. These were never
+    # covered on this copy in either form: the fork's tests could not pin
+    # them because the fork answered every one with a fabricated `now + 1h`
+    # rather than a distinguishable None. ---
+
+    def test_unknown_month_returns_none(self):
+        """The with-date regex matches but `_MONTH_ABBR` has no 'xyz', so
+        the branch raises into `except Exception: pass`; the no-date branch
+        then fails to match (a month word precedes the time), so the
+        function falls all the way through to None."""
+        assert _parse_resets_at('resets Xyz 30, 6pm (UTC)', now=_MID_JAN) is None
+
+    def test_with_date_unparseable_time_returns_none(self):
+        """The regex matches '99:99pm', but every strptime format fails, so
+        the `for/else` raises into `except Exception: pass` → None."""
+        assert _parse_resets_at('resets Mar 30, 99:99pm (UTC)', now=_MID_JAN) is None
+
+    def test_with_date_unknown_timezone_returns_none(self):
+        """ZoneInfo raises on a non-existent key inside the with-date
+        branch's try → None."""
+        assert _parse_resets_at('resets Mar 30, 6pm (Fake/Zone)', now=_MID_JAN) is None
+
+    def test_no_date_unparseable_time_returns_none(self):
+        """The no-date branch's own `for/else: return None` arm."""
+        assert _parse_resets_at('resets 99:99pm (UTC)', now=_MID_JAN) is None
+
+    def test_no_date_unknown_timezone_returns_none(self):
+        """ZoneInfo raises inside the no-date branch's try → None."""
+        assert _parse_resets_at('resets 6pm (Fake/Zone)', now=_MID_JAN) is None
+
 
 class TestExtractCapMessage:
     """_extract_cap_message: returns the sentence containing the matched prefix."""
@@ -263,6 +370,45 @@ class TestExtractCapMessage:
         text = "YOU'VE HIT YOUR usage limit. resets in 3h."
         message = _extract_cap_message(text, "you've hit your")
         assert message != ''
+
+    # --- Truncation, ported from the retired usage_gate.py fork (task 4357).
+    # The two bodies were byte-identical, so these pin behaviour that was
+    # always this copy's too — it simply had no test here. ---
+
+    def test_long_text_truncated_at_newline(self):
+        """A newline inside the 200-char window wins over the char bound:
+        the whole first line comes back, however long."""
+        line = "You've hit your " + 'x' * 300
+        result = _extract_cap_message(line + '\nNext line', "You've hit your")
+        assert result == line.strip()
+
+    def test_no_newline_truncated_at_200_chars(self):
+        """With no newline the extract is capped at idx+200."""
+        text = "You've hit your " + 'x' * 300
+        result = _extract_cap_message(text, "You've hit your")
+        assert len(result) == 200
+
+    # --- Offset arithmetic, also ported from the fork suites (task 4357).
+    # Every case above puts the prefix at index 0, where `text.find('\n', idx)`
+    # and `min(idx + 200, len(text))` are indistinguishable from `text.find(
+    # '\n')`, `text[:end]` and `min(200, len(text))`. These two pin the `idx`
+    # in all three — measured to kill each of those mutants. ---
+
+    def test_prefix_after_a_preamble_line_returns_only_that_line(self):
+        """The line the prefix is ON, and nothing else: the preceding line is
+        not swallowed, and the newline that ends the extract is the one AFTER
+        the prefix rather than the earlier one that ends the preamble."""
+        text = "Some preamble\nYou've hit your usage limit for Claude.\nMore text"
+        result = _extract_cap_message(text, "You've hit your")
+        assert result == "You've hit your usage limit for Claude."
+
+    def test_char_bound_counts_from_the_prefix_not_the_text_start(self):
+        """With no newline AFTER the prefix the 200-char window opens at the
+        prefix, so a preamble must not eat into it."""
+        text = 'Some preamble\n' + "You've hit your " + 'x' * 300
+        result = _extract_cap_message(text, "You've hit your")
+        assert result.startswith("You've hit your ")
+        assert len(result) == 200
 
 
 class TestSingleSourceOwnership:
@@ -547,6 +693,103 @@ class TestClassifyInvocationAuthFailedBodyIsScrubbed:
             outcome = classify_invocation(result, strict_confirm=True)
             assert isinstance(outcome, AuthFailed)
             assert outcome.body == text, f'over-masked: {text!r} -> {outcome.body!r}'
+
+
+_EACH_REJECTION = pytest.mark.parametrize(
+    'rejection', REAL_CLI_AUTH_REJECTIONS, ids=lambda rejection: rejection.lead,
+)
+
+
+class TestClassifyTextAuthRejection:
+    """Text-mode ``claude -p`` carries no api_error_status, so an auth rejection
+    is recognised from the stream text alone (task 5947) — and only when the
+    stream OPENS with a measured rejection's lead, because a failed digest's
+    output can quote that sentence and a false AUTH_FAILED lasts the night.
+    """
+
+    @_EACH_REJECTION
+    def test_a_measured_rejection_on_stdout_carries_its_measured_status(self, rejection):
+        outcome = classify_text_auth_rejection(rejection.message, '')
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.status == rejection.status
+        assert outcome.body
+        assert rejection.message.startswith(outcome.body)
+
+    @_EACH_REJECTION
+    def test_a_measured_rejection_on_stderr_also_classifies(self, rejection):
+        outcome = classify_text_auth_rejection('', rejection.message)
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.status == rejection.status
+        assert rejection.message.startswith(outcome.body)
+
+    @_EACH_REJECTION
+    def test_the_lead_alone_identifies_the_rejection_whatever_follows(self, rejection):
+        outcome = classify_text_auth_rejection(f'{rejection.lead} · some newer advice', '')
+        assert isinstance(outcome, AuthFailed)
+        assert outcome.status == rejection.status
+
+    def test_stdout_is_read_before_stderr(self):
+        first, second = (rejection.message for rejection in REAL_CLI_AUTH_REJECTIONS[:2])
+        outcome = classify_text_auth_rejection(first, second)
+        assert isinstance(outcome, AuthFailed)
+        assert first.startswith(outcome.body)
+
+    def test_a_non_matching_stdout_falls_through_to_stderr(self):
+        message = REAL_CLI_AUTH_REJECTIONS[0].message
+        outcome = classify_text_auth_rejection('some unrelated chatter', message)
+        assert isinstance(outcome, AuthFailed)
+        assert message.startswith(outcome.body)
+
+    @_EACH_REJECTION
+    def test_surrounding_whitespace_is_stripped(self, rejection):
+        outcome = classify_text_auth_rejection(f'\n\n  {rejection.message}  \n', '')
+        assert isinstance(outcome, AuthFailed)
+        assert rejection.message.startswith(outcome.body)
+
+    @_EACH_REJECTION
+    def test_the_lead_matches_case_insensitively(self, rejection):
+        assert isinstance(classify_text_auth_rejection(rejection.message.upper(), ''), AuthFailed)
+        assert isinstance(classify_text_auth_rejection('', rejection.message.lower()), AuthFailed)
+
+    @_EACH_REJECTION
+    def test_a_verdict_quoting_the_rejection_is_not_one(self, rejection):
+        verdict = json.dumps({
+            'matches': [{'code': 'C1', 'evidence_quote': rejection.message}],
+            'candidates': [],
+        })
+        assert classify_text_auth_rejection(verdict, '') is None
+        assert classify_text_auth_rejection('', verdict) is None
+
+    @_EACH_REJECTION
+    def test_prose_mentioning_the_rejection_mid_stream_is_not_one(self, rejection):
+        prose = f'the session failed because {rejection.message}'
+        assert classify_text_auth_rejection(prose, prose) is None
+
+    @pytest.mark.parametrize(
+        'text', [*REAL_CLI_CAP_MESSAGES, 'Invalid API key · Please run /login'],
+    )
+    def test_cap_banners_and_unmeasured_401_text_are_not_recognised(self, text):
+        assert classify_text_auth_rejection(text, '') is None
+        assert classify_text_auth_rejection('', text) is None
+
+    @pytest.mark.parametrize('output, stderr', [('', ''), ('   ', '\n\t\n')])
+    def test_empty_streams_are_not_a_rejection(self, output, stderr):
+        assert classify_text_auth_rejection(output, stderr) is None
+
+    @pytest.mark.parametrize('lead', ['', 'Your account', 'organization has disabled'])
+    def test_a_lead_must_open_its_message(self, lead):
+        with pytest.raises(ValueError, match='opening'):
+            TextAuthRejection(
+                message='Your organization has disabled Claude subscription access',
+                lead=lead,
+                status=403,
+            )
+
+    def test_is_exported(self):
+        exported = invocation_outcome_module.__all__
+        assert 'classify_text_auth_rejection' in exported
+        assert 'REAL_CLI_AUTH_REJECTIONS' in exported
+        assert 'TextAuthRejection' in exported
 
 
 class TestClassifyInvocationCliLocalError:

@@ -18,10 +18,12 @@ byte-identical (no lease recorded).
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from typing import Any
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, VerifyScript
 from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -29,6 +31,7 @@ from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_queue import MergeOutcome, MergeRequest, _run_post_merge_verify
 from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_cancel import read_lock_holder_pgid
 
 # ---------------------------------------------------------------------------
 # Real-git fixtures (mirroring test_merge_queue_persistent_worktree.py /
@@ -116,6 +119,32 @@ def _mock_verify_result(passed: bool) -> VerifyResult:
     )
 
 
+class _LeaseObservingVerifier(FakeVerifier):
+    """A ``VerifyPort`` that records the lease holder pgid at dispatch time.
+
+    Injected through ``_run_post_merge_verify(..., verifier=...)`` — the
+    production keyword — rather than monkeypatched, so the observation is
+    taken from inside the REAL ``VerifyRunnerPool``/``LocalRunner`` dispatch
+    the lease is supposed to span (``merge_queue.py`` builds the local pool as
+    ``LocalRunner(..., run_scoped=verifier.run_scoped, ...)``).
+
+    Records the pgid itself, not a "is a lease file present" bool: production
+    writes ``os.getpgrp()`` into the rendezvous
+    (``git_ops.py::GitOps.merge_verify_lease``), so comparing against this
+    process's own group pins WHO holds the lease instead of restating a
+    weakened copy of ``_merge_verify_lease_active``'s predicate.
+    """
+
+    def __init__(self, worktree_base: Path) -> None:
+        super().__init__(default=VerifyScript(result=_mock_verify_result(True)))
+        self._worktree_base = worktree_base
+        self.holder_at_dispatch: list[int | None] = []
+
+    async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
+        self.holder_at_dispatch.append(read_lock_holder_pgid(self._worktree_base))
+        return await super().run_scoped(*args, **options)
+
+
 # ---------------------------------------------------------------------------
 # step-17/18
 # ---------------------------------------------------------------------------
@@ -136,29 +165,22 @@ class TestInflightVerifyMergeLease:
         merge_wt = await git_ops.reset_persistent_merge_worktree(await _head_sha(git_repo))
         req = _make_request(config, tmp_path)
 
-        dispatch_observed_lease: list[bool] = []
+        verifier = _LeaseObservingVerifier(git_ops.worktree_base)
 
-        async def _side(*args, **kwargs):
-            dispatch_observed_lease.append(git_ops._merge_verify_lease_active())
-            return _mock_verify_result(True)
-
-        with patch(
-            'orchestrator.merge_queue.VerifyRunnerPool.dispatch',
-            new=AsyncMock(side_effect=_side),
-        ):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, merge_wt=merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=3, max_enospc=1,
-                runner=None,
-            )
+        outcome = await _run_post_merge_verify(
+            git_ops, req, merge_wt=merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=3, max_enospc=1,
+            runner=None, verifier=verifier,
+        )
 
         assert outcome is None, f'expected PASS (None outcome), got {outcome}'
-        assert dispatch_observed_lease == [True], (
-            'the merge-verify lease must be held at dispatch time for the '
-            'local in-process verify on the persistent warm lane'
+        assert verifier.holder_at_dispatch == [os.getpgrp()], (
+            'the merge-verify lease must be held BY THIS PROCESS GROUP at '
+            'dispatch time for the local in-process verify on the persistent '
+            'warm lane'
         )
-        assert git_ops._merge_verify_lease_active() is False, (
+        assert read_lock_holder_pgid(git_ops.worktree_base) is None, (
             'the lease must be released once the verify span completes'
         )
 
@@ -171,25 +193,17 @@ class TestInflightVerifyMergeLease:
         merge_wt = git_ops.worktree_base / '_merge-abc123'
         req = _make_request(config, tmp_path)
 
-        dispatch_observed_lease: list[bool] = []
+        verifier = _LeaseObservingVerifier(git_ops.worktree_base)
 
-        async def _side(*args, **kwargs):
-            dispatch_observed_lease.append(git_ops._merge_verify_lease_active())
-            return _mock_verify_result(True)
-
-        with patch(
-            'orchestrator.merge_queue.VerifyRunnerPool.dispatch',
-            new=AsyncMock(side_effect=_side),
-        ):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, merge_wt=merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=3, max_enospc=1,
-                runner=None,
-            )
+        outcome = await _run_post_merge_verify(
+            git_ops, req, merge_wt=merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=3, max_enospc=1,
+            runner=None, verifier=verifier,
+        )
 
         assert outcome is None
-        assert dispatch_observed_lease == [False], (
+        assert verifier.holder_at_dispatch == [None], (
             'an ephemeral (non-warm-lane) merge_wt must not record a lease'
         )
 
@@ -203,25 +217,17 @@ class TestInflightVerifyMergeLease:
         merge_wt = git_ops.persistent_merge_worktree_path
         req = _make_request(config, tmp_path)
 
-        dispatch_observed_lease: list[bool] = []
+        verifier = _LeaseObservingVerifier(git_ops.worktree_base)
 
-        async def _side(*args, **kwargs):
-            dispatch_observed_lease.append(git_ops._merge_verify_lease_active())
-            return _mock_verify_result(True)
-
-        with patch(
-            'orchestrator.merge_queue.VerifyRunnerPool.dispatch',
-            new=AsyncMock(side_effect=_side),
-        ):
-            outcome = await _run_post_merge_verify(
-                git_ops, req, merge_wt=merge_wt,
-                timeouts={}, enospc_retries={},
-                max_timeouts=3, max_enospc=1,
-                runner=None,
-            )
+        outcome = await _run_post_merge_verify(
+            git_ops, req, merge_wt=merge_wt,
+            timeouts={}, enospc_retries={},
+            max_timeouts=3, max_enospc=1,
+            runner=None, verifier=verifier,
+        )
 
         assert outcome is None
-        assert dispatch_observed_lease == [False], (
+        assert verifier.holder_at_dispatch == [None], (
             'persistent_merge_worktree=False must never record a lease, '
             'even against the nominal persistent path'
         )

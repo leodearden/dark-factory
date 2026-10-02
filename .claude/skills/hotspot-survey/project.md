@@ -16,7 +16,7 @@
 - **Fix-commit vocabulary**: generic set plus `--grep='amend:'` (post-merge patch-ups) and `--grep='red-main'` (broke main) — these mark the weakest code.
 - **History window**: `--since=2026-01-01` (the autonomous-factory era; most commits are agent-authored TDD).
 - **Subsystem vocabulary seed** (from the 2026-07-06 run; re-derive sizes/churn fresh in Phase 0):
-  merge-queue (merge_queue.py + merge_* satellites), workflow (workflow.py, workflow_types.py), harness (harness.py, invoke/steward), git-worktrees (git_ops.py, warm_lane_pool.py, worktree_identity.py, offline_lane.py, cargo_scope.py), scheduler, verify, fm-task-layer (fused-memory task backend + curator), fm-recon (reconciliation), fm-memory (graphiti/mem0 clients), shared-infra (shared/ incl. usage_gate.py), escalation, dashboard.
+  merge-queue (merge_lane/ package: worker.py + satellites), workflow (workflow.py, workflow_types.py), harness (harness.py, invoke/steward), git-worktrees (git_ops.py, warm_lane_pool.py, worktree_identity.py, offline_lane.py, cargo_scope.py), scheduler, verify, fm-task-layer (fused-memory task backend + curator), fm-recon (reconciliation), fm-memory (graphiti/mem0 clients), shared-infra (shared/ incl. usage_gate.py), escalation, dashboard.
 - **Doc corpora**: `plans/*.md` (PRDs/postmortems), `CHANGELOG.md`, `DESIGN.md`, `docs/`, `fused-memory/docs/`.
 - **Deterministic audit fold-in**: none (no /audit CLI in this repo).
 - **Known-context sources**: fused-memory `search` + the auto-memory index (`~/.claude/projects/-home-leo-src-dark-factory/memory/MEMORY.md`) — incident/fix-batch entries seed cluster `context` paragraphs.

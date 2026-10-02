@@ -18,27 +18,35 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _campaign_gate_helpers import (
+    NO_INJECTED_GATE as _NO_INJECTED_GATE,
+)
+from _campaign_gate_helpers import (
+    CampaignGateProbe as _CampaignGateProbe,
+)
+from _campaign_gate_helpers import (
+    assert_a_degraded_campaign_stays_ungated as _assert_a_degraded_campaign_stays_ungated,
+)
+from _campaign_gate_helpers import (
+    assert_one_gate_serves_every_cell as _assert_one_gate_serves_every_cell,
+)
+from _campaign_gate_helpers import (
+    assert_teardown_survives_a_failing_cell as _assert_teardown_survives_a_failing_cell,
+)
+from _campaign_gate_helpers import (
+    assert_teardown_survives_cancellation as _assert_teardown_survives_cancellation,
+)
+from _campaign_gate_helpers import (
+    eval_base_config as _base_config,
+)
 
-from orchestrator.config import load_config
 from orchestrator.evals.configs import EvalConfig
 from orchestrator.evals.runner import EvalResult
 from orchestrator.workflow import WorkflowOutcome
-
-
-def _base_config(tmp_path: Path):
-    """A deterministic pure-code-default base config via the REAL load_config().
-
-    Mirrors test_eval_boundary_suite._load_default_config: write a minimal YAML
-    setting only project_root so load_config layers it over the packaged
-    defaults.yaml — every leaf resolves to its code default through the real
-    production config-load entry point (never a hand-built OrchestratorConfig).
-    """
-    cfg_path = tmp_path / 'orchestrator.yaml'
-    cfg_path.write_text(f'project_root: {tmp_path}\n')
-    return load_config(cfg_path)
 
 
 def _impl_cfg() -> EvalConfig:
@@ -374,11 +382,33 @@ async def _run_eval_hermetic(
     *,
     judge_config: EvalConfig | None = None,
     outcome: WorkflowOutcome = WorkflowOutcome.DONE,
+    gate=None,
+    injected_gate=_NO_INJECTED_GATE,
+    run_side_effect: BaseException | None = None,
+    collect_side_effect: BaseException | None = None,
 ):
     """Drive run_eval with the worktree/workflow/metrics boundaries mocked.
 
     Returns ``(result, captured)`` where ``captured['build_workflow']`` is the
     kwargs dict build_workflow received (for asserting the threaded config).
+
+    ``_build_eval_usage_gate`` is patched UNCONDITIONALLY (task 4427) and
+    exposed as ``captured['build_gate']``. It has to be: the packaged default is
+    ``usage_cap.enabled: true``, so the real builder would otherwise construct a
+    live ``UsageGate`` off ``_base_config``'s resolved cap block — touching the
+    filesystem for probe dirs and account state, and leaving whether the gate
+    resolves to ``None`` dependent on whatever credentials the test machine
+    happens to export. ``gate=`` sets what the patched builder returns (default
+    ``None``, i.e. the ungated cell every pre-4427 case here already meant).
+
+    ``injected_gate=`` forwards to ``run_eval``'s own ``usage_gate=`` parameter —
+    a gate a campaign owner already built, which this cell must use without
+    tearing down. Omitted, no argument is passed at all (the owned path);
+    ``injected_gate=None`` passes an explicit ``None``, which is NOT the same
+    thing. ``run_side_effect`` / ``collect_side_effect`` make ``workflow.run()``
+    / ``collect_metrics`` raise, the two ways a cell can fail after the gate is
+    resolved — which is what proves the owned teardown really is in a
+    ``finally``.
     """
     from orchestrator.evals import runner
 
@@ -388,7 +418,9 @@ async def _run_eval_hermetic(
         return Path('/fake/wt'), 'run-eval'
 
     fake_wf = MagicMock()
-    fake_wf.run = AsyncMock(return_value=SimpleNamespace(outcome=outcome))
+    fake_wf.run = AsyncMock(
+        return_value=SimpleNamespace(outcome=outcome), side_effect=run_side_effect,
+    )
 
     def fake_build_workflow(**kwargs):
         captured['build_workflow'] = kwargs
@@ -396,17 +428,24 @@ async def _run_eval_hermetic(
 
     metrics_obj = MagicMock()
     metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
-    mock_collect = AsyncMock(return_value=metrics_obj)
+    mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
     mock_save = MagicMock()
+    mock_build_gate = AsyncMock(return_value=gate)
 
     monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
     monkeypatch.setattr(runner, 'save_result', mock_save)
+    monkeypatch.setattr(runner, '_build_eval_usage_gate', mock_build_gate)
+    captured['build_gate'] = mock_build_gate
+    captured['wf'] = fake_wf
 
+    extra: dict[str, Any] = (
+        {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
+    )
     result = await runner.run_eval(
-        Path('/fake/task.json'), config, base, judge_config=judge_config,
+        Path('/fake/task.json'), config, base, judge_config=judge_config, **extra,
     )
     return result, captured
 
@@ -480,11 +519,21 @@ async def _run_end_to_end_hermetic(
     monkeypatch: pytest.MonkeyPatch,
     *,
     outcome: WorkflowOutcome = WorkflowOutcome.DONE,
+    gate=None,
+    injected_gate=_NO_INJECTED_GATE,
+    run_side_effect: BaseException | None = None,
+    collect_side_effect: BaseException | None = None,
 ):
     """Drive run_end_to_end with the worktree/workflow/metrics boundaries mocked.
 
     Returns ``(result, captured, mocks)`` where ``captured['build_workflow']``
-    is the kwargs dict build_workflow received (for asserting config + plan).
+    is the kwargs dict build_workflow received (for asserting config + plan)
+    and ``mocks['build_gate']`` is the patched ``_build_eval_usage_gate``.
+
+    The gate knobs (``gate`` / ``injected_gate`` / ``run_side_effect`` /
+    ``collect_side_effect``) mean exactly what they mean in
+    :func:`_run_eval_hermetic` — see its docstring for why the builder is
+    patched unconditionally.
     """
     from orchestrator.evals import runner
 
@@ -494,7 +543,9 @@ async def _run_end_to_end_hermetic(
         return Path('/fake/wt'), 'run-e2e'
 
     fake_wf = MagicMock()
-    fake_wf.run = AsyncMock(return_value=SimpleNamespace(outcome=outcome))
+    fake_wf.run = AsyncMock(
+        return_value=SimpleNamespace(outcome=outcome), side_effect=run_side_effect,
+    )
 
     def fake_build_workflow(**kwargs):
         captured['build_workflow'] = kwargs
@@ -502,19 +553,27 @@ async def _run_end_to_end_hermetic(
 
     metrics_obj = MagicMock()
     metrics_obj.to_dict.return_value = {'composite_score': 0.9, 'tests_pass': True}
-    mock_collect = AsyncMock(return_value=metrics_obj)
+    mock_collect = AsyncMock(return_value=metrics_obj, side_effect=collect_side_effect)
     mock_save = MagicMock()
+    mock_build_gate = AsyncMock(return_value=gate)
 
     monkeypatch.setattr(runner, 'create_eval_worktree', fake_create_wt)
     monkeypatch.setattr(runner, 'build_workflow', fake_build_workflow)
     monkeypatch.setattr(runner, 'collect_metrics', mock_collect)
     monkeypatch.setattr(runner, 'load_task', lambda _p: task)
     monkeypatch.setattr(runner, 'save_result', mock_save)
+    monkeypatch.setattr(runner, '_build_eval_usage_gate', mock_build_gate)
 
-    result = await runner.run_end_to_end(
-        Path('/fake/task.json'), arch_cfg, impl_cfg, base,
+    extra: dict[str, Any] = (
+        {} if injected_gate is _NO_INJECTED_GATE else {'usage_gate': injected_gate}
     )
-    return result, captured, {'collect': mock_collect, 'save': mock_save, 'wf': fake_wf}
+    result = await runner.run_end_to_end(
+        Path('/fake/task.json'), arch_cfg, impl_cfg, base, **extra,
+    )
+    return result, captured, {
+        'collect': mock_collect, 'save': mock_save, 'wf': fake_wf,
+        'build_gate': mock_build_gate,
+    }
 
 
 @pytest.mark.asyncio
@@ -561,6 +620,159 @@ class TestRunEndToEnd:
 
 
 # ---------------------------------------------------------------------------
+# task 4427 — run_eval / run_end_to_end gain the same injected-gate contract
+# run_architect_eval got: build-and-tear-down only when the caller supplied
+# nothing; use-and-leave-alone when a campaign owner handed one down.
+#
+# These two paths had ZERO gate coverage before this task — nothing outside
+# test_eval_architect.py ever exercised the seam — and they also never tore
+# their OWN gate down (469a2b5bd0 closed that leak for run_architect_eval
+# alone), so the owned-path teardown pins below are closing a pre-existing bug
+# as well as pinning new behaviour.
+# ---------------------------------------------------------------------------
+
+# The two executors differ only in their hermetic driver's arity and in where
+# it parks the patched builder, so the contract is pinned ONCE and parametrized
+# over them rather than cloned class-for-class. Each adapter normalises to
+# ``(result, build_workflow_kwargs, build_gate_mock)``.
+
+async def _drive_run_eval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **gate_kw):
+    result, captured = await _run_eval_hermetic(
+        _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+        **gate_kw,
+    )
+    return result, captured['build_workflow'], captured['build_gate']
+
+
+async def _drive_run_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **gate_kw):
+    result, captured, mocks = await _run_end_to_end_hermetic(
+        _arch_cfg(), _impl_cfg(), _base_config(tmp_path), _e2e_task(tmp_path),
+        monkeypatch, **gate_kw,
+    )
+    return result, captured['build_workflow'], mocks['build_gate']
+
+
+_GATE_EXECUTORS = [
+    pytest.param(_drive_run_eval, id='run_eval'),
+    pytest.param(_drive_run_end_to_end, id='run_end_to_end'),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('drive', _GATE_EXECUTORS)
+class TestInjectedGateContract:
+    async def test_injected_gate_reaches_the_workflow(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _result, wf_kwargs, build_gate = await drive(
+            tmp_path, monkeypatch, injected_gate=gate,
+        )
+
+        assert wf_kwargs['usage_gate'] is gate
+        # The hoist is pointless if the cell builds one anyway.
+        build_gate.assert_not_awaited()
+
+    async def test_injected_gate_is_never_torn_down(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Shutting down a borrowed gate would take failover from every sibling."""
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        await drive(tmp_path, monkeypatch, injected_gate=gate)
+
+        gate.shutdown.assert_not_awaited()
+
+    async def test_injected_gate_survives_a_failing_workflow(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        result, _wf_kwargs, _build_gate = await drive(
+            tmp_path, monkeypatch, injected_gate=gate,
+            run_side_effect=RuntimeError('workflow exploded'),
+        )
+
+        assert result.outcome == 'blocked'
+        gate.shutdown.assert_not_awaited()
+
+    async def test_explicit_none_means_ungated_not_unset(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """A campaign that degraded to ungated must not have cells rebuild."""
+        _result, wf_kwargs, build_gate = await drive(
+            tmp_path, monkeypatch, injected_gate=None,
+        )
+
+        build_gate.assert_not_awaited()
+        assert wf_kwargs['usage_gate'] is None
+
+    async def test_owned_gate_is_built_and_torn_down(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Closes a pre-existing leak: neither executor shut its own gate down."""
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        _result, wf_kwargs, build_gate = await drive(
+            tmp_path, monkeypatch, gate=gate,
+        )
+
+        build_gate.assert_awaited_once()
+        assert wf_kwargs['usage_gate'] is gate
+        gate.shutdown.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        'failure', ['run', 'collect'],
+        ids=['workflow_run_raises', 'collect_metrics_raises'],
+    )
+    async def test_owned_gate_teardown_is_in_a_finally(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+    ):
+        """Both post-gate failure shapes must still reach the teardown.
+
+        A cell that failed is the one most likely to have hit a cap, i.e. the
+        one holding a live account-resume probe loop — leaking there leaks
+        exactly where it costs most.
+        """
+        from shared.testing import make_gate_mock
+
+        gate = make_gate_mock()
+        boom = RuntimeError('boom')
+        kwargs: dict[str, Any] = (
+            {'run_side_effect': boom} if failure == 'run'
+            else {'collect_side_effect': boom}
+        )
+        await drive(tmp_path, monkeypatch, gate=gate, **kwargs)
+
+        gate.shutdown.assert_awaited_once()
+
+    async def test_a_failing_owned_shutdown_never_damages_the_cell(
+        self, drive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Best-effort teardown, mirroring run_architect_eval's finally."""
+        import logging
+
+        from shared.testing import make_gate_mock
+
+        caplog.set_level(logging.WARNING, logger='orchestrator.evals.runner')
+        gate = make_gate_mock()
+        gate.shutdown = AsyncMock(side_effect=RuntimeError('teardown boom'))
+
+        result, _wf_kwargs, _build_gate = await drive(
+            tmp_path, monkeypatch, gate=gate,
+        )
+
+        assert result.outcome == 'done'
+        assert 'shutdown failed' in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # step-07/08 — run_ofat_stage: role-dispatching bounded-concurrency fan-out.
 #
 # OFAT reuses the EXISTING frozen-input executors (decision 9): an implementer
@@ -574,6 +786,19 @@ class TestRunEndToEnd:
 def _ofat_task_loader(path: Path) -> dict:
     return {'id': path.stem, 'project_root': '/fake', 'pre_task_commit': 'x'}
 
+
+# ---------------------------------------------------------------------------
+# task 4427 — ONE gate per campaign, shared by every cell of a stage fan-out.
+#
+# A stage IS the campaign: it expands fixtures × candidates × trials and fans
+# the cells out. Owning the gate there is what lets cell N+1 inherit cell N's
+# cap knowledge instead of re-leasing an account already proved capped — the
+# wall-clock win φ's failover was added for, which a per-cell gate forfeits.
+#
+# The probe, the sentinels and the assertion bodies live in
+# _campaign_gate_helpers so test_runner_matrix and test_eval_architect pin the
+# same contract from the same code.
+# ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 class TestRunOfatStage:
@@ -649,6 +874,75 @@ class TestRunOfatStage:
         assert len(results) == 1
         assert results[0].task_id == 'df_task_ok'
         assert any('failed' in r.message.lower() for r in caplog.records)
+
+    # --- task 4427: the OFAT stage owns ONE gate for the whole screen -------
+
+    def _cells(self, tmp_path: Path):
+        t1 = tmp_path / 'df_task_a.json'
+        t2 = tmp_path / 'df_task_b.json'
+        t1.touch()
+        t2.touch()
+        return [t1, t2], [
+            EvalConfig('claude-opus-high', 'claude', 'opus', 'high'),
+            EvalConfig('architect-sonnet-high', 'claude', 'sonnet', 'high',
+                       role='architect'),
+            EvalConfig('judge-haiku', 'claude', 'haiku', 'medium', role='judge'),
+        ]
+
+    def _stage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe, **kw):
+        from orchestrator.evals import runner
+
+        paths, candidates = self._cells(tmp_path)
+        probe.install('run_eval', 'run_architect_eval', **kw)
+        base = _base_config(tmp_path)
+
+        async def stage():
+            return await runner.run_ofat_stage(
+                paths, candidates, base_config=base, trials=2,
+            )
+        return stage
+
+    async def test_one_gate_serves_every_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_one_gate_serves_every_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
+        # All three role branches (implementer / architect / judge-via-run_eval)
+        # ride the same gate — the judge branch pins JUDGE_OFAT_IMPLEMENTER_PIN
+        # as its config and would be easy to miss when threading.
+        assert len(probe.seen) == 2 * 3 * 2  # fixtures × candidates × trials
+
+    async def test_teardown_survives_a_failing_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_a_failing_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe, fail_on='df_task_a'),
+        )
+
+    async def test_teardown_survives_cancellation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_cancellation(
+            probe, self._stage(tmp_path, monkeypatch, probe, cancel_on='df_task_a'),
+        )
+
+    async def test_a_degraded_campaign_stays_ungated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        probe = _CampaignGateProbe(monkeypatch, None)
+        await _assert_a_degraded_campaign_stays_ungated(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +1066,70 @@ class TestRunOfatStageJudge:
 
 @pytest.mark.asyncio
 class TestRunMatrixStage:
+
+    def _invoke(self, runner, paths, base):
+        arch_survivors = [
+            EvalConfig('arch-sonnet', 'claude', 'sonnet', 'high', role='architect'),
+            EvalConfig('arch-opus', 'claude', 'opus', 'high', role='architect'),
+        ]
+        impl_survivors = [EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')]
+
+        async def stage():
+            return await runner.run_matrix_stage(
+                paths, arch_survivors, impl_survivors, base_config=base, trials=2,
+            )
+        return stage
+
+    # --- task 4427: the stage owns ONE gate for the whole fan-out ----------
+
+    def _stage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe, **kw):
+        from orchestrator.evals import runner
+
+        t1 = tmp_path / 'df_task_a.json'
+        t2 = tmp_path / 'df_task_b.json'
+        t1.touch()
+        t2.touch()
+        probe.install('run_end_to_end', **kw)
+        base = _base_config(tmp_path)
+        return self._invoke(runner, [t1, t2], base)
+
+    async def test_one_gate_serves_every_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_one_gate_serves_every_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
+
+    async def test_teardown_survives_a_failing_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_a_failing_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe, fail_on='df_task_a'),
+        )
+
+    async def test_teardown_survives_cancellation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_cancellation(
+            probe, self._stage(tmp_path, monkeypatch, probe, cancel_on='df_task_a'),
+        )
+
+    async def test_a_degraded_campaign_stays_ungated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        probe = _CampaignGateProbe(monkeypatch, None)
+        await _assert_a_degraded_campaign_stays_ungated(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
     async def test_runs_end_to_end_over_full_cross_product_incl_diagonal(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):
@@ -877,6 +1235,68 @@ class TestRunMatrixStage:
 
 @pytest.mark.asyncio
 class TestRunConfirmStage:
+
+    def _invoke(self, runner, paths, base):
+        arch_winner = EvalConfig('arch-opus', 'claude', 'opus', 'high',
+                                 role='architect')
+        impl_winner = EvalConfig('impl-sonnet', 'claude', 'sonnet', 'high')
+
+        async def stage():
+            return await runner.run_confirm_stage(
+                paths, arch_winner, impl_winner, base_config=base, trials=3,
+            )
+        return stage
+
+    # --- task 4427: the stage owns ONE gate for the whole fan-out ----------
+
+    def _stage(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe, **kw):
+        from orchestrator.evals import runner
+
+        t1 = tmp_path / 'df_task_a.json'
+        t2 = tmp_path / 'df_task_b.json'
+        t1.touch()
+        t2.touch()
+        probe.install('run_end_to_end', **kw)
+        base = _base_config(tmp_path)
+        return self._invoke(runner, [t1, t2], base)
+
+    async def test_one_gate_serves_every_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_one_gate_serves_every_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
+
+    async def test_teardown_survives_a_failing_cell(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_a_failing_cell(
+            probe, self._stage(tmp_path, monkeypatch, probe, fail_on='df_task_a'),
+        )
+
+    async def test_teardown_survives_cancellation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from shared.testing import make_gate_mock
+
+        probe = _CampaignGateProbe(monkeypatch, make_gate_mock())
+        await _assert_teardown_survives_cancellation(
+            probe, self._stage(tmp_path, monkeypatch, probe, cancel_on='df_task_a'),
+        )
+
+    async def test_a_degraded_campaign_stays_ungated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        probe = _CampaignGateProbe(monkeypatch, None)
+        await _assert_a_degraded_campaign_stays_ungated(
+            probe, self._stage(tmp_path, monkeypatch, probe),
+        )
     async def test_runs_single_winning_combo_over_fixtures_and_trials(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ):

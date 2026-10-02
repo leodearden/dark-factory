@@ -55,11 +55,18 @@ B7, never on the category string itself.
   `reap-decisions` → 1).
 
 ### r6 — seed the first two chains (leaf, integration gate)
-- Seed jobs verified real: `reify-closure-staleness-sweep.sh` (exists,
-  executable, stdlib-only, always-exit-0 — needs the predicate variant this task
-  writes; its `$sweep_rc`/`$consumer_rc` already captured) and the
-  transcript-check command (`check_transcript_persistence.py` via uv, unit never
-  installed) — substrate PASS.
-- Delivery: grep `reify-closure-staleness-predicate` in `scripts/` (0 today).
+- Seed jobs verified real: `reclaim-orphaned-worktrees.sh` (exists, executable
+  mode 100755, stdlib-only — it `exec`s `python3 reclaim_orphaned_worktrees.py`
+  with no uv, no `.env` and no service-env exports; live installed timer at
+  04:00; `main()` has a single `return 0` path so it reports success
+  unconditionally and needs the predicate variant this task writes, for which
+  its structured JSON report's `failed` counter and its existing read-only
+  `--check` mode are the input) and the transcript-check command
+  (`check_transcript_persistence.py` via uv, unit never installed) — substrate
+  PASS. Re-verified first-hand after task 5247 retired the originally-named
+  seed.
+- Delivery: `kind: path` on `scripts/reclaim-orphaned-worktrees-predicate.sh`
+  (absent today), repaired by task 6036 from a content grep for that name, which
+  could go green only if some file happened to mention it.
 - End-to-end link→successor demonstration (B10): `manual` — the task IS the
   integration gate; its signal is the product-read-path chain evidence.

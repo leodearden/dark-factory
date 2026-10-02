@@ -160,15 +160,18 @@ class TestCorpusSanityCostDisplay:
 class TestMineMinDiffsThreading:
     """`mine --min-diffs N` must thread N into the post-run audit call."""
 
-    def test_mine_threads_min_diffs_into_post_run_audit(self) -> None:
+    def test_mine_threads_min_diffs_into_post_run_audit(self, tmp_path: Path) -> None:
         """The CLI-supplied --min-diffs floor must reach audit_corpus's
         post-run call, not a hardcoded default.
 
         Hermetic: the candidate pool is forced empty (mine_fn_candidates ->
         [], mine_escalation_refs -> {}) so the pipeline reaches the audit
         call at the end of `mine` without touching the real runs.db, git,
-        or a frontier LLM. The synthetic corpus's diffs are all
-        source='mined' so the hand-authored backfill loop skips them and
+        or a frontier LLM. ``--runs-db`` points at an empty file under
+        ``tmp_path`` so the command's is-file guard passes on any host (the
+        live runs.db is gitignored and exists only on the main checkout's
+        host); the mocked miners never open it. The synthetic corpus's diffs are
+        all source='mined' so the hand-authored backfill loop skips them and
         `_resave()` (which would rewrite the real committed corpus) is
         never invoked. `audit_corpus` is mocked so its return value doesn't
         depend on the real (bypassed) checks -- we only care what it was
@@ -192,6 +195,8 @@ class TestMineMinDiffsThreading:
             ),
         ])
         stub_report = AuditReport(ok=True, diff_count=len(manifest.diffs), failures=[])
+        runs_db = tmp_path / 'runs.db'
+        runs_db.touch()
 
         with (
             patch(
@@ -216,7 +221,9 @@ class TestMineMinDiffsThreading:
             ) as audit_spy,
         ):
             runner = CliRunner()
-            result = runner.invoke(cli, ['mine', '--min-diffs', '80'])
+            result = runner.invoke(
+                cli, ['mine', '--min-diffs', '80', '--runs-db', str(runs_db)],
+            )
 
         assert result.exit_code == 0, (
             f'Command exited with code {result.exit_code}.\nOutput:\n{result.output}'

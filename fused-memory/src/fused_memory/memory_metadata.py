@@ -161,9 +161,21 @@ def normalize_supersedes(value: Any) -> list[Any]:
 #:
 #: Generated mechanically from the census artifact, NOT read at import
 #: time: a registry that mutates when an artifact is regenerated is not
-#: a registry.  ``tests/test_memory_metadata.py::TestKindRegistry`` loads
-#: the artifact and asserts this literal against it, so a regeneration
-#: that adds a kind fails the suite loudly instead of drifting silently.
+#: a registry.  ``tests/test_memory_metadata.py::TestKindRegistry`` asserts
+#: this literal against the census it was DERIVED from — a frozen
+#: projection at ``tests/fixtures/census-grandfather-oracle.json``, not the
+#: live ``plans/`` artifact, which task 4006 turned into a nightly
+#: regenerated trend input (see that constant's docstring for the full
+#: rationale, and for why re-deriving needs leaf β review rather than a
+#: fixture refresh).
+#:
+#: KNOWN STALE against the live corpus as of 2026-08-16: 4006's first live
+#: census measured 385 distinct ``kind`` values vs the 329 below (+70 new,
+#: −14 disappeared).  Harmless under the shipped defaults —
+#: ``enforce_kind_registry`` is False and deliberately stays off (see the
+#: WARNING below) — so nothing is rejected; re-derivation is queued as
+#: reviewed leaf-β work, including a policy for values that LEAVE the
+#: corpus, which this registry does not currently have.
 KIND_REGISTRY: frozenset[str] = frozenset({
     # ---------------------------------------------------------------
     # BLOCK 1 — CENSUS-MEASURED (329 values)
@@ -561,7 +573,7 @@ KIND_REGISTRY: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 
 #: Keys this server stamps onto metadata itself.  They are NOT all stamped at
-#: the same layer, and a reviewer must not read these as three write-seam
+#: the same layer, and a reviewer must not read these as four write-seam
 #: stamps:
 #:
 #: * ``category``   -- stamped at the write seam:
@@ -574,6 +586,17 @@ KIND_REGISTRY: frozenset[str] = frozenset({
 #:                     ``:2921``, read back at ``:2962``).  It is listed here
 #:                     so that a round-tripped search result re-written as
 #:                     metadata does not census-warn on the server's own field.
+#: * ``unverified_claim`` -- stamped at the add_memory write seam
+#:                     (``services/memory_service.py::MemoryService.add_memory``)
+#:                     when the completion-claim gate
+#:                     (``services/completion_claim_gate.py::UNVERIFIED_CLAIM_TAG``)
+#:                     flags the write.  Episode-derived facts get it from
+#:                     ``MemoryService._execute_mem0_classify_and_add``, which
+#:                     does not pass through this validator.  Unlike the
+#:                     census, which only stops warning about it, both seams
+#:                     DISCARD a caller-supplied value
+#:                     (``services/memory_service.py::_stamp_unverified_claim``),
+#:                     so a caller can neither forge the tag nor persist False.
 #:
 #: DELIBERATELY ABSENT: ``run_id``.  It *is* server-stamped, by the same
 #: ``_apply_cycle_summary_metadata_tagging`` helper (``memory_service.py:389``)
@@ -587,6 +610,7 @@ SERVER_STAMPED_KEYS: frozenset[str] = frozenset({
     'category',
     'recon_pool',
     'planned',
+    'unverified_claim',
 })
 
 #: The five keys this PRD reserves and gives shape rules to (V1).  Every one

@@ -27,67 +27,15 @@ import types
 from typing import Any
 
 import pytest
+from _pending_tool_fixtures import (
+    IN_PROGRESS,
+    _file,
+    _get_pending,
+    _harness,
+)
 
-from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
-
-IN_PROGRESS = 'in-progress'
-
-
-def _file(queue: EscalationQueue, task_id: str, **kw: Any) -> Escalation:
-    """Submit one pending escalation and return it."""
-    esc = Escalation(
-        id=queue.make_id(task_id),
-        task_id=task_id,
-        agent_role=kw.pop('agent_role', 'implementer'),
-        severity=kw.pop('severity', 'blocking'),
-        category=kw.pop('category', 'scope_violation'),
-        summary=kw.pop('summary', 'pins-recovery fixture'),
-        level=kw.pop('level', 1),
-        **kw,
-    )
-    queue.submit(esc)
-    return esc
-
-
-class _Scheduler:
-    """Minimal stand-in for orchestrator.scheduler's status accessors.
-
-    ``get_statuses`` returns a ``(statuses, error)`` TUPLE — the real shape at
-    orchestrator/src/orchestrator/scheduler.py:2523, and the reason a caller
-    that assumes a bare dict silently treats an error as "no tasks".
-    """
-
-    def __init__(self, statuses: dict[str, str], error: Exception | None = None):
-        self._statuses = statuses
-        self._error = error
-        self.calls: list[Any] = []
-
-    async def get_statuses(self, ids: list[str] | None = None):
-        self.calls.append(ids)
-        if self._error is not None:
-            return {}, self._error
-        if ids is None:
-            return dict(self._statuses), None
-        return {i: self._statuses[i] for i in ids if i in self._statuses}, None
-
-
-def _harness(statuses: dict[str, str], *, live: set[str] | None = None, **kw: Any):
-    live_ids = live or set()
-    scheduler = _Scheduler(statuses, error=kw.pop('error', None))
-    return types.SimpleNamespace(
-        scheduler=scheduler,
-        is_workflow_active=lambda tid: tid in live_ids,
-        **kw,
-    )
-
-
-async def _get_pending(server, **kwargs: Any) -> list[dict[str, Any]]:
-    """get_pending_escalations is an ASYNC def as of task 3543 — it awaits a
-    batched scheduler status read to compute pins_recovery."""
-    tool = await server.get_tool('get_pending_escalations')
-    return await tool.fn(**kwargs)
 
 
 @pytest.mark.asyncio
@@ -208,6 +156,143 @@ class TestPinsRecoveryBatching:
         # The L0's own filer is gone => dead_l0 => it does not pin, even though
         # its sibling L1 does.  The annotation is per-record, not per-task.
         assert recs[0]['pins_recovery'] == []
+
+
+class _CountingQueue(EscalationQueue):
+    """A REAL queue that records every read it is asked to perform.
+
+    A subclass delegating through ``super()``, deliberately NOT a mock: each
+    counted call must still do the real glob + JSON parse, so these tests
+    cannot pass because the scan was stubbed out from under them.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.get_by_task_calls: list[tuple[Any, ...]] = []
+        self.get_pending_calls: int = 0
+
+    def get_by_task(self, task_id, status=None, level=None, agent_role=None):
+        self.get_by_task_calls.append((task_id, status, level, agent_role))
+        return super().get_by_task(task_id, status, level, agent_role)
+
+    def get_pending(self):
+        self.get_pending_calls += 1
+        return super().get_pending()
+
+    @property
+    def total_reads(self) -> int:
+        return len(self.get_by_task_calls) + self.get_pending_calls
+
+
+@pytest.mark.asyncio
+class TestPinsRecoveryScanBudget:
+    """The annotation adds ZERO queue reads on top of the caller's own.
+
+    ``get_pending_escalations`` already reads every pending record — and, when
+    a ``level`` filter is set, then throws the other levels away.  Re-reading
+    the same directory once per distinct task id to recover exactly what was
+    just discarded makes the tool O(T) full-directory scans on a dashboard
+    poll path.  The data is already in hand; the annotation must group it in
+    memory instead.
+
+    These count SCANS, not results, because the results are identical either
+    way — a green suite is not evidence that the extra I/O is gone.
+    """
+
+    async def test_level_filter_adds_no_per_task_rescan(self, tmp_path):
+        """T distinct task ids must still cost exactly ONE queue read."""
+        task_ids = ('940', '941', '942')
+        queue = _CountingQueue(tmp_path / 'esc')
+        for tid in task_ids:
+            _file(queue, tid, level=1)
+            _file(queue, tid, level=0, filing_claimant_run_id='r1/s1/pid=7')
+        server = create_server(
+            queue, harness=_harness({t: IN_PROGRESS for t in task_ids}),
+        )
+
+        recs = await _get_pending(server, level=1)
+
+        assert sorted(r['task_id'] for r in recs) == list(task_ids)
+        assert queue.get_by_task_calls == [], (
+            'the annotation must not re-read the queue per task; got '
+            f'{queue.get_by_task_calls!r}'
+        )
+        assert queue.get_pending_calls == 1, (
+            'exactly the one read the tool already makes, no more and no '
+            f'fewer; got {queue.get_pending_calls}'
+        )
+
+    async def test_level_filter_still_classifies_against_the_full_open_set(
+        self, tmp_path,
+    ):
+        """Same setup shape as ``test_level_filter_classifies_against_the_full
+        _open_set``, viewed from the other level.
+
+        The grouping the annotation now builds in memory must still contain
+        the record being annotated.  A grouping accidentally derived from the
+        FILTERED list — or one that drops rows — leaves the visible L1's id out
+        of ``PinReport.queue_handoff``, and ``esc.id in report.queue_handoff``
+        then reports a confident ``[]``: "nothing pins this task", the esc-3163
+        collapse, on a task that is in fact pinned.
+        """
+        queue = _CountingQueue(tmp_path / 'esc')
+        _file(queue, '943', level=0, filing_claimant_run_id='r1/s1/pid=7')
+        l1 = _file(queue, '943', level=1)
+        server = create_server(queue, harness=_harness({'943': IN_PROGRESS}))
+
+        recs = await _get_pending(server, level=1)
+
+        assert [r['id'] for r in recs] == [l1.id]
+        assert recs[0]['pins_recovery'] == ['943'], (
+            'the visible L1 pins; a filtered-out dead-L0 sibling must not '
+            'unpin it'
+        )
+
+    async def test_task_id_branch_reads_the_queue_exactly_once(self, tmp_path):
+        """The ``task_id=`` path drops from two scans to one, not to zero."""
+        queue = _CountingQueue(tmp_path / 'esc')
+        _file(queue, '944', level=1)
+        _file(queue, '944', level=0, filing_claimant_run_id='r1/s1/pid=7')
+        _file(queue, '945', level=1)
+        server = create_server(
+            queue, harness=_harness({'944': IN_PROGRESS, '945': IN_PROGRESS}),
+        )
+
+        recs = await _get_pending(server, task_id='944', level=1)
+
+        assert [r['task_id'] for r in recs] == ['944']
+        assert recs[0]['pins_recovery'] == ['944']
+        assert queue.total_reads == 1, (
+            'one read for the view AND the classification; got '
+            f'get_by_task={queue.get_by_task_calls!r} '
+            f'get_pending={queue.get_pending_calls}'
+        )
+
+    async def test_grouping_never_derives_a_task_id_from_a_filename(
+        self, tmp_path,
+    ):
+        """Hyphenated task ids must group by the PARSED task_id only.
+
+        queue.py:1266-1272 records that the retired parse-after-last-hyphen
+        derivation was a real bug (task 3238): recovering task ``1-2`` from a
+        stem would wrongly claim ``esc-1-2-3-9.json``, which belongs to task
+        ``1-2-3``.  The in-memory group-by must never reintroduce it.
+        """
+        queue = _CountingQueue(tmp_path / 'esc')
+        _file(queue, '1-2', level=1)
+        _file(queue, '1-2-3', level=1)
+        server = create_server(
+            queue, harness=_harness({'1-2': IN_PROGRESS, '1-2-3': 'done'}),
+        )
+
+        by_task = {r['task_id']: r for r in await _get_pending(server, level=1)}
+
+        assert sorted(by_task) == ['1-2', '1-2-3']
+        assert by_task['1-2']['pins_recovery'] == ['1-2']
+        # '1-2-3' is done => nothing to recover => it pins nothing.  Were the
+        # two tasks' records conflated by a stem-based grouping, the verdicts
+        # would cross over.
+        assert by_task['1-2-3']['pins_recovery'] == []
 
 
 @pytest.mark.asyncio

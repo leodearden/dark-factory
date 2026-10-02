@@ -27,12 +27,15 @@ a nested-pytest end-to-end failure contract with a non-vacuity control.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import time
+import warnings
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -52,11 +55,15 @@ from df_pytest_isolation import (  # noqa: E402
     LEAK_TOKEN_ENV,
     WAIT_PROOF_GRACE_FLOOR_SECS,
     WAIT_PROOF_GRACE_MULTIPLIER,
+    WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
     fixture_marker,
     leaked_drain_process_reason,
     leaked_drain_processes,
+    load_scaled_grace,
+    read_drain_poll_trace,
     read_leaked_pid,
     run_in_new_session,
+    run_in_new_session_until,
     wait_pid_gone,
     wait_proof_grace_secs,
 )
@@ -348,6 +355,122 @@ class TestRunInNewSession:
         )
 
 
+def _pid_recorded(pidfile: Path) -> Callable[[], bool]:
+    """A condition that holds once the leaker has written its grandchild's pid."""
+    def condition() -> bool:
+        try:
+            return pidfile.read_text().strip().isdigit()
+        except OSError:
+            return False
+    return condition
+
+
+def _never() -> bool:
+    return False
+
+
+class TestRunInNewSessionUntil:
+    """The spawner stops the whole process group once an observed condition holds."""
+
+    def test_it_stops_the_group_as_soon_as_the_condition_holds(self, tmp_path: Path) -> None:
+        """``stopped_on_condition`` is the non-vacuity proof: a stop on the 60s
+        deadline raises ``TimeoutExpired`` instead of returning an outcome."""
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            outcome = run_in_new_session_until(
+                ['bash', str(leaker)], condition=_pid_recorded(pidfile),
+                env=_leaker_env(pidfile), timeout=60,
+            )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert outcome.stopped_on_condition is True
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid}, a grandchild backgrounded by the spawned '
+                'script, is STILL ALIVE after the condition stopped the spawn: '
+                'the stop reached the direct child only.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_output_printed_before_the_stop_is_kept(self, tmp_path: Path) -> None:
+        flag = tmp_path / 'ready.flag'
+        env = dict(os.environ)
+        env['FLAG'] = str(flag)
+
+        outcome = run_in_new_session_until(
+            ['bash', '-c', 'echo READY; : > "$FLAG"; sleep 300'],
+            condition=flag.exists, env=env, timeout=60,
+        )
+
+        assert outcome.stopped_on_condition is True
+        assert 'READY' in outcome.completed.stdout
+
+    def test_a_child_that_exits_first_is_reported_as_completed(self) -> None:
+        outcome = run_in_new_session_until(
+            ['bash', '-c', 'echo hi; echo boom >&2; exit 3'], condition=_never, timeout=30,
+        )
+
+        assert outcome.stopped_on_condition is False
+        assert isinstance(outcome.completed, subprocess.CompletedProcess)
+        assert outcome.completed.returncode == 3
+        assert outcome.completed.stdout == 'hi\n'
+        assert outcome.completed.stderr == 'boom\n'
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            outcome.stopped_on_condition = True  # type: ignore[misc]
+
+    def test_the_deadline_still_binds_and_kills_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        leaked_pid = None
+        try:
+            with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+                run_in_new_session_until(
+                    ['bash', str(leaker)], condition=_never,
+                    env=_leaker_env(pidfile), timeout=2,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            stdout = exc_info.value.stdout
+            text = stdout.decode(errors='replace') if isinstance(stdout, bytes) else stdout
+            assert 'MAIN_UP' in (text or ''), (
+                f'partial stdout was lost on the deadline path; got {text!r}'
+            )
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the deadline fired: the '
+                'deadline path did not stop the whole process group.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+    def test_a_raising_condition_never_leaks_the_group(self, tmp_path: Path) -> None:
+        pidfile = tmp_path / 'leaked.pid'
+        leaker = _leaker_script(tmp_path)
+        pid_recorded = _pid_recorded(pidfile)
+
+        def condition() -> bool:
+            if pid_recorded():
+                raise RuntimeError('condition blew up')
+            return False
+
+        leaked_pid = None
+        try:
+            with pytest.raises(RuntimeError, match='condition blew up'):
+                run_in_new_session_until(
+                    ['bash', str(leaker)], condition=condition,
+                    env=_leaker_env(pidfile), timeout=60,
+                )
+            leaked_pid = read_leaked_pid(pidfile)
+
+            assert wait_pid_gone(leaked_pid), (
+                f'pid {leaked_pid} is STILL ALIVE after the condition raised: an '
+                'exception escaping the poll loop left the process group running.'
+            )
+        finally:
+            _reap(leaked_pid)
+
+
 class TestWaitProofGraceSecs:
     """The grace a wait-proving test hands its script is DERIVED, not typed.
 
@@ -367,7 +490,8 @@ class TestWaitProofGraceSecs:
     # The two spawn timeouts actually in use, at the three sites step-9 edits:
     # test_defer_withholds_restart_while_busy (3s),
     # test_unknown_grace_withholds_restart_while_absent (3s),
-    # test_boundary4_defers_busy_unit_while_others_proceed (20s).
+    # scripts/tests/test_restart_all_orchestrators.py::
+    # test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await (20s).
     REAL_SPAWN_TIMEOUTS = (3, 20)
 
     def test_the_grace_comfortably_exceeds_the_spawn_timeout_that_kills_it(self) -> None:
@@ -408,6 +532,46 @@ class TestWaitProofGraceSecs:
                 'ceiling — a leak from this call site would outlive its fake '
                 'systemctl and reach the real one.'
             )
+
+    def test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits(self) -> None:
+        """``WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS`` is DERIVED, not chosen.
+
+        A wait-proving spawn timeout that is itself load-scaled needs an upper
+        bound, because the grace derived FROM it must still land inside the
+        self-termination ceiling. That bound is not free to be picked: it is
+        the largest spawn timeout whose derived grace still fits.
+
+        Both halves are asserted, and the MAXIMALITY half is the point. Legal
+        alone would pass for any smaller value too, which is exactly how the
+        constant could later be raised by hand until it silently stopped
+        fitting — freehand grace selection is what let 86 orphan pollers
+        accumulate on 2026-08-06. With maximality pinned, the constant cannot
+        be raised without either failing here or deliberately moving
+        ``LEAK_SELF_TERMINATION_CEILING_SECS`` / the multiplier, which is a
+        visible decision rather than a quiet edit.
+
+        Asserted against the imported constants and the FUNCTION, never
+        against the literals 22/88/90: this tracks the formula, so a change to
+        the multiplier or the ceiling re-derives the answer here instead of
+        leaving a restatement of today's arithmetic behind.
+        """
+        legal = wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+        assert legal <= LEAK_SELF_TERMINATION_CEILING_SECS, (
+            f'the cap {WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s derives a grace of '
+            f'{legal}s, past the {LEAK_SELF_TERMINATION_CEILING_SECS}s '
+            'self-termination ceiling — a leak from a call site scaled to the '
+            'cap would outlive its fake systemctl and reach the real one.'
+        )
+
+        over = wait_proof_grace_secs(WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS + 1)
+        assert over > LEAK_SELF_TERMINATION_CEILING_SECS, (
+            f'the cap {WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS}s is not MAXIMAL: '
+            f'{WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS + 1}s still derives '
+            f'{over}s, inside the {LEAK_SELF_TERMINATION_CEILING_SECS}s '
+            'ceiling. Either the cap is being left below what the ceiling '
+            'permits, or the ceiling/multiplier moved and the cap was not '
+            're-derived.'
+        )
 
     def test_a_floor_applies_to_very_short_timeouts(self) -> None:
         """A tiny timeout must not derive a grace that expires mid-test.
@@ -454,6 +618,182 @@ class TestWaitProofGraceSecs:
         """
         assert wait_proof_grace_secs(3) == 30
         assert wait_proof_grace_secs(20) == 80
+
+
+class TestLoadScaledGrace:
+    """The shared subprocess-budget scaler both test roots resolve through.
+
+    Promoted out of ``tests/scripts/test_spawn_claude.py`` (task 4890) so
+    ``scripts/tests/`` can reach it: the two roots cannot import each other's
+    test modules, and ``df_pytest_isolation`` is the established home for
+    cross-root helpers. The first four cases are that file's own
+    ``test_load_scaled_grace_*`` family, MOVED here rather than mirrored (task
+    4890 amendment). A mirror was the wrong shape: both modules sit in the SAME
+    root, so the cross-root import barrier that justifies duplicating a test
+    never applied, and after the promotion both sets exercised one shared
+    definition -- straight duplication. ``test_spawn_claude.py`` keeps only its
+    WRAPPER-specific tests (``_spawn_run_budget``, ``_wait_for_path_scaled``,
+    ``_set_started_grace``), which use this scaler as an oracle rather than
+    re-deriving its arithmetic. The fifth case pins an ordering property this
+    repo now depends on and the original four never covered.
+
+    Colocated with :class:`TestWaitProofGraceSecs` so every
+    ``df_pytest_isolation`` budget helper -- the derived wait-proving grace,
+    its self-termination ceiling, the spawn-timeout cap and this scaler -- is
+    pinned in ONE module instead of scattered across three.
+
+    ``os.getloadavg``/``os.cpu_count`` are patched on the ``os`` MODULE, not
+    on a per-module alias, so the patch is visible from
+    ``df_pytest_isolation``'s own namespace.
+    """
+
+    def test_an_idle_host_returns_base_exactly_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """load-per-core <= 1 floors at base_secs -- no scaling up at all.
+
+        This is the byte-identical-when-unloaded guarantee every call site
+        that adopts this scaler depends on: adopting it can LENGTHEN a budget
+        under contention and can never shorten one or slow an idle run.
+        """
+        monkeypatch.setattr(os, 'getloadavg', lambda: (10.0, 10.0, 10.0))
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        assert load_scaled_grace(3, cap_secs=30) == 3
+
+    def test_it_scales_with_load_per_core(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ceil(base_secs * loadavg1 / cpu_count) once the host is oversubscribed."""
+        monkeypatch.setattr(os, 'getloadavg', lambda: (64.0, 64.0, 64.0))
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        assert load_scaled_grace(3, cap_secs=30) == 6
+
+    def test_it_clamps_to_the_cap(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A pathological host stays bounded instead of growing without limit."""
+        monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        assert load_scaled_grace(3, cap_secs=30) == 30
+
+    def test_no_loadavg_on_this_platform_fails_safe_to_base(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both spellings of "this platform has no loadavg" return base_secs.
+
+        Fail-safe rather than fail-open: an unavailable signal must not turn
+        a budget into something SHORTER than the caller asked for.
+        """
+        def _raise_oserror() -> tuple[float, float, float]:
+            raise OSError('getloadavg not supported on this platform')
+
+        monkeypatch.setattr(os, 'getloadavg', _raise_oserror)
+        assert load_scaled_grace(3, cap_secs=30) == 3
+
+        def _raise_attributeerror() -> tuple[float, float, float]:
+            raise AttributeError('os has no getloadavg on this platform')
+
+        monkeypatch.setattr(os, 'getloadavg', _raise_attributeerror)
+        assert load_scaled_grace(3, cap_secs=30) == 3
+
+    def test_the_floor_beats_the_cap_when_base_exceeds_it(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """base_secs > cap_secs returns base_secs, NOT cap_secs -- and WARNS.
+
+        The ``max(base, min(cap, ...))`` ordering, which the four cases above
+        never reach because each uses base=3 < cap=30. Pinned because callers
+        pass caps DERIVED from an unrelated ceiling (a per-test timeout axe, a
+        leak self-termination bound) rather than caps chosen to sit above every
+        base -- so a cap below a base is a reachable combination, and silently
+        SHORTENING a budget to it is the one behaviour a scaler must never
+        have. Asserted at both an idle and a loaded host, since the clamp is
+        the only term load can move.
+
+        BOTH HALVES MATTER, and the second was added by the task-4890
+        amendment. Safe is not enough: in this regime the ``min`` can never
+        raise the result above the cap and the ``max`` can never lower it
+        below the base, so the budget is INERT at every load and the call site
+        gets none of the load protection adopting this function looks like it
+        bought. Degrading to that silently is what would make a mis-derived cap
+        undiscoverable, so the warning is part of the contract and is asserted
+        here rather than left to a reader's inspection. No current call site is
+        in this regime (3 < 22, 20 < 120), so this is forward-looking.
+        """
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+
+        monkeypatch.setattr(os, 'getloadavg', lambda: (10.0, 10.0, 10.0))
+        with pytest.warns(RuntimeWarning, match='INERT'):
+            assert load_scaled_grace(20, cap_secs=5) == 20
+
+        monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
+        with pytest.warns(RuntimeWarning, match='INERT'):
+            assert load_scaled_grace(20, cap_secs=5) == 20
+
+    def test_the_ordinary_cap_above_base_regime_is_silent(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Non-vacuity for the warning above: every real call site is quiet.
+
+        A guard that fired on the normal `cap_secs >= base_secs` shape would
+        be noise every suite learns to ignore, which is the failure mode of a
+        warning nobody scoped. Covers the loaded, clamped and equal-bounds
+        cases, since those are the ones an off-by-one in the comparison would
+        reach first.
+        """
+        monkeypatch.setattr(os, 'cpu_count', lambda: 32)
+        monkeypatch.setattr(os, 'getloadavg', lambda: (3200.0, 3200.0, 3200.0))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            assert load_scaled_grace(3, cap_secs=30) == 30
+            assert load_scaled_grace(20, cap_secs=20) == 20
+
+
+class TestReadDrainPollTrace:
+    """The drain gate's poll ledger has ONE parser, shared by both test roots."""
+
+    UNIT = 'orchestrator-fake-reify.service'
+
+    def test_an_absent_ledger_reads_as_no_polls(self, tmp_path: Path) -> None:
+        """Callers then fail on their own diagnostic, not a bare FileNotFoundError."""
+        assert read_drain_poll_trace(tmp_path / 'never-written.tsv') == []
+
+    def test_records_are_verdict_unit_pairs_in_file_order(self, tmp_path: Path) -> None:
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidle\t{self.UNIT}\n')
+
+        assert read_drain_poll_trace(ledger) == [('busy', self.UNIT), ('idle', self.UNIT)]
+
+    def test_complete_only_drops_a_record_still_being_appended(self, tmp_path: Path) -> None:
+        """A reader racing the script must never count a half-written record."""
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidl')
+
+        assert read_drain_poll_trace(ledger, complete_only=True) == [('busy', self.UNIT)]
+
+    def test_a_finished_ledger_with_a_torn_record_is_rejected(self, tmp_path: Path) -> None:
+        """Read whole, a torn final record must fail loudly rather than vanish."""
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'busy\t{self.UNIT}\nidl')
+
+        with pytest.raises(ValueError):
+            read_drain_poll_trace(ledger, complete_only=False)
+
+    @pytest.mark.parametrize('bad_line', ['busy', f'busy\t{UNIT}\textra'])
+    def test_a_record_without_exactly_two_fields_names_the_line_and_the_ledger(
+        self, tmp_path: Path, bad_line: str,
+    ) -> None:
+        ledger = tmp_path / 'trace.tsv'
+        ledger.write_text(f'idle\t{self.UNIT}\n{bad_line}\n')
+
+        with pytest.raises(ValueError) as exc_info:
+            read_drain_poll_trace(ledger)
+
+        message = str(exc_info.value)
+        assert repr(bad_line) in message
+        assert str(ledger) in message
 
 
 # ---------------------------------------------------------------------------
