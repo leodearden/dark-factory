@@ -724,23 +724,7 @@ def _unguarded_worker_teardown_methods(source: str) -> list[str]:
 #   bills 90+90+90+40+60+20 = 390s against the shared HEAVY_BARRIER_TEST_TIMEOUT
 #   (300s) -- cannot land without first resolving that mark's arithmetic
 #   across all nine classes that share it.
-#
-# - TestChainInvalidationUnderOverlap::test_n_fail_aborts_downstream_verify_reruns_remerge:
-#   its current (unmigrated) worst-case budget is 175s (45+45+45+20+20),
-#   comfortably under the class's 300s mark today -- but its three
-#   non-suppressed load-bearing waits already sit at the task-2350-widened
-#   45.0 nominal (gate_a, gate_b, req_a), so migrating at preserved nominals
-#   bills 90+90+90 for those three plus 40 for the formerly-suppressed 20.0
-#   req_b wait, plus the unmigrated 20s teardown join = 330s > 300s. It is
-#   the MIGRATED total, not the current one, that blows the mark -- same
-#   shared-mark arithmetic problem as the entry above, same follow-up.
-#
-# Both are filed as one follow-up: resolve the HEAVY_BARRIER_TEST_TIMEOUT
-# arithmetic across every class that shares it, then migrate them.
 _SUPPRESSED_WAIT_DEBT: dict[str, frozenset[str]] = {
-    'TestChainInvalidationUnderOverlap': frozenset({
-        'test_n_fail_aborts_downstream_verify_reruns_remerge',
-    }),
     'TestCascadeErrorContainment': frozenset({
         'test_cascade_cancel_and_release_raises_contained',
     }),
