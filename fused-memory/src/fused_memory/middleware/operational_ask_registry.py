@@ -71,7 +71,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import yaml
+from fused_memory.utils.safe_yaml import load_yaml_list_file
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_curator import CandidateTask
@@ -96,53 +96,20 @@ class OperationalAskEntry:
 
 
 def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
-    """Load the operational-ask registry from a YAML file.
+    """Load the operational-ask registry from a YAML file; never raises.
 
-    Returns an empty list (without warning) when *path* is ``None``.
-    Returns an empty list and emits one WARNING when the file is missing,
-    unreadable, not valid YAML, or its top-level document is not a list.
-    Skips malformed individual entries with one WARNING each while returning
-    the well-formed entries from the same file.
-
-    The function never raises — all failures degrade gracefully to [].
+    File-level failures (unset path, missing / unreadable / undecodable file,
+    invalid YAML, non-list document) degrade to [] as specified by
+    fused_memory/utils/safe_yaml.py::load_yaml_list_file. Malformed individual
+    entries are skipped with one WARNING each.
     """
-    if path is None:
-        return []
-
-    # Missing-file / unreadable
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        logger.warning(
-            "operational_ask_registry: file not found: %s — registry disabled", path
-        )
-        return []
-    except OSError as exc:
-        logger.warning(
-            "operational_ask_registry: cannot read %s: %s — registry disabled",
-            path, exc,
-        )
-        return []
-
-    # Parse
-    try:
-        data = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        logger.warning(
-            "operational_ask_registry: YAML parse error in %s: %s — registry disabled",
-            path, exc,
-        )
-        return []
-
-    if not isinstance(data, list):
-        logger.warning(
-            "operational_ask_registry: expected a YAML list in %s, got %s — registry disabled",
-            path, type(data).__name__,
-        )
-        return []
-
     entries: list[OperationalAskEntry] = []
-    for item in data:
+    for item in load_yaml_list_file(
+        path,
+        logger=logger,
+        label="operational_ask_registry",
+        consequence="registry disabled",
+    ):
         if not isinstance(item, dict):
             logger.warning(
                 "operational_ask_registry: skipping non-dict entry in %s: %r", path, item
