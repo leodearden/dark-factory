@@ -1066,24 +1066,23 @@ class UsageGate:
         ADMISSION POLICY: ``before_invoke`` waits for headroom that does not
         exist yet, this returns ``None`` and lets the caller decide.
 
-        WHY THE SYNC POLICY EXISTS (task 5488). The legibility trickle runs
-        33 sequential one-shot ``claude -p`` subprocesses in a plain
-        synchronous process with no event loop, and task 4736 rules that an
-        all-capped night must DEFER at exit 0 within the nightly's own
-        runtime. ``before_invoke`` cannot serve that caller twice over: it is
-        a coroutine, and when nothing is admissible it awaits ``_open``
-        rather than returning, so it would hang the 03:00 unit until the
-        weekly reset instead of deferring. The alternative — a second,
-        hand-rolled rotation inside ``scripts/legibility/`` — would duplicate
-        the skip predicate, the probe-slot claim and the failover event,
-        which is precisely the drift this extraction prevents.
+        WHY THE SYNC POLICY EXISTS (task 5488). A plain synchronous process
+        with no event loop cannot await ``before_invoke``; today that caller
+        is ``scripts/sitting/nightly_prepare.py``, which leases one account
+        for one headless run and hands the lease straight back. (The
+        legibility trickle it was added for now runs every call through
+        :func:`shared.cli_invoke.invoke_with_cap_retry` on its own event loop
+        with ``park_on_frozen_pool=False``, task 6042.) The alternative — a
+        hand-rolled rotation in ``scripts/`` — would duplicate the skip
+        predicate, the probe-slot claim and the failover event, which is
+        precisely the drift this extraction prevents.
 
         NARROW CONTRACT, READ IT BEFORE CALLING. This method deliberately
         does NOT acquire ``self._lock``: that is an ``asyncio.Lock``, which
         synchronous code cannot hold. It is therefore safe ONLY for a
         single-threaded caller with no concurrent coroutines touching this
-        gate — one process, one invocation at a time, which is exactly the
-        trickle. Every ASYNC caller must keep using
+        gate — one process, one invocation at a time, which is exactly
+        nightly_prepare. Every ASYNC caller must keep using
         :meth:`before_invoke` / :meth:`invoke_slot`, which call this under
         the lock and keep the blocking policy.
 

@@ -47,6 +47,7 @@ _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
+from legibility import account_pool  # noqa: E402
 from shared.cli_invoke import (  # noqa: E402
     AgentResult,
     AllAccountsCappedException,
@@ -358,10 +359,6 @@ def _pool_exhausted(label: str, reason: str) -> NoHeadroom:
 
 def open_pooled_runner(label: str, *, accounts_file=None, env_file=None) -> SessionRunner:
     """A :class:`SessionRunner` over the fleet's shared account pool."""
-    # Function-local only while account_pool still imports coder (which
-    # imports this module); hoisted once that import is retired.
-    from legibility import account_pool
-
     return SessionRunner(
         account_pool.build_pool(accounts_file=accounts_file, env_file=env_file),
         label=label,
