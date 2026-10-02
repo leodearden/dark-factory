@@ -13,7 +13,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import logging
-from enum import Enum
 from pathlib import Path
 
 import pytest
@@ -54,12 +53,9 @@ def _all_text(kept: tuple) -> str:
 
 
 class TestMemoryFailure:
-    def test_the_reason_classes_are_an_enum_whose_values_the_notices_render(self):
-        assert issubclass(MemoryFailure, Enum)
-        assert {member.name: member.value for member in MemoryFailure} == {
-            'TIMEOUT': 'timeout',
-            'TRANSPORT': 'transport',
-            'MALFORMED': 'malformed',
+    def test_the_notices_can_render_exactly_three_reason_classes(self):
+        assert {failure.value for failure in MemoryFailure} == {
+            'timeout', 'transport', 'malformed',
         }
 
 

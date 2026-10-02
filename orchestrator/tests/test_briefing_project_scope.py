@@ -542,16 +542,28 @@ class TestTaskEntityChannel:
             for r in caplog.records
         )
 
-    async def test_a_non_json_graph_reply_renders_nothing_and_warns(
-        self, briefing: BriefingAssembler, caplog,
+    @pytest.mark.parametrize(
+        'text',
+        ['not json', '["a", "list"]', '"a bare string"', 'null'],
+        ids=['not-json', 'json-list', 'json-string', 'json-null'],
+    )
+    async def test_a_graph_reply_that_is_not_a_json_object_is_named_malformed(
+        self, briefing: BriefingAssembler, caplog, text,
     ):
+        """Unlike a search reply, a garbled graph reply cannot fail open: the
+        exact-name admission needs the parsed node, so it is a failure, never
+        an empty graph and never rendered."""
         with caplog.at_level(logging.WARNING):
             context = await self._render(briefing, {'result': {
-                'content': [{'type': 'text', 'text': 'not json'}],
+                'content': [{'type': 'text', 'text': text}],
             }})
 
-        assert 'not json' not in context
-        assert 'A recalled fact.' in context
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX,
+            reason=MemoryFailure.MALFORMED.value,
+        ) in context
+        assert text not in context.split('## Task Context')[1]
+        assert 'A recalled fact.' in context, 'the semantic channel still renders'
         assert any('Task 3609' in r.getMessage() for r in caplog.records)
 
     async def test_the_two_channels_of_one_section_name_themselves_apart(
@@ -736,6 +748,16 @@ class TestDegradationIsLoud:
         no_result_logs = [r for r in caplog.records if 'no tool result' in r.getMessage()]
         assert no_result_logs
         assert all(r.levelno >= logging.WARNING for r in no_result_logs)
+
+    async def test_a_reply_with_null_content_is_an_honest_empty_answer(
+        self, briefing: BriefingAssembler,
+    ):
+        """The service answered, oddly but without ``isError``: that is no
+        text, read the same way the shared envelope reader reads it, never a
+        broken recall loop that blames the transport."""
+        context = await _recall(briefing, _answering({'result': {'content': None}}))
+
+        assert context == f'# Context\n\n{MEMORY_EMPTY_NOTICE}'
 
     async def test_a_non_dict_tool_result_is_named_malformed(
         self, briefing: BriefingAssembler,

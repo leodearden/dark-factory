@@ -554,10 +554,23 @@ def tool_error_text(reply: Mapping[str, Any]) -> str | None:
     """
     if not reply.get('isError'):
         return None
-    for block in reply.get('content') or []:
-        if isinstance(block, dict) and block.get('type') == 'text':
-            return str(block.get('text', ''))
-    return ''
+    texts = tool_text_blocks(reply)
+    return texts[0] if texts else ''
+
+
+def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
+    """The text of each ``text`` content block of a tool result, in order.
+
+    An envelope whose ``content`` is missing, null or not a list carries no text.
+    """
+    content = reply.get('content')
+    if not isinstance(content, list):
+        return ()
+    return tuple(
+        str(block.get('text', ''))
+        for block in content
+        if isinstance(block, dict) and block.get('type') == 'text'
+    )
 
 
 MCP_HEADERS = {

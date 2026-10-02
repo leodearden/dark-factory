@@ -16,7 +16,12 @@ from typing import Any
 
 from shared.briefing_queries import BriefingQuerySpec, BriefingScope, queries_for
 
-from orchestrator.mcp_lifecycle import is_timeout_failure, mcp_call, tool_error_text
+from orchestrator.mcp_lifecycle import (
+    is_timeout_failure,
+    mcp_call,
+    tool_error_text,
+    tool_text_blocks,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -322,8 +327,9 @@ class MemoryFailure(Enum):
 
     A timeout says the service is alive and slow; a transport failure says it
     is unreachable; a malformed reply says it answered with no usable result
-    (a JSON-RPC error, a tool-level ``isError``, or a document with no results
-    list). "The corpus holds nothing" is not a failure at all. The values are
+    (a JSON-RPC error, a tool-level ``isError``, a search document with no
+    results list, or a graph reply that is not a JSON object). "The corpus
+    holds nothing" is not a failure at all. The values are
     what the prompt's notices render.
     """
 
@@ -581,16 +587,23 @@ def _search_outcome(text: str, subject: str, project_id: str) -> MemoryQueryOutc
 
 
 def _entity_outcome(text: str, expected_name: str) -> MemoryQueryOutcome:
-    """Decode one ``get_entity`` reply once, render it and read its store health."""
+    """Decode one ``get_entity`` reply once, render it and read its store health.
+
+    Unlike a search reply, a reply that is not a JSON object cannot fail open:
+    the exact-name admission in :func:`render_entity_block` needs the parsed
+    node, so rendering the text verbatim would let a fuzzy neighbour through.
+    It is MALFORMED instead.
+    """
     if not text:
         return MemoryQueryOutcome()
     try:
         payload = json.loads(text)
     except (json.JSONDecodeError, TypeError, ValueError) as e:
         logger.warning(f'MCP get_entity reply for {expected_name!r} is not JSON ({e})')
-        return MemoryQueryOutcome()
+        return MemoryQueryOutcome(failure=MemoryFailure.MALFORMED)
     if not isinstance(payload, dict):
-        return MemoryQueryOutcome()
+        logger.warning(f'MCP get_entity reply for {expected_name!r} is not a JSON object: {text!r}')
+        return MemoryQueryOutcome(failure=MemoryFailure.MALFORMED)
     return MemoryQueryOutcome(
         rendered=render_entity_block(payload, expected_name),
         failed_stores=reported_failed_stores(payload),
@@ -725,11 +738,7 @@ class MemoryRecall:
         if error_text is not None:
             logger.warning(f'{subject} returned a tool error: {error_text!r}')
             return MemoryFailure.MALFORMED
-        return '\n'.join(
-            block['text']
-            for block in reply.get('content', [])
-            if isinstance(block, dict) and block.get('type') == 'text'
-        )
+        return '\n'.join(tool_text_blocks(reply))
 
     def _note_outage(self, outage: bool) -> None:
         """Track the outage streak; log ERROR whenever it reaches a multiple of the threshold."""
