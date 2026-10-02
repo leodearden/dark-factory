@@ -34,7 +34,7 @@ from dashboard.data.datum import (
     aged_at,
     validate_datum,
 )
-from dashboard.data.escalations import resolve_owning_project
+from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.mcp_fanout import project_label
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceCards
@@ -432,6 +432,33 @@ def shape_recon(
 # ---------------------------------------------------------------------------
 
 
+def _wire_served(candidate: object, field: str, served_at: datetime) -> dict[str, object]:
+    """*candidate* as served at *served_at*: aged, validated and rendered to the wire.
+
+    A route fills every Datum field of its payload, so a *field* holding
+    anything but a Datum is a wiring bug and raises ``DATUM_REQUIRED``, as
+    does a Datum that breaks its contract at *served_at*.
+    """
+    if not isinstance(candidate, Datum):
+        raise DatumContractError(
+            DatumInvariant.DATUM_REQUIRED, f'{field} must be a Datum, got {candidate!r}',
+        )
+    aged = aged_at(candidate, served_at)
+    validate_datum(aged, served_at)
+    return aged.to_wire()
+
+
+def _wire_views(
+    views: Mapping[EscalationView, object] | None, field: str, served_at: datetime,
+) -> dict[str, dict[str, object]]:
+    """Every escalation view of *views*, wired; a missing one is a wiring bug."""
+    held = views or {}
+    return {
+        view.value: _wire_served(held.get(view), f'{field}.views.{view.value}', served_at)
+        for view in EscalationView
+    }
+
+
 def _shape_outcomes(raw: Mapping[str, Any] | None) -> dict[str, Any]:
     """Enrich an outcomes dict with a parallel ``colors`` list.
 
@@ -481,14 +508,7 @@ def shape_merge_queue(
     pill on every panel.
     """
     def _served(candidate: object, field: str) -> dict[str, object]:
-        if not isinstance(candidate, Datum):
-            raise DatumContractError(
-                DatumInvariant.DATUM_REQUIRED,
-                f'MERGE_QUEUE {field} must be a Datum, got {candidate!r}',
-            )
-        aged = aged_at(candidate, served_at)
-        validate_datum(aged, served_at)
-        return aged.to_wire()
+        return _wire_served(candidate, f'MERGE_QUEUE {field}', served_at)
 
     def _titled(rows: Iterable[Mapping[str, Any]] | None, table: str) -> list[dict[str, Any]]:
         return [
@@ -744,115 +764,76 @@ def shape_costs(
 
 def shape_escalations(
     queues: Mapping[str, Any],
-    task_maps: Mapping[str, Iterable[dict[str, Any]]],
+    cards: Mapping[tuple[str, Any], Datum[dict]],
+    *,
+    served_at: datetime,
 ) -> dict[str, Any]:
-    """Reshape build_escalation_queues output into the ESCALATIONS DF_DATA key.
+    """``{ESCALATIONS: {subsections, summary, views}, served_at}`` from ``build_escalation_queues``.
 
-    Contract:
-        ``queues``    — dict returned by ``build_escalation_queues(config)``:
-                        ``{subsections: [...], summary: {...}}``.
-        ``task_maps`` — ``{root_path_str: list[task_dict]}`` keyed by the same
-                        absolute root path strings used as subsection ``id`` values
-                        for orchestrator subsections.  Reconciliation subsections
-                        use the literal ``'reconciliation'`` key which is never in
-                        ``task_maps``.
+    Each row keeps its escalation fields and ``project``, and gains ``task``:
+    its card from *cards* (keyed by ``(subsection id, escalation id)``), wired
+    at *served_at*. Each subsection, and the top level, carries ``views``,
+    every :class:`~dashboard.data.escalation_corpus.EscalationView` wired the
+    same way. A row with no card or a missing view is a wiring bug and raises
+    ``DATUM_REQUIRED``.
 
-    Each shaped subsection carries, alongside its ``escalations`` rows:
-
-    - ``skipped`` — list of ``{'path': str, 'error': str}`` records for the
-      queue ``*.json`` files ``load_queue_escalations`` could not parse.  Always
-      a list (a missing or ``None`` upstream value shapes to ``[]``), so the
-      client can iterate unconditionally.
-    - ``summary.skipped_count`` — ``len(skipped)`` for that subsection; the
-      top-level ``summary.skipped_count`` is the sum across all of them.  It
-      says how short the ``by_level``/``by_status`` counts beside it may be.
-
-    Both are the payload's statement that a queue holds escalations it could not
-    read — without them the loss is only a server-side WARNING line, and the tab
-    renders short with nothing saying so (INV-2, ``structured-facts-at-failure``).
-
-    Returns:
-        ``{'ESCALATIONS': {'subsections': [...], 'summary': {...}}}``
+    ``skipped`` (the queue's unreadable files) and ``summary.skipped_count``
+    sit beside the counts they qualify (INV-2), copied so the payload never
+    aliases the builder's lists.
     """
-    # Build fast per-root task-id lookup: {root_str: {str(task_id): task_dict}}
-    tasks_by_root_id: dict[str, dict[str, Any]] = {
-        root_str: {
-            str(t['id']): dict(t)
-            for t in task_list
-            if t.get('id') is not None
-        }
-        for root_str, task_list in task_maps.items()
-    }
-
-    # Build roots list for reconciliation resolution (worktree-prefix + task-map probe).
-    # Use Path.resolve(strict=False) so root paths are canonicalised — resolve_owning_project
-    # canonicalises the worktree with the same call, and is_relative_to compares path
-    # components, so unresolved symlinked segments would silently break the prefix match.
-    # Passing list(task_list) avoids the O(n) deep-copy; resolve_owning_project only reads
-    # task['id'] and does not mutate the list.
-    roots_for_resolution: list[tuple[Path, list[dict[str, Any]]]] = [
-        (Path(root_str).resolve(strict=False), list(task_list))
-        for root_str, task_list in task_maps.items()
-    ]
-
-    # Build a reverse mapping: resolved root basename → root_str (unresolved, as used in
-    # tasks_by_root_id keys), for task lookup after owning-project resolution.
-    # Multiple roots with the same resolved basename are ambiguous; first-seen wins.
-    basename_to_root_str: dict[str, str] = {}
-    for root_str in task_maps:
-        name = Path(root_str).resolve(strict=False).name
-        if name not in basename_to_root_str:
-            basename_to_root_str[name] = root_str
-
     out_subsections: list[dict[str, Any]] = []
     for sub in queues.get('subsections') or []:
         sub_id = sub.get('id') or ''
-        sub_label = sub.get('label')
-        sub_kind = sub.get('kind')
-
-        rows: list[dict[str, Any]] = []
-        for esc in sub.get('escalations') or []:
-            if sub_kind == 'reconciliation':
-                # Use resolve_owning_project to map reconciliation escalation back to a project.
-                resolved_label = resolve_owning_project(esc, roots_for_resolution)
-                project = resolved_label
-                if resolved_label is not None:
-                    root_str = basename_to_root_str.get(resolved_label)
-                    root_tasks = tasks_by_root_id.get(root_str or '', {})
-                    task_dict = root_tasks.get(str(esc.get('task_id', ''))) if root_str else None
-                else:
-                    task_dict = None
-            else:
-                # Orchestrator: project label is the subsection label, task lookup by subsection id.
-                project = sub_label
-                root_tasks = tasks_by_root_id.get(sub_id, {})
-                task_dict = root_tasks.get(str(esc.get('task_id', '')))
-
-            rows.append({
-                **esc,
-                'project': project,
-                'task': task_dict,
-                'task_unresolved': task_dict is None,
-            })
-
+        label = sub.get('label')
+        rows = [
+            {
+                **{k: v for k, v in esc.items() if k != 'project_root'},
+                'task': _wire_served(
+                    cards.get((sub_id, esc.get('id'))),
+                    f"ESCALATIONS {label} {esc.get('id')} task", served_at,
+                ),
+            }
+            for esc in sub.get('escalations') or []
+        ]
         out_subsections.append({
             'id': sub_id,
-            'label': sub_label,
-            'kind': sub_kind,
+            'label': label,
+            'kind': sub.get('kind'),
             'summary': dict(sub.get('summary') or {}),
-            # Degraded-state facts sit beside the counts they qualify.  `or []`
-            # handles both a missing key and an explicit None (a stale or partial
-            # upstream dict) so the JSX can iterate unconditionally; the per-entry
-            # dict(e) copy matches how `summary` is copied and keeps the shaped
-            # payload from aliasing the caller's list.
             'skipped': [dict(e) for e in sub.get('skipped') or []],
             'escalations': rows,
+            'views': _wire_views(sub.get('views'), f'ESCALATIONS {label}', served_at),
         })
     return {
         'ESCALATIONS': {
             'subsections': out_subsections,
             'summary': dict(queues.get('summary') or {}),
+            'views': _wire_views(queues.get('views'), 'ESCALATIONS', served_at),
         },
+        'served_at': served_at.isoformat(),
+    }
+
+
+def shape_escalation_analytics(
+    payload: Mapping[str, Any], *, served_at: datetime,
+) -> dict[str, Any]:
+    """``{ESCALATION_ANALYTICS: payload, served_at}`` with every view wired at *served_at*."""
+    per_project = [
+        {
+            **entry,
+            'views': _wire_views(
+                entry.get('views'), f"ESCALATION_ANALYTICS {entry.get('project')}", served_at,
+            ),
+        }
+        for entry in payload.get('per_project') or []
+    ]
+    return {
+        'ESCALATION_ANALYTICS': {
+            **payload,
+            'per_project': per_project,
+            'views': _wire_views(payload.get('views'), 'ESCALATION_ANALYTICS', served_at),
+        },
+        'served_at': served_at.isoformat(),
     }
 
 
