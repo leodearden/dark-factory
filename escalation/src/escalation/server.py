@@ -1496,8 +1496,9 @@ def create_server(
 
         Gate order (first match wins, all others fall through to _submit_or_dedupe):
           0. eval-lane provenance (shared.eval_lane) → contain: file as resolved
-               via submit_resolved before ANY other gate or lookup, so no
-               argument can mint it pending or at L2
+               with resolution_action='close_only' via submit_resolved before
+               ANY other gate or lookup, so no argument can mint it pending or
+               at L2
           1. terminal_state_is_the_bug=True  → bypass (submit normally)
           2. category == 'review_suggestions' → bypass (A4b owns this category)
           3. task_status_lookup is None       → bypass (chokepoint disabled)
@@ -1516,6 +1517,7 @@ def create_server(
                 esc.id, eval_lane_reason, esc.task_id, esc.agent_role,
                 esc.severity, esc.level,
             )
+            esc.resolution_action = 'close_only'
             contained = queue.submit_resolved(
                 esc,
                 f'contained: eval-lane artifact ({eval_lane_reason}); not a '
