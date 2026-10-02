@@ -50,6 +50,7 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify import VerifyResult
 
 
@@ -200,7 +201,7 @@ async def test_maybe_run_drift_check_guards_against_non_positive_every_n(
     state_path = tmp_path / 'drift_check_state.json'
     worker = _build_drift_worker(state_path)
 
-    await _maybe_run_drift_check(worker, git_ops, req, 'commit-sha')
+    await _maybe_run_drift_check(worker, git_ops, req, 'commit-sha', verifier=PRODUCTION_VERIFIER)
 
     assert _load_drift_check_state(state_path).land_count == 0, (
         'land count must not advance on the disabled path'
@@ -257,17 +258,17 @@ class TestDriftCheckCadencePersistence:
 
         reachback = AsyncMock(return_value=None)
         worker = _build_drift_worker(state_path)
-        with patch('orchestrator.merge_queue._run_drift_check', reachback):
+        with patch('orchestrator.merge_lane.drift._run_drift_check', reachback):
             # Land 1: no fire; persisted count advances to 1.
-            await _maybe_run_drift_check(worker, git_ops, req, 'c1')
+            await _maybe_run_drift_check(worker, git_ops, req, 'c1', verifier=PRODUCTION_VERIFIER)
             assert len(worker._drift_check_tasks) == 0
             assert _load_drift_check_state(state_path).land_count == 1
             # Land 2: no fire; persisted count advances to 2.
-            await _maybe_run_drift_check(worker, git_ops, req, 'c2')
+            await _maybe_run_drift_check(worker, git_ops, req, 'c2', verifier=PRODUCTION_VERIFIER)
             assert len(worker._drift_check_tasks) == 0
             assert _load_drift_check_state(state_path).land_count == 2
             # Land 3: fires (3 % 3 == 0), keyed off the PERSISTED count.
-            await _maybe_run_drift_check(worker, git_ops, req, 'c3')
+            await _maybe_run_drift_check(worker, git_ops, req, 'c3', verifier=PRODUCTION_VERIFIER)
             assert len(worker._drift_check_tasks) == 1
             for t in list(worker._drift_check_tasks):
                 await t
@@ -286,11 +287,11 @@ class TestDriftCheckCadencePersistence:
         req.config.verify_drift_check_every_n_lands = 3
 
         reachback = AsyncMock(return_value=None)
-        with patch('orchestrator.merge_queue._run_drift_check', reachback):
+        with patch('orchestrator.merge_lane.drift._run_drift_check', reachback):
             # Worker A observes 2 lands (no fire), then the process restarts.
             worker_a = _build_drift_worker(state_path)
-            await _maybe_run_drift_check(worker_a, git_ops, req, 'c1')
-            await _maybe_run_drift_check(worker_a, git_ops, req, 'c2')
+            await _maybe_run_drift_check(worker_a, git_ops, req, 'c1', verifier=PRODUCTION_VERIFIER)
+            await _maybe_run_drift_check(worker_a, git_ops, req, 'c2', verifier=PRODUCTION_VERIFIER)
             assert len(worker_a._drift_check_tasks) == 0
             assert reachback.await_count == 0
 
@@ -302,7 +303,7 @@ class TestDriftCheckCadencePersistence:
             # The persisted count (2) is what must carry over; the fresh
             # worker's in-memory counter is vestigial (merge_drift.py:407-420).
             assert _load_drift_check_state(state_path).land_count == 2
-            await _maybe_run_drift_check(worker_b, git_ops, req, 'c3')
+            await _maybe_run_drift_check(worker_b, git_ops, req, 'c3', verifier=PRODUCTION_VERIFIER)
             assert len(worker_b._drift_check_tasks) == 1
             for t in list(worker_b._drift_check_tasks):
                 await t
@@ -337,9 +338,8 @@ class TestDriftCheckFullGateSpecNoDerivation:
         Both assert the identical outcome (``spec_calls[0] is None``, no
         derivation), which is why they are one test.
 
-        Still exercises reach-back routing: the ``build_merge_verify_spec`` spy
-        only captures calls when ``_run_drift_check`` resolves it via
-        ``orchestrator.merge_queue``.
+        The ``build_merge_verify_spec`` spy is patched where ``_run_drift_check``
+        looks it up (``orchestrator.merge_lane.drift``).
         """
         import orchestrator.verify_runner as _vr
         from orchestrator.event_store import EventStore
@@ -394,7 +394,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
         derive_spy = AsyncMock(return_value=['derived/from/mq.py'])
         with (
             patch(
-                'orchestrator.merge_queue.build_merge_verify_spec',
+                'orchestrator.merge_lane.drift.build_merge_verify_spec',
                 side_effect=spy_build_spec,
             ),
             # A full-gate drift spec must NOT derive/scope task_files at all.
@@ -410,6 +410,7 @@ class TestDriftCheckFullGateSpecNoDerivation:
             await _run_drift_check(
                 git_ops, req, 'commit-sha', None, event_store, set(),
                 allocator=allocator,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         assert spec_calls, 'expected build_merge_verify_spec to be called at least once'
@@ -584,6 +585,7 @@ class TestDriftCheckHoldsLaneLease:
         ):
             await _run_drift_check(
                 drift_git_ops, req, head, None, None, set(), allocator=allocator,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         assert recorded, (

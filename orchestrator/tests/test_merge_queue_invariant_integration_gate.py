@@ -116,7 +116,7 @@ from test_merge_queue_concurrent_verify import (
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import AdvanceOutcome, GitOps, MergeResult, _run
-from orchestrator.merge_lane import MergeLane
+from orchestrator.merge_lane import MergeLane, WaiterRecord
 from orchestrator.merge_queue import (
     DecidedItem,
     InflightEntry,
@@ -124,7 +124,6 @@ from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
     RealMergeItem,
-    WaiterRecord,
     coalesce_or_enqueue_merge_request,
     item_merge_wt,
 )

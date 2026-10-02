@@ -290,9 +290,9 @@ class TestBouncePrimitives:
 
     def test_needs_rebase_reason_prefix_is_distinct(self) -> None:
         """NEEDS_REBASE_REASON_PREFIX differs from the other *_REASON_PREFIX constants."""
+        from orchestrator.merge_lane import PLAN_FILES_NOT_TOUCHED_REASON_PREFIX
         from orchestrator.merge_queue import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
-            PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
         )
         others = {

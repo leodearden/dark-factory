@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from escalation.models import Escalation
 from shared.asyncio_tasks import abandon_task
 
 logger = logging.getLogger('orchestrator.merge_skew_tripwire')
@@ -346,8 +347,6 @@ async def emit_pipeline_landing_tripwire(
         hits = compute_tripwire_overlap(landing_changed_files, inflight_diffs)
         if not hits:
             return
-
-        from escalation.models import Escalation  # noqa: PLC0415, I001 — local import, escalation optional dep
 
         hit_lines = '\n'.join(
             f'- task {hit.task_id} (branch {hit.branch}): {", ".join(hit.overlap_files)}'

@@ -1,43 +1,24 @@
 """Startup liveness-margin guard, verify-host-unreachable alarms, and
 persistent-worktree operational guards (MQ-refactor task γ).
 
-Extracted verbatim from :mod:`orchestrator.merge_queue`: the startup
-liveness-margin guard (heartbeat-floor vs. reaper-window safety check), the
-verify-host-unreachable alarm/recovery helpers, and the persistent
-warm-merge-verify-worktree serial-lane guards.  These three subsystems are
+The startup liveness-margin guard (heartbeat-floor vs. reaper-window safety
+check), the verify-host-unreachable alarm/recovery helpers, and the
+persistent warm-merge-verify-worktree serial-lane guards.  These three subsystems are
 folded into one module as "operational guards" (PRD Open Q5 resolution —
 see plan.json design_decisions) rather than split into their own modules,
 since none is individually large and all three gate/monitor worker-level
 operational health rather than verify-parity detection (the shadow/drift
-family in :mod:`orchestrator.merge_shadow` / :mod:`orchestrator.merge_drift`).
-``merge_queue`` re-exports every name here through a top-level shim so
-existing importers (``from orchestrator.merge_queue import X``, etc.) keep
-working unchanged.
+family in :mod:`orchestrator.merge_lane.shadow` /
+:mod:`orchestrator.merge_lane.drift`).
 
-A moved function that reads or calls a merge_queue-resident sibling —
-whether a function (``check_merge_liveness_margin``) or a module-level
-CONSTANT (``_HEARTBEAT_POLL_S``, ``TOUCH_MISS_TOLERANCE``,
-``INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``, ``_MERGE_AHEAD_BOUND``) that
-stays in ``merge_queue.py`` and is monkeypatched by the existing test suite
-via the string path ``orchestrator.merge_queue.<name>`` — resolves it
-through a function-local (deferred) import from :mod:`orchestrator.merge_queue`
-rather than a direct intra-module reference.  This mirrors the
-``_main_health_fingerprint`` convention in ``merge_queue.py`` and keeps this
-module free of any top-level import of ``merge_queue`` (which would deadlock
-module load, since merge_queue's shim needs this module fully defined
-first).
-
-Engine-constant default-argument hazard: ``liveness_secs`` (on
-``check_merge_liveness_margin`` / ``enforce_merge_liveness_margin``) and
-``merge_ahead_bound`` (on ``enforce_persistent_worktree_serial_lane``)
-default to a merge_queue-resident constant in the original code.  Default
-values are evaluated at *def time* (module import), so defaulting to a bare
-``INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`` / ``_MERGE_AHEAD_BOUND`` reference
-here would require a top-level ``import orchestrator.merge_queue`` —
-deadlocking module load, since merge_queue's shim needs this module fully
-defined first.  Each default is therefore a ``None`` sentinel, resolved
-in-body via the same deferred-import reach-back (identical effective
-defaults: 10800 / 1).
+Engine constants are read at CALL time, never as default-argument values:
+``liveness_secs`` (on ``check_merge_liveness_margin`` /
+``enforce_merge_liveness_margin``) and ``merge_ahead_bound`` (on
+``enforce_persistent_worktree_serial_lane`` / ``check_serial_lane_tripwire``)
+default to a ``None`` sentinel resolved in-body from the module global
+(effective defaults 10800 / 1), and ``_HEARTBEAT_POLL_S`` /
+``TOUCH_MISS_TOLERANCE`` are read as globals in the body, so a monkeypatch of
+any of them is seen by the next call.
 """
 
 from __future__ import annotations
@@ -49,13 +30,66 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from escalation.models import Escalation
+
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import PERSISTENT_MERGE_WORKTREE_NAME, GitOps
-from orchestrator.merge_lane.types import MergeRequest
+from orchestrator.merge_lane.types import _HEARTBEAT_POLL_S, _MERGE_AHEAD_BOUND, MergeRequest
 
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
 
 logger = logging.getLogger('orchestrator.merge_queue')
+
+
+TOUCH_MISS_TOLERANCE: int = 20
+"""Maximum number of consecutive _HEARTBEAT_POLL_S ticks a live worker's
+owned ``_merge-*`` worktrees are permitted to miss before their mtime would
+falsely age into the reaper window.
+
+**Derivation**
+
+The α owner-heartbeat (task 1728) touches every owned ``_merge-*`` worktree's
+mtime every :data:`_HEARTBEAT_POLL_S` seconds.  Under normal operation a
+worktree's mtime age is bounded by ~1 poll period (30 s).  A sustained
+event-loop stall (GIL contention, heavy I/O, OS scheduling jitter) can delay
+the heartbeat, but the stall budget is:
+
+    floor_secs = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE = 30 × 20 = 600 s
+
+**Margin calibration** (PRD §9, 10–60 band)
+
+    default_threshold = 0.75 × INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
+                      = 0.75 × 10800 = 8100 s
+    margin = 8100 / 600 = 13.5× ≥ 3× (PRD minimum)
+
+20 is the PRD's running example ("e.g. 20 → 600 s floor").  The constant is
+read in the body of :func:`check_merge_liveness_margin` (not as a default
+argument) so that a harness-level test can monkeypatch it to force an
+over-budget verdict without requiring a low-liveness config."""
+
+
+INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS: int = 10800
+"""Maximum age (seconds, wall-clock mtime) for an on-disk ``_merge-*`` worktree
+to be considered actively in-flight rather than abandoned.
+
+.. note:: Raising this value (or raising :data:`_MERGE_AHEAD_BOUND`, or
+   increasing the merge-verify cold timeout) affects the safety margin computed
+   by :func:`check_merge_liveness_margin`.  Run that guard after changing any
+   of these three values.
+
+Set to 3 hours (10800 s) so the liveness window comfortably exceeds the cold
+merge-verify budget shipped in ``defaults.yaml``
+(``merge_verify_cold_command_timeout_secs: 7200``).  With ``safety_factor=0.75``
+the guard threshold is ``0.75 × 10800 = 8100 s > 7200 s``, so the shipped
+config is silent and in-flight verifies are never reaped mid-run.
+
+**Tradeoff**: a genuinely-abandoned ``_merge-*`` worktree (e.g. from a crashed
+worker) now lingers up to ~3 hours before the reaper reclaims it.  The cost is
+disk space only — no correctness impact — and is the deliberate, accepted cost
+of closing the merge-verify-vs-reaper race (esc-1674-34 Option 2).
+
+Adjusted at module level or injected via `liveness_secs` in tests."""
 
 
 # ---------------------------------------------------------------------------
@@ -237,19 +271,6 @@ def check_merge_liveness_margin(
         :class:`MergeLivenessAssessment` with all computed values and the
         ``safe`` verdict.
     """
-    # Reach-back (deferred import): _HEARTBEAT_POLL_S, TOUCH_MISS_TOLERANCE,
-    # and INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS stay in merge_queue.py (engine
-    # constants) and the existing test suite monkeypatches them by string path
-    # at orchestrator.merge_queue.<name>.  Resolving them dynamically from
-    # merge_queue's namespace at call time keeps those patches effective post-
-    # extraction — see the module docstring's reach-back convention and its
-    # note on the engine-constant default-argument hazard.
-    from orchestrator.merge_queue import (
-        _HEARTBEAT_POLL_S,
-        INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
-        TOUCH_MISS_TOLERANCE,
-    )
-
     if liveness_secs is None:
         liveness_secs = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
 
@@ -335,19 +356,6 @@ def enforce_merge_liveness_margin(
         :exc:`MergeLivenessConfigError`: When ``worst_case_secs >= threshold_secs``
             (i.e. heartbeat floor ≥ threshold).
     """
-    # Reach-back (deferred import): check_merge_liveness_margin is a co-moved
-    # sibling that the existing test suite monkeypatches by string path at
-    # orchestrator.merge_queue.check_merge_liveness_margin (this function
-    # used to live in merge_queue.py, alongside its sibling).
-    # INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS is the same engine-constant
-    # default-argument hazard as in check_merge_liveness_margin above.
-    # Resolving both dynamically from merge_queue's namespace at call time
-    # keeps those patches effective post-extraction.
-    from orchestrator.merge_queue import (
-        INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
-        check_merge_liveness_margin,
-    )
-
     if liveness_secs is None:
         liveness_secs = INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
 
@@ -484,8 +492,6 @@ def _alarm_verify_host_unreachable(
     if escalation_queue.has_open_l1(sentinel):
         return
 
-    from escalation.models import Escalation  # local import — escalation optional dep
-
     minutes = duration_s / 60.0
     duration_str = f'{minutes:.1f} min' if duration_s < 3600 else f'{duration_s / 3600:.1f} h'
     summary = (
@@ -529,7 +535,6 @@ def _alarm_verify_host_unreachable(
     escalation_queue.submit(esc)
 
     if event_store is not None:
-        from orchestrator.event_store import EventType
         event_store.emit(
             EventType.verify_host_unreachable,
             data={'host': host, 'reason': reason, 'streak': streak, 'duration_s': duration_s},
@@ -601,14 +606,12 @@ def _clear_verify_host_unreachable(
 
     # Emit recovery event.
     if event_store is not None:
-        from orchestrator.event_store import EventType
         event_store.emit(
             EventType.verify_host_recovered,
             data={'host': host, 'downtime_s': downtime_s},
         )
 
     # Submit an info-level recovery escalation for audit trail visibility.
-    from escalation.models import Escalation  # local import — escalation optional dep
 
     minutes = downtime_s / 60.0
     duration_str = f'{minutes:.1f} min' if downtime_s < 3600 else f'{downtime_s / 3600:.1f} h'
@@ -922,13 +925,6 @@ def enforce_persistent_worktree_serial_lane(
             ``config.git.persistent_merge_worktree is True`` and the per-host
             in-flight count ``ceil(merge_ahead_bound / num_hosts) > 1``.
     """
-    # Reach-back (deferred import): _MERGE_AHEAD_BOUND stays in merge_queue.py
-    # (engine constant) and the existing test suite monkeypatches it by
-    # string path at orchestrator.merge_queue._MERGE_AHEAD_BOUND — the same
-    # engine-constant default-argument hazard as liveness_secs above (see the
-    # module docstring's reach-back convention).
-    from orchestrator.merge_queue import _MERGE_AHEAD_BOUND
-
     if merge_ahead_bound is None:
         merge_ahead_bound = _MERGE_AHEAD_BOUND
 
@@ -1029,23 +1025,12 @@ def check_serial_lane_tripwire(
     Args:
         local_inflight: Local verifies in flight, INCLUDING the new dispatch.
         merge_ahead_bound: Effective merge-ahead bound; ``None`` resolves the
-            engine constant at CALL time (see the reach-back note below).
+            engine constant at CALL time (see the module docstring).
         num_hosts: Number of verify hosts sharing the workload (default 1).
 
     Returns:
         A :class:`SerialLaneAssessment` carrying the verdict and its inputs.
     """
-    # Reach-back (deferred import): _MERGE_AHEAD_BOUND stays in merge_queue.py
-    # (engine constant) and the existing test suite monkeypatches it by string
-    # path at orchestrator.merge_queue._MERGE_AHEAD_BOUND.  A def-time default
-    # would require a top-level `import orchestrator.merge_queue`, which
-    # DEADLOCKS module load (merge_queue's re-export shim needs this module
-    # fully defined first) and would freeze the value past any monkeypatch —
-    # the engine-constant default-argument hazard the module docstring
-    # describes, and the identical shape used by
-    # enforce_persistent_worktree_serial_lane above.
-    from orchestrator.merge_queue import _MERGE_AHEAD_BOUND
-
     if merge_ahead_bound is None:
         merge_ahead_bound = _MERGE_AHEAD_BOUND
 
@@ -1132,7 +1117,6 @@ def alarm_serial_lane_breach(
         # try/except is belt-and-braces for a duck-typed or mock store that
         # DOES raise — the tripwire must never propagate into the dispatch path.
         try:
-            from orchestrator.event_store import EventType
             event_store.emit(
                 EventType.merge_serial_lane_breached,
                 task_id=task_id,

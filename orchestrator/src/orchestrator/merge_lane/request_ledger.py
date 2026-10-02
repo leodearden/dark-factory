@@ -42,10 +42,6 @@ Lifecycle (see :class:`RequestLedger`):
   manual/operator-driven "stop tracking this" for a request that will never
   resolve on its own and was never requeued (the genuine silent-hang case);
   see :class:`RequestLedger`'s docstring for the unbounded-lifetime note.
-
-``merge_queue.py`` re-exports every public name here through its top-level
-shim so existing importers (``from orchestrator.merge_queue import X``)
-keep working unchanged — see that module's re-export shim block.
 """
 
 from __future__ import annotations
@@ -53,6 +49,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from escalation.models import Escalation
+
+from orchestrator.event_store import EventType
 
 if TYPE_CHECKING:
     from orchestrator.merge_lane.types import MergeRequest
@@ -306,8 +306,6 @@ def _alarm_merge_request_stuck(
     if escalation_queue.has_open_l1(sentinel):
         return
 
-    from escalation.models import Escalation  # local import — escalation optional dep
-
     age_int = int(stuck.age_secs)
     summary = (
         f'MergeRequest {stuck.request_id!r} (branch {stuck.branch!r}) has been '
@@ -348,8 +346,6 @@ def _alarm_merge_request_stuck(
     escalation_queue.submit(esc)
 
     if event_store is not None:
-        from orchestrator.event_store import EventType
-
         event_store.emit(
             EventType.escalation_created,
             data={

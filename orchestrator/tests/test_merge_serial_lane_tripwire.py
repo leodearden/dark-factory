@@ -231,7 +231,7 @@ class TestCheckSerialLaneTripwire:
         """
         from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
 
-        monkeypatch.setattr('orchestrator.merge_queue._MERGE_AHEAD_BOUND', 4)
+        monkeypatch.setattr('orchestrator.merge_lane.liveness._MERGE_AHEAD_BOUND', 4)
         assessment = check_serial_lane_tripwire(2)
         assert assessment.merge_ahead_bound == 4
         assert assessment.breached is False  # 2 > ceil(4/1)=4 is False

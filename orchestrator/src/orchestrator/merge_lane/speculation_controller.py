@@ -79,12 +79,6 @@ until task eta) can race a merger-side release of what the ledger still
 believes is the same live token, and the ledger applies that second
 release like any other, over-releasing the wrapped semaphore exactly as
 before.
-
-``merge_queue.py`` re-exports :class:`SpeculationController` and
-:class:`PermitLedger` through its top-level shim so existing importers
-(``from orchestrator.merge_queue import SpeculationController,
-PermitLedger``) keep working unchanged — see that module's re-export shim
-block.
 """
 
 from __future__ import annotations

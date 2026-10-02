@@ -1,24 +1,11 @@
 """Warm-vs-cold shadow-compare detective (MQ-refactor task γ).
 
-Extracted verbatim from :mod:`orchestrator.merge_queue`: the per-test result
-parsers, the persisted cadence state, and the shadow-compare functions that
-run a from-scratch cold verify alongside a landed warm merge and alarm on
-divergence (PRD §10 invariant 6(b)).  ``merge_queue`` re-exports every name
-here through a top-level shim so existing importers
-(``from orchestrator.merge_queue import X``, etc.) keep working unchanged.
-
-A moved function that calls a merge_queue-resident sibling — whether that
-sibling stays permanently (``_run_unscoped_typechecks``) or is monkeypatched
-by the existing test suite via the string path
-``orchestrator.merge_queue.<name>`` (``run_scoped_verification``,
-``build_merge_verify_spec``, ``VerifyRunnerPool``, ``LocalRunner``,
-``_run_cold_shadow_verify``, ``_run_shadow_compare``) — resolves it through a
-function-local (deferred) import from :mod:`orchestrator.merge_queue` rather
-than a direct intra-module reference.  This mirrors the
-``_main_health_fingerprint`` convention in ``merge_queue.py`` and keeps this
-module free of any top-level import of ``merge_queue`` (which would deadlock
-module load, since merge_queue's shim needs this module fully defined
-first).
+The per-test result parsers, the persisted cadence state, and the
+shadow-compare functions that run a from-scratch cold verify alongside a
+landed warm merge and alarm on divergence (PRD §10 invariant 6(b)).  The cold
+leg verifies through the worker's injected
+:class:`~orchestrator.merge_lane.ports.VerifyPort`; this module never imports
+the worker.
 """
 
 from __future__ import annotations
@@ -34,23 +21,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from escalation.models import Escalation
+
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import MergeRequest
-
-# These four are not referenced directly in this module — _run_cold_shadow_verify
-# always reaches back to the orchestrator.merge_queue-resident binding (see its
-# body).  They are imported here only so TestReachBackRouting has a "naive"
-# orchestrator.merge_shadow.<name> patch target to assert is NOT what governs.
-from orchestrator.verify import run_scoped_verification  # noqa: F401
 from orchestrator.verify_categories import FailureCategory
-from orchestrator.verify_runner import (  # noqa: F401
+from orchestrator.verify_runner import (
     LocalRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
 )
 
 if TYPE_CHECKING:
+    from orchestrator.merge_lane.ports import VerifyPort
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
     from orchestrator.verify import VerifyResult
 
@@ -963,8 +947,6 @@ def _submit_shadow_divergence_escalation(
     if escalation_queue.has_open_l1(_WARM_COLD_SHADOW_SENTINEL):
         return
 
-    from escalation.models import Escalation  # local import — escalation optional dep
-
     n_diverging = len(diff.diverging) + len(diff.only_warm) + len(diff.only_cold)
     short_sha = merge_commit[:8]
 
@@ -1078,8 +1060,6 @@ def _alarm_warm_shadow_unparseable(
     if escalation_queue.has_open_l1(_WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL):
         return
 
-    from escalation.models import Escalation  # local import — escalation optional dep
-
     short_sha = merge_commit[:8]
     summary = (
         f'Warm/cold shadow-compare INERT on {short_sha}: '
@@ -1154,8 +1134,6 @@ def _submit_coarse_shadow_divergence_escalation(
     if escalation_queue.has_open_l1(_WARM_COLD_SHADOW_SENTINEL):
         return
 
-    from escalation.models import Escalation  # local import — escalation optional dep
-
     short_sha = merge_commit[:8]
     summary = (
         f'Coarse warm/cold shadow divergence on {short_sha}: cold FULL-gate '
@@ -1199,13 +1177,15 @@ async def _run_cold_shadow_verify_suite(
     req: MergeRequest,
     merge_commit: str,
     event_store: EventStore | None,
+    *,
+    verifier: VerifyPort,
 ) -> VerifyResult:
     """Run a from-scratch cold FULL-GATE verify on *merge_commit*, returning the
     suite-level :class:`~orchestrator.verify.VerifyResult`.
 
     Mirrors :func:`_run_cold_shadow_verify` (throwaway ``_merge-<uuid>`` worktree,
-    LOCAL-only from-scratch trust-anchor, ``finally`` cleanup, reach-back deferred
-    imports resolved from :mod:`orchestrator.merge_queue`) but with the two
+    LOCAL-only from-scratch trust-anchor, ``finally`` cleanup, verify through the
+    injected *verifier*) but with the two
     differences the COARSE map-less compare (FIX 2) requires:
 
     * the spec is built FULL-GATE (``task_files=None`` → verify.py workspace
@@ -1222,30 +1202,26 @@ async def _run_cold_shadow_verify_suite(
         req: The :class:`MergeRequest` that just warm-landed.
         merge_commit: The merge commit SHA to verify cold.
         event_store: Optional event store (passed to VerifyRunnerPool; None-safe).
+        verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`;
+            the local trust-anchor runs its scoped verify and unscoped type-checks.
 
     Returns:
         The suite-level :class:`VerifyResult` from the cold FULL-gate dispatch.
     """
-    # Reach-back (deferred import): mirrors _run_cold_shadow_verify — the test
-    # suite patches these pool-construction deps by string path at
-    # orchestrator.merge_queue.<name>; resolving them from merge_queue's
-    # namespace at call time keeps those patches effective.
-    import orchestrator.merge_queue as _mq
-
     wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
     try:
         # FULL-GATE: task_files=None → the complete workspace suite on the cold
         # leg (verify.py workspace path).  A scoped/no-source spec would trivially
         # pass and could not catch the trivial-pass divergence class (PRD §8δ).
-        spec = _mq.build_merge_verify_spec(req.config, req.module_configs, None)
+        spec = build_merge_verify_spec(req.config, req.module_configs, None)
         # LOCAL-ONLY by design (same as _run_cold_shadow_verify): this is the
         # from-scratch cold trust-anchor control; a remote may carry warm
         # sccache/target warmth and defeat the from-scratch-cold guarantee.
-        pool = _mq.VerifyRunnerPool(
-            [_mq.LocalRunner(
+        pool = VerifyRunnerPool(
+            [LocalRunner(
                 wt, req.config, req.module_configs, None,
-                run_scoped=_mq.run_scoped_verification,
-                run_unscoped=_mq._run_unscoped_typechecks,
+                run_scoped=verifier.run_scoped,
+                run_unscoped=verifier.run_unscoped_typechecks,
                 task_id=req.task_id,
             )],
             event_store=event_store,
@@ -1261,6 +1237,8 @@ async def _run_cold_shadow_verify(
     req: MergeRequest,
     merge_commit: str,
     event_store: EventStore | None,
+    *,
+    verifier: VerifyPort,
 ) -> dict[str, str]:
     """Run a from-scratch cold verify on *merge_commit* in a throwaway worktree.
 
@@ -1286,26 +1264,13 @@ async def _run_cold_shadow_verify(
             module_configs, task_files, task_id).
         merge_commit: The merge commit SHA to verify cold.
         event_store: Optional event store (passed to VerifyRunnerPool; None-safe).
+        verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`;
+            the local trust-anchor runs its scoped verify and unscoped type-checks.
 
     Returns:
         Per-test verdict map as returned by :func:`parse_per_test_results`.
         Empty dict if the cold verify produced no parseable test output.
     """
-    # Reach-back (deferred import): the existing test suite patches these
-    # dependencies by string path at orchestrator.merge_queue.<name> (this
-    # function used to live in merge_queue.py).  Resolving them dynamically
-    # from merge_queue's namespace at call time keeps those patches
-    # effective post-extraction — see the module docstring's reach-back
-    # convention.  Attribute access (rather than `from ... import <name>`)
-    # is used here because build_merge_verify_spec / VerifyRunnerPool /
-    # LocalRunner / run_scoped_verification also have a module-level "naive"
-    # import above (kept solely as a TestReachBackRouting patch target); a
-    # `from ... import` reach-back would shadow-and-thus-dead-code that
-    # naive import, which ruff flags (F811).  _run_unscoped_typechecks has
-    # no merge_shadow-local copy at all (it stays permanently in
-    # merge_queue.py) but is accessed the same way for consistency.
-    import orchestrator.merge_queue as _mq
-
     wt = await git_ops.create_throwaway_verify_worktree(merge_commit)
     try:
         # Hold THIS throwaway lane's flock for the duration of the verify
@@ -1346,7 +1311,7 @@ async def _run_cold_shadow_verify(
             task_files_tuple = (
                 tuple(req.task_files) if req.task_files is not None else None
             )
-            spec = _mq.build_merge_verify_spec(
+            spec = build_merge_verify_spec(
                 req.config, req.module_configs, task_files_tuple
             )
             # LOCAL-ONLY by design: this is the from-scratch cold trust-anchor
@@ -1355,11 +1320,11 @@ async def _run_cold_shadow_verify(
             # sccache/target) and (b) reintroduce remote scope-derivation concerns
             # into the very control whose purpose is to BE the local ground truth.
             # See design decision in plan.json.
-            pool = _mq.VerifyRunnerPool(
-                [_mq.LocalRunner(
+            pool = VerifyRunnerPool(
+                [LocalRunner(
                     wt, req.config, req.module_configs, task_files_tuple,
-                    run_scoped=_mq.run_scoped_verification,
-                    run_unscoped=_mq._run_unscoped_typechecks,
+                    run_scoped=verifier.run_scoped,
+                    run_unscoped=verifier.run_unscoped_typechecks,
                     task_id=req.task_id,
                 )],
                 event_store=event_store,
@@ -1407,6 +1372,8 @@ async def _run_shadow_compare(
     warm_results: dict[str, str],
     escalation_queue: Any,
     event_store: EventStore | None,
+    *,
+    verifier: VerifyPort,
 ) -> None:
     """Compare warm vs cold verify results for *merge_commit* and alarm on divergence.
 
@@ -1439,18 +1406,12 @@ async def _run_shadow_compare(
         warm_results: Per-test verdict map captured from the warm verify run.
         escalation_queue: Live escalation queue, or ``None`` (None-safe).
         event_store: Optional event store for parity-ok event emission.
+        verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`,
+            handed on to the cold leg.
     """
-    # Reach-back (deferred import): the existing test suite patches the cold
-    # leg by string path at orchestrator.merge_queue._run_cold_shadow_verify
-    # (this function used to live in merge_queue.py, alongside its sibling).
-    # Resolving it dynamically from merge_queue's namespace at call time
-    # keeps those patches effective post-extraction for BOTH cold-leg calls
-    # below (initial + Option-B re-confirmation).
-    from orchestrator.merge_queue import _run_cold_shadow_verify
-
     try:
         cold_results = await _run_cold_shadow_verify(
-            git_ops, req, merge_commit, event_store
+            git_ops, req, merge_commit, event_store, verifier=verifier
         )
     except Exception:
         logger.warning(
@@ -1496,7 +1457,7 @@ async def _run_shadow_compare(
         )
         try:
             cold2 = await _run_cold_shadow_verify(
-                git_ops, req, merge_commit, event_store
+                git_ops, req, merge_commit, event_store, verifier=verifier
             )
         except Exception:
             logger.warning(
@@ -1589,6 +1550,8 @@ async def _run_coarse_shadow_compare(
     merge_commit: str,
     escalation_queue: Any,
     event_store: EventStore | None,
+    *,
+    verifier: VerifyPort,
 ) -> None:
     """COARSE suite-level warm-vs-cold shadow compare for a MAP-LESS land.
 
@@ -1638,16 +1601,12 @@ async def _run_coarse_shadow_compare(
         merge_commit: The just-landed merge commit SHA.
         escalation_queue: Live escalation queue, or ``None`` (None-safe).
         event_store: Optional event store for parity-ok event emission.
+        verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`,
+            handed on to the cold leg.
     """
-    # Reach-back (deferred import): the test suite patches the cold FULL-gate leg
-    # by string path at orchestrator.merge_queue._run_cold_shadow_verify_suite.
-    # Resolving it from merge_queue's namespace at call time keeps that patch
-    # effective post-extraction (mirrors _run_shadow_compare's reach-back).
-    from orchestrator.merge_queue import _run_cold_shadow_verify_suite
-
     try:
         cold = await _run_cold_shadow_verify_suite(
-            git_ops, req, merge_commit, event_store
+            git_ops, req, merge_commit, event_store, verifier=verifier
         )
     except Exception:
         logger.warning(
@@ -1732,6 +1691,8 @@ async def _maybe_schedule_shadow_compare(
     warm_results: dict[str, str],
     escalation_queue: Any,
     event_store: EventStore | None,
+    *,
+    verifier: VerifyPort,
 ) -> None:
     """Non-blocking scheduler for the warm-vs-cold SHADOW compare (PRD §10 invariant 6(b)).
 
@@ -1761,19 +1722,9 @@ async def _maybe_schedule_shadow_compare(
         warm_results: Per-test pass/fail map from the warm verify run.
         escalation_queue: Live escalation queue, or ``None`` (None-safe).
         event_store: Optional event store for parity-ok event emission.
+        verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`,
+            handed on to the cold leg.
     """
-    # Reach-back (deferred import): the existing test suite patches the
-    # spawned coroutine(s) by string path at
-    # orchestrator.merge_queue._run_shadow_compare /
-    # orchestrator.merge_queue._run_coarse_shadow_compare (these functions used
-    # to live in merge_queue.py, alongside their siblings).  Resolving them
-    # dynamically from merge_queue's namespace at call time keeps those patches
-    # effective post-extraction.
-    from orchestrator.merge_queue import (
-        _run_coarse_shadow_compare,
-        _run_shadow_compare,
-    )
-
     # Early exit: knob off.
     #
     # FIX 2 (task 2886, PRD leaf δ §3.4): the historical ``if not warm_results:
@@ -1834,11 +1785,13 @@ async def _maybe_schedule_shadow_compare(
     # compares its suite verdict against the warm-passed (implicit) land.
     if warm_results:
         compare_coro = _run_shadow_compare(
-            git_ops, req, merge_commit, warm_results, escalation_queue, event_store
+            git_ops, req, merge_commit, warm_results, escalation_queue, event_store,
+            verifier=verifier,
         )
     else:
         compare_coro = _run_coarse_shadow_compare(
-            git_ops, req, merge_commit, escalation_queue, event_store
+            git_ops, req, merge_commit, escalation_queue, event_store,
+            verifier=verifier,
         )
     t = asyncio.create_task(compare_coro)
 

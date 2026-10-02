@@ -3114,10 +3114,8 @@ class TestMarkBlockedFalseDoneGuard:
         """
         from unittest.mock import AsyncMock, patch
 
-        from orchestrator.merge_queue import (
-            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
-            MergeOutcome,
-        )
+        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_queue import MergeOutcome
 
         wt_info = await git_ops.create_worktree(task_assignment.task_id)
         wt = wt_info.path

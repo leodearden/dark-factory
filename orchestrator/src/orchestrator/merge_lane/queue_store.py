@@ -52,15 +52,18 @@ from shared import safe_io
 from shared.safe_io import load_json_or_warn
 
 from orchestrator.merge_lane.types import (
+    GroupMergeRequest,
     InFlightMergeRegistry,
+    MergeRequest,
     QueuedBranch,
     WaiterRecord,
 )
 from orchestrator.module_charter import derive_modules
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from orchestrator.config import ModuleConfig, OrchestratorConfig
-    from orchestrator.merge_lane.worker import MergeRequest
 
 logger = logging.getLogger('orchestrator.merge_queue_store')
 
@@ -180,10 +183,6 @@ class MergeQueueStore:
         Re-recording the same ``request_id`` overwrites the previous entry
         (idempotent on redispatch).
         """
-        # Import here to keep the dependency one-directional:
-        # merge_queue_store -> merge_queue (not the reverse).
-        from orchestrator.merge_queue import GroupMergeRequest
-
         if isinstance(req, GroupMergeRequest):
             return
 
@@ -527,8 +526,6 @@ def reconstruct_merge_request(
     * ``pre_rebased=False`` — ensures the worker rebases before merging.
     * ``config`` from the live harness (current config is always correct).
     """
-    from orchestrator.merge_queue import MergeRequest  # local import; avoid circularity
-
     loop = asyncio.get_running_loop()
     future: asyncio.Future[Any] = loop.create_future()
 
@@ -582,6 +579,8 @@ async def recover_pending_merges(
     branch_prefix: str,
     retention: Any = None,
     registry: InFlightMergeRegistry | None = None,
+    enqueue_merge_request: Callable[..., Awaitable[None]],
+    select_recovery_winner: Callable[..., Awaitable[tuple[int, bool]]],
 ) -> dict[str, Any]:
     """Re-enqueue surviving merge requests from the durable journal.
 
@@ -628,17 +627,16 @@ async def recover_pending_merges(
     exactly — every survivor is reconstructed and enqueued directly — so every
     existing caller/test is unaffected.
 
+    *enqueue_merge_request* and *select_recovery_winner* are the worker's
+    functions of those names, injected by the caller so this module never
+    imports the worker.
+
     Errors on individual records / branch groups are logged and skipped
     (fail-open) so one bad entry never aborts the whole recovery pass.
 
     Returns a dict with ``recovered``, ``dropped`` and ``coalesced`` counts,
     the enqueued ``requests``, and the ``journal_corrupt`` flag.
     """
-    from orchestrator.merge_queue import (  # avoid circular
-        enqueue_merge_request,
-        select_recovery_winner,
-    )
-
     # Detect and loudly surface a corrupt journal so pending merges are NOT
     # silently dropped — operators must see the distinction between a corrupt
     # journal (possible data loss) and a fresh/empty one (nothing to recover).

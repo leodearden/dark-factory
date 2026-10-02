@@ -22,13 +22,9 @@ from _merge_lane_fakes import FakeClock
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
-    EMPTY_SUFFIX_CONFLICT_GRAPH,
-    MergeRequest,
-    SpeculativeMergeWorker,
-    SuffixConflictGraph,
-)
+from orchestrator.merge_queue import MergeRequest, SpeculativeMergeWorker, SuffixConflictGraph
 from orchestrator.merge_types import QueuedBranch
+from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH
 
 # ── fixtures (mirrors test_merge_queue_finalize_head_visibility.py) ────────────
 

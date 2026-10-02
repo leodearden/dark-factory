@@ -1,24 +1,16 @@
 """Post-merge gates, finalize, and reason-prefix constants (MQ-refactor task β).
 
-Extracted verbatim from :mod:`orchestrator.merge_queue`: the plan-target /
-plan-files-touched / post-merge-equivalence / post-merge-pyright gates, the
-advance-finalize and advance-failure-mapping functions, and their supporting
-types and reason-prefix constants.  ``merge_queue`` re-exports every name
-here through a top-level shim so existing importers
-(``from orchestrator.merge_queue import X``, etc.) keep working unchanged.
+The plan-target / plan-files-touched / post-merge-equivalence /
+post-merge-pyright gates, the advance-finalize and advance-failure-mapping
+functions, the ``merge_attempt`` event emitter they share with the worker,
+and their supporting types and reason-prefix constants.
 
-Verify EXECUTION (``_run_post_merge_verify`` and its cluster) stays in
-``merge_queue`` — this module owns gate POLICY, not verify execution (PRD
-Open Q1).  A moved function that calls a merge_queue-resident sibling —
-whether that sibling stays permanently or co-moved here but is monkeypatched
-by the existing test suite via the string path
-``orchestrator.merge_queue.<name>`` — resolves it through a function-local
-(deferred) import from :mod:`orchestrator.merge_queue` rather than a direct
-intra-module reference.  This mirrors the existing
-``_main_health_fingerprint`` convention in ``merge_queue.py`` and keeps this
-module free of any top-level import of ``merge_queue`` (which would deadlock
-module load, since merge_queue's shim needs this module fully defined
-first).
+Verify EXECUTION (``_run_post_merge_verify`` and its cluster) stays in the
+worker — this module owns gate POLICY, not verify execution (PRD Open Q1).
+Where a gate needs a worker function, the worker injects it: the re-verify
+through ``_reverify_rebased_tree``'s *run_post_merge_verify*, the γ2
+auto-chain through :class:`_GenerationChainContext`.  This module never
+imports the worker.
 """
 
 from __future__ import annotations
@@ -30,24 +22,251 @@ import os
 import posixpath
 import re
 import tempfile
+import time
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
-from orchestrator.event_store import EventStore
+from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
+from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
 from orchestrator.merge_lane.types import (
     MergeOutcome,
     MergeRequest,
     OutcomeKind,
     TerminalOutcomeRetention,
 )
+from orchestrator.verify import VerifyResult, run_verification
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 logger = logging.getLogger('orchestrator.merge_queue')
+
+
+AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
+"""Kill-switch for the γ2 generation auto-chaining producer.
+
+MUST remain False until the sole remaining γ3 precondition lands:
+  1. ✓ DONE (task/1717): The workflow.py 'superseded' consumer handler — the
+     single-task merge consumer in ``_submit_to_merge_queue`` now parks
+     'superseded' outcomes as merge-deferred via ``_handle_superseded`` instead
+     of falling through to ``_mark_blocked`` with an empty reason.
+  2. The gen-(n+1) registry slot handoff via ATTACH_AND_CHAIN (re-acquiring the
+     branch slot in InFlightMergeRegistry for the chained request without tripping
+     the gen-1 done-callback double-release, and threading TerminalOutcomeRetention
+     from the harness into the workers — harness.py:3238 omits both today).
+
+While False, _finalize_advanced_merge ignores chain_ctx on equivalence failures
+and returns 'blocked' exactly as before γ2, so no 'superseded' outcome can reach
+the workflow consumer."""
+
+
+# Maximum number of characters to include in the detail field of a
+# ``PostMergePyrightResult`` — keeps the blocked reason string in the
+# escalation payload under reasonable size limits.
+_POST_MERGE_PYRIGHT_MAX_DETAIL = 2000
+
+
+async def _run_unscoped_typechecks(
+    worktree: Path,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    *,
+    block_on_timeout: bool,
+    task_id: str | None = None,
+) -> PostMergePyrightResult:
+    """Run each module's ``type_check_command`` unscoped against a caller-owned worktree.
+
+    This helper operates on a worktree supplied by the caller — it does **not**
+    create or clean up any worktree itself.
+
+    Args:
+        worktree: Path to the worktree to run type-checks in.  Caller owns it.
+        config: Orchestrator config (passed through to ``run_verification``).
+        module_configs: List of module configs.  Modules without a
+            ``type_check_command`` are silently skipped.
+        block_on_timeout: When ``True``, a timed-out module is appended to
+            *both* ``timed_out_subprojects`` and ``failing_subprojects``, making
+            the result ``broken`` (fail-closed, for the pre-advance gate).
+            When ``False``, a timed-out module is appended only to
+            ``timed_out_subprojects`` (fail-open, for the post-advance check).
+        task_id: Optional task identifier for log messages.
+
+    Returns:
+        :class:`PostMergePyrightResult` with the classification of each
+        module's type-check outcome.
+    """
+    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    if not active:
+        return PostMergePyrightResult()
+
+    async def _run_one(mc: ModuleConfig) -> tuple[ModuleConfig, VerifyResult]:
+        # Run only the type-check command verbatim (unscoped).
+        # Null out test/lint so run_verification skips them (None => skip).
+        # is_merge_verify=True forces cold semantics; the per-command timeout
+        # used is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
+        # if set, falling back to `verify_cold_command_timeout_secs` then warm.
+        type_only_mc = dataclasses.replace(mc, test_command=None, lint_command=None)
+        return mc, await run_verification(
+            worktree, config, type_only_mc,
+            max_retries=0, is_merge_verify=True, role='merge',
+        )
+
+    # Run all subproject type-checks concurrently to minimise wall-clock
+    # impact on the merge queue's push_main delay.
+    pairs = await asyncio.gather(*(_run_one(mc) for mc in active))
+
+    failing_subprojects: list[str] = []
+    timed_out_subprojects: list[str] = []
+    detail_parts: list[str] = []
+
+    for mc, verify in pairs:
+        if verify.timed_out:
+            timed_out_subprojects.append(mc.prefix)
+            if block_on_timeout:
+                failing_subprojects.append(mc.prefix)
+            continue
+
+        if not verify.passed:
+            failing_subprojects.append(mc.prefix)
+            # Collect bounded detail from the FIRST failing subproject only
+            # (matches PostMergePyrightResult.detail docstring).
+            if not detail_parts:
+                raw = verify.failure_report() or verify.type_output or ''
+                if isinstance(raw, str) and raw:
+                    detail_parts.append(raw[:_POST_MERGE_PYRIGHT_MAX_DETAIL])
+
+    detail = '\n'.join(detail_parts)
+    return PostMergePyrightResult(
+        failing_subprojects=failing_subprojects,
+        timed_out_subprojects=timed_out_subprojects,
+        detail=detail,
+    )
+
+
+def _elapsed_ms(start: float | None) -> int | None:
+    """Milliseconds since *start* (a ``time.monotonic()`` value).
+
+    Returns ``None`` when *start* is ``None`` so callers can safely forward
+    the result to ``event_store.emit(duration_ms=...)`` without special-casing.
+    """
+    if start is None:
+        return None
+    return round((time.monotonic() - start) * 1000)
+
+
+# Bound on how many SHAs / paths a single merge_attempt row spells out (task
+# 3178). Driver: reify 5566 attempt-2 cited 22 SHAs touching 7 files, and an
+# unbounded list would bloat runs.db rows. The TRUE count is persisted alongside
+# each truncated slice as ``<key>_total``, so the bounding is never silent.
+#
+# Deliberately LARGER than merge_disposition._MAX_LOGGED_EVIDENCE_ITEMS (5),
+# which bounds the same bundle on the degrade WARNING: that cap is tuned for
+# one-line log readability, this one for runs.db row size — a census querying
+# these rows wants more of the citation than a human grepping a log line does.
+# The two truncation points differ on purpose; neither is drift from the other.
+_MAX_EVENT_EVIDENCE_ITEMS = 10
+
+
+def _emit_merge_attempt(
+    event_store: EventStore | None,
+    task_id: str,
+    outcome: OutcomeKind,
+    *,
+    attempt: int | None = None,
+    duration_ms: int | None = None,
+    train_id: str | None = None,
+    member_task_ids: list[str] | None = None,
+    disposition: MergeFailureDisposition | None = None,
+    origin_host: Literal['local', 'remote'] | None = None,
+    probe_host: Literal['local', 'remote'] | None = None,
+    skew_evidence: SkewEvidence | None = None,
+) -> None:
+    """Emit a ``merge_attempt`` event for the given outcome.
+
+    Note: certain terminal outcomes are intentionally NOT emitted here —
+    specifically ``blocked`` outcomes from ``not merge_result.success`` paths
+    (e.g. merge infrastructure failures unrelated to conflicts) and from
+    ``advance_main`` non-CAS failure codes (``not_descendant``, ``contaminated``,
+    ``stash_failed``).  These are rare infrastructure errors rather than
+    normal merge-latency outcomes and omitting them keeps dashboard latency
+    percentiles free of unbounded outliers from external failures.
+
+    ``blocked`` outcomes that carry a specific diagnostic outcome code
+    (e.g. ``dropped_plan_targets``, ``cas_exhausted``) ARE emitted here;
+    only ``blocked`` outcomes from infrastructure failures are not.
+
+    When called from ``_do_train_merge``, *train_id* and *member_task_ids* are
+    set so downstream reconciliation can correlate ``merge_attempt`` rows with
+    the specific train — not just the tip task_id.
+
+    *disposition* is the optional merge-skew attribution verdict (task 2381 α
+    ``MergeFailureDisposition``, e.g. ``INTEGRATION_SKEW``/``BRANCH_BUG``).
+    When supplied, its ``.value`` is stored under the ``'disposition'`` payload
+    key so ``digest.merge_disposition_counts`` can separate integration-skew
+    failures from branch bugs/indeterminate in runs.db stats (task 2384 γ,
+    mechanism M2). When omitted (the default), no ``'disposition'`` key is
+    added — existing callers' payloads stay byte-identical. Production
+    call sites are threaded by task 2383 β; this parameter's mechanism is
+    proven independently by a direct-emit unit test.
+
+    *origin_host* / *probe_host* are the optional HOST-AFFINITY placement
+    record for a ``main_health_red`` outcome (task 2565): ``origin_host`` is
+    ``'local'``/``'remote'`` depending on which host ran the failing
+    post-merge verify that triggered the main-health probe; ``probe_host``
+    is always ``'local'`` — the probe itself never runs remote-affine (see
+    :func:`verify_failure_is_preexisting_on_main`'s LEASE-SAFETY &
+    HOST-AFFINITY contract). Recording both makes the deliberate local-only
+    placement decision OBSERVABLE in telemetry even when the triggering
+    verify ran remote. When omitted (the default; every non-main-health-red
+    call site), neither key is added — existing callers' payloads stay
+    byte-identical.
+
+    *skew_evidence* is the optional :class:`SkewEvidence` bundle GATHERED by
+    ``classify_merge_failure_disposition`` (task 3178; motivation in
+    merge_disposition's module docstring, THE I7 INCIDENT). When supplied, its
+    ``failing_tests`` / ``implicated_commits`` / ``overlap_files`` are written as
+    json-serialisable lists, each BOUNDED at ``_MAX_EVENT_EVIDENCE_ITEMS`` with
+    the true length recorded under ``<key>_total`` — a silent cap would let a
+    reader infer "3 commits were cited" from a truncated row, so the truncation
+    is made self-describing. When omitted or None (every pre-3178 call site), no
+    key is added — existing callers' payloads stay byte-identical.
+
+    This helper is deliberately disposition-AGNOSTIC about evidence: it writes
+    whatever bundle it is handed, and deciding *when* to emit at all is the
+    caller's guard. That is what lets one code path serve both the
+    ``integration_skew`` row and the ADJUDICATED ``indeterminate`` row.
+    """
+    if event_store is not None:
+        data: dict = {'outcome': outcome}
+        if attempt is not None:
+            data['attempt'] = attempt
+        if train_id is not None:
+            data['train_id'] = train_id
+        if member_task_ids is not None:
+            data['member_task_ids'] = member_task_ids
+        if disposition is not None:
+            data['disposition'] = disposition.value
+        if origin_host is not None:
+            data['origin_host'] = origin_host
+        if probe_host is not None:
+            data['probe_host'] = probe_host
+        if skew_evidence is not None:
+            for key, items in (
+                ('failing_tests', skew_evidence.failing_tests),
+                ('implicated_commits', skew_evidence.implicated_commits),
+                ('overlap_files', skew_evidence.overlap_files),
+            ):
+                data[key] = list(items[:_MAX_EVENT_EVIDENCE_ITEMS])
+                # Recorded unconditionally: a reader never has to know the cap
+                # to tell a short citation from a truncated one.
+                data[f'{key}_total'] = len(items)
+        event_store.emit(
+            EventType.merge_attempt, task_id=task_id, phase='merge',
+            data=data, duration_ms=duration_ms,
+        )
 
 
 #: Bounded FIFO of main-tip SHAs this process's merge queue itself landed —
@@ -347,9 +566,10 @@ class PostMergePyrightResult:
 class _GenerationChainContext:
     """Bundle passed from a worker into _finalize_advanced_merge for γ2 auto-chaining.
 
-    Carries the worker's queue, the per-branch generation counter dict, and
-    the configured maximum so _finalize_advanced_merge can delegate to
-    _maybe_auto_chain_generation without a direct worker reference.
+    Carries the worker's queue, the per-branch generation counter dict, the
+    configured maximum, and the worker's ``_maybe_auto_chain_generation`` so
+    _finalize_advanced_merge can delegate to it without a direct worker
+    reference.
 
     Defaulting to None in _finalize_advanced_merge preserves the function's
     behaviour for trains (_do_train_merge passes None, per PRD D9) and all
@@ -359,6 +579,7 @@ class _GenerationChainContext:
     queue: asyncio.Queue
     counts: dict  # dict[str, int] — per-branch chain counter
     max_auto_generations: int
+    maybe_auto_chain_generation: Callable[..., Awaitable[MergeOutcome | None]]
     retention: TerminalOutcomeRetention | None = None
     """Retention ring to pass to enqueue_merge_request for the chained gen-(n+1)
     request so its terminal outcome is recorded (provenance: superseded_by resolves).
@@ -379,23 +600,9 @@ async def _resolve_second_parent(git_ops: GitOps, sha: str) -> str | None:
     equivalence gate compares the right tree (drift-proof vs a lane whose
     worktree HEAD has been hijacked or rebased after snapshotting).
 
-    Discoverability note: ``_finalize_advanced_merge`` never calls this
-    definition directly — it reaches back through
-    ``orchestrator.merge_queue._resolve_second_parent`` (see the module
-    docstring's reach-back convention) so the existing suite's string-path
-    monkeypatches stay effective.  This function body is nonetheless the
-    canonical implementation that ``merge_queue`` re-exports.
-
     Fail-open: any exception returns ``None`` so the caller falls back to the
     next tier (``merged_branch_tip`` or ``req.snapshot_tip``).
     """
-    # Reach-back (deferred import): the existing test suite patches the git
-    # subprocess runner by string path at `orchestrator.merge_queue._run`
-    # (this function used to live in merge_queue.py).  Resolving `_run`
-    # dynamically from merge_queue's namespace at call time keeps those
-    # patches effective post-extraction.
-    from orchestrator.merge_queue import _run
-
     try:
         rc, out, _err = await _run(
             ['git', 'rev-parse', f'{sha}^2'],
@@ -440,17 +647,7 @@ async def _commit_is_linear(git_ops: GitOps, sha: str) -> bool:
     redundant gate — the tree was already re-verified by ``_reverify_rebased_tree``)
     from a transient ``^2`` git error on a real merge commit (must keep the
     legacy HEAD check to avoid masking a real drop).
-
-    Discoverability note: like :func:`_resolve_second_parent`,
-    ``_finalize_advanced_merge`` calls this via the
-    ``orchestrator.merge_queue._commit_is_linear`` reach-back rather than
-    this local definition, so the existing suite's monkeypatches on that
-    string path stay effective.
     """
-    # Reach-back (deferred import): see _resolve_second_parent — same
-    # `orchestrator.merge_queue._run` string-path patch convention applies.
-    from orchestrator.merge_queue import _run
-
     try:
         rc, out, _err = await _run(
             ['git', 'rev-list', '--parents', '-n', '1', sha],
@@ -548,16 +745,7 @@ class _PostAdvanceContext:
 
 
 async def _run_equivalence_gate(ctx: _PostAdvanceContext) -> GateVerdict:
-    """Decision-2 post-merge content-equivalence gate.
-
-    Discoverability note: reaches back through
-    ``orchestrator.merge_queue._check_post_merge_equivalence`` (see the
-    module docstring's reach-back convention) rather than calling the
-    co-located definition directly, so the existing suite's string-path
-    monkeypatches stay effective.
-    """
-    from orchestrator.merge_queue import _check_post_merge_equivalence
-
+    """Decision-2 post-merge content-equivalence gate."""
     equiv_failed = await _check_post_merge_equivalence(
         ctx.req.worktree, ctx.advanced_sha, ctx.git_ops, ctx.base_sha,
         task_id=ctx.req.task_id,
@@ -600,17 +788,10 @@ async def _auto_chain_on_equivalence_blocked(ctx: _PostAdvanceContext) -> MergeO
     off, or the tip genuinely did not advance), so the caller falls through
     to the default ``'blocked'`` outcome built from the gate's verdict.
     """
-    from orchestrator.merge_queue import (
-        AUTO_CHAIN_GENERATIONS_ENABLED,
-        _elapsed_ms,
-        _emit_merge_attempt,
-        _maybe_auto_chain_generation,
-    )
-
     if ctx.chain_ctx is None or not AUTO_CHAIN_GENERATIONS_ENABLED:
         return None
 
-    chained = await _maybe_auto_chain_generation(
+    chained = await ctx.chain_ctx.maybe_auto_chain_generation(
         ctx.req, ctx.advanced_sha, ctx.git_ops, ctx.event_store,
         merged_branch_tip=ctx.merged_branch_tip or ctx.resolved_merged_tip,
         counts=ctx.chain_ctx.counts,
@@ -632,15 +813,7 @@ async def _auto_chain_on_equivalence_blocked(ctx: _PostAdvanceContext) -> MergeO
 
 
 async def _run_pyright_gate(ctx: _PostAdvanceContext) -> GateVerdict:
-    """Decision-3 post-merge unscoped type-check gate.
-
-    Discoverability note: reaches back through
-    ``orchestrator.merge_queue._check_post_merge_pyright`` rather than
-    calling the co-located definition directly, so the existing suite's
-    string-path monkeypatches stay effective.
-    """
-    from orchestrator.merge_queue import _check_post_merge_pyright
-
+    """Decision-3 post-merge unscoped type-check gate."""
     pyright_result = await _check_post_merge_pyright(
         ctx.advanced_sha, ctx.git_ops, ctx.req.config, ctx.req.module_configs,
         task_id=ctx.req.task_id,
@@ -673,9 +846,8 @@ POST_ADVANCE_GATES: list[Gate] = [
 """Declarative post-advance gate chain, run in order by
 :func:`_finalize_advanced_merge`.  Registering a new gate is an append to
 this list — "a registration, not surgery" — rather than an edit to
-``_finalize_advanced_merge``'s body.  ``merge_queue`` re-exports this exact
-list object (not a copy) so a test — or a future gate author — can register
-a gate by replacing/monkeypatching this module attribute."""
+``_finalize_advanced_merge``'s body.  A test — or a future gate author —
+can register a gate by replacing/monkeypatching this module attribute."""
 
 
 async def _finalize_advanced_merge(
@@ -733,13 +905,6 @@ async def _finalize_advanced_merge(
     ``advance_main`` call that preceded this one.  ``None`` (e.g. no rebase
     occurred) falls back to *merge_commit_fallback*.
     """
-    from orchestrator.merge_queue import (
-        _commit_is_linear,
-        _elapsed_ms,
-        _emit_merge_attempt,
-        _resolve_second_parent,
-    )
-
     cas_retries.pop(req.task_id, None)
     timeouts.pop(req.task_id, None)
     enospc_retries.pop(req.task_id, None)
@@ -2967,11 +3132,6 @@ async def _rebase_delta_touched_overlap(
         Provides ``project_root`` for cross-worktree git operations.
     task_id:
         Optional task identifier for log messages.
-
-    Discoverability note: :func:`_reverify_rebased_tree` calls this via the
-    ``orchestrator.merge_queue._rebase_delta_touched_overlap`` reach-back
-    rather than this local definition, so the existing suite's monkeypatches
-    on that string path stay effective.
     """
     label = task_id or '<unknown>'
 
@@ -3160,6 +3320,7 @@ async def _reverify_rebased_tree(
     max_enospc: int,
     merge_sha: str = '',
     keep_worktrees: Collection[Path] | None = None,
+    run_post_merge_verify: Callable[..., Awaitable[MergeOutcome | None]],
 ) -> MergeOutcome | None:
     """Shared gate for the disjoint-delta re-verify check.
 
@@ -3204,9 +3365,10 @@ async def _reverify_rebased_tree(
         Additional worktrees to protect from disk-guard pruning — forwarded
         verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
         legacy single-keep behaviour (only ``merge_wt`` is protected).
+    run_post_merge_verify:
+        The worker's ``_run_post_merge_verify``, which this gate delegates the
+        re-verify to when the delta overlaps.
     """
-    from orchestrator.merge_queue import _rebase_delta_touched_overlap, _run_post_merge_verify
-
     overlap = await _rebase_delta_touched_overlap(
         req.worktree, rebased_from, rebased_onto, git_ops,
         task_id=req.task_id,
@@ -3240,7 +3402,7 @@ async def _reverify_rebased_tree(
             req.task_id, rebased_from[:8], rebased_onto[:8],
             len(overlap), ', '.join(overlap[:5]),
         )
-    return await _run_post_merge_verify(
+    return await run_post_merge_verify(
         git_ops, req, merge_wt,
         timeouts=timeouts,
         enospc_retries=enospc_retries,
@@ -3294,8 +3456,6 @@ async def _check_post_merge_pyright(
         on main as a standing pre-condition.  Fix the pre-existing failure
         forward to unblock the queue.
     """
-    from orchestrator.merge_queue import _run_unscoped_typechecks
-
     # Quick-exit: if no module defines a type_check_command there is nothing to check.
     active = [mc for mc in module_configs if mc.type_check_command is not None]
     if not active:

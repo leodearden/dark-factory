@@ -38,6 +38,11 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
+from escalation.models import Escalation
+from shared.mcp_post import open_mcp_client, post_mcp_tool_call
+from shared.task_metadata import RetryLedger
+
 from orchestrator import chronic_flake
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
@@ -60,65 +65,43 @@ from orchestrator.merge_lane.disposition import (
     SkewEvidence,
     classify_merge_failure_disposition,
 )
-from orchestrator.merge_lane.drift import (  # noqa: F401  re-export shim
-    DriftCheckState,
-    _load_drift_check_state,
+from orchestrator.merge_lane.drift import (
+    _build_remote_runners,
     _maybe_run_drift_check,
-    _run_drift_check,
-    _save_drift_check_state,
 )
-from orchestrator.merge_lane.gates import (  # noqa: F401  re-export shim
-    _OVERLAP_GIT_ERROR_SENTINEL,
+from orchestrator.merge_lane.gates import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
-    PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
-    POST_ADVANCE_GATES,
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-    POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
-    DropGuardResult,
-    Gate,
-    GateVerdict,
-    PlanFilesTouchedResult,
-    PostMergePyrightResult,
-    _check_plan_files_touched_in_branch,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
     _check_post_merge_pyright,
-    _commit_is_linear,
+    _elapsed_ms,
+    _emit_merge_attempt,
     _finalize_advanced_merge,
     _GenerationChainContext,
     _map_advance_failure,
-    _normalize_plan_path,
-    _rebase_delta_touched_overlap,
     _resolve_second_parent,
     _reverify_rebased_tree,
+    _run_unscoped_typechecks,
 )
 from orchestrator.merge_lane.landed_outbox import LandedOutbox, LandedRow, MergeProvenance
 from orchestrator.merge_lane.landing_evidence import (
     LandingEvidenceVerdict,
     file_unattributed_landing_escalation,
+    patch_content_contained,
     validate_landing_evidence,
 )
-from orchestrator.merge_lane.liveness import (  # noqa: F401  re-export shim
+from orchestrator.merge_lane.liveness import (
     _MERGE_WORKER_LOOP_DIED_SENTINEL,
-    _VERIFY_HOST_RECOVERED_SENTINEL_PREFIX,
-    _VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX,
-    MergeLivenessAssessment,
-    MergeLivenessConfigError,
-    PersistentWorktreeConfigError,
-    SerialLaneAssessment,
+    INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     _acquire_warm_verify_worktree,
     _alarm_verify_host_unreachable,
     _clear_verify_host_unreachable,
     _safety_valve_due,
-    _verify_host_unreachable_sentinel,
     acquire_chain_build_lane,
     alarm_serial_lane_breach,
-    check_merge_liveness_margin,
     check_serial_lane_tripwire,
-    enforce_merge_liveness_margin,
-    enforce_persistent_worktree_serial_lane,
     newest_content_mtime,
-    per_host_inflight_bound,
     release_chain_build_lane,
 )
 from orchestrator.merge_lane.ports import (
@@ -129,50 +112,29 @@ from orchestrator.merge_lane.ports import (
     VerifyPort,
     escalation_port,
 )
-from orchestrator.merge_lane.request_ledger import (  # noqa: F401  re-export shim
+from orchestrator.merge_lane.request_ledger import (
     RequestLedger,
-    StuckRequest,
     _alarm_merge_request_stuck,
-    _merge_request_stuck_sentinel,
 )
-from orchestrator.merge_lane.shadow import (  # noqa: F401  re-export shim
-    _LIBTEST_TEST_LINE_RE,
-    _NEXTEST_SUMMARY_LINE_RE,
-    _NEXTEST_TEST_LINE_RE,
-    _WARM_COLD_SHADOW_SENTINEL,
-    _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL,
-    ShadowCompareDiff,
-    ShadowCompareState,
+from orchestrator.merge_lane.shadow import (
     _alarm_warm_shadow_unparseable,
-    _classify_test_status,
-    _load_shadow_compare_state,
     _maybe_schedule_shadow_compare,
-    _nextest_reported_test_count,
-    _persistent_alarm_tests,
-    _run_coarse_shadow_compare,
     _run_cold_shadow_verify,
-    _run_cold_shadow_verify_suite,
-    _run_shadow_compare,
-    _save_shadow_compare_state,
-    _shadow_compare_due,
-    _submit_coarse_shadow_divergence_escalation,
-    _submit_shadow_divergence_escalation,
     build_fail_fast_map,
     build_warm_shadow_results,
     did_not_pass_subset,
-    diff_per_test_results,
-    merge_retry_shadow_baseline,
     nextest_filter_ids,
     parse_failed_run_all_members,
     parse_nextest_list_planned,
     parse_per_test_results,
 )
-from orchestrator.merge_lane.speculation_controller import (  # noqa: F401  re-export shim
+from orchestrator.merge_lane.speculation_controller import (
     PermitLedger,
     SpeculationController,
 )
-from orchestrator.merge_lane.types import (  # noqa: F401  re-export shim
-    _INFLIGHT_MERGE_ETA_ESTIMATE_SECS,
+from orchestrator.merge_lane.types import (
+    _HEARTBEAT_POLL_S,
+    _MERGE_AHEAD_BOUND,
     CapPermit,
     ChainResult,
     Decided,
@@ -199,25 +161,13 @@ from orchestrator.merge_lane.types import (  # noqa: F401  re-export shim
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
     TrainCallbackFactory,
-    TrainCallbacks,
     VerifyWorktreeHandle,
-    WaiterRecord,
     _HostUnavailability,
     _InFlightEntry,
     item_merge_wt,
 )
-from orchestrator.overlap_footprint import (  # noqa: F401  re-export seam for δ/ζ consumers
-    DEFAULT_OVERLAP_DETECTOR,
-    DefaultPathOverlapDetector,
-    Footprint,
-    OverlapFootprintDetector,
-    changesets_overlap,
-    get_overlap_detector,
-    register_overlap_detector,
-)
 from orchestrator.scheduler import StaleEvidenceRejection
-from orchestrator.suffix_graph import (  # noqa: F401  re-export shim
-    EMPTY_SUFFIX_CONFLICT_GRAPH,
+from orchestrator.suffix_graph import (
     SuffixConflictGraph,
     SuffixConflictTracker,
 )
@@ -229,7 +179,6 @@ from orchestrator.verify import (
     cached_main_baseline_failing_ids,
     diff_new_failures,
     run_scoped_verification,
-    run_verification,
     seed_main_baseline,
     verify_failure_is_preexisting_on_main,
 )
@@ -244,62 +193,20 @@ from orchestrator.verify_runner import (
     UNSCOPED_TYPECHECK_TIMEOUT_CATEGORY,
     HostAllocator,
     LocalRunner,
-    RemoteRunner,
     RunnerUnavailable,
     VerifyRunner,
     VerifyRunnerPool,
     build_merge_verify_spec,
     is_flock_contention_failure,
     is_unscoped_gate_failure,
-    resolve_local_df_checkout,
     unscoped_gate_failing_subprojects,
 )
+from orchestrator.workflow import _select_train_members
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 logger = logging.getLogger('orchestrator.merge_queue')
-
-
-def _build_remote_runners(
-    config: OrchestratorConfig,
-    cwd: str | Path,
-    *,
-    quarantine: set[str] | None = None,
-) -> list[RemoteRunner]:
-    """Build the list of RemoteRunner instances from operator config (Lever C).
-
-    Returns REMOTES ONLY — the LocalRunner trust anchor is prepended by callers
-    since it needs call-specific arguments (worktree path, module configs, etc.).
-
-    Filters out disabled runners (enabled=False) and any runner whose name is in
-    the quarantine set (in-memory worker-level quarantine from DriftDetector).
-    quarantine=None is treated as an empty set (no quarantine).
-
-    _build_verify_runners passes main_branch=config.git.main_branch so the
-    remote host receives a freshness push before the merge-sha transport.
-
-    Each runner also receives the INV-2 contract-currency paths (task 2884):
-    df_remote_checkout=r.df_checkout_path (per-runner, opt-in; None keeps
-    auto-sync OFF / byte-identical) and df_local_checkout=the dispatcher's own
-    DF code root, resolved ONCE here (call-invariant) and shared across every
-    runner so sync_if_stale can HEAD-compare remote-vs-local at dispatch.
-    """
-    _local_df = resolve_local_df_checkout()
-    return [
-        RemoteRunner(
-            name=r.name,
-            ssh_host=r.ssh_host,
-            git_remote=r.git_remote,
-            cwd=cwd,
-            config_path=r.config_path,
-            main_branch=config.git.main_branch,
-            df_remote_checkout=r.df_checkout_path,
-            df_local_checkout=_local_df,
-        )
-        for r in config.enabled_verify_runners
-        if quarantine is None or r.name not in quarantine
-    ]
 
 
 NEEDS_REBASE_REASON_PREFIX = 'Suffix item needs rebase onto frozen-prefix tip'
@@ -375,92 +282,6 @@ _TRAIN_PREDECESSOR_SETTLE_SLACK_SECS = 120.0
 """Added to the predecessor's verify budget so the settle wait expires only
 AFTER the verify it is waiting on has itself timed out — the wait must not be
 the thing that gives up first."""
-
-_MERGE_AHEAD_BOUND = 1
-"""Maximum number of counted (non-speculative, non-train) items that may sit in
-the SpeculativeMergeWorker verifier queue simultaneously (Mechanism 1, task 1646).
-
-.. note:: This constant is an input to the startup liveness-margin guard.
-   See :func:`check_merge_liveness_margin` for the coupling between this bound,
-   the verify timeout, and :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`.
-
-With BOUND=1 the Merger runs at most one non-speculative merge ahead of the
-Verifier: after enqueuing a counted item the Merger blocks at
-``self._merge_ahead_ledger.acquire()`` (task 2161/θ: ledger-mediated, wraps
-``_merge_ahead_cap``) until the Verifier drains that item, at which point it
-re-reads a fresh main HEAD for the next merge.  Values in [1, 2] are safe;
-higher values allow more build-ahead but increase staleness risk.
-
-Cap invariants (all verified by integration tests):
-- Acquired at the single success-enqueue site in _merger_loop for non-speculative
-  blocking-path items (trains continue before this site; speculative items are
-  governed by _speculation_slot instead), stamped onto the item's
-  :attr:`~orchestrator.merge_types.RealMergeItem.cap_permit`.
-- Released ON-DRAIN in _verifier_loop, immediately after ``_verifier_queue.get()``
-  returns a non-None item, before any branching or item reassignment.  This
-  uniform placement covers all drain paths (normal verify, immediate_outcome,
-  chain-invalidation discard+_remerge, abandoned early-continue) with a single
-  release point and no risk of double-release (each counted item has exactly one
-  drain in the FIFO).
-- Released by stop() (over-release of a plain Semaphore is safe) so a merger
-  blocked at acquire() unblocks cleanly at shutdown."""
-
-_HEARTBEAT_POLL_S: float = 30.0
-"""How often _heartbeat_loop wakes up to call _maybe_log_queue_heartbeat.
-
-The heartbeat loop polls this frequently; the actual emission rate is governed
-by the per-instance _heartbeat_interval_s (default 300 s).  Keeping the poll
-period short (30 s) means the first heartbeat fires within ~30 s of startup
-when depth > 0 (because _last_heartbeat_at is initialised to 0.0, making the
-rate-limit check pass immediately on the first poll), then subsequently no
-more often than _heartbeat_interval_s, without adding measurable overhead.
-
-This constant is also a multiplicand of the liveness-margin guard's heartbeat
-floor (see :data:`TOUCH_MISS_TOLERANCE`)."""
-
-TOUCH_MISS_TOLERANCE: int = 20
-"""Maximum number of consecutive _HEARTBEAT_POLL_S ticks a live worker's
-owned ``_merge-*`` worktrees are permitted to miss before their mtime would
-falsely age into the reaper window.
-
-**Derivation**
-
-The α owner-heartbeat (task 1728) touches every owned ``_merge-*`` worktree's
-mtime every :data:`_HEARTBEAT_POLL_S` seconds.  Under normal operation a
-worktree's mtime age is bounded by ~1 poll period (30 s).  A sustained
-event-loop stall (GIL contention, heavy I/O, OS scheduling jitter) can delay
-the heartbeat, but the stall budget is:
-
-    floor_secs = _HEARTBEAT_POLL_S × TOUCH_MISS_TOLERANCE = 30 × 20 = 600 s
-
-**Margin calibration** (PRD §9, 10–60 band)
-
-    default_threshold = 0.75 × INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
-                      = 0.75 × 10800 = 8100 s
-    margin = 8100 / 600 = 13.5× ≥ 3× (PRD minimum)
-
-20 is the PRD's running example ("e.g. 20 → 600 s floor").  The constant is
-read in the body of :func:`check_merge_liveness_margin` (not as a default
-argument) so that a harness-level test can monkeypatch it to force an
-over-budget verdict without requiring a low-liveness config."""
-
-AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
-"""Kill-switch for the γ2 generation auto-chaining producer.
-
-MUST remain False until the sole remaining γ3 precondition lands:
-  1. ✓ DONE (task/1717): The workflow.py 'superseded' consumer handler — the
-     single-task merge consumer in ``_submit_to_merge_queue`` now parks
-     'superseded' outcomes as merge-deferred via ``_handle_superseded`` instead
-     of falling through to ``_mark_blocked`` with an empty reason.
-  2. The gen-(n+1) registry slot handoff via ATTACH_AND_CHAIN (re-acquiring the
-     branch slot in InFlightMergeRegistry for the chained request without tripping
-     the gen-1 done-callback double-release, and threading TerminalOutcomeRetention
-     from the harness into the workers — harness.py:3238 omits both today).
-
-While False, _finalize_advanced_merge ignores chain_ctx on equivalence failures
-and returns 'blocked' exactly as before γ2, so no 'superseded' outcome can reach
-the workflow consumer."""
-
 
 MERGE_LANES: tuple[str, ...] = ('high', 'normal')
 """Priority-ordered lane names (high first).  Used by SpeculativeMergeWorker to
@@ -871,7 +692,9 @@ PRODUCTION_VERIFIER: VerifyPort = ProductionVerifier(
     post_merge_pyright=lambda: _check_post_merge_pyright,
     post_merge_equivalence=lambda: _check_post_merge_equivalence,
     disk_guard=lambda: _ensure_verify_disk_space,
-    cold_shadow_verify=lambda: _run_cold_shadow_verify,
+    cold_shadow_verify=lambda: functools.partial(
+        _run_cold_shadow_verify, verifier=PRODUCTION_VERIFIER,
+    ),
     dry_run=lambda: run_dry_run_unblock,
 )
 PRODUCTION_CLOCK: ClockPort = ProductionClock(content_mtime=lambda: newest_content_mtime)
@@ -1185,8 +1008,6 @@ def _alarm_verify_worktree_contention(
     """
     if escalation_queue is None:
         return
-
-    from escalation.models import Escalation  # local import — escalation optional dep
 
     sentinel = _verify_worktree_contention_sentinel(host)
 
@@ -1578,9 +1399,6 @@ def _file_main_health_escalation(
     """
     if escalation_queue is None:
         return None
-
-    from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
-    from escalation.models import Escalation  # local import — escalation optional dep
 
     fp = outcome.dedupe_fingerprint or None
     esc = Escalation(
@@ -3421,9 +3239,6 @@ async def _run_post_merge_verify(
                     escalation_queue is not None
                     and not escalation_queue.has_open_l1(_CROSS_CHECK_SENTINEL)
                 ):
-                    from escalation.models import (
-                        Escalation,  # local import — escalation optional dep
-                    )
                     if local_infra_fail:
                         # Local infra hiccup, not a genuine divergence: pre-fix-3
                         # L1 blocking shape — land withheld + remote quarantined,
@@ -3945,36 +3760,6 @@ async def classify_tip_relation(
     return TipRelation.DIVERGENT
 
 
-async def patch_content_contained(
-    head: str,
-    upstream: str,
-    git_ops: GitOps,
-) -> bool:
-    """Return True if every commit in *head* is already present (by patch-id) in *upstream*.
-
-    Uses ``git cherry upstream head``: lines without a leading ``+`` are
-    commits already applied; ``+`` lines are commits NOT yet in *upstream*.
-    An empty ``+``-line set → fully contained → True.
-
-    Fail-open: returns False on any git error (``rc != 0``) so that the
-    caller falls through to a full merge attempt rather than incorrectly
-    declaring the branch "already merged".
-
-    This is also the α2/D6 submit-time fast-path machinery: a branch whose
-    content is fully cherry-picked/rebased into main is "already merged" even
-    when its tip is not a literal ancestor.  The ``is_ancestor``-only
-    fast-path was wired in task 1629; the patch-id extension (this helper)
-    for escalation/server.py is not yet scheduled as a separate task.
-    """
-    rc, out, _ = await _run(
-        ['git', 'cherry', upstream, head],
-        cwd=git_ops.project_root,
-    )
-    if rc != 0:
-        return False  # fail-open
-    return not any(line.startswith('+') for line in out.splitlines())
-
-
 async def resolve_divergent(
     new_tip: str,
     old_tip: str,
@@ -4270,89 +4055,6 @@ async def _resolve_commit_tree(git_ops: GitOps, commit: str) -> str | None:
     return out.strip() or None
 
 
-# Maximum number of characters to include in the detail field of a
-# ``PostMergePyrightResult`` — keeps the blocked reason string in the
-# escalation payload under reasonable size limits.
-_POST_MERGE_PYRIGHT_MAX_DETAIL = 2000
-
-
-async def _run_unscoped_typechecks(
-    worktree: Path,
-    config: OrchestratorConfig,
-    module_configs: list[ModuleConfig],
-    *,
-    block_on_timeout: bool,
-    task_id: str | None = None,
-) -> PostMergePyrightResult:
-    """Run each module's ``type_check_command`` unscoped against a caller-owned worktree.
-
-    This helper operates on a worktree supplied by the caller — it does **not**
-    create or clean up any worktree itself.
-
-    Args:
-        worktree: Path to the worktree to run type-checks in.  Caller owns it.
-        config: Orchestrator config (passed through to ``run_verification``).
-        module_configs: List of module configs.  Modules without a
-            ``type_check_command`` are silently skipped.
-        block_on_timeout: When ``True``, a timed-out module is appended to
-            *both* ``timed_out_subprojects`` and ``failing_subprojects``, making
-            the result ``broken`` (fail-closed, for the pre-advance gate).
-            When ``False``, a timed-out module is appended only to
-            ``timed_out_subprojects`` (fail-open, for the post-advance check).
-        task_id: Optional task identifier for log messages.
-
-    Returns:
-        :class:`PostMergePyrightResult` with the classification of each
-        module's type-check outcome.
-    """
-    active = [mc for mc in module_configs if mc.type_check_command is not None]
-    if not active:
-        return PostMergePyrightResult()
-
-    async def _run_one(mc: ModuleConfig) -> tuple[ModuleConfig, VerifyResult]:
-        # Run only the type-check command verbatim (unscoped).
-        # Null out test/lint so run_verification skips them (None => skip).
-        # is_merge_verify=True forces cold semantics; the per-command timeout
-        # used is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
-        # if set, falling back to `verify_cold_command_timeout_secs` then warm.
-        type_only_mc = dataclasses.replace(mc, test_command=None, lint_command=None)
-        return mc, await run_verification(
-            worktree, config, type_only_mc,
-            max_retries=0, is_merge_verify=True, role='merge',
-        )
-
-    # Run all subproject type-checks concurrently to minimise wall-clock
-    # impact on the merge queue's push_main delay.
-    pairs = await asyncio.gather(*(_run_one(mc) for mc in active))
-
-    failing_subprojects: list[str] = []
-    timed_out_subprojects: list[str] = []
-    detail_parts: list[str] = []
-
-    for mc, verify in pairs:
-        if verify.timed_out:
-            timed_out_subprojects.append(mc.prefix)
-            if block_on_timeout:
-                failing_subprojects.append(mc.prefix)
-            continue
-
-        if not verify.passed:
-            failing_subprojects.append(mc.prefix)
-            # Collect bounded detail from the FIRST failing subproject only
-            # (matches PostMergePyrightResult.detail docstring).
-            if not detail_parts:
-                raw = verify.failure_report() or verify.type_output or ''
-                if isinstance(raw, str) and raw:
-                    detail_parts.append(raw[:_POST_MERGE_PYRIGHT_MAX_DETAIL])
-
-    detail = '\n'.join(detail_parts)
-    return PostMergePyrightResult(
-        failing_subprojects=failing_subprojects,
-        timed_out_subprojects=timed_out_subprojects,
-        detail=detail,
-    )
-
-
 ABANDONED_REASON_PREFIX = 'Post-merge verify timed out'
 """Prefix of the ``MergeOutcome.reason`` string emitted by the merge-queue
 loop-breaker.  Downstream classifiers (task steward, dashboard) use this to
@@ -4367,129 +4069,6 @@ has been removed out-of-band (typically by a human marking the task ``done``
 and cleaning up).  ``TaskWorkflow._submit_to_merge_queue`` recognises this
 prefix and re-checks task status: if terminal, it short-circuits to
 ``WorkflowOutcome.DONE`` instead of cascading into ``_mark_blocked``."""
-
-
-def _elapsed_ms(start: float | None) -> int | None:
-    """Milliseconds since *start* (a ``time.monotonic()`` value).
-
-    Returns ``None`` when *start* is ``None`` so callers can safely forward
-    the result to ``event_store.emit(duration_ms=...)`` without special-casing.
-    """
-    if start is None:
-        return None
-    return round((time.monotonic() - start) * 1000)
-
-
-# Bound on how many SHAs / paths a single merge_attempt row spells out (task
-# 3178). Driver: reify 5566 attempt-2 cited 22 SHAs touching 7 files, and an
-# unbounded list would bloat runs.db rows. The TRUE count is persisted alongside
-# each truncated slice as ``<key>_total``, so the bounding is never silent.
-#
-# Deliberately LARGER than merge_disposition._MAX_LOGGED_EVIDENCE_ITEMS (5),
-# which bounds the same bundle on the degrade WARNING: that cap is tuned for
-# one-line log readability, this one for runs.db row size — a census querying
-# these rows wants more of the citation than a human grepping a log line does.
-# The two truncation points differ on purpose; neither is drift from the other.
-_MAX_EVENT_EVIDENCE_ITEMS = 10
-
-
-def _emit_merge_attempt(
-    event_store: EventStore | None,
-    task_id: str,
-    outcome: OutcomeKind,
-    *,
-    attempt: int | None = None,
-    duration_ms: int | None = None,
-    train_id: str | None = None,
-    member_task_ids: list[str] | None = None,
-    disposition: MergeFailureDisposition | None = None,
-    origin_host: Literal['local', 'remote'] | None = None,
-    probe_host: Literal['local', 'remote'] | None = None,
-    skew_evidence: SkewEvidence | None = None,
-) -> None:
-    """Emit a ``merge_attempt`` event for the given outcome.
-
-    Note: certain terminal outcomes are intentionally NOT emitted here —
-    specifically ``blocked`` outcomes from ``not merge_result.success`` paths
-    (e.g. merge infrastructure failures unrelated to conflicts) and from
-    ``advance_main`` non-CAS failure codes (``not_descendant``, ``contaminated``,
-    ``stash_failed``).  These are rare infrastructure errors rather than
-    normal merge-latency outcomes and omitting them keeps dashboard latency
-    percentiles free of unbounded outliers from external failures.
-
-    ``blocked`` outcomes that carry a specific diagnostic outcome code
-    (e.g. ``dropped_plan_targets``, ``cas_exhausted``) ARE emitted here;
-    only ``blocked`` outcomes from infrastructure failures are not.
-
-    When called from ``_do_train_merge``, *train_id* and *member_task_ids* are
-    set so downstream reconciliation can correlate ``merge_attempt`` rows with
-    the specific train — not just the tip task_id.
-
-    *disposition* is the optional merge-skew attribution verdict (task 2381 α
-    ``MergeFailureDisposition``, e.g. ``INTEGRATION_SKEW``/``BRANCH_BUG``).
-    When supplied, its ``.value`` is stored under the ``'disposition'`` payload
-    key so ``digest.merge_disposition_counts`` can separate integration-skew
-    failures from branch bugs/indeterminate in runs.db stats (task 2384 γ,
-    mechanism M2). When omitted (the default), no ``'disposition'`` key is
-    added — existing callers' payloads stay byte-identical. Production
-    call sites are threaded by task 2383 β; this parameter's mechanism is
-    proven independently by a direct-emit unit test.
-
-    *origin_host* / *probe_host* are the optional HOST-AFFINITY placement
-    record for a ``main_health_red`` outcome (task 2565): ``origin_host`` is
-    ``'local'``/``'remote'`` depending on which host ran the failing
-    post-merge verify that triggered the main-health probe; ``probe_host``
-    is always ``'local'`` — the probe itself never runs remote-affine (see
-    :func:`verify_failure_is_preexisting_on_main`'s LEASE-SAFETY &
-    HOST-AFFINITY contract). Recording both makes the deliberate local-only
-    placement decision OBSERVABLE in telemetry even when the triggering
-    verify ran remote. When omitted (the default; every non-main-health-red
-    call site), neither key is added — existing callers' payloads stay
-    byte-identical.
-
-    *skew_evidence* is the optional :class:`SkewEvidence` bundle GATHERED by
-    ``classify_merge_failure_disposition`` (task 3178; motivation in
-    merge_disposition's module docstring, THE I7 INCIDENT). When supplied, its
-    ``failing_tests`` / ``implicated_commits`` / ``overlap_files`` are written as
-    json-serialisable lists, each BOUNDED at ``_MAX_EVENT_EVIDENCE_ITEMS`` with
-    the true length recorded under ``<key>_total`` — a silent cap would let a
-    reader infer "3 commits were cited" from a truncated row, so the truncation
-    is made self-describing. When omitted or None (every pre-3178 call site), no
-    key is added — existing callers' payloads stay byte-identical.
-
-    This helper is deliberately disposition-AGNOSTIC about evidence: it writes
-    whatever bundle it is handed, and deciding *when* to emit at all is the
-    caller's guard. That is what lets one code path serve both the
-    ``integration_skew`` row and the ADJUDICATED ``indeterminate`` row.
-    """
-    if event_store is not None:
-        data: dict = {'outcome': outcome}
-        if attempt is not None:
-            data['attempt'] = attempt
-        if train_id is not None:
-            data['train_id'] = train_id
-        if member_task_ids is not None:
-            data['member_task_ids'] = member_task_ids
-        if disposition is not None:
-            data['disposition'] = disposition.value
-        if origin_host is not None:
-            data['origin_host'] = origin_host
-        if probe_host is not None:
-            data['probe_host'] = probe_host
-        if skew_evidence is not None:
-            for key, items in (
-                ('failing_tests', skew_evidence.failing_tests),
-                ('implicated_commits', skew_evidence.implicated_commits),
-                ('overlap_files', skew_evidence.overlap_files),
-            ):
-                data[key] = list(items[:_MAX_EVENT_EVIDENCE_ITEMS])
-                # Recorded unconditionally: a reader never has to know the cap
-                # to tell a short citation from a truncated one.
-                data[f'{key}_total'] = len(items)
-        event_store.emit(
-            EventType.merge_attempt, task_id=task_id, phase='merge',
-            data=data, duration_ms=duration_ms,
-        )
 
 
 async def _classify_branch_presence(
@@ -4632,29 +4211,6 @@ def _emit_train_event(
     if data:
         payload.update(data)
     event_store.emit(event_type, task_id=task_id, phase='merge', data=payload)
-
-
-INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS: int = 10800
-"""Maximum age (seconds, wall-clock mtime) for an on-disk ``_merge-*`` worktree
-to be considered actively in-flight rather than abandoned.
-
-.. note:: Raising this value (or raising :data:`_MERGE_AHEAD_BOUND`, or
-   increasing the merge-verify cold timeout) affects the safety margin computed
-   by :func:`check_merge_liveness_margin`.  Run that guard after changing any
-   of these three values.
-
-Set to 3 hours (10800 s) so the liveness window comfortably exceeds the cold
-merge-verify budget shipped in ``defaults.yaml``
-(``merge_verify_cold_command_timeout_secs: 7200``).  With ``safety_factor=0.75``
-the guard threshold is ``0.75 × 10800 = 8100 s > 7200 s``, so the shipped
-config is silent and in-flight verifies are never reaped mid-run.
-
-**Tradeoff**: a genuinely-abandoned ``_merge-*`` worktree (e.g. from a crashed
-worker) now lingers up to ~3 hours before the reaper reclaims it.  The cost is
-disk space only — no correctness impact — and is the deliberate, accepted cost
-of closing the merge-verify-vs-reaper race (esc-1674-34 Option 2).
-
-Adjusted at module level or injected via `liveness_secs` in tests."""
 
 
 def _emit_merge_queued(
@@ -8553,8 +8109,6 @@ def _alarm_illegal_lifecycle_transition(
     if escalation_queue.has_open_l1(sentinel):
         return
 
-    from escalation.models import Escalation  # local import — escalation optional dep
-
     summary = (
         f'ItemLifecycle rejected a transition for request_id {request_id!r}: '
         f'{from_state!r} -> {to_state!r}'
@@ -8590,8 +8144,6 @@ def _alarm_illegal_lifecycle_transition(
     escalation_queue.submit(esc)
 
     if event_store is not None:
-        from orchestrator.event_store import EventType
-
         event_store.emit(
             EventType.escalation_created,
             data={
@@ -8636,8 +8188,6 @@ def _alarm_coalesce_live_original(
     sentinel = f'{_COALESCE_LIVE_ORIGINAL_SENTINEL_PREFIX}{request.request_id}'
     if escalation_queue.has_open_l1(sentinel):
         return
-
-    from escalation.models import Escalation  # local import — escalation optional dep
 
     summary = (
         f'Re-entrant merge drain of the LIVE ORIGINAL request '
@@ -8690,8 +8240,6 @@ def _alarm_coalesce_live_original(
     escalation_queue.submit(esc)
 
     if event_store is not None:
-        from orchestrator.event_store import EventType
-
         event_store.emit(
             EventType.escalation_created,
             task_id=request.task_id,
@@ -13921,9 +13469,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         ``threshold_s`` defaults to ``None``, resolved in-body to 1.5 ×
         :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` (~4.5h — comfortably
         past the cold-verify ceiling, so anything still unresolved past it is
-        definitively stuck).  Resolved via the same deferred reach-back
-        import used throughout ``merge_liveness.py`` so a test's
-        string-path monkeypatch of
+        definitively stuck).  Read from the module global at call time, so a
+        test's string-path monkeypatch of
         ``orchestrator.merge_queue.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS``
         stays effective.
 
@@ -13937,8 +13484,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         an operator resolves the L1 is unaffected by the log-dedup state.
         """
         if threshold_s is None:
-            from orchestrator.merge_queue import INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
-
             threshold_s = 1.5 * INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS
 
         stuck_list = self._request_ledger.stuck_entries(now, threshold_s)
@@ -15412,9 +14957,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # ── Step-6: core pass body ─────────────────────────────────────────────
         # SELECTION: fan out line-range fetches concurrently (one git subprocess
         # per candidate), then delegate to the greedy mutually-stackable selector.
-        # Function-local import avoids a load-time circular import: workflow.py
-        # imports merge_queue only lazily, so merge_queue→workflow is safe here.
-        from orchestrator.workflow import _select_train_members  # noqa: PLC0415
 
         anchor = candidates[0]
         other_ids = [c.task_id for c in candidates[1:]]
@@ -17716,7 +17258,6 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if self._mcp is None:
             return
         try:
-            from shared.mcp_post import open_mcp_client, post_mcp_tool_call
             async with open_mcp_client() as client:
                 for arguments in arguments_list:
                     try:
@@ -17819,11 +17360,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         primitive directly (``auto_heal_registry``, ``halt_lane``, etc.), so
         that branch collapses into the non-mechanical / no-queue check.
         """
-        # Local import — the SAME signature-keying authority
-        # workflow._compute_merge_outcome_signature delegates to.  merge_queue
-        # must NOT import from orchestrator.workflow (that would be a cycle);
-        # shared.task_metadata has no orchestrator dependency, so this is safe.
-        from shared.task_metadata import RetryLedger
+        # RetryLedger is the SAME signature-keying authority
+        # workflow._compute_merge_outcome_signature delegates to.
 
         category = outcome.failure_category or ''
         cause_hint = outcome.failure_cause_hint or ''
@@ -20653,6 +20191,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             queue=self._queue,
                             counts=self._generation_chain_counts,
                             max_auto_generations=MAX_AUTO_CHAINED_GENERATIONS,
+                            maybe_auto_chain_generation=_maybe_auto_chain_generation,
                         ),
                         merged_branch_tip=item.merged_branch_tip,
                         advanced_sha=adv_outcome.advanced_sha,
@@ -20705,9 +20244,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             warm_results=_warm_results,
                             escalation_queue=self._escalation_queue,
                             event_store=self._event_store,
+                            verifier=self._verifier,
                         )
                         await _maybe_run_drift_check(
                             self, self._git_ops, req, merge_commit,
+                            verifier=self._verifier,
                         )
                         # D10 promote-provenance: advance the rolling warm base
                         # from the _merge-verify lane's target (the just-landed
@@ -20771,6 +20312,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         max_enospc=self.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
                         merge_sha=rebased_sha,
                         keep_worktrees=set(self._owned_merge_worktrees),
+                        run_post_merge_verify=_run_post_merge_verify,
                     )
                     if gate is not None:
                         # task 2604: route through the unified terminal
@@ -21631,8 +21173,6 @@ def _alarm_resource_audit(
     if escalation_queue.has_open_l1(sentinel):
         return
 
-    from escalation.models import Escalation  # local import — escalation optional dep
-
     count = len(violations)
     headline = violations[0] if violations else 'unknown violation'
     summary = (
@@ -21696,8 +21236,6 @@ def _alarm_resource_audit(
     escalation_queue.submit(esc)
 
     if event_store is not None:
-        from orchestrator.event_store import EventType
-
         event_store.emit(
             EventType.escalation_created,
             data={

@@ -198,15 +198,49 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
+from escalation.models import Escalation
+
+from orchestrator.config import RecoveryEmissionConfig
+from orchestrator.git_ops import _run
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from escalation.queue import EscalationQueue
 
-    from orchestrator.config import RecoveryEmissionConfig
     from orchestrator.git_ops import GitOps
 
 logger = logging.getLogger('orchestrator.landing_evidence')
+
+
+async def patch_content_contained(
+    head: str,
+    upstream: str,
+    git_ops: GitOps,
+) -> bool:
+    """Return True if every commit in *head* is already present (by patch-id) in *upstream*.
+
+    Uses ``git cherry upstream head``: lines without a leading ``+`` are
+    commits already applied; ``+`` lines are commits NOT yet in *upstream*.
+    An empty ``+``-line set → fully contained → True.
+
+    Fail-open: returns False on any git error (``rc != 0``) so that the
+    caller falls through to a full merge attempt rather than incorrectly
+    declaring the branch "already merged".
+
+    This is also the α2/D6 submit-time fast-path machinery: a branch whose
+    content is fully cherry-picked/rebased into main is "already merged" even
+    when its tip is not a literal ancestor.  The ``is_ancestor``-only
+    fast-path was wired in task 1629; the patch-id extension (this helper)
+    for escalation/server.py is not yet scheduled as a separate task.
+    """
+    rc, out, _ = await _run(
+        ['git', 'cherry', upstream, head],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        return False  # fail-open
+    return not any(line.startswith('+') for line in out.splitlines())
 
 __all__ = [
     'LANDING_GIT_ERROR_STORM_CATEGORY',
@@ -469,9 +503,8 @@ def _resolve_recovery_emission(
     """
     if recovery_emission is not None:
         return recovery_emission
-    from orchestrator.config import RecoveryEmissionConfig as _Config  # noqa: PLC0415
 
-    return _Config()
+    return RecoveryEmissionConfig()
 
 
 def _observe_landing_verdict(
@@ -1513,10 +1546,6 @@ async def branch_work_landed(
             if net_empty:
                 return _reject(LandingReason.no_op_landing)
 
-        # Function-scoped: merge_queue.py imports from this module at module
-        # level, so importing it back at module level would close an import cycle.
-        from orchestrator.merge_queue import patch_content_contained  # noqa: PLC0415
-
         contained = await patch_content_contained(head, upstream, git_ops)
         probe['patch_id_contained'] = contained
         if not contained:
@@ -2359,7 +2388,6 @@ def file_unattributed_landing_escalation(
                 prior.resolved_by, absorbed if absorbed is not None else 'uncounted',
             )
             return
-        from escalation.models import Escalation  # noqa: PLC0415
 
         summary, detail = format_unattributed_landing_detail(task_id, branch, verdict)
         esc = Escalation(
@@ -2459,7 +2487,6 @@ def file_landing_git_error_storm_escalation(
             category=LANDING_GIT_ERROR_STORM_CATEGORY,
         ):
             return False
-        from escalation.models import Escalation  # noqa: PLC0415
 
         window_hours = tally.window_secs / 3600.0
         summary = (

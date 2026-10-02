@@ -1,29 +1,16 @@
 """Lever-C drift-check detective (MQ-refactor task γ).
 
-Extracted verbatim from :mod:`orchestrator.merge_queue`: the drift-check
-runner (dispatches a local + remote pair through
-:class:`~orchestrator.verify_runner.DriftDetector` in a throwaway worktree)
-and its land-hook cadence gate.  ``merge_queue`` re-exports both names
-through a top-level shim so existing importers
-(``from orchestrator.merge_queue import X``, etc.) keep working unchanged.
-
-A moved function that calls a merge_queue-resident sibling — whether that
-sibling stays permanently (``_run_unscoped_typechecks``, the module-level
-``_build_remote_runners`` legacy-pool builder) or is monkeypatched by the
-existing test suite via the string path ``orchestrator.merge_queue.<name>``
-(``run_scoped_verification``, ``build_merge_verify_spec``, ``LocalRunner``,
-``VerifyRunnerPool``, ``_run_drift_check``) — resolves it through a
-function-local (deferred) import from
-:mod:`orchestrator.merge_queue` rather than a direct intra-module reference.
-This mirrors the ``_main_health_fingerprint`` convention in
-``merge_queue.py`` and keeps this module free of any top-level import of
-``merge_queue`` (which would deadlock module load, since merge_queue's shim
-needs this module fully defined first).
+The drift-check runner (dispatches a local + remote pair through
+:class:`~orchestrator.verify_runner.DriftDetector` in a throwaway worktree),
+the legacy remote-pool builder, and the land-hook cadence gate.  The local
+trust-anchor verifies through the worker's injected
+:class:`~orchestrator.merge_lane.ports.VerifyPort`; this module never imports
+the worker.
 
 Note: despite both being off-serial-lane detective controls spawned from the
 same 'done'-land hook, :func:`_run_drift_check` does NOT call
 ``_run_cold_shadow_verify`` or ``_run_shadow_compare`` (in
-:mod:`orchestrator.merge_shadow`) — drift-check and shadow-compare are
+:mod:`orchestrator.merge_lane.shadow`) — drift-check and shadow-compare are
 independent sibling detectives, not caller/callee.
 """
 
@@ -40,32 +27,63 @@ from typing import TYPE_CHECKING, Any
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane.types import MergeRequest
-
-# run_scoped_verification is not referenced directly in this module —
-# _run_drift_check always reaches back to the orchestrator.merge_queue-
-# resident binding (see its body).  Imported here only so TestReachBackRouting
-# has a "naive" orchestrator.merge_drift.run_scoped_verification patch target
-# to assert is NOT what governs.  _derive_task_files_from_git is deliberately
-# NOT imported here and (as of task 2886 fix 1b) is no longer referenced by
-# _run_drift_check at all: the drift spec is now full-gate (task_files=None),
-# so the drift path performs no dispatching-host scope derivation.
-from orchestrator.verify import run_scoped_verification  # noqa: F401
-
-# LocalRunner / VerifyRunnerPool / build_merge_verify_spec: same reasoning —
-# _run_drift_check always reaches back to orchestrator.merge_queue for these;
-# DriftDetector / HostAllocator are used directly (not reached back).
 from orchestrator.verify_runner import (
     DriftDetector,
     HostAllocator,
-    LocalRunner,  # noqa: F401
-    VerifyRunnerPool,  # noqa: F401
-    build_merge_verify_spec,  # noqa: F401
+    LocalRunner,
+    RemoteRunner,
+    VerifyRunnerPool,
+    build_merge_verify_spec,
+    resolve_local_df_checkout,
 )
 
 if TYPE_CHECKING:
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.merge_lane.ports import VerifyPort
     from orchestrator.merge_lane.worker import SpeculativeMergeWorker
 
 logger = logging.getLogger('orchestrator.merge_queue')
+
+
+def _build_remote_runners(
+    config: OrchestratorConfig,
+    cwd: str | Path,
+    *,
+    quarantine: set[str] | None = None,
+) -> list[RemoteRunner]:
+    """Build the list of RemoteRunner instances from operator config (Lever C).
+
+    Returns REMOTES ONLY — the LocalRunner trust anchor is prepended by callers
+    since it needs call-specific arguments (worktree path, module configs, etc.).
+
+    Filters out disabled runners (enabled=False) and any runner whose name is in
+    the quarantine set (in-memory worker-level quarantine from DriftDetector).
+    quarantine=None is treated as an empty set (no quarantine).
+
+    _build_verify_runners passes main_branch=config.git.main_branch so the
+    remote host receives a freshness push before the merge-sha transport.
+
+    Each runner also receives the INV-2 contract-currency paths (task 2884):
+    df_remote_checkout=r.df_checkout_path (per-runner, opt-in; None keeps
+    auto-sync OFF / byte-identical) and df_local_checkout=the dispatcher's own
+    DF code root, resolved ONCE here (call-invariant) and shared across every
+    runner so sync_if_stale can HEAD-compare remote-vs-local at dispatch.
+    """
+    _local_df = resolve_local_df_checkout()
+    return [
+        RemoteRunner(
+            name=r.name,
+            ssh_host=r.ssh_host,
+            git_remote=r.git_remote,
+            cwd=cwd,
+            config_path=r.config_path,
+            main_branch=config.git.main_branch,
+            df_remote_checkout=r.df_checkout_path,
+            df_local_checkout=_local_df,
+        )
+        for r in config.enabled_verify_runners
+        if quarantine is None or r.name not in quarantine
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +167,7 @@ async def _run_drift_check(
     event_store: EventStore | None,
     quarantine_set: set[str],
     *,
+    verifier: VerifyPort,
     allocator: HostAllocator | None = None,
 ) -> None:
     """Drift detective control: run DriftDetector.check in a throwaway worktree.
@@ -182,25 +201,9 @@ async def _run_drift_check(
             (β decision 5).  When provided, both host slots are acquired via the
             allocator and released in the finally block.  Fallback to the legacy
             ``_build_remote_runners`` pool when ``None`` (backward-compatible).
+        verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`;
+            the local trust-anchor runs its scoped verify and unscoped type-checks.
     """
-    # Reach-back (deferred import): the existing test suite patches these
-    # dependencies by string path at orchestrator.merge_queue.<name> (this
-    # function used to live in merge_queue.py).  Resolving them dynamically
-    # from merge_queue's namespace at call time keeps those patches
-    # effective post-extraction — see the module docstring's reach-back
-    # convention.  Attribute access (rather than `from ... import <name>`)
-    # is used here because build_merge_verify_spec / VerifyRunnerPool /
-    # LocalRunner / run_scoped_verification also have a module-level "naive"
-    # import above (kept solely as a TestReachBackRouting patch target); a
-    # `from ... import` reach-back would shadow-and-thus-dead-code that
-    # naive import, which ruff flags (F811).  _run_unscoped_typechecks and
-    # _build_remote_runners have no merge_drift-local copy at all (both stay
-    # permanently in merge_queue.py) but are accessed the same way for
-    # consistency.  (Task 2886 fix 1b dropped the _derive_task_files_from_git
-    # reach-back: the drift spec is now full-gate, task_files=None, so no
-    # dispatching-host scope derivation happens on this path.)
-    import orchestrator.merge_queue as _mq
-
     # wt is initialised before the try so the finally guard (`if wt is not None`)
     # is safe even when create_throwaway_verify_worktree itself raises.  Moving the
     # creation inside the try ensures the docstring contract ("Exceptions are caught
@@ -264,7 +267,7 @@ async def _run_drift_check(
             # dropped here.  task_files_tuple stays None so BOTH the spec and the
             # LocalRunner below run the whole suite.
             task_files_tuple = None
-            spec = _mq.build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
+            spec = build_merge_verify_spec(req.config, req.module_configs, task_files_tuple)
 
             if allocator is not None:
                 # β decision 5: acquire both hosts through the allocator so slot
@@ -274,11 +277,11 @@ async def _run_drift_check(
                 # constructed if the local slot is unavailable.
                 _ttf = task_files_tuple  # capture for closure
 
-                def _local_factory() -> _mq.LocalRunner:
-                    return _mq.LocalRunner(
+                def _local_factory() -> LocalRunner:
+                    return LocalRunner(
                         wt, req.config, req.module_configs, _ttf,
-                        run_scoped=_mq.run_scoped_verification,
-                        run_unscoped=_mq._run_unscoped_typechecks,
+                        run_scoped=verifier.run_scoped,
+                        run_unscoped=verifier.run_unscoped_typechecks,
                         task_id=req.task_id,
                     )
 
@@ -293,7 +296,7 @@ async def _run_drift_check(
                         remote_lease is not None,
                     )
                     return
-                pool = _mq.VerifyRunnerPool(
+                pool = VerifyRunnerPool(
                     [local_lease.runner, remote_lease.runner],
                     event_store=event_store,
                     task_id=req.task_id,
@@ -301,13 +304,13 @@ async def _run_drift_check(
             else:
                 # Legacy fallback: build fresh pool via _build_remote_runners (no
                 # slot accounting — used when allocator is not threaded in yet).
-                pool = _mq.VerifyRunnerPool(
-                    [_mq.LocalRunner(
+                pool = VerifyRunnerPool(
+                    [LocalRunner(
                         wt, req.config, req.module_configs, task_files_tuple,
-                        run_scoped=_mq.run_scoped_verification,
-                        run_unscoped=_mq._run_unscoped_typechecks,
+                        run_scoped=verifier.run_scoped,
+                        run_unscoped=verifier.run_unscoped_typechecks,
                         task_id=req.task_id,
-                    ), *_mq._build_remote_runners(req.config, wt, quarantine=quarantine_set)],
+                    ), *_build_remote_runners(req.config, wt, quarantine=quarantine_set)],
                     event_store=event_store,
                     task_id=req.task_id,
                 )
@@ -350,6 +353,8 @@ async def _maybe_run_drift_check(
     git_ops: GitOps,
     req: MergeRequest,
     merge_commit: str,
+    *,
+    verifier: VerifyPort,
 ) -> None:
     """Cadence gate + off-serial-lane spawn for the Lever C drift detective.
 
@@ -372,15 +377,9 @@ async def _maybe_run_drift_check(
         git_ops: Live :class:`~orchestrator.git_ops.GitOps` instance.
         req: The :class:`MergeRequest` that just landed.
         merge_commit: The just-landed merge commit SHA.
+        verifier: The worker's :class:`~orchestrator.merge_lane.ports.VerifyPort`,
+            handed on to :func:`_run_drift_check`.
     """
-    # Reach-back (deferred import): the existing test suite patches the
-    # spawned coroutine by string path at
-    # orchestrator.merge_queue._run_drift_check (this function used to live
-    # in merge_queue.py, alongside its sibling).  Resolving it dynamically
-    # from merge_queue's namespace at call time keeps those patches
-    # effective post-extraction.
-    from orchestrator.merge_queue import _run_drift_check
-
     if not req.config.enabled_verify_runners:
         return
     every_n = req.config.verify_drift_check_every_n_lands
@@ -399,10 +398,7 @@ async def _maybe_run_drift_check(
     # the drift check had NEVER fired).  Fall back to the in-memory
     # worker._drift_land_count on bare-harness workers where _drift_state_path
     # is None — mirrors _maybe_schedule_shadow_compare's _shadow_state_path
-    # None-safety.  DriftCheckState / _load / _save are referenced module-local
-    # (not reached back) exactly like _maybe_schedule_shadow_compare references
-    # ShadowCompareState / _load / _save; only the spawned _run_drift_check
-    # coroutine is monkeypatched by tests and therefore reached back below.
+    # None-safety.
     if worker._drift_state_path is None:
         worker._drift_land_count += 1
         count = worker._drift_land_count
@@ -424,6 +420,7 @@ async def _maybe_run_drift_check(
             git_ops, req, merge_commit,
             worker._escalation_queue, worker._event_store,
             worker._runner_quarantine,
+            verifier=verifier,
             allocator=worker._ensure_host_allocator(req.config),
         )
         _task = asyncio.create_task(_coro)

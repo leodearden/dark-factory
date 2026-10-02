@@ -43,6 +43,7 @@ import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
 from orchestrator.verify import VerifyResult
 
 
@@ -376,12 +377,13 @@ class TestScheduleShadowCompareMapLess:
             # create=True: the reach-back target does not exist until the impl
             # step adds the coroutine + shim re-export; this keeps the RED
             # failure the scheduling assertion, not a patch-time AttributeError.
-            patch('orchestrator.merge_queue._run_coarse_shadow_compare', coarse,
+            patch('orchestrator.merge_lane.shadow._run_coarse_shadow_compare', coarse,
                   create=True),
-            patch('orchestrator.merge_queue._run_shadow_compare', per_test),
+            patch('orchestrator.merge_lane.shadow._run_shadow_compare', per_test),
         ):
             await _maybe_schedule_shadow_compare(
                 worker, git_ops, req, 'commit-sha', {}, None, None,
+                verifier=PRODUCTION_VERIFIER,
             )
             assert len(worker._shadow_compare_tasks) == 1, (
                 'expected a coarse shadow-compare task to be scheduled for a '
@@ -429,10 +431,11 @@ class TestScheduleShadowCompareMapLess:
         worker._shadow_compare_tasks = set()
 
         coarse = AsyncMock(return_value=None)
-        with patch('orchestrator.merge_queue._run_coarse_shadow_compare', coarse,
+        with patch('orchestrator.merge_lane.shadow._run_coarse_shadow_compare', coarse,
                    create=True):
             await _maybe_schedule_shadow_compare(
                 worker, git_ops, req, 'commit-sha', {}, None, None,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         assert len(worker._shadow_compare_tasks) == 0, (
@@ -495,11 +498,12 @@ class TestCoarseShadowCompare:
             lint_output='', type_output='', summary='cold full-gate suite failed',
         )
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify_suite',
             AsyncMock(return_value=cold_fail), create=True,
         ):
             await _run_coarse_shadow_compare(
                 git_ops, req, 'deadbeefcafef00d', esc_queue, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         esc_queue.submit.assert_called_once()
@@ -535,11 +539,12 @@ class TestCoarseShadowCompare:
             lint_output='', type_output='', summary='cold full-gate suite passed',
         )
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify_suite',
             AsyncMock(return_value=cold_pass), create=True,
         ):
             await _run_coarse_shadow_compare(
                 git_ops, req, 'cafef00ddeadbeef', esc_queue, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         esc_queue.submit.assert_not_called()
@@ -570,11 +575,12 @@ class TestCoarseShadowCompare:
             category='',
         )
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify_suite',
             AsyncMock(return_value=cold_broken), create=True,
         ):
             await _run_coarse_shadow_compare(
                 git_ops, req, 'facefeed12345678', esc_queue, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         esc_queue.submit.assert_not_called()
@@ -606,11 +612,12 @@ class TestCoarseShadowCompare:
             category='compile_error',
         )
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify_suite',
             AsyncMock(return_value=cold_build_fail), create=True,
         ):
             await _run_coarse_shadow_compare(
                 git_ops, req, 'badc0de099887766', esc_queue, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # Born-at-L2 alarm fired despite the empty per-test map.
@@ -641,11 +648,12 @@ class TestCoarseShadowCompare:
             category='disk_full',
         )
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify_suite',
             AsyncMock(return_value=cold_infra), create=True,
         ):
             await _run_coarse_shadow_compare(
                 git_ops, req, 'd15cfull01020304', esc_queue, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         esc_queue.submit.assert_not_called()
@@ -661,13 +669,14 @@ class TestCoarseShadowCompare:
         event_store = MagicMock()
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify_suite',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify_suite',
             AsyncMock(side_effect=RuntimeError('cold worktree exploded')),
             create=True,
         ):
             # Must NOT raise.
             await _run_coarse_shadow_compare(
                 git_ops, req, 'c0ffee00c0ffee00', esc_queue, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         esc_queue.submit.assert_not_called()
@@ -1525,7 +1534,7 @@ class TestColdShadowVerifyHoldsLaneLease:
         with patch(
             'orchestrator.merge_queue.run_scoped_verification', _reaping_scoped,
         ):
-            result = await _run_cold_shadow_verify(shadow_git_ops, req, head, None)
+            result = await _run_cold_shadow_verify(shadow_git_ops, req, head, None, verifier=PRODUCTION_VERIFIER)
 
         assert recorded, (
             'the patched run_scoped_verification never ran, so the concurrent '

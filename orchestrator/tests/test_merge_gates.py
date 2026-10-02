@@ -250,11 +250,11 @@ class TestReachBackRouting:
         clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
         ):
@@ -304,11 +304,11 @@ class TestReachBackRouting:
         )
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=broken_pyright),
             ),
         ):
@@ -552,7 +552,7 @@ class TestGateFunctionsReachBack:
 
         ctx = self._make_ctx()
         with patch(
-            'orchestrator.merge_queue._check_post_merge_equivalence',
+            'orchestrator.merge_lane.gates._check_post_merge_equivalence',
             AsyncMock(return_value=[]),
         ):
             verdict = await _run_equivalence_gate(ctx)
@@ -619,7 +619,7 @@ class TestGateFunctionsReachBack:
             advanced_sha=advanced_sha, resolved_merged_tip=merged_tip,
         )
         with patch(
-            'orchestrator.merge_queue._check_post_merge_equivalence',
+            'orchestrator.merge_lane.gates._check_post_merge_equivalence',
             AsyncMock(return_value=['pkg/sub/mod.py']),
         ):
             verdict = await _run_equivalence_gate(ctx)
@@ -648,7 +648,7 @@ class TestGateFunctionsReachBack:
         ctx = self._make_ctx()
         clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with patch(
-            'orchestrator.merge_queue._check_post_merge_pyright',
+            'orchestrator.merge_lane.gates._check_post_merge_pyright',
             AsyncMock(return_value=clean),
         ):
             verdict = await _run_pyright_gate(ctx)
@@ -741,11 +741,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args()
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
         ):
@@ -762,11 +762,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args()
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
@@ -793,7 +793,7 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args(chain_ctx=None)
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=['f.py']),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
@@ -833,11 +833,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args(chain_ctx=None)
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=broken_pyright),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
@@ -863,10 +863,12 @@ class TestFinalizeDrivesRegistry:
         from orchestrator.merge_gates import _finalize_advanced_merge, _GenerationChainContext
         from orchestrator.merge_types import MergeOutcome
 
+        chained_outcome = MergeOutcome('superseded', merge_sha='chained-sha')
+        maybe_chain_mock = AsyncMock(return_value=chained_outcome)
         chain_ctx = _GenerationChainContext(
             queue=MagicMock(), counts={}, max_auto_generations=3,
+            maybe_auto_chain_generation=maybe_chain_mock,
         )
-        chained_outcome = MergeOutcome('superseded', merge_sha='chained-sha')
         event_store = MagicMock()
         args = self._make_finalize_args(
             chain_ctx=chain_ctx, merged_branch_tip='trusted-tip', event_store=event_store,
@@ -874,14 +876,10 @@ class TestFinalizeDrivesRegistry:
 
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=['f.py']),
             ),
-            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
-            patch(
-                'orchestrator.merge_queue._maybe_auto_chain_generation',
-                AsyncMock(return_value=chained_outcome),
-            ) as maybe_chain_mock,
+            patch('orchestrator.merge_lane.gates.AUTO_CHAIN_GENERATIONS_ENABLED', True),
         ):
             outcome = await _finalize_advanced_merge(**args)
 
@@ -905,11 +903,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args(advanced_sha=None)
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
         ):

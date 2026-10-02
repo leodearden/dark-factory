@@ -2542,7 +2542,7 @@ def _stub_train_callback_factory(train_id: str):  # noqa: ARG001
     """Minimal TrainCallbacks stub (duplicated from
     test_merge_queue_coalesce.py's _stub_factory — per-file duplication
     convention, see this file's module docstring)."""
-    from orchestrator.merge_queue import TrainCallbacks
+    from orchestrator.merge_lane.types import TrainCallbacks
 
     return TrainCallbacks(
         status_check=AsyncMock(return_value={}),
