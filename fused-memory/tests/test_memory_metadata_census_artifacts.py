@@ -31,6 +31,77 @@ def _census() -> types.ModuleType:
 
 
 # ---------------------------------------------------------------------------
+# Damage detectors: structure only, never corpus properties the nightly drifts
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_TOPIC_TABLE_KEYS = ('grand_total', 'topic', 'entries')
+
+
+def _shape(node: object) -> str:
+    if node is None:
+        return 'absent'
+    if node == []:
+        return 'an empty list'
+    return f'a {type(node).__name__}'
+
+
+def _topic_table_problem(payload: object) -> str | None:
+    node = payload
+    for depth, key in enumerate(_TOPIC_TABLE_KEYS):
+        if not isinstance(node, dict):
+            where = '.'.join(_TOPIC_TABLE_KEYS[:depth]) or 'the top level'
+            return f'{where} is {_shape(node)}, not an object'
+        node = node.get(key)
+    if not isinstance(node, list) or not node:
+        return f'{".".join(_TOPIC_TABLE_KEYS)} is {_shape(node)}, not a non-empty topic table'
+    return None
+
+
+def _census_report_damage(path: Path) -> str | None:
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except OSError as exc:
+        return f'unreadable: {exc}'
+    except ValueError as exc:
+        return f'not JSON: {exc}'
+    problem = _topic_table_problem(payload)
+    if problem is not None:
+        return problem
+    disclosures = _probe().derive_registry_candidates([], payload, ()).disclosures
+    bad_values = disclosures['census_rows_malformed_value']
+    bad_counts = disclosures['census_rows_malformed_count']
+    if bad_values or bad_counts:
+        return f'{bad_values} topic row(s) with a malformed value, {bad_counts} with a malformed count'
+    return None
+
+
+def _coverage_history_damage(path: Path) -> str | None:
+    if not path.exists():
+        return 'absent, so the next census would silently start a fresh history in its place'
+    census = _census()
+    try:
+        census.load_coverage_history(str(path))
+    except census.CoverageHistoryError as exc:
+        return str(exc)
+    return None
+
+
+def _repo_relative(path: Path) -> Path:
+    resolved = path.resolve()
+    return resolved.relative_to(_REPO_ROOT) if resolved.is_relative_to(_REPO_ROOT) else resolved
+
+
+def _damaged_artifact_message(path: Path, reason: str) -> str:
+    shown = _repo_relative(path)
+    return (
+        f'the committed artifact {shown} is damaged ({reason}) -- this is NOT a defect in the '
+        f'branch under test; restore its last good blob, found with `git log -- {shown}` '
+        '(precedent: commit 38dc63ea42)'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Falsifiability: each detector catches the damage it exists for
 # ---------------------------------------------------------------------------
 
@@ -109,7 +180,9 @@ class TestTheGuardMessage:
 
 class TestTheCommittedArtifacts:
     def test_the_probe_reads_the_report_the_census_writes(self):
-        assert _probe().DEFAULT_CENSUS_PATH == Path(_census().DEFAULT_JSON_OUT)
+        probe_reads = _probe().DEFAULT_CENSUS_PATH
+        census_writes = Path(_census().DEFAULT_JSON_OUT)
+        assert probe_reads == census_writes
 
     def test_the_committed_census_report_is_one_the_probe_can_derive_from(self):
         path = _probe().DEFAULT_CENSUS_PATH
