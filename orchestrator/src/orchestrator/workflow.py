@@ -225,6 +225,7 @@ from orchestrator.workflow_types import (  # noqa: F401  re-export shim
     WorkflowStateMachine,
     classify_failure,
 )
+from orchestrator.zero_work_failure import is_zero_work_failure
 
 # Orchestrator package directory — used to resolve ``uv run --project`` for
 # the plan-tools stdio MCP server.
@@ -350,25 +351,6 @@ _ESCALATION_CAPABLE_ROLES: frozenset[str] = frozenset(
 # by ``_warn_orphan_halt_no_queue``.  Referenced by tests so wording changes are
 # caught at the constant definition rather than silently diverging across assertions.
 _ORPHAN_HALT_NO_QUEUE_TOKENS: tuple[str, ...] = ('orphan halt', 'unhalt_merge_queue')
-
-# Architect failure kinds eligible for ONE transient-glitch retry in ``_plan``
-# (task 3143; the 2026-07-28 ~16:31Z incident cluster, where a turns=0 /
-# $0.00 / no-plan.json architect failure terminally blocked a planning task).
-# Both kinds mean the run did NO work and billed NOTHING, so a retry cannot
-# double-bill and is the only thing standing between a sub-second transport
-# glitch and a terminally-blocked task.
-#
-# Deliberately EXCLUDED, because a second Opus dispatch buys nothing:
-# - TIMED_OUT: burned the full wall clock; the next attempt would too.
-# - MAX_TURNS: the run saturated its budget doing real work.
-# - API_ERROR: provider-side; the scheduler's transient requeue lane owns the
-#   pacing, and retrying here just multiplies load on a degraded provider.
-# - MODEL_NOT_FOUND: deterministic — the model does not exist for this account.
-_ARCHITECT_TRANSIENT_RETRY_KINDS: frozenset[AgentFailureKind] = frozenset({
-    AgentFailureKind.EMPTY_OUTPUT,
-    AgentFailureKind.CLI_INPUT_REJECTED,
-})
-
 
 def _is_transient_architect_glitch(result: AgentResult, *, plan_on_disk: bool) -> bool:
     """Return True when an architect run shows the anomalous-premature-exit shape.
@@ -5494,32 +5476,8 @@ class TaskWorkflow:
                     # non-transient kind: this strictly ADDS one retry and
                     # removes no terminal path.
                     #
-                    # TRANSCRIPT-AUTHORITATIVE extra clause, failure path only.
-                    # On the error_empty_output / error_cli_input_rejected
-                    # arms the CLI's JSON is never parsed, so result.turns and
-                    # result.cost_usd are 0 BY CONSTRUCTION — the numeric
-                    # clauses inside _is_transient_architect_glitch are
-                    # therefore vacuous here and cannot testify that no work
-                    # was done.  The transcript can: an architect SIGKILLed
-                    # from outside (OOM killer, not our watchdog, so
-                    # timed_out=False) after 40 productive turns arrives with
-                    # exactly this shape but transcript_turns>0, and retrying
-                    # it DOES double-bill a full Opus architect run.  Same
-                    # signal steward._is_empty_output already consults via
-                    # is_timed_out_with_progress.
-                    #
-                    # Deliberately NOT folded into
-                    # _is_transient_architect_glitch: on the success path turns
-                    # and cost are real, parsed numbers that already bound the
-                    # work done, and transcript_turns there tracks those turns
-                    # — so the clause would suppress genuine
-                    # anomalous-premature-exit retries rather than being the
-                    # no-op it is here.
-                    #
-                    # A zero-turn, $0.00, zero-transcript failure did no work,
-                    # so the retry cannot double-bill — and it is the only
-                    # thing standing between a sub-second transport glitch and
-                    # a terminally blocked planning task (2026-07-28 ~16:31Z).
+                    # Zero-work shape and its transcript-authoritative clause:
+                    # orchestrator/zero_work_failure.py.
                     #
                     # bool(salvaged) is the honest analogue of the success
                     # path's `not self.plan`: `salvaged` is already
@@ -5528,8 +5486,7 @@ class TaskWorkflow:
                     # risk the two branches disagreeing.
                     if (
                         attempt == 0
-                        and cls.kind in _ARCHITECT_TRANSIENT_RETRY_KINDS
-                        and not (result.transcript_turns or 0)
+                        and is_zero_work_failure(result)
                         and _is_transient_architect_glitch(
                             result, plan_on_disk=bool(salvaged)
                         )

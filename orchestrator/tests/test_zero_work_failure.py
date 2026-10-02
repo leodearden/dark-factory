@@ -73,7 +73,5 @@ class TestNotZeroWork:
 
 
 def test_zero_work_kinds_are_the_two_pre_turn_failures():
-    assert ZERO_WORK_FAILURE_KINDS == frozenset({
-        AgentFailureKind.EMPTY_OUTPUT,
-        AgentFailureKind.CLI_INPUT_REJECTED,
-    })
+    pre_turn_kinds = {AgentFailureKind.EMPTY_OUTPUT, AgentFailureKind.CLI_INPUT_REJECTED}
+    assert frozenset(pre_turn_kinds) == ZERO_WORK_FAILURE_KINDS
