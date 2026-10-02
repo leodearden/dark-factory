@@ -1085,10 +1085,11 @@ HARNESS_BRIEFING_HEADINGS: tuple[str, ...] = (
     '# context', '## agent identity', '# task',
 )
 """ANCHOR heading literals for an injected orchestrator briefing
-(orchestrator/src/orchestrator/agents/briefing.py): ``_get_memory_context``
-emits '# Context' on its normal path (:1350) and on every early return --
-memory-unavailable (:1325, :1328) and no-context (:1330, :1331), all with a
-SINGLE hash; ``_agent_identity`` emits '## Agent Identity' (:272); the role
+(orchestrator/src/orchestrator/agents/briefing.py):
+``orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block``
+emits '# Context' on both its recalled-sections and its no-recalled-sections
+paths, always with a SINGLE hash; ``_agent_identity`` emits
+'## Agent Identity' (:272); the role
 prompt templates emit '# Task' (:362/:435/:506/:589/:666/:1198). At least
 one anchor must be present as a line-anchored heading for a turn to
 classify as briefing-injected -- see :func:`is_harness_injected_turn` for
@@ -1117,7 +1118,7 @@ entry rather than matching by prefix.
 
 Two generations, both live, because this filter reads transcripts written
 long before it: today
-``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``
+``orchestrator/src/orchestrator/agents/memory_recall.py::MemoryRecall``
 renders its headings from the section titles in
 ``shared/src/shared/briefing_queries.py`` -- '## Conventions & Gotchas' and
 '## Task Context' -- while '## Project Context', '## Conventions' and
@@ -1272,17 +1273,16 @@ and the longer literal covers the archived pre-3659 corpus. Do not prune
 the retired one -- dropping it silently un-classifies every historical
 outage turn.
 
-These four markers are EXHAUSTIVE over ``_get_memory_context``'s return
+These four markers are EXHAUSTIVE over
+``orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block``'s return
 paths as of this commit: the no-recalled-sections paths (each of the two
 literal families has a plain, a drop_note-bearing and a notices-bearing
 variant, all three covered by the same family marker, since the family
 line leads the body and the notices and drop_note are appended after it),
-PLUS the recalled-sections path
-(``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``)
--- covered by the caveat marker ALONE, including
+PLUS the recalled-sections path -- covered by the caveat marker ALONE, including
 its own drop_note suffix (``'\n\n_In total, {drop_note}._'``) and the
 trailing "_Memory unavailable for the remaining queries..._" note a
-later-failing query appends, since both are appended AFTER the caveat
+recall loop that broke later appends, since both are appended AFTER the caveat
 prefix this marker matches on, never before it. That exhaustiveness
 claim is what
 ``TestHarnessInjectedTurnFilter.test_no_recalled_sections_variant_is_excluded``
