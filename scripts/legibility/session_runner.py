@@ -67,10 +67,6 @@ logger = logging.getLogger("legibility.session_runner")
 
 _CONFIG_DIR_TASK_PREFIX = "legibility-session-"
 
-_EXHAUSTED_MARKER = "pool exhausted"
-"""``NoHeadroom.marker`` for an exhausted pool: not a banner the CLI printed
-but the gate reporting that no account remains, and saying so is honest."""
-
 _ERROR_STREAM_TAIL_CHARS = 2000
 """How much of EACH output stream an ``InvocationFailed`` carries. One bound
 for both streams, because the asymmetry of carrying one is exactly the
@@ -91,15 +87,7 @@ class InvocationFailed(Exception):
     nothing after the colon — on 17 of 20 digests. A diagnostic the process
     EMITTED must never be dropped because it arrived on the less-expected
     stream.
-
-    The two tails are ALSO carried as structured ``stdout``/``stderr``
-    attributes, defaulting to ``''`` for the arms that have no streams.
     """
-
-    def __init__(self, message: str, *, stdout: str = "", stderr: str = "") -> None:
-        super().__init__(message)
-        self.stdout = stdout
-        self.stderr = stderr
 
 
 class NoHeadroom(InvocationFailed):
@@ -118,15 +106,8 @@ class NoHeadroom(InvocationFailed):
     which, like an all-auth-failed pool, must stay a loud ``InvocationFailed``
     — is task 5947's table.
 
-    ``marker`` names the signal that fired, so a deferral reason can say WHICH.
     Never fabricated into a verdict: a capped digest yields no record at all.
     """
-
-    def __init__(
-        self, message: str, *, marker: str, stdout: str = "", stderr: str = "",
-    ) -> None:
-        super().__init__(message, stdout=stdout, stderr=stderr)
-        self.marker = marker
 
 
 @dataclass(frozen=True)
@@ -289,8 +270,7 @@ def _failure_error(label: str, stage: StageSpec, model: str, result: AgentResult
         f"{label}: claude CLI {what} (model={model!r}, "
         f"account={result.account_name!r}, subtype={result.subtype!r}, "
         f"api_error_status={result.api_error_status!r}): "
-        f"stdout={stdout_tail!r} stderr={stderr_tail!r}",
-        stdout=stdout_tail, stderr=stderr_tail,
+        f"stdout={stdout_tail!r} stderr={stderr_tail!r}"
     )
 
 
@@ -354,7 +334,7 @@ def _exhaustion_error(gate, label: str) -> InvocationFailed:
 
 
 def _pool_exhausted(label: str, reason: str) -> NoHeadroom:
-    return NoHeadroom(f"{label}: {reason}", marker=_EXHAUSTED_MARKER)
+    return NoHeadroom(f"{label}: {reason}")
 
 
 def open_pooled_runner(label: str, *, accounts_file=None, env_file=None) -> SessionRunner:

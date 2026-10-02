@@ -6,40 +6,29 @@ Task delta of the confusion-reduction PRD (plans/confusion-reduction-prd.md
 §5.3, contract §7.3, boundary tests §8.1 consumer side + §8.6). Reads ONE
 confusion digest (alpha/digest.py output), builds a COMPACT codebook index
 (entry ids + titles + one-line causes — NOT the full YAML) from the v2
-codebook (gamma/codebook.py), invokes ONE headless
-``claude -p --model <model>`` call (default haiku), parses the model's
-strict-JSON judgment, and assembles it into a deterministic-header coding
-record that codebook.validate_coding_record schema-gates.
+codebook (gamma/codebook.py), makes ONE model call (default haiku), parses
+the model's strict-JSON judgment, and assembles it into a deterministic-header
+coding record that codebook.validate_coding_record schema-gates.
 
-Dependency-light library + argparse CLI, a plain-Python scripts/legibility
-sibling of digest.py/codebook.py — deliberately does NOT import the
-heavyweight async ``shared.cli_invoke`` machinery (usage gates, cost
-stores, cap-retry, transcript watchdogs). What it DOES take from ``shared``
-is one pure function: ``cap_markers.looks_like_blocking_banner``, the loose
-OR-substring DEFER GATE — the same matcher ``census.preflight_headroom``
-uses, and explicitly not the strict production cap detector
-(``usage_gate.detect_cap_hit``), whose combined prefix-AND-confirm policy is
-tuned for account failover.
+The model call crosses exactly one seam, ``invoke``: a ``(prompt, model) ->
+str`` callable that every public function REQUIRES, with no default. The
+production one is ``session_runner.SessionRunner.invoker(TRICKLE_CODER_STAGE)``
+-- the orchestrator's own session runner over the fleet's account pool, never
+a spawn of this module's own (Leo's 2026-09-29 ruling, task 6042). Rotation,
+cap detection and credentials are all the runner's; what reaches this module
+is a reply, a ``session_runner.NoHeadroom`` (no pool account could take the
+call) or an ``InvocationFailed`` (any other call without a reply). No test
+reaches a real model: they inject an ``invoke``, or run ``main`` over a fake
+CLI.
 
-BOTH MATCHERS ARE NOW LIVE IN THE TRICKLE, each doing its own job, and this
-paragraph used to claim otherwise: "the trickle unit runs under an
-interpreter where the orchestrator config, and therefore a multi-account
-``UsageGate``, is unreachable" was FALSE, and task 5488 retires it. Only the
-orchestrator YAML is unreachable; the gate needs nothing but the roster
-file. The loose matcher HERE keeps deciding whether an already-FAILED
-invocation is a per-digest DEFER (task 4736), while the strict detector —
-reached from ``account_pool.pool_invoke``, outside this module — decides
-whether an ACCOUNT is out and should be rotated away from. That is exactly
-the split ``cap_markers``' own docstring argues for, and having a real pool
-to fail over to VINDICATES it rather than weakening it: a loose false
-positive can still only re-label one digest, never burn an account.
-
-The real LLM call lives behind
-exactly one swappable seam, the module-level ``_invoke_cli``, which every
-public function accepts as an ``invoke`` override. What no test ever does
-is spawn a REAL model — but the seam ITSELF is exercised, so "the LLM is
-always mocked" is not the same claim as "``_invoke_cli`` never runs": see
-its own docstring for which tests reach it and how they stay free.
+What this module still takes from ``shared`` directly is one pure function,
+``cap_markers.looks_like_blocking_banner``: the loose OR-substring DEFER GATE
+``census.preflight_headroom`` also uses, applied on one path only -- a reply
+that came back as a SUCCESS yet could not be parsed into a verdict. The runner
+deliberately never cap-scans a successful reply for this caller, because a
+verdict that QUOTES a banner is a verdict and this codebook is full of them,
+so a banner delivered as an ordinary reply reaches this scan instead. A loose
+false positive there can only re-label a digest that was failing anyway.
 
 Never-fabricate contract (codebook lesson ``one-shot-subagent-contract`` —
 the fail-soft fallback that hid a total outage): a CLI-invocation error,
@@ -65,9 +54,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,8 +107,9 @@ class CodingResult:
     LLM output, or a schema-invalid assembled record are never partially
     applied and never fabricated into a record.
 
-    ``capped=True`` means the CLI answered with a capacity/auth banner
-    instead of a model turn. It is a strict REFINEMENT of ``ok=False``,
+    ``capped=True`` means no pool account had headroom to take this digest
+    (``session_runner.NoHeadroom``), or the reply was a capacity/auth banner
+    rather than a verdict. It is a strict REFINEMENT of ``ok=False``,
     never a third success state — ``record`` is still None and the
     never-fabricate contract is untouched. What it records is a fact about
     the ACCOUNT, not a judgment about the digest: this digest was never
@@ -277,14 +265,6 @@ def parse_coder_output(raw: str) -> dict:
     array-shaped output, which must instead raise). Output that never
     parses to a dict at all raises CoderParseError. Never returns a
     fabricated default.
-
-    A SECOND CONSUMER now depends on that raise, so it is load-bearing for
-    account rotation and not only for this module's never-fabricate path:
-    ``scripts/legibility/account_pool.py::_banner_instead_of_verdict``
-    (``pool_invoke``'s exit-0 arm) calls this function as its "is this reply
-    a verdict?" gate, and offers the reply to the usage gate's strict cap
-    detector only when it raises. Parsing something a caller meant as
-    unusable would therefore cost a rotation, not just a bad record.
     """
     primary_candidates = [raw]
     fence_match = _FENCE_RE.search(raw)
@@ -335,208 +315,6 @@ coding call, is the binding bound; turns and budget are ceilings."""
 
 
 # ---------------------------------------------------------------------------
-# _invoke_cli — the ONE real `claude -p --model` subprocess boundary
-# ---------------------------------------------------------------------------
-
-_DEFAULT_INVOKE_TIMEOUT_SECS = 120
-"""Default subprocess timeout (seconds) for a single _invoke_cli call."""
-
-_CLAUDE_BIN_ENV_VAR = "LEGIBILITY_CLAUDE_BIN"
-"""Env var overriding the `claude` binary path; falls back to the bare
-"claude" (PATH-resolved -- /home/leo/.local/bin is on PATH)."""
-
-_ERROR_STREAM_TAIL_CHARS = 2000
-"""How much of EACH captured output stream an InvocationFailed carries.
-
-One constant for both streams, deliberately: this started as a bare
-``[-2000:]`` on stderr alone, and the asymmetry that grew beside it (stdout
-not bounded because stdout was not carried at all) is exactly the 2026-08-24
-diagnostic loss. Bounded because the text lands verbatim in journal lines,
-``run.failures`` entries and escalation bodies; the TAIL is kept because a
-CLI's last words are its diagnostic ones."""
-
-
-def child_env(oauth_token):
-    """The environment a child process needs to authenticate as *oauth_token*,
-    or ``None`` to inherit the parent's unchanged.
-
-    A copy of ``os.environ`` with ``ANTHROPIC_API_KEY`` REMOVED and
-    ``CLAUDE_CODE_OAUTH_TOKEN`` set -- the same construction every other CLI
-    spawn in the fleet uses (``agents/invoke.py``, ``cli_invoke.py``,
-    ``usage_gate.py``). The removal is the load-bearing half, not tidiness:
-    the CLI prefers an API key over the OAuth token, so leaving one set
-    silently authenticates as the API key's identity and the account choice is
-    defeated while the failover still LOOKS like it worked.
-
-    An OVERLAY on the parent env rather than a replacement, because a child
-    still needs PATH, HOME and whatever the systemd unit exported.
-
-    Public and separate from ``_invoke_cli`` because the trickle spawns a
-    SECOND child that must make the same choice: ``account_pool.subprocess_env``
-    builds the env for the census subprocess (task 5488). One statement of the
-    policy, two spawn sites -- a second copy would be the fifth in the fleet
-    and the first that could drift from this one silently.
-    """
-    if not oauth_token:
-        return None
-    env = {k: v for k, v in os.environ.items() if k != 'ANTHROPIC_API_KEY'}
-    env['CLAUDE_CODE_OAUTH_TOKEN'] = oauth_token
-    return env
-
-
-def _invoke_cli(
-    prompt: str,
-    model: str,
-    *,
-    claude_bin: str | None = None,
-    timeout: float = _DEFAULT_INVOKE_TIMEOUT_SECS,
-    cwd: str | os.PathLike | None = None,
-    oauth_token: str | None = None,
-) -> str:
-    """Invoke the real headless ``claude -p --model <model>`` CLI exactly
-    once, delivering *prompt* via stdin, and return its raw stdout.
-
-    This is the ONE real-subprocess boundary in this module -- every
-    public function accepts an ``invoke`` override, and most tests inject
-    a fake one. *claude_bin* resolves, in order: the explicit argument,
-    the ``LEGIBILITY_CLAUDE_BIN`` env var, else the bare ``"claude"``.
-
-    *oauth_token*, when given, is the ACCOUNT the caller chose -- the token
-    of a lease taken from the shared multi-account ``UsageGate`` (see
-    ``account_pool.pool_invoke``, which is what passes it). The child env it
-    produces, and why ``ANTHROPIC_API_KEY`` is stripped from it, is
-    :func:`child_env`'s. ``None`` (the default) passes ``env=None``, which is
-    subprocess's own "inherit the parent unchanged", so this parameter is
-    strictly additive: census's wiring (``preflight_headroom`` and
-    ``_build_stage_invokes``) spawns byte-identically to before it existed.
-
-    THIS FUNCTION IS ITSELF UNDER TEST -- it is no longer true that "no
-    test ever reaches it", and the resolution order above is exactly what
-    keeps those tests free. Two suites reach it, from two modules:
-    test_legibility_coder.py points *claude_bin* / ``LEGIBILITY_CLAUDE_BIN``
-    at a FAKE ``claude`` script it writes itself (task 4510, argv/stdin
-    delivery, non-zero exit, timeout, and the env-var branch), and
-    test_legibility_nightly.py replays the 2026-08-18 ENOENT incident end
-    to end by pointing ``LEGIBILITY_CLAUDE_BIN`` at a NONEXISTENT path and
-    running ``run_nightly`` with no ``invoke=`` override at all (task
-    4511). Both scrub PATH of any real ``claude`` first and assert
-    ``shutil.which("claude") is None``, because the bare-name fallback at
-    the end of the chain would otherwise turn a regression in the env-var
-    lookup into genuine, billable model calls inside a unit test. Preserve
-    that assertion if you touch the resolution order.
-
-    *cwd*, when given, is the directory the headless CLI process RUNS IN;
-    ``None`` (the default) is subprocess's own "inherit the parent's
-    working directory", i.e. exactly the behavior every caller had before
-    this parameter existed. It is load-bearing, not cosmetic: ``claude -p``
-    SANDBOXES its tool access to the cwd tree, so a caller that wants the
-    model to read a tree other than the launcher's MUST pass it -- every
-    Read/Bash against that other tree is otherwise permission-denied, and
-    non-interactively there is no prompt to approve. Proven on 2026-08-03:
-    the legibility census verifying a project other than its launcher's cwd
-    had every verifier read denied, and since the verify seam fails CLOSED
-    per cluster (``census._build_default_verify_fn``) that surfaced as a
-    silent mass rejection of every cluster rather than an error.
-
-    Raises InvocationFailed on a non-zero exit, a timeout, or a
-    failure to START the process at all -- never silently swallowed, never
-    a fabricated empty stdout. On a non-zero exit the error message carries
-    a tail of BOTH output streams, each LABELLED, plus the resolved cwd, so
-    a future sandbox/permission failure NAMES the directory the process was
-    scoped to instead of leaving it to be inferred.
-
-    Both streams because the CLI does not reliably diagnose itself on
-    stderr: on 2026-08-24 it wrote a usage-cap banner to STDOUT and exited
-    1, and a stderr-only message reached the journal EMPTY after the colon
-    on 17 of 20 digests (see InvocationFailed). The exit-0 RETURN
-    contract is untouched by that -- stdout is still returned raw and
-    unbounded there, which census._build_stage_invokes (wiring this
-    function as its mining/verify/synthesis primitive) and
-    census.preflight_headroom (scanning the returned reply itself) both
-    depend on.
-
-    That third case is why the ``OSError`` arm below exists. Passing *cwd*
-    hands ``subprocess.run`` a second thing that can be missing besides the
-    binary: a cwd that does not exist, is not a directory, or is not
-    searchable makes it raise a RAW ``FileNotFoundError`` /
-    ``NotADirectoryError`` / ``PermissionError``, which would escape this
-    function and falsify the contract above. It also lands badly
-    downstream: census's FIRST invoke is the headroom probe, and
-    ``census.preflight_headroom`` folds ANY probe exception into
-    ``HeadroomResult(ok=False)`` (deliberately fail-safe), so an operator
-    typo in ``--project-root`` would read exactly like a usage-limit defer
-    -- exit 0, an INFO escalation, and a census that silently never runs
-    again. Wrapping it here keeps the failure typed; ``census.main`` also
-    rejects a non-directory project_root up front so the loud error names
-    the flag rather than the subprocess.
-    """
-    resolved_bin = claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"
-
-    env = child_env(oauth_token)
-
-    try:
-        proc = subprocess.run(
-            [resolved_bin, "-p", "--model", model],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            cwd=cwd,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise session_runner.InvocationFailed(
-            f"claude CLI timed out after {timeout}s (model={model!r}, "
-            f"claude_bin={resolved_bin!r}, cwd={cwd!r})"
-        ) from exc
-    except OSError as exc:
-        # The process never started: a missing/non-executable binary, or a
-        # cwd that is missing / not a directory / not searchable. Both name
-        # themselves in the underlying OSError text, so echo it verbatim
-        # alongside BOTH candidates rather than guessing which one the
-        # kernel objected to.
-        raise session_runner.InvocationFailed(
-            f"claude CLI could not be started (model={model!r}, "
-            f"claude_bin={resolved_bin!r}, cwd={cwd!r}): {exc}"
-        ) from exc
-
-    if proc.returncode != 0:
-        # BOTH streams, each labelled. The claude CLI does not reliably put
-        # its own diagnostics on stderr -- on 2026-08-24 it wrote a usage-cap
-        # banner to STDOUT and exited 1 -- so carrying one stream and
-        # labelling neither loses both the text and the fact of WHICH stream
-        # said it. See InvocationFailed's docstring for the incident.
-        stdout_tail = (proc.stdout or "")[-_ERROR_STREAM_TAIL_CHARS:]
-        stderr_tail = (proc.stderr or "")[-_ERROR_STREAM_TAIL_CHARS:]
-        message = (
-            f"claude CLI exited {proc.returncode} (model={model!r}, "
-            f"claude_bin={resolved_bin!r}, cwd={cwd!r}): "
-            f"stdout={stdout_tail!r} stderr={stderr_tail!r}"
-        )
-        # Scan for a cap/auth banner ONLY here, on an already-FAILED
-        # invocation. This is census's split-on-parse-success rule, adopted
-        # unchanged: a failed invocation is never a verdict, so re-reading it
-        # as a banner can only re-LABEL an already-failed digest. An exit-0
-        # reply is the opposite -- arbitrary model output, whose JSON
-        # `note`/`cause`/`evidence_quote` legitimately QUOTE cap-themed
-        # sessions. census._build_default_verify_fn records what happens when
-        # that distinction is lost: this repo's codebook is dominated by
-        # clusters ABOUT usage and weekly limits, so the loose markers match
-        # ordinary healthy content and the census aborted on cap-themed
-        # clusters. The exit-0 path below is therefore left alone, which also
-        # keeps census.preflight_headroom -- whose whole probe is "call this
-        # function and scan what comes BACK" -- working unchanged.
-        marker = looks_like_blocking_banner(f"{stdout_tail}\n{stderr_tail}")
-        if marker:
-            raise session_runner.NoHeadroom(
-                message, marker=marker, stdout=stdout_tail, stderr=stderr_tail,
-            )
-        raise session_runner.InvocationFailed(message, stdout=stdout_tail, stderr=stderr_tail)
-
-    return proc.stdout
-
-
-# ---------------------------------------------------------------------------
 # code_digest — one digest -> one CodingResult
 # ---------------------------------------------------------------------------
 
@@ -546,13 +324,13 @@ def code_digest(
     *,
     project: str,
     model: str = "haiku",
-    invoke=None,
+    invoke,
 ) -> CodingResult:
     """Code one digest against one codebook.
 
     Flow: parse the digest's frontmatter -> build the compact codebook
-    index -> build the prompt -> invoke the LLM (*invoke* override, or the
-    real ``_invoke_cli`` by default) -> parse its strict-JSON judgment ->
+    index -> build the prompt -> make the model call through *invoke* ->
+    parse its strict-JSON judgment ->
     assemble a §7.3 coding record with a DETERMINISTIC header
     (session/date/agent_class from the digest's own frontmatter; project
     from *project* — the LLM never supplies the header) -> schema-gate it
@@ -564,7 +342,7 @@ def code_digest(
     ``record=None`` and ``reason`` set — never partially applied, never
     fabricated. The cap case additionally sets ``capped=True``: it is the
     one cause that says nothing about this digest or this coder, only that
-    the account had no headroom left to look (see ``session_runner.NoHeadroom``). A
+    no account had headroom left to look (see ``session_runner.NoHeadroom``). A
     legitimately empty judgment (``{"matches": [], "candidates": []}``)
     that passes schema validation is a genuine ``ok=True`` success: "coded
     fine, found nothing" is never conflated with "coding failed" (codebook
@@ -578,10 +356,9 @@ def code_digest(
 
     index = build_codebook_index(codebook)
     prompt = build_prompt(digest_text, index)
-    invoke_fn = invoke or _invoke_cli
 
     try:
-        raw = invoke_fn(prompt, model)
+        raw = invoke(prompt, model)
     except session_runner.NoHeadroom as exc:
         # ORDERED ABOVE the generic arm below, and that ordering is
         # load-bearing: NoHeadroom SUBCLASSES InvocationFailed, so
@@ -596,10 +373,12 @@ def code_digest(
     try:
         judgment = parse_coder_output(raw)
     except CoderParseError as exc:
-        # The SECOND cap scan site, and its placement INSIDE this arm is
-        # load-bearing. The CLI does not always exit non-zero when it declines
-        # to answer -- it can print the banner and exit 0, so the "reply"
-        # arrives here as prose that could not be parsed into a verdict.
+        # The coder's one cap scan, and its placement INSIDE this arm is
+        # load-bearing. The CLI does not always FAIL when it declines to
+        # answer -- it can deliver the banner as an ordinary successful reply,
+        # which the session runner deliberately does not cap-scan for this
+        # caller. So the "reply" arrives here as prose that could not be
+        # parsed into a verdict, and this is what still labels it capped.
         #
         # Scanning only AFTER the parse has failed is census's
         # split-on-parse-success rule, adopted unchanged (see
@@ -618,19 +397,12 @@ def code_digest(
         # ONE deliberate divergence from census: no confirmation probe. Census
         # needs one because its scan can strike a reply it would otherwise
         # have ACCEPTED, so a false positive there destroys a good verdict.
-        # Both of the coder's scan sites sit on already-failed paths, where
-        # the alternative disposition is already "per-digest failure" -- so a
-        # false positive can only re-LABEL a digest that was failing anyway,
-        # never launder a genuine verdict into a defer. The hazard the probe
-        # exists to prevent does not exist here.
-        #
-        # NOT the only thing between an exit-0 banner and a lost night any
-        # more (task 5637): for a POOLED run that route rotates upstream in
-        # `scripts/legibility/account_pool.py::pool_invoke`, which is the only
-        # layer holding an account to rotate TO. This site remains the
-        # fallback for a caller with no pool -- census's own wiring, a
-        # single-account run -- and for the case where the whole pool is
-        # exhausted.
+        # This scan sits on an already-failed path, where the alternative
+        # disposition is already "per-digest failure" -- so a false positive
+        # can only re-LABEL a digest that was failing anyway, never launder a
+        # genuine verdict into a defer. It also never costs an account: the
+        # label stays on this digest, and the account is not reported to the
+        # pool.
         marker = looks_like_blocking_banner(raw)
         if marker:
             return CodingResult(
@@ -711,7 +483,7 @@ def code_digests(
     *,
     project: str,
     model: str = "haiku",
-    invoke=None,
+    invoke,
 ) -> RunResult:
     """Code a batch of digests against one codebook.
 
@@ -739,7 +511,7 @@ def code_digests(
     WARNING rather than ERROR, deliberately: one failed digest does not by
     itself fail the run. Only the storm does, and that branch's ERROR is
     emitted by ``nightly.post_escalation``. The reason is logged unbounded;
-    ``_invoke_cli`` already tail-bounds the stderr it embeds.
+    ``session_runner`` already tail-bounds the output streams it embeds.
 
     TWO CONSUMERS, VERY DIFFERENT VOLUMES — and everything above is the
     TRICKLE's argument. ``nightly.run_nightly`` codes exactly ONE small
@@ -885,6 +657,9 @@ def main(argv: list[str] | None = None) -> int:
     headroom defer, so an operator reads the same thing from both legibility
     CLIs. The one-line summary still reports ``status=failure`` with the
     true counts: the exit code changes, the tally never lies.
+
+    Every digest is coded on the fleet's shared account pool, through one
+    ``session_runner`` opened for the run and closed when coding ends.
     """
     parser = argparse.ArgumentParser(
         prog="coder",
@@ -938,7 +713,11 @@ def main(argv: list[str] | None = None) -> int:
     codebook = codebook_mod.load(args.codebook)
     digests = [p.read_text(encoding="utf-8") for p in digest_paths]
 
-    result = code_digests(digests, codebook, project=args.project, model=args.model)
+    with session_runner.open_pooled_runner(label="legibility-coder-cli") as runner:
+        result = code_digests(
+            digests, codebook, project=args.project, model=args.model,
+            invoke=runner.invoker(TRICKLE_CODER_STAGE),
+        )
 
     matched = sum(len(r.get("matches") or []) for r in result.records)
     candidates = sum(len(r.get("candidates") or []) for r in result.records)
