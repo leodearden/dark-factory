@@ -4,6 +4,9 @@ Only POSITIVE evidence yields ``landed=True``: a fresh ``Merge task/<id> into
 main`` merge marker when the branch carries no unmerged commits of its own, or
 a twin on main (same author date, author email and subject) for EVERY one of
 the branch's own commits, which is what a rebase or cherry-pick leaves behind.
+At least one of those twins must be a COPY of the branch's work, committed
+after its branch original; a branch whose twins are all older holds only
+commits it copied from main, such as a pulled-in fix.
 A failed probe yields *unknown* (``landed=None``), and unknown is never
 ``False``.
 
@@ -83,6 +86,13 @@ class CommitFingerprint(NamedTuple):
     author_epoch: int
     author_email: str
     subject: str
+
+
+class BranchCommit(NamedTuple):
+    """One of a branch's own commits, and when it was committed."""
+
+    fingerprint: CommitFingerprint
+    committed_epoch: int
 
 
 class MarkerHit(NamedTuple):
@@ -165,28 +175,30 @@ async def _merge_marker_index(project_root: str) -> dict[str, MarkerHit] | None:
     return index
 
 
-async def _own_commits(project_root: str, branch: str) -> tuple[CommitFingerprint, ...] | None:
+async def _own_commits(project_root: str, branch: str) -> tuple[BranchCommit, ...] | None:
     stdout = await _git_stdout(
         project_root, f'own-commit scan of {branch}',
-        'log', f'{DEFAULT_BASE_BRANCH}..{branch}', '--format=%at%x1f%ae%x1f%s', '--',
+        'log', f'{DEFAULT_BASE_BRANCH}..{branch}', '--format=%at%x1f%ae%x1f%s%x1f%ct', '--',
     )
     if stdout is None:
         return None
     return tuple(
-        CommitFingerprint(int(author_epoch), email, subject)
-        for author_epoch, email, subject in _records(stdout)
+        BranchCommit(CommitFingerprint(int(author_epoch), email, subject), int(committed_epoch))
+        for author_epoch, email, subject, committed_epoch in _records(stdout)
     )
 
 
 async def _main_twins(
-    project_root: str, own_commits: Iterable[tuple[CommitFingerprint, ...] | None],
+    project_root: str, own_commits: Iterable[tuple[BranchCommit, ...] | None],
 ) -> dict[CommitFingerprint, int] | None:
     """Map each main commit's fingerprint to its newest committer epoch.
 
     One scan covers every probed branch: ``--since`` filters by committer date,
     which for a rebased or cherry-picked twin is never before its author date.
     """
-    author_epochs = [fp.author_epoch for commits in own_commits if commits for fp in commits]
+    author_epochs = [
+        commit.fingerprint.author_epoch for commits in own_commits if commits for commit in commits
+    ]
     if not author_epochs:
         return {}
     stdout = await _git_stdout(
@@ -219,18 +231,23 @@ def _classify_by_marker(
 
 
 def _classify_by_twins(
-    own: tuple[CommitFingerprint, ...],
+    own: tuple[BranchCommit, ...],
     twins: Mapping[CommitFingerprint, int] | None,
     reopened_at: datetime | None,
 ) -> LandingVerdict:
+    """Landed iff every own commit has a fresh twin and main holds a copy of at least one."""
     if twins is None:
         return LandingVerdict.unknown()
-    for fingerprint in own:
-        committed_epoch = twins.get(fingerprint)
-        if committed_epoch is None:
+    main_holds_a_copy = False
+    for commit in own:
+        twin_epoch = twins.get(commit.fingerprint)
+        if twin_epoch is None:
             return LandingVerdict.not_landed()
-        if not _is_fresh(datetime.fromtimestamp(committed_epoch, tz=UTC), reopened_at):
+        if not _is_fresh(datetime.fromtimestamp(twin_epoch, tz=UTC), reopened_at):
             return LandingVerdict.not_landed()
+        main_holds_a_copy = main_holds_a_copy or twin_epoch > commit.committed_epoch
+    if not main_holds_a_copy:
+        return LandingVerdict.not_landed()
     return LandingVerdict.landed_by(LandingEvidence.REBASED_TWINS)
 
 
@@ -238,7 +255,7 @@ def _classify(
     query: LandingQuery,
     branches: frozenset[str] | None,
     markers: Mapping[str, MarkerHit] | None,
-    own_commits: Mapping[str, tuple[CommitFingerprint, ...] | None],
+    own_commits: Mapping[str, tuple[BranchCommit, ...] | None],
     twins: Mapping[CommitFingerprint, int] | None,
 ) -> LandingVerdict:
     """Apply the decision table: own commits need twins, otherwise a fresh marker."""

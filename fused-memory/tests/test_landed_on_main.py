@@ -200,6 +200,53 @@ async def test_rebased_twin_older_than_reopen_is_stale(repo: Path) -> None:
     assert before_reopen.evidence is LandingEvidence.REBASED_TWINS
 
 
+def _branch_holding_a_fix_from_main(repo: Path, task_id: str, *, behind_the_fork: bool) -> None:
+    """``task/<id>`` whose only own commit is a cherry-pick of a commit on main.
+
+    The fix lands on main either before the branch forks (so the pick is
+    redundant) or after it (the usual pull-in of a fix the task needs).
+    """
+    if behind_the_fork:
+        fix = _commit(repo, 'fix.txt', 'fix a shared bug', when=T0)
+        _git(repo, 'checkout', '-q', '-b', f'task/{task_id}', 'main')
+    else:
+        _git(repo, 'branch', f'task/{task_id}', 'main')
+        fix = _commit(repo, 'fix.txt', 'fix a shared bug', when=T0)
+        _git(repo, 'checkout', '-q', f'task/{task_id}')
+    _committer_only(
+        repo, 'cherry-pick', '--keep-redundant-commits', fix, when=T0 + timedelta(hours=1),
+    )
+    _git(repo, 'checkout', '-q', 'main')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('behind_the_fork', [False, True], ids=['after-the-fork', 'behind-the-fork'])
+async def test_a_branch_holding_only_a_fix_from_main_is_not_landed(
+    repo: Path, behind_the_fork: bool,
+) -> None:
+    _branch_holding_a_fix_from_main(repo, '110', behind_the_fork=behind_the_fork)
+
+    verdict = await _probe_one(repo, '110')
+
+    assert verdict.landed is False, (
+        "main holds the original the branch copied, not a copy of the branch's own work"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_fix_pulled_from_main_does_not_hide_work_that_landed(repo: Path) -> None:
+    _branch_holding_a_fix_from_main(repo, '111', behind_the_fork=False)
+    _git(repo, 'checkout', '-q', 'task/111')
+    work = _commit(repo, '111.txt', 'task 111 work', when=T0 + timedelta(hours=2))
+    _git(repo, 'checkout', '-q', 'main')
+    _cherry_pick_onto_main(repo, [work], when=T0 + timedelta(hours=3))
+
+    verdict = await _probe_one(repo, '111')
+
+    assert verdict.landed is True, 'the task work itself was rebased onto main'
+    assert verdict.evidence is LandingEvidence.REBASED_TWINS
+
+
 @pytest.mark.asyncio
 async def test_marker_for_task_10_does_not_land_task_1(repo: Path) -> None:
     _branch_with_commits(repo, '10', 1, when=T0)
