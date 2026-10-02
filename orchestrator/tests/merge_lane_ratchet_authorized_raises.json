@@ -1237,6 +1237,36 @@
           "current": 269
         }
       ]
+    },
+    {
+      "task_id": "5036",
+      "reason": "Review-round fixes for task 5036 (PRD plans/merge-lane-quality-prd.md zeta2). (a) merge_lane/liveness.py lines 1138 -> 1181: _HEARTBEAT_POLL_S and _MERGE_AHEAD_BOUND moved byte-identically from merge_lane/types.py (value types only), which falls 1743 -> 1699, to sit beside TOUCH_MISS_TOLERANCE and INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS, the guard constants they feed; cognitive unchanged. (b) merge_lane/__init__.py lines 92 -> 93: one _LANDING_EVIDENCE submodule constant so the facade resolves patch_content_contained from landing_evidence, where it now lives, instead of loading the worker. (c) test_merge_liveness.py patch_targets 0 -> 3 and the cluster union 58 -> 60: three restored single-patch tests pin the call-time (not def-time) read of INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS, _HEARTBEAT_POLL_S and _MERGE_AHEAD_BOUND at their defining module. Their only previous pin was the deleted TestReachBackRouting. _MERGE_AHEAD_BOUND's leaf already existed in test_merge_serial_lane_tripwire.py, so the union rises by 2, not 3.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/__init__.py",
+          "baseline": 92,
+          "current": 93
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/liveness.py",
+          "baseline": 1138,
+          "current": 1181
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_liveness.py",
+          "baseline": 0,
+          "current": 3
+        },
+        {
+          "measure": "total:patch_targets",
+          "key": "<cluster>",
+          "baseline": 58,
+          "current": 60
+        }
+      ]
     }
   ]
 }

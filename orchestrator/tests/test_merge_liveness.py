@@ -18,6 +18,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 
 def test_merge_liveness_exports_moved_public_symbols() -> None:
@@ -188,3 +191,62 @@ def test_merge_liveness_logger_name_is_merge_queue() -> None:
 
     assert merge_liveness.logger.name == 'orchestrator.merge_queue'
 
+
+
+class TestEngineConstantsAreReadAtCallTime:
+    """The liveness guards read their engine constants when CALLED, not when defined.
+
+    Each test patches one constant on ``orchestrator.merge_lane.liveness``, the
+    module that defines it and reads it, and calls the guard with the
+    corresponding argument omitted. A def-time default would have frozen the
+    original value and ignored the patch (see the module docstring of
+    ``orchestrator/src/orchestrator/merge_lane/liveness.py``).
+    """
+
+    def test_check_merge_liveness_margin_defaults_liveness_secs_at_call_time(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with patch('orchestrator.merge_lane.liveness.INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS', 600.0):
+            result = check_merge_liveness_margin(cfg)
+
+        assert result.liveness_secs == 600.0, result
+
+    def test_check_merge_liveness_margin_reads_heartbeat_poll_at_call_time(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.merge_lane.liveness import (
+            TOUCH_MISS_TOLERANCE,
+            check_merge_liveness_margin,
+        )
+
+        cfg = OrchestratorConfig(project_root=tmp_path)
+        with patch('orchestrator.merge_lane.liveness._HEARTBEAT_POLL_S', 1000.0):
+            result = check_merge_liveness_margin(cfg, liveness_secs=10800.0)
+
+        assert result.worst_case_secs == 1000.0 * TOUCH_MISS_TOLERANCE, result
+        assert result.safe is False, result
+
+    def test_enforce_persistent_worktree_serial_lane_defaults_merge_ahead_bound_at_call_time(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator.config import GitConfig, OrchestratorConfig
+        from orchestrator.merge_lane.liveness import (
+            PersistentWorktreeConfigError,
+            enforce_persistent_worktree_serial_lane,
+        )
+
+        cfg = OrchestratorConfig(
+            project_root=tmp_path,
+            git=GitConfig(persistent_merge_worktree=True),
+        )
+        # merge_ahead_bound omitted; num_hosts=1, so per-host ceil(5/1)=5 > 1 raises.
+        with (
+            patch('orchestrator.merge_lane.liveness._MERGE_AHEAD_BOUND', 5),
+            pytest.raises(PersistentWorktreeConfigError),
+        ):
+            enforce_persistent_worktree_serial_lane(cfg)

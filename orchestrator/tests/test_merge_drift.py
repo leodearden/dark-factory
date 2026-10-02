@@ -415,13 +415,14 @@ class TestDriftCheckFullGateSpecNoDerivation:
 # `remove_merge_worktree_guarded` as its only liveness protection.
 #
 # Deliberately uses a REAL git repo + REAL throwaway worktree (not the
-# MagicMock git_ops the reach-back tests above use) so `lane_lock_path(wt)`
+# MagicMock git_ops the cadence tests above use) so `lane_lock_path(wt)`
 # names a real file and the flock contention is genuine — a mocked git_ops
 # cannot exercise a real lock.  The pool half is built the way
 # TestDriftCheckFullGateSpecNoDerivation builds it: a real HostAllocator plus a
 # fake remote, which is what gets DriftDetector.check past its `local is None
-# or remote is None` INCONCLUSIVE early-return and into the LocalRunner that
-# reaches back to the patched `orchestrator.merge_queue.run_scoped_verification`.
+# or remote is None` INCONCLUSIVE early-return and into the LocalRunner, which
+# verifies through the injected VerifyPort and so through the patched
+# `orchestrator.merge_queue.run_scoped_verification`.
 # ---------------------------------------------------------------------------
 
 

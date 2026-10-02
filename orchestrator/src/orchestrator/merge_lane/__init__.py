@@ -19,6 +19,7 @@ from typing import Any
 
 _WORKER = 'orchestrator.merge_lane.worker'
 _GATES = 'orchestrator.merge_lane.gates'
+_LANDING_EVIDENCE = 'orchestrator.merge_lane.landing_evidence'
 _PORTS = 'orchestrator.merge_lane.ports'
 _TYPES = 'orchestrator.merge_lane.types'
 
@@ -43,7 +44,7 @@ _EXPORTS = _ExportTable({
     'retire_cancelled_merge_request': (_WORKER, 'retire_cancelled_merge_request'),
     'resolve_dispatch_time_merge_base': (_WORKER, '_resolve_dispatch_time_merge_base'),
     '_resolve_dispatch_time_merge_base': (_WORKER, '_resolve_dispatch_time_merge_base'),
-    'patch_content_contained': (_WORKER, 'patch_content_contained'),
+    'patch_content_contained': (_LANDING_EVIDENCE, 'patch_content_contained'),
     'MergeRequest': (_TYPES, 'MergeRequest'),
     'GroupMergeRequest': (_TYPES, 'GroupMergeRequest'),
     'MergeOutcome': (_TYPES, 'MergeOutcome'),

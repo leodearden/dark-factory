@@ -1753,8 +1753,8 @@ class TestRunInflightVerifyRunnerUnavailableSpecWarm:
         The warm swap is driven through the REAL ``_acquire_warm_verify_worktree``
         (spec-lane-pool knob on + speculative item + valve disabled, the three
         preconditions of its ``_spec-`` branch) with only ``git_ops`` stubbed —
-        never by monkeypatching the helper onto ``orchestrator.merge_queue``,
-        which ``test_merge_queue_reachback_patch_guard`` freezes.  So the True
+        never by monkeypatching the helper onto ``orchestrator.merge_queue``.
+        So the True
         asserted below is the value production would compute, not one injected.
         """
         from orchestrator.config import GitConfig, OrchestratorConfig

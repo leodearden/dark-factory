@@ -92,6 +92,8 @@ from orchestrator.merge_lane.landing_evidence import (
     validate_landing_evidence,
 )
 from orchestrator.merge_lane.liveness import (
+    _HEARTBEAT_POLL_S,
+    _MERGE_AHEAD_BOUND,
     _MERGE_WORKER_LOOP_DIED_SENTINEL,
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     _acquire_warm_verify_worktree,
@@ -133,8 +135,6 @@ from orchestrator.merge_lane.speculation_controller import (
     SpeculationController,
 )
 from orchestrator.merge_lane.types import (
-    _HEARTBEAT_POLL_S,
-    _MERGE_AHEAD_BOUND,
     CapPermit,
     ChainResult,
     Decided,
@@ -8836,8 +8836,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     #
     # This is DEFENSE-IN-DEPTH, not the primary protection.  A live throwaway
     # verify worktree now holds `merge_verify_lease(lane_dir=wt)` for the
-    # duration of its verify (merge_shadow._run_cold_shadow_verify /
-    # merge_drift._run_drift_check), so remove_merge_worktree_guarded returns
+    # duration of its verify (merge_lane/shadow.py::_run_cold_shadow_verify /
+    # merge_lane/drift.py::_run_drift_check), so remove_merge_worktree_guarded returns
     # 'skipped_lease_held' and skips it regardless of age.  This floor covers
     # any live-but-unleased tree on a path not yet enumerated.  Kept as a class
     # attribute so tests can monkeypatch it small, matching the
@@ -12619,8 +12619,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Note the age gate is DEFENSE-IN-DEPTH, not the primary protection for
         a live verify: throwaway verify worktrees hold
         ``merge_verify_lease(lane_dir=wt)`` for the duration of their verify
-        (``merge_shadow._run_cold_shadow_verify`` /
-        ``merge_drift._run_drift_check``), so
+        (``merge_lane/shadow.py::_run_cold_shadow_verify`` /
+        ``merge_lane/drift.py::_run_drift_check``), so
         :meth:`GitOps.remove_merge_worktree_guarded` refuses them with
         ``'skipped_lease_held'`` regardless of age.
 
@@ -12767,8 +12767,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         derivation).  That floor is defense-in-depth behind the primary
         protection: a live throwaway verify worktree holds
         ``merge_verify_lease(lane_dir=wt)`` across its verify
-        (``merge_shadow._run_cold_shadow_verify`` /
-        ``merge_drift._run_drift_check``), so this sweep skips it via
+        (``merge_lane/shadow.py::_run_cold_shadow_verify`` /
+        ``merge_lane/drift.py::_run_drift_check``), so this sweep skips it via
         ``'skipped_lease_held'`` regardless of age.
 
         Rate-limited by :attr:`_reap_interval_s` (default 300s), mirroring

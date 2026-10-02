@@ -32,7 +32,7 @@ Design highlights
   JSON object but whose value for one key is not a mapping loses only THAT
   key — never the whole recovery pass.  ``_load_raw``'s ``isinstance`` check
   inspects only the top level, so such a value reaches ``load()`` intact, and
-  ``merge_queue_store.py::recover_pending_merges`` calls ``load()`` unguarded:
+  ``merge_lane/queue_store.py::recover_pending_merges`` calls ``load()`` unguarded:
   one exception raised there drops every in-flight merge request in the
   journal, not just the malformed one.
 * Keyed by ``request_id`` so ``record()`` is idempotent on redispatch (updates

@@ -30,50 +30,6 @@ if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
 
 
-_MERGE_AHEAD_BOUND = 1
-"""Maximum number of counted (non-speculative, non-train) items that may sit in
-the SpeculativeMergeWorker verifier queue simultaneously (Mechanism 1, task 1646).
-
-.. note:: This constant is an input to the startup liveness-margin guard.
-   See :func:`check_merge_liveness_margin` for the coupling between this bound,
-   the verify timeout, and :data:`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`.
-
-With BOUND=1 the Merger runs at most one non-speculative merge ahead of the
-Verifier: after enqueuing a counted item the Merger blocks at
-``self._merge_ahead_ledger.acquire()`` (task 2161/θ: ledger-mediated, wraps
-``_merge_ahead_cap``) until the Verifier drains that item, at which point it
-re-reads a fresh main HEAD for the next merge.  Values in [1, 2] are safe;
-higher values allow more build-ahead but increase staleness risk.
-
-Cap invariants (all verified by integration tests):
-- Acquired at the single success-enqueue site in _merger_loop for non-speculative
-  blocking-path items (trains continue before this site; speculative items are
-  governed by _speculation_slot instead), stamped onto the item's
-  :attr:`~orchestrator.merge_types.RealMergeItem.cap_permit`.
-- Released ON-DRAIN in _verifier_loop, immediately after ``_verifier_queue.get()``
-  returns a non-None item, before any branching or item reassignment.  This
-  uniform placement covers all drain paths (normal verify, immediate_outcome,
-  chain-invalidation discard+_remerge, abandoned early-continue) with a single
-  release point and no risk of double-release (each counted item has exactly one
-  drain in the FIFO).
-- Released by stop() (over-release of a plain Semaphore is safe) so a merger
-  blocked at acquire() unblocks cleanly at shutdown."""
-
-
-_HEARTBEAT_POLL_S: float = 30.0
-"""How often _heartbeat_loop wakes up to call _maybe_log_queue_heartbeat.
-
-The heartbeat loop polls this frequently; the actual emission rate is governed
-by the per-instance _heartbeat_interval_s (default 300 s).  Keeping the poll
-period short (30 s) means the first heartbeat fires within ~30 s of startup
-when depth > 0 (because _last_heartbeat_at is initialised to 0.0, making the
-rate-limit check pass immediately on the first poll), then subsequently no
-more often than _heartbeat_interval_s, without adding measurable overhead.
-
-This constant is also a multiplicand of the liveness-margin guard's heartbeat
-floor (see :data:`TOUCH_MISS_TOLERANCE`)."""
-
-
 class MainHealthAutoHealRegistry:
     """Monotonic per-signature attempt counter for main-health auto-heal.
 
