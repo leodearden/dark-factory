@@ -21,7 +21,6 @@ from pydantic import ValidationError
 
 from orchestrator.config import OrchestratorConfig
 
-
 # Real-subprocess tests run _run_cmd, whose TimeoutError path escalates
 # terminate_process_group(grace_secs=5.0) as SIGTERM-wait then SIGKILL-wait, so
 # its bounded worst case is (largest _run_cmd timeout, 10.0) + 2 * 5.0 = 20s.
