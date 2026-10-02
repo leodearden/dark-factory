@@ -818,7 +818,9 @@ class UsageGate:
         """Resolve account tokens from env vars.
 
         If no accounts are configured, falls back to reading the default
-        credential from ``~/.claude/.credentials.json``.
+        credential from ``~/.claude/.credentials.json`` — unless the config
+        disables that fallback (``fallback_to_default_credential=False``), in
+        which case the pool stays empty.
         """
         accounts: list[AccountState] = []
         for acct_cfg in self._config.accounts:
@@ -831,7 +833,12 @@ class UsageGate:
                 continue
             accounts.append(AccountState(name=acct_cfg.name, token=token))
 
-        if not accounts:
+        if not accounts and not self._config.fallback_to_default_credential:
+            logger.warning(
+                'No configured account resolved a token, and the ~/.claude '
+                'default-credential fallback is disabled — the pool is empty'
+            )
+        elif not accounts:
             token = _read_oauth_token()
             if token:
                 accounts.append(AccountState(name='default', token=token))
