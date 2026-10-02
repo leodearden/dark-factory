@@ -934,7 +934,7 @@ class TestUIConfigWriteDebounce:
         here rather than left implicit in _flush_ui_config's docstring.
 
         cockpit/src/cockpit/ui_config.py::save_ui_config logs and swallows
-        OSError and returns None either way, so _persist_ui_config cannot
+        any exception and returns None either way, so _persist_ui_config cannot
         tell a failed write from a successful one and advances the baseline
         regardless. The retry CADENCE did materially change when the write
         left the highlight handler: a persistently unwritable fleet_root

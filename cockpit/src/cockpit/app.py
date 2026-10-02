@@ -1583,7 +1583,7 @@ class CockpitApp(App):
         There is nothing to retry on. _persist_ui_config advances the
         baseline immediately after the fail-soft
         cockpit/src/cockpit/ui_config.py::save_ui_config call, which logs
-        and swallows OSError and returns None either way, so a failed write
+        and swallows any exception and returns None either way, so a failed write
         is dropped exactly as a highlight-time save failure used to be. The
         next selection change makes the two values differ again, and
         on_unmount's unconditional write gets one more attempt at shutdown.
