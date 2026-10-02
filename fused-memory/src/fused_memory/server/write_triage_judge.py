@@ -43,7 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any, NamedTuple, get_args
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, get_args
 
 from fused_memory.config.schema import JudgeReasoningEffort
 from fused_memory.routing.json_extract import extract_json
@@ -825,7 +825,7 @@ class _JudgeReply(NamedTuple):
     usage: JudgeUsage | None
 
 
-def _is_token_count(value: object) -> bool:
+def _is_token_count(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
