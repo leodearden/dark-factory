@@ -1175,26 +1175,21 @@ def check_canonical_routing(
 
     WHY THE RULE EXISTS — measured on graphiti_core 0.28.2, not assumed.
     THIS DOCSTRING IS THE SINGLE HOME for that measurement: the two
-    service-seam docstrings, the two call-site comments and the tests
-    carry one line and a pointer here rather than a copy, so there is ONE
-    thing to update when graphiti_core changes (INV-5).  On a write that
-    reaches only Graphiti the metadata is not merely UNCOUNTED, it is
-    DISCARDED:
+    service-seam docstrings and the three call-site comments (``add_memory``,
+    ``add_system_record``, ``update_memory``) carry at most a line, so there
+    is ONE thing to update when graphiti_core changes (INV-5).  Cited by
+    symbol, not line.  On a write that reaches only Graphiti the metadata is
+    not merely UNCOUNTED, it is DISCARDED:
 
     * the ``add_memory_graphiti`` enqueue payload built in
-      :meth:`MemoryService.add_memory` carries name/content/source/
-      group_id/source_description and the two correlation ids — the
-      validated ``meta`` dict is referenced only in the Mem0 branch;
+      :meth:`MemoryService.add_memory` carries no ``meta``; its only
+      metadata-derived fields are ``referents`` (bridged from ``task_id``
+      alone) and ``unverified_claim``, neither of which carries
+      ``canonical`` or ``topic``;
     * :meth:`GraphitiBackend.add_episode` has no metadata parameter to
-      receive one; the string ``metadata`` occurs zero times in that
-      3,011-line module;
+      receive one; the string ``metadata`` occurs zero times in that module;
     * ``entity_types``, the only route to ``EntityNode.attributes``, is
       never supplied by any caller, so attributes are always ``{}``.
-
-    Cited by SYMBOL, not by line, deliberately: line numbers into a
-    3,000-line module rot on the next edit — the change that introduced
-    this rule moved the enqueue payload ~80 lines by itself — and a
-    citation that lands a reader in the wrong function is worse than none.
 
     So the marker is never stored — hence never readable by its only live
     reader (``pick_survivor`` in ``scripts/audit_duplicate_memories.py``,
@@ -1235,6 +1230,8 @@ def check_canonical_routing(
     be wrong exactly when it mattered.  The caller passes the routing
     OUTCOME (``resolved_category in MEM0_PRIMARY or dual_write``) rather
     than the category, so this rule never restates the routing rule.
+    ``update_memory`` and ``add_system_record`` pass ``True`` because they
+    always land in Mem0, whatever their ``category`` tag.
 
     ``fatal=True``, so it inherits warn-mode-first from the existing
     ``memory_metadata.enforce`` flag exactly like every sibling shape
@@ -1251,8 +1248,8 @@ def check_canonical_routing(
 
     :param reaches_mem0: whether this write will actually be persisted to
         Mem0.  Not defaulted anywhere up the call chain, deliberately: a
-        default would let a future third write path skip the check
-        silently, which is the exact silence this rule removes.
+        default would let a future write path skip the check silently,
+        which is the exact silence this rule removes.
     """
     # `is True`, not truthiness — the same discipline rule 2b documents
     # above (`1 == True`).  The int form is `invalid_canonical_type`'s
