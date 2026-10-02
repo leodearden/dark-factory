@@ -490,6 +490,12 @@ class TestCommittedRegistryFixture:
 
 CALIBRATION_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
 CENSUS_PATH = Path(__file__).parents[2] / 'plans' / 'memory-metadata-census-report.json'
+_CENSUS_TOPIC_ROWS = (
+    {'value': 'census-multi-alpha', 'count': 5},
+    {'value': 'census_multi_beta', 'count': 2},
+    {'value': 'census-singleton-gamma', 'count': 1},
+    {'value': 'census-singleton-delta', 'count': 1},
+)
 
 
 @pytest.fixture(scope='module')
@@ -605,23 +611,12 @@ class TestDeriveFromCuratorGates:
 class TestDeriveFromCensus:
     """Multi-entry census topics, with the skipped long tail DISCLOSED."""
 
-    def test_emits_multi_entry_topics_only(self, derived, census_report):
-        multi = {
-            e['value'] for e in census_report['grand_total']['topic']['entries']
-            if e['count'] > 1
-        }
+    def test_emits_multi_entry_topics_only(self, derived):
         emitted = {c['topic'] for c in _of(derived, 'census_topic')}
-        assert emitted
-        assert emitted <= multi
+        assert emitted == {'census-multi-alpha', 'census_multi_beta'}
 
-    def test_skipped_singletons_are_disclosed_not_silently_dropped(
-        self, derived, census_report,
-    ):
-        singletons = [
-            e for e in census_report['grand_total']['topic']['entries'] if e['count'] <= 1
-        ]
-        assert singletons, 'census no longer has a count-1 tail'
-        assert derived.disclosures['census_topics_skipped_singleton'] == len(singletons)
+    def test_skipped_singletons_are_disclosed_not_silently_dropped(self, derived):
+        assert derived.disclosures['census_topics_skipped_singleton'] == 2
 
     def test_census_forward_compat_extra_key(self, calibration_rows, guard_clusters):
         payload = {
