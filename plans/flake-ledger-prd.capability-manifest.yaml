@@ -196,7 +196,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: flake_suppression['"]?\s*[:=]
+      pattern: record_merge_flake_suppression
       paths:
       - orchestrator/src/orchestrator/merge_queue.py
       expect: present
