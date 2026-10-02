@@ -2027,7 +2027,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         coder_module = importlib.import_module(spelling)
 
         def capped_invoke(prompt, model):
-            raise session_runner.NoHeadroom('no headroom', marker='pool exhausted')
+            raise session_runner.NoHeadroom('no headroom')
 
         result = coder_module.code_digest(
             _HAND_DIGEST_FOR_IDENTITY, {'entries': []}, project='dark_factory',
@@ -2495,7 +2495,6 @@ def _fake_invoke_capped(prompt: str, model: str):
     raise session_runner.NoHeadroom(
         "claude CLI exited 1 (model='haiku', claude_bin='claude', cwd=None): "
         f'stdout="{_CAP_BANNER_4736}" stderr=\'\'',
-        marker="you've hit your",
     )
 
 
