@@ -44,6 +44,7 @@ fixtures prove it still fires.
 
 from __future__ import annotations
 
+import ast
 import re
 import textwrap
 from pathlib import Path
@@ -61,6 +62,7 @@ from loop_blocking_scan import (
     METHOD_PRIMITIVES,
     LoopBlockingSite,
     find_loop_blocking_sites,
+    find_loop_blocking_sites_in_trees,
     site_key,
 )
 from silent_fallthrough_scan import (
@@ -696,6 +698,77 @@ class TestScannerHygiene:
         assert [f.qualname for f in findings] == ['b']
 
 
+def _trees(sources: dict[str, str]) -> dict[str, ast.Module]:
+    return {relpath: ast.parse(source, filename=relpath) for relpath, source in sources.items()}
+
+
+#: A caller in one module reaching a blocking helper defined in another.
+_CROSS_MODULE_SOURCES = {
+    'pkg/registry.py': _module(_HELPER_DEF),
+    'pkg/caller.py': _module(
+        """
+        async def b(path):
+            from pkg.registry import load_registry
+
+            return load_registry(path)
+        """,
+    ),
+}
+
+_CLEAN_SOURCES = {
+    'pkg/mod.py': _module(
+        """
+        async def a(text):
+            return text.split(',')
+        """,
+    ),
+}
+
+#: Task 5099's async-consumption shape: an awaited read_text is an async API,
+#: a bare one in a sibling coroutine is a finding.
+_ASYNC_CONSUMPTION_SOURCES = {
+    'pkg/mod.py': _module(
+        """
+        async def a(apath):
+            return await apath.read_text()
+        """,
+        """
+        async def d(path):
+            return path.read_text()
+        """,
+    ),
+}
+
+
+class TestTreesEntryPoint:
+    """``find_loop_blocking_sites_in_trees`` is what the gate calls on the shared ASTs.
+
+    ``find_loop_blocking_sites`` parses and delegates to it, so the two must
+    agree exactly on every mapping.
+    """
+
+    @pytest.mark.parametrize(
+        ('sources', 'expected'),
+        [
+            (_CROSS_MODULE_SOURCES, [('pkg/caller.py', 'b', 'load_registry')]),
+            (_CLEAN_SOURCES, []),
+            (_ASYNC_CONSUMPTION_SOURCES, [('pkg/mod.py', 'd', 'read_text')]),
+        ],
+        ids=['cross-module', 'clean', 'async-consumption'],
+    )
+    def test_matches_the_source_entry_point_exactly(self, sources, expected):
+        from_trees = find_loop_blocking_sites_in_trees(_trees(sources))
+        assert from_trees == find_loop_blocking_sites(sources)
+        assert [(f.filename, f.qualname, f.callee) for f in from_trees] == expected
+
+    def test_an_unparseable_module_left_out_of_the_trees_contributes_nothing(self):
+        """Mirrors the source entry point's SyntaxError skip."""
+        sources = {**_CROSS_MODULE_SOURCES, 'pkg/broken.py': 'def ( oops\n'}
+        assert find_loop_blocking_sites_in_trees(_trees(_CROSS_MODULE_SOURCES)) == (
+            find_loop_blocking_sites(sources)
+        )
+
+
 # --------------------------------------------------------------------------- #
 # The primitive table (task 4484 gap B)
 # --------------------------------------------------------------------------- #
@@ -1152,6 +1225,27 @@ def tree_scan() -> _TreeScan:
             continue
         sources[rel] = path.read_text(encoding='utf-8', errors='replace')
     return _TreeScan(scanned_files=len(sources), findings=find_loop_blocking_sites(sources))
+
+
+class TestSweepUsesTheSharedTree:
+    """The sweep walks the session's shared ASTs and does no I/O of its own."""
+
+    def test_the_sweep_reads_nothing_and_parses_nothing(self, first_party_tree, monkeypatch):
+        """Scoped by ``monkeypatch.context()``: pytest's own failure report calls
+        ``ast.parse``, so the patch must be gone before a failure is rendered."""
+
+        def no_parse(*_args, **_kwargs):
+            raise AssertionError('ast.parse called: the sweep re-parsed a file')
+
+        def no_read(*_args, **_kwargs):
+            raise AssertionError('pathlib.Path.read_text called: the sweep re-read a file')
+
+        with monkeypatch.context() as patched:
+            patched.setattr(ast, 'parse', no_parse)
+            patched.setattr(Path, 'read_text', no_read)
+            scan = _build_tree_scan(first_party_tree)
+        assert scan.scanned_files >= 100
+        assert scan.findings
 
 
 class TestSweepIsNotVacuous:

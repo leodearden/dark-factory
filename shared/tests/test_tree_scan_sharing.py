@@ -782,18 +782,23 @@ def _walks_a_directory_tree(tree: ast.Module) -> bool:
     return False
 
 
-def _grows_a_private_tree_parse(tree: ast.Module) -> bool:
-    """The offence: enumerate the first-party tree AND parse it yourself."""
-    return 'iter_first_party_files' in _names_referenced(tree) and _calls_ast_parse(tree)
+def _names_the_enumerator(tree: ast.Module) -> bool:
+    """Rule 1: enumerating the first-party tree is the provider's job alone.
+
+    Keyed on the NAME, not on a parse in the same module: a module that
+    enumerates and hands sources to a scanner that parses elsewhere is still a
+    second whole-tree parse.
+    """
+    return 'iter_first_party_files' in _names_referenced(tree)
 
 
 def _rolls_its_own_root_parse(tree: ast.Module) -> bool:
-    """The offence's other shape: walk a directory tree yourself AND parse."""
+    """Rule 2: walk a directory tree yourself AND parse."""
     return _walks_a_directory_tree(tree) and _calls_ast_parse(tree)
 
 
 def _is_private_tree_parse_offender(tree: ast.Module) -> bool:
-    return _grows_a_private_tree_parse(tree) or _rolls_its_own_root_parse(tree)
+    return _names_the_enumerator(tree) or _rolls_its_own_root_parse(tree)
 
 
 def _could_offend(source: str) -> bool:
@@ -810,14 +815,14 @@ def _could_offend(source: str) -> bool:
 class TestNoRegrownWholeTreeParse:
     """No shared/tests module may grow a SECOND private whole-tree parse.
 
-    Written in this directory's established ratchet idiom
-    (``test_safe_io.TestNoRegrownAtomicWriters``, the silent-fallthrough gate,
-    the archival gate): AST scan, name the offender, carry an anti-vacuity
-    floor. Two shapes offend: naming ``iter_first_party_files`` and parsing,
-    and walking a directory tree yourself (``rglob`` / ``os.walk``) and
-    parsing. ``test_safe_io``'s cross-tree sweep left shared/tests in task 3388
-    (now ``tests/scripts/test_atomic_write_regrowth.py``), and
-    ``test_auth_failed`` now walks the shared tree.
+    Written in this directory's established ratchet idiom (the
+    silent-fallthrough gate, the archival gate): AST scan, name the offender,
+    carry an anti-vacuity floor. Two shapes offend: naming
+    ``iter_first_party_files`` at all (rule 1), and walking a directory tree
+    yourself (``rglob`` / ``os.walk``) and parsing (rule 2). ``test_safe_io``'s
+    cross-tree sweep left shared/tests in task 3388 (now
+    ``tests/scripts/test_atomic_write_regrowth.py``), and ``test_auth_failed``
+    now walks the shared tree.
     """
 
     def test_no_module_enumerates_and_parses_the_tree_itself(self):
@@ -837,16 +842,15 @@ class TestNoRegrownWholeTreeParse:
             f'({_TESTS_DIR})'
         )
         assert not offenders, (
-            'These shared/tests modules enumerate a source tree themselves '
-            '(iter_first_party_files, rglob or os.walk) AND parse it:\n'
+            'These shared/tests modules name iter_first_party_files, or walk '
+            'a directory tree with rglob/os.walk AND call ast.parse:\n'
             + '\n'.join(f'  {name}' for name in offenders)
-            + '\n\nThat is a SECOND whole-tree parse. Two of them already '
+            + '\n\nEither is a SECOND whole-tree parse. Two of them already '
               'collided with the 60s pytest-timeout budget under load (task '
-              '4520): pytest-timeout arms its timer over the whole runtest '
-              'protocol, so the duplicated work lands on one arbitrary test '
-              'item as an ERROR-at-setup. Take the session-scoped '
-              '`first_party_tree` fixture (conftest.py) and walk the ASTs '
-              'silent_fallthrough_scan.parse_first_party_tree already built.'
+              '4520). Take the session-scoped `first_party_tree` fixture '
+              '(conftest.py) instead: its records carry each file\'s relpath, '
+              'source and parsed tree, built once at collection, outside every '
+              'item\'s pytest-timeout timer.'
         )
 
     def test_the_detector_actually_fires(self):
@@ -857,28 +861,36 @@ class TestNoRegrownWholeTreeParse:
             'def scan(root):\n'
             '    return [ast.parse(p.read_text()) for p in iter_first_party_files(root)]\n'
         )
-        assert _grows_a_private_tree_parse(offender)
+        assert _is_private_tree_parse_offender(offender)
 
-    def test_the_detector_catches_the_from_import_spelling(self):
-        """`from ast import parse` must not evade the ratchet."""
-        offender = ast.parse(
-            'from ast import parse\n'
-            'from silent_fallthrough_scan import iter_first_party_files\n'
-            'def scan(root):\n'
-            '    return [parse(p.read_text()) for p in iter_first_party_files(root)]\n'
-        )
-        assert _grows_a_private_tree_parse(offender)
-
-    def test_the_detector_does_not_fire_on_either_half_alone(self):
-        """Parsing a synthetic source, or naming the enumerator, is fine alone."""
-        parses_only = ast.parse('import ast\nast.parse("x = 1")\n')
+    def test_naming_the_enumerator_alone_fires(self):
+        """Rule 1: a consumer never needs the enumerator; paths are on the records."""
         enumerates_only = ast.parse(
             'from silent_fallthrough_scan import iter_first_party_files\n'
             'def files(root):\n'
             '    return list(iter_first_party_files(root))\n'
         )
-        assert not _grows_a_private_tree_parse(parses_only)
-        assert not _grows_a_private_tree_parse(enumerates_only)
+        assert _is_private_tree_parse_offender(enumerates_only)
+
+    def test_the_split_enumerate_here_parse_elsewhere_shape_fires(self):
+        """The loop-blocking gate's old shape: enumerate, then a scanner parses."""
+        offender = ast.parse(
+            'from loop_blocking_scan import find_loop_blocking_sites\n'
+            'from silent_fallthrough_scan import iter_first_party_files\n'
+            'def scan(root):\n'
+            '    sources = {str(p): p.read_text() for p in iter_first_party_files(root)}\n'
+            '    return find_loop_blocking_sites(sources)\n'
+        )
+        assert _is_private_tree_parse_offender(offender)
+
+    def test_the_detector_catches_the_from_import_spelling(self):
+        """`from ast import parse` must not evade rule 2."""
+        offender = ast.parse(
+            'from ast import parse\n'
+            'def scan(root):\n'
+            "    return [parse(p.read_text()) for p in root.rglob('*.py')]\n"
+        )
+        assert _is_private_tree_parse_offender(offender)
 
     def test_the_detector_catches_a_rolled_own_rglob_root(self):
         offender = ast.parse(
