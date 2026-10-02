@@ -49,11 +49,14 @@ from graphiti_core.graph_queries import (
 from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT, fulltext_query
 
 from fused_memory.backends.falkor_indices import (
+    IndexSpec,
     expected_index_set,
+    normalize_index_records,
     parse_index_statement,
     unsettled_index_statuses,
 )
 from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
+from fused_memory.reconciliation.index_health import summarize_index_health
 
 pytestmark = [
     falkor_skipif(),
@@ -198,6 +201,27 @@ async def _index_unsettled(backend: GraphitiBackend, group_id: str, label: str) 
     """Whether *label*'s index is listed AND not OPERATIONAL; an absent index is False."""
     records = await backend.list_indices(group_id=group_id)
     return any(unsettled == label for unsettled, _ in unsettled_index_statuses(records))
+
+
+# --- The production expected-set check --------------------------------------
+
+
+async def missing_production_indices(backend: GraphitiBackend, group_id: str) -> list[IndexSpec]:
+    """Expected-but-absent specs, judged by the reader and summarizer δ's detector uses."""
+    actual = normalize_index_records(await backend.list_indices(group_id=group_id))
+    return summarize_index_health(actual, expected_index_set())['missing']
+
+
+_DROP_KEYWORD_BY_INDEX_TYPE = {'RANGE': '', 'FULLTEXT': 'FULLTEXT '}
+_DROP_PATTERN_BY_ENTITY_TYPE = {'NODE': '(x:{label})', 'RELATIONSHIP': '()-[x:{label}]-()'}
+
+
+def _drop_statement(spec: IndexSpec) -> str:
+    """The statement that drops exactly *spec*; an unknown type raises KeyError."""
+    label, entity_type, field, index_type = spec
+    keyword = _DROP_KEYWORD_BY_INDEX_TYPE[index_type]
+    pattern = _DROP_PATTERN_BY_ENTITY_TYPE[entity_type].format(label=label)
+    return f'DROP {keyword}INDEX FOR {pattern} ON (x.{field})'
 
 
 # --- Fixtures ---------------------------------------------------------------
