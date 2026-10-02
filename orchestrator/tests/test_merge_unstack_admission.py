@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from _orch_helpers import wait_responsive
 
 from orchestrator.branch_stack import (
     STACKED_ON_UNLANDED_BASE_REASON_PREFIX,
@@ -330,7 +331,7 @@ async def _run_through_merger(
     await queue.put(train.request)
     worker_task = asyncio.create_task(worker.run())
     try:
-        return await asyncio.wait_for(train.request.result, timeout=30)
+        return await wait_responsive(train.request.result, label='coalesce train outcome')
     finally:
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
