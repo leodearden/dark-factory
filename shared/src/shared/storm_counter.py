@@ -7,7 +7,8 @@ first written as ``reconciliation/harness.py::_record_placeholder_finding_drop``
 and since reproduced in ``harness._dead_owner_suppressions`` and
 ``server/markup_tripwire.MarkupStormCounter``. Task 3088 extracted it (into
 ``fused_memory.server.storm_counter``) so a fourth consumer reuses rather than
-re-copies it (INV-5).
+re-copies it (INV-5). The append / prune / count step is public on its own as
+:meth:`StormCounter.observe`, for a consumer that thresholds outside the counter.
 
 Task 3689 PROMOTED it to ``shared`` when that fourth consumer arrived:
 ``shared.mcp_markup_middleware`` keys a burst by ``(project, policy_outcome)``,
@@ -261,6 +262,51 @@ class StormCounter:
         """
         return self._prune(now if now is not None else self._now(), window_seconds)
 
+    def observe(
+        self,
+        *,
+        window_seconds: float,
+        label: str | None = None,
+        key: str | None = None,
+        now: float | None = None,
+    ) -> int:
+        """Record one event WITHOUT a fire decision; return the RAW live event count.
+
+        The count follows :meth:`prune`'s contract: remaining events, even in
+        ``count_distinct`` mode. This is for a consumer whose fire is decided
+        outside the counter —
+        ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::LandingTally``.
+
+        :meth:`record` is ``observe()`` plus the fire decision, so the two may
+        be mixed on one counter: observed events count toward, and are named
+        in, a later :meth:`record`'s summary. ``observe()`` arms neither the
+        rate limit nor the latch.
+
+        *label*, *key* and *now* mean what they mean on :meth:`record`.
+
+        Passing a non-``None`` *key* to a DEFAULT-mode counter raises rather
+        than degrading that counter to raw-event thresholding while the call
+        site reads as if it were counting distinct keys — the pre-task-2039
+        regression (esc-recon-50da2482-1) that ``count_distinct`` exists to
+        prevent, invisible in the summary, the logs and the return value alike.
+        A mode mismatch is a wiring bug in the CALL SITE, deterministic and
+        caught on its first call, so this fails loudly (INV
+        no-silent-fail-soft / structured-facts-at-failure).
+
+        :raises ValueError: if *key* is not ``None`` on a counter built without
+            ``count_distinct=True``.
+        """
+        if key is not None and not self._count_distinct:
+            raise ValueError(
+                f'key={key!r} was passed to a StormCounter built without '
+                'count_distinct=True; that counter thresholds on the RAW event '
+                'count and would silently ignore the key. Construct it with '
+                'StormCounter(count_distinct=True), or drop the key.'
+            )
+        effective_now = now if now is not None else self._now()
+        self._events.append((effective_now, label, key))
+        return self._prune(effective_now, window_seconds)
+
     def record(
         self,
         *,
@@ -289,14 +335,7 @@ class StormCounter:
         optional identifier that happens to be missing is never a mismatch.
 
         Passing a non-``None`` *key* to a DEFAULT-mode counter raises
-        ``ValueError``. Silently ignoring it would degrade that counter to raw-
-        event thresholding while the call site reads as if it were counting
-        distinct keys — precisely the pre-task-2039 regression
-        (esc-recon-50da2482-1) that ``count_distinct`` exists to prevent, and
-        invisible in the summary, the logs and the return value alike. A mode
-        mismatch is a wiring bug in the CALL SITE, deterministic and caught on
-        its first call, so this fails loudly rather than fails soft (INV
-        no-silent-fail-soft / structured-facts-at-failure).
+        ``ValueError`` — see :meth:`observe`, which owns that guard.
 
         *now* is an optional PER-CALL clock override, as an epoch float. The
         constructor-injected *time_provider* remains the default and is what
@@ -345,19 +384,10 @@ class StormCounter:
         :raises ValueError: if *key* is not ``None`` on a counter built without
             ``count_distinct=True``.
         """
-        if key is not None and not self._count_distinct:
-            raise ValueError(
-                f'key={key!r} was passed to a StormCounter built without '
-                'count_distinct=True; that counter thresholds on the RAW event '
-                'count and would silently ignore the key. Construct it with '
-                'StormCounter(count_distinct=True), or drop the key.'
-            )
-
         effective_now = now if now is not None else self._now()
-
-        # Append, then prune.
-        self._events.append((effective_now, label, key))
-        count = self._prune(effective_now, window_seconds)
+        count = self.observe(
+            window_seconds=window_seconds, label=label, key=key, now=effective_now
+        )
         if self._count_distinct:
             count = len({k for _, _, k in self._events if k is not None})
         if count < threshold:
