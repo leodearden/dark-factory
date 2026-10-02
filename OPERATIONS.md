@@ -820,7 +820,7 @@ takes no arguments: it always re-reads that process's own
 - `merge_disjoint_skip_requires_verified_drift` (the soundness gate on the
   merge queue's disjoint-delta fast path — see
   [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state)'s
-  neighbourhood and `merge_gates._disjoint_skip_blockers`). When `true`
+  neighbourhood and `merge_lane/gates.py::_disjoint_skip_blockers`). When `true`
   (the default) a rebase whose footprint is disjoint from the intervening
   main delta is re-verified anyway unless that delta is a main tip **this
   queue landed green**; drift from any other writer — an unattended nightly

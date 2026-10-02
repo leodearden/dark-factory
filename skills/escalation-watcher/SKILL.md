@@ -1282,7 +1282,7 @@ re-checking a named, machine-checkable predicate.
 
 Merge-gate verify failures now carry a **disposition** — a classification of whose
 fault the failure is, orthogonal to the failure's `category` (`plans/merge-skew-attribution-prd.md`,
-task β, `orchestrator/src/orchestrator/merge_disposition.py`). It is a **closed enum**:
+task β, `orchestrator/src/orchestrator/merge_lane/disposition.py`). It is a **closed enum**:
 
 | Disposition | Meaning |
 |---|---|

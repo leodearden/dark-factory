@@ -33,6 +33,7 @@ from _orch_helpers import make_placeholder_future
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
 from orchestrator.merge_queue import (
     MERGE_WORKER_SHUTDOWN_REASON,
     MergeOutcome,
@@ -406,6 +407,8 @@ async def test_restart_recovery_integration(
         event_store=None,
         main_branch=config.git.main_branch,
         branch_prefix=config.git.branch_prefix,
+        enqueue_merge_request=enqueue_merge_request,
+        select_recovery_winner=select_recovery_winner,
     )
 
     assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
@@ -515,6 +518,8 @@ async def test_idempotency_already_landed_branch_dropped(
         event_store=None,
         main_branch=config.git.main_branch,
         branch_prefix=config.git.branch_prefix,
+        enqueue_merge_request=enqueue_merge_request,
+        select_recovery_winner=select_recovery_winner,
     )
 
     # Record must be dropped (not re-enqueued).
@@ -675,6 +680,8 @@ async def test_anti_retry_deterministic_failure_not_requeued(
         event_store=None,
         main_branch=config.git.main_branch,
         branch_prefix=config.git.branch_prefix,
+        enqueue_merge_request=enqueue_merge_request,
+        select_recovery_winner=select_recovery_winner,
     )
 
     assert report['recovered'] == 0, (
@@ -893,6 +900,8 @@ async def test_verifying_merge_survives_graceful_restart_and_recovers(
         event_store=None,
         main_branch=config.git.main_branch,
         branch_prefix=config.git.branch_prefix,
+        enqueue_merge_request=enqueue_merge_request,
+        select_recovery_winner=select_recovery_winner,
     )
 
     assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'

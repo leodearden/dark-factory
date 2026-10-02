@@ -52,10 +52,10 @@ from orchestrator.git_ops import (
     WorktreeMissing,
     _run,
 )
+from orchestrator.merge_lane.gates import DropGuardResult, _check_plan_files_touched_in_branch
 from orchestrator.merge_lane.ports import ProductionVerifier, VerifyPort
 from orchestrator.merge_lane.types import DiskGuardOutcome
 from orchestrator.merge_queue import (
-    EMPTY_SUFFIX_CONFLICT_GRAPH,
     INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS,
     MERGE_LANES,
     NEEDS_REBASE_REASON_PREFIX,
@@ -67,7 +67,6 @@ from orchestrator.merge_queue import (
     WORKTREE_MISSING_REASON_PREFIX,
     CapPermit,
     DecidedItem,
-    DropGuardResult,
     GroupMergeRequest,
     InFlightMergeRegistry,
     MergeOutcome,
@@ -78,7 +77,6 @@ from orchestrator.merge_queue import (
     SuffixConflictGraph,
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
-    _check_plan_files_touched_in_branch,
     _check_plan_targets_in_tree,
     _check_post_merge_equivalence,
     _classify_branch_presence,
@@ -90,6 +88,7 @@ from orchestrator.merge_queue import (
     register_and_enqueue_merge_request,
 )
 from orchestrator.merge_types import QueuedBranch
+from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
 
@@ -2649,7 +2648,7 @@ class TestSpeculativeMergeWorker:
                 return (1, '', 'fatal: not a git repository')
             return await original_run(cmd, cwd=cwd, **kwargs)
 
-        with patch('orchestrator.merge_queue._run', new=mock_run):
+        with patch('orchestrator.merge_queue._run', new=mock_run), patch('orchestrator.merge_lane.gates._run', new=mock_run):
             req_n = _make_request('rp-n', 'rp-n', wt_n, config)
             req_ok = _make_request('rp-ok', 'rp-ok', wt_ok, config)
             await queue.put(req_n)
@@ -4146,7 +4145,7 @@ class TestSpeculativeMergeWorker:
         Asserts both the primary future and the attached peer future resolve to
         status 'blocked'.
         """
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
 
         wt = (await git_ops.create_worktree('mw-cfl')).path
 
@@ -9004,11 +9003,11 @@ class TestMergedBranchTipCarryThroughRebuild:
                 AsyncMock(return_value=None),  # gate cleared (disjoint/green)
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 side_effect=_spy_equiv,
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=pyright_clean),
             ),
         ):
@@ -9096,7 +9095,7 @@ class TestMergedBranchTipCarryThroughRebuild:
                 AsyncMock(return_value=None),  # gate cleared
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=pyright_clean),
             ),
             # No spy on _check_post_merge_equivalence: real impl runs so the
@@ -9195,15 +9194,15 @@ class TestMergedBranchTipCarryThroughRebuild:
             patch.object(git_ops, 'get_main_sha', AsyncMock(return_value=base_sha)),
             # Eliminate term-1 so only term-2 (merged_branch_tip) can provide the tip.
             patch(
-                'orchestrator.merge_queue._resolve_second_parent',
+                'orchestrator.merge_lane.gates._resolve_second_parent',
                 AsyncMock(return_value=None),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 side_effect=_spy_equiv,
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=pyright_clean),
             ),
         ):
@@ -9320,11 +9319,11 @@ class TestMergedBranchTipCarryThroughRebuild:
                 AsyncMock(return_value=None),  # gate cleared (disjoint or green re-verify)
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=pyright_clean),
             ),
             patch('orchestrator.merge_queue.dataclasses.replace', side_effect=_spy_replace),
@@ -9414,15 +9413,15 @@ class TestMergedBranchTipCarryThroughRebuild:
             # Eliminate term-1 so an unrelated merged_branch_tip regression
             # elsewhere can't accidentally mask a dropped field here too.
             patch(
-                'orchestrator.merge_queue._resolve_second_parent',
+                'orchestrator.merge_lane.gates._resolve_second_parent',
                 AsyncMock(return_value=None),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=pyright_clean),
             ),
             patch('orchestrator.merge_queue.dataclasses.replace', side_effect=_spy_replace),
@@ -10722,7 +10721,7 @@ class TestInFlightMergeRegistryReleaseDetach:
 
     async def test_release_detach_waiters_cancels_primary_and_waiters(self):
         """(a) release(detach_waiters=True) cancels all pending waiters and pops slot."""
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         f2 = self._make_future()
@@ -14155,7 +14154,7 @@ class TestUnscopedTypecheckGate:
         timeouts: dict[str, int] = {}
         # The unscoped gate itself must be the real one, so `run_verification`
         # — which it calls, one layer BELOW the port — stays patched.
-        with patch('orchestrator.merge_queue.run_verification', AsyncMock(return_value=timeout_result)):
+        with patch('orchestrator.merge_lane.gates.run_verification', AsyncMock(return_value=timeout_result)):
             outcome = await _run_post_merge_verify(
                 git_ops, req, merge_wt,
                 timeouts=timeouts, enospc_retries={},
@@ -14226,8 +14225,8 @@ class TestFinalizeAdvancedMerge:
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
 
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
         ):
             outcome = await _finalize_advanced_merge(
                 git_ops, req, None,
@@ -14261,8 +14260,8 @@ class TestFinalizeAdvancedMerge:
         cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
 
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['file.py'])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()) as mock_pyright,
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=['file.py'])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock()) as mock_pyright,
         ):
             outcome = await _finalize_advanced_merge(
                 git_ops, req, None,
@@ -14284,10 +14283,8 @@ class TestFinalizeAdvancedMerge:
 
     async def test_pyright_broken_blocks_no_push(self) -> None:
         """(c) pyright .broken True → blocked with pyright prefix, failing subproject in reason; push NOT called."""
-        from orchestrator.merge_queue import (
-            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
-            _finalize_advanced_merge,
-        )
+        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_queue import _finalize_advanced_merge
 
         git_ops = self._make_git_ops()
         req = self._make_req()
@@ -14295,8 +14292,8 @@ class TestFinalizeAdvancedMerge:
         pyright_broken = MagicMock(broken=True, failing_subprojects=['mypackage'], detail='type error detail')
 
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_broken)),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock(return_value=pyright_broken)),
         ):
             outcome = await _finalize_advanced_merge(
                 git_ops, req, None,
@@ -14326,8 +14323,8 @@ class TestFinalizeAdvancedMerge:
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
 
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
         ):
             outcome = await _finalize_advanced_merge(
                 git_ops, req, None,
@@ -14355,8 +14352,8 @@ class TestFinalizeAdvancedMerge:
         cas_retries, timeouts, enospc_retries = self._primed_dicts(req.task_id)
 
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock()),
         ):
             # No chain_ctx — default behaviour
             outcome = await _finalize_advanced_merge(
@@ -14378,17 +14375,18 @@ class TestFinalizeAdvancedMerge:
         """(b-gate) AUTO_CHAIN_GENERATIONS_ENABLED defaults to False; with kill-switch
         OFF, _finalize_advanced_merge returns 'blocked' (not 'superseded') even when
         chain_ctx is wired and tip is a SUPERSET advance, and the queue stays empty."""
-        import orchestrator.merge_queue as mq
+        from orchestrator.merge_lane import gates
         from orchestrator.merge_queue import (
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
             MergeRequest,
             TipRelation,
             _finalize_advanced_merge,
             _GenerationChainContext,
+            _maybe_auto_chain_generation,
         )
 
         # Verify the kill-switch is False by default.
-        assert mq.AUTO_CHAIN_GENERATIONS_ENABLED is False
+        assert gates.AUTO_CHAIN_GENERATIONS_ENABLED is False
 
         git_ops = self._make_git_ops()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -14408,13 +14406,14 @@ class TestFinalizeAdvancedMerge:
         counts: dict[str, int] = {}
         chain_ctx = _GenerationChainContext(
             queue=queue, counts=counts, max_auto_generations=2,
+            maybe_auto_chain_generation=_maybe_auto_chain_generation,
         )
 
         # Kill-switch is OFF (default) — no patch needed.
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
-            patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_lane.gates._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
             patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
         ):
             outcome = await _finalize_advanced_merge(
@@ -14445,6 +14444,7 @@ class TestFinalizeAdvancedMerge:
             TipRelation,
             _finalize_advanced_merge,
             _GenerationChainContext,
+            _maybe_auto_chain_generation,
         )
 
         git_ops = self._make_git_ops()
@@ -14467,13 +14467,15 @@ class TestFinalizeAdvancedMerge:
         counts: dict[str, int] = {}
         chain_ctx = _GenerationChainContext(
             queue=queue, counts=counts, max_auto_generations=2,
+            maybe_auto_chain_generation=_maybe_auto_chain_generation,
         )
 
         with (
-            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_lane.gates.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock()),
             patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_lane.gates._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
             patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
         ):
             outcome = await _finalize_advanced_merge(
@@ -14505,6 +14507,7 @@ class TestFinalizeAdvancedMerge:
             TipRelation,
             _finalize_advanced_merge,
             _GenerationChainContext,
+            _maybe_auto_chain_generation,
         )
 
         event_store = MagicMock()
@@ -14526,13 +14529,15 @@ class TestFinalizeAdvancedMerge:
         counts: dict[str, int] = {}
         chain_ctx = _GenerationChainContext(
             queue=queue, counts=counts, max_auto_generations=2,
+            maybe_auto_chain_generation=_maybe_auto_chain_generation,
         )
 
         with (
-            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_lane.gates.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock()),
             patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_lane.gates._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
             patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
         ):
             outcome = await _finalize_advanced_merge(
@@ -14582,6 +14587,7 @@ class TestFinalizeAdvancedMerge:
         from orchestrator.merge_queue import (
             _finalize_advanced_merge,
             _GenerationChainContext,
+            _maybe_auto_chain_generation,
         )
 
         git_ops = self._make_git_ops()
@@ -14592,12 +14598,13 @@ class TestFinalizeAdvancedMerge:
         counts: dict[str, int] = {'t-done-pop': 1}
         chain_ctx = _GenerationChainContext(
             queue=queue, counts=counts, max_auto_generations=2,
+            maybe_auto_chain_generation=_maybe_auto_chain_generation,
         )
         pyright_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
 
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=[])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=[])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
         ):
             outcome = await _finalize_advanced_merge(
                 git_ops, req, None,
@@ -14635,6 +14642,7 @@ class TestFinalizeAdvancedMerge:
             TipRelation,
             _finalize_advanced_merge,
             _GenerationChainContext,
+            _maybe_auto_chain_generation,
         )
 
         git_ops = self._make_git_ops()
@@ -14655,13 +14663,15 @@ class TestFinalizeAdvancedMerge:
         counts: dict[str, int] = {}
         chain_ctx = _GenerationChainContext(
             queue=queue, counts=counts, max_auto_generations=2, retention=retention,
+            maybe_auto_chain_generation=_maybe_auto_chain_generation,
         )
 
         with (
-            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_lane.gates.AUTO_CHAIN_GENERATIONS_ENABLED', True),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', AsyncMock(return_value=['f.py'])),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock()),
             patch('orchestrator.merge_queue._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
+            patch('orchestrator.merge_lane.gates._run', AsyncMock(return_value=(0, 'newhead\n', ''))),
             patch('orchestrator.merge_queue.classify_tip_relation', AsyncMock(return_value=TipRelation.SUPERSET)),
         ):
             outcome = await _finalize_advanced_merge(
@@ -14830,9 +14840,9 @@ class TestFinalizeAdvancedMerge:
             raise AssertionError(f'Unexpected _run call: {cmd!r}')
 
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence', equiv_mock),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
-            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=_run_side_effect)),
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence', equiv_mock),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock(return_value=pyright_clean)),
+            patch('orchestrator.merge_lane.gates._run', AsyncMock(side_effect=_run_side_effect)),
         ):
             outcome = await _finalize_advanced_merge(
                 git_ops, req, None,
@@ -14884,10 +14894,10 @@ class TestFinalizeAdvancedMerge:
             raise AssertionError(f'Unexpected _run call: {cmd!r}')
 
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence',
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence',
                   AsyncMock(return_value=['f.py'])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright', AsyncMock()),
-            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=_run_side_effect)),
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright', AsyncMock()),
+            patch('orchestrator.merge_lane.gates._run', AsyncMock(side_effect=_run_side_effect)),
         ):
             outcome = await _finalize_advanced_merge(
                 git_ops, req, None,
@@ -14918,10 +14928,8 @@ class TestFinalizeAdvancedMerge:
 
         RED until step-10: currently merge_sha is not set on the pyright-blocked outcome.
         """
-        from orchestrator.merge_queue import (
-            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
-            _finalize_advanced_merge,
-        )
+        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_queue import _finalize_advanced_merge
 
         ADVANCED = 'cafebabe5678'
 
@@ -14938,11 +14946,11 @@ class TestFinalizeAdvancedMerge:
             raise AssertionError(f'Unexpected _run call: {cmd!r}')
 
         with (
-            patch('orchestrator.merge_queue._check_post_merge_equivalence',
+            patch('orchestrator.merge_lane.gates._check_post_merge_equivalence',
                   AsyncMock(return_value=[])),
-            patch('orchestrator.merge_queue._check_post_merge_pyright',
+            patch('orchestrator.merge_lane.gates._check_post_merge_pyright',
                   AsyncMock(return_value=pyright_broken)),
-            patch('orchestrator.merge_queue._run', AsyncMock(side_effect=_run_side_effect)),
+            patch('orchestrator.merge_lane.gates._run', AsyncMock(side_effect=_run_side_effect)),
         ):
             outcome = await _finalize_advanced_merge(
                 git_ops, req, None,
@@ -14999,21 +15007,21 @@ class TestFinalizeAdvancedMerge:
 
         with (
             patch(
-                'orchestrator.merge_queue._resolve_second_parent',
+                'orchestrator.merge_lane.gates._resolve_second_parent',
                 AsyncMock(return_value=None),  # term-1 = None
             ),
             # Patch _commit_is_linear → True: advanced_sha is positively linear.
             # RED: AttributeError because _commit_is_linear does not exist yet.
             patch(
-                'orchestrator.merge_queue._commit_is_linear',
+                'orchestrator.merge_lane.gates._commit_is_linear',
                 AsyncMock(return_value=True),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 side_effect=_spy_equiv,
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=pyright_clean),
             ),
         ):
@@ -15078,15 +15086,15 @@ class TestFinalizeAdvancedMerge:
             # _resolve_second_parent returns the real branch tip → term-1 non-None
             # → resolved_merged_tip = RECOVERABLE_TIP → fail-safe never fires.
             patch(
-                'orchestrator.merge_queue._resolve_second_parent',
+                'orchestrator.merge_lane.gates._resolve_second_parent',
                 AsyncMock(return_value=RECOVERABLE_TIP),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 side_effect=_spy_equiv_drop,
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(),
             ),
         ):
@@ -15145,22 +15153,22 @@ class TestFinalizeAdvancedMerge:
 
         with (
             patch(
-                'orchestrator.merge_queue._resolve_second_parent',
+                'orchestrator.merge_lane.gates._resolve_second_parent',
                 AsyncMock(return_value=None),  # term-1 = None (transient error)
             ),
             # _commit_is_linear=False: advanced_sha has 2+ parents (real merge commit,
             # or linearity check failed due to transient git error).
             # RED: AttributeError because _commit_is_linear does not exist yet.
             patch(
-                'orchestrator.merge_queue._commit_is_linear',
+                'orchestrator.merge_lane.gates._commit_is_linear',
                 AsyncMock(return_value=False),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 side_effect=_spy_equiv_clean,
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=pyright_clean),
             ),
         ):
@@ -15726,7 +15734,7 @@ class TestRebaseDeltaTouchedOverlap:
 
         The intersection must be empty (no overlap → no re-verify).
         """
-        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+        from orchestrator.merge_lane.gates import _rebase_delta_touched_overlap
 
         # Create the branch worktree at the fork point (current main)
         fork_sha = await git_ops.get_main_sha()  # F = rebased_from
@@ -15756,7 +15764,7 @@ class TestRebaseDeltaTouchedOverlap:
 
         After a clean 3-way rebase the touched sets intersect on shared.py.
         """
-        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+        from orchestrator.merge_lane.gates import _rebase_delta_touched_overlap
 
         # Commit a 20-line base file on main before the fork
         base_content = ''.join(f'line{i}\n' for i in range(20))
@@ -15807,7 +15815,7 @@ class TestRebaseDeltaTouchedOverlap:
         != main_file.py and .task/plan.json != .task/state.json, so every
         pair is disjoint.
         """
-        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+        from orchestrator.merge_lane.gates import _rebase_delta_touched_overlap
 
         fork_sha = await git_ops.get_main_sha()
         wt = (await git_ops.create_worktree('delta-taskdir')).path
@@ -15845,7 +15853,7 @@ class TestRebaseDeltaTouchedOverlap:
         """(d) Fail CLOSED: bogus rebased_from causes a git error; the helper
         must return a non-empty sentinel list so the caller re-verifies.
         """
-        from orchestrator.merge_queue import _rebase_delta_touched_overlap
+        from orchestrator.merge_lane.gates import _rebase_delta_touched_overlap
 
         wt = (await git_ops.create_worktree('delta-failclosed')).path
         (wt / 'file.py').write_text('x = 1\n')
@@ -15906,7 +15914,7 @@ class TestReverifyRebasedTree:
         run_scoped_verification.  merge_wt still exists.
         """
         from orchestrator.merge_gates import note_queue_verified_main_tip
-        from orchestrator.merge_queue import _reverify_rebased_tree
+        from orchestrator.merge_queue import _reverify_rebased_tree, _run_post_merge_verify
 
         # This repo's own config declares merge_verify_breadth='full' (a
         # whole-tree merge gate), which alone denies the fast path.  Exercise
@@ -15929,7 +15937,7 @@ class TestReverifyRebasedTree:
         try:
             with (
                 patch(
-                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    'orchestrator.merge_lane.gates._rebase_delta_touched_overlap',
                     new=AsyncMock(return_value=[]),  # disjoint
                 ),
                 patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
@@ -15942,6 +15950,7 @@ class TestReverifyRebasedTree:
                     enospc_retries={},
                     max_timeouts=3,
                     max_enospc=1,
+                    run_post_merge_verify=_run_post_merge_verify,
                 )
             assert result is None, (
                 f'Disjoint: expected None, got {result!r}'
@@ -15966,7 +15975,7 @@ class TestReverifyRebasedTree:
         Disjointness alone must NOT clear the gate when the intervening tip is
         not one this queue landed green.
         """
-        from orchestrator.merge_queue import _reverify_rebased_tree
+        from orchestrator.merge_queue import _reverify_rebased_tree, _run_post_merge_verify
 
         # Diff-scoped breadth, so the ONLY thing denying the fast path is the
         # drift's unknown provenance.
@@ -15987,7 +15996,7 @@ class TestReverifyRebasedTree:
         try:
             with (
                 patch(
-                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    'orchestrator.merge_lane.gates._rebase_delta_touched_overlap',
                     new=AsyncMock(return_value=[]),  # disjoint
                 ),
                 patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
@@ -16000,6 +16009,7 @@ class TestReverifyRebasedTree:
                     enospc_retries={},
                     max_timeouts=3,
                     max_enospc=1,
+                    run_post_merge_verify=_run_post_merge_verify,
                 )
             assert result is None, (
                 f'Re-verify ran and passed: expected None, got {result!r}'
@@ -16022,7 +16032,7 @@ class TestReverifyRebasedTree:
         this arm.
         """
         from orchestrator.merge_gates import note_queue_verified_main_tip
-        from orchestrator.merge_queue import _reverify_rebased_tree
+        from orchestrator.merge_queue import _reverify_rebased_tree, _run_post_merge_verify
 
         merge_wt, req = await self._make_merge_wt(
             git_ops, 'rvrt-whole-tree', config,
@@ -16045,7 +16055,7 @@ class TestReverifyRebasedTree:
         try:
             with (
                 patch(
-                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    'orchestrator.merge_lane.gates._rebase_delta_touched_overlap',
                     new=AsyncMock(return_value=[]),  # disjoint
                 ),
                 patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
@@ -16058,6 +16068,7 @@ class TestReverifyRebasedTree:
                     enospc_retries={},
                     max_timeouts=3,
                     max_enospc=1,
+                    run_post_merge_verify=_run_post_merge_verify,
                 )
             assert result is None, (
                 f'Re-verify ran and passed: expected None, got {result!r}'
@@ -16076,7 +16087,7 @@ class TestReverifyRebasedTree:
         """(b) Overlapping + green verify: gate returns None,
         run_scoped_verification called exactly once, merge_wt still exists.
         """
-        from orchestrator.merge_queue import _reverify_rebased_tree
+        from orchestrator.merge_queue import _reverify_rebased_tree, _run_post_merge_verify
 
         merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-green', config)
         fork_sha = await git_ops.get_main_sha()
@@ -16089,7 +16100,7 @@ class TestReverifyRebasedTree:
         try:
             with (
                 patch(
-                    'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                    'orchestrator.merge_lane.gates._rebase_delta_touched_overlap',
                     new=AsyncMock(return_value=['rvrt_shared.py']),  # overlapping
                 ),
                 patch('orchestrator.merge_queue.run_scoped_verification', verify_mock),
@@ -16102,6 +16113,7 @@ class TestReverifyRebasedTree:
                     enospc_retries={},
                     max_timeouts=3,
                     max_enospc=1,
+                    run_post_merge_verify=_run_post_merge_verify,
                 )
             assert result is None, (
                 f'Green verify: expected None, got {result!r}'
@@ -16118,7 +16130,7 @@ class TestReverifyRebasedTree:
         """(c) Overlapping + red verify: gate returns blocked MergeOutcome,
         merge_wt cleaned up.
         """
-        from orchestrator.merge_queue import _reverify_rebased_tree
+        from orchestrator.merge_queue import _reverify_rebased_tree, _run_post_merge_verify
 
         merge_wt, req = await self._make_merge_wt(git_ops, 'rvrt-overlap-red', config)
         fork_sha = await git_ops.get_main_sha()
@@ -16133,7 +16145,7 @@ class TestReverifyRebasedTree:
 
         with (
             patch(
-                'orchestrator.merge_queue._rebase_delta_touched_overlap',
+                'orchestrator.merge_lane.gates._rebase_delta_touched_overlap',
                 new=AsyncMock(return_value=['rvrt_red.py']),  # overlapping
             ),
             patch('orchestrator.merge_queue.run_scoped_verification', verify_fail),
@@ -16146,6 +16158,7 @@ class TestReverifyRebasedTree:
                 enospc_retries={},
                 max_timeouts=3,
                 max_enospc=1,
+                run_post_merge_verify=_run_post_merge_verify,
             )
         assert result is not None, 'Red verify: expected a MergeOutcome, got None'
         assert isinstance(result, MergeOutcome)
@@ -16185,11 +16198,10 @@ class TestReverifyRebasedTree:
             captured_kw.update(kwargs)
             return None  # verify passes
 
+        pmpv = AsyncMock(side_effect=capture_pmpv)
         with (
-            patch('orchestrator.merge_queue._rebase_delta_touched_overlap',
+            patch('orchestrator.merge_lane.gates._rebase_delta_touched_overlap',
                   AsyncMock(return_value=['shared.py'])),
-            patch('orchestrator.merge_queue._run_post_merge_verify',
-                  side_effect=capture_pmpv),
         ):
             result = await _reverify_rebased_tree(
                 git_ops, req, merge_wt,
@@ -16200,6 +16212,7 @@ class TestReverifyRebasedTree:
                 max_timeouts=3,
                 max_enospc=1,
                 keep_worktrees={l1, l2},  # RED: TypeError until step-10
+                run_post_merge_verify=pmpv,
             )
 
         assert result is None, f'expected None (green verify), got {result!r}'
@@ -16239,11 +16252,10 @@ class TestReverifyRebasedTree:
             captured_kw.update(kwargs)
             return None  # verify passes
 
+        pmpv = AsyncMock(side_effect=capture_pmpv)
         with (
-            patch('orchestrator.merge_queue._rebase_delta_touched_overlap',
+            patch('orchestrator.merge_lane.gates._rebase_delta_touched_overlap',
                   AsyncMock(return_value=['shared.py'])),
-            patch('orchestrator.merge_queue._run_post_merge_verify',
-                  side_effect=capture_pmpv),
         ):
             result = await _reverify_rebased_tree(
                 git_ops, req, merge_wt,
@@ -16254,6 +16266,7 @@ class TestReverifyRebasedTree:
                 max_timeouts=3,
                 max_enospc=1,
                 # No keep_worktrees — regression test
+                run_post_merge_verify=pmpv,
             )
 
         assert result is None, f'expected None (green verify), got {result!r}'
@@ -17134,7 +17147,7 @@ class TestWaiterRecordContract:
 
     async def test_waiter_record_fields(self):
         """Construct WaiterRecord and verify all field contracts."""
-        from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import WaiterRecord
 
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
@@ -17148,7 +17161,7 @@ class TestWaiterRecordContract:
 
     async def test_waiter_record_explicit_source_and_tip(self):
         """Explicit source and submitted_tip are stored correctly."""
-        from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import WaiterRecord
 
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
@@ -17243,7 +17256,7 @@ class TestAttachFanOut:
 
     async def test_attach_appends_waiter_returns_true(self):
         """attach() on a held branch appends waiter, returns True."""
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         registry.acquire('B', 'task-B', f1, request_id='mr-1')
@@ -17260,7 +17273,7 @@ class TestAttachFanOut:
 
     async def test_attach_free_branch_returns_false(self):
         """attach() on a branch not in-flight returns False."""
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
         registry = InFlightMergeRegistry()
         f = self._make_future()
 
@@ -17272,7 +17285,7 @@ class TestAttachFanOut:
 
     async def test_fanout_result_mirrors_to_attached_future(self):
         """Resolving primary future mirrors result onto attached waiter's future."""
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         registry.acquire('B', 'task-B', f1, request_id='mr-1')
@@ -17288,7 +17301,7 @@ class TestAttachFanOut:
 
     async def test_fanout_cancel_mirrors_to_attached_future(self):
         """Cancelling primary future also cancels attached waiter's future."""
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         registry.acquire('B', 'task-B', f1, request_id='mr-1')
@@ -17302,7 +17315,7 @@ class TestAttachFanOut:
 
     async def test_fanout_exception_mirrors_to_attached_future(self):
         """Setting exception on primary mirrors exception onto attached waiter's future."""
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         registry.acquire('B', 'task-B', f1, request_id='mr-1')
@@ -17318,7 +17331,7 @@ class TestAttachFanOut:
 
     async def test_fanout_skips_pre_resolved_attached_future(self):
         """Fan-out callback skips an attached future that is already done."""
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         registry.acquire('B', 'task-B', f1, request_id='mr-1')
@@ -17352,7 +17365,7 @@ class TestDetachProceedDrop:
 
     async def test_detach_non_last_proceeds(self):
         """Detaching one of two waiters keeps the entry in-flight."""
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         registry.acquire('B', 'task-B', f1, request_id='mr-1')
@@ -17368,7 +17381,7 @@ class TestDetachProceedDrop:
 
     async def test_detach_last_cancels_primary_and_releases(self):
         """Detaching the last waiter cancels primary, releases slot."""
-        from orchestrator.merge_queue import WaiterRecord
+        from orchestrator.merge_lane import WaiterRecord
         registry = InFlightMergeRegistry()
         f1 = self._make_future()
         registry.acquire('B', 'task-B', f1, request_id='mr-1')
@@ -18123,6 +18136,7 @@ class TestMaybeAutoChainGeneration:
             counts={},
             max_auto_generations=2,
             retention=ring,
+            maybe_auto_chain_generation=_maybe_auto_chain_generation,
         )
         assert ctx.retention is ring
 
@@ -18357,7 +18371,7 @@ class TestTrainEquivalenceNeverAutoChains:
         lane = SpeculativeMergeWorker(git_ops, queue)
 
         with patch(
-            'orchestrator.merge_queue._check_post_merge_equivalence',
+            'orchestrator.merge_lane.gates._check_post_merge_equivalence',
             AsyncMock(return_value=['train.py']),
         ):
             outcome = await merge_through_lane(lane, queue, req)
@@ -18420,7 +18434,7 @@ async def _setup_two_source_entry(
     Returns (mcp_future, workflow_future) — resolving mcp_future fans-out to
     workflow_future via the registry's _mirror done-callback.
     """
-    from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+    from orchestrator.merge_lane import WaiterRecord
 
     loop = asyncio.get_running_loop()
     mcp_future: asyncio.Future = loop.create_future()
@@ -18488,7 +18502,7 @@ class TestBoundaryTableWorkerEntry:
             result=primary_future,
         )
 
-        from orchestrator.merge_queue import WaiterRecord  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import WaiterRecord
 
         # Acquire the registry slot for the primary
         registry.acquire(
@@ -18552,7 +18566,6 @@ class TestBoundaryTableWorkerEntry:
         carries superseded_by == gen-2 request_id.
         Reuses TestMaybeAutoChainGeneration._make_req and the flag-flip pattern.
         """
-        import orchestrator.merge_queue as mq_mod
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MAX_AUTO_CHAINED_GENERATIONS,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
@@ -18561,7 +18574,7 @@ class TestBoundaryTableWorkerEntry:
             _maybe_auto_chain_generation,
         )
 
-        monkeypatch.setattr(mq_mod, 'AUTO_CHAIN_GENERATIONS_ENABLED', True)
+        monkeypatch.setattr('orchestrator.merge_lane.gates.AUTO_CHAIN_GENERATIONS_ENABLED', True)
 
         git_ops_mock = MagicMock()
         event_store_mock = MagicMock()
@@ -18721,11 +18734,11 @@ class TestBoundaryTableWorkerEntry:
         Resolve primary with 'done'; assert subset waiter resolves to
         status in {done, already_merged} (fan-out realization).
         """
-        from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
+        from orchestrator.merge_lane import WaiterRecord
+        from orchestrator.merge_queue import (
             AttachAction,
             MergeOutcome,
             TipRelation,
-            WaiterRecord,
             classify_tip_relation,
             decide_attach_action,
         )
@@ -18815,11 +18828,11 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
         self, tmp_path: Path, cold_timeout: float,
     ):
         """worst_case_secs is identical regardless of merge_verify_cold_command_timeout_secs."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
-            _HEARTBEAT_POLL_S,
+        from orchestrator.merge_lane.liveness import (
             TOUCH_MISS_TOLERANCE,
             check_merge_liveness_margin,
         )
+        from orchestrator.merge_queue import _HEARTBEAT_POLL_S
         cfg = OrchestratorConfig(
             project_root=tmp_path,
             merge_verify_cold_command_timeout_secs=cold_timeout,
@@ -18834,7 +18847,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_merge_ahead_bound_kwarg_raises_type_error(self, tmp_path: Path):
         """check_merge_liveness_margin no longer accepts merge_ahead_bound kwarg."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with pytest.raises(TypeError):
@@ -18842,7 +18855,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_num_hosts_kwarg_raises_type_error(self, tmp_path: Path):
         """check_merge_liveness_margin no longer accepts num_hosts kwarg."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with pytest.raises(TypeError):
@@ -18850,7 +18863,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_threshold_equals_safety_factor_times_liveness(self, tmp_path: Path):
         """threshold_secs == safety_factor * liveness_secs (injected)."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg, safety_factor=0.5, liveness_secs=3600.0)
@@ -18861,7 +18874,7 @@ class TestCheckMergeLivenessMarginHeartbeatFloor:
 
     def test_safe_flag_matches_comparison(self, tmp_path: Path):
         """safe == (worst_case_secs < threshold_secs)."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         # Shipped defaults: floor=600, threshold=8100 → safe=True
@@ -18884,7 +18897,7 @@ class TestMergeLivenessAssessmentFields:
 
     def test_new_fields_present(self, tmp_path: Path):
         """Assessment exposes heartbeat_poll_secs, touch_miss_tolerance, safety_factor."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg)
@@ -18901,7 +18914,7 @@ class TestMergeLivenessAssessmentFields:
 
     def test_old_fields_absent(self, tmp_path: Path):
         """Assessment no longer has timeout_secs, merge_ahead_bound, num_hosts, max_verify_timeouts."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         result = check_merge_liveness_margin(cfg)
@@ -18941,11 +18954,11 @@ class TestCheckMergeLivenessMarginShippedDefaults:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """Bare OrchestratorConfig (no overrides) → safe=True, no WARNING."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
-            _HEARTBEAT_POLL_S,
+        from orchestrator.merge_lane.liveness import (
             TOUCH_MISS_TOLERANCE,
             check_merge_liveness_margin,
         )
+        from orchestrator.merge_queue import _HEARTBEAT_POLL_S
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             result = check_merge_liveness_margin(cfg)
@@ -18972,7 +18985,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """liveness_secs=600 → threshold=450 ≤ floor=600 → safe=False + exactly one WARNING."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
@@ -18993,7 +19006,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """Shipped defaults → safe=True → no WARNING emitted."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
@@ -19011,7 +19024,7 @@ class TestCheckMergeLivenessMarginClassificationAndLogging:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """WARNING names the heartbeat model; does NOT mention cold_timeout or merge_ahead_bound."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
@@ -19035,7 +19048,7 @@ class TestCheckMergeLivenessMarginInvariant:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
         """liveness_secs=600 with safety_factor=0.5 → .safe False + exactly one WARNING."""
-        from orchestrator.merge_queue import check_merge_liveness_margin  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import check_merge_liveness_margin  # noqa: PLC0415
 
         cfg = OrchestratorConfig(project_root=tmp_path)
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
@@ -21029,11 +21042,10 @@ class TestMergeShaThreading:
             captured_sha.append(merge_sha)
             return None
 
+        pmpv = AsyncMock(side_effect=capture_pmpv)
         with (
-            patch('orchestrator.merge_queue._rebase_delta_touched_overlap',
+            patch('orchestrator.merge_lane.gates._rebase_delta_touched_overlap',
                   AsyncMock(return_value=['shared.py'])),
-            patch('orchestrator.merge_queue._run_post_merge_verify',
-                  side_effect=capture_pmpv),
         ):
             result = await _reverify_rebased_tree(
                 git_ops, req, merge_wt,
@@ -21044,6 +21056,7 @@ class TestMergeShaThreading:
                 max_timeouts=3,
                 max_enospc=1,
                 merge_sha='c' * 40,  # RED: TypeError until step-14 adds this kwarg
+                run_post_merge_verify=pmpv,
             )
 
         assert result is None, f'expected None (green verify), got {result!r}'
@@ -21121,7 +21134,7 @@ class TestEnforceMergeLivenessMargin:
 
     def test_over_budget_raises_config_error(self, tmp_path: Path):
         """liveness_secs=600 → threshold=450 ≤ floor=600 → raises MergeLivenessConfigError."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             MergeLivenessConfigError,
             enforce_merge_liveness_margin,
         )
@@ -21131,7 +21144,7 @@ class TestEnforceMergeLivenessMargin:
 
     def test_in_budget_returns_assessment(self, tmp_path: Path):
         """Shipped defaults → floor=600 < threshold=8100 → no raise, returns MergeLivenessAssessment."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             MergeLivenessAssessment,
             enforce_merge_liveness_margin,
         )
@@ -21147,7 +21160,7 @@ class TestEnforceMergeLivenessMargin:
 
     def test_refusal_message_names_heartbeat_not_cold_timeout(self, tmp_path: Path):
         """MergeLivenessConfigError message names the heartbeat model, not cold_timeout."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             MergeLivenessConfigError,
             enforce_merge_liveness_margin,
         )
@@ -21170,7 +21183,7 @@ class TestEnforceMergeLivenessMargin:
 
     def test_worst_case_numeric_in_refusal(self, tmp_path: Path):
         """MergeLivenessConfigError message includes the heartbeat floor (600) value."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             MergeLivenessConfigError,
             enforce_merge_liveness_margin,
         )

@@ -1339,7 +1339,7 @@ ahead of the queue.
 request inherits `metadata.merge_lane`, under the precedence **`lane`
 argument > `metadata.merge_lane` > `'normal'`**. An unrecognised value in a
 task's *metadata* is silently normalised to `'normal'` by
-`orchestrator/src/orchestrator/merge_queue.py::_normalize_lane`, so a typo
+`orchestrator/src/orchestrator/merge_lane/worker.py::_normalize_lane`, so a typo
 *here* is a silent downgrade — which is exactly why the companion `lane`
 parameter rejects an unknown value loudly instead (see its docstring in
 `escalation/src/escalation/server.py::merge_request` for that contract). The

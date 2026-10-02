@@ -260,7 +260,7 @@ things about it are not, and both are prose:
 
    The harness site's only degeneracy-specific backstop is the independent
    `_branch_is_degenerate(branch, metadata)` disjunct, which is **fail-open**:
-   `orchestrator/src/orchestrator/landing_evidence.py::branch_is_degenerate`
+   `orchestrator/src/orchestrator/merge_lane/landing_evidence.py::branch_is_degenerate`
    returns `False` whenever `metadata['branch_base_sha']` is absent or is not a
    40-hex sha. So the backstop is not unconditional, and K6's fixture — a
    foreign on-main tip whose subject cites task 51 — is precisely the shape

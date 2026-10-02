@@ -27,7 +27,7 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 _RETIRED_CLASS = 'MergeWorker'
 _TESTS_DIR = Path(__file__).resolve().parent
-_SRC_DIR = Path(mq.__file__).resolve().parent
+_SRC_DIR = Path(mq.__file__).resolve().parents[1]
 
 #: Anti-vacuity floors, one per swept tree (630 test files and 155 source
 #: files today): a sweep that silently reads nothing must fail rather than

@@ -84,13 +84,12 @@ from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (
-    PRODUCTION_CLOCK,
-    MergeRequest,
+from orchestrator.merge_lane.liveness import (
     PersistentWorktreeConfigError,
     check_merge_liveness_margin,
     enforce_persistent_worktree_serial_lane,
 )
+from orchestrator.merge_queue import PRODUCTION_CLOCK, MergeRequest
 from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import (
