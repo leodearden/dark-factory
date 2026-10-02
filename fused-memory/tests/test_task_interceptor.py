@@ -8741,6 +8741,90 @@ class TestProseRightBoundarySignal:
 # ---------------------------------------------------------------------------
 
 
+async def _submit_foreign_prose_task(
+    interceptor, tmp_path, *, title, description, metadata=None, **fields,
+):
+    """Submit under dark_factory a task whose *description* cites reify's tree.
+
+    Returns ``(result, calls)``, *calls* being every ``report_rejection`` the
+    scope-violation escalator received.  Extra *fields* go to ``submit_task``.
+
+    Anti-vacuity first: *description* must still lex as a ``crates/`` hit, so
+    a suppression assertion cannot pass merely because the lexer stopped
+    matching rather than because attribution fired.
+    """
+    registry = _two_project_registry(tmp_path)
+    interceptor._prefix_registry = registry
+    assert registry.project_for_prefix('crates/') == 'reify'
+    probe = interceptor._path_guard_check(
+        None, {'description': description}, 'dark_factory',
+    )
+    assert probe.is_rejection and probe.matched_paths == ('crates/',), (
+        f'Expected the prose scan to still hit crates/, got: {probe!r}'
+    )
+
+    spy = _SpyEscalator()
+    interceptor._scope_violation_escalator = spy
+    if metadata is not None:
+        fields['metadata'] = metadata
+    try:
+        result = await interceptor.submit_task(
+            project_root=str(tmp_path / 'dark-factory'),
+            title=title,
+            description=description,
+            **fields,
+        )
+    finally:
+        await _cancel_interceptor_workers(interceptor)
+    return result, spy.calls
+
+
+async def _assert_prose_advisory_fired(ticket_store, result, calls):
+    """The unchanged advisory: a crates/ stamp naming reify, and ONE advisory escalation."""
+    meta = await _persisted_candidate_metadata(ticket_store, result)
+    marker = meta.get('possible_scope_mismatch')
+    assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
+    assert marker['matched_paths'] == ['crates/']
+    assert marker['suggested_project'] == 'reify'
+    assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
+    assert calls[0].get('advisory') is True
+
+
+def _suppression_records(caplog):
+    """INFO records from the interceptor that report a guard suppression.
+
+    Selected by the stable greppable token an operator would search for,
+    deliberately NOT by exact sentence wording — callers pin the FACTS the
+    record carries, so the sentence stays free to change.
+    """
+    return [
+        rec for rec in caplog.records
+        if rec.name == 'fused_memory.middleware.task_interceptor'
+        and 'path-guard' in rec.getMessage()
+        and 'suppress' in rec.getMessage().lower()
+    ]
+
+
+def _assert_one_suppression_record(caplog, facts):
+    """Exactly one INFO suppression record, carrying every one of *facts*.
+
+    INFO, not WARNING: a suppression is a CORRECT attribution decision, so it
+    is a log-trail fact rather than an operator-queue item — but never silent.
+    """
+    records = _suppression_records(caplog)
+    assert len(records) == 1, (
+        f'Expected exactly one suppression record, got: '
+        f'{[r.getMessage() for r in records]!r}'
+    )
+    record = records[0]
+    assert record.levelno == logging.INFO
+    message = record.getMessage()
+    for fact in facts:
+        assert fact in message, (
+            f'Suppression record must carry {fact!r}; got: {message!r}'
+        )
+
+
 class TestProseAdvisoryDeliverableAttribution:
     """Suppression and retained-protection halves, end-to-end via submit_task.
 
@@ -8757,41 +8841,12 @@ class TestProseAdvisoryDeliverableAttribution:
 
     async def _submit(self, interceptor, tmp_path, metadata=None):
         """Submit the foreign-prose task under dark_factory; return (result, calls)."""
-        registry = _two_project_registry(tmp_path)
-        interceptor._prefix_registry = registry
-
-        # Anti-vacuity: the prose really does still lex as a foreign-path hit.
-        # Without this, a suppression assertion below could pass merely because
-        # the lexer stopped matching rather than because attribution fired.
-        assert registry.project_for_prefix('crates/') == 'reify'
-        probe = interceptor._path_guard_check(
-            None, {'description': self._FOREIGN_PROSE}, 'dark_factory',
+        return await _submit_foreign_prose_task(
+            interceptor, tmp_path,
+            title='Port the engine edit path',
+            description=self._FOREIGN_PROSE,
+            metadata=metadata,
         )
-        assert probe.is_rejection and probe.matched_paths == ('crates/',), (
-            f'Expected the prose scan to still hit crates/, got: {probe!r}'
-        )
-
-        calls: list = []
-
-        class SpyEscalator:
-            def report_rejection(self, **kwargs):
-                calls.append(kwargs)
-
-        interceptor._scope_violation_escalator = SpyEscalator()
-
-        kwargs = {}
-        if metadata is not None:
-            kwargs['metadata'] = metadata
-        try:
-            result = await interceptor.submit_task(
-                project_root=str(tmp_path / 'dark-factory'),
-                title='Port the engine edit path',
-                description=self._FOREIGN_PROSE,
-                **kwargs,
-            )
-        finally:
-            await _cancel_interceptor_workers(interceptor)
-        return result, calls
 
     # -- SUPPRESSION: a locally-owned declared deliverable attests ----------
 
@@ -8866,13 +8921,7 @@ class TestProseAdvisoryDeliverableAttribution:
             interceptor_with_store, tmp_path, metadata={'files': ['README.md']},
         )
 
-        meta = await _persisted_candidate_metadata(ticket_store, result)
-        marker = meta.get('possible_scope_mismatch')
-        assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
-        assert marker['matched_paths'] == ['crates/']
-        assert marker['suggested_project'] == 'reify'
-        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
-        assert calls[0].get('advisory') is True
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.parametrize('foreign_key', ['files_to_modify', 'modules'])
     @pytest.mark.asyncio
@@ -8910,15 +8959,7 @@ class TestProseAdvisoryDeliverableAttribution:
         # Still CREATED — the veto only declines to suppress; it never
         # promotes the advisory into a rejection (task 2206 blast radius
         # unchanged).
-        meta = await _persisted_candidate_metadata(ticket_store, result)
-        marker = meta.get('possible_scope_mismatch')
-        assert marker is not None, (
-            f'A foreign {foreign_key} entry must veto the suppression: {meta!r}'
-        )
-        assert marker['matched_paths'] == ['crates/']
-        assert marker['suggested_project'] == 'reify'
-        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
-        assert calls[0].get('advisory') is True
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.asyncio
     async def test_no_declared_deliverable_still_advises(
@@ -8927,31 +8968,9 @@ class TestProseAdvisoryDeliverableAttribution:
         """No metadata at all → no attribution → the advisory is unchanged."""
         result, calls = await self._submit(interceptor_with_store, tmp_path)
 
-        meta = await _persisted_candidate_metadata(ticket_store, result)
-        marker = meta.get('possible_scope_mismatch')
-        assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
-        assert marker['matched_paths'] == ['crates/']
-        assert marker['suggested_project'] == 'reify'
-        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
-        assert calls[0].get('advisory') is True
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     # -- LEGIBILITY: a suppression is RECORDED, never silent ----------------
-
-    @staticmethod
-    def _suppression_records(caplog):
-        """INFO records from the interceptor that report a guard suppression.
-
-        Selected by the stable greppable token an operator would search for,
-        deliberately NOT by exact sentence wording — the assertions below
-        pin the FACTS the record carries, so the sentence stays free to
-        change.
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'fused_memory.middleware.task_interceptor'
-            and 'path-guard' in rec.getMessage()
-            and 'suppress' in rec.getMessage().lower()
-        ]
 
     @pytest.mark.asyncio
     async def test_suppression_is_logged_with_structured_facts(
@@ -8976,26 +8995,12 @@ class TestProseAdvisoryDeliverableAttribution:
         assert 'possible_scope_mismatch' not in meta
         assert calls == []
 
-        records = self._suppression_records(caplog)
-        assert len(records) == 1, (
-            f'Expected exactly one suppression record, got: '
-            f'{[r.getMessage() for r in records]!r}'
-        )
-        record = records[0]
-        assert record.levelno == logging.INFO, (
-            'A correct attribution decision is INFO, not WARNING — it is a '
-            'log-trail fact, not an operator-queue item'
-        )
-        message = record.getMessage()
-        for fact in (
+        _assert_one_suppression_record(caplog, (
             'crates/',                 # the matched prose prefix
             'fused-memory/src/x.py',   # the attesting deliverable signal
             'dark_factory',            # the filing project
             'reify',                   # the prose-suggested owner
-        ):
-            assert fact in message, (
-                f'Suppression record must carry {fact!r}; got: {message!r}'
-            )
+        ))
 
     @pytest.mark.asyncio
     async def test_no_suppression_record_when_advisory_fires(
@@ -9013,7 +9018,7 @@ class TestProseAdvisoryDeliverableAttribution:
         assert meta.get('possible_scope_mismatch') is not None
         assert len(calls) == 1
 
-        records = self._suppression_records(caplog)
+        records = _suppression_records(caplog)
         assert records == [], (
             f'Expected no suppression record when the advisory fires, got: '
             f'{[r.getMessage() for r in records]!r}'
@@ -9066,55 +9071,25 @@ class TestProseAdvisoryConsolidationGateAttribution:
 
     async def _submit_gate(self, interceptor, tmp_path, metadata=None):
         """Submit the gate under dark_factory; return (result, calls)."""
-        interceptor._prefix_registry = _two_project_registry(tmp_path)
-
-        # Anti-vacuity: the quoted member prose really does lex as a foreign hit.
-        probe = interceptor._path_guard_check(
-            None, {'description': self._FOREIGN}, 'dark_factory',
-        )
-        assert probe.is_rejection and probe.matched_paths == ('crates/',), (
-            f'Expected the prose scan to still hit crates/, got: {probe!r}'
-        )
-
-        calls: list = []
-
-        class SpyEscalator:
-            def report_rejection(self, **kwargs):
-                calls.append(kwargs)
-
-        interceptor._scope_violation_escalator = SpyEscalator()
-
         spec = self._spec()
-        try:
-            result = await interceptor.submit_task(
-                project_root=str(tmp_path / 'dark-factory'),
-                title=spec.title,
-                description=spec.description,
-                priority=spec.priority,
-                metadata=(
-                    copy.deepcopy(spec.metadata) if metadata is None else metadata
-                ),
-            )
-        finally:
-            await _cancel_interceptor_workers(interceptor)
-        return result, calls
-
-    async def _assert_advisory_fired(self, ticket_store, result, calls):
-        meta = await _persisted_candidate_metadata(ticket_store, result)
-        marker = meta.get('possible_scope_mismatch')
-        assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
-        assert marker['matched_paths'] == ['crates/']
-        assert marker['suggested_project'] == 'reify'
-        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
-        assert calls[0].get('advisory') is True
+        return await _submit_foreign_prose_task(
+            interceptor, tmp_path,
+            title=spec.title,
+            description=spec.description,
+            priority=spec.priority,
+            metadata=copy.deepcopy(spec.metadata) if metadata is None else metadata,
+        )
 
     # -- SUPPRESSION: the builder's own shape ---------------------------------
 
+    @pytest.mark.parametrize('encode', [copy.deepcopy, json.dumps], ids=['dict', 'json'])
     @pytest.mark.asyncio
     async def test_pure_consolidation_gate_suppresses_stamp_and_escalation(
-        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+        self, encode, interceptor_with_store, ticket_store, taskmaster, tmp_path,
     ):
-        result, calls = await self._submit_gate(interceptor_with_store, tmp_path)
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path, metadata=encode(self._spec().metadata),
+        )
 
         meta = await _persisted_candidate_metadata(ticket_store, result)
         assert 'possible_scope_mismatch' not in meta, (
@@ -9131,33 +9106,55 @@ class TestProseAdvisoryConsolidationGateAttribution:
         ):
             await self._submit_gate(interceptor_with_store, tmp_path)
 
-        records = TestProseAdvisoryDeliverableAttribution._suppression_records(caplog)
-        assert len(records) == 1, (
-            f'Expected exactly one suppression record, got: '
-            f'{[r.getMessage() for r in records]!r}'
+        _assert_one_suppression_record(
+            caplog, ('crates/', 'dark_factory', 'reify', self._GATE_TOPIC),
         )
-        record = records[0]
-        assert record.levelno == logging.INFO
-        message = record.getMessage()
-        for fact in ('crates/', 'dark_factory', 'reify', self._GATE_TOPIC):
-            assert fact in message, (
-                f'Suppression record must carry {fact!r}; got: {message!r}'
+
+    @pytest.mark.asyncio
+    async def test_pure_gate_without_prose_hit_still_gets_soft_signal_adjudication(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """The gate attribution sits after the fileless early return, so a pure
+        gate quoting an absolute foreign root (no repo-relative prefix) still
+        reaches the task-3122 soft-signal adjudicator."""
+        registry = _soft_scope_registry(interceptor_with_store, tmp_path)
+        stub = _stub_adjudicator(interceptor_with_store)
+        spec = build_consolidation_gate_task(
+            topic=self._GATE_TOPIC,
+            rationale=f"Member 338b4868 cites {registry.root_for_project('reify')}",
+        )
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'dark-factory'),
+                title=spec.title,
+                description=spec.description,
+                priority=spec.priority,
+                metadata=copy.deepcopy(spec.metadata),
             )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        await _persisted_candidate_metadata(ticket_store, result)
+        stub.adjudicate.assert_awaited_once()
 
     # -- RETAINED PROTECTION: any other gate shape keeps the advisory ---------
 
+    @pytest.mark.parametrize('encode', [copy.deepcopy, json.dumps], ids=['dict', 'json'])
     @pytest.mark.asyncio
     async def test_generic_human_gate_without_block_still_advises(
-        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+        self, encode, interceptor_with_store, ticket_store, taskmaster, tmp_path,
     ):
+        """The json case is the anti-vacuity pair for the json suppression case:
+        string metadata really is parsed, so a missing block keeps the advisory."""
         metadata = self._gate_metadata()
         metadata.pop(GATE_METADATA_KEY)
 
         result, calls = await self._submit_gate(
-            interceptor_with_store, tmp_path, metadata=metadata,
+            interceptor_with_store, tmp_path, metadata=encode(metadata),
         )
 
-        await self._assert_advisory_fired(ticket_store, result, calls)
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.asyncio
     async def test_malformed_gate_topic_still_advises(
@@ -9170,7 +9167,7 @@ class TestProseAdvisoryConsolidationGateAttribution:
             interceptor_with_store, tmp_path, metadata=metadata,
         )
 
-        await self._assert_advisory_fired(ticket_store, result, calls)
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.asyncio
     async def test_block_on_non_gate_task_still_advises(
@@ -9184,7 +9181,7 @@ class TestProseAdvisoryConsolidationGateAttribution:
             interceptor_with_store, tmp_path, metadata=metadata,
         )
 
-        await self._assert_advisory_fired(ticket_store, result, calls)
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.asyncio
     async def test_gate_with_foreign_modules_entry_still_advises(
@@ -9198,7 +9195,21 @@ class TestProseAdvisoryConsolidationGateAttribution:
             metadata=self._gate_metadata(modules=['crates/widget.rs']),
         )
 
-        await self._assert_advisory_fired(ticket_store, result, calls)
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.parametrize('malformed', [5, {'fused-memory/src/x.py': 1}])
+    @pytest.mark.asyncio
+    async def test_gate_with_malformed_deliverable_declaration_still_advises(
+        self, malformed, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """An unusable ``modules`` value yields no attesting signal, but the
+        filer still declared a deliverable, so the gate is not pure."""
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path,
+            metadata=self._gate_metadata(modules=malformed),
+        )
+
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.asyncio
     async def test_gate_with_foreign_files_still_hard_rejects(
@@ -9410,12 +9421,12 @@ class TestExtractMetaFiles:
 
 
 # ---------------------------------------------------------------------------
-# Unit tests for TaskInterceptor._extract_deliverable_signals (task 3106)
+# Unit tests for TaskInterceptor._extract_deliverable_signals_from_meta (task 3106)
 # ---------------------------------------------------------------------------
 
 
 class TestExtractDeliverableSignals:
-    """Unit tests for the _extract_deliverable_signals static helper.
+    """Unit tests for the _extract_deliverable_signals_from_meta static helper.
 
     Deliberately DIVERGES from _extract_meta_files: it takes the UNION of
     ``files`` ∪ ``files_to_modify`` ∪ ``modules`` rather than the
@@ -9426,13 +9437,19 @@ class TestExtractDeliverableSignals:
     warn-and-discard degrade on malformed values.
     """
 
+    @staticmethod
+    def _signals(kwargs):
+        """Parse then extract, as _path_guard_or_skip composes the two."""
+        meta = TaskInterceptor._parse_metadata(kwargs)
+        return TaskInterceptor._extract_deliverable_signals_from_meta(meta)
+
     def test_files_key_only(self):
         kwargs = {'metadata': {'files': ['a/x.py']}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['a/x.py']
+        assert self._signals(kwargs) == ['a/x.py']
 
     def test_files_to_modify_key_only(self):
         kwargs = {'metadata': {'files_to_modify': ['b/y.py']}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['b/y.py']
+        assert self._signals(kwargs) == ['b/y.py']
 
     def test_modules_key_only(self):
         """metadata.modules (Tier-A path-like lock keys) is a signal too.
@@ -9441,7 +9458,7 @@ class TestExtractDeliverableSignals:
         because a declared module directory is evidence of local work.
         """
         kwargs = {'metadata': {'modules': ['c/z']}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['c/z']
+        assert self._signals(kwargs) == ['c/z']
 
     def test_all_three_keys_union_in_declared_order(self):
         """UNION, not precedence — contrasted inline with _extract_meta_files.
@@ -9456,7 +9473,7 @@ class TestExtractDeliverableSignals:
                 'modules': ['c/z'],
             }
         }
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == [
+        assert self._signals(kwargs) == [
             'a/x.py', 'b/y.py', 'c/z',
         ]
         # Divergence pinned: the FILES-certain extractor keeps its precedence.
@@ -9470,18 +9487,18 @@ class TestExtractDeliverableSignals:
                 'modules': ['a/x.py', 'c/z'],
             }
         }
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == [
+        assert self._signals(kwargs) == [
             'a/x.py', 'dup.py', 'b/y.py', 'c/z',
         ]
 
     def test_scalar_string_value_coerced_to_list(self):
         """Matches _extract_meta_files_from_meta's scalar-str coercion."""
         kwargs = {'metadata': {'modules': 'c/z'}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['c/z']
+        assert self._signals(kwargs) == ['c/z']
 
     def test_falsy_entries_dropped_and_non_strings_coerced(self):
         kwargs = {'metadata': {'files': ['', None, 'src/bar.py'], 'modules': [42]}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == [
+        assert self._signals(kwargs) == [
             'src/bar.py', '42',
         ]
 
@@ -9495,14 +9512,14 @@ class TestExtractDeliverableSignals:
         ``submit_task`` as an unstructured crash.  ``modules`` is the sharp
         edge — it was never read on this path before task 3106.
         """
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'modules': 5}},
         ) == []
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'files': 5}},
         ) == []
         # A malformed key discards only ITSELF; well-formed siblings survive.
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'files': ['a/x.py'], 'modules': 5}},
         ) == ['a/x.py']
 
@@ -9513,31 +9530,31 @@ class TestExtractDeliverableSignals:
         silently suppress a prose advisory on metadata the author never
         meant as a path list.
         """
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'modules': {'fused-memory/src': 1}}},
         ) == []
 
     def test_tuple_and_set_values_are_accepted(self):
         """Sequence shapes other than list still carry signal."""
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'files': ('a/x.py', 'b/y.py')}},
         ) == ['a/x.py', 'b/y.py']
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'modules': {'c/z'}}},
         ) == ['c/z']
 
     def test_json_string_metadata_parsed_via_same_path(self):
         """JSON-string metadata goes through _parse_metadata, as _extract_meta_files does."""
         kwargs = {'metadata': '{"files": ["a/x.py"], "modules": ["c/z"]}'}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['a/x.py', 'c/z']
+        assert self._signals(kwargs) == ['a/x.py', 'c/z']
 
     def test_missing_non_dict_or_keyless_metadata_returns_empty(self):
-        assert TaskInterceptor._extract_deliverable_signals({}) == []
-        assert TaskInterceptor._extract_deliverable_signals({'metadata': None}) == []
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals({}) == []
+        assert self._signals({'metadata': None}) == []
+        assert self._signals(
             {'metadata': ['some', 'list']},
         ) == []
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'priority': 'low'}},
         ) == []
 

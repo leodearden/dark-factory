@@ -148,6 +148,12 @@ _METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 # which uses it to build the `declared` dict named in the log line.
 _GATE_MARKER_KEYS = ('execution_class', 'operational_mode', 'task_kind', 'always_escalates')
 
+# The metadata keys through which a filer DECLARES a deliverable, in the order
+# ``TaskInterceptor._extract_deliverable_signals_from_meta`` unions them.
+# ``TaskInterceptor._pure_consolidation_gate_topic`` reads the same keys for
+# mere presence, so the two cannot disagree about what counts as a declaration.
+_DELIVERABLE_SIGNAL_KEYS = ('files', 'files_to_modify', 'modules')
+
 
 def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
     """Best-effort parse of *metadata* into a raw dict.
@@ -1957,7 +1963,7 @@ class TaskInterceptor:
         """
         out: list[str] = []
         seen: set[str] = set()
-        for key in ('files', 'files_to_modify', 'modules'):
+        for key in _DELIVERABLE_SIGNAL_KEYS:
             values = meta.get(key) or []
             if isinstance(values, str):
                 values = [values]
@@ -1988,21 +1994,6 @@ class TaskInterceptor:
                 seen.add(entry)
                 out.append(entry)
         return out
-
-    @staticmethod
-    def _extract_deliverable_signals(kwargs: dict[str, Any]) -> list[str]:
-        """Extract declared deliverable signals from add_task kwargs.
-
-        Thin wrapper around :meth:`_extract_deliverable_signals_from_meta`
-        that handles the ``kwargs → meta`` parsing step via
-        :meth:`_parse_metadata` — the SAME parsing path
-        :meth:`_extract_meta_files` uses, so JSON-string metadata is
-        normalised identically with no new parsing branch.  Only the
-        key-selection policy differs (union of three keys vs. precedence
-        over two); see that method's docstring for why.
-        """
-        meta = TaskInterceptor._parse_metadata(kwargs)
-        return TaskInterceptor._extract_deliverable_signals_from_meta(meta)
 
     @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
@@ -2096,10 +2087,10 @@ class TaskInterceptor:
 
     def _local_attesting_signals(
         self,
-        kwargs: dict[str, Any],
+        meta: dict,
         project_id: str,
     ) -> list[str]:
-        """Return the declared deliverable signals that ATTEST *project_id*.
+        """Return the declared deliverable signals in *meta* that ATTEST *project_id*.
 
         Thin wrapper — registry guard here, all registry logic in the pure
         :func:`local_attesting_signals` (which documents the two conditions
@@ -2107,7 +2098,7 @@ class TaskInterceptor:
         :meth:`_all_files_foreign_owner`, and, like it, returns the WITNESS
         rather than a bare bool so the caller can name it in the log.
 
-        Reads ``kwargs`` directly rather than ``candidate.files_to_modify``:
+        Reads the parsed metadata rather than ``candidate.files_to_modify``:
         the candidate's list has already been narrowed by
         :meth:`_extract_meta_files_from_meta`'s ``files``-over-
         ``files_to_modify`` precedence and carries no ``modules`` at all, so
@@ -2122,12 +2113,12 @@ class TaskInterceptor:
         if registry is None:
             return []
         return local_attesting_signals(
-            self._extract_deliverable_signals(kwargs), project_id, registry,
+            self._extract_deliverable_signals_from_meta(meta), project_id, registry,
         )
 
     @staticmethod
-    def _pure_consolidation_gate_topic(kwargs: dict[str, Any]) -> str | None:
-        """Return the declared topic iff the submission is a PURE consolidation gate.
+    def _pure_consolidation_gate_topic(meta: dict) -> str | None:
+        """Return the declared topic iff *meta* describes a PURE consolidation gate.
 
         A pure consolidation gate declares no deliverable, and its subject is
         the filing project's own memory topic (the closure scroll is resolved
@@ -2136,9 +2127,13 @@ class TaskInterceptor:
         :meth:`_local_attesting_signals`.  See
         ``reconciliation/consolidation_gate.py::declared_gate_topic`` and
         outcome (3) of :mod:`fused_memory.middleware.path_scope_guard`.
+
+        "Declares" means the key carries a value at all, malformed or not:
+        :meth:`_extract_deliverable_signals_from_meta` discards a ``modules: 5``
+        as unusable, but the filer still claimed a deliverable, so that gate
+        is not pure and keeps the advisory.
         """
-        meta = TaskInterceptor._parse_metadata(kwargs)
-        if TaskInterceptor._extract_deliverable_signals_from_meta(meta):
+        if any(meta.get(key) for key in _DELIVERABLE_SIGNAL_KEYS):
             return None
         return declared_gate_topic(meta)
 
@@ -2778,13 +2773,14 @@ class TaskInterceptor:
         # triage. But it is never SILENT — the guard's most consequential
         # branch has to stay auditable by anyone asking why a task was not
         # flagged, so the record carries every fact the decision turned on.
-        attesting_signals = self._local_attesting_signals(kwargs, project_id)
+        meta = self._parse_metadata(kwargs)
+        attesting_signals = self._local_attesting_signals(meta, project_id)
         if attesting_signals:
             self._log_prose_advisory_suppressed(
                 verdict, project_id, attested_by=attesting_signals,
             )
             return None
-        gate_topic = self._pure_consolidation_gate_topic(kwargs)
+        gate_topic = self._pure_consolidation_gate_topic(meta)
         if gate_topic is not None:
             self._log_prose_advisory_suppressed(
                 verdict, project_id,
