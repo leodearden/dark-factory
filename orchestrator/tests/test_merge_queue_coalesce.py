@@ -1169,30 +1169,37 @@ class TestEndToEndWiring:
                 'orchestrator.merge_queue.run_scoped_verification',
                 _gated_verify(gate_release, gate_entered),
             ):
-                # (a) Wait for the train's verify to start.
-                # When gate_entered fires: _maybe_coalesce_waiting_singles has already
-                # run (resolving the 3 singles as 'superseded') AND _do_train_merge has
-                # run the rebase + merge steps before calling run_scoped_verification.
-                await wait_responsive(
-                    gate_entered.wait(),
-                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
-                    label='coalesced train verify entry (3 singles rebased + merged)',
-                )
-
-                for req, label in ((req1, 'e2e1'), (req2, 'e2e2'), (req3, 'e2e3')):
-                    assert req.result.done(), (
-                        f'{label}: future must be resolved as superseded before verify starts'
-                    )
-                    outcome = req.result.result()
-                    assert outcome.status == 'superseded', (
-                        f'{label}: expected superseded, got {outcome.status!r}'
+                try:
+                    # (a) Wait for the train's verify to start.
+                    # When gate_entered fires: _maybe_coalesce_waiting_singles has already
+                    # run (resolving the 3 singles as 'superseded') AND _do_train_merge has
+                    # run the rebase + merge steps before calling run_scoped_verification.
+                    await wait_responsive(
+                        gate_entered.wait(),
+                        timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                        label='coalesced train verify entry (3 singles rebased + merged)',
                     )
 
-                # Release the gate — train verify completes, advance_main runs.
-                gate_release.set()
+                    for req, label in ((req1, 'e2e1'), (req2, 'e2e2'), (req3, 'e2e3')):
+                        assert req.result.done(), (
+                            f'{label}: future must be resolved as superseded before verify starts'
+                        )
+                        outcome = req.result.result()
+                        assert outcome.status == 'superseded', (
+                            f'{label}: expected superseded, got {outcome.status!r}'
+                        )
+                finally:
+                    # Release the gate — train verify completes, advance_main runs.
+                    # On a give-up or failed assert above too, so the worker's stop
+                    # never meets a train verify still parked on the gate.
+                    gate_release.set()
 
                 # (d) Wait for all 3 mark_member_done calls (train has fully landed).
-                await asyncio.wait_for(all_done.wait(), timeout=60)
+                await wait_responsive(
+                    all_done.wait(),
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='coalesced train landed (all 3 members marked done)',
+                )
 
             # (c) All 3 member files appear on main.
             _, main_files, _ = await _run(
@@ -2688,7 +2695,7 @@ class TestCoalesceRedriveEndToEnd:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(360)  # 300s wait bill (90 + 90 + 120) + 60s real-git setup headroom
+@pytest.mark.timeout(360)  # a headroom widening of the earlier 300, not a summed wait bill
 class TestCoalesceAfterHealthyMerge:
     """A train forms while the pipeline is HEALTHY — the regression that made
     merge trains stop forming in dark-factory between 2026-08-19 and
@@ -2783,38 +2790,41 @@ class TestCoalesceAfterHealthyMerge:
         # old gate read as busy.
         await queue.put(warm_req)
         async with running_merge_worker(worker):
-            await wait_responsive(
-                gate_entered.wait(),
-                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
-                label='warm-up hm0 verify entry',
-            )
+            try:
+                await wait_responsive(
+                    gate_entered.wait(),
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='warm-up hm0 verify entry',
+                )
 
-            for req in follower_reqs.values():
-                queue.put_nowait(req)
+                for req in follower_reqs.values():
+                    queue.put_nowait(req)
 
-            # Hold the gate until a follower has actually been dequeued, so the
-            # first coalesce evaluation provably happened with hm0's merge
-            # commit still unadvanced.  Releasing before that could hand the
-            # coalescer a settled pipeline — the sterile state every other test
-            # already covers.
-            deadline = asyncio.get_running_loop().time() + 60
-            while asyncio.get_running_loop().time() < deadline:
-                dequeued = {
-                    e['task_id'] for e in _events_of_type(db_path, 'merge_dequeued')
-                }
-                if dequeued & set(follower_reqs):
-                    break
-                await asyncio.sleep(0.05)
-            else:
-                pytest.fail('no follower was dequeued within 60s')
-
-            # Release now: with speculation depth K=1 the merger blocks on the
-            # speculation permit at its next look-ahead until the verifier
-            # drains, so holding the gate any longer would stall the run rather
-            # than test it.  Every later coalesce evaluation still carries a
-            # non-None spec_base from the preceding look-ahead — which is
-            # exactly the state the old is_idle() gate read as busy.
-            gate_release.set()
+                # Hold the gate until a follower has actually been dequeued, so the
+                # first coalesce evaluation provably happened with hm0's merge
+                # commit still unadvanced.  Releasing before that could hand the
+                # coalescer a settled pipeline — the sterile state every other test
+                # already covers.
+                deadline = asyncio.get_running_loop().time() + 60
+                while asyncio.get_running_loop().time() < deadline:
+                    dequeued = {
+                        e['task_id'] for e in _events_of_type(db_path, 'merge_dequeued')
+                    }
+                    if dequeued & set(follower_reqs):
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    pytest.fail('no follower was dequeued within 60s')
+            finally:
+                # Release now: with speculation depth K=1 the merger blocks on the
+                # speculation permit at its next look-ahead until the verifier
+                # drains, so holding the gate any longer would stall the run rather
+                # than test it.  Every later coalesce evaluation still carries a
+                # non-None spec_base from the preceding look-ahead — which is
+                # exactly the state the old is_idle() gate read as busy.  On a
+                # give-up or failed poll above too, so the worker's stop never
+                # meets hm0's verify still parked on the gate.
+                gate_release.set()
 
             events = await _poll_events('train_coalesced', timeout=120)
             assert events, (
