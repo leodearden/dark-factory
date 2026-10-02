@@ -315,9 +315,11 @@ def _production_src_roots() -> list[str]:
     one simply overlooked, `dashboard/src` being the pointed example, since
     the dashboard is the consumer a fabricated reset time would mislead —
     would sail past a guard still reporting green. The ownership scan walks
-    the session's shared first-party tree, whose scope is a fixed list, so the
+    the session's shared first-party tree, whose scope is a fixed list and
+    which also applies `iter_first_party_files`' test-code exclusions, so the
     discovered contract is this discovery PLUS
-    `test_shared_tree_spans_every_production_src_root`. Scoped to `<pkg>/src`
+    `test_shared_tree_spans_every_production_src_root` and
+    `test_shared_tree_drops_no_production_module`. Scoped to `<pkg>/src`
     on purpose: `.worktrees/` sits at the REPO root, so unlike a root-level
     rglob (the trap capability_manifest_corpus.py documents) this glob cannot
     wander into a sibling task's checkout.
@@ -570,6 +572,30 @@ class TestSingleResetsParserOwnership:
             f'shared/tests/silent_fallthrough_scan.py::_SCOPE_ROOTS; never narrow '
             f'this discovery. (A `<pkg>/src` holding no Python at all also trips '
             f'this check.)'
+        )
+
+    def test_shared_tree_drops_no_production_module(self, first_party_tree):
+        """Every `*.py` under a discovered `<pkg>/src` root is a shared-tree record.
+
+        The shared tree applies `iter_first_party_files`' test-code exclusions:
+        path parts named `tests`, `mem0` or `graphiti`, and files named
+        `test_*.py` or `conftest.py`. No production module matches them today.
+        One that ever did would be silently skipped by the ownership scan, so a
+        re-fork hidden there would pass a guard that claims every `<pkg>/src`.
+        """
+        in_tree = {record.relpath for record in first_party_tree}
+        dropped = sorted(
+            relpath
+            for root_rel in _production_src_roots()
+            for path in (_REPO_ROOT / root_rel).rglob('*.py')
+            if (relpath := path.relative_to(_REPO_ROOT).as_posix()) not in in_tree
+        )
+        assert dropped == [], (
+            f'production module(s) under a discovered `<pkg>/src` root that the '
+            f'shared first-party tree excludes: {dropped}. The ownership scan '
+            f'cannot see them. Rename them out of the exclusions in '
+            f'shared/tests/silent_fallthrough_scan.py::iter_first_party_files, or '
+            f'narrow those exclusions; never let this scan narrow silently.'
         )
 
 
