@@ -14,6 +14,7 @@ dependencies = [
     "textual>=0.60",
     "pyyaml>=6.0",
     "orchestrator",
+    "dark-factory-shared",
 ]
 
 [project.scripts]
@@ -21,6 +22,7 @@ cockpit = "cockpit.app:main"
 
 [tool.uv.sources]
 orchestrator = { workspace = true }
+dark-factory-shared = { workspace = true }
 
 [dependency-groups]
 dev = [

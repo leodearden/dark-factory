@@ -204,25 +204,6 @@ async def _assert_rebuilds_cost_one_write(tmp_path, monkeypatch, *, drive, round
         assert recorded == [parked.session_slug]
 
 
-class _NoTempFiles:
-    """Stand-in for cockpit.ui_config's module-global `tempfile`, whose
-    mkstemp always raises -- the shape a full or read-only fleet_root has
-    from save_ui_config's point of view.
-
-    Patched as the NAME `tempfile` in cockpit.ui_config's globals rather
-    than as an attribute of the stdlib module, so the breakage is scoped to
-    the one module under test and every other importer's tempfile is
-    untouched. save_ui_config resolves the name from module globals at call
-    time, so the REAL function still runs and takes its real fail-soft
-    `except OSError` branch: logged, swallowed, returns None, no file
-    created -- exactly what _persist_ui_config sees in production.
-    """
-
-    @staticmethod
-    def mkstemp(*args, **kwargs):
-        raise OSError(28, 'No space left on device')
-
-
 class _BlockingScanner:
     """Fake SessionScanner for TestNonBlockingPoll: pins the exact moment a
     threaded poll scan is in-flight, deterministically and without needing
@@ -754,7 +735,7 @@ class TestUIConfigWriteDebounce:
 
     Before this, on_data_table_row_highlighted called _persist_ui_config
     directly, so holding an arrow key down over a large session table did a
-    full mkdir + mkstemp + json.dump + os.replace
+    full synchronous atomic write
     (cockpit/src/cockpit/ui_config.py::save_ui_config) per keypress on the
     event-loop thread, and CockpitApp._resync_session_detail wrote again
     whenever a rebuild moved the cursor.
@@ -934,7 +915,7 @@ class TestUIConfigWriteDebounce:
         here rather than left implicit in _flush_ui_config's docstring.
 
         cockpit/src/cockpit/ui_config.py::save_ui_config logs and swallows
-        OSError and returns None either way, so _persist_ui_config cannot
+        any exception and returns None either way, so _persist_ui_config cannot
         tell a failed write from a successful one and advances the baseline
         regardless. The retry CADENCE did materially change when the write
         left the highlight handler: a persistently unwritable fleet_root
@@ -947,10 +928,9 @@ class TestUIConfigWriteDebounce:
         gating the baseline on it: cockpit-ui.json is fail-soft UI state
         whose total loss costs the operator one restored cursor position,
         and a retry loop over a read-only fleet_root would put the
-        synchronous mkstemp back on every single tick -- reintroducing, in
+        synchronous atomic write back on every single tick -- reintroducing, in
         the worst case, exactly the per-tick I/O this debounce removed.
         """
-        from cockpit import ui_config as ui_config_module
         from cockpit.app import CockpitApp
         from cockpit.panes.session_table import SessionTable
         from cockpit.ui_config import ui_config_path
@@ -974,16 +954,18 @@ class TestUIConfigWriteDebounce:
             assert table.highlighted_slug() == parked.session_slug
 
             recorded = _count_ui_config_writes(monkeypatch)
-            # Break the REAL writer from here on. Everything below observes
-            # what production observes when fleet_root cannot be written.
-            monkeypatch.setattr(ui_config_module, 'tempfile', _NoTempFiles)
+            # Break the REAL writer from here on with a real filesystem
+            # fault: a directory occupying the config path makes every save
+            # fail, as a full or read-only fleet_root would. Everything below
+            # observes what production observes when the write cannot land.
+            ui_config_path(tmp_path).mkdir()
 
             await tick()
             # The flush ran and attempted the write ...
             assert recorded == [parked.session_slug]
             # ... the write really failed, fail-soft: no exception reached
-            # the event loop, and no file was created ...
-            assert not ui_config_path(tmp_path).exists()
+            # the event loop, and no file landed ...
+            assert not ui_config_path(tmp_path).is_file()
             # ... and the baseline advanced anyway ("persisted" means handed
             # to the writer, not on disk), so further ticks over the same
             # selection stay silent: no retry.
@@ -999,7 +981,7 @@ class TestUIConfigWriteDebounce:
             assert table.highlighted_slug() == moved_to.session_slug
             await tick()
             assert recorded == [parked.session_slug, moved_to.session_slug]
-            assert not ui_config_path(tmp_path).exists()
+            assert not ui_config_path(tmp_path).is_file()
 
         # on_unmount's unconditional final attempt is the only other write
         # this selection ever gets, and it fails the same way -- so a
@@ -1010,7 +992,7 @@ class TestUIConfigWriteDebounce:
             moved_to.session_slug,
             moved_to.session_slug,
         ]
-        assert not ui_config_path(tmp_path).exists()
+        assert not ui_config_path(tmp_path).is_file()
 
     @pytest.mark.timeout(10)
     async def test_flush_is_not_starved_by_the_scan_backpressure_drop(self, tmp_path, monkeypatch):
