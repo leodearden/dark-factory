@@ -996,6 +996,13 @@ async def _call_openai_responses(
             ),
             timeout=timeout,
         )
+    # An incomplete answer is not a verdict even when its partial text parses,
+    # and the logged reason must say so: an exhausted budget would otherwise
+    # read as an empty body, indistinguishable from a model that answered
+    # nothing (INV-2).
+    if getattr(response, 'status', None) == 'incomplete':
+        reason = getattr(getattr(response, 'incomplete_details', None), 'reason', None)
+        raise _reject(f'response incomplete ({reason})', response.output_text)
     return _JudgeReply(
         response.output_text or '',
         _usage_from(
