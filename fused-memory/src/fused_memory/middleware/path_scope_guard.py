@@ -67,14 +67,20 @@ plus one bypass that PRECEDES all three:
    deliverables (``metadata.files`` ∪ ``files_to_modify`` ∪ ``modules``)
    attest work in the FILING project, i.e. at least one is owned by it and
    NONE is owned by another; when they do, the interceptor suppresses BOTH
-   the stamp and the escalation, logging the decision at INFO instead.  With
-   no declared deliverable, with only unowned ones, or with a MIXED
-   declaration, the advisory fires unchanged.
+   the stamp and the escalation, logging the decision at INFO instead.  The
+   same suppression applies to a PURE consolidation gate (task 2948): a
+   well-formed ``reconciliation/consolidation_gate.py::declared_gate_topic``
+   block and NO declared deliverable.  Its subject is the filing project's
+   own memory topic, so a foreign path in its prose is quoted memory content.
+   Otherwise, with no declared deliverable, with only unowned ones, or with a
+   MIXED declaration, the advisory fires unchanged.
 
 (1) and (2) partition the DECLARED signal; (3) applies only once neither
 fired.  (2) and (3)'s suppression are logical complements — one needs every
 owned file foreign, the other needs at least one local and none foreign — so
-they can never both apply.
+they can never both apply.  The pure-gate suppression needs no declared
+deliverable at all, while (2) needs declared files, so it is disjoint from
+(2) too.
 
 THIS IS THE CANONICAL STATEMENT of the taxonomy: the interceptor's
 ``_path_guard_or_skip`` and the individual functions below cross-reference

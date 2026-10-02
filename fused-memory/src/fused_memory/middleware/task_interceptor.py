@@ -101,6 +101,7 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
+    declared_gate_topic,
     evaluate_closure,
     handrolled_member_enumeration,
     resolve_unstamped_live_ids,
@@ -2124,6 +2125,41 @@ class TaskInterceptor:
             self._extract_deliverable_signals(kwargs), project_id, registry,
         )
 
+    @staticmethod
+    def _pure_consolidation_gate_topic(kwargs: dict[str, Any]) -> str | None:
+        """Return the declared topic iff the submission is a PURE consolidation gate.
+
+        A pure consolidation gate declares no deliverable, and its subject is
+        the filing project's own memory topic (the closure scroll is resolved
+        with this project's ``project_id``), so a foreign path in its prose is
+        quoted memory content.  Any declared deliverable leaves attribution to
+        :meth:`_local_attesting_signals`.  See
+        ``reconciliation/consolidation_gate.py::declared_gate_topic`` and
+        outcome (3) of :mod:`fused_memory.middleware.path_scope_guard`.
+        """
+        meta = TaskInterceptor._parse_metadata(kwargs)
+        if TaskInterceptor._extract_deliverable_signals_from_meta(meta):
+            return None
+        return declared_gate_topic(meta)
+
+    @staticmethod
+    def _log_prose_advisory_suppressed(
+        verdict: PathGuardVerdict, project_id: str, *, attested_by: list[str],
+    ) -> None:
+        """Emit the ONE structured INFO record for a suppressed prose advisory."""
+        logger.info(
+            'path-guard PROSE ADVISORY SUPPRESSED: the declared metadata '
+            'attributes the submission to the filing project, so the prose '
+            'citation is incidental — '
+            'no possible_scope_mismatch stamp and no escalation. '
+            'project_id=%s matched_paths=%s suggested_project=%s '
+            'attested_by=%s',
+            project_id,
+            list(verdict.matched_paths),
+            verdict.suggested_project,
+            attested_by,
+        )
+
     def _path_guard_check(
         self,
         candidate: CandidateTask | None,
@@ -2579,7 +2615,8 @@ class TaskInterceptor:
           or it isn't, so there is nothing to adjudicate.
         * Outcome (2), CROSS-REPO allow-and-tag — :meth:`_all_files_foreign_owner`.
         * Outcome (3), PROSE-ADVISORY — :meth:`_path_guard_check`, gated on
-          :meth:`_local_attesting_signals`.  The registry is always present
+          :meth:`_local_attesting_signals` and then on
+          :meth:`_pure_consolidation_gate_topic`.  The registry is always present
           (defaults to ``ProjectPrefixRegistry.default()``, task 2208), so
           the advisory is the ONLY prose path — the pre-task-2208
           hard-reject-on-prose back-compat branch has been retired.  On an
@@ -2743,16 +2780,15 @@ class TaskInterceptor:
         # flagged, so the record carries every fact the decision turned on.
         attesting_signals = self._local_attesting_signals(kwargs, project_id)
         if attesting_signals:
-            logger.info(
-                'path-guard PROSE ADVISORY SUPPRESSED: declared deliverable '
-                'attests local work, so the prose citation is incidental — '
-                'no possible_scope_mismatch stamp and no escalation. '
-                'project_id=%s matched_paths=%s suggested_project=%s '
-                'attested_by=%s',
-                project_id,
-                list(verdict.matched_paths),
-                verdict.suggested_project,
-                attesting_signals,
+            self._log_prose_advisory_suppressed(
+                verdict, project_id, attested_by=attesting_signals,
+            )
+            return None
+        gate_topic = self._pure_consolidation_gate_topic(kwargs)
+        if gate_topic is not None:
+            self._log_prose_advisory_suppressed(
+                verdict, project_id,
+                attested_by=[f'{GATE_METADATA_KEY}.topic={gate_topic}'],
             )
             return None
 
