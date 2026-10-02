@@ -1848,7 +1848,8 @@ def test_build_pool_warns_LOUDLY_when_it_falls_back_to_the_default_credential(
 # could only imitate by implementing a private gate hook.
 # ---------------------------------------------------------------------------
 
-_AUTH_REJECTION = invocation_outcome.REAL_CLI_AUTH_REJECTION_MESSAGES[0]
+_MEASURED_REJECTION = invocation_outcome.REAL_CLI_AUTH_REJECTIONS[0]
+_AUTH_REJECTION = _MEASURED_REJECTION.message
 _EMPTY_VERDICT = '{"matches": [], "candidates": []}'
 
 
@@ -1926,7 +1927,7 @@ def test_the_journal_names_the_auth_route_apart_from_both_cap_routes(real_pool, 
     rotations = _module_rotations(caplog)
     assert len(rotations) == 1, rotations
     (line,) = rotations
-    assert 'max-d' in line and '403' in line, line
+    assert 'max-d' in line and str(_MEASURED_REJECTION.status) in line, line
     for cap_route_phrase in ('cap signal', 'non-zero', 'exited 0'):
         assert cap_route_phrase not in line, (
             f'{cap_route_phrase!r} belongs to a cap route; a journal grep must '

@@ -54,7 +54,8 @@ __all__ = [
     'ServerError',
     'ZeroOutputWedge',
     'Failure',
-    'REAL_CLI_AUTH_REJECTION_MESSAGES',
+    'REAL_CLI_AUTH_REJECTIONS',
+    'TextAuthRejection',
     'auth_failure_reason',
     'classify_invocation',
     'classify_text_auth_rejection',
@@ -682,24 +683,45 @@ def classify_invocation(
     return Failure(kind='unclassified')
 
 
-# Verbatim text-mode auth rejections, each a measured HTTP 403. The SINGLE
-# source for these strings: shared and scripts tests derive their input from
-# it. Add an entry only with a transcript to cite. Keep the U+00B7 byte-exact.
-REAL_CLI_AUTH_REJECTION_MESSAGES: tuple[str, ...] = (
+@dataclass(frozen=True)
+class TextAuthRejection:
+    """One measured text-mode auth rejection.
+
+    ``message`` is the verbatim text, ``lead`` the opening a stream must start
+    with to count as this rejection, and ``status`` the HTTP status measured
+    for that text.
+    """
+
+    message: str
+    lead: str
+    status: int
+
+    def __post_init__(self) -> None:
+        if not self.lead or not self.message.startswith(self.lead):
+            raise ValueError(
+                f'lead {self.lead!r} must be a non-empty opening of message {self.message!r}'
+            )
+
+
+# The SINGLE source for text-mode auth rejections: the classifier and the
+# shared and scripts tests all read it. Add an entry only with a transcript to
+# cite. Keep the U+00B7 byte-exact.
+REAL_CLI_AUTH_REJECTIONS: tuple[TextAuthRejection, ...] = (
     # Text-mode stdout at exit 1, 2026-09-29 legibility trickle
     # (esc-legibility-trickle-dark_factory-6). The same text was the JSON
     # `result` beside api_error_status 403 on CLI 2.1.168, 2026-06-08.
-    'Your organization has disabled Claude subscription access for Claude Code'
-    ' · Use an Anthropic API key instead, or ask your admin to enable access',
-    # HTTP 403 on every call from max-b, 2026-04-20.
-    'Your organization does not have access to Claude',
-)
-
-# (opening sentence, HTTP status measured for that text). A stream is a
-# rejection only when it OPENS with one of these leads.
-_TEXT_AUTH_REJECTION_LEADS: tuple[tuple[str, int], ...] = (
-    ('Your organization has disabled Claude subscription access', 403),
-    ('Your organization does not have access to Claude', 403),
+    TextAuthRejection(
+        message='Your organization has disabled Claude subscription access for Claude Code'
+        ' · Use an Anthropic API key instead, or ask your admin to enable access',
+        lead='Your organization has disabled Claude subscription access',
+        status=403,
+    ),
+    # Every call from max-b, 2026-04-20.
+    TextAuthRejection(
+        message='Your organization does not have access to Claude',
+        lead='Your organization does not have access to Claude',
+        status=403,
+    ),
 )
 
 
@@ -716,7 +738,7 @@ def classify_text_auth_rejection(output: str, stderr: str) -> AuthFailed | None:
     for stream in (output, stderr):
         text = stream.strip()
         opening = text.lower()
-        for lead, status in _TEXT_AUTH_REJECTION_LEADS:
-            if opening.startswith(lead.lower()):
-                return AuthFailed(status=status, body=_sanitise_auth_body(text))
+        for rejection in REAL_CLI_AUTH_REJECTIONS:
+            if opening.startswith(rejection.lead.lower()):
+                return AuthFailed(status=rejection.status, body=_sanitise_auth_body(text))
     return None

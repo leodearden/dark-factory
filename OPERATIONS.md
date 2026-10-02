@@ -1931,11 +1931,11 @@ legibility-trickle@<project>`):
   reason names the auth-failed accounts that will not come back with the rest.
 
 Only the measured text-mode 403 wordings are recognised as an auth rejection.
-The one list sits beside
-`shared/src/shared/invocation_outcome.py::classify_text_auth_rejection`, and a
-stream must *open* with one of them. A new wording still
-fails loudly per digest, unrotated, until an entry citing its transcript is
-added there.
+They live in one table,
+`shared/src/shared/invocation_outcome.py::REAL_CLI_AUTH_REJECTIONS`. Each
+entry holds a verbatim message, the lead a stream must *open* with, and the
+measured HTTP status. A new wording still fails loudly per digest, unrotated,
+until an entry citing its transcript is added there.
 
 ### Legibility trickle health probe (04:30)
 
