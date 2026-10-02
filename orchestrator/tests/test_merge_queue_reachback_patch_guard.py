@@ -60,14 +60,14 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 _THIS_FILE = Path(__file__).name
 _TESTS_DIR = Path(__file__).parent
 _SRC_DIR = Path(__file__).parent.parent / 'src' / 'orchestrator'
-_MERGE_QUEUE_PATH = _SRC_DIR / 'merge_queue.py'
+_MERGE_QUEUE_PATH = _SRC_DIR / 'merge_lane' / 'worker.py'
 _MERGE_QUEUE_PATCH_PREFIX = 'orchestrator.merge_queue.'
 
 _SATELLITE_MODULES = {
-    'orchestrator.merge_gates',
-    'orchestrator.merge_drift',
-    'orchestrator.merge_shadow',
-    'orchestrator.merge_liveness',
+    'orchestrator.merge_lane.gates',
+    'orchestrator.merge_lane.drift',
+    'orchestrator.merge_lane.shadow',
+    'orchestrator.merge_lane.liveness',
 }
 # Last path segment of each satellite module (e.g. 'merge_gates'). A relative
 # shim import (`from .merge_gates import ...`) carries no package prefix --
@@ -541,11 +541,11 @@ def test_forbidden_reachback_names_from_source_handles_relative_imports() -> Non
     see the non-empty assertion in
     `test_no_new_merge_queue_private_reachback_patches`)."""
     source = (
-        "from .merge_gates import (\n"
+        "from .gates import (\n"
         "    _check_post_merge_equivalence,  # noqa: F401 re-export shim\n"
         "    PostMergePyrightResult,  # noqa: F401 re-export shim\n"
         ")\n"
-        "from .merge_drift import _run_drift_check  # noqa: F401 re-export shim\n"
+        "from .drift import _run_drift_check  # noqa: F401 re-export shim\n"
     )
     forbidden = _forbidden_reachback_names_from_source(source)
     assert forbidden == {'_check_post_merge_equivalence', '_run_drift_check'}

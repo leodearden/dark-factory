@@ -517,7 +517,7 @@ class TestFileSizeMeasures:
         # regenerating the baseline with --write-baseline in the same commit,
         # actually applies. That is where exactness lives; here, only the
         # anti-vacuity property.
-        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py').read_text(
+        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py').read_text(
             encoding='utf-8'
         )
         measures = metrics.file_size_measures(source, path='merge_queue.py')
@@ -691,7 +691,7 @@ class TestReexportNames:
         # also catches pure re-exports nobody annotated.
         import ast as _ast
 
-        path = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py'
+        path = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py'
         source = path.read_text(encoding='utf-8')
         reported = set(metrics.reexport_names(source, path=str(path)))
         assert reported
@@ -859,7 +859,7 @@ class TestCognitiveComplexity:
         # test_pyproject_pin_matches_the_scripts_requirement and the
         # comparator's params.complexipy_version check already hard-block every
         # other major with a named failure.
-        target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py'
+        target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py'
         measures = metrics.file_cognitive_measures(target)
         assert measures.per_function['SpeculativeMergeWorker::_verifier_loop'] >= 100
         assert measures.per_function['SpeculativeMergeWorker::stop'] >= 50
@@ -939,7 +939,7 @@ class TestMaintainabilityIndex:
         # The PRD Background table's "Maintainability index (radon) | 0" row.
         # Reported, never ratcheted -- but genuinely exercised, so the `radon`
         # dev-group entry is not dead weight.
-        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py').read_text(
+        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py').read_text(
             encoding='utf-8'
         )
         assert metrics.maintainability_index(source, path='merge_queue.py') == 0.0
@@ -1321,7 +1321,7 @@ class TestBuildReport:
         assert report['enumeration']['unreadable'] == []
 
     def test_file_entries_carry_the_five_measures(self, report: dict) -> None:
-        entry = report['files']['orchestrator/src/orchestrator/merge_queue.py']
+        entry = report['files']['orchestrator/src/orchestrator/merge_lane/worker.py']
         assert set(entry) == {
             'lines',
             'prose_lines',
@@ -1337,7 +1337,7 @@ class TestBuildReport:
         assert entry['cognitive'] >= 1000
 
     def test_functions_is_a_flat_path_qualname_map(self, report: dict) -> None:
-        key = 'orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_verifier_loop'
+        key = 'orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_verifier_loop'
         # Floor, not equality (measured 245): a fall is permitted by the
         # ratchet contract -- see test_real_merge_queue_line_count_anchor.
         assert report['functions'][key] >= 100
