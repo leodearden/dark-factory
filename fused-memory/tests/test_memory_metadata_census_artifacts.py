@@ -35,27 +35,6 @@ def _census() -> types.ModuleType:
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_TOPIC_TABLE_KEYS = ('grand_total', 'topic', 'entries')
-
-
-def _shape(node: object) -> str:
-    if node is None:
-        return 'absent'
-    if node == []:
-        return 'an empty list'
-    return f'a {type(node).__name__}'
-
-
-def _topic_table_problem(payload: object) -> str | None:
-    node = payload
-    for depth, key in enumerate(_TOPIC_TABLE_KEYS):
-        if not isinstance(node, dict):
-            where = '.'.join(_TOPIC_TABLE_KEYS[:depth]) or 'the top level'
-            return f'{where} is {_shape(node)}, not an object'
-        node = node.get(key)
-    if not isinstance(node, list) or not node:
-        return f'{".".join(_TOPIC_TABLE_KEYS)} is {_shape(node)}, not a non-empty topic table'
-    return None
 
 
 def _census_report_damage(path: Path) -> str | None:
@@ -65,14 +44,16 @@ def _census_report_damage(path: Path) -> str | None:
         return f'unreadable: {exc}'
     except ValueError as exc:
         return f'not JSON: {exc}'
-    problem = _topic_table_problem(payload)
-    if problem is not None:
-        return problem
-    disclosures = _probe().derive_registry_candidates([], payload, ()).disclosures
+    try:
+        disclosures = _probe().derive_registry_candidates([], payload, ()).disclosures
+    except (AttributeError, TypeError) as exc:
+        return f"the probe's reader cannot walk it to a topic table: {exc!r}"
     bad_values = disclosures['census_rows_malformed_value']
     bad_counts = disclosures['census_rows_malformed_count']
     if bad_values or bad_counts:
         return f'{bad_values} topic row(s) with a malformed value, {bad_counts} with a malformed count'
+    if not (disclosures['census_topics_emitted'] or disclosures['census_topics_skipped_singleton']):
+        return "the probe's reader finds no topic rows in it"
     return None
 
 
@@ -127,6 +108,7 @@ class TestCensusReportDamageIsDetected:
         pytest.param('{"grand_total": "nope"}', id='grand-total-not-an-object'),
         pytest.param('{"grand_total": {"topic": "nope"}}', id='topic-not-an-object'),
         pytest.param('{"grand_total": {"topic": {"entries": {}}}}', id='entries-not-a-list'),
+        pytest.param('{"grand_total": {"topic": {"entries": 5}}}', id='entries-a-number'),
         pytest.param(_census_text(), id='empty-topic-table'),
         pytest.param(
             _census_text(_HEALTHY_ROW, {'value': '', 'count': 2}), id='row-with-empty-value',
