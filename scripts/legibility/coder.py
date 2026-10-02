@@ -87,8 +87,16 @@ _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
+# Self-bootstrap for a standalone `python scripts/legibility/coder.py` run --
+# must precede the `legibility.*` import below, since a direct script
+# invocation puts only scripts/legibility/ (not scripts/) on sys.path. Skipped
+# under pytest/package import. Mirrors census.py/nightly.py's identical guard.
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import codebook as codebook_mod  # noqa: E402
 import yaml  # noqa: E402
+from legibility import session_runner  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 
 logger = logging.getLogger("legibility.coder")
@@ -99,80 +107,6 @@ class CoderParseError(Exception):
     LLM's raw output into a usable structure. Never silently defaulted —
     callers must treat this as a hard per-digest failure (never-fabricate
     contract)."""
-
-
-class CoderInvocationError(Exception):
-    """Raised when the ``claude -p --model`` subprocess invocation fails —
-    non-zero exit or a timeout. Carries a tail of BOTH output streams for
-    diagnosis, each labelled. Never silently swallowed: code_digest turns
-    this into a per-digest failure, never a fabricated record.
-
-    BOTH streams, not just stderr, because of what happened on 2026-08-24:
-    the claude CLI wrote its usage-cap banner to STDOUT and exited 1, and
-    this error embedded only ``(proc.stderr or "")[-2000:]``. With stderr
-    empty, the reason that reached the journal, the epsilon escalation and
-    ``run.failures`` was the bare ``claude CLI exited 1 (model='haiku',
-    ...): `` — nothing after the colon — on 17 of 20 digests. The CLI had
-    stated exactly what was wrong and the coder discarded it, so a night
-    with one plain cause was investigated as twenty causeless failures.
-    A diagnostic the process EMITTED must never be dropped on the floor
-    because it arrived on the less-expected stream.
-
-    The same two tails are ALSO carried as structured ``stdout``/``stderr``
-    attributes, beside the formatted message rather than only inside it.
-    ``account_pool``'s failover path feeds them to the gate's strict
-    detector, ``InvokeSlot.detect_cap_hit(stderr, result_text)``, which takes
-    the streams as two distinct arguments; recovering them by re-parsing
-    ``stdout={!r} stderr={!r}`` back out of the message would be an ad-hoc
-    parser over a meaningful string (docs/code-quality.md heuristic 12) and
-    would couple account failover to wording that exists for humans reading
-    journals. ``CoderCapExhausted.marker`` is the established precedent for
-    a typed attribute on this hierarchy. Both default to ``''`` -- the
-    timeout and never-started arms have no streams to carry -- so every
-    consumer can read them unconditionally instead of guarding with
-    ``hasattr``, which would silently read a regression as "no banner" and
-    never rotate the account.
-    """
-
-    def __init__(self, message: str, *, stdout: str = "", stderr: str = "") -> None:
-        super().__init__(message)
-        self.stdout = stdout
-        self.stderr = stderr
-
-
-class CoderCapExhausted(CoderInvocationError):
-    """Raised when the CLI answered with a capacity/auth banner instead of a
-    model turn — i.e. there is no headroom left to code this digest.
-
-    A SUBCLASS, not a sibling, and that is load-bearing: three sites already
-    catch ``CoderInvocationError`` (``code_digest`` here,
-    ``census._build_default_verify_fn`` and ``census.preflight_headroom``)
-    and none of them is touched by this task. A sibling type would escape all
-    three, turning a typed per-digest failure into an uncaught crash that
-    takes down the whole batch.
-
-    **This is a NORMAL operating condition, never a coder defect.** Leo's
-    standing directive (sibling task 4503): an all-accounts-capped night is
-    expected weather, not an incident. Before this existed, 2026-08-24
-    presented as 17 of 20 hard per-digest failures, tripped ``code_digests``'
-    >50% storm threshold, and became ``exit_code=1`` plus an ERROR-level
-    escalation — an infra page for a condition ruled routine.
-
-    ``marker`` names the banner marker that matched, so a deferral reason can
-    quote WHICH signal fired — the difference between an operator reading
-    "deferred: weekly limit" and reading "deferred". Mirrors
-    ``census.preflight_headroom``'s "...carries a banner marker: {marker!r}".
-
-    Never fabricated into a verdict. A capped digest yields no record at all;
-    it is labelled and excluded, exactly as ``evals/runner.py`` excludes a
-    ``cap_exhausted:`` cell from a reported mean rather than scoring it 0.0.
-    """
-
-    def __init__(
-        self, message: str, *, marker: str, stdout: str = "", stderr: str = "",
-    ) -> None:
-        super().__init__(message, stdout=stdout, stderr=stderr)
-        self.marker = marker
 
 
 @dataclass
@@ -395,7 +329,7 @@ _CLAUDE_BIN_ENV_VAR = "LEGIBILITY_CLAUDE_BIN"
 "claude" (PATH-resolved -- /home/leo/.local/bin is on PATH)."""
 
 _ERROR_STREAM_TAIL_CHARS = 2000
-"""How much of EACH captured output stream a CoderInvocationError carries.
+"""How much of EACH captured output stream an InvocationFailed carries.
 
 One constant for both streams, deliberately: this started as a bare
 ``[-2000:]`` on stderr alone, and the asymmetry that grew beside it (stdout
@@ -487,7 +421,7 @@ def _invoke_cli(
     per cluster (``census._build_default_verify_fn``) that surfaced as a
     silent mass rejection of every cluster rather than an error.
 
-    Raises CoderInvocationError on a non-zero exit, a timeout, or a
+    Raises InvocationFailed on a non-zero exit, a timeout, or a
     failure to START the process at all -- never silently swallowed, never
     a fabricated empty stdout. On a non-zero exit the error message carries
     a tail of BOTH output streams, each LABELLED, plus the resolved cwd, so
@@ -497,7 +431,7 @@ def _invoke_cli(
     Both streams because the CLI does not reliably diagnose itself on
     stderr: on 2026-08-24 it wrote a usage-cap banner to STDOUT and exited
     1, and a stderr-only message reached the journal EMPTY after the colon
-    on 17 of 20 digests (see CoderInvocationError). The exit-0 RETURN
+    on 17 of 20 digests (see InvocationFailed). The exit-0 RETURN
     contract is untouched by that -- stdout is still returned raw and
     unbounded there, which census._build_stage_invokes (wiring this
     function as its mining/verify/synthesis primitive) and
@@ -534,7 +468,7 @@ def _invoke_cli(
             env=env,
         )
     except subprocess.TimeoutExpired as exc:
-        raise CoderInvocationError(
+        raise session_runner.InvocationFailed(
             f"claude CLI timed out after {timeout}s (model={model!r}, "
             f"claude_bin={resolved_bin!r}, cwd={cwd!r})"
         ) from exc
@@ -544,7 +478,7 @@ def _invoke_cli(
         # themselves in the underlying OSError text, so echo it verbatim
         # alongside BOTH candidates rather than guessing which one the
         # kernel objected to.
-        raise CoderInvocationError(
+        raise session_runner.InvocationFailed(
             f"claude CLI could not be started (model={model!r}, "
             f"claude_bin={resolved_bin!r}, cwd={cwd!r}): {exc}"
         ) from exc
@@ -554,7 +488,7 @@ def _invoke_cli(
         # its own diagnostics on stderr -- on 2026-08-24 it wrote a usage-cap
         # banner to STDOUT and exited 1 -- so carrying one stream and
         # labelling neither loses both the text and the fact of WHICH stream
-        # said it. See CoderInvocationError's docstring for the incident.
+        # said it. See InvocationFailed's docstring for the incident.
         stdout_tail = (proc.stdout or "")[-_ERROR_STREAM_TAIL_CHARS:]
         stderr_tail = (proc.stderr or "")[-_ERROR_STREAM_TAIL_CHARS:]
         message = (
@@ -577,10 +511,10 @@ def _invoke_cli(
         # function and scan what comes BACK" -- working unchanged.
         marker = looks_like_blocking_banner(f"{stdout_tail}\n{stderr_tail}")
         if marker:
-            raise CoderCapExhausted(
+            raise session_runner.NoHeadroom(
                 message, marker=marker, stdout=stdout_tail, stderr=stderr_tail,
             )
-        raise CoderInvocationError(message, stdout=stdout_tail, stderr=stderr_tail)
+        raise session_runner.InvocationFailed(message, stdout=stdout_tail, stderr=stderr_tail)
 
     return proc.stdout
 
@@ -613,7 +547,7 @@ def code_digest(
     ``record=None`` and ``reason`` set — never partially applied, never
     fabricated. The cap case additionally sets ``capped=True``: it is the
     one cause that says nothing about this digest or this coder, only that
-    the account had no headroom left to look (see ``CoderCapExhausted``). A
+    the account had no headroom left to look (see ``session_runner.NoHeadroom``). A
     legitimately empty judgment (``{"matches": [], "candidates": []}``)
     that passes schema validation is a genuine ``ok=True`` success: "coded
     fine, found nothing" is never conflated with "coding failed" (codebook
@@ -631,15 +565,15 @@ def code_digest(
 
     try:
         raw = invoke_fn(prompt, model)
-    except CoderCapExhausted as exc:
+    except session_runner.NoHeadroom as exc:
         # ORDERED ABOVE the generic arm below, and that ordering is
-        # load-bearing: CoderCapExhausted SUBCLASSES CoderInvocationError, so
+        # load-bearing: NoHeadroom SUBCLASSES InvocationFailed, so
         # reversing these two silently routes every cap into the generic arm
         # and the label is never applied.
         return CodingResult(
             ok=False, record=None, reason=str(exc), session=session, capped=True,
         )
-    except CoderInvocationError as exc:
+    except session_runner.InvocationFailed as exc:
         return CodingResult(ok=False, record=None, reason=str(exc), session=session)
 
     try:

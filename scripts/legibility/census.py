@@ -698,7 +698,7 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     ``shared.cap_markers.looks_like_blocking_banner`` (capacity OR auth --
     either means no useful model output is coming); a match defers, and
     the reason quotes the marker that fired. An invocation error
-    raised by *invoke* (e.g. a ``CoderInvocationError``-shaped failure)
+    raised by *invoke* (e.g. a ``session_runner.InvocationFailed``-shaped failure)
     is also treated as a deferral -- fail-safe, never a crash, since a
     probe failure is exactly the kind of "the model isn't reachable right
     now" signal this preflight exists to catch. Makes no mining decisions
@@ -3820,7 +3820,7 @@ def main(argv: list[str] | None = None) -> int:
     # Rejected LOUDLY here, at the CLI boundary, rather than left to fail
     # somewhere downstream. Now that project_root is also the stage
     # subprocess cwd, a typo'd root surfaces on the FIRST invoke -- the
-    # headroom probe -- as a CoderInvocationError, and preflight_headroom
+    # headroom probe -- as a session_runner.InvocationFailed, and preflight_headroom
     # deliberately folds ANY probe exception into HeadroomResult(ok=False).
     # Without this check `census --project-root /typo --config <real one>`
     # would exit 0 with "census deferred: headroom probe invocation

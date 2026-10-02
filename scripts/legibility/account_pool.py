@@ -57,17 +57,12 @@ if str(_SHARED_SRC) not in sys.path:
 import yaml  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
-# THE PACKAGE SPELLING, never a bare `import coder`, and the difference is
-# load-bearing. scripts/legibility/ sits on sys.path alongside scripts/, so
-# the two spellings build two DISTINCT module objects carrying two distinct
-# `CoderCapExhausted` classes. `pool_invoke` raises that exception and
-# `coder.code_digest` catches it by name, under two except arms with no
-# generic `except Exception` beneath them -- so a mismatch would not
-# mislabel the deferral, it would let the exception escape `run_nightly`
-# entirely and crash the very night task 4736 exists to make exit 0. Any
-# future consumer of this module (census.py, which today reaches the coder
-# by its bare name) must reach it by this same spelling.
-from legibility import coder  # noqa: E402
+# THE PACKAGE SPELLING, never a bare import. scripts/legibility/ sits on
+# sys.path alongside scripts/, so the two spellings build two DISTINCT module
+# objects. The exceptions `pool_invoke` raises live in session_runner, which
+# every consumer reaches by this spelling, so `coder.code_digest` catches the
+# same `NoHeadroom` class however coder itself was imported.
+from legibility import coder, session_runner  # noqa: E402
 from shared.config_models import UsageCapConfig  # noqa: E402
 from shared.invocation_outcome import classify_text_auth_rejection  # noqa: E402
 from shared.usage_gate import InvokeSlot, UsageGate  # noqa: E402
@@ -122,7 +117,7 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
     shape, for a reason specific to this caller: refusing to start would
     take the whole night down, while a warned empty pool still reaches task
     4736's honest DEFERRED path (``pool_invoke`` raises
-    ``CoderCapExhausted`` naming this exact condition). What must never
+    ``NoHeadroom`` naming this exact condition). What must never
     happen is the quiet version.
     """
     load_dotenv(env_file if env_file is not None else _REPO_ROOT / ".env")
@@ -176,29 +171,29 @@ the default to discover it would be spawning a real `claude`."""
 
 
 _EXHAUSTED_MARKER = "pool exhausted"
-"""Marker carried by the pool's own CoderCapExhausted.
+"""Marker carried by the pool's own NoHeadroom.
 
-``CoderCapExhausted.marker`` names the signal that fired, so a deferral
+``NoHeadroom.marker`` names the signal that fired, so a deferral
 reason can quote WHICH one. A per-digest cap quotes the banner phrase the
 CLI printed; this one is not a banner at all -- it is the gate reporting
 that no account remains -- and saying so is the honest spelling."""
 
 
-def _exhaustion_error(gate, tried) -> coder.CoderInvocationError:
+def _exhaustion_error(gate, tried) -> session_runner.InvocationFailed:
     """The exception to raise when no account is left — typed as well as
     worded, because each exhaustion needs a different operator response.
 
     ===============================  ====================  ======================
     gate state (public predicates)   raised                clears on its own?
     ===============================  ====================  ======================
-    ``account_count == 0``           CoderCapExhausted     no — config fault
-    ``active_account_name`` set      CoderCapExhausted     no — not a cap at all
-    every account auth-failed        CoderInvocationError  no — operator action
-    some auth-failed, rest capped    CoderCapExhausted     only the capped ones
-    all capped                       CoderCapExhausted     yes — weekly reset
+    ``account_count == 0``           NoHeadroom            no — config fault
+    ``active_account_name`` set      NoHeadroom            no — not a cap at all
+    every account auth-failed        InvocationFailed      no — operator action
+    some auth-failed, rest capped    NoHeadroom            only the capped ones
+    all capped                       NoHeadroom            yes — weekly reset
     ===============================  ====================  ======================
 
-    The all-auth-failed pool must NOT be a ``CoderCapExhausted``:
+    The all-auth-failed pool must NOT be a ``NoHeadroom``:
     ``coder.is_cap_deferral`` would turn a majority of those into an exit-0
     DEFERRED night, which is reserved for weather that clears at the reset
     (task 4503). As a plain failure it trips the storm, so the night exits 1
@@ -225,7 +220,7 @@ def _exhaustion_error(gate, tried) -> coder.CoderInvocationError:
         )
     auth_failed = gate.auth_failed_account_names
     if len(auth_failed) == count:
-        return coder.CoderInvocationError(
+        return session_runner.InvocationFailed(
             f"legibility trickle: every one of the {count} pool accounts had "
             f"its credentials rejected (HTTP 401/403): {', '.join(auth_failed)} "
             f"— this is not a capacity limit and will not clear at the weekly "
@@ -241,8 +236,8 @@ def _exhaustion_error(gate, tried) -> coder.CoderInvocationError:
     return _pool_exhausted(f"all {count} pool accounts capped")
 
 
-def _pool_exhausted(reason) -> coder.CoderCapExhausted:
-    return coder.CoderCapExhausted(
+def _pool_exhausted(reason) -> session_runner.NoHeadroom:
+    return session_runner.NoHeadroom(
         f"legibility trickle: {reason}", marker=_EXHAUSTED_MARKER,
     )
 
@@ -313,7 +308,7 @@ def _account_declined(slot, exc) -> bool:
     precedence. A stream that opens with a measured rejection is reported
     through ``InvokeSlot.report``, which moves the account to AUTH_FAILED;
     with no event loop no re-probe can start, so it stays out for the rest of
-    the run. Otherwise only a ``CoderCapExhausted`` — the loose per-digest
+    the run. Otherwise only a ``NoHeadroom`` — the loose per-digest
     matcher fired — is put to the gate's STRICT detector, which settles the
     slot on any True verdict. Which transition that took (a CapHit caps, a
     NearCap only annotates) is the gate's business, which is why the caller's
@@ -324,7 +319,7 @@ def _account_declined(slot, exc) -> bool:
         slot.report(outcome)
         _log_rotation(slot, _auth_rejection_route(outcome.status))
         return True
-    if isinstance(exc, coder.CoderCapExhausted) and slot.detect_cap_hit(exc.stderr, exc.stdout):
+    if isinstance(exc, session_runner.NoHeadroom) and slot.detect_cap_hit(exc.stderr, exc.stdout):
         _log_rotation(slot, _ROUTE_NONZERO_EXIT)
         return True
     return False
@@ -394,8 +389,8 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
     seam, so ``coder``'s control flow — the never-fabricate contract, the
     storm threshold, the taint-and-exclude rule, task 4736's whole deferral
     chain — is inherited unchanged. The only new input it ever produces is
-    ``_exhaustion_error``'s: a ``CoderCapExhausted`` that now means the POOL
-    is exhausted rather than one login, or a plain ``CoderInvocationError``
+    ``_exhaustion_error``'s: a ``NoHeadroom`` that now means the POOL
+    is exhausted rather than one login, or a plain ``InvocationFailed``
     when every account's credentials were rejected.
 
     *reverse* defaults to True: the trickle drains the roster h→b so its
@@ -460,7 +455,7 @@ def pool_invoke(gate, *, reverse: bool = True, invoke=_DEFAULT_INVOKE):
             slot = InvokeSlot(gate, lease)
             try:
                 reply = invoke(prompt, model, oauth_token=slot.token)
-            except coder.CoderInvocationError as exc:
+            except session_runner.InvocationFailed as exc:
                 if not _account_declined(slot, exc):
                     raise
             else:
