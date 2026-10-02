@@ -110,7 +110,7 @@ def _fake_claude(tmp_path: Path, *, stdout: str = OK_RESULT, stderr: str = '', e
 
 @dataclass
 class FakeGate:
-    """The two gate members ``account_pool.subprocess_env`` calls, over ``(name, capped)`` accounts."""
+    """The two gate members ``nightly_prepare`` calls to lease an account, over ``(name, capped)`` accounts."""
 
     accounts: list[tuple[str, bool]]
     released: list[str | None] = field(default_factory=list)
@@ -348,16 +348,33 @@ def test_a_leased_account_supplies_the_child_env(tmp_path, monkeypatch):
     monkeypatch.setenv('SITTING_TEST_MARKER', 'kept')
     fake = _fake_claude(tmp_path)
     gate = _live_gate()
-    expected = account_pool.subprocess_env(_live_gate())
-    assert expected is not None
 
     assert _main(fake, gate=gate) == mod.EXIT_OK
 
     call = fake.only_call()
-    assert call['env']['CLAUDE_CODE_OAUTH_TOKEN'] == expected['CLAUDE_CODE_OAUTH_TOKEN']
+    assert call['env']['CLAUDE_CODE_OAUTH_TOKEN'] == 'tok-max-h', 'leased from the END of the roster'
     assert call['env']['SITTING_TEST_MARKER'] == 'kept'
+    assert call['env']['SITTING_NIGHTLY_CONFINED']
     assert not call['env_has']['ANTHROPIC_API_KEY']
-    assert gate.released == [expected['CLAUDE_CODE_OAUTH_TOKEN']], 'the lease is handed straight back'
+    assert gate.released == ['tok-max-h'], 'the lease is handed straight back'
+
+
+def test_a_real_pool_lease_is_handed_back_before_the_run(tmp_path, monkeypatch, pool_roster):
+    """Nothing in the child can settle a slot, so a kept PROBE_IN_FLIGHT claim
+    would hold that account out of the pool for the rest of the night."""
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-must-not-survive')
+    accounts_file, env_file = pool_roster('max-p', 'max-q')
+    gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
+    fake = _fake_claude(tmp_path)
+
+    assert _main(fake, gate=gate) == mod.EXIT_OK
+
+    assert fake.only_call()['env']['CLAUDE_CODE_OAUTH_TOKEN'] == pool_roster.token('max-q')
+    assert not fake.only_call()['env_has']['ANTHROPIC_API_KEY']
+    released = gate.try_lease(reverse=True)
+    assert released is not None and released.name == 'max-q', (
+        'the account the run leased must be leasable again once the run has its env'
+    )
 
 
 def test_no_lease_inherits_the_parent_env_and_still_runs(tmp_path, monkeypatch):
