@@ -45,7 +45,7 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.hold_history import HoldHistory
-from orchestrator.mcp_lifecycle import mcp_call
+from orchestrator.mcp_lifecycle import mcp_call, tool_error_text
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
@@ -4577,12 +4577,7 @@ class Scheduler:
             )
             # MCP tool errors return in the response body, not as exceptions
             content = result.get('result', result) if isinstance(result, dict) else result
-            if isinstance(content, dict) and content.get('isError'):
-                text = ''
-                for block in content.get('content', []):
-                    if isinstance(block, dict) and block.get('type') == 'text':
-                        text = block.get('text', '')
-                        break
+            if isinstance(content, dict) and (text := tool_error_text(content)) is not None:
                 logger.error(f'Failed to update task {task_id}: {text}')
                 return False
             # Structured rejections (e.g. LockCharterViolation, ValidationError)

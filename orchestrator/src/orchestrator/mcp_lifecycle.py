@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -541,6 +542,22 @@ def is_timeout_failure(exc: BaseException) -> bool:
         seen.add(id(current))
         current = current.__cause__
     return False
+
+
+def tool_error_text(reply: Mapping[str, Any]) -> str | None:
+    """The error prose of a tool-level failure, or None if the tool succeeded.
+
+    An MCP tool reports its own failure in the response body, as a
+    well-formed envelope carrying ``isError``, not by breaking the transport.
+    Nothing about that envelope's shape says it failed, so a reader that
+    checks only the shape would take the error prose for a result.
+    """
+    if not reply.get('isError'):
+        return None
+    for block in reply.get('content') or []:
+        if isinstance(block, dict) and block.get('type') == 'text':
+            return str(block.get('text', ''))
+    return ''
 
 
 MCP_HEADERS = {

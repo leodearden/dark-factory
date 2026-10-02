@@ -17,7 +17,7 @@ from shared.briefing_queries import (
 
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
-from orchestrator.mcp_lifecycle import is_timeout_failure, mcp_call
+from orchestrator.mcp_lifecycle import is_timeout_failure, mcp_call, tool_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -876,30 +876,6 @@ def _failed_stores(payload_text: str) -> tuple[str, ...]:
     if not isinstance(stores, list):
         return ()
     return tuple(store for store in stores if isinstance(store, str) and store)
-
-
-def _tool_error_text(reply: dict) -> str | None:
-    """The error prose of a tool-level failure, or None if the tool succeeded.
-
-    An MCP tool reports its own failure IN the response body rather than by
-    breaking the transport: FastMCP answers with a well-formed
-    ``{'isError': True, 'content': [{'type': 'text', 'text': 'Error: ...'}]}``.
-    Nothing about that envelope's SHAPE says it failed, so a reader that
-    checks only the shape extracts the error prose and renders it as recalled
-    memory — and, worse, counts it as a successful recall that resets the
-    outage streak.
-
-    Spelled as ``orchestrator/src/orchestrator/scheduler.py``'s reader of the
-    same envelope spells it (see its ``update_task`` call site and the
-    ``extract_rejection`` docstring), so the two cannot drift apart on what
-    "the tool errored" looks like on the wire.
-    """
-    if not reply.get('isError'):
-        return None
-    for block in reply.get('content', []) or []:
-        if isinstance(block, dict) and block.get('type') == 'text':
-            return str(block.get('text', ''))
-    return ''
 
 
 MEMORY_CONTEXT_CAVEAT = (
@@ -2259,7 +2235,7 @@ Handle this escalation, then call `resolve_issue` with a summary.
             logger.warning(f'MCP get_entity for {name!r} answered with no tool result: {result!r}')
             return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
 
-        error_text = _tool_error_text(reply)
+        error_text = tool_error_text(reply)
         if error_text is not None:
             logger.warning(f'MCP get_entity for {name!r} returned a tool error: {error_text!r}')
             return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
@@ -2375,7 +2351,7 @@ Handle this escalation, then call `resolve_issue` with a summary.
             )
             return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
 
-        error_text = _tool_error_text(reply)
+        error_text = tool_error_text(reply)
         if error_text is not None:
             logger.warning(
                 f'Memory search for {query!r} returned a tool error: {error_text!r}'
