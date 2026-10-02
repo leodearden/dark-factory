@@ -144,5 +144,9 @@ def _roster_names(accounts_file) -> list[str]:
     try:
         data = yaml.safe_load(Path(accounts_file).read_text()) or {}
         return [entry.get("name", "?") for entry in data.get("accounts", [])]
-    except Exception:  # noqa: BLE001 — a warning's detail must never raise
+    except Exception as exc:  # noqa: BLE001 — a warning's detail must never raise
+        logger.warning(
+            "could not read the configured account names back from roster %s "
+            "(%s: %s)", accounts_file, type(exc).__name__, exc,
+        )
         return []
