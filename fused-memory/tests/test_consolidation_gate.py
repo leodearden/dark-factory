@@ -1434,6 +1434,68 @@ class TestHandrolledMemberEnumeration:
         assert 'HANDROLLED_MEMBER_KEYS' in consolidation_gate.__all__
         assert 'handrolled_member_enumeration' in consolidation_gate.__all__
 
+
+class TestDeclaredGateTopic:
+    """The positive counterpart of :class:`TestHandrolledMemberEnumeration`: a
+    gate whose subject is DECLARED by a well-formed block (task 2948)."""
+
+    _GATE_TOPIC = 'review-issues-detail-omits-suggestions'
+
+    @classmethod
+    def _meta(cls, **extra):
+        meta = {
+            'operational_mode': 'gate',
+            GATE_METADATA_KEY: {'topic': cls._GATE_TOPIC},
+        }
+        meta.update(extra)
+        return meta
+
+    def test_recognises_the_builders_own_output(self):
+        spec = build_consolidation_gate_task(topic=self._GATE_TOPIC, rationale='x')
+        assert (
+            consolidation_gate.declared_gate_topic(spec.metadata) == self._GATE_TOPIC
+        )
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [
+            None,
+            ['operational_mode', 'gate'],
+            'operational_mode=gate',
+            {GATE_METADATA_KEY: {'topic': _GATE_TOPIC}},
+            {'operational_mode': 'normal', GATE_METADATA_KEY: {'topic': _GATE_TOPIC}},
+            {'operational_mode': 'gate'},
+            {'operational_mode': 'gate', GATE_METADATA_KEY: [_GATE_TOPIC]},
+            {'operational_mode': 'gate', GATE_METADATA_KEY: _GATE_TOPIC},
+            {'operational_mode': 'gate', GATE_METADATA_KEY: {}},
+            {'operational_mode': 'gate', GATE_METADATA_KEY: {'topic': 5}},
+            {'operational_mode': 'gate', GATE_METADATA_KEY: {'topic': 'Not A Slug'}},
+            {'operational_mode': 'gate', GATE_METADATA_KEY: {'topic': ''}},
+        ],
+        ids=[
+            'none',
+            'list',
+            'str',
+            'operational-mode-missing',
+            'operational-mode-not-gate',
+            'block-absent',
+            'block-is-list',
+            'block-is-str',
+            'topic-missing',
+            'topic-not-str',
+            'topic-not-slug',
+            'topic-empty',
+        ],
+    )
+    def test_none_for_every_undeclared_shape(self, metadata):
+        assert consolidation_gate.declared_gate_topic(metadata) is None
+
+    def test_a_hand_built_well_formed_gate_is_recognised(self):
+        assert consolidation_gate.declared_gate_topic(self._meta()) == self._GATE_TOPIC
+
+    def test_is_exported(self):
+        assert 'declared_gate_topic' in consolidation_gate.__all__
+
 # --------------------------------------------------------------------------- #
 # Guard: the seam's import weight, and INV-5's single homes (step-15a)
 # --------------------------------------------------------------------------- #

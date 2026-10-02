@@ -87,6 +87,7 @@ __all__ = [
     'ConsolidationGateSpec',
     'build_consolidation_gate_task',
     'closure_exists_probe',
+    'declared_gate_topic',
     'evaluate_closure',
     'handrolled_member_enumeration',
     'render_consolidation_gate_section',
@@ -369,6 +370,31 @@ def handrolled_member_enumeration(metadata: Any) -> tuple[str, list[Any]] | None
             and len(value) > 0
         ):
             return key, list(value)
+    return None
+
+
+def declared_gate_topic(metadata: Any) -> str | None:
+    """Return the topic a consolidation gate DECLARES as its subject, else ``None``.
+
+    The topic is the cluster that
+    ``middleware/task_interceptor.py::TaskInterceptor._consolidation_closure_error``
+    resolves in the gate's OWN project's memory store.  This is the positive
+    counterpart of :func:`handrolled_member_enumeration`: it requires
+    ``operational_mode == 'gate'`` and a :data:`GATE_METADATA_KEY` block whose
+    topic is a well-formed slug.  PURE, and defensive on every shape.
+
+    Consumer: the path-scope prose-advisory attribution (task 2948).
+    """
+    if not isinstance(metadata, Mapping):
+        return None
+    if metadata.get('operational_mode') != _GATE_OPERATIONAL_MODE:
+        return None
+    block = metadata.get(GATE_METADATA_KEY)
+    if not isinstance(block, Mapping):
+        return None
+    topic = block.get('topic')
+    if isinstance(topic, str) and is_valid_topic_slug(topic):
+        return topic
     return None
 
 
