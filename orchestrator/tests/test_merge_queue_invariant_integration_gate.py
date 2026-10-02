@@ -106,7 +106,7 @@ from _merge_lane_fakes import (
     main_health_probe_spawned,
     passes,
 )
-from _orch_helpers import MERGE_RESULT_TIMEOUT
+from _orch_helpers import wait_responsive
 from test_merge_queue_concurrent_verify import (
     _gated_runner,
     _inject_two_host_allocator,
@@ -440,8 +440,12 @@ class TestScenario1SpeculativeCascade:
             # task can unblock even if cancel() arrives slightly late.
             follower_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result, label='casc1-a (N, head) outcome after head-failure cascade',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result, label='casc1-b (N+1, remote) outcome after cascade re-merge',
+            )
 
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail (genuine VerifyResult failure, not '
@@ -507,7 +511,9 @@ class TestScenario234VerifierLifecycleFaults:
             req = await _submitted(git_ops, config, 'ru2', 'ru2.py', 'r = 1\n')
             await queue.put(req)
 
-            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome = await wait_responsive(
+                req.result, label='ru2 outcome after RunnerUnavailable re-dispatch',
+            )
 
             assert outcome.status == 'done', (
                 f'RUNNER_UNAVAILABLE is transient — the item must be re-dispatched '
@@ -554,7 +560,9 @@ class TestScenario234VerifierLifecycleFaults:
 
             lane.unhalt_all_lanes('row-3 unhalt')
             verify_gate.set()
-            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome = await wait_responsive(
+                req.result, label='halt3 outcome after unhalt re-verify',
+            )
             assert outcome.status == 'done', (
                 f'expected the re-verify after unhalt to land "done", got {outcome!r}'
             )
@@ -791,7 +799,9 @@ class TestScenario8CasRetryTipCarry:
             req = await _submitted(git_ops, config, 'row8', 'row8.py', 'row8 = 1\n')
             with patch.object(git_ops, 'advance_main', side_effect=_fake_advance):
                 await queue.put(req)
-                outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+                outcome = await wait_responsive(
+                    req.result, label='row8 outcome after rebased_pending_reverify CAS retry',
+                )
 
             assert len(advance_calls) >= 2, (
                 f'expected the CAS retry to re-advance after the rebase, got '
@@ -871,7 +881,9 @@ class TestScenario10VerifyBaseMismatch:
             # Draining the item clears the surface: quiescence is measured
             # against the main the pipeline actually ends on.
             verify_gate.set()
-            await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+            await wait_responsive(
+                req.result, label='vb10 outcome after the verify-base mismatch drains',
+            )
             main_final = await git_ops.get_main_sha()
             _assert_quiescent(lane, main_final, [req])
 
@@ -1065,8 +1077,12 @@ class TestB8MidPipelineCensus:
             head_gate.set()
             follower_release.set()
 
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_a = await wait_responsive(
+                req_a.result, label='b8-a (N, head) outcome after the mid-pipeline sample',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result, label='b8-b (N+1, remote) outcome after cascade re-merge',
+            )
             assert outcome_a.status not in ('done', 'already_merged'), (
                 f'Expected N to fail (genuine VerifyResult failure), got {outcome_a!r}.'
             )
