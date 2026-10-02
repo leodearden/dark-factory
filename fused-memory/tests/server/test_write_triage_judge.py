@@ -2296,7 +2296,7 @@ class TestJudgeWriteFailuresRaise:
         with pytest.raises(ValueError, match='provider'):
             await _call_llm(
                 provider='gemini', model='m', prompt='p',
-                memory_service=_judge_svc(), timeout=1.0,
+                memory_service=_judge_svc(), timeout=1.0, reasoning_effort=None,
             )
 
 

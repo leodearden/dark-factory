@@ -553,9 +553,10 @@ def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
     lines.append('')
     # The closed vocabulary and the output shape are RESTATED here, next to
     # the data, even though JUDGE_SYSTEM_PROMPT already carries both. Two
-    # reasons, neither cosmetic. (1) The two provider arms deliver the system
-    # prompt differently — openai as messages[0], anthropic via `system=` —
-    # so a wiring mistake on either arm could drop it entirely; restating the
+    # reasons, neither cosmetic. (1) Each provider arm delivers the system
+    # prompt its own way — `instructions=` on the Responses API, messages[0]
+    # on a chat endpoint, `system=` on anthropic — so a wiring mistake on any
+    # arm could drop it entirely; restating the
     # contract in the user turn means the worst case is a weaker prompt, not
     # a model answering in a vocabulary parse_judge_verdict rejects on every
     # single write. (2) An out-of-vocabulary answer is a counted fail-open
@@ -765,13 +766,25 @@ def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
 
 # --- the LLM call ------------------------------------------------------------
 
-#: Output cap. The answer is a closed-vocabulary word plus a candidate id — a
+#: Output cap for the two answer-only arms (anthropic, and a chat-only compat
+#: endpoint). The answer is a closed-vocabulary word plus a candidate id — a
 #: 36-char opaque uuid, which tokenizes far worse than prose — inside a
 #: two-key JSON object. Sized to leave room for a model that adds a short
 #: `reasoning` key (the parser ignores extra keys) without leaving room for an
 #: essay billed per token on every middle-band write. Too tight is not a worse
 #: verdict: a truncated answer is unparseable, i.e. a counted fail-open.
 _JUDGE_MAX_TOKENS = 128
+
+#: The Responses API's ``max_output_tokens``, which bounds reasoning PLUS the
+#: answer, so it is a different dimension from :data:`_JUDGE_MAX_TOKENS`.
+#: Measured 2026-09-30 over 3,669 Responses calls, the largest output was 1,161
+#: tokens (gpt-6-luna at medium effort); gpt-6.1-sol at low peaked at 168 and
+#: every low-effort arm at 476. 2,048 is ~1.8x the largest measured and ~4x any
+#: low-effort arm. Exhaustion is a counted fail-open naming its reason, never a
+#: wrong verdict, and a pathological answer that reaches the cap costs about
+#: USD 0.02 at gpt-6.1-sol list price. See plans/write-triage-flip-readiness-prd.md
+#: §11.
+_JUDGE_MAX_OUTPUT_TOKENS = 2_048
 
 
 class _ProviderCredentials(NamedTuple):
@@ -862,23 +875,35 @@ async def _call_llm(
     prompt: str,
     memory_service: Any,
     timeout: float,
+    reasoning_effort: str | None,
 ) -> _JudgeReply:
     """One single-turn call to *provider*: the raw response text and its usage.
 
-    Mirrors ``reconciliation/judge.py::_call_llm``'s two-arm fan-out at
-    write-path scale. Determinism (``temperature=0.0``) and the token cap
-    (:data:`_JUDGE_MAX_TOKENS`) are pinned IDENTICALLY on both arms: the
-    judge is a classifier answering from a closed vocabulary, so sampling
-    buys nothing and costs parse failures — and a parse failure
-    here is a counted fail-open, not merely a worse answer. Omitting
-    ``temperature`` on an arm does not mean "unset": Anthropic's default is
-    1.0.
+    Three arms behind one dispatch. NATIVE OPENAI — an endpoint that serves the
+    Responses API, per :class:`_ProviderCredentials` — posts
+    ``responses.create``: the system prompt as ``instructions=``, the user turn
+    as ``input=``, a JSON-object text format so that arm's happy path is the
+    parser's, :data:`_JUDGE_MAX_OUTPUT_TOKENS`, and ``reasoning={'effort': …}``
+    only when ``write_triage.judge_reasoning_effort`` is set. It sends NO
+    ``temperature``: reasoning models reject the parameter. A consequence worth
+    knowing when comparing runs: gpt-4o-mini on this arm samples at the
+    provider default rather than at 0.0.
 
-    ``response_format={'type': 'json_object'}`` is the ONLY openai-specific
-    request parameter — Anthropic has no equivalent — and it makes that arm's
-    happy path the parser's happy path. The anthropic arm passes the system
-    prompt via ``system=`` because Anthropic has no system ROLE; a system
-    message would arrive as an ordinary user turn.
+    An OPENAI-COMPATIBLE endpoint (``llm.client_class: openai_generic`` —
+    llama.cpp, vLLM, LM Studio) serves chat.completions only, so it keeps the
+    chat request unchanged: ``temperature=0.0``, :data:`_JUDGE_MAX_TOKENS` and
+    ``response_format`` json_object (task 5277 C owns its compat 400s). Which
+    OpenAI arm runs is decided by that capability flag, never by the model
+    name. The ANTHROPIC arm is unchanged too: ``temperature=0.0``, because
+    Anthropic's default is 1.0 and sampling a closed-vocabulary classifier
+    buys nothing but parse failures, and the system prompt via ``system=``,
+    because Anthropic has no system ROLE.
+
+    A set *reasoning_effort* on an arm that cannot send it RAISES before any
+    client is built. Silently dropping it would let the operator believe the
+    selected configuration is running when it is not (INV-11). Like the
+    unknown-provider raise, it lands in ``triage_write``'s fail-open arm, so it
+    is counted and logged naming the leaf to fix.
 
     The client is constructed PER CALL and deliberately not cached on a module
     global. ``add_memory`` is served by one long-lived server process, and a
@@ -915,67 +940,132 @@ async def _call_llm(
     raising, whereas this raise lands INSIDE the fail-open arm. Silently
     picking an arm here would bill an account the operator never chose.
     """
-    if provider == 'openai':
-        import openai  # noqa: PLC0415 — per-call import, matching judge.py
-
-        async with openai.AsyncOpenAI(
-            **_provider_credentials(memory_service, provider).client_kwargs,
-        ) as client:
-            response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
-                        {'role': 'user', 'content': prompt},
-                    ],
-                    temperature=0.0,
-                    max_tokens=_JUDGE_MAX_TOKENS,
-                    response_format={'type': 'json_object'},
-                ),
-                timeout=timeout,
-            )
-        return _JudgeReply(
-            response.choices[0].message.content or '',
-            _usage_from(
-                getattr(response, 'usage', None),
-                input_field='prompt_tokens',
-                output_field='completion_tokens',
-                details_field='completion_tokens_details',
-            ),
+    if provider not in _KNOWN_PROVIDERS:
+        raise ValueError(
+            f'unknown judge provider {provider!r}; implemented arms are '
+            f'{list(_KNOWN_PROVIDERS)}',
         )
-
+    creds = _provider_credentials(memory_service, provider)
+    if reasoning_effort is not None and not creds.serves_responses_api:
+        why = (
+            'the anthropic arm has no reasoning-effort parameter'
+            if provider == 'anthropic'
+            else "llm.client_class='openai_generic' names an endpoint serving "
+            'chat.completions only'
+        )
+        raise ValueError(
+            f'write_triage.judge_reasoning_effort={reasoning_effort!r} cannot be '
+            f'sent: {why}. Set it to null for this arm, or judge on an endpoint '
+            'that serves the Responses API.',
+        )
     if provider == 'anthropic':
-        import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
-
-        async with anthropic.AsyncAnthropic(
-            **_provider_credentials(memory_service, provider).client_kwargs,
-        ) as client:
-            response = await asyncio.wait_for(
-                client.messages.create(
-                    model=model,
-                    temperature=0.0,
-                    max_tokens=_JUDGE_MAX_TOKENS,
-                    system=JUDGE_SYSTEM_PROMPT,
-                    messages=[{'role': 'user', 'content': prompt}],
-                ),
-                timeout=timeout,
-            )
-        # First TEXT block, not first block: a leading thinking/tool_use block
-        # must not be read as the answer.
-        text_blocks = [b for b in response.content if b.type == 'text']
-        return _JudgeReply(
-            text_blocks[0].text if text_blocks else '',
-            _usage_from(
-                getattr(response, 'usage', None),
-                input_field='input_tokens',
-                output_field='output_tokens',
-                details_field=None,
-            ),
+        return await _call_anthropic(creds, model=model, prompt=prompt, timeout=timeout)
+    if creds.serves_responses_api:
+        return await _call_openai_responses(
+            creds, model=model, prompt=prompt, timeout=timeout,
+            reasoning_effort=reasoning_effort,
         )
+    return await _call_openai_chat(creds, model=model, prompt=prompt, timeout=timeout)
 
-    raise ValueError(
-        f'unknown judge provider {provider!r}; implemented arms are '
-        f'{list(_KNOWN_PROVIDERS)}',
+
+async def _call_openai_responses(
+    creds: _ProviderCredentials,
+    *,
+    model: str,
+    prompt: str,
+    timeout: float,
+    reasoning_effort: str | None,
+) -> _JudgeReply:
+    """Native OpenAI, on the Responses API that frontier reasoning models require."""
+    import openai  # noqa: PLC0415 — per-call import, matching judge.py
+
+    # Omitted outright when unset, not sent as the SDK's `omit`, so the call's
+    # kwargs say exactly what reaches the wire.
+    reasoning: dict[str, Any] = (
+        {} if reasoning_effort is None else {'reasoning': {'effort': reasoning_effort}}
+    )
+    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+        response = await asyncio.wait_for(
+            client.responses.create(
+                model=model,
+                instructions=JUDGE_SYSTEM_PROMPT,
+                input=prompt,
+                max_output_tokens=_JUDGE_MAX_OUTPUT_TOKENS,
+                text={'format': {'type': 'json_object'}},
+                **reasoning,
+            ),
+            timeout=timeout,
+        )
+    return _JudgeReply(
+        response.output_text or '',
+        _usage_from(
+            getattr(response, 'usage', None),
+            input_field='input_tokens',
+            output_field='output_tokens',
+            details_field='output_tokens_details',
+        ),
+    )
+
+
+async def _call_openai_chat(
+    creds: _ProviderCredentials, *, model: str, prompt: str, timeout: float,
+) -> _JudgeReply:
+    """An OpenAI-compatible endpoint that serves chat.completions only."""
+    import openai  # noqa: PLC0415 — per-call import, matching judge.py
+
+    async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[
+                    {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
+                    {'role': 'user', 'content': prompt},
+                ],
+                temperature=0.0,
+                max_tokens=_JUDGE_MAX_TOKENS,
+                response_format={'type': 'json_object'},
+            ),
+            timeout=timeout,
+        )
+    return _JudgeReply(
+        response.choices[0].message.content or '',
+        _usage_from(
+            getattr(response, 'usage', None),
+            input_field='prompt_tokens',
+            output_field='completion_tokens',
+            details_field='completion_tokens_details',
+        ),
+    )
+
+
+async def _call_anthropic(
+    creds: _ProviderCredentials, *, model: str, prompt: str, timeout: float,
+) -> _JudgeReply:
+    """The anthropic Messages API."""
+    import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
+
+    async with anthropic.AsyncAnthropic(**creds.client_kwargs) as client:
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model=model,
+                temperature=0.0,
+                max_tokens=_JUDGE_MAX_TOKENS,
+                system=JUDGE_SYSTEM_PROMPT,
+                messages=[{'role': 'user', 'content': prompt}],
+            ),
+            timeout=timeout,
+        )
+    # First TEXT block, not first block: a leading thinking/tool_use block
+    # must not be read as the answer.
+    text_blocks = [b for b in response.content if b.type == 'text']
+    return _JudgeReply(
+        text_blocks[0].text if text_blocks else '',
+        _usage_from(
+            getattr(response, 'usage', None),
+            input_field='input_tokens',
+            output_field='output_tokens',
+            details_field=None,
+        ),
     )
 
 
@@ -1035,7 +1125,10 @@ async def judge_write(
     committed calibration report is the product of live OpenAI calls from this
     same checkout. The anthropic arm is implemented and selectable by config
     for a deployment that has the key; PRD C1's "haiku-class" is a cost/size
-    class, not a vendor pin.
+    class, not a vendor pin. On openai, an endpoint that serves the Responses
+    API (the shipped ``llm.client_class: openai``) is called through it, with
+    ``write_triage.judge_reasoning_effort`` sent when set; a chat-only
+    compatible endpoint keeps chat.completions (see :func:`_call_llm`).
 
     USAGE. The verdict carries what the provider reported for the call
     (``TriageJudgeVerdict.usage``), so the eval can price a write without
@@ -1071,6 +1164,7 @@ async def judge_write(
         prompt=build_judge_prompt(content, selected),
         memory_service=memory_service,
         timeout=resolve_judge_timeout(memory_service),
+        reasoning_effort=resolve_judge_reasoning_effort(memory_service),
     )
     verdict = parse_judge_verdict(reply.text, [candidate.id for candidate in selected])
     return verdict._replace(usage=reply.usage)
