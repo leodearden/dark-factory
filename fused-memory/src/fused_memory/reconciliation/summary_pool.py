@@ -145,7 +145,7 @@ async def _warn_on_untrimmable_pool_residue(
     strips ``recon_pool`` from any write whose ``kind`` is not
     ``cycle_summary``. The residue this backstop reports is what remains —
     records written before task 3239, and ``update_memory`` patches, which do
-    not run the add-path tagging helper.
+    not run the add-path tagging helper (that gap is tracked as task 6054).
 
     So the narrowed delete filter stays and the pool gets an observability
     backstop instead: one ``count_memories_by_metadata`` on the ``recon_pool``
