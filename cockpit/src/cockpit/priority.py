@@ -490,18 +490,14 @@ def load_priorities(path: Path | None = None) -> Priorities:
 
 
 def save_priorities(priorities: Priorities, path: Path | None = None) -> None:
-    """Atomically write *priorities* to *path* (default ``~/.claude/fleet/priorities.yaml``).
+    """Atomically write *priorities* to *path*, owner-only (0600).
 
-    The exact inverse of load_priorities/_priorities_from_dict (see
+    *path* defaults to ``~/.claude/fleet/priorities.yaml``. The exact inverse of load_priorities/_priorities_from_dict (see
     _priorities_to_dict): writes the same six sections load_priorities
     reads, so ``load_priorities(path) == priorities`` after this call.
-    Delegates to ``shared/src/shared/safe_io.py::atomic_write_text`` (with
-    ``mode=0o600``, preserving the owner-only permissions the former
-    hand-rolled mkstemp writer produced), so a save is never observed
-    half-written. Fail-soft: ANY exception during the write (not just
-    OSError -- e.g. an unexpected yaml.safe_dump fault) is logged and
-    swallowed, never raised, per the cockpit's hard constraint that a view
-    must never be a dependency (PRD §2).
+    Never raises: ANY exception during the write -- e.g. an unexpected
+    yaml.safe_dump fault -- is logged and swallowed, because a view must
+    never be a dependency (PRD §2).
     """
     target = path if path is not None else _default_priorities_path()
     try:

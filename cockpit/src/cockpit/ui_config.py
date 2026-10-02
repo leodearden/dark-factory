@@ -72,15 +72,11 @@ def load_ui_config(root: Path | str | None = None) -> CockpitUIConfig:
 
 
 def save_ui_config(cfg: CockpitUIConfig, root: Path | str | None = None) -> None:
-    """Atomically write *cfg* to ``ui_config_path(root)``.
+    """Atomically write *cfg* to ``ui_config_path(root)``, owner-only (0600).
 
-    Delegates to ``shared/src/shared/safe_io.py::atomic_write_text`` (with
-    ``mode=0o600``, preserving the owner-only permissions the former
-    hand-rolled mkstemp writer produced), so a save is never observed
-    half-written. Fail-soft: ANY exception during the write (not just
-    OSError -- e.g. a json.dumps TypeError from a non-serializable field) is
-    logged and swallowed, never raised, per the cockpit's hard constraint
-    that a view must never be a dependency (PRD §2).
+    Never raises: ANY exception during the write -- e.g. a json.dumps
+    TypeError from a non-serializable field -- is logged and swallowed,
+    because a view must never be a dependency (PRD §2).
 
     This write is synchronous, and is deliberately NOT called once per UI
     event: ``cockpit/src/cockpit/app.py::CockpitApp._flush_ui_config``

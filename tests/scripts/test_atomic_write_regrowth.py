@@ -89,11 +89,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # SCOPE LIMIT — the fence is narrower than "the repo", and saying so matters
 # more than the fence looking complete.  Task 3388 widened ``_SRC_TREES`` from
 # three trees to six: ``shared/src``, ``orchestrator/src``, ``escalation/src``,
-# ``fused-memory/src``, ``fused-memory/scripts`` and ``scripts``.  Task 5261
-# widened it from six to nine with ``cockpit/src``, ``dashboard/src`` and
-# ``sampler/src``, which surfaced exactly two writers
-# (cockpit priority.py::save_priorities and ui_config.py::save_ui_config).
-# Both were MIGRATED to ``atomic_write_text``, not allowlisted.
+# ``fused-memory/src``, ``fused-memory/scripts`` and ``scripts``.
+# ``cockpit/src``, ``dashboard/src`` and ``sampler/src`` complete the set: the
+# ``src`` of every workspace member is fenced.
 #
 # THE COUNT, CORRECTED BY MEASUREMENT.  Widening surfaced SEVENTEEN unmigrated
 # hand-rolled writers, not the six this block used to enumerate — and not the
@@ -103,25 +101,20 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # included, and re-run it rather than re-trusting the sentence.  A fence sized
 # from stale prose is not a fence, which is the whole reason 3388 existed.
 #
-# STILL NOT SCANNED, stated with COUNTS rather than bare directory names so the
-# claim is falsifiable (measured with ``_find_renamers`` at 421c86b9ad):
-# ``skills`` 0; the repo-root ``tests/`` 0.
+# STILL NOT SCANNED: ``skills``, the repo-root ``tests/``, and the tests dirs
+# of the ``*/src`` packages.  Run ``_find_renamers`` over one to learn what it
+# holds; no count is written here, for the reason given above.
 #
 # TEST DIRECTORIES.  ``fused-memory/scripts`` and ``scripts`` are scanned
 # WHOLESALE, tests included, rather than through an exclusion mirroring the
 # ``*/src`` convention: a flat operator directory has no ``src/`` boundary to
 # mirror, and the one place a regrown production writer could hide is precisely
-# a directory somebody decided not to look at.  That is nearly free today: the
-# one test dir INSIDE a scanned tree, ``scripts/tests``, carries 1 renamer —
-# the allowlisted ``_write_heartbeat`` fixture.  Stated in that scoped form
-# deliberately: the general claim "test trees are clean" is FALSE.  The tests
-# dirs of the ``*/src`` packages sit OUTSIDE every scanned tree, and measured
-# with ``_find_renamers`` at 421c86b9ad they carry: ``shared/tests`` 0,
-# ``fused-memory/tests`` 1, ``orchestrator/tests`` 2, ``escalation/tests`` 5,
-# ``cockpit/tests`` 0, ``dashboard/tests`` 0, ``sampler/tests`` 0.  None of
-# those affects red/green — but they are live evidence that test directories
-# do accumulate this pattern over time, and so that an exclusion would not have
-# stayed harmless.
+# a directory somebody decided not to look at.  So a renamer in
+# ``scripts/tests`` needs an allowlist entry, as the ``_write_heartbeat``
+# fixture has.  The general claim "test trees are clean" is FALSE: the tests
+# dirs of the ``*/src`` packages, which sit OUTSIDE every scanned tree, have
+# accumulated hand-rolled renamers, so an exclusion would not have stayed
+# harmless.
 
 _SRC_TREES = (
     'shared/src',
@@ -629,13 +622,7 @@ def _scan_source_trees() -> tuple[_ScannedModule, ...]:
 
 
 def _iter_source_files():
-    """Yield (repo-relative posix path, source text) for every scanned tree.
-
-    "Every scanned tree" means ``_SRC_TREES``, whatever that currently holds.
-    Stated by reference rather than by count: this sentence used to say "the
-    three src trees" and stayed there through the widening to six (task 3388),
-    then said "six at the time of writing" through the widening to nine (task
-    5261) — precisely the stale-prose failure this module exists to prevent.
+    """Yield (repo-relative posix path, source text) for every tree in ``_SRC_TREES``.
 
     A thin view over the cached ``_read_tree``, which carries the hard
     ``assert root.is_dir()`` and the argument for keeping it hard.  Kept as a
@@ -775,11 +762,7 @@ class TestNoRegrownAtomicWriters:
         assert _find_renamers(prose_only) == []
 
     def test_no_unapproved_renamers_in_source_trees(self):
-        """Every rename-into-place in the scanned trees is a known, reasoned survivor.
-
-        Scanned trees = ``_SRC_TREES``.  Read the tuple — see
-        _iter_source_files on why no count is written here.
-        """
+        """Every rename-into-place in a ``_SRC_TREES`` tree is a known, reasoned survivor."""
         actual = {
             (module.relpath, qualname)
             for module in _scan_source_trees()
