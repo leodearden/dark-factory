@@ -25,7 +25,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pydantic_core
 import pytest
+from _fm_helpers import MCP_SAFE_RESPONSE_CHARS
 
 import fused_memory.server.tools as tools_module
 from fused_memory.config.schema import Mem0UpdateConfig
@@ -2417,27 +2419,13 @@ class TestTheEnvelopeSurvivesTheExtraction:
     be covered by the first.
     """
 
-    #: The closure listing every member of this fixture's topic, as
-    #: `get_memories_by_metadata` lifts it (`created_at` flat, not nested).
+    #: The closure listing every member of this fixture's topic. Task 5275
+    #: projected it to the id and the canonical flag; every other key of
+    #: both pins is unchanged from the original capture.
     _TOPIC_MEMBERS = [
-        {
-            'id': S1,
-            'content': f'record {S1}',
-            'created_at': CREATED_AT,
-            'metadata': {'topic': TOPIC},
-        },
-        {
-            'id': S2,
-            'content': f'record {S2}',
-            'created_at': CREATED_AT,
-            'metadata': {'topic': TOPIC},
-        },
-        {
-            'id': S3,
-            'content': f'record {S3}',
-            'created_at': CREATED_AT,
-            'metadata': {'topic': TOPIC},
-        },
+        {'id': S1, 'canonical': False},
+        {'id': S2, 'canonical': False},
+        {'id': S3, 'canonical': False},
     ]
 
     @pytest.mark.asyncio
@@ -2548,3 +2536,74 @@ class TestTheClosureListingIsReadAfterTheFold:
         await call_consolidate(svc, **shape)
 
         svc.get_memories_by_metadata.assert_awaited_once()
+
+
+class TestTheClosureListingIsProjected:
+    """The envelope is the ONLY record of an irreversible multi-delete, so a
+    dumping-ground topic must not push it past the MCP transport limit, where
+    it is rejected wholesale and every per-id disposition is lost for records
+    that are already gone. A closure proof needs the id and the canonical
+    flag; the rest of a row is one `get_memory_by_id` away (task 5275)."""
+
+    @pytest.mark.asyncio
+    async def test_member_rows_carry_only_the_id_and_the_canonical_flag(self):
+        svc = make_service()
+        svc.get_memories_by_metadata = AsyncMock(
+            return_value=[
+                _scroll_row(
+                    CANONICAL, content='x' * 500, canonical=True, supersedes=list(SUPERSEDES)
+                ),
+                _scroll_row(RETAIN_1, content='y' * 500, source='recon'),
+            ]
+        )
+
+        result = await call_consolidate(svc)
+
+        assert result['topic_members'] == [
+            {'id': CANONICAL, 'canonical': True},
+            {'id': RETAIN_1, 'canonical': False},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_full_listing_of_fat_members_stays_inside_the_transport_envelope(self):
+        from fused_memory.services.consolidation_ops import TOPIC_MEMBER_LIMIT
+
+        ids = [f'{i:08x}-0000-4000-8000-000000000000' for i in range(TOPIC_MEMBER_LIMIT)]
+        svc = make_service(
+            topic_members=ids, topic_total=512, contents={m: 'x' * 2_000 for m in ids}
+        )
+
+        result = await call_consolidate(svc)
+
+        raw_rows = [_scroll_row(m, content='x' * 2_000) for m in ids]
+        assert len(json.dumps(raw_rows)) > MCP_SAFE_RESPONSE_CHARS
+        # The TextContent FastMCP emits for a dict result.
+        assert len(pydantic_core.to_json(result, indent=2)) < MCP_SAFE_RESPONSE_CHARS
+        assert result['status'] == 'consolidated'
+        assert result['deleted'] == SUPERSEDES
+        assert result['survivors'] == []
+        assert result['failed_deletes'] == []
+        assert result['topic_members_truncated'] is True
+        assert result['topic_members_total'] == 512
+        assert len(result['topic_members']) == TOPIC_MEMBER_LIMIT
+
+    def test_a_malformed_closure_row_never_costs_the_envelope(self):
+        result = build_consolidation_result(
+            canonical_id=CANONICAL,
+            topic=TOPIC,
+            deleted=[S1],
+            failed_deletes=[],
+            survivors=[],
+            topic_members=[
+                {'id': CANONICAL, 'metadata': None},
+                'not-a-row',
+                {'id': RETAIN_1, 'metadata': {'canonical': 'true'}},
+            ],
+        )
+
+        assert result['deleted'] == [S1]
+        assert result['topic_members'] == [
+            {'id': CANONICAL, 'canonical': False},
+            {'id': None, 'canonical': False},
+            {'id': RETAIN_1, 'canonical': False},
+        ]
