@@ -3324,7 +3324,7 @@ class TestChainInvalidationUnderOverlap:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 65s worst case
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 4846: 125s worst case
 class TestHaltAndUnavailable:
     """step-21 RED tests: halt aborts all in-flight; RUNNER_UNAVAILABLE quarantine.
 
@@ -3461,8 +3461,6 @@ class TestHaltAndUnavailable:
         in _runner_quarantine, item is re-dispatched on local, req_b resolves
         'done' after a proper re-verify.
         """
-        import contextlib
-
         from orchestrator.verify_runner import RunnerUnavailable
 
         gate_a_release = asyncio.Event()
@@ -3508,37 +3506,46 @@ class TestHaltAndUnavailable:
 
         worker_task = asyncio.create_task(worker.run())
 
-        await q.put(req_a)
-        await q.put(req_b)
-
-        # Wait for both verifies to enter
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=15.0)
-        await asyncio.wait_for(gate_b_entered.wait(), timeout=15.0)
-
-        # N+1's runner already raised RunnerUnavailable (no gate; fires immediately)
-        # Release N's gate so it can complete
-        gate_a_release.set()
-
-        # Wait for both to resolve
         try:
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=15.0)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=15.0)
-        except TimeoutError:
-            outcome_a = None
-            outcome_b = None
-        finally:
-            await worker.stop()
+            await q.put(req_a)
+            await q.put(req_b)
 
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=5.0)
+            # Wait for both verifies to enter
+            await wait_responsive(
+                gate_a_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='unav-a: local verify entered',
+            )
+            await wait_responsive(
+                gate_b_entered.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='unav-b: remote verify entered',
+            )
+
+            # N+1's runner already raised RunnerUnavailable (no gate; fires
+            # immediately). Release N's gate so it can complete.
+            gate_a_release.set()
+
+            outcome_a = await wait_responsive(
+                req_a.result,
+                timeout=15.0,
+                label='unav-a: MergeOutcome (local verify passed)',
+            )
+            outcome_b = await wait_responsive(
+                req_b.result,
+                timeout=15.0,
+                label='unav-b: MergeOutcome (re-dispatched on local after quarantine)',
+            )
+        finally:
+            await _stop_worker(worker, worker_task)
 
         # N should resolve 'done' (local verify passed)
-        assert outcome_a is not None and outcome_a.status == 'done', (
+        assert outcome_a.status == 'done', (
             f'Expected N to resolve "done", got {outcome_a!r}'
         )
 
         # N+1 should also resolve 'done' (re-dispatched on local fallback)
-        assert outcome_b is not None and outcome_b.status == 'done', (
+        assert outcome_b.status == 'done', (
             f'Expected N+1 to resolve "done" after re-dispatch on local, got {outcome_b!r}. '
             'RED: RUNNER_UNAVAILABLE falls through to PASS → unverified advance.'
         )
@@ -7495,8 +7502,9 @@ class TestTimeoutMarkOffenders:
 # see the policy note above test_merge_speculation.py::TestTimeoutMarkCoverage.
 #
 # THIS FILE CARRIES DEBT under that rule: it is on the shrink-only, opt-out
-# `_WALL_CLOCK_DEADLINE_DEBT` baseline at its measured day-one count (90
-# violations), so its pre-existing sites are grandfathered but the budget is
+# `_WALL_CLOCK_DEADLINE_DEBT` baseline, recorded at its measured day-one count
+# (90 violations) and lowered as sites migrate, so its pre-existing sites are
+# grandfathered but the budget is
 # CHECKED — add one more offending wait and the gate reports the overrun. New
 # load-bearing waits added here must therefore use `wait_responsive(...)`, and
 # the recorded number may only be lowered as sites are migrated, never raised.
