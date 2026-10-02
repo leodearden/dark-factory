@@ -2609,7 +2609,7 @@ class WriteTriageConfig(BaseModel):
         ),
     )
     judge_timeout_seconds: float = Field(
-        default=10.0,
+        default=15.0,
         gt=0,
         description=(
             'Per-call wall-clock budget for the judge, enforced with '
@@ -2621,7 +2621,9 @@ class WriteTriageConfig(BaseModel):
             'TimeoutError propagates into triage_write\'s fail-open arm, which '
             'is exactly C1\'s "judge error/timeout => stored + storm counter" '
             '(INV-4). Bounded gt=0 because a zero budget would fail every call '
-            'and read as a total judge outage caused by nothing.'
+            'and read as a total judge outage caused by nothing. 15 s rather '
+            'than 10 s because the frontier judge arms measured p95 4.6-6.4 s '
+            '(plans/write-triage-flip-readiness-prd.md §11.2 D15).'
         ),
     )
     judge_reasoning_effort: JudgeReasoningEffort | None = Field(

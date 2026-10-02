@@ -618,10 +618,13 @@ _DEFAULT_MODEL_BY_PROVIDER = {
 #: No LLM call anywhere in fused-memory sets a timeout today, and the openai
 #: SDK default is 600 seconds. On the SYNCHRONOUS ``add_memory`` write path
 #: that is a wedge, not a degradation: the caller waits ten minutes for a
-#: write C1 promises never to block. Ten seconds is generous for a ~2.5k-token
-#: single-turn classification and bounded enough that a hung provider costs
-#: one slow write rather than a hung server.
-_DEFAULT_JUDGE_TIMEOUT_SECONDS = 10.0
+#: write C1 promises never to block. This bound keeps a hung provider to one
+#: slow write rather than a hung server. It is 15 s rather than 10 s because
+#: the frontier arms the judge-arm selection chooses between measured p95
+#: 4.6–6.4 s against gpt-4o-mini's 1.7–1.9 s, and 10 s would cut into the tail
+#: of the arm being selected (plans/write-triage-flip-readiness-prd.md §11.2
+#: D15).
+_DEFAULT_JUDGE_TIMEOUT_SECONDS = 15.0
 
 
 def _judge_attr(memory_service: Any, attr: str) -> Any:
