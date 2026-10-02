@@ -117,6 +117,34 @@ def test_guidance_appears_exactly_once_per_role():
     )
 
 
+def _assert_lands_after(*, follows: str, follows_name: str, remedy: str) -> None:
+    """The contract's constant starts at or after the end of ``follows`` in every role.
+
+    Order only, never adjacency. ABSENT (either constant) is recorded, never
+    skipped, so this cannot pass vacuously on a role that dropped a splice.
+    """
+    offenders: dict[str, dict[str, object]] = {}
+    for role in sorted(_CONTRACT.roles):
+        prompt = _CONTRACT.all_roles[role].system_prompt
+        idx = prompt.find(_CONTRACT.constant)
+        follows_idx = prompt.find(follows)
+        if idx == -1 or follows_idx == -1:
+            offenders[role] = {
+                'offset': idx if idx != -1 else 'ABSENT',
+                'follows_offset': follows_idx if follows_idx != -1 else 'ABSENT',
+            }
+            continue
+        earliest_allowed = follows_idx + len(follows)
+        if idx < earliest_allowed:
+            offenders[role] = {'offset': idx, 'earliest_allowed': earliest_allowed}
+
+    assert offenders == {}, (
+        f'Roles placing {_CONTRACT.constant_name} before the end of '
+        f"{follows_name}: {offenders}. An 'ABSENT' offset means that constant "
+        f'is missing from the role entirely. {remedy}'
+    )
+
+
 def test_guidance_lands_after_the_grep_block():
     """The block lands anywhere after `GREP_LOOKAROUND_GUIDANCE` ends.
 
@@ -127,29 +155,14 @@ def test_guidance_lands_after_the_grep_block():
     (b) Adjacency is deliberately NOT pinned. Sibling census blocks append to
     the same tail of `_BASH_CAPABLE_ROLE_PREAMBLE` concurrently, so "immediately
     after X" would make whichever branch merges second fail its own test.
-
-    ABSENT is recorded, never skipped, so this cannot pass vacuously.
     """
-    offenders: dict[str, dict[str, object]] = {}
-    for role in sorted(_CONTRACT.roles):
-        prompt = _CONTRACT.all_roles[role].system_prompt
-        idx = prompt.find(PKILL_SELF_MATCH_GUIDANCE)
-        grep_idx = prompt.find(GREP_LOOKAROUND_GUIDANCE)
-        if idx == -1 or grep_idx == -1:
-            offenders[role] = {
-                'offset': idx if idx != -1 else 'ABSENT',
-                'follows_offset': grep_idx if grep_idx != -1 else 'ABSENT',
-            }
-            continue
-        earliest_allowed = grep_idx + len(GREP_LOOKAROUND_GUIDANCE)
-        if idx < earliest_allowed:
-            offenders[role] = {'offset': idx, 'earliest_allowed': earliest_allowed}
-
-    assert offenders == {}, (
-        f'Roles placing PKILL_SELF_MATCH_GUIDANCE incorrectly: {offenders}. It '
-        'must land anywhere after GREP_LOOKAROUND_GUIDANCE ends. Append it at '
-        'the tail of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE; moving it earlier '
-        'breaks the adjacency pins of the blocks ahead of it.'
+    _assert_lands_after(
+        follows=GREP_LOOKAROUND_GUIDANCE,
+        follows_name='GREP_LOOKAROUND_GUIDANCE',
+        remedy=(
+            'Append it at the tail of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE; '
+            'moving it earlier breaks the adjacency pins of the blocks ahead of it.'
+        ),
     )
 
 
@@ -159,20 +172,12 @@ def test_wait_section_pointers_cannot_dangle():
     The prose points at the exit-code section and at the wait section's
     termination tool, both members of that block. The structural twin of
     `orchestrator/tests/test_roles_wait_pattern.py::test_amender_reminder_cannot_dangle`.
-    A role where either constant is absent is recorded (offset -1), never
-    skipped.
     """
-    offenders: dict[str, dict[str, int]] = {}
-    for role in sorted(_CONTRACT.roles):
-        prompt = _CONTRACT.all_roles[role].system_prompt
-        wait_offset = prompt.find(BACKGROUND_WAIT_GUIDANCE)
-        pkill_offset = prompt.find(PKILL_SELF_MATCH_GUIDANCE)
-        if not 0 <= wait_offset < pkill_offset:
-            offenders[role] = {'wait_offset': wait_offset, 'pkill_offset': pkill_offset}
-
-    assert offenders == {}, (
-        f'Roles where PKILL_SELF_MATCH_GUIDANCE does not follow '
-        f'BACKGROUND_WAIT_GUIDANCE: {offenders}. Its pointers to the exit-code '
-        'and wait sections "above" would dangle. Keep both in the preamble, '
-        'the wait block first.'
+    _assert_lands_after(
+        follows=BACKGROUND_WAIT_GUIDANCE,
+        follows_name='BACKGROUND_WAIT_GUIDANCE',
+        remedy=(
+            'Its pointers to the exit-code and wait sections "above" would '
+            'dangle. Keep both in the preamble, the wait block first.'
+        ),
     )
