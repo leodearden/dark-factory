@@ -46,7 +46,7 @@ def finalize_module():
     """
     sys.path.insert(0, _SCRIPTS_DIR)
     try:
-        import cgl_eta_finalize_gate
+        import cgl_eta_finalize_gate  # pyright: ignore[reportMissingImports]
         yield cgl_eta_finalize_gate
     finally:
         sys.path.remove(_SCRIPTS_DIR)
