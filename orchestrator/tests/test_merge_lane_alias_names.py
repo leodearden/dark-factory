@@ -18,11 +18,16 @@ through an alias, each checked with ``hasattr`` against the live module:
   bare ``orchestrator.<leaf>.N`` chain);
 * a string constant ``'<alias>.N…'``, a ``patch`` or ``monkeypatch`` target,
   checked on its first segment after the alias.
+
+The facade ``orchestrator.merge_lane`` has the same blind spot (its export
+table is a module ``__getattr__``), so ``from orchestrator.merge_lane import N``
+is checked too: ``N`` must be an export or a submodule.
 """
 from __future__ import annotations
 
 import ast
 import importlib
+import importlib.util
 import re
 import sys
 from collections.abc import Iterator, Mapping
@@ -45,6 +50,11 @@ if str(_SCRIPTS) not in sys.path:
 import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
+
+_FACADE = 'orchestrator.merge_lane'
+
+#: Where a ``from <module> import N`` is checked: every alias, and the facade.
+_FROM_IMPORT_CHECKED = frozenset({*metrics.ALIAS_MODULES, _FACADE})
 
 _DOTTED_NAME = re.compile(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*')
 
@@ -137,6 +147,11 @@ def _attribute_references(tree: ast.Module) -> Iterator[tuple[int, str, str]]:
     yield from visit(tree, {})
 
 
+def _is_submodule(module: str, name: str) -> bool:
+    """``from <package> import <submodule>`` imports it even when no attribute exists yet."""
+    return module == _FACADE and importlib.util.find_spec(f'{module}.{name}') is not None
+
+
 def stale_alias_references(
     source: str, *, path: str, live: Mapping[str, ModuleType],
 ) -> list[str]:
@@ -145,14 +160,14 @@ def stale_alias_references(
     stale: list[str] = []
 
     def check(lineno: int, kind: str, alias: str, name: str) -> None:
-        if not hasattr(live[alias], name):
+        if not hasattr(live[alias], name) and not _is_submodule(alias, name):
             stale.append(f'{path}:{lineno}: {kind} {alias}.{name}')
 
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.ImportFrom)
             and node.module is not None
-            and node.module in metrics.ALIAS_MODULES
+            and node.module in _FROM_IMPORT_CHECKED
         ):
             for imported in node.names:
                 if imported.name != '*':
@@ -172,7 +187,7 @@ def stale_alias_references(
 
 @pytest.fixture(scope='module')
 def live_aliases() -> dict[str, ModuleType]:
-    return {alias: importlib.import_module(alias) for alias in metrics.ALIAS_MODULES}
+    return {module: importlib.import_module(module) for module in _FROM_IMPORT_CHECKED}
 
 
 def test_no_tracked_file_reaches_a_missing_name_through_an_alias(
@@ -203,6 +218,7 @@ class TestStaleAliasReferences:
         "patch('orchestrator.merge_queue.NoSuchName.attr', 1)\n",
         "monkeypatch.setattr('orchestrator.merge_queue_store.NoSuchName', 1)\n",
         'def f():\n    import orchestrator.merge_queue as mq\n    return mq.NoSuchName\n',
+        'from orchestrator.merge_lane import NoSuchName\n',
     ])
     def test_a_stale_reference_is_flagged(
         self, source: str, live_aliases: dict[str, ModuleType],
@@ -218,6 +234,8 @@ class TestStaleAliasReferences:
         "patch('orchestrator.merge_lane.gates.NotAnAliasPath', 1)\n",
         'def f(mq):\n    return mq.put\nimport orchestrator.merge_queue as mq\n',
         'mq = object()\nmq.anything\n',
+        'from orchestrator.merge_lane import MergeLane, WaiterRecord\n',
+        'from orchestrator.merge_lane import landed_outbox\n',
     ])
     def test_a_live_or_unrelated_reference_is_not_flagged(
         self, source: str, live_aliases: dict[str, ModuleType],

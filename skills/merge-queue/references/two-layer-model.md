@@ -171,8 +171,7 @@ The merge-queue data types and the registries that own them live in
 `orchestrator/src/orchestrator/merge_lane/types.py` (task α of
 `plans/merge-queue-modularization-invariants-prd.md`; moved from `merge_types.py` by task 5036).
 Importers use `orchestrator.merge_lane.types`; the façade (`orchestrator/merge_lane/__init__.py`)
-exports the public subset. Also defined here since task 5036 (formerly worker-resident):
-`_HEARTBEAT_POLL_S` and `_MERGE_AHEAD_BOUND`.
+exports the public subset.
 
 | Symbol | Location | Description |
 |--------|----------|-------------|
@@ -198,8 +197,6 @@ exports the public subset. Also defined here since task 5036 (formerly worker-re
 | `MergeReadyPredicate` | merge_lane/types.py | Type alias for the injectable merge-ready confidence-gate predicate (δ/1720) |
 | `_HostUnavailability` | merge_lane/types.py | Per-host `RunnerUnavailable` streak tracker entry (task 1795) |
 | `_INFLIGHT_MERGE_ETA_ESTIMATE_SECS` | merge_lane/types.py | Coarse ETA estimate (seconds) used by `InFlightMergeRegistry.eta_seconds` |
-| `_HEARTBEAT_POLL_S` | merge_lane/types.py | How often the worker heartbeat loop wakes (30.0 s); moved out of the worker, task 5036 |
-| `_MERGE_AHEAD_BOUND` | merge_lane/types.py | Max counted (non-speculative, non-train) items in the verifier queue at once (= 1; Mechanism 1, task 1646); moved out of the worker, task 5036 |
 
 ### 7.2 merge_lane/gates.py — post-merge gates + finalize + reason prefixes (MQ-refactor task β)
 
@@ -311,9 +308,9 @@ than verify-parity detection (the shadow/drift detective family in `shadow.py` /
 The module is `orchestrator/src/orchestrator/merge_lane/liveness.py` (task 5036 moved it from
 `merge_liveness.py`); every target in it is a SYNC function.
 
-**Constants:** `TOUCH_MISS_TOLERANCE` and `INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` are defined in
-`liveness.py` itself; `_HEARTBEAT_POLL_S` and `_MERGE_AHEAD_BOUND` are defined in
-`merge_lane/types.py` and imported here. The module imports nothing from the worker.
+**Constants:** `TOUCH_MISS_TOLERANCE`, `INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`, `_HEARTBEAT_POLL_S`
+and `_MERGE_AHEAD_BOUND` are all defined in `liveness.py` itself; the worker imports them from
+here. The module imports nothing from the worker.
 
 **Engine-constant default-argument hazard:** `liveness_secs` (on `check_merge_liveness_margin` /
 `enforce_merge_liveness_margin`) and `merge_ahead_bound` (on
@@ -340,6 +337,8 @@ test or config patches later.
 | `enforce_persistent_worktree_serial_lane()` | merge_lane/liveness.py | Fail-closed startup guard: per-host in-flight verify count must not exceed 1 |
 | `TOUCH_MISS_TOLERANCE` | merge_lane/liveness.py | Consecutive heartbeat ticks a live worker's `_merge-*` worktrees may miss before mtime ages into the reaper window (= 20); moved out of the worker, task 5036 |
 | `INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` | merge_lane/liveness.py | The reaper's liveness window in seconds (= 10800); moved out of the worker, task 5036 |
+| `_HEARTBEAT_POLL_S` | merge_lane/liveness.py | How often the worker heartbeat loop wakes (30.0 s); moved out of the worker, task 5036 |
+| `_MERGE_AHEAD_BOUND` | merge_lane/liveness.py | Max counted (non-speculative, non-train) items in the verifier queue at once (= 1; Mechanism 1, task 1646); moved out of the worker, task 5036 |
 
 ### 7.6 suffix_graph.py — SuffixConflictTracker (conflict graph + bounce state) (MQ-refactor task δ)
 
