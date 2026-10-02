@@ -1622,11 +1622,12 @@ merge_verify_max_concurrent_modules: 1
 # every verdict is a REMOTE verdict, so verify_drift_check_every_n_lands is the
 # standing fidelity guard: 10 here, not the 20 of the PRD's first draft. A drift check
 # leases BOTH hosts and runs both legs, so 1-in-10 gives back a little local CPU.
-# verify_cross_check_remote_green is deliberately NOT set (2026-09-30): the code
-# default TRUE applies — every non-trivial remote green gets a blocking local
-# re-verify — for the 3-day parity window that opens when this block first goes live
-# (the next restart of any kind; deliberately 5054's). Task 5416 runs the window and
-# owns the OFF step (reload), so there is nothing to edit here.
+# verify_cross_check_remote_green: false (2026-10-02, task 5416 OFF step). Leo ruled on
+# esc-5416-2 to shorten the parity window to one day and pre-approved the OFF step. The
+# window ran 2026-10-01T05:01Z to 2026-10-02T05:01Z on the code default TRUE (a blocking
+# local re-verify of every non-trivial remote green): dark_factory verdict_parity_ok x13,
+# zero mismatch or inconclusive. reload_config re-reads this file and takes no arguments,
+# so OFF needs this key; deleting it restores TRUE on the next reload.
 # ROLLBACK: verify_host_policy: prefer_local (green tier, mcp__escalation__reload_config);
 # enabled: false, or dropping this block, needs a restart (verify_runners and
 # verify_drift_check_every_n_lands are restart-only).
@@ -1639,6 +1640,7 @@ verify_runners:
     enabled: true
 verify_host_policy: prefer_remote
 verify_drift_check_every_n_lands: 10
+verify_cross_check_remote_green: false
 
 # Pre-merge rebase-and-reverify: run it ONCE and never repeat it (Leo, 2026-09-06).
 # workflow.py's merge phase rebases the task branch onto main and runs a full
