@@ -199,6 +199,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard
 
 from escalation.models import Escalation
+from shared.storm_counter import StormCounter
 
 from orchestrator.config import RecoveryEmissionConfig
 from orchestrator.git_ops import _run
@@ -385,7 +386,10 @@ class LandingTally:
       sees what happened early.
     - :meth:`git_error_count_in_window` answers "is it failing RIGHT NOW".  It
       slides, because a latched alarm that never clears is one that gets
-      ignored rather than fixed.
+      ignored rather than fixed.  Its window is a shared ``StormCounter`` used
+      only to append/prune/count (INV-5): the FIRE stays in the escape hatch,
+      deduped by the open L1 rather than by time, as pinned by
+      ``orchestrator/tests/test_branch_work_landed.py::TestGitErrorStormEscape``.
 
     Collapsing the two would break whichever question lost.
 
@@ -408,29 +412,20 @@ class LandingTally:
     #: matching the ``landing_git_error_rate_per_hour`` config leaf's units.
     DEFAULT_WINDOW_SECS = 3600.0
 
-    #: Hard cap on retained stamps, so a pathological storm cannot grow the
-    #: deque without bound between trims.  Far above any threshold an operator
-    #: would set; it exists as a memory backstop, not as a policy.
-    DEFAULT_MAX_STAMPS = 4096
-
     def __init__(
         self,
         *,
         clock: Callable[[], float] = time.monotonic,
         window_secs: float = DEFAULT_WINDOW_SECS,
-        max_stamps: int = DEFAULT_MAX_STAMPS,
     ) -> None:
-        #: Injectable so the window can be driven deterministically in tests.
-        #: ``time.monotonic`` and not ``time.time``: an NTP step backwards
-        #: would otherwise appear as a burst of stamps inside the window.
-        self._clock = clock
         self.window_secs = window_secs
         self._counts: collections.Counter[LandingReason] = collections.Counter(
             dict.fromkeys(LandingReason, 0),
         )
-        self._git_error_stamps: collections.deque[float] = collections.deque(
-            maxlen=max_stamps,
-        )
+        #: Injectable so the window can be driven deterministically in tests.
+        #: ``time.monotonic`` and not ``time.time``: an NTP step backwards
+        #: would otherwise appear as a burst of stamps inside the window.
+        self._git_errors = StormCounter(time_provider=clock)
 
     def record(self, reason: LandingReason | str) -> None:
         """Charge one verdict.  Called for EVERY verdict, accepted or not.
@@ -452,18 +447,11 @@ class LandingTally:
             return
         self._counts[key] += 1
         if key is LandingReason.git_error:
-            self._git_error_stamps.append(self._clock())
-            self._trim()
-
-    def _trim(self) -> None:
-        cutoff = self._clock() - self.window_secs
-        while self._git_error_stamps and self._git_error_stamps[0] <= cutoff:
-            self._git_error_stamps.popleft()
+            self._git_errors.observe(window_seconds=self.window_secs)
 
     def git_error_count_in_window(self) -> int:
         """How many ``git_error`` verdicts fall in the trailing window."""
-        self._trim()
-        return len(self._git_error_stamps)
+        return self._git_errors.prune(self.window_secs)
 
     def snapshot(self) -> dict[LandingReason, int]:
         """A COPY of the cumulative per-reason counts.
