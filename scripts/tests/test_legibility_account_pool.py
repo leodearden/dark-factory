@@ -7,19 +7,25 @@ account deferred an entire night while six other accounts sat idle. The
 pool turns the gate's roster into the ``(prompt, model) -> str`` callable
 the seam already speaks.
 
-THE FAKE GATE IS THE POINT, not a shortcut. ``account_pool`` depends on
-eight members of the real 3004-line ``UsageGate`` — ``try_lease``,
-``detect_cap_hit``, ``confirm_account_ok``, ``on_agent_complete``,
-``release_probe_slot``, ``account_count``, ``active_account_name`` and
-``auth_failed_account_names`` — and stating exactly those here is how the
-test says what the interface IS rather than reaching through it into gate
-internals (docs/code-quality.md: tests that reach a module's internals are
-an interface-design smell). The leases it hands out are REAL
-``AccountLease`` objects and the slot wrapping them is the REAL
-``InvokeSlot``, so the probe-claim discipline under test is the production
-one, not a lookalike. The auth route settles through ``InvokeSlot.report``
-into the gate's private auth handler, so its tests (task 5947) use a REAL
-gate from ``build_pool`` instead of teaching the fake that hook.
+THE FAKE GATE IS THE POINT, not a shortcut. It implements exactly the
+``UsageGate`` members the pool reaches, grouped as ``account_pool.py``'s
+docstring groups its consumed interface:
+
+* the members the pool calls itself: ``try_lease``, ``account_count``,
+  ``active_account_name``, ``auth_failed_account_names`` and
+  ``release_probe_slot``;
+* the members the REAL ``InvokeSlot`` calls on the pool's behalf when it
+  settles: ``slot.detect_cap_hit`` calls ``detect_cap_hit``, and
+  ``slot.confirm`` calls ``confirm_account_ok`` and ``on_agent_complete``.
+
+Stating exactly those here is how the test says what the interface IS
+rather than reaching through it into gate internals (docs/code-quality.md:
+tests that reach a module's internals are an interface-design smell). The
+leases the fake hands out are REAL ``AccountLease`` objects, so the
+probe-claim discipline under test is the production one, not a lookalike.
+The third settle route, ``slot.report``, lands in the gate's PRIVATE auth
+handler. The fake therefore lacks it, and the auth-route tests (task 5947)
+use a REAL gate from ``build_pool`` instead of teaching the fake that hook.
 
 The LLM is ALWAYS mocked here: every test injects an ``invoke`` stub. The
 one test that drives a real ``claude`` is marked ``integration`` and is
@@ -85,7 +91,8 @@ class FakeAccount:
 
 
 class FakeGate:
-    """Exactly the eight members ``account_pool`` calls, and nothing else.
+    """Exactly the gate members the pool reaches, directly or through the real
+    ``InvokeSlot`` (grouped in the module docstring), and nothing else.
 
     ``try_lease`` reproduces the real gate's first-fit walk and its
     ``reverse`` / ``exclude`` knobs; ``detect_cap_hit`` reproduces the STRICT
