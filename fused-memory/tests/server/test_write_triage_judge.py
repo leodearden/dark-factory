@@ -77,6 +77,7 @@ from fused_memory.server.write_triage_judge import (
     resolve_judge_enabled,
     resolve_judge_model,
     resolve_judge_provider,
+    resolve_judge_reasoning_effort,
     resolve_judge_timeout,
     select_judge_candidates,
 )
@@ -1173,6 +1174,31 @@ class TestResolveJudgeCandidateCount:
         )
 
 
+class TestResolveJudgeReasoningEffort:
+    """`judge_reasoning_effort` — sent only when set; ``None`` omits the parameter."""
+
+    @pytest.mark.parametrize('value', ['none', 'low', 'medium', 'high'])
+    def test_a_configured_effort_is_used(self, value: str) -> None:
+        assert resolve_judge_reasoning_effort(_svc(judge_reasoning_effort=value)) == value
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_omits_the_parameter(
+        self, label: str, service: object,
+    ) -> None:
+        assert resolve_judge_reasoning_effort(service) is None, label
+
+    @pytest.mark.parametrize(
+        'value', ['minimal', 'LOW', 'xhigh', '', 1, True, None, []],
+    )
+    def test_an_out_of_set_effort_omits_the_parameter(self, value: object) -> None:
+        """A value the API would reject on every call is not sent at all."""
+        service = _svc(judge_reasoning_effort=value)
+        assert resolve_judge_reasoning_effort(service) is None
+
+
 class TestEveryResolverReadsLive:
     """Nothing is captured at import or construction.
 
@@ -1195,8 +1221,12 @@ class TestEveryResolverReadsLive:
             (resolve_judge_model, 'judge_model', 'model-a', 'model-b'),
             (resolve_judge_timeout, 'judge_timeout_seconds', 5.0, 12.0),
             (resolve_judge_candidate_count, 'judge_candidate_count', 3, 4),
+            (resolve_judge_reasoning_effort, 'judge_reasoning_effort', 'low', 'high'),
         ],
-        ids=['enabled', 'provider', 'model', 'timeout', 'candidate_count'],
+        ids=[
+            'enabled', 'provider', 'model', 'timeout', 'candidate_count',
+            'reasoning_effort',
+        ],
     )
     def test_a_mutation_is_observed_on_the_very_next_call(
         self, resolver, attr: str, first: object, second: object,
