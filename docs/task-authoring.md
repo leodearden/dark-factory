@@ -1612,22 +1612,30 @@ it. Generalising: prefer blessing when validation is context-dependent, when
 the live corpus already contains values a type would reject, or when the
 apparent enum is not the thing writers are actually held to.
 
-### Known gaps (re-measured 2026-08-18 — not fixed)
+### Known gaps (re-measured 2026-10-02 — none open)
 
-Two `unknown_key` sources are known, measured, and deliberately left
-open. They are recorded here so the next reader does not re-measure them.
-All counts are a snapshot of a **growing** corpus, not an invariant: 4748
-tasks carried dict metadata at the latest corpus-wide measurement
+No tracked `unknown_key` source is open. All counts are a snapshot of a
+**growing** corpus, not an invariant: 4748 tasks carried dict metadata at
+the latest corpus-wide measurement
 (2026-08-31), up from 4204 on 2026-08-18 and 3553 when this section was
 first written. Across that corpus 1516 tasks emit at least one
-`unknown_key` line, 3130 lines over 1028 distinct spellings. The *per-gap*
-counts in the table below are still the 2026-08-18 figures and were **not**
-re-measured — only the corpus total was.
+`unknown_key` line, 3130 lines over 1028 distinct spellings; those are
+untracked Tier-C keys, not gaps this section owns.
 
-| Gap | Measured | Owner |
-|---|---|---|
-| Ad-hoc reify/escalation keys unmigrated corpus-wide | `origin_escalation` 19, `related_reify_tasks` 8, `origin_reify_task` 4, `related_reify_memories` 1 — 29 distinct tasks, of which only 6 are writable today | task 4302 |
-| Task 3083 still emits 6 `unknown_key` lines — the write path is blocked | 6 of an original 7 | `tkt_0RS4WVMH1RSTSY88N781E70F5S` |
+**The two rows this table last carried are CLOSED**, recorded in the same
+shape as the `execution_class` row below so a reader arriving from an older
+revision does not re-open them:
+
+- **Ad-hoc reify/escalation keys unmigrated corpus-wide** (task 4302) — swept
+  on 2026-10-02. All 30 carriers (`origin_escalation` 20,
+  `related_reify_tasks` 7, `origin_reify_task` 3, `related_reify_memories` 0)
+  were renamed into `x_`, one `--apply` per task, and a re-run census finds
+  zero tasks carrying any of the four bare spellings. The one code reader,
+  `scripts/sitting/ownership.py::FOLLOWUP_KEYS`, was changed first (task
+  6196) to read `x_origin_escalation` as well as the legacy spelling.
+- **Task 3083's `unknown_key` lines** — task 3777 opened the write path
+  described below and gate 6118 applied the migration; 3083's live blob now
+  parses with zero `unknown_key` lines (measured 2026-10-02).
 
 **`execution_class` was the third row here and is now CLOSED** — task 3780
 blessed it into Tier-A rather than typing or retiring it. Recorded so a
@@ -1650,8 +1658,9 @@ largest single `unknown_key` contributor in the corpus and, unusually, the
 following the documentation still minted a census line. Blessing rather
 than retiring, in one line: it is the documented migration target for three
 live aliases, it is corpus-dominant on the `esc-3796-1` precedent, and
-retirement is structurally blocked today because ~70% of its carriers hold
-`done_provenance` and are unwritable under the floor described below —
+retirement was structurally blocked when it was decided, because ~70% of its
+carriers held `done_provenance` and were unwritable under the floor described
+below (task 3777 has since opened a passthrough route) —
 sweeping only the writable remainder is the same "fifth of the benefit"
 vocabulary fork ruled out for task 4302 just below. See the frozenset entry
 in `shared/src/shared/task_metadata.py` for the census, the value-shape
@@ -1678,12 +1687,11 @@ re-running a task-metadata census must import the submodel registrations
 first, or they will measure phantom leaks. The corpus totals quoted above
 were measured with them imported.
 
-**The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
-a ~30-task metadata rewrite has a very different blast radius from one
-reserved task. `x_`-prefixed precedents for these same spellings already
-exist (`x_origin_escalation` 1, `x_related_reify_tasks` 1,
-`x_related_df_tasks` 5), so the target spelling is not in doubt and the
-sweep is a mechanical per-task re-run of
+**The `x_` sweep** was first scoped to task 3083 alone, not the corpus,
+because a ~30-task metadata rewrite has a very different blast radius from
+one reserved task. `x_`-prefixed precedents for these same spellings
+already existed, so the target spelling was not in doubt and the corpus
+sweep was a mechanical per-task re-run of
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`. That
 script's "no reader anywhere" grep argument covers only its six built-in
 default keys, so when you re-run it with your own `--keys` it validates
@@ -1694,27 +1702,26 @@ its own timestamped pre-write snapshot and never overwrites an existing
 one — a path you named is refused, one the script chose steps aside — so
 the re-run prescribed here cannot cost you the original row.
 
-What actually gates the sweep is **writability**, not effort. Of the 29
-target tasks, 23 carry `done_provenance` and are structurally unwritable
-under the floor described below; only 3048, 3084, 3116, 3162, 3282 and 3501
-can be migrated today. Sweeping just those six is worse than not sweeping:
-it forks the vocabulary across the corpus for a fifth of the benefit, which
-is the outcome the canonical-spelling convention exists to prevent. Hence
-task 4302 (split out of task 3780, which reached this measurement while
-closing the `execution_class` row; originally filed as
+What gated the corpus sweep was **writability**, not effort. Of the 29
+targets measured on 2026-08-16, 23 carried `done_provenance` and were
+unwritable under the floor described below. Sweeping only the writable six
+would have forked the vocabulary across the corpus for a fifth of the
+benefit, which is the outcome the canonical-spelling convention exists to
+prevent. So task 4302 (split out of task 3780, which reached this
+measurement while closing the `execution_class` row; originally filed as
 `tkt_0RSM2ECXBS1RPHMGYQVZ0V3QZZ`, which the curator dropped into 4302 as a
-duplicate) carries a hard dependency on task 3777 and should not be started
-before it lands.
+duplicate) waited on task 3777 and then ran once over all of them.
 
-**The write-path blocker** is why the second row is still open, and it
-bounds the other one too: `update_task` rejects any metadata payload
-containing `done_provenance` — a presence-only write-authority floor
-evaluated *before* `metadata_mode` is resolved — and `'merge'` mode cannot
-retire a key at all, since `_merge_metadata` is a shallow `{**old, **new}`
-with no deletion sentinel. A whole-blob `'replace'` is therefore
-structurally impossible on any `done`/merged task, which is most of the
-corpus above. Check a target task's status before assuming its metadata is
-writable.
+**The write-path floor** bounds any metadata repair on a `done`/merged
+task: `update_task` may never add, change or remove
+`metadata.done_provenance`, and `'merge'` mode cannot retire a key at all,
+since `_merge_metadata` is a shallow `{**old, **new}` with no deletion
+sentinel. Until task 3777 that made a whole-blob `'replace'` impossible on
+most of the corpus. It is now admitted when the payload carries the stored
+`done_provenance` through verbatim (the contract is
+`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_done_provenance_passthrough`),
+which is exactly what the migration script sends. Any other shape that
+touches the key is still refused.
 
 ---
 
