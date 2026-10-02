@@ -1279,6 +1279,15 @@ def _client_double() -> MagicMock:
     return client
 
 
+def _incomplete_openai_client(content: str, reason: str) -> MagicMock:
+    """A Responses answer the provider marked ``incomplete`` for *reason*."""
+    client = _openai_client(content, status='incomplete')
+    client.responses.create.return_value.incomplete_details = types.SimpleNamespace(
+        reason=reason,
+    )
+    return client
+
+
 def _openai_client(
     content: str | None, usage: object = None, status: str = 'completed',
 ) -> MagicMock:
@@ -2286,6 +2295,23 @@ class TestJudgeWriteFailuresRaise:
             )
 
     @pytest.mark.asyncio
+    async def test_an_incomplete_responses_answer_names_its_reason(self) -> None:
+        """INV-2: the logged exception must say the budget was exhausted.
+
+        An empty-body JudgeOutputError cannot be told apart from a model that
+        answered nothing. And an incomplete answer is not a verdict even when
+        its partial text happens to parse, as this one does.
+        """
+        client = _incomplete_openai_client(_payload('restates', 'm1'), 'max_output_tokens')
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(JudgeOutputError, match='max_output_tokens'):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+    @pytest.mark.asyncio
     async def test_an_unresolvable_provider_raises_rather_than_guessing(self) -> None:
         """Silently picking an arm would bill an account the operator did not choose.
 
@@ -2364,6 +2390,22 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
             )
 
         assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_answer_stores_and_counts_exactly_once(self) -> None:
+        counter = TriageFailOpenCounter()
+        service = self._mid_band_service()
+        client = _incomplete_openai_client(_payload('restates', 'm1'), 'max_output_tokens')
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            decision = await triage_write(
+                service, content='c', project_id='p',
+                counter=counter, judge=judge_write,
+            )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.canonical_id is None
         assert counter.live_count() == 1
 
     @pytest.mark.asyncio
