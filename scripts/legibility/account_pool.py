@@ -112,13 +112,14 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
     ``UnsetEnvironment=`` removed. Policy and the other two strip points:
     ``OPERATIONS.md`` §"Legibility trickle accounts (03:00)".
 
-    Degrades LOUDLY, never raises, when the pool comes back empty. Copies
-    ``evals/runner.py::_build_eval_usage_gate``'s warn-rather-than-crash
+    NEVER RAISES: a pool that comes back empty, and a roster that cannot be
+    read or parsed at all (task 5635), both degrade LOUDLY to an empty pool.
+    Copies ``evals/runner.py::_build_eval_usage_gate``'s warn-rather-than-crash
     shape, for a reason specific to this caller: refusing to start would
     take the whole night down, while a warned empty pool still reaches task
-    4736's honest DEFERRED path (``pool_invoke`` raises
-    ``NoHeadroom`` naming this exact condition). What must never
-    happen is the quiet version.
+    4736's honest DEFERRED path (``session_runner`` raises ``NoHeadroom``
+    naming this exact condition). What must never happen is the quiet
+    version.
     """
     load_dotenv(env_file if env_file is not None else _REPO_ROOT / ".env")
     os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -126,14 +127,16 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
     resolved = accounts_file or os.environ.get("USAGE_ACCOUNTS_FILE") or str(
         default_accounts_file()
     )
-    # Never the operator's own ~/.claude login (fallback off), and no resume
-    # probes: those reopen a pool for PARKED callers, and the legibility
-    # runner never parks (task 6042).
-    gate = UsageGate(UsageCapConfig(
-        accounts_file=str(Path(resolved).resolve()),
-        fallback_to_default_credential=False,
-        wait_for_reset=False,
-    ))
+    try:
+        gate = UsageGate(_pool_config(accounts_file=str(Path(resolved).resolve())))
+    except Exception as exc:  # noqa: BLE001 — a bad roster defers the night, never crashes it
+        logger.warning(
+            "legibility account pool could not load its roster %s (%s: %s) — "
+            "every invocation will defer for want of an account; there is no "
+            "~/.claude fallback.",
+            resolved, type(exc).__name__, exc,
+        )
+        return UsageGate(_pool_config())
 
     # The roster's names, because the gate publishes only a count: the
     # operator's next move on a short pool is to check which
@@ -156,6 +159,15 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
     return gate
 
 
+def _pool_config(**roster) -> UsageCapConfig:
+    """Never the operator's own ~/.claude login (fallback off), and no resume
+    probes: those reopen a pool for PARKED callers, and the legibility runner
+    never parks (task 6042)."""
+    return UsageCapConfig(
+        fallback_to_default_credential=False, wait_for_reset=False, **roster,
+    )
+
+
 def _roster_names(accounts_file) -> list[str]:
     """Account names the roster FILE declares, whether or not their tokens
     resolved. Read straight back off the YAML because the gate keeps no
@@ -164,7 +176,7 @@ def _roster_names(accounts_file) -> list[str]:
     try:
         data = yaml.safe_load(Path(accounts_file).read_text()) or {}
         return [entry.get("name", "?") for entry in data.get("accounts", [])]
-    except OSError:
+    except Exception:  # noqa: BLE001 — a warning's detail must never raise
         return []
 
 

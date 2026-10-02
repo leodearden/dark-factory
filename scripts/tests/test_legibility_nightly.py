@@ -1325,18 +1325,6 @@ def test_default_census_launcher_refuses_a_relative_config_path(monkeypatch):
     assert seen == {}, 'a refused config path must never reach subprocess.run'
 
 
-def test_default_census_launcher_composes_project_root_with_the_pool_env(monkeypatch):
-    """Task 3269's argv fix and task 5488's env overlay ride the SAME launch."""
-    seen = _spy_subprocess_run(monkeypatch)
-    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok'}
-
-    nightly._default_census_launcher('/p', env=env)
-
-    assert seen['env'] is env
-    assert seen['check'] is False
-    assert _adjacent_pair(seen['args'], '--project-root') == ['--project-root', '/p']
-
-
 def test_default_census_launcher_refuses_a_relative_project_root(monkeypatch):
     """A relative target would resolve against the trickle's cwd -- the unit
     file's WorkingDirectory -- which is task 3269's defect all over again."""
@@ -1408,18 +1396,16 @@ def test_default_census_launcher_one_null_cap_omits_only_that_flag(monkeypatch):
     assert _adjacent_pair(argv, '--max-verify-clusters') == ['--max-verify-clusters', '9']
 
 
-def test_default_census_launcher_composes_caps_config_path_and_pool_env(monkeypatch):
-    """Caps, the pinned config path and the pool env ride ONE launch."""
+def test_default_census_launcher_composes_caps_config_path_and_project_root(monkeypatch):
+    """Caps, the pinned config path and the project root ride ONE launch."""
     seen = _spy_subprocess_run(monkeypatch)
-    env = {'CLAUDE_CODE_OAUTH_TOKEN': 'tok'}
     config_path = '/p/docs/legibility/legibility.yaml'
 
     nightly._default_census_launcher(
-        '/p', config_path=config_path, caps=TrickleCensusCaps(max_batches=7), env=env,
+        '/p', config_path=config_path, caps=TrickleCensusCaps(max_batches=7),
     )
 
     argv = seen['args']
-    assert seen['env'] is env
     assert seen['check'] is False
     assert _adjacent_pair(argv, '--project-root') == ['--project-root', '/p']
     assert _adjacent_pair(argv, '--config') == ['--config', config_path]
@@ -4508,6 +4494,19 @@ def test_post_escalation_reports_false_on_a_tool_error_envelope(
 # `nightly._default_census_launcher`. The two tests below are the pattern.
 # ---------------------------------------------------------------------------
 
+class _UnusedRunner:
+    """A pooled session runner for a night that must never call the model."""
+
+    def invoker(self, stage):
+        def invoke(prompt, model):
+            pytest.fail(f'{stage.name} invoked the model on a night with no digests')
+
+        return invoke
+
+    def close(self):
+        pass
+
+
 def _stub_census_launcher_and_pool(monkeypatch):
     """Stub both of a ``main()``-driven run's reaches into the real world, and
     return the launcher's call list, one ``(args, kwargs)`` pair per call.
@@ -4515,26 +4514,19 @@ def _stub_census_launcher_and_pool(monkeypatch):
     MANDATORY, not cosmetic, on both counts. On FIRE the real launcher
     subprocess-runs scripts/legibility/census.py (real LLM spend + real git
     writes) and ``_default_entrypoint_exists`` is true in a real checkout --
-    and reaching FIRE is the entire point of the tests that call this. Since
-    task 5488, main() -- which injects no ``invoke`` -- also makes run_nightly
-    build a REAL multi-account pool out of the operator's own
-    CLAUDE_OAUTH_TOKEN_* vars and hand one of those tokens to that launcher.
-    A test about the census trigger has no business touching either.
+    and reaching FIRE is the entire point of the tests that call this. And
+    main() -- which injects no ``invoke`` -- makes run_nightly open a REAL
+    pooled session runner over the operator's own roster and
+    CLAUDE_OAUTH_TOKEN_* vars. A test about the census trigger has no
+    business touching either.
     """
     launcher_calls = []
     monkeypatch.setattr(
         nightly, '_default_census_launcher',
         lambda *args, **kwargs: launcher_calls.append((args, kwargs)),
     )
-
-    class _EmptyPool:
-        account_count = 0
-
-        def try_lease(self, **_kwargs):
-            return None
-
     monkeypatch.setattr(
-        nightly.account_pool, 'build_pool', lambda **_kwargs: _EmptyPool(),
+        session_runner, 'open_pooled_runner', lambda *_args, **_kwargs: _UnusedRunner(),
     )
     return launcher_calls
 

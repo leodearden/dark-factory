@@ -318,6 +318,23 @@ def parse_coder_output(raw: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# TRICKLE_CODER_STAGE — how one trickle digest calls the model
+# ---------------------------------------------------------------------------
+
+TRICKLE_CODER_STAGE = session_runner.StageSpec(
+    name="trickle-coder",
+    cwd=None,
+    timeout_secs=120,
+    max_turns=2,
+    max_budget_usd=1.0,
+    tools=session_runner.CLASSIFIER,
+)
+"""A pure classifier: the codebook index and the digest are both in the
+prompt, so it needs no tools and no project cwd. 120s, sized for one Haiku
+coding call, is the binding bound; turns and budget are ceilings."""
+
+
+# ---------------------------------------------------------------------------
 # _invoke_cli — the ONE real `claude -p --model` subprocess boundary
 # ---------------------------------------------------------------------------
 
