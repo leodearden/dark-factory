@@ -17,6 +17,7 @@ prints a raw literal back into an agent's context.
 """
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 from pathlib import Path
@@ -31,36 +32,71 @@ ESCAPED_BRACKET = '\\x3c'
 RAW_PREFIXES: tuple[str, ...] = (_LT + '/', _LT + 'parameter')
 SANCTIONED_BRACKET_SPELLINGS: tuple[str, ...] = ('chr(60)', ESCAPED_BRACKET)
 LITERAL_OWNER = 'shared.toolcall_markup'
+_OWNER_PACKAGE, _, _OWNER_MODULE = LITERAL_OWNER.rpartition('.')
+
+
+def _imports_owner(node: ast.AST) -> bool:
+    if isinstance(node, ast.ImportFrom):
+        return node.module == LITERAL_OWNER or (
+            node.module == _OWNER_PACKAGE
+            and any(alias.name == _OWNER_MODULE for alias in node.names)
+        )
+    if isinstance(node, ast.Import):
+        return any(alias.name == LITERAL_OWNER for alias in node.names)
+    return False
 
 
 def imports_literal_owner(source: str) -> bool:
     """Whether *source* imports :data:`LITERAL_OWNER`; an unparsable source counts."""
-    raise NotImplementedError
+    if _OWNER_MODULE not in source:
+        return False
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return True
+    return any(_imports_owner(node) for node in ast.walk(tree))
 
 
 def handles_envelope_markup(source: str) -> bool:
     """Whether *source* belongs to the guarded population."""
-    raise NotImplementedError
+    spells_bracket = any(spelling in source for spelling in SANCTIONED_BRACKET_SPELLINGS)
+    return spells_bracket or imports_literal_owner(source)
 
 
 def raw_prefix_lines(source: str) -> dict[str, tuple[int, ...]]:
     """1-based lines holding each raw prefix, keyed by the prefix's escaped spelling."""
-    raise NotImplementedError
+    lines = source.split('\n')
+    hits = {
+        prefix.replace(_LT, ESCAPED_BRACKET): tuple(
+            number for number, line in enumerate(lines, start=1) if prefix in line
+        )
+        for prefix in RAW_PREFIXES
+    }
+    return {key: numbers for key, numbers in hits.items() if numbers}
 
 
 def python_files(root: Path) -> list[Path]:
     """Existing ``.py`` files git tracks, or sees untracked and not ignored, under *root*."""
-    raise NotImplementedError
+    listing = _git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', '*.py')
+    candidates = [root / entry for entry in listing.split('\0') if entry]
+    return [path for path in candidates if path.is_file()]
 
 
 def guarded_population(root: Path) -> list[Path]:
     """The :func:`python_files` under *root* whose source handles envelope markup."""
-    raise NotImplementedError
+    return [
+        path for path in python_files(root)
+        if handles_envelope_markup(path.read_text(encoding='utf-8'))
+    ]
 
 
 def raw_literal_violations(root: Path) -> dict[str, dict[str, tuple[int, ...]]]:
     """Repo-relative posix path -> :func:`raw_prefix_lines`, for each guarded file with hits."""
-    raise NotImplementedError
+    hits_by_path = {
+        path.relative_to(root).as_posix(): raw_prefix_lines(path.read_text(encoding='utf-8'))
+        for path in guarded_population(root)
+    }
+    return {path: hits for path, hits in hits_by_path.items() if hits}
 
 
 def _git(cwd: Path, *args: str) -> str:
