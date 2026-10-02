@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+
 from fused_memory.utils.safe_yaml import (
     SAFE_YAML_LOADER,
     load_yaml_list_file,
