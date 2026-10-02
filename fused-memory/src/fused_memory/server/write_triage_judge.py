@@ -61,6 +61,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_CONTESTED,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
+    JudgeUsage,
     TriageJudgeVerdict,
 )
 
@@ -817,6 +818,43 @@ def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCreden
     return _ProviderCredentials(client_kwargs, serves_responses_api)
 
 
+class _JudgeReply(NamedTuple):
+    """What one judge call returned: the raw answer text and the provider's usage."""
+
+    text: str
+    usage: JudgeUsage | None
+
+
+def _is_token_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _usage_from(
+    usage: object, *, input_field: str, output_field: str, details_field: str | None,
+) -> JudgeUsage | None:
+    """Read a provider's *usage* object as a :class:`JudgeUsage`, or ``None``.
+
+    Counts are taken only when they are real ``int``s — never coerced, because
+    ``int()`` of an unspecced Mock is 1 and a ``bool`` is an ``int``. Never
+    raises: usage is metadata about a call that already succeeded, so an
+    unreadable one is carried as ``None`` (which the eval reports as unpriced)
+    rather than turning a good verdict into a fail-open.
+    """
+    input_tokens = getattr(usage, input_field, None)
+    output_tokens = getattr(usage, output_field, None)
+    if not (_is_token_count(input_tokens) and _is_token_count(output_tokens)):
+        return None
+    reasoning_tokens = None
+    if details_field is not None:
+        details = getattr(usage, details_field, None)
+        reasoning_tokens = getattr(details, 'reasoning_tokens', None)
+    return JudgeUsage(
+        input_tokens,
+        output_tokens,
+        reasoning_tokens if _is_token_count(reasoning_tokens) else None,
+    )
+
+
 async def _call_llm(
     *,
     provider: str,
@@ -824,8 +862,8 @@ async def _call_llm(
     prompt: str,
     memory_service: Any,
     timeout: float,
-) -> str:
-    """One single-turn call to *provider*, returning the raw response text.
+) -> _JudgeReply:
+    """One single-turn call to *provider*: the raw response text and its usage.
 
     Mirrors ``reconciliation/judge.py::_call_llm``'s two-arm fan-out at
     write-path scale. Determinism (``temperature=0.0``) and the token cap
@@ -896,7 +934,15 @@ async def _call_llm(
                 ),
                 timeout=timeout,
             )
-        return response.choices[0].message.content or ''
+        return _JudgeReply(
+            response.choices[0].message.content or '',
+            _usage_from(
+                getattr(response, 'usage', None),
+                input_field='prompt_tokens',
+                output_field='completion_tokens',
+                details_field='completion_tokens_details',
+            ),
+        )
 
     if provider == 'anthropic':
         import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
@@ -917,7 +963,15 @@ async def _call_llm(
         # First TEXT block, not first block: a leading thinking/tool_use block
         # must not be read as the answer.
         text_blocks = [b for b in response.content if b.type == 'text']
-        return text_blocks[0].text if text_blocks else ''
+        return _JudgeReply(
+            text_blocks[0].text if text_blocks else '',
+            _usage_from(
+                getattr(response, 'usage', None),
+                input_field='input_tokens',
+                output_field='output_tokens',
+                details_field=None,
+            ),
+        )
 
     raise ValueError(
         f'unknown judge provider {provider!r}; implemented arms are '
@@ -982,6 +1036,11 @@ async def judge_write(
     same checkout. The anthropic arm is implemented and selectable by config
     for a deployment that has the key; PRD C1's "haiku-class" is a cost/size
     class, not a vendor pin.
+
+    USAGE. The verdict carries what the provider reported for the call
+    (``TriageJudgeVerdict.usage``), so the eval can price a write without
+    patching the SDK (task 5846 item 3). The early returns made no call and
+    carry ``None``; so does a call whose usage could not be read.
     """
     if not resolve_judge_enabled(memory_service):
         # SAID OUT LOUD, unlike the empty-slate return below. An unlogged
@@ -1006,11 +1065,12 @@ async def judge_write(
     if not selected:
         return TriageJudgeVerdict(OUTCOME_STORED)
 
-    raw = await _call_llm(
+    reply = await _call_llm(
         provider=resolve_judge_provider(memory_service),
         model=resolve_judge_model(memory_service),
         prompt=build_judge_prompt(content, selected),
         memory_service=memory_service,
         timeout=resolve_judge_timeout(memory_service),
     )
-    return parse_judge_verdict(raw, [candidate.id for candidate in selected])
+    verdict = parse_judge_verdict(reply.text, [candidate.id for candidate in selected])
+    return verdict._replace(usage=reply.usage)
