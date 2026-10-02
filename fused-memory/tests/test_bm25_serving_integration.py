@@ -328,3 +328,43 @@ class TestProductionIndexesServe:
 
         readings = [await bm25_canary(graph, t, group_id=name) for t in targets]
         assert all(r.serving for r in readings), readings
+
+
+class TestProductionExpectedSet:
+    """The production-set check reports exactly what a graph lacks."""
+
+    @pytest.mark.asyncio
+    async def test_production_startup_sweep_leaves_nothing_missing(
+        self, scratch, live_backend_factory,
+    ):
+        name, graph = scratch('sweep_complete')
+        # The sweep skips graphs whose KEY does not exist yet.
+        await graph.query('CREATE (:Probe {seed: 1})')
+        backend = live_backend_factory({name})
+
+        await backend.provision_registered_graphs()
+        await await_index_operational(graph)
+
+        assert await missing_production_indices(backend, name) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('spec', sorted(expected_index_set()), ids=lambda spec: '.'.join(spec))
+    async def test_reports_exactly_the_one_missing_spec(
+        self, scratch, live_backend_factory, spec,
+    ):
+        """The negative control: the check FAILS on a graph missing ANY expected index.
+
+        A fresh graph per spec, because a partially dropped fulltext index
+        cannot be re-created, so one graph cannot be repaired between cases.
+        """
+        name, graph = scratch('drop_one')
+        await graph.query('CREATE (:Probe {seed: 1})')
+        backend = live_backend_factory({name})
+        await backend.provision_registered_graphs()
+        await await_index_operational(graph)
+
+        await graph.query(_drop_statement(spec))
+        # A per-field drop on a merged index can open a rebuild window.
+        await await_index_operational(graph)
+
+        assert await missing_production_indices(backend, name) == [spec]
