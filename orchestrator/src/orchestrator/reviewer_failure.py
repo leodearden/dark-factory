@@ -13,7 +13,7 @@ halves are task 3321.
 from __future__ import annotations
 
 import enum
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -204,3 +204,63 @@ def should_retry_reviewer(outcome: object) -> bool:
     if isinstance(outcome, Mapping) and outcome.get('verdict') == 'ERROR':
         return ReviewerFailure.from_review(outcome).retry_in_phase
     return False
+
+
+@dataclass(frozen=True)
+class ReviewErrorTriage:
+    requeue: bool
+    reason: str
+    detail: str
+    api_error_status: int | None
+
+
+def triage_reviewer_errors(
+    reviewer_errors: Sequence[str], errored_reviews: Mapping[str, Mapping],
+) -> ReviewErrorTriage:
+    """Decide the review arm's exit for a panel with errored reviewers.
+
+    Requeue only when EVERY errored reviewer is requeue-eligible; any cap,
+    quality or unclassified failure blocks. A 5xx status, when present, is
+    carried so the requeue rides the scheduler's transient lane.
+    """
+    if not reviewer_errors:
+        raise ValueError(
+            'triage_reviewer_errors requires a non-empty reviewer_errors; '
+            'an empty panel must never read as all-transient'
+        )
+    failures = {
+        name: ReviewerFailure.from_review(errored_reviews.get(name, {}))
+        for name in sorted(reviewer_errors)
+    }
+    requeue = all(failure.requeue_eligible for failure in failures.values())
+    listing = '; '.join(f'{name}: {failure.describe()}' for name, failure in failures.items())
+    if requeue:
+        reason = f'Review requeued: {len(failures)} reviewer(s) hit transient failures: {listing}'
+    else:
+        reason = f'{len(failures)} reviewer(s) failed without a usable verdict: {listing}'
+    return ReviewErrorTriage(
+        requeue=requeue,
+        reason=reason,
+        detail=_triage_detail(failures),
+        api_error_status=_first_server_error_status(failures.values()),
+    )
+
+
+def _first_server_error_status(failures: Iterable[ReviewerFailure]) -> int | None:
+    return next(
+        (
+            failure.api_error_status
+            for failure in failures
+            if failure.kind is ReviewerFailureKind.SERVER_ERROR
+            and failure.api_error_status is not None
+        ),
+        None,
+    )
+
+
+def _triage_detail(failures: Mapping[str, ReviewerFailure]) -> str:
+    return '\n'.join(
+        f'{name} kind={failure.kind.value} '
+        f'api_error_status={failure.api_error_status} detail={failure.detail}'
+        for name, failure in failures.items()
+    )
