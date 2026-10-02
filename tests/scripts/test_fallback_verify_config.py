@@ -29,6 +29,7 @@ in ``test_orchestrator_restart_config_drift.py``.
 """
 
 import pathlib
+import posixpath
 import re
 import shlex
 import sys
@@ -198,6 +199,33 @@ def _discover_per_module_configs() -> dict[str, ModuleConfig]:
 
 def _pytest_segments(cmd: str) -> list[str]:
     return [seg for seg in cmd.split("&&") if "pytest" in seg]
+
+
+_MEMBER_SUITE_RE = re.compile(r"cd\s+(?:\.\./)?([A-Za-z0-9_.-]+)\s*&&\s*uv run pytest\s+tests/")
+_ROOT_SUITE_RE = re.compile(r"uv run --project \S+ pytest\s+([^-]+?)\s*--timeout")
+
+
+def _fleet_pytest_suite_names(cmd: str) -> set[str]:
+    """Every test-suite directory the fleet TEST chain runs, keyed as MEASURED_FLEET_SEGMENT_SECS is.
+
+    A member suite (``cd <member> && uv run pytest tests/``) is keyed by its
+    bare member name; a root-level target by its normalised repo-relative path.
+
+    Matched against the raw command rather than by walking ``&&`` clauses: the
+    cockpit clause is a presence-guarded subshell, so a crude ``&&`` split
+    severs it, and the production segmenter
+    (``verify_cmd.split_and_chain_segments``) keeps it as ONE segment at cwd
+    ``.`` — neither yields the suite name. Same raw-command convention as
+    :func:`test_fanout_includes_sampler_member` and
+    :func:`test_fanout_includes_cockpit_presence_guarded`.
+    """
+    members = set(_MEMBER_SUITE_RE.findall(cmd))
+    roots = {
+        posixpath.normpath(target)
+        for targets in _ROOT_SUITE_RE.findall(cmd)
+        for target in targets.split()
+    }
+    return members | roots
 
 
 def test_fallback_verify_runs_tests_scripts() -> None:
@@ -710,6 +738,13 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
         '2026-07-31', 4, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
 }
 
+# The suites the chain runs that have NO figure in MEASURED_FLEET_SEGMENT_SECS:
+# task 3062 attempt-2 timed out at 1800.66s before dashboard started, so none
+# of these was ever reached, and dark-factory-orchestrator.yaml's budget
+# derivation costs them by ESTIMATE instead. This is the machine-checkable form
+# of the "OMITTED ENTIRELY" sentence in the table's WHAT THE SUM IS comment.
+UNMEASURED_FLEET_SEGMENTS = frozenset({'dashboard', 'sampler', 'cockpit'})
+
 
 def _verify_budgets() -> dict:
     return yaml.safe_load(DF_CONFIG_PATH.read_text(encoding='utf-8'))
@@ -827,6 +862,49 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
         'the same command chain plus the verify_cold_preprovision_command '
         'preprovision (uv sync + npm ci), so it is strictly more expensive; a '
         'warm budget above the cold one is incoherent by construction'
+    )
+
+
+def test_measured_fleet_table_partitions_the_chain_it_measures() -> None:
+    """Every suite the fleet TEST chain runs is either measured or named as unmeasured.
+
+    Task 3496. The TEST-chain twin of
+    ``TestFleetTypeCheckCoversEveryWorkspaceMember.test_type_chain_table_matches_the_chain_it_measures``,
+    asserting a PARTITION rather than equality because the TEST chain carries
+    suites that are deliberately unmeasured. A suite added to the chain in
+    neither bucket silently UNDER-counts the floor asserted by
+    ``test_fallback_verify_budget_clears_the_measured_fleet_chain_floor``; a
+    suite still listed after leaving the chain silently OVER-counts it.
+
+    This is a MEMBERSHIP-drift check, not the duration-growth detector that
+    test's SCOPE paragraph disclaims; the TYPE-chain pair above coexists the
+    same way.
+    """
+    chain = _fleet_pytest_suite_names(_fleet_test_command())
+    assert 'orchestrator' in chain, (
+        'the fleet test_command parse resolved no orchestrator suite (task 3496) '
+        f'— resolved {sorted(chain)}; the raw-command regexes no longer match the '
+        'chain, and this partition invariant would pass vacuously'
+    )
+
+    measured = set(MEASURED_FLEET_SEGMENT_SECS)
+    assert measured.isdisjoint(UNMEASURED_FLEET_SEGMENTS), (
+        f'{sorted(measured & UNMEASURED_FLEET_SEGMENTS)} are listed both in '
+        'MEASURED_FLEET_SEGMENT_SECS and in UNMEASURED_FLEET_SEGMENTS (task '
+        '3496) — a suite is either measured or estimated, not both'
+    )
+
+    accounted = measured | UNMEASURED_FLEET_SEGMENTS
+    assert accounted == chain, (
+        'MEASURED_FLEET_SEGMENT_SECS | UNMEASURED_FLEET_SEGMENTS does not '
+        f'partition the fleet test_command suites {sorted(chain)} (task 3496). '
+        f'UNACCOUNTED (in the chain, in neither bucket — the floor silently '
+        f'UNDER-counts): {sorted(chain - accounted)}. ORPHANED (in a bucket, no '
+        f'longer in the chain — the floor silently OVER-counts): '
+        f'{sorted(accounted - chain)}. Measure an unaccounted suite and add it to '
+        'MEASURED_FLEET_SEGMENT_SECS and MEASURED_FLEET_SEGMENT_PROVENANCE, or, '
+        'if it genuinely cannot be measured, list it in '
+        'UNMEASURED_FLEET_SEGMENTS; drop an orphan from whichever bucket holds it.'
     )
 
 
