@@ -10,14 +10,14 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import sqlite3
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, make_lane
+from _merge_lane_fakes import FakeVerifier, make_lane, running_lane
+from _orch_helpers import wait_responsive
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -504,7 +504,7 @@ class TestRunUnscopedTypechecks:
 
 
 # ---------------------------------------------------------------------------
-# Shared request/drain helpers for the call-site integration tests below
+# Shared request helper for the call-site integration tests below
 # ---------------------------------------------------------------------------
 
 
@@ -526,14 +526,6 @@ def _make_merge_request(
         config=config,
         result=future,
     )
-
-
-async def _drain(worker, worker_task: asyncio.Task) -> None:
-    """Stop *worker* and let its run loop finish."""
-    await worker.stop()
-    worker_task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await worker_task
 
 
 # ---------------------------------------------------------------------------
@@ -562,18 +554,18 @@ class TestMergeLanePyrightCallSite:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = make_lane(git_ops, queue, verifier=FakeVerifier())
-        worker_task = asyncio.create_task(worker.run())
 
         push_mock = AsyncMock(return_value='pushed')
-        with patch.object(git_ops, 'push_main', push_mock):
-            req = _make_merge_request(
-                'smw-pyright-broken', 'smw-pyright-broken', worktree, config,
-                module_configs=[_make_module_config(prefix='subpkg')],
-            )
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        await _drain(worker, worker_task)
+        async with running_lane(worker):
+            with patch.object(git_ops, 'push_main', push_mock):
+                req = _make_merge_request(
+                    'smw-pyright-broken', 'smw-pyright-broken', worktree, config,
+                    module_configs=[_make_module_config(prefix='subpkg')],
+                )
+                await queue.put(req)
+                outcome = await wait_responsive(
+                    req.result, label='smw-pyright-broken outcome (broken pyright, no push)',
+                )
 
         assert outcome.status == 'blocked'
         assert outcome.reason is not None
@@ -591,16 +583,15 @@ class TestMergeLanePyrightCallSite:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = make_lane(git_ops, queue, verifier=FakeVerifier())
-        worker_task = asyncio.create_task(worker.run())
-
-        req = _make_merge_request(
-            'smw-pyright-clean', 'smw-pyright-clean', worktree, config,
-            module_configs=[_make_module_config(prefix='subpkg')],
-        )
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        await _drain(worker, worker_task)
+        async with running_lane(worker):
+            req = _make_merge_request(
+                'smw-pyright-clean', 'smw-pyright-clean', worktree, config,
+                module_configs=[_make_module_config(prefix='subpkg')],
+            )
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result, label='smw-pyright-clean outcome (clean pyright lands)',
+            )
 
         assert outcome.status == 'done'
 
@@ -614,16 +605,15 @@ class TestMergeLanePyrightCallSite:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = make_lane(git_ops, queue, verifier=FakeVerifier())
-        worker_task = asyncio.create_task(worker.run())
-
-        req = _make_merge_request(
-            'smw-pyright-cleanup', 'smw-pyright-cleanup', worktree, config,
-            module_configs=[_make_module_config(prefix='subpkg')],
-        )
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        await _drain(worker, worker_task)
+        async with running_lane(worker):
+            req = _make_merge_request(
+                'smw-pyright-cleanup', 'smw-pyright-cleanup', worktree, config,
+                module_configs=[_make_module_config(prefix='subpkg')],
+            )
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result, label='smw-pyright-cleanup outcome (worktrees removed on block)',
+            )
 
         assert outcome.status == 'blocked'
         # WHY it blocked, not merely that it did: an unrelated earlier block
@@ -645,16 +635,15 @@ class TestMergeLanePyrightCallSite:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = make_lane(git_ops, queue, event_store=event_store)
-        worker_task = asyncio.create_task(worker.run())
-
-        req = _make_merge_request(
-            'smw-pyright-event', 'smw-pyright-event', worktree, config,
-            module_configs=[_make_module_config(prefix='subpkg')],
-        )
-        await queue.put(req)
-        await asyncio.wait_for(req.result, timeout=30)
-
-        await _drain(worker, worker_task)
+        async with running_lane(worker):
+            req = _make_merge_request(
+                'smw-pyright-event', 'smw-pyright-event', worktree, config,
+                module_configs=[_make_module_config(prefix='subpkg')],
+            )
+            await queue.put(req)
+            await wait_responsive(
+                req.result, label='smw-pyright-event outcome (post_merge_pyright_broken event)',
+            )
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
