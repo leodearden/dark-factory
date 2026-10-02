@@ -236,15 +236,8 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
 # `timeout` stretched by RESPONSIVE_WAIT_STRETCH and hard-bounded by
 # RESPONSIVE_WAIT_WALL_CAP.  IMPORTED, not re-derived: the helper computes its
 # own per-call default cap from the very same constant, so the RATIO cannot
-# drift and this bill is an EXACT upper bound for any site that leaves
-# `max_wall_s` at its default.
-#
-# The exactness is NOT unconditional: an explicit `max_wall_s=` wins over the
-# scaled default inside the helper and the branch below does not scan for it,
-# so such a site would be under-billed.  No scanned site passes `max_wall_s`
-# (only the hermetic unit tests do, and they carry no mark obligation), so the
-# claim holds over the audited corpus today; closing that gap structurally is
-# tracked as follow-up.
+# drift and the bill `_wait_responsive_budget` computes is an EXACT upper bound
+# on every site, whatever it passes.
 #
 # Fixing the ratio at 2 is what lets a reviewer check the paired-mark
 # arithmetic instead of trusting a number: the worst per-method budget this
@@ -256,16 +249,59 @@ _RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 def _resolve_wait_value(node: ast.expr | None) -> float:
     """Resolve a single AST expression to a wait-budget number, or 0.0.
 
-    Conservative by construction: a literal number resolves directly; a
-    name reference resolves ONLY via ``_KNOWN_WAIT_CONSTANTS``; anything
-    else (a local variable, an attribute access, an arithmetic expression,
-    an unknown name) resolves to 0.0. Unknown means ignore, never guess.
+    Never guesses: a literal number resolves directly; a name reference
+    resolves ONLY via ``_KNOWN_WAIT_CONSTANTS``; anything else (a local
+    variable, an attribute access, an arithmetic expression, an unknown
+    name) resolves to 0.0. What that 0.0 means is the caller's call: the
+    ``asyncio.wait_for`` and ``_await_outcome`` nominals take it as "ignore",
+    while ``_wait_responsive_budget`` replaces it with a bound that holds
+    whatever the value was.
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
         return float(node.value)
     if isinstance(node, ast.Name):
         return _KNOWN_WAIT_CONSTANTS.get(node.id, 0.0)
     return 0.0
+
+
+def _keyword(call: ast.Call, name: str) -> ast.expr | None:
+    """Return the value of *call*'s ``name=`` keyword argument, or None."""
+    return next((kw.value for kw in call.keywords if kw.arg == name), None)
+
+
+def _wait_responsive_budget(call: ast.Call) -> float:
+    """Return the worst-case WALL clock a ``wait_responsive(...)`` call can
+    consume -- an unconditional upper bound, not an estimate (task 3980).
+
+    The helper gives up once its wall clock reaches its cap: an explicit
+    ``max_wall_s`` when one is passed, else the nominal ``timeout`` (hidden
+    default ``MERGE_RESULT_TIMEOUT``) stretched by ``_RESPONSIVE_WAIT_STRETCH``
+    and clamped to ``RESPONSIVE_WAIT_WALL_CAP``. So:
+
+    - an explicit ``max_wall_s`` other than the literal None is billed
+      verbatim when it resolves to a positive number, and ``math.inf``
+      otherwise -- a cap the scan cannot read may allow any wall clock, and
+      no timeout mark clears an unbounded bill;
+    - otherwise the stretched, clamped nominal is billed. An unresolvable or
+      non-positive nominal bills the clamp itself, which the default cap can
+      never exceed.
+    """
+    max_wall = _keyword(call, 'max_wall_s')
+    explicit_none = isinstance(max_wall, ast.Constant) and max_wall.value is None
+    if max_wall is not None and not explicit_none:
+        cap = _resolve_wait_value(max_wall)
+        return cap if cap > 0 else math.inf
+
+    wall_cap = _KNOWN_WAIT_CONSTANTS['RESPONSIVE_WAIT_WALL_CAP']
+    timeout = _keyword(call, 'timeout')
+    nominal = (
+        _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+        if timeout is None
+        else _resolve_wait_value(timeout)
+    )
+    if nominal <= 0:
+        return wall_cap
+    return min(nominal * _RESPONSIVE_WAIT_STRETCH, wall_cap)
 
 
 def _call_wait_budget(call: ast.Call) -> float:
@@ -276,16 +312,16 @@ def _call_wait_budget(call: ast.Call) -> float:
     ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match),
     ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
     when no ``timeout=`` kwarg is given), and ``wait_responsive(...)``
-    (task 3980; same hidden default, but its worst-case WALL clock is the
-    nominal budget stretched by ``_RESPONSIVE_WAIT_STRETCH`` and hard-bounded
-    by ``RESPONSIVE_WAIT_WALL_CAP`` -- see below). Every other call shape --
-    ``asyncio.sleep``, ``.wait()``, ``.result()``, ``.join()``, a
-    non-``asyncio`` ``.wait_for(...)``, attribute access, arithmetic,
-    unknown names -- contributes 0.0 and is skipped silently (this is a
-    conservative FLOOR over call *shapes*: an unrecognised shape can only
-    under-count, never fabricate a wait; see the plan's floor/superset
-    design decision, and ``_method_wait_budget`` below for the orthogonal
-    over-count risk from control flow).
+    (task 3980), billed by ``_wait_responsive_budget`` as an unconditional
+    upper bound on its wall clock. For the first two, an unresolvable
+    nominal contributes 0.0 -- unknown means ignore, never guess. Every
+    other call shape -- ``asyncio.sleep``, ``.wait()``, ``.result()``,
+    ``.join()``, a non-``asyncio`` ``.wait_for(...)``, attribute access,
+    arithmetic, unknown names -- contributes 0.0 and is skipped silently
+    (this is a conservative FLOOR over call *shapes*: an unrecognised shape
+    can only under-count, never fabricate a wait; see the plan's
+    floor/superset design decision, and ``_method_wait_budget`` below for
+    the orthogonal over-count risk from control flow).
     """
     func = call.func
     if (
@@ -294,35 +330,17 @@ def _call_wait_budget(call: ast.Call) -> float:
         and isinstance(func.value, ast.Name)
         and func.value.id == 'asyncio'
     ):
-        for kw in call.keywords:
-            if kw.arg == 'timeout':
-                return _resolve_wait_value(kw.value)
-        if len(call.args) >= 2:
-            return _resolve_wait_value(call.args[1])
-        return 0.0
+        timeout = _keyword(call, 'timeout')
+        if timeout is None and len(call.args) >= 2:
+            timeout = call.args[1]
+        return _resolve_wait_value(timeout)
     if isinstance(func, ast.Name) and func.id == '_await_outcome':
-        for kw in call.keywords:
-            if kw.arg == 'timeout':
-                return _resolve_wait_value(kw.value)
-        return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+        timeout = _keyword(call, 'timeout')
+        if timeout is None:
+            return _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
+        return _resolve_wait_value(timeout)
     if isinstance(func, ast.Name) and func.id == 'wait_responsive':
-        # task 3980: the nominal `timeout` is charged in loop-responsive
-        # time, so real wall clock can run past it under starvation. Bill
-        # the stretched worst case, hard-bounded by the wall cap the helper
-        # itself enforces -- a wait_responsive call that leaves `max_wall_s`
-        # at its default can never consume more wall clock than
-        # RESPONSIVE_WAIT_WALL_CAP, whatever its nominal budget.  A site
-        # passing an explicit `max_wall_s` is NOT covered by that bound and is
-        # not scanned here; see the RESPONSIVE_WAIT_STRETCH comment above.
-        nominal = _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
-        for kw in call.keywords:
-            if kw.arg == 'timeout':
-                nominal = _resolve_wait_value(kw.value)
-                break
-        return min(
-            nominal * _RESPONSIVE_WAIT_STRETCH,
-            _KNOWN_WAIT_CONSTANTS['RESPONSIVE_WAIT_WALL_CAP'],
-        )
+        return _wait_responsive_budget(call)
     return 0.0
 
 
@@ -737,11 +755,17 @@ def _timeout_mark_offenders(
     for class_name, budget in sorted(budgets.items()):
         if budget <= 0:
             continue
+        budget_text = (
+            'unbounded (some wait in the method has no resolvable '
+            'wall-clock cap)'
+            if math.isinf(budget)
+            else f'{budget}s'
+        )
 
         cls = resolve(class_name)
         if cls is None:
             offenders.append(
-                f'{class_name}: computed budget {budget}s, but the '
+                f'{class_name}: computed budget {budget_text}, but the '
                 f'class could not be resolved from module globals to '
                 f'inspect its marks.'
             )
@@ -756,7 +780,7 @@ def _timeout_mark_offenders(
                 continue
             offenders.append(
                 f'{class_name}: computed worst-case per-method wait '
-                f'budget is {budget}s, reaching the '
+                f'budget is {budget_text}, reaching the '
                 f'{_AMBIENT_TEST_TIMEOUT}s an unmarked class runs under '
                 f'(the tighter of the {PYPROJECT_DEFAULT_TIMEOUT}s ini '
                 f'default and verify\'s --timeout='
@@ -769,7 +793,7 @@ def _timeout_mark_offenders(
         if mark_value is None or mark_value < budget:
             offenders.append(
                 f'{class_name}: computed worst-case per-method wait '
-                f'budget is {budget}s, but its @pytest.mark.timeout '
+                f'budget is {budget_text}, but its @pytest.mark.timeout '
                 f'mark is only {mark_value!r} -- too tight to clear '
                 f'it.'
             )

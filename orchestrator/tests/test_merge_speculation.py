@@ -2957,8 +2957,7 @@ class TestTimeoutMarkCoverage:
     worst case, ``min(RESPONSIVE_WAIT_STRETCH * timeout,
     RESPONSIVE_WAIT_WALL_CAP)``.  The helper computes its own default cap from
     that SAME formula, which is what makes the bill an EXACT upper bound on
-    real wall clock rather than an under-count -- for any site leaving
-    ``max_wall_s`` at its default, which is every scanned site here.  That
+    real wall clock rather than an under-count.  That
     stretch is why this guard must exist BEFORE any wait in this file is
     migrated: a stretched wait under an inadequate mark is strictly worse than
     the flake it fixes.
