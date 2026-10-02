@@ -1305,7 +1305,7 @@ class TestFailureClassification:
                 caller_agent_id='claude-task-3609-implementer', caller_task_id='3609',
             )
 
-        assert outcome.failure is MemoryFailure.TIMEOUT
+        assert outcome == MemoryQueryOutcome(failure=MemoryFailure.TIMEOUT)
 
     async def test_an_exhausted_connect_error_is_classified_as_transport(
         self, briefing: BriefingAssembler,
@@ -1319,7 +1319,7 @@ class TestFailureClassification:
                 caller_agent_id='claude-task-3609-implementer', caller_task_id='3609',
             )
 
-        assert outcome.failure is MemoryFailure.TRANSPORT
+        assert outcome == MemoryQueryOutcome(failure=MemoryFailure.TRANSPORT)
 
     async def test_a_timeout_reaches_the_reader_as_a_timeout(
         self, briefing: BriefingAssembler,

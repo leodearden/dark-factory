@@ -1255,10 +1255,10 @@ HARNESS_CONTEXT_BLOCK_MARKERS: tuple[str, ...] = (
     '_memory unavailable — proceed with codebase exploration',
     '_no memory context available',
 )
-"""Body literals ``_get_memory_context`` renders right after its
-'# Context' heading (orchestrator/src/orchestrator/agents/briefing.py):
+"""Body literals the briefing's memory recall renders right after its
+'# Context' heading (orchestrator/src/orchestrator/agents/memory_recall.py):
 the standing provenance caveat's prefix
-(``orchestrator.agents.briefing.MEMORY_CONTEXT_CAVEAT``, when a memory
+(``orchestrator.agents.memory_recall.MEMORY_CONTEXT_CAVEAT``, when a memory
 section was actually recalled), and its two no-recalled-sections literal
 families (memory-unavailable / no-memory-context-available). Every
 marker deliberately stops BEFORE an interpolation point -- the caveat's
