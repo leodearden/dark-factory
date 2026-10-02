@@ -398,3 +398,35 @@ class SpliceContract:
             f'`over_budget` entry means it landed at or past the char budget. '
             f'{remedy}'
         )
+
+    def assert_lands_after(self, *, follows: str, follows_name: str, remedy: str) -> None:
+        """The constant starts at or after the end of ``follows`` in every role.
+
+        The ORDER-only sibling of ``assert_placement``'s FOLLOWS arm, for a block
+        appended at the TAIL of a shared splice chain: concurrent blocks append
+        there in any merge order, so an adjacency pin would make whichever merges
+        second fail. There is no up-front fallback, because every carrier of a
+        tail block carries its predecessor, so a missing predecessor is an
+        offender. ABSENT is recorded, never skipped.
+        """
+        offenders: dict[str, dict[str, object]] = {}
+        for role_name in sorted(self.roles):
+            prompt = self.all_roles[role_name].system_prompt
+            idx = prompt.find(self.constant)
+            predecessor_idx = prompt.find(follows)
+            if idx == -1 or predecessor_idx == -1:
+                offenders[role_name] = {
+                    'offset': idx if idx != -1 else 'ABSENT',
+                    'follows_offset': predecessor_idx if predecessor_idx != -1 else 'ABSENT',
+                }
+                continue
+            earliest_allowed = predecessor_idx + len(follows)
+            if idx < earliest_allowed:
+                offenders[role_name] = {'offset': idx, 'earliest_allowed': earliest_allowed}
+
+        assert offenders == {}, (
+            f'Roles placing {self.constant_name} out of order: {offenders}. It must '
+            f'land anywhere after the end of {follows_name} (offset >= '
+            "earliest_allowed); an `offset` or `follows_offset` of 'ABSENT' means "
+            f'that block is missing from the role entirely. {remedy}'
+        )
