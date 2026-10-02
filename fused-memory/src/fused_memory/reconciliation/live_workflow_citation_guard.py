@@ -51,7 +51,9 @@ _SIGNAL_TOKEN = re.compile(
     re.IGNORECASE,
 )
 _TASK_REF = re.compile(r'\btask/(\d+)\b', re.IGNORECASE)
-_LIVE_LANGUAGE = re.compile(r'\blive\b', re.IGNORECASE)
+#: A hyphenated compound is not live language, so the section's own name
+#: ("Live-Workflow Signals") never asserts liveness.
+_LIVE_LANGUAGE = re.compile(r'(?<![-\w])live(?![-\w])', re.IGNORECASE)
 _NEGATION_CUE = re.compile(r'\b(?:no|not|without|absent|none)\b', re.IGNORECASE)
 _WINDOW_BREAK = re.compile(r'[.;\n]')
 

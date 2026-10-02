@@ -125,6 +125,11 @@ class TestExtractLiveWorkflowCitations:
             pytest.param(
                 'task/5891 and task/6122 are live (worktree)', id='ambiguous-two-tasks',
             ),
+            pytest.param(
+                'Live-Workflow Signals list task/123 with landed=true, its worktree '
+                'lingers after merge',
+                id='the-section-name-is-not-live-language',
+            ),
         ],
     )
     def test_conservative_negatives_yield_no_citation(self, description):
