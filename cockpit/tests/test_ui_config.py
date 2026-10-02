@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import stat
+from typing import cast
 
 from orchestrator import session_registry as sr
 
@@ -66,3 +67,21 @@ class TestSaveUiConfig:
         save_ui_config(CockpitUIConfig(selected_slug='some-slug'), tmp_path)
 
         assert stat.S_IMODE(ui_config_path(tmp_path).stat().st_mode) == 0o600
+
+    def test_non_os_error_during_write_is_fail_soft_and_warns(self, tmp_path, caplog):
+        """save_ui_config's fail-soft guarantee isn't limited to OSError: a
+        non-JSON-serializable field must be logged and swallowed, never raised,
+        because a view must never be a dependency (PRD §2).
+        """
+        from cockpit.ui_config import CockpitUIConfig, save_ui_config, ui_config_path
+
+        unserializable = CockpitUIConfig(selected_slug=cast(str, object()))
+
+        with caplog.at_level(logging.WARNING):
+            save_ui_config(unserializable, tmp_path)
+
+        assert not ui_config_path(tmp_path).exists()
+        warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any('cockpit-ui.json' in msg for msg in warnings), (
+            f'Expected a WARNING naming cockpit-ui.json; got: {warnings}'
+        )
