@@ -12,21 +12,26 @@ module's public names are driven.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from escalation.models import Escalation
 
+import dashboard.data.escalation_corpus as escalation_corpus
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, validate_datum
 from dashboard.data.escalation_corpus import (
     CORPUS_FRESHNESS_BOUND_SECONDS,
+    CORPUS_TTL_SECONDS,
     EscalationCorpus,
     EscalationView,
     Location,
     QueueKind,
     QueueRef,
+    acquire_corpus,
     corpus_queues,
     views_over,
     walk_corpus,
@@ -264,3 +269,127 @@ class TestViewsOver:
         assert views[EscalationView.QUEUE_PENDING].value == 3
         assert views[EscalationView.OPEN_IN_HISTORY].value == 7
 
+
+
+@pytest.fixture(autouse=True)
+def _corpus_cache():
+    """No corpus walk may cross a test."""
+    escalation_corpus._corpus_cache_clear()
+    yield
+    escalation_corpus._corpus_cache_clear()
+
+
+def _counts(corpus_datum: Datum[EscalationCorpus], queue: QueueRef) -> tuple[int, int]:
+    views = views_over(corpus_datum, [queue.id])
+    return (
+        views[EscalationView.QUEUE_PENDING].value,
+        views[EscalationView.OPEN_IN_HISTORY].value,
+    )
+
+
+class TestAcquireCorpus:
+    """The ONE cache: every escalation surface reads the corpus through it."""
+
+    async def test_a_clean_walk_is_a_fresh_datum_stamped_now(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _sketch_10(queue_dir)
+        queue = _queue(queue_dir)
+
+        corpus_datum = await acquire_corpus((queue,), now=NOW)
+
+        assert isinstance(corpus_datum.value, EscalationCorpus)
+        assert corpus_datum.as_of == NOW
+        assert corpus_datum.state is DatumState.FRESH
+        assert corpus_datum.reason is None
+        assert corpus_datum.freshness_bound_seconds == 2 * CORPUS_TTL_SECONDS
+        validate_datum(corpus_datum, NOW)
+
+    async def test_a_partial_walk_is_a_lower_bound_naming_the_queue(self, tmp_path):
+        present_dir = tmp_path / 'present' / 'escalations'
+        _write(present_dir, _record('esc-1-1'))
+        missing = _queue(tmp_path / 'missing' / 'escalations', 'missing')
+
+        corpus_datum = await acquire_corpus((_queue(present_dir, 'present'), missing), now=NOW)
+
+        assert corpus_datum.state is DatumState.LOWER_BOUND
+        assert 'missing' in corpus_datum.reason
+        validate_datum(corpus_datum, NOW)
+
+    async def test_a_record_written_within_the_ttl_is_not_seen(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _sketch_10(queue_dir)
+        queue = _queue(queue_dir)
+
+        first = await acquire_corpus((queue,), now=NOW)
+        _write(queue_dir, _record('esc-1-7'))
+        second = await acquire_corpus((queue,), now=NOW + timedelta(seconds=1))
+
+        assert second.as_of == first.as_of == NOW
+        assert _counts(second, queue) == (2, 5)
+
+    async def test_a_record_written_before_the_ttl_expires_is_seen_after(
+        self, tmp_path, monkeypatch,
+    ):
+        queue_dir = tmp_path / 'escalations'
+        _sketch_10(queue_dir)
+        queue = _queue(queue_dir)
+        later = NOW + timedelta(seconds=1)
+
+        await acquire_corpus((queue,), now=NOW)
+        _write(queue_dir, _record('esc-1-7'))
+        monkeypatch.setattr(escalation_corpus, 'CORPUS_TTL_SECONDS', 0.0)
+        refreshed = await acquire_corpus((queue,), now=later)
+
+        assert refreshed.as_of == later
+        assert _counts(refreshed, queue) == (3, 6)
+
+    async def test_a_walk_that_reached_no_queue_is_served_but_not_cached(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        queue = _queue(queue_dir)
+
+        empty = await acquire_corpus((queue,), now=NOW)
+        _sketch_10(queue_dir)
+        filled = await acquire_corpus((queue,), now=NOW + timedelta(seconds=1))
+
+        assert empty.value.reached_any is False
+        assert _counts(empty, queue) == (0, 0)
+        assert _counts(filled, queue) == (2, 5)
+
+    async def test_a_partial_walk_is_cached(self, tmp_path):
+        present_dir = tmp_path / 'present' / 'escalations'
+        _sketch_10(present_dir)
+        present = _queue(present_dir, 'present')
+        missing_dir = tmp_path / 'missing' / 'escalations'
+        missing = _queue(missing_dir, 'missing')
+
+        first = await acquire_corpus((present, missing), now=NOW)
+        _write(missing_dir, _record('esc-2-1'))
+        second = await acquire_corpus((present, missing), now=NOW + timedelta(seconds=1))
+
+        assert second is first
+        assert second.value.scan(missing.id).reached is False
+
+    @pytest.mark.parametrize('ttl_seconds', [0.001, 3600.0])
+    async def test_sketch_10_counts_do_not_depend_on_the_ttl(
+        self, tmp_path, monkeypatch, ttl_seconds,
+    ):
+        queue_dir = tmp_path / 'escalations'
+        _sketch_10(queue_dir)
+        queue = _queue(queue_dir)
+        monkeypatch.setattr(escalation_corpus, 'CORPUS_TTL_SECONDS', ttl_seconds)
+
+        corpus_datum = await acquire_corpus((queue,), now=NOW)
+
+        assert _counts(corpus_datum, queue) == (2, 5)
+
+    async def test_concurrent_cold_acquires_share_one_walk(self, tmp_path):
+        queue_dir = tmp_path / 'escalations'
+        _sketch_10(queue_dir)
+        queue = _queue(queue_dir)
+
+        first, second = await asyncio.gather(
+            acquire_corpus((queue,), now=NOW),
+            acquire_corpus((queue,), now=NOW),
+        )
+
+        assert first is second
