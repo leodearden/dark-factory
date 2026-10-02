@@ -17,7 +17,9 @@ from orchestrator.reviewer_failure import (
     classify_reviewer_result,
     error_review,
     should_retry_reviewer,
+    triage_reviewer_errors,
 )
+from orchestrator.scheduler import is_transient_api_requeue
 
 ROLE = 'reviewer_comprehensive'
 
@@ -225,3 +227,97 @@ class TestShouldRetryReviewer:
         assert not should_retry_reviewer(
             {'reviewer': ROLE, 'verdict': verdict, 'issues': [], 'summary': 'ok'}
         )
+
+
+def _errored(role: str, result: AgentResult) -> dict:
+    return error_review(role, classify_reviewer_result(result), summary='s')
+
+
+_SERVER_529 = AgentResult(success=False, output='API Error: 529', api_error_status=529)
+_SERVER_503 = AgentResult(success=False, output='API Error: 503', api_error_status=503)
+_TURN_CAP = AgentResult(success=False, output='', subtype='error_max_turns', turns=31)
+_BUDGET_CAP = AgentResult(
+    success=False, output='', subtype='error_max_budget_usd', turns=24, cost_usd=5.07,
+)
+_NO_VERDICT = AgentResult(success=True, output='looks fine')
+
+
+def _triage(results: dict[str, AgentResult]):
+    errored = {role: _errored(role, result) for role, result in results.items()}
+    return triage_reviewer_errors(list(errored), errored)
+
+
+class TestTriageRequeues:
+    def test_all_5xx_rides_the_transient_lane(self):
+        triage = _triage({ROLE: _SERVER_529})
+        assert triage.requeue
+        assert triage.api_error_status == 529
+        assert 'agent API error: HTTP 529' in triage.reason
+        assert is_transient_api_requeue(triage.reason, api_error_status=triage.api_error_status)
+
+    def test_two_5xx_reviewers_pick_a_status_deterministically(self):
+        errored = {
+            'reviewer_b': _errored('reviewer_b', _SERVER_503),
+            'reviewer_a': _errored('reviewer_a', _SERVER_529),
+        }
+        forward = triage_reviewer_errors(['reviewer_a', 'reviewer_b'], errored)
+        backward = triage_reviewer_errors(['reviewer_b', 'reviewer_a'], errored)
+        assert forward.requeue
+        assert forward.api_error_status in {529, 503}
+        assert forward == backward
+
+    def test_all_zero_work_rides_the_genuine_lane(self):
+        triage = _triage({ROLE: _zero_work(transcript_turns=0)})
+        assert triage.requeue
+        assert triage.api_error_status is None
+        assert not is_transient_api_requeue(triage.reason, api_error_status=None)
+
+    def test_5xx_plus_zero_work_carries_the_5xx_status(self):
+        triage = _triage({
+            'reviewer_a': _SERVER_529,
+            'reviewer_b': _zero_work(transcript_turns=0),
+        })
+        assert triage.requeue
+        assert triage.api_error_status == 529
+
+
+class TestTriageBlocks:
+    def test_5xx_mixed_with_a_quality_error_blocks(self):
+        triage = _triage({'reviewer_a': _SERVER_529, 'reviewer_b': _NO_VERDICT})
+        assert not triage.requeue
+
+    def test_turn_cap_is_named_up_front_and_never_called_infrastructure(self):
+        triage = _triage({ROLE: _TURN_CAP})
+        assert not triage.requeue
+        assert 'turn cap' in triage.reason
+        assert 'infrastructure' not in triage.reason.lower()
+        assert ReviewerFailure(ReviewerFailureKind.TURN_CAP, 'd').label in triage.reason[:200]
+
+    def test_budget_cap_is_named_and_never_called_infrastructure(self):
+        triage = _triage({ROLE: _BUDGET_CAP})
+        assert not triage.requeue
+        assert 'budget' in triage.reason
+        assert 'infrastructure' not in triage.reason.lower()
+
+    def test_name_without_an_errored_review_blocks(self):
+        triage = triage_reviewer_errors([ROLE], {})
+        assert not triage.requeue
+
+    def test_legacy_error_dict_without_record_blocks(self):
+        legacy = {'reviewer': ROLE, 'verdict': 'ERROR', 'issues': [], 'summary': 'old'}
+        triage = triage_reviewer_errors([ROLE], {ROLE: legacy})
+        assert not triage.requeue
+
+
+def test_detail_names_every_reviewer_kind_and_status():
+    triage = _triage({'reviewer_a': _SERVER_529, 'reviewer_b': _TURN_CAP})
+    for fragment in (
+        'reviewer_a', 'server_error', 'api_error_status=529',
+        'reviewer_b', 'turn_cap', 'api_error_status=None',
+    ):
+        assert fragment in triage.detail
+
+
+def test_empty_panel_is_rejected_rather_than_read_as_all_transient():
+    with pytest.raises(ValueError, match='reviewer_errors'):
+        triage_reviewer_errors([], {})
