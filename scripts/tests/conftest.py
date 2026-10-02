@@ -33,9 +33,10 @@ copies of one fake-httpx idiom spread across four of this directory's files.
 So do `runs_db_path` / `runs_db` (task 5441): a synthetic orchestrator runs.db
 shared by the model-admission audit and review suites.
 
-And `fake_claude_cli` / `pool_roster` (task 6042): a JSON-mode fake `claude`
-binary keyed on the leased OAuth token, plus a hermetic account roster, for
-the legibility suites that drive the shared session runner end to end.
+And `fake_claude_cli` / `pool_roster` / `sentinel_login` (task 6042): a
+JSON-mode fake `claude` binary keyed on the leased OAuth token, a hermetic
+account roster, and a decoy operator login, for the legibility suites that
+drive the shared session runner end to end.
 """
 import json
 import os
@@ -749,3 +750,27 @@ def pool_roster(tmp_path, monkeypatch):
     directory = tmp_path / 'pool-roster'
     directory.mkdir()
     return PoolRoster(directory, monkeypatch)
+
+
+SENTINEL_LOGIN_TOKEN = 'sk-ant-oat01-SENTINEL-operator-login'
+
+
+@pytest.fixture
+def sentinel_login(tmp_path, monkeypatch):
+    """The operator's interactive login, faked: ``HOME``, the ambient
+    ``CLAUDE_CONFIG_DIR``, ``~/.claude/.credentials.json`` (as the shared
+    gate's default-credential fallback reads it) and an API key all point
+    somewhere a legibility call must never use. Returns the sentinel HOME."""
+    from shared import usage_gate
+
+    home = tmp_path / 'sentinel-home'
+    claude_dir = home / '.claude'
+    claude_dir.mkdir(parents=True)
+    credentials = claude_dir / '.credentials.json'
+    credentials.write_text(json.dumps({'claudeAiOauth': {'accessToken': SENTINEL_LOGIN_TOKEN}}))
+    (home / '.claude.json').write_text('{}')
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(claude_dir))
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-api-SENTINEL')
+    monkeypatch.setattr(usage_gate, 'CREDENTIALS_PATH', credentials)
+    return home

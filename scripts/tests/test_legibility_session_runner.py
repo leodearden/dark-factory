@@ -29,28 +29,7 @@ from legibility.session_runner import (
 )
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_NEAR_CAP_MESSAGES
 
-from shared import usage_gate as usage_gate_mod
-
-_SENTINEL_TOKEN = 'sk-ant-oat01-SENTINEL-operator-login'
-
 pytestmark = pytest.mark.timeout(60)
-
-
-@pytest.fixture
-def sentinel_login(tmp_path, monkeypatch):
-    """The operator's interactive login, faked: HOME, the ambient config dir
-    and an API key all point somewhere a legibility call must never use."""
-    home = tmp_path / 'sentinel-home'
-    claude_dir = home / '.claude'
-    claude_dir.mkdir(parents=True)
-    credentials = claude_dir / '.credentials.json'
-    credentials.write_text(json.dumps({'claudeAiOauth': {'accessToken': _SENTINEL_TOKEN}}))
-    (home / '.claude.json').write_text('{}')
-    monkeypatch.setenv('HOME', str(home))
-    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(claude_dir))
-    monkeypatch.setenv('ANTHROPIC_API_KEY', 'sk-ant-api-SENTINEL')
-    monkeypatch.setattr(usage_gate_mod, 'CREDENTIALS_PATH', credentials)
-    return home
 
 
 _CLASSIFIER_STAGE = StageSpec(
