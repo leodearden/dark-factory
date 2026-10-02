@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from fused_memory.middleware.task_curator import CandidateTask
 
 logger = logging.getLogger(__name__)
+_LOG_LABEL = "cancelled_premise_blocklist"
 
 
 @dataclass(frozen=True)
@@ -63,12 +64,13 @@ def load_blocklist(path: Path | None) -> list[BlocklistEntry]:
     for item in load_yaml_list_file(
         path,
         logger=logger,
-        label="cancelled_premise_blocklist",
+        label=_LOG_LABEL,
         consequence="blocklist disabled",
     ):
         if not isinstance(item, dict):
             logger.warning(
-                "cancelled_premise_blocklist: skipping non-dict entry in %s: %r", path, item
+                "%s: skipping non-dict entry in %s: %r",
+                _LOG_LABEL, path, item
             )
             continue
 
@@ -79,8 +81,8 @@ def load_blocklist(path: Path | None) -> list[BlocklistEntry]:
         ]
         if missing:
             logger.warning(
-                "cancelled_premise_blocklist: skipping entry missing fields %s in %s: %r",
-                missing, path, item.get("name", "<unnamed>"),
+                "%s: skipping entry missing fields %s in %s: %r",
+                _LOG_LABEL, missing, path, item.get("name", "<unnamed>"),
             )
             continue
 
@@ -88,8 +90,9 @@ def load_blocklist(path: Path | None) -> list[BlocklistEntry]:
         desc_subs = item["description_substrings"]
         if not isinstance(title_subs, list) or not isinstance(desc_subs, list):
             logger.warning(
-                "cancelled_premise_blocklist: skipping entry %r — title_substrings and "
+                "%s: skipping entry %r — title_substrings and "
                 "description_substrings must be lists",
+                _LOG_LABEL,
                 item.get("name", "<unnamed>"),
             )
             continue

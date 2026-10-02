@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from fused_memory.middleware.task_curator import CandidateTask
 
 logger = logging.getLogger(__name__)
+_LOG_LABEL = "recon_code_fix_premise_guard"
 
 __all__ = [
     "PremiseEntry",
@@ -104,12 +105,13 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
     for item in load_yaml_list_file(
         path,
         logger=logger,
-        label="recon_code_fix_premise_guard",
+        label=_LOG_LABEL,
         consequence="guard disabled",
     ):
         if not isinstance(item, dict):
             logger.warning(
-                "recon_code_fix_premise_guard: skipping non-dict entry in %s: %r", path, item
+                "%s: skipping non-dict entry in %s: %r",
+                _LOG_LABEL, path, item
             )
             continue
 
@@ -123,8 +125,8 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
         ]
         if missing:
             logger.warning(
-                "recon_code_fix_premise_guard: skipping entry missing fields %s in %s: %r",
-                missing, path, item.get("name", "<unnamed>"),
+                "%s: skipping entry missing fields %s in %s: %r",
+                _LOG_LABEL, missing, path, item.get("name", "<unnamed>"),
             )
             continue
 
@@ -133,15 +135,17 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
         raw_assertions = item["source_assertions"]
         if not isinstance(title_subs, list) or not isinstance(desc_subs, list):
             logger.warning(
-                "recon_code_fix_premise_guard: skipping entry %r — title_substrings and "
+                "%s: skipping entry %r — title_substrings and "
                 "description_substrings must be lists",
+                _LOG_LABEL,
                 item.get("name", "<unnamed>"),
             )
             continue
         if not isinstance(raw_assertions, list):
             logger.warning(
-                "recon_code_fix_premise_guard: skipping entry %r — source_assertions must "
+                "%s: skipping entry %r — source_assertions must "
                 "be a list",
+                _LOG_LABEL,
                 item.get("name", "<unnamed>"),
             )
             continue
@@ -156,8 +160,9 @@ def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
             assertions.append(sa)
         if malformed_assertion:
             logger.warning(
-                "recon_code_fix_premise_guard: skipping entry %r — malformed "
+                "%s: skipping entry %r — malformed "
                 "source_assertions entry (each requires a 'file' key)",
+                _LOG_LABEL,
                 item.get("name", "<unnamed>"),
             )
             continue
@@ -230,12 +235,14 @@ def _assertion_holds(assertion: SourceAssertion, source_root: Path) -> bool:
         # common "cited file missing" case, but any unreadable-file OSError
         # fails open the same way.
         logger.warning(
-            "recon_code_fix_premise_guard: cannot read %s: %s — assertion fails open", target, exc,
+            "%s: cannot read %s: %s — assertion fails open",
+            _LOG_LABEL, target, exc,
         )
         return False
     except Exception:  # noqa: BLE001 - never raise out of the guard
         logger.warning(
-            "recon_code_fix_premise_guard: unexpected error reading %s — assertion fails open",
+            "%s: unexpected error reading %s — assertion fails open",
+            _LOG_LABEL,
             target,
             exc_info=True,
         )

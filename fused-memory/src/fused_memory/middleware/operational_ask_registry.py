@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from fused_memory.middleware.task_curator import CandidateTask
 
 logger = logging.getLogger(__name__)
+_LOG_LABEL = "operational_ask_registry"
 
 
 @dataclass(frozen=True)
@@ -107,12 +108,13 @@ def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
     for item in load_yaml_list_file(
         path,
         logger=logger,
-        label="operational_ask_registry",
+        label=_LOG_LABEL,
         consequence="registry disabled",
     ):
         if not isinstance(item, dict):
             logger.warning(
-                "operational_ask_registry: skipping non-dict entry in %s: %r", path, item
+                "%s: skipping non-dict entry in %s: %r",
+                _LOG_LABEL, path, item
             )
             continue
 
@@ -123,8 +125,8 @@ def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
         ]
         if missing:
             logger.warning(
-                "operational_ask_registry: skipping entry missing fields %s in %s: %r",
-                missing, path, item.get("name", "<unnamed>"),
+                "%s: skipping entry missing fields %s in %s: %r",
+                _LOG_LABEL, missing, path, item.get("name", "<unnamed>"),
             )
             continue
 
@@ -132,18 +134,20 @@ def load_operational_registry(path: Path | None) -> list[OperationalAskEntry]:
         desc_subs = item["description_substrings"]
         if not isinstance(title_subs, list) or not isinstance(desc_subs, list):
             logger.warning(
-                "operational_ask_registry: skipping entry %r — title_substrings and "
+                "%s: skipping entry %r — title_substrings and "
                 "description_substrings must be lists",
+                _LOG_LABEL,
                 item.get("name", "<unnamed>"),
             )
             continue
 
         if not title_subs or not desc_subs:
             logger.warning(
-                "operational_ask_registry: skipping entry %r — title_substrings and "
+                "%s: skipping entry %r — title_substrings and "
                 "description_substrings must be non-empty (an empty title_substrings "
                 "would match every candidate title via all([]) == True, degrading the "
                 "gate to a description-only match)",
+                _LOG_LABEL,
                 item.get("name", "<unnamed>"),
             )
             continue
