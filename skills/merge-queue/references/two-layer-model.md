@@ -135,240 +135,211 @@ occupant when two entries share a host.
 
 ## 7. As-built symbol map
 
+> **Where the code lives (task 5036, PRD `plans/merge-lane-quality-prd.md` ζ2).** The lane is the
+> package `orchestrator/src/orchestrator/merge_lane/`; Location cells below are relative to it
+> unless they name another file. The old `orchestrator.merge_*` module paths
+> (`orchestrator/src/orchestrator/merge_queue.py`, `merge_types.py`, `merge_gates.py`, …) are now
+> thin module aliases that resolve to the new modules, and task 5037 deletes them — cite the
+> new paths. The façade `orchestrator.merge_lane` (`merge_lane/__init__.py`) lazily exports the
+> public surface (`MergeLane`, the request entry points, the value types, the reason constants,
+> the ports). `merge_queue.py` became `worker.py`; the other `merge_`-prefixed modules dropped the
+> prefix. `git_ops.py`, `lane_lifecycle.py`, `warm_lane_pool.py`, `offline_lane.py`,
+> `recover_main.py` and `suffix_graph.py` stayed outside the package.
+
 | Symbol | Location | Description |
 |--------|----------|-------------|
-| `NEEDS_REBASE_REASON_PREFIX` | merge_queue.py | Prefix of the `needs_rebase` bounce reason string |
-| `MERGE_BOUNCE_CAP` | merge_queue.py | Max bounce count before thrash-backstop triggers (= 3) |
-| `_aging_key(req)` | merge_queue.py | Sort key: `(merge_first_enqueued_at or enqueued_at, request_id)` |
-| `merge_first_enqueued_at` | merge_queue.py | Write-once field: epoch of first submission to the merge queue |
+| `NEEDS_REBASE_REASON_PREFIX` | merge_lane/worker.py | Prefix of the `needs_rebase` bounce reason string |
+| `MERGE_BOUNCE_CAP` | merge_lane/worker.py | Max bounce count before thrash-backstop triggers (= 3) |
+| `_aging_key(req)` | merge_lane/worker.py | Sort key: `(merge_first_enqueued_at or enqueued_at, request_id)` |
+| `merge_first_enqueued_at` | merge_lane/types.py | Write-once field: epoch of first submission to the merge queue |
 | `SuffixConflictGraph` | suffix_graph.py | In-memory conflict graph over the unfrozen suffix |
-| `NoLandingsCircuitBreaker` | merge_queue.py | No-landings circuit-breaker decision object (θ=1893) |
-| `_pop_next_pickable()` | merge_queue.py | Select next item using clique-scoped aging (ζ=1891) |
-| `frozen_prefix()` | merge_queue.py | Return ordered `request_id`s in the frozen prefix |
-| `frozen_prefix_tip()` | merge_queue.py | Return the base SHA for next verify dispatch |
-| `check_frozen_prefix_invariant()` | merge_queue.py | §5.3 I1+I2 violations (base-chain integrity) |
-| `two_layer_invariants()` | merge_queue.py | All §5.3 violations (I1–I4 + graph consistency) |
-| `recompute_suffix_conflict_graph()` | merge_queue.py | Worker delegator → `SuffixConflictTracker.recompute()` (suffix_graph.py); recomputes the conflict graph, triggers bounce |
-| `_bounce_conflicting_suffix_items()` | merge_queue.py | Worker delegator → `SuffixConflictTracker.bounce_conflicting_suffix_items()` (suffix_graph.py); graph-time disk-free bounce of the younger conflicting item |
+| `NoLandingsCircuitBreaker` | merge_lane/worker.py | No-landings circuit-breaker decision object (θ=1893) |
+| `_pop_next_pickable()` | merge_lane/worker.py | Select next item using clique-scoped aging (ζ=1891) |
+| `frozen_prefix()` | merge_lane/worker.py | Return ordered `request_id`s in the frozen prefix |
+| `frozen_prefix_tip()` | merge_lane/worker.py | Return the base SHA for next verify dispatch |
+| `check_frozen_prefix_invariant()` | merge_lane/worker.py | §5.3 I1+I2 violations (base-chain integrity) |
+| `two_layer_invariants()` | merge_lane/worker.py | All §5.3 violations (I1–I4 + graph consistency) |
+| `recompute_suffix_conflict_graph()` | merge_lane/worker.py | Worker delegator → `SuffixConflictTracker.recompute()` (suffix_graph.py); recomputes the conflict graph, triggers bounce |
+| `_bounce_conflicting_suffix_items()` | merge_lane/worker.py | Worker delegator → `SuffixConflictTracker.bounce_conflicting_suffix_items()` (suffix_graph.py); graph-time disk-free bounce of the younger conflicting item |
 | `_run_no_landings_breaker_pass()` | harness.py | Harness pass that acts on `BreakerTrip`: calls `force_halt_scheduler` + files L2-INFO escalation |
-| `classify_and_merge()` | merge_queue.py | Shared pre-merge guard + merge + drop-guard pipeline (branch-presence → already-merged → merge → conflict/non-conflict-failure → drop-guard), returning `MergedOk \| Decided`; `SpeculativeMergeWorker._merger_loop` and `SpeculativeMergeWorker._remerge` both delegate to it instead of each running its own duplicated inline copy (MQ-refactor task κ, task 1995) |
+| `classify_and_merge()` | merge_lane/worker.py | Shared pre-merge guard + merge + drop-guard pipeline (branch-presence → already-merged → merge → conflict/non-conflict-failure → drop-guard), returning `MergedOk \| Decided`; `SpeculativeMergeWorker._merger_loop` and `SpeculativeMergeWorker._remerge` both delegate to it instead of each running its own duplicated inline copy (MQ-refactor task κ, task 1995) |
+| `patch_content_contained()` | merge_lane/landing_evidence.py | Patch-id containment check: True iff every commit in `head` is already present in `upstream` (moved out of the worker, task 5036) |
 
-### 7.1 merge_types.py — request/outcome/item/entry types + registries (MQ-refactor task α)
+### 7.1 merge_lane/types.py — request/outcome/item/entry types + registries (MQ-refactor task α)
 
-The merge-queue data types and the registries that own them were extracted verbatim into
-`orchestrator/merge_types.py` (task α of `plans/merge-queue-modularization-invariants-prd.md`).
-`merge_queue.py` re-exports every one of these names through a single top-level shim import
-(`from orchestrator.merge_types import (...)  # noqa: F401  re-export shim`), so existing call
-sites — `from orchestrator.merge_queue import MergeRequest`, etc. — keep working unchanged.
+The merge-queue data types and the registries that own them live in
+`orchestrator/src/orchestrator/merge_lane/types.py` (task α of
+`plans/merge-queue-modularization-invariants-prd.md`; moved from `merge_types.py` by task 5036).
+Importers use `orchestrator.merge_lane.types`; the façade (`orchestrator/merge_lane/__init__.py`)
+exports the public subset. Also defined here since task 5036 (formerly worker-resident):
+`_HEARTBEAT_POLL_S` and `_MERGE_AHEAD_BOUND`.
 
 | Symbol | Location | Description |
 |--------|----------|-------------|
-| `MergeRequest` | merge_types.py | A request to merge a task branch into main |
-| `GroupMergeRequest` | merge_types.py | `MergeRequest` subclass for an atomic linear-stacked train merge |
-| `MergeOutcome` | merge_types.py | Result delivered to the caller via the request's Future |
-| `RealMergeItem` | merge_types.py | REAL arm of the Merger→Verifier item union: a merge actually happened (`merge_result` + `merge_wt` required, no `immediate_outcome`) (MQ-refactor task ο, task 2000) |
-| `DecidedItem` | merge_types.py | DECIDED arm of the Merger→Verifier item union: a terminal `MergeOutcome` was already decided, delivered as a passthrough (`immediate_outcome` required, no `merge_result`/`merge_wt`) (MQ-refactor task ο, task 2000) |
-| `SpeculativeItem` | merge_types.py | `TypeAlias` for `RealMergeItem \| DecidedItem` — retained name for existing annotations/`isinstance` checks; no longer a constructible dataclass itself (MQ-refactor task ο, task 2000) |
-| `item_merge_wt` | merge_types.py | Helper returning the owned merge worktree for a `RealMergeItem` or `None` for a `DecidedItem`, via an `assert_never`-exhaustive match (MQ-refactor task ο, task 2000) |
-| `MergedOk` | merge_types.py | `classify_and_merge`'s REAL-arm return value (mirrors `SpeculativeItem`'s REAL/DECIDED split): `merge_result` + `merge_wt` + `branch_tip` for a merge that actually happened (MQ-refactor task κ, task 1995) |
-| `Decided` | merge_types.py | `classify_and_merge`'s DECIDED-arm return value: a terminal `MergeOutcome` (+ the failed `MergeResult`, when one was attempted) (MQ-refactor task κ, task 1995) |
-| `InflightEntry` | merge_types.py | An in-flight verify entry held in `SpeculativeMergeWorker._inflight` |
-| `InflightVerifyResult` | merge_types.py | Result returned by `SpeculativeMergeWorker._run_inflight_verify` |
-| `SoloVerifyResult` | merge_types.py | Result of verifying a single train member's delta in isolation |
-| `WaiterRecord` | merge_types.py | Server-side durable-intent waiter record keyed by `request_id` |
-| `MergeDispatchResult` | merge_types.py | Structured return value from `coalesce_or_enqueue_merge_request` |
-| `InFlightMergeRegistry` (+ `_InFlightEntry`) | merge_types.py | Per-branch in-flight de-dup registry and its slot record |
-| `TerminalOutcomeRetention` (+ `TerminalOutcomeRecord`) | merge_types.py | Bounded ring of recent terminal merge outcomes and its record type |
-| `MergeBounceRegistry` | merge_types.py | Monotonic per-branch bounce counter (η=1892 needs-rebase bounce cap) |
-| `MainHealthAutoHealRegistry` | merge_types.py | Monotonic per-signature attempt counter for main-health auto-heal |
-| `TrainCallbacks` / `TrainCallbackFactory` | merge_types.py | Scheduler-backed per-train callbacks and their factory type alias |
-| `MergeReadyPredicate` | merge_types.py | Type alias for the injectable merge-ready confidence-gate predicate (δ/1720) |
-| `_HostUnavailability` | merge_types.py | Per-host `RunnerUnavailable` streak tracker entry (task 1795) |
-| `_INFLIGHT_MERGE_ETA_ESTIMATE_SECS` | merge_types.py | Coarse ETA estimate (seconds) used by `InFlightMergeRegistry.eta_seconds` |
+| `MergeRequest` | merge_lane/types.py | A request to merge a task branch into main |
+| `GroupMergeRequest` | merge_lane/types.py | `MergeRequest` subclass for an atomic linear-stacked train merge |
+| `MergeOutcome` | merge_lane/types.py | Result delivered to the caller via the request's Future |
+| `RealMergeItem` | merge_lane/types.py | REAL arm of the Merger→Verifier item union: a merge actually happened (`merge_result` + `merge_wt` required, no `immediate_outcome`) (MQ-refactor task ο, task 2000) |
+| `DecidedItem` | merge_lane/types.py | DECIDED arm of the Merger→Verifier item union: a terminal `MergeOutcome` was already decided, delivered as a passthrough (`immediate_outcome` required, no `merge_result`/`merge_wt`) (MQ-refactor task ο, task 2000) |
+| `SpeculativeItem` | merge_lane/types.py | `TypeAlias` for `RealMergeItem \| DecidedItem` — retained name for existing annotations/`isinstance` checks; no longer a constructible dataclass itself (MQ-refactor task ο, task 2000) |
+| `item_merge_wt` | merge_lane/types.py | Helper returning the owned merge worktree for a `RealMergeItem` or `None` for a `DecidedItem`, via an `assert_never`-exhaustive match (MQ-refactor task ο, task 2000) |
+| `MergedOk` | merge_lane/types.py | `classify_and_merge`'s REAL-arm return value (mirrors `SpeculativeItem`'s REAL/DECIDED split): `merge_result` + `merge_wt` + `branch_tip` for a merge that actually happened (MQ-refactor task κ, task 1995) |
+| `Decided` | merge_lane/types.py | `classify_and_merge`'s DECIDED-arm return value: a terminal `MergeOutcome` (+ the failed `MergeResult`, when one was attempted) (MQ-refactor task κ, task 1995) |
+| `InflightEntry` | merge_lane/types.py | An in-flight verify entry held in `SpeculativeMergeWorker._inflight` |
+| `InflightVerifyResult` | merge_lane/types.py | Result returned by `SpeculativeMergeWorker._run_inflight_verify` |
+| `SoloVerifyResult` | merge_lane/types.py | Result of verifying a single train member's delta in isolation |
+| `WaiterRecord` | merge_lane/types.py | Server-side durable-intent waiter record keyed by `request_id` |
+| `MergeDispatchResult` | merge_lane/types.py | Structured return value from `coalesce_or_enqueue_merge_request` |
+| `InFlightMergeRegistry` (+ `_InFlightEntry`) | merge_lane/types.py | Per-branch in-flight de-dup registry and its slot record |
+| `TerminalOutcomeRetention` (+ `TerminalOutcomeRecord`) | merge_lane/types.py | Bounded ring of recent terminal merge outcomes and its record type |
+| `MergeBounceRegistry` | merge_lane/types.py | Monotonic per-branch bounce counter (η=1892 needs-rebase bounce cap) |
+| `MainHealthAutoHealRegistry` | merge_lane/types.py | Monotonic per-signature attempt counter for main-health auto-heal |
+| `TrainCallbacks` / `TrainCallbackFactory` | merge_lane/types.py | Scheduler-backed per-train callbacks and their factory type alias |
+| `MergeReadyPredicate` | merge_lane/types.py | Type alias for the injectable merge-ready confidence-gate predicate (δ/1720) |
+| `_HostUnavailability` | merge_lane/types.py | Per-host `RunnerUnavailable` streak tracker entry (task 1795) |
+| `_INFLIGHT_MERGE_ETA_ESTIMATE_SECS` | merge_lane/types.py | Coarse ETA estimate (seconds) used by `InFlightMergeRegistry.eta_seconds` |
+| `_HEARTBEAT_POLL_S` | merge_lane/types.py | How often the worker heartbeat loop wakes (30.0 s); moved out of the worker, task 5036 |
+| `_MERGE_AHEAD_BOUND` | merge_lane/types.py | Max counted (non-speculative, non-train) items in the verifier queue at once (= 1; Mechanism 1, task 1646); moved out of the worker, task 5036 |
 
-### 7.2 merge_gates.py — post-merge gates + finalize + reason prefixes (MQ-refactor task β)
+### 7.2 merge_lane/gates.py — post-merge gates + finalize + reason prefixes (MQ-refactor task β)
 
 The pre-/post-merge gate functions, the advance-finalize and advance-failure-mapping
-functions, and their supporting types and gate-owned reason-prefix constants were
-extracted verbatim into `orchestrator/merge_gates.py` (task β of
-`plans/merge-queue-modularization-invariants-prd.md`). `merge_queue.py` re-exports every
-one of these names through a single top-level shim import (`from orchestrator.merge_gates
-import (...)  # noqa: F401  re-export shim`), so existing call sites —
-`from orchestrator.merge_queue import _finalize_advanced_merge`, etc. — keep working
-unchanged.
+functions, the `merge_attempt` event emitter they share with the worker, and their supporting
+types and gate-owned reason-prefix constants live in
+`orchestrator/src/orchestrator/merge_lane/gates.py` (task β of
+`plans/merge-queue-modularization-invariants-prd.md`; moved from `merge_gates.py` by task 5036).
+Also here since task 5036 (formerly worker-resident): `AUTO_CHAIN_GENERATIONS_ENABLED`,
+`_run_unscoped_typechecks` + `_POST_MERGE_PYRIGHT_MAX_DETAIL`, `_emit_merge_attempt`,
+`_elapsed_ms` and `_MAX_EVENT_EVIDENCE_ITEMS`.
 
-**Open Q1 (resolved NO):** verify *execution* — `_run_post_merge_verify` and its cluster
-(`_run_unscoped_typechecks` + `_POST_MERGE_PYRIGHT_MAX_DETAIL`, `_ensure_verify_disk_space`,
-`_classify_main_health_red`, `_verify_hit_enospc`) — stays in `merge_queue.py`. This module
-owns gate *policy* only. `_run_unscoped_typechecks` staying is decisive for behavior
-preservation: the equivalence/pyright tests patch `orchestrator.merge_queue.run_verification`
-(the dependency beneath it), and because it stays in `merge_queue.py` it resolves
-`run_verification` in `merge_queue`'s own namespace — no reach-back needed for that
-specific patch chain.
-
-**Reach-back convention (for future γ/δ extractors):** a moved function that calls a
-merge_queue-resident sibling — whether that sibling stays permanently or was co-moved here
-but is monkeypatched by the existing test suite via the string path
-`orchestrator.merge_queue.<name>` — resolves it through a function-local (deferred)
-`from orchestrator.merge_queue import <name>` import rather than a direct intra-module
-reference. This mirrors the pre-existing `_main_health_fingerprint` convention
-(`merge_queue.py`) and keeps `merge_gates.py` free of any top-level import of
-`merge_queue` (which would deadlock module load, since merge_queue's shim needs this
-module fully defined first). Counterintuitively, this applies even to calls between two
-functions that *both* moved here (e.g. `_finalize_advanced_merge` →
-`_check_post_merge_pyright`), because the patch target the test suite uses is the
-`merge_queue` shim binding, not the `merge_gates` definition. Watch also for **bare
-module-level constants** referenced inside a moved function body (not just callables) —
-`_finalize_advanced_merge`'s `AUTO_CHAIN_GENERATIONS_ENABLED` kill-switch check needed the
-same deferred-import treatment even though it is a plain `bool`, not a function.
+**Open Q1 (resolved NO):** verify *execution* — `_run_post_merge_verify`, `_ensure_verify_disk_space`,
+`_classify_main_health_red`, `_verify_hit_enospc` — stays in `merge_lane/worker.py`. This module
+owns gate *policy* only, and never imports the worker: where a gate needs a worker function the
+worker injects it — the re-verify through `_reverify_rebased_tree`'s `run_post_merge_verify`
+parameter, the γ2 auto-chain through `_GenerationChainContext`.
 
 | Symbol | Location | Description |
 |--------|----------|-------------|
-| `DROPPED_PLAN_TARGETS_REASON_PREFIX` | merge_gates.py | Reason prefix: drop-guard found branch work missing from the merge commit |
-| `PLAN_FILES_NOT_TOUCHED_REASON_PREFIX` | merge_gates.py | Reason prefix: pre-merge Decision-1 check found a declared plan file untouched by the branch |
-| `POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX` | merge_gates.py | Reason prefix: post-merge Decision-2 content-equivalence gate failed |
-| `POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX` | merge_gates.py | Reason prefix: post-merge unscoped type-check found a cross-PR union break |
-| `DropGuardResult` | merge_gates.py | Structured return value from `_check_plan_targets_in_tree` |
-| `PlanFilesTouchedResult` | merge_gates.py | Structured return value from `_check_plan_files_touched_in_branch` |
-| `PostMergePyrightResult` | merge_gates.py | Structured return value from `_check_post_merge_pyright` / `_run_unscoped_typechecks` |
-| `_GenerationChainContext` | merge_gates.py | Bundle passed into `_finalize_advanced_merge` for γ2 auto-chaining (queue + counters + retention) |
-| `_OVERLAP_GIT_ERROR_SENTINEL` | merge_gates.py | Fail-CLOSED sentinel returned by `_rebase_delta_touched_overlap` on a git error |
-| `_check_plan_targets_in_tree()` | merge_gates.py | Drop-guard: files on task HEAD but dropped from the merge commit |
-| `_normalize_plan_path()` | merge_gates.py | Git-canonical form of a declared plan path (helper of the plan-files-touched gate) |
-| `_check_plan_files_touched_in_branch()` | merge_gates.py | Pre-merge Decision-1: every declared plan file must be touched on the branch |
-| `_check_post_merge_equivalence()` | merge_gates.py | Post-merge Decision-2: branch-touched paths must match the advanced main tree |
-| `_rebase_delta_touched_overlap()` | merge_gates.py | Intersection of branch-touched and intervening-rebase-delta files (fail-closed) |
-| `_reverify_rebased_tree()` | merge_gates.py | Disjoint-delta re-verify gate; delegates to `_run_post_merge_verify` when overlapping |
-| `_check_post_merge_pyright()` | merge_gates.py | Post-merge Decision-3: unscoped package-wide type-check against the advanced main SHA |
-| `_resolve_second_parent()` | merge_gates.py | Second parent (`sha^2`) of a `--no-ff` merge commit, for equivalence-gate tip resolution |
-| `_commit_is_linear()` | merge_gates.py | True iff a commit has ≤1 parent (task-1928 worktree-HEAD-fallback fail-safe gate) |
-| `_finalize_advanced_merge()` | merge_gates.py | Post-advance success block: runs the equivalence + pyright gates, returns `MergeOutcome` |
-| `_map_advance_failure()` | merge_gates.py | `advance_main` failure-result → `MergeOutcome` mapping shared by both workers |
+| `DROPPED_PLAN_TARGETS_REASON_PREFIX` | merge_lane/gates.py | Reason prefix: drop-guard found branch work missing from the merge commit |
+| `PLAN_FILES_NOT_TOUCHED_REASON_PREFIX` | merge_lane/gates.py | Reason prefix: pre-merge Decision-1 check found a declared plan file untouched by the branch |
+| `POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX` | merge_lane/gates.py | Reason prefix: post-merge Decision-2 content-equivalence gate failed |
+| `POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX` | merge_lane/gates.py | Reason prefix: post-merge unscoped type-check found a cross-PR union break |
+| `DropGuardResult` | merge_lane/gates.py | Structured return value from `_check_plan_targets_in_tree` |
+| `PlanFilesTouchedResult` | merge_lane/gates.py | Structured return value from `_check_plan_files_touched_in_branch` |
+| `PostMergePyrightResult` | merge_lane/gates.py | Structured return value from `_check_post_merge_pyright` / `_run_unscoped_typechecks` |
+| `_GenerationChainContext` | merge_lane/gates.py | Bundle passed into `_finalize_advanced_merge` for γ2 auto-chaining (queue + counters + retention) |
+| `_OVERLAP_GIT_ERROR_SENTINEL` | merge_lane/gates.py | Fail-CLOSED sentinel returned by `_rebase_delta_touched_overlap` on a git error |
+| `_check_plan_targets_in_tree()` | merge_lane/gates.py | Drop-guard: files on task HEAD but dropped from the merge commit |
+| `_normalize_plan_path()` | merge_lane/gates.py | Git-canonical form of a declared plan path (helper of the plan-files-touched gate) |
+| `_check_plan_files_touched_in_branch()` | merge_lane/gates.py | Pre-merge Decision-1: every declared plan file must be touched on the branch |
+| `_check_post_merge_equivalence()` | merge_lane/gates.py | Post-merge Decision-2: branch-touched paths must match the advanced main tree |
+| `_rebase_delta_touched_overlap()` | merge_lane/gates.py | Intersection of branch-touched and intervening-rebase-delta files (fail-closed) |
+| `_reverify_rebased_tree()` | merge_lane/gates.py | Disjoint-delta re-verify gate; delegates to `_run_post_merge_verify` when overlapping |
+| `_check_post_merge_pyright()` | merge_lane/gates.py | Post-merge Decision-3: unscoped package-wide type-check against the advanced main SHA |
+| `_resolve_second_parent()` | merge_lane/gates.py | Second parent (`sha^2`) of a `--no-ff` merge commit, for equivalence-gate tip resolution |
+| `_commit_is_linear()` | merge_lane/gates.py | True iff a commit has ≤1 parent (task-1928 worktree-HEAD-fallback fail-safe gate) |
+| `_finalize_advanced_merge()` | merge_lane/gates.py | Post-advance success block: runs the equivalence + pyright gates, returns `MergeOutcome` |
+| `_map_advance_failure()` | merge_lane/gates.py | `advance_main` failure-result → `MergeOutcome` mapping shared by both workers |
+| `AUTO_CHAIN_GENERATIONS_ENABLED` | merge_lane/gates.py | γ2 auto-chain kill switch (module-level bool, default `False`); moved out of the worker, task 5036 |
+| `_run_unscoped_typechecks()` | merge_lane/gates.py | Unscoped package-wide type-check runner behind `_check_post_merge_pyright`; moved out of the worker, task 5036 |
+| `_POST_MERGE_PYRIGHT_MAX_DETAIL` | merge_lane/gates.py | Character cap on `PostMergePyrightResult.detail` |
+| `_emit_merge_attempt()` | merge_lane/gates.py | `merge_attempt` event emitter shared by the gates and the worker; moved out of the worker, task 5036 |
+| `_elapsed_ms()` | merge_lane/gates.py | Milliseconds since a `time.monotonic()` start value, or `None` |
+| `_MAX_EVENT_EVIDENCE_ITEMS` | merge_lane/gates.py | Cap on evidence items carried on a `merge_attempt` event |
 
-### 7.3 merge_shadow.py — warm-vs-cold shadow-compare detective (MQ-refactor task γ)
+### 7.3 merge_lane/shadow.py — warm-vs-cold shadow-compare detective (MQ-refactor task γ)
 
 The per-test result parsers, the persisted shadow-compare cadence state, and the warm-vs-cold
-shadow-compare functions (PRD §10 invariant 6(b)) were extracted verbatim into
-`orchestrator/merge_shadow.py` (task γ of `plans/merge-queue-modularization-invariants-prd.md`).
-`merge_queue.py` re-exports every one of these names through a single top-level shim import
-(`from orchestrator.merge_shadow import (...)  # noqa: F401  re-export shim`), so existing call
-sites — `from orchestrator.merge_queue import _run_shadow_compare`, etc. — keep working
-unchanged.
-
-**Reach-back convention:** identical in spirit to β's (§7.2) — a moved function that calls a
-merge_queue-resident sibling, whether that sibling stays permanently
-(`_run_unscoped_typechecks`) or is monkeypatched by the existing test suite via the string path
-`orchestrator.merge_queue.<name>`, resolves it through a function-local deferred import from
-`orchestrator.merge_queue`. Two distinct import styles are used, depending on whether the
-target also carries a module-level "naive" import: `run_scoped_verification`,
-`build_merge_verify_spec`, `VerifyRunnerPool`, and `LocalRunner` each have one (kept solely as a
-`TestReachBackRouting` patch target), so `_run_cold_shadow_verify` reaches back to them — and to
-the permanently-staying `_run_unscoped_typechecks`, for consistency — via
-`import orchestrator.merge_queue as _mq` + `_mq.<name>` attribute access; a `from ... import`
-reach-back would instead shadow the naive import and trip ruff's F811. `_run_cold_shadow_verify`
-and `_run_shadow_compare` themselves carry no naive top-level import (they are local
-definitions, not re-imported leaf symbols), so their respective callers use a plain
-`from orchestrator.merge_queue import <name>` instead: `_run_shadow_compare` reaches back to
-`_run_cold_shadow_verify` this way for both the initial and the Option-B re-confirmation cold
-leg; `_maybe_schedule_shadow_compare` reaches back to `_run_shadow_compare` the same way when
-spawning the off-serial-lane task.
+shadow-compare functions (PRD §10 invariant 6(b)) live in
+`orchestrator/src/orchestrator/merge_lane/shadow.py` (task γ of
+`plans/merge-queue-modularization-invariants-prd.md`; moved from `merge_shadow.py` by task 5036).
+The module imports the verify-pool cluster (`build_merge_verify_spec` / `VerifyRunnerPool` /
+`LocalRunner`) directly from `orchestrator/verify_runner.py` and the worker only under
+`TYPE_CHECKING`, so there is no reach-back into the worker.
 
 | Symbol | Location | Description |
 |--------|----------|--------------|
-| `ShadowCompareState` | merge_shadow.py | Persisted cadence state (`merges_since_last_shadow`, `last_shadow_run_at`) |
-| `ShadowCompareDiff` | merge_shadow.py | Per-test divergence buckets between a warm and a cold verify run |
-| `_NEXTEST_TEST_LINE_RE` | merge_shadow.py | Regex matching cargo-nextest human-output per-test result lines |
-| `_LIBTEST_TEST_LINE_RE` | merge_shadow.py | Regex matching plain `cargo test` (libtest) per-test result lines |
-| `_NEXTEST_SUMMARY_LINE_RE` | merge_shadow.py | Regex matching the cargo-nextest `Summary [..] N tests run:` footer |
-| `_classify_test_status()` | merge_shadow.py | Map a raw nextest/libtest status token to `'pass'`/`'fail'`/`'inconclusive'` |
-| `parse_per_test_results()` | merge_shadow.py | Parse verify output into a per-test verdict map (nextest or libtest format) |
-| `_nextest_reported_test_count()` | merge_shadow.py | Sum of `N tests run:` counts across all Summary footer lines, or `None` |
-| `diff_per_test_results()` | merge_shadow.py | Compute the `ShadowCompareDiff` between a warm and a cold per-test result map |
-| `_persistent_alarm_tests()` | merge_shadow.py | Intersection of alarm-worthy test ids across two `ShadowCompareDiff`s (Option-B re-confirmation) |
-| `_load_shadow_compare_state()` | merge_shadow.py | Fail-safe JSON load of the persisted cadence state |
-| `_save_shadow_compare_state()` | merge_shadow.py | Persist the cadence state to JSON |
-| `_shadow_compare_due()` | merge_shadow.py | OR-cadence gate: every-N-merges leg OR nightly-timer leg |
-| `_WARM_COLD_SHADOW_SENTINEL` | merge_shadow.py | Dedup sentinel task_id for the divergence escalation |
-| `_WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL` | merge_shadow.py | Dedup sentinel task_id for the fail-closed unparseable-format escalation |
-| `_submit_shadow_divergence_escalation()` | merge_shadow.py | Born-at-L2 critical escalation for a warm/cold divergence |
-| `_alarm_warm_shadow_unparseable()` | merge_shadow.py | Fail-closed born-at-L2 alarm when the warm verify output is unparseable despite tests having run |
-| `_run_cold_shadow_verify()` | merge_shadow.py | From-scratch cold verify of a landed merge commit in a throwaway worktree |
-| `_run_shadow_compare()` | merge_shadow.py | Detective control: cold-vs-warm compare with Option-B re-confirmation and alarm/parity-ok emission |
-| `_maybe_schedule_shadow_compare()` | merge_shadow.py | Non-blocking cadence-gated scheduler; spawns `_run_shadow_compare` off the serial lane |
+| `ShadowCompareState` | merge_lane/shadow.py | Persisted cadence state (`merges_since_last_shadow`, `last_shadow_run_at`) |
+| `ShadowCompareDiff` | merge_lane/shadow.py | Per-test divergence buckets between a warm and a cold verify run |
+| `_NEXTEST_TEST_LINE_RE` | merge_lane/shadow.py | Regex matching cargo-nextest human-output per-test result lines |
+| `_LIBTEST_TEST_LINE_RE` | merge_lane/shadow.py | Regex matching plain `cargo test` (libtest) per-test result lines |
+| `_NEXTEST_SUMMARY_LINE_RE` | merge_lane/shadow.py | Regex matching the cargo-nextest `Summary [..] N tests run:` footer |
+| `_classify_test_status()` | merge_lane/shadow.py | Map a raw nextest/libtest status token to `'pass'`/`'fail'`/`'inconclusive'` |
+| `parse_per_test_results()` | merge_lane/shadow.py | Parse verify output into a per-test verdict map (nextest or libtest format) |
+| `_nextest_reported_test_count()` | merge_lane/shadow.py | Sum of `N tests run:` counts across all Summary footer lines, or `None` |
+| `diff_per_test_results()` | merge_lane/shadow.py | Compute the `ShadowCompareDiff` between a warm and a cold per-test result map |
+| `_persistent_alarm_tests()` | merge_lane/shadow.py | Intersection of alarm-worthy test ids across two `ShadowCompareDiff`s (Option-B re-confirmation) |
+| `_load_shadow_compare_state()` | merge_lane/shadow.py | Fail-safe JSON load of the persisted cadence state |
+| `_save_shadow_compare_state()` | merge_lane/shadow.py | Persist the cadence state to JSON |
+| `_shadow_compare_due()` | merge_lane/shadow.py | OR-cadence gate: every-N-merges leg OR nightly-timer leg |
+| `_WARM_COLD_SHADOW_SENTINEL` | merge_lane/shadow.py | Dedup sentinel task_id for the divergence escalation |
+| `_WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL` | merge_lane/shadow.py | Dedup sentinel task_id for the fail-closed unparseable-format escalation |
+| `_submit_shadow_divergence_escalation()` | merge_lane/shadow.py | Born-at-L2 critical escalation for a warm/cold divergence |
+| `_alarm_warm_shadow_unparseable()` | merge_lane/shadow.py | Fail-closed born-at-L2 alarm when the warm verify output is unparseable despite tests having run |
+| `_run_cold_shadow_verify()` | merge_lane/shadow.py | From-scratch cold verify of a landed merge commit in a throwaway worktree |
+| `_run_shadow_compare()` | merge_lane/shadow.py | Detective control: cold-vs-warm compare with Option-B re-confirmation and alarm/parity-ok emission |
+| `_maybe_schedule_shadow_compare()` | merge_lane/shadow.py | Non-blocking cadence-gated scheduler; spawns `_run_shadow_compare` off the serial lane |
 
-### 7.4 merge_drift.py — drift-check detective (MQ-refactor task γ)
+### 7.4 merge_lane/drift.py — drift-check detective (MQ-refactor task γ)
 
-The Lever-C drift-check runner and its land-hook cadence gate were extracted verbatim into
-`orchestrator/merge_drift.py` (task γ). `merge_queue.py` re-exports both names through a
-top-level shim import (`from orchestrator.merge_drift import (...)  # noqa: F401  re-export
-shim`), so existing call sites — `from orchestrator.merge_queue import _run_drift_check`, etc. —
-keep working unchanged.
+The Lever-C drift-check runner and its land-hook cadence gate live in
+`orchestrator/src/orchestrator/merge_lane/drift.py` (task γ; moved from `merge_drift.py` by task
+5036), together with the module-level `_build_remote_runners` legacy-pool builder (formerly in the
+worker).
 
 **Correction to the step-3 plan prose:** despite both being off-serial-lane detective controls
 spawned from the same `'done'`-land hook, `_run_drift_check` does **not** call
 `_run_cold_shadow_verify` / `_run_shadow_compare` — drift-check and shadow-compare are
-independent sibling detectives, not caller/callee. The reach-back cluster this module actually
-needs is the verify-pool-construction cluster it shares with merge_shadow.py:
-`build_merge_verify_spec` / `VerifyRunnerPool` / `LocalRunner` / `run_scoped_verification` (plus
-the staying `_run_unscoped_typechecks` and the module-level `_build_remote_runners` legacy-pool
-builder), all resolved via the same `import orchestrator.merge_queue as _mq` attribute-access
-reach-back as merge_shadow.py, for the same F811-avoidance reason. `_maybe_run_drift_check`
-separately reaches back to `_run_drift_check` via `from orchestrator.merge_queue import
-_run_drift_check` when spawning the off-serial-lane task.
+independent sibling detectives, not caller/callee. Both modules import the verify-pool cluster
+(`build_merge_verify_spec` / `VerifyRunnerPool` / `LocalRunner`, from `orchestrator/verify_runner.py`)
+directly; the worker is imported only under `TYPE_CHECKING`.
 
 | Symbol | Location | Description |
 |--------|----------|--------------|
-| `_run_drift_check()` | merge_drift.py | Drift detective: `DriftDetector.check` in a throwaway worktree against a 2-host (local + remote) pool |
-| `_maybe_run_drift_check()` | merge_drift.py | Cadence gate + off-serial-lane spawn, called immediately after `_maybe_schedule_shadow_compare` |
+| `_run_drift_check()` | merge_lane/drift.py | Drift detective: `DriftDetector.check` in a throwaway worktree against a 2-host (local + remote) pool |
+| `_maybe_run_drift_check()` | merge_lane/drift.py | Cadence gate + off-serial-lane spawn, called immediately after `_maybe_schedule_shadow_compare` |
+| `_build_remote_runners()` | merge_lane/drift.py | Builds the remote-only `RemoteRunner` list from operator config (Lever C); moved out of the worker, task 5036 |
 
-### 7.5 merge_liveness.py — startup liveness margin, verify-host alarms, persistent-worktree guards (MQ-refactor task γ)
+### 7.5 merge_lane/liveness.py — startup liveness margin, verify-host alarms, persistent-worktree guards (MQ-refactor task γ)
 
 **Open Q5 resolution:** three subsystems — the startup liveness-margin guard (heartbeat-floor
 vs. reaper-window safety check), the verify-host-unreachable alarm/recovery helpers, and the
 persistent warm-merge-verify-worktree serial-lane guards — are folded into one module as
 "operational guards" rather than split into their own modules (plan.json design_decisions #1):
 none is individually large, and all three gate/monitor worker-level operational health rather
-than verify-parity detection (the shadow/drift detective family in merge_shadow.py /
-merge_drift.py). `merge_queue.py` re-exports every one of these names through a single
-top-level shim import (`from orchestrator.merge_liveness import (...)  # noqa: F401
-re-export shim`), so existing call sites — `from orchestrator.merge_queue import
-enforce_merge_liveness_margin`, etc. — keep working unchanged.
+than verify-parity detection (the shadow/drift detective family in `shadow.py` / `drift.py`).
+The module is `orchestrator/src/orchestrator/merge_lane/liveness.py` (task 5036 moved it from
+`merge_liveness.py`); every target in it is a SYNC function.
 
-**Reach-back convention:** a moved function that reads or calls a merge_queue-resident
-sibling — whether a function (`check_merge_liveness_margin`) or a module-level CONSTANT
-(`_HEARTBEAT_POLL_S`, `TOUCH_MISS_TOLERANCE`, `INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS`,
-`_MERGE_AHEAD_BOUND`) that stays in `merge_queue.py` and is monkeypatched by the existing test
-suite via the string path `orchestrator.merge_queue.<name>` — resolves it through a
-function-local deferred `from orchestrator.merge_queue import <name>` rather than a direct
-intra-module reference. Every target in this module is a SYNC function.
+**Constants:** `TOUCH_MISS_TOLERANCE` and `INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` are defined in
+`liveness.py` itself; `_HEARTBEAT_POLL_S` and `_MERGE_AHEAD_BOUND` are defined in
+`merge_lane/types.py` and imported here. The module imports nothing from the worker.
 
 **Engine-constant default-argument hazard:** `liveness_secs` (on `check_merge_liveness_margin` /
 `enforce_merge_liveness_margin`) and `merge_ahead_bound` (on
-`enforce_persistent_worktree_serial_lane`) used to default to a bare merge_queue-resident
-constant (`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` / `_MERGE_AHEAD_BOUND`). Default values are
-evaluated at *def time* (module import), so a moved function cannot default to a
-merge_queue-resident constant without a top-level `import orchestrator.merge_queue` — which
-would deadlock module load, since merge_queue's shim needs this module fully defined first.
-Each default is therefore a `None` sentinel, resolved in-body via the same deferred-import
-reach-back — behavior-preserving (identical effective defaults: 10800 / 1); only the signature
-default literal changed (to `None`).
+`enforce_persistent_worktree_serial_lane`) default to a `None` sentinel, resolved in-body to
+`INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` / `_MERGE_AHEAD_BOUND` (effective defaults 10800 / 1) —
+default values are evaluated at *def time*, so a bare-constant default would freeze the value a
+test or config patches later.
 
 | Symbol | Location | Description |
 |--------|----------|--------------|
-| `MergeLivenessAssessment` | merge_liveness.py | Return value from `check_merge_liveness_margin` (heartbeat-floor vs. threshold, `safe` verdict) |
-| `check_merge_liveness_margin()` | merge_liveness.py | WARNING-only heartbeat-floor-vs-reaper-window assessment |
-| `MergeLivenessConfigError` | merge_liveness.py | Raised by `enforce_merge_liveness_margin` when the margin is unsafe |
-| `enforce_merge_liveness_margin()` | merge_liveness.py | Fail-closed wrapper: raises `MergeLivenessConfigError` when not safe |
-| `PersistentWorktreeConfigError` | merge_liveness.py | Raised by `enforce_persistent_worktree_serial_lane` when per-host in-flight count would exceed 1 |
-| `_safety_valve_due()` | merge_liveness.py | Periodic cold-verify safety-valve gate (every Nth verifying attempt, PRD §10 invariant 6) |
-| `_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX` | merge_liveness.py | Per-host dedup sentinel prefix for unreachability alarms (task 1795) |
-| `_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX` | merge_liveness.py | Per-host sentinel prefix for recovery info escalations, distinct from the unreachable prefix |
-| `_MERGE_WORKER_LOOP_DIED_SENTINEL` | merge_liveness.py | Sentinel task_id base for the merge-worker supervisor loop-death escalation |
-| `_verify_host_unreachable_sentinel()` | merge_liveness.py | Per-host dedup sentinel task_id for unreachability alarms |
-| `_alarm_verify_host_unreachable()` | merge_liveness.py | Dedup'd L1 escalation when a remote verify host is persistently unreachable |
-| `_clear_verify_host_unreachable()` | merge_liveness.py | Resolve any open unreachability alarm and emit a recovery event on reprobe success |
-| `_acquire_warm_verify_worktree()` | merge_liveness.py | Swap the ephemeral merge worktree for the persistent warm worktree (or the `_spec-` warm lane) |
-| `enforce_persistent_worktree_serial_lane()` | merge_liveness.py | Fail-closed startup guard: per-host in-flight verify count must not exceed 1 |
+| `MergeLivenessAssessment` | merge_lane/liveness.py | Return value from `check_merge_liveness_margin` (heartbeat-floor vs. threshold, `safe` verdict) |
+| `check_merge_liveness_margin()` | merge_lane/liveness.py | WARNING-only heartbeat-floor-vs-reaper-window assessment |
+| `MergeLivenessConfigError` | merge_lane/liveness.py | Raised by `enforce_merge_liveness_margin` when the margin is unsafe |
+| `enforce_merge_liveness_margin()` | merge_lane/liveness.py | Fail-closed wrapper: raises `MergeLivenessConfigError` when not safe |
+| `PersistentWorktreeConfigError` | merge_lane/liveness.py | Raised by `enforce_persistent_worktree_serial_lane` when per-host in-flight count would exceed 1 |
+| `_safety_valve_due()` | merge_lane/liveness.py | Periodic cold-verify safety-valve gate (every Nth verifying attempt, PRD §10 invariant 6) |
+| `_VERIFY_HOST_UNREACHABLE_SENTINEL_PREFIX` | merge_lane/liveness.py | Per-host dedup sentinel prefix for unreachability alarms (task 1795) |
+| `_VERIFY_HOST_RECOVERED_SENTINEL_PREFIX` | merge_lane/liveness.py | Per-host sentinel prefix for recovery info escalations, distinct from the unreachable prefix |
+| `_MERGE_WORKER_LOOP_DIED_SENTINEL` | merge_lane/liveness.py | Sentinel task_id base for the merge-worker supervisor loop-death escalation |
+| `_verify_host_unreachable_sentinel()` | merge_lane/liveness.py | Per-host dedup sentinel task_id for unreachability alarms |
+| `_alarm_verify_host_unreachable()` | merge_lane/liveness.py | Dedup'd L1 escalation when a remote verify host is persistently unreachable |
+| `_clear_verify_host_unreachable()` | merge_lane/liveness.py | Resolve any open unreachability alarm and emit a recovery event on reprobe success |
+| `_acquire_warm_verify_worktree()` | merge_lane/liveness.py | Swap the ephemeral merge worktree for the persistent warm worktree (or the `_spec-` warm lane) |
+| `enforce_persistent_worktree_serial_lane()` | merge_lane/liveness.py | Fail-closed startup guard: per-host in-flight verify count must not exceed 1 |
+| `TOUCH_MISS_TOLERANCE` | merge_lane/liveness.py | Consecutive heartbeat ticks a live worker's `_merge-*` worktrees may miss before mtime ages into the reaper window (= 20); moved out of the worker, task 5036 |
+| `INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS` | merge_lane/liveness.py | The reaper's liveness window in seconds (= 10800); moved out of the worker, task 5036 |
 
 ### 7.6 suffix_graph.py — SuffixConflictTracker (conflict graph + bounce state) (MQ-refactor task δ)
 
@@ -376,10 +347,8 @@ The two-layer suffix-conflict machinery — the `SuffixConflictGraph` immutable 
 dataclass and its `EMPTY_SUFFIX_CONFLICT_GRAPH` sentinel — were extracted verbatim, and a NEW
 `SuffixConflictTracker` class that owns the state (`graph` / `signature` / `last_known_main_sha` /
 `bounce_registry`) and logic (`recompute()` / `bounce_conflicting_suffix_items()`) was added, into
-`orchestrator/suffix_graph.py` (task δ of `plans/merge-queue-modularization-invariants-prd.md`).
-`merge_queue.py` re-exports all three names through a single top-level shim import (`from
-orchestrator.suffix_graph import (...)  # noqa: F401  re-export shim`), so existing call sites —
-`from orchestrator.merge_queue import SuffixConflictGraph`, etc. — keep working unchanged.
+`orchestrator/src/orchestrator/suffix_graph.py` (task δ of `plans/merge-queue-modularization-invariants-prd.md`).
+This module stayed OUTSIDE the `orchestrator/merge_lane/` package (task 5036).
 
 Unlike α–γ's pure function/type extractions, this module also introduces a NEW owning class.
 `SuffixConflictTracker` takes a live `GitOps` reference plus three narrow accessor callables —
@@ -394,17 +363,16 @@ tracker — so `_acquire_next_request()`, `snapshot()`, `_pop_next_pickable()`,
 `two_layer_invariants()`, and the existing conflict-graph/bounce test suites all keep working with
 zero churn.
 
-**Reach-back convention:** identical in spirit to β/γ/λ (§7.2/7.3/7.5) — the two tracker methods
-resolve the three merge_queue-resident constants they read (`MERGE_LANES`, `MERGE_BOUNCE_CAP`,
-`NEEDS_REBASE_REASON_PREFIX`) through function-local deferred `from orchestrator.merge_queue
-import <name>` imports rather than a top-level import, keeping `suffix_graph.py` free of any
-top-level import of `merge_queue` (which would deadlock module load, since merge_queue's shim
-needs this module fully defined first). None of the three constants were moved — they stay in
-`merge_queue.py`.
+**Reach-back convention:** the two tracker methods resolve the three worker-resident constants
+they read (`MERGE_LANES`, `MERGE_BOUNCE_CAP`, `NEEDS_REBASE_REASON_PREFIX`, all in
+`merge_lane/worker.py`) through a function-local deferred `from orchestrator.merge_queue import
+<name>` import (the `orchestrator.merge_queue` alias, until task 5037 re-points it at
+`orchestrator.merge_lane.worker`) rather than a top-level import, keeping `suffix_graph.py` free of
+any top-level import of the worker (which would be a cycle, since the worker imports this module).
 
 | Symbol | Location | Description |
 |--------|----------|--------------|
-| `SuffixConflictGraph` | suffix_graph.py | Immutable conflict graph over the unfrozen suffix (moved verbatim from merge_queue.py) |
+| `SuffixConflictGraph` | suffix_graph.py | Immutable conflict graph over the unfrozen suffix (moved verbatim from the monolith, now `merge_lane/worker.py`) |
 | `EMPTY_SUFFIX_CONFLICT_GRAPH` | suffix_graph.py | Sentinel empty `SuffixConflictGraph` for the default/zero-suffix case (moved verbatim) |
 | `SuffixConflictTracker` | suffix_graph.py | Owns `graph` / `signature` / `last_known_main_sha` / `bounce_registry`; constructed with `git_ops` + `lane_buffers`/`frozen_prefix`/`frozen_prefix_tip` callables |
 | `SuffixConflictTracker.recompute()` | suffix_graph.py | Recompute and store the conflict graph over the unfrozen suffix (debounced, fail-open); `SpeculativeMergeWorker.recompute_suffix_conflict_graph()` delegates here |
@@ -413,7 +381,7 @@ needs this module fully defined first). None of the three constants were moved �
 ### 7.7 MergeWorker retirement — one merge worker, in production and in the tests (MQ-refactor task ν, merge-lane-quality δ)
 
 The legacy serial `MergeWorker` — the single-coroutine worker with no lane-priority ordering
-that predated the two-layer model — was retired from `orchestrator/src/orchestrator/merge_queue.py`
+that predated the two-layer model — was retired from `orchestrator/src/orchestrator/merge_lane/worker.py` (then `merge_queue.py`)
 by task ν of `plans/merge-queue-modularization-invariants-prd.md` (R7b). `SpeculativeMergeWorker`,
 exported as `orchestrator.merge_lane.MergeLane`, is the sole merge worker.
 

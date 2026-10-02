@@ -494,7 +494,7 @@ requirement for a working install — skip this section unless you need it.
   remote checkout has checked out, and git refuses to accept a push to a
   checked-out branch by default. The `RemoteRunner(main_branch=...)`
   argument is always populated from `git.main_branch` in production —
-  `merge_queue.py::_build_verify_runners` is the sole production site that
+  `merge_lane/drift.py::_build_remote_runners` is the sole production site that
   constructs a `RemoteRunner`, and it always passes
   `main_branch=config.git.main_branch` — so this push, and therefore the
   `updateInstead` requirement, is not optional. `RemoteRunner`'s
@@ -707,7 +707,7 @@ reuse is worth having at all:
 
    It is worth being precise about what does **not** back you up here,
    because the name suggests otherwise. There is a fail-closed config-time
-   guard, `merge_liveness.py::enforce_persistent_worktree_serial_lane`,
+   guard, `merge_lane/liveness.py::enforce_persistent_worktree_serial_lane`,
    which raises `PersistentWorktreeConfigError` when the per-host worst
    case `ceil(merge_ahead_bound / num_hosts)` exceeds `1` (PRD §A
    invariant 4) — but at its only production call site
@@ -762,7 +762,7 @@ throughput-and-paging basis rather than a corruption one.
    documented and implemented as **one slot per host**
    (`self._slots[name] = _SLOT_FREE`; `acquire_remote` requires
    `_SLOT_FREE`), and both the merge worker and the drift detective
-   (`merge_drift.py`'s `acquire_local`/`acquire_remote`) dispatch through
+   (`merge_lane/drift.py`'s `acquire_local`/`acquire_remote`) dispatch through
    that same worker-lifetime allocator instance. So at `K=2`, ordinary
    allocator-mediated concurrency cannot by itself put two dark_factory
    verifies on the laptop together — a runtime "by construction"

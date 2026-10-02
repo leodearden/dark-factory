@@ -403,7 +403,7 @@ directly, not just interactive agents.
 - Do not direct-commit to main while a merge verify is **in flight**;
   queued-only is fine (`depth` counts queued entries, not work). Moving main
   under a solo merge forces a full re-verify however disjoint the files:
-  `orchestrator/src/orchestrator/merge_gates.py::_disjoint_skip_blockers`
+  `orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers`
   refuses the disjoint skip here on two counts — this project's
   `merge_verify_breadth: "full"` (a whole-tree gate), and drift the queue did
   not itself land green (commit `fa95988c8e`). Under a coalesce train it is
