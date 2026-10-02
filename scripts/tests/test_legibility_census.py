@@ -30,7 +30,7 @@ import digest as digest_mod
 import filing_policy
 import inventory
 import pytest
-from legibility import census_trigger, unlanded
+from legibility import census_trigger, session_runner, unlanded
 from shared.cap_markers import BLOCKING_BANNER_MARKERS, REAL_CLI_CAP_MESSAGES
 
 import config as config_mod
@@ -622,7 +622,7 @@ def test_preflight_headroom_banner_match_is_case_insensitive():
 
 def test_preflight_headroom_invocation_error_defers_fail_safe():
     def raising_invoke(prompt, model):
-        raise coder.CoderInvocationError(
+        raise session_runner.InvocationFailed(
             "claude CLI exited 1 (model='sonnet'): simulated backend outage"
         )
 
@@ -5560,7 +5560,7 @@ def test_default_verify_fn_raises_when_an_invocation_error_reprobes_capped():
     def invoke(prompt, model):
         calls.append(prompt)
         if len(calls) == 2:
-            raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+            raise session_runner.InvocationFailed("claude CLI exited 1: simulated cap")
         return _verdict()
 
     probe = _make_recording_probe(
@@ -5593,7 +5593,7 @@ def test_default_verify_fn_still_rejects_when_the_reprobe_says_healthy():
     def invoke(prompt, model):
         calls.append(prompt)
         if len(calls) == 2:
-            raise coder.CoderInvocationError("claude CLI exited 1: unrelated outage")
+            raise session_runner.InvocationFailed("claude CLI exited 1: unrelated outage")
         return _verdict()
 
     probe = _make_recording_probe(mod.HeadroomResult(ok=True))
@@ -5620,7 +5620,7 @@ def test_default_verify_fn_without_probe_args_behaves_exactly_as_before():
     def invoke(prompt, model):
         calls.append(prompt)
         if len(calls) == 2:
-            raise coder.CoderInvocationError("claude CLI exited 1: simulated outage")
+            raise session_runner.InvocationFailed("claude CLI exited 1: simulated outage")
         return _verdict()
 
     verify_fn = mod._build_default_verify_fn("/tmp/root", invoke)
@@ -5980,7 +5980,7 @@ def test_default_verify_fn_treats_a_raising_probe_as_no_headroom():
     def invoke(prompt, model):
         calls.append(prompt)
         if len(calls) == 2:
-            raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+            raise session_runner.InvocationFailed("claude CLI exited 1: simulated cap")
         return _verdict()
 
     verify_fn = mod._build_default_verify_fn(
@@ -6411,7 +6411,7 @@ def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_t
             return _verdict()                  # cluster 0 verifies
         if len(calls) == 2:
             return _UNPARSEABLE_PLAIN_PROSE    # cluster 1 rejects
-        raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+        raise session_runner.InvocationFailed("claude CLI exited 1: simulated cap")
 
     clusters = _clusters(5)
     verify_fn = mod._build_default_verify_fn(

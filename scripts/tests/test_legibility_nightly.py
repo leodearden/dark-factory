@@ -30,6 +30,7 @@ from legibility import (
     coder,
     digest,
     nightly,
+    session_runner,
     trickle_state,
     unlanded,
 )
@@ -2028,24 +2029,41 @@ class TestRunNightlyDefaultsTheInvokeSeamToThePool:
             'an injected invoke must short-circuit the pool entirely'
         )
 
-    def test_the_pool_and_the_coder_share_one_module_object(self):
-        """account_pool's `coder` must BE nightly's `coder`, not a second
-        import of the same file.
-
-        scripts/legibility/ is on sys.path as well as scripts/, so a bare
-        `import coder` and `from legibility import coder` build two distinct
-        module objects carrying two distinct `CoderCapExhausted` classes. The
-        pool raises that exception and `coder.code_digest` catches it by name
-        -- and there is no generic `except Exception` beneath those two arms,
-        so a mismatch would not mislabel the deferral, it would let the
-        exception escape run_nightly entirely and crash the night that task
-        4736 exists to make exit 0.
+    @pytest.mark.parametrize('spelling', ['coder', 'legibility.coder'])
+    def test_the_capped_arm_catches_no_headroom_however_coder_was_imported(
+        self, spelling,
+    ):
+        """scripts/legibility/ is on sys.path as well as scripts/, so census's
+        bare `import coder` and nightly's `from legibility import coder` build
+        two distinct coder module objects. The invocation-boundary exceptions
+        live in session_runner, reached by the package spelling only, so both
+        coders catch the ONE NoHeadroom class the invoker raises. A mismatch
+        would let a capped digest escape run_nightly instead of reaching task
+        4736's exit-0 DEFERRED path.
         """
-        assert nightly.account_pool.coder is nightly.coder
-        assert (
-            nightly.account_pool.coder.CoderCapExhausted
-            is nightly.coder.CoderCapExhausted
+        import importlib
+
+        coder_module = importlib.import_module(spelling)
+
+        def capped_invoke(prompt, model):
+            raise session_runner.NoHeadroom('no headroom', marker='pool exhausted')
+
+        result = coder_module.code_digest(
+            _HAND_DIGEST_FOR_IDENTITY, {'entries': []}, project='dark_factory',
+            invoke=capped_invoke,
         )
+
+        assert result.capped is True
+
+
+_HAND_DIGEST_FOR_IDENTITY = (
+    '---\n'
+    'session: "sess-identity"\n'
+    'date: "2026-07-14"\n'
+    'agent_class: "interactive"\n'
+    '---\n\n'
+    '## User Corrections\n- a confusing correction\n'
+)
 
 
 def _no_outbound_post(url, **kwargs):
@@ -2493,7 +2511,7 @@ asserts this exact text survives the whole chain."""
 
 def _fake_invoke_capped(prompt: str, model: str):
     """Every digest hits a usage cap -- the 2026-08-24 shape."""
-    raise coder.CoderCapExhausted(
+    raise session_runner.NoHeadroom(
         "claude CLI exited 1 (model='haiku', claude_bin='claude', cwd=None): "
         f'stdout="{_CAP_BANNER_4736}" stderr=\'\'',
         marker="you've hit your",

@@ -44,10 +44,11 @@ import account_pool as mod
 import pytest
 
 # The `legibility.` spelling, matching account_pool's own import: a bare
-# `import coder` is a SECOND module object whose `CoderCapExhausted` is a
+# `import coder` is a SECOND module object whose `NoHeadroom` is a
 # different class from the one the pool raises, so every `pytest.raises`
 # below would stop matching what it is supposed to catch.
 from legibility import coder as coder_mod
+from legibility import session_runner
 from shared.usage_gate import AccountLease
 
 from shared import cap_markers, invocation_outcome
@@ -323,7 +324,7 @@ def test_pool_invoke_defaults_to_the_real_coder_seam():
 # ACCOUNT CAPPED and the SAME digest completes on the next account.
 #
 # Within a digest, not across digests, and that is a deliberate reading of
-# the existing code rather than of the task's prose: CoderCapExhausted's
+# the existing code rather than of the task's prose: NoHeadroom's
 # docstring defines capped as "there is no headroom left to code this
 # digest", and both coder.is_cap_deferral and nightly's DEFERRED summary
 # read it as "the CLI never looked at this digest". If one account's banner
@@ -341,7 +342,7 @@ def test_pool_invoke_defaults_to_the_real_coder_seam():
 # ---------------------------------------------------------------------------
 
 def _cap_exhausted(marker='weekly limit', *, stdout='', stderr=''):
-    return coder_mod.CoderCapExhausted(
+    return session_runner.NoHeadroom(
         f'claude CLI exited 1 (...): stdout={stdout!r} stderr={stderr!r}',
         marker=marker, stdout=stdout, stderr=stderr,
     )
@@ -396,7 +397,7 @@ def test_a_banner_caps_that_account_and_the_same_digest_completes_next_door():
 def test_a_loose_false_positive_propagates_unrotated():
     """THE guard that keeps a loose matcher from burning the pool.
 
-    coder's loose gate fired (so the exception is a CoderCapExhausted), but
+    coder's loose gate fired (so the exception is a NoHeadroom), but
     the gate's strict prefix-AND-confirm policy did NOT verdict a cap. The
     original exception must propagate untouched and NO second account may be
     leased — the loose verdict can re-label this one digest and nothing
@@ -408,7 +409,7 @@ def test_a_loose_false_positive_propagates_unrotated():
     original = _cap_exhausted(stdout='a digest that merely QUOTES a limit banner')
     invoke = _RecordingInvoke(raises={'tok-max-c': original})
 
-    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
     assert excinfo.value is original, (
@@ -431,21 +432,21 @@ def test_a_loose_false_positive_propagates_unrotated():
 
 
 def test_an_ordinary_failure_never_consults_the_gate_at_all():
-    """A plain CoderInvocationError is not a capacity signal. It propagates
+    """A plain InvocationFailed is not a capacity signal. It propagates
     immediately, without a cap verdict and without rotation: the account is
     fine, this digest is not."""
     gate = _pool(('max-b', False), ('max-c', False))
-    boom = coder_mod.CoderInvocationError(
+    boom = session_runner.InvocationFailed(
         'claude CLI exited 1: the model backend is down',
         stdout='', stderr='backend down',
     )
     invoke = _RecordingInvoke(raises={'tok-max-c': boom})
 
-    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
     assert excinfo.value is boom
-    assert not isinstance(excinfo.value, coder_mod.CoderCapExhausted)
+    assert not isinstance(excinfo.value, session_runner.NoHeadroom)
     assert gate.detect_calls == [], (
         f'an ordinary failure must not be offered to the cap detector at '
         f'all; got {gate.detect_calls}'
@@ -461,7 +462,7 @@ def test_an_ordinary_failure_never_consults_the_gate_at_all():
 def test_a_bare_exception_still_releases_the_probe_claim_and_never_rotates():
     """The `finally` covers EVERY exit path, not only the two coder
     exceptions this module knows how to interpret. A bare ``ValueError`` is
-    not caught by ``except coder.CoderCapExhausted`` at all, so this is the
+    not caught by ``except session_runner.NoHeadroom`` at all, so this is the
     one case that proves ``finally: gate.release_probe_slot(...)`` itself
     releases the claim rather than one of the `except` arms doing it.
     """
@@ -534,7 +535,7 @@ def test_an_exhausted_pool_raises_cap_exhausted_without_calling_the_cli():
     gate = _pool(('max-b', True), ('max-c', True))
     invoke = _RecordingInvoke()
 
-    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
     assert invoke.calls == [], (
@@ -557,7 +558,7 @@ def test_exhaustion_mid_rotation_also_raises_cap_exhausted():
         'tok-max-c': _cap_exhausted(stdout=banner),
     })
 
-    with pytest.raises(coder_mod.CoderCapExhausted):
+    with pytest.raises(session_runner.NoHeadroom):
         mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
     assert len(invoke.calls) == 2, (
@@ -572,7 +573,7 @@ def test_exhaustion_reason_names_how_many_accounts_were_capped():
     exhausted fleet from a pool that resolved almost empty."""
     gate = _pool(('max-b', True), ('max-c', True))
 
-    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod.pool_invoke(gate, invoke=_RecordingInvoke())('prompt', 'haiku')
 
     message = str(excinfo.value)
@@ -592,7 +593,7 @@ def test_a_pool_that_resolved_NO_accounts_says_so_instead():
     """
     gate = _pool()  # zero accounts
 
-    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod.pool_invoke(gate, invoke=_RecordingInvoke())('prompt', 'haiku')
 
     message = str(excinfo.value).lower()
@@ -663,7 +664,7 @@ def test_a_near_cap_verdict_everywhere_still_terminates():
     Every account banners, every verdict is True, and not one account
     transitions — which is precisely the real gate's near-cap behaviour. The
     digest must still give up after exactly one try per account and raise
-    CoderCapExhausted, so the night reaches task 4736's exit-0 DEFERRED path
+    NoHeadroom, so the night reaches task 4736's exit-0 DEFERRED path
     instead of hanging the 03:00 unit until the weekly reset.
     """
     gate = _near_cap_pool(('max-b', False), ('max-c', False), ('max-d', False))
@@ -672,7 +673,7 @@ def test_a_near_cap_verdict_everywhere_still_terminates():
         for name in ('max-b', 'max-c', 'max-d')
     })
 
-    with pytest.raises(coder_mod.CoderCapExhausted):
+    with pytest.raises(session_runner.NoHeadroom):
         mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
     assert len(invoke.calls) == gate.account_count == 3, (
@@ -735,7 +736,7 @@ def test_the_growing_exclusion_is_what_bounds_the_rotation():
         for name in ('max-b', 'max-c', 'max-d')
     })
 
-    with pytest.raises(coder_mod.CoderCapExhausted):
+    with pytest.raises(session_runner.NoHeadroom):
         mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
     # An omitted exclusion and an empty one mean the same thing to the gate,
@@ -837,8 +838,8 @@ class _OpaqueGate:
 
 
 def _reason_from(gate, invoke=None):
-    """The CoderCapExhausted message ``pool_invoke`` produces for *gate*."""
-    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+    """The NoHeadroom message ``pool_invoke`` produces for *gate*."""
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod.pool_invoke(gate, invoke=invoke or _RecordingInvoke())('prompt', 'haiku')
     return str(excinfo.value)
 
@@ -1010,7 +1011,7 @@ def test_a_near_cap_pool_reads_as_a_cap_deferral_end_to_end():
 # ---------------------------------------------------------------------------
 # task 5637: THE EXIT-0 BANNER ROUTE — the CLI declines by PRINTING the banner
 # and exiting 0, so the banner arrives as a RETURNED reply rather than as a
-# raised CoderCapExhausted.
+# raised NoHeadroom.
 #
 # The section above covers the route where the CLI exits non-zero; this is the
 # other half of the same weather, and before this task it was not rotated at
@@ -1342,7 +1343,7 @@ def test_the_zero_exit_route_walks_the_whole_pool_before_giving_up():
     gate = _pool(('max-b', False), ('max-c', False), ('max-d', False))
     invoke = _NeverTwice(default_reply=cap_markers.REAL_CLI_CAP_HIT_MESSAGES[0])
 
-    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
     assert excinfo.value.marker == mod._EXHAUSTED_MARKER, (
@@ -1378,7 +1379,7 @@ def test_a_zero_exit_near_cap_everywhere_still_terminates():
     gate = _near_cap_pool(('max-b', False), ('max-c', False), ('max-d', False))
     invoke = _NeverTwice(default_reply=cap_markers.REAL_CLI_NEAR_CAP_MESSAGES[0])
 
-    with pytest.raises(coder_mod.CoderCapExhausted) as excinfo:
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod.pool_invoke(gate, invoke=invoke)('prompt', 'haiku')
 
     assert excinfo.value.marker == mod._EXHAUSTED_MARKER
@@ -1846,7 +1847,7 @@ def test_build_pool_warns_LOUDLY_when_it_falls_back_to_the_default_credential(
 # 2026-09-29 ~02:11Z (esc-legibility-trickle-dark_factory-6): max-h's org had
 # disabled subscription access. Text-mode `claude -p` printed the rejection on
 # STDOUT and exited 1 — no banner marker, so the coder raised a plain
-# CoderInvocationError and the pool let it propagate unrotated. The gate was
+# InvocationFailed and the pool let it propagate unrotated. The gate was
 # never told, max-h stayed AVAILABLE, and since the pool drains from the end it
 # was drawn first for every digest: 23 of 23 failed beside four live accounts.
 #
@@ -1867,14 +1868,14 @@ def real_pool(roster_file, empty_env_file, monkeypatch):
 
 
 def _cli_exit_1(stdout):
-    return coder_mod.CoderInvocationError(
+    return session_runner.InvocationFailed(
         f"claude CLI exited 1 (model='haiku'): stdout={stdout!r} stderr=''",
         stdout=stdout,
     )
 
 
 def _loosely_labelled_capped(stdout):
-    return coder_mod.CoderCapExhausted(
+    return session_runner.NoHeadroom(
         f"claude CLI exited 1 (model='haiku'): stdout={stdout!r} stderr=''",
         marker='x', stdout=stdout,
     )
@@ -1914,7 +1915,7 @@ def test_a_failure_that_merely_quotes_the_rejection_is_not_an_auth_failure(real_
     original = _cli_exit_1(quoting)
     invoke = _RecordingInvoke(raises={'tok-d': original})
 
-    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod.pool_invoke(real_pool, invoke=invoke)('prompt', 'haiku')
 
     assert excinfo.value is original
@@ -1971,7 +1972,7 @@ def _write_fake_claude_rejecting(bin_dir, *, rejected_token):
 @pytest.mark.timeout(60)
 def test_an_auth_rejected_night_is_not_lost_end_to_end(real_pool, tmp_path):
     """The real chain the task's JSON premise would have missed: text-mode
-    stdout -> coder._invoke_cli's CoderInvocationError -> the pool's
+    stdout -> coder._invoke_cli's InvocationFailed -> the pool's
     classifier -> InvokeSlot.report -> the next lease. ``claude_bin`` is
     explicit, so the bare-name PATH fallback can never reach a real CLI."""
     bin_dir = tmp_path / "bin"
@@ -1995,8 +1996,8 @@ def test_an_auth_rejected_night_is_not_lost_end_to_end(real_pool, tmp_path):
 
 
 # An all-auth-failed pool never clears on its own, so it must be LOUD: a plain
-# CoderInvocationError that code_digests counts as a real failure (storm, exit
-# 1, ERROR escalation), never a CoderCapExhausted that coder.is_cap_deferral
+# InvocationFailed that code_digests counts as a real failure (storm, exit
+# 1, ERROR escalation), never a NoHeadroom that coder.is_cap_deferral
 # would turn into a quiet exit-0 DEFERRED night. A mixed pool still defers —
 # its capped accounts do clear — but must not claim every account is capped.
 
@@ -2012,11 +2013,11 @@ def test_a_pool_whose_every_account_rejects_its_credentials_fails_loud_not_defer
     invoke = _every_account_rejecting()
     call = mod.pool_invoke(real_pool, invoke=invoke)
 
-    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         call('prompt', 'haiku')
 
     exc = excinfo.value
-    assert not isinstance(exc, coder_mod.CoderCapExhausted), exc
+    assert not isinstance(exc, session_runner.NoHeadroom), exc
     message = str(exc)
     for name in ('max-b', 'max-c', 'max-d'):
         assert name in message, message
@@ -2024,10 +2025,10 @@ def test_a_pool_whose_every_account_rejects_its_credentials_fails_loud_not_defer
     assert 'will not clear at the weekly reset' in message, message
     assert len(invoke.calls) == 3
 
-    with pytest.raises(coder_mod.CoderInvocationError) as second:
+    with pytest.raises(session_runner.InvocationFailed) as second:
         call('the next digest prompt', 'haiku')
 
-    assert not isinstance(second.value, coder_mod.CoderCapExhausted), second.value
+    assert not isinstance(second.value, session_runner.NoHeadroom), second.value
     assert len(invoke.calls) == 3, (
         'every account is already AUTH_FAILED, so the next digest must not '
         'spend a single CLI call finding that out again'
@@ -2040,10 +2041,10 @@ def test_the_all_auth_failed_decision_comes_from_the_gates_public_predicates():
         auth_failed_account_names=('max-b', 'max-c', 'max-d'),
     )
 
-    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod.pool_invoke(gate, invoke=_RecordingInvoke())('prompt', 'haiku')
 
-    assert not isinstance(excinfo.value, coder_mod.CoderCapExhausted), excinfo.value
+    assert not isinstance(excinfo.value, session_runner.NoHeadroom), excinfo.value
 
 
 def test_a_partly_auth_failed_pool_defers_without_claiming_every_account_is_capped():
@@ -2230,7 +2231,7 @@ def test_live_one_shot_completes_when_a_pool_token_is_missing(monkeypatch, tmp_p
     invoke = mod.pool_invoke(gate, invoke=_recording_invoke)
     try:
         reply = invoke("Reply with exactly the two characters: OK", "haiku")
-    except coder_mod.CoderCapExhausted as exc:
+    except session_runner.NoHeadroom as exc:
         # The same policy shared/tests/_capacity_skip.py applies to every
         # real-CLI test: a genuinely exhausted fleet is not a failure of this
         # code, and cannot be told apart from one by running it.

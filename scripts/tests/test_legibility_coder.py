@@ -27,6 +27,7 @@ import codebook as codebook_mod
 import coder as mod
 import digest as digest_mod
 import pytest
+from legibility import session_runner
 
 # Imported AFTER `coder`, deliberately: it is coder.py's own module-level
 # sys.path bootstrap that puts this checkout's shared/src on the path, so this
@@ -420,7 +421,7 @@ def test_code_digest_invocation_error_is_failure_not_fabricated():
     codebook = _tiny_codebook()
 
     def fake_invoke(prompt, model):
-        raise mod.CoderInvocationError(
+        raise session_runner.InvocationFailed(
             "claude CLI exited 1 (model='haiku'): simulated backend outage"
         )
 
@@ -511,7 +512,7 @@ def test_code_digest_cap_exhausted_is_a_labelled_failure_not_fabricated():
     codebook = _tiny_codebook()
 
     def fake_invoke(prompt, model):
-        raise mod.CoderCapExhausted(
+        raise session_runner.NoHeadroom(
             "claude CLI exited 1 (model='haiku', ...): "
             "stdout=\"You've hit your weekly limit - resets 2pm\" stderr=''",
             marker="you've hit your",
@@ -551,7 +552,7 @@ def _capped_flag_for(invoke):
 
 
 def _raise_ordinary_invocation_error(prompt, model):
-    raise mod.CoderInvocationError(
+    raise session_runner.InvocationFailed(
         "claude CLI exited 1 (model='haiku'): simulated backend outage"
     )
 
@@ -764,7 +765,7 @@ def _mixed_batch_invoke(*, capped, failed):
     def fake_invoke(prompt, model):
         for i in range(capped):
             if f'"batch-sess-{i}"' in prompt:
-                raise mod.CoderCapExhausted(
+                raise session_runner.NoHeadroom(
                     "claude CLI exited 1 (model='haiku', ...): "
                     "stdout=\"You've hit your weekly limit - resets 2pm\" stderr=''",
                     marker="you've hit your",
@@ -976,7 +977,7 @@ def _coder_warnings(caplog):
 
 
 def _make_crashing_invoke(crash_sessions):
-    """Fake invoke that raises a BARE RuntimeError (not CoderInvocationError)
+    """Fake invoke that raises a BARE RuntimeError (not InvocationFailed)
     for the named sessions -- the exception class code_digest does NOT catch,
     so it escapes to code_digests' own isolating `except Exception` and lands
     as a `(None, reason)` failure."""
@@ -1140,7 +1141,7 @@ def _write_fake_claude_failing(bin_dir, *, exit_code=1, stderr_text="simulated f
 def _write_fake_claude_sleeping(bin_dir, *, sleep_secs):
     """Fake `claude` binary: sleeps past any reasonable test timeout before
     ever producing output, to exercise _invoke_cli's
-    subprocess.TimeoutExpired -> CoderInvocationError path."""
+    subprocess.TimeoutExpired -> InvocationFailed path."""
     p = bin_dir / "claude"
     p.write_text(
         "#!/usr/bin/env bash\n"
@@ -1184,7 +1185,7 @@ def test_invoke_cli_nonzero_exit_raises_invocation_error(tmp_path):
     bin_dir.mkdir()
     _write_fake_claude_failing(bin_dir, exit_code=1, stderr_text="boom, the model backend is down")
 
-    with pytest.raises(mod.CoderInvocationError):
+    with pytest.raises(session_runner.InvocationFailed):
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10,
@@ -1244,7 +1245,7 @@ def test_invoke_cli_nonzero_exit_carries_both_streams_labelled(tmp_path):
         stderr_text="STDERR_MARKER_SE7412 the backend's complaint",
     )
 
-    with pytest.raises(mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10, cwd=str(tmp_path),
@@ -1289,7 +1290,7 @@ def test_invoke_cli_nonzero_exit_with_empty_stderr_still_says_why(tmp_path):
         stderr_text="",
     )
 
-    with pytest.raises(mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10,
@@ -1332,7 +1333,7 @@ def test_invoke_cli_nonzero_exit_tail_bounds_each_stream_keeping_the_tail(
         stderr_text=payload if stream == "stderr" else "",
     )
 
-    with pytest.raises(mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10,
@@ -1377,7 +1378,7 @@ def test_invoke_cli_nonzero_exit_tail_bounds_each_stream_keeping_the_tail(
 
 
 def test_cap_exhausted_is_a_subclass_of_invocation_error():
-    """Every existing `except CoderInvocationError` site keeps working.
+    """Every existing `except InvocationFailed` site keeps working.
 
     There are three -- code_digest, census._build_default_verify_fn and
     census.preflight_headroom -- and none of them is touched by this task.  A
@@ -1385,7 +1386,7 @@ def test_cap_exhausted_is_a_subclass_of_invocation_error():
     typed per-digest failure into an uncaught crash that takes down the whole
     batch: strictly worse than the storm this task exists to prevent.
     """
-    assert issubclass(mod.CoderCapExhausted, mod.CoderInvocationError)
+    assert issubclass(session_runner.NoHeadroom, session_runner.InvocationFailed)
 
 
 @pytest.mark.parametrize("message", REAL_CLI_CAP_MESSAGES)
@@ -1399,7 +1400,7 @@ def test_invoke_cli_nonzero_exit_with_cap_banner_on_stdout_is_typed(
         bin_dir, stdout_text=message, stderr_text="", exit_code=1,
     )
 
-    with pytest.raises(mod.CoderCapExhausted) as excinfo:
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10, cwd=str(tmp_path),
@@ -1438,7 +1439,7 @@ def test_invoke_cli_nonzero_exit_with_cap_banner_on_stderr_is_typed(
         bin_dir, stdout_text="", stderr_text=message, exit_code=1,
     )
 
-    with pytest.raises(mod.CoderCapExhausted) as excinfo:
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10,
@@ -1457,13 +1458,13 @@ def test_invoke_cli_ordinary_failure_is_not_typed_as_a_cap(tmp_path):
         bin_dir, exit_code=1, stderr_text="boom, the model backend is down",
     )
 
-    with pytest.raises(mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10,
         )
 
-    assert not isinstance(excinfo.value, mod.CoderCapExhausted), (
+    assert not isinstance(excinfo.value, session_runner.NoHeadroom), (
         "an ordinary backend failure was classified as a usage cap; that "
         "silently converts a real regression into a deferred night"
     )
@@ -1507,7 +1508,7 @@ def test_invoke_cli_timeout_raises_invocation_error(tmp_path):
     bin_dir.mkdir()
     _write_fake_claude_sleeping(bin_dir, sleep_secs=2)
 
-    with pytest.raises(mod.CoderInvocationError):
+    with pytest.raises(session_runner.InvocationFailed):
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=0.2,
@@ -1564,7 +1565,7 @@ def test_invoke_cli_without_cwd_inherits_the_launcher_cwd(tmp_path, monkeypatch)
 
 
 def test_invoke_cli_missing_cwd_raises_invocation_error(tmp_path, monkeypatch):
-    """A cwd that does not exist must fail as a CoderInvocationError, not
+    """A cwd that does not exist must fail as a InvocationFailed, not
     as a raw FileNotFoundError escaping the documented contract.
 
     This is not cosmetic typing. census's first invoke is the headroom
@@ -1575,7 +1576,7 @@ def test_invoke_cli_missing_cwd_raises_invocation_error(tmp_path, monkeypatch):
     """
     _launcher, target, _cwd_file, claude_bin = _cwd_probe(tmp_path, monkeypatch)
 
-    with pytest.raises(mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=claude_bin, timeout=10, cwd=str(target / "does-not-exist"),
@@ -1595,7 +1596,7 @@ def test_invoke_cli_cwd_that_is_a_file_raises_invocation_error(tmp_path, monkeyp
     not_a_dir = target / "regular-file.txt"
     not_a_dir.write_text("i am not a directory", encoding="utf-8")
 
-    with pytest.raises(mod.CoderInvocationError):
+    with pytest.raises(session_runner.InvocationFailed):
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=claude_bin, timeout=10, cwd=str(not_a_dir),
@@ -1622,7 +1623,7 @@ def _scrub_path_of_claude(tmp_path, monkeypatch):
     CLI — real LLM spend, real wall-clock, and a test that passes for the
     wrong reason, silently breaking this module's docstring promise that the
     LLM is ALWAYS mocked here. With `claude` unresolvable, that same
-    regression instead ENOENTs into CoderInvocationError: loud and cheap.
+    regression instead ENOENTs into InvocationFailed: loud and cheap.
 
     Deliberately NOT a fully empty PATH, though that is the obvious spelling.
     The fake binaries above are `#!/usr/bin/env bash` scripts and `env` needs
@@ -1676,7 +1677,7 @@ def test_invoke_cli_honours_claude_bin_env_var(tmp_path, monkeypatch):
 def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch):
     """Pins the precedence order _invoke_cli's docstring promises: explicit
     argument > env var > bare name. The env var points at a FAILING fake, so
-    if precedence ever inverted this would raise CoderInvocationError."""
+    if precedence ever inverted this would raise InvocationFailed."""
     good_dir = tmp_path / "good-bin"
     bad_dir = tmp_path / "bad-bin"
     good_dir.mkdir()
@@ -1713,7 +1714,7 @@ def test_invoke_cli_explicit_claude_bin_beats_the_env_var(tmp_path, monkeypatch)
 # The pool-backed invoker is just another (prompt, model) -> str callable
 # through the existing seam, so code_digests' control flow is inherited
 # unchanged. What this pins is that the NEW input it can now produce -- a
-# CoderCapExhausted meaning "every account in the pool is out", rather than
+# NoHeadroom meaning "every account in the pool is out", rather than
 # "the one login I happened to ride is out" -- still produces exactly the
 # RunResult shape nightly's DEFERRED branch keys on.
 # ---------------------------------------------------------------------------
@@ -1725,7 +1726,7 @@ def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
     # `mod`. scripts/legibility/ is on sys.path alongside scripts/, so this
     # file's `import coder as mod` and account_pool's (and nightly's)
     # `from legibility import coder` are two DISTINCT module objects carrying
-    # two distinct CoderCapExhausted classes. code_digest catches that
+    # two distinct NoHeadroom classes. code_digest catches that
     # exception BY NAME under two arms with no generic `except Exception`
     # beneath them, so an unpaired module here would not merely mislabel the
     # deferral -- in production it would let the exception escape run_nightly
@@ -1806,7 +1807,7 @@ def test_an_exhausted_pool_reads_as_a_cap_deferral_end_to_end(monkeypatch):
 # by re-parsing `stdout={!r} stderr={!r}` out of the message would be an
 # ad-hoc parser over a meaningful string (docs/code-quality.md heuristic 12),
 # and would couple failover to wording that exists for humans reading
-# journals. `marker` on CoderCapExhausted is the precedent for a typed
+# journals. `marker` on NoHeadroom is the precedent for a typed
 # attribute on this hierarchy.
 #
 # The message text is deliberately NOT changed: it is pinned by
@@ -1823,7 +1824,7 @@ def test_invocation_error_carries_both_streams_as_structured_attributes(tmp_path
         stderr_text="STDERR_STRUCT_SE5488 the backend's complaint",
     )
 
-    with pytest.raises(mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10, cwd=str(tmp_path),
@@ -1859,7 +1860,7 @@ def test_cap_exhausted_carries_the_streams_alongside_its_marker(tmp_path):
         bin_dir, stdout_text=banner, stderr_text="STDERR_CAP_SE5488",
     )
 
-    with pytest.raises(mod.CoderCapExhausted) as excinfo:
+    with pytest.raises(session_runner.NoHeadroom) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=10,
@@ -1886,7 +1887,7 @@ def test_invocation_error_streams_default_to_empty_for_the_streamless_arms(
     bin_dir.mkdir()
     _write_fake_claude_sleeping(bin_dir, sleep_secs=2)
 
-    with pytest.raises(mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(bin_dir / "claude"), timeout=0.2,
@@ -1897,7 +1898,7 @@ def test_invocation_error_streams_default_to_empty_for_the_streamless_arms(
 
     # The never-started arm: a binary that does not exist at all.
     _scrub_path_of_claude(tmp_path, monkeypatch)
-    with pytest.raises(mod.CoderInvocationError) as excinfo:
+    with pytest.raises(session_runner.InvocationFailed) as excinfo:
         mod._invoke_cli(
             "prompt text", "haiku",
             claude_bin=str(tmp_path / "no-such-claude"), timeout=10,
@@ -1911,7 +1912,7 @@ def test_invocation_error_is_constructible_with_no_streams_at_all():
     """Positional-message construction must keep working: three sites raise
     or catch this type today (code_digest, census._build_default_verify_fn,
     census.preflight_headroom) and none of them is in this task's scope."""
-    exc = mod.CoderInvocationError("plain message")
+    exc = session_runner.InvocationFailed("plain message")
     assert str(exc) == "plain message"
     assert exc.stdout == ""
     assert exc.stderr == ""
@@ -2074,7 +2075,7 @@ def test_main_happy_path_writes_valid_jsonl_and_returns_0(tmp_path, monkeypatch,
 # ---------------------------------------------------------------------------
 
 def _capping_invoke_cli(prompt, model, **kwargs):
-    raise mod.CoderCapExhausted(
+    raise session_runner.NoHeadroom(
         "claude CLI exited 1 (model='haiku', claude_bin='claude', cwd=None): "
         "stdout=\"You've hit your weekly limit - resets 2pm (Europe/London)\" "
         "stderr=''",
