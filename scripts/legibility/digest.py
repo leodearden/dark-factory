@@ -1185,17 +1185,12 @@ MERGER_HEADINGS: tuple[str, ...] = (
 (``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler.build_merger_prompt``,
 a single f-string emitting '# Task Intent', '# Merge Conflicts', '# Action').
 
-This set exists because task 3659 removed the merger's memory block, and
-with it the '# Context' anchor that had been the ONLY heading
-:data:`HARNESS_BRIEFING_HEADINGS` could recognise in a merger dispatch.
-Measured against the real builder: pre-3659 shape -> True (with recalled
-memory AND with the memory-unavailable notice alike), post-3659 shape ->
-False. Without this entry every merge-conflict dispatch -- the docstring
-measures 7 per 14 days -- would be mined as a genuine human turn and
+The merger prompt carries no '# Context' anchor, so without this set
+:data:`HARNESS_BRIEFING_HEADINGS` cannot recognise a merger dispatch, and
+every merge-conflict dispatch would be mined as a genuine human turn and
 rendered in the digest's gold 'User Correction' section (PRD Sec 5).
 
-Strict all-of, like every non-briefing injector: the task-3610 relaxation
-was earned by forensics on the briefing shape alone. All three headings are
+Strict all-of, like every non-briefing injector. All three headings are
 '# '-level, which is exactly why the all-of match is required here and why
 these literals must NOT be folded into
 :data:`HARNESS_BRIEFING_SUBHEADINGS` -- a '# '-level corroborator would
