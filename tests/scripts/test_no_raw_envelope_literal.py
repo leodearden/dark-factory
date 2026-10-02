@@ -118,6 +118,34 @@ def _git(cwd: Path, *args: str) -> str:
     return proc.stdout
 
 
+def _describe(violations: dict[str, dict[str, tuple[int, ...]]]) -> str:
+    return '\n'.join(
+        f'  {path}: '
+        + '; '.join(f'{prefix} on line(s) {list(lines)}' for prefix, lines in hits.items())
+        for path, hits in sorted(violations.items())
+    )
+
+
+def test_no_markup_handling_file_spells_a_raw_envelope_literal() -> None:
+    violations = raw_literal_violations(REPO_ROOT)
+    assert not violations, (
+        'These files handle MCP envelope markup yet spell an envelope literal with a '
+        f'raw opening bracket (each prefix is shown escaped):\n{_describe(violations)}\n'
+        f'Build the literal in code from {LITERAL_OWNER} constants or chr(60), or spell '
+        f'the bracket as {ESCAPED_BRACKET} in prose and strings. Why: the '
+        "'Sentinel-literal hazard' section of shared/src/shared/toolcall_markup.py."
+    )
+
+
+def test_this_guard_is_inside_its_own_population() -> None:
+    population = {path.resolve() for path in guarded_population(REPO_ROOT)}
+    assert Path(__file__).resolve() in population, (
+        'This guard spells chr(60) and imports the literal owner, so git discovery plus '
+        'the population predicate must select it; if they do not, the repo-wide check above '
+        'is passing vacuously.'
+    )
+
+
 def test_every_envelope_literal_starts_with_a_scanned_prefix() -> None:
     unscanned = [
         literal.replace(_LT, ESCAPED_BRACKET)
