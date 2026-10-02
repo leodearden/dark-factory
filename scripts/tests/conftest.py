@@ -32,8 +32,14 @@ copies of one fake-httpx idiom spread across four of this directory's files.
 
 So do `runs_db_path` / `runs_db` (task 5441): a synthetic orchestrator runs.db
 shared by the model-admission audit and review suites.
+
+And `fake_claude_cli` / `pool_roster` (task 6042): a JSON-mode fake `claude`
+binary keyed on the leased OAuth token, plus a hermetic account roster, for
+the legibility suites that drive the shared session runner end to end.
 """
 import json
+import os
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -542,3 +548,196 @@ def runs_db(runs_db_path):
         yield conn
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Fake JSON-mode `claude` CLI + hermetic account roster (task 6042).
+#
+# The legibility trickle and census spawn `claude` through the shared runner
+# (shared.cli_invoke.invoke_with_cap_retry -> invoke_claude_agent), which
+# resolves the BARE name against PATH. These fixtures put a fake first on PATH
+# and give it a per-token script, so a suite can drive a real UsageGate through
+# failover, auth rejection and caps without any real CLI being reachable.
+# ---------------------------------------------------------------------------
+
+_FAKE_CLAUDE_PLAN_ENV = 'FAKE_CLAUDE_PLAN'
+_FAKE_CLAUDE_CALLS_ENV = 'FAKE_CLAUDE_CALLS'
+
+_FAKE_CLAUDE_DEFAULT_RESPONSE = {
+    'result': 'fake claude reply',
+    'is_error': False,
+    'api_error_status': None,
+    'rc': 0,
+    'sleep_secs': 0,
+}
+
+_FAKE_CLAUDE_SOURCE = """\
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+
+plan = json.loads(Path(os.environ[{plan_env!r}]).read_text())
+token = os.environ.get('CLAUDE_CODE_OAUTH_TOKEN', '')
+response = {{**plan['default'], **plan['by_token'].get(token, {{}})}}
+
+argv = sys.argv[1:]
+stdin = sys.stdin.read()
+system_prompt = None
+if '--system-prompt-file' in argv:
+    system_prompt = Path(argv[argv.index('--system-prompt-file') + 1]).read_text()
+config_dir = os.environ.get('CLAUDE_CONFIG_DIR')
+credentials = None
+if config_dir:
+    try:
+        credentials = json.loads((Path(config_dir) / '.credentials.json').read_text())
+    except (OSError, ValueError):
+        credentials = None
+
+record = {{
+    'argv': argv,
+    'cwd': os.getcwd(),
+    'stdin': stdin,
+    'system_prompt': system_prompt,
+    'env': {{
+        'CLAUDE_CONFIG_DIR': config_dir,
+        'CLAUDE_CODE_OAUTH_TOKEN': os.environ.get('CLAUDE_CODE_OAUTH_TOKEN'),
+        'ANTHROPIC_API_KEY_present': 'ANTHROPIC_API_KEY' in os.environ,
+        'HOME': os.environ.get('HOME'),
+    }},
+    'credentials': credentials,
+}}
+with open(os.environ[{calls_env!r}], 'a') as calls:
+    calls.write(json.dumps(record) + '\\n')
+
+time.sleep(response['sleep_secs'])
+print(json.dumps({{
+    'type': 'result',
+    'subtype': 'success',
+    'is_error': response['is_error'],
+    'result': response['result'],
+    'session_id': str(uuid.uuid4()),
+    'num_turns': 1,
+    'total_cost_usd': 0.0,
+    'duration_ms': 1200,
+    'api_error_status': response['api_error_status'],
+}}))
+sys.exit(response['rc'])
+"""
+
+
+class FakeClaudeCli:
+    """A fake `claude` first on PATH, scripted per leased OAuth token.
+
+    ``plan(by_token, default=...)`` maps a ``CLAUDE_CODE_OAUTH_TOKEN`` value to
+    a response dict (any of ``result``, ``is_error``, ``api_error_status``,
+    ``rc``, ``sleep_secs``); a token with no entry gets *default*, itself laid
+    over ``_FAKE_CLAUDE_DEFAULT_RESPONSE``. The fake prints real-CLI-shaped
+    ``--output-format json`` (``subtype`` is ``success`` even on an error, as
+    measured on CLI 2.1.287) and exits ``rc``.
+
+    ``calls()`` returns one dict per invocation, recorded BEFORE any scripted
+    sleep so a timed-out call is still visible: ``argv``, ``cwd``, ``stdin``,
+    ``system_prompt``, an ``env`` subset (``CLAUDE_CONFIG_DIR``,
+    ``CLAUDE_CODE_OAUTH_TOKEN``, ``ANTHROPIC_API_KEY_present``, ``HOME``) and
+    ``credentials``, the parsed ``$CLAUDE_CONFIG_DIR/.credentials.json`` as the
+    child saw it.
+    """
+
+    def __init__(self, bin_dir: Path, state_dir: Path):
+        self.bin_dir = bin_dir
+        self.path = bin_dir / 'claude'
+        self._plan_path = state_dir / 'fake-claude-plan.json'
+        self._calls_path = state_dir / 'fake-claude-calls.jsonl'
+
+    def plan(self, by_token=None, *, default=None):
+        self._plan_path.write_text(json.dumps({
+            'by_token': dict(by_token or {}),
+            'default': {**_FAKE_CLAUDE_DEFAULT_RESPONSE, **(default or {})},
+        }))
+
+    def calls(self):
+        if not self._calls_path.exists():
+            return []
+        return [json.loads(line) for line in self._calls_path.read_text().splitlines()]
+
+
+@pytest.fixture
+def fake_claude_cli(tmp_path, monkeypatch):
+    """Install a :class:`FakeClaudeCli` as the only `claude` on PATH.
+
+    Prepended to PATH and then PROVEN to win: ``shutil.which('claude')`` must
+    resolve to the fake, so no test using this fixture can ever reach the real
+    CLI (real LLM spend, and a test passing for the wrong reason). The shebang
+    is ``sys.executable``, so the fake needs nothing else on PATH to start.
+    Starts with the default plan; call ``.plan(...)`` to script it.
+    """
+    bin_dir = tmp_path / 'fake-claude-bin'
+    bin_dir.mkdir()
+    state_dir = tmp_path / 'fake-claude-state'
+    state_dir.mkdir()
+    fake = FakeClaudeCli(bin_dir, state_dir)
+    fake.path.write_text(f'#!{sys.executable}\n' + _FAKE_CLAUDE_SOURCE.format(
+        plan_env=_FAKE_CLAUDE_PLAN_ENV, calls_env=_FAKE_CLAUDE_CALLS_ENV,
+    ))
+    fake.path.chmod(0o755)
+    fake.plan()
+    monkeypatch.setenv(_FAKE_CLAUDE_PLAN_ENV, str(fake._plan_path))
+    monkeypatch.setenv(_FAKE_CLAUDE_CALLS_ENV, str(fake._calls_path))
+    monkeypatch.setenv('PATH', f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    assert shutil.which('claude') == str(fake.path), (
+        f"the fake claude at {fake.path} must be the one PATH resolves; "
+        f"got {shutil.which('claude')!r}"
+    )
+    return fake
+
+
+class PoolRoster:
+    """Writes ``config/usage-accounts.yaml``-shaped rosters for build_pool.
+
+    ``pool_roster('a', 'b')`` returns ``(accounts_file, env_file)``: a roster
+    naming each account, with its ``CLAUDE_OAUTH_TOKEN_<NAME>`` set to
+    ``pool_roster.token(name)`` through monkeypatch (so nothing leaks past the
+    test), and a guaranteed-empty ``.env`` — never the repo's, which carries
+    real tokens when the suite runs from the main checkout.
+    ``resolve_tokens=False`` deletes those vars instead, for an empty pool.
+    """
+
+    def __init__(self, directory: Path, monkeypatch):
+        self._directory = directory
+        self._monkeypatch = monkeypatch
+        self._written = 0
+
+    @staticmethod
+    def token(name: str) -> str:
+        return f'tok-{name}'
+
+    @staticmethod
+    def token_env(name: str) -> str:
+        return 'CLAUDE_OAUTH_TOKEN_' + name.upper().replace('-', '_')
+
+    def __call__(self, *names: str, resolve_tokens: bool = True):
+        self._written += 1
+        lines = ['accounts:']
+        for name in names:
+            env = self.token_env(name)
+            lines += [f'  - name: {name}', f'    oauth_token_env: {env}']
+            if resolve_tokens:
+                self._monkeypatch.setenv(env, self.token(name))
+            else:
+                self._monkeypatch.delenv(env, raising=False)
+        accounts_file = self._directory / f'usage-accounts-{self._written}.yaml'
+        accounts_file.write_text('\n'.join(lines) + '\n')
+        env_file = self._directory / f'empty-{self._written}.env'
+        env_file.write_text('')
+        return accounts_file, env_file
+
+
+@pytest.fixture
+def pool_roster(tmp_path, monkeypatch):
+    """A :class:`PoolRoster` writing into this test's tmp dir."""
+    directory = tmp_path / 'pool-roster'
+    directory.mkdir()
+    return PoolRoster(directory, monkeypatch)
