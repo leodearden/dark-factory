@@ -5,6 +5,10 @@ protocol, so a lazily built session fixture is billed to whichever item happens
 to request it first. ``pytest_collection_finish`` runs after collection and
 before ``pytest_runtestloop`` starts any item's protocol, so a value built there
 is billed to no item at all. Bound in ``shared/tests/conftest.py::first_party_tree``.
+
+The flip side: no ``--timeout`` bounds the build, only the outer runner's
+deadline. Under xdist every worker that collects a requester runs its own build,
+so the workers all build at once at the end of collection.
 """
 
 from __future__ import annotations

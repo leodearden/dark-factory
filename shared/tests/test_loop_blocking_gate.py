@@ -1253,8 +1253,7 @@ class TestSweepUsesTheSharedTree:
             patched.setattr(ast, 'parse', no_parse)
             patched.setattr(Path, 'read_text', no_read)
             scan = _build_tree_scan(first_party_tree)
-        assert scan.scanned_files >= 100
-        assert scan.findings
+        assert scan.findings, 'the patched sweep walked nothing, so it proved nothing about I/O'
 
 
 class TestSweepIsNotVacuous:
