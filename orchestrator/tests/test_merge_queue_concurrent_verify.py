@@ -6566,6 +6566,34 @@ class TestWaitResponsiveUnknownNominal:
             f'RESPONSIVE_WAIT_WALL_CAP (90.0), got {budgets!r}.'
         )
 
+    def test_stop_worker_bills_its_hidden_default_join(self) -> None:
+        """`_stop_worker(worker, worker_task)` joins the worker task for up
+        to its hidden default (5.0s), so a teardown through it is billed.
+        """
+        source = '''
+class TestStopWorkerDefault:
+    async def test_it(self):
+        await _stop_worker(worker, worker_task)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestStopWorkerDefault': 5.0}, (
+            f'Expected the hidden default join (5.0), got {budgets!r}.'
+        )
+
+    def test_stop_worker_bills_an_explicit_join_timeout(self) -> None:
+        """An explicit `join_timeout=` is the join actually waited (20.0)."""
+        source = '''
+class TestStopWorkerExplicit:
+    async def test_it(self):
+        await _stop_worker(worker, worker_task, join_timeout=20.0)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestStopWorkerExplicit': 20.0}, (
+            f'Expected an explicit join_timeout=20.0 to be billed, got {budgets!r}.'
+        )
+
     def test_asyncio_sleep_is_outside_the_counted_shape_set(self) -> None:
         """`asyncio.sleep(999)` contributes 0.0 -- sleeps are deliberately
         OUT of the counted shape set (the guard is a conservative floor,
