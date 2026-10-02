@@ -102,6 +102,13 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # MY task", never "extract every id") applied to the commit SUBJECT only
 # (git_ops.py) or immediately after the conventional-commit type word
 # (merge_gates.py), never to the whole commit MESSAGE this script scans.
+# The conventional-commit type vocabulary diverges too: task 5190 widened
+# this copy past `build`, but these hand-maintained siblings still stop there —
+# orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN,
+# orchestrator/merge_gates.py::ALREADY_LANDED_CITATION_PATTERN, the
+# citation-gate `--grep` in
+# orchestrator/agents/briefing.py::BriefingAssembler.build_steward_initial_prompt,
+# and skills/_shared/deriving-landed-sha.md.
 # NOT imported from there — orchestrator.git_ops pulls in the whole GitOps
 # stack, and a fused-memory -> orchestrator runtime import is architecturally
 # backwards (see task 2645 design decisions). This local pattern is
@@ -210,7 +217,7 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # but not for this script's independent copy.
 CITATION_PATTERN = re.compile(
     r'^(?:merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build'
-    r'|config|perf|revert)'
+    r'|config|perf|revert|pre|prereq)'
     r'\(\s*(?P<conv_tid>\d+)\s*[):]'
     r'|\btask/(?P<branch_tid>\d+)\b'
     r'|\(#(?P<paren_tid>\d+)\)'
