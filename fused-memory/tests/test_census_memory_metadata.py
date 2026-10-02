@@ -3982,7 +3982,7 @@ class TestRegenCommandCoversTheNewFlags:
         params = {
             'projects': ['dark_factory', 'reify'],
             'registry': 'fused-memory/tests/fixtures/census-grandfather-oracle.json',
-            'history_out': 'plans/memory-metadata-census-report.json',
+            'history_out': 'fused-memory/tests/fixtures/write_triage_calibration.jsonl',
         }
         command = _mod._regen_command(params)
         tokens = command.split()
@@ -4091,10 +4091,23 @@ class TestCommittedParamsAreCheckoutIndependent:
     async def test_run_records_the_default_paths_repo_relative(self, tmp_path, monkeypatch):
         monkeypatch.setattr(_mod, 'census_project', _census_project_stub())
         monkeypatch.setattr(_mod, '_build_backend', lambda cfg: AsyncMock())
+        reads: list[str] = []
+        writes: list[str] = []
+
+        def _read(path):
+            reads.append(path)
+            return _mod.empty_coverage_history()
+
+        monkeypatch.setattr(_mod, 'load_coverage_history', _read)
+        monkeypatch.setattr(
+            _mod, 'save_coverage_history', lambda history, path: writes.append(path),
+        )
         await _mod._run(_args(
             tmp_path, registry=_mod.DEFAULT_REGISTRY_PATH,
             history_out=_mod.DEFAULT_HISTORY_OUT, no_history=True,
         ))
+        assert reads == [_mod.DEFAULT_HISTORY_OUT]
+        assert writes == []
         params = json.loads((tmp_path / 'census.json').read_text())['params']
         assert params['registry'] == (
             'fused-memory/tests/fixtures/memory_eval_topic_registry.json'
