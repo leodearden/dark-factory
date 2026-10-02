@@ -515,6 +515,16 @@ def validate_consolidate_args(
     )
 
 
+def _closure_member_ref(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {'id': None, 'canonical': False}
+    meta = row.get('metadata')
+    return {
+        'id': row.get('id'),
+        'canonical': isinstance(meta, dict) and meta.get('canonical') is True,
+    }
+
+
 def build_consolidation_result(
     *,
     canonical_id: str,
@@ -609,6 +619,14 @@ def build_consolidation_result(
     ``topic_cluster_seed`` (absent means no topic-cluster store is wired, so
     no seed was attempted) and ``hint`` (recovery guidance on a clean run
     would be noise).
+
+    ``topic_members`` rows are projected to ``{'id', 'canonical'}``.  This
+    envelope is the ONLY record of an irreversible multi-delete, and a
+    dumping-ground topic's raw rows could push it past the MCP transport
+    limit, where it is rejected wholesale and ``deleted``, ``survivors`` and
+    ``failed_deletes`` are lost for records that are already gone.  A
+    closure proof needs only the id and the canonical flag, and the
+    projection never raises, for the same reason.
     """
     failed_deletes = list(failed_deletes)
     survivors = list(survivors)
@@ -622,7 +640,7 @@ def build_consolidation_result(
         or survivors
         or survivor_check_failed
     )
-    members = list(topic_members or [])
+    members = [_closure_member_ref(row) for row in (topic_members or [])]
     result: dict[str, Any] = {
         'status': 'partial' if open_business else 'consolidated',
         'canonical_id': canonical_id,

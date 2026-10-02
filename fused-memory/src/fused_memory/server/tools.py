@@ -5747,6 +5747,10 @@ def create_mcp_server(
             keeps an empty listing from being misread as "this topic has no
             members".
 
+            ``topic_members`` rows are ``{'id', 'canonical'}`` only, so a
+            dumping-ground topic cannot push this envelope past the MCP
+            transport limit; the full record is one ``get_memory_by_id`` away.
+
             The tombstone counts are reported as a PAIR and deliberately do
             NOT affect ``status``: a shortfall means the consolidation
             completed but its audit trail did not land, and ``'partial'``
