@@ -1365,7 +1365,7 @@ class TestProviderCredentials:
                 api_key='sk-pinned', api_url='http://localhost:8000/v1',
             ),
         )
-        assert _provider_credentials(service, 'openai') == {
+        assert _provider_credentials(service, 'openai').client_kwargs == {
             'api_key': 'sk-pinned',
             'base_url': 'http://localhost:8000/v1',
         }
@@ -1373,9 +1373,13 @@ class TestProviderCredentials:
     def test_either_leaf_alone_is_forwarded(self) -> None:
         """Pinning a key without an endpoint (and vice versa) is a real config."""
         key_only = _creds_svc(openai=types.SimpleNamespace(api_key='sk-only'))
-        assert _provider_credentials(key_only, 'openai') == {'api_key': 'sk-only'}
+        assert _provider_credentials(key_only, 'openai').client_kwargs == {
+            'api_key': 'sk-only',
+        }
         url_only = _creds_svc(anthropic=types.SimpleNamespace(api_url='http://h/v1'))
-        assert _provider_credentials(url_only, 'anthropic') == {'base_url': 'http://h/v1'}
+        assert _provider_credentials(url_only, 'anthropic').client_kwargs == {
+            'base_url': 'http://h/v1',
+        }
 
     @pytest.mark.parametrize(
         ('label', 'service'),
@@ -1406,7 +1410,7 @@ class TestProviderCredentials:
         also pins that a sibling provider's key is not handed to the arm that
         was actually selected.
         """
-        assert _provider_credentials(service, 'openai') == {}, label
+        assert _provider_credentials(service, 'openai').client_kwargs == {}, label
 
     @pytest.mark.parametrize('value', ['', None, 0, b'sk-bytes', object()])
     def test_a_blank_or_non_string_leaf_is_not_forwarded(self, value: object) -> None:
@@ -1421,7 +1425,50 @@ class TestProviderCredentials:
         service = _creds_svc(
             openai=types.SimpleNamespace(api_key=value, api_url=value),
         )
-        assert _provider_credentials(service, 'openai') == {}
+        assert _provider_credentials(service, 'openai').client_kwargs == {}
+
+    @pytest.mark.parametrize(
+        ('provider', 'client_class', 'serves_responses_api'),
+        [
+            ('openai', None, True),
+            ('openai', 'openai', True),
+            ('openai', 'openai_generic', False),
+            ('anthropic', None, False),
+            ('anthropic', 'openai', False),
+            ('anthropic', 'openai_generic', False),
+        ],
+        ids=[
+            'openai-absent', 'openai-openai', 'openai-generic',
+            'anthropic-absent', 'anthropic-openai', 'anthropic-generic',
+        ],
+    )
+    def test_the_capability_flag_follows_llm_client_class(
+        self, provider: str, client_class: str | None, serves_responses_api: bool,
+    ) -> None:
+        """`llm.client_class` is the deployment's declaration of what the endpoint speaks."""
+        service = _creds_svc(openai=types.SimpleNamespace(api_url='http://h/v1'))
+        if client_class is not None:
+            service.config.llm.client_class = client_class
+
+        creds = _provider_credentials(service, provider)
+
+        assert creds.serves_responses_api is serves_responses_api
+
+    def test_the_shipped_config_serves_the_responses_api_despite_its_base_url(
+        self,
+    ) -> None:
+        """The shipped config.yaml ALWAYS sets a base_url for openai.
+
+        `llm.providers.openai.api_url` is `${OPENAI_API_URL:https://api.openai.com/v1}`,
+        so a "base_url present => compat endpoint" rule would have routed
+        production to chat.completions and defeated the Responses arm.
+        """
+        service = types.SimpleNamespace(config=FusedMemoryConfig())
+
+        creds = _provider_credentials(service, 'openai')
+
+        assert creds.client_kwargs.get('base_url')
+        assert creds.serves_responses_api is True
 
     @pytest.mark.asyncio
     async def test_the_credentials_reach_the_sdk_constructor(self) -> None:
