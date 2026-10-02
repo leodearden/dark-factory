@@ -69,6 +69,7 @@ from orchestrator.agents.roles import (
     SIMPLE_TASK,
     AgentRole,
 )
+from orchestrator.agents.triage import suggestion_hash
 from orchestrator.agents.write_set import (
     WriteSet,
     compute_write_set,
@@ -103,6 +104,7 @@ from orchestrator.git_ops import (
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
+from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.routing import (
     PlanShape,
     RoleDefaults,
@@ -1428,11 +1430,12 @@ class TaskWorkflow:
         # consecutive identical re-entries so the curator R4 gate never has to
         # absorb redundant N-HTTP batches.
         #
-        # Boundary: sequence A→B→A will re-submit A on the third call because
-        # B overwrites the cache entry.  This is intentional — the scalar
-        # fast-path only eliminates *consecutive* duplicates.  The server-side
-        # curator R4 idempotency gate (task_interceptor._check_escalation_idempotency)
-        # is the durable source-of-truth dedup for non-consecutive repeats.
+        # Boundary: only a byte-identical whole set is absorbed here (A→B→A
+        # re-submits A).  The server-side curator R4 gate
+        # (task_interceptor._check_escalation_idempotency) dedups the rest
+        # PER ITEM, so an item repeated in any later batch folds away; a
+        # reworded re-raise carries a new key and is left to the curator's
+        # semantic dedup.
         self._last_routed_suggestion_hash: str | None = None
 
         # Dedup guard for _reconcile_done_step_commits' flag-for-review
@@ -7947,30 +7950,8 @@ class TaskWorkflow:
                     f'infrastructure errors after retries: {names}'
                 )
             if not reviews.has_blocking_issues:
-                # Scope a post-amendment review to the amendment delta (task
-                # 2750).  Runs FIRST inside the non-blocking arm — after the
-                # reviewer_errors early-return and outside the blocking-replan
-                # path — so it never touches the blocking safety valve: only
-                # `suggestions` is partitioned; out-of-delta suggestions are
-                # routed to the curator inside _apply_amendment_delta_scope and
-                # dropped from the verdict.  The re-arm check, the DONE-path
-                # curator routing, and the task-2749 verdict cache below then
-                # all see only in-delta suggestions.  No-op when this review
-                # does not follow an amendment (used_ctx is None).
-                if used_ctx is not None:
-                    reviews = await self._apply_amendment_delta_scope(
-                        reviews, used_ctx,
-                    )
-                # Temporal companion to the spatial delta scope above (task
-                # 2523): drop suggestions already SETTLED in a PRIOR amendment
-                # round so they neither re-arm the loop below nor churn the
-                # DONE-path curator routing.  Composes SPATIAL(2750) →
-                # TEMPORAL(2523); no-op on a first-pass review or when no prior
-                # archive exists, and fails safe toward EMIT on any adjudication
-                # error.  Blocking issues never reach here (short-circuited by
-                # the enclosing non-blocking arm).
-                reviews = await self._suppress_resettled_suggestions(
-                    reviews, amendment_round,
+                reviews = await self._scope_review_suggestions(
+                    reviews, used_ctx, amendment_round,
                 )
                 # L2b: try an amendment pass before escalating suggestions.
                 # In-scope suggestions (module-lock members) are applied by
@@ -8110,8 +8091,9 @@ class TaskWorkflow:
                     logger.info('Task %s: archived reviews to %s', self.task_id, archive_dir.name)
 
             if review_cycle >= self.config.max_review_cycles:
-                self._escalate_review_issues(reviews)
-                return WorkflowOutcome.ESCALATED
+                return await self._exit_review_cycles_exhausted(
+                    reviews, used_ctx, amendment_round,
+                )
 
             # Re-plan based on review feedback
             logger.info(
@@ -9999,6 +9981,25 @@ class TaskWorkflow:
 
             if not debug_result.success:
                 logger.warning(f'Task {self.task_id}: debugger failed')
+
+    async def _scope_review_suggestions(
+        self,
+        reviews: ReviewAggregation,
+        amendment_ctx: AmendmentReviewContext | None,
+        amendment_round: int,
+    ) -> ReviewAggregation:
+        """The suggestion scoping both review exits apply before routing.
+
+        SPATIAL then TEMPORAL: a review that immediately follows an amendment
+        (``amendment_ctx`` set) is scoped to the amendment delta, routing the
+        out-of-delta suggestions to the curator (task 2750); then suggestions
+        already settled in a prior amendment round are dropped (task 2523).
+        Only ``suggestions`` is filtered — blocking issues pass through
+        untouched.
+        """
+        if amendment_ctx is not None:
+            reviews = await self._apply_amendment_delta_scope(reviews, amendment_ctx)
+        return await self._suppress_resettled_suggestions(reviews, amendment_round)
 
     async def _apply_amendment_delta_scope(
         self, reviews: ReviewAggregation, ctx: AmendmentReviewContext,
@@ -16827,18 +16828,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 self.task_id, exc,
             )
 
-    async def _route_review_suggestions_to_curator(self, reviews) -> None:
+    async def _route_review_suggestions_to_curator(
+        self, reviews: ReviewAggregation,
+    ) -> SuggestionDisposition:
         """Route review suggestions directly to the curator intake (fire-and-forget).
 
         Inserts suggestions as CandidateTask tickets via ``submit_task`` MCP calls.
         The curator's ``_curator_worker`` drains tickets asynchronously; this method
-        returns immediately after scheduling regardless of curator speed.
+        returns immediately after scheduling regardless of curator speed, and
+        reports which sink it handed the batch to.
 
         Cross-submission dedup is handled by the curator R4 gate
         ``_check_escalation_idempotency`` which matches
         ``(escalation_id, suggestion_hash)`` metadata against existing
-        non-cancelled tasks.  Re-submitting identical suggestions produces the
-        same content_hash → same metadata → ticket marked 'combined' → 0 new rows.
+        non-cancelled tasks.  Each ticket carries its own item's
+        ``orchestrator.agents.triage.suggestion_hash``, so a suggestion
+        re-submitted in any later batch is marked 'combined' → 0 new rows.  A
+        re-review that rewords a suggestion produces a new key; that duplicate
+        is left to the curator's semantic dedup.
 
         Must NOT call curate_batch — that dispatches invoke_with_cap_retry and
         can stall up to 31 minutes.  Uses asyncio.create_task +
@@ -16855,7 +16862,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         suggestions = reviews.suggestions
         if not suggestions:
-            return
+            return SuggestionDisposition.NONE
 
         # In-task dedup: compute the hash first so the cache check sits above
         # ALL routing branches (curator submit, escalation-queue fallback, no-op).
@@ -16869,7 +16876,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 'Task %s: skipping duplicate curator route (hash=%s already sent)',
                 self.task_id, content_hash,
             )
-            return
+            return SuggestionDisposition.DEDUPED
 
         # Guard: fall back if MCP transport is unavailable so suggestions are
         # never silently dropped.  _escalate_suggestions is the real caller of
@@ -16882,6 +16889,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # own dedup would also catch it, but the in-task fast-path
                 # avoids touching the queue at all.
                 self._last_routed_suggestion_hash = content_hash
+                return SuggestionDisposition.ESCALATION_QUEUE
             else:
                 logger.warning(
                     'Task %s: dropping %d review suggestion(s) — no MCP transport and no '
@@ -16892,7 +16900,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 # Suggestions were dropped, not routed.  The WARNING must fire
                 # on every drop call to preserve audit visibility of this
                 # pathological branch.
-            return
+                return SuggestionDisposition.DROPPED
         task_id = self.task_id
         project_root = str(self.config.project_root)
 
@@ -16913,7 +16921,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     'spawned_from': task_id,
                     'spawn_context': 'review_suggestions',
                     'escalation_id': f'review-suggestions-{task_id}',
-                    'suggestion_hash': content_hash,
+                    'suggestion_hash': suggestion_hash(suggestion),
                 },
             })
 
@@ -16936,12 +16944,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 'Task %s: failed to schedule curator submits: %s',
                 task_id, exc,
             )
+            return SuggestionDisposition.ERROR
 
         logger.info(
             'Task %s: scheduled %d suggestion(s) for direct curator intake '
             '(hash=%s)',
             task_id, len(suggestions), content_hash,
         )
+        return SuggestionDisposition.CURATOR
 
     def _escalate_suggestions(self, reviews) -> None:
         """Submit review suggestions as an info escalation for steward triage.
@@ -17004,16 +17014,73 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             f'for steward triage ({esc.id})'
         )
 
-    def _escalate_review_issues(self, reviews) -> None:
-        """Submit remaining review issues as a blocking escalation for the steward."""
+    async def _exit_review_cycles_exhausted(
+        self,
+        reviews: ReviewAggregation,
+        amendment_ctx: AmendmentReviewContext | None,
+        amendment_round: int,
+    ) -> WorkflowOutcome:
+        """The review-cap exit: scope and route suggestions like the DONE exit, then escalate.
+
+        Scoping and routing are best-effort; the blocking escalation is
+        mandatory and inlines exactly the set this exit routed — every
+        suggestion when scoping itself failed — and counts the ones scoping
+        removed, so its total still matches the archived review.
+        """
+        scoped = reviews
+        try:
+            scoped = await self._scope_review_suggestions(
+                reviews, amendment_ctx, amendment_round,
+            )
+            disposition = await self._route_review_suggestions_to_curator(scoped)
+        except Exception:
+            logger.warning(
+                'Task %s: suggestion routing failed at the review-cap exit; '
+                'escalating with the content inlined',
+                self.task_id, exc_info=True,
+            )
+            disposition = SuggestionDisposition.ERROR
+        self._escalate_review_issues(
+            scoped,
+            suggestion_disposition=disposition,
+            n_suggestions_raw=len(reviews.suggestions),
+        )
+        return WorkflowOutcome.ESCALATED
+
+    def _escalate_review_issues(
+        self,
+        reviews: ReviewAggregation,
+        *,
+        suggestion_disposition: SuggestionDisposition,
+        n_suggestions_raw: int,
+    ) -> None:
+        """Submit remaining review issues as a blocking escalation for the steward.
+
+        The detail carries the blocking issues AND the suggestions, so every
+        count in the summary is backed by content the steward can read.
+        ``n_suggestions_raw`` is the review's count before suggestion scoping;
+        the summary names any difference so it reconciles with the archive.
+        """
         if not self.escalation_queue:
             return
 
         from escalation.models import Escalation
 
-        detail = reviews.format_for_replan()
+        detail = reviews.format_for_escalation()
         n_blocking = len(reviews.blocking_issues)
         n_suggestions = len(reviews.suggestions)
+        summary = (
+            f'Review cycles exhausted with {n_blocking} blocking issue(s) '
+            f'and {n_suggestions} suggestion(s)'
+        )
+        n_scoped_out = n_suggestions_raw - n_suggestions
+        if n_scoped_out > 0:
+            summary += (
+                f' (+{n_scoped_out} scoped out: routed separately or settled '
+                'in a prior round)'
+            )
+        if n_suggestions:
+            summary += f' [suggestions → {suggestion_disposition}]'
 
         esc = Escalation(
             id=self.escalation_queue.make_id(self.task_id),
@@ -17021,10 +17088,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             agent_role='orchestrator',
             severity='blocking',
             category='review_issues',
-            summary=(
-                f'Review cycles exhausted with {n_blocking} blocking issue(s) '
-                f'and {n_suggestions} suggestion(s)'
-            ),
+            summary=summary,
             detail=detail,
             suggested_action='fix_review_issues',
             worktree=str(self.worktree) if self.worktree else None,
@@ -17038,7 +17102,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                 task_id=self.task_id, phase=self.state.value,
                 data={'escalation_id': esc.id, 'category': 'review_issues',
                       'severity': 'blocking', 'n_blocking': n_blocking,
-                      'n_suggestions': n_suggestions},
+                      'n_suggestions': n_suggestions,
+                      'n_suggestions_raw': n_suggestions_raw,
+                      'suggestion_disposition': str(suggestion_disposition)},
             )
         logger.info(
             f'Task {self.task_id}: escalated {n_blocking} review issues '

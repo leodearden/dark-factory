@@ -12,11 +12,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _review_fixtures import review_aggregation, review_issue
 from shared import safe_io
 
 from orchestrator.artifacts import (
     PLAN_SCHEMA_VERSION,
     ArtifactWriteError,
+    ReviewAggregation,
     TaskArtifacts,
     _normalize_plan,
 )
@@ -1105,6 +1107,36 @@ class TestReviews:
         assert 'missing_test' in text
         assert 'No test for empty input' in text
         assert 'c.py:10' in text
+
+    @staticmethod
+    def _aggregation(suggestion_tags: list[str]) -> ReviewAggregation:
+        return review_aggregation(
+            [review_issue('blocker', 'blocking')],
+            [review_issue(tag) for tag in suggestion_tags],
+        )
+
+    def test_format_for_escalation_inlines_every_suggestion(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        text = agg.format_for_escalation()
+        for suggestion in agg.suggestions:
+            for key in ('location', 'category', 'description', 'suggested_fix'):
+                assert suggestion[key] in text
+        blocking_at = text.index('# Review Feedback — Blocking Issues')
+        assert text.index('# Review Feedback — Suggestions') > blocking_at
+
+    def test_format_for_escalation_begins_with_the_replan_rendering(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        assert agg.format_for_escalation().startswith(agg.format_for_replan())
+
+    def test_format_for_escalation_without_suggestions_equals_replan(self):
+        agg = self._aggregation([])
+        assert agg.format_for_escalation() == agg.format_for_replan()
+
+    def test_format_for_replan_stays_blocking_only(self):
+        agg = self._aggregation(['alpha', 'beta'])
+        text = agg.format_for_replan()
+        for suggestion in agg.suggestions:
+            assert suggestion['description'] not in text
 
     def test_aggregate_reviews_error_filtered(self, artifacts: TaskArtifacts):
         artifacts.write_review('reviewer1', {
