@@ -110,9 +110,8 @@ class TestGetMergeHaltStatus:
         """A project that does not answer inside per_call_timeout is offline,
         while a sibling that did answer stays online.
 
-        The answering project must beat the same deadline the slow one misses;
-        on the host clock a stalled worker made it miss that deadline too, so
-        the scenario runs on tests/_virtual_clock_helpers.py's loop clock.
+        Runs on tests/_virtual_clock_helpers.py::run_on_virtual_clock so host
+        stalls cannot expire the deadline.
         """
         from dashboard.data.merge_halt import get_merge_halt_status
 
