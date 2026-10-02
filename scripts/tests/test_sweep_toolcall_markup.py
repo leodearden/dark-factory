@@ -3,8 +3,8 @@
 ## AUTHORING HAZARD — every envelope sentinel here is ``\\x3c``-escaped
 
 Not one raw ``chr(60)`` + ``/`` sequence may appear in this file's SOURCE TEXT,
-and :func:`test_this_module_spells_no_raw_envelope_literal` enforces that
-mechanically by reading the module's own bytes.
+and tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal
+enforces that mechanically, repo-wide.
 
 The rationale is the one recorded at ``shared/src/shared/toolcall_markup.py``
 lines 52-62 and ``fused_memory/utils/toolcall_xml_leak.py`` lines 77-86: writing
@@ -337,22 +337,6 @@ def sweep_root(tmp_path) -> Path:
 # ---------------------------------------------------------------------------
 # Scaffolding self-tests.
 # ---------------------------------------------------------------------------
-
-
-def test_this_module_spells_no_raw_envelope_literal():
-    """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``.
-
-    The mechanical half of the authoring-hazard note in the module docstring.
-    Computed at runtime from :func:`chr` so the needle itself is not spelled
-    here either — a test that had to write the literal to check for it would
-    be the very hazard it guards.
-    """
-    needle = chr(60) + '/'
-    source = Path(__file__).read_text(encoding='utf-8')
-    assert needle not in source, (
-        'A raw envelope literal was written into this test file. Spell it with '
-        'the \\x3c escape instead — see this module\'s docstring for why.'
-    )
 
 
 def test_sentinel_helpers_agree_with_the_shared_enumeration():
@@ -1818,17 +1802,6 @@ def test_the_lane_flag_narrows_the_sweep(sweep_root, capsys):
     assert (plans_code, esc_code, meta_code) == (
         sweep.EXIT_REPAIRABLE_REMAINS,
     ) * 3, 'every lane of this fixture has repairable work pending'
-
-
-def test_the_script_source_spells_no_raw_envelope_literal():
-    """Mirrors this test module's own self-check, for the script under test.
-
-    Every sentinel it needs is imported from shared.toolcall_markup, so a raw
-    chr(60)+'/' in its source would mean someone re-spelled one — which is both
-    a third enumeration site (INV-5) and the authoring hazard itself.
-    """
-    source = Path(sweep.__file__).read_text(encoding='utf-8')
-    assert (chr(60) + '/') not in source
 
 
 # ---------------------------------------------------------------------------

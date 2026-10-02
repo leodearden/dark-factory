@@ -104,6 +104,8 @@ file and silently dropping the sibling arguments of that same call. ``\\x3c`` is
 byte-identical at runtime and never appears verbatim in the file text, so it is
 immune. Leave it escaped.
 Runtime text quoting them gets the same spelling via :func:`escape_envelope_literals`.
+The rule is enforced repo-wide, for every source that handles envelope markup, by
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``.
 
 This module is pure and stdlib-only (``re``, ``json``). It deliberately imports
 nothing from ``fused_memory``, ``orchestrator`` or ``escalation`` so that every
