@@ -752,34 +752,74 @@ def _calls_ast_parse(tree: ast.Module) -> bool:
     return False
 
 
-def _walks_a_directory_tree(tree: ast.Module) -> bool:
-    """True if the module calls ``<x>.rglob(...)`` or ``os.walk(...)`` (either spelling).
+def _os_module_names(tree: ast.Module) -> set[str]:
+    """``os`` plus every alias an ``import os as <x>`` binds."""
+    return {'os'} | {
+        alias.asname
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+        if alias.name == 'os' and alias.asname
+    }
 
-    Only ``ast.Call`` nodes count, so a string constant naming ``'os.walk'``
+
+def _bare_os_walk_names(tree: ast.Module) -> set[str]:
+    """Every name a ``from os import walk [as <x>]`` binds."""
+    return {
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == 'os'
+        for alias in node.names
+        if alias.name == 'walk'
+    }
+
+
+_GLOB_NAMES = frozenset({'glob', 'iglob'})
+
+
+def _is_recursive_glob(call: ast.Call) -> bool:
+    """A glob that descends: a literal ``**`` pattern, or ``recursive=True``."""
+    pattern = call.args[0] if call.args else None
+    if isinstance(pattern, ast.Constant) and isinstance(pattern.value, str) and '**' in pattern.value:
+        return True
+    return any(
+        keyword.arg == 'recursive'
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in call.keywords
+    )
+
+
+def _is_walk_call(call: ast.Call, os_names: set[str], bare_walks: set[str]) -> bool:
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        receiver = func.value.id if isinstance(func.value, ast.Name) else None
+        return (
+            func.attr == 'rglob'
+            or (func.attr == 'walk' and receiver in os_names)
+            or (func.attr in _GLOB_NAMES and _is_recursive_glob(call))
+        )
+    if isinstance(func, ast.Name):
+        return func.id in bare_walks or (func.id in _GLOB_NAMES and _is_recursive_glob(call))
+    return False
+
+
+def _walks_a_directory_tree(tree: ast.Module) -> bool:
+    """True if the module calls a recursive directory walk.
+
+    The walks are ``<x>.rglob(...)``, ``os.walk(...)`` under any import
+    spelling or alias, and a ``glob``/``iglob`` call that recurses (a ``**``
+    pattern on ``Path.glob``, or ``glob.glob(..., recursive=True)``). A flat
+    ``<dir>.glob('*.py')`` lists one directory and is not a walk. Only
+    ``ast.Call`` nodes count, so a string constant naming ``'os.walk'``
     (test_loop_blocking_gate's primitive table) is not a walk.
     """
-    bare_walk_is_os = any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == 'os'
-        and any(alias.name == 'walk' for alias in node.names)
+    os_names = _os_module_names(tree)
+    bare_walks = _bare_os_walk_names(tree)
+    return any(
+        isinstance(node, ast.Call) and _is_walk_call(node, os_names, bare_walks)
         for node in ast.walk(tree)
     )
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if isinstance(func, ast.Attribute) and func.attr == 'rglob':
-            return True
-        if (
-            isinstance(func, ast.Attribute)
-            and func.attr == 'walk'
-            and isinstance(func.value, ast.Name)
-            and func.value.id == 'os'
-        ):
-            return True
-        if bare_walk_is_os and isinstance(func, ast.Name) and func.id == 'walk':
-            return True
-    return False
 
 
 def _names_the_enumerator(tree: ast.Module) -> bool:
@@ -808,7 +848,14 @@ def _could_offend(source: str) -> bool:
     so a module failing this test cannot offend and need not be parsed.
     """
     return 'iter_first_party_files' in source or (
-        'parse' in source and ('rglob' in source or 'walk' in source)
+        'parse' in source and ('glob' in source or 'walk' in source)
+    )
+
+
+def _offends(source: str, filename: str = '<synthetic>') -> bool:
+    """The ratchet's whole verdict on one module: the prefilter, then the detectors."""
+    return _could_offend(source) and _is_private_tree_parse_offender(
+        ast.parse(source, filename=filename)
     )
 
 
@@ -819,7 +866,8 @@ class TestNoRegrownWholeTreeParse:
     silent-fallthrough gate, the archival gate): AST scan, name the offender,
     carry an anti-vacuity floor. Two shapes offend: naming
     ``iter_first_party_files`` at all (rule 1), and walking a directory tree
-    yourself (``rglob`` / ``os.walk``) and parsing (rule 2). ``test_safe_io``'s
+    yourself (``rglob``, ``os.walk``, a recursive glob) and parsing (rule 2).
+    ``test_safe_io``'s
     cross-tree sweep left shared/tests in task 3388 (now
     ``tests/scripts/test_atomic_write_regrowth.py``), and ``test_auth_failed``
     now walks the shared tree.
@@ -833,9 +881,7 @@ class TestNoRegrownWholeTreeParse:
                 continue
             scanned += 1
             source = module_path.read_text(encoding='utf-8')
-            if _could_offend(source) and _is_private_tree_parse_offender(
-                ast.parse(source, filename=str(module_path))
-            ):
+            if _offends(source, filename=str(module_path)):
                 offenders.append(module_path.name)
         assert scanned >= 50, (
             f'only {scanned} modules scanned — is the tests dir correct? '
@@ -843,7 +889,8 @@ class TestNoRegrownWholeTreeParse:
         )
         assert not offenders, (
             'These shared/tests modules name iter_first_party_files, or walk '
-            'a directory tree with rglob/os.walk AND call ast.parse:\n'
+            'a directory tree (rglob, os.walk, a recursive glob) AND call '
+            'ast.parse:\n'
             + '\n'.join(f'  {name}' for name in offenders)
             + '\n\nEither is a SECOND whole-tree parse. Two of them already '
               'collided with the 60s pytest-timeout budget under load (task '
@@ -855,60 +902,99 @@ class TestNoRegrownWholeTreeParse:
 
     def test_the_detector_actually_fires(self):
         """Anti-vacuity: a synthetic offender must be caught."""
-        offender = ast.parse(
+        assert _offends(
             'import ast\n'
             'from silent_fallthrough_scan import iter_first_party_files\n'
             'def scan(root):\n'
             '    return [ast.parse(p.read_text()) for p in iter_first_party_files(root)]\n'
         )
-        assert _is_private_tree_parse_offender(offender)
 
     def test_naming_the_enumerator_alone_fires(self):
         """Rule 1: a consumer never needs the enumerator; paths are on the records."""
-        enumerates_only = ast.parse(
+        assert _offends(
             'from silent_fallthrough_scan import iter_first_party_files\n'
             'def files(root):\n'
             '    return list(iter_first_party_files(root))\n'
         )
-        assert _is_private_tree_parse_offender(enumerates_only)
 
     def test_the_split_enumerate_here_parse_elsewhere_shape_fires(self):
         """The loop-blocking gate's old shape: enumerate, then a scanner parses."""
-        offender = ast.parse(
+        assert _offends(
             'from loop_blocking_scan import find_loop_blocking_sites\n'
             'from silent_fallthrough_scan import iter_first_party_files\n'
             'def scan(root):\n'
             '    sources = {str(p): p.read_text() for p in iter_first_party_files(root)}\n'
             '    return find_loop_blocking_sites(sources)\n'
         )
-        assert _is_private_tree_parse_offender(offender)
 
     def test_the_detector_catches_the_from_import_spelling(self):
         """`from ast import parse` must not evade rule 2."""
-        offender = ast.parse(
+        assert _offends(
             'from ast import parse\n'
             'def scan(root):\n'
             "    return [parse(p.read_text()) for p in root.rglob('*.py')]\n"
         )
-        assert _is_private_tree_parse_offender(offender)
 
-    def test_the_detector_catches_a_rolled_own_rglob_root(self):
-        offender = ast.parse(
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(
+                'import ast\n'
+                'def scan(root):\n'
+                "    return [ast.parse(p.read_text()) for p in root.rglob('*.py')]\n",
+                id='rglob',
+            ),
+            pytest.param(
+                'import ast, os\n'
+                'def scan(root):\n'
+                '    for dirpath, _dirs, names in os.walk(root):\n'
+                '        for name in names:\n'
+                '            ast.parse(open(os.path.join(dirpath, name)).read())\n',
+                id='os-walk',
+            ),
+            pytest.param(
+                'import ast\n'
+                'import os as o\n'
+                'def scan(root):\n'
+                '    for dirpath, _dirs, names in o.walk(root):\n'
+                '        for name in names:\n'
+                '            ast.parse(open(o.path.join(dirpath, name)).read())\n',
+                id='aliased-os-walk',
+            ),
+            pytest.param(
+                'import ast\n'
+                'from os import walk as w\n'
+                'def scan(root):\n'
+                '    return [ast.parse(name) for _d, _s, names in w(root) for name in names]\n',
+                id='aliased-from-os-import-walk',
+            ),
+            pytest.param(
+                'import ast\n'
+                'def scan(root):\n'
+                "    return [ast.parse(p.read_text()) for p in root.glob('**/*.py')]\n",
+                id='double-star-path-glob',
+            ),
+            pytest.param(
+                'import ast, glob, os\n'
+                'def scan(root):\n'
+                "    paths = glob.glob(os.path.join(root, '**', '*.py'), recursive=True)\n"
+                '    return [ast.parse(open(p).read()) for p in paths]\n',
+                id='recursive-glob-module',
+            ),
+        ],
+    )
+    def test_the_detector_catches_every_directory_walk_spelling(self, source):
+        """Rule 2 keys on the walk, whichever spelling rolls it."""
+        assert _offends(source)
+
+    def test_a_flat_glob_is_not_a_walk(self):
+        """One directory level is not a tree: this ratchet itself globs '*.py' and parses."""
+        flat = ast.parse(
             'import ast\n'
-            'def scan(root):\n'
-            "    return [ast.parse(p.read_text()) for p in root.rglob('*.py')]\n"
+            'def scan(directory):\n'
+            "    return [ast.parse(p.read_text()) for p in directory.glob('*.py')]\n"
         )
-        assert _is_private_tree_parse_offender(offender)
-
-    def test_the_detector_catches_an_os_walk_root(self):
-        offender = ast.parse(
-            'import ast, os\n'
-            'def scan(root):\n'
-            '    for dirpath, _dirs, names in os.walk(root):\n'
-            '        for name in names:\n'
-            '            ast.parse(open(os.path.join(dirpath, name)).read())\n'
-        )
-        assert _is_private_tree_parse_offender(offender)
+        assert not _is_private_tree_parse_offender(flat)
 
     def test_a_walk_or_a_parse_alone_does_not_fire(self):
         walks_only = ast.parse(
