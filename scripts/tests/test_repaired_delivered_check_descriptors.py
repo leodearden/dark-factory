@@ -5,8 +5,10 @@ producer task's ``metadata.delivered_checks`` entry in tasks.db AND the sidecar
 the stamper copies it from. Task 5256 resynced sidecars, sidecar-only, to task
 records that had already been repaired. CI can never see the tasks.db half, so
 either way these pins guard the SIDECAR half: a stale sidecar would be
-re-stamped over the repaired record by the next re-decompose.
-They read only tracked files in this checkout and open no database.
+re-stamped over the repaired record by the next re-decompose. Every resynced
+producer is done, so the resynced rows are also evaluated at HEAD through the
+runtime grep primitive. They read only tracked files in this checkout and open
+no database.
 
 MAINTENANCE CONTRACT: an exact pin also fires on a legitimate later both-sides
 re-repair. In that case, update the row here in the same change and re-run
@@ -22,6 +24,7 @@ import pytest
 from audit_delivered_checks import load_manifest_checks, structural_findings
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
+from shared.delivered_check_polarity import CheckOutcome, evaluate_grep_at_tree
 
 # Task 6036: re-anchored on both sides.
 _REANCHORED = [
@@ -55,9 +58,15 @@ _REANCHORED = [
 _RESYNCED_TO_TASK_RECORD = [
     (
         "plans/flake-ledger-prd.capability-manifest.yaml",
+        3787, "γ", "merge-boundary-call-sites-exist",
+        {"kind": "grep", "pattern": r"effective_merge_module_configs\(", "expect": "present",
+         "paths": ["orchestrator/src/orchestrator/merge_lane/worker.py"]},
+    ),
+    (
+        "plans/flake-ledger-prd.capability-manifest.yaml",
         3789, "ε", "remote-path-drops-all-three-side-effects-today",
         {"kind": "grep", "pattern": "record_merge_flake_suppression", "expect": "present",
-         "paths": ["orchestrator/src/orchestrator/merge_queue.py"]},
+         "paths": ["orchestrator/src/orchestrator/merge_lane/worker.py"]},
     ),
     (
         "plans/merge-lane-throughput-prd.capability-manifest.yaml",
@@ -131,6 +140,35 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
         f"{relpath} label {label} capability {capability} (task {task_id}) does not "
         f"carry the repaired descriptor pinned in this module. If it was re-repaired "
         f"on BOTH sides on purpose, follow this module's MAINTENANCE CONTRACT."
+    )
+
+
+_RESYNCED_GREPS = [r[:4] for r in _RESYNCED_TO_TASK_RECORD if r[4]["kind"] == "grep"]
+
+
+@pytest.mark.parametrize(
+    "relpath,task_id,label,capability",
+    _RESYNCED_GREPS,
+    ids=[f"{r[1]}-{r[3]}" for r in _RESYNCED_GREPS],
+)
+def test_resynced_sidecar_descriptor_delivers_at_head(relpath, task_id, label, capability):
+    """Every producer in _RESYNCED_TO_TASK_RECORD is done, so its sidecar gate must
+    deliver at HEAD; _REANCHORED is excluded because it holds a pending producer
+    (5324) whose forward-looking gate legitimately fails at HEAD."""
+    root = checkout_root_or_skip()
+    check = _the_one_capability(root, relpath, label, capability).delivered_check
+
+    assert check is not None
+    outcome = evaluate_grep_at_tree(
+        check.pattern or "", list(check.paths),
+        expect=check.expect, repo_root=root, ref="HEAD",
+    )
+    assert outcome is CheckOutcome.PASS, (
+        f"{relpath} label {label} capability {capability} (task {task_id}) evaluates "
+        f"{outcome.value} at HEAD, but its producer is done, so its sidecar "
+        f"delivered_check must deliver. If code moved, repath BOTH halves (the task "
+        f"record via update_task, the sidecar here) and update this module's row per "
+        f"the MAINTENANCE CONTRACT."
     )
 
 
