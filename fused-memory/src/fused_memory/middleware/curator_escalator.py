@@ -539,7 +539,9 @@ class CuratorEscalator:
         no-escalation-package gates: it runs after the task already exists, so
         raising could only turn a missed notice into noise on a successful write.
         """
-        if not HAS_ESCALATION or not self._orchestrator_running(project_root):
+        if not HAS_ESCALATION or not await asyncio.to_thread(
+            self._orchestrator_running, project_root,
+        ):
             logger.warning(
                 'curator_escalator: no orchestrator/escalation queue for project %s; '
                 'post-ZOT duplicate %s ~ %s (score %.3f) not escalated',
