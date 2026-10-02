@@ -43,6 +43,14 @@ from fused_memory.middleware.execution_class_guard import (
     execution_class_error,
     inject_execution_class,
 )
+from fused_memory.middleware.gitignored_deliverable_guard import (
+    gitignored_deliverable_enforced,
+    gitignored_deliverable_finding,
+    gitignored_deliverable_reject,
+    gitignored_deliverable_warning,
+    log_gitignored_deliverable_flagged,
+    make_gitignore_probe,
+)
 from fused_memory.middleware.lock_charter_guard import (
     directory_locks,
     extract_files,
@@ -8840,6 +8848,11 @@ def create_mcp_server(
                 under project_root that exists and is executable, ``timeout_secs``
                 positive int) and/or ``always_escalates`` (bool) in metadata.
 
+                A ``task_kind='normal'`` submission whose declared ``files``
+                are ALL gitignored is flagged (or rejected under
+                FUSED_GITIGNORED_DELIVERABLE_ENFORCE): no commit can deliver
+                it, so it should likely be ``task_kind='deterministic'``.
+
                 allow_mcp_markup (optional): set to ``True`` to bypass the
                 MCP-markup boundary guard when the task text quotes envelope markup
                 deliberately. Write-time-only — it is stripped before
@@ -9099,6 +9112,19 @@ def create_mcp_server(
         if _op_finding is not None:
             _op_warning = operational_suggestion_warning(_op_finding)
 
+        # Gitignored-deliverable lint (task 3611): a task_kind='normal' filing
+        # whose declared files are ALL gitignored can never produce a commit.
+        # One placement covers the curator and planning_mode paths, because
+        # their split happens inside task_interceptor.submit_task.
+        _gitignored_finding = await asyncio.to_thread(
+            gitignored_deliverable_finding,
+            task_kind=task_kind,
+            metadata=metadata,
+            probe=make_gitignore_probe(project_root),
+        )
+        if _gitignored_finding is not None and gitignored_deliverable_enforced():
+            return gitignored_deliverable_reject(_gitignored_finding)
+
         result = await task_interceptor.submit_task(
             project_root=project_root,
             prompt=prompt,
@@ -9124,6 +9150,9 @@ def create_mcp_server(
         # in result`).
         if _op_warning is not None and isinstance(result, dict) and 'error' not in result:
             result.update(_op_warning)
+        if _gitignored_finding is not None and isinstance(result, dict) and 'error' not in result:
+            result.update(gitignored_deliverable_warning(_gitignored_finding))
+            log_gitignored_deliverable_flagged(_gitignored_finding)
         return result
 
     @mcp.tool()

@@ -838,6 +838,50 @@ rather than a `DeterministicRunner` action or a code merge.
 **Dep convention:** deterministic deploys and gates use **normal**
 dependencies — including cross-project `project_id:task_id` deps (§3.2).
 
+### Gitignored-only deliverables are flagged at submit
+
+A `task_kind='normal'` submission is flagged when **every** declared
+`metadata.files` path is gitignored in the target project. The check runs
+`git check-ignore`, which consults the index, so a tracked file is never
+flagged even if an ignore rule matches it. One committable path anywhere in
+the list suppresses the flag.
+
+Such a task is structurally undeliverable. Its plan still passes, because
+`confirm_plan` only checks that `plan.files` is declared and non-empty. But
+no commit can ever touch a gitignored path, so neither of these can be
+satisfied:
+
+- the merge-time plan-files-touched gate (`plan_files_not_touched`);
+- `done_provenance` (§2).
+
+**Exempt (no flag):**
+
+- `files=[]`;
+- `task_kind='deterministic'`;
+- `execution_class` `operational` or `decision`;
+- a hand-set `metadata.cross_repo` (§3.2.1);
+- any case where git cannot answer, such as a non-git root or a declared
+  path outside the repo. These fail open.
+
+A path whose extension is not on the lock-charter allowlist (for example
+`tasks.db`) is refused earlier, as a "directory declaration" with
+`LockCharterViolation`, so this lint never sees it.
+
+**Posture.** By default the lint only warns. When the submission succeeds,
+it merges a `gitignored_deliverable_warning` key into the result and logs a
+`gitignored_deliverable_lint.flagged` census line, so the census counts
+accepted filings only. Setting
+`FUSED_GITIGNORED_DELIVERABLE_ENFORCE=1` makes it a hard reject
+(`ValidationError`) instead.
+
+**Fix.** Most such tasks should be filed as `task_kind='deterministic'`:
+
+- with `before_done` pointing at a committed script, for a scripted action;
+- or with `always_escalates=True`, for a human gate.
+
+If a code deliverable really is intended, declare at least one committable
+path.
+
 ---
 
 ## 6. Milestone tasks (dated / delayed)
