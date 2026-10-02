@@ -40,7 +40,8 @@ from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _orch_helpers import make_placeholder_future
+from _live_merge_worker import running_merge_worker
+from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -1017,11 +1018,15 @@ class TestPathEquivalence:
             worker1, '_bounce_conflicting_suffix_items',
             AsyncMock(return_value=None),
         )
-        worker1_task = asyncio.create_task(worker1.run())
-        await queue.put(merger_req)
-        merger_outcome = await asyncio.wait_for(merger_req.result, timeout=30)
-        await worker1.stop()
-        await worker1_task
+        async with running_merge_worker(worker1):
+            await queue.put(merger_req)
+            merger_outcome = await wait_responsive(
+                merger_req.result,
+                label=(
+                    f'merger-path outcome for the {scenario!r} '
+                    'classify_and_merge equivalence scenario'
+                ),
+            )
 
         # ── Drive the REMERGE path ──────────────────────────────────────────
         es_remerge = _make_event_store(tmp_path / 'remerge')

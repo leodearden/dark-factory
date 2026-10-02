@@ -12,7 +12,7 @@ import ast
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from _fm_helpers import load_script_module
@@ -1201,8 +1201,9 @@ class TestRuleBIsUnconditional:
 
     def test_a_rule_c_debt_file_reports_rule_b_in_full(self):
         """Rule C's surviving baseline must not shadow Rule B at its own debt paths."""
+        entry, _budget = _live_rule_c_debt_entry()
         self._assert_reports_three_plain_hits(
-            _RULE_C_DEBT_FILE, "Rule C's baseline grandfathers wall-clock debt alone"
+            entry, "Rule C's baseline grandfathers wall-clock debt alone"
         )
 
 
@@ -1699,28 +1700,49 @@ _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue_request_liveness.py',
     'orchestrator/tests/test_coalesce_integration_gate.py',
     'orchestrator/tests/test_merge_queue_coalesce.py',
-    'orchestrator/tests/test_merge_queue_persistent_worktree.py',
-    'orchestrator/tests/test_merge_queue_single_writer_asserts.py',
-    'orchestrator/tests/test_merge_guard_pipeline.py',
-    'orchestrator/tests/test_merge_queue_supervisor.py',
-    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
-    'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py',
-    'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py',
 })
 
-# A Rule C debt file with a budget of exactly 1, so at-budget / over-budget
-# arithmetic can be driven with a handful of single-violation synthetic sources.
-_RULE_C_DEBT_FILE = 'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py'
-
-# A Rule C debt file with a budget of exactly 2, used by the FILENAME-MATCHING tests
-# so they can drive the two-violation source and still be at budget. Those tests are
-# about which paths resolve to a budget, not about the arithmetic once one is found —
-# a budget-1 entry would report a 1-violation overrun and mask what they measure.
-_RULE_C_DEBT_FILE_BUDGET_2 = 'orchestrator/tests/test_merge_guard_pipeline.py'
+# A SYNTHETIC debt mapping for the path-matching tests, which drive the pure
+# _debt_budget helper with it.  It names no real file, so no migration can ever
+# shrink it out from under them.
+_SYNTHETIC_DEBT_ENTRY = 'orchestrator/tests/test_synthetic_rule_c_debt.py'
+_SYNTHETIC_RULE_C_DEBT = {_SYNTHETIC_DEBT_ENTRY: 2}
 
 # Exactly ONE Rule C violation (bare wait_for; the bound is derived, not written),
 # so N copies produce N violations and the arithmetic in the budget tests is exact.
 _RULE_C_ONE_HIT = 'asyncio.wait_for(req_a.result, timeout=MERGE_RESULT_TIMEOUT)\n'
+
+
+def _live_rule_c_debt_entry() -> tuple[str, int]:
+    """The live baseline entry with the LARGEST budget, for the find_violations legs.
+
+    Chosen at runtime rather than named, so no future shrink can strand a test on a
+    migrated file; callers keep their arithmetic relative to the returned budget.
+
+    Fails rather than skips on an empty baseline: a skip would leave the debt
+    machinery and its tests dormant, unnoticed among thousands of passes.
+    """
+    debt = _checker._WALL_CLOCK_DEADLINE_DEBT
+    if not debt:
+        pytest.fail(
+            'the Rule C debt baseline is empty: every file is migrated. Retire the '
+            'debt machinery in this same change: _WALL_CLOCK_DEADLINE_DEBT, '
+            '_debt_budget, _apply_debt_budget and _wall_clock_overrun_msg in '
+            'check_bare_magicmock_config.py, and the tests that call '
+            '_live_rule_c_debt_entry here'
+        )
+    return max(debt.items(), key=lambda item: item[1])
+
+
+def _against_a_budget_of_1(copies: int) -> list:
+    """Run *copies* raw Rule C hits through the pure budget arithmetic, budget 1."""
+    found = _rule_c(_RULE_C_ONE_HIT * copies)
+    assert len(found) == copies, (
+        f'_RULE_C_ONE_HIT must yield exactly one raw hit per copy; got {found!r}'
+    )
+    return _checker._apply_debt_budget(
+        found, 1, build_overrun_msg=_checker._wall_clock_overrun_msg
+    )
 
 
 class TestWallClockDeadlineDebtBaseline:
@@ -1754,10 +1776,14 @@ class TestWallClockDeadlineDebtBaseline:
         measurement is not inert — it silently licences that many new waits. The
         cost is that an orchestrator-side edit can turn fused-memory RED, so those
         failure messages lead with the exact edit to make, not with a diagnosis.
+
+    For the same reason as that removed pin, no test here is anchored to a real
+    file's exact budget: the pure helpers take synthetic inputs, and the
+    find_violations legs pick a live entry at runtime.
     """
 
     def test_debt_baseline_holds_exactly_the_measured_census_paths(self):
-        """_WALL_CLOCK_DEADLINE_DEBT == the 20 census paths — no more, no less."""
+        """_WALL_CLOCK_DEADLINE_DEBT == the measured census paths — no more, no less."""
         debt = _checker._WALL_CLOCK_DEADLINE_DEBT
         assert set(debt) == _EXPECTED_WALL_CLOCK_DEBT_PATHS, (
             'Rule C debt baseline drifted from the measured census.\n'
@@ -1783,17 +1809,14 @@ class TestWallClockDeadlineDebtBaseline:
             'zero and must FAIL the gate on a regression, not be grandfathered'
         )
 
-    def test_the_budget_2_fixture_still_has_a_budget_of_2(self):
-        """The filename-matching tests assume it; pin it so a later shrink is loud."""
-        budget = _checker._WALL_CLOCK_DEADLINE_DEBT[_RULE_C_DEBT_FILE_BUDGET_2]
-        assert budget == 2, (
-            f'the filename-matching tests drive a two-violation source against this '
-            f'entry and expect silence; got budget {budget}'
-        )
-
     def test_same_source_opposite_verdicts_by_filename(self):
         """The identical offending source is suppressed in a debt file and flagged elsewhere."""
-        assert _rule_c(_RULE_C_SOURCE, _RULE_C_DEBT_FILE_BUDGET_2) == [], (
+        entry, budget = _live_rule_c_debt_entry()
+        assert budget >= 2, (
+            f'this leg drives a two-violation source and expects silence under {entry}, '
+            f'so it needs a budget of at least 2; got {budget}'
+        )
+        assert _rule_c(_RULE_C_SOURCE, entry) == [], (
             'Rule C must be suppressed in a debt-listed file'
         )
         flagged = _rule_c(_RULE_C_SOURCE, _NON_DEBT_FILE)
@@ -1803,59 +1826,77 @@ class TestWallClockDeadlineDebtBaseline:
         )
 
     def test_suppression_works_for_absolute_paths(self):
-        """An absolute path ending in the debt components is suppressed too.
+        """An absolute path ending in the debt components resolves to the budget too.
 
         The nine call sites pass repo-relative paths; pytest passes absolutes. Both
         must reach the same verdict or the baseline would be invisible to one caller.
         """
-        absolute = str(_REPO_ROOT / _RULE_C_DEBT_FILE_BUDGET_2)
-        assert _rule_c(_RULE_C_SOURCE, absolute) == [], (
-            f'an absolute path to a debt file must be suppressed; filename={absolute!r}'
+        assert _checker._debt_budget(_SYNTHETIC_DEBT_ENTRY, _SYNTHETIC_RULE_C_DEBT) == 2
+        absolute = str(_REPO_ROOT / _SYNTHETIC_DEBT_ENTRY)
+        assert _checker._debt_budget(absolute, _SYNTHETIC_RULE_C_DEBT) == 2, (
+            f'an absolute path to a debt file must resolve to its budget; '
+            f'filename={absolute!r}'
+        )
+
+        entry, budget = _live_rule_c_debt_entry()
+        assert budget >= 2, (
+            f'the find_violations leg drives a two-violation source and expects silence '
+            f'under {entry}, so it needs a budget of at least 2; got {budget}'
+        )
+        live_absolute = str(_REPO_ROOT / entry)
+        assert _rule_c(_RULE_C_SOURCE, live_absolute) == [], (
+            'find_violations must hand an absolute filename to the baseline lookup '
+            f'unchanged, so a debt file is suppressed for pytest callers too; '
+            f'filename={live_absolute!r}'
         )
 
     def test_matching_is_path_component_aware_not_substring(self):
         """Trailing-COMPONENT matching: a substring match must not grandfather an unrelated file."""
-        assert _rule_c(_RULE_C_SOURCE, 'evil/' + _RULE_C_DEBT_FILE_BUDGET_2) == [], (
-            'a path whose real trailing components are a debt entry is suppressed'
+        assert _checker._debt_budget('evil/' + _SYNTHETIC_DEBT_ENTRY, _SYNTHETIC_RULE_C_DEBT) == 2, (
+            'a path whose real trailing components are a debt entry resolves to its budget'
         )
-        not_suppressed = _rule_c(
-            _RULE_C_SOURCE, 'orchestrator/tests/not_test_merge_queue.py'
+        substring = 'orchestrator/tests/not_test_synthetic_rule_c_debt.py'
+        assert _checker._debt_budget(substring, _SYNTHETIC_RULE_C_DEBT) is None, (
+            f'{substring} merely CONTAINS a debt filename as a substring; a substring '
+            'match must not grandfather it'
         )
-        assert len(not_suppressed) == 2, (
-            'not_test_merge_queue.py merely CONTAINS a debt filename as a substring; '
-            f'a substring match must not grandfather it. got {not_suppressed!r}'
-        )
-        bare = _rule_c(_RULE_C_SOURCE, 'test_merge_queue.py')
-        assert len(bare) == 2, (
+        bare = 'test_synthetic_rule_c_debt.py'
+        assert _checker._debt_budget(bare, _SYNTHETIC_RULE_C_DEBT) is None, (
             'a bare basename at another root shares only ONE trailing component and '
-            f'must not be suppressed. got {bare!r}'
+            'must not be grandfathered'
+        )
+
+        entry, _budget = _live_rule_c_debt_entry()
+        live = PurePosixPath(entry)
+        live_substring = str(live.with_name('not_' + live.name))
+        flagged = _rule_c(_RULE_C_SOURCE, live_substring)
+        assert len(flagged) == 2, (
+            f'through find_violations, {live_substring} merely CONTAINS the debt '
+            f'filename {live.name} and must be reported in full; got {flagged!r}'
         )
 
     def test_debt_file_is_silent_at_budget_and_reports_the_overrun_above_it(self):
         """The budget is what makes 'shrink-only' checked rather than merely commented.
 
         Without it a debt entry grandfathers its file WHOLESALE, so a brand-new
-        wall-clock wait added to test_merge_queue.py (317 violations, an
+        wall-clock wait added to test_merge_queue.py (the largest debt file, an
         actively-developed hub) would be invisible to the gate forever.
         """
-        budget = _checker._WALL_CLOCK_DEADLINE_DEBT[_RULE_C_DEBT_FILE]
-        assert budget == 1, f'this test is written against a budget of 1; got {budget}'
-
-        at_budget = _rule_c(_RULE_C_ONE_HIT, _RULE_C_DEBT_FILE)
+        at_budget = _against_a_budget_of_1(1)
         assert at_budget == [], (
-            f'a debt file carrying exactly its recorded {budget} violation(s) must stay '
-            f'silent — that is the grandfathering the baseline exists for; got {at_budget!r}'
+            'a debt file carrying exactly its recorded 1 violation must stay silent — '
+            f'that is the grandfathering the baseline exists for; got {at_budget!r}'
         )
 
-        over_budget = _rule_c(_RULE_C_ONE_HIT * 3, _RULE_C_DEBT_FILE)
+        over_budget = _against_a_budget_of_1(3)
         assert len(over_budget) == 2, (
             'a debt file that GROWS past its recorded budget must report exactly the '
-            f'overrun (3 - budget {budget} = 2); got {over_budget!r}'
+            f'overrun (3 - budget 1 = 2); got {over_budget!r}'
         )
 
     def test_reported_overrun_sites_are_the_last_in_source_order(self):
         """The anchor is positional and deterministic, not a claim about which site is new."""
-        over_budget = _rule_c(_RULE_C_ONE_HIT * 4, _RULE_C_DEBT_FILE)
+        over_budget = _against_a_budget_of_1(4)
         assert [v.lineno for v in over_budget] == [2, 3, 4], (
             f'expected the LAST 3 of 4 sites (budget 1); got {[v.lineno for v in over_budget]}'
         )
@@ -1867,7 +1908,7 @@ class TestWallClockDeadlineDebtBaseline:
         wait_responsive", an overrun says "you added debt to a file that may only
         shrink". Conflating them invites the reader to fix it by editing the number.
         """
-        message = _rule_c(_RULE_C_ONE_HIT * 2, _RULE_C_DEBT_FILE)[0].message
+        message = _against_a_budget_of_1(2)[0].message
         for needle in ('debt baseline', 'budget of 1', '2 were found', 'Do NOT raise'):
             assert needle in message, (
                 f'the overrun message must name {needle!r} so the reader fixes the debt '
@@ -1875,11 +1916,29 @@ class TestWallClockDeadlineDebtBaseline:
             )
 
     def test_overrun_message_carries_rule_c_remedies_not_rule_b_ones(self):
-        """A Rule C overrun must never prescribe _fake_verify_result."""
-        message = _rule_c(_RULE_C_ONE_HIT * 2, _RULE_C_DEBT_FILE)[0].message
-        assert 'wall-clock-deadline' in message
-        assert 'wait_responsive' in message
-        assert 'MERGE_RESULT_TIMEOUT' in message
+        """A Rule C overrun must never prescribe _fake_verify_result.
+
+        Driven end to end through find_violations against a LIVE baseline entry, so
+        it also proves find_violations looks the filename up in the real baseline,
+        applies that budget to the count, and wires Rule C's own overrun builder.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        overrun = _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)
+        assert len(overrun) == 1, (
+            f'{budget + 1} hits against {entry} (budget {budget}) must report exactly '
+            f'the one-violation overrun; got {overrun!r}'
+        )
+        message = overrun[0].message
+        for needle in (
+            'wall-clock-deadline',
+            'wait_responsive',
+            'MERGE_RESULT_TIMEOUT',
+            'debt baseline',
+            f'budget of {budget}',
+        ):
+            assert needle in message, (
+                f'the Rule C overrun message must carry {needle!r}; got {message!r}'
+            )
         for foreign in ('_fake_verify_result', 'spec=VerifyResult', 'bare-dataclass-double'):
             assert foreign not in message, (
                 f'Rule C overrun message must not offer {foreign!r}: {message!r}'
@@ -1912,7 +1971,8 @@ class TestDebtBaselineIsolation:
 
     def test_rule_a_is_reported_in_full_in_a_rule_c_debt_file(self):
         """The Rule C baseline grandfathers wall-clock debt, not all test-quality discipline."""
-        violations = find_violations(_RULE_A_SOURCE, _RULE_C_DEBT_FILE)
+        entry, _budget = _live_rule_c_debt_entry()
+        violations = find_violations(_RULE_A_SOURCE, entry)
         assert len(violations) == 1, (
             'a bare config MagicMock in a Rule-C-debt file is still a Rule A '
             f'violation; got {violations}'
