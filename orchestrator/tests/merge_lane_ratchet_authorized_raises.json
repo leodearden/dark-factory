@@ -1291,6 +1291,138 @@
           "current": 279
         }
       ]
+    },
+    {
+      "task_id": "5618",
+      "reason": "Net-additive defect fix (task 5618): stack_train_branches records the base each member was stacked onto; GitOps.unstack_from_unlanded_base strips a never-landed predecessor's commits (mechanism in the new orchestrator/branch_stack.py); classify_and_merge un-stacks a branch from an unlanded base before merging and coalesce-derail redrive un-stacks members before re-dispatch, so a member is never merged or reviewed carrying another task's commits. Re-authorized as one entry after rebasing onto main (esc-5618-2).",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1403,
+          "current": 1417
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 2163,
+          "current": 2171
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_queue.py::classify_and_merge",
+          "baseline": 30,
+          "current": 31
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15498,
+          "current": 15662
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 21707,
+          "current": 21788
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9070,
+          "current": 9100
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 12348,
+          "current": 12374
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4726,
+          "current": 4748
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55961,
+          "current": 56206
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31450,
+          "current": 31506
+        }
+      ]
+    },
+    {
+      "task_id": "5618",
+      "reason": "Merge resolution for task 5618 over main's merge_lane/ move (task 5036): the un-stack admission hook, the train-landing stack-base cleanup and the coalesce-derail redrive un-stack were transplanted from merge_queue.py onto merge_lane/worker.py unchanged (85 added lines, cognitive +8, one new import of orchestrator.branch_stack), and git_ops.py carries the same stack-base ledger and unstack_from_unlanded_base additions the branch's earlier entry recorded. Net-additive defect fix, no refactor; the earlier 5618 entry named the pre-move paths.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1403,
+          "current": 1417
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2120,
+          "current": 2128
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::classify_and_merge",
+          "baseline": 30,
+          "current": 31
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15498,
+          "current": 15662
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21245,
+          "current": 21326
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9070,
+          "current": 9100
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12187,
+          "current": 12213
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4726,
+          "current": 4748
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 55788,
+          "current": 56033
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31244,
+          "current": 31300
+        }
+      ]
     }
   ]
 }

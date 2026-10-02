@@ -74,8 +74,16 @@ from shared.proc_group import (
 )
 from shared.transcript_archive import archive_before_delete
 
-from orchestrator import rebase_recovery
+from orchestrator import branch_stack, rebase_recovery
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.branch_stack import (
+    StackBaseLedger,
+    UnstackOutcome,
+    UnstackResult,
+    base_owners,
+    foreign_commit_cut,
+    rebase_own_delta,
+)
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
 from orchestrator.lane_lifecycle import (
     ACQUIRE_ROUTE_TRANSITIONS,
@@ -9967,7 +9975,14 @@ class GitOps:
         ``rebase_onto_main(wt, onto=...)``.
 
         On a clean rebase the member is appended to *survivors* and becomes
-        the new last-good predecessor for the next member.
+        the new last-good predecessor for the next member, and the base it
+        was stacked onto is recorded (see
+        ``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``).
+        Records are only ever written here, so this is also where the
+        records of branches that no longer exist are pruned.
+        A member is always stacked from its own delta: before the rebase it
+        is un-stacked from any earlier unlanded base, and a member that
+        cannot be un-stacked is ejected.
 
         On a rebase conflict the member is added to *ejected*; the last-good
         predecessor is NOT advanced, so the next member re-links onto the last
@@ -9985,6 +10000,7 @@ class GitOps:
         """
         if not member_ids:
             return TrainStackResult(survivors=[], ejected=[])
+        await self._stack_ledger().prune_orphans()
 
         anchor_id = member_ids[0]
         survivors: list[str] = [anchor_id]
@@ -10003,7 +10019,8 @@ class GitOps:
                 continue
 
             onto_branch = f'{self.config.branch_prefix}{last_good_id}'
-            success = await self.rebase_onto_main(wt_path, onto=onto_branch)
+            member_branch = f'{self.config.branch_prefix}{member_id}'
+            success = await self._stack_member(wt_path, member_branch, onto_branch)
             if success:
                 survivors.append(member_id)
                 last_good_id = member_id
@@ -10012,6 +10029,153 @@ class GitOps:
                 # Do not advance last_good_id.
 
         return TrainStackResult(survivors=survivors, ejected=ejected)
+
+    async def _stack_member(
+        self, wt_path: Path, member_branch: str, onto_branch: str,
+    ) -> bool:
+        """Stack *member_branch* onto *onto_branch* from its own delta.
+
+        Returns False when the member must be ejected: it could not be
+        un-stacked from an earlier unlanded base, or the rebase conflicted.
+        """
+        earlier = await self.unstack_from_unlanded_base(member_branch)
+        if earlier.stops_merge:
+            logger.warning(
+                'stack_train_branches: ejecting %s — %s',
+                member_branch, earlier.merge_block_reason(),
+            )
+            return False
+        if not await self.rebase_onto_main(wt_path, onto=onto_branch):
+            return False
+        base_sha = await self.resolve_branch_sha(onto_branch)
+        if base_sha is None:
+            logger.warning(
+                'stack_train_branches: %s did not resolve after stacking %s '
+                'onto it; no stack base recorded',
+                onto_branch, member_branch,
+            )
+            return True
+        await self._stack_ledger().record(member_branch, base_sha)
+        return True
+
+    def _stack_ledger(self) -> StackBaseLedger:
+        return StackBaseLedger(self.project_root, _run)
+
+    async def forget_stack_bases(self, task_ids: Iterable[str]) -> None:
+        """Drop the stack-base records of *task_ids*' branches, e.g. once
+        their train has landed.  A failed delete is logged, not raised."""
+        ledger = self._stack_ledger()
+        for task_id in task_ids:
+            await ledger.forget(f'{self.config.branch_prefix}{task_id}')
+
+    async def unstack_from_unlanded_base(self, full_branch: str) -> UnstackResult:
+        """Strip the commits of a never-landed stack base from *full_branch*.
+
+        Reads the base recorded when the branch was stacked
+        (``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``).
+        No record, a base already on main, a vanished branch, or no foreign
+        commits left: the record is cleared and the result is NOT_STACKED.
+        Otherwise the branch's own delta is replayed onto main with
+        ``git rebase --onto <main> <cut>`` inside the worktree that holds the
+        branch, and only when that tree is clean.
+
+        Never raises.  A failed git read, a dirty tree, no holding worktree or
+        a rebase that fails without a conflicted path (a contended lock, say)
+        is BLOCKED; a conflict in the branch's OWN delta is CONFLICT.  Both
+        keep the record, and their ``merge_block_reason()`` attributes the
+        stop to the base.
+        """
+        ledger = self._stack_ledger()
+        base = await ledger.base_of(full_branch)
+        if base is None:
+            return UnstackResult(
+                outcome=UnstackOutcome.NOT_STACKED,
+                branch=full_branch,
+                main_branch=self.config.main_branch,
+            )
+        try:
+            return await self._unstack_recorded(ledger, full_branch, base)
+        except (branch_stack.StackInspectionError, WorktreeMissing) as exc:
+            return UnstackResult(
+                outcome=UnstackOutcome.BLOCKED,
+                branch=full_branch,
+                main_branch=self.config.main_branch,
+                base=base,
+                detail=str(exc),
+            )
+
+    async def _unstack_recorded(
+        self, ledger: StackBaseLedger, full_branch: str, base: str,
+    ) -> UnstackResult:
+        tip = await self.resolve_branch_sha(full_branch)
+        main_sha = await self.get_main_sha()
+        cut = None
+        if tip is not None and not await self.is_ancestor(base, main_sha):
+            cut = await foreign_commit_cut(
+                _run, self.project_root, tip=tip, main_ref=main_sha, base=base,
+            )
+        if cut is None:
+            await ledger.forget(full_branch)
+            return UnstackResult(
+                outcome=UnstackOutcome.NOT_STACKED,
+                branch=full_branch,
+                main_branch=self.config.main_branch,
+            )
+        return await self._rebase_off_base(
+            ledger, full_branch, base=base, cut=cut, main_sha=main_sha,
+        )
+
+    async def _rebase_off_base(
+        self,
+        ledger: StackBaseLedger,
+        full_branch: str,
+        *,
+        base: str,
+        cut: str,
+        main_sha: str,
+    ) -> UnstackResult:
+        verdict = functools.partial(
+            UnstackResult,
+            branch=full_branch,
+            main_branch=self.config.main_branch,
+            base=base,
+            cut=cut,
+            base_owners=await base_owners(_run, self.project_root, base),
+        )
+        wt = await self._worktree_holding_branch(full_branch)
+        if wt is None:
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail=f'no worktree has {full_branch} checked out',
+            )
+        if await self.has_uncommitted_work(wt):
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail=f'worktree {wt} has uncommitted changes',
+            )
+        foreign_count = await self.get_rebase_distance(main_sha, cut)
+        rebased = await rebase_own_delta(_run, wt, onto=main_sha, cut=cut)
+        if rebased.conflicted_paths:
+            return verdict(
+                outcome=UnstackOutcome.CONFLICT,
+                conflicted_paths=rebased.conflicted_paths,
+                detail=rebased.stderr,
+            )
+        if not rebased.ok:
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail='git rebase --onto failed without a conflict: '
+                + ' '.join(rebased.stderr.split()),
+            )
+        await ledger.forget(full_branch)
+        result = verdict(outcome=UnstackOutcome.UNSTACKED)
+        logger.warning(
+            'Un-stacked %s from unlanded base %s (owners: %s): dropped %d '
+            'foreign commit(s), own delta replayed onto %s',
+            full_branch, base, ', '.join(result.base_owners) or 'none',
+            foreign_count, self.config.main_branch,
+        )
+        return result
 
     async def materialize_member_solo(
         self,

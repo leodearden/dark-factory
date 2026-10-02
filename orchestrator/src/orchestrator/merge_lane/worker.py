@@ -44,6 +44,7 @@ from shared.mcp_post import open_mcp_client, post_mcp_tool_call
 from shared.task_metadata import RetryLedger
 
 from orchestrator import chronic_flake
+from orchestrator.branch_stack import UnstackOutcome
 from orchestrator.critical_gate import critical_filing_gate
 from orchestrator.delivered_checks import gate_mark_done_on_delivered_checks
 from orchestrator.dry_run_unblock import run_dry_run_unblock
@@ -5630,6 +5631,42 @@ async def _already_merged_is_genuine(
     return citation is not None
 
 
+async def _unstack_before_merge(git_ops: GitOps, req: MergeRequest) -> Decided | None:
+    """Strip a never-landed stack base from *req*'s branch (task 5618).
+
+    Returns the terminal ``blocked`` decision when the branch cannot be
+    un-stacked, None when the merge may proceed on the branch's own delta.
+    A train is never un-stacked: its tip's recorded base is a co-member, and
+    stripping that base would drop the co-member from the landing.
+    """
+    if isinstance(req, GroupMergeRequest):
+        return None
+    result = await git_ops.unstack_from_unlanded_base(req.branch.full_name)
+    if result.outcome is UnstackOutcome.UNSTACKED:
+        logger.info('Task %s: merging its own delta after un-stacking', req.task_id)
+    if not result.stops_merge:
+        return None
+    reason = result.merge_block_reason()
+    logger.warning('Task %s: %s', req.task_id, reason)
+    return Decided(MergeOutcome('blocked', reason=reason))
+
+
+async def _forget_landed_stack_bases(git_ops: GitOps, req: GroupMergeRequest) -> None:
+    """Drop every member's stack-base record once the train has landed (task 5618).
+
+    No landed member is un-stacked again, and a record pins its base commit
+    against gc.  Never raises: main has already advanced, and a record left
+    behind costs one ref.
+    """
+    try:
+        await git_ops.forget_stack_bases(req.member_task_ids)
+    except Exception:
+        logger.warning(
+            "Train %s: could not clear its members' stack-base records",
+            req.train_id, exc_info=True,
+        )
+
+
 async def classify_and_merge(
     worker: _TrainMergeHost,
     req: MergeRequest,
@@ -5643,8 +5680,8 @@ async def classify_and_merge(
     The shared core used by both callers,
     ``SpeculativeMergeWorker._merger_loop`` and
     ``SpeculativeMergeWorker._remerge``: branch-presence guard →
-    already-merged detection → merge → conflict / non-conflict-failure →
-    drop-guard.  Returns :class:`MergedOk` on success or :class:`Decided`
+    un-stack from an unlanded base (task 5618) → already-merged detection →
+    merge → conflict / non-conflict-failure → drop-guard.  Returns :class:`MergedOk` on success or :class:`Decided`
     wrapping the terminal :class:`MergeOutcome` otherwise.
 
     Divergences between the three call sites are preserved via parameters
@@ -5692,6 +5729,11 @@ async def classify_and_merge(
     )
     if guard is not None:
         return Decided(guard)
+
+    # 1b. Un-stack a single request from an unlanded base (task 5618).
+    unstacked = await _unstack_before_merge(git_ops, req)
+    if unstacked is not None:
+        return unstacked
 
     # 2. Already-merged detection (ghost-loop fix).  effective_tip prefers
     # snapshot_tip when set, drift-proof vs a worktree HEAD that may have
@@ -6682,7 +6724,9 @@ async def _do_train_merge(
     (e) CAS advance — ``advance_main`` atomically updates the main ref.
     (f) Member callbacks — ``req.mark_member_done`` is called for each member
         ONLY after advance + _finalize_advanced_merge succeed (invariant: members
-        flip iff main lands AND post-merge gates pass).
+        flip iff main lands AND post-merge gates pass).  On that same
+        condition, and before any flip, every member's stack-base record is
+        dropped (:func:`_forget_landed_stack_bases`).
     """
     # Unpack worker state so the rest of the function reads like the single-task path.
     git_ops = worker._git_ops
@@ -7024,6 +7068,8 @@ async def _do_train_merge(
             data={'derail_reason': outcome.reason},
         )
         return outcome  # no member flips
+
+    await _forget_landed_stack_bases(git_ops, req)
 
     # outcome.merge_sha: post-rebase advanced SHA resolved by finalize (rebase-robust).
     advanced_sha: str = outcome.merge_sha  # type: ignore[assignment]
@@ -14583,7 +14629,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           - Otherwise (branch not an ancestor of main) flip it to 'pending'
             via req.redrive_member(mid, False, None) so the scheduler
             re-dispatches a fresh solo-merge workflow that owns the
-            merge-deferred→done transition.
+            merge-deferred→done transition.  The member is first un-stacked
+            from any unlanded base (:meth:`_unstack_redriven_member`, task
+            5618), so neither the re-dispatched agent nor its reviewer sees
+            another task's commits.
 
         Members not in 'merge-deferred' (e.g. raced to 'in-progress' by a sibling)
         are left alone — the live workflow owns their done-transition.
@@ -14674,6 +14723,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             req.train_id, mid, verdict.reason,
                         )
                 else:
+                    await self._unstack_redriven_member(req.train_id, mid)
                     await req.redrive_member(mid, False, None)
                     logger.info(
                         'Coalesce train %s: member %s not on main — '
@@ -14698,6 +14748,37 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'continuing with remaining members',
                     req.train_id, mid,
                 )
+
+    async def _unstack_redriven_member(self, train_id: str, mid: str) -> None:
+        """Strip an unlanded stack base from a derailed member before re-drive.
+
+        Never raises, so the re-drive that follows always runs: a member left
+        merge-deferred with no workflow is stranded.  A member that cannot be
+        un-stacked is re-driven anyway; its solo merge admission un-stacks it
+        again, and blocks with the attributed reason if it still cannot.
+        """
+        try:
+            result = await self._git_ops.unstack_from_unlanded_base(
+                f'{self._git_ops.config.branch_prefix}{mid}',
+            )
+        except Exception:
+            logger.exception(
+                'Coalesce train %s: un-stacking member %s raised — re-driving '
+                'it anyway; its solo merge admission un-stacks it again',
+                train_id, mid,
+            )
+            return
+        if result.outcome is UnstackOutcome.UNSTACKED:
+            logger.info(
+                'Coalesce train %s: member %s un-stacked before re-drive',
+                train_id, mid,
+            )
+        elif result.stops_merge:
+            logger.warning(
+                'Coalesce train %s: member %s re-driven still stacked; its solo '
+                'merge admission will block with: %s',
+                train_id, mid, result.merge_block_reason(),
+            )
 
     def _file_unattributed_landing_escalation(
         self, task_id: str, branch: str, verdict: LandingEvidenceVerdict,
