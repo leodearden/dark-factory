@@ -549,6 +549,7 @@ class TestAuthorizationIsFailClosedAndPreWrite:
         contrast = await call_consolidate(make_service(), **malformed)
         assert contrast['error_type'] == 'ValidationError'
         assert contrast['hint']
+        assert 'supersedes[0]' in contrast['error']
 
         svc = make_service()
         result = await call_consolidate(svc, agent_id='claude-interactive', **malformed)
@@ -2441,9 +2442,7 @@ class TestTheEnvelopeSurvivesTheExtraction:
     be covered by the first.
     """
 
-    #: The closure listing every member of this fixture's topic. Task 5275
-    #: projected it to the id and the canonical flag; every other key of
-    #: both pins is unchanged from the original capture.
+    #: The projected closure listing for this fixture's topic.
     _TOPIC_MEMBERS = [
         {'id': S1, 'canonical': False},
         {'id': S2, 'canonical': False},
