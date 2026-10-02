@@ -1302,6 +1302,16 @@ async def _run_cold_shadow_verify(
         #     create_throwaway_verify_worktree and is uncontended by
         #     construction — nobody else knows it.
         #
+        # (iv) FLOCK ONLY, NO GLOBAL RENDEZVOUS (task 4189).  Because `wt` is
+        #     ephemeral, this lease takes the lane flock and does NOT record
+        #     the single fixed-key global holder-pgid — `merge_verify_lease`'s
+        #     docstring carries the full argument; the two consequences that
+        #     motivated it were both this call site's hours-long cold-shadow
+        #     window (deferring warm-lane GC for its whole span, and stripping
+        #     the next merge's live persistent-lane rendezvous on exit).  The
+        #     `skipped_lease_held` protection in (i) is unaffected — it comes
+        #     from the FLOCK, which is untouched.
+        #
         # SCOPE IS LOAD-BEARING: the lease wraps ONLY the verify body and
         # closes before the `finally` below.  If cleanup ran while we still
         # held the lease, `remove_merge_worktree_guarded`'s NON-BLOCKING

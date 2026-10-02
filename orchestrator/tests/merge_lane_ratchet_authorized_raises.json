@@ -1447,6 +1447,90 @@
           "current": 31300
         }
       ]
+    },
+    {
+      "task_id": "4189",
+      "reason": "Net-additive defect fix, not a failed refactor. merge_verify_lease now writes/removes the single fixed-key global holder-pgid rendezvous ONLY for the persistent merge lane (is_persistent_merge_lane, keyed on the resolved path), so an hours-long ephemeral cold-shadow/drift lease no longer defers warm-lane GC reclaim nor strips a concurrent persistent-lane verify's live rendezvous on exit. The cognitive rise on merge_verify_lease 4->9 IS that persistent-lane gate plus the never-orphan-the-flock unwind; the prose rise records why the rendezvous is persistent-only so the next reader does not restore the unconditional write; private_reads +4 are the RED/GREEN pins on the rendezvous key. The branch predates the ratchet (baseline absent at its base 734a027ac9); raise recorded while merging main into task/4189 (esc-4189-2).",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1417,
+          "current": 1422
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::merge_verify_lease",
+          "baseline": 4,
+          "current": 9
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15662,
+          "current": 15859
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/drift.py",
+          "baseline": 440,
+          "current": 449
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/shadow.py",
+          "baseline": 1802,
+          "current": 1812
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_verify_lease_guard.py",
+          "baseline": 10,
+          "current": 14
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9100,
+          "current": 9283
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/drift.py",
+          "baseline": 240,
+          "current": 249
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/shadow.py",
+          "baseline": 1032,
+          "current": 1042
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4748,
+          "current": 4753
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56033,
+          "current": 56249
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6593,
+          "current": 6597
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31300,
+          "current": 31502
+        }
+      ]
     }
   ]
 }
