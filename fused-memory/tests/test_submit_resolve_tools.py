@@ -604,23 +604,27 @@ async def test_gitignored_deliverable_warning_merged_into_planning_mode_result(
 
 @pytest.mark.asyncio
 async def test_gitignored_deliverable_warning_not_merged_into_error_result(
-    mcp_server, task_interceptor, ignored_project, monkeypatch,
+    mcp_server, task_interceptor, ignored_project, monkeypatch, caplog,
 ):
     monkeypatch.delenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', raising=False)
     task_interceptor.submit_task = AsyncMock(
         return_value={'error': 'x', 'error_type': 'ValidationError'}
     )
-    result = await mcp_server._tool_manager.call_tool(
-        'submit_task',
-        {
-            'project_root': str(ignored_project),
-            'title': 'Edit the task store',
-            'task_kind': 'normal',
-            'metadata': {'files': [_IGNORED_DELIVERABLE]},
-        },
-    )
+    with caplog.at_level(logging.WARNING):
+        result = await mcp_server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': str(ignored_project),
+                'title': 'Edit the task store',
+                'task_kind': 'normal',
+                'metadata': {'files': [_IGNORED_DELIVERABLE]},
+            },
+        )
     assert result.get('error') == 'x'
     assert 'gitignored_deliverable_warning' not in result
+    assert not any(
+        'gitignored_deliverable_lint.flagged' in rec.getMessage() for rec in caplog.records
+    ), 'The census counts accepted filings only, not ones the interceptor rejected'
 
 
 @pytest.mark.asyncio

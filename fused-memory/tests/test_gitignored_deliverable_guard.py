@@ -14,6 +14,7 @@ from fused_memory.middleware.gitignored_deliverable_guard import (
     gitignored_deliverable_finding,
     gitignored_deliverable_reject,
     gitignored_deliverable_warning,
+    log_gitignored_deliverable_flagged,
     make_gitignore_probe,
 )
 
@@ -35,11 +36,7 @@ def gitignore_repo(tmp_path):
         check=True,
     )
     subprocess.run(
-        [
-            'git', '-C', str(tmp_path),
-            '-c', 'user.email=t@e.example', '-c', 'user.name=T',
-            'commit', '-q', '-m', 'ignore rules and a force-tracked log',
-        ],
+        ['git', '-C', str(tmp_path), 'commit', '-q', '-m', 'ignore rules and a force-tracked log'],
         check=True,
     )
     return tmp_path
@@ -227,9 +224,14 @@ class TestGitignoredDeliverablePayloads:
         assert nested['ignored_paths'] == list(_FINDING.ignored_paths)
         assert _DETERMINISTIC_HINT in nested['hint']
 
-    def test_warning_emits_the_flagged_census_line(self, caplog):
-        with caplog.at_level('WARNING'):
+    def test_warning_payload_builder_logs_nothing(self, caplog):
+        with caplog.at_level('DEBUG'):
             gitignored_deliverable_warning(_FINDING)
+        assert caplog.records == []
+
+    def test_flagged_log_emits_the_census_line(self, caplog):
+        with caplog.at_level('WARNING'):
+            log_gitignored_deliverable_flagged(_FINDING)
         census = [
             r.getMessage() for r in caplog.records
             if 'gitignored_deliverable_lint.flagged' in r.getMessage()

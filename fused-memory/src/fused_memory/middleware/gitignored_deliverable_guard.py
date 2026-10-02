@@ -55,6 +55,7 @@ __all__ = [
     'gitignored_deliverable_finding',
     'gitignored_deliverable_reject',
     'gitignored_deliverable_warning',
+    'log_gitignored_deliverable_flagged',
     'make_gitignore_probe',
 ]
 
@@ -195,15 +196,7 @@ def gitignored_deliverable_reject(finding: GitignoredDeliverableFinding) -> dict
 
 
 def gitignored_deliverable_warning(finding: GitignoredDeliverableFinding) -> dict[str, Any]:
-    """Non-blocking advisory to merge into a successful submit result.
-
-    Also logs the ``gitignored_deliverable_lint.flagged`` census line whose
-    rate is the signal for flipping the enforce switch.
-    """
-    logger.warning(
-        'gitignored_deliverable_lint.flagged task_kind=normal paths=%s',
-        ','.join(finding.ignored_paths),
-    )
+    """Non-blocking advisory to merge into a successful submit result."""
     return {
         'gitignored_deliverable_warning': {
             'ignored_paths': list(finding.ignored_paths),
@@ -214,6 +207,18 @@ def gitignored_deliverable_warning(finding: GitignoredDeliverableFinding) -> dic
             ),
         },
     }
+
+
+def log_gitignored_deliverable_flagged(finding: GitignoredDeliverableFinding) -> None:
+    """Log the census line whose rate is the signal for flipping the enforce switch.
+
+    Call it only for an ACCEPTED filing, so the census counts tasks that
+    actually landed rather than submissions the interceptor went on to reject.
+    """
+    logger.warning(
+        'gitignored_deliverable_lint.flagged task_kind=normal paths=%s',
+        ','.join(finding.ignored_paths),
+    )
 
 
 def gitignored_deliverable_enforced() -> bool:

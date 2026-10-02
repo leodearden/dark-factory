@@ -48,6 +48,7 @@ from fused_memory.middleware.gitignored_deliverable_guard import (
     gitignored_deliverable_finding,
     gitignored_deliverable_reject,
     gitignored_deliverable_warning,
+    log_gitignored_deliverable_flagged,
     make_gitignore_probe,
 )
 from fused_memory.middleware.lock_charter_guard import (
@@ -9121,11 +9122,8 @@ def create_mcp_server(
             metadata=metadata,
             probe=make_gitignore_probe(project_root),
         )
-        _gitignored_warning: dict[str, Any] | None = None
-        if _gitignored_finding is not None:
-            if gitignored_deliverable_enforced():
-                return gitignored_deliverable_reject(_gitignored_finding)
-            _gitignored_warning = gitignored_deliverable_warning(_gitignored_finding)
+        if _gitignored_finding is not None and gitignored_deliverable_enforced():
+            return gitignored_deliverable_reject(_gitignored_finding)
 
         result = await task_interceptor.submit_task(
             project_root=project_root,
@@ -9152,8 +9150,9 @@ def create_mcp_server(
         # in result`).
         if _op_warning is not None and isinstance(result, dict) and 'error' not in result:
             result.update(_op_warning)
-        if _gitignored_warning is not None and isinstance(result, dict) and 'error' not in result:
-            result.update(_gitignored_warning)
+        if _gitignored_finding is not None and isinstance(result, dict) and 'error' not in result:
+            result.update(gitignored_deliverable_warning(_gitignored_finding))
+            log_gitignored_deliverable_flagged(_gitignored_finding)
         return result
 
     @mcp.tool()

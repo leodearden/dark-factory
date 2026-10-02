@@ -867,9 +867,10 @@ A path whose extension is not on the lock-charter allowlist (for example
 `tasks.db`) is refused earlier, as a "directory declaration" with
 `LockCharterViolation`, so this lint never sees it.
 
-**Posture.** By default the lint only warns. It merges a
-`gitignored_deliverable_warning` key into a successful submit result and
-logs a `gitignored_deliverable_lint.flagged` census line. Setting
+**Posture.** By default the lint only warns. When the submission succeeds,
+it merges a `gitignored_deliverable_warning` key into the result and logs a
+`gitignored_deliverable_lint.flagged` census line, so the census counts
+accepted filings only. Setting
 `FUSED_GITIGNORED_DELIVERABLE_ENFORCE=1` makes it a hard reject
 (`ValidationError`) instead.
 
