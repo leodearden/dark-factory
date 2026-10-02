@@ -637,6 +637,12 @@ async def submit_and_resolve(
     )
 
 
+#: The documented-safe MCP tool-response size, in serialised chars. Derived in
+#: test_get_statuses_pagination.py::test_auto_page_limit_fits_documented_safe_envelope
+#: (see also server/tools.py::_STATUSES_AUTO_PAGE_LIMIT).
+MCP_SAFE_RESPONSE_CHARS = 62_000
+
+
 # ---------------------------------------------------------------------------
 # Shared Qdrant test scaffolding (task 2277)
 # ---------------------------------------------------------------------------

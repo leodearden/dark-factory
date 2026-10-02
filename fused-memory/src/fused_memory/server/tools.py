@@ -5597,9 +5597,13 @@ def create_mcp_server(
         Ordering is the contract — each step sits where it does because of
         what its failure would cost:
 
-        (1) Validate every argument. Pure, zero writes: an argument set that
-            cannot be executed safely is refused while refusing is free.
-        (2) Authorize the metadata-patch arm.
+        (1) Authorize the metadata-patch arm. Unconditional and fail-closed,
+            before any other work, so an unauthorized caller is turned away
+            before it learns anything about its arguments (the order and
+            reason ``update_memory`` uses).
+        (2) Validate every argument, project scope first and then the op's
+            own shape. Pure, zero writes: an argument set that cannot be
+            executed safely is refused while refusing is free.
         (3) Pre-flight and repoint task-metadata citations across the whole
             delete set. A refused op has mutated nothing.
         (4) Write the canonical — BEFORE any destructive step, so a
@@ -5625,8 +5629,8 @@ def create_mcp_server(
         that could not be completed, which fails closed.
 
         WHAT "A REFUSED CONSOLIDATION LEAVES THE CORPUS BYTE-IDENTICAL"
-        COVERS, exactly: refusals from steps (1)-(4) — validation,
-        authorization, the ``scan_only`` pre-flight and the canonical write
+        COVERS, exactly: refusals from steps (1)-(4) — authorization,
+        validation, the ``scan_only`` pre-flight and the canonical write
         itself. It does NOT extend to a per-id refusal below step (4). The
         MUTATING repoint pass runs over the whole delete set immediately
         after the canonical write, before it is known whether any given id's
@@ -5747,6 +5751,10 @@ def create_mcp_server(
             keeps an empty listing from being misread as "this topic has no
             members".
 
+            ``topic_members`` rows are ``{'id', 'canonical'}`` only, so a
+            dumping-ground topic cannot push this envelope past the MCP
+            transport limit; the full record is one ``get_memory_by_id`` away.
+
             The tombstone counts are reported as a PAIR and deliberately do
             NOT affect ``status``: a shortfall means the consolidation
             completed but its audit trail did not land, and ``'partial'``
@@ -5762,7 +5770,7 @@ def create_mcp_server(
             for this project.
         """
         agent_id, session_id = _resolve_identity(agent_id, session_id, ctx)
-        # (2) AUTHORIZE before any other work, mirroring `update_memory`'s
+        # (1) AUTHORIZE before any other work, mirroring `update_memory`'s
         # ordering and for its stated reason: an unauthorized caller is
         # turned away before anything is done on its behalf and before it
         # learns anything about the system.
@@ -5791,6 +5799,7 @@ def create_mcp_server(
                 'error_type': decision.error_type,
                 'agent_id': agent_id,
             }
+        # (2) VALIDATE: project scope, then the op's own arguments.
         project_id, err = _canonicalize_project_id_arg(project_id)
         if err:
             return err
