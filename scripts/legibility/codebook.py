@@ -682,8 +682,8 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
                 # The census already turned this title into a real entry.
                 # A promoted candidate's `sightings` list is a DEAD field
                 # from that moment on: promote_candidate deep-copies it into
-                # the entry ONCE, and every consumer afterwards (the matrix
-                # path, build_codebook_index) reads ENTRY sightings. Filing
+                # the entry ONCE, and every consumer that reads sightings at
+                # all (the matrix path) reads ENTRY sightings. Filing
                 # the recurrence on the candidate would report the signal as
                 # preserved while writing it where nothing looks -- so it
                 # goes on the entry, deduped by session and counted exactly
