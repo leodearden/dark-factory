@@ -219,12 +219,13 @@ class TestBudget:
         result = await _lookup(_hung_snapshot, dummy_client, dashboard_config, [held, unread])
 
         assert time.monotonic() - started < 2.0
-        assert result[held].state is DatumState.FRESH
-        assert result[held].value is not None
-        assert result[held].value['title'] == 'task 3'
-        assert result[unread].state is DatumState.UNKNOWN
-        assert result[unread].reason is not None
-        assert result[unread].reason.startswith('lookup budget')
+        held_served, unread_served = result[held], result[unread]
+        assert held_served.state is DatumState.FRESH
+        assert held_served.value is not None
+        assert held_served.value['title'] == 'task 3'
+        assert unread_served.state is DatumState.UNKNOWN
+        assert unread_served.reason is not None
+        assert unread_served.reason.startswith('lookup budget')
 
     async def test_misses_are_read_at_most_lookup_concurrency_at_a_time(
         self, root, dashboard_config, dummy_client,
