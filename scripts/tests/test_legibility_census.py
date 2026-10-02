@@ -5314,6 +5314,7 @@ def test_the_headroom_probe_defers_only_when_no_pool_account_has_headroom(
     )
 
     assert result.ok is False
+    assert result.reason is not None
     assert "all 2 pool accounts capped" in result.reason, result.reason
 
 

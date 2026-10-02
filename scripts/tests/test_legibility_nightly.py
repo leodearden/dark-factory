@@ -1860,6 +1860,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
             'a rejected credential never clears at the weekly reset, so it must '
             'never read as a deferral'
         )
+        assert result.reason is not None
         assert 'coder storm' in result.reason
         detail = _escalated_detail(escalations)
         assert 'credentials rejected' in detail, detail
@@ -1880,6 +1881,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         assert result.exit_code == 0
         assert result.capped is True
         assert result.commit_made is False
+        assert result.reason is not None
         assert 'found no pool account with headroom' in result.reason, result.reason
         assert 'all 2 pool accounts capped' in _escalated_detail(escalations)
         assert [r for r in _nightly_warnings(caplog) if r.levelno >= logging.ERROR] == [], (
