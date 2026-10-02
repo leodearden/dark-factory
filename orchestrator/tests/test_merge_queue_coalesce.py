@@ -113,7 +113,7 @@ def _make_single_req(
 
 def _stub_factory() -> TrainCallbackFactory:
     """Return a simple TrainCallbackFactory stub."""
-    from orchestrator.merge_queue import TrainCallbacks
+    from orchestrator.merge_lane.types import TrainCallbacks
     def _factory(train_id: str) -> TrainCallbacks:
         return TrainCallbacks(
             status_check=AsyncMock(return_value={}),
@@ -376,7 +376,7 @@ class TestCoreFormation:
         # Stub factory: records calls with per-train marks.
         mark_done = AsyncMock()
         status_check = AsyncMock(return_value={'t1': 'merge-deferred', 't2': 'merge-deferred', 't3': 'merge-deferred'})
-        from orchestrator.merge_queue import TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
         def factory(train_id: str) -> TrainCallbacks:
             return TrainCallbacks(
                 status_check=status_check,
@@ -1106,7 +1106,8 @@ class TestEndToEndWiring:
 
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import _run
-        from orchestrator.merge_queue import SpeculativeMergeWorker, TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
+        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         # Build 3 disjoint-file branches off main.
         # Each touches a unique file → mutually line-stackable.
@@ -2722,7 +2723,8 @@ class TestCoalesceAfterHealthyMerge:
 
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import _run
-        from orchestrator.merge_queue import SpeculativeMergeWorker, TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
+        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         # Five disjoint-file branches: one warm-up single whose verify is gated
         # open, then four followers.  The followers arrive as ONE synchronous

@@ -22,6 +22,10 @@ import pytest
 from escalation.queue import EscalationQueue
 
 from fused_memory.middleware.curator_escalator import CuratorEscalator
+from fused_memory.middleware.curator_zot_duplicate_sweep import (
+    DUPLICATE_METADATA_KEY,
+    DuplicateFinding,
+)
 from fused_memory.middleware.task_curator import CuratorFailureError
 
 
@@ -531,6 +535,249 @@ class TestZeroOutputTimeoutEscalation:
             assert 'esc-task-curator-17' in detail
             assert _PINNED_ZOT_ROOT_CAUSE in detail
             assert 'dedupe_count' in detail
+        finally:
+            handle.close()
+
+
+
+class TestReportFailureReturnsZotEscalationId:
+    """Task 5491: report_failure returns the live ZOT record id, or None."""
+
+    @pytest.mark.asyncio
+    async def test_first_zot_report_returns_the_pending_record_id(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            returned = await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            [record] = _pending_records(tmp_path)
+            assert isinstance(returned, str)
+            assert returned == record['id']
+            assert record['category'] == 'curator_zero_output_hang'
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_batch_sibling_inside_window_returns_the_same_id(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            first = await escalator.report_failure(**_zot_report(tmp_path))
+            sibling = await escalator.report_failure(**_zot_report(tmp_path))
+
+            [record] = _pending_records(tmp_path)
+            assert first == record['id']
+            assert sibling == first
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_folded_recurrence_returns_the_parent_id(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            first = await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+            folded = await CuratorEscalator().report_failure(**_zot_report(tmp_path))
+
+            [parent] = _pending_records(tmp_path)
+            assert first == parent['id']
+            assert folded == parent['id']
+            assert folded not in parent['dedupe_children']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_non_zot_branches_return_none(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            burst = await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='ordinary', candidate_title='T',
+            )
+            denied = await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='denied', candidate_title='T', schema_tool_denied=True,
+            )
+            assert burst is None
+            assert denied is None
+            assert len(_pending_records(tmp_path)) == 2
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_suppressed_burst_report_returns_none(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator(cooldown_secs=3600.0)
+            for _ in range(3):
+                await escalator.report_failure(
+                    project_root=str(tmp_path), project_id='proj-x',
+                    justification='repeat', candidate_title='T',
+                )
+            suppressed = await escalator.report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='repeat', candidate_title='T',
+            )
+            assert suppressed is None
+            assert len(_pending_records(tmp_path)) == 3
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_failed_submit_returns_none_and_never_a_stale_id(
+        self, tmp_path, monkeypatch,
+    ):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            def _broken_submit(*_args, **_kwargs):
+                raise OSError('queue dir unwritable')
+
+            monkeypatch.setattr(
+                'fused_memory.middleware.curator_escalator.submit_or_dedupe',
+                _broken_submit,
+            )
+            escalator = CuratorEscalator()
+            failed = await escalator.report_failure(**_zot_report(tmp_path))
+            follow_up = await escalator.report_failure(**_zot_report(tmp_path))
+
+            assert failed is None
+            assert follow_up is None
+            assert _pending_records(tmp_path) == []
+        finally:
+            handle.close()
+
+
+
+class TestRaisedFailureKeepsZotMarker:
+    """Task 5491: the interactive-path raise still says whether it was a ZOT."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('gate', ['no-orchestrator', 'no-escalation-package'])
+    @pytest.mark.parametrize('zero_output_timeout', [True, False])
+    async def test_raise_carries_zero_output_timeout(
+        self, tmp_path, monkeypatch, gate, zero_output_timeout,
+    ):
+        if gate == 'no-escalation-package':
+            monkeypatch.setattr(
+                'fused_memory.middleware.curator_escalator.HAS_ESCALATION', False,
+            )
+        with pytest.raises(CuratorFailureError) as exc_info:
+            await CuratorEscalator().report_failure(
+                project_root=str(tmp_path), project_id='proj-x',
+                justification='hang', candidate_title='T',
+                zero_output_timeout=zero_output_timeout,
+            )
+        assert exc_info.value.zero_output_timeout is zero_output_timeout
+
+
+_FINDING = DuplicateFinding(
+    task_id='7416', duplicate_task_id='7383', duplicate_title='Existing gate fix', score=0.6812,
+)
+
+
+def _duplicate_report(
+    root,
+    finding: DuplicateFinding = _FINDING,
+    zot_escalation_id: str | None = 'esc-curator-41',
+    *,
+    stamped: bool = True,
+) -> dict[str, Any]:
+    return dict(
+        project_root=str(root), project_id='proj-dup',
+        finding=finding, candidate_title='Re-filed gate fix',
+        zot_escalation_id=zot_escalation_id, stamped=stamped,
+    )
+
+
+class TestReportZotDuplicate:
+    """Task 5491: each post-ZOT duplicate finding files its own L1 record."""
+
+    @pytest.mark.asyncio
+    async def test_files_one_record_carrying_the_finding(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+
+            [record] = _pending_records(tmp_path)
+            assert record['category'] == 'curator_zot_duplicate'
+            assert record['level'] == 1
+            assert record['severity'] == 'blocking'
+            detail = record['detail']
+            for value in ('7416', '7383', '0.681', 'Re-filed gate fix', 'proj-dup', 'esc-curator-41'):
+                assert value in detail
+            assert f'The new task carries metadata.{DUPLICATE_METADATA_KEY}.' in detail
+            assert 'FAILED' not in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_unstamped_finding_never_claims_the_metadata(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_zot_duplicate(
+                **_duplicate_report(tmp_path, stamped=False),
+            )
+
+            detail = _only_escalation_detail(tmp_path)
+            assert 'The new task carries' not in detail
+            assert f'Stamping metadata.{DUPLICATE_METADATA_KEY} on the new task FAILED' in detail
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_absent_zot_id_still_files_without_a_fake_id(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await CuratorEscalator().report_zot_duplicate(
+                **_duplicate_report(tmp_path, zot_escalation_id=None),
+            )
+
+            [record] = _pending_records(tmp_path)
+            assert record['category'] == 'curator_zot_duplicate'
+            assert 'esc-' not in record['detail']
+            assert "zot_escalation_id='None'" not in record['detail']
+            assert 'zot_escalation_id=None' not in record['detail']
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_no_orchestrator_returns_quietly(self, tmp_path):
+        _make_orchestrator_layout(tmp_path, hold_lock=False)
+
+        await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+
+        assert not list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+
+    @pytest.mark.asyncio
+    async def test_queue_failure_is_swallowed(self, tmp_path, monkeypatch):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            def _broken_submit(self, escalation):
+                raise OSError('queue dir unwritable')
+
+            monkeypatch.setattr(EscalationQueue, 'submit', _broken_submit)
+
+            await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+        finally:
+            handle.close()
+
+    @pytest.mark.asyncio
+    async def test_distinct_findings_file_distinct_records(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            escalator = CuratorEscalator()
+            await escalator.report_zot_duplicate(**_duplicate_report(tmp_path))
+            await escalator.report_zot_duplicate(**_duplicate_report(
+                tmp_path,
+                finding=DuplicateFinding(
+                    task_id='6583', duplicate_task_id='5436',
+                    duplicate_title='Other', score=0.9,
+                ),
+            ))
+
+            records = _pending_records(tmp_path)
+            assert len(records) == 2
+            assert {r['category'] for r in records} == {'curator_zot_duplicate'}
+            assert all(r['dedupe_count'] == 0 for r in records)
         finally:
             handle.close()
 

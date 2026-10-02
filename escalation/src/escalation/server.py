@@ -3516,11 +3516,13 @@ def create_server(
         from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
             branch_is_degenerate,
         )
+        from orchestrator.merge_lane import (  # type: ignore[reportMissingImports]
+            WaiterRecord,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
             QueuedBranch,
-            WaiterRecord,
             coalesce_or_enqueue_merge_request,
             patch_content_contained,
         )

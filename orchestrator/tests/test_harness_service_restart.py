@@ -234,7 +234,7 @@ class TestStartMergeWorkerBuildsCoordinatorList:
         """_start_merge_worker populates _service_restart_coordinators with fused+dashboard+orchestrator."""
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         assert isinstance(harness._service_restart_coordinators, list)
@@ -256,7 +256,7 @@ class TestStartMergeWorkerBuildsCoordinatorList:
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task') as mock_ct, \
              patch(
-                 'orchestrator.merge_queue.check_merge_liveness_margin',
+                 'orchestrator.merge_lane.liveness.check_merge_liveness_margin',
                  side_effect=RuntimeError('liveness boom'),
              ), \
              caplog.at_level(logging.WARNING):
@@ -426,7 +426,7 @@ class TestStartMergeWorkerOnMergeLandedWiring:
         """
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         call_kwargs = mock_smw.call_args.kwargs
@@ -1050,7 +1050,7 @@ class TestOrchestratorCoordinatorEndToEnd:
 
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         # Drained pipeline: no in-flight/verifying merge, empty queue.
@@ -1112,7 +1112,7 @@ class TestOrchestratorCoordinatorEndToEnd:
 
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         mock_smw.return_value.snapshot.return_value = {'depth': 1}  # in-flight — NOT drained
@@ -1139,7 +1139,7 @@ class TestOrchestratorCoordinatorEndToEnd:
         """With orchestrator_restart_on_merge_enabled=False (fixture default), it never arms."""
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker'), \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         orch_coord = harness._service_restart_coordinators[2]

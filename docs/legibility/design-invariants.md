@@ -98,7 +98,7 @@ an hour, who hears about it, and via what counter?
 (`one-shot-subagent-contract`, 17); curator degrade-to-create; 1755
 storm-counter precedent.
 
-**House pattern**: Consecutive-streak gate (`merge_liveness.py`, generalized
+**House pattern**: Consecutive-streak gate (`merge_lane/liveness.py`, generalized
 by 2558); storm counter (1755); LLM-adjudicated guard failing safe to
 strict.
 

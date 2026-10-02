@@ -680,14 +680,14 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
                         break
             if promoted_entry is not None:
                 # The census already turned this title into a real entry.
-                # A promoted candidate's `sightings` list is a DEAD field
-                # from that moment on: promote_candidate deep-copies it into
-                # the entry ONCE, and every consumer afterwards (the matrix
-                # path, build_codebook_index) reads ENTRY sightings. Filing
-                # the recurrence on the candidate would report the signal as
-                # preserved while writing it where nothing looks -- so it
-                # goes on the entry, deduped by session and counted exactly
-                # as the match path above counts its own appends.
+                # promote_candidate deep-copies the candidate's `sightings`
+                # into the entry ONCE and never again, and the entry is what
+                # the census files from: census.py::_entry_cluster rebuilds a
+                # withheld entry's task, evidence included, from ENTRY
+                # sightings alone. Filing the recurrence on the candidate
+                # would leave it out of that task -- so it goes on the entry,
+                # deduped by session and counted exactly as the match path
+                # above counts its own appends.
                 entry_sightings = promoted_entry.setdefault("sightings", [])
                 if session not in {s.get("session") for s in entry_sightings}:
                     entry_sightings.append(sighting)

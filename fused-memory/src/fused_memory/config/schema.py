@@ -2344,6 +2344,12 @@ class CuratorConfig(BaseModel):
     # task_curator.py::TaskCurator._reset_zero_output_breaker and
     # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
+    # Post-ZOT duplicate sweep (fused_memory/middleware/curator_zot_duplicate_sweep.py).
+    # The threshold is the sweep's own cosine flagging cutoff, not a curator
+    # combine threshold: combine-vs-create is an LLM judgement with no numeric cutoff.
+    zot_duplicate_sweep_enabled: bool = Field(default=True)
+    zot_duplicate_score_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    zot_duplicate_search_limit: int = Field(default=5, ge=1)
 
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching

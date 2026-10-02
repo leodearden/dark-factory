@@ -35,6 +35,7 @@ from fused_memory.mcp_tools.scheduler_state import (
     effective_lock_depth,
 )
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.task_curator import (
     _CURATOR_PROMPT_HARNESS_VERSION,
     CURATOR_BATCH_OUTPUT_SCHEMA,
@@ -56,6 +57,7 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     clip_for_prompt,
+    embedding_text,
     flatten_task_tree,
     is_combine_eligible_status,
     normalize_title,
@@ -252,6 +254,22 @@ class TestClipForPrompt:
     def test_marker_keeps_the_ellipsis_prefix(self):
         clipped = clip_for_prompt('z' * 50, 10)
         assert clipped[10] == '\u2026'
+
+
+class TestEmbeddingText:
+    """`embedding_text` is the single owner of the curator corpus embedding text."""
+
+    def test_title_alone(self):
+        assert embedding_text('Fix the bug', '', []) == 'Fix the bug'
+
+    def test_title_and_description_join_with_blank_line(self):
+        assert embedding_text('T', 'D', []) == 'T\n\nD'
+
+    def test_files_are_their_own_newline_block(self):
+        assert embedding_text('T', 'D', ['a.py', 'b.py']) == 'T\n\nD\n\na.py\nb.py'
+
+    def test_empty_description_contributes_nothing(self):
+        assert embedding_text('T', '', ['a.py']) == 'T\n\na.py'
 
 
 class TestTrimPool:
@@ -1429,6 +1447,130 @@ class TestZeroOutputTimeoutAcceptance:
         assert result_a.action == 'create'
         assert result_b.action == 'drop'
         assert mock_llm.await_count == 2
+
+
+_EMPTY_POOL_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+
+def _prepared(candidate: CandidateTask) -> PreparedCandidate:
+    return PreparedCandidate(
+        candidate=candidate, pool=[], pool_sizes=dict(_EMPTY_POOL_SIZES), prompt_tokens=0,
+    )
+
+
+def _zot_agent_result() -> AgentResult:
+    return AgentResult(
+        success=False, output='', subtype='error_empty_output',
+        timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+    )
+
+
+class TestCuratorDecisionZotMarker:
+    """Task 5491: a structured marker says dedupe was skipped by a ZOT hang."""
+
+    @staticmethod
+    def _curator(*, breaker_threshold: int | None = None) -> TaskCurator:
+        config = _make_config()
+        if breaker_threshold is not None:
+            config.curator.zero_output_breaker_threshold = breaker_threshold
+            config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value='esc-curator-7')
+        return TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+    @staticmethod
+    async def _curate(curator: TaskCurator, candidate: CandidateTask, llm_result: AgentResult):
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=llm_result)):
+            return await curator.curate(
+                candidate, project_id='p', project_root='/x', prepared=_prepared(candidate),
+            )
+
+    def test_defaults_are_not_degraded(self):
+        decision = CuratorDecision(action='create')
+        assert decision.degraded_by_zot is False
+        assert decision.zot_escalation_id is None
+
+    @pytest.mark.asyncio
+    async def test_zot_curate_is_marked_with_the_escalation_id(self):
+        decision = await self._curate(
+            self._curator(), CandidateTask(title='ZOT candidate'), _zot_agent_result(),
+        )
+        assert decision.action == 'create'
+        assert decision.degraded_by_zot is True
+        assert decision.zot_escalation_id == 'esc-curator-7'
+
+    @pytest.mark.asyncio
+    async def test_non_zot_llm_failure_is_not_marked(self):
+        max_turns = AgentResult(
+            success=False, output='partial', subtype='error_max_turns',
+            timed_out=False, turns=3, cost_usd=0.05, duration_ms=9_000,
+        )
+        decision = await self._curate(
+            self._curator(), CandidateTask(title='Max-turns candidate'), max_turns,
+        )
+        assert decision.action == 'create'
+        assert decision.justification == 'llm-error-escalated'
+        assert decision.degraded_by_zot is False
+        assert decision.zot_escalation_id is None
+
+    @pytest.mark.asyncio
+    async def test_curate_breaker_short_circuit_is_marked(self):
+        curator = self._curator(breaker_threshold=1)
+        await self._curate(curator, CandidateTask(title='Opener'), _zot_agent_result())
+
+        decision = await self._curate(
+            curator, CandidateTask(title='Second distinct candidate'), _zot_agent_result(),
+        )
+        assert decision.justification == 'zero-output-breaker-open'
+        assert decision.degraded_by_zot is True
+        assert decision.zot_escalation_id is None
+
+    @pytest.mark.asyncio
+    async def test_batch_breaker_short_circuit_marks_every_decision(self):
+        curator = self._curator(breaker_threshold=1)
+        await self._curate(curator, CandidateTask(title='Opener'), _zot_agent_result())
+
+        prepared = [
+            _prepared(CandidateTask(title='Batch Alpha', description='alpha details')),
+            _prepared(CandidateTask(title='Batch Beta', description='beta details')),
+        ]
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_zot_agent_result())):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id='p', project_root='/x',
+            )
+        assert len(decisions) == 2
+        for decision in decisions:
+            assert decision.justification == 'zero-output-breaker-open'
+            assert decision.degraded_by_zot is True
+
+    @pytest.mark.asyncio
+    async def test_interactive_path_reraises_with_the_zot_marker(self, tmp_path):
+        curator = TaskCurator(
+            config=_make_config(), taskmaster=None, escalator=CuratorEscalator(),
+        )
+        candidate = CandidateTask(title='ZOT with no orchestrator')
+        with (
+            patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_zot_agent_result())),
+            pytest.raises(CuratorFailureError) as exc_info,
+        ):
+            await curator.curate(
+                candidate, project_id='p', project_root=str(tmp_path),
+                prepared=_prepared(candidate),
+            )
+        assert exc_info.value.zero_output_timeout is True
+
+    @pytest.mark.asyncio
+    async def test_successful_curate_is_not_marked(self):
+        healthy = _agent_result({'action': 'create', 'justification': 'genuinely new'})
+        decision = await self._curate(
+            self._curator(), CandidateTask(title='Healthy candidate'), healthy,
+        )
+        assert decision.action == 'create'
+        assert decision.degraded_by_zot is False
+        assert decision.zot_escalation_id is None
 
 
 class TestZeroOutputBreakerCurate:

@@ -316,7 +316,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        request id:
        - **`coalesce-*`** → a **train** id, not a request id: this submission was absorbed into a
          coalesce train (`MergeOutcome('superseded', superseded_by=train_id)`,
-         `orchestrator/src/orchestrator/merge_queue.py`). Do **not** poll it by `request_id` —
+         `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`). Do **not** poll it by `request_id` —
          that returns an honest `unknown` which never resolves to anything else.
        - **`mr-*`** → a generation advance: this same branch re-enqueued at a newer generation
          (`MergeOutcome('superseded', superseded_by=gen_next.request_id, ...)`, same module).

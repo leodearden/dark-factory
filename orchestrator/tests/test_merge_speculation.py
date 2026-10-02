@@ -97,18 +97,10 @@ from orchestrator.merge_disposition import (  # noqa: F401
     classify_merge_failure_disposition,
 )
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (  # noqa: F401
-    InflightEntry,
-    InflightVerifyResult,
-    MergeOutcome,
+from orchestrator.merge_lane.shadow import _submit_shadow_divergence_escalation  # noqa: F401
+from orchestrator.merge_queue import (
     MergeRequest,
-    RealMergeItem,
-    SpeculativeMergeWorker,
     _acquire_warm_verify_worktree,
-    _maybe_run_drift_check,
-    _maybe_schedule_shadow_compare,
-    _run_cold_shadow_verify,
-    _submit_shadow_divergence_escalation,
 )
 from orchestrator.verify import VerifyResult  # noqa: F401
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401

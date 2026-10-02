@@ -740,7 +740,7 @@ resolver and rule vocabulary.
 ## 5. The merge lane
 
 Code lands on `main` through a **two-layer speculative merge queue**
-(`orchestrator/src/orchestrator/merge_queue.py`, class
+(`orchestrator/src/orchestrator/merge_lane/worker.py`, class
 `SpeculativeMergeWorker`, run inside the `merge-worker` lifecycle entry —
 there is no separate merge process).
 

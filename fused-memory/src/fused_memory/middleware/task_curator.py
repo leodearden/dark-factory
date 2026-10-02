@@ -421,6 +421,10 @@ class CuratorDecision:
     # candidate in the same batch (neither yet materialised as a task).
     # The worker substitutes the sibling's resulting task_id at dispatch time.
     batch_target_index: int | None = None
+    # Structured signal that dedupe was silently skipped for this create by a
+    # zero-output hang; never derived from ``justification``, which is shared.
+    degraded_by_zot: bool = False
+    zot_escalation_id: str | None = None
 
     def to_log_fields(self) -> dict[str, Any]:
         return {
@@ -724,6 +728,20 @@ def normalize_title(title: str | None) -> str:
     and the intra-batch dedup key helper (``TaskCurator._intra_batch_key``).
     """
     return ' '.join((title or '').strip().lower().split())
+
+
+def embedding_text(title: str, description: str, files_to_modify: list[str]) -> str:
+    """Compose the text every curator corpus embedding is computed over.
+
+    Single owner: a caller comparing cosine scores against stored tasks must
+    compose its query with this, or the scores are not comparable.
+    """
+    parts = [title]
+    if description:
+        parts.append(description)
+    if files_to_modify:
+        parts.append('\n'.join(files_to_modify))
+    return '\n\n'.join(parts)
 
 
 def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float:
@@ -1033,18 +1051,6 @@ class TaskCurator:
             logger.info('Created task curator collection: %s', name)
         self._initialized_collections.add(name)
         return name
-
-    @staticmethod
-    def _embedding_text(
-        title: str, description: str, files_to_modify: list[str],
-    ) -> str:
-        """Text used for embedding — title + description + file list."""
-        parts = [title]
-        if description:
-            parts.append(description)
-        if files_to_modify:
-            parts.append('\n'.join(files_to_modify))
-        return '\n\n'.join(parts)
 
     # ------------------------------------------------------------------
     # Public API
@@ -1697,6 +1703,7 @@ class TaskCurator:
                 justification='zero-output-breaker-open',
                 pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
                 latency_ms=int((time.monotonic() - start) * 1000),
+                degraded_by_zot=True,
             )
 
         if prepared is not None and prepared.corpus_error is None:
@@ -1759,9 +1766,10 @@ class TaskCurator:
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
         except CuratorFailureError as exc:
+            zot_escalation_id: str | None = None
             if self._escalator is not None:
                 # May re-raise CuratorFailureError on the interactive path.
-                await self._escalator.report_failure(
+                zot_escalation_id = await self._escalator.report_failure(
                     project_root=project_root,
                     project_id=project_id,
                     justification=str(exc),
@@ -1794,6 +1802,8 @@ class TaskCurator:
                 justification='llm-error-escalated',
                 pool_sizes=pool_sizes,
                 latency_ms=int((time.monotonic() - start) * 1000),
+                degraded_by_zot=exc.zero_output_timeout,
+                zot_escalation_id=zot_escalation_id if exc.zero_output_timeout else None,
             )
         except Exception as exc:
             logger.warning(
@@ -2136,6 +2146,7 @@ class TaskCurator:
                     justification='zero-output-breaker-open',
                     pool_sizes=_empty_pool_sizes,
                     latency_ms=int((batch_breaker_now - start) * 1000),
+                    degraded_by_zot=True,
                 )
             llm_k_list = []
 
@@ -2245,7 +2256,7 @@ class TaskCurator:
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
@@ -2361,7 +2372,7 @@ class TaskCurator:
 
         Args:
             query: Free-text query, embedded as-is (NOT passed through
-                ``_embedding_text``, which composes stored-task fields).
+                ``embedding_text``, which composes stored-task fields).
             project_id: Project identifier selecting the collection.
             limit: Max number of hits to return.
             score_threshold: Drop hits below this cosine score server-side.
@@ -2446,7 +2457,7 @@ class TaskCurator:
 
             description = str(task.get('description', '') or '')
             files = _task_files(task)
-            text = self._embedding_text(title, description, files)
+            text = embedding_text(title, description, files)
 
             try:
                 async with sem:
@@ -2704,7 +2715,7 @@ class TaskCurator:
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)

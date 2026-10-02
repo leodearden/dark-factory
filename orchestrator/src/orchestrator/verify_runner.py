@@ -611,7 +611,7 @@ async def run_merge_verify_on_worktree(
         from orchestrator.verify import run_scoped_verification  # type: ignore[attr-defined]
         run_scoped = run_scoped_verification
     if run_unscoped is None:
-        from orchestrator.merge_queue import _run_unscoped_typechecks  # type: ignore[attr-defined]
+        from orchestrator.merge_lane.worker import _run_unscoped_typechecks
         run_unscoped = _run_unscoped_typechecks
 
     # module_configs is reconstructed from spec.verify_commands (which carries
