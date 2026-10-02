@@ -1555,8 +1555,9 @@ def merge_decision_enrichment(
     field unguarded. (2) Task 3640 (merged) hard-commits the field to a
     scalar, adding UNKNOWN_QUEUE as a THIRD scalar state plus a back-fill
     that stamps the live population as scalars; a list would contradict
-    shipped, tested behaviour. (3) Widening it needs a SCHEMA_VERSION minor
-    bump (fleet-cockpit-prd.md:180) and belongs to its own task.
+    shipped, tested behaviour. (3) DECIDED won't-do by task 4835 (a faithful
+    widening would be (queue, escalation_id) pairs, and any-of closure fails
+    closed); see plans/4835-decision-plumbing-decisions.md.
 
     First-writer-wins therefore leaves the known MODE-2 reap gap that
     test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_
