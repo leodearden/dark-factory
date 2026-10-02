@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import functools
 import logging
 import os
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _usage_gate_test_helpers import spawn_fault as _spawn_fault
+from silent_fallthrough_scan import ParsedFile
 
 from shared import invocation_outcome
 from shared.cli_invoke import AgentResult
@@ -306,25 +307,29 @@ _OWNED_NAMES = ('_parse_resets_at', '_extract_cap_message')
 _REQUIRED_SRC_ROOTS = ('shared/src', 'orchestrator/src')
 
 
-def _production_src_roots() -> list[Path]:
-    """Every workspace package's `<pkg>/src` tree.
+def _production_src_roots() -> list[str]:
+    """Every workspace package's `<pkg>/src` tree, as a posix repo-relative path.
 
     DISCOVERED rather than hardcoded: a fixed list covers only the trees
     someone remembered to name, so a re-fork in a package added later — or in
     one simply overlooked, `dashboard/src` being the pointed example, since
     the dashboard is the consumer a fabricated reset time would mislead —
-    would sail past a guard still reporting green. Scoped to `<pkg>/src` on
-    purpose: `.worktrees/` sits at the REPO root, so unlike a root-level rglob
-    (the trap capability_manifest_corpus.py documents) this walk cannot wander
-    into a sibling task's checkout.
+    would sail past a guard still reporting green. The ownership scan walks
+    the session's shared first-party tree, whose scope is a fixed list, so the
+    discovered contract is this discovery PLUS
+    `test_shared_tree_spans_every_production_src_root`. Scoped to `<pkg>/src`
+    on purpose: `.worktrees/` sits at the REPO root, so unlike a root-level
+    rglob (the trap capability_manifest_corpus.py documents) this glob cannot
+    wander into a sibling task's checkout.
     """
-    roots = sorted(p for p in _REPO_ROOT.glob('*/src') if p.is_dir())
-    found = {str(p.relative_to(_REPO_ROOT)) for p in roots}
+    found = sorted(
+        p.relative_to(_REPO_ROOT).as_posix() for p in _REPO_ROOT.glob('*/src') if p.is_dir()
+    )
     # Loud, not silently narrowed: a guard that quietly stops scanning a tree
     # it can no longer find is worse than no guard.
     missing = [rel for rel in _REQUIRED_SRC_ROOTS if rel not in found]
     assert not missing, f'production source root(s) missing under {_REPO_ROOT}: {missing}'
-    return roots
+    return found
 
 
 class _Site(NamedTuple):
@@ -344,10 +349,12 @@ class _OwnedNameSites(NamedTuple):
     definitions: tuple[_Site, ...]
 
 
-@functools.cache
-def _owned_name_sites() -> _OwnedNameSites:
-    """Module-level DEFINITIONS and bare-name CALLS of the owned names, across
-    every production source tree.
+def _owned_name_sites(records: Sequence[ParsedFile]) -> _OwnedNameSites:
+    """Module-level DEFINITIONS and bare-name CALLS of the owned names in *records*.
+
+    Walks each record's already-parsed tree READ-ONLY (the trees are the
+    session's shared ones) and does no I/O. A record that failed to parse is
+    skipped here; the `owned_name_sites` fixture refuses one up front.
 
     AST-based, not grep-based: the retired fork and its history are discussed
     at length in comments and docstrings across `usage_gate.py` and
@@ -358,41 +365,47 @@ def _owned_name_sites() -> _OwnedNameSites:
 
     The substring pre-filter is an optimisation, never a narrowing: every node
     reported here carries an owned name as a literal identifier, so a file
-    whose text contains neither name cannot hold one. Measured on this tree,
-    it is what makes scanning all 426 production files (0.10s) cheaper than
-    parsing the 188 in two trees (1.84s).
+    whose text contains neither name cannot hold one, and its tree is never
+    walked.
     """
     calls: list[_Site] = []
     definitions: list[_Site] = []
-    for root in _production_src_roots():
-        for path in sorted(root.rglob('*.py')):
-            source = path.read_text(encoding='utf-8')
-            if not any(name in source for name in _OWNED_NAMES):
+    for record in records:
+        tree = record.tree
+        if tree is None or not any(name in record.source for name in _OWNED_NAMES):
+            continue
+        lines = record.source.splitlines()
+        definitions.extend(
+            _Site(record.relpath, node.lineno, node.name)
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name in _OWNED_NAMES
+        )
+        # ast.walk is breadth-first, so a single file's hits are not
+        # source-ordered; both lists are sorted before being returned.
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
                 continue
-            rel = str(path.relative_to(_REPO_ROOT))
-            lines = source.splitlines()
-            tree = ast.parse(source, filename=str(path))
-            definitions.extend(
-                _Site(rel, node.lineno, node.name)
-                for node in tree.body
-                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-                and node.name in _OWNED_NAMES
-            )
-            # ast.walk is breadth-first, so a single file's hits are not
-            # source-ordered; both lists are sorted before being returned.
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
-                    continue
-                func = node.func
-                if isinstance(func, ast.Name):
-                    called = func.id
-                elif isinstance(func, ast.Attribute):
-                    called = func.attr
-                else:
-                    continue
-                if called in _OWNED_NAMES:
-                    calls.append(_Site(rel, node.lineno, lines[node.lineno - 1].strip()))
+            func = node.func
+            if isinstance(func, ast.Name):
+                called = func.id
+            elif isinstance(func, ast.Attribute):
+                called = func.attr
+            else:
+                continue
+            if called in _OWNED_NAMES:
+                calls.append(_Site(record.relpath, node.lineno, lines[node.lineno - 1].strip()))
     return _OwnedNameSites(tuple(sorted(calls)), tuple(sorted(definitions)))
+
+
+@pytest.fixture(scope='module')
+def owned_name_sites(first_party_tree: tuple[ParsedFile, ...]) -> _OwnedNameSites:
+    """The ownership scan over the shared tree's production `<pkg>/src` records."""
+    prefixes = tuple(f'{root}/' for root in _production_src_roots())
+    production = [record for record in first_party_tree if record.relpath.startswith(prefixes)]
+    unparseable = [record.relpath for record in production if record.syntax_error is not None]
+    assert not unparseable, f'production module(s) that do not parse: {unparseable}'
+    return _owned_name_sites(production)
 
 
 class TestSingleResetsParserOwnership:
@@ -426,11 +439,11 @@ class TestSingleResetsParserOwnership:
     that is a design change: argue it, don't let a guard erode.
     """
 
-    def test_scan_finds_the_owner_defining_and_calling_both_names(self):
+    def test_scan_finds_the_owner_defining_and_calling_both_names(self, owned_name_sites):
         # Anti-vacuity: proves the AST walk resolves BOTH node kinds it
         # reports, so a future rename cannot turn the guards below into no-ops
         # that pass because they found nothing at all.
-        sites = _owned_name_sites()
+        sites = owned_name_sites
         assert sites.calls, 'AST scan found no call of either owned name — guard is vacuous'
         owner_defs = {s.detail for s in sites.definitions if s.path == _STRICT_PARSE_OWNER}
         assert owner_defs == set(_OWNED_NAMES), (
@@ -438,12 +451,12 @@ class TestSingleResetsParserOwnership:
             f'(found {sorted(owner_defs)}) — the definition guard is vacuous.'
         )
 
-    def test_only_the_owner_calls_the_bare_names(self):
+    def test_only_the_owner_calls_the_bare_names(self, owned_name_sites):
         # Exact match on the structured `path`, not a prefix match on a
         # rendered string — and NO assertion on the call COUNT: a legitimate
         # new call inside the owner's own module must not fail this guard.
         offenders = [
-            str(site) for site in _owned_name_sites().calls
+            str(site) for site in owned_name_sites.calls
             if site.path != _STRICT_PARSE_OWNER
         ]
         assert offenders == [], (
@@ -463,7 +476,7 @@ class TestSingleResetsParserOwnership:
 
         assert usage_gate_module._parse_resets_at_strict is invocation_outcome._parse_resets_at
 
-    def test_no_production_module_redefines_the_names(self):
+    def test_no_production_module_redefines_the_names(self, owned_name_sites):
         """No module but the owner may DEFINE either function.
 
         Scans every production tree rather than only `usage_gate.py` where
@@ -480,7 +493,7 @@ class TestSingleResetsParserOwnership:
         `test_only_the_owner_calls_the_bare_names` to find.
         """
         refork = [
-            str(site) for site in _owned_name_sites().definitions
+            str(site) for site in owned_name_sites.definitions
             if site.path != _STRICT_PARSE_OWNER
         ]
         assert refork == [], (
@@ -491,7 +504,7 @@ class TestSingleResetsParserOwnership:
             'failure.'
         )
 
-    def test_orchestrator_shim_does_not_reexport_the_retired_names(self):
+    def test_orchestrator_shim_does_not_reexport_the_retired_names(self, first_party_tree):
         """The orchestrator shim is public-surface-only.
 
         `shared.usage_gate.__all__` lists no underscore names, so the star
@@ -510,13 +523,17 @@ class TestSingleResetsParserOwnership:
         with nothing to do with what it guards, and go green again only if
         some earlier command happened to leave an `--all-packages` venv
         behind. Reading the source keeps the assertion true of the file,
-        which is what "does not re-export" actually means.
+        which is what "does not re-export" actually means. The AST walked is
+        the session's shared one (`first_party_tree`).
         """
-        path = _REPO_ROOT / 'orchestrator/src/orchestrator/usage_gate.py'
-        assert path.is_file(), f'orchestrator usage_gate shim missing: {path}'
-        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        shim_rel = 'orchestrator/src/orchestrator/usage_gate.py'
+        shim = next((r for r in first_party_tree if r.relpath == shim_rel), None)
+        assert shim is not None, (
+            f'orchestrator usage_gate shim missing from the shared tree: {shim_rel}'
+        )
+        assert shim.tree is not None, f'{shim_rel} does not parse: {shim.syntax_error}'
         bound: set[str] = set()
-        for node in tree.body:
+        for node in shim.tree.body:
             if isinstance(node, ast.Import | ast.ImportFrom):
                 # A `from ... import *` alias is literally named '*' and binds
                 # nothing statically — it cannot reintroduce these two, since
@@ -544,9 +561,7 @@ class TestSingleResetsParserOwnership:
         relpaths = [record.relpath for record in first_party_tree]
         missing = [
             root_rel
-            for root_rel in (
-                root.relative_to(_REPO_ROOT).as_posix() for root in _production_src_roots()
-            )
+            for root_rel in _production_src_roots()
             if not any(rel.startswith(f'{root_rel}/') for rel in relpaths)
         ]
         assert missing == [], (
