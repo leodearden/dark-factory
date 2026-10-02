@@ -43,8 +43,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, get_args
 
+from fused_memory.config.schema import JudgeReasoningEffort
 from fused_memory.routing.json_extract import extract_json
 from fused_memory.server.grouped_read import PARENT_ID_KEY
 
@@ -741,6 +742,21 @@ def resolve_judge_candidate_count(memory_service: Any) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
     return _DEFAULT_JUDGE_CANDIDATE_COUNT
+
+
+def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
+    """The reasoning effort to send, or ``None`` to omit the parameter.
+
+    Only a member of ``config.schema.JudgeReasoningEffort`` is returned; any
+    other value reads as ``None`` rather than raising, because this runs on the
+    write path. ``None`` is a first-class answer, not a fallback: it is what a
+    non-reasoning model needs. Whether the resolved arm can SEND a set effort is
+    :func:`_call_llm`'s question, asked inside the fail-open arm.
+    """
+    value = _judge_attr(memory_service, 'judge_reasoning_effort')
+    if isinstance(value, str) and value in get_args(JudgeReasoningEffort):
+        return value
+    return None
 
 
 # --- the LLM call ------------------------------------------------------------
