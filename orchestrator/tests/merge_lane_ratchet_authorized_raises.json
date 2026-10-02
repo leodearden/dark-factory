@@ -1267,6 +1267,30 @@
           "current": 60
         }
       ]
+    },
+    {
+      "task_id": "5036",
+      "reason": "The external_importers measure now also counts string-path dependents: files that name a path into an alias module in a string constant (for example a patch target such as 'orchestrator.landing_evidence._helper') and never import it, which break when task eta (5037) deletes the alias. This widens what is measured; nothing in the tree grew. Docstrings and bare module-name strings (logger names) stay uncounted.",
+      "measures": [
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/landing_evidence.py",
+          "baseline": 11,
+          "current": 12
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 120,
+          "current": 129
+        },
+        {
+          "measure": "total:external_importers",
+          "key": "<cluster>",
+          "baseline": 269,
+          "current": 279
+        }
+      ]
     }
   ]
 }

@@ -1130,6 +1130,82 @@ class TestPrivateReads:
         assert 'broken.py' in str(excinfo.value)
 
 
+class TestTheTreeAndSourceFormsAgree:
+    """Each measure has a source-taking form and a tree-taking one.
+
+    The sweeps parse once and call the tree form; everything else calls the
+    source form, which is a parse plus a call of the tree form. They are one
+    implementation, and this is what notices a change that makes them two.
+    """
+
+    _SOURCE = (
+        '"""Docstring."""\n'
+        'from orchestrator import merge_queue\n'
+        'from unittest.mock import patch\n'
+        'from pathlib import Path\n\n'
+        '# a comment\n'
+        'def test_x():\n'
+        '    from json import dumps\n'
+        "    with patch('orchestrator.merge_queue.helper'):\n"
+        '        assert merge_queue._worker\n'
+    )
+
+    @pytest.mark.parametrize(
+        ('from_source', 'from_tree'),
+        [
+            pytest.param(
+                lambda src: metrics.file_size_measures(src, path='t.py'),
+                lambda src, tree: metrics.file_size_measures_in_tree(
+                    src, tree, path='t.py'
+                ),
+                id='file_size_measures',
+            ),
+            pytest.param(
+                lambda src: metrics.function_local_imports(src, path='t.py'),
+                lambda src, tree: metrics.function_local_imports_in_tree(tree),
+                id='function_local_imports',
+            ),
+            pytest.param(
+                lambda src: metrics.reexport_names(src, path='t.py'),
+                lambda src, tree: metrics.reexport_names_in_tree(tree),
+                id='reexport_names',
+            ),
+            pytest.param(
+                lambda src: metrics.patch_targets(src, path='t.py'),
+                lambda src, tree: metrics.patch_targets_in_tree(tree),
+                id='patch_targets',
+            ),
+            pytest.param(
+                lambda src: metrics.private_reads(src, path='t.py'),
+                lambda src, tree: metrics.private_reads_in_tree(tree),
+                id='private_reads',
+            ),
+            pytest.param(
+                lambda src: metrics.imports_lane_module(src, path='t.py'),
+                lambda src, tree: metrics.imports_lane_module_in_tree(tree),
+                id='imports_lane_module',
+            ),
+            pytest.param(
+                lambda src: metrics.test_file_measures(src, path='t.py'),
+                lambda src, tree: metrics.test_file_measures_in_tree(tree),
+                id='test_file_measures',
+            ),
+            pytest.param(
+                lambda src: metrics.referenced_alias_modules(src, path='t.py'),
+                lambda src, tree: metrics.referenced_alias_modules_in_tree(tree),
+                id='referenced_alias_modules',
+            ),
+        ],
+    )
+    def test_the_two_forms_return_the_same_measure(self, from_source, from_tree) -> None:
+        tree = metrics._parse(self._SOURCE, path='t.py')
+        expected = from_source(self._SOURCE)
+        assert from_tree(self._SOURCE, tree) == expected
+        # ANTI-VACUITY: the snippet exercises every measure, so none is trivially
+        # equal as an empty value.
+        assert expected not in (0, [], set(), frozenset(), None)
+
+
 class TestTestFileMeasures:
     def test_a_non_lane_importing_file_yields_none(self) -> None:
         # The exclusion is a property of the MEASURE, not of the caller: a
@@ -1591,8 +1667,8 @@ class TestAliasModules:
             metrics._require_aliases_in_cluster()
 
 
-class TestImportedAliasModules:
-    """The import-form detector, on source snippets."""
+class TestReferencedAliasModules:
+    """The detector, on source snippets: import forms, and string paths into a module."""
 
     @pytest.mark.parametrize(
         ('source', 'expected'),
@@ -1677,10 +1753,46 @@ class TestImportedAliasModules:
                 {_MQ_MODULE},
                 id='the-same-alias-twice-is-one',
             ),
+            pytest.param(
+                'from unittest.mock import patch\n'
+        'from pathlib import Path\n\n'
+                'def test_x():\n'
+                "    with patch('orchestrator.landing_evidence._helper'):\n"
+                '        pass\n',
+                {'orchestrator.landing_evidence'},
+                id='string-path-patch-target-with-no-import',
+            ),
+            pytest.param(
+                'def test_x(monkeypatch):\n'
+                "    monkeypatch.setattr('orchestrator.merge_queue.X', 1)\n",
+                {_MQ_MODULE},
+                id='string-path-setattr',
+            ),
+            pytest.param(
+                "PATH = 'orchestrator.merge_queue.helper.deep'\n",
+                {_MQ_MODULE},
+                id='string-path-below-the-module',
+            ),
+            pytest.param(
+                "def f():\n    'a docstring'\n    'orchestrator.merge_queue.X'\n",
+                {_MQ_MODULE},
+                id='a-second-string-statement-is-code-not-a-docstring',
+            ),
+            pytest.param(
+                "PATH = 'orchestrator.merge_queue_store.X'\n",
+                {'orchestrator.merge_queue_store'},
+                id='string-path-names-the-longer-module-only',
+            ),
+            pytest.param(
+                'from orchestrator import merge_queue\n'
+                "PATH = 'orchestrator.merge_queue.X'\n",
+                {_MQ_MODULE},
+                id='import-and-string-path-are-one-dependent',
+            ),
         ],
     )
-    def test_every_import_form_counts(self, source: str, expected: set[str]) -> None:
-        assert metrics.imported_alias_modules(source) == expected
+    def test_every_dependency_form_counts(self, source: str, expected: set[str]) -> None:
+        assert metrics.referenced_alias_modules(source) == expected
 
     @pytest.mark.parametrize(
         'source',
@@ -1689,7 +1801,7 @@ class TestImportedAliasModules:
                 '"""from orchestrator import merge_queue"""\nx = 1\n', id='docstring'
             ),
             pytest.param('# import orchestrator.merge_queue\nx = 1\n', id='comment'),
-            pytest.param("PATH = 'orchestrator.merge_queue.helper'\n", id='string-literal'),
+            pytest.param("PATH = 'orchestrator.merge_queue'\n", id='bare-module-name-string'),
             pytest.param(
                 'import orchestrator\nvalue = orchestrator.merge_queue.X\n',
                 id='attribute-access-alone',
@@ -1712,14 +1824,46 @@ class TestImportedAliasModules:
             pytest.param('import orchestrator.merge_lane.worker\n', id='the-new-import'),
             pytest.param('from orchestrator import git_ops\n', id='another-orchestrator-module'),
             pytest.param('import orchestrator\n', id='the-bare-package'),
+            pytest.param(
+                "import logging\nlog = logging.getLogger('orchestrator.merge_queue')\n",
+                id='bare-logger-name',
+            ),
+            pytest.param(
+                'def test_x(caplog):\n'
+                "    caplog.set_level('INFO', logger='orchestrator.merge_queue')\n",
+                id='bare-logger-name-in-caplog',
+            ),
+            pytest.param(
+                '"""Patches \'orchestrator.merge_queue.X\' in every test."""\n',
+                id='string-path-in-a-module-docstring',
+            ),
+            pytest.param(
+                "def f():\n    '''Reaches orchestrator.merge_queue.X.'''\n",
+                id='string-path-in-a-function-docstring',
+            ),
+            pytest.param(
+                "class C:\n    '''See orchestrator.merge_queue.X.'''\n",
+                id='string-path-in-a-class-docstring',
+            ),
+            pytest.param(
+                "# 'orchestrator.merge_queue.X'\nx = 1\n", id='string-path-in-a-comment'
+            ),
+            pytest.param("PATH = 'dashboard.merge_queue.X'\n", id='unrelated-string-path'),
+            pytest.param(
+                "PATH = 'orchestrator.merge_lane.worker.X'\n",
+                id='string-path-into-the-new-module',
+            ),
+            pytest.param(
+                "PATH = 'orchestrator.merge_queue_helpers.X'\n", id='lookalike-prefix'
+            ),
         ],
     )
     def test_everything_else_does_not(self, source: str) -> None:
-        assert metrics.imported_alias_modules(source) == frozenset()
+        assert metrics.referenced_alias_modules(source) == frozenset()
 
     def test_unparseable_source_raises_naming_the_path(self) -> None:
         with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.imported_alias_modules('def (:\n', path='pkg/broken.py')
+            metrics.referenced_alias_modules('def (:\n', path='pkg/broken.py')
         assert 'pkg/broken.py' in str(excinfo.value)
 
 
@@ -1835,13 +1979,45 @@ class TestExternalImporterSweep:
         )
         assert metrics.sweep_repo(root).unreadable == ()
 
+    def test_parsing_remembers_nothing_between_calls(self) -> None:
+        # Two callers of one source must not share a tree: a measure that
+        # mutated it would corrupt the other, and the only guard would be prose.
+        source = 'import json\n'
+        assert metrics._parse(source, path='a.py') is not metrics._parse(
+            source, path='a.py'
+        )
+
+    def test_a_string_path_dependent_counts_and_a_logger_name_does_not(
+        self, tmp_path: Path
+    ) -> None:
+        # The file patches `orchestrator.merge_gates._x` and never imports the
+        # module, so deleting the alias breaks it while no import changes.
+        root = _committed_tree(
+            tmp_path,
+            {
+                **_IMPORTER_TREE,
+                'tests/test_patches.py': (
+                    'def test_x(monkeypatch):\n'
+                    "    monkeypatch.setattr('orchestrator.merge_gates._x', 1)\n"
+                ),
+                'app/logs.py': (
+                    "import logging\nlog = logging.getLogger('orchestrator.merge_queue')\n"
+                ),
+            },
+        )
+        sweep = metrics.sweep_repo(root)
+        assert sweep.alias_importers[_GATES_MODULE] == 4
+        assert sweep.alias_importers[_MQ_MODULE] == 2
+
     def test_a_file_in_both_domains_is_parsed_once(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Task 5101's discipline, counted as WORK rather than timed: a
         # lane-importing test file is wanted by three test-suite measures AND the
-        # importer count, and the sweep must hand all four ONE parse. A second
-        # walk for the importer count would show here as a second parse.
+        # importer count, and the sweep must hand all four ONE parse -- by
+        # construction, because it parses once and passes the tree on; nothing
+        # in the instrument remembers a parse. A second walk for the importer
+        # count would show here as a second parse.
         monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
         root = _committed_tree(
             tmp_path,

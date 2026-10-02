@@ -7,8 +7,9 @@ cognitive complexity, function-local (reach-back) imports, re-export shim names,
 distinct test patch targets into lane internals, and private-attribute reads
 from tests -- plus, from PRD task zeta2, ``external_importers``: for each of the
 fourteen old module paths that ``ALIAS_MODULES`` names, the number of distinct
-tracked repo files outside ``merge_lane/`` that still import it, which is the
-target PRD task eta drives to zero. The committed baseline lives at
+tracked repo files outside ``merge_lane/`` that still import it or name a path
+into it in a string (a patch target), which is the target PRD task eta drives to
+zero. The committed baseline lives at
 ``orchestrator/tests/merge_lane_ratchet_baseline.json`` and the gate that
 enforces it is ``orchestrator/tests/test_merge_lane_ratchet.py``.
 
@@ -84,7 +85,6 @@ from __future__ import annotations
 import argparse
 import ast
 import dataclasses
-import functools
 import json
 import subprocess
 import sys
@@ -314,11 +314,6 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
 # Source helpers shared by the per-file measures.
 
 
-@functools.lru_cache(maxsize=1)
-def _parsed(source: str) -> ast.Module:
-    return ast.parse(source)
-
-
 def _parse(source: str, *, path: str) -> ast.Module:
     """Parse *source*, translating a SyntaxError into a named MetricsError.
 
@@ -326,15 +321,13 @@ def _parse(source: str, *, path: str) -> ast.Module:
     Callers sweeping files OUTSIDE the cluster (the whole test tree) catch
     this and record the path in ``Enumeration.unreadable`` instead.
 
-    The LAST source parsed is remembered, so the several measures one sweep takes
-    of one file share a single parse; a lane-importing test file used to be
-    parsed three times over, and it is the largest kind of file in the repo. The
-    tree handed back is shared: every caller reads it and none may mutate it.
-    ``sweep_repo`` drops the memo when it finishes so a sweep does not leave the
-    last tree resident.
+    Nothing is remembered between calls. A file's measures share ONE parse by
+    its caller parsing once and handing the tree to each ``*_in_tree`` measure;
+    the ``source``-taking functions beside them are thin wrappers that parse and
+    delegate, for the callers that measure a single measure of a single snippet.
     """
     try:
-        return _parsed(source)
+        return ast.parse(source)
     except SyntaxError as exc:
         raise MetricsError(
             f'{path}: could not be parsed -- SyntaxError: {exc}'
@@ -385,34 +378,51 @@ class FileSizeMeasures:
     prose_lines: int
 
 
-def _docstring_lines(tree: ast.Module) -> set[int]:
-    """Line numbers spanned by every docstring in *tree*.
+_DOCSTRING_HOLDERS: tuple[type[ast.AST], ...] = (
+    ast.Module,
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+)
+
+
+def _docstring_of(node: ast.AST) -> ast.Expr | None:
+    """The docstring statement of *node*, or None when it has none.
 
     A docstring is the FIRST body element of a module, class or function when it
     is a bare string expression -- exactly Python's own rule, so a second string
     expression in the same body is code, not prose.
     """
+    if not isinstance(node, _DOCSTRING_HOLDERS):
+        return None
+    body = getattr(node, 'body', None)
+    if not body:
+        return None
+    first = body[0]
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        return first
+    return None
+
+
+def _docstrings(tree: ast.Module) -> list[ast.Expr]:
+    """Every docstring statement in *tree*."""
+    return [
+        docstring
+        for node in ast.walk(tree)
+        if (docstring := _docstring_of(node)) is not None
+    ]
+
+
+def _docstring_lines(tree: ast.Module) -> set[int]:
+    """Line numbers spanned by every docstring in *tree*."""
     lines: set[int] = set()
-    holders: tuple[type[ast.AST], ...] = (
-        ast.Module,
-        ast.FunctionDef,
-        ast.AsyncFunctionDef,
-        ast.ClassDef,
-    )
-    for node in ast.walk(tree):
-        if not isinstance(node, holders):
-            continue
-        body = getattr(node, 'body', None)
-        if not body:
-            continue
-        first = body[0]
-        if (
-            isinstance(first, ast.Expr)
-            and isinstance(first.value, ast.Constant)
-            and isinstance(first.value.value, str)
-        ):
-            end = first.end_lineno if first.end_lineno is not None else first.lineno
-            lines.update(range(first.lineno, end + 1))
+    for docstring in _docstrings(tree):
+        end = docstring.end_lineno if docstring.end_lineno is not None else docstring.lineno
+        lines.update(range(docstring.lineno, end + 1))
     return lines
 
 
@@ -428,7 +438,13 @@ def file_size_measures(source: str, *, path: str) -> FileSizeMeasures:
     Raises ``MetricsError`` naming *path* when the source cannot be parsed or
     tokenized. INV-11: never a zero or None measure for a file we failed to read.
     """
-    tree = _parse(source, path=path)
+    return file_size_measures_in_tree(source, _parse(source, path=path), path=path)
+
+
+def file_size_measures_in_tree(
+    source: str, tree: ast.Module, *, path: str
+) -> FileSizeMeasures:
+    """``file_size_measures`` over a tree the caller already parsed from *source*."""
     prose = _docstring_lines(tree) | _comment_lines(source, path=path)
     return FileSizeMeasures(lines=len(source.splitlines()), prose_lines=len(prose))
 
@@ -452,7 +468,11 @@ def function_local_imports(source: str, *, path: str) -> int:
     function. AST-based, so a docstring quoting an import statement -- which the
     satellite modules' reach-back notes do verbatim -- is never counted.
     """
-    tree = _parse(source, path=path)
+    return function_local_imports_in_tree(_parse(source, path=path))
+
+
+def function_local_imports_in_tree(tree: ast.Module) -> int:
+    """``function_local_imports`` over an already-parsed tree."""
     seen: set[int] = set()
     for node in ast.walk(tree):
         if not isinstance(node, _FUNCTION_NODES):
@@ -483,7 +503,11 @@ def reexport_names(source: str, *, path: str) -> list[str]:
     changes runtime annotation semantics. Returns the bound names
     (``asname or name``) sorted and deduped.
     """
-    tree = _parse(source, path=path)
+    return reexport_names_in_tree(_parse(source, path=path))
+
+
+def reexport_names_in_tree(tree: ast.Module) -> list[str]:
+    """``reexport_names`` over an already-parsed tree."""
     used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     # An attribute chain rooted at the binding (`B.attr`) also uses it, and so
     # does an `__all__` listing -- but `__all__` entries are string constants,
@@ -776,7 +800,11 @@ def patch_targets(source: str, *, path: str = '<source>') -> set[str]:
     satellite module docstrings and the reachback guard's own ALLOWLIST literal
     both do -- is never mistaken for a real patch site.
     """
-    tree = _parse(source, path=path)
+    return patch_targets_in_tree(_parse(source, path=path))
+
+
+def patch_targets_in_tree(tree: ast.Module) -> set[str]:
+    """``patch_targets`` over an already-parsed tree."""
     aliases = _lane_module_aliases(tree)
     leaves = {module.rsplit('.', 1)[-1] for module in LANE_PATCH_MODULES}
 
@@ -897,7 +925,11 @@ def lane_module_names() -> frozenset[str]:
 def imports_lane_module(source: str, *, path: str) -> bool:
     """True when *source* imports any cluster module, or anything under
     ``orchestrator.merge_lane``."""
-    tree = _parse(source, path=path)
+    return imports_lane_module_in_tree(_parse(source, path=path))
+
+
+def imports_lane_module_in_tree(tree: ast.Module) -> bool:
+    """``imports_lane_module`` over an already-parsed tree."""
     lane_names = lane_module_names()
     lane_leaves = {name.rsplit('.', 1)[-1] for name in lane_names}
 
@@ -929,7 +961,11 @@ def private_reads(source: str, *, path: str) -> int:
     is the coupling the measure exists to shrink. Dunders are excluded (Python
     protocol, not lane internals) and so is the bare ``self``/``cls`` receiver.
     """
-    tree = _parse(source, path=path)
+    return private_reads_in_tree(_parse(source, path=path))
+
+
+def private_reads_in_tree(tree: ast.Module) -> int:
+    """``private_reads`` over an already-parsed tree."""
     count = 0
     for node in ast.walk(tree):
         if not isinstance(node, ast.Attribute):
@@ -951,11 +987,16 @@ def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
     the MEASURE rather than of the caller, so a non-lane-importing file can
     never be summed into the report by accident.
     """
-    if not imports_lane_module(source, path=path):
+    return test_file_measures_in_tree(_parse(source, path=path))
+
+
+def test_file_measures_in_tree(tree: ast.Module) -> dict[str, object] | None:
+    """``test_file_measures`` over an already-parsed tree."""
+    if not imports_lane_module_in_tree(tree):
         return None
     return {
-        'patch_targets': sorted(patch_targets(source, path=path)),
-        'private_reads': private_reads(source, path=path),
+        'patch_targets': sorted(patch_targets_in_tree(tree)),
+        'private_reads': private_reads_in_tree(tree),
     }
 
 
@@ -963,12 +1004,15 @@ def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
 # External importers of the alias modules (PRD task zeta2).
 #
 # WHAT IS COUNTED. For each old module of ``ALIAS_MODULES``, the number of
-# DISTINCT files that import it. Every import form counts -- ``import X``,
+# DISTINCT files that depend on it. Every import form counts -- ``import X``,
 # ``import X as Y``, ``from X import ...`` and ``from <package> import <leaf>``
 # -- at module level or inside a function, and under ``if TYPE_CHECKING:``: a
-# type-only import still breaks the day the alias is deleted. Detection is
-# AST-based and on FULL dotted names, so a docstring quoting a name never
-# counts, and neither does an unrelated module that merely shares a leaf
+# type-only import still breaks the day the alias is deleted. So does a string
+# constant that continues past the module name (``'orchestrator.X.attr'``, a
+# patch target): that file never imports X and breaks all the same. A bare
+# ``'orchestrator.X'`` is a logger name and does not. Detection is AST-based and
+# on FULL dotted names, so a docstring quoting a name never counts, and neither
+# does an unrelated module that merely shares a leaf
 # (``dashboard/data/merge_queue.py``). Relative imports are out of scope: the
 # only files that use them for these modules sit inside ``merge_lane/``, which
 # is excluded, and the rest of the tree imports by absolute name.
@@ -991,34 +1035,76 @@ def test_file_measures(source: str, *, path: str) -> dict[str, object] | None:
 # ``scripts/check_staged_ratchet_raise.py``.
 #
 # A cheap text prefilter (the file mentions a leaf name at all) runs before the
-# AST parse. It cannot hide an importer, since an import statement must spell the
-# leaf, so a file that is both unparseable and silent about every leaf is not an
-# importer and is not recorded as unreadable.
+# AST parse. It cannot hide a dependent, since an import or a dotted string must
+# spell the leaf, so a file that is both unparseable and silent about every leaf
+# depends on no alias and is not recorded as unreadable.
 
 _ALIAS_LEAVES = frozenset(name.rsplit('.', 1)[-1] for name in ALIAS_MODULES)
 
 
-def imported_alias_modules(source: str, *, path: str = '<source>') -> frozenset[str]:
-    """The old dotted names of ``ALIAS_MODULES`` that *source* imports.
+#: ``'<old dotted name>.'`` for each alias. The trailing dot is the point: a string
+#: that CONTINUES past the module is a path into it (``patch(...)``,
+#: ``monkeypatch.setattr(...)``, ``importlib`` of a submodule) and breaks when the
+#: alias is deleted, where a bare ``'orchestrator.merge_queue'`` is a logger name
+#: and survives it.
+_ALIAS_STRING_PREFIXES = {name + '.': name for name in ALIAS_MODULES}
+_ALIAS_STRING_PREFIX_TUPLE = tuple(_ALIAS_STRING_PREFIXES)
 
-    ``from P import m`` binds the module ``P.m`` whenever that is a module, so
-    each name in the statement is also tried joined to ``P`` -- which is how
-    ``from orchestrator import merge_queue`` is read without this function
-    knowing the word ``orchestrator``. Raises ``MetricsError`` naming *path* when
-    the source cannot be parsed.
+
+def _aliases_imported_by_statement(node: ast.Import | ast.ImportFrom) -> set[str]:
+    if isinstance(node, ast.Import):
+        imported = [alias.name for alias in node.names]
+    elif node.module and not node.level:
+        imported = [node.module] + [f'{node.module}.{alias.name}' for alias in node.names]
+    else:
+        return set()
+    return {name for name in imported if name in ALIAS_MODULES}
+
+
+def _aliases_named_by_string(value: str) -> set[str]:
+    if not value.startswith(_ALIAS_STRING_PREFIX_TUPLE):
+        return set()
+    return {
+        name for prefix, name in _ALIAS_STRING_PREFIXES.items() if value.startswith(prefix)
+    }
+
+
+def referenced_alias_modules(source: str, *, path: str = '<source>') -> frozenset[str]:
+    """The old dotted names of ``ALIAS_MODULES`` that *source* depends on.
+
+    Raises ``MetricsError`` naming *path* when the source cannot be parsed.
     """
-    tree = _parse(source, path=path)
+    return referenced_alias_modules_in_tree(_parse(source, path=path))
+
+
+def referenced_alias_modules_in_tree(tree: ast.Module) -> frozenset[str]:
+    """``referenced_alias_modules`` over an already-parsed tree.
+
+    A module is depended on in two ways. It is IMPORTED: ``from P import m`` binds
+    the module ``P.m`` whenever that is a module, so each name in the statement
+    is also tried joined to ``P`` -- which is how ``from orchestrator import
+    merge_queue`` is read without this function knowing the word
+    ``orchestrator``. Or it is NAMED BY PATH in a string constant that continues
+    past the module, ``'orchestrator.landing_evidence._helper'``: a file that
+    patches an alias's attribute never imports it, and counting only imports
+    would let task eta read zero, delete the alias, and break that file. Neither a
+    docstring nor a bare module-name string (a logger name) counts.
+    """
     found: set[str] = set()
+    docstring_values: set[int] = set()
+    # One walk, parents before children, so a holder has named its docstring's
+    # constant before the walk reaches it.
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported = [alias.name for alias in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-            imported = [node.module] + [
-                f'{node.module}.{alias.name}' for alias in node.names
-            ]
-        else:
-            continue
-        found.update(name for name in imported if name in ALIAS_MODULES)
+        if (docstring := _docstring_of(node)) is not None:
+            docstring_values.add(id(docstring.value))
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            found |= _aliases_imported_by_statement(node)
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstring_values
+        ):
+            found |= _aliases_named_by_string(node.value)
     return frozenset(found)
 
 
@@ -1075,14 +1161,14 @@ def is_external_importer_source(relpath: str) -> bool:
     )
 
 
-def _aliases_imported_by(source: str, relpath: str) -> frozenset[str]:
-    if not any(leaf in source for leaf in _ALIAS_LEAVES):
-        return frozenset()
+def _mentions_an_alias_leaf(source: str) -> bool:
+    return any(leaf in source for leaf in _ALIAS_LEAVES)
+
+
+def _external_aliases_referenced_by(tree: ast.Module, relpath: str) -> frozenset[str]:
     own_name = src_module_name(relpath)
     return frozenset(
-        name
-        for name in imported_alias_modules(source, path=relpath)
-        if name != own_name
+        name for name in referenced_alias_modules_in_tree(tree) if name != own_name
     )
 
 
@@ -1147,15 +1233,16 @@ def build_report(root: Path) -> dict[str, object]:
     functions: dict[str, int] = {}
     for relpath in enumeration.resolved:
         source = _read_source(root, relpath)
-        size = file_size_measures(source, path=relpath)
+        tree = _parse(source, path=relpath)
+        size = file_size_measures_in_tree(source, tree, path=relpath)
         target = root / relpath
         cognitive = file_cognitive_measures(target)
         files[relpath] = {
             'lines': size.lines,
             'prose_lines': size.prose_lines,
             'cognitive': cognitive.total,
-            'function_local_imports': function_local_imports(source, path=relpath),
-            'reexport_names': len(reexport_names(source, path=relpath)),
+            'function_local_imports': function_local_imports_in_tree(tree),
+            'reexport_names': len(reexport_names_in_tree(tree)),
             **alias_importer_measure(relpath, sweep.alias_importers),
         }
         for qualname, score in cognitive.per_function.items():
@@ -1214,19 +1301,22 @@ def _test_tree_files(root: Path) -> frozenset[str]:
 def _measure_file(
     root: Path, relpath: str, *, in_test_tree: bool, is_importer_source: bool
 ) -> _FileFindings:
-    """Read *relpath* once and take every measure it is in the domain of.
+    """Read *relpath* once, parse it at most once, and take every measure it is
+    in the domain of from that one tree.
 
-    One read, and -- through the memo in ``_parse`` -- one parse, however many
-    of the measures want the tree.
+    A file that is not in the test tree and names no alias leaf is not parsed at
+    all: a reference to an alias must spell the leaf.
     """
     source = (root / relpath).read_text(encoding='utf-8')
+    is_importer = is_importer_source and _mentions_an_alias_leaf(source)
+    if not (in_test_tree or is_importer):
+        return _FileFindings(test_measures=None, imported_aliases=frozenset())
+    tree = _parse(source, path=relpath)
     return _FileFindings(
-        test_measures=(
-            test_file_measures(source, path=relpath) if in_test_tree else None
-        ),
+        test_measures=test_file_measures_in_tree(tree) if in_test_tree else None,
         imported_aliases=(
-            _aliases_imported_by(source, relpath)
-            if is_importer_source
+            _external_aliases_referenced_by(tree, relpath)
+            if is_importer
             else frozenset()
         ),
     )
@@ -1258,30 +1348,27 @@ def sweep_repo(root: Path) -> RepoSweep:
     alias_importers = dict.fromkeys(ALIAS_MODULES, 0)
     tests: dict[str, object] = {}
     unreadable: list[str] = []
-    try:
-        for relpath in sorted(tracked | test_tree):
-            in_test_tree = relpath in test_tree
-            is_importer_source = relpath in tracked and is_external_importer_source(
-                relpath
+    for relpath in sorted(tracked | test_tree):
+        in_test_tree = relpath in test_tree
+        is_importer_source = relpath in tracked and is_external_importer_source(
+            relpath
+        )
+        if not (in_test_tree or is_importer_source):
+            continue
+        try:
+            found = _measure_file(
+                root,
+                relpath,
+                in_test_tree=in_test_tree,
+                is_importer_source=is_importer_source,
             )
-            if not (in_test_tree or is_importer_source):
-                continue
-            try:
-                found = _measure_file(
-                    root,
-                    relpath,
-                    in_test_tree=in_test_tree,
-                    is_importer_source=is_importer_source,
-                )
-            except (OSError, UnicodeDecodeError, MetricsError):
-                unreadable.append(relpath)
-                continue
-            if found.test_measures is not None:
-                tests[relpath] = found.test_measures
-            for name in found.imported_aliases:
-                alias_importers[name] += 1
-    finally:
-        _parsed.cache_clear()
+        except (OSError, UnicodeDecodeError, MetricsError):
+            unreadable.append(relpath)
+            continue
+        if found.test_measures is not None:
+            tests[relpath] = found.test_measures
+        for name in found.imported_aliases:
+            alias_importers[name] += 1
     return RepoSweep(
         tests=tests,
         alias_importers=MappingProxyType(alias_importers),
@@ -1449,7 +1536,10 @@ BASELINE_README = (
     'arriving never touches these bytes. The files entry of each of the fourteen '
     'old merge-lane modules also carries external_importers: how many tracked '
     'repo files outside orchestrator/src/orchestrator/merge_lane/ still import '
-    'that module by its old name (PRD task zeta2). It is ratcheted like every '
+    'that module by its old name, or name a path into it in a string such as a '
+    "patch target ('orchestrator.<old name>.<attr>'; a bare module-name string, "
+    'which is a logger name, does not count) (PRD task zeta2). It is ratcheted '
+    'like every '
     'other measure, per module and in the derived total, and PRD task eta drives '
     'it to 0.\n'
     # Composed, never paraphrased: this is the one string in the instrument that
