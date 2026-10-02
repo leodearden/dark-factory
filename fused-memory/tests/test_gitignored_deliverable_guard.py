@@ -174,6 +174,21 @@ class TestGitignoredDeliverableFindingMatrix:
         assert finding is not None
         assert finding.ignored_paths == ('tasks.db',)
 
+    def test_malformed_metadata_is_discarded_once_under_the_shared_policy(self, caplog):
+        probe = _FakeProbe(frozenset({'tasks.db'}))
+        with caplog.at_level('WARNING'):
+            finding = gitignored_deliverable_finding(
+                task_kind='normal', metadata='{"files": ["tasks.db"', probe=probe,
+            )
+        assert finding is None
+        assert probe.calls == []
+        schema_warnings = [
+            r.getMessage() for r in caplog.records
+            if 'task_metadata.schema_warning' in r.getMessage()
+        ]
+        assert len(schema_warnings) == 1
+        assert 'source=gitignored_deliverable_guard' in schema_warnings[0]
+
     def test_blank_entries_are_not_probed(self):
         probe = _FakeProbe(frozenset({'tasks.db'}))
         finding = gitignored_deliverable_finding(

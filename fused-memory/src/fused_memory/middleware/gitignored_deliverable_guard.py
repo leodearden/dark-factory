@@ -35,7 +35,6 @@ split inside the interceptor, so that one placement covers both.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
@@ -45,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from fused_memory.middleware.lock_charter_guard import extract_files
+from fused_memory.middleware.metadata_dict import raw_metadata_dict
 from fused_memory.reconciliation.recon_self_model import EXECUTION_CLASSES
 
 logger = logging.getLogger(__name__)
@@ -86,23 +86,6 @@ class GitignoredDeliverableFinding:
     ignored_paths: tuple[str, ...]
 
 
-def _parse_metadata(metadata: Any) -> dict:
-    """Return *metadata* as a dict (best-effort; unknown shapes -> {})."""
-    if metadata is None:
-        return {}
-    if isinstance(metadata, dict):
-        return metadata
-    if isinstance(metadata, str):
-        if not metadata:
-            return {}
-        try:
-            parsed = json.loads(metadata)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
-    return {}
-
-
 def gitignored_deliverable_finding(
     *,
     task_kind: str,
@@ -117,12 +100,12 @@ def gitignored_deliverable_finding(
     """
     if task_kind != 'normal':
         return None
-    parsed = _parse_metadata(metadata)
+    parsed = raw_metadata_dict(metadata, source='gitignored_deliverable_guard')
     if parsed.get('execution_class') in _EXEMPT_EXECUTION_CLASSES:
         return None
     if parsed.get('cross_repo'):
         return None
-    declared = [f.strip() for f in extract_files(metadata) if f.strip()]
+    declared = [f.strip() for f in extract_files(parsed) if f.strip()]
     if not declared:
         return None
     ignored = probe(declared)
