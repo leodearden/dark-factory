@@ -58,7 +58,6 @@ import pytest
 # file's group migrates or retires it.
 from _fill_drive_harness import (  # noqa: F401,E402
     _drive_fill,
-    _make_real_item,
     _teardown_fill_drive,
 )
 from _merge_lane_fakes import FakeVerifier, VerifyScript, fails, hangs_until, passes

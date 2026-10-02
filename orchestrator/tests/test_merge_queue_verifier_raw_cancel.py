@@ -35,6 +35,7 @@ from _orch_helpers import MERGE_RESULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
     _inject_two_host_allocator,
     _make_fake_remote,
+    _make_real_item,
     config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_config,  # noqa: F401 — pytest fixture re-exported from γ harness
     git_ops,  # noqa: F401 — pytest fixture re-exported from γ harness
@@ -42,7 +43,6 @@ from test_merge_queue_concurrent_verify import (
 )
 from test_merge_queue_dispatch_fill_redispatch import (
     _drive_fill,
-    _make_real_item,
     _running_lane,
     _teardown_fill_drive,
 )

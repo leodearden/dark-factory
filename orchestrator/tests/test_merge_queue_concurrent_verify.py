@@ -63,7 +63,12 @@ from _orch_helpers import (
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
-from orchestrator.merge_queue import MergeOutcome, MergeRequest, SpeculativeMergeWorker
+from orchestrator.merge_queue import (
+    MergeOutcome,
+    MergeRequest,
+    RealMergeItem,
+    SpeculativeMergeWorker,
+)
 from orchestrator.merge_types import QueuedBranch
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_runner import HostAllocator, HostLease
@@ -151,6 +156,28 @@ def _make_request(
         config=config,
         result=future,
         lane=lane,
+    )
+
+
+def _make_real_item(
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    task_id: str,
+    base_sha: str,
+) -> RealMergeItem:
+    """Build a dispatch-ready, non-speculative RealMergeItem over a fresh
+    MergeRequest whose merge has notionally succeeded -- the single
+    construction site for tests that hand a worker an item without running
+    a real merge.
+    """
+    req = _make_request(task_id, f'task/{task_id}', git_ops.project_root, config)
+    wt = git_ops.project_root / '.worktrees' / task_id
+    return RealMergeItem(
+        request=req,
+        merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt),
+        merge_wt=wt,
+        base_sha=base_sha,
+        speculative=False,
     )
 
 
