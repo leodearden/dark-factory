@@ -904,9 +904,18 @@ class TestSpawnBoundSizingModel:
     test_merge_queue_deep_integration_gate.py -- which cannot import a test
     module without coupling the two suites' collection order -- so it moved to
     _orch_helpers.py, this package's established home for the
-    timeout-constant family.  The last test below is what stops the old copy
-    growing back.
+    timeout-constant family.  The last test below is what stops a copy
+    growing back -- in the model's origin or in any other module under
+    tests/.
     """
+
+    #: The two ways the model can be DEFINED, as MULTILINE source patterns.
+    #: Each matches the private spelling task 4203 shipped and the public one
+    #: _orch_helpers.py defines, so either shape of a copy is caught.
+    _DEFINITION_PATTERNS = (
+        r'^_?MEASURED_SPAWN_LATENCY_SECS\s*(?::[^=\n]+)?=',
+        r'^def _?required_timeout_secs\b',
+    )
 
     def test_the_measured_spawn_latency_is_the_one_task_3451_measured(self) -> None:
         """The per-spawn price is a MEASUREMENT, and it is that one.
@@ -975,48 +984,65 @@ class TestSpawnBoundSizingModel:
                 'docstring in _orch_helpers.py.'
             )
 
-    def test_the_offline_lane_module_no_longer_defines_its_own_copy(self) -> None:
-        """The model's ORIGIN must import it, not redeclare it.
+    def test_the_model_has_exactly_one_home_and_it_is_orch_helpers(self) -> None:
+        """Every module under tests/ must import the model, not redeclare it.
 
-        Reads the source TEXT rather than the imported module, because that is
-        the only way to tell an import apart from a redefinition: a module
+        Reads the source TEXT rather than the imported modules, because that
+        is the only way to tell an import apart from a redefinition: a module
         doing both would still answer every attribute lookup correctly while
         shipping a second, independently-editable copy.
 
         BOTH SPELLINGS are rejected.  The private one is what task 4203
         shipped and what a revert would restore; the PUBLIC one is what the
-        module imports today and is therefore the likelier shape for a copy to
-        come back in -- an author retuning a value "just for this module"
-        would shadow the imported name, and every call site would keep
-        reading.
+        offline-lane modules import today and is therefore the likelier shape
+        for a copy to come back in -- an author retuning a value "just for
+        this module" would shadow the imported name, and every call site
+        would keep reading.
+
+        The ONE match each pattern must find in _orch_helpers.py is what keeps
+        this from passing vacuously after a rename of the canonical name.
         """
-        offline_lane = _TESTS_DIR / 'test_offline_lane_integration.py'
-        source = offline_lane.read_text(encoding='utf-8')
+        homes: dict[str, list[tuple[str, int, str]]] = {
+            pattern: [] for pattern in self._DEFINITION_PATTERNS
+        }
+        for py_file in sorted(_TESTS_DIR.rglob('*.py')):
+            module = py_file.relative_to(_TESTS_DIR).as_posix()
+            source = py_file.read_text(encoding='utf-8')
+            for pattern, found in homes.items():
+                found.extend(
+                    (module, source.count('\n', 0, match.start()) + 1, match.group(0))
+                    for match in re.finditer(pattern, source, re.MULTILINE)
+                )
 
-        redefinitions = [
-            f'  {offline_lane.name}:{source.count(chr(10), 0, match.start()) + 1}'
-            f'  {match.group(0)!r}'
-            for pattern in (
-                r'^_?MEASURED_SPAWN_LATENCY_SECS\s*(?::[^=\n]+)?=',
-                r'^def _?required_timeout_secs\b',
-            )
-            for match in re.finditer(pattern, source, re.MULTILINE)
+        forks = [
+            f'  {module}:{lineno}  {text!r}'
+            for found in homes.values()
+            for module, lineno, text in found
+            if module != '_orch_helpers.py'
         ]
-
-        assert not redefinitions, (
-            f'{len(redefinitions)} definition(s) of the spawn-bound sizing '
-            'model remain in test_offline_lane_integration.py, which must '
-            'IMPORT it from _orch_helpers.py instead.\n\n'
-            'Task 4203 wrote the model there, where only that module could '
+        assert not forks, (
+            f'{len(forks)} definition(s) of the spawn-bound sizing model '
+            'remain outside _orch_helpers.py. IMPORT '
+            'MEASURED_SPAWN_LATENCY_SECS / required_timeout_secs from '
+            '_orch_helpers instead.\n\n'
+            'Task 4203 wrote the model inside '
+            'test_offline_lane_integration.py, where only that module could '
             'reach it; task 5333 moved it to _orch_helpers.py so '
             'test_merge_queue_deep_integration_gate.py could size its own '
             'marker from the same arithmetic without importing a test module. '
-            'A second definition here would not be a redundancy but a FORK -- '
-            'two copies pricing spawns independently -- and 4203\'s own '
-            'docstring records that per-callsite copies of a spawn count had '
-            'ALREADY drifted apart once, inconsistently, before it '
-            'consolidated them.\n\n' + chr(10).join(redefinitions)
+            'A second definition is not a redundancy but a FORK -- two copies '
+            'pricing spawns independently -- and 4203\'s own docstring records '
+            'that per-callsite copies of a spawn count had ALREADY drifted '
+            'apart once, inconsistently, before it consolidated them.\n\n'
+            + '\n'.join(forks)
         )
+        for pattern, found in homes.items():
+            assert len(found) == 1, (
+                f'{pattern!r} matched {len(found)} time(s) in _orch_helpers.py, '
+                'not exactly once. The canonical definition was renamed, moved '
+                'or duplicated, so this scan would pass VACUOUSLY (or name the '
+                'wrong home). Update _DEFINITION_PATTERNS alongside the rename.'
+            )
 
 
 class TestDeepGateSceneBudget:

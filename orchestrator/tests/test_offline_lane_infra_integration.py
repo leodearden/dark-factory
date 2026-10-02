@@ -79,7 +79,11 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _orch_helpers import pydantic_spec
+from _orch_helpers import (
+    MEASURED_SPAWN_LATENCY_SECS,
+    pydantic_spec,
+    required_timeout_secs,
+)
 from escalation.queue import EscalationQueue
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -98,7 +102,7 @@ logger = logging.getLogger(__name__)
 # convention: _orch_helpers.py's CANCEL_SCOPE_BARRIER_TIMEOUT /
 # CANCEL_SCOPE_PURE_UNIT_TIMEOUT and test_lane_lock_leak_guard.py's
 # _FOREIGN_HOLDER_* block. The full floor (task 3451's measured spawn
-# latency) / ceiling (the pyproject 60s global) derivation lives in
+# latency) / ceiling (the effective per-test pytest-timeout) derivation lives in
 # `_run_lane`'s docstring below; the executable pins are
 # `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` and
 # `test_every_composing_caller_carries_a_timeout_override`.
@@ -113,12 +117,6 @@ _NOTE_OFFLINE_LANE_BOUND_SECS = 0.5
 
 # Bound for `_assert_infra_never_a_gate`'s `_note_merge_all` promptness check.
 _NOTE_MERGE_ALL_BOUND_SECS = 15.0
-
-# Task 3451's measured worst-case happy-path subprocess spawn latency (n=3:
-# 2.13/3.10/4.71, load-per-core 6.6) -- the FLOOR authority
-# _LANE_PASS_BOUND_SECS is sized against. See `_run_lane`'s docstring for the
-# full derivation.
-_MEASURED_SPAWN_LATENCY_SECS = 4.71
 
 # task 3836's own fraction, reused rather than re-derived: the CEILING a
 # marker-less test's worst-case bounded-wait budget must stay under, as a
@@ -140,15 +138,15 @@ _MARKERLESS_CEILING_FRACTION = 0.6
 _SPAWNS_PER_LANE_PASS_WORST_CASE = 5
 
 # Task 4203 — this module's own copy of the sibling numeric module's
-# constant of the same name (see that module for the full rationale). The
-# multiplicand `_required_timeout_secs` below prices at
-# `_MEASURED_SPAWN_LATENCY_SECS` per spawn. MEASURED by
+# constant of the same name (see that module for the full rationale): a
+# multiplicand `_orch_helpers.py::required_timeout_secs` prices at
+# `MEASURED_SPAWN_LATENCY_SECS` per spawn. MEASURED by
 # `test_out_of_bound_spawn_counts_are_measured_not_asserted`, not
 # hand-counted: the `repo` fixture's `_setup_repo` spawns `init`, `config`
 # x2, `add`, `commit`.
 _SPAWNS_PER_REPO_FIXTURE = 5
 
-# Task 4203 — the other multiplicand of `_required_timeout_secs`. MEASURED,
+# Task 4203 — the other multiplicand of `required_timeout_secs`. MEASURED,
 # not hand-counted (see `test_out_of_bound_spawn_counts_are_measured_not_asserted`):
 # `_drive_advance` costs `get_main_sha` (1) plus `_advance_main`'s `add` /
 # `commit` / `rev-parse` (3) = 4. This is NOT the naive "5" a reading of
@@ -171,34 +169,6 @@ _SPAWNS_PER_DRIVE_ADVANCE = 4
 # An earlier hand approximation priced this whole function as "one
 # _drive_advance-equivalent round" (4), undercounting the true value by 3.
 _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE = 7
-
-
-def _required_timeout_secs(bounded_secs: float, out_of_bound_spawns: int) -> float:
-    """Task 4203 — this module's own copy of the sibling numeric module's
-    `_required_timeout_secs` of the same name: THE canonical sizing model
-    for `@pytest.mark.timeout` OVERRIDES on tests that compose past a
-    single `_run_lane` pass. Both
-    `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling` and
-    `test_every_composing_caller_carries_a_timeout_override` call it rather
-    than re-deriving or re-stating it in prose. See the sibling module's
-    version of this function for the full derivation (why the additive
-    term exists, and why the marker-less population is deliberately NOT
-    gated by it) — not restated here, to avoid recreating the near-verbatim
-    docstring copies task 4030 removed.
-
-    THE MODEL: a composing test's effective per-test pytest-timeout must
-    cover its bounded-wait sum (*bounded_secs*) PLUS its counted
-    out-of-bound real-git subprocess spawns (*out_of_bound_spawns*), each
-    priced at the worst-case measured latency `_MEASURED_SPAWN_LATENCY_SECS`.
-    Every term is an already-measured, already-pinned quantity — task
-    3451's 4.71s, and this module's own `_SPAWNS_PER_REPO_FIXTURE` /
-    `_SPAWNS_PER_DRIVE_ADVANCE` counts — nothing guessed.
-
-    CONSUMERS: `test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling`
-    and `test_every_composing_caller_carries_a_timeout_override`, both in
-    this module.
-    """
-    return bounded_secs + out_of_bound_spawns * _MEASURED_SPAWN_LATENCY_SECS
 
 
 # Default git_overrides for _build_infra_worker — declared with an explicit
@@ -458,18 +428,22 @@ async def _run_lane(
     ``timeout`` defaults to 30.0, not a tight bound: the clock starts at
     ``asyncio.create_task`` above, so it also covers the real-git test-body
     work the caller does between entering the held pass and releasing it
-    (each :func:`_drive_advance` is a git add + commit + rev-parse, i.e. 3+
-    subprocess spawns) — not just the lane pass(es) themselves. Task 3451
+    (each :func:`_drive_advance` costs `_SPAWNS_PER_DRIVE_ADVANCE` subprocess
+    spawns — MEASURED, not hand-counted, by
+    `test_out_of_bound_spawn_counts_are_measured_not_asserted`) — not just
+    the lane pass(es) themselves. Task 3451
     measured worst-case single subprocess spawn latency at 4.71s on this
     host under load; a caller can easily need several spawns inside this
     window. Same load-sensitive full-suite-flake class as
     1335/1836/2819/3451/3491 (task 3832). FLOOR (task 3451): worst-case
     happy-path subprocess spawn latency measured at 4.71s (n=3:
     2.13/3.10/4.71, load-per-core 6.6) — this, not task 3491, is the genuine
-    precedent for ``_LANE_PASS_BOUND_SECS``. CEILING: the 60s global
-    pytest-timeout (``orchestrator/pyproject.toml``, ``timeout_method =
-    "thread"``, ``--max-worker-restart=0``). Task 3491 is precedent AGAINST
-    a bound near that ceiling, not for one: it REJECTED a 30s ceiling for
+    precedent for ``_LANE_PASS_BOUND_SECS``. CEILING: the effective per-test
+    pytest-timeout (`_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT` under a
+    bare run, `_orch_helpers.py::VERIFY_CLI_PER_TEST_TIMEOUT` under verify;
+    ``timeout_method = "thread"``, ``--max-worker-restart=0``). Task 3491 is
+    precedent AGAINST a bound near that ceiling, not for one: it REJECTED a
+    30s ceiling for
     this exact collision and landed ``asyncio.wait_for(..., timeout=5)``
     instead (``test_usage_gate.py``:328,790) — its scope was exclusively
     ``test_usage_gate.py``; it never touched any offline-lane module. Both
@@ -479,9 +453,9 @@ async def _run_lane(
     staging pass — it only lengthens how long a genuinely broken SINGLE pass
     takes to fail. That safety property does not compose for free: callers
     chaining N passes (:func:`_drive_infra_reds`) sum this bound N times, so
-    a worst case can now approach or exceed this module's pyproject-
-    configured 60s per-test timeout before this function's own ``wait_for``
-    ever fires — trading a clean, well-located ``TimeoutError`` here for
+    a worst case can now approach or exceed the effective per-test timeout
+    before this function's own ``wait_for`` ever fires — trading a clean,
+    well-located ``TimeoutError`` here for
     pytest-timeout's blunter thread-mode worker kill instead (task 3832
     review; see ``orchestrator/pyproject.toml``'s ``timeout``/
     ``timeout_method`` comment). Multi-pass callers whose worst-case sum is
@@ -651,9 +625,9 @@ async def _drive_infra_reds(
     sequence IB4's dedup scenario needs.
 
     Each pass sums its own 30s :func:`_run_lane` bound (see that function's
-    docstring); a caller whose ``n`` pushes the total at or above the 60s
-    pyproject per-test timeout MUST carry its own ``@pytest.mark.timeout``
-    override (task 3832 review) — see IB4 below. This rule is enforced, not
+    docstring); a caller composing past a single pass MUST carry its own
+    ``@pytest.mark.timeout`` override, sized by `required_timeout_secs`
+    (task 3832 review) — see IB4 below. This rule is enforced, not
     merely described, by
     ``test_every_composing_caller_carries_a_timeout_override``.
     """
@@ -718,7 +692,7 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
     """Every test that composes bounded waits PAST a single `_run_lane` pass
     must carry its own `@pytest.mark.timeout` override wide enough to cover
     its own worst-case bounded-wait sum — otherwise it can silently collide
-    with this module's pyproject-configured 60s per-test default.
+    with the effective per-test timeout.
 
     This module's own copy of ``test_offline_lane_integration.py``'s
     invariant of the same name (these two modules are deliberate lock-step
@@ -750,8 +724,8 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
 
     `out_of_bound_spawns` (task 4203) maps the SAME function objects to
     their counted real-git subprocess spawns that happen OUTSIDE any bounded
-    wait — the other multiplicand `_required_timeout_secs` prices at
-    `_MEASURED_SPAWN_LATENCY_SECS` per spawn. This module's own copy of the
+    wait — the other multiplicand `_orch_helpers.py::required_timeout_secs`
+    prices at `MEASURED_SPAWN_LATENCY_SECS` per spawn. This module's own copy of the
     sibling's table of the same name; see that module for the full
     rationale. Every function classified in `worst_case_secs` must also
     appear here (enforced by a key-set equality assertion below).
@@ -812,7 +786,7 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
         f'same composing tests — '
         f'{sorted(fn.__name__ for fn in set(worst_case_secs) ^ set(out_of_bound_spawns))} '
         f'appear in only one of the two tables, so a row added to one table '
-        f'silently omits half of the _required_timeout_secs inputs for that '
+        f'silently omits half of the required_timeout_secs inputs for that '
         f'test.'
     )
     single_pass_exempt = {
@@ -841,22 +815,24 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
 
     for fn, worst_case in worst_case_secs.items():
         out_of_bound = out_of_bound_spawns[fn]
-        required = _required_timeout_secs(worst_case, out_of_bound)
-        spawn_allowance = out_of_bound * _MEASURED_SPAWN_LATENCY_SECS
+        required = required_timeout_secs(worst_case, out_of_bound)
+        spawn_allowance = out_of_bound * MEASURED_SPAWN_LATENCY_SECS
         markers = [m for m in getattr(fn, 'pytestmark', []) if m.name == 'timeout']
         assert markers, (
             f'{fn.__name__} composes bounded waits to a worst case of '
             f'{worst_case}s plus {out_of_bound} out-of-bound real-git spawns '
-            f'({out_of_bound} x {_MEASURED_SPAWN_LATENCY_SECS}s = '
+            f'({out_of_bound} x {MEASURED_SPAWN_LATENCY_SECS}s = '
             f'{spawn_allowance}s) — required = {required}s — but carries no '
-            f'@pytest.mark.timeout override. Left uncovered, this can '
-            f'silently collide with the 60s orchestrator/pyproject.toml '
-            f'per-test default — under timeout_method="thread" with '
+            f'@pytest.mark.timeout override. Without one it inherits the '
+            f'effective per-test timeout (the CLI --timeout under verify, else '
+            f'the pyproject default), a budget this module neither sets nor '
+            f'checks against its worst case. Were that budget ever below '
+            f'{required}s, then under timeout_method="thread" with '
             f'--max-worker-restart=0, pytest-timeout os._exit()s the xdist '
             f"worker instead of failing cleanly, discarding _run_lane's own "
             f'well-located TimeoutError. Add @pytest.mark.timeout(N) with '
             f'N >= {required} ({worst_case}s bounded + {out_of_bound} spawns '
-            f'x {_MEASURED_SPAWN_LATENCY_SECS}s).'
+            f'x {MEASURED_SPAWN_LATENCY_SECS}s).'
         )
         value = markers[0].args[0] if markers[0].args else markers[0].kwargs.get('timeout')
         assert value is not None, (
@@ -869,10 +845,9 @@ def test_every_composing_caller_carries_a_timeout_override() -> None:
             f'{fn.__name__} carries @pytest.mark.timeout({value}) but the '
             f'required timeout is {required}s — {worst_case}s bounded-wait '
             f'sum + {out_of_bound} out-of-bound real-git spawns x '
-            f'{_MEASURED_SPAWN_LATENCY_SECS}s = {spawn_allowance}s — the '
-            f'override does not actually clear what it exists to cover. '
-            f'Left uncovered, this can silently collide with the 60s '
-            f'orchestrator/pyproject.toml per-test default — under '
+            f'{MEASURED_SPAWN_LATENCY_SECS}s = {spawn_allowance}s — the '
+            f'override does not actually clear what it exists to cover: it '
+            f'fires before that worst case completes, and under '
             f'timeout_method="thread" with --max-worker-restart=0, '
             f'pytest-timeout os._exit()s the xdist worker instead of '
             f"failing cleanly, discarding _run_lane's own well-located "
@@ -892,7 +867,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     name (these two modules are deliberate lock-step siblings).
 
     FLOOR — `_LANE_PASS_BOUND_SECS` must be at least
-    `_SPAWNS_PER_LANE_PASS_WORST_CASE`x `_MEASURED_SPAWN_LATENCY_SECS` (task
+    `_SPAWNS_PER_LANE_PASS_WORST_CASE`x `MEASURED_SPAWN_LATENCY_SECS` (task
     3451's measured worst-case happy-path subprocess spawn latency: n=3,
     2.13/3.10/4.71s, load-per-core 6.6). The multiplier is DERIVED, not
     guessed, and the measurement lives IN THIS MODULE:
@@ -924,7 +899,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     Why 60%, made concrete rather than left abstract: pytest-timeout 2.4.0
     installs its timer in `pytest_runtest_protocol` whenever `func_only` is
     False (the default; `timeout_func_only` is not set anywhere in this
-    repo), so the 60s budget covers FIXTURE SETUP AND TEARDOWN, not just the
+    repo), so the per-test budget covers FIXTURE SETUP AND TEARDOWN, not just the
     call phase. Every test in both offline-lane modules transitively pulls
     the `repo` fixture, whose `_setup_repo` costs `_SPAWNS_PER_REPO_FIXTURE`
     git spawns (`init`, `config` x2, `add`, `commit`), and each
@@ -932,9 +907,9 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     `add`, `commit`, `rev-parse` — NOT `_note_merge_all`'s `git diff`, which
     this module's `harness` fixture stubs to an `AsyncMock` and so never
     reaches a subprocess; see `_SPAWNS_PER_DRIVE_ADVANCE`'s own comment and
-    `test_out_of_bound_spawn_counts_are_measured_not_asserted`) — the 24s of
-    headroom the 0.6 fraction leaves at a 60s timeout is what pays for that
-    out-of-bound work.
+    `test_out_of_bound_spawn_counts_are_measured_not_asserted`) — the 40% of
+    the effective per-test timeout the 0.6 fraction holds back is what pays
+    for that out-of-bound work.
 
     When no timeout is in effect at all, this either fails loudly (this
     module's own `orchestrator/pyproject.toml` is the governing inifile —
@@ -944,11 +919,11 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     """
     from test_lane_lock_leak_guard import _effective_per_test_timeout  # noqa: PLC0415
 
-    floor = _SPAWNS_PER_LANE_PASS_WORST_CASE * _MEASURED_SPAWN_LATENCY_SECS
+    floor = _SPAWNS_PER_LANE_PASS_WORST_CASE * MEASURED_SPAWN_LATENCY_SECS
     assert floor <= _LANE_PASS_BOUND_SECS, (
         f'_LANE_PASS_BOUND_SECS ({_LANE_PASS_BOUND_SECS}) must clear '
         f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}x the measured worst-case happy-path '
-        f'subprocess spawn latency ({_MEASURED_SPAWN_LATENCY_SECS}s, task 3451: n=3 '
+        f'subprocess spawn latency ({MEASURED_SPAWN_LATENCY_SECS}s, task 3451: n=3 '
         f'2.13/3.10/4.71, load-per-core 6.6) = {floor}s. The '
         f'{_SPAWNS_PER_LANE_PASS_WORST_CASE}-spawn multiplier is the measured worst-case '
         f'count of subprocess spawns inside a single _run_lane window (see '
@@ -993,13 +968,13 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     )
 
     # Task 4203 — reconcile the retained 0.6 fraction (marker-less budget)
-    # against the additive `_required_timeout_secs` model this task adopts
+    # against the additive `required_timeout_secs` model this task adopts
     # for @pytest.mark.timeout OVERRIDES. This module's own copy of the
     # sibling numeric module's reconciliation assertion — see that module's
     # version of this test for the full rationale (not restated here, to
     # avoid recreating the near-verbatim docstring copies task 4030
     # removed).
-    fixture_only_required = _required_timeout_secs(0.0, _SPAWNS_PER_REPO_FIXTURE)
+    fixture_only_required = required_timeout_secs(0.0, _SPAWNS_PER_REPO_FIXTURE)
     marker_less_headroom = (1 - _MARKERLESS_CEILING_FRACTION) * global_timeout
     assert marker_less_headroom >= fixture_only_required, (
         f'the {(1 - _MARKERLESS_CEILING_FRACTION) * 100:.0f}% of the effective per-test '
@@ -1007,12 +982,13 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
         f'back as marker-less headroom = {marker_less_headroom}s, but the repo fixture '
         f'alone already requires {fixture_only_required}s '
         f'(_SPAWNS_PER_REPO_FIXTURE={_SPAWNS_PER_REPO_FIXTURE} spawns x '
-        f'{_MEASURED_SPAWN_LATENCY_SECS}s) under the additive model this task adopts for '
+        f'{MEASURED_SPAWN_LATENCY_SECS}s) under the additive model this task adopts for '
         f'@pytest.mark.timeout overrides. The 0.6 fraction is deliberately kept (not '
         f'replaced by the additive model) for the marker-less population, since a '
-        f"marker-less test's timeout is the fixed 60s global and cannot be widened — but "
+        f"marker-less test's timeout is the ambient effective per-test timeout "
+        f'({global_timeout}s for this run), which this suite cannot widen — but '
         f'that choice is only sound while this fixture-only floor holds; a failure here '
-        f'means _MEASURED_SPAWN_LATENCY_SECS has been re-measured upward enough that even '
+        f'means MEASURED_SPAWN_LATENCY_SECS has been re-measured upward enough that even '
         f'the cheapest marker-less test (fixture only, zero _drive_advance calls) no '
         f'longer fits, and the 0.6 fraction itself needs re-deriving.'
     )
@@ -1026,7 +1002,7 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
 # = 21 spawns: 2 x _SPAWNS_PER_REPO_FIXTURE (the repo fixture AND the fresh _setup_repo
 # measured against below -- the only doubled fixture term in either module), plus
 # _SPAWNS_PER_DRIVE_ADVANCE (4) and _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE (7); 21 x
-# _MEASURED_SPAWN_LATENCY_SECS = 98.91s, required = 114.41s. 120 is the next multiple of
+# MEASURED_SPAWN_LATENCY_SECS = 98.91s, required = 114.41s. 120 is the next multiple of
 # the 60s pyproject grid at or above that -- the same rule that derived the sibling's
 # b7 360. Unlike a hand-maintained comment this value is ENFORCED: this test now has its
 # own row in test_every_composing_caller_carries_a_timeout_override.
@@ -1035,8 +1011,8 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     harness: Harness, git_ops: GitOps, repo: Path, tmp_path: Path,
 ) -> None:
     """`_SPAWNS_PER_DRIVE_ADVANCE` / `_SPAWNS_PER_REPO_FIXTURE` are the
-    multiplicands `_required_timeout_secs` (task 4203) prices at
-    `_MEASURED_SPAWN_LATENCY_SECS` per spawn — this test MEASURES them by
+    multiplicands `required_timeout_secs` (task 4203) prices at
+    `MEASURED_SPAWN_LATENCY_SECS` per spawn — this test MEASURES them by
     counting real git subprocess spawns, rather than trusting a
     hand-maintained comment. This module's own copy of the sibling numeric
     module's test of the same name — see that module for the full
@@ -1096,11 +1072,12 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     (`_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS`) and 21
     out-of-bound spawns, ~2.3x the real-git work of an ib1/ib3/ib5 test (9
     each: the `repo` fixture plus one `_drive_advance`), for a
-    `_required_timeout_secs` of 114.41s — nearly twice the 60s pyproject
-    default this test would otherwise have run under. See the marker comment
-    above for the derivation; the value is enforced by
-    `test_every_composing_caller_carries_a_timeout_override`'s row for this
-    test, not by this prose.
+    `required_timeout_secs` of 114.41s. The 120s marker sits below the
+    ambient per-test budget, so it tightens rather than widens it; the site
+    is listed in `test_timeout_marker_inversion_guard.py::_GRANDFATHERED`.
+    See the marker comment above for the derivation; the value is enforced
+    by `test_every_composing_caller_carries_a_timeout_override`'s row for
+    this test, not by this prose.
     """
     import orchestrator.git_ops as git_ops_mod
 
@@ -1121,7 +1098,7 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
         f'_drive_advance spawned {len(calls)} real git subprocess(es) '
         f'({calls}), not the pinned _SPAWNS_PER_DRIVE_ADVANCE = '
         f'{_SPAWNS_PER_DRIVE_ADVANCE}. This count is a multiplicand of '
-        f'_required_timeout_secs (the @pytest.mark.timeout override sizing '
+        f'required_timeout_secs (the @pytest.mark.timeout override sizing '
         f'model) — a drift here silently mis-prices every composing test '
         f'that calls _drive_advance, directly or via _drive_infra_reds.'
     )
@@ -1137,7 +1114,7 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
         f'_setup_repo spawned {len(calls)} real git subprocess(es) '
         f'({calls}), not the pinned _SPAWNS_PER_REPO_FIXTURE = '
         f'{_SPAWNS_PER_REPO_FIXTURE}. This count is a multiplicand of '
-        f'_required_timeout_secs — every test in this module transitively '
+        f'required_timeout_secs — every test in this module transitively '
         f'pulls the repo fixture, so a drift here mis-prices every '
         f'composing test, not just one.'
     )
@@ -1371,8 +1348,7 @@ async def _assert_infra_never_a_gate(
 # get_main_sha + two _advance_main rounds (_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE=7, task 4203
 # reviewer amendment -- MEASURED, supersedes an earlier "two _drive_advance/_advance_main
 # rounds" approximation) = 16 spawns x 4.71s = 75.36s, required = 120.86s, comfortably under
-# this marker. Clear the 60s pyproject default with margin so a genuinely wedged pass fails
-# via _run_lane's own TimeoutError, not pytest-timeout's blunter worker kill.
+# this marker. Grandfathered in test_timeout_marker_inversion_guard.py::_GRANDFATHERED.
 @pytest.mark.asyncio
 async def test_ib2_infra_run_in_flight_never_gates_merge(harness, git_ops, repo, tmp_path):
     """IB2 (C7/§6, load-bearing) — a merge-landed notification while the
@@ -1464,8 +1440,8 @@ async def test_ib3_confirmed_infra_red_files_normal_fix_task_and_info_escalation
 
 @pytest.mark.timeout(150)  # task 3832 review: _drive_infra_reds(n=2) chains 2
 # 30s-bounded _run_one_lane_pass calls (60s alone) plus real-git _drive_advance
-# overhead -- clear the 60s pyproject default with margin so a genuinely wedged
-# pass fails via _run_lane's own TimeoutError, not pytest-timeout's worker kill.
+# overhead (5 + 2 x 4 = 13 spawns x 4.71s = 61.23s, required = 121.23s).
+# Grandfathered in test_timeout_marker_inversion_guard.py::_GRANDFATHERED.
 @pytest.mark.asyncio
 async def test_ib4_same_infra_set_recurrence_updates_not_duplicates(
     harness,
