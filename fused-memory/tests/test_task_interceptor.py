@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import os
@@ -33,6 +34,10 @@ from fused_memory.middleware.task_curator import (
 )
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import resolve_project_id
+from fused_memory.reconciliation.consolidation_gate import (
+    GATE_METADATA_KEY,
+    build_consolidation_gate_task,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 
@@ -9039,6 +9044,181 @@ class TestProseAdvisoryDeliverableAttribution:
         )
         assert 'crates/widget.rs' in result.get('matched_paths', [])
         assert result.get('suggested_project') == 'reify'
+
+
+# Task 2948, the reify-7319 shape: a consolidation gate filed in its own project whose rationale quotes a member memory's foreign path.
+class TestProseAdvisoryConsolidationGateAttribution:
+    """A PURE consolidation gate's declared topic attributes it to the filing
+    project; every other gate shape keeps the unchanged rules."""
+
+    _FOREIGN = 'Member 338b4868 confirms the mechanism at crates/reify-eval/src/engine_edit.rs'
+    _GATE_TOPIC = 'review-issues-detail-omits-suggestions'
+
+    def _spec(self):
+        return build_consolidation_gate_task(
+            topic=self._GATE_TOPIC, rationale=self._FOREIGN,
+        )
+
+    def _gate_metadata(self, **extra):
+        metadata = copy.deepcopy(self._spec().metadata)
+        metadata.update(extra)
+        return metadata
+
+    async def _submit_gate(self, interceptor, tmp_path, metadata=None):
+        """Submit the gate under dark_factory; return (result, calls)."""
+        interceptor._prefix_registry = _two_project_registry(tmp_path)
+
+        # Anti-vacuity: the quoted member prose really does lex as a foreign hit.
+        probe = interceptor._path_guard_check(
+            None, {'description': self._FOREIGN}, 'dark_factory',
+        )
+        assert probe.is_rejection and probe.matched_paths == ('crates/',), (
+            f'Expected the prose scan to still hit crates/, got: {probe!r}'
+        )
+
+        calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        spec = self._spec()
+        try:
+            result = await interceptor.submit_task(
+                project_root=str(tmp_path / 'dark-factory'),
+                title=spec.title,
+                description=spec.description,
+                priority=spec.priority,
+                metadata=(
+                    copy.deepcopy(spec.metadata) if metadata is None else metadata
+                ),
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor)
+        return result, calls
+
+    async def _assert_advisory_fired(self, ticket_store, result, calls):
+        meta = await _persisted_candidate_metadata(ticket_store, result)
+        marker = meta.get('possible_scope_mismatch')
+        assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
+        assert marker['matched_paths'] == ['crates/']
+        assert marker['suggested_project'] == 'reify'
+        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
+        assert calls[0].get('advisory') is True
+
+    # -- SUPPRESSION: the builder's own shape ---------------------------------
+
+    @pytest.mark.asyncio
+    async def test_pure_consolidation_gate_suppresses_stamp_and_escalation(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        result, calls = await self._submit_gate(interceptor_with_store, tmp_path)
+
+        meta = await _persisted_candidate_metadata(ticket_store, result)
+        assert 'possible_scope_mismatch' not in meta, (
+            f'A pure consolidation gate must suppress the stamp: {meta!r}'
+        )
+        assert calls == [], f'Expected no scope_violation escalation, got: {calls!r}'
+
+    @pytest.mark.asyncio
+    async def test_gate_suppression_is_logged_with_structured_facts(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path, caplog,
+    ):
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.middleware.task_interceptor',
+        ):
+            await self._submit_gate(interceptor_with_store, tmp_path)
+
+        records = TestProseAdvisoryDeliverableAttribution._suppression_records(caplog)
+        assert len(records) == 1, (
+            f'Expected exactly one suppression record, got: '
+            f'{[r.getMessage() for r in records]!r}'
+        )
+        record = records[0]
+        assert record.levelno == logging.INFO
+        message = record.getMessage()
+        for fact in ('crates/', 'dark_factory', 'reify', self._GATE_TOPIC):
+            assert fact in message, (
+                f'Suppression record must carry {fact!r}; got: {message!r}'
+            )
+
+    # -- RETAINED PROTECTION: any other gate shape keeps the advisory ---------
+
+    @pytest.mark.asyncio
+    async def test_generic_human_gate_without_block_still_advises(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        metadata = self._gate_metadata()
+        metadata.pop(GATE_METADATA_KEY)
+
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path, metadata=metadata,
+        )
+
+        await self._assert_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.asyncio
+    async def test_malformed_gate_topic_still_advises(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        metadata = self._gate_metadata()
+        metadata[GATE_METADATA_KEY]['topic'] = 'Not A Slug'
+
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path, metadata=metadata,
+        )
+
+        await self._assert_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.asyncio
+    async def test_block_on_non_gate_task_still_advises(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        metadata = self._gate_metadata()
+        metadata.pop('operational_mode')
+        metadata.pop('execution_class')
+
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path, metadata=metadata,
+        )
+
+        await self._assert_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.asyncio
+    async def test_gate_with_foreign_modules_entry_still_advises(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """A declared deliverable hands attribution to the task-3106 rule,
+        whose foreign veto keeps the advisory; the hard reject never reads
+        ``modules``."""
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path,
+            metadata=self._gate_metadata(modules=['crates/widget.rs']),
+        )
+
+        await self._assert_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.asyncio
+    async def test_gate_with_foreign_files_still_hard_rejects(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path,
+            metadata=self._gate_metadata(
+                files=['crates/widget.rs', 'fused-memory/src/x.py'],
+            ),
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected the FILES-certain hard reject, got: {result}'
+        )
+        assert 'crates/widget.rs' in result.get('matched_paths', [])
+        assert result.get('suggested_project') == 'reify'
+        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
+        assert calls[0].get('advisory') is False
 
 
 # ---------------------------------------------------------------------------
