@@ -42,7 +42,6 @@ _patch_cold_shadow_verify(monkeypatch, return_value) (helper)
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import stat
 from collections.abc import Awaitable, Callable
@@ -77,6 +76,7 @@ from test_merge_queue_concurrent_verify import (  # noqa: F401
     _inject_two_host_allocator,
     _make_branch_with_file,
     _make_request,
+    _stop_worker,
     _timeout_mark_offenders,
     _worst_per_method_wait_budget,
 )
@@ -1400,50 +1400,13 @@ def _make_late_arrival_lane(
     return lane, q
 
 
-async def _stop_worker(
-    worker: MergeLane,
-    worker_task: asyncio.Task[None],
-    *,
-    join_timeout: float = 5.0,
-) -> None:
-    """Shut *worker* down and join its run task — the ONE teardown shape every
-    late-arrival test uses, so no site can drift or be forgotten.
-
-    ALWAYS call this from a ``finally:`` covering the body of the
-    ``with patch(...)`` block (task 3980 amendment, esc-3980-4). ``wait_responsive``
-    gives up by raising ``_pytest.outcomes.Failed``, and an assertion mid-body
-    raises too; on the old straight-line shape either one skipped ``stop()``
-    entirely and leaked a live merge worker plus its run task into
-    pytest-asyncio teardown. That leak is why one red test used to cascade into
-    unrelated failures elsewhere in the session.
-
-    Safe on the give-up path even when a gate was never released: ``stop()``
-    cancels every in-flight verify task rather than awaiting it
-    (merge_queue.py:12730+), so it cannot itself block on an unreleased
-    ``asyncio.Event``.  Whatever the lane still has to unwind on the way out
-    keeps seeing the injected verifier, which is the lane's own collaborator
-    for its whole lifetime rather than a binding swapped in for a block.
-
-    The join stays best-effort (``suppress(Exception)``): it asserts nothing,
-    and a slow join must not convert a real failure above into a confusing
-    second one. It is also why this wait is exempt from the shared
-    ``wall-clock-deadline`` rule
-    (fused-memory/scripts/check_bare_magicmock_config.py): its target is a bare
-    Name, not a ``.result`` future or a ``gate*.wait()`` barrier, so the
-    exemption is structural rather than a listed name.
-    """
-    await worker.stop()
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(worker_task, timeout=join_timeout)
-
-
 # ===========================================================================
 # Step-1 RED: late arrival attaches to in-flight predecessor's merge commit
 # ===========================================================================
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 210s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 215s here
 class TestLateArrivalAttaches:
     """Step-1 RED — late arrival B attaches to in-flight predecessor A's merge commit.
 
@@ -1658,7 +1621,7 @@ class TestLateArrivalAttaches:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 240s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 245s here
 class TestLateArrivalCleanCAS:
     """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
 
@@ -1837,7 +1800,7 @@ class TestLateArrivalCleanCAS:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 240s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 245s here
 class TestLateArrivalFailCascade:
     """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
 
@@ -2075,7 +2038,7 @@ class TestLateArrivalFailCascade:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 210s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 215s here
 class TestLateArrivalGuards:
     """Step-7 guards — fallback + permit accounting + depth-K + skip_verify + K=1 sanity.
 
@@ -2599,7 +2562,7 @@ class TestLateArrivalGuards:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 240s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 245s here
 class TestLateArrivalSubmissionOrderCAS:
     """Step-8 guard — main advances in strict submission order on the late-arrival path.
 
@@ -2970,7 +2933,7 @@ class TestTimeoutMarkCoverage:
 
         Recomputes from source; no figure written anywhere in this file is
         load-bearing for the assertion.  (For orientation only, current at the
-        time of writing: 210/240/240/210/240 for the five late-arrival classes
+        time of writing: 215/245/245/215/245 for the five late-arrival classes
         against their 300s marks.  The per-class ``@pytest.mark.timeout``
         comments carry the same numbers -- if they disagree with this guard,
         the guard is right.)

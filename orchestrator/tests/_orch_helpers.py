@@ -894,9 +894,10 @@ RESPONSIVE_WAIT_STRETCH = 2.0
 # reviewer can check the arithmetic instead of trusting a number.  It bounds
 # the scaled per-call cap above whatever nominal a call site passes.  Sizing
 # check: the worst per-method budget the auditor computes for
-# test_merge_speculation.py is 240s (TestLateArrivalCleanCAS /
+# test_merge_speculation.py is 245s (TestLateArrivalCleanCAS /
 # TestLateArrivalFailCascade / TestLateArrivalSubmissionOrderCAS: 2 gate
-# barriers x 30 + 2 result waits x 90), under HEAVY_BARRIER_TEST_TIMEOUT
+# barriers x 30 + 2 result waits x 90 + the 5s `_stop_worker` teardown join),
+# under HEAVY_BARRIER_TEST_TIMEOUT
 # (300s, itself `5 * MERGE_RESULT_TIMEOUT + 75` in
 # test_merge_queue_concurrent_verify.py).  Never-narrow.
 RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  # 90s
@@ -918,7 +919,7 @@ RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  
 #      that has not been observed to fail is a plain widening, which this repo
 #      forbids as a flake fix (plans/flake-ledger-prd.md:216-223).
 #   2. It would be actively harmful.  Gates at a 45s nominal are billed 90s
-#      each, taking the worst per-method budget from 240s to 360s and blowing
+#      each, taking the worst per-method budget from 245s to 365s and blowing
 #      the paired @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (300s) —
 #      under `timeout_method = "thread"` plus `--max-worker-restart=0` that is
 #      an os._exit() of the xdist worker, i.e. a worker death instead of a

@@ -192,6 +192,50 @@ async def _await_outcome(
         )
 
 
+_STOP_WORKER_JOIN_TIMEOUT = 5.0
+
+
+async def _stop_worker(
+    worker: SpeculativeMergeWorker,
+    worker_task: asyncio.Task[None],
+    *,
+    join_timeout: float = _STOP_WORKER_JOIN_TIMEOUT,
+) -> None:
+    """Shut *worker* down and join its run task -- the ONE teardown shape
+    shared by this module and test_merge_speculation.py, so no site can
+    drift or be forgotten.
+
+    ALWAYS call this from a ``finally:`` whose ``try:`` encloses every wait in
+    the test body (task 3980 amendment, esc-3980-4). ``wait_responsive``
+    gives up by raising ``_pytest.outcomes.Failed``, and an assertion
+    mid-body raises too; on the old straight-line shape either one skipped
+    ``stop()`` entirely and leaked a live merge worker plus its run task into
+    pytest-asyncio teardown. That leak is why one red test used to cascade
+    into unrelated failures elsewhere in the session.
+    ``_unguarded_worker_teardown_methods`` enforces the ``finally:``.
+
+    Safe on the give-up path even when a gate was never released: ``stop()``
+    cancels every in-flight verify task rather than awaiting it
+    (``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.stop``),
+    so it cannot itself block on an unreleased ``asyncio.Event``.  Whatever
+    the lane still has to unwind on the way out keeps seeing the injected
+    verifier, which is the lane's own collaborator for its whole lifetime
+    rather than a binding swapped in for a block.
+
+    The join stays best-effort (``suppress(Exception)``): it asserts nothing,
+    and a slow join must not convert a real failure above into a confusing
+    second one. It is also why this wait is exempt from the shared
+    ``wall-clock-deadline`` rule
+    (fused-memory/scripts/check_bare_magicmock_config.py): its target is a
+    bare Name, not a ``.result`` future or a ``gate*.wait()`` barrier, so the
+    exemption is structural rather than a listed name. It is still a real
+    wait, so ``_call_wait_budget`` bills its *join_timeout*.
+    """
+    await worker.stop()
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(worker_task, timeout=join_timeout)
+
+
 # task 3477 amend: both cascade classes below perform the SAME five sequential
 # real-time waits (2 gates + 2 _await_outcome + 1 worker_task teardown) at
 # MERGE_RESULT_TIMEOUT (45s) each -- a 225s worst case -- plus git-fixture setup
@@ -241,7 +285,7 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
 #
 # Fixing the ratio at 2 is what lets a reviewer check the paired-mark
 # arithmetic instead of trusting a number: the worst per-method budget this
-# scan computes for test_merge_speculation.py is 240s, clearing
+# scan computes for test_merge_speculation.py is 245s, clearing
 # HEAVY_BARRIER_TEST_TIMEOUT (300s).
 _RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 
@@ -307,14 +351,16 @@ def _wait_responsive_budget(call: ast.Call) -> float:
 def _call_wait_budget(call: ast.Call) -> float:
     """Return the wait-budget contribution of a single ``ast.Call`` node.
 
-    Recognises exactly three call shapes -- ``asyncio.wait_for(..., timeout=N)``
+    Recognises exactly four call shapes -- ``asyncio.wait_for(..., timeout=N)``
     (the attribute's value must itself be the ``asyncio`` name, so
     ``gate.wait_for(...)`` or ``self.wait_for(...)`` do NOT match),
     ``_await_outcome(...)`` (whose hidden default is ``MERGE_RESULT_TIMEOUT``
-    when no ``timeout=`` kwarg is given), and ``wait_responsive(...)``
+    when no ``timeout=`` kwarg is given), ``wait_responsive(...)``
     (task 3980), billed by ``_wait_responsive_budget`` as an unconditional
-    upper bound on its wall clock. For the first two, an unresolvable
-    nominal contributes 0.0 -- unknown means ignore, never guess. Every
+    upper bound on its wall clock, and the ``_stop_worker(...)`` teardown,
+    whose join is billed its ``join_timeout=`` kwarg or hidden default
+    ``_STOP_WORKER_JOIN_TIMEOUT``. For the first and last, an unresolvable
+    value contributes 0.0 -- unknown means ignore, never guess. Every
     other call shape -- ``asyncio.sleep``, ``.wait()``, ``.result()``,
     ``.join()``, a non-``asyncio`` ``.wait_for(...)``, attribute access,
     arithmetic, unknown names -- contributes 0.0 and is skipped silently
@@ -341,6 +387,11 @@ def _call_wait_budget(call: ast.Call) -> float:
         return _resolve_wait_value(timeout)
     if isinstance(func, ast.Name) and func.id == 'wait_responsive':
         return _wait_responsive_budget(call)
+    if isinstance(func, ast.Name) and func.id == '_stop_worker':
+        join_timeout = _keyword(call, 'join_timeout')
+        if join_timeout is None:
+            return _STOP_WORKER_JOIN_TIMEOUT
+        return _resolve_wait_value(join_timeout)
     return 0.0
 
 
@@ -553,8 +604,8 @@ def _suppressed_result_wait_methods(source: str) -> dict[str, set[str]]:
 
 def _unguarded_worker_teardown_methods(source: str) -> list[str]:
     """Statically scan *source* for the esc-3980-4 leak invariant recorded
-    at test_merge_speculation.py:1972-2003 (`_stop_worker`'s docstring):
-    `wait_responsive` gives up by raising `_pytest.outcomes.Failed` (a
+    in `_stop_worker`'s docstring: `wait_responsive` gives up by raising
+    `_pytest.outcomes.Failed` (a
     ``BaseException`` subclass), so on a straight-line body a give-up --
     like a mid-body ``assert`` -- skips the worker-stop call entirely and
     leaks a live ``SpeculativeMergeWorker`` plus its run task into
@@ -564,8 +615,7 @@ def _unguarded_worker_teardown_methods(source: str) -> list[str]:
     For each top-level ``Test*`` class, reports every ``test_*`` method
     that calls ``wait_responsive(...)`` AND calls a worker-stop -- either
     ``worker.stop()`` or the shared ``_stop_worker(worker, ...)`` teardown
-    helper (test_merge_speculation.py:1972-2006) -- from somewhere that is
-    NOT inside a ``finally:`` block whose guarded ``try:`` body encloses
+    helper -- from somewhere that is NOT inside a ``finally:`` block whose guarded ``try:`` body encloses
     EVERY ``wait_responsive`` call in the method, as a sorted list of
     ``'ClassName::method_name'`` strings. Requiring the ``try:`` to enclose
     every ``wait_responsive`` call (not just crediting any ``finally`` in
@@ -4940,16 +4990,12 @@ class TestCascadeErrorContainment:
                 label='cascade-err-c: MergeOutcome (loop-survival signal)',
             )
         finally:
-            # esc-3980-4 (test_merge_speculation.py:1972-2003, _stop_worker):
-            # wait_responsive gives up by raising _pytest.outcomes.Failed,
-            # and the two hard asserts above raise too -- so on the old
-            # straight-line shape any of those could skip worker.stop()
-            # and leak a live worker plus its run task into pytest-asyncio
-            # teardown. stop() is safe here even with an unreleased gate --
-            # it cancels in-flight verify tasks rather than awaiting them.
-            await worker.stop()
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(worker_task, timeout=5.0)
+            # esc-3980-4 (see _stop_worker): wait_responsive gives up by
+            # raising _pytest.outcomes.Failed, and the two hard asserts above
+            # raise too -- so on the old straight-line shape any of those
+            # could skip worker.stop() and leak a live worker plus its run
+            # task into pytest-asyncio teardown.
+            await _stop_worker(worker, worker_task)
 
         # ── (1) LOOP SURVIVES ────────────────────────────────────────────────
         # A starved-or-hung wait now fails loudly by label at the
@@ -6993,9 +7039,8 @@ class NotATestClass:
 
 class TestWorkerTeardownGuardScanner:
     """Unit tests for `_unguarded_worker_teardown_methods` -- the executable
-    form of the esc-3980-4 leak invariant recorded at
-    test_merge_speculation.py:1972-2003 (`_stop_worker`'s docstring):
-    `wait_responsive` gives up by raising `_pytest.outcomes.Failed`, so a
+    form of the esc-3980-4 leak invariant recorded in `_stop_worker`'s
+    docstring: `wait_responsive` gives up by raising `_pytest.outcomes.Failed`, so a
     give-up on a straight-line body (like a mid-body `assert`) skips the
     worker-stop call entirely and leaks a live SpeculativeMergeWorker plus
     its run task into pytest-asyncio teardown -- how one red test used to
@@ -7103,9 +7148,8 @@ class TestMixedGuardedAndUnguarded:
 
     def test_straight_line_stop_worker_helper_is_reported(self) -> None:
         """A straight-line `await _stop_worker(worker, worker_task)` --
-        the shared teardown helper from test_merge_speculation.py:1972-2006
-        -- IS reported when not inside a finally, exactly like a
-        straight-line `worker.stop()`. Without this, a future migration
+        the shared teardown helper -- IS reported when not inside a
+        finally, exactly like a straight-line `worker.stop()`. Without this, a future migration
         that adopts the module's OTHER blessed teardown shape would make
         the guard silently vacuous instead of rewarding the correct usage.
         """
@@ -7276,8 +7320,8 @@ class TestLoudWaitMigrationRatchet:
         assert not offenders, (
             'The following methods call wait_responsive but do not call '
             'worker.stop() from inside a finally: block (esc-3980-4 leak '
-            'invariant -- see test_merge_speculation.py:1972-2003, '
-            '_stop_worker):\n'
+            'invariant -- see '
+            'test_merge_queue_concurrent_verify.py::_stop_worker):\n'
             + '\n'.join(f'  - {offender}' for offender in offenders)
         )
 
