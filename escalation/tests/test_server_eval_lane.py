@@ -18,6 +18,8 @@ from _escalation_http import escalation_http_call
 from _escalation_seed import seed_escalation
 from _filing_tools import call_blocker, call_info
 
+from escalation.action_effects import WORKFLOW_NONE, effect_for
+from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 
@@ -64,6 +66,7 @@ def _assert_contained(queue: EscalationQueue, result: dict, reason: str) -> None
     assert record.status == 'resolved'
     assert record.resolved_by == CONTAINMENT_RESOLVER
     assert record.resolution_class == 'benign'
+    assert record.resolution_action == 'close_only'
     assert reason in (record.resolution or '')
 
 
@@ -105,6 +108,27 @@ class TestFilingIsContained:
         )
 
         _assert_contained(queue, result, f'eval-worktree:{EVAL_WORKTREE}')
+
+
+class TestContainedDispositionIsCloseOnly:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'task_id, worktree', [(ADV_FIXTURE_ID, None), ('5383', EVAL_WORKTREE)]
+    )
+    async def test_resolve_callback_sees_a_no_effect_action(
+        self, queue, task_id, worktree
+    ):
+        seen: list[Escalation] = []
+        queue.set_resolve_callback(seen.append)
+        server, _, _ = _server(queue)
+
+        await call_blocker(server, task_id=task_id, worktree=worktree, **_FILING)
+
+        assert len(seen) == 1
+        assert seen[0].resolution_action == 'close_only'
+        effect = effect_for(seen[0].resolution_action, seen[0].level, seen[0].category)
+        assert effect is not None
+        assert effect.workflow_disposition == WORKFLOW_NONE
 
 
 class TestContainmentCannotBeArguedAround:
