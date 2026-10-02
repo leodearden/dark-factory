@@ -9051,10 +9051,45 @@ class TaskWorkflow:
         that returns ``None`` (no equivalent) does the step escalate. This tier
         keeps the same best-effort/fail-safe and zero-persisted-state posture:
         it is re-derived from live git every pass, and a false negative reverts
-        to exactly the pre-2762 escalation baseline. The WIP heuristic stays
-        FIRST because in Scenario A the step's diff is folded into a larger WIP
-        diff with a different patch-id and no standalone equivalent, so the
-        filename-subset signal is the only correct one there.
+        to exactly the pre-2762 escalation baseline.
+
+        **Tier ordering (task 3651)**: this remap tier now runs FIRST, ahead
+        of the filename-subset WIP heuristic. The original 2762 rationale for
+        keeping the heuristic in front — that in Scenario A the step's diff is
+        folded into a larger WIP diff with a different patch-id and no
+        standalone equivalent — is TRUE, but the conclusion does not follow:
+        precisely BECAUSE this tier cannot match a genuine squash,
+        :meth:`GitOps.find_equivalent_commit` returns ``None`` there and the
+        heuristic still fires unchanged on the next line. Ordering is therefore
+        free in Scenario A, and strictly better whenever several steps are
+        orphaned in one pass — see the fallback-tier paragraph below.
+
+        Free for CORRECTNESS, not for COST: Scenario A is precisely where tier
+        1 always misses and now always pays, and each
+        :meth:`GitOps.find_equivalent_commit` call rebuilds the whole
+        ``base..HEAD`` patch-id map from scratch (~4 subprocesses, one of them
+        a full-range ``git log -p``). With N orphans that is N such rebuilds.
+        The bill is bounded and only ever charged on the already-degraded
+        orphaned-step path — a clean pass has no ``done_items`` failing the
+        ``is_ancestor`` check at all and calls it zero times — and the WIP
+        run's own filename union is now materialised lazily so tier 1 hits stop
+        paying for it. n is the number of ORPHANED done steps in one pass,
+        realistically well under 20, and the same full-range ``git log -p``
+        already ran per step on the no-WIP-run path before the reorder, so the
+        worst case is not new.
+
+        Caching the map was considered and DECLINED here (task 3651 design
+        decision 3), not merely deferred: a per-pass memo means either a
+        mutable-state parameter or an instance-level cache that must be
+        invalidated on every HEAD move, which buys a micro-optimisation on a
+        best-effort bookkeeping path at the cost of the property that makes
+        ``find_equivalent_commit`` trustworthy — no persisted state, re-derived
+        from live git on every call, identical across restarts. A follow-up
+        ticket carries the idea for anyone who later measures the cost as
+        actually binding; whoever picks it up must answer the staleness
+        question first, and must do it inside
+        ``git_ops.py::find_equivalent_commit``, which task 3651 holds no lock
+        for.
 
         **Cross-restart durability (task 2764)**: the per-``(step_id,
         stale_commit)`` dedup set is in-memory and process-local, so an
@@ -9072,13 +9107,27 @@ class TaskWorkflow:
         the ``if remapped: continue`` early-out), so hydration suppresses
         precisely the re-files it should and nothing more.
 
-        **Heuristic, not a content diff**: the match above is a
-        *filename-set* subset check only — it never compares file contents
-        or blob shas. A WIP commit that happens to touch a superset of the
-        orphaned step's filenames but with unrelated content would still
-        count as a match and get silently re-pointed. This is accepted
-        given the best-effort posture (the fallback on any doubt is an
-        escalation, never silence) — :meth:`GitOps.branch_content_in_main`
+        **Heuristic, not a content diff — and the FALLBACK tier (task
+        3651)**: the WIP match is a *filename-set* subset check only — it
+        never compares file contents or blob shas. A WIP commit that happens
+        to touch a superset of the orphaned step's filenames but with
+        unrelated content would still count as a match and get silently
+        re-pointed. Worse, the test is outright DEGENERATE when several done
+        steps touch the same file(s): every one of them satisfies
+        ``set(orphaned_files) <= wip_files``, so running it first stamped the
+        single ``wip_tip_sha`` onto ALL of them and destroyed per-step
+        provenance (observed on reify task 5665 — four commits all touching
+        one file, steps 3/5/7 all recording the same sha — and on tasks 4050
+        and 4154). That is precisely why
+        :meth:`GitOps.find_equivalent_commit` now runs first: it resolves each
+        orphan to its OWN replayed sha when one exists, and this
+        filename-subset test is reached only when no precise equivalent does.
+        Demoting it rather than deleting it is deliberate — it is the only
+        tier that can resolve a genuine squash, where the step's content
+        lives inside a larger WIP diff with no standalone equivalent. Its
+        residual looseness stays acceptable given the best-effort posture
+        (the fallback on any doubt is an escalation, never silence) —
+        :meth:`GitOps.branch_content_in_main`
         shows the byte-level ``git diff --quiet`` pattern this could
         upgrade to if the filename heuristic ever proves too loose in
         practice.
@@ -9124,9 +9173,25 @@ class TaskWorkflow:
                     break
                 wip_run.append((sha, subject))
             wip_tip_sha = wip_run[0][0] if wip_run else None
-            wip_files: set[str] = set()
-            for wip_sha, _subject in wip_run:
-                wip_files.update(await self.git_ops.get_commit_changed_files(wip_sha))
+            # task 3651 — the WIP run's filename union is TIER 2's only
+            # consumer, and tier 1 now resolves the common case, so it is
+            # materialised on the first fallthrough and cached for the rest of
+            # the pass. A pass whose orphans all remap precisely — and every
+            # clean pass, which has no orphans at all — no longer spends one
+            # `git show --name-only` per WIP commit on a set it never reads.
+            wip_files: set[str] | None = None
+
+            async def wip_run_files() -> set[str]:
+                """Filename union of the tip WIP run, materialised once."""
+                nonlocal wip_files
+                if wip_files is None:
+                    collected: set[str] = set()
+                    for wip_sha, _subject in wip_run:
+                        collected.update(
+                            await self.git_ops.get_commit_changed_files(wip_sha)
+                        )
+                    wip_files = collected
+                return wip_files
 
             done_items = [
                 item
@@ -9138,31 +9203,46 @@ class TaskWorkflow:
                 commit = item['commit']
                 if await self.git_ops.is_ancestor(commit, head):
                     continue  # still reachable — nothing to reconcile
+                # TIER 1 (precise, task 2762 — promoted ahead of the WIP
+                # heuristic by task 3651): remap the orphaned commit to its
+                # rebase-replayed sha on the live branch.
+                # find_equivalent_commit locates a patch-id-equivalent (or, on
+                # a diff-altering rebase that kept the message, a uniquely
+                # subject-matching) commit in base..HEAD and returns its sha.
+                # It is fully fail-safe (None on any git error, an
+                # unresolvable/GC'd commit, ambiguity, or no equivalent), so a
+                # miss simply falls through to the tiers below — zero persisted
+                # state, re-derived from live git each pass. Running it first
+                # is what stops N orphans that share a filename from all
+                # collapsing onto the one WIP tip (see the docstring's
+                # fallback-tier paragraph).
+                remapped = await self.git_ops.find_equivalent_commit(
+                    self.worktree, base, commit,
+                )
+                if remapped:
+                    self.artifacts.update_step_status(item['id'], 'done', remapped)
+                    continue
+                # TIER 2 (coarse fallback): the filename-subset WIP heuristic.
+                # Reached only when tier 1 found no precise equivalent — which
+                # is exactly the genuine-squash case (Scenario A), where the
+                # step's diff is folded into a larger WIP diff carrying a
+                # different patch-id and a WIP subject, so no standalone
+                # equivalent exists and this is the only signal available.
+                # orphaned_files is computed lazily HERE rather than before the
+                # dispatch: the subset test is its only consumer (the
+                # escalation below never reads it), so a tier-1 hit no longer
+                # pays for a `git show --name-only` it would discard.
                 orphaned_files = await self.git_ops.get_commit_changed_files(commit)
-                if orphaned_files and wip_tip_sha and set(orphaned_files) <= wip_files:
+                if (
+                    orphaned_files
+                    and wip_tip_sha
+                    # Short-circuited on purpose: wip_run_files() is the lazy
+                    # materialiser above, so the WIP run's `git show` calls are
+                    # paid only once a step actually reaches this test.
+                    and set(orphaned_files) <= await wip_run_files()
+                ):
                     self.artifacts.update_step_status(item['id'], 'done', wip_tip_sha)
                 else:
-                    # No WIP-filename match. Before escalating, try to remap the
-                    # orphaned commit to its rebase-replayed sha on the live
-                    # branch. This is the clean-replay case (Scenario B): a
-                    # requeue/inter-iteration rebase that preserves individual
-                    # commits rather than squashing them into a WIP
-                    # safety-commit leaves NO WIP run at HEAD, so wip_tip_sha is
-                    # None and the filename heuristic above never fires.
-                    # find_equivalent_commit locates a patch-id-equivalent (or,
-                    # on a diff-altering rebase that kept the message, a
-                    # uniquely subject-matching) commit in base..HEAD and
-                    # returns its sha. It is fully fail-safe (None on any git
-                    # error, an unresolvable/GC'd commit, ambiguity, or no
-                    # equivalent), so a false negative simply falls through to
-                    # the unchanged escalation path below — zero persisted
-                    # state, re-derived from live git each pass.
-                    remapped = await self.git_ops.find_equivalent_commit(
-                        self.worktree, base, commit,
-                    )
-                    if remapped:
-                        self.artifacts.update_step_status(item['id'], 'done', remapped)
-                        continue
                     # Mismatch, unresolvable original (empty file set — e.g.
                     # GC'd), no WIP run at HEAD, and no live-branch equivalent:
                     # cannot safely auto-reconcile. Flag for review and leave
@@ -9371,19 +9451,52 @@ class TaskWorkflow:
         Unions every ``.task/iterations.jsonl`` entry's ``steps_completed``
         into the set of step IDs genuinely completed on this branch, then
         flips any plan.json step currently "pending" whose ID is in that set
-        to "done" — recording the post-rebase HEAD (not the log entry's own
-        ``commit``) as the step's commit. The log-reported commit is a
-        *pre-rebase* SHA: this method runs immediately after
-        ``rebase_preserving_task_commits`` has already rewritten the branch
-        onto the new base, so that SHA is virtually guaranteed to be
-        unreachable from the new HEAD. Recording it anyway would manufacture
-        exactly the "done step with an orphaned commit" condition
-        :meth:`_reconcile_done_step_commits` exists to repair — and that
-        repair only succeeds when the step's code happens to have been
-        folded into a WIP safety-commit sitting at HEAD; otherwise it falls
-        through to a non-blocking info escalation on every such rebase.
-        Recording ``head`` directly satisfies the reachable-commit invariant
-        up front instead of depending on that downstream heuristic.
+        to "done".
+
+        **Which commit gets recorded — a three-rung ladder (task 3651)**. The
+        log entry's own ``commit`` is a *pre-rebase* SHA: this method runs
+        immediately after ``rebase_preserving_task_commits`` has already
+        rewritten the branch onto the new base, so that SHA is virtually
+        guaranteed to be unreachable from the new HEAD. Recording it blindly
+        would manufacture exactly the "done step with an orphaned commit"
+        condition :meth:`_reconcile_done_step_commits` exists to repair. The
+        original fix was to record the post-rebase ``head`` for EVERY step,
+        which satisfies the reachable-commit invariant up front but is wrong
+        for a different reason: every step re-derived in one pass then shares
+        a single sha, destroying per-step provenance — the same collapse task
+        3651 fixes at ``workflow.py::_reconcile_done_step_commits``, arrived
+        at by a different route. So per step:
+
+        1. the logged commit, if ``is_ancestor(logged, head)`` — the rebase
+           happened to preserve it, so it is both correct AND reachable;
+        2. otherwise :meth:`GitOps.find_equivalent_commit`'s precise remap of
+           the logged commit to its replayed sha. That call can only ever
+           return a sha drawn from ``base..HEAD``, hence always reachable from
+           HEAD;
+        3. otherwise ``head``, exactly the pre-3651 behaviour.
+
+        The reachable-commit invariant is therefore PRESERVED, not weakened —
+        rung 1 checks it explicitly, rung 2 cannot violate it by construction,
+        and rung 3 is HEAD itself. ``find_equivalent_commit`` is fail-safe by
+        contract, so any miss (no logged commit, a GC'd target, an ambiguous
+        patch-id, a git error) drops silently to rung 3.
+
+        **What a log entry's ``commit`` actually means, and why rungs 1-2 are
+        gated on a SINGLE-step round.** That field is the POST-ITERATION HEAD
+        (``workflow.py::_iteration_commit_provenance``), not a per-step sha,
+        and ``steps_completed`` is the LIST of every step the round finished
+        (the implementer ledger writer's ``newly_completed``). A round that
+        completes three steps therefore records ONE sha for all three, and it
+        is the round's last commit — correct for at most one member, wrong for
+        the others, with no way to tell which, since ``newly_completed`` is
+        sorted by step id rather than by landing order. Feeding all three into
+        the ladder would reproduce the very collapse this change exists to end,
+        in a strictly more misleading form: the earlier steps would stop
+        carrying an obvious coarse marker and start carrying a specific commit
+        that is really a later step's. So the map is populated only from rounds
+        naming exactly one step; every step of a multi-step round falls to rung
+        3's honest ``head``. Narrowing this is a briefing/ledger-granularity
+        change (one ledger entry per committed step), not a resolver change.
 
         GUARD: only reconciles when :meth:`_has_prior_implementation`
         (called with the current branch HEAD, i.e. SHA-primary mode) reports
@@ -9440,6 +9553,14 @@ class TaskWorkflow:
                 return []
 
             completed_ids: set[str] = set()
+            # task 3651 — per-step provenance for the ladder below, so every
+            # step gets its OWN sha instead of one blanket HEAD. Populated
+            # ONLY from rounds that completed exactly one step (see the
+            # single-step comment in the loop): that is the only shape in
+            # which an entry's post-iteration HEAD IS a step's own commit.
+            # Later entries overwrite earlier ones — the most recent landing
+            # of a step is the one whose sha the plan should carry.
+            step_commit: dict[str, str] = {}
             for entry in status.entries:
                 # An entry that explicitly recorded no durable commit
                 # (committed:False, task 2759) did not land its step on the
@@ -9448,7 +9569,24 @@ class TaskWorkflow:
                 # other real work. Legacy entries lack the key and fall through.
                 if entry.get('committed') is False:
                     continue
-                completed_ids.update(entry.get('steps_completed') or [])
+                entry_steps = entry.get('steps_completed') or []
+                completed_ids.update(entry_steps)
+                entry_commit = entry.get('commit')
+                # SINGLE-STEP ROUNDS ONLY. An entry's `commit` is the
+                # POST-ITERATION HEAD stamped by
+                # ``workflow.py::_iteration_commit_provenance``, and
+                # `steps_completed` is the LIST of every step that round
+                # finished (the ledger writer's `newly_completed`). So the sha
+                # is that step's own provenance exactly when the round
+                # completed ONE step; for a multi-step round it is the last
+                # commit of the round — right for at most one member and
+                # silently wrong for the rest, and `newly_completed` is sorted
+                # by step id, not by landing order, so we cannot even tell
+                # which one. Those steps deliberately fall through to rung 3's
+                # honest `head`: a coarse marker every reader can recognise
+                # beats a specific-looking sha that is really another step's.
+                if entry_commit and len(entry_steps) == 1:
+                    step_commit[entry_steps[0]] = entry_commit
 
             plan = self.artifacts.read_plan()
             rederived: list[str] = []
@@ -9458,9 +9596,26 @@ class TaskWorkflow:
                         continue
                     if item.get('status') == 'pending' and item.get('id') in completed_ids:
                         step_id = item['id']
-                        # Always record post-rebase HEAD, never the log's
-                        # pre-rebase commit — see the docstring above.
-                        self.artifacts.update_step_status(step_id, 'done', commit=head)
+                        # task 3651 — resolve THIS step's own commit rather
+                        # than stamping the one post-rebase HEAD on all of
+                        # them (which collapsed N steps onto one sha). Every
+                        # rung yields a sha reachable from HEAD; see the
+                        # ladder in the docstring above. `step_commit` carries
+                        # ONLY single-step rounds, so a `logged` miss here is
+                        # the honest outcome for a multi-step round, not a
+                        # lookup failure.
+                        logged = step_commit.get(step_id)
+                        resolved = None
+                        if logged:
+                            if await self.git_ops.is_ancestor(logged, head):
+                                resolved = logged
+                            else:
+                                resolved = await self.git_ops.find_equivalent_commit(
+                                    self.worktree, base, logged,
+                                )
+                        self.artifacts.update_step_status(
+                            step_id, 'done', commit=resolved or head,
+                        )
                         rederived.append(step_id)
 
             if rederived:

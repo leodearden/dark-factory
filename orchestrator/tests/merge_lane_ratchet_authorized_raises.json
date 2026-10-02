@@ -777,6 +777,30 @@
       ]
     },
     {
+      "task_id": "3651",
+      "reason": "Regression tests for the task 3651 provenance-collapse fix: three new rederive tests drive workflow._inter_iteration_rebase and two new reconcile tests drive workflow._reconcile_done_step_commits -- the private methods under test, called exactly as every existing test in those two files already does. No public entry point reaches them short of a full workflow run. The avoidable reads (workflow._get_head_commit) were replaced with git rev-parse.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_harness_plan_step_rederive.py",
+          "baseline": 12,
+          "current": 15
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_reconcile_done_step_commits.py",
+          "baseline": 25,
+          "current": 27
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6593,
+          "current": 6598
+        }
+      ]
+    },
+    {
       "task_id": "5036",
       "reason": "Move, not growth (PRD plans/merge-lane-quality-prd.md task zeta2): git mv moved 14 lane modules into orchestrator/src/orchestrator/merge_lane/ (merge_queue.py -> worker.py, merge_gates.py -> gates.py, and so on), so every per-path entry recorded here under a merge_lane/ path is the same code it was under its old path, a rename artifact the gate cannot see as a rename (new-path files and functions read as absent from the previous baseline, so the ceilings fire on them). merge_types.py and the zeta1 merge_lane/types.py were folded into one merge_lane/types.py (1669 + 40 lines -> 1699, cognitive 63 + 0 -> 63). The only genuinely new lines are the 14 alias modules at the old paths (12 lines and 2 prose lines each: 168 lines, 28 prose), which keep the old import paths working until task 5037; each has cognitive 0. Cluster totals: lines 55961 -> 56118, prose_lines 31450 -> 31470, cognitive 4726 -> 4726 (unchanged).",
       "measures": [
