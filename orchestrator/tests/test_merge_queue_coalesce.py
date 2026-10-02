@@ -25,8 +25,9 @@ from typing import TYPE_CHECKING, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
 from _merge_lane_fakes import FakeClock, FakeVerifier
-from _orch_helpers import make_placeholder_future
+from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.landing_evidence import LandingEvidenceVerdict
 from orchestrator.merge_types import QueuedBranch
@@ -1102,8 +1103,6 @@ class TestEndToEndWiring:
         coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
-        import contextlib
-
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import _run
         from orchestrator.merge_lane.types import TrainCallbacks
@@ -1165,68 +1164,67 @@ class TestEndToEndWiring:
         # resolves PRODUCTION_VERIFIER. Until that gap closes, the train's gate
         # has to be installed on the module global — but it is the SAME gate
         # object the port-injected scenes use, not a second implementation.
-        with patch(
-            'orchestrator.merge_queue.run_scoped_verification',
-            _gated_verify(gate_release, gate_entered),
-        ):
-            worker_task = asyncio.create_task(worker.run())
-
-            # (a) Wait for the train's verify to start.
-            # When gate_entered fires: _maybe_coalesce_waiting_singles has already
-            # run (resolving the 3 singles as 'superseded') AND _do_train_merge has
-            # run the rebase + merge steps before calling run_scoped_verification.
-            await asyncio.wait_for(gate_entered.wait(), timeout=60)
-
-            for req, label in ((req1, 'e2e1'), (req2, 'e2e2'), (req3, 'e2e3')):
-                assert req.result.done(), (
-                    f'{label}: future must be resolved as superseded before verify starts'
-                )
-                outcome = req.result.result()
-                assert outcome.status == 'superseded', (
-                    f'{label}: expected superseded, got {outcome.status!r}'
+        async with running_merge_worker(worker):
+            with patch(
+                'orchestrator.merge_queue.run_scoped_verification',
+                _gated_verify(gate_release, gate_entered),
+            ):
+                # (a) Wait for the train's verify to start.
+                # When gate_entered fires: _maybe_coalesce_waiting_singles has already
+                # run (resolving the 3 singles as 'superseded') AND _do_train_merge has
+                # run the rebase + merge steps before calling run_scoped_verification.
+                await wait_responsive(
+                    gate_entered.wait(),
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label='coalesced train verify entry (3 singles rebased + merged)',
                 )
 
-            # Release the gate — train verify completes, advance_main runs.
-            gate_release.set()
+                for req, label in ((req1, 'e2e1'), (req2, 'e2e2'), (req3, 'e2e3')):
+                    assert req.result.done(), (
+                        f'{label}: future must be resolved as superseded before verify starts'
+                    )
+                    outcome = req.result.result()
+                    assert outcome.status == 'superseded', (
+                        f'{label}: expected superseded, got {outcome.status!r}'
+                    )
 
-            # (d) Wait for all 3 mark_member_done calls (train has fully landed).
-            await asyncio.wait_for(all_done.wait(), timeout=60)
+                # Release the gate — train verify completes, advance_main runs.
+                gate_release.set()
 
-        # (c) All 3 member files appear on main.
-        _, main_files, _ = await _run(
-            ['git', 'ls-tree', '-r', '--name-only', 'main'],
-            cwd=git_ops.project_root,
-        )
-        assert 'file_e2e1.py' in main_files, 'file_e2e1.py must be on main after train lands'
-        assert 'file_e2e2.py' in main_files, 'file_e2e2.py must be on main after train lands'
-        assert 'file_e2e3.py' in main_files, 'file_e2e3.py must be on main after train lands'
+                # (d) Wait for all 3 mark_member_done calls (train has fully landed).
+                await asyncio.wait_for(all_done.wait(), timeout=60)
 
-        # (d) mark_member_done called once per member with the same merge SHA.
-        assert len(mark_done_calls) == 3, (
-            f'expected 3 mark_member_done calls, got {len(mark_done_calls)}'
-        )
-        task_ids_notified = {tid for tid, _ in mark_done_calls}
-        assert task_ids_notified == {'e2e1', 'e2e2', 'e2e3'}, (
-            f'unexpected member task IDs: {task_ids_notified}'
-        )
-        merge_shas = {sha for _, sha in mark_done_calls}
-        assert len(merge_shas) == 1, (
-            f'all mark_member_done calls must share one SHA; got: {merge_shas}'
-        )
+            # (c) All 3 member files appear on main.
+            _, main_files, _ = await _run(
+                ['git', 'ls-tree', '-r', '--name-only', 'main'],
+                cwd=git_ops.project_root,
+            )
+            assert 'file_e2e1.py' in main_files, 'file_e2e1.py must be on main after train lands'
+            assert 'file_e2e2.py' in main_files, 'file_e2e2.py must be on main after train lands'
+            assert 'file_e2e3.py' in main_files, 'file_e2e3.py must be on main after train lands'
 
-        # (e) train_coalesced event emitted with correct member_task_ids.
-        events = _events_of_type(db_path, 'train_coalesced')
-        assert len(events) == 1, (
-            f'expected 1 train_coalesced event, got {len(events)}'
-        )
-        event_data = events[0]['data']
-        assert set(event_data.get('member_task_ids', [])) == {'e2e1', 'e2e2', 'e2e3'}, (
-            f'train_coalesced event member_task_ids mismatch: {event_data}'
-        )
+            # (d) mark_member_done called once per member with the same merge SHA.
+            assert len(mark_done_calls) == 3, (
+                f'expected 3 mark_member_done calls, got {len(mark_done_calls)}'
+            )
+            task_ids_notified = {tid for tid, _ in mark_done_calls}
+            assert task_ids_notified == {'e2e1', 'e2e2', 'e2e3'}, (
+                f'unexpected member task IDs: {task_ids_notified}'
+            )
+            merge_shas = {sha for _, sha in mark_done_calls}
+            assert len(merge_shas) == 1, (
+                f'all mark_member_done calls must share one SHA; got: {merge_shas}'
+            )
 
-        await worker.stop()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+            # (e) train_coalesced event emitted with correct member_task_ids.
+            events = _events_of_type(db_path, 'train_coalesced')
+            assert len(events) == 1, (
+                f'expected 1 train_coalesced event, got {len(events)}'
+            )
+            event_data = events[0]['data']
+            assert set(event_data.get('member_task_ids', [])) == {'e2e1', 'e2e2', 'e2e3'}, (
+                f'train_coalesced event member_task_ids mismatch: {event_data}'
+            )
 
 
 # ─── Task δ/1720 — merge-ready confidence gate ──────────────────────────────
@@ -2690,7 +2688,7 @@ class TestCoalesceRedriveEndToEnd:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(360)  # 300s wait bill (90 + 90 + 120) + 60s real-git setup headroom
 class TestCoalesceAfterHealthyMerge:
     """A train forms while the pipeline is HEALTHY — the regression that made
     merge trains stop forming in dark-factory between 2026-08-19 and
@@ -2719,8 +2717,6 @@ class TestCoalesceAfterHealthyMerge:
         coalesce_config: OrchestratorConfig,
         tmp_path: Path,
     ):
-        import contextlib
-
         from orchestrator.event_store import EventStore
         from orchestrator.git_ops import _run
         from orchestrator.merge_lane.types import TrainCallbacks
@@ -2786,115 +2782,117 @@ class TestCoalesceAfterHealthyMerge:
         # succeeded, look-ahead left speculation state behind" condition the
         # old gate read as busy.
         await queue.put(warm_req)
-        worker_task = asyncio.create_task(worker.run())
+        async with running_merge_worker(worker):
+            await wait_responsive(
+                gate_entered.wait(),
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='warm-up hm0 verify entry',
+            )
 
-        await asyncio.wait_for(gate_entered.wait(), timeout=60)
+            for req in follower_reqs.values():
+                queue.put_nowait(req)
 
-        for req in follower_reqs.values():
-            queue.put_nowait(req)
+            # Hold the gate until a follower has actually been dequeued, so the
+            # first coalesce evaluation provably happened with hm0's merge
+            # commit still unadvanced.  Releasing before that could hand the
+            # coalescer a settled pipeline — the sterile state every other test
+            # already covers.
+            deadline = asyncio.get_running_loop().time() + 60
+            while asyncio.get_running_loop().time() < deadline:
+                dequeued = {
+                    e['task_id'] for e in _events_of_type(db_path, 'merge_dequeued')
+                }
+                if dequeued & set(follower_reqs):
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail('no follower was dequeued within 60s')
 
-        # Hold the gate until a follower has actually been dequeued, so the
-        # first coalesce evaluation provably happened with hm0's merge
-        # commit still unadvanced.  Releasing before that could hand the
-        # coalescer a settled pipeline — the sterile state every other test
-        # already covers.
-        deadline = asyncio.get_running_loop().time() + 60
-        while asyncio.get_running_loop().time() < deadline:
-            dequeued = {
-                e['task_id'] for e in _events_of_type(db_path, 'merge_dequeued')
+            # Release now: with speculation depth K=1 the merger blocks on the
+            # speculation permit at its next look-ahead until the verifier
+            # drains, so holding the gate any longer would stall the run rather
+            # than test it.  Every later coalesce evaluation still carries a
+            # non-None spec_base from the preceding look-ahead — which is
+            # exactly the state the old is_idle() gate read as busy.
+            gate_release.set()
+
+            events = await _poll_events('train_coalesced', timeout=120)
+            assert events, (
+                'no train_coalesced event: the coalescer never ran while a '
+                'merge was in flight — every merge in this sequence succeeded, '
+                'so there was no conflict/abandon/drop to open the gate'
+            )
+            coalesced_members = list(events[0]['data'].get('member_task_ids', []))
+            assert len(coalesced_members) >= 2, coalesced_members
+            assert set(coalesced_members) <= set(follower_reqs), coalesced_members
+            assert 'hm0' not in coalesced_members, (
+                'the in-flight warm-up request must not be a coalesce candidate'
+            )
+
+            for tid in coalesced_members:
+                outcome = await wait_responsive(
+                    follower_reqs[tid].result,
+                    timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                    label=f'{tid} absorbed-member outcome',
+                )
+                assert outcome.status == 'superseded', (
+                    f'{tid}: absorbed member must resolve superseded, '
+                    f'got {outcome.status!r}'
+                )
+
+            warm_outcome = await asyncio.wait_for(warm_req.result, timeout=120)
+            assert warm_outcome.status == 'done', (
+                f'warm-up merge must land cleanly; got {warm_outcome.status!r}'
+            )
+
+            # The train lands only after its members are marked done, which is
+            # the last step of _do_train_merge's success path.
+            merged = await _poll_events('train_merged', timeout=180)
+            assert merged, (
+                'train_coalesced but never train_merged: the train derailed. '
+                'A train cannot recover from a lost CAS — check that it parked '
+                'behind the unadvanced predecessor '
+                '(_await_unadvanced_predecessor)'
+            )
+
+            # The train landed: every member's file is on main under one shared SHA.
+            _, main_files, _ = await _run(
+                ['git', 'ls-tree', '-r', '--name-only', 'main'],
+                cwd=git_ops.project_root,
+            )
+            for tid in coalesced_members:
+                assert f'file_{tid}.py' in main_files, (
+                    f'file_{tid}.py must be on main after the train lands'
+                )
+            assert {tid for tid, _ in mark_done_calls} == set(coalesced_members)
+            assert len({sha for _, sha in mark_done_calls}) == 1, mark_done_calls
+
+            # No window-opener anywhere in the run: the coalescer did NOT ride on a
+            # merge that produced no merge commit.  This is the assertion the whole
+            # task exists to pin — without it a conflict slipping into the fixture
+            # would silently restore the old gate's only opening.
+            opener_states = {'conflict', 'already_merged', 'abandoned', 'dropped'}
+            observed = {
+                e['data'].get('state')
+                for e in _events_of_type(db_path, 'merge_finalized')
             }
-            if dequeued & set(follower_reqs):
-                break
-            await asyncio.sleep(0.05)
-        else:
-            pytest.fail('no follower was dequeued within 60s')
-
-        # Release now: with speculation depth K=1 the merger blocks on the
-        # speculation permit at its next look-ahead until the verifier
-        # drains, so holding the gate any longer would stall the run rather
-        # than test it.  Every later coalesce evaluation still carries a
-        # non-None spec_base from the preceding look-ahead — which is
-        # exactly the state the old is_idle() gate read as busy.
-        gate_release.set()
-
-        events = await _poll_events('train_coalesced', timeout=120)
-        assert events, (
-            'no train_coalesced event: the coalescer never ran while a '
-            'merge was in flight — every merge in this sequence succeeded, '
-            'so there was no conflict/abandon/drop to open the gate'
-        )
-        coalesced_members = list(events[0]['data'].get('member_task_ids', []))
-        assert len(coalesced_members) >= 2, coalesced_members
-        assert set(coalesced_members) <= set(follower_reqs), coalesced_members
-        assert 'hm0' not in coalesced_members, (
-            'the in-flight warm-up request must not be a coalesce candidate'
-        )
-
-        for tid in coalesced_members:
-            outcome = await asyncio.wait_for(
-                follower_reqs[tid].result, timeout=60)
-            assert outcome.status == 'superseded', (
-                f'{tid}: absorbed member must resolve superseded, '
-                f'got {outcome.status!r}'
+            assert not (observed & opener_states), (
+                f'a merge in this sequence produced no merge commit '
+                f'({observed & opener_states}) — that is the accidental gate-opener '
+                f'the fix removes, so a train forming here would prove nothing'
             )
-
-        warm_outcome = await asyncio.wait_for(warm_req.result, timeout=120)
-        assert warm_outcome.status == 'done', (
-            f'warm-up merge must land cleanly; got {warm_outcome.status!r}'
-        )
-
-        # The train lands only after its members are marked done, which is
-        # the last step of _do_train_merge's success path.
-        merged = await _poll_events('train_merged', timeout=180)
-        assert merged, (
-            'train_coalesced but never train_merged: the train derailed. '
-            'A train cannot recover from a lost CAS — check that it parked '
-            'behind the unadvanced predecessor '
-            '(_await_unadvanced_predecessor)'
-        )
-
-        # The train landed: every member's file is on main under one shared SHA.
-        _, main_files, _ = await _run(
-            ['git', 'ls-tree', '-r', '--name-only', 'main'],
-            cwd=git_ops.project_root,
-        )
-        for tid in coalesced_members:
-            assert f'file_{tid}.py' in main_files, (
-                f'file_{tid}.py must be on main after the train lands'
+            assert not _events_of_type(db_path, 'train_derailed'), (
+                'the train derailed — most likely it lost the CAS to a predecessor '
+                'that advanced main under it; see _await_unadvanced_predecessor'
             )
-        assert {tid for tid, _ in mark_done_calls} == set(coalesced_members)
-        assert len({sha for _, sha in mark_done_calls}) == 1, mark_done_calls
-
-        # No window-opener anywhere in the run: the coalescer did NOT ride on a
-        # merge that produced no merge commit.  This is the assertion the whole
-        # task exists to pin — without it a conflict slipping into the fixture
-        # would silently restore the old gate's only opening.
-        opener_states = {'conflict', 'already_merged', 'abandoned', 'dropped'}
-        observed = {
-            e['data'].get('state')
-            for e in _events_of_type(db_path, 'merge_finalized')
-        }
-        assert not (observed & opener_states), (
-            f'a merge in this sequence produced no merge commit '
-            f'({observed & opener_states}) — that is the accidental gate-opener '
-            f'the fix removes, so a train forming here would prove nothing'
-        )
-        assert not _events_of_type(db_path, 'train_derailed'), (
-            'the train derailed — most likely it lost the CAS to a predecessor '
-            'that advanced main under it; see _await_unadvanced_predecessor'
-        )
-        # And the pipeline really was speculating while all this happened —
-        # i.e. the coalescer ran against a live, healthy merge chain rather
-        # than a drained one.
-        assert _events_of_type(db_path, 'speculative_merge'), (
-            'no speculative_merge event: the pipeline never got ahead of '
-            'itself, so this run does not exercise the state that kept the '
-            'old gate shut'
-        )
-
-        await worker.stop()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task
+            # And the pipeline really was speculating while all this happened —
+            # i.e. the coalescer ran against a live, healthy merge chain rather
+            # than a drained one.
+            assert _events_of_type(db_path, 'speculative_merge'), (
+                'no speculative_merge event: the pipeline never got ahead of '
+                'itself, so this run does not exercise the state that kept the '
+                'old gate shut'
+            )
 
 
 @pytest.mark.asyncio
