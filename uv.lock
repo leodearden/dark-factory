@@ -500,6 +500,7 @@ name = "cockpit"
 version = "0.1.0"
 source = { editable = "cockpit" }
 dependencies = [
+    { name = "dark-factory-shared" },
     { name = "orchestrator" },
     { name = "pyyaml" },
     { name = "textual" },
@@ -518,6 +519,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "dark-factory-shared", editable = "shared" },
     { name = "orchestrator", editable = "orchestrator" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "textual", specifier = ">=0.60" },

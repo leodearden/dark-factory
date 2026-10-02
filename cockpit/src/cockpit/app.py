@@ -21,10 +21,10 @@ writes from the poll timer (CockpitApp._poll_registry) only when that
 differs from what was last persisted, leaving CockpitApp.on_unmount as the
 single unconditional final write. So neither a keypress nor a table rebuild
 ever WRITES cockpit-ui.json -- a narrower claim than it may look: the
-debounce reduces how OFTEN that synchronous mkdir + mkstemp + json.dump +
-os.replace runs, it does not move it off the event-loop thread the way
-esc-2303-1 threaded the registry scan, and the poll-tick flush still
-performs it inline. The only other event-path I/O is C5b's sanctioned
+debounce reduces how OFTEN that synchronous atomic write
+(cockpit/src/cockpit/ui_config.py::save_ui_config) runs, it does not move it
+off the event-loop thread the way esc-2303-1 threaded the registry scan, and
+the poll-tick flush still performs it inline. The only other event-path I/O is C5b's sanctioned
 decision writes: its explicit-action keybindings (boost/drop) add
 action-only writes to a DECISION's manual_boost/state via C1's
 set_manual_boost/update_decision_state, each of which runs synchronously on

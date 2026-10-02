@@ -204,22 +204,22 @@ async def _assert_rebuilds_cost_one_write(tmp_path, monkeypatch, *, drive, round
         assert recorded == [parked.session_slug]
 
 
-class _NoTempFiles:
-    """Stand-in for cockpit.ui_config's module-global `tempfile`, whose
-    mkstemp always raises -- the shape a full or read-only fleet_root has
-    from save_ui_config's point of view.
+class _NoSpaceSafeIO:
+    """Stand-in for cockpit.ui_config's module-global `safe_io`, whose
+    atomic_write_text always raises -- the shape a full or read-only
+    fleet_root has from save_ui_config's point of view.
 
-    Patched as the NAME `tempfile` in cockpit.ui_config's globals rather
-    than as an attribute of the stdlib module, so the breakage is scoped to
-    the one module under test and every other importer's tempfile is
+    Patched as the NAME `safe_io` in cockpit.ui_config's globals rather
+    than as an attribute of shared.safe_io, so the breakage is scoped to
+    the one module under test and every other importer's safe_io is
     untouched. save_ui_config resolves the name from module globals at call
     time, so the REAL function still runs and takes its real fail-soft
-    `except OSError` branch: logged, swallowed, returns None, no file
-    created -- exactly what _persist_ui_config sees in production.
+    branch: logged, swallowed, returns None, no file created -- exactly
+    what _persist_ui_config sees in production.
     """
 
     @staticmethod
-    def mkstemp(*args, **kwargs):
+    def atomic_write_text(*args, **kwargs):
         raise OSError(28, 'No space left on device')
 
 
@@ -754,7 +754,7 @@ class TestUIConfigWriteDebounce:
 
     Before this, on_data_table_row_highlighted called _persist_ui_config
     directly, so holding an arrow key down over a large session table did a
-    full mkdir + mkstemp + json.dump + os.replace
+    full synchronous atomic write
     (cockpit/src/cockpit/ui_config.py::save_ui_config) per keypress on the
     event-loop thread, and CockpitApp._resync_session_detail wrote again
     whenever a rebuild moved the cursor.
@@ -947,7 +947,7 @@ class TestUIConfigWriteDebounce:
         gating the baseline on it: cockpit-ui.json is fail-soft UI state
         whose total loss costs the operator one restored cursor position,
         and a retry loop over a read-only fleet_root would put the
-        synchronous mkstemp back on every single tick -- reintroducing, in
+        synchronous atomic write back on every single tick -- reintroducing, in
         the worst case, exactly the per-tick I/O this debounce removed.
         """
         from cockpit import ui_config as ui_config_module
@@ -976,7 +976,7 @@ class TestUIConfigWriteDebounce:
             recorded = _count_ui_config_writes(monkeypatch)
             # Break the REAL writer from here on. Everything below observes
             # what production observes when fleet_root cannot be written.
-            monkeypatch.setattr(ui_config_module, 'tempfile', _NoTempFiles)
+            monkeypatch.setattr(ui_config_module, 'safe_io', _NoSpaceSafeIO)
 
             await tick()
             # The flush ran and attempted the write ...
