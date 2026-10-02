@@ -298,6 +298,76 @@ async def test_non_git_root_is_unknown_and_logged(
     ), f'expected a WARNING naming the failed probe and {root}; got {warnings!r}'
 
 
+def _counting_git(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """Record every git argv ``probe_landing`` runs, still delegating to real git."""
+    calls: list[tuple[str, ...]] = []
+    real_run_git = landed_module.run_git
+
+    async def counting_run_git(cmd, *args, **kwargs):
+        calls.append(tuple(cmd))
+        return await real_run_git(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(landed_module, 'run_git', counting_run_git)
+    return calls
+
+
+def _marker_scans(calls: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    return [c for c in calls if any(a.startswith('--grep') for a in c)]
+
+
+def _scanned_revisions(scan: tuple[str, ...]) -> str:
+    return scan[scan.index('log') + 1]
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_main_is_not_rescanned_for_markers(
+    repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _branch_with_commits(repo, '120', 1, when=T0)
+    merge_sha = _merge_and_delete(repo, '120', when=T0 + timedelta(hours=1))
+    await _probe_one(repo, '120')
+    calls = _counting_git(monkeypatch)
+
+    verdict = await _probe_one(repo, '120')
+
+    assert _marker_scans(calls) == [], 'the second stage of a cycle must reuse the first one\'s index'
+    assert verdict == LandingVerdict.landed_by(LandingEvidence.MERGE_MARKER, merge_sha)
+
+
+@pytest.mark.asyncio
+async def test_a_grown_main_is_scanned_only_for_what_it_gained(
+    repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _branch_with_commits(repo, '121', 1, when=T0)
+    _merge_and_delete(repo, '121', when=T0 + timedelta(hours=1))
+    await _probe_one(repo, '121')
+    scanned_main = _git(repo, 'rev-parse', 'main')
+    _branch_with_commits(repo, '122', 1, when=T0 + timedelta(hours=2))
+    _merge_and_delete(repo, '122', when=T0 + timedelta(hours=3))
+    calls = _counting_git(monkeypatch)
+
+    verdicts = await probe_landing(str(repo), [LandingQuery('121'), LandingQuery('122')])
+
+    assert [_scanned_revisions(s) for s in _marker_scans(calls)] == [
+        f'{scanned_main}..{_git(repo, "rev-parse", "main")}',
+    ]
+    assert verdicts['121'].landed is True, 'a marker found by an earlier scan is kept'
+    assert verdicts['122'].landed is True, 'a marker main gained since is found'
+
+
+@pytest.mark.asyncio
+async def test_a_main_that_moved_back_is_rescanned_in_full(repo: Path) -> None:
+    _branch_with_commits(repo, '123', 1, when=T0)
+    _merge_and_delete(repo, '123', when=T0 + timedelta(hours=1))
+    landed_before = await _probe_one(repo, '123')
+    _git(repo, 'reset', '-q', '--hard', 'HEAD~1')
+
+    landed_after = await _probe_one(repo, '123')
+
+    assert landed_before.landed is True
+    assert landed_after.landed is False, 'a marker main no longer holds is not evidence'
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize('query_count', [1, 5])
 async def test_shared_scans_run_once_per_probe_call(
@@ -308,20 +378,13 @@ async def test_shared_scans_run_once_per_probe_call(
         shas = _branch_with_commits(repo, task_id, 1, when=T0)
         _cherry_pick_onto_main(repo, shas, when=T0 + timedelta(hours=1))
 
-    calls: list[tuple[str, ...]] = []
-    real_run_git = landed_module.run_git
-
-    async def counting_run_git(cmd, *args, **kwargs):
-        calls.append(tuple(cmd))
-        return await real_run_git(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(landed_module, 'run_git', counting_run_git)
+    calls = _counting_git(monkeypatch)
 
     verdicts = await probe_landing(str(repo), [LandingQuery(t) for t in task_ids])
 
     assert all(verdicts[t].landed is True for t in task_ids)
     branch_listings = [c for c in calls if 'for-each-ref' in c]
-    marker_scans = [c for c in calls if any(a.startswith('--grep') for a in c)]
+    marker_scans = _marker_scans(calls)
     twin_scans = [c for c in calls if any(a.startswith('--since') for a in c)]
     assert len(branch_listings) == 1, f'branch listing must be hoisted; got {branch_listings!r}'
     assert len(marker_scans) == 1, f'marker scan must be hoisted; got {marker_scans!r}'

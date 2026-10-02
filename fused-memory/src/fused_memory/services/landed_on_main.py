@@ -34,10 +34,13 @@ from fused_memory.services.live_workflow_detector import (
 
 logger = logging.getLogger(__name__)
 
-#: Per-probe timeout. The merge-marker scan walks all of main's history
-#: (measured 2.3 s wall over 70k commits on an idle host), so it gets head-room
-#: for a loaded one.
+#: Per-probe timeout. A full merge-marker scan walks all of main's history
+#: (measured 2.3 s wall over 70k commits on an idle host, 6.7 s on a loaded
+#: one), so it gets head-room.
 _GIT_TIMEOUT_SECONDS = 30.0
+
+#: How many project roots keep a merge-marker index between probes.
+_MARKER_INDEX_ROOTS_KEPT = 32
 
 _FIELD_SEPARATOR = '\x1f'
 
@@ -100,6 +103,17 @@ class MarkerHit(NamedTuple):
     committed_at: datetime
 
 
+@dataclass(frozen=True)
+class _MarkerIndex:
+    """Every merged branch's newest marker on main as of *main_sha*."""
+
+    main_sha: str
+    markers: Mapping[str, MarkerHit]
+
+
+_marker_indexes: dict[str, _MarkerIndex] = {}
+
+
 def _merge_subject(branch: str, main: str) -> str:
     """Mirror of ``orchestrator/src/orchestrator/git_ops.py::_merge_subject``.
 
@@ -157,11 +171,54 @@ async def _task_branches(project_root: str) -> frozenset[str] | None:
     return frozenset(line for line in stdout.splitlines() if line)
 
 
-async def _merge_marker_index(project_root: str) -> dict[str, MarkerHit] | None:
-    """Map each merged branch to its NEWEST marker; only an exact SUBJECT counts."""
+async def _merge_marker_index(project_root: str) -> Mapping[str, MarkerHit] | None:
+    """Every merged branch's NEWEST marker on main, scanning only what main gained.
+
+    Both stages probe every cycle and a full scan walks all of main's history,
+    so the index is kept per project root at the main sha it was built for.
+    When main has only grown since, just the new commits are scanned and their
+    markers override the kept ones; any other move rescans in full.  A failed
+    scan keeps nothing, so a probe failure is never remembered as "no markers".
+    """
+    resolved = await _git_stdout(
+        project_root, 'main resolution',
+        'rev-parse', '--verify', '--quiet', f'{DEFAULT_BASE_BRANCH}^{{commit}}',
+    )
+    main_sha = (resolved or '').strip()
+    if not main_sha:
+        return None
+    kept = _marker_indexes.get(project_root)
+    if kept is not None and kept.main_sha == main_sha:
+        return kept.markers
+    grown_from_kept = kept is not None and await _is_ancestor(project_root, kept.main_sha, main_sha)
+    base = kept if grown_from_kept else None
+    scanned = await _scan_merge_markers(
+        project_root, main_sha if base is None else f'{base.main_sha}..{main_sha}',
+    )
+    if scanned is None:
+        return None
+    markers = scanned if base is None else {**base.markers, **scanned}
+    _keep_marker_index(project_root, _MarkerIndex(main_sha, markers))
+    return markers
+
+
+async def _is_ancestor(project_root: str, older: str, newer: str) -> bool:
+    """Whether *newer* only added commits on top of *older*; a failed check answers False."""
+    try:
+        result = await run_git(
+            ['git', '-C', project_root, 'merge-base', '--is-ancestor', older, newer],
+            timeout=_GIT_TIMEOUT_SECONDS,
+        )
+    except OSError:
+        return False
+    return result.ok
+
+
+async def _scan_merge_markers(project_root: str, revisions: str) -> dict[str, MarkerHit] | None:
+    """Map each branch merged in *revisions* to its NEWEST marker; only an exact SUBJECT counts."""
     stdout = await _git_stdout(
         project_root, 'merge-marker scan',
-        'log', DEFAULT_BASE_BRANCH, '--fixed-strings', f'--grep={_MARKER_GREP}',
+        'log', revisions, '--fixed-strings', f'--grep={_MARKER_GREP}',
         '--format=%H%x1f%ct%x1f%s', '--',
     )
     if stdout is None:
@@ -173,6 +230,13 @@ async def _merge_marker_index(project_root: str) -> dict[str, MarkerHit] | None:
             committed_at = datetime.fromtimestamp(int(committed_epoch), tz=UTC)
             index.setdefault(match.group(1), MarkerHit(sha, committed_at))
     return index
+
+
+def _keep_marker_index(project_root: str, index: _MarkerIndex) -> None:
+    _marker_indexes.pop(project_root, None)
+    _marker_indexes[project_root] = index
+    while len(_marker_indexes) > _MARKER_INDEX_ROOTS_KEPT:
+        del _marker_indexes[next(iter(_marker_indexes))]
 
 
 async def _own_commits(project_root: str, branch: str) -> tuple[BranchCommit, ...] | None:
