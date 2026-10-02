@@ -47,7 +47,12 @@ _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
-from shared.cli_invoke import invoke_with_cap_retry, no_mcp_servers_config  # noqa: E402
+from shared.cli_invoke import (  # noqa: E402
+    AgentResult,
+    AllAccountsCappedException,
+    invoke_with_cap_retry,
+    no_mcp_servers_config,
+)
 from shared.config_dir import (  # noqa: E402
     CONFIG_DIR_PREFIX,
     TaskConfigDir,
@@ -55,11 +60,21 @@ from shared.config_dir import (  # noqa: E402
     sweep_stale_pid_dirs_once,
 )
 from shared.neutral_cwd import neutral_cli_cwd  # noqa: E402
+from shared.usage_gate import PoolFrozen  # noqa: E402
 
 logger = logging.getLogger("legibility.session_runner")
 
 _CONFIG_DIR_TASK_PREFIX = "legibility-session-"
+
 _EXHAUSTED_MARKER = "pool exhausted"
+"""``NoHeadroom.marker`` for an exhausted pool: not a banner the CLI printed
+but the gate reporting that no account remains, and saying so is honest."""
+
+_ERROR_STREAM_TAIL_CHARS = 2000
+"""How much of EACH output stream an ``InvocationFailed`` carries. One bound
+for both streams, because the asymmetry of carrying one is exactly the
+2026-08-24 diagnostic loss; the TAIL, because a CLI's last words are its
+diagnostic ones."""
 
 
 class InvocationFailed(Exception):
@@ -219,31 +234,38 @@ class SessionRunner:
         return invoke
 
     def _invoke(self, stage: StageSpec, prompt: str, model: str) -> str:
-        if not self._gate.account_count:
-            raise NoHeadroom(
-                f"{self._label}: no pool accounts resolved — check that the "
-                f"unit's EnvironmentFile supplies the CLAUDE_OAUTH_TOKEN_* vars "
-                f"named in config/usage-accounts.yaml",
-                marker=_EXHAUSTED_MARKER,
-            )
         label = f"{self._label}[{stage.name}]"
-        result = self._loop.run(invoke_with_cap_retry(
-            self._gate,
-            label,
-            config_dir=self._config_dir,
-            max_cap_retries=self._gate.account_count,
-            park_on_frozen_pool=False,
-            detect_caps_in_successful_output=False,
-            prompt=prompt,
-            model=model,
-            cwd=stage.cwd if stage.cwd is not None else neutral_cli_cwd(),
-            timeout_seconds=stage.timeout_secs,
-            max_turns=stage.max_turns,
-            max_budget_usd=stage.max_budget_usd,
-            **stage.tools.invoke_kwargs(),
-        ))
+        if not self._gate.account_count:
+            raise _exhaustion_error(self._gate, label)
+        cwd = stage.cwd if stage.cwd is not None else neutral_cli_cwd()
+        try:
+            result = self._loop.run(invoke_with_cap_retry(
+                self._gate,
+                label,
+                config_dir=self._config_dir,
+                max_cap_retries=self._gate.account_count,
+                park_on_frozen_pool=False,
+                detect_caps_in_successful_output=False,
+                prompt=prompt,
+                model=model,
+                cwd=cwd,
+                timeout_seconds=stage.timeout_secs,
+                max_turns=stage.max_turns,
+                max_budget_usd=stage.max_budget_usd,
+                **stage.tools.invoke_kwargs(),
+            ))
+        except (AllAccountsCappedException, PoolFrozen) as exc:
+            raise _exhaustion_error(self._gate, label) from exc
+        except OSError as exc:
+            # The process never started: a missing claude on the child's PATH,
+            # or a cwd that is missing or not a directory. The OSError names
+            # which, so it is echoed verbatim beside both candidates.
+            raise InvocationFailed(
+                f"{label}: claude CLI could not be started (model={model!r}, "
+                f"cwd={str(cwd)!r}): {exc}"
+            ) from exc
         if not result.success:
-            raise InvocationFailed(f"{label}: claude CLI failed: {result.output}")
+            raise _failure_error(label, stage, model, result)
         return result.output
 
     def close(self) -> None:
@@ -252,6 +274,86 @@ class SessionRunner:
         finally:
             self._loop.close()
             self._config_dir.cleanup()
+
+
+def _failure_error(label: str, stage: StageSpec, model: str, result: AgentResult) -> InvocationFailed:
+    """The ``InvocationFailed`` for a call that returned without a reply.
+
+    BOTH stream tails, each labelled: on 2026-08-24 the CLI put its only
+    diagnostic on stdout and an error carrying stderr alone said nothing."""
+    stdout_tail = (result.output or "")[-_ERROR_STREAM_TAIL_CHARS:]
+    stderr_tail = (result.stderr or "")[-_ERROR_STREAM_TAIL_CHARS:]
+    what = f"timed out after {stage.timeout_secs}s" if result.timed_out else "failed"
+    return InvocationFailed(
+        f"{label}: claude CLI {what} (model={model!r}, "
+        f"account={result.account_name!r}, subtype={result.subtype!r}, "
+        f"api_error_status={result.api_error_status!r}): "
+        f"stdout={stdout_tail!r} stderr={stderr_tail!r}",
+        stdout=stdout_tail, stderr=stderr_tail,
+    )
+
+
+def _exhaustion_error(gate, label: str) -> InvocationFailed:
+    """The exception for a pool with no account left — typed as well as
+    worded, because each exhaustion needs a different operator response.
+
+    ===============================  ====================  ======================
+    gate state (public predicates)   raised                clears on its own?
+    ===============================  ====================  ======================
+    ``account_count == 0``           NoHeadroom            no — config fault
+    ``active_account_name`` set      NoHeadroom            no — not a cap at all
+    every account auth-failed        InvocationFailed      no — operator action
+    some auth-failed, rest capped    NoHeadroom            only the capped ones
+    all capped                       NoHeadroom            yes — weekly reset
+    ===============================  ====================  ======================
+
+    The all-auth-failed pool must NOT be a ``NoHeadroom``:
+    ``coder.is_cap_deferral`` would turn a majority of those into an exit-0
+    DEFERRED night, which is reserved for weather that clears at the reset
+    (task 4503). As a plain failure it trips the storm, so the night exits 1
+    with an ERROR escalation (task 5947).
+
+    Read only off the gate's PUBLIC predicates.
+    """
+    count = gate.account_count
+    if not count:
+        return _pool_exhausted(
+            label,
+            "no pool accounts resolved — check that the unit's EnvironmentFile "
+            "supplies the CLAUDE_OAUTH_TOKEN_* vars named in "
+            "config/usage-accounts.yaml",
+        )
+    live = gate.active_account_name
+    if live is not None:
+        return _pool_exhausted(
+            label,
+            f"no account completed this invocation in one pass over the "
+            f"{count}-account pool and the gate still considers {live} usable — "
+            f"so this is not a capacity limit and will not clear at the weekly "
+            f"reset; the run's per-digest failures say what each account "
+            f"reported",
+        )
+    auth_failed = gate.auth_failed_account_names
+    if len(auth_failed) == count:
+        return InvocationFailed(
+            f"{label}: every one of the {count} pool accounts had its "
+            f"credentials rejected (HTTP 401/403): {', '.join(auth_failed)} — "
+            f"this is not a capacity limit and will not clear at the weekly "
+            f"reset; those accounts' access or tokens need operator action"
+        )
+    if auth_failed:
+        return _pool_exhausted(
+            label,
+            f"all {count} pool accounts unavailable — {count - len(auth_failed)} "
+            f"capped, which clears at the weekly reset, and "
+            f"{', '.join(auth_failed)} with credentials rejected (HTTP 401/403), "
+            f"which will not clear without operator action",
+        )
+    return _pool_exhausted(label, f"all {count} pool accounts capped")
+
+
+def _pool_exhausted(label: str, reason: str) -> NoHeadroom:
+    return NoHeadroom(f"{label}: {reason}", marker=_EXHAUSTED_MARKER)
 
 
 def open_pooled_runner(label: str, *, accounts_file=None, env_file=None) -> SessionRunner:
