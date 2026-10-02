@@ -11,32 +11,12 @@ mirroring task β's test_merge_gates.py:
    logger name (not ``orchestrator.merge_drift``) so existing ``caplog``
    assertions filtered to the merge_queue logger keep capturing the moved
    drift-check's WARNING-level fail-open messages.
-3. Reach-back / string-path monkeypatch routing — the existing test suite
-   monkeypatches drift-check dependencies by STRING PATH
-   ``orchestrator.merge_queue.<name>``.  A moved function must resolve a
-   monkeypatched-or-staying sibling via a function-local deferred import so
-   those patches stay effective even though the function body now lives in
-   this module.  ``TestDriftCheckFullGateSpecNoDerivation`` below carries
-   that coverage: its ``build_merge_verify_spec`` spy records a call only
-   when ``_run_drift_check`` resolves the name through
-   ``orchestrator.merge_queue``, so a naive merge_drift-local resolution
-   leaves ``spec_calls`` empty and the test fails on its first assertion.
-
-   Correction to this module's own extraction-time docstring: reading the
-   extracted ``_run_drift_check`` body confirms it does NOT call
-   ``_run_cold_shadow_verify`` / ``_run_shadow_compare`` — drift-check and
-   shadow-compare are independent sibling detectives (as the module
-   docstring below already states).  The reach-back cluster that actually
-   needs coverage here is the verify-pool-construction cluster
-   (``build_merge_verify_spec`` / ``VerifyRunnerPool`` / ``LocalRunner`` /
-   ``run_scoped_verification``), mirroring merge_shadow's
-   ``_run_cold_shadow_verify`` contract — confirmed necessary by
-   ``LocalRunner``'s own docstring and by the existing
-   ``TestRunDriftCheck`` tests in ``test_merge_queue_multihost_wiring.py``,
-   which construct a real ``HostAllocator`` and patch
-   ``orchestrator.merge_queue.run_scoped_verification`` directly.
-4. Shim re-export identity (added in a later step, once merge_queue.py's
-   shim swap lands).
+3. Verify-pool construction — ``TestDriftCheckFullGateSpecNoDerivation``
+   spies on ``build_merge_verify_spec`` where ``_run_drift_check`` looks it
+   up, and the local trust-anchor verifies through the injected
+   :class:`~orchestrator.merge_lane.ports.VerifyPort`.  ``_run_drift_check``
+   does NOT call ``_run_cold_shadow_verify`` / ``_run_shadow_compare`` —
+   drift-check and shadow-compare are independent sibling detectives.
 """
 
 from __future__ import annotations
@@ -419,33 +399,6 @@ class TestDriftCheckFullGateSpecNoDerivation:
             f'complete suite and CAN diverge; got task_files={spec_calls[0]!r}'
         )
         derive_spy.assert_not_awaited()
-
-
-def test_merge_queue_reexports_identical_objects() -> None:
-    """merge_queue re-exports the SAME objects from merge_drift (shim identity).
-
-    Covers both of the 2 moved names.
-
-    RED (pre-shim): merge_queue.py still defines its own independent copies
-    of these names (the duplicate definitions left in place by the EXPAND
-    step), so ``getattr(merge_queue, name) is getattr(merge_drift, name)``
-    fails for every name — two distinct objects that merely share a name.
-    """
-    import orchestrator.merge_drift as merge_drift
-    import orchestrator.merge_queue as merge_queue
-
-    moved_names = [
-        '_run_drift_check',
-        '_maybe_run_drift_check',
-    ]
-
-    for name in moved_names:
-        mq_obj = getattr(merge_queue, name)
-        md_obj = getattr(merge_drift, name)
-        assert mq_obj is md_obj, (
-            f'{name}: orchestrator.merge_queue.{name} and '
-            f'orchestrator.merge_drift.{name} must be the identical object'
-        )
 
 
 # ---------------------------------------------------------------------------

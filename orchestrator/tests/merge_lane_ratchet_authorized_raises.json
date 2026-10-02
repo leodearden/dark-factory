@@ -1069,6 +1069,78 @@
           "current": 31470
         }
       ]
+    },
+    {
+      "task_id": "5036",
+      "reason": "Move, not growth (PRD plans/merge-lane-quality-prd.md task zeta2, reach-back removal). (1) M3 moves, each a byte-identical cut/paste from merge_lane/worker.py to its lowest consumer: AUTO_CHAIN_GENERATIONS_ENABLED, _elapsed_ms, _MAX_EVENT_EVIDENCE_ITEMS + _emit_merge_attempt, _POST_MERGE_PYRIGHT_MAX_DETAIL + _run_unscoped_typechecks -> gates.py; _build_remote_runners -> drift.py; patch_content_contained -> landing_evidence.py; _HEARTBEAT_POLL_S and _MERGE_AHEAD_BOUND -> types.py; TOUCH_MISS_TOLERANCE and INFLIGHT_MERGE_WORKTREE_LIVENESS_SECS -> liveness.py. The per-file rises in drift/gates/landing_evidence/types are that code arriving, and worker.py falls by the same amount. The two new_function_over_ceiling keys (gates.py::_emit_merge_attempt 18, gates.py::_run_unscoped_typechecks 20) carry the same values the worker had. Cluster cognitive is unchanged at 4726. (2) test_merge_queue.py patch_targets 26 -> 27: one both-sides patch, gates._run beside the existing orchestrator.merge_queue._run, in 4 tests. Removing the reach-back split one binding into two lookup sites (the worker's own _maybe_auto_chain_generation and rev-parse paths; gates' _resolve_second_parent/_commit_is_linear). A reach-trace on commit 1 and a poison probe on this tree proved both sites are called. The distinct patch_targets union falls from 60 to 58.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/drift.py",
+          "baseline": 24,
+          "current": 27
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 296,
+          "current": 335
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+          "baseline": 143,
+          "current": 144
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3334,
+          "current": 3494
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+          "baseline": 2541,
+          "current": 2568
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1699,
+          "current": 1743
+        },
+        {
+          "measure": "new_function_over_ceiling",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_emit_merge_attempt",
+          "baseline": 15,
+          "current": 18
+        },
+        {
+          "measure": "new_function_over_ceiling",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py::_run_unscoped_typechecks",
+          "baseline": 15,
+          "current": 20
+        },
+        {
+          "measure": "patch_targets",
+          "key": "orchestrator/tests/test_merge_queue.py",
+          "baseline": 26,
+          "current": 27
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 1514,
+          "current": 1577
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+          "baseline": 1436,
+          "current": 1447
+        }
+      ]
     }
   ]
 }
