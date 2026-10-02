@@ -24,7 +24,12 @@ backend gets an EXPLICIT ``registered_graph_ids`` naming only scratch graphs;
 
 from __future__ import annotations
 
+import contextlib
+from collections import defaultdict
+from dataclasses import dataclass
+
 import pytest
+import pytest_asyncio
 from _fm_helpers import (
     FALKOR_HOST,
     FALKOR_PORT,
@@ -33,6 +38,22 @@ from _fm_helpers import (
     retry_until_observed,
     unique_graph_name,
 )
+from falkordb.asyncio import FalkorDB
+from graphiti_core.driver.driver import GraphProvider
+from graphiti_core.graph_queries import (
+    NEO4J_TO_FALKORDB_MAPPING,
+    get_fulltext_indices,
+    get_nodes_query,
+    get_relationships_query,
+)
+from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT, fulltext_query
+
+from fused_memory.backends.falkor_indices import (
+    expected_index_set,
+    parse_index_statement,
+    unsettled_index_statuses,
+)
+from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
 
 pytestmark = [
     falkor_skipif(),
@@ -42,6 +63,187 @@ pytestmark = [
     pytest.mark.timeout(120),
     pytest.mark.integration,
 ]
+
+
+# --- The D9 serving canary -------------------------------------------------
+
+# Not a graphiti stopword, alphanumeric, and a single RediSearch token.
+CANARY_TOKEN = 'bm25canary'
+
+# Builds queries only; no connection is ever opened on it.
+_QUERY_BUILDER = object.__new__(_MultiTenantFalkorDriver)
+
+_FULLTEXT_INDEX_NAME_BY_LABEL = {
+    label: index_name for index_name, label in NEO4J_TO_FALKORDB_MAPPING.items()
+}
+
+
+@dataclass(frozen=True)
+class FulltextTarget:
+    """One production fulltext index: what BM25 queries, and which fields hold text."""
+
+    label: str
+    entity_type: str
+    text_fields: tuple[str, ...]
+
+
+def production_fulltext_targets() -> tuple[FulltextTarget, ...]:
+    """Every fulltext index production provisions, derived from ``expected_index_set``."""
+    fields_by_target: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for label, entity_type, field, index_type in expected_index_set():
+        if index_type == 'FULLTEXT':
+            fields_by_target[(label, entity_type)].add(field)
+    targets = []
+    for (label, entity_type), fields in sorted(fields_by_target.items()):
+        text_fields = tuple(sorted(fields - {'group_id'}))
+        if not text_fields:
+            raise ValueError(
+                f'fulltext target {label!r} ({entity_type}) indexes no field but '
+                'group_id, so no canary token can be seeded into it'
+            )
+        targets.append(FulltextTarget(label, entity_type, text_fields))
+    return tuple(targets)
+
+
+async def seed_canary_element(graph, target: FulltextTarget, *, group_id: str) -> None:
+    """Write one element carrying ``CANARY_TOKEN`` in every text field of *target*."""
+    props = dict.fromkeys(target.text_fields, CANARY_TOKEN) | {'group_id': group_id}
+    if target.entity_type == 'NODE':
+        pattern = f'(x:{target.label})'
+    elif target.entity_type == 'RELATIONSHIP':
+        # A neutral endpoint label, so the edge never feeds a node target.
+        pattern = f'(:CanaryEndpoint)-[x:{target.label}]->(:CanaryEndpoint)'
+    else:
+        raise ValueError(f'cannot seed entity_type {target.entity_type!r} for {target}')
+    await graph.query(f'CREATE {pattern} SET x += $props', {'props': props})
+
+
+@dataclass(frozen=True)
+class CanaryReading:
+    """How many rows BM25 returned for the canary token on one target.
+
+    Deliberately has no ``__bool__``/``__len__``: ``retry_until_observed`` reads
+    a falsy observation as a miss, so a falsy NOT_SERVING reading would be
+    retried until SERVING and boundary test 6 would become a tautology.
+    """
+
+    target: FulltextTarget
+    rows: int
+
+    @property
+    def serving(self) -> bool:
+        return self.rows >= 1
+
+
+async def bm25_canary(graph, target: FulltextTarget, *, group_id: str) -> CanaryReading:
+    """Issue graphiti's own BM25 query for ``CANARY_TOKEN`` and count the rows.
+
+    Measures SERVICE only: it never consults ``CALL db.indexes()``.
+    """
+    query = fulltext_query(CANARY_TOKEN, [group_id], _QUERY_BUILDER)
+    if query == '':
+        raise AssertionError(
+            f'fulltext_query built no query for {CANARY_TOKEN!r} in {group_id!r}; '
+            'a canary that never queries proves nothing'
+        )
+    index_name = _FULLTEXT_INDEX_NAME_BY_LABEL[target.label]
+    if target.entity_type == 'NODE':
+        procedure = get_nodes_query(
+            index_name, '$query', limit=RELEVANT_SCHEMA_LIMIT, provider=GraphProvider.FALKORDB,
+        ) + ' YIELD node RETURN id(node)'
+    elif target.entity_type == 'RELATIONSHIP':
+        procedure = get_relationships_query(
+            index_name, limit=RELEVANT_SCHEMA_LIMIT, provider=GraphProvider.FALKORDB,
+        ) + ' YIELD relationship RETURN id(relationship)'
+    else:
+        raise ValueError(f'cannot query entity_type {target.entity_type!r} for {target}')
+    result = await graph.query(procedure, {'query': query})
+    return CanaryReading(target, len(result.result_set))
+
+
+# --- Boundary test 6: holding the UNDER CONSTRUCTION window open -----------
+
+# A one-node corpus is OPERATIONAL before the first status read.
+_UNDER_CONSTRUCTION_CORPUS = 50_000
+# Independent window openings before the observation is declared impossible.
+_OBSERVATION_ATTEMPTS = 5
+
+_FILLER_TEXT = 'filler'
+
+
+def _production_fulltext_statement(target: FulltextTarget) -> str:
+    """The one statement graphiti emits to create *target*'s fulltext index."""
+    statements = [
+        statement
+        for statement in get_fulltext_indices(GraphProvider.FALKORDB)
+        if parse_index_statement(statement)[0][:2] == (target.label, target.entity_type)
+    ]
+    if len(statements) != 1:
+        raise ValueError(f'expected one fulltext statement for {target}, got {statements!r}')
+    return statements[0]
+
+
+async def _seed_filler(graph, target: FulltextTarget, *, group_id: str, count: int) -> None:
+    """Write *count* token-free elements for *target*, in one query."""
+    if target.entity_type != 'NODE':
+        raise ValueError(f'filler is seeded for NODE targets only, got {target}')
+    props = dict.fromkeys(target.text_fields, _FILLER_TEXT) | {'group_id': group_id}
+    await graph.query(
+        f'UNWIND range(1, $count) AS i CREATE (x:{target.label}) SET x += $props',
+        {'count': count, 'props': props},
+    )
+
+
+async def _index_unsettled(backend: GraphitiBackend, group_id: str, label: str) -> bool:
+    """Whether *label*'s index is listed AND not OPERATIONAL; an absent index is False."""
+    records = await backend.list_indices(group_id=group_id)
+    return any(unsettled == label for unsettled, _ in unsettled_index_statuses(records))
+
+
+# --- Fixtures ---------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def scratch():
+    """Factory for uuid-suffixed throwaway graphs, each torn down in ``finally``."""
+    clients: list[FalkorDB] = []
+    graphs: list = []
+
+    def _make(slug: str):
+        name = unique_graph_name(f'3710_{slug}')
+        client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+        clients.append(client)
+        graph = client.select_graph(name)
+        graphs.append(graph)
+        return name, graph
+
+    try:
+        yield _make
+    finally:
+        for graph in graphs:
+            with contextlib.suppress(Exception):
+                await graph.delete()
+        for client in clients:
+            with contextlib.suppress(Exception):
+                await client.aclose()
+
+
+@pytest_asyncio.fixture
+async def live_backend_factory(mock_config):
+    """Build backends wired to a REAL driver, with an explicit scratch-only registry."""
+    backends: list[GraphitiBackend] = []
+
+    def _make(registered: set[str]) -> GraphitiBackend:
+        backend = GraphitiBackend(mock_config, registered_graph_ids=registered)
+        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
+        backends.append(backend)
+        return backend
+
+    try:
+        yield _make
+    finally:
+        for backend in backends:
+            await backend.close()
 
 
 class TestCanaryDistinguishesPresentFromServing:
