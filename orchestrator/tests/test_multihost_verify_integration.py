@@ -1238,6 +1238,10 @@ def host_config(host_repo: Path, host_git_config: GitConfig) -> OrchestratorConf
         host_repo, host_git_config,
         verify_host_unreachable_escalate_after_n=1,
         verify_host_unreachable_escalate_after_secs=0.0,  # streak-only
+        # Pinned, not inherited: conftest points ORCH_CONFIG_PATH at the live
+        # yaml, so an unset knob reads the operator's current choice, and
+        # TestTwoHostFalseGreenCapstone's subject IS the cross-check.
+        verify_cross_check_remote_green=True,
     )
 
 
