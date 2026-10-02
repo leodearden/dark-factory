@@ -558,6 +558,29 @@ class TestSingleResetsParserOwnership:
         )
 
 
+class TestOwnershipScanUsesTheSharedTree:
+    """The ownership scan walks the session's shared ASTs and does no I/O of its own."""
+
+    def test_the_ownership_scan_reads_nothing_and_parses_nothing(
+        self, first_party_tree, monkeypatch
+    ):
+        """Scoped by ``monkeypatch.context()``: pytest's own failure report calls
+        ``ast.parse``, so the patch must be gone before a failure is rendered."""
+
+        def no_parse(*_args, **_kwargs):
+            raise AssertionError('ast.parse called: the ownership scan re-parsed a file')
+
+        def no_read(*_args, **_kwargs):
+            raise AssertionError('pathlib.Path.read_text called: the ownership scan re-read a file')
+
+        with monkeypatch.context() as patched:
+            patched.setattr(ast, 'parse', no_parse)
+            patched.setattr(Path, 'read_text', no_read)
+            sites = _owned_name_sites(first_party_tree)
+        owner_defs = {s.detail for s in sites.definitions if s.path == _STRICT_PARSE_OWNER}
+        assert owner_defs == set(_OWNED_NAMES)
+
+
 @pytest.mark.asyncio
 class TestBeforeInvokeSkipsAuthFailed:
 
