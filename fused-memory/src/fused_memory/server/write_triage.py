@@ -168,6 +168,18 @@ TRIAGE_OUTCOMES: frozenset[str] = frozenset({
 })
 
 
+class JudgeUsage(NamedTuple):
+    """What the provider reported for ONE judge call.
+
+    Output includes reasoning, as both OpenAI APIs bill it.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    #: ``None`` when the provider does not report reasoning separately.
+    reasoning_tokens: int | None = None
+
+
 class TriageJudgeVerdict(NamedTuple):
     """The middle-band judge's answer: a verdict and the candidate it is about.
 
@@ -180,6 +192,10 @@ class TriageJudgeVerdict(NamedTuple):
     outcome: str
     #: The id of the RETRIEVED record the verdict is about; ``None`` names none.
     candidate_id: str | None = None
+    #: What the provider reported for the call that produced the verdict;
+    #: ``None`` when no call was made or none was reported. Triage ignores it;
+    #: the eval prices a write from it.
+    usage: JudgeUsage | None = None
 
 
 def attach_write_landed(result: Any) -> bool:
@@ -898,9 +914,9 @@ def _apply_judge_verdict(
 ) -> BandDecision:
     """The judged band's attach rule: file the write against the candidate named.
 
-    *answer* is what the judge returned — a :class:`TriageJudgeVerdict`, any
-    ``(outcome, candidate_id)`` pair, or a bare outcome word naming no
-    candidate. A verdict naming a candidate attaches to that retrieved record,
+    *answer* is what the judge returned — a :class:`TriageJudgeVerdict` (its
+    ``usage`` is ignored here), any ``(outcome, candidate_id)`` pair, or a bare
+    outcome word naming no candidate. A verdict naming a candidate attaches to that retrieved record,
     hoisted by :func:`_canonical_id_of` exactly as the band's winner is; one
     naming none attaches to the band's winner. ``stored`` attaches nothing, so
     it carries no canonical a caller could mistake for an endorsement.
@@ -939,10 +955,12 @@ def _apply_judge_verdict(
 
 def _judge_verdict_of(answer: object) -> TriageJudgeVerdict:
     """Read a judge's *answer* as a verdict: a bare word names no candidate."""
+    if isinstance(answer, TriageJudgeVerdict):
+        return answer
     if isinstance(answer, str):
         return TriageJudgeVerdict(answer)
     if isinstance(answer, tuple) and len(answer) == 2:
-        return TriageJudgeVerdict._make(answer)
+        return TriageJudgeVerdict(*answer)
     raise TypeError(f'judge returned {answer!r}, not an (outcome, candidate_id) pair')
 
 
