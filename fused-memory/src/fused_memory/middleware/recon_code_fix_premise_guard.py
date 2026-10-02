@@ -23,9 +23,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-import yaml
+from fused_memory.utils.safe_yaml import load_yaml_list_file
 
 if TYPE_CHECKING:
     from fused_memory.middleware.task_curator import CandidateTask
@@ -40,26 +40,6 @@ __all__ = [
     "premise_refuted_entry",
     "verify_premise_refuted",
 ]
-
-
-def _resolve_yaml_loader(yaml_module: Any = yaml) -> type:
-    """Return the fastest available SAFE YAML loader from *yaml_module*.
-
-    Prefers ``CSafeLoader`` (the libyaml-backed C implementation, measured
-    ~8x faster than the pure-Python ``SafeLoader`` on a single parse of the
-    shipped registry) and falls back to ``SafeLoader`` when PyYAML was built
-    without libyaml. Both are *safe* loaders: same restricted tag set, no
-    arbitrary object construction.
-    """
-    return getattr(yaml_module, "CSafeLoader", None) or yaml_module.SafeLoader
-
-
-#: Resolved once at import for tidiness — NOT because this is a hot loop.
-#: load_premise_registry runs at most once per TaskCurator instance
-#: (task_curator.py caches the parsed entries for the instance's lifetime
-#: behind its `_premise_registry_load_attempted` guard), so this buys a
-#: one-time ~8ms saving on the registry parse, not a per-call one.
-_YAML_LOADER: type = _resolve_yaml_loader()
 
 
 @dataclass(frozen=True)
@@ -113,65 +93,20 @@ def _coerce_source_assertion(item: object) -> SourceAssertion | None:
 
 
 def load_premise_registry(path: Path | None) -> list[PremiseEntry]:
-    """Load the recon code-fix premise-verification registry from a YAML file.
+    """Load the recon code-fix premise-verification registry from a YAML file; never raises.
 
-    Returns an empty list (without warning) when *path* is ``None``.
-    Returns an empty list and emits one WARNING when the file is missing,
-    unreadable, not decodable as UTF-8, or not valid YAML.
-    Skips malformed individual entries with one WARNING each while returning
-    the well-formed entries from the same file.
-
-    The function never raises — all failures degrade gracefully to [].
+    File-level failures (unset path, missing / unreadable / undecodable file,
+    invalid YAML, non-list document) degrade to [] as specified by
+    fused_memory/utils/safe_yaml.py::load_yaml_list_file. Malformed individual
+    entries are skipped with one WARNING each.
     """
-    if path is None:
-        return []
-
-    # Missing-file / unreadable
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        logger.warning(
-            "recon_code_fix_premise_guard: file not found: %s — guard disabled", path
-        )
-        return []
-    except OSError as exc:
-        logger.warning(
-            "recon_code_fix_premise_guard: cannot read %s: %s — guard disabled",
-            path, exc,
-        )
-        return []
-    except UnicodeDecodeError as exc:
-        logger.warning(
-            "recon_code_fix_premise_guard: cannot decode %s as UTF-8: %s — guard disabled",
-            path, exc,
-        )
-        return []
-
-    # Parse. The `except yaml.YAMLError` below is exhaustive only because
-    # `text` was already decoded as strict UTF-8 above — that rejects lone
-    # surrogates before the parser ever sees them. On a scalar containing a
-    # lone surrogate, CSafeLoader raises UnicodeEncodeError (a ValueError,
-    # NOT a yaml.YAMLError) where SafeLoader raises yaml.reader.ReaderError
-    # (which IS a YAMLError) — so a future change to a bytes/errors="replace"
-    # read path must re-check this handler.
-    try:
-        data = yaml.load(text, Loader=_YAML_LOADER)
-    except yaml.YAMLError as exc:
-        logger.warning(
-            "recon_code_fix_premise_guard: YAML parse error in %s: %s — guard disabled",
-            path, exc,
-        )
-        return []
-
-    if not isinstance(data, list):
-        logger.warning(
-            "recon_code_fix_premise_guard: expected a YAML list in %s, got %s — guard disabled",
-            path, type(data).__name__,
-        )
-        return []
-
     entries: list[PremiseEntry] = []
-    for item in data:
+    for item in load_yaml_list_file(
+        path,
+        logger=logger,
+        label="recon_code_fix_premise_guard",
+        consequence="guard disabled",
+    ):
         if not isinstance(item, dict):
             logger.warning(
                 "recon_code_fix_premise_guard: skipping non-dict entry in %s: %r", path, item
