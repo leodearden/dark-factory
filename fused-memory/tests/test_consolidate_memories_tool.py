@@ -539,6 +539,28 @@ class TestAuthorizationIsFailClosedAndPreWrite:
         svc.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_an_unauthorized_caller_with_malformed_arguments_is_denied_not_validated(
+        self,
+    ):
+        """Authorization is step (1): as in `update_memory`, an unauthorized
+        caller is refused before validation could tell it anything about its
+        arguments."""
+        malformed = {'topic': 'Not_A_Slug', 'supersedes': ['873889a1'], 'run_id': None}
+        contrast = await call_consolidate(make_service(), **malformed)
+        assert contrast['error_type'] == 'ValidationError'
+        assert contrast['hint']
+
+        svc = make_service()
+        result = await call_consolidate(svc, agent_id='claude-interactive', **malformed)
+
+        assert result['error_type'] == 'Mem0UpdateNotAuthorized'
+        assert 'hint' not in result
+        assert 'supersedes[0]' not in result['error']
+        svc.add_memory.assert_not_called()
+        svc.get_memory_by_id.assert_not_called()
+        svc.get_memories_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_kill_switch_denies_every_agent(self):
         svc = make_service()
         svc.config.mem0_update = Mem0UpdateConfig(enabled=False)
