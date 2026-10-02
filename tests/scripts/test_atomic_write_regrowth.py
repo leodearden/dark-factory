@@ -1158,6 +1158,28 @@ def test_every_declared_tree_contributes_scanned_files():
     )
 
 
+def test_every_fenced_package_tests_dir_is_a_required_pointer_tree():
+    """The tests dir of every package whose ``src`` this guard fences is swept, hard.
+
+    ``_POINTER_EXTRA_TREES`` states the rule; this asserts it, so the next
+    widening of ``_SRC_TREES`` cannot leave a fenced package's tests behind.
+    Flat trees with no ``/src`` suffix have no sibling ``tests`` to derive.
+    """
+    required: set[str] = set(_POINTER_EXTRA_TREES)
+    fenced_tests = sorted(
+        f'{tree.removesuffix("/src")}/tests'
+        for tree in _SRC_TREES
+        if tree.endswith('/src')
+        and (_REPO_ROOT / tree.removesuffix('/src') / 'tests').is_dir()
+    )
+    missing = [tests for tests in fenced_tests if tests not in required]
+    assert not missing, (
+        f'Tests dirs of fenced packages missing from _POINTER_EXTRA_TREES: {missing}. '
+        'Rule: the tests dir of every package whose src tree this guard FENCES is '
+        'a REQUIRED pointer tree, swept with a hard is_dir assertion.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pointer resolution (task 3388)
 # ---------------------------------------------------------------------------
