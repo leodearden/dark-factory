@@ -843,13 +843,11 @@ class _LazyRegistry:
                     try:
                         self._entries = await asyncio.to_thread(loader, path)
                     except Exception as exc:
-                        # The loader documents "never raises", but
-                        # asyncio.to_thread adds a raise path (thread-pool
-                        # failure, or an exception type the loader's own
-                        # internal except does not cover — e.g. a registry
-                        # that is not valid UTF-8 raises UnicodeDecodeError,
-                        # a ValueError, not an OSError) that no loader-
-                        # internal except can ever cover. Fail OPEN (guard
+                        # The loaders never raise (their file-level contract is
+                        # fused_memory/utils/safe_yaml.py::load_yaml_list_file),
+                        # but asyncio.to_thread adds a raise path of its own
+                        # (thread-pool failure or shutdown) that no loader-
+                        # internal except can cover. Fail OPEN (guard
                         # disabled) rather than escaping into curate() /
                         # curate_batch_prepared, which call the guard
                         # methods unguarded — an escape would fail the whole
@@ -1288,9 +1286,9 @@ class TaskCurator:
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
         - The registry file is missing, unreadable, or unparseable, or the
-          offloaded load raised — for example a registry file that is not
-          valid UTF-8 (one WARNING logged; the guard then stays disabled for
-          this TaskCurator instance rather than retrying per call). This is
+          offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per
+          call). This is
           deliberate even for a cause that is transient in principle (a
           partially-written file observed mid-deploy, a momentary worker
           thread I/O error): :class:`_LazyRegistry.entries`'s

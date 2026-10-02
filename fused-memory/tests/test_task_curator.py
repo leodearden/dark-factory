@@ -5141,6 +5141,24 @@ class TestCancelledPremiseBlocklistLoader:
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
 
+    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
+        """(c2) File with bytes that are not valid UTF-8 returns [] and emits
+        exactly one WARNING, on this module's own logger.
+        """
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+
+        bad_encoding = tmp_path / "bad_encoding.yaml"
+        bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
+
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(bad_encoding)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert str(bad_encoding) in warnings[0].getMessage()
+        assert warnings[0].name == "fused_memory.middleware.cancelled_premise_blocklist"
+
     def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
         """(d) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""
         from fused_memory.middleware.cancelled_premise_blocklist import (
