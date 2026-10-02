@@ -1,9 +1,11 @@
-"""Live-corpus pins for delivered_check descriptors that task 6036 repaired on BOTH sides.
+"""Live-corpus pins for repaired capability-manifest delivered_check descriptors.
 
-Each repair changed a producer task's ``metadata.delivered_checks`` entry in
-tasks.db AND the capability-manifest sidecar the stamper copies it from. CI can
-never see the tasks.db half, so these pins guard the SIDECAR half: a reverted
-sidecar would be re-stamped over the repaired record by the next re-decompose.
+Two populations are pinned. Task 6036 re-anchored descriptors on BOTH sides: the
+producer task's ``metadata.delivered_checks`` entry in tasks.db AND the sidecar
+the stamper copies it from. Task 5256 resynced sidecars, sidecar-only, to task
+records that had already been repaired. CI can never see the tasks.db half, so
+either way these pins guard the SIDECAR half: a stale sidecar would be
+re-stamped over the repaired record by the next re-decompose.
 They read only tracked files in this checkout and open no database.
 
 MAINTENANCE CONTRACT: an exact pin also fires on a legitimate later both-sides
@@ -21,6 +23,7 @@ from audit_delivered_checks import load_manifest_checks, structural_findings
 from git_checkout_root import checkout_root_or_skip
 from shared.capability_manifest import load_capability_manifest
 
+# Task 6036: re-anchored on both sides.
 _REANCHORED = [
     (
         "docs/prds/recurring-deterministic-tasks.capability-manifest.yaml",
@@ -47,6 +50,43 @@ _REANCHORED = [
          "paths": ["scripts/eval_bootstrap_smoke.sh"]},
     ),
 ]
+
+# Task 5256: sidecar resynced to the already-repaired task record.
+_RESYNCED_TO_TASK_RECORD = [
+    (
+        "plans/flake-ledger-prd.capability-manifest.yaml",
+        3789, "ε", "remote-path-drops-all-three-side-effects-today",
+        {"kind": "grep", "pattern": "record_merge_flake_suppression", "expect": "present",
+         "paths": ["orchestrator/src/orchestrator/merge_queue.py"]},
+    ),
+    (
+        "plans/merge-lane-throughput-prd.capability-manifest.yaml",
+        5051, "B", "setup-md-remote-verify-host-section",
+        {"kind": "grep", "pattern": "remote merge-verify host", "expect": "present",
+         "paths": ["SETUP.md"]},
+    ),
+    (
+        "plans/session-resume-eligibility-seam-prd.capability-manifest.yaml",
+        3733, "ε", "storm-prose-no-longer-misdirects-to-ntp",
+        {"kind": "grep", "pattern": r"clock skew \(NTP\)", "expect": "absent",
+         "paths": ["orchestrator/src/orchestrator/harness.py"]},
+    ),
+    (
+        "plans/memory-referent-fidelity-prd.capability-manifest.yaml",
+        3669, "δ", "entities-param-on-add-memory",
+        {"kind": "grep", "pattern": r"entities_gate\(", "expect": "present",
+         "paths": ["fused-memory/src/fused_memory/server/tools.py"]},
+    ),
+    (
+        "plans/dashboard-one-datum-one-path-prd.capability-manifest.yaml",
+        5588, "γ1", "registry-receipt-metadata",
+        {"kind": "grep", "pattern": "_received_at", "expect": "present",
+         "paths": ["dashboard/src/dashboard/static/redux/data.js",
+                   "dashboard/src/dashboard/static/redux/datum.js"]},
+    ),
+]
+
+_REPAIRED_DESCRIPTORS = [*_REANCHORED, *_RESYNCED_TO_TASK_RECORD]
 
 _RETIRED_TO_MANUAL = [
     (
@@ -77,8 +117,8 @@ def _the_one_capability(root: str, relpath: str, label: str, capability: str):
 
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability,expected",
-    _REANCHORED,
-    ids=[f"{r[1]}-{r[3]}" for r in _REANCHORED],
+    _REPAIRED_DESCRIPTORS,
+    ids=[f"{r[1]}-{r[3]}" for r in _REPAIRED_DESCRIPTORS],
 )
 def test_repaired_sidecar_carries_the_repaired_descriptor(
         relpath, task_id, label, capability, expected):
@@ -89,8 +129,8 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
     dump = check.model_dump()
     assert {key: dump[key] for key in expected} == expected, (
         f"{relpath} label {label} capability {capability} (task {task_id}) does not "
-        f"carry the task-6036 repaired descriptor. If it was re-repaired on BOTH "
-        f"sides on purpose, follow this module's MAINTENANCE CONTRACT."
+        f"carry the repaired descriptor pinned in this module. If it was re-repaired "
+        f"on BOTH sides on purpose, follow this module's MAINTENANCE CONTRACT."
     )
 
 
