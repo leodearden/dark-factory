@@ -297,7 +297,7 @@ def test_every_shared_component_file_destructures_df_datum(
 #
 # THE PRD'S OWN LIST IS STALE IN BOTH DIRECTIONS, which is why this table was
 # re-measured rather than transcribed.  It names "36 in tabs.jsx/tab_overview.jsx"
-# — correct, 32 + 4 — but omits the seven `<C.StatTile` sites in
+# — correct, 32 + 4 — but omits the eight `<C.StatTile` sites in
 # tab_escalations.jsx and tab_escalation_analytics.jsx, and it names four files
 # (scheduler_drawer.jsx, tab_curator.jsx, tab_memory_evals.jsx, tab_scheduler.jsx)
 # that carry no StatTile site at all — they do not even import the component.
@@ -311,7 +311,7 @@ def test_every_shared_component_file_destructures_df_datum(
 _STAT_TILE_SITES = {
     'tabs.jsx': 30,
     'tab_overview.jsx': 4,
-    'tab_escalations.jsx': 5,
+    'tab_escalations.jsx': 6,
     'tab_escalation_analytics.jsx': 2,
 }
 

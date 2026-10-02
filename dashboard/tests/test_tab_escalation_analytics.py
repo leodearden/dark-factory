@@ -19,6 +19,7 @@ from _dashboard_helpers import (
     extract_df_data_block,
     extract_function_body,
     find_script_position,
+    strip_js_comments,
 )
 
 # ---------------------------------------------------------------------------
@@ -732,9 +733,11 @@ def test_tab_analytics_origin_panel(tab_analytics_jsx_body: str) -> None:
     Asserts, scoped to the Origin panel's own function body:
     (a) A `StackedAreaChart` fed `daily_by_source`, with the long tail folded
         into an `'other'` bucket.
-    (b) A benign-rate table over `origin.sources` referencing `benign_rate`,
-        `stamped_share` (stamped-vs-inferred split), and `actionable`
-        (benign/actionable segmented bar).
+    (b) A benign-rate table over `origin.sources` referencing `benign_rate`
+        and `stamped_share` (stamped-vs-inferred split), whose segmented bar
+        draws one segment per served resolution class —
+        escalation_views.js::resolutionSegments over `s.classes` — rather than
+        a fixed benign/actionable pair that hides every other class.
     (c) A `predictably_benign` badge.
     (d) A per-source `Sparkline` fed by `daily_spark`.
     (e) Rows sorted by benign COUNT — a `.sort(` referencing `.benign`.
@@ -774,9 +777,15 @@ def test_tab_analytics_origin_panel(tab_analytics_jsx_body: str) -> None:
         'OriginPanel does not reference `stamped_share` — render the stamped-vs-'
         'inferred split.'
     )
-    assert 'actionable' in origin_body, (
-        'OriginPanel does not reference `actionable` — render the benign/actionable '
-        'segmented bar.'
+    assert re.search(r'resolutionSegments\(\s*s\.classes\s*\)\.map\(', origin_body), (
+        'OriginPanel does not draw its bar from `resolutionSegments(s.classes).map(` — '
+        'every served resolution class gets a segment, so the parts add up to the '
+        'whole the benign rate is a share of.'
+    )
+    origin_code = strip_js_comments(origin_body)
+    assert not re.search(r'\bs\.(benign|actionable)\b', origin_code), (
+        'OriginPanel still reads `s.benign`/`s.actionable` — the payload serves the '
+        'split as `s.classes`, keyed by every resolution class.'
     )
 
     # (c) predictably_benign badge.
@@ -952,6 +961,16 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
         'WorkflowPanel does not render <C.Donut — the action-mix chart must use '
         'the Donut primitive.'
     )
+    # The donut states the population it divides: the project's `terminal`
+    # count, the one whole that origin's classes and action_mix both sum to.
+    assert re.search(r'of \{terminal\} terminal', workflow_body), (
+        'WorkflowPanel does not caption the action-mix donut `of {terminal} terminal` '
+        '— the donut must say which population its shares are of.'
+    )
+    tab_body = extract_function_body(body, 'EscalationAnalyticsTab')
+    assert re.search(r'<WorkflowPanel\b[^>]*\bterminal=\{p\.terminal\}', tab_body), (
+        'EscalationAnalyticsTab does not pass `terminal={p.terminal}` to WorkflowPanel.'
+    )
 
     # (d)/(e) churn + esc-per-done LineCharts (two distinct charts).
     assert 'churn_daily' in workflow_body, (
@@ -1087,3 +1106,33 @@ def test_charts_jsx_padding_matches_analytics_marker_overlay(charts_jsx_body: st
             'RegimeMarkers overlay (see that file) and must be updated to match, '
             'or charts.jsx should export the constant instead.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5596 (PRD leaf eta): the analytics tab reads the corpus through
+# escalation_views.js and states the age of the walk it shows
+# ---------------------------------------------------------------------------
+
+
+def test_tab_analytics_reads_escalation_views_at_module_scope(tab_analytics_jsx_body: str) -> None:
+    """DF_ESCALATION_VIEWS is destructured at module scope, with no fallback."""
+    code = strip_js_comments(tab_analytics_jsx_body)
+    m = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_ESCALATION_VIEWS\s*;', code)
+    assert m is not None, (
+        'tab_escalation_analytics.jsx does not destructure `window.DF_ESCALATION_VIEWS` '
+        'at module scope (`const { … } = window.DF_ESCALATION_VIEWS;`, no `|| {}`).'
+    )
+    names = {n.split(':')[-1].strip() for n in m.group(1).split(',') if n.strip()}
+    for name in ('resolutionSegments', 'corpusAgeCaption', 'openInHistoryOver'):
+        assert name in names, (
+            f'tab_escalation_analytics.jsx does not take `{name}` from DF_ESCALATION_VIEWS.'
+        )
+
+
+def test_tab_analytics_states_the_corpus_age(tab_analytics_jsx_body: str) -> None:
+    """The tab renders how old the corpus walk behind every panel is."""
+    tab_body = extract_function_body(strip_js_comments(tab_analytics_jsx_body), 'EscalationAnalyticsTab')
+    assert re.search(r'\{\s*corpusAgeCaption\(', tab_body), (
+        'EscalationAnalyticsTab renders no `{corpusAgeCaption(…)}` — the payload is '
+        'derived from a cached walk and must say when that walk was.'
+    )
