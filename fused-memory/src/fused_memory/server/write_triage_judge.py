@@ -773,27 +773,48 @@ def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
 _JUDGE_MAX_TOKENS = 128
 
 
-def _provider_credentials(memory_service: Any, provider: str) -> dict[str, Any]:
-    """``api_key``/``base_url`` for *provider*, defensively, possibly empty.
+class _ProviderCredentials(NamedTuple):
+    """How to reach *provider*'s endpoint, and what that endpoint speaks."""
 
-    An empty dict is a FIRST-CLASS result, not a failure: both SDKs fall back
-    to their standard environment variables, which is how this deployment is
-    actually configured (``OPENAI_API_KEY`` in the shell, nothing in
-    config.yaml). Reading the config section is for a deployment that pins a
+    #: The SDK constructor kwargs (``api_key``/``base_url``), possibly empty.
+    client_kwargs: dict[str, Any]
+    #: Whether the endpoint serves the OpenAI Responses API.
+    serves_responses_api: bool
+
+
+def _provider_credentials(memory_service: Any, provider: str) -> _ProviderCredentials:
+    """``api_key``/``base_url`` for *provider*, defensively, and its capability.
+
+    Empty ``client_kwargs`` is a FIRST-CLASS result, not a failure: both SDKs
+    fall back to their standard environment variables, which is how this
+    deployment is actually configured (``OPENAI_API_KEY`` in the shell, nothing
+    in config.yaml). Reading the config section is for a deployment that pins a
     key or points at an OpenAI-compatible local endpoint.
+
+    ``serves_responses_api`` is the deployment's existing declaration of what
+    the configured OpenAI endpoint speaks — ``llm.client_class``, the same
+    declaration ``backends/graphiti_client.py`` builds its client from, where
+    ``'openai_generic'`` names a compat endpoint serving chat.completions only.
+    It is deliberately NOT inferred from the model name, nor from ``base_url``
+    being present: the shipped config always sets a ``base_url``. A missing or
+    unrecognised value reads as ``'openai'``, ``LLMConfig.client_class``'s
+    default.
     """
     config = getattr(memory_service, 'config', None)
     llm = getattr(config, 'llm', None)
     providers = getattr(llm, 'providers', None)
     section = getattr(providers, provider, None)
-    creds: dict[str, Any] = {}
+    client_kwargs: dict[str, Any] = {}
     api_key = getattr(section, 'api_key', None)
     if isinstance(api_key, str) and api_key:
-        creds['api_key'] = api_key
+        client_kwargs['api_key'] = api_key
     api_url = getattr(section, 'api_url', None)
     if isinstance(api_url, str) and api_url:
-        creds['base_url'] = api_url
-    return creds
+        client_kwargs['base_url'] = api_url
+    serves_responses_api = (
+        provider == 'openai' and _llm_attr(memory_service, 'client_class') != 'openai_generic'
+    )
+    return _ProviderCredentials(client_kwargs, serves_responses_api)
 
 
 async def _call_llm(
@@ -860,7 +881,7 @@ async def _call_llm(
         import openai  # noqa: PLC0415 — per-call import, matching judge.py
 
         async with openai.AsyncOpenAI(
-            **_provider_credentials(memory_service, provider),
+            **_provider_credentials(memory_service, provider).client_kwargs,
         ) as client:
             response = await asyncio.wait_for(
                 client.chat.completions.create(
@@ -881,7 +902,7 @@ async def _call_llm(
         import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
 
         async with anthropic.AsyncAnthropic(
-            **_provider_credentials(memory_service, provider),
+            **_provider_credentials(memory_service, provider).client_kwargs,
         ) as client:
             response = await asyncio.wait_for(
                 client.messages.create(

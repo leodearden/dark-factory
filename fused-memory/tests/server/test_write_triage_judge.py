@@ -1126,15 +1126,12 @@ class TestResolveJudgeTimeout:
         CONFIG_PATH pin) — and this three-way equality is what stops them
         drifting apart.
         """
+        schema_default = WriteTriageConfig.model_fields['judge_timeout_seconds'].default
+        shipped = FusedMemoryConfig().write_triage.judge_timeout_seconds
+
         assert _DEFAULT_JUDGE_TIMEOUT_SECONDS == 15.0
-        assert (
-            _DEFAULT_JUDGE_TIMEOUT_SECONDS
-            == WriteTriageConfig.model_fields['judge_timeout_seconds'].default
-        )
-        assert (
-            _DEFAULT_JUDGE_TIMEOUT_SECONDS
-            == FusedMemoryConfig().write_triage.judge_timeout_seconds
-        )
+        assert schema_default == _DEFAULT_JUDGE_TIMEOUT_SECONDS
+        assert shipped == _DEFAULT_JUDGE_TIMEOUT_SECONDS
 
     @pytest.mark.parametrize('value', [1, 2.5, 30, 0.01])
     def test_a_configured_positive_number_is_used(self, value: float) -> None:
