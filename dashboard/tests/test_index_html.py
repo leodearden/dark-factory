@@ -1558,6 +1558,81 @@ def test_merge_queue_js_load_order(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: escalation_views.js is served, versioned, and sits between
+# the modules it reads and the two escalation tabs that read it (task 5596,
+# PRD leaf eta)
+#
+# escalation_views.js destructures window.DF_DATUM and
+# window.DF_ENDPOINT_STALENESS at module scope, and tab_escalations.jsx and
+# tab_escalation_analytics.jsx destructure window.DF_ESCALATION_VIEWS at module
+# scope — none with a fallback. Each edge is its own case because each blanks a
+# different surface.
+# ---------------------------------------------------------------------------
+
+_ESCALATION_VIEWS_PREFIX = '/static/redux/escalation_views.js'
+
+
+def test_escalation_views_js_is_served(client) -> None:
+    """GET /static/redux/escalation_views.js returns 200.
+
+    The load-order guards below only read tag positions, which a file present
+    in git but not served would still pass — while both escalation tabs throw
+    on their top-level destructure.
+    """
+    resp = client.get(_ESCALATION_VIEWS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_ESCALATION_VIEWS_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_escalation_views_js_has_cache_buster(index_html_body: str) -> None:
+    """escalation_views.js is present among the VERSIONED redux assets."""
+    assert re.search(r'/static/redux/escalation_views\.js\?v=\d+', index_html_body), (
+        'escalation_views.js is not present among the versioned /static/redux/* '
+        'assets in index.html — tab_escalations.jsx and tab_escalation_analytics.jsx '
+        'destructure window.DF_ESCALATION_VIEWS at top level with no fallback. '
+        'Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+_ESCALATION_VIEWS_ORDER_CASES = [
+    (_ENDPOINT_STALENESS_PREFIX, 'endpoint_staleness.js', _ESCALATION_VIEWS_PREFIX, 'escalation_views.js'),
+    (_DATUM_PREFIX, 'datum.js', _ESCALATION_VIEWS_PREFIX, 'escalation_views.js'),
+    (_ESCALATION_VIEWS_PREFIX, 'escalation_views.js', _TAB_ESCALATIONS_PREFIX, 'tab_escalations.jsx'),
+    (_ESCALATION_VIEWS_PREFIX, 'escalation_views.js', _TAB_ESC_ANALYTICS_PREFIX, 'tab_escalation_analytics.jsx'),
+]
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label',
+    _ESCALATION_VIEWS_ORDER_CASES,
+    ids=[
+        'staleness-before-escalation-views',
+        'datum-before-escalation-views',
+        'escalation-views-before-tab-escalations',
+        'escalation-views-before-tab-escalation-analytics',
+    ],
+)
+def test_escalation_views_js_load_order(
+    index_html_body: str,
+    before_prefix: str,
+    before_label: str,
+    after_prefix: str,
+    after_label: str,
+) -> None:
+    """The escalation-views reader loads after what it reads and before what reads it."""
+    assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+        consumer_note=f'{after_label} ' + _READS_AT_MODULE_SCOPE.format(before=before_label),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 

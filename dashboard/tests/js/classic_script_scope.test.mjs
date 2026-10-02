@@ -70,6 +70,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'scheduler_heatmap_bounds.js': 'DF_SCHED_HEATMAP_BOUNDS',
   'window_chip.js': 'DF_WINDOW_CHIP',
   'merge_queue.js': 'DF_MERGE_QUEUE',
+  'escalation_views.js': 'DF_ESCALATION_VIEWS',
 };
 
 function readIndexHtml() {
