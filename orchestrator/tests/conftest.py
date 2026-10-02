@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import sys
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -90,6 +91,7 @@ from orchestrator.config import (  # noqa: E402
     ReviewConfig,
     SandboxConfig,
 )
+from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
 # orchestrator.merge_queue was imported (by another conftest/plugin) before
@@ -122,7 +124,7 @@ async def _drain_leaked_tasks():
 
 @pytest_asyncio.fixture(autouse=True)
 async def _reap_leaked_merge_workers(_drain_leaked_tasks):
-    """Gracefully stop any MergeWorker orphaned onto the test event loop (task 1907).
+    """Gracefully stop any merge worker orphaned onto the test event loop (task 1907).
 
     A merge-queue test that raises before its own ``await worker.stop()`` leaks
     the worker's ``run()`` task and its background loops, which do real ``git``
@@ -788,12 +790,26 @@ def _clear_probe_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolated_merge_provenance(tmp_path_factory):
+    """Start every test with MergeProvenance on a fresh, empty landed outbox.
+
+    MergeProvenance is process-global, and every lane built over a real repo
+    binds its own outbox there (SpeculativeMergeWorker.__init__) with nothing
+    to unbind it, so a row one test's lane recorded would answer a later test's
+    lookup in the same worker (task 5034). The file is never created unless
+    something records through the facade.
+    """
+    basetemp = tmp_path_factory.getbasetemp()
+    MergeProvenance.bind(LandedOutbox(basetemp / f'landed-outbox-{uuid.uuid4().hex}.json'))
+
+
+@pytest.fixture(autouse=True)
 def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
-    MergeWorker hardcodes orchestrator.merge_queue.run_scoped_verification in its
-    internal calls; tests that create a live MergeWorker need this patched or
-    pytest/ruff/pyright (not in PATH in test environments) cause BLOCKED outcomes.
+    A lane on the production verifier (``ports.py::ProductionVerifier``) resolves
+    orchestrator.merge_queue.run_scoped_verification on every call; tests that run
+    one need it patched or pytest/ruff/pyright cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
 

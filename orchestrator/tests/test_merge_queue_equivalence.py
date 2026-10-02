@@ -4,7 +4,7 @@ Covers:
 - ``PostMergePyrightResult`` dataclass and ``.broken`` property
 - ``_check_post_merge_pyright`` function — real-git behavioural tests
   (using hermetic stand-in type_check_command), classification / fail-open
-  edge cases, and call-site integration with MergeWorker / SpeculativeMergeWorker.
+  edge cases, and call-site integration with the merge lane.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _merge_lane_fakes import FakeVerifier, make_lane
-from _serial_merge_worker import MergeWorker
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
@@ -264,27 +263,6 @@ class TestCheckPostMergePyrightBehavioral:
 _TYPE_CMD_HANGS = 'python3 -c "import time; time.sleep(60)"'
 
 
-def _type_cmd_green_then_red(counter: Path) -> str:
-    """A type_check_command green on its first run and red on every later one.
-
-    Models what the POST-advance gate exists to catch: a type-check that
-    passed in the merge worktree and fails once main carries the merge.  The
-    pre-advance gate consumes the green run, the post-advance check sees the
-    red one.  The counter lives outside the worktree so the fresh worktree
-    created at the advanced SHA still sees it.
-    """
-    return (
-        'python3 -c "'
-        'import sys, pathlib; '
-        f"c = pathlib.Path('{counter}'); "
-        'first = not c.exists(); '
-        "c.write_text('ran'); "
-        'sys.exit(0) if first else '
-        "(sys.stderr.write('synthetic type error\\n'), sys.exit(1))"
-        '"'
-    )
-
-
 def _impatient(config: OrchestratorConfig, secs: float = 1.0) -> OrchestratorConfig:
     """*config* with a per-command verify budget short enough to trip in a test."""
     return config.model_copy(update={
@@ -526,7 +504,7 @@ class TestRunUnscopedTypechecks:
 
 
 # ---------------------------------------------------------------------------
-# MergeWorker._do_merge call-site integration tests  (step-5)
+# Shared request/drain helpers for the call-site integration tests below
 # ---------------------------------------------------------------------------
 
 
@@ -556,115 +534,6 @@ async def _drain(worker, worker_task: asyncio.Task) -> None:
     worker_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await worker_task
-
-
-@pytest.mark.asyncio
-class TestMergeWorkerPyrightCallSite:
-    """MergeWorker._do_merge runs the post-advance type-check gate.
-
-    The serial worker takes no ``VerifyPort``, so BOTH the pre-advance gate
-    and the post-advance check run the real ``type_check_command``.  The
-    broken rows therefore use the green-then-red stand-in: the pre-advance
-    gate consumes the green run and the post-advance check sees the red one,
-    which is exactly the condition this gate exists for.
-    """
-
-    async def test_broken_pyright_blocks_merge_without_push(
-        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
-    ):
-        """Broken pyright → blocked outcome, reason starts with prefix, push NOT called."""
-        worktree = (await git_ops.create_worktree('mw-pyright-broken')).path
-        (worktree / 'mod.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add mod.py')
-
-        mc = _make_module_config(
-            prefix='subpkg',
-            type_check_command=_type_cmd_green_then_red(tmp_path / 'mw-broken.count'),
-        )
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
-
-        push_mock = AsyncMock(return_value='pushed')
-        with patch.object(git_ops, 'push_main', push_mock):
-            req = _make_merge_request(
-                'mw-pyright-broken', 'mw-pyright-broken', worktree, config,
-                module_configs=[mc],
-            )
-            await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        await _drain(worker, worker_task)
-
-        assert outcome.status == 'blocked'
-        assert outcome.reason is not None
-        assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)
-        assert 'subpkg' in outcome.reason
-        # push_main must NOT be called on the broken path
-        push_mock.assert_not_awaited()
-
-    async def test_clean_pyright_allows_merge_to_succeed(
-        self, git_ops: GitOps, config: OrchestratorConfig,
-    ):
-        """Clean pyright → 'done' outcome (same as no-pyright path)."""
-        worktree = (await git_ops.create_worktree('mw-pyright-clean')).path
-        (worktree / 'mod.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add mod.py')
-
-        mc = _make_module_config(prefix='subpkg')
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue)
-        worker_task = asyncio.create_task(worker.run())
-
-        req = _make_merge_request(
-            'mw-pyright-clean', 'mw-pyright-clean', worktree, config,
-            module_configs=[mc],
-        )
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=30)
-
-        await _drain(worker, worker_task)
-
-        assert outcome.status == 'done'
-
-    async def test_broken_pyright_emits_post_merge_pyright_broken_event(
-        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
-    ):
-        """post_merge_pyright_broken merge_attempt event emitted on broken path."""
-        db_path = tmp_path / 'events.db'
-        event_store = EventStore(db_path=db_path, run_id='test-run')
-
-        worktree = (await git_ops.create_worktree('mw-pyright-event')).path
-        (worktree / 'mod.py').write_text('x = 1\n')
-        await git_ops.commit(worktree, 'Add mod.py')
-
-        mc = _make_module_config(
-            prefix='subpkg',
-            type_check_command=_type_cmd_green_then_red(tmp_path / 'mw-event.count'),
-        )
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=event_store)
-        worker_task = asyncio.create_task(worker.run())
-
-        req = _make_merge_request(
-            'mw-pyright-event', 'mw-pyright-event', worktree, config,
-            module_configs=[mc],
-        )
-        await queue.put(req)
-        await asyncio.wait_for(req.result, timeout=30)
-
-        await _drain(worker, worker_task)
-
-        conn = sqlite3.connect(str(db_path))
-        rows = conn.execute(
-            "SELECT json_extract(data, '$.outcome') FROM events "
-            "WHERE event_type = 'merge_attempt'"
-        ).fetchall()
-        conn.close()
-        outcomes = [r[0] for r in rows]
-        assert 'post_merge_pyright_broken' in outcomes, (
-            f'Expected post_merge_pyright_broken event, got: {outcomes!r}'
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -762,3 +631,38 @@ class TestMergeLanePyrightCallSite:
         assert outcome.reason is not None
         assert outcome.reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX)
         assert _merge_worktrees(git_ops) == []
+
+    async def test_broken_pyright_emits_post_merge_pyright_broken_event(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """post_merge_pyright_broken merge_attempt event emitted on broken path."""
+        db_path = tmp_path / 'events.db'
+        event_store = EventStore(db_path=db_path, run_id='test-run')
+
+        worktree = (await git_ops.create_worktree('smw-pyright-event')).path
+        (worktree / '.BROKEN_UNION').write_text('broken\n')
+        await git_ops.commit(worktree, 'Add .BROKEN_UNION marker')
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = make_lane(git_ops, queue, event_store=event_store)
+        worker_task = asyncio.create_task(worker.run())
+
+        req = _make_merge_request(
+            'smw-pyright-event', 'smw-pyright-event', worktree, config,
+            module_configs=[_make_module_config(prefix='subpkg')],
+        )
+        await queue.put(req)
+        await asyncio.wait_for(req.result, timeout=30)
+
+        await _drain(worker, worker_task)
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT json_extract(data, '$.outcome') FROM events "
+            "WHERE event_type = 'merge_attempt'"
+        ).fetchall()
+        conn.close()
+        outcomes = [r[0] for r in rows]
+        assert 'post_merge_pyright_broken' in outcomes, (
+            f'Expected post_merge_pyright_broken event, got: {outcomes!r}'
+        )

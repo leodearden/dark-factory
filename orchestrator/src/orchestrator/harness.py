@@ -11986,9 +11986,8 @@ class Harness:
         """Start the merge queue worker as a background asyncio task.
 
         Uses SpeculativeMergeWorker (two-coroutine pipeline) — the sole
-        production merge worker (MQ-refactor task ν retired the legacy serial
-        MergeWorker; its readable-reference role now lives as a test-local
-        fixture in ``tests/_serial_merge_worker.py``).
+        merge worker (MQ-refactor task ν retired the legacy serial
+        MergeWorker).
 
         Also builds and stores the StaleServiceRestartCoordinator and wires
         its note_merge method as the merge worker's on_merge_landed callback.

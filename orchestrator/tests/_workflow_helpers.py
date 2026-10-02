@@ -41,6 +41,7 @@ from orchestrator.mcp.verdict_tools import (
 from orchestrator.mcp.verdict_tools import (
     _submit_review_verdict,
 )
+from orchestrator.merge_lane import MergeLane
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import (
     TaskAssignment,
@@ -1129,11 +1130,9 @@ def _build_workflow(
     agent_stub: AgentStub,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
     """Wire up a TaskWorkflow with all fakes injected."""
-    from _serial_merge_worker import MergeWorker
-
     scheduler = FakeScheduler()
     merge_queue: asyncio.Queue = asyncio.Queue()
-    worker = MergeWorker(git_ops, merge_queue)
+    worker = MergeLane(git_ops, merge_queue)
     # Start merge worker — cleaned up when event loop tears down after test
     asyncio.create_task(worker.run(), name='test-merge-worker')
     workflow = TaskWorkflow(
@@ -1159,19 +1158,17 @@ def _build_workflow_with_escalation(
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Wire up a TaskWorkflow with an EscalationQueue attached.
 
-    When ``spawn_merge_worker=False``, skips the MergeWorker/asyncio.create_task
+    When ``spawn_merge_worker=False``, skips the MergeLane/asyncio.create_task
     setup — use for tests that exercise _mark_blocked directly and never enqueue
     merge work; omitting create_task avoids the 'Task was destroyed but it is
     pending!' warning in pytest teardown.
     """
-    from _serial_merge_worker import MergeWorker
-
     scheduler = FakeScheduler()
     queue_dir = tmp_path / 'escalation_queue'
     queue = EscalationQueue(queue_dir)
     merge_queue: asyncio.Queue = asyncio.Queue()
     if spawn_merge_worker:
-        worker = MergeWorker(git_ops, merge_queue)
+        worker = MergeLane(git_ops, merge_queue)
         asyncio.create_task(worker.run(), name='test-merge-worker')
     else:
         worker = None

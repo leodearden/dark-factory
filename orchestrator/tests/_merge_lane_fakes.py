@@ -7,8 +7,10 @@ hand-advanced clock whose ``sleep`` advances it instead of waiting;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
-that owns its worker never falls back to a production adapter by omission,
-and ``drive_merge`` plays the merger for a caller that enqueues onto a queue
+that owns its worker never falls back to a production adapter by omission;
+``running_lane`` runs such a lane for the body of a block and
+``merge_through_lane`` until it resolves one request; ``drive_merge`` plays
+the merger for a caller that enqueues onto a queue
 nothing is draining. ``main_health_probe_spawned`` reads off a red
 ``MergeOutcome`` whether it left a detached main-health probe running, and
 ``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
@@ -22,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-from collections.abc import Collection, Coroutine, Mapping
+from collections.abc import AsyncIterator, Collection, Coroutine, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +135,13 @@ def raises(error: BaseException) -> VerifyScript:
 
 def hangs_until(release: asyncio.Event) -> VerifyScript:
     return VerifyScript(result=passes().result, release=release)
+
+
+def times_out(summary: str = 'Verification timed out') -> VerifyScript:
+    return VerifyScript(result=VerifyResult(
+        passed=False, test_output='', lint_output='', type_output='',
+        summary=summary, timed_out=True,
+    ))
 
 
 class FakeVerifier:
@@ -390,6 +399,66 @@ def make_lane(
         clock=FakeClock() if clock is None else clock,
         **kwargs,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class LaneRun:
+    """A lane's ``run()`` task, as ``running_lane`` yields it."""
+
+    task: asyncio.Task[None]
+
+    async def outcome(self, request: Any, *, timeout: float = 120.0) -> MergeOutcome:
+        """The outcome the lane resolves *request* with.
+
+        Watches the ``run()`` task while waiting, so a lane that crashes or
+        returns first raises that, instead of surfacing as a timeout.
+        """
+        done, _ = await asyncio.wait(
+            {self.task, request.result}, timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if request.result in done:
+            return request.result.result()
+        if self.task in done:
+            self.task.result()
+            raise AssertionError('the lane stopped before resolving the request')
+        raise TimeoutError(f'the lane did not resolve the request within {timeout}s')
+
+
+@contextlib.asynccontextmanager
+async def running_lane(
+    lane: MergeLane, *, stop_timeout: float = 60.0,
+) -> AsyncIterator[LaneRun]:
+    """Run *lane* for the body of the block, then stop it.
+
+    On the way out, whatever happened, the lane is stopped and its ``run()``
+    awaited, so a failure of ``run()`` itself is raised rather than lost.
+    """
+    run = asyncio.create_task(lane.run())
+    try:
+        yield LaneRun(run)
+    finally:
+        await lane.stop()
+        await asyncio.wait_for(run, stop_timeout)
+
+
+async def merge_through_lane(
+    lane: MergeLane,
+    queue: asyncio.Queue[Any],
+    request: Any,
+    *,
+    timeout: float = 120.0,
+) -> MergeOutcome:
+    """Run *lane* until it resolves *request*, then stop it; return the outcome.
+
+    *queue* is the one *lane* was built on. The request -- a single
+    ``MergeRequest`` or a train's ``GroupMergeRequest`` -- goes in through the
+    lane's queue like any submission, so it takes the production dispatch
+    route rather than a test-chosen internal entry point.
+    """
+    async with running_lane(lane) as run:
+        await queue.put(request)
+        return await run.outcome(request, timeout=timeout)
 
 
 @dataclasses.dataclass(frozen=True)
