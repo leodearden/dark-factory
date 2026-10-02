@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 import types
@@ -1278,8 +1279,26 @@ def _client_double() -> MagicMock:
     return client
 
 
-def _openai_client(content: str | None, usage: object = None) -> MagicMock:
-    """A fake ``AsyncOpenAI`` yielding *content* as the message body.
+def _openai_client(
+    content: str | None, usage: object = None, status: str = 'completed',
+) -> MagicMock:
+    """A fake ``AsyncOpenAI`` whose Responses API answers *content*.
+
+    The response is plain namespaces in the SDK ``Response``'s shape
+    (``output_text``, ``usage``, ``status``, ``incomplete_details``), so an
+    unset *usage* reports none rather than an auto-generated Mock. The chat
+    endpoint is a bare ``AsyncMock``, so a call on the wrong arm is visible.
+    """
+    client = _client_double()
+    client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
+        output_text=content, usage=usage, status=status, incomplete_details=None,
+    ))
+    client.chat.completions.create = AsyncMock()
+    return client
+
+
+def _chat_client(content: str | None, usage: object = None) -> MagicMock:
+    """A fake ``AsyncOpenAI`` for an ``openai_generic`` endpoint: chat.completions only.
 
     Same construction shape as ``test_classifier.py::_make_mock_client`` — the
     established openai double in this repo, plus the async-CM protocol the
@@ -1296,6 +1315,7 @@ def _openai_client(content: str | None, usage: object = None) -> MagicMock:
         response.usage = usage
     client = _client_double()
     client.chat.completions.create = AsyncMock(return_value=response)
+    client.responses.create = AsyncMock()
     return client
 
 
@@ -1331,6 +1351,13 @@ def _judge_svc(provider: str = 'openai', **write_triage) -> types.SimpleNamespac
         ),
         **write_triage,
     )
+
+
+def _compat_svc(**write_triage) -> types.SimpleNamespace:
+    """A judge service whose OpenAI endpoint serves chat.completions only."""
+    service = _judge_svc(**write_triage)
+    service.config.llm.client_class = 'openai_generic'
+    return service
 
 
 def _creds_svc(**providers: object) -> types.SimpleNamespace:
@@ -1500,22 +1527,6 @@ class TestTheVerdictCarriesTheCallsUsage:
     """
 
     @pytest.mark.asyncio
-    async def test_the_chat_arm_reports_its_usage(self) -> None:
-        usage = types.SimpleNamespace(
-            prompt_tokens=850, completion_tokens=40,
-            completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
-        )
-        client = _openai_client(_payload('restates', 'm1'), usage=usage)
-        with patch('openai.AsyncOpenAI', return_value=client):
-            verdict = await judge_write(
-                memory_service=_judge_svc(),
-                content='c', project_id='p',
-                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
-            )
-        assert verdict.usage == JudgeUsage(850, 40, 0)
-        assert (verdict.outcome, verdict.candidate_id) == (OUTCOME_RESTATED, 'm1')
-
-    @pytest.mark.asyncio
     async def test_the_anthropic_arm_reports_its_usage(self) -> None:
         client = _anthropic_client(
             [FakeAnthropicTextBlock(text=_payload('contests', 'm1'))],
@@ -1540,11 +1551,11 @@ class TestTheVerdictCarriesTheCallsUsage:
             pytest.param({'usage': None}, id='None'),
             pytest.param({'usage': MagicMock()}, id='unspecced mock'),
             pytest.param(
-                {'usage': types.SimpleNamespace(prompt_tokens=True, completion_tokens=40)},
+                {'usage': types.SimpleNamespace(input_tokens=True, output_tokens=40)},
                 id='a bool count',
             ),
             pytest.param(
-                {'usage': types.SimpleNamespace(prompt_tokens='850', completion_tokens=40)},
+                {'usage': types.SimpleNamespace(input_tokens='850', output_tokens=40)},
                 id='a str count',
             ),
         ],
@@ -1553,10 +1564,10 @@ class TestTheVerdictCarriesTheCallsUsage:
         self, response_usage: dict,
     ) -> None:
         """`int(MagicMock())` is 1: the reader checks `isinstance(int)`, never coerces."""
-        message = types.SimpleNamespace(content=_payload('amends', 'm1'))
         client = _client_double()
-        client.chat.completions.create = AsyncMock(return_value=types.SimpleNamespace(
-            choices=[types.SimpleNamespace(message=message)], **response_usage,
+        client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
+            output_text=_payload('amends', 'm1'), status='completed',
+            incomplete_details=None, **response_usage,
         ))
         with patch('openai.AsyncOpenAI', return_value=client):
             verdict = await judge_write(
@@ -1676,7 +1687,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 candidates=[_result('m1', 0.80)],
             )
         assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
-        client.chat.completions.create.assert_not_awaited()
+        client.responses.create.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_empty_candidate_set_answers_stored_and_makes_no_call(self) -> None:
@@ -1691,7 +1702,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 candidates=[],
             )
         assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
-        client.chat.completions.create.assert_not_awaited()
+        client.responses.create.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_wholly_uncomparable_slate_answers_stored(self) -> None:
@@ -1706,7 +1717,7 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 candidates=[_result('pin0', None, omit_store_score=True)],
             )
         assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
-        client.chat.completions.create.assert_not_awaited()
+        client.responses.create.assert_not_awaited()
 
 
 class TestTheSlateIsShownWithoutAFavourite:
@@ -1731,7 +1742,7 @@ class TestTheSlateIsShownWithoutAFavourite:
                     decision=_decision(winner),
                     candidates=candidates,
                 )
-            sent.append(client.chat.completions.create.call_args.kwargs['messages'][1]['content'])
+            sent.append(client.responses.create.call_args.kwargs['input'])
         assert sent[0] == sent[1]
 
 
@@ -1792,8 +1803,14 @@ class TestJudgeWriteOpenAIArm:
             )
 
     @pytest.mark.asyncio
-    async def test_the_call_is_made_once_with_the_resolved_shape(self) -> None:
-        """Deterministic, bounded, and JSON-forced — one call, no retry loop."""
+    async def test_the_call_is_made_once_on_the_responses_api(self) -> None:
+        """Bounded and JSON-forced, one call, no retry loop — and nothing unset is sent.
+
+        No ``temperature`` (reasoning models reject it) and, with
+        ``judge_reasoning_effort`` null, no ``reasoning`` either: the request is
+        pinned exactly, so an extra parameter fails here.
+        """
+        candidates = [_result('m1', 0.80)]
         client = _openai_client(_payload('amends', 'm1'))
         with patch('openai.AsyncOpenAI', return_value=client):
             await judge_write(
@@ -1801,18 +1818,47 @@ class TestJudgeWriteOpenAIArm:
                 content='c',
                 project_id='p',
                 decision=_decision('m1'),
-                candidates=[_result('m1', 0.80)],
+                candidates=candidates,
             )
-        client.chat.completions.create.assert_awaited_once()
-        kwargs = client.chat.completions.create.call_args.kwargs
-        assert kwargs['model'] == 'pinned-model'
-        assert kwargs['temperature'] == 0.0
-        assert kwargs['max_tokens'] == _JUDGE_MAX_TOKENS
-        assert kwargs['response_format'] == {'type': 'json_object'}
-        assert kwargs['messages'][0] == {
-            'role': 'system', 'content': JUDGE_SYSTEM_PROMPT,
+        client.responses.create.assert_awaited_once()
+        client.chat.completions.create.assert_not_awaited()
+        assert client.responses.create.call_args.kwargs == {
+            'model': 'pinned-model',
+            'instructions': JUDGE_SYSTEM_PROMPT,
+            'input': build_judge_prompt('c', candidates),
+            'max_output_tokens': judge_module._JUDGE_MAX_OUTPUT_TOKENS,
+            'text': {'format': {'type': 'json_object'}},
         }
-        assert kwargs['messages'][1]['role'] == 'user'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('effort', ['none', 'low', 'medium', 'high'])
+    async def test_a_configured_effort_reaches_the_wire(self, effort: str) -> None:
+        client = _openai_client(_payload('amends', 'm1'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(judge_reasoning_effort=effort),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        kwargs = client.responses.create.call_args.kwargs
+        assert kwargs['reasoning'] == {'effort': effort}
+        assert 'temperature' not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_the_responses_usage_rides_on_the_verdict(self) -> None:
+        usage = types.SimpleNamespace(
+            input_tokens=900, output_tokens=60,
+            output_tokens_details=types.SimpleNamespace(reasoning_tokens=40),
+        )
+        client = _openai_client(_payload('restates', 'm1'), usage=usage)
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict.usage == JudgeUsage(900, 60, 40)
+        assert (verdict.outcome, verdict.candidate_id) == (OUTCOME_RESTATED, 'm1')
 
     @pytest.mark.asyncio
     async def test_at_most_the_configured_candidate_count_reaches_the_prompt(self) -> None:
@@ -1827,8 +1873,119 @@ class TestJudgeWriteOpenAIArm:
                 decision=_decision('m0'),
                 candidates=candidates,
             )
-        rendered = client.chat.completions.create.call_args.kwargs['messages'][1]['content']
+        rendered = client.responses.create.call_args.kwargs['input']
         assert sum(1 for c in candidates if f'id: {c.id}\n' in rendered) == 3
+
+
+class TestTheChatArmServesCompatEndpoints:
+    """An ``openai_generic`` endpoint (llama.cpp, vLLM, ...) serves chat.completions only.
+
+    It keeps main's chat request byte for byte; task 5277 C owns its compat
+    400s. Which arm runs is decided by ``llm.client_class``, never the model.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_call_is_mains_chat_request(self) -> None:
+        candidates = [_result('m1', 0.80)]
+        client = _chat_client(_payload('amends', 'm1'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_compat_svc(judge_model='pinned-model'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=candidates,
+            )
+        assert verdict == TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')
+        client.chat.completions.create.assert_awaited_once()
+        client.responses.create.assert_not_awaited()
+        assert client.chat.completions.create.call_args.kwargs == {
+            'model': 'pinned-model',
+            'messages': [
+                {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
+                {'role': 'user', 'content': build_judge_prompt('c', candidates)},
+            ],
+            'temperature': 0.0,
+            'max_tokens': _JUDGE_MAX_TOKENS,
+            'response_format': {'type': 'json_object'},
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_chat_arm_reports_its_usage(self) -> None:
+        usage = types.SimpleNamespace(
+            prompt_tokens=850, completion_tokens=40,
+            completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
+        )
+        client = _chat_client(_payload('restates', 'm1'), usage=usage)
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_compat_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict.usage == JudgeUsage(850, 40, 0)
+        assert (verdict.outcome, verdict.candidate_id) == (OUTCOME_RESTATED, 'm1')
+
+
+#: The two arms that cannot send a reasoning effort, each with a configured one.
+_ARMS_WITHOUT_REASONING = [
+    pytest.param(
+        lambda: _judge_svc('anthropic', judge_reasoning_effort='low'),
+        'anthropic.AsyncAnthropic',
+        id='anthropic',
+    ),
+    pytest.param(
+        lambda: _compat_svc(judge_reasoning_effort='low'),
+        'openai.AsyncOpenAI',
+        id='openai_generic',
+    ),
+]
+
+
+class TestAReasoningEffortTheArmCannotSendRaises:
+    """A set effort the arm cannot send is refused, never silently dropped (INV-11).
+
+    Dropping it would let an operator believe the selected configuration runs
+    when it does not. The refusal lands in ``triage_write``'s fail-open arm, as
+    the unknown-provider raise does, so it is counted and logged naming the leaf.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('make_service', 'ctor'), _ARMS_WITHOUT_REASONING)
+    async def test_the_call_is_refused_before_any_client_is_built(
+        self, make_service, ctor: str,
+    ) -> None:
+        client = _client_double()
+        client.messages.create = AsyncMock()
+        client.chat.completions.create = AsyncMock()
+        client.responses.create = AsyncMock()
+        with patch(ctor, return_value=client) as built, \
+                pytest.raises(ValueError, match='judge_reasoning_effort'):
+            await judge_write(
+                memory_service=make_service(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        built.assert_not_called()
+        client.messages.create.assert_not_awaited()
+        client.chat.completions.create.assert_not_awaited()
+        client.responses.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('make_service', 'ctor'), _ARMS_WITHOUT_REASONING)
+    async def test_through_triage_it_stores_and_counts_one_fail_open(
+        self, make_service, ctor: str,
+    ) -> None:
+        counter = TriageFailOpenCounter()
+        service = make_service()
+        service.config.write_triage.t_high = 0.95
+        service.config.write_triage.t_low = 0.50
+        service.search = AsyncMock(return_value=SearchResults([_result('m1', 0.80)]))
+        with patch(ctor, return_value=_client_double()):
+            decision = await triage_write(
+                service, content='c', project_id='p',
+                counter=counter, judge=judge_write,
+            )
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 1
 
 
 class TestJudgeWriteAnthropicArm:
@@ -1959,7 +2116,7 @@ class TestTheClientIsReleased:
     @pytest.mark.parametrize(
         ('provider', 'ctor', 'attr'),
         [
-            ('openai', 'openai.AsyncOpenAI', 'chat'),
+            ('openai', 'openai.AsyncOpenAI', 'responses'),
             ('anthropic', 'anthropic.AsyncAnthropic', 'messages'),
         ],
         ids=['openai', 'anthropic'],
@@ -1978,7 +2135,7 @@ class TestTheClientIsReleased:
 
         client = _client_double()
         if provider == 'openai':
-            client.chat.completions.create = AsyncMock(side_effect=_hang)
+            client.responses.create = AsyncMock(side_effect=_hang)
         else:
             client.messages.create = AsyncMock(side_effect=_hang)
         with patch(ctor, return_value=client), pytest.raises(TimeoutError):
@@ -1993,7 +2150,7 @@ class TestTheClientIsReleased:
     async def test_the_client_is_released_when_the_transport_raises(self) -> None:
         """A release must not depend on the call having succeeded."""
         client = _client_double()
-        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
+        client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
             await judge_write(
@@ -2050,7 +2207,7 @@ class TestJudgeWriteFailuresRaise:
     @pytest.mark.asyncio
     async def test_a_transport_error_propagates(self) -> None:
         client = _client_double()
-        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
+        client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
             await judge_write(
@@ -2072,7 +2229,7 @@ class TestJudgeWriteFailuresRaise:
             await asyncio.sleep(5)
 
         client = _client_double()
-        client.chat.completions.create = AsyncMock(side_effect=_hang)
+        client.responses.create = AsyncMock(side_effect=_hang)
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(TimeoutError):
             await judge_write(
@@ -2178,7 +2335,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         service = self._mid_band_service()
         client = _openai_client(body)
         if side_effect is not None:
-            client.chat.completions.create = AsyncMock(side_effect=side_effect)
+            client.responses.create = AsyncMock(side_effect=side_effect)
 
         with patch('openai.AsyncOpenAI', return_value=client):
             decision = await triage_write(
@@ -2198,7 +2355,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         counter = TriageFailOpenCounter()
         service = self._mid_band_service(judge_timeout_seconds=0.01)
         client = _client_double()
-        client.chat.completions.create = AsyncMock(side_effect=_hang)
+        client.responses.create = AsyncMock(side_effect=_hang)
 
         with patch('openai.AsyncOpenAI', return_value=client):
             decision = await triage_write(
@@ -2244,3 +2401,62 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         assert decision.outcome == OUTCOME_AMENDED
         assert decision.canonical_id == 'm1'
         assert counter.live_count() == 0
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get('OPENAI_API_KEY'),
+    reason='needs OPENAI_API_KEY for a live Responses API call',
+)
+@pytest.mark.timeout(120)
+class TestTheFrontierArmLive:
+    """The live edge: a frontier reasoning model judges a fixture write through triage."""
+
+    @pytest.mark.asyncio
+    async def test_a_middle_band_write_is_judged_by_a_reasoning_model(
+        self, records: list[dict],
+    ) -> None:
+        duplicate = next(r for r in records if r['label'] == 'duplicate')
+        canonical = next(r for r in records if r['memory_id'] == duplicate['cluster_id'])
+        distractors = [r for r in records if r['cluster_id'] != duplicate['cluster_id']][:2]
+        slate = [
+            _result(canonical['memory_id'], 0.80, content=canonical['content']),
+            *(
+                _result(r['memory_id'], 0.75 - index * 0.05, content=r['content'])
+                for index, r in enumerate(distractors)
+            ),
+        ]
+        config = FusedMemoryConfig()
+        write_triage = config.write_triage
+        write_triage.judge_enabled = True
+        write_triage.judge_provider = 'openai'
+        write_triage.judge_model = 'gpt-6.1-sol'
+        write_triage.judge_reasoning_effort = 'low'
+        write_triage.t_high = 0.95
+        write_triage.t_low = 0.50
+        service = types.SimpleNamespace(
+            config=config, search=AsyncMock(return_value=SearchResults(slate)),
+        )
+        verdicts: list[TriageJudgeVerdict] = []
+
+        async def recording_judge(**kwargs) -> TriageJudgeVerdict:
+            verdict = await judge_write(**kwargs)
+            verdicts.append(verdict)
+            return verdict
+
+        counter = TriageFailOpenCounter()
+        decision = await triage_write(
+            service, content=duplicate['content'], project_id='p',
+            counter=counter, judge=recording_judge,
+        )
+
+        assert counter.live_count() == 0
+        assert decision.outcome in TRIAGE_OUTCOMES
+        if decision.judged_candidate_id is not None:
+            assert decision.judged_candidate_id in {result.id for result in slate}
+        [verdict] = verdicts
+        usage = verdict.usage
+        assert usage is not None
+        assert isinstance(usage.input_tokens, int) and usage.input_tokens > 0
+        assert isinstance(usage.reasoning_tokens, int)
+        assert usage.reasoning_tokens <= usage.output_tokens

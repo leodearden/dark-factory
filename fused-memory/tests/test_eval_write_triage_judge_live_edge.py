@@ -11,6 +11,7 @@ here needs a key, a network or Qdrant.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -39,10 +40,13 @@ from fused_memory.services.memory_service import SearchResults
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
 
-#: What the fake provider bills for every completion, in the provider's shape.
+#: The committed curator-labelled corpus the seeded eval runs over.
+SEEDED_FIXTURE = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
+
+#: What the fake provider bills for every response, in the Responses API's shape.
 _BILLED = types.SimpleNamespace(
-    prompt_tokens=321, completion_tokens=7, total_tokens=328,
-    completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
+    input_tokens=321, output_tokens=7,
+    output_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
 )
 
 #: The same bill as the eval artifact's per-case ``usage`` row records it.
@@ -85,33 +89,29 @@ _CORPUS = (
 _ID_LINE = re.compile(r'^- id: (\S+)$', re.MULTILINE)
 
 
-def _user_turn(messages: list[dict]) -> str:
-    return next(m['content'] for m in messages if m['role'] == 'user')
-
-
 def _openai(word: str, *, named: int = 0, billed: object = _BILLED) -> MagicMock:
     """A fake `AsyncOpenAI` that is its own async context manager, as the SDK is.
 
-    Every completion answers *word* about the candidate at position *named* of
-    its own prompt (an attach verdict must name one; `distinct` names none) and
-    bills *billed*. The response is plain namespaces because a MagicMock
-    `usage` would hand `int()` a 1.
+    Every Responses call answers *word* about the candidate at position *named*
+    of its own prompt (an attach verdict must name one; `distinct` names none)
+    and bills *billed*. The response is plain namespaces because a MagicMock
+    `usage` would hand `int()` a 1. The chat endpoint is a bare `AsyncMock`, so
+    a call on the wrong arm is visible.
     """
-    async def _complete(**kwargs) -> types.SimpleNamespace:
+    async def _respond(**kwargs) -> types.SimpleNamespace:
         answer = {VERDICT_KEY: word}
         if JUDGE_VERDICTS[word] != OUTCOME_STORED:
-            answer[CANDIDATE_ID_KEY] = _ID_LINE.findall(_user_turn(kwargs['messages']))[named]
+            answer[CANDIDATE_ID_KEY] = _ID_LINE.findall(kwargs['input'])[named]
         return types.SimpleNamespace(
-            choices=[types.SimpleNamespace(
-                message=types.SimpleNamespace(content=json.dumps(answer)),
-            )],
-            usage=billed,
+            output_text=json.dumps(answer), status='completed',
+            incomplete_details=None, usage=billed,
         )
 
     client = MagicMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
-    client.chat.completions.create = AsyncMock(side_effect=_complete)
+    client.responses.create = AsyncMock(side_effect=_respond)
+    client.chat.completions.create = AsyncMock()
     return client
 
 
@@ -127,11 +127,8 @@ def _judge_config() -> types.SimpleNamespace:
 
 
 def _prompt_ids(create: AsyncMock) -> list[list[str]]:
-    """The candidate ids each awaited completion's user prompt named, in order."""
-    return [
-        _ID_LINE.findall(_user_turn(call.kwargs['messages']))
-        for call in create.await_args_list
-    ]
+    """The candidate ids each awaited Responses call's user prompt named, in order."""
+    return [_ID_LINE.findall(call.kwargs['input']) for call in create.await_args_list]
 
 
 def _resolved(plan, index: int) -> list:
@@ -155,7 +152,7 @@ class TestTheSeededLiveEdge:
                 plan=plan, judge_fn=_mod().build_judge_fn(_judge_config()),
                 report_path=tmp_path / 'r.json', provenance={},
             )
-        create = client.chat.completions.create
+        create = client.responses.create
         assert create.await_count == len(plan.cases)
         assert _prompt_ids(create) == [case['candidates'] for case in plan.cases]
 
@@ -181,6 +178,87 @@ class TestTheSeededLiveEdge:
         with patch('openai.AsyncOpenAI', return_value=_openai('restates', billed=None)):
             answer = _mod().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
         assert answer.usage is None
+
+
+def _deterministic_answer(system: str, user: str) -> str:
+    """One verdict per (system, user) text pair, so any wire difference changes a verdict."""
+    digest = hashlib.sha256(f'{system}\x00{user}'.encode()).digest()
+    word = sorted(JUDGE_VERDICTS)[digest[0] % len(JUDGE_VERDICTS)]
+    answer = {VERDICT_KEY: word}
+    if JUDGE_VERDICTS[word] != OUTCOME_STORED:
+        ids = _ID_LINE.findall(user)
+        answer[CANDIDATE_ID_KEY] = ids[digest[1] % len(ids)]
+    return json.dumps(answer)
+
+
+def _answering_both_apis() -> MagicMock:
+    """A fake `AsyncOpenAI` serving both OpenAI APIs from :func:`_deterministic_answer`."""
+    async def _respond(**kwargs) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            output_text=_deterministic_answer(kwargs['instructions'], kwargs['input']),
+            status='completed', incomplete_details=None, usage=None,
+        )
+
+    async def _complete(**kwargs) -> types.SimpleNamespace:
+        system, user = (message['content'] for message in kwargs['messages'])
+        return types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(
+                content=_deterministic_answer(system, user),
+            ))],
+            usage=None,
+        )
+
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    client.responses.create = AsyncMock(side_effect=_respond)
+    client.chat.completions.create = AsyncMock(side_effect=_complete)
+    return client
+
+
+class TestTheDefaultModelsSeededVerdictsAreUnchanged:
+    """Over the committed seeded fixture, the Responses arm reproduces main's chat verdicts.
+
+    A live byte-identical run is not achievable (the provider samples), so the
+    regression is pinned offline: both arms put the same prompt bytes on the
+    wire, and one answer function of those bytes yields the same verdict per
+    case. The chat arm is main's request, kept for ``openai_generic`` endpoints.
+    """
+
+    def test_both_arms_send_the_same_bytes_and_read_the_same_verdicts(self) -> None:
+        mod = _mod()
+        plan = mod.seeded_plan(mod.load_fixture(SEEDED_FIXTURE), distractors=4)
+        chat_config = _judge_config()
+        chat_config.llm.client_class = 'openai_generic'
+        verdicts: dict[str, list] = {}
+        clients: dict[str, MagicMock] = {}
+        for arm, config in (('responses', _judge_config()), ('chat', chat_config)):
+            client = _answering_both_apis()
+            judge_fn = mod.build_judge_fn(config)
+            with patch('openai.AsyncOpenAI', return_value=client):
+                answers = [
+                    judge_fn(case, _resolved(plan, index))
+                    for index, case in enumerate(plan.cases)
+                ]
+            verdicts[arm] = [(answer.outcome, answer.candidate_id) for answer in answers]
+            clients[arm] = client
+
+        sent = [
+            (call.kwargs['instructions'], call.kwargs['input'])
+            for call in clients['responses'].responses.create.await_args_list
+        ]
+        main = [
+            tuple(message['content'] for message in call.kwargs['messages'])
+            for call in clients['chat'].chat.completions.create.await_args_list
+        ]
+        assert len(sent) == len(plan.cases)
+        assert sent == main
+        assert verdicts['responses'] == verdicts['chat']
+        assert len({outcome for outcome, _ in verdicts['chat']}) > 1, (
+            'precondition: the answer function varies, or the comparison is vacuous'
+        )
+        clients['responses'].chat.completions.create.assert_not_awaited()
+        clients['chat'].responses.create.assert_not_awaited()
 
 
 def _hit(memory_id: str, cosine: float) -> MemoryResult:
@@ -243,7 +321,7 @@ class TestTheRetrievedLiveEdge:
             answer = _mod().build_retrieved_judge_fn(_judge_config())(case, candidates)
         assert (answer.outcome, answer.verdict) == (band, None)
         assert answer.candidate_id is None
-        client.chat.completions.create.assert_not_awaited()
+        client.responses.create.assert_not_awaited()
 
     def test_a_middle_band_case_is_one_completion(self) -> None:
         case, candidates = self._case(0.7)
@@ -251,7 +329,7 @@ class TestTheRetrievedLiveEdge:
         client = _openai('amends')
         with patch('openai.AsyncOpenAI', return_value=client):
             answer = _mod().build_retrieved_judge_fn(_judge_config())(case, candidates)
-        assert client.chat.completions.create.await_count == 1
+        assert client.responses.create.await_count == 1
         assert (answer.outcome, answer.verdict) == (JUDGE_VERDICTS['amends'],) * 2
 
     def test_the_answer_carries_the_candidate_the_verdict_named(self) -> None:
@@ -307,7 +385,7 @@ class TestEachPromptRendersItsOwnRetrieval:
                 plan=plan, judge_fn=_mod().build_retrieved_judge_fn(_judge_config()),
                 report_path=tmp_path / 'r.json', provenance={},
             )
-        assert _prompt_ids(client.chat.completions.create) == [
+        assert _prompt_ids(client.responses.create) == [
             case['candidates'] for case in plan.cases
         ]
 

@@ -356,13 +356,22 @@ def _tool_service(results: list[MemoryResult]) -> AsyncMock:
 
 
 def _provider_answering(answer: dict) -> MagicMock:
-    """A fake ``AsyncOpenAI``, its own async context manager as the SDK's is."""
-    message = types.SimpleNamespace(content=json.dumps(answer))
+    """A fake ``AsyncOpenAI``, its own async context manager as the SDK's is.
+
+    It answers on the Responses API with a real-shaped usage, reasoning tokens
+    included, so the tool-level path carries a verdict with usage end to end.
+    """
     client = MagicMock()
     client.__aenter__ = AsyncMock(return_value=client)
     client.__aexit__ = AsyncMock(return_value=False)
-    client.chat.completions.create = AsyncMock(return_value=types.SimpleNamespace(
-        choices=[types.SimpleNamespace(message=message)],
+    client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
+        output_text=json.dumps(answer),
+        status='completed',
+        incomplete_details=None,
+        usage=types.SimpleNamespace(
+            input_tokens=900, output_tokens=60,
+            output_tokens_details=types.SimpleNamespace(reasoning_tokens=40),
+        ),
     ))
     return client
 
