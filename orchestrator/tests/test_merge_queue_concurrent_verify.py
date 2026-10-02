@@ -30,6 +30,7 @@ import collections
 import contextlib
 import dataclasses
 import logging
+import math
 import traceback
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -6410,6 +6411,137 @@ class TestHeavyBarrierTimeoutName:
             f'300.0, got {budgets!r}.'
         )
 
+    def test_wait_responsive_bare_bills_the_stretched_hidden_default(self) -> None:
+        """A `wait_responsive(...)` with no `timeout=` bills its hidden
+        MERGE_RESULT_TIMEOUT default stretched by RESPONSIVE_WAIT_STRETCH
+        (2 x 45 = 90.0), the wall clock the helper can actually consume.
+        """
+        source = '''
+class TestWaitResponsiveBare:
+    async def test_it(self):
+        await wait_responsive(req.result, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestWaitResponsiveBare': 90.0}, (
+            f'Expected the stretched hidden default (90.0), got {budgets!r}.'
+        )
+
+    def test_wait_responsive_gate_barrier_bills_twice_its_nominal(self) -> None:
+        """`timeout=MERGE_GATE_BARRIER_TIMEOUT` (15) bills 2 x 15 = 30.0."""
+        source = '''
+class TestWaitResponsiveGate:
+    async def test_it(self, g):
+        await wait_responsive(g.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestWaitResponsiveGate': 30.0}, (
+            f'Expected a stretched gate-barrier nominal (30.0), got {budgets!r}.'
+        )
+
+    def test_wait_responsive_large_nominal_is_clamped_to_the_wall_cap(self) -> None:
+        """A nominal whose stretch exceeds RESPONSIVE_WAIT_WALL_CAP bills
+        the cap (90.0): the helper's default cap never exceeds it.
+        """
+        source = '''
+class TestWaitResponsiveClamped:
+    async def test_it(self):
+        await wait_responsive(req.result, timeout=500.0, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestWaitResponsiveClamped': 90.0}, (
+            f'Expected the RESPONSIVE_WAIT_WALL_CAP clamp (90.0), got {budgets!r}.'
+        )
+
+    def test_wait_responsive_explicit_max_wall_is_billed_verbatim(self) -> None:
+        """An explicit `max_wall_s` replaces the helper's scaled default cap,
+        so it is the wall clock the site may consume and is billed as is --
+        not the 2 x nominal a default-cap site would get.
+        """
+        source = '''
+class TestWaitResponsiveExplicitCap:
+    async def test_it(self):
+        await wait_responsive(req.result, timeout=1.0, max_wall_s=1000.0, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestWaitResponsiveExplicitCap': 1000.0}, (
+            f'Expected an explicit max_wall_s=1000.0 to be billed verbatim, '
+            f'got {budgets!r}.'
+        )
+
+    def test_wait_responsive_explicit_max_wall_name_resolves(self) -> None:
+        """`max_wall_s=RESPONSIVE_WAIT_WALL_CAP` resolves the name and bills
+        it (90.0).
+        """
+        source = '''
+class TestWaitResponsiveNamedCap:
+    async def test_it(self):
+        await wait_responsive(
+            req.result, timeout=1.0, max_wall_s=RESPONSIVE_WAIT_WALL_CAP, label='x'
+        )
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestWaitResponsiveNamedCap': 90.0}, (
+            f'Expected max_wall_s=RESPONSIVE_WAIT_WALL_CAP to bill 90.0, '
+            f'got {budgets!r}.'
+        )
+
+    def test_wait_responsive_explicit_none_max_wall_is_the_default(self) -> None:
+        """`max_wall_s=None` IS the helper's default, so the site bills the
+        stretched nominal (2 x 15 = 30.0), not an unknown cap.
+        """
+        source = '''
+class TestWaitResponsiveNoneCap:
+    async def test_it(self, g):
+        await wait_responsive(
+            g.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, max_wall_s=None, label='x'
+        )
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestWaitResponsiveNoneCap': 30.0}, (
+            f'Expected max_wall_s=None to bill the stretched nominal (30.0), '
+            f'got {budgets!r}.'
+        )
+
+    def test_wait_responsive_unresolvable_max_wall_is_unbounded(self) -> None:
+        """An explicit `max_wall_s` the auditor cannot resolve could allow
+        any wall clock at all, so the site bills `math.inf` -- which no mark
+        clears, making the coverage guard fail loudly rather than quietly
+        under-billing.
+        """
+        source = '''
+class TestWaitResponsiveUnknownCap:
+    async def test_it(self):
+        await wait_responsive(req.result, timeout=1.0, max_wall_s=some_var, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestWaitResponsiveUnknownCap': math.inf}, (
+            f'Expected an unresolvable max_wall_s to bill math.inf, got {budgets!r}.'
+        )
+
+    def test_wait_responsive_unresolvable_nominal_bills_the_wall_cap(self) -> None:
+        """With a default cap the helper never exceeds
+        RESPONSIVE_WAIT_WALL_CAP whatever its nominal, so an unresolvable
+        `timeout=` bills that exact bound (90.0) rather than 0.0.
+        """
+        source = '''
+class TestWaitResponsiveUnknownNominal:
+    async def test_it(self):
+        await wait_responsive(req.result, timeout=some_var, label='x')
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestWaitResponsiveUnknownNominal': 90.0}, (
+            f'Expected an unresolvable wait_responsive nominal to bill '
+            f'RESPONSIVE_WAIT_WALL_CAP (90.0), got {budgets!r}.'
+        )
+
     def test_asyncio_sleep_is_outside_the_counted_shape_set(self) -> None:
         """`asyncio.sleep(999)` contributes 0.0 -- sleeps are deliberately
         OUT of the counted shape set (the guard is a conservative floor,
@@ -7247,6 +7379,24 @@ class TestTimeoutMarkOffenders:
         assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
         assert '_UnmarkedAtCli' in offenders[0]
         assert 'no @pytest.mark.timeout mark' in offenders[0]
+
+    def test_unbounded_budget_is_reported_as_unbounded(self) -> None:
+        """An infinite budget -- some wait with no resolvable wall-clock cap
+        -- is one offender whatever the mark, and says so in words rather
+        than rendering a meaningless `infs`.
+        """
+
+        @pytest.mark.timeout(10**6)
+        class _Unbounded:
+            pass
+
+        offenders = _timeout_mark_offenders(
+            {'_Unbounded': math.inf}, {'_Unbounded': _Unbounded}.get
+        )
+
+        assert len(offenders) == 1, f'Expected exactly one offender, got {offenders!r}.'
+        assert '_Unbounded' in offenders[0]
+        assert 'unbounded' in offenders[0]
 
 
 # ---------------------------------------------------------------------------
