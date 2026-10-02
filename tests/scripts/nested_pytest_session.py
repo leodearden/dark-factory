@@ -36,11 +36,11 @@ if str(REPO_ROOT) not in sys.path:
 
 import df_pytest_isolation  # noqa: E402
 
-# Must sit strictly below pytest-timeout's per-test axe (the modules'
-# `--timeout=300`), so a wedged nested run reports as the calling test's
-# TimeoutExpired, carrying its captured output, rather than the outer test being
-# killed mid-assertion. A nested session takes ~2-4s, so this leaves wide
-# headroom. Checked by test_nested_pytest_session.py::
+# Must sit strictly below the run's pytest-timeout per-test axe, so a wedged
+# nested run reports as the calling test's TimeoutExpired, carrying its captured
+# output, rather than the outer test being killed mid-assertion. A nested
+# session takes ~2-4s, so this leaves wide headroom. Checked against the axe
+# actually in force by test_nested_pytest_session.py::
 # test_the_nested_cap_is_below_this_runs_per_test_timeout.
 NESTED_SESSION_TIMEOUT_SECS = 120
 

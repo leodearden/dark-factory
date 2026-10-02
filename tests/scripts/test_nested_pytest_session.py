@@ -10,20 +10,10 @@ nested run, remain the main regression detectors for it.
 from __future__ import annotations
 
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
-
-REPO_ROOT = Path(__file__).resolve().parents[2]
-# APPEND, never insert(0, ...): the repo root must stay LAST on sys.path or the
-# subproject directories (orchestrator/, shared/, ...) resolve as namespace
-# packages shadowing their own src/<pkg>/ — the failure the root conftest.py
-# docstring exists to prevent.
-if str(REPO_ROOT) not in sys.path:
-    sys.path.append(str(REPO_ROOT))
-
-from nested_pytest_session import (  # noqa: E402
+from nested_pytest_session import (
     NESTED_SESSION_TIMEOUT_SECS,
     binding_conftest,
     run_nested_pytest,
