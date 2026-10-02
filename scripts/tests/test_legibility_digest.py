@@ -31,7 +31,7 @@ import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
-from orchestrator.agents.briefing import (
+from orchestrator.agents.memory_recall import (
     MEMORY_CONTEXT_CAVEAT,
     MEMORY_DEGRADED_STORES_NOTICE,
     MEMORY_EMPTY_NOTICE,

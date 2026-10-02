@@ -29,10 +29,10 @@ from test_roles_ancestry_check import _tool_is_granted
 
 from orchestrator.agents.briefing import (
     DELIVERED_CHECK_BULLET_LIMIT,
-    MEMORY_CONTEXT_CAVEAT,
     BriefingAssembler,
     _format_delivered_checks,
 )
+from orchestrator.agents.memory_recall import MEMORY_CONTEXT_CAVEAT
 from orchestrator.agents.roles import ARCHITECT
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
