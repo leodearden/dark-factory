@@ -583,6 +583,9 @@ def test_per_module_verify_commands_never_pair_project_with_directory() -> None:
 
 
 # Task 4902 RE-MEASUREMENT of the `orchestrator` fleet segment, in seconds.
+# HISTORICAL since task 3496: no longer the source of MEASURED_FLEET_SEGMENT_SECS
+# (task 3353's census superseded it); kept because the repo-root yaml and
+# test_module_verify_budgets.py cite it by name as 4902's record.
 #
 # WHY THIS EXISTS: the table below was frozen at a task-3062 single run from
 # 2026-07-31. On 2026-08-20 commit 685f558728 landed
@@ -643,14 +646,17 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 #     escalation esc-3062-3. One logged run each, except `tests/scripts`, which
 #     uses the LOWEST of four independent measurements (105-127s).
 #
-#   orchestrator — RE-MEASURED by task 4902 on 2026-08-28 from the per-module
-#     verify corpus (`.worktrees/*/.task/verify/*.orchestrator.summary.json`),
-#     selecting FULL-SUITE GREEN runs only: n=28, window 2026-08-22..2026-08-28,
-#     p50 1765.95 / p90 2552.09 / max 3310.50. The old figure (1366.23, one run)
-#     predates commit 685f558728's `verify_admission_pytest_n: "8"` fanout cap
-#     and understated this segment by ~400s. Full selection rules, both regime
-#     arms and the percentile conventions are on
-#     POST_CAP_ORCHESTRATOR_GREEN_SECS above.
+#   orchestrator — task 3353's census, adopted by task 3496:
+#     tests/scripts/test_module_verify_budgets.py::ORCHESTRATOR_BUDGET_CENSUS,
+#     measured 2026-09-14 over the prevailing config regime (since the
+#     2026-09-12 3600 -> 7200 fleet-ceiling raise), full-suite GREEN runs only:
+#     n=14, p50 3274.92 / p90 3684.59 / max 4626.17. That record is the method's
+#     single home — window, regime scoping and census_command live there.
+#     Superseded predecessors: task 4902's 1765.95 (n=28, 2026-08-28;
+#     POST_CAP_ORCHESTRATOR_GREEN_SECS above) and task 3062's 1366.23 (one run,
+#     2026-07-31). Independent corroboration: the M1a PRE arm in
+#     plans/verify-admission-task-slots-gate.md (verify_admission_task_slots=1,
+#     today's value) reports a clean p50 of 3233s, n=14 — within 1.3%.
 #
 #   scripts/tests — task 3384, 2026-08-01: one standalone local run (1184
 #     passed in ~113s, "lowest of local runs"), recorded in commit 7249f40f14,
@@ -660,26 +666,42 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 #     `scripts/tests/` together, and `tests/scripts` already has its own row, so
 #     a combined figure would double-count it.
 #
-# WHAT THE SUM IS, PRECISELY. `dashboard`, `sampler` and `cockpit` are OMITTED
-# ENTIRELY — task 3062's run timed out at 1800.66s before dashboard even
+# KNOWN-STALE ROWS, deliberately not re-measured here. Two 2026-07-31 rows are
+# stale in OPPOSITE directions: `shared` UNDER-states (task 5131 measured +48%
+# collection growth; re-measure ticket tkt_0RTA9W8FEYMNAC7RQ4Y0QR857R) and
+# `escalation` OVER-states (task 5408 moved it to xdist: 49.63s vs 123.29s
+# serial). 5131's own 296.88 is the WORST run of a different command under
+# contention (test_module_verify_budgets.py::MEASURED_MODULE_SUITE_WORST_SECS)
+# and does not belong in a table of representative green runs. The sum still
+# reads as a lower bound on the median chain, because the omitted suites'
+# 5408-measured cost (dashboard 95.07 + cockpit 16.78) exceeds escalation's
+# overstatement (73.66).
+#
+# WHAT THE SUM IS, PRECISELY. The suites in UNMEASURED_FLEET_SEGMENTS are
+# OMITTED ENTIRELY — task 3062's run timed out at 1800.66s before dashboard even
 # started, so no figure exists for them. So sum() is a lower bound on the MEDIAN
-# green chain cost: five of eight segments, each a representative green run.
+# green chain cost over the measured subset of the chain's suites, each a
+# representative green run.
 #
 # It is NOT a bound on an individual run, and the earlier wording here ("the
 # real green-path chain is strictly more expensive than this, never less") was
 # wrong to imply otherwise — task 3062 itself logged 1366.23s and 1157.62s for
-# the same segment on the same day, and the 4902 corpus shows green full-suite
-# orchestrator runs spanning 864.83s to 3310.50s. Individual runs land on both
-# sides of this sum; the median chain does not.
+# the same segment on the same day, and the 3353 census shows green full-suite
+# orchestrator runs in its regime reaching p90 3684.59s and max 4626.17s
+# against a p50 of 3274.92s. Individual runs land on both sides of this sum;
+# the median chain does not.
 #
-# FINDING (data for the pinned operator decision, task 3353's L1 — deliberately
-# NOT acted on here). At the observed green MAXIMUM the five-segment floor is
-# 472.37 + 3310.50 = 3782.87s, already above the 3600s
-# `verify_command_timeout_secs`; adding the yaml's own ~407s of estimates for
-# the three unmeasured segments puts that path at ~4190s. At the time of the
-# mine one run had already consumed the full ceiling and been recorded as a
-# false infra_timeout: 3600.649s, started 2026-08-28T17:25:05Z, observed at
-# .worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json.
+# FINDING of task 4902, dated 2026-08-28, since ACTED ON. At 4902's observed
+# green maximum the then five-segment floor was 472.37 + 3310.50 = 3782.87s,
+# already above the 3600s `verify_command_timeout_secs` of the time, and one
+# run had consumed the full ceiling and been recorded as a false
+# infra_timeout: 3600.649s, started 2026-08-28T17:25:05Z, observed at
+# .worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json. Leo raised
+# the fleet ceiling to 7200 on 2026-09-12 and task 5422 gave the orchestrator
+# module its own budget. At today's figures the six-suite floor is 3860.29s at
+# census p50 and 5211.54s at census max — both under 7200, but ABOVE 3600 at the
+# median already, so the repo-root yaml's stated revert to 3600 would be refused
+# by the floor guard below (task 3496's finding, recorded, not acted on).
 #
 # THE INLINED FIGURES ARE THE EVIDENCE; THE PATH IS NOT — the same caveat the
 # repo-root yaml carries beside this finding. A `.task/verify/*.summary.json`
@@ -693,14 +715,16 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 # re-read one path. This is also the reason the guards in this file compare
 # recorded constants and read no corpus at test time.
 #
-# This task changes NO budget, NOT the -n cap, and NOT
-# orchestrator/orchestrator.yaml — it only records the measurement those
+# Neither task 4902 nor task 3496 changes any budget, the -n cap, or
+# orchestrator/orchestrator.yaml — they only record the measurements those
 # decisions need.
 MEASURED_FLEET_SEGMENT_SECS = {
     'shared': 120.21,
     'escalation': 123.29,
-    # Task 4902: 1366.23 -> 1765.95, the post-cap median. See PROVENANCE above.
-    'orchestrator': 1765.95,
+    # Task 3496: ORCHESTRATOR_BUDGET_CENSUS.p50 (test_module_verify_budgets.py,
+    # 2026-09-14, regime since the 2026-09-12 fleet-ceiling raise) to 2 dp. A
+    # re-measure repeats that record's census_command and moves BOTH figures.
+    'orchestrator': 3274.92,
     'fused-memory': 123.87,
     'tests/scripts': 105.0,
     'scripts/tests': 113.0,
@@ -726,7 +750,7 @@ class _SegmentProvenance(NamedTuple):
 # `pytest -n 8` cap) invalidated the table wholesale and nothing noticed for
 # eight days. `tests/scripts` is n=4 because the comment above records it as
 # the lowest of four independent measurements. Only `orchestrator` rests on a
-# real sample, and only because task 4902 mined one.
+# real sample: task 4902 first mined one, and task 3353's census replaced it.
 #
 # This makes the table DATED, not CURRENT. Nothing here re-measures anything —
 # see the SCOPE paragraph on the floor guard below.
@@ -736,10 +760,9 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
     'escalation': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'orchestrator': _SegmentProvenance(
-        # Spelled literally rather than as a reference to
-        # POST_CAP_ORCHESTRATOR_GREEN_N so this record reads standalone. The
-        # two are the same n by construction — a re-mine must move both.
-        '2026-08-28', 28, '4902',
+        # ORCHESTRATOR_BUDGET_CENSUS.n, spelled literally because a test file
+        # does not import a sibling test file. A re-measure must move both.
+        '2026-09-14', 14, '3353',
         '.worktrees/*/.task/verify/*.orchestrator.summary.json'),
     'fused-memory': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
