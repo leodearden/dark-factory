@@ -75,6 +75,16 @@ def _fresh(corpus: EscalationCorpus) -> Datum[EscalationCorpus]:
     return Datum(corpus, NOW, DatumState.FRESH, None, CORPUS_FRESHNESS_BOUND_SECONDS)
 
 
+def _reason(datum: Datum) -> str:
+    assert datum.reason is not None
+    return datum.reason
+
+
+def _corpus(datum: Datum[EscalationCorpus]) -> EscalationCorpus:
+    assert datum.value is not None
+    return datum.value
+
+
 def _sketch_10(queue_dir: Path) -> None:
     """Sketch #10: 2 pending at the root, 3 pending in the archive, 1 resolved at the root."""
     for n in (1, 2):
@@ -228,8 +238,8 @@ class TestViewsOver:
 
         for datum in partial.values():
             assert datum.state is DatumState.LOWER_BOUND
-            assert 'broken' in datum.reason
-            assert '1 file' in datum.reason
+            assert 'broken' in _reason(datum)
+            assert '1 file' in _reason(datum)
             validate_datum(datum, NOW)
         assert partial[EscalationView.QUEUE_PENDING].value == 1
         for datum in sibling.values():
@@ -249,8 +259,8 @@ class TestViewsOver:
 
         for datum in fleet.values():
             assert datum.state is DatumState.LOWER_BOUND
-            assert 'missing' in datum.reason
-            assert str(missing_dir) in datum.reason
+            assert 'missing' in _reason(datum)
+            assert str(missing_dir) in _reason(datum)
             validate_datum(datum, NOW)
         assert fleet[EscalationView.QUEUE_PENDING].value == 1
         assert fleet[EscalationView.OPEN_IN_HISTORY].value == 1
@@ -279,7 +289,9 @@ def _corpus_cache():
     escalation_corpus._corpus_cache_clear()
 
 
-def _counts(corpus_datum: Datum[EscalationCorpus], queue: QueueRef) -> tuple[int, int]:
+def _counts(
+    corpus_datum: Datum[EscalationCorpus], queue: QueueRef,
+) -> tuple[int | None, int | None]:
     views = views_over(corpus_datum, [queue.id])
     return (
         views[EscalationView.QUEUE_PENDING].value,
@@ -312,7 +324,7 @@ class TestAcquireCorpus:
         corpus_datum = await acquire_corpus((_queue(present_dir, 'present'), missing), now=NOW)
 
         assert corpus_datum.state is DatumState.LOWER_BOUND
-        assert 'missing' in corpus_datum.reason
+        assert 'missing' in _reason(corpus_datum)
         validate_datum(corpus_datum, NOW)
 
     async def test_a_record_written_within_the_ttl_is_not_seen(self, tmp_path):
@@ -351,7 +363,7 @@ class TestAcquireCorpus:
         _sketch_10(queue_dir)
         filled = await acquire_corpus((queue,), now=NOW + timedelta(seconds=1))
 
-        assert empty.value.reached_any is False
+        assert _corpus(empty).reached_any is False
         assert _counts(empty, queue) == (0, 0)
         assert _counts(filled, queue) == (2, 5)
 
@@ -367,7 +379,7 @@ class TestAcquireCorpus:
         second = await acquire_corpus((present, missing), now=NOW + timedelta(seconds=1))
 
         assert second is first
-        assert second.value.scan(missing.id).reached is False
+        assert _corpus(second).scan(missing.id).reached is False
 
     @pytest.mark.parametrize('ttl_seconds', [0.001, 3600.0])
     async def test_sketch_10_counts_do_not_depend_on_the_ttl(

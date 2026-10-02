@@ -1,26 +1,38 @@
 """The escalation corpus datum: one walk of every escalation queue, root and archive.
 
-Declared by ``plans/dashboard-one-datum-one-path-prd.md``, decision 13. Every
-escalation surface reads the same walk: the Escalations tab's live-queue
-table and the analytics aggregates. "Pending in the live queue" and "open in
-history" are two named views over that one walk (:class:`EscalationView`),
-so the two can no longer count different populations at different
-freshnesses.
+Declared by ``plans/dashboard-one-datum-one-path-prd.md``, decision 13, and
+this module is that datum's single access implementation: every escalation
+surface — the Escalations tab's live-queue table and the analytics
+aggregates — reads the same walk through :func:`acquire_corpus` and its one
+cache. "Pending in the live queue" and "open in history" are two named views
+over that walk (:class:`EscalationView`), so the two can no longer count
+different populations at different freshnesses.
 
 A queue whose directory was not found, or that holds a file this walk could
 not parse, is a partial scan. Every view whose scope covers it is a
 ``lower_bound`` Datum whose reason names the queue and the cause (INV-11).
+
+A walk that reached NO queue directory is served but not cached. That walk
+is O(1) to repeat — one negative stat per queue — while caching it would
+keep every surface reporting an empty corpus for a whole TTL after the
+volume mounts. A partial walk IS cached: the ordinary multi-project config
+has roots that have never escalated, and one of those must not defeat the
+cache in front of every other root's archive walk. Unreadable files never
+gate caching, because a corrupt file is permanent and would defeat the cache
+forever.
 
 This module reads no clock: the walk's instant is injected.
 """
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import json
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from escalation.models import Escalation
@@ -28,11 +40,15 @@ from escalation.queue import iter_all_escalation_paths
 
 from dashboard.config import DashboardConfig
 from dashboard.data.datum import Datum, DatumState, unknown_datum
+from dashboard.data.mcp_fanout import TTLCache
 
 logger = logging.getLogger(__name__)
 
-CORPUS_FRESHNESS_BOUND_SECONDS = 120
-"""The age past which a corpus walk is no longer fresh."""
+CORPUS_TTL_SECONDS = 60.0
+"""How long one walk is served before the next request walks again."""
+
+CORPUS_FRESHNESS_BOUND_SECONDS = int(2 * CORPUS_TTL_SECONDS)
+"""Twice the TTL, so a walk served at any age inside it is still fresh."""
 
 
 class QueueKind(enum.StrEnum):
@@ -170,17 +186,56 @@ _VIEW_PREDICATES: Mapping[EscalationView, Callable[[CorpusRecord], bool]] = {
 }
 
 
-def _scope_provenance(
-    corpus_datum: Datum[EscalationCorpus], scans: Iterable[QueueScan],
-) -> tuple[DatumState, str | None]:
-    """The state and reason of a count over *scans*: a lower bound when any is partial."""
+def _partial_disclosure(scans: Iterable[QueueScan]) -> str | None:
+    """Why a count over *scans* may under-count, naming each partial queue; None when complete."""
     partial = [
         f"{scan.queue.label}: {', '.join(causes)}"
         for scan in scans
         if (causes := scan.partial_causes())
     ]
-    if partial:
-        return DatumState.LOWER_BOUND, 'partial scan, so at least this many — ' + '; '.join(partial)
+    if not partial:
+        return None
+    return 'partial scan, so at least this many — ' + '; '.join(partial)
+
+
+_corpus_cache: TTLCache[Datum[EscalationCorpus], tuple[QueueRef, ...]] = TTLCache(
+    ttl_seconds=lambda: CORPUS_TTL_SECONDS
+)
+
+
+def _corpus_cache_clear() -> None:
+    """Clear the corpus cache (test/admin hook)."""
+    _corpus_cache.clear()
+
+
+async def acquire_corpus(
+    queues: Iterable[QueueRef], *, now: datetime,
+) -> Datum[EscalationCorpus]:
+    """The corpus over *queues*, walked at most once per TTL; *now* stamps a new walk."""
+    key = tuple(queues)
+
+    async def _refresh() -> Datum[EscalationCorpus]:
+        corpus = await asyncio.to_thread(walk_corpus, key)
+        disclosure = _partial_disclosure(corpus.scans)
+        state = DatumState.FRESH if disclosure is None else DatumState.LOWER_BOUND
+        return Datum(corpus, now, state, disclosure, CORPUS_FRESHNESS_BOUND_SECONDS)
+
+    return await _corpus_cache.get_or_refresh(
+        key, _refresh, cache_ok=lambda datum: datum.value is not None and datum.value.reached_any,
+    )
+
+
+def _scope_provenance(
+    corpus_datum: Datum[EscalationCorpus], scans: Iterable[QueueScan],
+) -> tuple[DatumState, str | None]:
+    """A count over *scans* is a lower bound when any is partial, else as fresh as the walk.
+
+    The corpus' own ``lower_bound`` speaks for the whole walk; a scope that
+    holds none of its partial queues counted everything it covers.
+    """
+    disclosure = _partial_disclosure(scans)
+    if disclosure is not None:
+        return DatumState.LOWER_BOUND, disclosure
     if corpus_datum.state is DatumState.LOWER_BOUND:
         return DatumState.FRESH, None
     return corpus_datum.state, corpus_datum.reason
