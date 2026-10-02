@@ -124,6 +124,9 @@ _SRC_TREES = (
     'fused-memory/src',
     'fused-memory/scripts',
     'scripts',
+    'cockpit/src',
+    'dashboard/src',
+    'sampler/src',
 )
 
 # Every (module, function) in the six trees that renames a path into place,
@@ -975,6 +978,9 @@ _CONTROL_MODULES = {
     'fused-memory/src': 'fused-memory/src/fused_memory/reconciliation/event_queue.py',
     'fused-memory/scripts': 'fused-memory/scripts/bake_off_storage_shape.py',
     'scripts': 'scripts/legibility/codebook.py',
+    'cockpit/src': 'cockpit/src/cockpit/ui_config.py',
+    'dashboard/src': 'dashboard/src/dashboard/app.py',
+    'sampler/src': 'sampler/src/sampler/store.py',
 }
 
 
