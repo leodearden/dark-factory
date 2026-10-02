@@ -757,6 +757,24 @@
           "current": 31450
         }
       ]
+    },
+    {
+      "task_id": "5134",
+      "reason": "Task 5134 adds an in-test positive control to TestBuildAgentEnvCpuGovern::test_governance_disabled_by_default_no_df_agent_cpu_govern (one extra workflow._build_agent_env read) so the negative assertion cannot pass vacuously when cpu_governance resolution fails open; the control is the task's deliverable.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_workflow_e2e.py",
+          "baseline": 188,
+          "current": 189
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6592,
+          "current": 6593
+        }
+      ]
     }
   ]
 }
