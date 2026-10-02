@@ -704,33 +704,6 @@ def _unguarded_worker_teardown_methods(source: str) -> list[str]:
     return sorted(offenders)
 
 
-# task 4219: SHRINKING ratchet of methods that still carry the
-# suppress(TimeoutError)-wrapped-wait anti-pattern _suppressed_result_wait_methods
-# scans for -- both the `with contextlib.suppress(TimeoutError):` spelling
-# and the `try: ... except TimeoutError: ... = None` spelling (the latter
-# added to the scanner in the task 4219 amendment pass; see its docstring).
-# Entries may only be REMOVED as methods are migrated to wait_responsive --
-# never added to (a NEW offender must be migrated, not ledgered; see
-# TestLoudWaitMigrationRatchet.test_no_unledgered_suppressed_result_waits
-# below). The migration target of task 4219,
-# TestCascadeErrorContainment::test_cascade_remerge_error_does_not_kill_verifier_loop,
-# is deliberately NOT on this ledger.
-#
-# Each entry's reason individually -- none has a MEASURED failure (see the
-# never-widen design decision in the task 4219 plan), so none is urgent:
-#
-# - TestCascadeErrorContainment::test_cascade_cancel_and_release_raises_contained:
-#   routing its waits through wait_responsive at their PRESERVED nominals
-#   bills 90+90+90+40+60+20 = 390s against the shared HEAVY_BARRIER_TEST_TIMEOUT
-#   (300s) -- cannot land without first resolving that mark's arithmetic
-#   across all nine classes that share it.
-_SUPPRESSED_WAIT_DEBT: dict[str, frozenset[str]] = {
-    'TestCascadeErrorContainment': frozenset({
-        'test_cascade_cancel_and_release_raises_contained',
-    }),
-}
-
-
 # The per-test budget an UNMARKED class actually runs under: the tighter of
 # the ini default (a bare local run) and the `--timeout` verify passes on its
 # CLI (the merge-gating run).  Why the two differ, and why verify's is the
@@ -7209,73 +7182,42 @@ class TestNoStopCall:
 
 
 class TestLoudWaitMigrationRatchet:
-    """Enforced invariant, task 4219: every suppressed result wait (either
-    the `with contextlib.suppress(TimeoutError):` spelling or the
-    `try/except TimeoutError:` spelling) in THIS module's own source must
-    be accounted for on `_SUPPRESSED_WAIT_DEBT` -- a SHRINKING ratchet (see
-    the ledger's own comment, above, for its contents and why each entry
-    is not migrated in this task).
+    """Enforced invariant, task 4219, ratcheted to zero by task 4846: THIS
+    module's own source carries no suppressed result wait -- neither the
+    `with contextlib.suppress(TimeoutError):` spelling nor the swallowing
+    `try/except TimeoutError:` spelling -- and every method that waits
+    through `wait_responsive` stops its worker from a `finally:`.
 
-    No `@pytest.mark.timeout` mark needed: none of these three methods
+    No `@pytest.mark.timeout` mark needed: neither of these two methods
     performs a real await, so `_worst_per_method_wait_budget` would compute
     0.0 for this class.
     """
 
-    def test_no_unledgered_suppressed_result_waits(self) -> None:
-        """Every method `_suppressed_result_wait_methods` finds in this
-        module's own source must already be on `_SUPPRESSED_WAIT_DEBT` -- a
-        NEW offender (a fresh suppressed wait, in either recognised
-        spelling, or a migrated method that regressed) fails loudly, naming
+    def test_no_suppressed_result_waits(self) -> None:
+        """`_suppressed_result_wait_methods` finds nothing in this module's
+        own source -- a fresh suppressed wait, in either recognised
+        spelling, or a migrated method that regressed, fails loudly, naming
         the class and method and pointing at the two blessed replacements.
         """
         source = Path(__file__).read_text()
         scanned = _suppressed_result_wait_methods(source)
 
-        unledgered: list[str] = []
-        for class_name, methods in sorted(scanned.items()):
-            ledgered = _SUPPRESSED_WAIT_DEBT.get(class_name, frozenset())
-            for method_name in sorted(methods):
-                if method_name not in ledgered:
-                    unledgered.append(f'{class_name}::{method_name}')
-
-        assert not unledgered, (
+        assert scanned == {}, (
             'The following test methods contain a suppressed result wait '
             '(either `with contextlib.suppress(TimeoutError): await '
             'asyncio.wait_for(...)`, or `try: ... await asyncio.wait_for(...) '
-            'except TimeoutError: ... = None`) but are not on '
-            '_SUPPRESSED_WAIT_DEBT:\n'
-            + '\n'.join(f'  - {offender}' for offender in unledgered)
+            'except TimeoutError: ... = None`):\n'
+            + '\n'.join(
+                f'  - {class_name}::{method_name}'
+                for class_name, methods in sorted(scanned.items())
+                for method_name in sorted(methods)
+            )
             + '\n\nThis is the `outcome is None` anti-pattern: a genuine '
             'timeout is swallowed and a downstream assertion reports a '
             'confusing None/wrong-value failure instead of a loud, '
             'by-label timeout. Migrate the wait to '
             '`_orch_helpers.wait_responsive` (or, for a bare result future '
-            'with no starvation accounting needed, `_await_outcome`) '
-            'instead of adding it to the ledger.'
-        )
-
-    def test_ledger_has_no_stale_entries(self) -> None:
-        """Every `_SUPPRESSED_WAIT_DEBT` entry must still be found by the
-        scanner -- a migrated method left behind on the ledger fails
-        loudly instead of letting the ratchet rot (the ledger may only
-        shrink).
-        """
-        source = Path(__file__).read_text()
-        scanned = _suppressed_result_wait_methods(source)
-
-        stale: list[str] = []
-        for class_name, methods in sorted(_SUPPRESSED_WAIT_DEBT.items()):
-            scanned_methods = scanned.get(class_name, set())
-            for method_name in sorted(methods):
-                if method_name not in scanned_methods:
-                    stale.append(f'{class_name}::{method_name}')
-
-        assert not stale, (
-            'The following _SUPPRESSED_WAIT_DEBT entries were not found '
-            'by the scanner -- they appear to have been migrated already '
-            'and must be REMOVED from the ledger (it is a shrinking '
-            'ratchet; entries may only be deleted, not left stale):\n'
-            + '\n'.join(f'  - {entry}' for entry in stale)
+            'with no starvation accounting needed, `_await_outcome`).'
         )
 
     def test_migrated_methods_stop_worker_in_finally(self) -> None:
