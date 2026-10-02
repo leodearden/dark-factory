@@ -13,6 +13,7 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
+from _virtual_clock_helpers import run_on_virtual_clock
 
 
 class _PerPortHandler:
@@ -105,17 +106,28 @@ class TestGetMergeHaltStatus:
         assert result['proj8102']['halted'] is False
         assert 'error' in result['proj8102']
 
-    async def test_timeout_yields_offline_entry(self):
+    def test_timeout_yields_offline_entry(self):
+        """A project that does not answer inside per_call_timeout is offline,
+        while a sibling that did answer stays online.
+
+        Runs on tests/_virtual_clock_helpers.py::run_on_virtual_clock so host
+        stalls cannot expire the deadline.
+        """
         from dashboard.data.merge_halt import get_merge_halt_status
-        handler = _PerPortHandler(
-            {8100: {'wired': True, 'halted': False}},
-            slow_ports={8105: 0.5},
-        )
-        transport = httpx.MockTransport(handler)
-        async with httpx.AsyncClient(transport=transport) as client:
-            result = await get_merge_halt_status(
-                client, _urls(8100, 8105), per_call_timeout=0.05,
+
+        async def scenario():
+            handler = _PerPortHandler(
+                {8100: {'wired': True, 'halted': False}},
+                slow_ports={8105: 0.5},
             )
+            transport = httpx.MockTransport(handler)
+            async with httpx.AsyncClient(transport=transport) as client:
+                return await get_merge_halt_status(
+                    client, _urls(8100, 8105), per_call_timeout=0.05,
+                )
+
+        result = run_on_virtual_clock(scenario())
+
         assert result['proj8100']['offline'] is False
         assert result['proj8105']['offline'] is True
         assert 'error' in result['proj8105']
