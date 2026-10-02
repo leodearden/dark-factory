@@ -57,6 +57,7 @@ from orchestrator.workflow import (
     StewardResolved,
     StewardTerminalDecision,
     TaskWorkflow,
+    TerminalReport,
     WorkflowOutcome,
     WorkflowState,
 )
@@ -2092,6 +2093,13 @@ class TestDoneIsTerminal:
 # ---------------------------------------------------------------------------
 
 
+class _ReviewArmRun(NamedTuple):
+    report: TerminalReport
+    scheduler: FakeScheduler
+    queue: EscalationQueue
+    reviewer_calls: int
+
+
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestReviewerErrors:
@@ -2222,6 +2230,130 @@ class TestReviewerErrors:
         assert outcome == WorkflowOutcome.DONE
         # comprehensive reviewer was called twice (initial fail + retry success)
         assert call_counts['reviewer_comprehensive'] == 2
+
+    async def _run_with_reviewer_result(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+        reviewer_result: AgentResult, *, retries: int = 2,
+    ) -> _ReviewArmRun:
+        config.max_reviewer_retries = retries
+        config.reviewer_stagger_secs = 0.0
+        reviewer_calls: list[str] = []
+
+        class FixedReviewerStub(AgentStub):
+            def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+                reviewer_calls.append(role)
+                return reviewer_result
+
+        stub = FixedReviewerStub()
+        workflow, scheduler, queue = _build_workflow_with_escalation(
+            config, git_ops, task_assignment, stub, tmp_path,
+        )
+        monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(return_value=VerifyResult(
+                passed=True, test_output='', lint_output='',
+                type_output='', summary='All checks passed',
+            )),
+        )
+        report = await workflow.run()
+        return _ReviewArmRun(report, scheduler, queue, len(reviewer_calls))
+
+    async def test_server_error_requeues_without_retry_burn_or_escalation(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='API Error: 529 Overloaded',
+                api_error_status=529, structured_output=None,
+            ),
+        )
+
+        tid = task_assignment.task_id
+        assert run.report.outcome == WorkflowOutcome.REQUEUED
+        assert run.report.api_error_status == 529
+        assert 'agent API error: HTTP 529' in run.report.reason
+        assert run.reviewer_calls == 1
+        assert 'pending' in run.scheduler.statuses.get(tid, [])
+        assert 'blocked' not in run.scheduler.statuses.get(tid, [])
+        assert run.queue.get_by_task(tid) == []
+
+    async def test_zero_work_requeues_after_free_in_phase_retries(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='Agent produced no output',
+                subtype='error_empty_output', transcript_turns=0,
+            ),
+        )
+
+        tid = task_assignment.task_id
+        assert run.report.outcome == WorkflowOutcome.REQUEUED
+        assert run.report.api_error_status is None
+        assert run.reviewer_calls == 3
+        assert 'blocked' not in run.scheduler.statuses.get(tid, [])
+        assert run.queue.get_by_task(tid) == []
+
+    async def test_productive_kill_blocks(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='Agent produced no output',
+                subtype='error_empty_output', transcript_turns=40,
+            ),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+
+    async def test_turn_cap_blocks_naming_the_cap(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='', subtype='error_max_turns',
+                turns=31, cost_usd=2.6,
+            ),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+        assert 'turn cap' in run.report.reason
+        assert 'infrastructure' not in run.report.reason.lower()
+        l0_summaries = [
+            e.summary for e in run.queue.get_by_task(task_assignment.task_id, level=0)
+        ]
+        assert any('turn cap' in summary for summary in l0_summaries)
+
+    async def test_budget_cap_blocks_naming_the_cap(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(
+                success=False, output='', subtype='error_max_budget_usd',
+                turns=24, cost_usd=5.07,
+            ),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+        assert 'budget' in run.report.reason
+        assert 'infrastructure' not in run.report.reason.lower()
+
+    async def test_completed_run_without_verdict_blocks(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path
+    ):
+        run = await self._run_with_reviewer_result(
+            config, git_ops, task_assignment, monkeypatch, tmp_path,
+            AgentResult(success=True, output='looks fine', structured_output=None),
+        )
+
+        assert run.report.outcome == WorkflowOutcome.BLOCKED
+        assert 'without a usable verdict' in run.report.reason
 
 
 # ---------------------------------------------------------------------------
