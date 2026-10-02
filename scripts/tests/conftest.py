@@ -567,6 +567,11 @@ _FAKE_CLAUDE_DEFAULT_RESPONSE = {
     'result': 'fake claude reply',
     'is_error': False,
     'api_error_status': None,
+    'subtype': 'success',
+    'total_cost_usd': 0.0,
+    'num_turns': 1,
+    'duration_ms': 1200,
+    'stderr': '',
     'rc': 0,
     'sleep_secs': 0,
 }
@@ -615,15 +620,16 @@ with open(os.environ[{calls_env!r}], 'a') as calls:
 time.sleep(response['sleep_secs'])
 print(json.dumps({{
     'type': 'result',
-    'subtype': 'success',
+    'subtype': response['subtype'],
     'is_error': response['is_error'],
     'result': response['result'],
     'session_id': str(uuid.uuid4()),
-    'num_turns': 1,
-    'total_cost_usd': 0.0,
-    'duration_ms': 1200,
+    'num_turns': response['num_turns'],
+    'total_cost_usd': response['total_cost_usd'],
+    'duration_ms': response['duration_ms'],
     'api_error_status': response['api_error_status'],
 }}))
+sys.stderr.write(response['stderr'])
 sys.exit(response['rc'])
 """
 
@@ -632,11 +638,13 @@ class FakeClaudeCli:
     """A fake `claude` first on PATH, scripted per leased OAuth token.
 
     ``plan(by_token, default=...)`` maps a ``CLAUDE_CODE_OAUTH_TOKEN`` value to
-    a response dict (any of ``result``, ``is_error``, ``api_error_status``,
-    ``rc``, ``sleep_secs``); a token with no entry gets *default*, itself laid
-    over ``_FAKE_CLAUDE_DEFAULT_RESPONSE``. The fake prints real-CLI-shaped
-    ``--output-format json`` (``subtype`` is ``success`` even on an error, as
-    measured on CLI 2.1.287) and exits ``rc``.
+    a response dict (any key of ``_FAKE_CLAUDE_DEFAULT_RESPONSE``); a token
+    with no entry gets *default*, itself laid over those defaults. The fake
+    prints real-CLI-shaped ``--output-format json`` (``subtype`` defaults to
+    ``success`` even on an error, as measured on CLI 2.1.287), writes
+    ``stderr`` and exits ``rc``. A failure meant to be read as an ordinary
+    failure must cost something or run >=5s: the shared runner's heuristic
+    net reads a zero-cost, sub-5s, <=1-turn failure as an unrecognised cap.
 
     ``calls()`` returns one dict per invocation, recorded BEFORE any scripted
     sleep so a timed-out call is still visible: ``argv``, ``cwd``, ``stdin``,
