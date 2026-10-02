@@ -5540,8 +5540,9 @@ async def _run_segmented(
     # Load-bearing, not an edge case: removing the `&&` short-circuit (the whole
     # point of task 3338) makes budget exhaustion strictly MORE likely, since
     # all 8 segments now always run where the shell previously stopped at the
-    # first red — and the committed config's own measured table already records
-    # five of seven segments costing 1838.60s. So red-plus-exhausted is the
+    # first red — and the measured fleet-chain floor
+    # (tests/scripts/test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS)
+    # is a lower bound, not the whole chain. So red-plus-exhausted is the
     # COMMON shape of a red fallback verify. Under the old `&&` chain the shell
     # short-circuited at the red and the check finished fast with
     # rc=1/timed_out=False/`test_failure`; without this conditional, segmenting
@@ -8369,14 +8370,15 @@ async def run_scoped_verification(
                     # an unrelated red unrelated — but a merge failure goes
                     # straight to a human, who has the whole chain anyway. Cost:
                     # a merge verify whose first subproject goes red would now
-                    # run the remaining seven suites, up to the full resolved
+                    # run the remaining seven segments, up to the full resolved
                     # budget, with the queue blocked behind it — on the one path
                     # this module already treats as latency-critical (see the
                     # `-n`-cap comment in _run_or_skip_timed: 'merge' is never
                     # -n-capped for exactly this reason). Budget exhaustion is
                     # strictly MORE likely once every segment always runs; the
-                    # yaml's measured table already has five of seven segments
-                    # costing 1838.60s.
+                    # measured fleet-chain floor (tests/scripts/
+                    # test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS)
+                    # is a lower bound, not the whole chain.
                     segment_chained_test=role != 'merge',
                 )
                 fallback_result.plan = plan_dict

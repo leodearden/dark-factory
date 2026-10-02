@@ -763,7 +763,7 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
         # ORCHESTRATOR_BUDGET_CENSUS.n, spelled literally because a test file
         # does not import a sibling test file. A re-measure must move both.
         '2026-09-14', 14, '3353',
-        '.worktrees/*/.task/verify/*.orchestrator.summary.json'),
+        'verify-summary corpus read by ORCHESTRATOR_BUDGET_CENSUS.census_command'),
     'fused-memory': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'tests/scripts': _SegmentProvenance(
