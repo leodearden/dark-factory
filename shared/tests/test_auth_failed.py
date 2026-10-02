@@ -534,6 +534,29 @@ class TestSingleResetsParserOwnership:
             'importable.'
         )
 
+    def test_shared_tree_spans_every_production_src_root(self, first_party_tree):
+        """The shared tree must cover every DISCOVERED `<pkg>/src` root.
+
+        The ownership scan walks the session's shared first-party tree, whose
+        scope is a fixed list. This keeps the discovered contract: a package
+        added later is caught here rather than silently left unscanned.
+        """
+        relpaths = [record.relpath for record in first_party_tree]
+        missing = [
+            root_rel
+            for root_rel in (
+                root.relative_to(_REPO_ROOT).as_posix() for root in _production_src_roots()
+            )
+            if not any(rel.startswith(f'{root_rel}/') for rel in relpaths)
+        ]
+        assert missing == [], (
+            f'discovered production source root(s) absent from the shared '
+            f'first-party tree: {missing}. Add them to '
+            f'shared/tests/silent_fallthrough_scan.py::_SCOPE_ROOTS; never narrow '
+            f'this discovery. (A `<pkg>/src` holding no Python at all also trips '
+            f'this check.)'
+        )
+
 
 @pytest.mark.asyncio
 class TestBeforeInvokeSkipsAuthFailed:
