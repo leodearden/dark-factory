@@ -28,6 +28,7 @@ This test loads the *committed* ``dark-factory-orchestrator.yaml`` directly
 in ``test_orchestrator_restart_config_drift.py``.
 """
 
+import ast
 import pathlib
 import posixpath
 import re
@@ -201,31 +202,70 @@ def _pytest_segments(cmd: str) -> list[str]:
     return [seg for seg in cmd.split("&&") if "pytest" in seg]
 
 
-_MEMBER_SUITE_RE = re.compile(r"cd\s+(?:\.\./)?([A-Za-z0-9_.-]+)\s*&&\s*uv run pytest\s+tests/")
-_ROOT_SUITE_RE = re.compile(r"uv run --project \S+ pytest\s+([^-]+?)\s*--timeout")
+#: Shell tokens that end one simple command. ``(`` and ``)`` also open and
+#: close a subshell, whose ``cd`` does not leak past it.
+_SHELL_CLAUSE_ENDS = frozenset({'&&', '||', ';', '|', '(', ')'})
+
+#: pytest options whose value is a SEPARATE token, so that value is not read as
+#: a suite. This guard's own policy, handed to ``vci.positional_targets``; the
+#: ``--flag=value`` spelling needs no entry. An unlisted one donates its value
+#: as a phantom suite, which the partition guard reports as UNACCOUNTED.
+_PYTEST_VALUE_FLAGS = frozenset({
+    '-c', '-k', '-m', '-n', '-o', '-p', '-r', '-W',
+    '--basetemp', '--deselect', '--dist', '--durations', '--ignore',
+    '--ignore-glob', '--import-mode', '--maxfail', '--rootdir', '--tb', '--timeout',
+})
+
+
+def _shell_clauses(cmd: str) -> list[tuple[list[str], str | None]]:
+    """*cmd* as ``(clause tokens, the operator that ended the clause)`` pairs, in order.
+
+    The last clause's operator is ``None``.
+    """
+    lexer = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    clauses: list[tuple[list[str], str | None]] = []
+    clause: list[str] = []
+    for token in lexer:
+        if token in _SHELL_CLAUSE_ENDS:
+            clauses.append((clause, token))
+            clause = []
+        else:
+            clause.append(token)
+    clauses.append((clause, None))
+    return clauses
 
 
 def _fleet_pytest_suite_names(cmd: str) -> set[str]:
     """Every test-suite directory the fleet TEST chain runs, keyed as MEASURED_FLEET_SEGMENT_SECS is.
 
-    A member suite (``cd <member> && uv run pytest tests/``) is keyed by its
-    bare member name; a root-level target by its normalised repo-relative path.
+    A suite run from inside a member (``cd <member> && uv run pytest tests/``)
+    is keyed by that member's directory; one run from the repo root by its
+    normalised repo-relative target path (``tests/scripts``).
 
-    Matched against the raw command rather than by walking ``&&`` clauses: the
-    cockpit clause is a presence-guarded subshell, so a crude ``&&`` split
-    severs it, and the production segmenter
-    (``verify_cmd.split_and_chain_segments``) keeps it as ONE segment at cwd
-    ``.`` — neither yields the suite name. Same raw-command convention as
-    :func:`test_fanout_includes_sampler_member` and
-    :func:`test_fanout_includes_cockpit_presence_guarded`.
+    Walks the shell clauses, tracking cwd through ``cd`` clauses and keeping a
+    subshell's ``cd`` inside it (the cockpit clause is a presence-guarded
+    subshell). Each pytest clause's targets come from the shared
+    ``vci.positional_targets``, so flags before or between targets, value-taking
+    flags and a missing ``--timeout`` do not change the result.
+    :func:`test_fleet_pytest_suite_names_reads_each_chain_shape` pins the shapes.
     """
-    members = set(_MEMBER_SUITE_RE.findall(cmd))
-    roots = {
-        posixpath.normpath(target)
-        for targets in _ROOT_SUITE_RE.findall(cmd)
-        for target in targets.split()
-    }
-    return members | roots
+    cwds = ['.']
+    suites: set[str] = set()
+    for clause, ended_by in _shell_clauses(cmd):
+        if len(clause) == 2 and clause[0] == 'cd':
+            cwds[-1] = posixpath.normpath(posixpath.join(cwds[-1], clause[1]))
+        elif vci.PYTEST in clause:
+            targets = vci.positional_targets(
+                shlex.join(clause), vci.PYTEST, value_flags=_PYTEST_VALUE_FLAGS
+            )
+            cwd = cwds[-1]
+            suites.update(cwd if cwd != '.' else posixpath.normpath(t) for t in targets)
+        if ended_by == '(':
+            cwds.append(cwds[-1])
+        elif ended_by == ')':
+            cwds.pop()
+    return suites
 
 
 def test_fallback_verify_runs_tests_scripts() -> None:
@@ -584,8 +624,9 @@ def test_per_module_verify_commands_never_pair_project_with_directory() -> None:
 
 # Task 4902 RE-MEASUREMENT of the `orchestrator` fleet segment, in seconds.
 # HISTORICAL since task 3496: no longer the source of MEASURED_FLEET_SEGMENT_SECS
-# (task 3353's census superseded it); kept because the repo-root yaml and
-# test_module_verify_budgets.py cite it by name as 4902's record.
+# (task 3353's census superseded it); kept because
+# plans/fleet-verify-budget-history.md and test_module_verify_budgets.py cite it
+# by name as 4902's record.
 #
 # WHY THIS EXISTS: the table below was frozen at a task-3062 single run from
 # 2026-07-31. On 2026-08-20 commit 685f558728 landed
@@ -635,6 +676,48 @@ POST_CAP_ORCHESTRATOR_GREEN_SECS = {
 # percentiles and the n that produced them cannot drift apart.
 POST_CAP_ORCHESTRATOR_GREEN_N = 28
 
+# Task 3353's census record is the single home of the orchestrator figure, and
+# the `orchestrator` row below is DERIVED from it. It is read from that file's
+# SOURCE rather than imported, because a guard must not import a sibling guard
+# (the convention module_budget_family.py states).
+CENSUS_HOME_PATH = REPO_ROOT / 'tests' / 'scripts' / 'test_module_verify_budgets.py'
+ORCHESTRATOR_CENSUS_NAME = 'ORCHESTRATOR_BUDGET_CENSUS'
+
+
+class _CensusFigures(NamedTuple):
+    """The ``BudgetCensus`` fields the fleet table consumes."""
+
+    n: int
+    p50: float
+    measured_at: str
+
+
+def _read_census_figures(path: pathlib.Path, name: str) -> _CensusFigures:
+    """The literal keyword arguments of the module-level ``<name> = BudgetCensus(...)`` in *path*."""
+    for node in ast.parse(path.read_text(encoding='utf-8')).body:
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and any(isinstance(t, ast.Name) and t.id == name for t in node.targets)
+        ):
+            keywords = {kw.arg: kw.value for kw in node.value.keywords}
+            missing = [f for f in _CensusFigures._fields if f not in keywords]
+            if missing:
+                raise LookupError(
+                    f'{path}::{name} passes no {missing} keyword(s) (task 3496); '
+                    'MEASURED_FLEET_SEGMENT_SECS derives its orchestrator row from them'
+                )
+            return _CensusFigures(
+                **{f: ast.literal_eval(keywords[f]) for f in _CensusFigures._fields}
+            )
+    raise LookupError(
+        f'{path} binds no module-level `{name} = BudgetCensus(...)` (task 3496); '
+        'MEASURED_FLEET_SEGMENT_SECS derives its orchestrator row from that record'
+    )
+
+
+ORCHESTRATOR_CENSUS = _read_census_figures(CENSUS_HOME_PATH, ORCHESTRATOR_CENSUS_NAME)
+
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
 # PROVENANCE — this table now spans THREE measurement epochs. Do not read it as
@@ -646,17 +729,16 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 #     escalation esc-3062-3. One logged run each, except `tests/scripts`, which
 #     uses the LOWEST of four independent measurements (105-127s).
 #
-#   orchestrator — task 3353's census, adopted by task 3496:
-#     tests/scripts/test_module_verify_budgets.py::ORCHESTRATOR_BUDGET_CENSUS,
-#     measured 2026-09-14 over the prevailing config regime (since the
-#     2026-09-12 3600 -> 7200 fleet-ceiling raise), full-suite GREEN runs only:
-#     n=14, p50 3274.92 / p90 3684.59 / max 4626.17. That record is the method's
-#     single home — window, regime scoping and census_command live there.
-#     Superseded predecessors: task 4902's 1765.95 (n=28, 2026-08-28;
+#   orchestrator — DERIVED, not copied: ORCHESTRATOR_CENSUS.p50 to 2 dp, read
+#     from task 3353's census record (ORCHESTRATOR_CENSUS_NAME in
+#     CENSUS_HOME_PATH, above). That record is the single home of the figure's
+#     window, regime scoping, percentiles and census_command; re-measuring means
+#     replacing it, and this row and its provenance follow. Superseded
+#     predecessors: task 4902's 1765.95 (n=28, 2026-08-28;
 #     POST_CAP_ORCHESTRATOR_GREEN_SECS above) and task 3062's 1366.23 (one run,
-#     2026-07-31). Independent corroboration: the M1a PRE arm in
-#     plans/verify-admission-task-slots-gate.md (verify_admission_task_slots=1,
-#     today's value) reports a clean p50 of 3233s, n=14 — within 1.3%.
+#     2026-07-31). Independent corroboration of the 2026-09-14 census: the M1a
+#     PRE arm in plans/verify-admission-task-slots-gate.md
+#     (verify_admission_task_slots=1) reports a clean p50 of 3233s, n=14.
 #
 #   scripts/tests — task 3384, 2026-08-01: one standalone local run (1184
 #     passed in ~113s, "lowest of local runs"), recorded in commit 7249f40f14,
@@ -675,7 +757,10 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 # and does not belong in a table of representative green runs. The sum still
 # reads as a lower bound on the median chain, because the omitted suites'
 # 5408-measured cost (dashboard 95.07 + cockpit 16.78) exceeds escalation's
-# overstatement (73.66).
+# overstatement (73.66). Those measured figures are the SMALLER ones, so they
+# are the conservative choice for a lower-bound argument; the repo-root yaml's
+# budget sizing uses the larger serial-era estimates (~190, ~44), conservative
+# in the opposite direction.
 #
 # WHAT THE SUM IS, PRECISELY. The suites in UNMEASURED_FLEET_SEGMENTS are
 # OMITTED ENTIRELY — task 3062's run timed out at 1800.66s before dashboard even
@@ -686,34 +771,17 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 # It is NOT a bound on an individual run, and the earlier wording here ("the
 # real green-path chain is strictly more expensive than this, never less") was
 # wrong to imply otherwise — task 3062 itself logged 1366.23s and 1157.62s for
-# the same segment on the same day, and the 3353 census shows green full-suite
-# orchestrator runs in its regime reaching p90 3684.59s and max 4626.17s
-# against a p50 of 3274.92s. Individual runs land on both sides of this sum;
-# the median chain does not.
+# the same segment on the same day, and the 2026-09-14 census shows green
+# full-suite orchestrator runs in its regime reaching p90 3684.59s and max
+# 4626.17s against a p50 of 3274.92s. Individual runs land on both sides of
+# this sum; the median chain does not.
 #
-# FINDING of task 4902, dated 2026-08-28, since ACTED ON. At 4902's observed
-# green maximum the then five-segment floor was 472.37 + 3310.50 = 3782.87s,
-# already above the 3600s `verify_command_timeout_secs` of the time, and one
-# run had consumed the full ceiling and been recorded as a false
-# infra_timeout: 3600.649s, started 2026-08-28T17:25:05Z, observed at
-# .worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json. Leo raised
-# the fleet ceiling to 7200 on 2026-09-12 and task 5422 gave the orchestrator
-# module its own budget. At today's figures the six-suite floor is 3860.29s at
-# census p50 and 5211.54s at census max — both under 7200, but ABOVE 3600 at the
-# median already, so the repo-root yaml's stated revert to 3600 would be refused
-# by the floor guard below (task 3496's finding, recorded, not acted on).
-#
-# THE INLINED FIGURES ARE THE EVIDENCE; THE PATH IS NOT — the same caveat the
-# repo-root yaml carries beside this finding. A `.task/verify/*.summary.json`
-# is a TRANSIENT, per-attempt artifact, overwritten by the next attempt in its
-# worktree and pruned with that worktree; the numbers are inlined because that
-# is the only durable form the observation has, and the path says where it was
-# read, not where it can be re-read. Re-checked 2026-08-30: that path had
-# already been rewritten by a later, unrelated attempt (rc 1, timed_out FALSE,
-# 2884.15s) while a different worktree showed the same ceiling hit (3605.06s)
-# that day. Re-mine the corpus glob to re-establish the phenomenon; never
-# re-read one path. This is also the reason the guards in this file compare
-# recorded constants and read no corpus at test time.
+# HISTORY — task 4902's finding against the 3600s ceiling of 2026-08, the false
+# infra_timeout it recorded, the 2026-09-12 raise, and task 3496's finding that
+# a revert to 3600 is refused by the floor guard below — is in
+# plans/fleet-verify-budget-history.md. The guards here compare recorded
+# constants and read no `.task/verify/*.summary.json` corpus at test time: that
+# corpus is pruned with its worktrees.
 #
 # Neither task 4902 nor task 3496 changes any budget, the -n cap, or
 # orchestrator/orchestrator.yaml — they only record the measurements those
@@ -721,10 +789,7 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 MEASURED_FLEET_SEGMENT_SECS = {
     'shared': 120.21,
     'escalation': 123.29,
-    # Task 3496: ORCHESTRATOR_BUDGET_CENSUS.p50 (test_module_verify_budgets.py,
-    # 2026-09-14, regime since the 2026-09-12 fleet-ceiling raise) to 2 dp. A
-    # re-measure repeats that record's census_command and moves BOTH figures.
-    'orchestrator': 3274.92,
+    'orchestrator': round(ORCHESTRATOR_CENSUS.p50, 2),
     'fused-memory': 123.87,
     'tests/scripts': 105.0,
     'scripts/tests': 113.0,
@@ -760,10 +825,8 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
     'escalation': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'orchestrator': _SegmentProvenance(
-        # ORCHESTRATOR_BUDGET_CENSUS.n, spelled literally because a test file
-        # does not import a sibling test file. A re-measure must move both.
-        '2026-09-14', 14, '3353',
-        'verify-summary corpus read by ORCHESTRATOR_BUDGET_CENSUS.census_command'),
+        ORCHESTRATOR_CENSUS.measured_at, ORCHESTRATOR_CENSUS.n, '3353',
+        f'verify-summary corpus read by {ORCHESTRATOR_CENSUS_NAME}.census_command'),
     'fused-memory': _SegmentProvenance(
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'tests/scripts': _SegmentProvenance(
@@ -842,8 +905,10 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
     SCOPE — what this guard does NOT do. It is a floor-REGRESSION guard: it
     fails if someone lowers ``verify_command_timeout_secs`` back below the
     measured floor. It is NOT a suite-growth detector, and nothing here
-    re-measures anything. ``MEASURED_FLEET_SEGMENT_SECS`` is a frozen literal
-    asserted against a config value. Since task 3496 the table's MEMBERSHIP (not
+    re-measures anything. ``MEASURED_FLEET_SEGMENT_SECS`` holds recorded figures
+    asserted against a config value: its orchestrator row follows the census
+    record it is derived from, and that record moves only when a human
+    re-measures. Since task 3496 the table's MEMBERSHIP (not
     its durations) is pinned against the shipped chain by
     ``test_measured_fleet_table_partitions_the_chain_it_measures``, which is why
     the counts in the failure message below are derived rather than
@@ -948,8 +1013,56 @@ def test_measured_fleet_table_partitions_the_chain_it_measures() -> None:
         f'{sorted(accounted - chain)}. Measure an unaccounted suite and add it to '
         'MEASURED_FLEET_SEGMENT_SECS and MEASURED_FLEET_SEGMENT_PROVENANCE, or, '
         'if it genuinely cannot be measured, list it in '
-        'UNMEASURED_FLEET_SEGMENTS; drop an orphan from whichever bucket holds it.'
+        'UNMEASURED_FLEET_SEGMENTS; drop an orphan from whichever bucket holds it. '
+        'If an UNACCOUNTED name is not a directory, or every real suite shows as '
+        'ORPHANED, suspect the parse rather than the tables: '
+        '_fleet_pytest_suite_names, whose shapes '
+        'test_fleet_pytest_suite_names_reads_each_chain_shape pins.'
     )
+
+
+@pytest.mark.parametrize(
+    ('cmd', 'expected'),
+    [
+        pytest.param(
+            'cd shared && uv run pytest tests/ --timeout=300 && cd ../orchestrator '
+            '&& uv run pytest tests/ --timeout=300 && cd .. && ( [ -d cockpit ] '
+            '|| exit 0; cd cockpit && uv run pytest tests/ --timeout=300 ) && uv run '
+            '--project shared pytest tests/scripts/ scripts/tests/ --timeout=300',
+            {'shared', 'orchestrator', 'cockpit', 'tests/scripts', 'scripts/tests'},
+            id='shipped-shape-subshell-cd-does-not-leak',
+        ),
+        pytest.param(
+            'uv run --project shared pytest fused-memory/tests/ --timeout=300',
+            {'fused-memory/tests'},
+            id='hyphenated-root-target',
+        ),
+        pytest.param(
+            'uv run --project shared pytest -q --tb=short tests/scripts/ scripts/tests/',
+            {'tests/scripts', 'scripts/tests'},
+            id='flags-before-targets-and-no-timeout',
+        ),
+        pytest.param(
+            "cd orchestrator && uv run pytest -n 4 --dist loadgroup -m 'not smoke' "
+            'tests/ --timeout 300',
+            {'orchestrator'},
+            id='value-taking-flags',
+        ),
+        pytest.param(
+            'cd shared && uv run ruff check . && uv run pytest tests/',
+            {'shared'},
+            id='non-pytest-clause-ignored',
+        ),
+    ],
+)
+def test_fleet_pytest_suite_names_reads_each_chain_shape(cmd: str, expected: set[str]) -> None:
+    """The suite parser behind the partition guard reads every chain shape it may meet.
+
+    Task 3496 amendment. Pinned on synthetic chains so a parse regression fails
+    HERE, naming the parser, instead of surfacing in the partition guard as
+    suites "missing" from tables that are correct.
+    """
+    assert _fleet_pytest_suite_names(cmd) == expected
 
 
 def test_nested_module_configs_are_covered_by_the_per_test_timeout_guard() -> None:
