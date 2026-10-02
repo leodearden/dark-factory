@@ -672,6 +672,12 @@ class TestInterIterationRebaseRederivesStepStatus:
             'steps_completed': ['step-1', 'step-2'],
             'commit': commit_b,
         })
+        # An uncommitted tail, so the rebase's WIP-save commit lands on top
+        # of step-2's replay and the post-rebase HEAD is a sha distinct from
+        # it. Without this, whether HEAD differs from step-2's replay hinges
+        # on incidental .task/ churn, and the two assertions below cannot
+        # tell the ladder's answer from the honest HEAD.
+        (wt / 'scratch.py').write_text('uncommitted tail\n')
 
         repo = config.project_root
         (repo / 'sibling.txt').write_text('sibling fix\n')
