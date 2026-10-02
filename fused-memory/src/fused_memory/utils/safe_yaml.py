@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml
 
-__all__ = ["SAFE_YAML_LOADER", "load_yaml_list_file", "resolve_safe_yaml_loader"]
+__all__ = ["load_yaml_list_file"]
 
 
 def resolve_safe_yaml_loader(yaml_module: Any = yaml) -> type:
