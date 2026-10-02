@@ -3552,7 +3552,7 @@ class TestStopDrainsInflight:
         GREEN (step-24): stop() cancels each verify_task, resolves each
         pending req.result with the shutdown outcome.
         """
-        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult, RealMergeItem
+        from orchestrator.merge_queue import InflightEntry, InflightVerifyResult
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, q)
@@ -3573,25 +3573,8 @@ class TestStopDrainsInflight:
         verify_task_b = asyncio.ensure_future(_gated_verify_b())
 
         # Build two fake RealMergeItems with fresh futures.
-        req_a = _make_request('stop-a', 'task/stop-a', git_ops.project_root, config)
-        req_b = _make_request('stop-b', 'task/stop-b', git_ops.project_root, config)
-
-        wt_a = git_ops.project_root / '.worktrees' / 'stop-a'
-        wt_b = git_ops.project_root / '.worktrees' / 'stop-b'
-        item_a = RealMergeItem(
-            request=req_a,
-            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt_a),
-            merge_wt=wt_a,
-            base_sha='aaa',
-            speculative=False,
-        )
-        item_b = RealMergeItem(
-            request=req_b,
-            merge_result=MergeResult(success=True, merge_commit='deadbeef', merge_worktree=wt_b),
-            merge_wt=wt_b,
-            base_sha='bbb',
-            speculative=False,
-        )
+        item_a = _make_real_item(git_ops, config, 'stop-a', 'aaa')
+        item_b = _make_real_item(git_ops, config, 'stop-b', 'bbb')
 
         entry_a = InflightEntry(
             item=item_a,
@@ -3617,12 +3600,12 @@ class TestStopDrainsInflight:
 
         # RED: futures still pending (stop() ignored _inflight).
         # GREEN (step-24): stop() cancels tasks + resolves futures with shutdown.
-        assert req_a.result.done(), (
+        assert item_a.request.result.done(), (
             'req_a.result not resolved by stop(). '
             'RED: stop() does not drain _inflight. '
             'GREEN (step-24): stop() cancels each verify_task and resolves the future.'
         )
-        assert req_b.result.done(), (
+        assert item_b.request.result.done(), (
             'req_b.result not resolved by stop(). '
             'RED: stop() does not drain _inflight. '
             'GREEN (step-24): stop() cancels each verify_task and resolves the future.'
