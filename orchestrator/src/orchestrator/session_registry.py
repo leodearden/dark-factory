@@ -4275,7 +4275,7 @@ def _cwd_project_token(cwd: str) -> str:
 # CLI + fail-soft (PRD: a registry fault must never change the spawn's exit code)
 # ---------------------------------------------------------------------------
 
-_TITLE_RE =re.compile(r'^(?P<role>[^:]+):(?P<project>[^#\s]+)(?:#(?P<task_id>\S+))?')
+_TITLE_RE = re.compile(r'^(?P<role>[^:]+):(?P<project>[^#\s]+)(?:#(?P<task_id>\S+))?')
 """Matches the documented spawn terminal-title convention (skills/spawn/SKILL.md):
 ``'<role>:<project>#<task-id> <short-slug>'``, task-id and short-slug optional."""
 

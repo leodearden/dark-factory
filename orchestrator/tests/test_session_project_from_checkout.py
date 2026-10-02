@@ -97,6 +97,21 @@ def test_sibling_linked_worktree_resolves_to_main_checkout(acme: Path, tmp_path:
     assert _cwd_project(worktree) == 'acme'
 
 
+def test_relative_gitfile_resolves_against_the_gitfile_directory(acme: Path, tmp_path: Path) -> None:
+    """The layout ``git worktree add --relative-paths`` writes, hand-built for gits that predate it."""
+    admin = _mkdir(acme / '.git' / 'worktrees' / 'x')
+    (admin / 'commondir').write_text('../..\n')
+    worktree = _mkdir(tmp_path / 'acme-rel')
+    (worktree / '.git').write_text('gitdir: ../acme/.git/worktrees/x\n')
+    assert _cwd_project(_mkdir(worktree / 'sub')) == 'acme'
+
+
+def test_submodule_resolves_to_its_own_checkout(acme: Path, tmp_path: Path) -> None:
+    upstream = _init_repo(tmp_path / 'upstream')
+    _git(acme, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(upstream), 'vendor/widget')
+    assert _cwd_project(_mkdir(acme / 'vendor' / 'widget' / 'src')) == 'widget'
+
+
 def test_directory_outside_any_repo_keeps_its_basename(tmp_path: Path) -> None:
     assert _cwd_project(_mkdir(tmp_path / 'scratch' / 'outside')) == 'outside'
 
