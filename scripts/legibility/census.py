@@ -101,7 +101,7 @@ import digest  # noqa: E402
 import filing_policy  # noqa: E402
 import inventory  # noqa: E402
 import sampling  # noqa: E402
-from legibility import census_trigger, unlanded  # noqa: E402
+from legibility import census_trigger, session_runner, unlanded  # noqa: E402
 
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
@@ -703,6 +703,11 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     probe failure is exactly the kind of "the model isn't reachable right
     now" signal this preflight exists to catch. Makes no mining decisions
     itself -- just the ok/deferred verdict + reason.
+
+    In production *invoke* is the pooled runner's mining stage, so a capped
+    account fails over to the next INSIDE the probe; only a pool with no
+    headroom left raises (``session_runner.NoHeadroom``) and defers the
+    census (task 5515).
     """
     try:
         reply = invoke(_HEADROOM_PROBE_PROMPT, model)
@@ -3090,8 +3095,8 @@ def _verify_prompt(cluster: dict, *, project_root: str) -> str:
     cluster against *project_root*'s current main via targeted file reads.
 
     The CLI subprocess this prompt is delivered to runs with its cwd set to
-    *project_root* (``_build_stage_invokes`` binds it). That is load-bearing
-    for a reason that is NOT relative-path resolution: ``claude -p``
+    *project_root* (``census_stage_specs`` binds it). That is load-bearing
+    for a reason that is NOT relative-path resolution: the CLI
     SANDBOXES tool access to the cwd tree, so a verifier launched from
     anywhere else has every Read/Bash against this tree permission-denied,
     with no interactive prompt to approve (proven 2026-08-03). The
@@ -3179,8 +3184,8 @@ def _build_default_verify_fn(
     probe_every: int = _VERIFY_PROBE_EVERY,
 ):
     """Build the real ``verify_fn(clusters, *, model)`` seam: one Sonnet
-    call per cluster via *invoke* (default ``coder._invoke_cli`` --
-    headless ``claude -p --model``), parsed via ``coder.parse_coder_output``.
+    call per cluster via *invoke* (in production the pooled runner's verify
+    stage, ``census_stage_specs``), parsed via ``coder.parse_coder_output``.
     Any per-cluster failure (invocation error, unparseable output) rejects
     that cluster rather than crashing the whole census -- a conservative
     fail-closed default for an unverifiable claim. This default never
@@ -3192,7 +3197,7 @@ def _build_default_verify_fn(
     the censused tree, every permission-denied verifier read became an
     ordinary per-cluster rejection, so a whole census mass-rejected without
     a single error surfacing. What keeps the default honest rather than
-    indiscriminate is ``_build_stage_invokes`` scoping the subprocess cwd to
+    indiscriminate is ``census_stage_specs`` scoping the subprocess cwd to
     *project_root* -- a rejection then means the claim really could not be
     verified, not that the verifier could not see the tree.
 
@@ -3594,63 +3599,68 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _build_stage_invokes(cfg, *, project_root):
-    """Build the three per-stage ``invoke(prompt, model)`` seams, each
-    carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``
-    (see ``config.Timeouts`` for the rationale — why each stage needs its
-    own budget) and each scoped to *project_root* as its subprocess cwd.
+_MINING_MAX_TURNS, _MINING_MAX_BUDGET_USD = 2, 2.0
+_VERIFY_MAX_TURNS, _VERIFY_MAX_BUDGET_USD = 100, 10.0
+_SYNTHESIS_MAX_TURNS, _SYNTHESIS_MAX_BUDGET_USD = 2, 50.0
+"""Per-call ceilings the CLI requires, set well above any measured call so
+``cfg.timeouts`` stays the binding bound. Verify alone takes turns: it
+explores the tree with Read/Grep/Glob."""
 
-    Returns ``(mining_invoke, verify_invoke, synthesis_invoke)``. Every
-    census stage calls its invoke as ``invoke(prompt, model)`` with two
-    positional args and no kwargs, so a ``functools.partial`` that
-    pre-binds the keyword-only ``timeout`` is a drop-in ``invoke``.
-    ``mining_invoke`` also backs the headroom probe (``run_census`` routes
-    both through its single ``invoke`` param).
 
-    *project_root* is bound as ``cwd`` on ALL THREE partials, not on verify
-    alone. VERIFY is where the gap was proven fatal (fleet session
-    census-reify-3386101, 2026-08-03): it is the only stage whose prompt
-    directs the model to read the target tree, and ``claude -p`` sandboxes
-    tool access to its cwd tree, so censusing a project from some other
-    directory permission-denied every verifier read. Scoping only verify
-    would nonetheless leave mining and synthesis silently rooted in
-    whatever directory the operator launched from — an asymmetry with no
-    defensible reason that a later reader would file as a bug. Binding all
-    three makes "the census subprocess runs inside the censused project" a
-    uniform invariant instead of a verify-only patch.
+def census_stage_specs(cfg, *, project_root):
+    """How each census stage calls the model:
+    ``(mining, verify, synthesis)``.
 
-    That uniformity is NOT free, and the cost belongs on the record.
-    Mining and synthesis take no tool action, but their cwd is still
-    observable: ``claude -p`` assembles context from the directory it runs
-    in — CLAUDE.md, ``.claude/settings.json`` (hooks included) and
-    ``.mcp.json`` are all cwd-relative. Scoping the subprocess to the
-    censused project therefore prepends THAT project's CLAUDE.md to every
-    mining call — and mining is both the highest-volume stage (hundreds of
-    calls) and the dominant cost of a ~$100 census — and can fire that
-    project's session hooks inside the census subprocess. It is still the
-    right trade: reading the censused project's own conventions is if
-    anything more correct for mining, and the alternative is two stages
-    silently rooted in an arbitrary directory. But if the added per-call
-    context ever measures material, the lever is an explicit
-    ``--settings``/``--strict-mcp-config``-style flag on the mining and
-    synthesis partials — NOT un-scoping their cwd, which would restore the
-    asymmetry this paragraph exists to rule out.
+    Each carries its OWN timeout from ``cfg.timeouts`` (see
+    ``config.Timeouts`` for why each stage needs its own budget). Mining —
+    which also backs the headroom probe — and synthesis are pure classifiers
+    with no tools; verify may Read/Grep/Glob the censused tree and nothing
+    else, so it can never write into what it is censusing.
 
-    ``coder._invoke_cli`` is looked up here at call time (inside this
-    function, invoked from ``main``), never bound at import, so
-    monkeypatching ``coder._invoke_cli`` in tests takes effect.
+    *project_root* is the cwd of ALL THREE, not of verify alone. VERIFY is
+    where its absence was proven fatal (fleet session census-reify-3386101,
+    2026-08-03): it is the only stage whose prompt directs the model to read
+    the target tree, and the CLI scopes tool access to its cwd tree, so
+    censusing a project from some other directory permission-denied every
+    verifier read. Scoping only verify would leave mining and synthesis
+    rooted in whatever directory the operator launched from — an asymmetry a
+    later reader would file as a bug. The cost: the CLI loads the censused
+    project's CLAUDE.md into every mining call, the highest-volume stage. It
+    is the right trade, and if that context ever measures material the lever
+    is a settings flag on those two stages, not un-scoping their cwd.
     """
-    cwd = str(project_root)
+    timeouts = cfg.timeouts
     return (
-        functools.partial(
-            coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs, cwd=cwd,
+        session_runner.StageSpec(
+            name="census-mining", cwd=project_root,
+            timeout_secs=timeouts.census_mining_secs,
+            max_turns=_MINING_MAX_TURNS, max_budget_usd=_MINING_MAX_BUDGET_USD,
+            tools=session_runner.CLASSIFIER,
         ),
-        functools.partial(
-            coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs, cwd=cwd,
+        session_runner.StageSpec(
+            name="census-verify", cwd=project_root,
+            timeout_secs=timeouts.census_verify_secs,
+            max_turns=_VERIFY_MAX_TURNS, max_budget_usd=_VERIFY_MAX_BUDGET_USD,
+            tools=session_runner.READ_ONLY_EXPLORER,
         ),
-        functools.partial(
-            coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs, cwd=cwd,
+        session_runner.StageSpec(
+            name="census-synthesis", cwd=project_root,
+            timeout_secs=timeouts.census_synthesis_secs,
+            max_turns=_SYNTHESIS_MAX_TURNS, max_budget_usd=_SYNTHESIS_MAX_BUDGET_USD,
+            tools=session_runner.CLASSIFIER,
         ),
+    )
+
+
+def _build_stage_invokes(cfg, *, project_root, runner):
+    """The three per-stage ``invoke(prompt, model)`` seams on *runner*:
+    ``(mining_invoke, verify_invoke, synthesis_invoke)``, one per
+    :func:`census_stage_specs` entry. ``mining_invoke`` also backs the
+    headroom probe (``run_census`` routes both through its single ``invoke``
+    param), so the probe rotates over the pool exactly as mining does."""
+    return tuple(
+        runner.invoker(spec)
+        for spec in census_stage_specs(cfg, project_root=project_root)
     )
 
 
@@ -3898,72 +3908,75 @@ def main(argv: list[str] | None = None) -> int:
         )
         codebook_dict = {"version": 2, "entries": [], "candidates": []}
 
-    # Each census stage gets its OWN claude-CLI subprocess timeout; see
-    # config.Timeouts for the rationale.
-    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
-        cfg, project_root=project_root,
-    )
-
     # One escalate_fn closure shared by BOTH consumers: run_census's
-    # headroom-defer path (lines ~800) and main()'s hard-failure catch-all
-    # below -- so defer and hard-failure escalations share one census
-    # escalation source and one never-mask-the-exit contract.
+    # headroom-defer path and main()'s hard-failure catch-all below -- so
+    # defer and hard-failure escalations share one census escalation source
+    # and one never-mask-the-exit contract.
     escalate_fn = _build_default_escalate_fn(cfg)
 
-    try:
-        outcome = run_census(
-            batch_source=default_batch_source(
-                cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
-            ),
-            invoke=mining_invoke,
-            # The in-verify re-probe rides the SAME cwd-scoped invoke as the
-            # verifier it guards (so it fails exactly when the verifier would)
-            # but on the cheap trickle tier, matching every other headroom
-            # gate -- one probe implementation, one model tier, four sites.
-            verify_fn=_build_default_verify_fn(
-                str(project_root),
-                verify_invoke,
-                headroom_probe=functools.partial(
-                    preflight_headroom, verify_invoke, model=cfg.models.trickle,
+    # ONE pooled session runner for the whole census: every stage and every
+    # headroom probe rotates over the shared account pool per invocation
+    # (task 6042), and cap state learned by one stage carries to the next.
+    with session_runner.open_pooled_runner(
+        label=f"legibility-census[{cfg.project_id}]",
+    ) as runner:
+        mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
+            cfg, project_root=project_root, runner=runner,
+        )
+        try:
+            outcome = run_census(
+                batch_source=default_batch_source(
+                    cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
                 ),
-            ),
-            synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
-            submit_fn=default_submit_fn,
-            escalate_fn=escalate_fn,
-            status_fetcher=status_fetcher,
-            commit=_build_default_commit(project_root),
-            roll_back=functools.partial(
-                unlanded.roll_back, project_root,
-                project_id=cfg.project_id, label=f"census-{date_str}",
-            ),
-            codebook_dict=codebook_dict,
-            config=cfg,
-            project_root=str(project_root),
-            project_id=cfg.project_id,
-            codebook_path=codebook_path,
-            census_state_path=census_state_path,
-            report_path=report_path,
-            date=date_str,
-            force=args.force,
-            max_batches=args.max_batches,
-            max_verify_clusters=args.max_verify_clusters,
-            dry_run_payloads_path=dry_run_payloads_path,
-            harness_project=harness_project,
-        )
-    except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
-        print(f"census: FAILED -- {exc}", file=sys.stderr)
-        # PRD decision 8 -- degradation never silent: file a best-effort
-        # escalation via the shared closure so a hard failure leaves an
-        # operator signal, not just a stderr line. The closure swallows all
-        # POST errors internally (logging a best-effort warning), so this
-        # never masks the exit and `return 1` always runs.
-        escalate_fn(
-            category="infra_issue",
-            severity="info",
-            summary=f"legibility census run failed ({cfg.project_id}): {exc}",
-            detail=traceback.format_exc(),
-        )
-        return 1
+                invoke=mining_invoke,
+                # The in-verify re-probe rides the SAME cwd-scoped invoke as the
+                # verifier it guards (so it fails exactly when the verifier would)
+                # but on the cheap trickle tier, matching every other headroom
+                # gate -- one probe implementation, one model tier, four sites.
+                verify_fn=_build_default_verify_fn(
+                    str(project_root),
+                    verify_invoke,
+                    headroom_probe=functools.partial(
+                        preflight_headroom, verify_invoke, model=cfg.models.trickle,
+                    ),
+                ),
+                synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
+                submit_fn=default_submit_fn,
+                escalate_fn=escalate_fn,
+                status_fetcher=status_fetcher,
+                commit=_build_default_commit(project_root),
+                roll_back=functools.partial(
+                    unlanded.roll_back, project_root,
+                    project_id=cfg.project_id, label=f"census-{date_str}",
+                ),
+                codebook_dict=codebook_dict,
+                config=cfg,
+                project_root=str(project_root),
+                project_id=cfg.project_id,
+                codebook_path=codebook_path,
+                census_state_path=census_state_path,
+                report_path=report_path,
+                date=date_str,
+                force=args.force,
+                max_batches=args.max_batches,
+                max_verify_clusters=args.max_verify_clusters,
+                dry_run_payloads_path=dry_run_payloads_path,
+                harness_project=harness_project,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
+            print(f"census: FAILED -- {exc}", file=sys.stderr)
+            # PRD decision 8 -- degradation never silent: file a best-effort
+            # escalation via the shared closure so a hard failure leaves an
+            # operator signal, not just a stderr line. The closure swallows all
+            # POST errors internally (logging a best-effort warning), so this
+            # never masks the exit and `return 1` always runs.
+            escalate_fn(
+                category="infra_issue",
+                severity="info",
+                summary=f"legibility census run failed ({cfg.project_id}): {exc}",
+                detail=traceback.format_exc(),
+            )
+            return 1
 
     if outcome.status == "deferred":
         # The FIELDS, not only the prose. The two defer flavours read much the
