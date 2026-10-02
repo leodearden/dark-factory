@@ -821,26 +821,33 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
     """The warm per-command budget must exceed the MEASURED fleet-chain floor.
 
     Task 3350. ``verify_command_timeout_secs`` is a PER-COMMAND budget and the
-    fleet chain is ONE shell command, so this single ceiling bounds all seven
-    suites together. It was set to 1800s under the comment "Full warm verify
-    here is ~2 min" — false by roughly an order of magnitude.
+    fleet chain is ONE shell command, so this single ceiling bounds every suite
+    together — nine directories in eight ``&&`` segments, since
+    ``tests/scripts/`` and ``scripts/tests/`` share the final clause. It was set
+    to 1800s under the comment "Full warm verify here is ~2 min" — false by
+    roughly an order of magnitude.
 
-    A ceiling below a five-of-seven-segment measured floor cannot be cleared by
-    a healthy run, so it does not surface hangs; it manufactures ``infra_timeout``
-    on the honest green path. That is what task 3062 attempt-2 hit at 1800.66s.
+    A ceiling below the measured-subset floor cannot be cleared by a healthy
+    run, so it does not surface hangs; it manufactures ``infra_timeout`` on the
+    honest green path. That is what task 3062 attempt-2 hit at 1800.66s.
 
     This asserts against the measured floor rather than pinning the chosen
     value, deliberately. Pinning a number would re-encode a constant with no
     stated basis — the exact failure mode of the "~2 min" comment this test
     exists to replace. A floor derived from logged per-suite durations cannot be
-    wrong in the direction that matters: three segments are excluded, so it is
-    provably a lower bound on the chain's real cost.
+    wrong in the direction that matters: the suites in
+    ``UNMEASURED_FLEET_SEGMENTS`` are excluded, so it is provably a lower bound
+    on the chain's real cost.
 
     SCOPE — what this guard does NOT do. It is a floor-REGRESSION guard: it
     fails if someone lowers ``verify_command_timeout_secs`` back below the
-    measured floor (now 2238.32s). It is NOT a suite-growth detector, and
-    nothing here re-measures anything. ``MEASURED_FLEET_SEGMENT_SECS`` is a
-    frozen literal asserted against a config value.
+    measured floor. It is NOT a suite-growth detector, and nothing here
+    re-measures anything. ``MEASURED_FLEET_SEGMENT_SECS`` is a frozen literal
+    asserted against a config value. Since task 3496 the table's MEMBERSHIP (not
+    its durations) is pinned against the shipped chain by
+    ``test_measured_fleet_table_partitions_the_chain_it_measures``, which is why
+    the counts in the failure message below are derived rather than
+    re-hardcoded — "FIVE of seven" is the literal that drifted.
 
     That limitation is no longer hypothetical. This paragraph used to warn: "if
     the orchestrator segment doubles to 2700s tomorrow, the table still reads
@@ -876,13 +883,15 @@ def test_fallback_verify_budget_clears_the_measured_fleet_chain_floor() -> None:
     assert warm > floor, (
         f'dark-factory-orchestrator.yaml verify_command_timeout_secs={warm} is '
         f'below the measured fleet-chain floor of {floor:.2f}s — short by '
-        f'{floor - warm:.2f}s (task 3350). That floor sums only FIVE of seven '
-        f'logged segments ({", ".join(sorted(MEASURED_FLEET_SEGMENT_SECS))}); '
-        'dashboard, sampler and cockpit are excluded entirely because task 3062 '
-        'attempt-2 timed out at 1800.66s before dashboard even started. A '
-        'per-command ceiling below a five-of-seven floor surfaces no hangs — it '
-        'manufactures infra_timeout on the honest green path. Raise the budget, '
-        'or split the chain and re-measure this table.'
+        f'{floor - warm:.2f}s (task 3350). That floor sums only '
+        f'{len(MEASURED_FLEET_SEGMENT_SECS)} of the '
+        f'{len(_fleet_pytest_suite_names(_fleet_test_command()))} suites the '
+        f'chain runs ({", ".join(sorted(MEASURED_FLEET_SEGMENT_SECS))}); '
+        f'{", ".join(sorted(UNMEASURED_FLEET_SEGMENTS))} are excluded entirely '
+        'because task 3062 attempt-2 timed out at 1800.66s before dashboard even '
+        'started. A per-command ceiling below even this partial floor surfaces '
+        'no hangs — it manufactures infra_timeout on the honest green path. '
+        'Raise the budget, or split the chain and re-measure this table.'
     )
 
     # Internal coherence: a cold run does strictly MORE work than a warm one —
