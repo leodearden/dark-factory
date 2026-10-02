@@ -735,33 +735,14 @@ def _unguarded_worker_teardown_methods(source: str) -> list[str]:
 #   the MIGRATED total, not the current one, that blows the mark -- same
 #   shared-mark arithmetic problem as the entry above, same follow-up.
 #
-# - TestHaltAndUnavailable::test_runner_unavailable_quarantine_fallback:
-#   carries the try/except TimeoutError spelling (L3340-3346), not the
-#   `with suppress(...)` spelling -- undetected until the scanner was
-#   extended to recognise it (task 4219 amendment; reviewer finding).
-#   UNLIKE the two entries above, migrating this one does NOT blow its
-#   shared HEAVY_BARRIER_TEST_TIMEOUT mark: its four load-bearing waits are
-#   all still at the un-widened 15.0 nominal, so wait_responsive would bill
-#   30+30+30+30 = 120s plus the unmigrated 5s teardown join = 125s, well
-#   under 300s. It is ledgered rather than migrated anyway, to keep this
-#   amendment pass's diff to additive guards plus the one already-planned
-#   method (the task 4219 plan's design decision explicitly scoped this
-#   task to "one method plus additive guards") -- a good candidate for a
-#   quick, low-risk follow-up migration on its own, unlike the other two.
-#
-# All three are filed as one follow-up: resolve the HEAVY_BARRIER_TEST_TIMEOUT
-# arithmetic across every class that shares it (needed for the first two),
-# then migrate the survivors (the third needs no arithmetic fix, just a
-# migration).
+# Both are filed as one follow-up: resolve the HEAVY_BARRIER_TEST_TIMEOUT
+# arithmetic across every class that shares it, then migrate them.
 _SUPPRESSED_WAIT_DEBT: dict[str, frozenset[str]] = {
     'TestChainInvalidationUnderOverlap': frozenset({
         'test_n_fail_aborts_downstream_verify_reruns_remerge',
     }),
     'TestCascadeErrorContainment': frozenset({
         'test_cascade_cancel_and_release_raises_contained',
-    }),
-    'TestHaltAndUnavailable': frozenset({
-        'test_runner_unavailable_quarantine_fallback',
     }),
 }
 
