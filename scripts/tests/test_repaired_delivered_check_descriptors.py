@@ -143,13 +143,17 @@ def test_repaired_sidecar_carries_the_repaired_descriptor(
     )
 
 
-_RESYNCED_GREPS = [r[:4] for r in _RESYNCED_TO_TASK_RECORD if r[4]["kind"] == "grep"]
+assert all(r[4]["kind"] == "grep" for r in _RESYNCED_TO_TASK_RECORD), (
+    "test_resynced_sidecar_descriptor_delivers_at_head evaluates only grep gates; "
+    "teach it the new kind before adding a non-grep row to _RESYNCED_TO_TASK_RECORD"
+)
+_RESYNCED_HEADS = [r[:4] for r in _RESYNCED_TO_TASK_RECORD]
 
 
 @pytest.mark.parametrize(
     "relpath,task_id,label,capability",
-    _RESYNCED_GREPS,
-    ids=[f"{r[1]}-{r[3]}" for r in _RESYNCED_GREPS],
+    _RESYNCED_HEADS,
+    ids=[f"{r[1]}-{r[3]}" for r in _RESYNCED_HEADS],
 )
 def test_resynced_sidecar_descriptor_delivers_at_head(relpath, task_id, label, capability):
     """Every producer in _RESYNCED_TO_TASK_RECORD is done, so its sidecar gate must
