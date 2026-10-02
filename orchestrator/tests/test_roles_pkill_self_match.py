@@ -1,12 +1,6 @@
 """Anchor/contract test for `PKILL_SELF_MATCH_GUIDANCE` (task 5961).
 
-A sibling of `test_roles_grep_lookaround.py`, and the cross-repo refile of reify
-legibility-census candidate #7922. The finding, the measurements behind it and
-the prose constraints are recorded once, in the docstring of
-`orchestrator/src/orchestrator/agents/pkill_guidance.py`; this module points
-there rather than restating them.
-
-Every assertion here is an existence, containment, count or index check
+A sibling of `test_roles_grep_lookaround.py`. Every assertion here is an existence, containment, count or index check
 against a NAMED constant — never a prose pin, never a regex over wording. The
 mechanical half of that shape lives in `_role_splice_contract.py`.
 """
