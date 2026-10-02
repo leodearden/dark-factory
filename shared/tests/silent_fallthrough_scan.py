@@ -526,7 +526,7 @@ def find_violations_in_tree(
 # First-party file enumeration
 # ---------------------------------------------------------------------------
 
-#: The 7 scope roots searched for first-party source (relative to repo root).
+#: The scope roots searched for first-party source (relative to repo root).
 _SCOPE_ROOTS = [
     "orchestrator/src",
     "fused-memory/src",
@@ -534,6 +534,7 @@ _SCOPE_ROOTS = [
     "escalation/src",
     "shared/src",
     "sampler/src",
+    "cockpit/src",
     "scripts",
 ]
 
@@ -547,7 +548,8 @@ _EXCLUDED_NAMES: frozenset[str] = frozenset({"conftest.py"})
 def iter_first_party_files(repo_root: Path) -> Iterator[Path]:
     """Yield absolute paths to first-party Python source files.
 
-    Searches the 7 scope roots under *repo_root* and applies exclusions:
+    Searches the scope roots in ``_SCOPE_ROOTS`` under *repo_root* and applies
+    exclusions:
       - Path components named ``mem0``, ``graphiti``, or ``tests``
       - Files named ``test_*.py`` or ``conftest.py``
 
@@ -625,9 +627,10 @@ def parse_first_party_tree(repo_root: Path | str) -> tuple[ParsedFile, ...]:
     """Read and parse every first-party source file ONCE, memoized on *repo_root*.
 
     Enumeration is delegated verbatim to :func:`iter_first_party_files`, so the
-    7 scope roots, the ``mem0``/``graphiti``/``tests``/``conftest.py``
-    exclusions and the sentinel-dir validation that RAISES on a mis-resolved
-    root all keep their meaning here.
+    scope roots in ``_SCOPE_ROOTS``, the
+    ``mem0``/``graphiti``/``tests``/``conftest.py`` exclusions and the
+    sentinel-dir validation that RAISES on a mis-resolved root all keep their
+    meaning here.
 
     Failure modes are deliberately asymmetric, because the two consuming gates
     have deliberately different contracts and both must survive:
