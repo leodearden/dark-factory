@@ -1,4 +1,4 @@
-"""Repo-wide enforcement of the 'Sentinel-literal hazard' rule.
+"""Repo-wide scan enforcing the 'Sentinel-literal hazard' rule on markup-handling files.
 
 The rule is owned by ``shared/src/shared/toolcall_markup.py``: a source file
 that handles MCP envelope markup must never spell an envelope literal with a
@@ -6,9 +6,12 @@ raw opening bracket, because an agent editing that file would have to emit the
 literal inside its own tool-call envelope and so truncate its own edit.
 
 POPULATION. Every ``.py`` file git knows about (tracked, or untracked and not
-ignored) whose source handles envelope markup: it spells the bracket the
-sanctioned way (the text ``chr(60)`` or the ``\\x3c`` escape), or it imports
-``shared.toolcall_markup``. Files are found by path scan and never imported.
+ignored) whose source already handles envelope markup the sanctioned way: it
+spells the bracket as the text ``chr(60)`` or the ``\\x3c`` escape, or it
+imports ``shared.toolcall_markup``. Files are found by path scan, read once and
+never imported. The population selects itself, so this guard stops a
+markup-handling file from regressing to a raw literal; a file that spells
+envelope literals ONLY raw never enters it and is not caught here.
 
 NEEDLES. The two raw prefixes every envelope literal starts with: the bracket
 followed by a slash, and the bracket followed by ``parameter``. Reports name a
@@ -18,11 +21,11 @@ prints a raw literal back into an agent's context.
 from __future__ import annotations
 
 import ast
-import os
-import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from git_listing import git, listed_files
 from shared.toolcall_markup import ENVELOPE_LITERALS
 
 REPO_ROOT = Path(__file__).parents[2]
@@ -75,47 +78,20 @@ def raw_prefix_lines(source: str) -> dict[str, tuple[int, ...]]:
     return {key: numbers for key, numbers in hits.items() if numbers}
 
 
-def python_files(root: Path) -> list[Path]:
-    """Existing ``.py`` files git tracks, or sees untracked and not ignored, under *root*."""
-    listing = _git(root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z', '--', '*.py')
-    candidates = [root / entry for entry in listing.split('\0') if entry]
-    return [path for path in candidates if path.is_file()]
-
-
-def guarded_population(root: Path) -> list[Path]:
-    """The :func:`python_files` under *root* whose source handles envelope markup."""
-    return [
-        path for path in python_files(root)
-        if handles_envelope_markup(path.read_text(encoding='utf-8'))
-    ]
-
-
-def raw_literal_violations(root: Path) -> dict[str, dict[str, tuple[int, ...]]]:
-    """Repo-relative posix path -> :func:`raw_prefix_lines`, for each guarded file with hits."""
-    hits_by_path = {
-        path.relative_to(root).as_posix(): raw_prefix_lines(path.read_text(encoding='utf-8'))
-        for path in guarded_population(root)
+def guarded_sources(root: Path) -> dict[str, str]:
+    """Repo-relative posix path -> source, for each ``.py`` file under *root* that handles envelope markup."""
+    read = ((path, path.read_text(encoding='utf-8')) for path in listed_files(root, '*.py'))
+    return {
+        path.relative_to(root).as_posix(): source
+        for path, source in read
+        if handles_envelope_markup(source)
     }
+
+
+def raw_literal_violations(population: Mapping[str, str]) -> dict[str, dict[str, tuple[int, ...]]]:
+    """Path -> :func:`raw_prefix_lines`, for each file in *population* with hits."""
+    hits_by_path = {path: raw_prefix_lines(source) for path, source in population.items()}
     return {path: hits for path, hits in hits_by_path.items() if hits}
-
-
-def _git(cwd: Path, *args: str) -> str:
-    """Run git in *cwd* with ``GIT_*`` scrubbed, failing loudly and never skipping.
-
-    The idiom, and its reasons, are tests/scripts/test_nonmember_ruff_config.py::_git.
-    """
-    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
-    command = ['git', *args]
-    try:
-        proc = subprocess.run(
-            command, cwd=cwd, capture_output=True, text=True, env=env, check=False,
-        )
-    except OSError as exc:
-        raise AssertionError(f'could not run {command} in {cwd}: {exc!r}') from exc
-    assert proc.returncode == 0, (
-        f'{command} failed in {cwd} with rc={proc.returncode}; stderr: {proc.stderr!r}'
-    )
-    return proc.stdout
 
 
 def _describe(violations: dict[str, dict[str, tuple[int, ...]]]) -> str:
@@ -126,8 +102,15 @@ def _describe(violations: dict[str, dict[str, tuple[int, ...]]]) -> str:
     )
 
 
-def test_no_markup_handling_file_spells_a_raw_envelope_literal() -> None:
-    violations = raw_literal_violations(REPO_ROOT)
+@pytest.fixture(scope='module')
+def repo_population() -> dict[str, str]:
+    return guarded_sources(REPO_ROOT)
+
+
+def test_no_markup_handling_file_spells_a_raw_envelope_literal(
+    repo_population: dict[str, str],
+) -> None:
+    violations = raw_literal_violations(repo_population)
     assert not violations, (
         'These files handle MCP envelope markup yet spell an envelope literal with a '
         f'raw opening bracket (each prefix is shown escaped):\n{_describe(violations)}\n'
@@ -137,9 +120,9 @@ def test_no_markup_handling_file_spells_a_raw_envelope_literal() -> None:
     )
 
 
-def test_this_guard_is_inside_its_own_population() -> None:
-    population = {path.resolve() for path in guarded_population(REPO_ROOT)}
-    assert Path(__file__).resolve() in population, (
+def test_this_guard_is_inside_its_own_population(repo_population: dict[str, str]) -> None:
+    this_guard = Path(__file__).relative_to(REPO_ROOT).as_posix()
+    assert this_guard in repo_population, (
         'This guard spells chr(60) and imports the literal owner, so git discovery plus '
         'the population predicate must select it; if they do not, the repo-wide check above '
         'is passing vacuously.'
@@ -225,14 +208,14 @@ def synthetic_repo(tmp_path: Path) -> Path:
     """A git repo planting one file per discovery case; staged, never committed."""
     root = tmp_path / 'repo'
     root.mkdir()
-    _git(root, 'init', '-q')
+    git(root, 'init', '-q')
     _plant(root, '.gitignore', 'ignored/\n')
     _plant(root, 'tracked_violator.py', 'LT = chr(60)\nX = "' + _LT + '/content>"\n')
     _plant(root, 'html_fixture.py', 'PAGE = "' + _LT + 'p>hi' + _LT + '/p>"\n')
     _plant(root, 'clean_handler.py', 'from shared.toolcall_markup import closer_for\n')
     _plant(root, 'deleted.py', 'LT = chr(60)\n')
     _plant(root, 'notes.txt', 'chr(60) ' + _LT + '/content>\n')
-    _git(
+    git(
         root, 'add', '.gitignore', 'tracked_violator.py', 'html_fixture.py',
         'clean_handler.py', 'deleted.py', 'notes.txt',
     )
@@ -245,7 +228,7 @@ def synthetic_repo(tmp_path: Path) -> Path:
     return root
 
 
-def test_python_files_lists_existing_tracked_and_unignored_python_only(
+def test_discovery_lists_existing_tracked_and_unignored_python_only(
     synthetic_repo: Path,
 ) -> None:
     expected = [
@@ -254,13 +237,13 @@ def test_python_files_lists_existing_tracked_and_unignored_python_only(
         synthetic_repo / 'pkg' / 'untracked_violator.py',
         synthetic_repo / 'tracked_violator.py',
     ]
-    assert sorted(python_files(synthetic_repo)) == expected
+    assert sorted(listed_files(synthetic_repo, '*.py')) == expected
 
 
 def test_raw_literal_violations_reports_tracked_and_untracked_violators(
     synthetic_repo: Path,
 ) -> None:
-    violations = raw_literal_violations(synthetic_repo)
+    violations = raw_literal_violations(guarded_sources(synthetic_repo))
     assert violations == {
         'tracked_violator.py': {'\\x3c/': (2,)},
         'pkg/untracked_violator.py': {'\\x3cparameter': (4,)},
