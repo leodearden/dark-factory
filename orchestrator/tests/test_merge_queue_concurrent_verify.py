@@ -3028,49 +3028,49 @@ class TestChainInvalidationUnderOverlap:
             config=config, result=loop.create_future(), lane='normal',
         )
 
-        outcome_b: MergeOutcome | None = None
-
         worker_task = asyncio.create_task(worker.run())
 
-        await q.put(req_a)
-        await q.put(req_b)
+        try:
+            await q.put(req_a)
+            await q.put(req_b)
 
-        # Wait for both verifies to enter (true concurrent overlap)
-        # NOTE (task 2350): widened from 15.0s -- fixed real-time deadlines
-        # starve under heavy shared-host xdist contention even though the
-        # underlying cascade logic is correct (timing flake, not a bug).
-        await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
-        await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
+            # Wait for both verifies to enter (true concurrent overlap)
+            # NOTE (task 2350): widened from 15.0s -- fixed real-time deadlines
+            # starve under heavy shared-host xdist contention even though the
+            # underlying cascade logic is correct (timing flake, not a bug).
+            await asyncio.wait_for(gate_a_entered.wait(), timeout=45.0)
+            await asyncio.wait_for(gate_b_entered.wait(), timeout=45.0)
 
-        # N's verify fails
-        gate_a_release.set()
+            # N's verify fails
+            gate_a_release.set()
 
-        # N must resolve with a fail status
-        outcome_a = await asyncio.wait_for(req_a.result, timeout=45.0)
-        assert outcome_a.status not in ('done', 'already_merged'), (
-            f'Expected N to fail, got status={outcome_a.status!r}.'
-        )
+            # N must resolve with a fail status
+            outcome_a = await asyncio.wait_for(req_a.result, timeout=45.0)
+            assert outcome_a.status not in ('done', 'already_merged'), (
+                f'Expected N to fail, got status={outcome_a.status!r}.'
+            )
 
-        # Release N+1's gate so the test can complete in both paths:
-        # RED: N+1's inner verify task unblocks, but the loop is still
-        #      stuck on fill-ahead queue.get() → req_b never resolves.
-        # GREEN: cascade already cancelled N+1's task; gate_b unblocks
-        #        only the leaked inner task (result ignored).
-        gate_b_release.set()
+            # Release N+1's gate so the test can complete in both paths:
+            # RED: N+1's inner verify task unblocks, but the loop is still
+            #      stuck on fill-ahead queue.get() → req_b never resolves.
+            # GREEN: cascade already cancelled N+1's task; gate_b unblocks
+            #        only the leaked inner task (result ignored).
+            gate_b_release.set()
 
-        # Wait for N+1 to resolve:
-        # GREEN: cascade → re-merge → re-verify → 'done' (fast)
-        # RED: deadlock → TimeoutError → outcome_b stays None
-        with contextlib.suppress(TimeoutError):
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=20.0)
+            # Wait for N+1 to resolve:
+            # GREEN: cascade → re-merge → re-verify → 'done' (fast)
+            # RED: deadlock → the wait gives up loudly, by label
+            outcome_b = await wait_responsive(
+                req_b.result,
+                timeout=20.0,
+                label='ci-b: MergeOutcome (re-merged and re-verified after N failed)',
+            )
+        finally:
+            await _stop_worker(worker, worker_task, join_timeout=20.0)
 
-        await worker.stop()
-
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(worker_task, timeout=20.0)
-
-        # ── RED: fails here (outcome_b is None due to timeout) ──────────────
-        assert outcome_b is not None and outcome_b.status == 'done', (
+        # A starved-or-hung wait fails loudly by label at the wait_responsive
+        # call above; this assertion only ever fires on a WRONG STATUS.
+        assert outcome_b.status == 'done', (
             f'Expected N+1 to resolve "done" after re-merge/re-verify, '
             f'got {outcome_b!r}. '
             'RED: fill-ahead blocking-get deadlocks after N fails — '
