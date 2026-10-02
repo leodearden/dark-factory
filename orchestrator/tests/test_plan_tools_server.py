@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _git_fixtures import RepoSeed, seed_repo
 from fastmcp import FastMCP
 
 from orchestrator.artifacts import TaskArtifacts
@@ -383,6 +384,11 @@ class TestAddReuseItem:
 # ---------------------------------------------------------------------------
 
 
+_GIT_ARTIFACTS_SEED = RepoSeed(
+    files=(('.gitignore', '.task/\n'), ('m.py', 'x = 1\n')), message='Initial',
+)
+
+
 @pytest.fixture()
 def git_artifacts(tmp_path):
     """TaskArtifacts pointing at a REAL git worktree (task 3651).
@@ -394,15 +400,7 @@ def git_artifacts(tmp_path):
     ``artifacts`` fixture (a bare temp dir) deliberately exercises the
     git-unavailable fall-through instead.
     """
-    repo = tmp_path / 'worktree'
-    repo.mkdir()
-    subprocess.run(['git', 'init', '-b', 'main'], cwd=repo, check=True, capture_output=True)
-    subprocess.run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo, check=True)
-    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=repo, check=True)
-    (repo / '.gitignore').write_text('.task/\n')
-    (repo / 'm.py').write_text('x = 1\n')
-    subprocess.run(['git', 'add', '-A'], cwd=repo, check=True, capture_output=True)
-    subprocess.run(['git', 'commit', '-m', 'Initial'], cwd=repo, check=True, capture_output=True)
+    repo = seed_repo(tmp_path / 'worktree', _GIT_ARTIFACTS_SEED)
     a = TaskArtifacts(repo)
     a.init('test-1', 'Test task', 'A test')
     return a

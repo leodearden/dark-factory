@@ -112,6 +112,11 @@ def _make_workflow(
     return workflow, artifacts
 
 
+async def _head(repo: Path) -> str:
+    _, sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+    return sha.strip()
+
+
 def _write_plan(
     artifacts: TaskArtifacts,
     workflow: TaskWorkflow,
@@ -557,7 +562,7 @@ class TestInterIterationRebaseRederivesStepStatus:
         plan = artifacts.read_plan()
         by_id = {s['id']: s for s in plan['steps']}
         step_1, step_2 = by_id['step-1'], by_id['step-2']
-        post_rebase_head = await workflow._get_head_commit()
+        post_rebase_head = await _head(wt)
 
         assert step_1['status'] == 'done'
         assert step_2['status'] == 'done'
@@ -626,7 +631,7 @@ class TestInterIterationRebaseRederivesStepStatus:
         plan = artifacts.read_plan()
         step_1 = plan['steps'][0]
         assert step_1['status'] == 'done'
-        assert step_1['commit'] == await workflow._get_head_commit()
+        assert step_1['commit'] == await _head(wt)
 
     async def test_multi_step_log_entry_is_not_trusted_as_per_step_provenance(
         self, config, git_ops, task_assignment,
@@ -679,7 +684,7 @@ class TestInterIterationRebaseRederivesStepStatus:
         plan = artifacts.read_plan()
         by_id = {s['id']: s for s in plan['steps']}
         step_1, step_2 = by_id['step-1'], by_id['step-2']
-        post_rebase_head = await workflow._get_head_commit()
+        post_rebase_head = await _head(wt)
 
         assert step_1['status'] == 'done'
         assert step_2['status'] == 'done'
