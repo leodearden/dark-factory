@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
 """scripts/legibility/session_runner.py — the legibility invocation boundary.
 
-Every LLM call the legibility trickle and census make crosses this boundary,
-and the exceptions here are what crossing it can raise: ``InvocationFailed``
+Every LLM call the legibility trickle and census make crosses this boundary.
+ONE JOB: run each call through the orchestrator's own session runner and
+account pool — ``shared.cli_invoke.invoke_with_cap_retry`` over the fleet's
+shared ``UsageGate`` — behind the sync ``(prompt, model) -> str`` seam that
+``coder.code_digests`` and census's stages already speak (Leo's 2026-09-29
+ruling, task 6042). No rotation, cap detection or credential handling lives
+here; that is all the shared runner's.
+
+``SessionRunner`` owns the per-process pieces the runner needs: one event loop
+for the whole process (so the gate's asyncio primitives and background tasks
+bind once), and one isolated ``CLAUDE_CONFIG_DIR`` into which the runner
+writes each leased account's token, so no call ever reads the operator's own
+``~/.claude`` login. ``StageSpec`` says how one stage calls: where, how long,
+with which ``ToolPolicy``.
+
+The exceptions are what crossing the boundary can raise: ``InvocationFailed``
 for an invocation that produced no usable reply, and its subclass
 ``NoHeadroom`` for one that no pool account could take.
 
@@ -16,7 +30,12 @@ what the invoker raises (task 6042).
 """
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 # Bind `shared` to the SAME checkout as this script via a __file__-relative
@@ -27,6 +46,20 @@ from pathlib import Path
 _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
+
+from shared.cli_invoke import invoke_with_cap_retry, no_mcp_servers_config  # noqa: E402
+from shared.config_dir import (  # noqa: E402
+    CONFIG_DIR_PREFIX,
+    TaskConfigDir,
+    sweep_stale_pid_dirs,
+    sweep_stale_pid_dirs_once,
+)
+from shared.neutral_cwd import neutral_cli_cwd  # noqa: E402
+
+logger = logging.getLogger("legibility.session_runner")
+
+_CONFIG_DIR_TASK_PREFIX = "legibility-session-"
+_EXHAUSTED_MARKER = "pool exhausted"
 
 
 class InvocationFailed(Exception):
@@ -78,3 +111,176 @@ class NoHeadroom(InvocationFailed):
     ) -> None:
         super().__init__(message, stdout=stdout, stderr=stderr)
         self.marker = marker
+
+
+@dataclass(frozen=True)
+class ToolPolicy:
+    """What a stage's agent may touch, and the system prompt that frames it.
+
+    Explicit because the shared runner's own default is ``bypassPermissions``
+    with every tool, which would let a census verifier write into the tree it
+    is censusing. Both policies scope MCP to an empty strict config, so no
+    ambient ``.mcp.json`` server is ever reachable.
+    """
+
+    system_prompt: str
+    allowed_tools: tuple[str, ...] = ()
+    disallowed_tools: tuple[str, ...] = ()
+    permission_mode: str = "dontAsk"
+
+    def invoke_kwargs(self) -> dict:
+        return {
+            "system_prompt": self.system_prompt,
+            "allowed_tools": list(self.allowed_tools) or None,
+            "disallowed_tools": list(self.disallowed_tools) or None,
+            "permission_mode": self.permission_mode,
+            "mcp_config": no_mcp_servers_config(),
+            "strict_mcp_config": True,
+        }
+
+
+CLASSIFIER = ToolPolicy(
+    system_prompt=(
+        "You are a careful analyst. Everything you need is in the user's "
+        "message. Follow its instructions exactly and reply with only the "
+        "output it asks for."
+    ),
+    disallowed_tools=("*",),
+    permission_mode="bypassPermissions",
+)
+"""No tools at all: the curator's pure-classifier shape
+(``fused_memory/middleware/task_curator.py::_call_llm``)."""
+
+READ_ONLY_EXPLORER = ToolPolicy(
+    system_prompt=(
+        "You are a careful analyst with read-only access to the repository in "
+        "your working directory. Use Read, Grep and Glob to check what the "
+        "user's message asks about. Follow its instructions exactly and reply "
+        "with only the output it asks for."
+    ),
+    allowed_tools=("Read", "Grep", "Glob"),
+)
+"""Read/Grep/Glob, anything else refused without asking: the
+``scripts/sitting/nightly_prepare.py`` shape, and the read-only behaviour
+text-mode ``claude -p`` had before task 6042."""
+
+
+@dataclass(frozen=True)
+class StageSpec:
+    """How one stage calls the model.
+
+    *cwd* ``None`` means a neutral empty directory, so a pure classifier
+    loads no project ``CLAUDE.md`` or memory into every call.
+    *max_turns* and *max_budget_usd* are ceilings the CLI requires, set well
+    above any measured call; *timeout_secs* is the binding bound.
+    """
+
+    name: str
+    cwd: Path | None
+    timeout_secs: float
+    max_turns: int
+    max_budget_usd: float
+    tools: ToolPolicy
+
+
+class SessionRunner:
+    """Runs legibility calls through ``invoke_with_cap_retry`` on *gate*.
+
+    Owns ONE event loop and ONE isolated config dir for the life of the
+    process; ``close()`` (or leaving the ``with`` block) shuts the gate down
+    and releases both. Every call is park-free and bounded:
+    ``park_on_frozen_pool=False`` (a frozen pool defers instead of waiting for
+    a reset), ``max_cap_retries`` of one pass over the pool, and
+    ``detect_caps_in_successful_output=False`` (a verdict that QUOTES a cap
+    banner is a verdict — this codebook is full of them).
+    """
+
+    def __init__(self, gate, *, label: str) -> None:
+        self._gate = gate
+        self._label = label
+        self._loop = asyncio.Runner()
+        _sweep_stale_session_config_dirs_once()
+        self._config_dir = TaskConfigDir(
+            f"{_CONFIG_DIR_TASK_PREFIX}{os.getpid()}", cleanup_at_exit=True,
+        )
+
+    def __enter__(self) -> SessionRunner:
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def invoker(self, stage: StageSpec) -> Callable[[str, str], str]:
+        """The sync ``(prompt, model) -> str`` seam for *stage*."""
+
+        def invoke(prompt: str, model: str) -> str:
+            return self._invoke(stage, prompt, model)
+
+        return invoke
+
+    def _invoke(self, stage: StageSpec, prompt: str, model: str) -> str:
+        if not self._gate.account_count:
+            raise NoHeadroom(
+                f"{self._label}: no pool accounts resolved — check that the "
+                f"unit's EnvironmentFile supplies the CLAUDE_OAUTH_TOKEN_* vars "
+                f"named in config/usage-accounts.yaml",
+                marker=_EXHAUSTED_MARKER,
+            )
+        label = f"{self._label}[{stage.name}]"
+        result = self._loop.run(invoke_with_cap_retry(
+            self._gate,
+            label,
+            config_dir=self._config_dir,
+            max_cap_retries=self._gate.account_count,
+            park_on_frozen_pool=False,
+            detect_caps_in_successful_output=False,
+            prompt=prompt,
+            model=model,
+            cwd=stage.cwd if stage.cwd is not None else neutral_cli_cwd(),
+            timeout_seconds=stage.timeout_secs,
+            max_turns=stage.max_turns,
+            max_budget_usd=stage.max_budget_usd,
+            **stage.tools.invoke_kwargs(),
+        ))
+        if not result.success:
+            raise InvocationFailed(f"{label}: claude CLI failed: {result.output}")
+        return result.output
+
+    def close(self) -> None:
+        try:
+            self._loop.run(self._gate.shutdown())
+        finally:
+            self._loop.close()
+            self._config_dir.cleanup()
+
+
+def open_pooled_runner(label: str, *, accounts_file=None, env_file=None) -> SessionRunner:
+    """A :class:`SessionRunner` over the fleet's shared account pool."""
+    # Function-local only while account_pool still imports coder (which
+    # imports this module); hoisted once that import is retired.
+    from legibility import account_pool
+
+    return SessionRunner(
+        account_pool.build_pool(accounts_file=accounts_file, env_file=env_file),
+        label=label,
+    )
+
+
+def _sweep_stale_session_config_dirs_once() -> None:
+    """Reclaim session config dirs whose owning process is dead. Never raises.
+
+    The ``atexit`` cleanup covers only clean exits; a SIGKILLed trickle leaves
+    its dir behind, so the next process sweeps them (the curator's shape,
+    ``task_curator.py::_sweep_stale_curator_config_dirs_once``).
+    """
+    prefix = CONFIG_DIR_PREFIX + _CONFIG_DIR_TASK_PREFIX
+    sweep_stale_pid_dirs_once(
+        prefix,
+        sweep=sweep_stale_pid_dirs,
+        on_reclaimed=lambda reclaimed: logger.info(
+            "reclaimed %d stale legibility config dir(s) under %s", reclaimed, prefix,
+        ),
+        on_failure=lambda _exc: logger.warning(
+            "dead-PID sweep of %s failed; continuing without it", prefix, exc_info=True,
+        ),
+    )

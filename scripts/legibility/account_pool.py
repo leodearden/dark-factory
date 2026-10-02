@@ -99,10 +99,10 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
 
     ORDER IS LOAD-BEARING. ``load_dotenv`` runs BEFORE the gate is built,
     because ``UsageGate._init_accounts`` reads ``os.environ`` eagerly at
-    construction: a ``.env`` loaded afterwards resolves nothing, every
-    account comes back token-less, and the gate silently falls back to
-    ``~/.claude/.credentials.json`` as an account named 'default' — which is
-    exactly the broken behaviour this module exists to end. The path is
+    construction: a ``.env`` loaded afterwards resolves nothing and every
+    account comes back token-less. The gate is built with the
+    ``~/.claude/.credentials.json`` fallback DISABLED, so that degrades to an
+    empty pool rather than to the operator's own login. The path is
     passed EXPLICITLY rather than letting ``load_dotenv()`` search: the bare
     call is frame-relative and silently switches to the CWD under a
     debugger or an interactive interpreter.
@@ -126,26 +126,32 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
     resolved = accounts_file or os.environ.get("USAGE_ACCOUNTS_FILE") or str(
         default_accounts_file()
     )
-    gate = UsageGate(UsageCapConfig(accounts_file=str(Path(resolved).resolve())))
+    # Never the operator's own ~/.claude login (fallback off), and no resume
+    # probes: those reopen a pool for PARKED callers, and the legibility
+    # runner never parks (task 6042).
+    gate = UsageGate(UsageCapConfig(
+        accounts_file=str(Path(resolved).resolve()),
+        fallback_to_default_credential=False,
+        wait_for_reset=False,
+    ))
 
-    names = [acct.name for acct in gate._accounts]
-    if gate.account_count == 0 or names == ["default"]:
-        # `default` is the name _init_accounts gives the ~/.claude fallback,
-        # so it is indistinguishable from the pre-5488 behaviour and equally
-        # useless to fail over with. Name the roster it FAILED to resolve --
-        # the operator's next move is to check which CLAUDE_OAUTH_TOKEN_* the
-        # unit is missing, and only the roster names that.
-        configured = _roster_names(resolved)
+    # The roster's names, because the gate publishes only a count: the
+    # operator's next move on a short pool is to check which
+    # CLAUDE_OAUTH_TOKEN_* the unit is missing, and only the roster names that.
+    configured = _roster_names(resolved)
+    if gate.account_count == 0:
         logger.warning(
             "legibility account pool resolved NO usable accounts from %s "
-            "(configured: %s) — every invocation would fall back to the "
-            "ambient ~/.claude login. Check the unit's EnvironmentFile "
-            "supplies those CLAUDE_OAUTH_TOKEN_* vars.",
+            "(configured: %s) — every invocation will defer for want of an "
+            "account; there is no ~/.claude fallback. Check the unit's "
+            "EnvironmentFile supplies those CLAUDE_OAUTH_TOKEN_* vars.",
             resolved, ", ".join(configured) or "<none>",
         )
     else:
         logger.info(
-            "legibility account pool: %d accounts — %s", len(names), ", ".join(names),
+            "legibility account pool: %d of %d configured accounts resolved "
+            "(configured: %s)",
+            gate.account_count, len(configured), ", ".join(configured),
         )
     return gate
 

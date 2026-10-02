@@ -1805,16 +1805,14 @@ def test_build_pool_warns_LOUDLY_when_it_resolves_no_accounts(
     )
 
 
-def test_build_pool_warns_LOUDLY_when_it_falls_back_to_the_default_credential(
+def test_build_pool_never_adopts_the_operator_login_and_warns_LOUDLY(
     tmp_path, monkeypatch, caplog, empty_env_file,
 ):
-    """The OTHER zero-usable-account arm, and the exact pre-5488 defect:
-    every ``CLAUDE_OAUTH_TOKEN_*`` is missing but
-    ``~/.claude/.credentials.json`` exists, so ``_init_accounts`` resolves
-    ONE account named 'default' -- ``build_pool``'s ``names == ["default"]``
-    branch. Before this test existed, that branch was exercised only on a
-    host that happened to carry real Claude credentials, so it could pass
-    CI green while carrying a defect no run of the suite would ever see.
+    """The exact pre-5488 defect, now closed at the gate (task 6042): every
+    ``CLAUDE_OAUTH_TOKEN_*`` is missing but ``~/.claude/.credentials.json``
+    exists. The gate is built with that fallback disabled, so the pool is
+    EMPTY rather than one account named 'default' riding the operator's own
+    login -- and the emptiness is as loud as the no-credentials arm above.
     """
     roster = tmp_path / "roster.yaml"
     roster.write_text(_ROSTER_YAML)
@@ -1827,16 +1825,8 @@ def test_build_pool_warns_LOUDLY_when_it_falls_back_to_the_default_credential(
     with caplog.at_level("WARNING", logger="legibility.account_pool"):
         gate = mod.build_pool(accounts_file=str(roster), env_file=str(empty_env_file))
 
-    assert [a.name for a in gate._accounts] == ["default"], (
-        f"this arm's premise: the ~/.claude fallback resolved exactly one "
-        f"account named 'default'; got "
-        f"{[a.name for a in gate._accounts]}"
-    )
+    assert gate.account_count == 0
     warnings = _module_warnings(caplog)
-    assert warnings, (
-        "the 'default' fallback IS today's broken behaviour and must warn "
-        "just as loudly as the zero-account arm"
-    )
     assert any("resolved NO usable accounts" in w for w in warnings), warnings
     assert any("max-b" in w for w in warnings), warnings
 

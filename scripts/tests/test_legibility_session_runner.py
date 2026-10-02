@@ -13,6 +13,7 @@ empty roster never falls back to that login.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -50,13 +51,10 @@ def sentinel_login(tmp_path, monkeypatch):
     return home
 
 
-def _classifier_stage(**overrides):
-    fields = dict(
-        name='s', cwd=None, timeout_secs=30, max_turns=2, max_budget_usd=1.0,
-        tools=CLASSIFIER,
-    )
-    fields.update(overrides)
-    return StageSpec(**fields)
+_CLASSIFIER_STAGE = StageSpec(
+    name='s', cwd=None, timeout_secs=30, max_turns=2, max_budget_usd=1.0,
+    tools=CLASSIFIER,
+)
 
 
 def _flag_values(argv, flag):
@@ -78,7 +76,7 @@ def test_a_call_runs_as_the_leased_account_never_the_operator_login(
 
     gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
     with SessionRunner(gate, label='t') as runner:
-        reply = runner.invoker(_classifier_stage())('the prompt', 'haiku')
+        reply = runner.invoker(_CLASSIFIER_STAGE)('the prompt', 'haiku')
 
     assert reply == 'the verdict text'
     [call] = fake_claude_cli.calls()
@@ -107,7 +105,9 @@ def test_a_read_only_explorer_runs_in_its_project_dir_and_cannot_write(
     accounts_file, env_file = pool_roster('a')
     project = tmp_path / 'project'
     project.mkdir()
-    stage = _classifier_stage(name='verify', cwd=project, tools=READ_ONLY_EXPLORER)
+    stage = dataclasses.replace(
+        _CLASSIFIER_STAGE, name='verify', cwd=project, tools=READ_ONLY_EXPLORER,
+    )
 
     gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
     with SessionRunner(gate, label='t') as runner:
@@ -126,7 +126,7 @@ def test_an_unresolvable_roster_raises_no_headroom_and_never_rides_the_operator_
 
     gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
     with SessionRunner(gate, label='t') as runner:
-        invoke = runner.invoker(_classifier_stage())
+        invoke = runner.invoker(_CLASSIFIER_STAGE)
         with pytest.raises(session_runner.NoHeadroom) as excinfo:
             invoke('the prompt', 'haiku')
 
