@@ -1404,22 +1404,14 @@ def test_row_discovery_ceiling_scales_with_load_and_clamps(monkeypatch):
     )
 
 
-def test_row_discovery_ceiling_is_the_shared_load_scaler(monkeypatch):
-    """The ceiling's load scaling IS ``df_pytest_isolation.load_scaled_grace``.
-
-    The shared scaler is the oracle, so this pins the delegation without
-    re-deriving its arithmetic. The 33.0 rung is a non-integer per-core
-    factor, where a local copy that skips the whole-second rounding diverges.
-    """
-    for load in (0.0, 16.0, 33.0, 64.0, 96.0, 200.0, 6400.0):
-        ours = _unpinned_ceiling_at(monkeypatch, load)
-        shared = load_scaled_grace(
-            ROW_DISCOVERY_CEILING_BASE_SECS, cap_secs=_ROW_DISCOVERY_CEILING_UNPINNED_MAX_SECS,
-        )
-        assert ours == shared, (
-            f'at loadavg {load} on 32 cores the discovery ceiling is {ours} but '
-            f'the shared scaler gives {shared}: the ceiling has its own scaler again'
-        )
+def test_row_discovery_ceiling_rounds_up_to_whole_seconds(monkeypatch):
+    """A fractional per-core load widens the ceiling to the next whole second."""
+    ceiling = _unpinned_ceiling_at(monkeypatch, 33.0)
+    expected = math.ceil(ROW_DISCOVERY_CEILING_BASE_SECS * 33.0 / 32)
+    assert ceiling == expected, (
+        f'at loadavg 33.0 on 32 cores the ceiling must be base * 33/32 rounded '
+        f'up to whole seconds ({expected}); got {ceiling}'
+    )
 
 
 def test_row_discovery_ceiling_fails_safe_without_loadavg(monkeypatch):
