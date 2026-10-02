@@ -1791,7 +1791,9 @@ class TestEvalLaneOrphansAreDismissed:
         assert refreshed.resolution_class == 'benign'
         assert reason in (refreshed.resolution or '')
         assert _reaper_l1s(queue) == []
-        harness.scheduler.get_task.assert_not_awaited()
+        get_task = harness.scheduler.get_task
+        assert isinstance(get_task, AsyncMock)
+        get_task.assert_not_awaited()
 
     @pytest.mark.parametrize('task_id', ['df_task_2430_adv_plan', 'shadow_5383_01JCELL'])
     async def test_aged_fixture_id_l0_is_dismissed(self, harness: Harness, task_id: str) -> None:
