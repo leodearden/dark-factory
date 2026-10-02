@@ -2231,9 +2231,10 @@ scripts/legibility/install-trickle-health-timer.sh <project_id>
 An agent session cannot run the installer: `~/.config/systemd/user/` is
 outside the sandbox write-set
 (`orchestrator/src/orchestrator/agents/write_set.py::compute_write_set`), so
-each project's deploy is a `task_kind='deterministic'` `before_done` task:
-task 6205 for dark_factory, while reify's is tracked by task 4556. A
-project's deploy is done when `systemctl --user list-timers --all` lists
+each project's deploy is a `task_kind='deterministic'` `before_done` task.
+dark_factory's is task 6205. reify's is not filed yet: task 4556, an ordinary
+agent task, tracks it and files that deterministic task. A project's deploy is
+done when `systemctl --user list-timers --all` lists
 `legibility-trickle-health@<project_id>.timer`, not when the installer lands
 on main.
 
