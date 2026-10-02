@@ -1,6 +1,7 @@
 """pytest configuration — ensure local src takes precedence over installed package."""
 import importlib
 import sys
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 
@@ -32,6 +33,12 @@ from df_pytest_isolation import (  # noqa: E402
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
     _df_git_env_hermetic,  # noqa: F401  — the binding IS the wiring
     reject_unsafe_basetemp,
+)
+from session_prebuild import SessionPrebuild  # noqa: E402
+from silent_fallthrough_scan import ParsedFile, parse_first_party_tree  # noqa: E402
+
+_FIRST_PARTY_TREE = SessionPrebuild(
+    'first_party_tree', partial(parse_first_party_tree, REPO_ROOT)
 )
 
 
@@ -93,7 +100,7 @@ def reload_module_under_env(monkeypatch):
 
 
 @pytest.fixture(scope='session')
-def first_party_tree():
+def first_party_tree(request: pytest.FixtureRequest) -> tuple[ParsedFile, ...]:
     """The whole first-party source tree, read and parsed ONCE per session.
 
     The single source every gate module in this directory walks (task 4520).
@@ -117,6 +124,4 @@ def first_party_tree():
 
     Consumers walk the ASTs READ-ONLY — they are shared with every other gate.
     """
-    from silent_fallthrough_scan import parse_first_party_tree
-
-    return parse_first_party_tree(REPO_ROOT)
+    return _FIRST_PARTY_TREE.result(request.session)
