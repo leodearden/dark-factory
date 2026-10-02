@@ -2375,8 +2375,10 @@ class TestCuratorWorkerBatchDrain:
             'note_created': True, 'record_task': True,
         }, f'_curator_lock not held across every batch phase: {held_during}'
         assert competitor.result() == 1, (
-            'competing acquirer got _curator_lock before the batch finished '
-            'its post-create curator steps'
+            'hand-off order: a waiter queued on _curator_lock during '
+            'curate_batch must acquire only after the batch ran record_task '
+            '(the in-phase locked() samples cannot see who is handed the '
+            f'lock next); it saw record_task.await_count={competitor.result()}'
         )
         assert row['status'] == 'created', f'Expected created, got {row["status"]}'
 
