@@ -527,6 +527,11 @@ def _corroboration(
             orchestrator_started_at=orchestrator_started,
         )
     except Exception:
+        logger.warning(
+            'reconciliation.render_live_workflow_section: '
+            'corroboration error for task_id=%s; leaving the gate inert',
+            task_id,
+        )
         return None
 
 
