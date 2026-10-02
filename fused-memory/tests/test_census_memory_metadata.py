@@ -3978,15 +3978,17 @@ class TestRegenCommandCoversTheNewFlags:
         fails the moment the two bases diverge again.
         """
         # Two real, non-default, repo-root-relative paths, so both flags are
-        # emitted and both can be resolved.
+        # emitted and both can be resolved. Only existence matters, so the
+        # history flag names this very module.
+        repo_root = Path(_mod._REPO_ROOT)
+        any_committed_file = Path(__file__).resolve().relative_to(repo_root).as_posix()
         params = {
             'projects': ['dark_factory', 'reify'],
             'registry': 'fused-memory/tests/fixtures/census-grandfather-oracle.json',
-            'history_out': 'fused-memory/tests/fixtures/write_triage_calibration.jsonl',
+            'history_out': any_committed_file,
         }
         command = _mod._regen_command(params)
         tokens = command.split()
-        repo_root = Path(_mod._REPO_ROOT)
 
         script = next(t for t in tokens if t.endswith('census_memory_metadata.py'))
         paths = {'script': script}
