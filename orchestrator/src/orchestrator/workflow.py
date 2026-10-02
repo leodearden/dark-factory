@@ -10788,13 +10788,15 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         the merge in-place instead of requeueing via the scheduler.
         """
         from orchestrator.merge_disposition import MergeFailureDisposition
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane import (
             PLAN_FILES_NOT_TOUCHED_REASON_PREFIX,
+            WaiterRecord,
+        )
+        from orchestrator.merge_lane.gates import _check_plan_files_touched_in_branch
+        from orchestrator.merge_queue import (
             AttachAction,
             MergeRequest,
             OutcomeKind,
-            WaiterRecord,
-            _check_plan_files_touched_in_branch,
             _emit_merge_attempt,
             _emit_merge_coalesced,
             register_and_enqueue_merge_request,
@@ -11277,11 +11279,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # case the gate exists for.  Steward mediation (e.g. mutating plan.json
         # to silence the gate) would undermine the safeguard, so skip the L0
         # steward path entirely and submit an L1 immediately.
+        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
         from orchestrator.merge_queue import (
             DROPPED_PLAN_TARGETS_REASON_PREFIX,
             MAIN_HEALTH_RED_REASON_PREFIX,
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
-            POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
             TRANSIENT_INFRA_REASON_PREFIX,
         )
         if result.reason.startswith(DROPPED_PLAN_TARGETS_REASON_PREFIX):
@@ -16014,7 +16016,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             # would cause b3_gate.check_proposal to act on incorrect data.
             # If you need to add a second post-advance class, extend this
             # check rather than removing it.
-            from orchestrator.merge_queue import (
+            from orchestrator.merge_lane import (
                 POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
             )
             if not reason.startswith(POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX):

@@ -7,17 +7,25 @@ account deferred an entire night while six other accounts sat idle. The
 pool turns the gate's roster into the ``(prompt, model) -> str`` callable
 the seam already speaks.
 
-THE FAKE GATE IS THE POINT, not a shortcut. ``account_pool`` depends on
-seven members of the real 3004-line ``UsageGate`` — ``try_lease``,
-``detect_cap_hit``, ``confirm_account_ok``, ``on_agent_complete``,
-``release_probe_slot``, ``account_count`` and ``active_account_name`` — and
-stating exactly those here is how the test
-says what the interface IS rather than reaching through it into gate
-internals (docs/code-quality.md: tests that reach a module's internals are
-an interface-design smell). The leases it hands out are REAL
-``AccountLease`` objects and the slot wrapping them is the REAL
-``InvokeSlot``, so the probe-claim discipline under test is the production
-one, not a lookalike.
+THE FAKE GATE IS THE POINT, not a shortcut. It implements exactly the
+``UsageGate`` members the pool reaches, grouped as ``account_pool.py``'s
+docstring groups its consumed interface:
+
+* the members the pool calls itself: ``try_lease``, ``account_count``,
+  ``active_account_name``, ``auth_failed_account_names`` and
+  ``release_probe_slot``;
+* the members the REAL ``InvokeSlot`` calls on the pool's behalf when it
+  settles: ``slot.detect_cap_hit`` calls ``detect_cap_hit``, and
+  ``slot.confirm`` calls ``confirm_account_ok`` and ``on_agent_complete``.
+
+Stating exactly those here is how the test says what the interface IS
+rather than reaching through it into gate internals (docs/code-quality.md:
+tests that reach a module's internals are an interface-design smell). The
+leases the fake hands out are REAL ``AccountLease`` objects, so the
+probe-claim discipline under test is the production one, not a lookalike.
+The third settle route, ``slot.report``, lands in the gate's PRIVATE auth
+handler. The fake therefore lacks it, and the auth-route tests (task 5947)
+use a REAL gate from ``build_pool`` instead of teaching the fake that hook.
 
 The LLM is ALWAYS mocked here: every test injects an ``invoke`` stub. The
 one test that drives a real ``claude`` is marked ``integration`` and is
@@ -25,6 +33,7 @@ deselected by default (``addopts = -m 'not integration'``).
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -41,7 +50,7 @@ import pytest
 from legibility import coder as coder_mod
 from shared.usage_gate import AccountLease
 
-from shared import cap_markers
+from shared import cap_markers, invocation_outcome
 from shared import usage_gate as usage_gate_mod
 
 
@@ -68,10 +77,11 @@ def _restore_environ():
 
 
 class FakeAccount:
-    def __init__(self, name, token, *, capped=False):
+    def __init__(self, name, token, *, capped=False, auth_failed=False):
         self.name = name
         self.token = token
         self.capped = capped
+        self.auth_failed = auth_failed
         # Annotation-only, exactly as on the real AccountState: a near-cap
         # account is NOT capped and keeps serving turns. The two flags are
         # separate here because the whole near-cap defect below lives in the
@@ -81,7 +91,8 @@ class FakeAccount:
 
 
 class FakeGate:
-    """Exactly the seven members ``account_pool`` calls, and nothing else.
+    """Exactly the gate members the pool reaches, directly or through the real
+    ``InvokeSlot`` (grouped in the module docstring), and nothing else.
 
     ``try_lease`` reproduces the real gate's first-fit walk and its
     ``reverse`` / ``exclude`` knobs; ``detect_cap_hit`` reproduces the STRICT
@@ -121,7 +132,7 @@ class FakeGate:
         })
         roster = reversed(self.accounts) if reverse else self.accounts
         for acct in roster:
-            if acct.capped:
+            if acct.capped or acct.auth_failed:
                 continue
             if exclude and acct.name in exclude:
                 continue
@@ -163,9 +174,16 @@ class FakeGate:
         private roster would be the interface smell, not a shortcut.
         """
         for acct in self.accounts:
-            if not acct.capped:
+            if not acct.capped and not acct.auth_failed:
                 return acct.name
         return None
+
+    @property
+    def auth_failed_account_names(self):
+        """The accounts whose credentials were rejected, in roster order —
+        how the exhaustion reason tells a pool that will never clear on its
+        own from one that clears at the weekly reset."""
+        return tuple(acct.name for acct in self.accounts if acct.auth_failed)
 
     # -- settle surface ----------------------------------------------------
     def confirm_account_ok(self, oauth_token):
@@ -792,9 +810,10 @@ class _OpaqueGate:
     caught it — both spellings produce the same words.
     """
 
-    def __init__(self, *, account_count, active_account_name):
+    def __init__(self, *, account_count, active_account_name, auth_failed_account_names=()):
         self._count = account_count
         self._active = active_account_name
+        self._auth_failed = tuple(auth_failed_account_names)
         self.lease_calls = []
 
     def try_lease(self, *, scope=None, reverse=False, exclude=None):
@@ -811,6 +830,10 @@ class _OpaqueGate:
     @property
     def active_account_name(self):
         return self._active
+
+    @property
+    def auth_failed_account_names(self):
+        return self._auth_failed
 
 
 def _reason_from(gate, invoke=None):
@@ -1815,6 +1838,244 @@ def test_build_pool_warns_LOUDLY_when_it_falls_back_to_the_default_credential(
     )
     assert any("resolved NO usable accounts" in w for w in warnings), warnings
     assert any("max-b" in w for w in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# task 5947: AN AUTH-REJECTED ACCOUNT IS REPORTED TO THE GATE AND ROTATED.
+#
+# 2026-09-29 ~02:11Z (esc-legibility-trickle-dark_factory-6): max-h's org had
+# disabled subscription access. Text-mode `claude -p` printed the rejection on
+# STDOUT and exited 1 — no banner marker, so the coder raised a plain
+# CoderInvocationError and the pool let it propagate unrotated. The gate was
+# never told, max-h stayed AVAILABLE, and since the pool drains from the end it
+# was drawn first for every digest: 23 of 23 failed beside four live accounts.
+#
+# A REAL gate (build_pool over the b,c,d roster; reverse=True leases max-d
+# first): the AUTH_FAILED transition is InvokeSlot.report's, which FakeGate
+# could only imitate by implementing a private gate hook.
+# ---------------------------------------------------------------------------
+
+_MEASURED_REJECTION = invocation_outcome.REAL_CLI_AUTH_REJECTIONS[0]
+_AUTH_REJECTION = _MEASURED_REJECTION.message
+_EMPTY_VERDICT = '{"matches": [], "candidates": []}'
+
+
+@pytest.fixture
+def real_pool(roster_file, empty_env_file, monkeypatch):
+    _set_pool_tokens(monkeypatch, "B", "C", "D")
+    return mod.build_pool(accounts_file=str(roster_file), env_file=str(empty_env_file))
+
+
+def _cli_exit_1(stdout):
+    return coder_mod.CoderInvocationError(
+        f"claude CLI exited 1 (model='haiku'): stdout={stdout!r} stderr=''",
+        stdout=stdout,
+    )
+
+
+def _loosely_labelled_capped(stdout):
+    return coder_mod.CoderCapExhausted(
+        f"claude CLI exited 1 (model='haiku'): stdout={stdout!r} stderr=''",
+        marker='x', stdout=stdout,
+    )
+
+
+@pytest.mark.parametrize('rejected', [_cli_exit_1, _loosely_labelled_capped])
+def test_an_auth_rejected_account_is_reported_and_the_same_digest_completes_next_door(
+    real_pool, rejected,
+):
+    """Parametrized over the raised type because the arm must key on the
+    STREAMS, not on whichever label coder's loose matcher happened to pick."""
+    invoke = _RecordingInvoke(
+        raises={'tok-d': rejected(_AUTH_REJECTION)},
+        replies={'tok-c': _EMPTY_VERDICT},
+    )
+    call = mod.pool_invoke(real_pool, invoke=invoke)
+
+    out = call('the digest prompt', 'haiku')
+
+    assert out == _EMPTY_VERDICT
+    assert [c['oauth_token'] for c in invoke.calls] == ['tok-d', 'tok-c']
+    assert [c['prompt'] for c in invoke.calls] == ['the digest prompt'] * 2
+    assert real_pool.auth_failed_account_names == ('max-d',)
+
+    call('the next digest prompt', 'haiku')
+
+    assert [c['oauth_token'] for c in invoke.calls] == ['tok-d', 'tok-c', 'tok-c'], (
+        'the incident\'s cure: the rejected account stays out for the NIGHT, '
+        'not just for the digest that found it'
+    )
+
+
+def test_a_failure_that_merely_quotes_the_rejection_is_not_an_auth_failure(real_pool):
+    quoting = json.dumps({
+        'matches': [{'cluster_id': 'org-disabled', 'evidence_quote': _AUTH_REJECTION}],
+    })
+    original = _cli_exit_1(quoting)
+    invoke = _RecordingInvoke(raises={'tok-d': original})
+
+    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+        mod.pool_invoke(real_pool, invoke=invoke)('prompt', 'haiku')
+
+    assert excinfo.value is original
+    assert len(invoke.calls) == 1
+    assert real_pool.auth_failed_account_names == ()
+
+
+def test_the_journal_names_the_auth_route_apart_from_both_cap_routes(real_pool, caplog):
+    invoke = _RecordingInvoke(
+        raises={'tok-d': _cli_exit_1(_AUTH_REJECTION)},
+        replies={'tok-c': _EMPTY_VERDICT},
+    )
+
+    with caplog.at_level(logging.INFO, logger='legibility.account_pool'):
+        mod.pool_invoke(real_pool, invoke=invoke)('prompt', 'haiku')
+
+    rotations = _module_rotations(caplog)
+    assert len(rotations) == 1, rotations
+    (line,) = rotations
+    assert 'max-d' in line and str(_MEASURED_REJECTION.status) in line, line
+    for cap_route_phrase in ('cap signal', 'non-zero', 'exited 0'):
+        assert cap_route_phrase not in line, (
+            f'{cap_route_phrase!r} belongs to a cap route; a journal grep must '
+            f'be able to count auth rotations separately; got {line!r}'
+        )
+
+
+def _write_fake_claude_rejecting(bin_dir, *, rejected_token):
+    """Fake `claude`: records each caller's token, prints the measured
+    rejection and exits 1 for *rejected_token*, else prints an empty verdict.
+    Payloads travel through sidecar files so the U+00B7 reaches stdout
+    byte-exact (same rationale as test_legibility_coder.py's
+    ``_write_fake_claude_failing_on_both_streams``)."""
+    calls = bin_dir / "calls.txt"
+    rejection = bin_dir / "rejection.txt"
+    verdict = bin_dir / "verdict.txt"
+    rejection.write_text(_AUTH_REJECTION, encoding="utf-8")
+    verdict.write_text(_EMPTY_VERDICT, encoding="utf-8")
+    claude = bin_dir / "claude"
+    claude.write_text(
+        "#!/usr/bin/env bash\n"
+        "cat > /dev/null\n"
+        f'printf "%s\\n" "$CLAUDE_CODE_OAUTH_TOKEN" >> "{calls}"\n'
+        f'if [ "$CLAUDE_CODE_OAUTH_TOKEN" = "{rejected_token}" ]; then\n'
+        f'  cat "{rejection}"\n'
+        "  exit 1\n"
+        "fi\n"
+        f'cat "{verdict}"\n'
+    )
+    claude.chmod(0o755)
+    return claude, calls
+
+
+@pytest.mark.timeout(60)
+def test_an_auth_rejected_night_is_not_lost_end_to_end(real_pool, tmp_path):
+    """The real chain the task's JSON premise would have missed: text-mode
+    stdout -> coder._invoke_cli's CoderInvocationError -> the pool's
+    classifier -> InvokeSlot.report -> the next lease. ``claude_bin`` is
+    explicit, so the bare-name PATH fallback can never reach a real CLI."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    claude, calls = _write_fake_claude_rejecting(bin_dir, rejected_token='tok-d')
+    invoke = functools.partial(coder_mod._invoke_cli, claude_bin=str(claude), timeout=30)
+
+    result = coder_mod.code_digests(
+        [_digest_text(f"auth-sess-{i}") for i in range(3)], _codebook(),
+        project="dark_factory", model="haiku",
+        invoke=mod.pool_invoke(real_pool, invoke=invoke),
+    )
+
+    assert result.total == 3
+    assert len(result.records) == 3, result.failures
+    assert result.capped == 0
+    assert result.status == "ok"
+    assert coder_mod.is_cap_deferral(result) is False
+    assert calls.read_text().split() == ['tok-d', 'tok-c', 'tok-c', 'tok-c']
+    assert real_pool.auth_failed_account_names == ('max-d',)
+
+
+# An all-auth-failed pool never clears on its own, so it must be LOUD: a plain
+# CoderInvocationError that code_digests counts as a real failure (storm, exit
+# 1, ERROR escalation), never a CoderCapExhausted that coder.is_cap_deferral
+# would turn into a quiet exit-0 DEFERRED night. A mixed pool still defers —
+# its capped accounts do clear — but must not claim every account is capped.
+
+def _every_account_rejecting():
+    return _RecordingInvoke(raises={
+        token: _cli_exit_1(_AUTH_REJECTION) for token in ('tok-b', 'tok-c', 'tok-d')
+    })
+
+
+def test_a_pool_whose_every_account_rejects_its_credentials_fails_loud_not_deferred(
+    real_pool,
+):
+    invoke = _every_account_rejecting()
+    call = mod.pool_invoke(real_pool, invoke=invoke)
+
+    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+        call('prompt', 'haiku')
+
+    exc = excinfo.value
+    assert not isinstance(exc, coder_mod.CoderCapExhausted), exc
+    message = str(exc)
+    for name in ('max-b', 'max-c', 'max-d'):
+        assert name in message, message
+    assert 'capped' not in message.lower(), message
+    assert 'will not clear at the weekly reset' in message, message
+    assert len(invoke.calls) == 3
+
+    with pytest.raises(coder_mod.CoderInvocationError) as second:
+        call('the next digest prompt', 'haiku')
+
+    assert not isinstance(second.value, coder_mod.CoderCapExhausted), second.value
+    assert len(invoke.calls) == 3, (
+        'every account is already AUTH_FAILED, so the next digest must not '
+        'spend a single CLI call finding that out again'
+    )
+
+
+def test_the_all_auth_failed_decision_comes_from_the_gates_public_predicates():
+    gate = _OpaqueGate(
+        account_count=3, active_account_name=None,
+        auth_failed_account_names=('max-b', 'max-c', 'max-d'),
+    )
+
+    with pytest.raises(coder_mod.CoderInvocationError) as excinfo:
+        mod.pool_invoke(gate, invoke=_RecordingInvoke())('prompt', 'haiku')
+
+    assert not isinstance(excinfo.value, coder_mod.CoderCapExhausted), excinfo.value
+
+
+def test_a_partly_auth_failed_pool_defers_without_claiming_every_account_is_capped():
+    gate = _OpaqueGate(
+        account_count=3, active_account_name=None, auth_failed_account_names=('max-b',),
+    )
+
+    message = _reason_from(gate)
+
+    assert 'max-b' in message, message
+    assert 'all 3 pool accounts capped' not in message, message
+    assert 'will not clear' in message, (
+        f'the auth-failed account must not be promised back at the reset; '
+        f'got {message!r}'
+    )
+
+
+@pytest.mark.timeout(60)
+def test_an_all_auth_failed_night_is_a_storm_not_a_deferral_end_to_end(real_pool):
+    result = coder_mod.code_digests(
+        [_digest_text(f"auth-sess-{i}") for i in range(3)], _codebook(),
+        project="dark_factory", model="haiku",
+        invoke=mod.pool_invoke(real_pool, invoke=_every_account_rejecting()),
+    )
+
+    assert result.capped == 0
+    assert result.failed == 3
+    assert result.status == "failure"
+    assert coder_mod.is_cap_deferral(result) is False, (
+        "the storm path is what makes nightly exit 1 with an ERROR escalation; "
+        "a deferral would hide a pool that never comes back on its own"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -81,7 +81,6 @@ from df_pytest_isolation import (  # noqa: E402
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
-from orchestrator import merge_queue  # noqa: E402
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
     EscalationConfig,
@@ -92,12 +91,13 @@ from orchestrator.config import (  # noqa: E402
     SandboxConfig,
 )
 from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402
+from orchestrator.merge_lane import worker  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
 # orchestrator.merge_queue was imported (by another conftest/plugin) before
 # the os.environ.setdefault above took effect, which would have frozen its
 # module-level _DEBUG_ASSERTS seed at False.
-merge_queue._DEBUG_ASSERTS = True
+worker._DEBUG_ASSERTS = True
 
 track_async_mock_coroutines()
 

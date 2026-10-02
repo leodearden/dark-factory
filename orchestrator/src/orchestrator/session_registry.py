@@ -30,7 +30,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Mapping
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -440,13 +441,15 @@ class DecisionRecord:
         hold before; packing it into ``text`` (the cockpit's one-line
         question) would bury a structured fact in prose. Written only by
         close_decision_with_evidence, which the sitting preparer's apply step
-        drives through the ``close-decision`` verb. Defaults to '' (not
+        drives through the ``close-decision`` verb, and cleared only by
+        reopen_decision. Defaults to '' (not
         closed with evidence, or filed before this field existed). CUSTODY,
         like ``state``: a watcher's re-file never changes it.
     closed_at: the ISO-8601 UTC instant close_decision_with_evidence recorded
         the close -- on the reap-decisions-got-there-first path, when the
         evidence was attached. Written only by close_decision_with_evidence,
-        in the same write as ``closing_evidence``, and CUSTODY like it. It
+        in the same write as ``closing_evidence``, cleared with it by
+        reopen_decision, and CUSTODY like it. It
         exists because the return brief windows its autonomous-closes section
         on when a close happened, and ``filed_at`` is the wrong clock for
         that: a carve-out close targets an L2 that has been open a while.
@@ -461,11 +464,12 @@ class DecisionRecord:
     are up -- scripts/backfill_decision_queue_stamp.py (via
     set_decision_escalations_dir), the ``write-decision`` verb itself
     (task 3559), whose enrichment path folds a SECOND watcher's filing into
-    an existing open record, and -- for task 5376's sitting preparer -- the
-    ``close-decision`` verb (via close_decision_with_evidence). The
+    an existing open record, -- for task 5376's sitting preparer -- the
+    ``close-decision`` verb (via close_decision_with_evidence), and the
+    ``reopen-decision`` verb (via reopen_decision, task 4835). The
     ``write-decision`` verb is the only mutator that may CREATE the record
     rather than merely mutate an existing one, so it races on a path where
-    nothing exists on disk yet. All five serialize their
+    nothing exists on disk yet. All six serialize their
     read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
     1609's escalation_id_lock), so a concurrent state-update, boost-update,
@@ -474,7 +478,7 @@ class DecisionRecord:
     read+mutate+write span is serialized against other callers on the same
     id. See update_decision_state/set_manual_boost/
     set_decision_escalations_dir/_run_write_decision/
-    close_decision_with_evidence for the caller-facing note.
+    close_decision_with_evidence/reopen_decision for the caller-facing note.
     """
 
     id: str
@@ -792,6 +796,25 @@ def decision_path_for_id(decision_id: str, root: Path | str | None = None) -> Pa
     return decisions_dir(root) / f'{stem}.json'
 
 
+DECISION_ID_PROJECT_SEPARATOR = '-'
+
+
+def qualify_decision_id(project: object, local_id: str) -> str:
+    """The fleet-unique decision key: *local_id* prefixed by the canonical *project*.
+
+    A pure join that never inspects *local_id*. A project that folds to ``''``
+    leaves *local_id* unqualified. ``-`` is the separator because canonical
+    tokens never contain one (so the join is injective), it survives
+    _DECISION_ID_SANITIZE_RE (so the file stem equals the id), and it matches
+    the sitting's existing ``<project>-<esc>`` ids. See
+    plans/4835-decision-plumbing-decisions.md.
+    """
+    folded = normalize_project_token(project)
+    if not folded:
+        return local_id
+    return f'{folded}{DECISION_ID_PROJECT_SEPARATOR}{local_id}'
+
+
 # ---------------------------------------------------------------------------
 # Single-writer atomic write / read / update
 # ---------------------------------------------------------------------------
@@ -1097,7 +1120,8 @@ def _mutate_decision(
 
     The single implementation of the field-setter body shared by
     update_decision_state, set_manual_boost, set_decision_escalations_dir
-    (task 3640 amendment) and close_decision_with_evidence (task 5376). Those
+    (task 3640 amendment), close_decision_with_evidence (task 5376) and
+    reopen_decision (task 4835). Those
     are the public, caller-facing names and keep their own docstrings; this holds the parts that MUST NOT diverge
     between them -- the lock placement, the read, the write, and the
     fail-soft except-tuple.
@@ -1228,6 +1252,29 @@ def set_decision_escalations_dir(
 CLOSING_DECISION_STATES = frozenset({DecisionState.ANSWERED, DecisionState.DROPPED})
 
 
+def _decision_identity(project: object, escalations_dir: str | Path) -> tuple[str, str]:
+    """The folded (project, queue stamp) pair a caller names a fleet-global decision record by."""
+    return normalize_project_token(project), normalize_escalations_dir(escalations_dir)
+
+
+def _refuse_unless_named_record(
+    decision_id: str,
+    record: DecisionRecord,
+    wanted: tuple[str, str],
+    refused: type[Exception],
+    *,
+    action: str,
+) -> None:
+    """Raise *refused* unless *record* is the one *wanted* names: the compare-and-swap of close and reopen."""
+    found = _decision_identity(record.project, record.escalations_dir)
+    if found != wanted:
+        raise refused(
+            f'{decision_id} is project {found[0]!r} in queue {found[1]!r}, not the record the '
+            f'caller named (project {wanted[0]!r} in queue {wanted[1]!r}); decision ids are '
+            f'fleet-global, so another project\'s or queue\'s record is never {action}'
+        )
+
+
 class DecisionCloseRefused(Exception):
     """close_decision_with_evidence refused; the record is untouched and the message names why.
 
@@ -1283,16 +1330,10 @@ def close_decision_with_evidence(
             f'{decision_id}: closing evidence is empty; quote the deciding evidence verbatim'
         )
 
-    wanted = (normalize_project_token(expected_project), normalize_escalations_dir(expected_escalations_dir))
+    wanted = _decision_identity(expected_project, expected_escalations_dir)
 
     def _close(record: DecisionRecord) -> None:
-        found = (normalize_project_token(record.project), normalize_escalations_dir(record.escalations_dir))
-        if found != wanted:
-            raise DecisionCloseRefused(
-                f'{decision_id} is project {found[0]!r} in queue {found[1]!r}, not the record the '
-                f'caller named (project {wanted[0]!r} in queue {wanted[1]!r}); decision ids are '
-                'fleet-global, so another project\'s or queue\'s record is never closed'
-            )
+        _refuse_unless_named_record(decision_id, record, wanted, DecisionCloseRefused, action='closed')
         if record.closing_evidence:
             raise DecisionCloseRefused(
                 f'{decision_id} already carries closing evidence; refusing to overwrite it'
@@ -1309,6 +1350,46 @@ def close_decision_with_evidence(
     return _mutate_decision(
         decision_id, _close, caller='close_decision_with_evidence', root=root
     )
+
+
+class DecisionReopenRefused(Exception):
+    """reopen_decision refused; the record is untouched and the message names why.
+
+    Not a ValueError, for DecisionCloseRefused's reason: _mutate_decision
+    absorbs ValueError, and a refusal must reach its caller.
+    """
+
+
+def reopen_decision(
+    decision_id: str,
+    root: Path | str | None = None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str | Path,
+) -> DecisionRecord | None:
+    """Re-open *decision_id* IN PLACE, in ONE locked read-modify-write.
+
+    The caller names the record it means exactly as for
+    close_decision_with_evidence, and any other record at that id raises
+    DecisionReopenRefused. Clears ``closing_evidence`` and ``closed_at``,
+    because a close never overwrites evidence, so a re-opened gate could
+    otherwise never be closed with evidence again. Every other field is kept,
+    ``filed_at`` and ``manual_boost`` included (custody). It is reopen-only
+    rather than a generic state setter, which would bypass the evidence-quoting
+    close; see plans/4835-decision-plumbing-decisions.md.
+
+    Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
+    missing file, a corrupt body, a lock fault or a write failure.
+    """
+    wanted = _decision_identity(expected_project, expected_escalations_dir)
+
+    def _reopen(record: DecisionRecord) -> None:
+        _refuse_unless_named_record(decision_id, record, wanted, DecisionReopenRefused, action='reopened')
+        record.state = DecisionState.OPEN
+        record.closing_evidence = ''
+        record.closed_at = ''
+
+    return _mutate_decision(decision_id, _reopen, caller='reopen_decision', root=root)
 
 
 def _merge_queue_and_escalation_id(
@@ -1474,8 +1555,9 @@ def merge_decision_enrichment(
     field unguarded. (2) Task 3640 (merged) hard-commits the field to a
     scalar, adding UNKNOWN_QUEUE as a THIRD scalar state plus a back-fill
     that stamps the live population as scalars; a list would contradict
-    shipped, tested behaviour. (3) Widening it needs a SCHEMA_VERSION minor
-    bump (fleet-cockpit-prd.md:180) and belongs to its own task.
+    shipped, tested behaviour. (3) DECIDED won't-do by task 4835 (a faithful
+    widening would be (queue, escalation_id) pairs, and any-of closure fails
+    closed); see plans/4835-decision-plumbing-decisions.md.
 
     First-writer-wins therefore leaves the known MODE-2 reap gap that
     test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_
@@ -1584,15 +1666,10 @@ def merge_same_queue_refile(
     reap_answered_decisions skips a non-open record ("already resolved -- no
     re-close"), so without this the operator's dismissal is undone forever
     and C5b's drop action is inert for exactly the class of row it exists
-    for. The escape hatch for a genuinely NEW ask at a closed id is to FILE
-    IT UNDER A NEW ID -- the remedy that exists on a shipped surface, and the
-    one _run_write_decision's divergence WARNING points a watcher at.
-    Re-opening the row IN PLACE is deliberately not offered as the headline
-    remedy, because today it needs a direct registry write: this module's
-    update_decision_state has no operator-facing caller that re-opens (the
-    cockpit's C5b decision pane writes DROPPED only) and the argparse below
-    exposes write-decision / reap-decisions but no update-decision-state
-    verb. Say "file a new id" until one of those exists.
+    for. When the SAME gate genuinely needs a human again, the row is
+    re-opened in place with the ``reopen-decision`` verb (reopen_decision),
+    which _run_write_decision's divergence WARNING names; a genuinely
+    DIFFERENT ask is filed under a new id.
 
     ADDITIVE-SAFE: ``state`` is copied as an opaque ``str``, never coerced
     through DecisionState -- mirrors DecisionRecord's own no-coercion note,
@@ -2061,10 +2138,11 @@ def declined_project_token_hint(value: object, action: str = '') -> str | None:
     must land. ``solar_challenge`` -- the token both SKILL.md files recommend
     -- must stay SILENT, or a watcher accrues a warning every Main Loop
     cycle and the signal degrades into noise. Because the check is gated on
-    a one-entry table it has zero false positives; it is deliberately
-    narrower than a generic "your --project matched zero records" warning,
-    which cannot distinguish a token nothing uses from a healthy project
-    with nothing open.
+    a one-entry table it has zero false positives, so it fires on every
+    reap. The general "your --project matched zero records" case is
+    unmatched_project_token_hint, which is OPT-IN (``reap-decisions
+    --expect-matches``) because by count alone a never-filed project cannot
+    be told apart from a mismatched one; this hint takes precedence over it.
 
     WHY IT IS VERB-AWARE. The two callers hit this table for OPPOSITE
     reasons, and one message cannot be true for both. ``reap-decisions`` is
@@ -2123,6 +2201,44 @@ def declined_project_token_hint(value: object, action: str = '') -> str | None:
             ),
         }.get(action, '')
         return f'{core}{consequence} See PROJECT_TOKEN_ALIASES_DECLINED for the evidence.'
+    return None
+
+
+def project_token_census(decisions: Iterable[DecisionRecord]) -> Counter[str]:
+    """How many *decisions*, in any state, carry each folded project token; an unset token is dropped."""
+    return Counter(
+        token for token in (normalize_project_token(d.project) for d in decisions) if token
+    )
+
+
+def unmatched_project_token_hint(value: object, census: Mapping[str, int]) -> str | None:
+    """One-line warning when *value* folds to a token no registry record carries, else None.
+
+    *census* is project_token_census over the whole registry. The line names
+    the tokens that DO exist, most common first, so a mismatched spelling is
+    one glance from its fix.
+    """
+    folded = normalize_project_token(value)
+    if not folded or folded in census:
+        return None
+    present = ', '.join(
+        f'{token}={count}'
+        for token, count in sorted(census.items(), key=lambda item: (-item[1], item[0]))
+    )
+    return (
+        f'--project {folded!r} matches ZERO of {sum(census.values())} decision records in the '
+        f'registry (any state), so this reap can close nothing. Tokens present: '
+        f'{present or "none"}. Re-run with the token whose rows you meant.'
+    )
+
+
+def _reap_scope_hint(reaper_project: str, *, expect_matches: bool) -> str | None:
+    """The one advisory reap-decisions logs: the declined-alias special case first, else the opt-in census."""
+    declined = declined_project_token_hint(reaper_project, action='reap')
+    if declined is not None:
+        return declined
+    if expect_matches:
+        return unmatched_project_token_hint(reaper_project, project_token_census(list_decisions()))
     return None
 
 
@@ -4525,8 +4641,50 @@ def _run_lease_reap() -> list[ReapedLease]:
     return reap_stale_leases()
 
 
+def _read_decision_or_none(decision_id: str) -> DecisionRecord | None:
+    """The record at *decision_id*, or None when it is absent, unreadable or corrupt."""
+    try:
+        return DecisionRecord.from_json(decision_path_for_id(decision_id).read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+@contextlib.contextmanager
+def _locked_filing_target(
+    canonical_project: str, local_id: str
+) -> Iterator[tuple[str, DecisionRecord | None]]:
+    """Lock and read the record a write-decision filing of *local_id* lands on.
+
+    That is the project-qualified id, unless only a bare-keyed record filed
+    before task 4835 exists at *local_id* for the SAME project: the filing
+    then continues that record in place, keeping its custody and any
+    held-closed state. Migration is lazy and ids are never rewritten, as in
+    migrate_decision_project_tokens. Locks go qualified-then-legacy, and the
+    legacy one only when its file exists, so a fresh filing leaves no orphan
+    sidecar. See plans/4835-decision-plumbing-decisions.md.
+    """
+    qualified = qualify_decision_id(canonical_project, local_id)
+    with decision_id_lock(qualified):
+        if (
+            local_id != qualified
+            and not decision_path_for_id(qualified).exists()
+            and decision_path_for_id(local_id).exists()
+        ):
+            with decision_id_lock(local_id):
+                legacy = _read_decision_or_none(local_id)
+                if (
+                    legacy is not None
+                    and normalize_project_token(legacy.project) == canonical_project
+                ):
+                    yield local_id, legacy
+                else:
+                    yield qualified, None
+            return
+        yield qualified, _read_decision_or_none(qualified)
+
+
 def _run_write_decision(
-    decision_id: str,
+    local_id: str,
     project: str,
     text: str,
     task_id: str | None,
@@ -4571,11 +4729,12 @@ def _run_write_decision(
     into an availability dependency. A rewrite is logged at WARNING so it
     stays LOUD rather than silent.
 
-    NOTE that ``decision_id`` is untouched by that normalization: the ``df-``
-    prefix on an id like ``df-esc-3524-1`` is part of ``--id``, which the
-    caller types, and is never derived from or rewritten because of
-    ``--project``. Conflating the two is how the three-way project split
-    arose.
+    ``local_id`` (``--id``) is project-LOCAL (task 4835): the record is
+    filed under ``qualify_decision_id(canonical project, local_id)``, so the
+    same escalation id in two projects lands on two rows, while both queues
+    of ONE project still share a row (the MODE-2 collapse below). A
+    same-project record filed before then under the bare id is continued in
+    place (_locked_filing_target), and the printed id is the one landed on.
 
     ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
     to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
@@ -4602,13 +4761,15 @@ def _run_write_decision(
     UPSERT, NOT A BLIND OVERWRITE (task 3559). Against an existing record at
     the same id, three cases are told apart:
 
-    - DIFFERENT project -- an id COLLISION, not one gate seen twice, since
-      DecisionRecords are fleet-global while ``esc-<taskid>-<n>`` task
-      numbering restarts per project. REFUSED (loud, fail-soft, nothing
-      written): merging would hide this ask inside the other project's row
-      and overwriting would delete that row. Scoped to an OPEN incumbent --
-      a closed row in another project is a question already dealt with, so a
-      filing there starts a new ask.
+    - DIFFERENT project -- an id COLLISION, not one gate seen twice. Since
+      task 4835 qualifies the id by project, this is reachable only when the
+      qualified id is itself held by another project's record: a legacy
+      hand-prefixed id such as the live ``recon-esc-7459-1`` held by project
+      reify. REFUSED (loud, fail-soft, nothing written): merging would hide
+      this ask inside the other project's row and overwriting would delete
+      that row. Scoped to an OPEN incumbent -- a closed row in another
+      project is a question already dealt with, so a filing there starts a
+      new ask.
     - DIFFERENT queue stamp -- the second watcher observing the same human
       gate through another queue (the observed esc-5914-1 MODE-2 shape), so
       the filing is folded in via merge_decision_enrichment rather than
@@ -4685,7 +4846,7 @@ def _run_write_decision(
             'normalized to nothing. A DecisionRecord is fleet-global but an '
             'esc-<taskid>-<n> id is unique only within one queue, so a queue-less '
             'record is cross-queue-ambiguous. Pass the SAME queue dir you reap with.',
-            decision_id,
+            local_id,
         )
         return
     if stamp == UNKNOWN_QUEUE:
@@ -4695,7 +4856,7 @@ def _run_write_decision(
             'reaper will ever close a decision stamped with it -- only a human could. '
             'A watcher knows its own queue by construction; pass the real queue dir '
             'you also reap with.',
-            decision_id,
+            local_id,
             UNKNOWN_QUEUE,
         )
         return
@@ -4719,19 +4880,6 @@ def _run_write_decision(
     if declined_hint is not None:
         logger.warning('write-decision: %s', declined_hint)
 
-    incoming = DecisionRecord(
-        id=decision_id,
-        project=canonical_project,
-        text=text,
-        filed_at=datetime.now(UTC).isoformat(),
-        task_id=task_id,
-        escalation_id=escalation_id,
-        session_id=session_id,
-        severity=severity,
-        escalations_dir=stamp,
-        record_slug=record_slug,
-    )
-
     # WHY THIS IS NOT ROUTED THROUGH _mutate_decision, despite sharing its
     # read-modify-write shape: _mutate_decision is a STRICT read-modify-write
     # -- it does DecisionRecord.from_json(path.read_text()) and fail-softs to
@@ -4750,27 +4898,31 @@ def _run_write_decision(
     # decision_id_lock's own docstring), and INSIDE the try/except so a
     # lock-acquisition fault is absorbed rather than raised at a watcher.
     try:
-        with decision_id_lock(decision_id):
+        with _locked_filing_target(canonical_project, local_id) as (decision_id, existing):
+            incoming = DecisionRecord(
+                id=decision_id,
+                project=canonical_project,
+                text=text,
+                filed_at=datetime.now(UTC).isoformat(),
+                task_id=task_id,
+                escalation_id=escalation_id,
+                session_id=session_id,
+                severity=severity,
+                escalations_dir=stamp,
+                record_slug=record_slug,
+            )
             record = incoming
-            try:
-                existing = DecisionRecord.from_json(
-                    decision_path_for_id(decision_id).read_text()
-                )
-            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-                # Absent (the common first-filing case), unreadable, or
-                # corrupt: all fall through to writing fresh.
-                existing = None
             if existing is not None:
                 if normalize_project_token(existing.project) != canonical_project:
                     # SAME id, DIFFERENT project: an id COLLISION, not a
-                    # MODE-2 collapse. Both SKILL.md files tell a watcher to
-                    # use the escalation id as the decision id, and
-                    # esc-<taskid>-<n> task numbering RESTARTS per project,
-                    # so 'esc-42-1' in dark_factory and 'esc-42-1' in reify
-                    # are two unrelated gates. Two projects also always have
-                    # different queue dirs, so without this guard every such
-                    # collision lands in the enrichment branch below and gets
-                    # folded into the OTHER project's row -- one cockpit row
+                    # MODE-2 collapse. The id is project-qualified (task
+                    # 4835), so this is reachable only when the qualified id
+                    # is held by a LEGACY hand-prefixed record of another
+                    # project (the live 'recon-esc-7459-1' held by reify is
+                    # the shape). Two projects also always have different
+                    # queue dirs, so without this guard such a collision
+                    # lands in the enrichment branch below and gets folded
+                    # into the OTHER project's row -- one cockpit row
                     # claiming to be project A's ask while B's human gate is
                     # invisible and unreapable by B's reaper.
                     #
@@ -4804,17 +4956,16 @@ def _run_write_decision(
                     if existing.state == DecisionState.OPEN:
                         logger.error(
                             'write-decision refusing to file %s for project %s: an OPEN '
-                            'decision already exists at that id for a DIFFERENT project '
-                            '(%s). DecisionRecords are fleet-global while '
-                            'esc-<taskid>-<n> ids restart per project, so this is an id '
+                            'decision already exists at that project-qualified id for a '
+                            'DIFFERENT project (%s) -- a legacy hand-prefixed id filed '
+                            'before ids were qualified by project. This is an id '
                             'COLLISION, not a MODE-2 cross-queue collapse of one human '
                             'gate -- merging would hide this ask inside the other '
                             'project\'s cockpit row and overwriting would delete that '
                             'row, so neither is safe. The existing row is left intact '
                             'and THIS ask did not reach the cockpit; it is still '
                             'carried by the in-session note / afk-digest line this '
-                            'filing accompanies. Re-file it under an id that is unique '
-                            'fleet-wide.',
+                            'filing accompanies. Re-file it under a different --id.',
                             decision_id,
                             project,
                             existing.project,
@@ -4867,18 +5018,20 @@ def _run_write_decision(
                             'already answered or dropped, not a new ask. Your text, '
                             'severity and ids DID land, but the row stays CLOSED and '
                             'will NOT reappear in the cockpit decision queue, which '
-                            'shows only state=open rows. Re-opening it would make an '
-                            'operator\'s cockpit disposition impossible to ever make '
-                            'stick, since a watcher re-files its stable id on every '
+                            'shows only state=open rows. Re-opening it on a re-file would '
+                            'make an operator\'s cockpit disposition impossible to ever '
+                            'make stick, since a watcher re-files its stable id on every '
                             'restart while an item stays parked. ADJUDICATE this rather '
-                            'than re-filing blindly: if the gate is genuinely a NEW ask, '
-                            'file it under a NEW id -- that is the remedy with a shipped '
-                            'surface, since re-opening this row in place currently needs '
-                            'a direct registry write (the cockpit decision pane offers a '
-                            'drop action but no re-open, and there is no '
-                            'update-decision-state CLI verb).',
+                            'than re-filing blindly: if this SAME gate genuinely needs a '
+                            'human again, re-open the row in place with '
+                            '`session_registry.py reopen-decision --id %s --project %s '
+                            '--escalations-dir %s`; file under a NEW id only for a '
+                            'genuinely DIFFERENT ask.',
                             decision_id,
                             str(existing.state),
+                            stamp,
+                            decision_id,
+                            canonical_project,
                             stamp,
                         )
                 elif existing.state == DecisionState.OPEN:
@@ -4898,10 +5051,15 @@ def _run_write_decision(
             if write_decision(record):
                 print(record.id)
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('write-decision: failed to file %s', decision_id, exc_info=True)
+        logger.error(
+            'write-decision: failed to file %s for project %s',
+            local_id,
+            canonical_project,
+            exc_info=True,
+        )
 
 
-def _run_reap_decisions(project: str, escalations_dir: str) -> None:
+def _run_reap_decisions(project: str, escalations_dir: str, *, expect_matches: bool = False) -> None:
     """Run the ``reap-decisions`` verb (Fleet Cockpit C8: close-on-resolve driver).
 
     Builds the production ``escalation_status`` closure for
@@ -4930,8 +5088,14 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
        A ``--project`` naming a DECLINED alias target now WARNS (task 3813,
        see PROJECT_TOKEN_ALIASES_DECLINED), so an operator passing a
        config-declared token that matches zero rows learns it immediately
-       instead of reading a silent no-op as "nothing to reap". Advisory
-       only: it does not change the axis, the scoping, or what gets closed.
+       instead of reading a silent no-op as "nothing to reap". The general
+       case is opt-in: with *expect_matches* (``--expect-matches``, task
+       4835) a token no registry record carries in ANY state warns and
+       names the tokens that do. It is not always on because by count alone
+       a never-filed project cannot be told apart from a mismatched one, and
+       a watcher reaps every Main Loop cycle. Both are advisory, one line
+       per invocation (_reap_scope_hint): neither changes the axis, the
+       scoping, or what gets closed.
     2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
        only WITHIN one queue, and a project can run several: dark_factory
        runs ``data/escalations`` (orchestrator) and
@@ -4986,16 +5150,14 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     reaper_dir = normalize_escalations_dir(escalations_dir)
     reaper_project = normalize_project_token(project)
 
-    # Advisory only (task 3813). Deliberately OUTSIDE _status, so it fires
-    # ONCE per invocation rather than once per record scanned -- a watcher
-    # runs this every Main Loop cycle and a per-record line would flood its
-    # log. It must not touch reaper_project, neither scoping axis, nor what
-    # gets closed: both guards below stay fail-OPEN exactly as documented.
-    # action='reap': this path really is MATCHING, so the zero-row-no-op
-    # consequence is the true one here (contrast _run_write_decision).
-    declined_hint = declined_project_token_hint(reaper_project, action='reap')
-    if declined_hint is not None:
-        logger.warning('reap-decisions: %s', declined_hint)
+    # Advisory only (tasks 3813, 4835). Deliberately OUTSIDE _status, so it
+    # fires ONCE per invocation rather than once per record scanned -- a
+    # watcher runs this every Main Loop cycle and a per-record line would
+    # flood its log. It must not touch reaper_project, neither scoping axis,
+    # nor what gets closed: both guards below stay fail-OPEN as documented.
+    scope_hint = _reap_scope_hint(reaper_project, expect_matches=expect_matches)
+    if scope_hint is not None:
+        logger.warning('reap-decisions: %s', scope_hint)
 
     def _status(decision: DecisionRecord) -> str | None:
         # Axis 1: normalize the decision's OWN stored token at compare time
@@ -5046,7 +5208,7 @@ def _run_close_decision(
     expected_project: str,
     expected_escalations_dir: str,
 ) -> int:
-    """Run the ``close-decision`` verb; the one decision verb whose failure is a non-zero exit.
+    """Run the ``close-decision`` verb, whose failure, like ``reopen-decision``'s, is a non-zero exit.
 
     Its caller is an agent executing a pre-built apply payload
     (``scripts/sitting/payloads.py::close_decision_argv``), not
@@ -5072,6 +5234,62 @@ def _run_close_decision(
     return 0
 
 
+def _run_reopen_decision(
+    decision_id: str,
+    root: str | None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str,
+) -> int:
+    """Run the ``reopen-decision`` verb; like close-decision, a refusal or an unreadable record exits non-zero.
+
+    Its caller is a human or agent adjudicating a held-closed row, who must
+    see a refusal rather than read it as success. Prints the record's id on
+    success, plus a stderr WARNING when the linked escalation is already
+    terminal in the stamped queue: the next reap-decisions cycle then closes
+    the row again, so the reopen alone cannot keep it open.
+    """
+    try:
+        record = reopen_decision(
+            decision_id,
+            root=root,
+            expected_project=expected_project,
+            expected_escalations_dir=expected_escalations_dir,
+        )
+    except DecisionReopenRefused as exc:
+        print(f'reopen-decision refused: {exc}', file=sys.stderr)
+        return 1
+    if record is None:
+        print(f'reopen-decision: {decision_id} has no readable record to reopen (see the ERROR log)', file=sys.stderr)
+        return 1
+    print(record.id)
+    closing_status = _reapable_escalation_status(record)
+    if closing_status is not None:
+        print(
+            f'reopen-decision: WARNING {record.id} is open again, but its escalation '
+            f'{record.escalation_id} is already {closing_status!r} in {record.escalations_dir}, so the '
+            'next reap-decisions cycle closes it again. A gate that needs a human again needs a new '
+            'escalation, filed under its own --id.',
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _reapable_escalation_status(record: DecisionRecord) -> str | None:
+    """The terminal status the reaper would close *record* on, read from its stamped queue; else None.
+
+    The reaper's own join (_run_reap_decisions._status) for a record whose
+    queue is known. None when the record has no escalation id, is unstamped
+    or stamped UNKNOWN_QUEUE (no reaper can be named), or its escalation is
+    not in DECISION_CLOSE_MAP.
+    """
+    queue = normalize_escalations_dir(record.escalations_dir)
+    if not record.escalation_id or queue in ('', UNKNOWN_QUEUE):
+        return None
+    status = read_escalation_status(queue, record.escalation_id)
+    return status if status in DECISION_CLOSE_MAP else None
+
+
 def _run_migrate_decision_projects(dry_run: bool) -> None:
     """Run the ``migrate-decision-projects`` verb (task 3807).
 
@@ -5093,6 +5311,27 @@ def _run_migrate_decision_projects(dry_run: bool) -> None:
     """
     for migrated in migrate_decision_project_tokens(dry_run=dry_run):
         print(f'{migrated.id} {migrated.old_project} -> {migrated.new_project}')
+
+
+def _add_record_identity_args(verb_parser: argparse.ArgumentParser) -> None:
+    """The compare-and-swap expectations close-decision and reopen-decision name a record by."""
+    verb_parser.add_argument(
+        '--project',
+        required=True,
+        help=(
+            "compare-and-swap expectation of the record's CURRENT project, not a stamp "
+            "like write-decision's: a record at --id whose folded project differs is refused"
+        ),
+    )
+    verb_parser.add_argument(
+        '--escalations-dir',
+        required=True,
+        help=(
+            "compare-and-swap expectation of the record's CURRENT queue stamp, not a stamp "
+            "like write-decision's, so '' is a legal expectation for a legacy unstamped record; "
+            'a record at --id whose normalized stamp differs is refused'
+        ),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -5198,7 +5437,14 @@ def _build_parser() -> argparse.ArgumentParser:
         'write-decision',
         help='file an OPEN DecisionRecord (Fleet Cockpit C8: park-to-registry)',
     )
-    write_decision_p.add_argument('--id', required=True, help="this decision's id")
+    write_decision_p.add_argument(
+        '--id',
+        required=True,
+        help=(
+            "this decision's id LOCAL to --project (usually the escalation id); "
+            'filed fleet-unique as <project>-<id>, which is printed'
+        ),
+    )
     write_decision_p.add_argument(
         '--project',
         required=True,
@@ -5237,24 +5483,18 @@ def _build_parser() -> argparse.ArgumentParser:
     close_decision_p.add_argument('--id', required=True, help="the decision's id")
     close_decision_p.add_argument('--state', required=True, help='answered or dropped')
     close_decision_p.add_argument('--evidence', required=True, help='the deciding evidence, verbatim')
-    close_decision_p.add_argument(
-        '--project',
-        required=True,
-        help=(
-            "compare-and-swap expectation of the record's CURRENT project, not a stamp "
-            "like write-decision's: a record at --id whose folded project differs is refused"
-        ),
-    )
-    close_decision_p.add_argument(
-        '--escalations-dir',
-        required=True,
-        help=(
-            "compare-and-swap expectation of the record's CURRENT queue stamp, not a stamp "
-            "like write-decision's, so '' is a legal expectation for a legacy unstamped record; "
-            'a record at --id whose normalized stamp differs is refused'
-        ),
-    )
+    _add_record_identity_args(close_decision_p)
     close_decision_p.add_argument('--root', default=None, help='fleet root (default: fleet_root())')
+
+    reopen_decision_p = sub.add_parser(
+        'reopen-decision',
+        help='re-open a closed decision in place, clearing its closing evidence (task 4835)',
+    )
+    reopen_decision_p.add_argument(
+        '--id', required=True, help='the record id as stored/printed by write-decision'
+    )
+    _add_record_identity_args(reopen_decision_p)
+    reopen_decision_p.add_argument('--root', default=None, help='fleet root (default: fleet_root())')
 
     # NOTE: --escalations-dir is required on BOTH halves of the file/reap
     # pair. reap-decisions has always required it; write-decision joined it
@@ -5274,6 +5514,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     reap_decisions_p.add_argument('--escalations-dir', required=True)
+    reap_decisions_p.add_argument(
+        '--expect-matches',
+        action='store_true',
+        help=(
+            'opt-in: warn when no registry record, in any state, carries the folded '
+            '--project token, naming the tokens that do; for diagnosis and manual runs, '
+            'not the per-cycle Main Loop reap'
+        ),
+    )
 
     migrate_projects_p = sub.add_parser(
         'migrate-decision-projects',
@@ -5308,8 +5557,9 @@ def main(argv: list[str] | None = None) -> int:
     distinguish from a supplied one) stays fail-soft: ERROR log, nothing
     written, nothing printed, rc 0.
 
-    ``close-decision`` is the one exception, and it is dispatched before the
-    swallowing try/except: see _run_close_decision for why its refusals exit
+    ``close-decision`` and ``reopen-decision`` are the two exceptions, and
+    they are dispatched before the swallowing try/except: see
+    _run_close_decision and _run_reopen_decision for why their refusals exit
     non-zero.
     """
     parser = _build_parser()
@@ -5399,6 +5649,13 @@ def main(argv: list[str] | None = None) -> int:
             expected_project=args.project,
             expected_escalations_dir=args.escalations_dir,
         )
+    if args.verb == 'reopen-decision':
+        return _run_reopen_decision(
+            args.id,
+            args.root,
+            expected_project=args.project,
+            expected_escalations_dir=args.escalations_dir,
+        )
 
     try:
         if args.verb == 'launching':
@@ -5436,7 +5693,9 @@ def main(argv: list[str] | None = None) -> int:
                 record_slug=resolve_own_record_slug() or '',
             )
         elif args.verb == 'reap-decisions':
-            _run_reap_decisions(args.project, args.escalations_dir)
+            _run_reap_decisions(
+                args.project, args.escalations_dir, expect_matches=args.expect_matches
+            )
         elif args.verb == 'migrate-decision-projects':
             _run_migrate_decision_projects(args.dry_run)
     except Exception:

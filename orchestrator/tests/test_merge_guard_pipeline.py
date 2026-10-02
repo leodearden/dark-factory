@@ -47,11 +47,11 @@ from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.merge_lane.gates import DropGuardResult
 from orchestrator.merge_queue import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     Decided,
     DecidedItem,
-    DropGuardResult,
     MergedOk,
     MergeOutcome,
     MergeRequest,

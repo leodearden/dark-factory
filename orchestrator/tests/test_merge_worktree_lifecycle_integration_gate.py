@@ -319,6 +319,7 @@ from orchestrator.merge_lane import (
     coalesce_or_enqueue_merge_request,
     retire_cancelled_merge_request,
 )
+from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
 from orchestrator.merge_queue import PRODUCTION_CLOCK
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_types import (
@@ -846,6 +847,8 @@ class TestIdentityFaceRecoveryDedupe:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -901,6 +904,8 @@ class TestIdentityFaceRecoveryDedupe:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -928,6 +933,8 @@ class TestIdentityFaceRecoveryDedupe:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1

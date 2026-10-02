@@ -2782,6 +2782,11 @@ class UsageGate:
         return None
 
     @property
+    def auth_failed_account_names(self) -> tuple[str, ...]:
+        """Names of the accounts currently AUTH_FAILED, in roster order."""
+        return tuple(acct.name for acct in self._accounts if acct.auth_failed)
+
+    @property
     def soonest_resets_at(self) -> datetime | None:
         """Earliest ``resets_at`` across currently-capped accounts, or None if unknown.
 

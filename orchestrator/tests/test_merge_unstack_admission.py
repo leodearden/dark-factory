@@ -11,7 +11,7 @@ its public seams against real temp git repositories:
 * ``TestDerailRedriveUnstacks`` and ``TestTrainLanding`` push a coalesce
   ``GroupMergeRequest`` through the real merger loop (``queue.put`` +
   ``worker.run()``), with the real ``_do_train_merge``: nothing in
-  ``orchestrator.merge_queue`` is patched.
+  ``orchestrator.merge_lane.worker`` is patched.
 
 Base fixture: main has shared.txt and other.txt.  Stacking is done with the
 production ``GitOps.stack_train_branches``.  After stacking, main advances
@@ -37,7 +37,8 @@ from orchestrator.branch_stack import (
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (
+from orchestrator.merge_lane.types import QueuedBranch
+from orchestrator.merge_lane.worker import (
     Decided,
     GroupMergeRequest,
     MergedOk,
@@ -46,7 +47,6 @@ from orchestrator.merge_queue import (
     SpeculativeMergeWorker,
     classify_and_merge,
 )
-from orchestrator.merge_types import QueuedBranch
 
 # ---------------------------------------------------------------------------
 # Fixtures (copied from test_merge_guard_pipeline.py, per-file convention)

@@ -2268,7 +2268,7 @@ class TestGate05TrainPostMergeEquivalence:
                 AsyncMock(return_value=_make_passing_verify_result()),
             ),
             patch(
-                "orchestrator.merge_queue._check_post_merge_equivalence",
+                "orchestrator.merge_lane.gates._check_post_merge_equivalence",
                 AsyncMock(return_value=["g-a/src/lib.rs"]),
             ),
         ):

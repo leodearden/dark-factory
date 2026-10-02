@@ -535,7 +535,7 @@ class BaseStage:
             # See STAGE3_DISALLOWED comment in cli_stage_runner.py for rationale.
             'recon-report': {
                 'type': 'http',
-                'url': f'http://127.0.0.1:{self._recon_report_port}/mcp/',
+                'url': f'http://127.0.0.1:{self._recon_report_port}/mcp/',  # mcp-url-sweep: allow MCP config entry for the Claude CLI's own client, which follows redirects natively
             },
         }
 
