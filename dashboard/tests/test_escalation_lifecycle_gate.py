@@ -96,6 +96,15 @@ def _make_config(tmp_path: Path, *, known_project_roots: list[Path] | None = Non
     return DashboardConfig(project_root=tmp_path, known_project_roots=known_project_roots or [])
 
 
+def _clear_escalation_caches() -> None:
+    """Clear the corpus cache and the analytics memo, so a route test walks its own tree."""
+    from dashboard.api.escalations import _analytics_memo_clear
+    from dashboard.data.escalation_corpus import _corpus_cache_clear
+
+    _corpus_cache_clear()
+    _analytics_memo_clear()
+
+
 async def _resolve_via_server(server: Any, esc_id: str, **kw: Any) -> dict[str, Any]:
     """Drive the REAL resolve_issue MCP tool (chokepoint for rows 1/3/4).
 
@@ -478,12 +487,11 @@ class TestEndpointOverLiveArchive:
     """
 
     def test_row6_route_contract_and_origin_stamps(self, client, tmp_path: Path) -> None:
-        from dashboard.app import _analytics_cache_clear
 
         _queue, arch = _live_archive_sync(tmp_path)
 
         client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp = client.get('/api/v2/dashboard/escalation-analytics')
 
         assert resp.status_code == 200
@@ -494,9 +502,11 @@ class TestEndpointOverLiveArchive:
             'generated_at', 'parse_failures', 'regime_markers', 'per_project',
             # The two archive-reach signals, and the only fields that can tell
             # an absent archive from an empty one: ``archives_present`` (all)
-            # is the completeness diagnostic, ``archives_reached`` (any) is the
-            # route's cacheability predicate.
+            # is the completeness diagnostic, ``archives_reached`` (any) is
+            # the corpus cache's own cacheability fact.
             'archives_present', 'archives_reached',
+            # The corpus' named views across every orchestrator queue.
+            'views',
         }
         assert isinstance(analytics['generated_at'], str) and analytics['generated_at']
         assert analytics['archives_present'] is True
@@ -521,14 +531,13 @@ class TestEndpointOverLiveArchive:
 
     def test_row9_malformed_regime_markers_never_500s(self, client, tmp_path, monkeypatch) -> None:
         import dashboard.data.escalation_analytics as escalation_analytics_module
-        from dashboard.app import _analytics_cache_clear
 
         _live_archive_sync(tmp_path)
         client.app.state.config = _make_config(tmp_path)
 
         # Pre-corruption baseline: parse_failures already >= 1 (the corrupt esc
         # file in the live archive), regime_markers loads cleanly.
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp1 = client.get('/api/v2/dashboard/escalation-analytics')
         assert resp1.status_code == 200
         pre = resp1.json()['ESCALATION_ANALYTICS']['parse_failures']
@@ -541,7 +550,7 @@ class TestEndpointOverLiveArchive:
         monkeypatch.setattr(
             escalation_analytics_module, '_DEFAULT_REGIME_MARKERS_PATH', bad_markers,
         )
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp2 = client.get('/api/v2/dashboard/escalation-analytics')
 
         assert resp2.status_code == 200
@@ -550,7 +559,6 @@ class TestEndpointOverLiveArchive:
         assert analytics2['parse_failures'] > pre
 
     def test_row10_triage_segments_render_when_present(self, client, tmp_path: Path) -> None:
-        from dashboard.app import _analytics_cache_clear
 
         # Primary: the live archive (row 1 carries a round-tripped triaged_at).
         _live_archive_sync(tmp_path)
@@ -559,7 +567,7 @@ class TestEndpointOverLiveArchive:
         _plain_terminal_archive(secondary)
 
         client.app.state.config = _make_config(tmp_path, known_project_roots=[secondary])
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp = client.get('/api/v2/dashboard/escalation-analytics')
 
         assert resp.status_code == 200
@@ -595,11 +603,10 @@ class TestFrontendPayloadContract:
     """
 
     def test_served_payload_exposes_every_consumed_key(self, client, tmp_path: Path) -> None:
-        from dashboard.app import _analytics_cache_clear
 
         _live_archive_sync(tmp_path)
         client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp = client.get('/api/v2/dashboard/escalation-analytics')
         assert resp.status_code == 200
         analytics = resp.json()['ESCALATION_ANALYTICS']

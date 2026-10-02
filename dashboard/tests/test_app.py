@@ -1734,468 +1734,366 @@ def test_burndown_route_serves_its_datums_at_the_window_instant(client):
 
 
 # ---------------------------------------------------------------------------
-# Escalations endpoint
-# ---------------------------------------------------------------------------
-
-_EMPTY_SUMMARY = {
-    'by_level': {0: 0, 1: 0, 2: 0},
-    'by_status': {'pending': 0, 'resolved': 0, 'dismissed': 0},
-}
-
-_EMPTY_QUEUES = {
-    'subsections': [],
-    'summary': _EMPTY_SUMMARY,
-}
-
-
-def test_escalations_endpoint_returns_escalations_block(client):
-    """GET /api/v2/dashboard/escalations returns 200 with ESCALATIONS key."""
-    with patch(
-        'dashboard.api.escalations.build_escalation_queues',
-        return_value=_EMPTY_QUEUES,
-    ), patch(
-        'dashboard.api.escalations.fetch_tasks',
-        new=AsyncMock(return_value=[]),
-    ):
-        resp = client.get('/api/v2/dashboard/escalations')
-    assert resp.status_code == 200
-    body = resp.json()
-    assert 'ESCALATIONS' in body
-    esc = body['ESCALATIONS']
-    assert 'subsections' in esc
-    assert 'summary' in esc
-    assert esc['subsections'] == []
-
-
-def test_escalations_endpoint_attaches_task_cards_and_resolves_recon(client, tmp_path):
-    """Full endpoint→shaper integration: task attachment + reconciliation resolution."""
-    from dashboard.api.escalations import _task_cards_cache_clear
-    _task_cards_cache_clear()
-
-    proj_a = tmp_path / 'projA'
-    task_dict = {
-        'id': 11, 'title': 'wired', 'description': '', 'details': '',
-        'status': 'pending', 'priority': 'med', 'dependencies': [], 'metadata': {},
-    }
-    sub_summary = {
-        'by_level': {0: 1, 1: 1, 2: 0},
-        'by_status': {'pending': 2, 'resolved': 0, 'dismissed': 0},
-    }
-    queues = {
-        'subsections': [
-            {
-                'id': str(proj_a),
-                'label': 'projA',
-                'kind': 'orchestrator',
-                'escalations': [{'id': 'e1', 'task_id': 11, 'level': 0, 'status': 'pending', 'summary': 'oops'}],
-                'summary': sub_summary,
-            },
-            {
-                'id': 'reconciliation',
-                'label': 'fused-memory',
-                'kind': 'reconciliation',
-                'escalations': [{
-                    'id': 'er1', 'task_id': 11,
-                    'worktree': str(proj_a / '.worktrees' / '11'),
-                    'level': 1, 'status': 'pending',
-                }],
-                'summary': sub_summary,
-            },
-        ],
-        'summary': {
-            'by_level': {0: 1, 1: 1, 2: 0},
-            'by_status': {'pending': 2, 'resolved': 0, 'dismissed': 0},
-        },
-    }
-
-    with patch(
-        'dashboard.api.escalations.build_escalation_queues',
-        return_value=queues,
-    ), patch(
-        'dashboard.api.escalations.fetch_tasks',
-        new=AsyncMock(return_value=[task_dict]),
-    ):
-        resp = client.get('/api/v2/dashboard/escalations')
-
-    assert resp.status_code == 200
-    body = resp.json()
-    subs = body['ESCALATIONS']['subsections']
-    assert len(subs) == 2
-
-    orch_sub = next(s for s in subs if s['kind'] == 'orchestrator')
-    assert len(orch_sub['escalations']) == 1
-    orch_row = orch_sub['escalations'][0]
-    assert orch_row['project'] == 'projA'
-    assert orch_row['task']['title'] == 'wired'
-    assert orch_row['task_unresolved'] is False
-
-    recon_sub = next(s for s in subs if s['kind'] == 'reconciliation')
-    assert len(recon_sub['escalations']) == 1
-    recon_row = recon_sub['escalations'][0]
-    assert recon_row['project'] == 'projA'
-    assert recon_row['task']['title'] == 'wired'
-    assert recon_row['task_unresolved'] is False
-
-
-def test_load_task_cards_caches_within_ttl(client, tmp_path):
-    """_load_task_cards: cache hit within TTL + offline result not cached."""
-    from dashboard.api.escalations import _task_cards_cache_clear
-
-    proj_a = tmp_path / 'projA'
-    orch_sub = {
-        'id': str(proj_a),
-        'label': 'projA',
-        'kind': 'orchestrator',
-        'escalations': [],
-        'summary': _EMPTY_SUMMARY,
-    }
-    recon_sub = {
-        'id': 'reconciliation',
-        'label': 'fused-memory',
-        'kind': 'reconciliation',
-        'escalations': [],
-        'summary': _EMPTY_SUMMARY,
-    }
-    one_orch_queues = {
-        'subsections': [orch_sub, recon_sub],
-        'summary': _EMPTY_SUMMARY,
-    }
-    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '', 'status': 'pending',
-                  'priority': 'low', 'dependencies': [], 'metadata': {}}]
-
-    # Case 1: cache hit — second request should NOT call fetch_tasks again.
-    _task_cards_cache_clear()
-    mock_ft = AsyncMock(return_value=task_list)
-    with patch('dashboard.api.escalations.build_escalation_queues', return_value=one_orch_queues), \
-         patch('dashboard.api.escalations.fetch_tasks', new=mock_ft):
-        client.get('/api/v2/dashboard/escalations')
-        client.get('/api/v2/dashboard/escalations')
-    assert mock_ft.call_count == 1, f'expected 1 fetch_tasks call, got {mock_ft.call_count}'
-
-    # Case 2: offline result NOT cached — each request should call fetch_tasks.
-    _task_cards_cache_clear()
-    mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
-    with patch('dashboard.api.escalations.build_escalation_queues', return_value=one_orch_queues), \
-         patch('dashboard.api.escalations.fetch_tasks', new=mock_offline):
-        r1 = client.get('/api/v2/dashboard/escalations')
-        r2 = client.get('/api/v2/dashboard/escalations')
-    assert r1.status_code == 200
-    assert r2.status_code == 200
-    assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
-
-
-def test_load_task_cards_ttl_expiry(client, tmp_path):
-    """_load_task_cards: after TTL expires, fetch_tasks is called again."""
-    import dashboard.api.escalations as escalations_module
-    from dashboard.api.escalations import _task_cards_cache_clear
-
-    proj_a = tmp_path / 'projA'
-    one_orch_queues = {
-        'subsections': [
-            {'id': str(proj_a), 'label': 'projA', 'kind': 'orchestrator',
-             'escalations': [], 'summary': _EMPTY_SUMMARY},
-            {'id': 'reconciliation', 'label': 'fused-memory', 'kind': 'reconciliation',
-             'escalations': [], 'summary': _EMPTY_SUMMARY},
-        ],
-        'summary': _EMPTY_SUMMARY,
-    }
-    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '',
-                  'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}]
-
-    _task_cards_cache_clear()
-    original_ttl = escalations_module._TASK_CARDS_TTL_SECONDS
-    mock_ft = AsyncMock(return_value=task_list)
-    try:
-        with patch('dashboard.api.escalations.build_escalation_queues', return_value=one_orch_queues), \
-             patch('dashboard.api.escalations.fetch_tasks', new=mock_ft):
-            # First request: cache miss — fetch_tasks called once, result cached.
-            client.get('/api/v2/dashboard/escalations')
-            assert mock_ft.call_count == 1
-
-            # Zero out TTL so the cached entry is immediately treated as expired.
-            escalations_module._TASK_CARDS_TTL_SECONDS = 0.0
-
-            # Second request: TTL expired — fetch_tasks called again.
-            resp = client.get('/api/v2/dashboard/escalations')
-    finally:
-        escalations_module._TASK_CARDS_TTL_SECONDS = original_ttl
-
-    assert resp.status_code == 200
-    assert mock_ft.call_count == 2, (
-        f'expected 2 fetch_tasks calls after TTL expiry, got {mock_ft.call_count}'
-    )
-
-
-# ---------------------------------------------------------------------------
-# task-2218 step-9: _load_task_cards single-flight (direct calls, no endpoint)
-# ---------------------------------------------------------------------------
-
-
-async def test_load_task_cards_single_flight_collapses_concurrent_cold_callers(
-    dummy_client, dummy_config
-):
-    """Concurrent cold callers for one project_root collapse onto one fetch_tasks call.
-
-    Case 1: three concurrent asyncio tasks hitting a cold cache for the same
-    project_root must share a single in-flight fetch_tasks call and all
-    receive the same result (TTLCache single-flight — the plain-dict cache
-    this replaces has no refresh lock, so today each of the three fetches).
-
-    Case 2 (reuse of existing behavior): an offline dict result from
-    fetch_tasks is never cached, so each direct call re-fetches.
-    """
-    import asyncio
-
-    from dashboard.api.escalations import _load_task_cards, _task_cards_cache_clear
-
-    # Case 1: single-flight collapse
-    _task_cards_cache_clear()
-    task_list = [{'id': 1, 'title': 't', 'description': '', 'details': '',
-                  'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}]
-    started = asyncio.Event()
-    release = asyncio.Event()
-    call_count = 0
-
-    async def slow_fetch_tasks(client, config, project_root):
-        nonlocal call_count
-        call_count += 1
-        started.set()
-        await release.wait()
-        return list(task_list)
-
-    with patch('dashboard.api.escalations.fetch_tasks', new=AsyncMock(side_effect=slow_fetch_tasks)):
-        tasks = [
-            asyncio.create_task(_load_task_cards(dummy_client, dummy_config, '/proj/X'))
-            for _ in range(3)
-        ]
-        await started.wait()
-        await asyncio.sleep(0)  # let the other two queue on the lock
-        release.set()
-        results = await asyncio.gather(*tasks)
-
-    assert call_count == 1, f'expected a single fetch_tasks call, got {call_count}'
-    assert all(r == task_list for r in results)
-
-    # Case 2: offline result NOT cached — each direct call re-fetches.
-    _task_cards_cache_clear()
-    mock_offline = AsyncMock(return_value={'offline': True, 'error': 'x'})
-    with patch('dashboard.api.escalations.fetch_tasks', new=mock_offline):
-        r1 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
-        r2 = await _load_task_cards(dummy_client, dummy_config, '/proj/Y')
-
-    assert r1 == [] and r2 == []
-    assert mock_offline.call_count == 2, f'expected 2 fetch_tasks calls, got {mock_offline.call_count}'
-
-
-# ---------------------------------------------------------------------------
-# task-4788: _load_task_cards whole-operation budget
+# Escalations + escalation-analytics: one corpus, one cache, cards by id
 #
-# ``fetch_tasks``' own *timeout* is a PER-HTTP-REQUEST budget: it bounds
-# connect/read/write and pool acquisition and nothing else. The incident that
-# motivated these two tests hung inside httpcore's connection lock, where no
-# outbound socket is ever opened and that timeout never fires — so
-# /api/v2/dashboard/escalations wedged for 19.8 h with the per-request budget
-# fully in place. Only an enclosing ``asyncio.wait_for`` cancels that wait.
+# Both routes read ONE walk of every queue through
+# ``escalation_corpus.acquire_corpus`` (PRD decision 13); the Escalations
+# tab's cards are read through ``task_lookup.lookup_tasks`` (decision 12).
+# The fused-memory substrate is the shared CannedMCP, patched at
+# ``dashboard.data.tasks.mcp_tool_call`` as test_task_lookup.py does, so the
+# real snapshot unit, ``fetch_task`` and every cache run underneath.
 #
-# Both hang stubs are ``await asyncio.Event().wait()`` on an event nothing
-# ever sets, deliberately NOT a sleep: a sleep shorter than the budget passes
-# against the pre-fix code too and would prove nothing. Since that would
-# otherwise hang pytest forever, each call is wrapped in a TEST-SIDE
-# ``wait_for(2.0)`` — 40x the monkeypatched 0.05 s budget, so it can only trip
-# on a real regression, never on scheduling jitter.
+# No autouse fixture clears these caches in this suite: every route test
+# below requests ``escalation_caches``, which clears them before and after.
 # ---------------------------------------------------------------------------
 
 
-async def test_a_hanging_fetch_tasks_does_not_hang_load_task_cards(
-    monkeypatch, dummy_client, dummy_config, caplog
-):
-    """A fetch that never returns degrades to [] — loudly, and uncached.
+@pytest.fixture()
+def escalation_caches():
+    """Clear the corpus, the analytics memo, the snapshot units and the per-id cache."""
+    from dashboard.api import escalations as escalation_routes
+    from dashboard.data import escalation_corpus, task_lookup, task_snapshot
 
-    The WARNING is asserted, not incidental: ``[]`` is exactly what an
-    ordinary empty result looks like, so the log line is the ONLY thing that
-    distinguishes "this project has no task cards" from "we ran out of budget
-    and never found out". Without it a timeout is invisible to an operator,
-    which is the 19.8 h failure mode in miniature.
-    """
-    import asyncio
-    import logging
+    def _clear() -> None:
+        escalation_corpus._corpus_cache_clear()
+        escalation_routes._analytics_memo_clear()
+        task_snapshot._snapshot_cache_clear()
+        task_lookup._lookup_cache_clear()
 
-    import dashboard.api.escalations as _esc
-    from dashboard.api.escalations import _load_task_cards, _task_cards_cache_clear
+    _clear()
+    yield
+    _clear()
 
-    # A warm entry would be served without ever reaching the hang.
-    _task_cards_cache_clear()
 
-    call_count = 0
+def _esc_record(esc_id: str, *, task_id: str = '11', status: str = 'pending',
+                worktree: str | None = None) -> dict:
+    """One escalation exactly as the escalation server writes it."""
+    from escalation.models import Escalation
 
-    async def hang_fetch_tasks(client, config, project_root):
-        nonlocal call_count
-        call_count += 1
-        await asyncio.Event().wait()  # nothing ever sets it
+    return Escalation(
+        id=esc_id, task_id=task_id, agent_role='implementer', severity='blocking',
+        category='design_concern', summary=f'summary of {esc_id}',
+        timestamp='2026-09-01T00:00:00+00:00', status=status, worktree=worktree,
+    ).to_dict()
 
-    monkeypatch.setattr(_esc, '_TASK_CARDS_BUDGET', 0.05)
 
-    with (
-        patch('dashboard.api.escalations.fetch_tasks', new=hang_fetch_tasks),
-        caplog.at_level(logging.WARNING, logger='dashboard.api.escalations'),
-    ):
-        result = await asyncio.wait_for(
-            _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
-            timeout=2.0,
-        )
-        assert result == [], (
-            'the shape _load_task_cards already promises for an offline '
-            'marker or MCP failure — the escalation tab renders cardless '
-            'rather than hanging'
-        )
-        assert call_count == 1
+def _write_esc(queue_dir, record: dict, *, archived: bool = False) -> None:
+    import json
 
-        # A timeout must not pin an empty card list for the TTL window:
-        # nothing was written to the cache, so the next poll re-attempts.
-        await asyncio.wait_for(
-            _load_task_cards(dummy_client, dummy_config, '/proj/HANG'),
-            timeout=2.0,
-        )
-    assert call_count == 2, (
-        'the second call must re-enter the stub — a timeout that cached its '
-        '[] would blank the tab for the whole TTL window'
+    directory = queue_dir / 'archive' / '2026-09-01' if archived else queue_dir
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{record['id']}.json").write_text(json.dumps(record))
+
+
+def _esc_config(root, *, known=(), escalation_urls=None):
+    """A config over *root* whose every queue dir exists, so a clean walk is fresh."""
+    from dashboard.config import DashboardConfig
+
+    config = DashboardConfig(
+        project_root=root, known_project_roots=list(known),
+        escalation_urls=escalation_urls or {},
     )
+    for queue_root in (config.project_root, *config.known_project_roots):
+        (queue_root / 'data' / 'escalations').mkdir(parents=True, exist_ok=True)
+    config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
+    return config
 
-    warnings = [
-        r.getMessage() for r in caplog.records
-        if r.levelno >= logging.WARNING and r.name == 'dashboard.api.escalations'
-    ]
-    assert any('whole-operation budget' in m for m in warnings), (
-        f'no timeout WARNING was logged (records: {warnings}) — the returned '
-        '[] is indistinguishable from an ordinary empty result, so the log '
-        'line is the only operator-visible trace that the budget expired'
-    )
-    assert any('/proj/HANG' in m for m in warnings), (
-        f'the WARNING must name the project root that degraded: {warnings}'
+
+def _canned_tasks(*pairs):
+    """A fused-memory substrate holding one row per ``(id, status)``, map agreeing."""
+    from _canned_mcp import CannedMCP, _raw_row
+
+    return CannedMCP(
+        rows=[_raw_row(tid, status) for tid, status in pairs],
+        status_map=dict(pairs),
+        status_page_size=2000,
     )
 
 
-async def test_a_concurrent_task_cards_caller_on_the_same_root_is_bounded_too(
-    monkeypatch, dummy_client, dummy_config
-):
-    """Both callers are bounded, not just the one that wins the lock.
+def _no_pins(monkeypatch) -> list[str]:
+    """Answer every escalation-MCP pins read with no annotation; return the call log."""
+    calls: list[str] = []
 
-    This pins the wrap PLACEMENT. ``TTLCache.get_or_refresh`` serializes cold callers for one key
-    behind a per-key lock and runs the refresh WHILE HOLDING it, so an
-    inner-only wrap would leave caller B queued UNBOUNDED for caller A's whole
-    budget and then running its own full-budget refresh — the pair costs 2x
-    the budget and N waiters cost N x. The dashboard polls every 3 s, so
-    waiters are the routine case, not a corner.
-    """
-    import asyncio
-
-    import dashboard.api.escalations as _esc
-    from dashboard.api.escalations import _load_task_cards, _task_cards_cache_clear
-
-    _task_cards_cache_clear()
-
-    async def hang_fetch_tasks(client, config, project_root):
-        await asyncio.Event().wait()
-
-    budget = 0.5
-    monkeypatch.setattr(_esc, '_TASK_CARDS_BUDGET', budget)
-    loop = asyncio.get_running_loop()
-
-    with patch('dashboard.api.escalations.fetch_tasks', new=hang_fetch_tasks):
-        started = loop.time()
-        results = await asyncio.wait_for(
-            asyncio.gather(*[
-                _load_task_cards(dummy_client, dummy_config, '/proj/SHARED')
-                for _ in range(2)
-            ]),
-            timeout=2.0,
-        )
-        elapsed = loop.time() - started
-
-    assert results == [[], []]
-    # The assertion is about SERIALIZATION, not merely about returning:
-    # an inner-only wrap costs 2 x budget here and scales with waiters.
-    #
-    # The budget is deliberately LARGE for a test whose subject is a timeout.
-    # It is not scaled because the operation needs 0.5 s — it is scaled so the
-    # assertion's ABSOLUTE jitter margin exceeds real-world event-loop
-    # scheduling, GC and pytest overhead. Correct behaviour (outer wrap) costs
-    # ~1x budget; the inner-only-wrap regression costs ~2x; 1.5x sits exactly
-    # midway, giving 0.25 s of slack on BOTH sides. At the original 0.05 s the
-    # discrimination was sound in ratio and worthless in absolute terms (50 ms
-    # of slack), and it flaked at ~4% per run. Do NOT shrink the budget back to
-    # "speed up the suite" — that silently reintroduces the flake.
-    assert elapsed < 1.5 * budget, (
-        f'two concurrent callers took {elapsed:.3f}s against a '
-        f'{1.5 * budget}s threshold (1.5 x the {budget}s per-call budget); '
-        f'the inner-only-wrap regression costs ~{2 * budget}s — that is the '
-        'serialized cost of an inner-only wrap; the wait_for must enclose '
-        'get_or_refresh so a caller QUEUED on the per-key lock is bounded too'
-    )
-
-
-def test_escalations_endpoint_multi_root_gather(client, tmp_path):
-    """Endpoint fetches each orchestrator root separately and maps tasks to the right subsection."""
-    from dashboard.api.escalations import _task_cards_cache_clear
-
-    _task_cards_cache_clear()
-
-    proj_a = tmp_path / 'projA'
-    proj_b = tmp_path / 'projB'
-
-    task_a = {'id': 11, 'title': 'task-A', 'description': '', 'details': '',
-              'status': 'pending', 'priority': 'low', 'dependencies': [], 'metadata': {}}
-    task_b = {'id': 22, 'title': 'task-B', 'description': '', 'details': '',
-              'status': 'pending', 'priority': 'high', 'dependencies': [], 'metadata': {}}
-
-    queues = {
-        'subsections': [
-            {'id': str(proj_a), 'label': 'projA', 'kind': 'orchestrator',
-             'escalations': [{'id': 'esc-a1', 'task_id': 11, 'level': 0,
-                              'status': 'pending', 'summary': 'a-issue'}],
-             'summary': _EMPTY_SUMMARY},
-            {'id': str(proj_b), 'label': 'projB', 'kind': 'orchestrator',
-             'escalations': [{'id': 'esc-b1', 'task_id': 22, 'level': 1,
-                              'status': 'pending', 'summary': 'b-issue'}],
-             'summary': _EMPTY_SUMMARY},
-        ],
-        'summary': _EMPTY_SUMMARY,
-    }
-
-    async def fetch_side_effect(_client, _config, root_id):
-        if 'projA' in root_id:
-            return [task_a]
-        if 'projB' in root_id:
-            return [task_b]
+    async def _pins(client, url, tool, args, **kwargs):
+        calls.append(url)
         return []
 
-    with patch('dashboard.api.escalations.build_escalation_queues', return_value=queues), \
-         patch('dashboard.api.escalations.fetch_tasks', side_effect=fetch_side_effect):
+    monkeypatch.setattr('dashboard.data.escalations.mcp_tool_call', _pins)
+    return calls
+
+
+def _get_both(client, canned) -> tuple[dict, dict]:
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        escalations = client.get('/api/v2/dashboard/escalations')
+        analytics = client.get('/api/v2/dashboard/escalation-analytics')
+    assert escalations.status_code == analytics.status_code == 200
+    return escalations.json(), analytics.json()
+
+
+def _row(body: dict, esc_id: str) -> dict:
+    return next(
+        row
+        for sub in body['ESCALATIONS']['subsections']
+        for row in sub['escalations']
+        if row['id'] == esc_id
+    )
+
+
+_WIRE_KEYS = {'value', 'as_of', 'state', 'reason', 'freshness_bound_seconds'}
+
+
+def test_escalations_endpoint_returns_escalations_block(client, tmp_path, escalation_caches):
+    """An empty corpus still serves every subsection, its summary and its views."""
+    client.app.state.config = _esc_config(tmp_path)
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=_canned_tasks()):
         resp = client.get('/api/v2/dashboard/escalations')
 
     assert resp.status_code == 200
     body = resp.json()
-    subs = body['ESCALATIONS']['subsections']
-    assert len(subs) == 2
+    assert isinstance(body['served_at'], str)
+    esc = body['ESCALATIONS']
+    assert [(s['label'], s['kind']) for s in esc['subsections']] == [
+        (tmp_path.name, 'orchestrator'), ('fused-memory', 'reconciliation'),
+    ]
+    assert all(s['escalations'] == [] for s in esc['subsections'])
+    assert esc['summary']['by_status'] == {'pending': 0, 'resolved': 0, 'dismissed': 0}
+    for views in (esc['views'], *(s['views'] for s in esc['subsections'])):
+        assert set(views) == {'queue_pending', 'open_in_history'}
+        for wired in views.values():
+            assert set(wired) == _WIRE_KEYS
+            assert (wired['value'], wired['state']) == (0, 'fresh')
 
-    sub_a = next(s for s in subs if s['label'] == 'projA')
-    sub_b = next(s for s in subs if s['label'] == 'projB')
 
-    # projA subsection gets task-A (id=11), not task-B.
-    assert len(sub_a['escalations']) == 1
-    row_a = sub_a['escalations'][0]
-    assert row_a['project'] == 'projA'
-    assert row_a['task']['id'] == 11
-    assert row_a['task']['title'] == 'task-A'
-    assert row_a['task_unresolved'] is False
+def test_sketch_10_one_walk_serves_both_views_at_one_instant(client, tmp_path, monkeypatch,
+                                                              escalation_caches):
+    """Sketch #10: 2 pending at the root and 3 in the archive read 2 and 5, as of one walk.
 
-    # projB subsection gets task-B (id=22), not task-A.
-    assert len(sub_b['escalations']) == 1
-    row_b = sub_b['escalations'][0]
-    assert row_b['project'] == 'projB'
-    assert row_b['task']['id'] == 22
-    assert row_b['task']['title'] == 'task-B'
-    assert row_b['task_unresolved'] is False
+    "Pending in the live queue" and "open in history" are two views over the
+    same walk, so they share its instant, and no TTL can change either number.
+    """
+    import dashboard.data.escalation_corpus as escalation_corpus
+
+    _no_pins(monkeypatch)
+    config = _esc_config(tmp_path)
+    for n in (1, 2):
+        _write_esc(config.escalations_dir, _esc_record(f'esc-1-{n}'))
+    for n in (3, 4, 5):
+        _write_esc(config.escalations_dir, _esc_record(f'esc-1-{n}'), archived=True)
+    _write_esc(config.escalations_dir, _esc_record('esc-1-6', status='resolved'))
+    client.app.state.config = config
+
+    readings = []
+    for ttl in (escalation_corpus.CORPUS_TTL_SECONDS, 600.0, 0.0):
+        monkeypatch.setattr(escalation_corpus, 'CORPUS_TTL_SECONDS', ttl)
+        escalation_corpus._corpus_cache_clear()
+        escalations, analytics = _get_both(client, _canned_tasks((11, 'in-progress')))
+        queue_pending = escalations['ESCALATIONS']['views']['queue_pending']
+        (project,) = analytics['ESCALATION_ANALYTICS']['per_project']
+        open_in_history = project['views']['open_in_history']
+        readings.append((ttl, queue_pending, open_in_history))
+
+    for ttl, queue_pending, open_in_history in readings:
+        assert (queue_pending['value'], open_in_history['value']) == (2, 5), f'TTL {ttl}'
+        assert queue_pending['state'] == open_in_history['state'] == 'fresh', f'TTL {ttl}'
+    for ttl, queue_pending, open_in_history in readings[:2]:
+        assert queue_pending['as_of'] == open_in_history['as_of'], (
+            f'TTL {ttl}: the live-queue count and the history count came from '
+            'two different walks'
+        )
+
+
+def test_the_escalations_request_reads_no_whole_task_tree(client, tmp_path, escalation_caches):
+    """Owner probe and cards read active rows and ids only — never an unfiltered get_tasks."""
+    config = _esc_config(tmp_path)
+    _write_esc(config.escalations_dir, _esc_record('esc-11-1', task_id='11'))
+    _write_esc(config.reconciliation_escalations_dir, _esc_record('esc-12-1', task_id='12'))
+    client.app.state.config = config
+    canned = _canned_tasks((11, 'in-progress'), (12, 'pending'), (3, 'done'))
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        resp = client.get('/api/v2/dashboard/escalations')
+
+    assert resp.status_code == 200
+    reads = canned.calls_to('get_tasks')
+    assert reads, 'the owner probe never read the active rows — the check is vacuous'
+    assert [call for call in reads if call['args'].get('statuses') is None] == [], (
+        'an unfiltered get_tasks is a whole-tree read on the request path'
+    )
+
+
+def test_escalation_cards_read_task_lookup(client, tmp_path, escalation_caches):
+    """A terminal id is one get_task; an absent id and a non-numeric id are unknown, saying why."""
+    config = _esc_config(tmp_path)
+    for esc_id, task_id in (('esc-3-1', '3'), ('esc-999-1', '999'), ('esc-x-1', 'abc')):
+        _write_esc(config.escalations_dir, _esc_record(esc_id, task_id=task_id))
+    client.app.state.config = config
+    canned = _canned_tasks((3, 'done'), (11, 'in-progress'))
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        body = client.get('/api/v2/dashboard/escalations').json()
+
+    terminal = _row(body, 'esc-3-1')['task']
+    assert set(terminal) == _WIRE_KEYS
+    assert terminal['state'] == 'fresh'
+    assert (terminal['value']['title'], terminal['value']['status']) == ('task 3', 'done')
+    reads_of_3 = [
+        call for call in canned.calls_to('get_task')
+        if call['args'] == {'id': '3', 'project_root': str(config.project_root)}
+    ]
+    assert len(reads_of_3) == 1
+
+    absent = _row(body, 'esc-999-1')['task']
+    assert (absent['value'], absent['state']) == (None, 'unknown')
+    assert '999' in absent['reason']
+
+    non_numeric = _row(body, 'esc-x-1')['task']
+    assert (non_numeric['value'], non_numeric['state']) == (None, 'unknown')
+    assert 'not a number' in non_numeric['reason']
+    assert 'task_unresolved' not in _row(body, 'esc-3-1')
+
+
+def test_a_reconciliation_row_belongs_to_the_root_its_task_is_active_in(
+    client, tmp_path, escalation_caches,
+):
+    """No worktree: the active rows decide the owner; a task active nowhere has none."""
+    config = _esc_config(tmp_path / 'projA')
+    _write_esc(config.escalations_dir, _esc_record('esc-11-1', task_id='11'))
+    _write_esc(config.reconciliation_escalations_dir, _esc_record('esc-11-2', task_id='11'))
+    _write_esc(config.reconciliation_escalations_dir, _esc_record('esc-3-1', task_id='3'))
+    client.app.state.config = config
+
+    with patch('dashboard.data.tasks.mcp_tool_call',
+               new=_canned_tasks((11, 'in-progress'), (3, 'done'))):
+        body = client.get('/api/v2/dashboard/escalations').json()
+
+    orch_row = _row(body, 'esc-11-1')
+    assert orch_row['project'] == 'projA'
+    assert orch_row['task']['value']['title'] == 'task 11'
+
+    recon_row = _row(body, 'esc-11-2')
+    assert recon_row['project'] == 'projA'
+    assert recon_row['task']['value']['title'] == 'task 11'
+
+    orphan = _row(body, 'esc-3-1')
+    assert orphan['project'] is None
+    assert (orphan['task']['value'], orphan['task']['state']) == (None, 'unknown')
+    assert 'no owning project' in orphan['task']['reason']
+
+
+def test_each_root_reads_its_own_cards(client, tmp_path, escalation_caches):
+    """Two orchestrator roots: each row's card is read against the root that holds it."""
+    proj_a, proj_b = tmp_path / 'projA', tmp_path / 'projB'
+    config = _esc_config(proj_a, known=[proj_b])
+    _write_esc(proj_a / 'data' / 'escalations', _esc_record('esc-a1', task_id='11'))
+    _write_esc(proj_b / 'data' / 'escalations', _esc_record('esc-b1', task_id='22'))
+    client.app.state.config = config
+    canned = _canned_tasks((11, 'done'), (22, 'done'))
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        body = client.get('/api/v2/dashboard/escalations').json()
+
+    row_a, row_b = _row(body, 'esc-a1'), _row(body, 'esc-b1')
+    assert (row_a['project'], row_a['task']['value']['id']) == ('projA', 11)
+    assert (row_b['project'], row_b['task']['value']['id']) == ('projB', 22)
+    assert sorted(
+        (call['args']['id'], call['args']['project_root'])
+        for call in canned.calls_to('get_task')
+    ) == [('11', str(config.project_root)), ('22', str(config.known_project_roots[0]))]
+
+
+def test_the_corpus_is_walked_once_per_ttl_across_both_routes(client, tmp_path, monkeypatch,
+                                                              escalation_caches):
+    """A file landing inside the TTL is unseen by BOTH routes until the next walk."""
+    import dashboard.data.escalation_corpus as escalation_corpus
+
+    _no_pins(monkeypatch)
+    config = _esc_config(tmp_path)
+    _write_esc(config.escalations_dir, _esc_record('esc-1-1'))
+    client.app.state.config = config
+    canned = _canned_tasks((11, 'in-progress'))
+
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        first = client.get('/api/v2/dashboard/escalations').json()
+    _write_esc(config.escalations_dir, _esc_record('esc-1-2'))
+    escalations, analytics = _get_both(client, canned)
+
+    walked = first['ESCALATIONS']['views']['queue_pending']
+    assert walked['value'] == 1
+    assert escalations['ESCALATIONS']['views']['queue_pending'] == walked
+    (project,) = analytics['ESCALATION_ANALYTICS']['per_project']
+    assert project['views']['open_in_history']['value'] == 1
+    assert (
+        datetime.fromisoformat(analytics['ESCALATION_ANALYTICS']['generated_at'])
+        == datetime.fromisoformat(walked['as_of'])
+    )
+
+    monkeypatch.setattr(escalation_corpus, 'CORPUS_TTL_SECONDS', 0.0)
+    escalations, analytics = _get_both(client, canned)
+    assert escalations['ESCALATIONS']['views']['queue_pending']['value'] == 2
+    (project,) = analytics['ESCALATION_ANALYTICS']['per_project']
+    assert project['views']['open_in_history']['value'] == 2
+
+
+def test_escalation_analytics_is_derived_once_per_corpus_generation(
+    client, tmp_path, monkeypatch, escalation_caches,
+):
+    """Inside one walk's TTL the payload, pins fan-out included, is derived once.
+
+    A NEW walk is a new generation, and is derived afresh: the memo can never
+    serve numbers from a different walk than the one /escalations reads.
+    """
+    import dashboard.data.escalation_corpus as escalation_corpus
+
+    pins_calls = _no_pins(monkeypatch)
+    config = _esc_config(tmp_path, escalation_urls={tmp_path.name: 'http://127.0.0.1:9/mcp'})
+    _write_esc(config.escalations_dir, _esc_record('esc-1-1'))
+    client.app.state.config = config
+
+    first = client.get('/api/v2/dashboard/escalation-analytics').json()
+    second = client.get('/api/v2/dashboard/escalation-analytics').json()
+
+    generated_at = first['ESCALATION_ANALYTICS']['generated_at']
+    assert second['ESCALATION_ANALYTICS']['generated_at'] == generated_at
+    assert len(pins_calls) == 1, f'the pins fan-out ran {len(pins_calls)} times in one generation'
+
+    escalation_corpus._corpus_cache_clear()
+    third = client.get('/api/v2/dashboard/escalation-analytics').json()
+    assert third['ESCALATION_ANALYTICS']['generated_at'] != generated_at
+    assert len(pins_calls) == 2
+
+
+def test_a_hung_card_read_bounds_the_escalations_request(client, tmp_path, monkeypatch,
+                                                         escalation_caches):
+    """A get_task that never answers costs the lookup budget once, and is retried next poll.
+
+    The card is UNKNOWN with the budget's reason — on the wire, where the
+    operator reads it, not only in a log line — and nothing is cached, so the
+    next request re-enters the read rather than pinning the gap for a TTL.
+    """
+    import time
+
+    from dashboard.data import task_lookup
+
+    config = _esc_config(tmp_path)
+    _write_esc(config.escalations_dir, _esc_record('esc-3-1', task_id='3'))
+    client.app.state.config = config
+    canned = _canned_tasks((3, 'done'))
+    canned.task_delays = {3: 30.0}
+    monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', 0.3)
+
+    started = time.monotonic()
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        first = client.get('/api/v2/dashboard/escalations')
+        client.get('/api/v2/dashboard/escalations')
+    elapsed = time.monotonic() - started
+
+    assert first.status_code == 200
+    assert elapsed < 5.0, f'two polls took {elapsed:.1f}s against a 0.3s lookup budget'
+    card = _row(first.json(), 'esc-3-1')['task']
+    assert (card['value'], card['state']) == (None, 'unknown')
+    assert card['reason'].startswith(task_lookup.LOOKUP_BUDGET_REASON)
+    assert len(canned.calls_to('get_task')) == 2, 'a timed-out read must not be cached'
 
 
 # ---------------------------------------------------------------------------
