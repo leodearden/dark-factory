@@ -489,6 +489,20 @@ class TestPairedVsReference:
         with pytest.raises(ValueError, match='w1'):
             _score(cases, SYNTH_VERDICTS)
 
+    @pytest.mark.parametrize('arm', ['ref', 'cand'])
+    def test_a_write_judged_in_one_arm_but_deterministic_in_the_other_is_refused(
+        self, arm: str,
+    ) -> None:
+        cases = _replaced(SYNTH_CASES, arm, 'w1', band='restated')
+        with pytest.raises(ValueError, match="'w1'") as caught:
+            _score(cases, SYNTH_VERDICTS)
+        assert "'restated'" in str(caught.value) and "'judge'" in str(caught.value)
+
+    def test_a_deterministic_write_whose_band_winner_differs_is_refused(self) -> None:
+        cases = _replaced(SYNTH_CASES, 'cand', 'w7', band_winner_id='p9')
+        with pytest.raises(ValueError, match="'w7'"):
+            _score(cases, SYNTH_VERDICTS)
+
 
 class TestRefusal:
     def test_the_refusal_is_a_value_error(self) -> None:
@@ -563,6 +577,10 @@ class TestRowContract:
     @pytest.mark.parametrize('outcome', ['judge', 'distinct', 'bogus'])
     def test_an_outcome_outside_the_ack_vocabulary_is_refused(self, outcome: str) -> None:
         self._refused(_replaced(CAND_CASES, 'cand', 'w5', outcome=outcome), 'cand', 'w5')
+
+    @pytest.mark.parametrize('band', ['Judge', 'middle', 'contested'])
+    def test_a_band_decide_band_cannot_route_to_is_refused(self, band: str) -> None:
+        self._refused(_replaced(CAND_CASES, 'cand', 'w5', band=band), 'cand', 'w5', band)
 
     def test_one_arm_answering_one_write_twice_is_refused(self) -> None:
         self._refused([*CAND_CASES, CAND_CASES[0]], 'cand', 'w1')
@@ -651,6 +669,15 @@ class TestCli:
         assert 'incomplete' in captured.err
         assert 'w6' in captured.err and 't6' in captured.err
         assert not out.exists()
+
+    @pytest.mark.parametrize('line', ['"x"', '[1, 2]', '3', 'null'])
+    def test_a_line_that_is_not_a_json_object_is_refused_naming_it(
+        self, tmp_path: Path, verdicts_file: Path, line: str,
+    ) -> None:
+        cases = tmp_path / 'cases.jsonl'
+        cases.write_text(json.dumps(SYNTH_CASES[0]) + '\n' + line + '\n')
+        with pytest.raises(ValueError, match=r'cases\.jsonl:2: not a JSON object line'):
+            self._main('--cases', cases, '--verdicts', verdicts_file, '--reference-arm', 'ref')
 
     def test_the_reference_arm_is_required(
         self, cases_file: Path, verdicts_file: Path,

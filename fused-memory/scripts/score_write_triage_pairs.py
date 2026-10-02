@@ -63,6 +63,7 @@ from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
+from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeAlias
@@ -70,6 +71,7 @@ from typing import Any, TypeAlias
 from fused_memory.server.write_triage import (
     OUTCOME_CONTESTED,
     OUTCOME_JUDGE,
+    OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
 )
@@ -83,6 +85,8 @@ _ABSTAIN = 'UNCLEAR'
 _REQUIRED_VOTE_KEYS = ('entry_id', 'target_id', 'verdict', 'rater', 'batch')
 _REQUIRED_CASE_KEYS = ('arm', 'memory_id', 'band', 'outcome')
 _ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
+_BANDS = frozenset({OUTCOME_RESTATED, OUTCOME_JUDGE, OUTCOME_STORED})
+"""Every band ``write_triage.py::decide_band`` routes a write to."""
 _WILSON_Z = 1.96
 
 Pair: TypeAlias = tuple[str, str]
@@ -215,6 +219,8 @@ class JudgedCase:
     def _contract_violation(self) -> str | None:
         if self.outcome not in TRIAGE_OUTCOMES:
             return f'outcome {self.outcome!r} is not one of {sorted(TRIAGE_OUTCOMES)}'
+        if self.band not in _BANDS:
+            return f'band {self.band!r} is not one of {sorted(_BANDS)}'
         if not self.attached and self.judged_candidate_id is not None:
             return f'a {self.outcome!r} write names judged_candidate_id {self.judged_candidate_id!r}'
         if not self.in_judge_band:
@@ -249,6 +255,11 @@ class JudgedCase:
             prompt_tokens=usage.get('prompt_tokens'),
             completion_tokens=usage.get('completion_tokens'),
         )
+
+    @property
+    def routing(self) -> tuple[str, str | None]:
+        """What the frozen slate decided before any judge ran: the band and its winner."""
+        return (self.band, self.band_winner_id)
 
     @property
     def in_judge_band(self) -> bool:
@@ -408,8 +419,8 @@ def score_pairs(
       and "filed contested" disagree.
     - ``parse_failures``: judge replies that could not be parsed.
     - ``unrated_pairs``, ``unrated_pair_ids``: pairs this arm named that the
-      corpus does not rate. Both are always empty in a returned result,
-      because an unrated pair raises :class:`IncompleteCorpusError` instead.
+      corpus does not rate. They are always 0 and empty, because an unrated
+      pair raises :class:`IncompleteCorpusError` instead.
 
     ``runtime`` covers the same judge-band rows, one judge call each. A figure
     that some call cannot support is None, never computed over the rest:
@@ -429,9 +440,11 @@ def score_pairs(
     the two-sided exact McNemar p. ``parent_sign_test`` runs the same exact
     test over parent groups. A write's parent group is its band winner, which
     is held fixed across arms because the band is decided before the judge
-    runs. A group favours whichever arm erred on fewer of its writes. A write
-    whose band winner differs between the two arms is refused, because the arms
-    were then not run on one population.
+    runs. A group favours whichever arm erred on fewer of its writes.
+
+    Every arm must have been run on the reference arm's frozen population: a
+    write both arms hold whose band or band winner differs between them is
+    refused, whichever band it is in.
 
     ``list_prices`` is the table those costs were computed from, with its date
     and source.
@@ -441,6 +454,7 @@ def score_pairs(
         raise ValueError(
             f'reference arm {reference_arm!r} is not among the arms {sorted(cases_by_arm)}'
         )
+    _refuse_unshared_routing(cases_by_arm, reference_arm)
     truth = resolve_verdicts(verdicts)
     unrated, tied = _incomplete(_judged_pairs(cases_by_arm), truth)
     if unrated or tied:
@@ -459,7 +473,6 @@ def score_pairs(
                 cases_by_arm[arm],
                 scored[arm],
                 None if arm == reference_arm else scored[reference_arm],
-                tuple(pair for pair in unrated if arm in pair.arms),
             )
             for arm in cases_by_arm
         },
@@ -474,6 +487,21 @@ def _cases_by_arm(rows: Iterable[Mapping[str, Any]]) -> dict[str, list[JudgedCas
             raise ValueError(f'{_case_label(case.arm, case.memory_id)} appears twice')
         by_arm[case.arm][case.memory_id] = case
     return {arm: list(by_arm[arm].values()) for arm in sorted(by_arm)}
+
+
+def _refuse_unshared_routing(
+    cases_by_arm: Mapping[str, Sequence[JudgedCase]], reference_arm: str,
+) -> None:
+    reference_by_write = {case.memory_id: case for case in cases_by_arm[reference_arm]}
+    for case in chain.from_iterable(cases_by_arm.values()):
+        theirs = reference_by_write.get(case.memory_id)
+        if theirs is not None and case.routing != theirs.routing:
+            raise ValueError(
+                f'write {case.memory_id!r} has band {case.band!r} and band winner'
+                f' {case.band_winner_id!r} in arm {case.arm!r} but band {theirs.band!r} and'
+                f' band winner {theirs.band_winner_id!r} in reference arm {reference_arm!r};'
+                ' the arms were not run on one frozen population'
+            )
 
 
 def _judged_pairs(cases_by_arm: Mapping[str, Sequence[JudgedCase]]) -> dict[Pair, tuple[str, ...]]:
@@ -498,12 +526,11 @@ def _arm_report(
     cases: Sequence[JudgedCase],
     scored: Sequence[ScoredCase],
     reference: Sequence[ScoredCase] | None,
-    unrated: Sequence[JudgedPair],
 ) -> dict[str, Any]:
     judged = [s.case for s in scored]
     return {
         'population': {'n_cases': len(cases), 'n_judge_band': len(judged)},
-        'quality': _quality(scored, unrated),
+        'quality': _quality(scored),
         'runtime': _runtime(judged),
         'paired_vs_reference': None if reference is None else _paired(scored, reference),
     }
@@ -532,7 +559,7 @@ def _corpus_summary(
     }
 
 
-def _quality(scored: Sequence[ScoredCase], unrated: Sequence[JudgedPair]) -> dict[str, Any]:
+def _quality(scored: Sequence[ScoredCase]) -> dict[str, Any]:
     attached = [s for s in scored if s.case.attached]
     decided = sum(s.decided for s in attached)
     misfiles = sum(s.misfile for s in attached)
@@ -560,8 +587,8 @@ def _quality(scored: Sequence[ScoredCase], unrated: Sequence[JudgedPair]) -> dic
         'true_links_answered_distinct_rate': _rate(answered_distinct, true_links),
         'contested_decision_errors': sum(s.contested_decision_error for s in scored),
         'parse_failures': sum(s.case.parse_failure for s in scored),
-        'unrated_pairs': len(unrated),
-        'unrated_pair_ids': [[pair.entry_id, pair.target_id] for pair in unrated],
+        'unrated_pairs': 0,
+        'unrated_pair_ids': [],
     }
 
 
@@ -629,14 +656,6 @@ def _paired(
         for mine in sorted(arm, key=lambda s: s.case.memory_id)
         if mine.case.memory_id in reference_by_write
     ]
-    for mine, theirs in common:
-        if mine.case.band_winner_id != theirs.case.band_winner_id:
-            raise ValueError(
-                f'write {mine.case.memory_id!r} has band winner {mine.case.band_winner_id!r}'
-                f' in arm {mine.case.arm!r} but {theirs.case.band_winner_id!r} in'
-                f' reference arm {theirs.case.arm!r}; the arms were not run on one'
-                ' frozen population'
-            )
     return {name: _paired_error(common, error) for name, error in PAIRED_ERRORS.items()}
 
 
@@ -681,9 +700,14 @@ def _read_jsonl(paths: Sequence[Path]) -> list[dict[str, Any]]:
                 if not line.strip():
                     continue
                 try:
-                    rows.append(json.loads(line))
+                    row = json.loads(line)
                 except json.JSONDecodeError as exc:
                     raise ValueError(f'{path}:{number}: not a JSON object line ({exc.msg})') from exc
+                if not isinstance(row, dict):
+                    raise ValueError(
+                        f'{path}:{number}: not a JSON object line (got {type(row).__name__})'
+                    )
+                rows.append(row)
     return rows
 
 
