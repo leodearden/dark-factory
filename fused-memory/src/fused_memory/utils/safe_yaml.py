@@ -21,7 +21,7 @@ def resolve_safe_yaml_loader(yaml_module: Any = yaml) -> type:
     """Return libyaml's ``CSafeLoader`` if *yaml_module* has it, else ``SafeLoader``.
 
     Both are safe loaders: the same restricted tag set, no arbitrary object
-    construction. Only their speed differs.
+    construction.
     """
     return getattr(yaml_module, "CSafeLoader", None) or yaml_module.SafeLoader
 
