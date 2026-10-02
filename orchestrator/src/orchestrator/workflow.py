@@ -161,6 +161,12 @@ from orchestrator.review_suggestions.curator_intake import (
     review_suggestion_submit_arguments,
 )
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
+from orchestrator.reviewer_failure import (
+    classify_reviewer_exception,
+    classify_reviewer_result,
+    error_review,
+    should_retry_reviewer,
+)
 from orchestrator.routing import (
     PlanShape,
     RoleDefaults,
@@ -11186,7 +11192,10 @@ class TaskWorkflow:
         return replace(reviews, suggestions=kept)
 
     async def _review(self, amendment_ctx: AmendmentReviewContext | None = None):
-        """Run all 5 reviewers with stagger, retry errors.
+        """Run the reviewer roster with staggered launches and aggregate it.
+
+        Errored reviewers are retried in-phase up to ``max_reviewer_retries``,
+        except 5xx-attributed ones: the scheduler's transient lane paces those.
 
         When *amendment_ctx* is set (this review immediately follows an
         amendment round), the amendment's addressed suggestions are threaded
@@ -11227,13 +11236,8 @@ class TaskWorkflow:
         tasks = [_staggered(i, r) for i, r in enumerate(roster)]
         results = list(await asyncio.gather(*tasks, return_exceptions=True))
 
-        # Retry ERROR verdicts and exceptions
         for attempt in range(self.config.max_reviewer_retries):
-            error_indices = [
-                i for i, r in enumerate(results)
-                if isinstance(r, Exception)
-                or (isinstance(r, dict) and r.get('verdict') == 'ERROR')
-            ]
+            error_indices = [i for i, r in enumerate(results) if should_retry_reviewer(r)]
             if not error_indices:
                 break
             logger.info(
@@ -11251,19 +11255,28 @@ class TaskWorkflow:
                 except Exception as exc:
                     results[i] = exc
 
-        # Write results — synthesize ERROR for persistent exceptions
+        not_retried = [
+            role.name for role, r in zip(roster, results, strict=True)
+            if isinstance(r, dict) and r.get('verdict') == 'ERROR'
+            and not should_retry_reviewer(r)
+        ]
+        if not_retried:
+            logger.info(
+                f'Task {self.task_id}: skipped in-phase retry for '
+                f'{len(not_retried)} 5xx-attributed reviewer(s): {", ".join(not_retried)}'
+            )
+
         for role, result in zip(roster, results, strict=True):
             if isinstance(result, Exception):
                 logger.error(
                     f'Reviewer {role.name} failed after retries: {result}',
                     exc_info=result,
                 )
-                result = {
-                    'reviewer': role.name,
-                    'verdict': 'ERROR',
-                    'issues': [],
-                    'summary': f'Reviewer exception: {result}',
-                }
+                result = error_review(
+                    role.name,
+                    classify_reviewer_exception(result),
+                    summary=f'Reviewer exception: {result}',
+                )
             if isinstance(result, dict):
                 self.artifacts.write_review(role.name, result)
 
@@ -11565,12 +11578,11 @@ class TaskWorkflow:
             # a disjunct here any more (see the narrowing note above).
             or result.timed_out
         ):
-            return {
-                'reviewer': role.name,
-                'verdict': 'ERROR',
-                'issues': [],
-                'summary': f'Reviewer emitted no/invalid verdict: {result.output[:200]}',
-            }
+            return error_review(
+                role.name,
+                classify_reviewer_result(result),
+                summary=f'Reviewer emitted no/invalid verdict: {result.output[:200]}',
+            )
         if not result.success:
             logger.warning(
                 'Task %s: reviewer %s invocation reported failure but a '
