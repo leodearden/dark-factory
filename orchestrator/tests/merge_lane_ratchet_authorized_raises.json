@@ -1141,6 +1141,102 @@
           "current": 1447
         }
       ]
+    },
+    {
+      "task_id": "5036",
+      "reason": "First recording of the new external_importers measure (PRD task zeta2 step 5): for each of the 14 pre-package module paths that task 5036 turned into aliases of orchestrator.merge_lane.*, the number of distinct tracked .py files outside the package that still import it. A new measure has no prior value, so every per-alias count and the total rise from 0; nothing in the tree grew. Task 5037 (eta) drives these to 0 and then deletes the alias modules.",
+      "measures": [
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/landed_outbox.py",
+          "baseline": 0,
+          "current": 21
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/landing_evidence.py",
+          "baseline": 0,
+          "current": 11
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_completion.py",
+          "baseline": 0,
+          "current": 2
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_disposition.py",
+          "baseline": 0,
+          "current": 8
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_drift.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_gates.py",
+          "baseline": 0,
+          "current": 16
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_liveness.py",
+          "baseline": 0,
+          "current": 4
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_queue.py",
+          "baseline": 0,
+          "current": 120
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_queue_store.py",
+          "baseline": 0,
+          "current": 7
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_request_ledger.py",
+          "baseline": 0,
+          "current": 1
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_shadow.py",
+          "baseline": 0,
+          "current": 2
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_skew_tripwire.py",
+          "baseline": 0,
+          "current": 2
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_speculation_controller.py",
+          "baseline": 0,
+          "current": 2
+        },
+        {
+          "measure": "external_importers",
+          "key": "orchestrator/src/orchestrator/merge_types.py",
+          "baseline": 0,
+          "current": 72
+        },
+        {
+          "measure": "total:external_importers",
+          "key": "<cluster>",
+          "baseline": 0,
+          "current": 269
+        }
+      ]
     }
   ]
 }
