@@ -634,7 +634,7 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 
 # Measured per-segment wall-clock of the FALLBACK fleet chain, in seconds.
 #
-# PROVENANCE — this table now spans TWO measurement epochs. Do not read it as
+# PROVENANCE — this table now spans THREE measurement epochs. Do not read it as
 # one run.
 #
 #   shared / escalation / fused-memory / tests/scripts — task 3062,
@@ -651,6 +651,14 @@ POST_CAP_ORCHESTRATOR_GREEN_N = 28
 #     and understated this segment by ~400s. Full selection rules, both regime
 #     arms and the percentile conventions are on
 #     POST_CAP_ORCHESTRATOR_GREEN_SECS above.
+#
+#   scripts/tests — task 3384, 2026-08-01: one standalone local run (1184
+#     passed in ~113s, "lowest of local runs"), recorded in commit 7249f40f14,
+#     which added the suite to the chain; no summary was persisted. The
+#     combined-clause figures recorded for task 3460 (288.65s / 411.87s /
+#     494.20s) are NOT used: that clause runs `tests/scripts/` and
+#     `scripts/tests/` together, and `tests/scripts` already has its own row, so
+#     a combined figure would double-count it.
 #
 # WHAT THE SUM IS, PRECISELY. `dashboard`, `sampler` and `cockpit` are OMITTED
 # ENTIRELY — task 3062's run timed out at 1800.66s before dashboard even
@@ -695,6 +703,7 @@ MEASURED_FLEET_SEGMENT_SECS = {
     'orchestrator': 1765.95,
     'fused-memory': 123.87,
     'tests/scripts': 105.0,
+    'scripts/tests': 113.0,
 }
 
 
@@ -707,12 +716,12 @@ class _SegmentProvenance(NamedTuple):
     corpus: str
 
 
-# Task 4902. The measurement table above now spans two epochs, and a bare
+# Task 4902. The measurement table above spans several epochs, and a bare
 # {name: float} mapping cannot say which entry belongs to which. This records
 # each figure's age and sample so the next reader — and the next re-measurement
 # — can see at a glance what is being replaced, without archaeology.
 #
-# Read the sample sizes literally. Three of these are n=1: a single logged run
+# Read the sample sizes literally. Four of these are n=1: a single logged run
 # each, which is exactly why a single later regime change (commit 685f558728's
 # `pytest -n 8` cap) invalidated the table wholesale and nothing noticed for
 # eight days. `tests/scripts` is n=4 because the comment above records it as
@@ -736,6 +745,9 @@ MEASURED_FLEET_SEGMENT_PROVENANCE: dict[str, _SegmentProvenance] = {
         '2026-07-31', 1, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
     'tests/scripts': _SegmentProvenance(
         '2026-07-31', 4, '3062', '.task/verify/attempt-2.__fallback__.summary.json'),
+    'scripts/tests': _SegmentProvenance(
+        '2026-08-01', 1, '3384',
+        'standalone local run recorded in commit 7249f40f14 (no persisted summary)'),
 }
 
 # The suites the chain runs that have NO figure in MEASURED_FLEET_SEGMENT_SECS:
