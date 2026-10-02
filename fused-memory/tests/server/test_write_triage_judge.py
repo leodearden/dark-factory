@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
+from fused_memory.config.schema import FusedMemoryConfig, WriteTriageConfig
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage_judge as judge_module
@@ -1116,6 +1117,24 @@ class TestResolveJudgeTimeout:
 
     def test_the_default_is_bounded_well_under_the_sdk_default(self) -> None:
         assert 0 < _DEFAULT_JUDGE_TIMEOUT_SECONDS <= 60
+
+    def test_the_shipped_default_is_fifteen_seconds_in_every_home(self) -> None:
+        """15 s because the frontier arms measured p95 4.6–6.4 s (PRD §11.2 D15).
+
+        The value is spelled in three places — the module fallback, the schema
+        default and the shipped config.yaml (read here through the conftest's
+        CONFIG_PATH pin) — and this three-way equality is what stops them
+        drifting apart.
+        """
+        assert _DEFAULT_JUDGE_TIMEOUT_SECONDS == 15.0
+        assert (
+            _DEFAULT_JUDGE_TIMEOUT_SECONDS
+            == WriteTriageConfig.model_fields['judge_timeout_seconds'].default
+        )
+        assert (
+            _DEFAULT_JUDGE_TIMEOUT_SECONDS
+            == FusedMemoryConfig().write_triage.judge_timeout_seconds
+        )
 
     @pytest.mark.parametrize('value', [1, 2.5, 30, 0.01])
     def test_a_configured_positive_number_is_used(self, value: float) -> None:
