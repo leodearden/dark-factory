@@ -39,8 +39,17 @@ from fused_memory.services.memory_service import SearchResults
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_write_triage_judge.py'
 
-#: What the fake provider bills for every completion.
-_USAGE = {'prompt_tokens': 321, 'completion_tokens': 7, 'total_tokens': 328}
+#: What the fake provider bills for every completion, in the provider's shape.
+_BILLED = types.SimpleNamespace(
+    prompt_tokens=321, completion_tokens=7, total_tokens=328,
+    completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
+)
+
+#: The same bill as the eval artifact's per-case ``usage`` row records it.
+_USAGE_ROW = {
+    'prompt_tokens': 321, 'completion_tokens': 7, 'total_tokens': 328,
+    'reasoning_tokens': 0,
+}
 
 T_HIGH = 0.9
 T_LOW = 0.5
@@ -80,12 +89,12 @@ def _user_turn(messages: list[dict]) -> str:
     return next(m['content'] for m in messages if m['role'] == 'user')
 
 
-def _openai(word: str, *, named: int = 0) -> MagicMock:
+def _openai(word: str, *, named: int = 0, billed: object = _BILLED) -> MagicMock:
     """A fake `AsyncOpenAI` that is its own async context manager, as the SDK is.
 
     Every completion answers *word* about the candidate at position *named* of
     its own prompt (an attach verdict must name one; `distinct` names none) and
-    bills :data:`_USAGE`. The response is plain namespaces because a MagicMock
+    bills *billed*. The response is plain namespaces because a MagicMock
     `usage` would hand `int()` a 1.
     """
     async def _complete(**kwargs) -> types.SimpleNamespace:
@@ -96,7 +105,7 @@ def _openai(word: str, *, named: int = 0) -> MagicMock:
             choices=[types.SimpleNamespace(
                 message=types.SimpleNamespace(content=json.dumps(answer)),
             )],
-            usage=types.SimpleNamespace(**_USAGE),
+            usage=billed,
         )
 
     client = MagicMock()
@@ -161,14 +170,17 @@ class TestTheSeededLiveEdge:
     def test_a_recorded_run_reports_what_the_provider_billed(self) -> None:
         plan = self._plan()
         case = plan.cases[0]
-        with (
-            patch('openai.AsyncOpenAI', return_value=_openai('restates')),
-            _mod().usage_recording_openai() as recorded,
-        ):
-            answer = _mod().build_judge_fn(_judge_config(), recorded)(
-                case, _resolved(plan, 0),
-            )
-        assert answer.usage == _USAGE
+        with patch('openai.AsyncOpenAI', return_value=_openai('restates')):
+            answer = _mod().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
+        assert answer.usage == _USAGE_ROW
+
+    def test_a_run_with_no_reported_usage_is_unpriced(self) -> None:
+        """The artifact says 'unpriced', never zeros."""
+        plan = self._plan()
+        case = plan.cases[0]
+        with patch('openai.AsyncOpenAI', return_value=_openai('restates', billed=None)):
+            answer = _mod().build_judge_fn(_judge_config())(case, _resolved(plan, 0))
+        assert answer.usage is None
 
 
 def _hit(memory_id: str, cosine: float) -> MemoryResult:
@@ -335,24 +347,15 @@ class TestTheLimitedCli:
 
 
 class TestTheRetrievedCli:
-    """`main()` on a retrieved `--dry-run` over a stub store: what the plan is built under, and from.
-
-    A retrieved plan builds a `MemoryService`, whose stores construct SDK
-    clients of their own, so it must be built outside `usage_recording_openai`,
-    which swaps `openai.AsyncOpenAI` for a plain factory.
-    """
+    """`main()` on a retrieved `--dry-run` over a stub store: what the plan is built from."""
 
     @staticmethod
-    def _main(tmp_path: Path, monkeypatch, *extra: str, rows=()) -> list:
-        """Every search answers *rows*. Returns the SDK class each store was built under."""
-        import openai  # noqa: PLC0415
-
-        built_under: list = []
+    def _main(tmp_path: Path, monkeypatch, *extra: str, rows=()) -> None:
+        """Every search answers *rows*."""
 
         class _LiveStore(FakeMemoryService):
             def __init__(self, config) -> None:
                 super().__init__(rows)
-                built_under.append(openai.AsyncOpenAI)
 
             async def initialize(self) -> None:
                 return None
@@ -365,14 +368,6 @@ class TestTheRetrievedCli:
             sys, 'argv', TestTheLimitedCli._argv(tmp_path, '--slate-mode', 'retrieved', *extra),
         )
         assert _mod().main() == 0
-        return built_under
-
-    def test_the_store_is_built_under_the_sdks_own_client_class(
-        self, tmp_path: Path, monkeypatch,
-    ) -> None:
-        import openai  # noqa: PLC0415
-
-        assert self._main(tmp_path, monkeypatch) == [openai.AsyncOpenAI]
 
     def test_a_limited_run_describes_its_targets_from_the_whole_fixture(
         self, tmp_path: Path, monkeypatch,
