@@ -29,7 +29,10 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / 'config'
 
 MIDDLEWARE_DIR = Path(__file__).resolve().parents[1] / 'src' / 'fused_memory' / 'middleware'
 
-REGISTRY_LOADER_MODULES = ('cancelled_premise_blocklist.py',)
+REGISTRY_LOADER_MODULES = (
+    'cancelled_premise_blocklist.py',
+    'operational_ask_registry.py',
+)
 
 
 def _load(path: Path | None) -> list[object]:
