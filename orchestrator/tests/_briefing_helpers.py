@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -37,6 +38,19 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
         ),
     )
     return BriefingAssembler(config)
+
+
+MEMORY_TRANSPORT = 'orchestrator.agents.memory_recall.mcp_call'
+"""The one patch target for answering briefing memory recall in a test.
+
+It is the network boundary, so patching it lets the real recall, parse,
+filter, render and compose pipeline run.
+"""
+
+
+def memory_transport(mock):
+    """Answer every memory call the briefing makes with *mock*."""
+    return patch(MEMORY_TRANSPORT, new=mock)
 
 
 def _result(
@@ -66,15 +80,12 @@ def _result(
 
 
 def _mcp_search_envelope(results: list[dict]) -> dict:
-    """Build the real ``tools/call`` response envelope ``_mcp_search`` reads.
+    """Build the real ``tools/call`` response envelope memory recall reads.
 
-    Mirrors ``BriefingAssembler._mcp_search``: FastMCP returns
-    ``{'result': {'content': [{'type': 'text', 'text': ...}]}}`` where
-    ``text`` is the JSON-serialised ``search`` tool payload. Used to patch
-    ``orchestrator.agents.briefing.mcp_call`` directly (unlike most briefing
-    tests, which patch ``_get_memory_context`` itself away to a stub) so the
-    real ``_get_memory_context`` / ``_scoped_search`` /
-    ``filter_foreign_project_results`` pipeline actually runs end-to-end.
+    FastMCP returns ``{'result': {'content': [{'type': 'text', 'text': ...}]}}``
+    where ``text`` is the JSON-serialised ``search`` tool payload. Handed to
+    :func:`memory_transport` so the real ``orchestrator.agents.memory_recall``
+    pipeline runs end to end.
     """
     return {
         'result': {

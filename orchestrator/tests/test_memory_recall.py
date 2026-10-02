@@ -1,10 +1,11 @@
 """Pure tests for ``orchestrator.agents.memory_recall``.
 
-The data layer recalls nothing itself: it parses one ``search`` reply once
-into a typed result, drops cross-project facts from it, and renders what
-survives. Every test here drives those functions directly with parsed data;
-the end-to-end behaviour of the ``# Context`` block, through the public
-prompt builders, lives in ``test_briefing_project_scope.py``.
+The data layer parses one ``search`` reply once into a typed result, drops
+cross-project facts from it, and renders what survives; the composition layer
+turns one dispatch's tally of sections, notices and outcomes into the
+``# Context`` block. Every test here drives those functions directly; the
+end-to-end behaviour, through the public prompt builders, lives in
+``test_briefing_project_scope.py``.
 """
 
 from __future__ import annotations
@@ -20,12 +21,18 @@ from _briefing_helpers import _edge, _grouped_block, _grouped_parent, _node, _re
 
 from orchestrator.agents.memory_recall import (
     FOREIGN_PROJECT_TAG_KEYS,
+    MEMORY_CONTEXT_CAVEAT,
+    MEMORY_EMPTY_NOTICE,
+    MEMORY_OUTAGE_NOTICE,
     FilteredResults,
     MemoryFailure,
+    MemoryQueryOutcome,
+    RecallTally,
     SearchReply,
     UnparsedReply,
     filter_foreign_project_results,
     parse_search_reply,
+    render_context_block,
     render_entity_block,
     render_memory_results,
 )
@@ -698,3 +705,139 @@ class TestRenderEntityBlock:
 
         missing = [r for r in caplog.records if 'Task 3609' in r.getMessage()]
         assert [r.levelno for r in missing] == [level]
+
+
+_SECTION = '## Conventions & Gotchas\n\n- [uncategorized · undated · mem0] A recalled fact.'
+_TIMEOUT = MemoryQueryOutcome(failure=MemoryFailure.TIMEOUT)
+_TRANSPORT = MemoryQueryOutcome(failure=MemoryFailure.TRANSPORT)
+_HEALTHY = MemoryQueryOutcome(rendered='- a fact')
+
+
+class TestRecallTally:
+    """One dispatch's recall, frozen so the outage verdict is a pure function of it."""
+
+    @pytest.mark.parametrize(
+        ('tally', 'outage'),
+        [
+            (RecallTally(searches=(_TIMEOUT, _TRANSPORT)), True),
+            (RecallTally(searches=(_TIMEOUT, MemoryQueryOutcome())), False),
+            (RecallTally(searches=(), loop_failure=MemoryFailure.TRANSPORT), True),
+            (
+                RecallTally(
+                    sections=(_SECTION,),
+                    searches=(_HEALTHY,),
+                    loop_failure=MemoryFailure.TRANSPORT,
+                ),
+                False,
+            ),
+            (RecallTally(searches=(MemoryQueryOutcome(), MemoryQueryOutcome())), False),
+        ],
+        ids=[
+            'every-search-failed',
+            'one-of-two-failed',
+            'loop-broke-before-anything',
+            'loop-broke-after-a-recalled-section',
+            'nothing-failed-nothing-recalled',
+        ],
+    )
+    def test_an_outage_means_nothing_worked(self, tally, outage):
+        assert tally.is_outage is outage
+
+    def test_reasons_are_deduplicated_in_order_then_the_loop_failure(self):
+        tally = RecallTally(
+            searches=(
+                _TIMEOUT,
+                MemoryQueryOutcome(failure=MemoryFailure.MALFORMED),
+                _TIMEOUT,
+                _HEALTHY,
+            ),
+            loop_failure=MemoryFailure.TRANSPORT,
+        )
+
+        assert tally.reasons == (
+            MemoryFailure.TIMEOUT, MemoryFailure.MALFORMED, MemoryFailure.TRANSPORT,
+        )
+
+    @pytest.mark.parametrize(
+        ('searches', 'note'),
+        [
+            (
+                (MemoryQueryOutcome(dropped=2), MemoryQueryOutcome()),
+                '2 memory result slot(s) across 2 queries were tagged to another '
+                'project and filtered out',
+            ),
+            (
+                (MemoryQueryOutcome(nested_dropped=4),),
+                '4 nested memory record(s) across 1 query were tagged to another '
+                'project and filtered out',
+            ),
+            (
+                (
+                    MemoryQueryOutcome(dropped=1, nested_dropped=2),
+                    MemoryQueryOutcome(dropped=1, nested_dropped=2),
+                ),
+                '2 memory result slot(s) and 4 nested memory record(s) across 2 '
+                'queries were tagged to another project and filtered out',
+            ),
+            ((MemoryQueryOutcome(), MemoryQueryOutcome()), ''),
+        ],
+        ids=['top-level-only', 'nested-only-one-query', 'both-named-apart', 'no-drops'],
+    )
+    def test_the_drop_note_names_each_quantity_apart(self, searches, note):
+        assert RecallTally(searches=searches).drop_note == note
+
+
+class TestRenderContextBlock:
+    """The three shapes of the ``# Context`` block."""
+
+    def test_nothing_recalled_and_no_outage_reads_as_an_empty_corpus(self):
+        tally = RecallTally(
+            notices=('_notice one_', '_notice two_'),
+            searches=(MemoryQueryOutcome(dropped=1), MemoryQueryOutcome()),
+        )
+
+        assert render_context_block(tally, PROJECT) == (
+            '# Context\n\n'
+            + MEMORY_EMPTY_NOTICE
+            + '\n\n_notice one_\n\n_notice two_'
+            + f'\n\n_Note: {tally.drop_note}._'
+        )
+
+    def test_an_outage_leads_with_its_reasons_then_the_section_notices(self):
+        tally = RecallTally(
+            notices=('_section notice_',),
+            searches=(_TIMEOUT, _TRANSPORT),
+        )
+
+        assert render_context_block(tally, PROJECT) == (
+            '# Context\n\n'
+            + MEMORY_OUTAGE_NOTICE.format(reasons='timeout, transport')
+            + '\n\n_section notice_'
+        )
+
+    def test_recalled_sections_carry_the_caveat_and_the_loop_failure_line(self):
+        tally = RecallTally(
+            sections=(_SECTION, '## Task Context\n\n- another fact'),
+            notices=('_section notice_',),
+            searches=(MemoryQueryOutcome(dropped=1), _HEALTHY),
+            loop_failure=MemoryFailure.TRANSPORT,
+        )
+
+        assert render_context_block(tally, PROJECT) == (
+            '# Context\n\n'
+            + MEMORY_CONTEXT_CAVEAT.format(project_id=PROJECT)
+            + f'\n\n_In total, {tally.drop_note}._'
+            + '\n\n'
+            + _SECTION
+            + '\n\n---\n\n## Task Context\n\n- another fact'
+            + '\n\n---\n\n_section notice_\n'
+            + '_Memory unavailable for the remaining queries — proceed with '
+            'codebase exploration for anything not covered above._'
+        )
+
+    def test_recalled_sections_without_notices_or_drops_are_just_the_caveat_and_sections(self):
+        tally = RecallTally(sections=(_SECTION,), searches=(_HEALTHY,))
+
+        assert render_context_block(tally, PROJECT) == (
+            '# Context\n\n' + MEMORY_CONTEXT_CAVEAT.format(project_id=PROJECT) + '\n\n' + _SECTION
+        )
