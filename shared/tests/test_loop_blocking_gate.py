@@ -47,6 +47,7 @@ from __future__ import annotations
 import ast
 import re
 import textwrap
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -66,7 +67,7 @@ from loop_blocking_scan import (
     site_key,
 )
 from silent_fallthrough_scan import (
-    iter_first_party_files,
+    ParsedFile,
     reconcile_against_allowlist,
 )
 
@@ -1186,25 +1187,25 @@ class TestPrimitiveTable:
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Task 4484's charter is "re-run the enumeration caller-side across
-# fused-memory", so the finding set is scoped to that package.
-# iter_first_party_files yields all SEVEN scope roots; orchestrator/src is also
-# heavily async and would balloon the baseline past anything a reviewer can
-# read, turning the ratchet into a merge blocker for unrelated work. Widening
-# is a deliberate follow-on decision with merge-lane consequences, not a
-# side effect of this audit.
+# fused-memory", so the finding set is scoped to that package. The shared
+# first-party tree spans every scope root in silent_fallthrough_scan's
+# _SCOPE_ROOTS; orchestrator/src is also heavily async and would balloon the
+# baseline past anything a reviewer can read, turning the ratchet into a merge
+# blocker for unrelated work. Widening is a deliberate follow-on decision with
+# merge-lane consequences, not a side effect of this audit.
 #
-# The scope is applied by FILTERING that generator's output, never by handing
-# it a narrower root: it validates repo_root against sentinel dirs
-# ('shared/src', 'orchestrator/src') and RAISES rather than yielding a
-# vacuously empty scan. Passing 'fused-memory/src' as the root would trip that
-# sentinel, and relaxing the sentinel to accommodate us would delete the
-# loud-failure property its existing consumers rely on.
+# The scope is applied by FILTERING the shared first-party tree, never by
+# handing the provider a narrower root: it validates repo_root against
+# sentinel dirs ('shared/src', 'orchestrator/src') and RAISES rather than
+# yielding a vacuously empty scan. Passing 'fused-memory/src' as the root
+# would trip that sentinel, and relaxing the sentinel to accommodate us would
+# delete the loud-failure property its existing consumers rely on.
 _SCOPE_PREFIX = 'fused-memory/src/'
 
-# How many out-of-scope first-party files the scope-filter test may read before
+# How many out-of-scope first-party files the scope-filter test may scan before
 # giving up. It stops at the FIRST file that yields a finding (the 4th, at the
 # task 4484 amendment pass); the cap only bounds the pathological case, so the
-# gate cannot become slow because the other six scope roots got clean.
+# gate cannot become slow because the other scope roots got clean.
 _OUT_OF_SCOPE_PROBE_CAP = 80
 
 
@@ -1215,16 +1216,24 @@ class _TreeScan(NamedTuple):
     findings: list[LoopBlockingSite]
 
 
+def _build_tree_scan(records: Sequence[ParsedFile]) -> _TreeScan:
+    """Scan the ``_SCOPE_PREFIX`` records of the shared first-party tree.
+
+    Every in-scope module is in the mapping handed to the scanner, so
+    cross-module resolution sees the whole package. The trees are walked, never
+    re-read or re-parsed.
+    """
+    in_scope = [record for record in records if record.relpath.startswith(_SCOPE_PREFIX)]
+    trees = {record.relpath: record.tree for record in in_scope if record.tree is not None}
+    return _TreeScan(
+        scanned_files=len(in_scope), findings=find_loop_blocking_sites_in_trees(trees)
+    )
+
+
 @pytest.fixture(scope='session')
-def tree_scan() -> _TreeScan:
-    """Enumerate, read and scan ``fused-memory/src`` once per test session."""
-    sources: dict[str, str] = {}
-    for path in iter_first_party_files(_REPO_ROOT):
-        rel = path.relative_to(_REPO_ROOT).as_posix()
-        if not rel.startswith(_SCOPE_PREFIX):
-            continue
-        sources[rel] = path.read_text(encoding='utf-8', errors='replace')
-    return _TreeScan(scanned_files=len(sources), findings=find_loop_blocking_sites(sources))
+def tree_scan(first_party_tree: tuple[ParsedFile, ...]) -> _TreeScan:
+    """Scan ``fused-memory/src`` once per test session, off the shared tree."""
+    return _build_tree_scan(first_party_tree)
 
 
 class TestSweepUsesTheSharedTree:
@@ -1274,36 +1283,35 @@ class TestSweepIsNotVacuous:
             f'synthetic fixtures above before believing the tree got clean.'
         )
 
-    def test_the_prefix_filter_is_what_keeps_the_ledger_scoped(self, tree_scan):
+    def test_the_prefix_filter_is_what_keeps_the_ledger_scoped(
+        self, tree_scan, first_party_tree
+    ):
         """Out-of-scope first-party files DO yield findings; the filter excludes them.
 
         Asserting that no finding in ``tree_scan`` lies outside
-        ``_SCOPE_PREFIX`` would test nothing: the fixture only inserts a path
-        into ``sources`` when it starts with that prefix, so the property holds
-        by construction one function above the assertion.
+        ``_SCOPE_PREFIX`` would test nothing: ``_build_tree_scan`` only keeps a
+        record whose relpath starts with that prefix, so the property holds by
+        construction one function above the assertion.
 
         This scans out-of-scope files INDEPENDENTLY (bounded, one file at a
         time, stopping at the first that yields anything -- ~4 files and well
         under a second in practice) and then checks those keys are absent from
-        the ledger sweep.  Delete the prefix filter from the fixture and this
-        goes red, which is what the earlier version could not do.
+        the ledger sweep.  Delete the prefix filter from ``_build_tree_scan``
+        and this goes red, which is what the earlier version could not do.
         """
         probe: list[LoopBlockingSite] = []
         scanned = 0
-        for path in iter_first_party_files(_REPO_ROOT):
-            rel = path.relative_to(_REPO_ROOT).as_posix()
-            if rel.startswith(_SCOPE_PREFIX):
+        for record in first_party_tree:
+            if record.relpath.startswith(_SCOPE_PREFIX) or record.tree is None:
                 continue
             scanned += 1
-            probe.extend(find_loop_blocking_sites(
-                {rel: path.read_text(encoding='utf-8', errors='replace')}
-            ))
+            probe.extend(find_loop_blocking_sites_in_trees({record.relpath: record.tree}))
             if probe or scanned >= _OUT_OF_SCOPE_PROBE_CAP:
                 break
 
         assert probe, (
             f'no out-of-scope finding in the first {scanned} first-party files '
-            f'outside {_SCOPE_PREFIX} -- either the other six scope roots got '
+            f'outside {_SCOPE_PREFIX} -- either the other scope roots got '
             f'clean (measured: 123 findings across 294 files at the task 4484 '
             f'amendment pass) or the sweep is broken. Without one, this test '
             f'cannot show the filter is doing anything.'
