@@ -25,6 +25,7 @@ import aiosqlite
 import pytest
 from _dashboard_helpers import (
     apply_isolated_env,
+    drive_loop_until,
     drive_metrics_loop,
     live_aiosqlite_worker_threads,
     yielding_noop_sleep,
@@ -197,17 +198,7 @@ async def test_burndown_loop_invokes_periodic_checkpoint(tmp_path: Path):
             patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
             patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 0),
         ):
-            task = asyncio.create_task(
-                _burndown_loop(store, config, MagicMock())
-            )
-            try:
-                # Wait until store.checkpoint() is actually called — this is racefree
-                # because the event is set inside the checkpoint mock itself.
-                await asyncio.wait_for(checkpoint_called.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            await drive_loop_until(_burndown_loop(store, config, MagicMock()), checkpoint_called)
     finally:
         await store.close()
 
@@ -257,16 +248,14 @@ async def test_burndown_loop_checkpoint_respects_interval_gate(tmp_path: Path):
             patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
             patch('dashboard.loops._CHECKPOINT_INTERVAL_SECONDS', 3600),
         ):
-            task = asyncio.create_task(_burndown_loop(store, config, MagicMock()))
-            try:
-                await asyncio.wait_for(many_iters_done.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+            await drive_loop_until(_burndown_loop(store, config, MagicMock()), many_iters_done)
     finally:
         await store.close()
 
+    assert many_iters_done.is_set(), (
+        f'_burndown_loop completed only {collect_calls} collect cycles (need 6) - '
+        f'checkpoint_count <= 1 below would hold vacuously'
+    )
     # With 3600s interval and 5 in-loop iterations completing in milliseconds,
     # checkpoint fires at most once (first iteration where monotonic() >> 3600s),
     # then the gate suppresses it for the remainder of the test.

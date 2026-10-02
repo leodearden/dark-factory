@@ -84,6 +84,27 @@ async def test_drives_cycles_until_the_event_and_records_each_call(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_without_until_it_stops_at_the_first_collect(tmp_path: Path) -> None:
+    app = _app_with_its_own_handles(DashboardConfig(project_root=tmp_path))
+    backstop = 10.0
+    clock = asyncio.get_running_loop()
+
+    async with _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000) as store:
+        started = clock.time()
+        calls = await drive_metrics_loop(
+            store, app, pool=_null_pool(), http_client=MagicMock(), timeout=backstop
+        )
+        elapsed = clock.time() - started
+
+    assert calls, 'the first cycle runs before any sleep, so it must have been recorded'
+    assert elapsed < backstop / 2, (
+        f'with no `until` the driver must stop at the first collect, but it ran '
+        f'{elapsed:.1f}s -- out to its {backstop}s backstop'
+    )
+    assert _live_metrics_loop_tasks() == [], 'the driver must not leave a _metrics_loop running'
+
+
+@pytest.mark.asyncio
 async def test_returns_rather_than_raises_when_the_event_never_fires(tmp_path: Path) -> None:
     config = DashboardConfig(project_root=tmp_path)
     app = _app_with_its_own_handles(config)

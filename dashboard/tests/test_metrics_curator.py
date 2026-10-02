@@ -717,14 +717,12 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     real lifespan — and its _burndown_loop side task — are never started.
     Only _metrics_loop is exercised, via
     dashboard/tests/_dashboard_helpers.py::drive_metrics_loop, which records
-    each collect_metrics_snapshot call; the first cycle sets the stop event.
+    each collect_metrics_snapshot call and stops after the first.
 
     tickets.db is created on disk at the canonical path so DbPool.get() returns
     a real connection.  This pins the path-to-connection wiring: a wrong-but-
     missing path would make get() return None, failing the is-not-None assertion.
     """
-    called_event = asyncio.Event()
-
     # Minimal app-state stub — no real lifespan, no side tasks.
     fixed_config = DashboardConfig(
         project_root=tmp_path,
@@ -753,8 +751,6 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
                 mock_app,
                 pool=pool,
                 http_client=mock_app.state.http_client,
-                until=called_event,
-                on_collect=lambda _kwargs: called_event.set(),
             )
         # Verify the loop opened the connection BEFORE calling pool.get() ourselves.
         # pool.open_count > 0 means _metrics_loop._run_once() actually called pool.get();

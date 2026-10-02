@@ -420,16 +420,9 @@ async def test_metrics_loop_uses_the_handles_it_was_passed_not_app_state(
     mock_app.state.db = state_pool
     mock_app.state.http_client = state_http_client
 
-    saw_call = asyncio.Event()
-
     async with _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000) as store:
         calls = await drive_metrics_loop(
-            store,
-            mock_app,
-            pool=arg_pool,
-            http_client=arg_http_client,
-            until=saw_call,
-            on_collect=lambda _kwargs: saw_call.set(),
+            store, mock_app, pool=arg_pool, http_client=arg_http_client
         )
 
     # Without this every assertion below is vacuous: _run_once swallows any

@@ -13,7 +13,7 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -242,12 +242,12 @@ async def drain(*tasks: asyncio.Task[Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _metrics_loop driving harness (task 5095)
+# Background-loop driving harness (task 5095)
 #
-# ONE definition of "run the real _metrics_loop against a recorded
-# collect_metrics_snapshot until the caller has seen enough", shared by every
-# test that drives the loop directly.  Its contract is pinned by
-# test_metrics_loop_harness.py.
+# ONE definition of "run a real dashboard loop until the caller has seen
+# enough, then cancel it": drive_loop_until for any loop, drive_metrics_loop
+# for _metrics_loop against a recorded collect_metrics_snapshot.  Their
+# contract is pinned by test_metrics_loop_harness.py.
 # ---------------------------------------------------------------------------
 
 
@@ -262,13 +262,35 @@ async def yielding_noop_sleep(*_args: object, **_kwargs: object) -> None:
     await asyncio.sleep(0)
 
 
+async def drive_loop_until(
+    loop: Coroutine[Any, Any, None], until: asyncio.Event, *, timeout: float = 2.0
+) -> None:
+    """Run the never-returning *loop* as a task until *until* is set, then cancel it.
+
+    *timeout* is a backstop that is SUPPRESSED, so a regression fails on the
+    caller's named assertions rather than a bare ``TimeoutError``; assert a
+    positive witness (``until.is_set()``) before any upper-bound or absence
+    assertion.  Only ``CancelledError`` is swallowed on the way out, so a loop
+    that died of a real exception still surfaces it.  The task never outlives
+    this call.
+    """
+    task = asyncio.create_task(loop)
+    try:
+        with suppress(TimeoutError):
+            await asyncio.wait_for(until.wait(), timeout=timeout)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
 async def drive_metrics_loop(
     store: _MetricsStore,
     app: FastAPI,
     *,
     pool: DbPool,
     http_client: httpx.AsyncClient,
-    until: asyncio.Event,
+    until: asyncio.Event | None = None,
     on_collect: Callable[[dict[str, Any]], None] | None = None,
     timeout: float = 2.0,
 ) -> list[dict[str, Any]]:
@@ -278,19 +300,19 @@ async def drive_metrics_loop(
     ``app.state`` is never read or written here -- the binding tests depend on
     the caller's ``app.state`` staying exactly as it built it.
 
-    The caller sets *until* from wherever its observable lives: an *on_collect*
-    hook, a checkpoint mock.  *timeout* is a backstop that is SUPPRESSED, so
-    assert a positive witness (``until.is_set()``, non-empty calls) before any
-    upper-bound or absence assertion.  *on_collect* runs INSIDE the loop's
-    ``_run_once``, whose ``except Exception`` swallows whatever it raises, so a
-    hook should record and signal, never assert.
-
-    The loop task never outlives this call.
+    With no *until* the driver stops after the first collect.  Otherwise the
+    caller sets *until* from wherever its observable lives: an *on_collect*
+    hook, a checkpoint mock.  *timeout* is ``drive_loop_until``'s suppressed
+    backstop.  *on_collect* runs INSIDE the loop's ``_run_once``, whose
+    ``except Exception`` swallows whatever it raises, so a hook should record
+    and signal, never assert.
     """
     calls: list[dict[str, Any]] = []
+    first_collect = asyncio.Event()
 
     async def _record(*_args: object, **kwargs: Any) -> None:
         calls.append(kwargs)
+        first_collect.set()
         if on_collect is not None:
             on_collect(kwargs)
 
@@ -298,14 +320,11 @@ async def drive_metrics_loop(
         patch('dashboard.loops.collect_metrics_snapshot', new=_record),
         patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
     ):
-        task = asyncio.create_task(_metrics_loop(store, app, pool=pool, http_client=http_client))
-        try:
-            with suppress(TimeoutError):
-                await asyncio.wait_for(until.wait(), timeout=timeout)
-        finally:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+        await drive_loop_until(
+            _metrics_loop(store, app, pool=pool, http_client=http_client),
+            first_collect if until is None else until,
+            timeout=timeout,
+        )
     return calls
 
 
