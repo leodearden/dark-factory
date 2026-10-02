@@ -895,7 +895,10 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   the bare escalation id — never hand-prefix the project. A record filed before this change under a
   bare id is continued in place by your re-file, so do **not** change an existing `--id` template
   (such as `recon-watcher-lease-orphan-<project>` above): rows already filed under it would stop receiving
-  your re-files.
+  your re-files. That includes a template that already hand-prefixes the project (`df-esc-<id>`):
+  keep it as it is, and the verb continues the `df-esc-…` row in place. "Never hand-prefix"
+  governs only a template you are writing new; dropping an existing prefix moves your re-files to
+  a fresh row that ignores the old row's answered or dropped state.
   **You no longer have to pre-check before filing (task 3559).** Decision ids are fleet-global, so
   the orchestrator's `escalation-watcher` may already have filed a decision under this id for the
   same underlying human gate. The verb now handles that for you: if an `open` record already exists
@@ -1023,7 +1026,10 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   ```
   It clears the row's closing evidence, so a later `close-decision` can quote fresh evidence, and
   it exits non-zero when it refuses (the record at that id is another project's or queue's) or
-  finds no record. File under a **new** id only for a genuinely *different* ask. Either way, do not
+  finds no record. It cannot hold open a row whose escalation is already resolved or dismissed:
+  the next reap closes it again, and the verb warns on stderr when that is the case. Such a gate
+  needs a new escalation, filed under its own id. File under a **new** id only for a genuinely
+  *different* ask. Either way, do not
   try to force the row open by re-filing.
 - The verb is fail-soft (a registry fault is logged and swallowed, never raised) — filing a
   decision can never crash the watch loop or block the "leave pending" action itself.

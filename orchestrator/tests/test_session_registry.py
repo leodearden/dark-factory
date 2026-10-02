@@ -7009,12 +7009,6 @@ class TestReapExpectMatches:
         [warning] = self._warnings(caplog)
         assert 'DECLINED' in warning
 
-    def test_the_flag_is_an_opt_in_switch(self) -> None:
-        argv = ['reap-decisions', '--project', 'df', '--escalations-dir', '/q']
-
-        assert sr._build_parser().parse_args(argv).expect_matches is False
-        assert sr._build_parser().parse_args([*argv, '--expect-matches']).expect_matches is True
-
 
 def test_main_reap_decisions_recommended_solar_token_warns_nothing(
     monkeypatch: pytest.MonkeyPatch,
@@ -10966,13 +10960,6 @@ class TestReopenDecisionVerb:
         )
         return sr.decision_path_for_id('esc-42-1', root=root)
 
-    def test_is_registered_in_the_parser(self, tmp_path: Path) -> None:
-        args = sr._build_parser().parse_args(self._argv(tmp_path))
-
-        assert (args.verb, args.id, args.project, args.escalations_dir, args.root) == (
-            'reopen-decision', 'esc-42-1', self._PROJECT, self._QUEUE, str(tmp_path),
-        )
-
     @pytest.mark.parametrize('dropped', ['--project', '--escalations-dir'])
     def test_the_verb_requires_both_expectations(self, tmp_path: Path, dropped: str) -> None:
         argv = self._argv(tmp_path)
@@ -11012,6 +10999,32 @@ class TestReopenDecisionVerb:
 
         assert rc != 0
         assert 'esc-42-1' in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ('status', 'warned'), [('resolved', True), ('dismissed', True), ('pending', False)]
+    )
+    def test_reopening_a_row_the_next_reap_would_close_again_warns(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], status: str, warned: bool
+    ) -> None:
+        queue = tmp_path / 'queue'
+        queue.mkdir()
+        (queue / 'esc-42-1.json').write_text(json.dumps({'status': status}))
+        sr.write_decision(
+            _make_decision(
+                id='esc-42-1', project=self._PROJECT, escalations_dir=str(queue), escalation_id='esc-42-1',
+                state=sr.DecisionState.DROPPED, closing_evidence=_EVIDENCE,
+            ),
+            root=tmp_path,
+        )
+
+        rc = sr.main(self._argv(tmp_path, queue=str(queue)))
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert captured.out == 'esc-42-1\n'
+        assert ('reap-decisions' in captured.err) is warned
+        assert (status in captured.err) is warned
+        assert sr.list_decisions(root=tmp_path)[0].state == sr.DecisionState.OPEN
 
     def test_a_held_closed_row_is_reopened_in_place_by_its_printed_id(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]

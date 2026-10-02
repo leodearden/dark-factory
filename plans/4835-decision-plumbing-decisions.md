@@ -122,6 +122,11 @@ qualified key is migrated by hand.
   `close_decision_with_evidence` never overwrites evidence. Without that, a
   re-opened gate could never be closed with evidence again. `filed_at` and
   `manual_boost` are kept (custody).
+- It does not refuse a row whose linked escalation is already resolved or
+  dismissed in its stamped queue, but it warns on stderr. The next
+  `reap-decisions` cycle closes such a row again, so re-opening cannot hold it.
+  The remedy is a new escalation filed under its own id. The main path, a
+  held-closed WARNING on a re-file of a still-pending park, is unaffected.
 - **Why reopen-only, not a generic `update-decision-state`.** A generic setter
   would allow closing without quoted evidence and moving between terminal
   states, bypassing task 5376's evidence discipline

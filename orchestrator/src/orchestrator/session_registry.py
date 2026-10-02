@@ -5245,7 +5245,9 @@ def _run_reopen_decision(
 
     Its caller is a human or agent adjudicating a held-closed row, who must
     see a refusal rather than read it as success. Prints the record's id on
-    success.
+    success, plus a stderr WARNING when the linked escalation is already
+    terminal in the stamped queue: the next reap-decisions cycle then closes
+    the row again, so the reopen alone cannot keep it open.
     """
     try:
         record = reopen_decision(
@@ -5261,7 +5263,31 @@ def _run_reopen_decision(
         print(f'reopen-decision: {decision_id} has no readable record to reopen (see the ERROR log)', file=sys.stderr)
         return 1
     print(record.id)
+    closing_status = _reapable_escalation_status(record)
+    if closing_status is not None:
+        print(
+            f'reopen-decision: WARNING {record.id} is open again, but its escalation '
+            f'{record.escalation_id} is already {closing_status!r} in {record.escalations_dir}, so the '
+            'next reap-decisions cycle closes it again. A gate that needs a human again needs a new '
+            'escalation, filed under its own --id.',
+            file=sys.stderr,
+        )
     return 0
+
+
+def _reapable_escalation_status(record: DecisionRecord) -> str | None:
+    """The terminal status the reaper would close *record* on, read from its stamped queue; else None.
+
+    The reaper's own join (_run_reap_decisions._status) for a record whose
+    queue is known. None when the record has no escalation id, is unstamped
+    or stamped UNKNOWN_QUEUE (no reaper can be named), or its escalation is
+    not in DECISION_CLOSE_MAP.
+    """
+    queue = normalize_escalations_dir(record.escalations_dir)
+    if not record.escalation_id or queue in ('', UNKNOWN_QUEUE):
+        return None
+    status = read_escalation_status(queue, record.escalation_id)
+    return status if status in DECISION_CLOSE_MAP else None
 
 
 def _run_migrate_decision_projects(dry_run: bool) -> None:
