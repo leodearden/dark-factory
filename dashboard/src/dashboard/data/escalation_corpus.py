@@ -208,6 +208,14 @@ def _corpus_cache_clear() -> None:
     _corpus_cache.clear()
 
 
+def measure_corpus(queues: Iterable[QueueRef], *, now: datetime) -> Datum[EscalationCorpus]:
+    """Walk *queues* as of *now*: fresh when complete, else a lower bound naming each gap."""
+    corpus = walk_corpus(queues)
+    disclosure = _partial_disclosure(corpus.scans)
+    state = DatumState.FRESH if disclosure is None else DatumState.LOWER_BOUND
+    return Datum(corpus, now, state, disclosure, CORPUS_FRESHNESS_BOUND_SECONDS)
+
+
 async def acquire_corpus(
     queues: Iterable[QueueRef], *, now: datetime,
 ) -> Datum[EscalationCorpus]:
@@ -215,10 +223,7 @@ async def acquire_corpus(
     key = tuple(queues)
 
     async def _refresh() -> Datum[EscalationCorpus]:
-        corpus = await asyncio.to_thread(walk_corpus, key)
-        disclosure = _partial_disclosure(corpus.scans)
-        state = DatumState.FRESH if disclosure is None else DatumState.LOWER_BOUND
-        return Datum(corpus, now, state, disclosure, CORPUS_FRESHNESS_BOUND_SECONDS)
+        return await asyncio.to_thread(measure_corpus, key, now=now)
 
     return await _corpus_cache.get_or_refresh(
         key, _refresh, cache_ok=lambda datum: datum.value is not None and datum.value.reached_any,

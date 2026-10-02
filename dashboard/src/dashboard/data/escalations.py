@@ -1,21 +1,21 @@
 """Backend data layer for the Escalations dashboard section.
 
-Provides four public functions:
+The Escalations tab reads the escalation corpus
+(:mod:`dashboard.data.escalation_corpus`); this module turns that walk into
+the tab's queues and names the task each row's card needs.
 
-- ``load_queue_escalations`` — root-only *.json reader for a single escalation
-  queue directory (no archive traversal), with an opt-in ``skipped``
-  accumulator so a caller can learn which files it dropped and why.
+- ``build_escalation_queues`` — one subsection per corpus queue: its live-queue
+  rows, the files it could not read, level/status summaries and the two named
+  views, plus the same rolled up across every queue.
 - ``resolve_owning_project`` — maps a reconciliation escalation back to its
-  owning project via worktree-prefix matching or task-map probe.
-- ``build_escalation_queues`` — enumerates per-project escalation dirs plus the
-  fused-memory reconciliation queue, returning a structured ``{subsections, summary}``
-  dict for the API layer to serve.
+  owning project via worktree-prefix matching or an active-row probe.
+- ``card_task_refs`` / ``card_datums`` — the task each row's card names, and
+  each row's card as a ``Datum`` once those have been looked up.
+- ``load_queue_escalations`` — the older root-only ``*.json`` reader of one
+  queue directory.  Its one consumer is ``dashboard.data.memory_evals``.
 - ``fetch_pins_recovery`` — the one ASYNC function here: fans
   ``get_pending_escalations`` out across every configured escalation MCP and
   returns each project's per-record ``pins_recovery`` annotation.
-
-The first three are pure filesystem readers; only ``fetch_pins_recovery``
-touches the network.
 """
 
 from __future__ import annotations
@@ -23,12 +23,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from dashboard.data.datum import Datum, unknown_datum
+from dashboard.data.escalation_corpus import (
+    EscalationCorpus,
+    Location,
+    QueueKind,
+    QueueRef,
+    views_over,
+)
 from dashboard.data.memory import mcp_tool_call
+from dashboard.data.task_lookup import FETCHED_ROW_FRESHNESS_BOUND_SECONDS, TaskRef
 
 logger = logging.getLogger(__name__)
 
@@ -66,15 +76,8 @@ def load_queue_escalations(
 
     An out-parameter is a deliberate divergence from the sibling readers in
     this subsystem (``_index_escalations``, ``_read_limits``), which return a
-    tuple when they have a second result to report.  Tuple-return was the first
-    choice and was rejected because this function is not private to one caller:
-    ``build_escalation_queues`` calls it twice and wants none of this, and
-    widening the return type would have forced an unpacking edit at every site
-    to serve one.  A sibling ``load_queue_escalations_reporting`` wrapper would
-    keep the idiom uniform, but it buys that uniformity with a second public
-    name for one function and one opted-in caller — worse than one documented
-    exception.  Revisit if a second consumer ever needs the skips: at two, the
-    tuple-returning sibling starts paying for itself.
+    tuple when they have a second result to report.  It predates the corpus
+    walk, when this reader had a second caller that wanted none of this.
 
     Args:
         esc_dir: Path to the escalation queue root directory.
@@ -85,9 +88,8 @@ def load_queue_escalations(
             ``path`` stays a ``Path`` (the caller may want ``.name`` or a retry
             read); stringify at the payload boundary, not here.  The default
             ``None`` leaves behaviour verbatim as it was before this parameter
-            existed, which is what every non-opted-in caller relies on.  The
-            ``WARNING`` log is emitted either way, so it remains the signal for
-            callers that do not opt in (``build_escalation_queues`` today).
+            existed.  The ``WARNING`` log is emitted either way, so it remains
+            the signal for a caller that does not opt in.
 
     Returns:
         List of escalation dicts (fields passed through unchanged).  Unaffected
@@ -173,34 +175,6 @@ _LEVEL_KEYS = (0, 1, 2)
 _STATUS_KEYS = ('pending', 'resolved', 'dismissed')
 
 
-def _load_queue_with_skips(esc_dir: Path) -> tuple[list[dict], list[dict[str, str]]]:
-    """Read one escalation queue dir, returning ``(escalations, skipped)``.
-
-    A FRESH accumulator per call is load-bearing: :func:`load_queue_escalations`
-    **appends** to the list it is handed, so one list shared across
-    :func:`build_escalation_queues`' two call sites would attribute every
-    queue's skips to every subsection — a single corrupt file in one
-    orchestrator's queue would then render as N badges across N unrelated
-    projects, a worse lie than silence.  Owning the allocation here makes that
-    failure mode unwritable by construction instead of comment-enforced at each
-    call site.
-
-    ``path`` is stringified here because this is the boundary between the reader
-    — which deliberately keeps a ``Path`` so callers can take ``.name`` or retry
-    the read — and the payload :func:`build_escalation_queues` hands the API
-    layer, where a ``Path`` reaching ``JSONResponse`` would 500 the endpoint.
-
-    Args:
-        esc_dir: Path to the escalation queue root directory.
-
-    Returns:
-        ``(escalations, [{"path": str, "error": str}, ...])``.
-    """
-    skips: list[dict[str, Any]] = []
-    escs = load_queue_escalations(esc_dir, skipped=skips)
-    return escs, [{'path': str(s['path']), 'error': s['error']} for s in skips]
-
-
 def _bucket(escalations: list[dict], *, skipped_count: int) -> dict:
     """Compute per-subsection summary counts from a list of escalation dicts.
 
@@ -211,7 +185,7 @@ def _bucket(escalations: list[dict], *, skipped_count: int) -> dict:
 
     Args:
         escalations: The escalations this subsection actually loaded.
-        skipped_count: How many ``*.json`` files in this queue could **not** be
+        skipped_count: How many files in this queue could **not** be
             read, and therefore how short the ``by_level``/``by_status`` counts
             beside it may be.  Passed through verbatim so the annotation lives
             in the same dict as the counts it qualifies, read by the same
@@ -244,7 +218,7 @@ def _merge_summaries(summaries: list[dict]) -> dict:
     ``skipped_count`` aggregates here alongside the level/status counts, so the
     top-level rollup comes free from the one call this function already has —
     there is no second aggregation path to keep in sync (INV-5).  It reports how
-    many ``*.json`` files across **all** queues could not be read, and therefore
+    many files across **all** queues could not be read, and therefore
     how short the merged ``by_level``/``by_status`` counts beside it may be.
 
     ``skipped_count`` is indexed, not ``.get(..., 0)``-ed, to match the adjacent
@@ -266,86 +240,152 @@ def _merge_summaries(summaries: list[dict]) -> dict:
     return {'by_level': by_level, 'by_status': by_status, 'skipped_count': skipped_count}
 
 
-def build_escalation_queues(config) -> dict:
-    """Enumerate escalation queues across all project roots and reconciliation.
+def _reconciliation_owners(
+    orchestrators: Sequence[QueueRef],
+    active_rows: Mapping[str, Sequence[dict]],
+) -> Callable[[dict], QueueRef | None]:
+    """Resolve a reconciliation row to the orchestrator queue that owns its task, or None.
 
-    Produces one ``orchestrator`` subsection per project root (primary first,
-    then :attr:`~dashboard.config.DashboardConfig.known_project_roots`, de-duped)
-    plus a single ``reconciliation`` subsection from
-    :attr:`~dashboard.config.DashboardConfig.reconciliation_escalations_dir`.
+    The probe population is each root's ACTIVE rows, never its whole tree
+    (PRD decision 12): a task active in no root has no owner.
+    """
+    roots = [
+        (Path(queue.id).resolve(strict=False), list(active_rows.get(queue.id, ())))
+        for queue in orchestrators
+    ]
+    by_name: dict[str, QueueRef] = {}
+    for (root, _rows), queue in zip(roots, orchestrators, strict=True):
+        by_name.setdefault(root.name, queue)
 
-    Each subsection has the shape::
+    def owner(esc: dict) -> QueueRef | None:
+        name = resolve_owning_project(esc, roots)
+        return None if name is None else by_name[name]
+
+    return owner
+
+
+def build_escalation_queues(
+    corpus_datum: Datum[EscalationCorpus],
+    *,
+    active_rows: Mapping[str, Sequence[dict]],
+) -> dict:
+    """The Escalations tab's queues, one subsection per corpus queue in corpus order.
+
+    Each subsection::
 
         {
-            "id":         str,        # str(root) for orchestrators; "reconciliation"
-            "label":      str,        # root.name for orchestrators; "fused-memory"
-            "kind":       str,        # "orchestrator" | "reconciliation"
-            "escalations": list[dict],
-            "skipped":    [{"path": str, "error": str}, ...],
-            "summary":    {"by_level": {0,1,2}, "by_status": {pending,resolved,dismissed},
-                           "skipped_count": int},
+            "id", "label", "kind",
+            "escalations": [row, ...],   # the live queue: ROOT-location records only
+            "skipped":     [{"path": str, "error": str, "location": "root"|"archive"}],
+            "summary":     {"by_level", "by_status", "skipped_count"},
+            "views":       {EscalationView: Datum[int]},
         }
 
-    ``summary.skipped_count`` is ``len(skipped)`` — how many ``*.json`` files in
-    this queue could not be read, and therefore how short the ``by_level`` /
-    ``by_status`` counts beside it may be.  It is always present (an absent key
-    would read as "unknown" and force every consumer into a ``.get(..., 0)``
-    guess).
+    A row is the escalation's own fields plus ``project`` (the owning root's
+    label) and ``project_root`` (its id), both ``None`` when no owner is
+    found. An orchestrator queue owns its rows; a reconciliation row is
+    resolved by :func:`resolve_owning_project` against *active_rows*, keyed by
+    orchestrator queue id.
 
-    ``skipped`` names the ``*.json`` files in this subsection's queue directory
-    that :func:`load_queue_escalations` could not read or parse — one record per
-    file, ``path`` stringified by :func:`_load_queue_with_skips` because this
-    function's return value is the payload the API layer serves (the reader
-    deliberately leaves ``path`` a ``Path`` and defers the coercion to its
-    caller; a ``Path`` reaching ``JSONResponse`` would 500 the endpoint).  It exists because a queue that
-    reports fewer escalations than it holds must say so in the payload, not only
-    in a WARNING line a human tailing stderr may never see (INV-2,
-    ``structured-facts-at-failure``).
-
-    The top-level return value also carries an aggregated ``summary`` block.
-
-    Args:
-        config: :class:`~dashboard.config.DashboardConfig` instance.
-
-    Returns:
-        ``{"subsections": [...], "summary": {...}}``
+    The archive is not listed: it feeds the views, not the table.
     """
+    corpus = corpus_datum.value
+    scans = corpus.scans if corpus is not None else ()
+    orchestrators = [scan.queue for scan in scans if scan.queue.kind is QueueKind.ORCHESTRATOR]
+    reconciliation_owner = _reconciliation_owners(orchestrators, active_rows)
+
     subsections: list[dict] = []
-
-    # De-duped root iteration: primary root first, then known_project_roots.
-    seen: set[Path] = {config.project_root}
-    roots_to_visit: list[Path] = [config.project_root]
-    for root in config.known_project_roots:
-        if root not in seen:
-            seen.add(root)
-            roots_to_visit.append(root)
-
-    # `_load_queue_with_skips` owns the per-call accumulator so no call site can
-    # share one list across queues and cross-attribute another queue's skips.
-    for root in roots_to_visit:
-        escs, skipped = _load_queue_with_skips(root / 'data' / 'escalations')
+    for scan in scans:
+        rows: list[dict] = []
+        for record in scan.records:
+            if record.location is not Location.ROOT:
+                continue
+            esc = record.escalation.to_dict()
+            owner = (
+                scan.queue if scan.queue.kind is QueueKind.ORCHESTRATOR
+                else reconciliation_owner(esc)
+            )
+            rows.append({
+                **esc,
+                'project': None if owner is None else owner.label,
+                'project_root': None if owner is None else owner.id,
+            })
+        skipped = [
+            {'path': u.path, 'error': u.error, 'location': u.location.value}
+            for u in scan.unreadable
+        ]
         subsections.append({
-            'id': str(root),
-            'label': root.name,
-            'kind': 'orchestrator',
-            'escalations': escs,
+            'id': scan.queue.id,
+            'label': scan.queue.label,
+            'kind': scan.queue.kind.value,
+            'escalations': rows,
             'skipped': skipped,
-            'summary': _bucket(escs, skipped_count=len(skipped)),
+            'summary': _bucket(rows, skipped_count=len(skipped)),
+            'views': views_over(corpus_datum, [scan.queue.id]),
         })
 
-    # Reconciliation subsection (fused-memory queue)
-    recon_escs, recon_skipped = _load_queue_with_skips(config.reconciliation_escalations_dir)
-    subsections.append({
-        'id': 'reconciliation',
-        'label': 'fused-memory',
-        'kind': 'reconciliation',
-        'escalations': recon_escs,
-        'skipped': recon_skipped,
-        'summary': _bucket(recon_escs, skipped_count=len(recon_skipped)),
-    })
+    return {
+        'subsections': subsections,
+        'summary': _merge_summaries([s['summary'] for s in subsections]),
+        'views': views_over(corpus_datum, [scan.queue.id for scan in scans]),
+    }
 
-    top_summary = _merge_summaries([s['summary'] for s in subsections])
-    return {'subsections': subsections, 'summary': top_summary}
+
+# ---------------------------------------------------------------------------
+# Task cards
+# ---------------------------------------------------------------------------
+
+_NO_OWNER_REASON = (
+    'no owning project (no worktree under a configured root and the task is '
+    'active in none)'
+)
+
+
+def _card_ref(row: Mapping[str, Any]) -> TaskRef | str:
+    """The task a row's card names, or the reason it names none."""
+    task_id = row.get('task_id')
+    if task_id is None or str(task_id) == '':
+        return 'no task id'
+    if not str(task_id).isdecimal():
+        return f'task id is not a number: {task_id!r}'
+    if row.get('project_root') is None:
+        return _NO_OWNER_REASON
+    return TaskRef(row['project_root'], int(task_id))
+
+
+def _rows(queues: Mapping[str, Any]) -> Iterable[tuple[str, Mapping[str, Any]]]:
+    for sub in queues['subsections']:
+        for row in sub['escalations']:
+            yield sub['id'], row
+
+
+def card_task_refs(queues: Mapping[str, Any]) -> set[TaskRef]:
+    """Every task a row of *queues* names that a lookup can answer."""
+    return {ref for _sub_id, row in _rows(queues) if isinstance(ref := _card_ref(row), TaskRef)}
+
+
+def card_datums(
+    queues: Mapping[str, Any],
+    lookup: Mapping[TaskRef, Datum[dict]],
+) -> dict[tuple[str, Any], Datum[dict]]:
+    """Each row's task card, keyed by ``(queue id, escalation id)``.
+
+    The lookup's answer when it has one; otherwise an ``unknown`` Datum whose
+    reason says why this row has no card.
+    """
+    cards: dict[tuple[str, Any], Datum[dict]] = {}
+    for sub_id, row in _rows(queues):
+        ref = _card_ref(row)
+        if isinstance(ref, str):
+            card = unknown_datum(ref, FETCHED_ROW_FRESHNESS_BOUND_SECONDS)
+        elif (found := lookup.get(ref)) is not None:
+            card = found
+        else:
+            card = unknown_datum(
+                f'task {ref.task_id} was not looked up', FETCHED_ROW_FRESHNESS_BOUND_SECONDS,
+            )
+        cards[(sub_id, row['id'])] = card
+    return cards
 
 
 # ---------------------------------------------------------------------------
