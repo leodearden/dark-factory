@@ -543,16 +543,6 @@ def marked_span(
     is only the four-assertion marker mechanic. *task* is the filing this guard
     belongs to, carried into every message so a human meets the rationale rather
     than a bare mismatch.
-
-    NOT YET THE SOLE HOME. ``test_contributing_lint_command_drift.py``'s
-    ``_documented_lint_command`` is still a private copy of these four
-    assertions: that file was outside task 4108's lock set, so migrating it would
-    have widened that task's concurrency footprint. The swap is mechanical —
-    pass its ``_MARKED_LINT_COMMAND`` pattern, its two marker literals and task
-    3558 — and until it happens, a change to the assertion mechanics here must be
-    mirrored there by hand. Filed as follow-up; recorded here rather than left
-    implicit because an un-migrated copy that nobody has written down is exactly
-    how the five copies this module replaced came to drift.
     """
     begin_count = text.count(begin)
     assert begin_count == 1, (

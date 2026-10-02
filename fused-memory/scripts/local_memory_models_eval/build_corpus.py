@@ -192,12 +192,21 @@ and ``replay_from_mem0:<category>`` on the Mem0 replay path. Anything else is a
 caller-supplied ``add_episode`` description.
 """
 
-_TEMPORAL_PREFIX_RE = re.compile(r'^\[temporal:[^\]]*\]\s*')
-"""``graphiti_client`` prepends ``[temporal:<ctx>] `` when temporal_context is set.
+_WRITER_ANNOTATIONS_RE = re.compile(r'^(?:\[(?:temporal:[^\]]*|unverified_claim)\]\s*)+')
+"""The leading annotations the episode writer adds in front of the description.
 
-Verified absent from dark_factory today — all rows are bare ``add_memory:*`` —
-but stripping it here keeps a future episode from landing in its own bogus
-payload-kind stratum.
+``fused-memory/src/fused_memory/backends/graphiti_client.py::GraphitiBackend.add_episode``
+prepends ``[unverified_claim] `` outermost (task 3142) and then
+``[temporal:<ctx>] ``. Both are write-time annotations, not part of the
+writer's category, so stripping them keeps a tagged write in its category's
+stratum instead of landing in its own bogus payload-kind stratum.
+
+The set is deliberately closed: an unrecognised bracket tag stays part of a
+caller string and buckets as :data:`ADD_EPISODE_KIND`. The live smoke's
+payload-axis equality is what catches a new writer annotation; a respelling of
+either existing one is caught offline by
+``fused-memory/tests/test_local_memory_models_eval_corpus.py::TestPayloadKind::test_classifies_what_the_episode_writer_persists``,
+which classifies the description the real writer persists.
 """
 
 STRATIFICATION_DIMENSIONS: tuple[str, ...] = (
@@ -342,8 +351,9 @@ def payload_kind(source_description: object) -> str:
     measured read-only, ``e.source`` is uniformly ``'text'`` across all 2770
     dark_factory episodes and discriminates nothing.
 
-    Recognized shapes, in order: an optional ``[temporal:<ctx>] `` prefix is
-    stripped first, then ``add_memory:<category>`` and
+    Recognized shapes, in order: optional writer annotations
+    (``[unverified_claim]`` / ``[temporal:<ctx>]``) are stripped first, then
+    ``add_memory:<category>`` and
     ``replay_from_mem0:<category>`` yield ``<category>``, and any other
     non-empty description is a caller-supplied ``add_episode`` string and
     yields :data:`ADD_EPISODE_KIND`.
@@ -356,10 +366,10 @@ def payload_kind(source_description: object) -> str:
         raise CorpusBuildError(
             f'source_description must be a non-empty string, got {source_description!r}'
         )
-    text = _TEMPORAL_PREFIX_RE.sub('', source_description.strip()).strip()
+    text = _WRITER_ANNOTATIONS_RE.sub('', source_description.strip()).strip()
     if not text:
         raise CorpusBuildError(
-            f'source_description carries only a temporal prefix: {source_description!r}'
+            f'source_description carries only writer annotations: {source_description!r}'
         )
     for prefix in _CATEGORY_PREFIXES:
         if text.startswith(prefix):
