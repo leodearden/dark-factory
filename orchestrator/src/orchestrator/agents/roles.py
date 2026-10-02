@@ -1258,8 +1258,10 @@ GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_
 # APPEND-ONLY AT THE TAIL. Each block through GREP_LOOKAROUND_GUIDANCE has its
 # own test module pin it to start exactly where its predecessor ends; blocks
 # appended after it pin only ORDER (after GREP_LOOKAROUND_GUIDANCE), so
-# concurrent appends do not break each other. BACKGROUND_WAIT_GUIDANCE's
-# heading must stay the prompt's first `##`.
+# concurrent appends do not break each other. That order pin is the one shared
+# orchestrator/tests/_role_splice_contract.py::SpliceContract.assert_lands_after;
+# do not add a local copy. BACKGROUND_WAIT_GUIDANCE's heading must stay the
+# prompt's first `##`.
 # _GREP_ENGINE_LIMITS's prose also points at ERROR_REMEDY_HINT_GUIDANCE as "the
 # section just above". Inserting anywhere but the end breaks a pin, or
 # silently redirects that pointer.
