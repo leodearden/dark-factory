@@ -438,6 +438,41 @@ class SessionBudgetExhausted(Exception):
         super().__init__(f'Session budget exhausted: ${cumulative_cost:.2f} spent')
 
 
+class PoolFrozen(Exception):
+    """No account is admissible and the caller asked not to park (task 6042).
+
+    Raised by :meth:`UsageGate.before_invoke` with ``park=False`` at the point
+    where the default would wait: every account capped and/or AUTH_FAILED, or
+    (for a scoped call) the scope exhausted on every account. A nightly
+    oneshot uses it to defer instead of hanging until a reset.
+
+    Deliberately NOT an ``AllAccountsCappedException``: a pool that is frozen
+    because every account's credentials were rejected will not clear at any
+    reset, and a caller must be able to tell the two apart. The structured
+    fields say which accounts are in which state, read at the moment of the
+    raise; *scope* is the exhausted model scope, or ``None`` for the fleet.
+    """
+
+    def __init__(
+        self,
+        *,
+        account_count: int,
+        capped_account_names: tuple[str, ...],
+        auth_failed_account_names: tuple[str, ...],
+        scope: str | None = None,
+    ):
+        self.account_count = account_count
+        self.capped_account_names = capped_account_names
+        self.auth_failed_account_names = auth_failed_account_names
+        self.scope = scope
+        where = f'model scope {scope!r} is exhausted on' if scope else 'no account admissible among'
+        super().__init__(
+            f'Usage pool frozen: {where} all {account_count} account(s) — '
+            f'capped: {", ".join(capped_account_names) or "none"}; '
+            f'auth-failed: {", ".join(auth_failed_account_names) or "none"}'
+        )
+
+
 class InvokeSlot:
     """Probe-slot guard for one iteration of a cap-retry loop.
 
@@ -1158,7 +1193,9 @@ class UsageGate:
             )
         return None
 
-    async def before_invoke(self, scope: str | None = None) -> AccountLease | None:
+    async def before_invoke(
+        self, scope: str | None = None, *, park: bool = True,
+    ) -> AccountLease | None:
         """Block until at least one account is available. Return its lease.
 
         Returns an :class:`AccountLease` snapshotting the selected account's
@@ -1174,6 +1211,12 @@ class UsageGate:
         ``scope=None`` (the general scope) is byte-identical to today (S1) —
         the scope predicate and the scope-wait fall-through are both guarded on
         ``scope is not None``.
+
+        *park* (task 6042): ``False`` raises :class:`PoolFrozen` at the point
+        where the default would wait — after the reset sweeps freed nothing,
+        and before EITHER park (the per-scope waiter or the ``_open`` freeze).
+        For a caller that must defer rather than wait out a reset; the
+        default ``True`` is unchanged.
         """
         # Session budget check
         if (
@@ -1212,6 +1255,8 @@ class UsageGate:
                 if self._refresh_scope_capped(scope):
                     continue
                 if not self.is_paused:
+                    if not park:
+                        raise self._pool_frozen(scope)
                     # Fleet is NOT frozen — at least one account is generally
                     # serviceable, only this scope is exhausted. Park on the
                     # per-scope waiter toward the soonest scope reset (or the
@@ -1269,9 +1314,20 @@ class UsageGate:
             # the for-loop above just confirmed every account is non-AVAILABLE
             # and non-PROBING, so clearing here is always correct regardless of
             # how _open drifted.
+            if not park:
+                raise self._pool_frozen(None)
             logger.info('All accounts capped — waiting for any to reopen')
             self._open.clear()
             await self._wait_for_any_account_to_reopen()
+
+    def _pool_frozen(self, scope: str | None) -> PoolFrozen:
+        """The :class:`PoolFrozen` describing this gate right now."""
+        return PoolFrozen(
+            account_count=self.account_count,
+            capped_account_names=tuple(a.name for a in self._accounts if a.capped),
+            auth_failed_account_names=self.auth_failed_account_names,
+            scope=scope,
+        )
 
     async def _wait_for_any_account_to_reopen(self) -> None:
         """Block until ``_open`` is set, announcing the park as it waits.
@@ -1427,8 +1483,12 @@ class UsageGate:
             self._park_waiters -= 1
 
     @contextlib.asynccontextmanager
-    async def invoke_slot(self, scope: str | None = None):
+    async def invoke_slot(self, scope: str | None = None, *, park: bool = True):
         """Acquire an account slot, releasing the probe lock on any exit path.
+
+        *park* is forwarded to :meth:`before_invoke`: ``False`` raises
+        :class:`PoolFrozen` out of the ``async with`` instead of waiting, before
+        any account is claimed.
 
         Yields an :class:`InvokeSlot` whose ``token`` and ``account_name``
         are ready to use.  On exit, if neither :meth:`~InvokeSlot.detect_cap_hit`
@@ -1453,7 +1513,7 @@ class UsageGate:
                     break          # probe settled by confirm
                 # any other exit path (continue, exception): auto-released
         """
-        lease = await self.before_invoke(scope=scope)
+        lease = await self.before_invoke(scope=scope, park=park)
         slot = InvokeSlot(self, lease, scope=scope)
         try:
             yield slot

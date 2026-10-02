@@ -190,10 +190,14 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # ends in an unbounded `await self._open.wait()` (usage_gate.py) released only
 # by a real cap reset or a successful resume probe.  So a caller whose pool is
 # ALREADY frozen when it starts can still block for hours despite a 120 s or
-# 1800 s policy here.  Every caller in this table inherits that gap; none of
-# them currently compensates for it.  Closing it belongs HERE, inside the
-# wrapper, where a wait in before_invoke is definitionally a cap wait and can
-# be attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
+# 1800 s policy here.  Every caller in this table inherits that gap by
+# default.  It is now closable PER CALLER, inside the wrapper as it had to be
+# (task 6042): park_on_frozen_pool=False makes before_invoke raise
+# usage_gate.PoolFrozen where it would have parked, so a caller that must
+# defer rather than wait never blocks on a frozen pool.  The default stays
+# True, so every caller above still parks.  The fix belongs in the wrapper
+# because a wait in before_invoke is definitionally a cap wait and can be
+# attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
 # pool from a slow agent and would misattribute the latter.
 #
 # AUDITED NON-CALLERS (task 4736).  A caller that deliberately does NOT route
@@ -2088,6 +2092,7 @@ async def invoke_with_cap_retry(
     resume_delivers_prompt: bool = False,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
+    park_on_frozen_pool: bool = True,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2133,6 +2138,15 @@ async def invoke_with_cap_retry(
     the time-based bound) before the next cooldown sleep.  Defaults to
     ``None``, which preserves the existing patient, count-unbounded wait —
     only *cap_wait_sanity_secs* bounds the retry loop.
+
+    *park_on_frozen_pool* bounds the wait neither of the two above can see:
+    the gate's own park when NO account is admissible (every one capped or
+    AUTH_FAILED, or a scoped model exhausted everywhere).  ``True`` (the
+    default) parks until an account reopens, unchanged.  ``False`` lets
+    ``usage_gate.PoolFrozen`` propagate unconverted, for a caller that must
+    defer rather than wait (task 6042).  It is not converted to
+    ``AllAccountsCappedException`` because a pool frozen on rejected
+    credentials is not a cap and will not clear at a reset.
 
     *rebuild_prompt*, when provided, is awaited as ``rebuild_prompt(True)``
     on a cap retry whose session cannot be resumed (no ``session_id`` on the
@@ -2406,7 +2420,7 @@ async def invoke_with_cap_retry(
         _cfg = getattr(usage_gate, '_config', None)
         scope = scope_for(model, _cfg) if (backend == 'claude' and _cfg is not None) else None
         while True:
-            async with usage_gate.invoke_slot(scope=scope) as slot:
+            async with usage_gate.invoke_slot(scope=scope, park=park_on_frozen_pool) as slot:
                 # slot.account_name is derived from slot.lease — the SAME
                 # account slot.token came from (task W4-δ, PRD §7.4). This
                 # is what makes the attribution below (and the save_invocation
