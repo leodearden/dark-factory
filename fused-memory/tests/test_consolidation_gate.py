@@ -349,6 +349,88 @@ class TestClosureSupersedes:
         assert _closure(members).closed is True
 
 
+class TestClosureRoutesProbeConfirmedClaims:
+    """A claimed-absorbed id the existence probe found LIVE is a false closure
+    claim, so it is ``absorbed_member_still_live`` — not an unstamped stray.
+
+    The probe hands such ids in through *unstamped_live_ids* because the topic
+    scroll cannot see them; the sole canonical's claim decides which of them
+    are a contradicted absorption rather than an unstamped member.
+    """
+
+    _CLAIMED = _uuid(42)
+
+    def _claiming(self, claim):
+        return [_member(_uuid(1), canonical=True, supersedes=claim), _member(_uuid(2))]
+
+    def _named(self, verdict, code):
+        return [r for r in verdict.reasons if r['code'] == code]
+
+    def test_a_probe_confirmed_claimed_id_is_absorbed_member_still_live(self):
+        x = self._CLAIMED
+        verdict = _closure(self._claiming([x]), unstamped_live_ids=[x])
+        assert verdict.closed is False
+        assert _codes(verdict) == ['absorbed_member_still_live']
+        assert self._named(verdict, 'absorbed_member_still_live')[0]['ids'] == [x]
+        assert 'unstamped_cluster_member' not in _codes(verdict)
+
+    def test_scroll_and_probe_hits_share_one_reason(self):
+        a, b = _uuid(3), _uuid(4)
+        members = [_member(_uuid(1), canonical=True, supersedes=[a, b]), _member(a)]
+        verdict = _closure(members, unstamped_live_ids=[b])
+        named = self._named(verdict, 'absorbed_member_still_live')
+        assert len(named) == 1
+        assert named[0]['ids'] == [a, b]
+        assert 'unstamped_cluster_member' not in _codes(verdict)
+
+    def test_a_probe_confirmed_claim_survives_truncation(self):
+        """Presence-based: the store proved the id exists, so a partial scroll
+        cannot make the contradiction unprovable."""
+        x = self._CLAIMED
+        codes = _codes(
+            _closure(
+                self._claiming([x]),
+                unstamped_live_ids=[x],
+                scroll_truncated=True,
+                scroll_total=2,
+            )
+        )
+        assert 'scroll_incomplete' in codes
+        assert 'absorbed_member_still_live' in codes
+
+    def test_routing_is_case_insensitive(self):
+        mixed = 'abcdef00-0000-4000-8000-00000000004a'
+        assert mixed.upper() != mixed
+        verdict = _closure(
+            self._claiming([mixed.upper()]), unstamped_live_ids=[mixed]
+        )
+        named = self._named(verdict, 'absorbed_member_still_live')
+        assert named and named[0]['ids'] == [mixed.upper()]
+        assert 'unstamped_cluster_member' not in _codes(verdict)
+
+    def test_without_a_sole_canonical_a_probed_id_stays_unstamped(self):
+        x = self._CLAIMED
+        members = [
+            _member(_uuid(1), canonical=True, supersedes=[x]),
+            _member(_uuid(2), canonical=True),
+        ]
+        codes = _codes(_closure(members, unstamped_live_ids=[x]))
+        assert 'multiple_canonicals' in codes
+        assert 'unstamped_cluster_member' in codes
+        assert 'absorbed_member_still_live' not in codes
+
+    def test_a_waiver_reaches_a_probe_confirmed_claim(self):
+        x = self._CLAIMED
+        verdict = _closure(
+            self._claiming([x]),
+            gate_block={'topic': _TOPIC, 'considered_and_kept': [_waiver(x)]},
+            unstamped_live_ids=[x],
+        )
+        assert verdict.closed is True
+        assert [w['id'] for w in verdict.waived] == [x]
+        assert 'stale_waiver' not in _codes(verdict)
+
+
 def _waiver(mid, note='curator judged this entry a legitimate separate claim'):
     return {
         'id': mid,
@@ -720,13 +802,13 @@ def _prov(observed):
 
 
 class TestUnstampedCandidates:
-    """The PURE half of the bridge: which observed ids must be PROBED.
+    """The PURE half of the bridge: which ids must be PROBED.
 
-    `unstamped_candidates` is `observed_members` MINUS the live topic scroll
-    MINUS the canonical\'s `supersedes` claim.  It answers "which ids are
-    ambiguous", not "which ids are unstamped" — an id absent from the scroll
-    is either absorbed-and-deleted or live-but-unstamped, and only a probe
-    can tell those apart.
+    `unstamped_candidates` is (the sole canonical\'s `supersedes` claim ∪
+    `observed_members`) MINUS the live topic scroll.  It answers "which ids
+    are ambiguous", not "which ids are unstamped" — an id absent from the
+    scroll is either absorbed-and-deleted or still live, and only a probe can
+    tell those apart.
     """
 
     def test_a_stamped_observed_member_is_not_a_candidate(self):
@@ -747,59 +829,86 @@ class TestUnstampedCandidates:
             _prov([_uuid(1), stray]), members=_well_formed_cluster(2)
         ) == (stray,)
 
-    def test_the_canonicals_supersedes_claim_suppresses_a_candidate(self):
-        """The DELETE arm.  Subtracting the cluster\'s own absorption claim is
-        what keeps a correctly executed delete-arm consolidation closeable."""
-        absorbed = _uuid(42)
-        members = [
-            _member(_uuid(1), canonical=True, supersedes=[absorbed]),
-            _member(_uuid(2)),
-        ]
-        assert (
-            consolidation_gate.unstamped_candidates(
-                _prov([_uuid(1), absorbed]), members=members
-            )
-            == ()
-        )
+    @staticmethod
+    def _claiming(claim):
+        return [_member(_uuid(1), canonical=True, supersedes=claim), _member(_uuid(2))]
 
-    def test_the_legacy_bare_scalar_supersedes_spelling_also_suppresses(self):
+    def test_the_canonicals_claim_is_probed_not_subtracted(self):
+        """A still-live claimed id is a false closure claim, so the claim must
+        be checked; a correctly executed delete arm probes ABSENT and closes."""
+        absorbed = _uuid(42)
+        assert consolidation_gate.unstamped_candidates(
+            _prov([_uuid(1), absorbed]), members=self._claiming([absorbed])
+        ) == (absorbed,)
+
+    @pytest.mark.parametrize('gate_block', [{'topic': _TOPIC}, None])
+    def test_a_claim_is_a_candidate_even_without_provenance(self, gate_block):
+        """The claim is itself a closure assertion; checking it only when the
+        detector also observed the id would leave every provenance-less gate
+        blind."""
+        absorbed = _uuid(42)
+        assert consolidation_gate.unstamped_candidates(
+            gate_block, members=self._claiming([absorbed])
+        ) == (absorbed,)
+
+    def test_the_legacy_bare_scalar_supersedes_is_one_candidate(self):
         """81 live records predate 3196\'s list migration; `normalize_supersedes`
-        accepts both spellings and this derivation must not disagree with it."""
+        reads the scalar as ONE member, never 36 characters."""
         absorbed = _uuid(42)
-        members = [
-            _member(_uuid(1), canonical=True, supersedes=absorbed),
-            _member(_uuid(2)),
-        ]
-        assert (
-            consolidation_gate.unstamped_candidates(
-                _prov([absorbed]), members=members
-            )
-            == ()
-        )
+        assert consolidation_gate.unstamped_candidates(
+            _prov([]), members=self._claiming(absorbed)
+        ) == (absorbed,)
 
-    def test_a_non_canonical_peers_supersedes_does_not_suppress(self):
+    def test_a_non_canonical_peers_supersedes_is_not_a_claim(self):
         """Only the CANONICAL\'s claim is the cluster\'s claim — the same rule
-        `consolidation_gate.py::_classify_supersedes` already states."""
-        stray = _uuid(42)
+        `evaluate_closure` applies."""
         members = [
             _member(_uuid(1), canonical=True),
-            _member(_uuid(2), supersedes=[stray]),
+            _member(_uuid(2), supersedes=[_uuid(43)]),
         ]
         assert consolidation_gate.unstamped_candidates(
-            _prov([stray]), members=members
-        ) == (stray,)
+            _prov([]), members=members
+        ) == ()
 
     def test_supersedes_is_only_read_when_exactly_one_canonical_exists(self):
         """With two canonicals there is no single cluster claim to trust; the
         gate is refusing on `multiple_canonicals` anyway."""
-        absorbed = _uuid(42)
         members = [
-            _member(_uuid(1), canonical=True, supersedes=[absorbed]),
+            _member(_uuid(1), canonical=True, supersedes=[_uuid(43)]),
             _member(_uuid(2), canonical=True),
         ]
         assert consolidation_gate.unstamped_candidates(
-            _prov([absorbed]), members=members
-        ) == (absorbed,)
+            _prov([]), members=members
+        ) == ()
+
+    def test_a_claimed_id_already_in_the_scroll_is_not_a_candidate(self):
+        """The scroll already proves it live; `evaluate_closure` names it from
+        there, so a point read would add nothing."""
+        assert consolidation_gate.unstamped_candidates(
+            _prov([]), members=self._claiming([_uuid(2)])
+        ) == ()
+
+    def test_a_malformed_claim_member_is_not_a_candidate(self):
+        """It cannot be probed; the predicate names it as
+        `malformed_supersedes_member` instead."""
+        assert consolidation_gate.unstamped_candidates(
+            _prov([]), members=self._claiming(['deadbeef', 12345, None])
+        ) == ()
+
+    def test_a_claim_and_an_observation_of_one_id_dedupe_case_insensitively(self):
+        mixed = 'abcdef00-0000-4000-8000-00000000004a'
+        assert mixed.upper() != mixed
+        assert consolidation_gate.unstamped_candidates(
+            _prov([mixed]), members=self._claiming([mixed.upper()])
+        ) == (mixed.upper(),)
+
+    def test_claims_are_ordered_before_observations(self):
+        """The shared probe cap must never drop the closure claim in favour of
+        inert provenance."""
+        claimed, observed = _uuid(42), _uuid(43)
+        assert consolidation_gate.unstamped_candidates(
+            _prov([observed]), members=self._claiming([claimed])
+        ) == (claimed, observed)
 
     def test_a_non_uuid_observed_id_is_dropped(self):
         """It cannot be probed, so it can never be substantiated."""
@@ -818,16 +927,6 @@ class TestUnstampedCandidates:
         assert (
             consolidation_gate.unstamped_candidates(
                 _prov([_uuid(1)]), members=members
-            )
-            == ()
-        )
-
-    def test_supersedes_matching_is_case_insensitive(self):
-        absorbed = _uuid(42)
-        members = [_member(_uuid(1), canonical=True, supersedes=[absorbed.upper()])]
-        assert (
-            consolidation_gate.unstamped_candidates(
-                _prov([absorbed]), members=members
             )
             == ()
         )
@@ -907,9 +1006,9 @@ class TestResolveUnstampedLiveIds:
     """The PROBE half of the bridge: which candidates are genuinely live.
 
     A candidate absent from the scroll is either absorbed-and-deleted or
-    live-but-unstamped.  One point read per candidate settles it — and the
-    candidate list is empty on every well-formed gate, so the common path
-    issues no reads at all.
+    still live.  One point read per candidate settles it — and a retain-arm
+    gate whose observed members are all stamped has no candidates, so the
+    common path issues no reads at all.
     """
 
     @pytest.mark.asyncio
@@ -957,26 +1056,53 @@ class TestResolveUnstampedLiveIds:
         )
         assert probe.calls == [(a, 'dark_factory'), (b, 'dark_factory')]
 
-    @pytest.mark.asyncio
-    async def test_suppressed_ids_are_never_probed(self):
-        """The cheap subtraction runs FIRST: stamped, claimed and non-uuid ids
-        cost nothing."""
-        stamped, absorbed = _uuid(1), _uuid(42)
-        members = [
-            _member(stamped, canonical=True, supersedes=[absorbed]),
+    @staticmethod
+    def _claiming(absorbed):
+        return [
+            _member(_uuid(1), canonical=True, supersedes=[absorbed]),
             _member(_uuid(2)),
         ]
+
+    @pytest.mark.asyncio
+    async def test_only_an_off_scroll_claim_is_probed_and_only_once(self):
+        """Stamped and non-uuid ids cost nothing; a claimed id the detector
+        also observed is ONE candidate, so ONE read."""
+        stamped, absorbed = _uuid(1), _uuid(42)
         probe = _RecordingProbe(live=[stamped, absorbed])
+        await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([stamped, absorbed, 'not-a-uuid']),
+            members=self._claiming(absorbed),
+            exists=probe,
+            project_id='dark_factory',
+        )
+        assert probe.calls == [(absorbed, 'dark_factory')]
+
+    @pytest.mark.asyncio
+    async def test_a_live_claimed_id_is_returned(self):
+        absorbed = _uuid(42)
+        probe = _RecordingProbe(live=[absorbed])
+        assert await consolidation_gate.resolve_unstamped_live_ids(
+            _prov([]),
+            members=self._claiming(absorbed),
+            exists=probe,
+            project_id='dark_factory',
+        ) == (absorbed,)
+
+    @pytest.mark.asyncio
+    async def test_an_absent_claimed_id_is_not_returned_after_one_probe(self):
+        """The correctly executed delete arm: a hard Qdrant delete reads as
+        absent, so the claim adds no refusal."""
+        probe = _RecordingProbe(live=[])
         assert (
             await consolidation_gate.resolve_unstamped_live_ids(
-                _prov([stamped, absorbed, 'not-a-uuid']),
-                members=members,
+                _prov([]),
+                members=self._claiming(_uuid(42)),
                 exists=probe,
                 project_id='dark_factory',
             )
             == ()
         )
-        assert probe.calls == []
+        assert len(probe.calls) == 1
 
     @pytest.mark.asyncio
     async def test_zero_candidates_never_awaits_the_probe(self):

@@ -112,8 +112,9 @@ def resolve_hook_identity(
 
     Delegates to ``session_registry.parse_spawn_identity``: ``CLAUDE_SPAWN_*``
     env wins when present; otherwise falls back to its documented defaults
-    (``role='session'``, ``project=basename(cwd)``) since hook stdin carries
-    no title to parse. *cwd* comes from the hook's stdin JSON, falling back
+    (``role='session'``, ``project`` derived from the enclosing checkout of
+    *cwd* -- see ``session_registry.py::parse_spawn_identity``) since hook
+    stdin carries no title to parse. *cwd* comes from the hook's stdin JSON, falling back
     to ``os.getcwd()`` when absent.
 
     SCOPE of the fork-path strip, stated once (task 4663): the strip is
@@ -182,7 +183,8 @@ def _non_spawner_identity_env(env: Mapping[str, str]) -> Mapping[str, str]:
     row would be indistinguishable from its spawner's except by slug.
 
     Stripping these keys makes both functions fall through to their own
-    non-spawn defaults (``role='session'``, ``project=basename(cwd)``,
+    non-spawn defaults (``role='session'``, ``project`` derived from the
+    enclosing checkout -- see ``session_registry.py::parse_spawn_identity``,
     ``task_id=None``, ``escalation_id=None``) instead of parroting the
     spawner's identity.
     """
