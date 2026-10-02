@@ -2093,6 +2093,7 @@ async def invoke_with_cap_retry(
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
+    detect_caps_in_successful_output: bool = True,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2147,6 +2148,17 @@ async def invoke_with_cap_retry(
     defer rather than wait (task 6042).  It is not converted to
     ``AllAccountsCappedException`` because a pool frozen on rejected
     credentials is not a cap and will not clear at a reset.
+
+    *detect_caps_in_successful_output* decides whether a SUCCESSFUL result is
+    offered to the cap detector at all.  ``UsageGate.detect_cap_hit`` builds a
+    synthetic ``success=False`` result before classifying, so a successful
+    reply that merely QUOTES a banner reads as a cap: measured 2026-10-02, a
+    verdict whose evidence quotes ``REAL_CLI_CAP_HIT_MESSAGES[0]`` classifies
+    ``OK()`` as it is and ``CapHit`` once forced to fail.  ``False`` confines
+    cap detection to failed results, for a caller whose replies routinely
+    quote cap text (the legibility coder, task 6042).  The default ``True``
+    is unchanged for the fleet until it is measured whether a JSON-mode cap
+    can ever arrive with ``is_error`` false.
 
     *rebuild_prompt*, when provided, is awaited as ``rebuild_prompt(True)``
     on a cap retry whose session cannot be resumed (no ``session_id`` on the
@@ -2599,7 +2611,9 @@ async def invoke_with_cap_retry(
                     await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
-                if slot.detect_cap_hit(result.stderr, result.output, backend=backend):
+                if (detect_caps_in_successful_output or not result.success) and slot.detect_cap_hit(
+                    result.stderr, result.output, backend=backend,
+                ):
                     consecutive_cap_hits += 1
                     full_cycles = (consecutive_cap_hits - 1) // num_accounts
                     cooldown = min(
