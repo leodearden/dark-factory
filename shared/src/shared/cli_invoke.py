@@ -488,6 +488,8 @@ class AgentResult:
       ``result.session_id``, so neither the caller's id nor the final
       ``result.session_id`` is reliably the session that was lost.  A tuple
       (not a list) so the default is a safe immutable dataclass default.
+    - ``stop_reason``: the CLI result JSON's ``stop_reason`` (None when absent
+      or not a string); ``'refusal'`` marks an API-side usage-policy refusal.
     """
 
     success: bool
@@ -512,6 +514,7 @@ class AgentResult:
     proc_tree: str = ''
     resume_fallbacks: int = 0
     resume_fallback_session_ids: tuple[str, ...] = ()
+    stop_reason: str | None = None
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
     when the transcript could not be read or located.  Stamped on the
@@ -1586,7 +1589,11 @@ class AgentFailureKind(enum.StrEnum):
     MODEL_NOT_FOUND = 'model_not_found'
     TIMED_OUT = 'timed_out'
     STRUCTURAL = 'structural'
+    API_REFUSAL = 'api_refusal'
     UNKNOWN = 'unknown'
+
+
+_REFUSAL_STOP_REASON = 'refusal'
 
 
 @dataclass
@@ -1692,7 +1699,12 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     10. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
        subtype looked like an error but a valid structured output was
        recovered; callers usually treat as success).
-    11. otherwise → ``UNKNOWN``.
+    11. ``result.stop_reason == 'refusal'`` → ``API_REFUSAL`` (task 6022): the
+       API's usage-policy safeguards refused the call, and the refused session
+       cannot be continued.  It sits last so that it only reclassifies results
+       that were ``UNKNOWN``, which means no existing kind, and no
+       orchestrator routing keyed on one, moves.
+    12. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
     duration_ms, timed_out, transcript_turns, api_error_status, output
@@ -1871,6 +1883,15 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         return AgentFailureClass(
             kind=AgentFailureKind.STRUCTURAL,
             summary='agent succeeded via schema salvage',
+            diagnostic_detail=diagnostic_detail,
+        )
+    if result.stop_reason == _REFUSAL_STOP_REASON:
+        return AgentFailureClass(
+            kind=AgentFailureKind.API_REFUSAL,
+            summary=(
+                "agent refused by the API's usage-policy safeguards "
+                "(stop_reason='refusal'); the refused session cannot be continued"
+            ),
             diagnostic_detail=diagnostic_detail,
         )
     return AgentFailureClass(
@@ -3386,6 +3407,8 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
     api_error_status = data.get('api_error_status')
+    raw_stop_reason = data.get('stop_reason')
+    stop_reason = raw_stop_reason if isinstance(raw_stop_reason, str) else None
 
     usage = data.get('usage') or {}
     input_tokens = _to_token_count(usage.get('input_tokens'))
@@ -3464,6 +3487,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         schema_tool_denied=schema_tool_denied,
         ended_awaiting_background=result.ended_awaiting_background,
         api_error_status=api_error_status,
+        stop_reason=stop_reason,
         proc_tree=result.proc_tree,
         transcript_turns=result.transcript_turns,
     )

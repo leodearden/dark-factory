@@ -17,8 +17,10 @@ if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionMessageParam
 
 from shared.cli_invoke import (
+    AgentFailureKind,
     AgentResult,
     build_failure_message,
+    classify_agent_failure,
     invoke_with_cap_retry,
     no_mcp_servers_config,
 )
@@ -30,17 +32,20 @@ from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SE
 logger = logging.getLogger(__name__)
 
 # The CLOSED vocabulary of CLI-failure origins run() will propagate as
-# `warning_origin` (task 4343).  Both members are synthesised by _call_llm_cli
-# below; nothing else may enter, because the value lands in
-# VerificationResult.failure_token and from there in the reconciliation.db
-# `verify/codebase` audit row that operators GROUP BY.  An unbounded or
-# agent-controlled token there would make that census unqueryable.
-CLI_WARNING_ORIGINS = frozenset({'cli_output_unparseable', 'cli_output_empty'})
+# `warning_origin` (task 4343).  All three members are synthesised by
+# _call_claude_cli below ('api_refusal' since task 6022); nothing else may
+# enter, because the value lands in VerificationResult.failure_token and from
+# there in the reconciliation.db `verify/codebase` audit row that operators
+# GROUP BY.  An unbounded or agent-controlled token there would make that
+# census unqueryable.
+CLI_WARNING_ORIGINS = frozenset({'cli_output_unparseable', 'cli_output_empty', 'api_refusal'})
 
+# No free-text or reasoning property: a required "thinking" field got verify
+# refused by the API's reasoning_extraction classifier (task 6022).  The
+# measurements live in fused-memory/scripts/probe_schema_max_turns.py's docstring.
 CLAUDE_CLI_RESPONSE_SCHEMA = {
     'type': 'object',
     'properties': {
-        'thinking': {'type': 'string'},
         'tool_calls': {
             'type': 'array',
             'items': {
@@ -54,7 +59,7 @@ CLAUDE_CLI_RESPONSE_SCHEMA = {
             },
         },
     },
-    'required': ['thinking', 'tool_calls'],
+    'required': ['tool_calls'],
 }
 
 # max_turns for ONE reconciliation-agent CLI invocation.  It caps a single
@@ -167,7 +172,7 @@ class AgentLoop:
                 #
                 # The membership test is load-bearing, not belt-and-braces:
                 # _CLIResponseAdapter.warning is structured_output['warning'],
-                # which is only OUR synthesised token when _call_llm_cli built
+                # which is only OUR synthesised token when _call_claude_cli built
                 # the dict — on a real turn it is whatever the agent's own JSON
                 # happened to put there.  Propagating that unchecked would let
                 # agent-controlled content (or a non-str) reach
@@ -380,7 +385,6 @@ class AgentLoop:
             '- "id": a unique string identifier\n'
             '- "name": the tool name from the list below\n'
             '- "input": an object matching the tool\'s parameters\n\n'
-            "Use the \"thinking\" field to explain your reasoning before making tool calls.\n"
             "If you have no more tool calls to make, return an empty tool_calls array.\n\n"
             + "\n\n".join(tools_section)
         )
@@ -412,7 +416,9 @@ class AgentLoop:
         ``AllAccountsCappedException`` after the retry loop gives up) or from the
         ``not result.success`` failure guard below — so that a subsequent
         reconciliation retry on the same ``AgentLoop`` instance does not attempt to
-        ``--resume`` an abandoned or capped session.
+        ``--resume`` an abandoned or capped session.  An API usage-policy refusal
+        is the one failure that returns instead of raising (see
+        ``_api_refusal_response``); it clears the session id too.
         """
         try:
             result: AgentResult = await invoke_with_cap_retry(
@@ -488,6 +494,10 @@ class AgentLoop:
                 cwd=self.cwd,
                 cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
             )
+            # Counted before the failure guard: a failed or refused result still
+            # reached the model and was billed.
+            self.llm_call_count += 1
+            self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
 
             if not result.success:
                 # schema_salvaged=True implies success=True (see the
@@ -495,6 +505,9 @@ class AgentLoop:
                 # parser), so `not result.success` is the complete failure guard.
                 # Salvage is not the backstop here (see _AGENT_CLI_MAX_TURNS):
                 # this guard is what fires on an ``error_max_turns`` failure.
+                failure = classify_agent_failure(result)
+                if failure.kind == AgentFailureKind.API_REFUSAL:
+                    return self._api_refusal_response(result)
                 raise RuntimeError(build_failure_message('Claude CLI agent', result))
         except Exception:
             # Clear stale session id so callers that retry don't --resume an abandoned session.
@@ -502,8 +515,6 @@ class AgentLoop:
             raise
 
         self._cli_session_id = result.session_id or self._cli_session_id
-        self.llm_call_count += 1
-        self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
 
         structured = result.structured_output
         if isinstance(structured, str):
@@ -517,7 +528,7 @@ class AgentLoop:
                 )
                 # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
                 # or run() will drop it as unknown.
-                structured = {'thinking': structured, 'tool_calls': [], 'warning': 'cli_output_unparseable'}
+                structured = {'text': structured, 'tool_calls': [], 'warning': 'cli_output_unparseable'}
         if not structured:
             logger.warning(
                 'cli_output_empty: Claude CLI reported success but structured_output'
@@ -525,9 +536,29 @@ class AgentLoop:
             )
             # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
             # or run() will drop it as unknown.
-            structured = {'thinking': '', 'tool_calls': [], 'warning': 'cli_output_empty'}
+            structured = {'text': '', 'tool_calls': [], 'warning': 'cli_output_empty'}
 
         return _CLIResponseAdapter(structured, session_id=result.session_id)
+
+    def _api_refusal_response(self, result: AgentResult) -> _CLIResponseAdapter:
+        """End the turn with no tool calls because the API refused the call (task 6022).
+
+        Returning instead of raising lets run() carry the 'api_refusal' origin
+        through to verify()'s failure_token, which gives an audited agent_failed
+        row rather than a prose-only error row.  The CLI says a refused session
+        cannot be continued, so the session is never resumed.
+        """
+        logger.warning(
+            'api_refusal: Claude CLI agent was refused by API usage-policy safeguards;'
+            ' treating as empty tool-call turn. Output: %s',
+            result.output[:500],
+        )
+        self._cli_session_id = None
+        # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
+        # or run() will drop it as unknown.
+        return _CLIResponseAdapter(
+            {'text': result.output, 'tool_calls': [], 'warning': 'api_refusal'}
+        )
 
 
 class _OpenAIResponseAdapter:
@@ -558,11 +589,16 @@ class _CLIResponseAdapter:
     Exposes both the legacy ``.content`` list (for drop-in compatibility with
     the anthropic/openai branches) and direct attribute access (for
     delegation-level tests and future callers that don't need the block list):
-    ``.thinking``, ``.tool_calls``, ``.session_id``, ``.warning``.
+    ``.text``, ``.tool_calls``, ``.session_id``, ``.warning``.
+
+    ``.text`` carries only the diagnostic text of the dicts ``_call_claude_cli``
+    synthesises itself.  ``CLAUDE_CLI_RESPONSE_SCHEMA`` deliberately declares
+    no free-text property, so a real turn never fills it (task 6022).
 
     Note on ``.warning``: this attribute surfaces the specific CLI-failure
-    token (``'cli_output_unparseable'`` — the CLI returned junk — versus
-    ``'cli_output_empty'`` — the CLI returned nothing) to the log and to
+    token (``'cli_output_unparseable'`` — the CLI returned junk —
+    ``'cli_output_empty'`` — the CLI returned nothing — or ``'api_refusal'``
+    — the API's usage-policy safeguards refused the call) to the log and to
     delegation-level tests.  Task 4343 is the revisit this docstring used to
     invite: ``AgentLoop.run()`` now **does** propagate the token, under the
     separate ``warning_origin`` key.  ``warning`` itself stays generic
@@ -579,7 +615,7 @@ class _CLIResponseAdapter:
     one without re-running anything.
 
     Because this attribute is just ``structured_output['warning']``, it holds
-    OUR synthesised token only when ``_call_llm_cli`` built the dict; on a real
+    OUR synthesised token only when ``_call_claude_cli`` built the dict; on a real
     turn it is whatever the agent's own JSON put under that key.  ``run()``
     therefore propagates it only if it is a member of ``CLI_WARNING_ORIGINS``.
     """
@@ -589,13 +625,13 @@ class _CLIResponseAdapter:
         self.usage = _CLIUsage()
 
         # Direct attribute access
-        self.thinking: str = structured_output.get('thinking', '')
+        self.text: str = structured_output.get('text', '')
         self.tool_calls: list = structured_output.get('tool_calls', [])
         self.session_id: str = session_id
         self.warning: str = structured_output.get('warning', '')
 
-        if self.thinking:
-            self.content.append(_TextBlock(self.thinking))
+        if self.text:
+            self.content.append(_TextBlock(self.text))
 
         for tc in self.tool_calls:
             self.content.append(
