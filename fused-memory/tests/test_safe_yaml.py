@@ -32,6 +32,7 @@ MIDDLEWARE_DIR = Path(__file__).resolve().parents[1] / 'src' / 'fused_memory' / 
 REGISTRY_LOADER_MODULES = (
     'cancelled_premise_blocklist.py',
     'operational_ask_registry.py',
+    'recon_code_fix_premise_guard.py',
 )
 
 
