@@ -389,10 +389,10 @@ own prior canonicals. The cure is ordering plus a closure that is CORROBORATED b
 live re-read, never inferred from "the delete call returned ok".
 
 Ordering is the contract, and each step sits where it does because of what its
-failure would cost: (1) argument validation, pure and free to refuse; (2) fail-closed
-`metadata_patch` authorization, inherited from task 3088's resolver and run
-unconditionally — reparenting is only discovered after the canonical exists, so a late
-denial would abort mid-transaction; (3) the same tool-layer citation gate `delete_memory`
+failure would cost: (1) fail-closed `metadata_patch` authorization, inherited from task
+3088's resolver and run unconditionally — reparenting is only discovered after the
+canonical exists, so a late denial would abort mid-transaction; (2) argument validation,
+pure and free to refuse; (3) the same tool-layer citation gate `delete_memory`
 runs, in its non-mutating `scan_only` pre-flight, so a set that cannot be cleared leaves
 the corpus byte-identical; (4) the canonical write, before anything destructive; (5)
 retained peers tagged, then per supersede read → re-home children → corroborate → delete;
@@ -514,6 +514,21 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 landed, have since landed under task 3134 (below).
 
 ### Changed
+
+#### `consolidate_memories` lists its closure as `{id, canonical}` rows, and its step contract now numbers authorization first (task 5275)
+
+- **Projection (wire-visible).** `topic_members` rows lose `content`, `created_at` and
+  `metadata`; the ids and the `topic_members_total` / `topic_members_truncated` /
+  `topic_members_available` qualifiers are unchanged. The envelope is the only record of
+  an irreversible multi-delete, and 200 raw rows could exceed the ~62 KB documented-safe
+  MCP response, which would lose every per-id disposition for records already gone. The
+  projection lives in `server/consolidation.py::build_consolidation_result`, so the
+  `execute_retain_consolidation` envelope gets it too; the topic-guard seed still reads
+  the full closure rows.
+- **Order.** The docs now match the code: (1) authorize, then (2) validate. Reordering
+  the code instead was rejected because auth-first is the repo-wide posture
+  (`update_memory`, `apply_retain_arm`). A test pins that an unauthorized caller with
+  malformed arguments gets `Mem0UpdateNotAuthorized`, not `ValidationError`.
 
 #### Fairness parks: `reservation_installed` never empty; new `reservation_install_blocked`; parks settled on every dispatch (task 5308)
 

@@ -26,13 +26,15 @@ therefore checked once, in one place, rather than re-typed per caller.
 calls NONE of this: PRD C2 makes the benign codes the emit boundary's business,
 and the predicate re-derives none of them.
 
-WHY VALIDATION IS A SEPARATE, FIRST STEP
-----------------------------------------
+WHY VALIDATION IS A SEPARATE, PRE-WRITE STEP (2)
+------------------------------------------------
 ``consolidate_memories`` is irreversible by construction: it writes a
 canonical, patches retained peers and DELETES its supersedes.  Argument
-validation is the only stage that can refuse at zero cost, so everything
-decidable from the arguments alone is decided here — before the canonical
-exists, before a single victim is touched.
+validation runs as step (2): immediately after the fail-closed
+authorization gate, which deliberately precedes it, and before anything
+reads or writes the corpus.  It is the last point where everything
+decidable from the arguments alone can be refused for free — before the
+canonical exists, before a single victim is touched.
 
 Two properties follow from that position and are not incidental:
 
