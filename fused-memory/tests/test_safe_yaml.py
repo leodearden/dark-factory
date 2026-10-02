@@ -6,6 +6,7 @@ registry).
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from _ast_guard import parse_python_module
 
 from fused_memory.utils.safe_yaml import (
     SAFE_YAML_LOADER,
@@ -24,6 +26,10 @@ from fused_memory.utils.safe_yaml import (
 LOG = logging.getLogger('tests.safe_yaml_owner')
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / 'config'
+
+MIDDLEWARE_DIR = Path(__file__).resolve().parents[1] / 'src' / 'fused_memory' / 'middleware'
+
+REGISTRY_LOADER_MODULES = ('cancelled_premise_blocklist.py',)
 
 
 def _load(path: Path | None) -> list[object]:
@@ -175,4 +181,37 @@ class TestSafeYamlLoader:
         text = path.read_text(encoding='utf-8')
         assert yaml.load(text, Loader=yaml.SafeLoader) == yaml.load(
             text, Loader=SAFE_YAML_LOADER
+        )
+
+
+def _yaml_imports(tree: ast.Module) -> list[ast.stmt]:
+    def is_yaml(name: str | None) -> bool:
+        return name is not None and (name == 'yaml' or name.startswith('yaml.'))
+
+    return [
+        node
+        for node in ast.walk(tree)
+        if (isinstance(node, ast.Import) and any(is_yaml(a.name) for a in node.names))
+        or (isinstance(node, ast.ImportFrom) and is_yaml(node.module))
+    ]
+
+
+class TestRegistryLoadersParseOnlyThroughSafeYaml:
+    """Per-loader pin that the loader choice and the read guard have ONE home
+    (INV-5): a registry module that never imports yaml cannot read or parse its
+    file outside load_yaml_list_file. AST, not grep, so prose mentioning yaml
+    cannot trip it. The list is fixed, not discovered, because only these
+    registry modules share the contract.
+    """
+
+    @pytest.mark.parametrize('module', REGISTRY_LOADER_MODULES)
+    def test_registry_module_does_not_import_yaml(self, module):
+        path = MIDDLEWARE_DIR / module
+
+        offending = _yaml_imports(parse_python_module(path))
+
+        assert not offending, (
+            f'{module} imports yaml (line(s) {[n.lineno for n in offending]}); '
+            'file-level YAML reading must go through '
+            'fused_memory.utils.safe_yaml.load_yaml_list_file'
         )
