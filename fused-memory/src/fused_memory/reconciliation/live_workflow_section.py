@@ -128,7 +128,8 @@ def render_live_workflow_authority_rules() -> str:
         f'could not be read. A `get_task` read settles any of them.\n\n'
         f'Every row ends with a `landed=` field saying whether the task\'s work is '
         f'already on main. A row that reads `{NOT_LIVE_TOKEN}` is listed only because '
-        f'its work landed.\n\n'
+        f'its work landed: the `landed=` rules below alone govern it, and no rule for '
+        f'a live row applies to it.\n\n'
         f"`{LandedToken.TRUE}` means the task's work is already on main: either its "
         f'branch is gone and a fresh `Merge task/<id> into main` marker is on main, or '
         f'every commit on its branch has a rebased twin on main. The evidence is named '

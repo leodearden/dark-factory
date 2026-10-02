@@ -7,6 +7,7 @@ from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
 from fused_memory.reconciliation.live_workflow_section import (
+    NOT_LIVE_TOKEN,
     render_live_workflow_authority_rules,
 )
 from fused_memory.reconciliation.policies.autopilot_video import (
@@ -824,7 +825,8 @@ lifecycle; the rules below say how to confirm it.
 
 {render_live_workflow_authority_rules()}
 
-**For any task listed in `### Live-Workflow Signals`:**
+**For any task with a LIVE row in `### Live-Workflow Signals` (any row not reading \
+`{NOT_LIVE_TOKEN}`):**
 
 1. **Do NOT call `set_task_status`** on that task. While a workflow is live, the \
    orchestrator owns its status. A recon status write races against the orchestrator's \
@@ -861,8 +863,8 @@ lifecycle; the rules below say how to confirm it.
    whose carrier is still non-terminal.
 
 **Only act on stranded / complete-but-unmerged findings when NO live signal is present** \
-— i.e., the task is absent from `### Live-Workflow Signals`, or it is listed but \
-`get_task` shows no live claimant (the tie-breaker above), and its work has not landed. \
+— i.e., the task has no live row in `### Live-Workflow Signals`, or `get_task` shows \
+no live claimant for it (the tie-breaker above), and its work has not landed. \
 That is the genuinely stranded case (e.g. esc-3803: orchestrator crashed, worktree \
 abandoned) that legitimately needs operator attention.
 

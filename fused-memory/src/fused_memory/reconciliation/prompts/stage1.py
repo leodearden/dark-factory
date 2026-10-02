@@ -10,6 +10,7 @@ from fused_memory.reconciliation.internal_writers import (
     INTERNAL_WRITER_POPULATION_NOTE,
 )
 from fused_memory.reconciliation.live_workflow_section import (
+    NOT_LIVE_TOKEN,
     render_live_workflow_authority_rules,
 )
 from fused_memory.reconciliation.prompts import (
@@ -990,14 +991,14 @@ lifecycle; the rules below say how to confirm it.
 
 {render_live_workflow_authority_rules()}
 
-**For any task listed in `### Live-Workflow Signals`, do NOT emit a stranded-work or \
-blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
+**For any task with a LIVE row in `### Live-Workflow Signals` (any row not reading \
+`{NOT_LIVE_TOKEN}`), do NOT emit a stranded-work or blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
 `severity='moderate'` with `actionable=true`.** A task under an active live pipeline is \
 mid-flight, not stranded — asserting a moderate/actionable disposition for it contradicts \
 Stage 2's own Live-Workflow Authority policy (task 1655) and produces two contradictory \
 disposition markers for the same `task_id`+`flag_type` in a single reconciliation cycle.
 
-Instead, for a task listed under `### Live-Workflow Signals`, do one of:
+Instead, for a task with a live row, do one of:
 1. **Downgrade** the flag to `severity='info'` and `actionable=false`, or
 2. **Annotate** the flag's description with "pending Stage 2 live-workflow confirmation" \
    and leave the final disposition to Stage 2, which has direct access to live scheduler \
@@ -1007,8 +1008,8 @@ Either remediation is acceptable; what is NOT acceptable is emitting the flag at
 `severity='moderate'` with `actionable=true` as though the task were genuinely stranded.
 
 **Only treat a stranded / blocked-escalation flag as fully actionable when NO live signal \
-is present** — i.e., the task is absent from `### Live-Workflow Signals`, or it is listed \
-but `get_task` shows no live claimant (the tie-breaker above), and its work has not \
+is present** — i.e., the task has no live row in `### Live-Workflow Signals`, or \
+`get_task` shows no live claimant for it (the tie-breaker above), and its work has not \
 landed. That is the genuinely stranded case that legitimately needs operator attention.
 
 If `### Live-Workflow Signals` is absent from the payload, no task is live this cycle — \
