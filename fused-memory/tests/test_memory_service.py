@@ -12016,6 +12016,13 @@ _MM_ENTRY_POINTS = ['add_memory', 'add_system_record', 'update_memory']
 #: "runs against all three".
 _MM_ADD_ENTRY_POINTS = ['add_memory', 'add_system_record']
 
+#: The entry points whose writes land in Mem0 REGARDLESS of the ``category``
+#: tag, so they pass ``reaches_mem0=True`` unconditionally (task 3508).
+#: ``add_memory`` is the only entry point whose routing depends on
+#: category/``dual_write``.  A fourth write path must be classified here
+#: explicitly rather than inheriting one side by accident.
+_MM_MEM0_ONLY_ENTRY_POINTS = ['add_system_record', 'update_memory']
+
 
 class TestMemoryMetadataValidationAtSeam:
     """PRD V1 enforcement at the MemoryService write seam (task 3195, leaf β)."""
@@ -12996,8 +13003,8 @@ class TestCanonicalRoutingAtSeam:
     The predicate is "will this land in Mem0", NOT "is the category
     Mem0-primary": `dual_write=True` routes a Graphiti-primary category
     into Mem0 too, where `canonical` genuinely IS stored and IS
-    enforceable. The two CONTROL cases below exist so a later reader
-    cannot collapse the two entry points onto one expression.
+    enforceable. The CONTROL cases below exist so a later reader
+    cannot collapse the entry points onto one expression.
     """
 
     _TOPIC = 'some-topic'
@@ -13113,33 +13120,54 @@ class TestCanonicalRoutingAtSeam:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('enforce', [False, True])
-    async def test_add_system_record_is_untouched_even_for_a_graphiti_category(
-        self, service, caplog, enforce
+    @pytest.mark.parametrize('entry_point', _MM_MEM0_ONLY_ENTRY_POINTS)
+    async def test_mem0_only_entry_points_are_untouched_even_for_a_graphiti_category(
+        self, service, caplog, entry_point, enforce
     ):
         """CONTROL, and a deliberate pin of the ENTRY-POINT ASYMMETRY.
 
-        `add_system_record` "never routes to Graphiti, regardless of
-        `category`" (`MemoryService.add_system_record`'s own docstring) —
-        category is stamped as a metadata TAG only, never used for store
-        routing. So its writes always land in Mem0 and its canonical
-        markers are always enforceable, which is why it passes
-        `reaches_mem0=True` unconditionally rather than recomputing
-        add_memory's expression.
-
-        Pinned so a later reader cannot "simplify" the two call sites into
-        one shared expression: doing so would refuse a perfectly valid
-        system record on nothing but its category tag.
+        `add_system_record` never routes to Graphiti, and `update_memory`
+        amends a record that already lives in Mem0; on both, `category` is
+        a metadata TAG, never a routing input. So their canonical markers
+        are always stored, and they pass `reaches_mem0=True` rather than
+        recomputing add_memory's expression — which would refuse a valid
+        record on nothing but its tag.
         """
         caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
         service.config.memory_metadata.enforce = enforce
 
         await _mm_write(
-            service, 'add_system_record',
+            service, entry_point,
             metadata={'topic': self._TOPIC, 'canonical': True},
             category=self._GRAPHITI_PRIMARY,
         )
 
         assert self._CODE not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_MEM0_ONLY_ENTRY_POINTS)
+    async def test_mem0_only_entry_points_still_probe_a_graphiti_tagged_canonical(
+        self, service, entry_point
+    ):
+        """POSITIVE CONTROL for the case above.
+
+        Without it, "no routing code" could not be told apart from "the
+        uniqueness probe was skipped too" — guard 4's early return would
+        make both invisible. On `update_memory` the probe is reachable
+        because `_MM_UPDATE_PRE_IMAGE` holds no claim, so guard 3 is inert.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, 'incumbent-uuid-1', topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category=self._GRAPHITI_PRIMARY,
+            )
+        service.mem0.count_by_metadata.assert_awaited_once()
 
 
 class TestCanonicalClaimChangeOnTheUpdatePath:
