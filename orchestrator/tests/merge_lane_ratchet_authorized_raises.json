@@ -775,6 +775,30 @@
           "current": 6593
         }
       ]
+    },
+    {
+      "task_id": "3651",
+      "reason": "Regression tests for the task 3651 provenance-collapse fix: three new rederive tests drive workflow._inter_iteration_rebase and two new reconcile tests drive workflow._reconcile_done_step_commits -- the private methods under test, called exactly as every existing test in those two files already does. No public entry point reaches them short of a full workflow run. The avoidable reads (workflow._get_head_commit) were replaced with git rev-parse.",
+      "measures": [
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_harness_plan_step_rederive.py",
+          "baseline": 12,
+          "current": 15
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_reconcile_done_step_commits.py",
+          "baseline": 25,
+          "current": 27
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6593,
+          "current": 6598
+        }
+      ]
     }
   ]
 }
