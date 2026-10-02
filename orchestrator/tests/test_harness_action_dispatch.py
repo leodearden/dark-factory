@@ -24,6 +24,7 @@ from _orch_helpers import wire_scheduler_liveness_mock
 from escalation.action_effects import ACTION_EFFECTS, ANY, WORKFLOW_NONE, TaskEffect
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
+from escalation.server import create_server
 
 from orchestrator.harness import Harness
 
@@ -74,6 +75,7 @@ def _make_esc(
     resolved_by: str = 'steward',
     level: int = 1,
     resolution_action: str | None = None,
+    worktree: str | None = None,
 ) -> Escalation:
     return Escalation(
         id=f'esc-{task_id}-1',
@@ -86,6 +88,7 @@ def _make_esc(
         status=status,
         resolved_by=resolved_by,
         resolution_action=resolution_action,
+        worktree=worktree,
     )
 
 
@@ -1514,3 +1517,106 @@ class TestRestartClearsMergeRetryPending:
         harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
             'task-1', 'pending',
         )
+
+
+# ---------------------------------------------------------------------------
+# Task 3096 — an eval-lane record (shared/src/shared/eval_lane.py) is inert:
+# no workflow wake, no cascade, no task-status write, whatever the action.
+# ---------------------------------------------------------------------------
+
+_EVAL_WORKTREE = '/home/leo/src/dark-factory-eval-worktrees/shadow_5383_01JCELL/run-c2fbbe84'
+_PRODUCTION_WORKTREE = '/home/leo/src/dark-factory/.worktrees/5383'
+
+_EVAL_LANE_RECORDS = pytest.mark.parametrize(
+    ('task_id', 'worktree'),
+    [('5383', _EVAL_WORKTREE), ('df_task_2430_adv_plan', None)],
+)
+
+
+def _assert_no_task_effect(harness: Harness) -> None:
+    harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+    harness.scheduler.get_status.assert_not_awaited()  # type: ignore[attr-defined]
+    harness.scheduler.get_task.assert_not_awaited()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+class TestEvalLaneResolutionIsInert:
+    @_EVAL_LANE_RECORDS
+    @pytest.mark.parametrize(
+        'resolution_action', [None, 'resume', 'abandon', 'close_only'],
+    )
+    async def test_no_status_effect_without_a_live_workflow(
+        self, harness: Harness, task_id: str, worktree: str | None,
+        resolution_action: str | None,
+    ):
+        esc = _make_esc(
+            task_id=task_id, worktree=worktree,
+            resolution_action=resolution_action, status='resolved',
+        )
+
+        harness._on_escalation_resolved(esc)
+        await asyncio.gather(*list(harness._background_tasks))
+
+        _assert_no_task_effect(harness)
+
+    @_EVAL_LANE_RECORDS
+    @pytest.mark.parametrize('status', ['resolved', 'dismissed'])
+    async def test_live_workflow_is_not_woken(
+        self, harness: Harness, task_id: str, worktree: str | None, status: str,
+    ):
+        event = asyncio.Event()
+        harness._escalation_events[task_id] = event
+
+        harness._on_escalation_resolved(
+            _make_esc(task_id=task_id, worktree=worktree, status=status),
+        )
+
+        assert not event.is_set()
+
+    async def test_same_id_from_production_worktree_still_wakes(self, harness: Harness):
+        event = asyncio.Event()
+        harness._escalation_events['5383'] = event
+
+        harness._on_escalation_resolved(
+            _make_esc(task_id='5383', worktree=_PRODUCTION_WORKTREE),
+        )
+
+        assert event.is_set()
+
+    async def test_same_id_from_production_worktree_still_repends(self, harness: Harness):
+        harness._on_escalation_resolved(
+            _make_esc(task_id='5383', worktree=_PRODUCTION_WORKTREE),
+        )
+        await asyncio.gather(*list(harness._background_tasks))
+
+        harness.scheduler.set_task_status.assert_awaited_once_with(  # type: ignore[attr-defined]
+            '5383', 'pending',
+        )
+
+    async def test_contained_filing_through_the_real_server_is_inert(
+        self, harness: Harness, tmp_path: Path,
+    ):
+        queue = EscalationQueue(tmp_path / 'esc')
+        harness._escalation_queue = queue
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        server = create_server(queue, startup_sweep=False)
+        event = asyncio.Event()
+        harness._escalation_events['5383'] = event
+
+        tool = await server.get_tool('escalate_blocker')
+        result = await tool.fn(
+            task_id='5383',
+            worktree=_EVAL_WORKTREE,
+            agent_role='implementer',
+            category='design_concern',
+            summary='refusing seeded wrong step',
+        )
+
+        assert result['status'] == 'resolved', result
+        record = queue.get(result['id'])
+        assert record is not None
+        assert harness._resolve_escalation_action(record) == 'close_only'
+        assert not event.is_set()
+        await asyncio.gather(*list(harness._background_tasks))
+        harness.scheduler.set_task_status.assert_not_awaited()  # type: ignore[attr-defined]
+        harness.scheduler.get_task.assert_not_awaited()  # type: ignore[attr-defined]

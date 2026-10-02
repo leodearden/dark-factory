@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1823,6 +1824,18 @@ class TestEvalLaneOrphansAreDismissed:
         assert await harness._reap_orphan_l0_escalations() == 0
 
         self._assert_dismissed(harness, esc, f'eval-worktree:{_EVAL_WORKTREE}')
+
+    async def test_dismissal_wakes_no_production_workflow(self, harness: Harness) -> None:
+        queue = _bound_queue(harness)
+        queue.set_resolve_callback(harness._on_escalation_resolved)
+        event = asyncio.Event()
+        harness._escalation_events['2339'] = event
+        esc = _submit_aged(queue, '2339', seconds_ago=120.0, worktree=_EVAL_WORKTREE)
+
+        assert await harness._reap_orphan_l0_escalations() == 0
+
+        self._assert_dismissed(harness, esc, f'eval-worktree:{_EVAL_WORKTREE}')
+        assert not event.is_set()
 
     async def test_young_eval_lane_l0_is_left_pending(self, harness: Harness) -> None:
         esc = _submit_aged(_bound_queue(harness), 'df_task_2430_adv_plan', seconds_ago=10.0)
