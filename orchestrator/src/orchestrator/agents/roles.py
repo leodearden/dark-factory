@@ -6,6 +6,8 @@ from typing import Literal
 
 from shared.prompt_artifact import PromptSpec
 
+from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
+
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
 # it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
 # family is a property OF THE ROLE, not a decision made elsewhere by
@@ -1252,9 +1254,11 @@ GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_
 # dropping that block from this one -- JUDGE already does: no wait block and
 # the read-only grep variant.
 #
-# APPEND-ONLY AT THE TAIL. Every adjacency here is pinned by the later block's
-# own test module (each asserts it starts exactly where its predecessor ends),
-# and BACKGROUND_WAIT_GUIDANCE's heading must stay the prompt's first `##`.
+# APPEND-ONLY AT THE TAIL. Each block through GREP_LOOKAROUND_GUIDANCE has its
+# own test module pin it to start exactly where its predecessor ends; blocks
+# appended after it pin only ORDER (after GREP_LOOKAROUND_GUIDANCE), so
+# concurrent appends do not break each other. BACKGROUND_WAIT_GUIDANCE's
+# heading must stay the prompt's first `##`.
 # _GREP_ENGINE_LIMITS's prose also points at ERROR_REMEDY_HINT_GUIDANCE as "the
 # section just above". Inserting anywhere but the end breaks a pin, or
 # silently redirects that pointer.
@@ -1263,6 +1267,7 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + TOOL_CALL_REJECTION_GUIDANCE
     + ERROR_REMEDY_HINT_GUIDANCE
     + GREP_LOOKAROUND_GUIDANCE
+    + PKILL_SELF_MATCH_GUIDANCE
 )
 
 
