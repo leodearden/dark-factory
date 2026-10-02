@@ -48,6 +48,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
     BandDecision,
+    JudgeUsage,
     TriageFailOpenCounter,
     TriageJudgeVerdict,
     triage_write,
@@ -1277,12 +1278,13 @@ def _client_double() -> MagicMock:
     return client
 
 
-def _openai_client(content: str | None) -> MagicMock:
+def _openai_client(content: str | None, usage: object = None) -> MagicMock:
     """A fake ``AsyncOpenAI`` yielding *content* as the message body.
 
     Same construction shape as ``test_classifier.py::_make_mock_client`` — the
     established openai double in this repo, plus the async-CM protocol the
-    client is used through.
+    client is used through. Without *usage* the response's ``usage`` is the
+    unspecced Mock's own auto-attribute, which reports no usable usage.
     """
     message = MagicMock()
     message.content = content
@@ -1290,6 +1292,8 @@ def _openai_client(content: str | None) -> MagicMock:
     choice.message = message
     response = MagicMock()
     response.choices = [choice]
+    if usage is not None:
+        response.usage = usage
     client = _client_double()
     client.chat.completions.create = AsyncMock(return_value=response)
     return client
@@ -1486,6 +1490,103 @@ class TestProviderCredentials:
         assert ctor.call_args.kwargs == {
             'api_key': 'sk-wire', 'base_url': 'http://h/v1',
         }
+
+
+class TestTheVerdictCarriesTheCallsUsage:
+    """The provider's per-call usage rides on the verdict, so a write can be priced.
+
+    Usage is metadata about a call that already succeeded: an unreadable usage
+    must never turn a good verdict into a fail-open.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_chat_arm_reports_its_usage(self) -> None:
+        usage = types.SimpleNamespace(
+            prompt_tokens=850, completion_tokens=40,
+            completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
+        )
+        client = _openai_client(_payload('restates', 'm1'), usage=usage)
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict.usage == JudgeUsage(850, 40, 0)
+        assert (verdict.outcome, verdict.candidate_id) == (OUTCOME_RESTATED, 'm1')
+
+    @pytest.mark.asyncio
+    async def test_the_anthropic_arm_reports_its_usage(self) -> None:
+        client = _anthropic_client(
+            [FakeAnthropicTextBlock(text=_payload('contests', 'm1'))],
+        )
+        client.messages.create.return_value.usage = types.SimpleNamespace(
+            input_tokens=700, output_tokens=30,
+        )
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict.usage == JudgeUsage(700, 30, None)
+        assert (verdict.outcome, verdict.candidate_id) == (OUTCOME_CONTESTED, 'm1')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'response_usage',
+        [
+            pytest.param({}, id='absent'),
+            pytest.param({'usage': None}, id='None'),
+            pytest.param({'usage': MagicMock()}, id='unspecced mock'),
+            pytest.param(
+                {'usage': types.SimpleNamespace(prompt_tokens=True, completion_tokens=40)},
+                id='a bool count',
+            ),
+            pytest.param(
+                {'usage': types.SimpleNamespace(prompt_tokens='850', completion_tokens=40)},
+                id='a str count',
+            ),
+        ],
+    )
+    async def test_an_unreadable_usage_leaves_the_verdict_unpriced(
+        self, response_usage: dict,
+    ) -> None:
+        """`int(MagicMock())` is 1: the reader checks `isinstance(int)`, never coerces."""
+        message = types.SimpleNamespace(content=_payload('amends', 'm1'))
+        client = _client_double()
+        client.chat.completions.create = AsyncMock(return_value=types.SimpleNamespace(
+            choices=[types.SimpleNamespace(message=message)], **response_usage,
+        ))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict == TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')
+        assert verdict.usage is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('write_triage', 'decision', 'candidates'),
+        [
+            pytest.param(
+                {'judge_enabled': False}, _decision('m1'), [_result('m1', 0.80)],
+                id='disabled',
+            ),
+            pytest.param({}, _decision(None), [], id='empty slate'),
+        ],
+    )
+    async def test_no_call_reports_no_usage(
+        self, write_triage: dict, decision: BandDecision, candidates: list,
+    ) -> None:
+        verdict = await judge_write(
+            memory_service=_judge_svc(**write_triage),
+            content='c', project_id='p',
+            decision=decision, candidates=candidates,
+        )
+        assert verdict.usage is None
 
 
 class TestJudgeWriteDecisionsThatAreNotFailures:
