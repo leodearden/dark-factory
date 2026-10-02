@@ -1,7 +1,8 @@
 """Recall memory for one dispatch and render it as the prompt's ``# Context`` block.
 
-Each fused-memory reply is parsed once into a typed result, facts tagged to
-another project are dropped, and what survives is rendered as markdown.
+:class:`MemoryRecall` is the one entry point. Each fused-memory reply is
+parsed once into a typed result, facts tagged to another project are dropped,
+and what survives is rendered as markdown and composed into the block.
 """
 
 from __future__ import annotations
@@ -12,6 +13,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+
+from shared.briefing_queries import BriefingQuerySpec, BriefingScope, queries_for
+
+from orchestrator.mcp_lifecycle import is_timeout_failure, mcp_call, tool_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -452,3 +457,290 @@ untagged (Graphiti-sourced) results survive the filter unclassified, so the
 caveat is what makes an agent verify a recalled path before using it.
 Formatted with the project id.
 """
+
+_LOOP_FAILURE_NOTICE = (
+    '_Memory unavailable for the remaining queries — proceed with '
+    'codebase exploration for anything not covered above._'
+)
+
+
+@dataclass(frozen=True)
+class RecallTally:
+    """One dispatch's recall: what rendered, what it owes the reader, how each search went.
+
+    ``searches`` holds the search channel's outcomes only. The graph channel
+    reports through ``notices`` but is not counted, because the outage
+    verdict and the drop note's query count are about the search table.
+    ``loop_failure`` is set when the recall loop itself broke.
+    """
+
+    sections: tuple[str, ...] = ()
+    notices: tuple[str, ...] = ()
+    searches: tuple[MemoryQueryOutcome, ...] = ()
+    loop_failure: MemoryFailure | None = None
+
+    @property
+    def reasons(self) -> tuple[MemoryFailure, ...]:
+        """Each distinct search failure in order, then the loop failure."""
+        failures = [search.failure for search in self.searches if search.failure is not None]
+        if self.loop_failure is not None:
+            failures.append(self.loop_failure)
+        return tuple(dict.fromkeys(failures))
+
+    @property
+    def is_outage(self) -> bool:
+        """Nothing worked: no section recalled, and every search failed or the loop broke.
+
+        One failed query among two is a partial recall, which the section
+        notices report; a loop that broke after a section was recalled still
+        put memory in the prompt.
+        """
+        failed = sum(1 for search in self.searches if search.failure is not None)
+        return (
+            not self.sections
+            and bool(self.reasons)
+            and (self.loop_failure is not None or failed == len(self.searches))
+        )
+
+    @property
+    def drop_note(self) -> str:
+        """How much the cross-project filter blocked, or '' when it blocked nothing.
+
+        Result slots and nested records are named apart, and the query count
+        is named too, because one foreign fact can match every query.
+        """
+        dropped = sum(search.dropped for search in self.searches)
+        nested = sum(search.nested_dropped for search in self.searches)
+        if dropped <= 0 and nested <= 0:
+            return ''
+        counted = []
+        if dropped > 0:
+            counted.append(f'{dropped} memory result slot(s)')
+        if nested > 0:
+            counted.append(f'{nested} nested memory record(s)')
+        queries = len(self.searches)
+        query_word = 'query' if queries == 1 else 'queries'
+        return (
+            f'{" and ".join(counted)} across {queries} {query_word} '
+            'were tagged to another project and filtered out'
+        )
+
+
+def render_context_block(tally: RecallTally, project_id: str) -> str:
+    """Compose the ``# Context`` block from one dispatch's tally.
+
+    With nothing recalled, the outage or empty notice leads (the legibility
+    digest recognises the block by that leading line), followed by every
+    section notice and the drop note. With something recalled, the
+    provenance caveat leads, and no later failure may suppress it.
+    """
+    drop_note = tally.drop_note
+    if not tally.sections:
+        family = (
+            MEMORY_OUTAGE_NOTICE.format(reasons=', '.join(r.value for r in tally.reasons))
+            if tally.is_outage else MEMORY_EMPTY_NOTICE
+        )
+        body = '\n\n'.join([family, *tally.notices])
+        if drop_note:
+            body += f'\n\n_Note: {drop_note}._'
+        return f'# Context\n\n{body}'
+
+    caveat = MEMORY_CONTEXT_CAVEAT.format(project_id=project_id)
+    if drop_note:
+        caveat += f'\n\n_In total, {drop_note}._'
+    notices = list(tally.notices)
+    if tally.loop_failure is not None:
+        notices.append(_LOOP_FAILURE_NOTICE)
+    parts = list(tally.sections)
+    if notices:
+        parts.append('\n'.join(notices))
+    return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(parts)
+
+
+def _search_outcome(text: str, subject: str, project_id: str) -> MemoryQueryOutcome:
+    """Parse, filter and render one search reply's text.
+
+    No text is an honest empty answer: the tool replied and recalled nothing.
+    """
+    if not text:
+        return MemoryQueryOutcome()
+    reply = parse_search_reply(text)
+    if isinstance(reply, MemoryFailure):
+        logger.warning(f'{subject} answered without a results list: {text!r}')
+        return MemoryQueryOutcome(failure=reply)
+    if isinstance(reply, UnparsedReply):
+        logger.warning(f'{subject} answered with text that is not JSON; rendering it unfiltered')
+        return MemoryQueryOutcome(rendered=reply.text)
+    filtered = filter_foreign_project_results(reply.results, project_id)
+    return MemoryQueryOutcome(
+        rendered=render_memory_results(filtered.kept),
+        dropped=filtered.dropped,
+        nested_dropped=filtered.nested_dropped,
+        failed_stores=reply.failed_stores,
+    )
+
+
+def _entity_outcome(text: str, expected_name: str) -> MemoryQueryOutcome:
+    """Decode one ``get_entity`` reply once, render it and read its store health."""
+    if not text:
+        return MemoryQueryOutcome()
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning(f'MCP get_entity reply for {expected_name!r} is not JSON ({e})')
+        return MemoryQueryOutcome()
+    if not isinstance(payload, dict):
+        return MemoryQueryOutcome()
+    return MemoryQueryOutcome(
+        rendered=render_entity_block(payload, expected_name),
+        failed_stores=reported_failed_stores(payload),
+    )
+
+
+class MemoryRecall:
+    """Recalls fused-memory for each dispatch and renders its ``# Context`` block."""
+
+    def __init__(self, memory_url: str, project_id: str):
+        self._memory_url = memory_url
+        self._project_id = project_id
+        self._outage_streak = 0
+        """Consecutive dispatches whose recall produced nothing at all.
+
+        Counted across every workflow this process serves, because the
+        question is about the shared SERVICE; any dispatch that recalled
+        something resets it.
+        """
+
+    async def context_block(self, scope: BriefingScope, caller_agent_id: str) -> str:
+        """The ``# Context`` block for a dispatch about *scope*, asked by *caller_agent_id*."""
+        tally = await self._recall(scope, caller_agent_id)
+        self._note_outage(tally.is_outage)
+        if tally.drop_note:
+            logger.info(
+                f'MemoryRecall.context_block: {tally.drop_note} of the context assembled '
+                f'for {self._project_id!r}'
+            )
+        return render_context_block(tally, self._project_id)
+
+    async def _recall(self, scope: BriefingScope, caller_agent_id: str) -> RecallTally:
+        """Fire the query table for *scope* and tally what each query produced."""
+        sections: list[str] = []
+        notices: list[str] = []
+        searches: list[MemoryQueryOutcome] = []
+        try:
+            for spec, query in queries_for(scope):
+                outcome = await self._search(spec, query, caller_agent_id, scope.task_id)
+                searches.append(outcome)
+                notices.extend(_section_notices(spec.section_title, outcome))
+                blocks = [outcome.rendered]
+                if spec.wants_entity_block and scope.task_id:
+                    entity = await self._task_entity(scope.task_id)
+                    notices.extend(_section_notices(
+                        spec.section_title + ENTITY_CHANNEL_SUFFIX, entity,
+                    ))
+                    blocks.append(entity.rendered)
+                body = '\n\n'.join(block for block in blocks if block)
+                if body:
+                    sections.append(f'## {spec.section_title}\n\n{body}')
+        except Exception as e:
+            # The loop itself broke rather than one query, so no section can
+            # name it; it still counts toward the outage verdict.
+            logger.warning(f'Failed to fetch memory context: {e}')
+            return RecallTally(
+                tuple(sections), tuple(notices), tuple(searches), MemoryFailure.TRANSPORT,
+            )
+        return RecallTally(tuple(sections), tuple(notices), tuple(searches))
+
+    async def _search(
+        self,
+        spec: BriefingQuerySpec,
+        query: str,
+        caller_agent_id: str,
+        caller_task_id: str | None,
+    ) -> MemoryQueryOutcome:
+        """Ask one query, scoped by its spec and declaring who asks (D8).
+
+        An empty ``stores``/``categories`` tuple is omitted rather than sent
+        empty, so the server applies its own routing instead of a filter that
+        matches nothing.
+        """
+        arguments: dict[str, Any] = {
+            'query': query,
+            'project_id': self._project_id,
+            'limit': spec.limit,
+            'caller_agent_id': caller_agent_id,
+        }
+        if spec.stores:
+            arguments['stores'] = list(spec.stores)
+        if spec.categories:
+            arguments['categories'] = list(spec.categories)
+        if caller_task_id:
+            arguments['caller_task_id'] = caller_task_id
+        subject = f'Memory search for {query!r}'
+        text = await self._call_tool('search', arguments, subject)
+        if isinstance(text, MemoryFailure):
+            return MemoryQueryOutcome(failure=text)
+        return _search_outcome(text, subject, self._project_id)
+
+    async def _task_entity(self, task_id: str) -> MemoryQueryOutcome:
+        """What the knowledge graph records ABOUT this task: D3's second channel."""
+        expected_name = f'Task {task_id}'
+        text = await self._call_tool(
+            'get_entity',
+            {'name': expected_name, 'project_id': self._project_id},
+            f'MCP get_entity for {expected_name!r}',
+        )
+        if isinstance(text, MemoryFailure):
+            return MemoryQueryOutcome(failure=text)
+        return _entity_outcome(text, expected_name)
+
+    async def _call_tool(
+        self, tool_name: str, arguments: dict[str, Any], subject: str,
+    ) -> str | MemoryFailure:
+        """Call one fused-memory tool: its joined text blocks, or why there are none.
+
+        Every failure is NAMED and logged at WARNING, so an unreachable
+        service never reads as an empty corpus.
+        """
+        try:
+            result = await mcp_call(
+                f'{self._memory_url}/mcp',
+                'tools/call',
+                {'name': tool_name, 'arguments': arguments},
+                timeout=10,
+            )
+        except Exception as e:
+            # The TYPE raised says nothing: on retry exhaustion mcp_call
+            # re-raises a plain RuntimeError that keeps a timeout only as
+            # __cause__, which is_timeout_failure unwraps.
+            failure = MemoryFailure.TIMEOUT if is_timeout_failure(e) else MemoryFailure.TRANSPORT
+            logger.warning(f'{subject} failed ({failure.value}): {type(e).__name__}: {e}')
+            return failure
+
+        reply = result.get('result') if isinstance(result, dict) else None
+        if not isinstance(reply, dict):
+            logger.warning(f'{subject} answered with no tool result: {result!r}')
+            return MemoryFailure.MALFORMED
+        error_text = tool_error_text(reply)
+        if error_text is not None:
+            logger.warning(f'{subject} returned a tool error: {error_text!r}')
+            return MemoryFailure.MALFORMED
+        return '\n'.join(
+            block['text']
+            for block in reply.get('content', [])
+            if isinstance(block, dict) and block.get('type') == 'text'
+        )
+
+    def _note_outage(self, outage: bool) -> None:
+        """Track the outage streak; log ERROR whenever it reaches a multiple of the threshold."""
+        if not outage:
+            self._outage_streak = 0
+            return
+        self._outage_streak += 1
+        if self._outage_streak % MEMORY_OUTAGE_STREAK_THRESHOLD == 0:
+            logger.error(
+                f'MemoryRecall: {self._outage_streak} consecutive dispatches recalled '
+                f'no memory at all for {self._project_id!r} — the memory service looks '
+                'unavailable, and every briefing since the streak began was assembled '
+                'without it'
+            )
