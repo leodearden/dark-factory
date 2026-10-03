@@ -322,6 +322,27 @@ class TestCrossProjectRefResolution:
         assert claims[0].project_id is None
 
 
+class TestForeignNumberRefs:
+    """A PR, issue or other-repository '#N' is not a task in the writer's project."""
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'Merged PR #4521 into main',
+            'The upstream issue #123 was closed as wontfix',
+        ],
+    )
+    def test_pull_request_and_issue_numbers_yield_nothing(self, text):
+        assert _extract(text) == []
+
+    def test_registered_project_hash_form_is_a_cross_project_task_ref(self):
+        claims = _extract('dark_factory#2748 was merged', default_project_id='reify')
+
+        assert [(c.subject, c.ref, c.project_id) for c in claims] == [
+            ('task', '2748', 'dark_factory'),
+        ]
+
+
 def _verify(claims, *, task=None, ticket=None, commit=None):
     """Run verify_claims with probes that fail loudly if an unexpected one is
     consulted — the short-circuit contract is part of what is under test."""

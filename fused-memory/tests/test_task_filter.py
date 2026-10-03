@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
+import pytest
 from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
 
 from fused_memory.reconciliation.task_filter import (
@@ -3523,6 +3524,44 @@ class TestTaskRefRe:
             )
 
     # ------------------------------------------------------------------ #
+    # foreign numbers — a PR/issue/GitHub '#N' is never a task id (task 4853)
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'Merged PR #4521 into main',
+            'Merged PR#4521 into main',
+            'pull request #4521',
+            'merge request #4521',
+            'the upstream issue #123',
+            'issues #123',
+            'GH #12',
+            'MR #7',
+            'see owner/repo#123',
+            'dark_factory#2748',
+        ],
+    )
+    def test_negative_foreign_number_cues_are_not_task_refs(self, text):
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        assert TASK_REF_RE.findall(text) == [], (
+            f'Expected [] — a cue-preceded or word-attached #N names a PR, an '
+            f'issue or another repository, not a task.\ntext={text!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'text',
+        ['#94', '(#94)', 'see #94 for details', 'task #94', 'df #94', 'blocked on #94'],
+    )
+    def test_positive_bare_hash_refs_still_match(self, text):
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        assert TASK_REF_RE.findall(text) == ['94'], (
+            f"Expected ['94'] — a bare '#N' is still a task reference.\ntext={text!r}"
+        )
+
+    # ------------------------------------------------------------------ #
     # arity: exactly one capture group
     # ------------------------------------------------------------------ #
 
@@ -4432,6 +4471,16 @@ class TestFindPresentTenseCompletionClaimTaskIds:
             f'Expected {{1985, 1986}} — the widened clause carries the completion '
             f'phrase across every id in the sentence, including the one the '
             f'sentence calls pending.\ntext={text!r}'
+        )
+
+    def test_merged_pull_request_number_is_not_a_task_completion(self):
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        text = 'Merged PR #4521 into main'
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f'Expected set() — PR #4521 is not task 4521.\ntext={text!r}'
         )
 
 
