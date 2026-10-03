@@ -31,7 +31,7 @@ const STALE_FAILURE_THRESHOLD = 3
 // Derived mechanically from what each tab actually reads off window.DF_DATA,
 // mapped through data.js::endpointsFor's key lists: e.g. tab_overview.jsx
 // reads ORCHESTRATORS/ORCHESTRATORS_SPARK (-> /orchestrators), MEMORY_STATUS
-// (-> /memory), MEMORY_TIMESERIES (-> /memory-graphs), and so on. Paths are
+// (-> /memory), MEMORY_OPS (-> /memory-graphs), and so on. Paths are
 // QUERY-STRIPPED, matching data.js::pollKey — the four ?window= endpoints key
 // their flow-control state the same way, and a URL-keyed map would miss every
 // one of them after the first chip change.

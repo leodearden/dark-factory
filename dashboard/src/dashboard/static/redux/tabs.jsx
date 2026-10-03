@@ -32,6 +32,7 @@ const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const { projectInQueue, inQueueOver, inQueueHistory, latencyCaption } = window.DF_MERGE_QUEUE;
+const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
 const { useState: uS, useEffect: uE } = React;
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
@@ -43,7 +44,7 @@ const { useState: uS, useEffect: uE } = React;
 // paths data.js polls are greppable from the tiles that render them.
 const EP = Object.freeze({
   orchestrators: '/api/v2/dashboard/orchestrators', performance:  '/api/v2/dashboard/performance',
-  memory:        '/api/v2/dashboard/memory',        memoryGraphs: '/api/v2/dashboard/memory-graphs',
+  memory:        '/api/v2/dashboard/memory',
   recon:         '/api/v2/dashboard/recon',         mergeQueue:   '/api/v2/dashboard/merge-queue',
   costs:         '/api/v2/dashboard/costs',         scheduler:    '/api/v2/dashboard/scheduler',
   burndown:      '/api/v2/dashboard/burndown',
@@ -640,7 +641,6 @@ function PerfTab({ projectFilter }) {
 // ── Memory ──
 function MemoryTab({ projectFilter, onNavigate }) {
   const projects = Object.entries(DF.MEMORY_STATUS.projects).filter(([pid]) => projectFilter.length === 0 || projectFilter.includes(pid));
-  const ts = DF.MEMORY_TIMESERIES;
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       <div className="col-span-12 grid cols-5">
@@ -650,36 +650,30 @@ function MemoryTab({ projectFilter, onNavigate }) {
         <ST label="Mem0 memories" datum={plainDatum(DF.MEMORY_STATUS.mem0.memory_count, EP.memory)} format={fmtCount}
             hint={`${DF.MEMORY_STATUS.graphiti.episode_count.toLocaleString()} episodes`}
             history={(DF.MEMORY_STATUS.mem0.spark?.values || []).slice(-30)} sparkColor={CP.info} />
-        <ST label="Write queue" datum={plainDatum(DF.MEMORY_STATUS.queue.counts.pending, EP.memory)}
-            hint={DF.MEMORY_STATUS.queue.oldest_pending_age_seconds != null
-              ? `${DF.MEMORY_STATUS.queue.oldest_pending_age_seconds}s oldest`
-              : 'idle'}
+        <ST label="Write queue" datum={writeQueue(DF)} format={q => fmtCount(q.pending)}
+            hint={queueHint(writeQueue(DF))}
             history={(DF.MEMORY_STATUS.queue.spark?.values || []).slice(-30)} sparkColor={CP.warn} />
-        {(() => {
-          // Combined ops (read+write) — last hour bucket, plus a per-hour spark.
-          const combined = ts.reads.map((r, i) => r + (ts.writes[i] || 0));
-          const last = combined.length ? combined[combined.length - 1] : null;
-          return (
-            <ST label="Ops / hr" datum={derivedDatum(last, EP.memoryGraphs, 'no hourly buckets in the last 24h')} format={fmtCount}
-                history={combined} sparkColor={CP.accent} hint="last 24h" />
-          );
-        })()}
+        <ST label="Ops / hr" datum={newestHourOps(DF)} format={fmtCount}
+            history={DF.MEMORY_OPS.total} sparkColor={CP.accent} hint="last 24h" />
         <ST label="fused-memory"
             datum={plainDatum(DF.MEMORY_STATUS.uptime_seconds, EP.memory)} format={secs => `up ${window.DF_SHELL.fmtUptime(secs)}`}
             hint={DF.MEMORY_STATUS.started_at || '—'} />
       </div>
 
       <div className="col-span-8 panel">
-        <div className="panel-head"><span className="title">Reads vs writes · last 24h</span></div>
+        <div className="panel-head">
+          <span className="title">Reads vs writes · last 24h</span>
+          <span className="meta"><DatumReading datum={opsTotals(DF)} format={opsCaption} /></span>
+        </div>
         <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div style={{ display: 'flex', gap: 16, fontSize: 11 }}>
             <span style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 2, background: CP.accent, marginRight: 5, verticalAlign: 'middle' }}></span>reads</span>
             <span style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 2, background: CP.ok, marginRight: 5, verticalAlign: 'middle' }}></span>writes</span>
           </div>
           <div style={{ flex: 1, minHeight: 220 }}>
-            <LC labels={ts.labels} series={[
-              { values: ts.reads, color: CP.accent },
-              { values: ts.writes, color: CP.ok },
+            <LC labels={DF.MEMORY_OPS.labels} series={[
+              { values: DF.MEMORY_OPS.reads, color: CP.accent },
+              { values: DF.MEMORY_OPS.writes, color: CP.ok },
             ]} height={240} formatY={formatCountTick} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
@@ -688,9 +682,9 @@ function MemoryTab({ projectFilter, onNavigate }) {
       <div className="col-span-4 panel">
         <div className="panel-head"><span className="title">Operations · 24h</span></div>
         <div className="panel-body" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <DN data={DF.MEMORY_OPS_BREAKDOWN.map((d, i) => ({ ...d, color: [CP.accent, CP.ok, CP.warn, CP.info, CP.accent2, CP.bad][i % 6] }))} size={130} thickness={18} centerValue={DF.MEMORY_OPS_BREAKDOWN.reduce((s,d)=>s+d.value,0).toLocaleString()} centerLabel="ops" />
+          <DN data={DF.MEMORY_OPS.by_operation.map((d, i) => ({ ...d, color: [CP.accent, CP.ok, CP.warn, CP.info, CP.accent2, CP.bad][i % 6] }))} size={130} thickness={18} centerValue={opsTotalText(DF)} centerLabel="ops" />
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 5 }}>
-            {DF.MEMORY_OPS_BREAKDOWN.map((d, i) => (
+            {DF.MEMORY_OPS.by_operation.map((d, i) => (
               <div key={d.label} style={{ display: 'grid', gridTemplateColumns: '8px 1fr auto', gap: 6, alignItems: 'center', fontSize: 11 }}>
                 <span style={{ width: 8, height: 8, background: [CP.accent, CP.ok, CP.warn, CP.info, CP.accent2, CP.bad][i % 6], borderRadius: 2 }}></span>
                 <span className="mono" style={{ color: 'var(--fg-2)' }}>{d.label}</span>
@@ -798,7 +792,7 @@ function ReconTab({ projectFilter, search }) {
                   : 'idle'}
                 history={(r.buffer.spark?.values || []).slice(-30)} sparkColor={CP.warn} />
             <ST label="Active agents" datum={plainDatum(r.burst_state.length, EP.recon)}
-                hint={`${r.burst_state.filter(b=>b.state!=='idle').length} non-idle`}
+                hint={`${r.agent_activity.non_idle} non-idle`}
                 history={(r.agents_spark?.values || []).slice(-30)} sparkColor={CP.accent} />
             <ST label="In progress" datum={plainDatum(counts.inFlight, EP.recon)}
                 hint={`of ${counts.total} recent runs (all projects)`}

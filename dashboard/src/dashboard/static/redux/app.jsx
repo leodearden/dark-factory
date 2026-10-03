@@ -10,6 +10,7 @@ const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
 const { inQueueOver } = window.DF_MERGE_QUEUE;
+const { writeQueue } = window.DF_MEMORY_READINGS;
 const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
 const DD = window.DF_DATA;
 
@@ -124,7 +125,7 @@ function App() {
     orchRunning: DD.ORCHESTRATORS.filter(o => o.running).length,
     orchTotal: DD.ORCHESTRATORS.length,
     tasks: <DatumReading datum={tasksCensus} format={runningOfInFlight} />,
-    queue: DD.MEMORY_STATUS.queue.counts.pending,
+    queue: <DatumReading datum={writeQueue(DD)} format={q => q.pending} />,
     spend24h: DD.COSTS?.summary?.today ?? 0,
   };
 
