@@ -2065,6 +2065,35 @@ _METHOD_EXPLANATIONS: dict[str, str] = {
 }
 
 
+#: What happened to the task, for a verdict from the branch-landing modes:
+#: their callers leave it pending (or flip it there), so it is redispatched.
+_REDISPATCH_DISPOSITION = (
+    'The task was NOT marked done. It is left pending (or flipped to '
+    'pending by the coalesce re-drive, from merge-deferred), which means '
+    'it will be DISPATCHED TO AN AGENT on the next dispatch tick — a '
+    'full plan/verify/review cycle, not a cheap idempotent re-check. If '
+    'this landing is genuine, that dispatch is pure waste and will '
+    'REPEAT every tick, because this condition does not heal on its own. '
+    'Investigate why attribution/effect-survival failed (e.g. a heavy '
+    'rewrite of the touched paths, a branch-alias landing, a genuine '
+    'reverted merge, an unattributed commit, or a missing task-citing '
+    'commit); resolve this escalation once confirmed.'
+)
+
+#: What happened to the task, for a :attr:`LandingMethod.reported_claim`
+#: verdict: the workflow that received the report holds it blocked.
+_HELD_BLOCKED_DISPOSITION = (
+    'The task was NOT marked done. An agent reported it as already on main '
+    'at the cited commit, and the report could not be corroborated, so the '
+    'task is held BLOCKED pending this escalation; nothing redispatches it '
+    'meanwhile. Verify whether the cited commit carries this task\'s work. '
+    'If it does, declare the metadata.files that commit touches (or '
+    'delivered_checks that prove the capability) and unblock the task or '
+    'mark it done by hand. If it does not, unblock the task so it is '
+    'implemented. Resolve this escalation once decided.'
+)
+
+
 def format_unattributed_landing_detail(
     task_id: str, branch: str, verdict: LandingVerdict,
 ) -> tuple[str, str]:
@@ -2082,11 +2111,19 @@ def format_unattributed_landing_detail(
             probe are rendered into the detail text regardless of value,
             but this is intended to be called only on rejection.
 
+    The opening line and the closing disposition are keyed on
+    ``verdict.method``: a :attr:`LandingMethod.reported_claim` verdict comes
+    from :func:`validate_reported_landing` and its task is held blocked, so the
+    redispatch paragraph the branch-landing modes need would be false for it.
+
     Returns:
         A ``(summary, detail)`` tuple — ``summary`` is a one-line, ``[:200]``-
         safe string suitable for ``Escalation.summary``; ``detail`` is a
         multi-line block for ``Escalation.detail``.
     """
+    reported = verdict.method is LandingMethod.reported_claim
+    producer = 'validate_reported_landing' if reported else 'validate_landing_evidence'
+    disposition = _HELD_BLOCKED_DISPOSITION if reported else _REDISPATCH_DISPOSITION
     explanation = _REASON_EXPLANATIONS.get(
         verdict.reason, f'Unrecognized reason code: {verdict.reason}',
     )
@@ -2097,23 +2134,14 @@ def format_unattributed_landing_detail(
         f'be attributed ({verdict.reason}){summary_fragment}'
     )[:200]
     detail = (
-        f'validate_landing_evidence rejected the landing evidence for task '
+        f'{producer} rejected the landing evidence for task '
         f'{task_id} on branch {branch!r}.\n\n'
         f'reason: {verdict.reason}\n'
         f'{explanation}\n\n'
         f'{divergence_block}'
         f'{differential_block}'
         f'probe: {verdict.probe}\n\n'
-        'The task was NOT marked done. It is left pending (or flipped to '
-        'pending by the coalesce re-drive, from merge-deferred), which means '
-        'it will be DISPATCHED TO AN AGENT on the next dispatch tick — a '
-        'full plan/verify/review cycle, not a cheap idempotent re-check. If '
-        'this landing is genuine, that dispatch is pure waste and will '
-        'REPEAT every tick, because this condition does not heal on its own. '
-        'Investigate why attribution/effect-survival failed (e.g. a heavy '
-        'rewrite of the touched paths, a branch-alias landing, a genuine '
-        'reverted merge, an unattributed commit, or a missing task-citing '
-        'commit); resolve this escalation once confirmed.'
+        f'{disposition}'
     )
     return summary, detail
 
@@ -2346,6 +2374,7 @@ def file_unattributed_landing_escalation(
     verdict: LandingVerdict,
     *,
     agent_role: str,
+    filing_claimant_run_id: str | None = None,
 ) -> None:
     """Best-effort, dedup-guarded L1 escalation for unattributable landing
     evidence (task 2678, INV-5; extracted in the amendment pass — review
@@ -2363,7 +2392,9 @@ def file_unattributed_landing_escalation(
     caller leaves the task/member row pending (or flips it to pending) and
     it is re-evaluated next tick; the caller's own open-L1 veto naturally
     suppresses reprocessing while this L1 stays open — no separate status
-    transition happens here.
+    transition happens here.  (The workflow's reported-claim caller,
+    ``TaskWorkflow._handle_already_done_report``, is the exception: it holds
+    its task blocked itself, after filing.)
 
     Best-effort (a no-op when *escalation_queue* is None, e.g. bare-harness
     or bare-worker unit tests) and deduped via ``has_open_l1`` so repeated
@@ -2468,6 +2499,11 @@ def file_unattributed_landing_escalation(
         agent_role: The filing caller's role, e.g. ``'harness-reconcile'``
             or ``'orchestrator-merge-worker'`` — the only thing that
             distinguishes the two call sites.
+        filing_claimant_run_id: The filing workflow incarnation's run id,
+            stamped onto the record (task 3550's rule that every workflow
+            filing names its incarnation, kept true for a filing routed
+            through this shared helper).  ``None`` for the harness and
+            merge-worker callers, which file no incarnation.
     """
     if not escalation_queue:
         return
@@ -2559,6 +2595,7 @@ def file_unattributed_landing_escalation(
             # without the key must degrade to None (= never suppress) rather
             # than raise inside this best-effort helper.
             citation_sha=citation_sha,
+            filing_claimant_run_id=filing_claimant_run_id,
         )
         escalation_queue.submit(esc)
         logger.warning(
