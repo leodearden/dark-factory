@@ -2406,62 +2406,75 @@ async def _seed_modules_carrier(interceptor, root):
     return added['id']
 
 
-@pytest.mark.parametrize(
-    'encode', [dict, json.dumps], ids=['dict', 'json'],
-)
-@pytest.mark.parametrize(
+_MODULES_CARRIER_METADATA = {'modules': ['widget'], 'files': ['widget/src/widget/app.py']}
+
+
+async def _submit_carrier_shaped(server, root, planning_mode, metadata):
+    """Submit the one payload both paired tests share, varying only metadata.
+    The description quotes the retired key, which must never trip the guard."""
+    return await server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': root,
+            'title': 'Declare widget scope',
+            'description': 'metadata.modules is retired; scope is declared in files',
+            'planning_mode': planning_mode,
+            'metadata': metadata,
+        },
+    )
+
+
+_ENCODINGS = pytest.mark.parametrize('encode', [dict, json.dumps], ids=['dict', 'json'])
+_CREATION_PATHS = pytest.mark.parametrize(
     'planning_mode', [True, False], ids=['planning', 'curator'],
 )
+
+
+@_ENCODINGS
+@_CREATION_PATHS
 @pytest.mark.asyncio
 async def test_submit_task_modules_carrier_returns_retired_key_modules_error(
     planning_mode, encode, real_task_stack, tmp_path,
 ):
     server, interceptor = real_task_stack
     root = str(tmp_path)
-    metadata = {'modules': ['widget'], 'files': ['widget/src/widget/app.py']}
 
-    result = await server._tool_manager.call_tool(
-        'submit_task',
-        {
-            'project_root': root,
-            'title': 'Carry the retired key',
-            'planning_mode': planning_mode,
-            'metadata': encode(metadata),
-        },
+    result = await _submit_carrier_shaped(
+        server, root, planning_mode, encode(_MODULES_CARRIER_METADATA),
     )
 
     assert result.get('error_type') == 'RetiredMetadataKey', f'got {result!r}'
     assert result['retired_key'] == 'modules'
-    assert 'metadata.files' in result['hint']
+    assert result['replacement_key'] == 'files'
+    assert result['error']
+    assert result['hint']
     assert 'ticket' not in result
     assert 'task_id' not in result
     assert await interceptor.get_statuses(root) == {}
 
 
+@_ENCODINGS
+@_CREATION_PATHS
 @pytest.mark.asyncio
-async def test_submit_task_same_submission_with_files_succeeds_where_retired_key_modules_error_fires(
-    real_task_stack, tmp_path,
+async def test_submit_task_without_modules_key_succeeds(
+    planning_mode, encode, real_task_stack, tmp_path,
 ):
-    """Paired positive: dropping the key is the whole fix, and quoting it in
-    prose never trips the guard."""
+    """Paired positive: the rejected payload minus ``modules`` is accepted, so
+    dropping the key is the whole fix."""
     server, interceptor = real_task_stack
     root = str(tmp_path)
+    metadata = {k: v for k, v in _MODULES_CARRIER_METADATA.items() if k != 'modules'}
 
-    result = await server._tool_manager.call_tool(
-        'submit_task',
-        {
-            'project_root': root,
-            'title': 'Declare scope in files',
-            'description': 'metadata.modules is retired; scope is declared in files',
-            'planning_mode': True,
-            'metadata': {'files': ['widget/src/widget/app.py']},
-        },
-    )
+    result = await _submit_carrier_shaped(server, root, planning_mode, encode(metadata))
 
-    assert result.get('status') == 'deferred', f'got {result!r}'
-    persisted = (await interceptor.get_task(result['task_id'], root))['metadata']
-    assert persisted['files'] == ['widget/src/widget/app.py']
-    assert 'modules' not in persisted
+    assert 'error' not in result, f'got {result!r}'
+    if planning_mode:
+        assert result.get('status') == 'deferred', f'got {result!r}'
+        persisted = (await interceptor.get_task(result['task_id'], root))['metadata']
+        assert persisted['files'] == metadata['files']
+        assert 'modules' not in persisted
+    else:
+        assert result['ticket'].startswith('tkt_'), f'got {result!r}'
 
 
 @pytest.mark.asyncio

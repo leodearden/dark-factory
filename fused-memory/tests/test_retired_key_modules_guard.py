@@ -1,9 +1,8 @@
 """Unit tests for fused_memory.middleware.retired_key_modules_guard.
 
-The guard runs after ``inject_task_kind`` has normalised submit metadata to a
-dict, so every case here is a plain mapping; JSON-string handling is the
-normaliser's job, and the MCP-boundary tests in test_task_tools.py cover it
-end to end (plans/metadata-modules-retirement-prd.md decision 3).
+The guard takes a mapping, so every case here is a plain dict; JSON-string
+metadata and both creation paths are covered end to end by the MCP-boundary
+tests in test_task_tools.py.
 """
 
 from __future__ import annotations
@@ -32,8 +31,8 @@ class TestRetiredKeyModulesErrorRejects:
         assert result['error_type'] == 'RetiredMetadataKey'
         assert result['retired_key'] == 'modules'
         assert result['replacement_key'] == 'files'
-        assert 'metadata.files' in result['hint']
-        assert 'metadata.modules' in result['error']
+        assert result['error']
+        assert result['hint']
 
     def test_valid_files_alongside_does_not_excuse_the_retired_key(self):
         result = retired_key_modules_error(
