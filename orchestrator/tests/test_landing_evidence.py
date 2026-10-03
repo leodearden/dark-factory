@@ -2706,3 +2706,93 @@ class TestValidateReportedLanding:
         await self._validate(self._ops(), declared_files=[], delivered_checks=[])
 
         assert LANDING_TALLY.snapshot()[LandingReason.no_attribution] == before + 1
+
+
+@pytest.mark.asyncio
+class TestReportedClaimEscalation:
+    """What a human reads, and what is filed, for a reported-claim reject (task 4704).
+
+    The verdict comes from CALLING the producer, never from a hand-built
+    dataclass: a hand-built one carries ``method=unspecified`` and would test
+    a shape production never files.  The formatter assertions are about WHICH
+    disposition branch is selected — a reported-claim reject holds the task
+    blocked, so the redispatch paragraph the other modes need would be false.
+    """
+
+    SHA = 'c' * 40
+
+    async def _reported_reject(self) -> LandingVerdict:
+        return await validate_reported_landing(
+            _git_ops(
+                citation=None, is_ancestor_map={}, effect_present=True,
+                reported_commit_files=['pkg/a.py'],
+            ),
+            '42', 'task/42',
+            reported_sha=self.SHA, declared_files=[], delivered_checks=[],
+        )
+
+    def _queue(self, tmp_path):
+        from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+        return EscalationQueue(tmp_path / 'queue')
+
+    async def test_detail_says_the_task_is_held_blocked_not_redispatched(self) -> None:
+        summary, detail = format_unattributed_landing_detail(
+            '42', 'task/42', await self._reported_reject(),
+        )
+
+        assert 'no_attribution' in summary
+        assert 'no_attribution' in detail
+        assert 'reported_claim' in detail
+        assert 'nothing_declared' in detail
+        assert 'BLOCKED' in detail
+        assert 'DISPATCHED TO AN AGENT' not in detail, (
+            'a held task is not redispatched; the pending/redispatch '
+            'disposition is false for this verdict'
+        )
+        assert not detail.startswith('validate_landing_evidence'), (
+            'validate_landing_evidence did not produce this verdict'
+        )
+
+    async def test_other_modes_keep_the_redispatch_disposition(self) -> None:
+        verdict = await validate_landing_evidence(
+            _git_ops(citation=None, is_ancestor_map={}, effect_present=False),
+            '42', 'task/42', branch_tip_sha=None, candidate_sha='b' * 40,
+        )
+
+        _summary, detail = format_unattributed_landing_detail('42', 'task/42', verdict)
+
+        assert 'DISPATCHED TO AN AGENT' in detail
+
+    async def test_filing_stamps_the_reported_sha_and_the_claimant_run(
+        self, tmp_path,
+    ) -> None:
+        queue = self._queue(tmp_path)
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', await self._reported_reject(),
+            agent_role='orchestrator-workflow', filing_claimant_run_id='run-x',
+        )
+
+        pending = queue.get_by_task('42', status='pending')
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 1
+        assert esc.category == 'provenance_unattributed'
+        assert esc.citation_sha == self.SHA
+        assert esc.filing_claimant_run_id == 'run-x'
+        assert esc.agent_role == 'orchestrator-workflow'
+
+    async def test_callers_that_pass_no_claimant_run_file_unchanged(
+        self, tmp_path,
+    ) -> None:
+        """The harness and merge-worker callers pass no run id and stay byte-identical."""
+        queue = self._queue(tmp_path)
+
+        file_unattributed_landing_escalation(
+            queue, '42', 'task/42', await self._reported_reject(),
+            agent_role='harness-reconcile',
+        )
+
+        (esc,) = queue.get_by_task('42', status='pending')
+        assert esc.filing_claimant_run_id is None
