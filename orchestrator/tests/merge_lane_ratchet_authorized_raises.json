@@ -1591,6 +1591,48 @@
           "current": 31675
         }
       ]
+    },
+    {
+      "task_id": "4704",
+      "reason": "Task 4704 adds the reported-claim attribution mode (validate_reported_landing) and a method-aware L1 disposition to landing_evidence so workflow.py's architect already_done writer stops stamping uncorroborated commits; net-additive guard, the CANDIDATE effect arm was extracted not copied.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+          "baseline": 142,
+          "current": 148
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+          "baseline": 2556,
+          "current": 2776
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+          "baseline": 1447,
+          "current": 1535
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4758,
+          "current": 4764
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56462,
+          "current": 56682
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31675,
+          "current": 31763
+        }
+      ]
     }
   ]
 }
