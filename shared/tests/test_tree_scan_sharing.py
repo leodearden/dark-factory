@@ -34,7 +34,12 @@ from pathlib import Path
 import pytest
 import silent_fallthrough_scan as sfs
 import test_config_dir_archival_gate as archival_gate
-from silent_fallthrough_scan import ParsedFile, iter_first_party_files
+from silent_fallthrough_scan import (
+    SCOPE_ROOTS,
+    ParsedFile,
+    ScopeRootsMissingError,
+    iter_first_party_files,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -46,15 +51,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _make_fake_repo(tmp_path: Path, files: dict[str, str | bytes]) -> Path:
-    """Build a minimal repo root that satisfies iter_first_party_files' sentinels.
+    """Build a minimal repo root carrying every ``SCOPE_ROOTS`` directory.
 
-    ``iter_first_party_files`` validates ``shared/src`` and ``orchestrator/src``
-    and RAISES if they are absent, so both are created even when no file is
-    placed in them.
+    Every scope root is required: ``iter_first_party_files`` RAISES if any one
+    is absent, so all of them are created even when no file is placed in them.
     """
     root = tmp_path / 'repo'
-    (root / 'shared' / 'src').mkdir(parents=True)
-    (root / 'orchestrator' / 'src').mkdir(parents=True)
+    for scope_root in SCOPE_ROOTS:
+        (root / scope_root).mkdir(parents=True)
     for rel, content in files.items():
         target = root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -246,6 +250,41 @@ class TestParseFirstPartyTreeIsMemoized:
         assert second is not first
         assert len(counter.parses) == 1
         assert len(counter.reads) == 1
+
+
+class TestEveryScopeRootIsRequired:
+    """An absent scope root RAISES; it is never skipped.
+
+    A skipped root is a green gate over less code — the silent fallthrough the
+    flagship gate exists to catch — so every ``SCOPE_ROOTS`` entry is required,
+    not just the two the enumerator once treated as sentinels.
+    """
+
+    @pytest.mark.parametrize('removed_root', SCOPE_ROOTS)
+    def test_each_absent_root_raises_naming_it(self, tmp_path, removed_root):
+        root = _make_fake_repo(tmp_path, {})
+        (root / removed_root).rmdir()
+        with pytest.raises(ScopeRootsMissingError) as excinfo:
+            list(iter_first_party_files(root))
+        assert excinfo.value.missing == (removed_root,)
+        assert excinfo.value.repo_root == root
+        assert isinstance(excinfo.value, RuntimeError)
+
+    def test_every_absent_root_is_named_in_one_error(self, tmp_path):
+        """Report them all at once, in declaration order — not first-hit-only."""
+        with pytest.raises(ScopeRootsMissingError) as excinfo:
+            list(iter_first_party_files(tmp_path))
+        assert excinfo.value.missing == SCOPE_ROOTS
+
+    def test_provider_propagates_and_memoizes_nothing(self, tmp_path,
+                                                      isolated_parse_cache):
+        """The raise reaches conftest's prebuild through the provider, uncached."""
+        root = _make_fake_repo(tmp_path, {'shared/src/shared/alpha.py': 'x = 1\n'})
+        (root / 'scripts').rmdir()
+        with pytest.raises(ScopeRootsMissingError) as excinfo:
+            sfs.parse_first_party_tree(root)
+        assert excinfo.value.missing == ('scripts',)
+        assert isolated_parse_cache == {}
 
 
 class TestSessionFixtureSharesTheProvider:

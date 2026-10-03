@@ -726,6 +726,7 @@ from pathlib import Path  # noqa: E402
 
 from silent_fallthrough_allowlist import ALLOWLIST_ENTRIES, ALLOWLIST_KEYS  # noqa: E402
 from silent_fallthrough_scan import (  # noqa: E402
+    SCOPE_ROOTS,
     reconcile_against_allowlist,
     violation_key,
 )
@@ -816,17 +817,24 @@ class TestGateSelfIntegrity:
             f"({_REPO_ROOT})"
         )
 
-    def test_known_first_party_files_are_included(self, tree_scan_data):
-        """Known first-party files must be present in the scan set."""
-        files = {str(f) for f in tree_scan_data.files}
-        expected = [
-            "orchestrator/src/orchestrator/scheduler.py",
-            "orchestrator/src/orchestrator/harness.py",
-            "fused-memory/src/fused_memory/services/memory_service.py",
-        ]
-        for rel in expected:
-            candidate = str(_REPO_ROOT / rel)
-            assert candidate in files, f"Expected file missing from scan: {rel}"
+    def test_every_scope_root_contributes_a_scanned_module(self, tree_scan_data):
+        """Each scope root yields a real module, not just a stray ``__init__.py``.
+
+        Keyed on ``SCOPE_ROOTS`` rather than on named files, so renaming a
+        module in a sibling package cannot red this self-check.
+        """
+        contributing = {
+            root
+            for root in SCOPE_ROOTS
+            for f in tree_scan_data.files
+            if Path(f).name != "__init__.py"
+            and Path(f).is_relative_to(_REPO_ROOT / root)
+        }
+        silent = [root for root in SCOPE_ROOTS if root not in contributing]
+        assert not silent, (
+            f"Scope roots contributing no scanned module: {silent} — the gate "
+            f"is scanning less than SCOPE_ROOTS declares ({_REPO_ROOT})"
+        )
 
     def test_excluded_paths_are_absent(self, tree_scan_data):
         """Submodule dirs (mem0/, graphiti/) and tests/ are excluded."""
