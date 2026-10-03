@@ -274,6 +274,9 @@ def _resolve_db_path(args: argparse.Namespace) -> Path:
 def main(argv: Sequence[str] | None = None) -> int:
     """Print the store's shape, or diagnose why it could not be read.
 
+    Line 1 is the absolute path of the store actually read, so a caller can
+    open it read-only from any cwd.
+
     Only this module's own typed refusals are caught, and each exits non-zero
     with its message on STDERR and NOTHING on stdout: reporting an empty
     schema would tell the reader the store has no tables.
@@ -291,7 +294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         conn.close()
 
-    print(db_path)
+    print(db_path.resolve())
     print(render(tables))
     return EXIT_OK
 
