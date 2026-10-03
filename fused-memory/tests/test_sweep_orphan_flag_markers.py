@@ -4154,9 +4154,9 @@ class TestKnownProjectsCoverageIssue:
 
     Three cases must be told apart:
       (i)   a named root that IS NOT A DIRECTORY (typo, moved/unmounted
-            checkout). ``Path.resolve()`` is non-strict, so the builder
-            ADMITS it under a basename-derived id — the sweep runs a phantom
-            project that enumerates 0, deletes 0 and exits 0;
+            checkout). The builder ADMITS it deliberately, with a WARNING
+            (task 5286, arm (b)), so the sweep runs a phantom project that
+            enumerates 0, deletes 0 and exits 0;
       (ii)  a named root whose resolved path is ABSENT from the map, i.e. its
             project_id was claimed first by another root (first-wins). That
             checkout is never swept;
@@ -4214,9 +4214,9 @@ class TestKnownProjectsCoverageIssue:
     ):
         """Case (i), and the reason id-membership was the wrong test.
 
-        A nonexistent root is NOT skipped by build_known_projects_map --
-        ``Path(raw).resolve()`` is non-strict, so the root is admitted under a
-        basename-derived project_id. Its id IS therefore in the map, an
+        A nonexistent root is NOT skipped by build_known_projects_map -- the
+        builder admits it deliberately, with a WARNING (task 5286, arm (b)),
+        under a basename-derived project_id. Its id IS therefore in the map, an
         id-membership predicate reports clean, and the wrapper goes on to
         sweep a phantom project that counts 0 and exits 0. Asserted here on
         the REAL map so the dead branch cannot come back.
@@ -4229,7 +4229,7 @@ class TestKnownProjectsCoverageIssue:
 
         assert 'gone_project' in known, (
             f'Premise of this test: the builder ADMITS a nonexistent root '
-            f'(resolve() is non-strict), which is why membership-by-id cannot '
+            f'(task 5286, arm (b)), which is why membership-by-id cannot '
             f'detect it; got {known!r}'
         )
         assert issue is not None, (

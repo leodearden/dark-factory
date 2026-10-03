@@ -460,10 +460,12 @@ an `if not known_projects` check is unreachable in exactly the degradation it
 looks like it guards. Three cases are distinguished:
 
 - **a named root that is not a directory on this host** — a typo, or a
-  moved/unmounted checkout. `Path.resolve()` is non-strict, so the builder
-  *admits* such a root under a basename-derived project_id rather than
-  skipping it: the nightly then sweeps a phantom project that enumerates 0,
-  deletes 0 and exits 0 — a silent green. Named individually.
+  moved/unmounted checkout. The builder *admits* such a root under a
+  basename-derived project_id deliberately, and WARNs at build time (task
+  5286; `fused-memory/src/fused_memory/models/scope.py::build_known_projects_map`'s
+  docstring records why). The nightly still sweeps that phantom project,
+  which enumerates 0, deletes 0 and exits 0 — a silent green — so the report
+  names it individually.
 - **a named root whose resolved path is absent from the map** — its
   project_id was claimed first by a root listed earlier (`first-wins`, with
   the primary root seeded first), so that checkout is never swept. Named

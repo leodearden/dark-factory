@@ -1912,15 +1912,16 @@ def _known_projects_coverage_issue(known: dict[str, str]) -> str | None:
     project_id (task 2917 amendment, reviewer_comprehensive #1/#6). The
     previous id-membership test could not fire for either cause it named:
     a first-wins collision leaves the dropped root's id in the map (so the
-    test passes), and a nonexistent root is ADMITTED to the map rather than
-    skipped, because ``Path.resolve()`` is non-strict.
+    test passes), and a root that is not a directory is ADMITTED to the map
+    deliberately (task 5286, arm (b); the builder's docstring says why).
 
     Three cases, deliberately told apart:
       (i)   the env var is SET and names a root that IS NOT A DIRECTORY on
-            this host — a typo, or a moved/unmounted checkout. The registry
-            admits it anyway under a basename-derived project_id, so the
-            nightly sweep runs that phantom id, enumerates 0, deletes 0 and
-            exits 0: the SILENT green this whole feature exists to close.
+            this host — a typo, or a moved/unmounted checkout. The builder
+            admits it DELIBERATELY and logs a WARNING at build time (task
+            5286, arm (b)). This report still names it, because the nightly
+            wrapper sweeps that phantom id, enumerates 0, deletes 0 and exits
+            0: the SILENT green this whole feature exists to close.
       (ii)  the env var is SET and names a root whose resolved path is ABSENT
             from the map — its project_id was already claimed by an earlier
             root (``build_known_projects_map`` is first-wins, primary seeded
@@ -1969,9 +1970,7 @@ def _known_projects_coverage_issue(known: dict[str, str]) -> str | None:
         phantom: list[str] = []   # case (i): named, but not a directory
         unmapped: list[str] = []  # case (ii): named, but absent from the map
         for raw in named_roots:
-            # Path.is_dir() swallows OSError (ENOENT, ELOOP, ENAMETOOLONG) and
-            # answers False, which is exactly the verdict wanted here.
-            if not Path(raw).is_dir():
+            if scope.is_phantom_project_root(raw):
                 phantom.append(raw)
                 continue
             try:
@@ -1986,10 +1985,10 @@ def _known_projects_coverage_issue(known: dict[str, str]) -> str | None:
         if phantom:
             problems.append(
                 f'{len(phantom)} of them IS NOT A DIRECTORY on this host: '
-                f'{", ".join(phantom)}. Path.resolve() is non-strict, so '
-                f'build_known_projects_map ADMITS such a root under a '
-                f'basename-derived project_id instead of skipping it — the '
-                f'nightly sweep then runs that phantom id, enumerates 0 '
+                f'{", ".join(phantom)}. build_known_projects_map admits '
+                f'such a root deliberately (task 5286) and WARNs at build '
+                f'time; the nightly sweep then runs that phantom id, '
+                f'enumerates 0 '
                 f'markers, deletes 0 and exits 0 (a SILENT green). Likely '
                 f'cause: a typo in the root path, or a moved/unmounted '
                 f'checkout.'
