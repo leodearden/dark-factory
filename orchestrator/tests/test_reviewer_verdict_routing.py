@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -808,6 +809,22 @@ class TestReviewMirrorCarriesSalvagedVerdict:
         assert mirror['failure']['kind'] == 'server_error'
         assert mirror['failure']['api_error_status'] == 529
         assert aggregation.errored_reviews == {'reviewer_comprehensive': mirror}
+
+    async def test_skipped_retry_log_names_the_decoded_cause(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        f = self._setup(tmp_path, retries=2)
+        f.wf._invoke = AsyncMock(  # type: ignore[method-assign]
+            return_value=AgentResult(
+                success=False, output='API Error: 529', api_error_status=529,
+            ),
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+            await f.wf._review()
+
+        label = ReviewerFailure.from_review(self._mirror(f)).label
+        assert f'reviewer_comprehensive ({label})' in caplog.text
 
     async def test_zero_work_keeps_its_free_in_phase_retries(self, tmp_path: Path):
         f = self._setup(tmp_path, retries=2)

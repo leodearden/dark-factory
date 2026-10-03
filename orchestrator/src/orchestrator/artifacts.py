@@ -1105,19 +1105,18 @@ class TaskArtifacts:
     def aggregate_reviews(self) -> ReviewAggregation:
         """Aggregate every review as ``orchestrator/review_payload.py::normalize_review`` reads it.
 
-        ERROR reviews are also returned verbatim in ``errored_reviews`` so the
-        review arm can read each errored reviewer's failure record.
+        ERROR reviews are kept out of ``reviews`` and returned verbatim in
+        ``errored_reviews`` (``reviewer_errors`` is its names), so the review
+        arm can read each errored reviewer's failure record.
         """
         reviews = self.read_reviews()
         blocking = []
         suggestions = []
-        errors = []
         errored_reviews = {}
 
         for reviewer_name, review in reviews.items():
             payload = normalize_review(review)
             if payload.verdict is Verdict.ERROR:
-                errors.append(reviewer_name)
                 errored_reviews[reviewer_name] = review
             blocking.extend(
                 {**issue, 'reviewer': reviewer_name} for issue in payload.blocking_issues
@@ -1126,13 +1125,13 @@ class TaskArtifacts:
                 {**issue, 'reviewer': reviewer_name} for issue in payload.suggestions
             )
 
-        clean = {k: v for k, v in reviews.items() if k not in errors}
+        clean = {k: v for k, v in reviews.items() if k not in errored_reviews}
         return ReviewAggregation(
             has_blocking_issues=len(blocking) > 0,
             blocking_issues=blocking,
             suggestions=suggestions,
             reviews=clean,
-            reviewer_errors=errors,
+            reviewer_errors=list(errored_reviews),
             errored_reviews=errored_reviews,
         )
 

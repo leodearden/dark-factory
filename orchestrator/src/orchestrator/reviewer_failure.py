@@ -13,7 +13,7 @@ halves are task 3321.
 from __future__ import annotations
 
 import enum
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -214,23 +214,21 @@ class ReviewErrorTriage:
     api_error_status: int | None
 
 
-def triage_reviewer_errors(
-    reviewer_errors: Sequence[str], errored_reviews: Mapping[str, Mapping],
-) -> ReviewErrorTriage:
-    """Decide the review arm's exit for a panel with errored reviewers.
+def triage_reviewer_errors(errored_reviews: Mapping[str, Mapping]) -> ReviewErrorTriage:
+    """Decide the review arm's exit for a panel's errored reviews, keyed by reviewer.
 
     Requeue only when EVERY errored reviewer is requeue-eligible; any cap,
     quality or unclassified failure blocks. A 5xx status, when present, is
     carried so the requeue rides the scheduler's transient lane.
     """
-    if not reviewer_errors:
+    if not errored_reviews:
         raise ValueError(
-            'triage_reviewer_errors requires a non-empty reviewer_errors; '
+            'triage_reviewer_errors requires a non-empty errored_reviews; '
             'an empty panel must never read as all-transient'
         )
     failures = {
-        name: ReviewerFailure.from_review(errored_reviews.get(name, {}))
-        for name in sorted(reviewer_errors)
+        name: ReviewerFailure.from_review(errored_reviews[name])
+        for name in sorted(errored_reviews)
     }
     requeue = all(failure.requeue_eligible for failure in failures.values())
     listing = '; '.join(f'{name}: {failure.describe()}' for name, failure in failures.items())

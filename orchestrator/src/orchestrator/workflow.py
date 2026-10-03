@@ -162,6 +162,7 @@ from orchestrator.review_suggestions.curator_intake import (
 )
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.reviewer_failure import (
+    ReviewerFailure,
     classify_reviewer_exception,
     classify_reviewer_result,
     error_review,
@@ -372,12 +373,12 @@ def _is_transient_architect_glitch(result: AgentResult, *, plan_on_disk: bool) -
     ``cost_usd`` are parsed from the CLI's JSON.  On the failure arms this
     predicate serves (``error_empty_output`` / ``error_cli_input_rejected``)
     that JSON is never parsed, so both are 0 by construction and the numeric
-    clauses are vacuous.  The failure call site therefore ANDs in the
-    transcript-authoritative ``not result.transcript_turns`` clause, which is
-    the only signal there that distinguishes "nothing ran" from "a productive
-    run was killed from outside".  That clause is kept at the call site rather
-    than folded in here precisely because it is NOT a no-op on the success
-    path.
+    clauses are vacuous.  The failure call site therefore ANDs in
+    ``orchestrator/zero_work_failure.py::is_zero_work_failure``, whose
+    transcript-authoritative zero-turn clause is the only signal there that
+    distinguishes "nothing ran" from "a productive run was killed from
+    outside".  That predicate is kept out of this one precisely because its
+    zero-turn clause is NOT a no-op on the success path.
     """
     return result.turns <= 2 and result.cost_usd < 0.20 and not plan_on_disk
 
@@ -8702,10 +8703,8 @@ class TaskWorkflow:
             used_ctx = amendment_ctx
             amendment_ctx = None
             reviews = await self._review(amendment_ctx=used_ctx)
-            if reviews.reviewer_errors:
-                triage = triage_reviewer_errors(
-                    reviews.reviewer_errors, reviews.errored_reviews,
-                )
+            if reviews.errored_reviews:
+                triage = triage_reviewer_errors(reviews.errored_reviews)
                 if triage.requeue:
                     logger.warning('Task %s: %s', self.task_id, triage.reason)
                     return await self._exit_requeued(
@@ -11215,8 +11214,9 @@ class TaskWorkflow:
     async def _review(self, amendment_ctx: AmendmentReviewContext | None = None):
         """Run the reviewer roster with staggered launches and aggregate it.
 
-        Errored reviewers are retried in-phase up to ``max_reviewer_retries``,
-        except 5xx-attributed ones: the scheduler's transient lane paces those.
+        Errored reviewers are retried in-phase up to ``max_reviewer_retries``
+        unless their failure kind's policy skips in-phase retry
+        (``orchestrator/reviewer_failure.py::should_retry_reviewer``).
 
         When *amendment_ctx* is set (this review immediately follows an
         amendment round), the amendment's addressed suggestions are threaded
@@ -11277,14 +11277,16 @@ class TaskWorkflow:
                     results[i] = exc
 
         not_retried = [
-            role.name for role, r in zip(roster, results, strict=True)
+            f'{role.name} ({ReviewerFailure.from_review(r).label})'
+            for role, r in zip(roster, results, strict=True)
             if isinstance(r, dict) and r.get('verdict') == 'ERROR'
             and not should_retry_reviewer(r)
         ]
         if not_retried:
             logger.info(
                 f'Task {self.task_id}: skipped in-phase retry for '
-                f'{len(not_retried)} 5xx-attributed reviewer(s): {", ".join(not_retried)}'
+                f'{len(not_retried)} reviewer(s) by failure-kind policy: '
+                f'{", ".join(not_retried)}'
             )
 
         for role, result in zip(roster, results, strict=True):

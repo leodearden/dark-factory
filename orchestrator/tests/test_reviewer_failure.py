@@ -243,8 +243,9 @@ _NO_VERDICT = AgentResult(success=True, output='looks fine')
 
 
 def _triage(results: dict[str, AgentResult]):
-    errored = {role: _errored(role, result) for role, result in results.items()}
-    return triage_reviewer_errors(list(errored), errored)
+    return triage_reviewer_errors(
+        {role: _errored(role, result) for role, result in results.items()},
+    )
 
 
 class TestTriageRequeues:
@@ -255,16 +256,14 @@ class TestTriageRequeues:
         assert 'agent API error: HTTP 529' in triage.reason
         assert is_transient_api_requeue(triage.reason, api_error_status=triage.api_error_status)
 
-    def test_two_5xx_reviewers_pick_a_status_deterministically(self):
-        errored = {
-            'reviewer_b': _errored('reviewer_b', _SERVER_503),
-            'reviewer_a': _errored('reviewer_a', _SERVER_529),
-        }
-        forward = triage_reviewer_errors(['reviewer_a', 'reviewer_b'], errored)
-        backward = triage_reviewer_errors(['reviewer_b', 'reviewer_a'], errored)
-        assert forward.requeue
-        assert forward.api_error_status in {529, 503}
-        assert forward == backward
+    def test_two_5xx_reviewers_carry_the_first_name_s_status(self):
+        reviewer_a = _errored('reviewer_a', _SERVER_529)
+        reviewer_b = _errored('reviewer_b', _SERVER_503)
+        a_first = triage_reviewer_errors({'reviewer_a': reviewer_a, 'reviewer_b': reviewer_b})
+        b_first = triage_reviewer_errors({'reviewer_b': reviewer_b, 'reviewer_a': reviewer_a})
+        assert a_first.requeue
+        assert a_first.api_error_status == 529
+        assert a_first == b_first
 
     def test_all_zero_work_rides_the_genuine_lane(self):
         triage = _triage({ROLE: _zero_work(transcript_turns=0)})
@@ -299,13 +298,9 @@ class TestTriageBlocks:
         assert 'budget' in triage.reason
         assert 'infrastructure' not in triage.reason.lower()
 
-    def test_name_without_an_errored_review_blocks(self):
-        triage = triage_reviewer_errors([ROLE], {})
-        assert not triage.requeue
-
     def test_legacy_error_dict_without_record_blocks(self):
         legacy = {'reviewer': ROLE, 'verdict': 'ERROR', 'issues': [], 'summary': 'old'}
-        triage = triage_reviewer_errors([ROLE], {ROLE: legacy})
+        triage = triage_reviewer_errors({ROLE: legacy})
         assert not triage.requeue
 
 
@@ -319,5 +314,5 @@ def test_detail_names_every_reviewer_kind_and_status():
 
 
 def test_empty_panel_is_rejected_rather_than_read_as_all_transient():
-    with pytest.raises(ValueError, match='reviewer_errors'):
-        triage_reviewer_errors([], {})
+    with pytest.raises(ValueError, match='errored_reviews'):
+        triage_reviewer_errors({})
