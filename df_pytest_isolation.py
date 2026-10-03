@@ -2626,9 +2626,9 @@ def _df_no_synthetic_heartbeats_in_live_fleet():
 # The vars that retarget git WITHOUT walking anywhere. Deliberately NARROW:
 # only names that change WHICH repository (or which config) a command acts on.
 # GIT_CONFIG_PARAMETERS is git's own `-c` propagation channel, read at
-# command-line precedence (it can inject a core.hooksPath). Identity vars (GIT_AUTHOR_*, GIT_COMMITTER_*) are left alone -- they change
-# what a commit says, never where it lands, and tests legitimately set them for
-# determinism.
+# command-line precedence (it can inject a core.hooksPath). Identity vars
+# (GIT_AUTHOR_*, GIT_COMMITTER_*) are left alone -- they change what a commit
+# says, never where it lands, and tests legitimately set them for determinism.
 #
 # GIT_CEILING_DIRECTORIES is NOT here and must never be: it is the first
 # defence's own mechanism (:func:`_df_git_ceiling_at_basetemp`), so scrubbing it
