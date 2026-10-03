@@ -1497,6 +1497,50 @@ class TestWallClockDeadlineDetection:
         )
         assert 'wait_responsive' in violations[0].message
 
+    def test_positional_timeout_literal_flags_both_kinds(self):
+        """``asyncio.wait_for(req.result, 25.0)`` writes its number positionally.
+
+        wait_for's second positional parameter IS its timeout, so a keyword-only
+        literal scan would see the routing offence and miss the written number.
+        """
+        violations = _rule_c('asyncio.wait_for(req.result, 25.0)\n')
+        assert len(violations) == 2, (
+            'a positional timeout literal is the raw-literal offence as surely as '
+            f'timeout=25.0; got {violations!r}'
+        )
+        assert any('MERGE_RESULT_TIMEOUT' in v.message for v in violations), violations
+
+    def test_positional_derived_timeout_flags_the_bare_wait_for_kind_only(self):
+        """A positional bound derived from MERGE_RESULT_TIMEOUT is not a written number."""
+        violations = _rule_c('asyncio.wait_for(req.result, MERGE_RESULT_TIMEOUT)\n')
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' not in violations[0].message
+
+    def test_positional_boolean_timeout_is_not_a_numeric_literal(self):
+        """A positional ``True`` is not a raw number either (bool is an int subclass)."""
+        violations = _rule_c('asyncio.wait_for(req.result, True)\n')
+        assert len(violations) == 1, (
+            f'only the bare-wait_for kind should fire for a positional True; got {violations!r}'
+        )
+        assert 'RAW wall-clock literal' not in violations[0].message
+
+    def test_max_wall_s_literal_on_wait_responsive_flags_the_literal_kind(self):
+        """``max_wall_s=30.0`` is wait_responsive's wall-clock cap, written as a number."""
+        violations = _rule_c("wait_responsive(req.result, label='x', max_wall_s=30.0)\n")
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' in violations[0].message
+        assert 'max_wall_s' in violations[0].message
+
+    def test_several_literals_on_one_call_are_one_raw_literal_violation(self):
+        """Offence kinds are per CALL: two written numbers are one raw-literal violation.
+
+        This keeps the per-file budget arithmetic at 0, 1 or 2 violations per call.
+        """
+        source = "wait_responsive(req.result, timeout=45.0, max_wall_s=90.0, label='x')\n"
+        violations = _rule_c(source)
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' in violations[0].message
+
     def test_a_call_with_no_positional_args_does_not_crash(self):
         """``asyncio.wait_for()`` has no args[0] to inspect — it must be skipped, not raise."""
         assert _rule_c('asyncio.wait_for()\nwait_responsive()\n') == []
@@ -1543,6 +1587,23 @@ class TestWallClockDeadlineMessage:
         """Every rule's message tells the reader how to suppress that rule specifically."""
         for v in _rule_c(self._BOTH_KINDS):
             assert '# noqa: wall-clock-deadline' in v.message
+
+    def test_raw_literal_message_names_the_offending_parameter(self):
+        """The raw-literal message says WHICH bound carries the number."""
+        timeout_msgs = [
+            v.message
+            for v in _rule_c("wait_responsive(req.result, timeout=45.0, label='x')\n")
+        ]
+        assert len(timeout_msgs) == 1, timeout_msgs
+        assert 'timeout' in timeout_msgs[0]
+        assert 'max_wall_s' not in timeout_msgs[0]
+
+        cap_msgs = [
+            v.message
+            for v in _rule_c("wait_responsive(req.result, label='x', max_wall_s=30.0)\n")
+        ]
+        assert len(cap_msgs) == 1, cap_msgs
+        assert 'max_wall_s' in cap_msgs[0]
 
     def test_messages_share_no_vocabulary_with_rule_a_or_rule_b(self):
         """Rule A's and Rule B's remedies are unusable here and must not appear.
