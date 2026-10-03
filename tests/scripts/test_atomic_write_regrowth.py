@@ -7,17 +7,19 @@ rename-into-place (the tmp+``os.replace`` shape task 3223 consolidated into
 ``shared.safe_io.atomic_write_text``) is a known, individually-reasoned
 survivor rather than a fresh hand-rolled copy.
 
-WHY IT LIVES HERE AND NOT IN A PACKAGE SUITE (task 3388).  It was born in
-``shared/tests/test_safe_io.py``, beside the implementation it protects, and
-that was defensible while it scanned three trees and shared owned the blessed
-writer.  It stopped being defensible once the guard asserted on five packages
-shared does not own: a guard that asserts on five packages cannot live inside a
-sixth package's tests.  The concrete failure it created — not hypothetical, and
-recorded in the allowlist itself — is that
+WHY IT LIVES HERE AND NOT IN A PACKAGE SUITE (task 3388).  ``CONTRIBUTING.md``
+§2, "Where repo-wide gates live", places a gate by what it reads: one that walks
+the shared ``first_party_tree`` parse lives in ``shared/tests``, and a sweep
+that brings its own reader lives here.  This guard brings its own reader, and
+its ``_SRC_TREES`` is not ``shared/tests/silent_fallthrough_scan.py::SCOPE_ROOTS``:
+it adds ``fused-memory/scripts`` and scans the test directories inside
+``scripts``, which ``iter_first_party_files`` excludes.  So it cannot share
+that parse without changing what it detects.  It was born in
+``shared/tests/test_safe_io.py``, beside safe_io's own unit suite, and left
+because its allowlist couples it to sibling code — not hypothetically:
 ``orchestrator/src/orchestrator/digest.py::write_digest_entry`` is allowlisted
-AND flagged there as a prime migration candidate, so migrating it turned the
-SHARED suite red, at a site no orchestrator author would think to look.  Moving
-the guard to the repo level puts the failure where the fix is.
+AND flagged there as a prime migration candidate, so migrating it turned
+safe_io's unit suite red, at a site no orchestrator author would think to look.
 
 THE PLACEMENT IS THE ESTABLISHED PATTERN, not a stray file.  ``tests/scripts/``
 is a registered module config (``tests/scripts/orchestrator.yaml``) and already
@@ -55,9 +57,9 @@ runs the guard that scans ``scripts/``.  No yaml edit was needed to register
 this file: all three commands there are directory-wide.
 
 SCOPE LIMIT, stated because a green run here must not be over-read: relocating
-this guard did NOT make ``shared/tests`` standalone-runnable.  Five other
-cross-tree gates still live there; they are enumerated, with measured counts, in
-``test_atomic_write_guard_does_not_scan_sibling_package_trees`` below.
+this guard did NOT make ``shared/tests`` standalone-runnable, and was not meant
+to — ``shared/tests`` deliberately hosts the whole-tree source gates and
+presumes a full checkout (``CONTRIBUTING.md`` §2, "Where repo-wide gates live").
 """
 import ast
 import functools
@@ -977,49 +979,18 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
     down; a root assembled at runtime from innocent segments still evades it,
     and that residual is documented at the predicate rather than left implicit.
 
-    (b) This test pins ONE file, not ``shared/tests`` as a whole.  It does NOT establish that shared's
-    suite is standalone-runnable against a lone ``dark-factory-shared``
-    checkout, and after task 3388 that suite is **not** standalone-runnable.
-    The five OTHER cross-tree gates below live in ``shared/tests`` and are
-    deliberately NOT covered here; each carries its own comment arguing for its
-    cross-tree reach, so narrowing them is a design question this task did not
-    settle rather than an oversight it missed.  (Each would trip the broadened
-    predicate on its own literals — which is the point: they are real cross-tree
-    gates, just not ones this fence is scoped to move.)
+    (b) This test pins ONE file, not ``shared/tests`` as a whole.  It does NOT
+    establish that shared's suite is standalone-runnable, and it is not meant
+    to: ``shared/tests`` deliberately hosts the whole-tree source gates, which
+    name sibling trees by design, and presumes a full checkout
+    (``CONTRIBUTING.md`` §2, "Where repo-wide gates live").
 
-      * ``silent_fallthrough_scan.py`` — ``_SCOPE_ROOTS`` (7 roots:
-        orchestrator/src, fused-memory/src, dashboard/src, escalation/src,
-        shared/src, sampler/src, scripts) and a hard ``RuntimeError`` when the
-        ``shared/src``/``orchestrator/src`` sentinels are absent, paired with
-        ``silent_fallthrough_allowlist.py`` (13 sibling-path literals, as
-        ``(path, qualname, hash, reason)`` tuples).
-      * ``config_dir_archival_allowlist.py`` — 10 sibling-path literals, as
-        ``{'path': ..., 'qualname': ...}`` dicts.
-      * ``test_auth_failed.py`` — ``_PRODUCTION_SRC_ROOTS = ('shared/src',
-        'orchestrator/src')`` with a hard ``assert root.is_dir()``.
-      * ``test_silent_fallthrough_gate.py`` — 3 sibling-path literals,
-        hard-asserted (``assert candidate in files``).
-      * ``test_capability_manifest.py`` — 21 sibling-path literals; most are
-        synthetic fixtures, but it hard-asserts on REAL files in ``scripts/``
-        (``committed_file_mode('scripts/check_method_param_wiring.py') ==
-        '100755'``, and a superset assertion naming
-        ``scripts/gc_agent_transcripts.py``).
-
-    Counts measured first-hand at commit 6b68a87fd6 by an ast sweep of
-    ``shared/tests/**/*.py`` for non-docstring string constants ending in
-    ``.py`` and beginning with a sibling package directory — stated as a method
-    plus a number so the claim stays falsifiable rather than becoming the kind
-    of stale prose task 3388 exists to eliminate.  Re-run the sweep; do not
-    re-trust this sentence.
-
-    WHY THE NARROW FORM.  The plan specified a walk of ``shared/tests/**/*.py``
-    asserting the whole directory names no sibling tree.  Measured, that test
-    is red forever: the gates above are the falsifying evidence, they are
-    outside this task's file scope, and each is load-bearing where it sits.
-    Ticket ``tkt_0RT7TDAAH2TS88BR88TZ1E3QMP`` tracks the real question — where
-    this family of repo-wide gates should live, and what it should do when a
-    tree it names is absent.  Until that lands, this test is a fence around one
-    gate and must not be read as evidence about the others.
+    WHY THE NARROW FORM.  A walk of ``shared/tests/**/*.py`` asserting the
+    whole directory names no sibling tree would be red forever: the whole-tree
+    source gates that live there name sibling trees on purpose, and each is
+    load-bearing where it sits.  The fence's purpose is SPOT: the atomic-write
+    guard has one home, this module, so ``test_safe_io.py`` must not fork a
+    second sweep.
     """
     target = _REPO_ROOT / _GUARDED_FILE
     assert target.is_file(), (
@@ -1039,12 +1010,11 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
     assert not offenders, (
         f'{_GUARDED_FILE} names a bare path in a package shared does not own:\n  '
         + '\n  '.join(offenders)
-        + '\nA guard that walks sibling package trees cannot live inside one '
-        'package\'s suite: a refactor in that sibling (migrating the allowlisted '
-        'orchestrator digest.write_digest_entry, say) turns SHARED red, at a site '
-        'no orchestrator author would think to look. Move the cross-tree guard to '
-        'a repo-level suite — tests/scripts/test_atomic_write_regrowth.py is where '
-        'the atomic-write one lives — rather than widening this exception. If the '
+        + '\nThe atomic-write anti-regrowth guard lives in '
+        'tests/scripts/test_atomic_write_regrowth.py; extend it there rather than '
+        'forking a second sweep into safe_io\'s unit suite. A new gate over the '
+        'shared first_party_tree parse belongs beside that fixture in shared/tests '
+        '(CONTRIBUTING.md §2, "Where repo-wide gates live"). If the '
         'literal is genuinely PROSE rather than a scan root, write it as prose: '
         'the predicate only flags a bare path with no whitespace in it.'
     )

@@ -527,7 +527,9 @@ def find_violations_in_tree(
 # ---------------------------------------------------------------------------
 
 #: The scope roots searched for first-party source (relative to repo root).
-_SCOPE_ROOTS = [
+#: Every entry is REQUIRED: ``iter_first_party_files`` raises
+#: :class:`ScopeRootsMissingError` if any one is absent, never skips it.
+SCOPE_ROOTS: tuple[str, ...] = (
     "orchestrator/src",
     "fused-memory/src",
     "dashboard/src",
@@ -536,7 +538,7 @@ _SCOPE_ROOTS = [
     "sampler/src",
     "cockpit/src",
     "scripts",
-]
+)
 
 #: Path components whose presence causes a file to be excluded from the scan.
 _EXCLUDED_PATH_PARTS: frozenset[str] = frozenset({"mem0", "graphiti", "tests"})
@@ -545,33 +547,52 @@ _EXCLUDED_PATH_PARTS: frozenset[str] = frozenset({"mem0", "graphiti", "tests"})
 _EXCLUDED_NAMES: frozenset[str] = frozenset({"conftest.py"})
 
 
+class ScopeRootsMissingError(RuntimeError):
+    """One or more ``SCOPE_ROOTS`` entries is absent under *repo_root*.
+
+    ``missing`` names EVERY absent root, in declaration order, so one run
+    reports them all.
+    """
+
+    def __init__(self, repo_root: Path, missing: tuple[str, ...]) -> None:
+        self.repo_root = repo_root
+        self.missing = missing
+        super().__init__(
+            f"Repo root validation failed: scope roots {list(missing)!r} not "
+            f"found under {str(repo_root)!r}. Pass the repository root, not a "
+            f"sub-directory. Every SCOPE_ROOTS entry is required, because a "
+            f"skipped root is a green gate over less code; if a root was "
+            f"renamed or removed, update SCOPE_ROOTS in "
+            f"shared/tests/silent_fallthrough_scan.py (see CONTRIBUTING.md §2, "
+            f"'Where repo-wide gates live')."
+        )
+
+
 def iter_first_party_files(repo_root: Path) -> Iterator[Path]:
     """Yield absolute paths to first-party Python source files.
 
-    Searches the scope roots in ``_SCOPE_ROOTS`` under *repo_root* and applies
+    Searches the scope roots in ``SCOPE_ROOTS`` under *repo_root* and applies
     exclusions:
       - Path components named ``mem0``, ``graphiti``, or ``tests``
       - Files named ``test_*.py`` or ``conftest.py``
 
     Args:
-        repo_root: Absolute path to the repository root.  Validated against
-            sentinel directories (``shared/src``, ``orchestrator/src``); raises
-            ``RuntimeError`` if they are absent (prevents a mis-resolved root
-            from producing a silently-empty scan).
+        repo_root: Absolute path to the repository root.  Every ``SCOPE_ROOTS``
+            entry is a sentinel directory: if any is absent this raises
+            :class:`ScopeRootsMissingError` naming all of them, before the
+            first yield (prevents a mis-resolved root from producing a
+            silently-empty scan, and a renamed or deleted root from producing
+            a silently-narrower one).
     """
-    # Sentinel validation: fail loudly if repo_root is wrong
-    for sentinel in ("shared/src", "orchestrator/src"):
-        if not (repo_root / sentinel).is_dir():
-            raise RuntimeError(
-                f"Repo root validation failed: {sentinel!r} not found under "
-                f"{repo_root!r}.  Ensure iter_first_party_files() receives the "
-                f"correct repository root (not a sub-directory)."
-            )
+    missing = tuple(
+        root_rel for root_rel in SCOPE_ROOTS
+        if not (repo_root / root_rel).is_dir()
+    )
+    if missing:
+        raise ScopeRootsMissingError(repo_root, missing)
 
-    for root_rel in _SCOPE_ROOTS:
+    for root_rel in SCOPE_ROOTS:
         root_abs = repo_root / root_rel
-        if not root_abs.is_dir():
-            continue
         for py_file in sorted(root_abs.rglob("*.py")):
             # Exclude by path component
             if any(part in _EXCLUDED_PATH_PARTS for part in py_file.parts):
@@ -627,9 +648,10 @@ def parse_first_party_tree(repo_root: Path | str) -> tuple[ParsedFile, ...]:
     """Read and parse every first-party source file ONCE, memoized on *repo_root*.
 
     Enumeration is delegated verbatim to :func:`iter_first_party_files`, so the
-    scope roots in ``_SCOPE_ROOTS``, the
+    scope roots in ``SCOPE_ROOTS``, the
     ``mem0``/``graphiti``/``tests``/``conftest.py`` exclusions and the
-    sentinel-dir validation that RAISES on a mis-resolved root all keep their
+    validation of every ``SCOPE_ROOTS`` entry, which RAISES
+    :class:`ScopeRootsMissingError` and memoizes nothing, all keep their
     meaning here.
 
     Failure modes are deliberately asymmetric, because the two consuming gates

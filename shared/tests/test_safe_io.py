@@ -834,22 +834,21 @@ class TestAtomicWriteRaceSafety:
 # test_allowlist_pointers_resolve_to_the_guard_module) CHECKS it: if the guard
 # moves again, this comment goes red rather than quietly rotting into a lie.
 #
-# WHY IT LEFT.  Task 3388 widened the guard from three source trees to six, so
-# it began asserting on five packages ``shared`` does not own.  A guard that
-# asserts on five packages cannot live inside a sixth package's tests: it
-# allowlists ``orchestrator/src/orchestrator/digest.py::write_digest_entry``
-# and flags it there as a prime migration candidate, so migrating that
-# orchestrator function turned THIS suite red, at a site no orchestrator author
-# would think to look.  ``tests/scripts/`` is the repo's established home for
-# repo-wide structural sweeps (test_nonmember_ruff_config.py,
-# test_pytest_workspace_collection.py, test_module_verify_budgets.py) and is
-# collected by two registered module configs, so a diff touching a scanned tree
-# still runs it.
+# WHY IT LEFT.  The guard brings its own reader, and its scan set is not
+# silent_fallthrough_scan.py::SCOPE_ROOTS: it adds the fused-memory scripts
+# tree and scans the test directories inside the repo-root scripts tree, which
+# that enumerator excludes, so it cannot share the first_party_tree parse
+# without changing what it detects.  It left THIS unit suite because its
+# allowlist couples it to sibling code: it allowlists
+# ``orchestrator/src/orchestrator/digest.py::write_digest_entry`` and flags it
+# there as a prime migration candidate, so migrating that orchestrator
+# function turned safe_io's unit suite red, at a site no orchestrator author
+# would think to look.
 #
 # DO NOT RE-ADD A CROSS-TREE SWEEP HERE.  A repo-level fence
 # (test_atomic_write_regrowth.py::
 # test_atomic_write_guard_does_not_scan_sibling_package_trees) fails if this
 # file declares a scan root in a package shared does not own.  That fence pins
 # THIS file only, and does not claim the rest of shared/tests is free of
-# cross-tree gates — read its docstring for the measured list of the ones that
-# remain.
+# cross-tree gates — see CONTRIBUTING.md §2, "Where repo-wide gates live",
+# for where those belong.

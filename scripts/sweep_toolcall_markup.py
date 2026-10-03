@@ -395,7 +395,7 @@ class Refusal(NamedTuple):
     """A target this sweep declines to write, and why.
 
     Returned as a VALUE, never raised-and-swallowed. ``scripts`` is inside
-    ``shared/tests/silent_fallthrough_scan.py``'s ``_SCOPE_ROOTS``, so a broad
+    ``shared/tests/silent_fallthrough_scan.py``'s ``SCOPE_ROOTS``, so a broad
     ``except Exception`` funnelling into a default would trip the ratchet — and
     would also discard the reason a human needs in order to adjudicate the
     refusal. Every refusal reaches the report.
@@ -1044,7 +1044,7 @@ def load_target(target: Target) -> LoadedDocument | Refusal:
     Error handling is NARROW by construction — only ``OSError``,
     ``UnicodeDecodeError`` and ``json.JSONDecodeError`` are caught, each
     recorded with a reason and returned as a value. ``scripts`` is inside
-    ``shared/tests/silent_fallthrough_scan.py``'s ``_SCOPE_ROOTS``, so a broad
+    ``shared/tests/silent_fallthrough_scan.py``'s ``SCOPE_ROOTS``, so a broad
     ``except Exception`` funnelling into a default would trip the ratchet; more
     to the point, it would swallow a genuine bug in the repairer as though it
     were a malformed file.

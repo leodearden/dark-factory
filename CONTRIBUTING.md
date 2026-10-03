@@ -110,6 +110,43 @@ Other top-level dirs:
 - **`hooks/`** — git hooks (`pre-commit`, `pre-merge-commit`, see §4-§5),
   install via `hooks/setup.sh`.
 
+**Where repo-wide gates live.** There are two homes, chosen by what the gate
+reads. `shared/tests/` hosts the whole-first-party-tree *source* gates: every
+gate that walks the Python tree through the session-scoped `first_party_tree`
+fixture (`shared/tests/conftest.py`), which parses
+`shared/tests/silent_fallthrough_scan.py::SCOPE_ROOTS` once per session, at
+collection time (`shared/tests/session_prebuild.py`). A new gate over that
+tree takes the fixture instead of growing a private parse;
+`shared/tests/test_tree_scan_sharing.py::TestNoRegrownWholeTreeParse`
+ratchets this. They do not live in `tests/scripts/` because two module
+configs collect that directory, `scripts/orchestrator.yaml` under `-n auto`:
+every xdist worker would pay the parse, whose CPU and resident-memory cost
+`silent_fallthrough_scan.py::parse_first_party_tree`'s docstring measures,
+and a full-breadth merge verify would pay it twice. `tests/scripts/` hosts the
+repo-level sweeps that bring their own reader — config, doc, systemd-unit and
+toolchain parity, and `tests/scripts/test_atomic_write_regrowth.py`, whose
+`_SRC_TREES` is not `SCOPE_ROOTS`.
+
+The consequence is accepted deliberately: `shared/tests/` is not a
+self-contained package suite. It presumes a full dark-factory checkout, and
+nothing runs it any other way, because `dark-factory-shared` is consumed only
+as a `{ workspace = true }` member. So these gates **hard-fail, never skip**,
+when a tree they scan is absent: `iter_first_party_files` raises
+`ScopeRootsMissingError` naming every missing root (pinned by
+`shared/tests/test_tree_scan_sharing.py::TestEveryScopeRootIsRequired`), and
+in the other direction
+`shared/tests/test_auth_failed.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root`
+reds when a new `<pkg>/src` is missing from `SCOPE_ROOTS`. A skip is a green
+run over less code — the silent fallthrough the flagship gate exists to catch
+— so do not add one to make the suite standalone.
+
+An allowlist keyed on a sibling's `(path, qualname)` goes red when you rename
+an allowlisted function in `orchestrator/` or `fused-memory/`. That follows
+from the keying, not the placement: relocating the gate would move the red,
+not remove it. The gate's failure message names the allowlist to edit.
+Reversing this placement means updating this paragraph together with the
+enumerator's required-root check.
+
 <!-- line-pin-policy:begin
      The repo's decision on bare `file.py:NNN` citations (esc-3815-7).
      Mirrored in CLAUDE.md and pinned by
