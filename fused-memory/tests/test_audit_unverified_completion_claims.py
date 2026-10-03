@@ -15,7 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_helpers import _init_git_repo, load_script_module
+from _distinct_git_repo import init_distinct_git_repo
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
@@ -1814,11 +1815,8 @@ class TestProbeBuilders:
         """Sweep Class C: a reify writer naming a dark_factory commit."""
         reify_root = tmp_path / 'reify'
         df_root = tmp_path / 'dark_factory'
-        df_root.mkdir()
-        # A file only this repo has, so its sha is not also reify's.
-        (df_root / 'repo-name.txt').write_text('dark_factory\n')
-        reify_sha = _init_git_repo(reify_root)
-        df_sha = _init_git_repo(df_root)
+        reify_sha = init_distinct_git_repo(reify_root)
+        df_sha = init_distinct_git_repo(df_root)
         assert df_sha != reify_sha
 
         probe = _mod._build_commit_probe(

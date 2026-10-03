@@ -31,7 +31,7 @@ import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _distinct_git_repo import init_distinct_git_repo
 
 from fused_memory.middleware.task_interceptor import TicketStoreNotConfiguredError
 from fused_memory.server.tools import create_mcp_server
@@ -396,11 +396,8 @@ class TestVerifiedClaimsAreInert:
         exists in a registered repository, so the claim verifies."""
         reify_root = tmp_path / 'reify'
         df_root = tmp_path / 'dark_factory'
-        df_root.mkdir()
-        # A file only this repo has, so its sha is not also reify's.
-        (df_root / 'repo-name.txt').write_text('dark_factory\n')
-        reify_sha = _init_git_repo(reify_root)
-        df_sha = _init_git_repo(df_root)
+        reify_sha = init_distinct_git_repo(reify_root)
+        df_sha = init_distinct_git_repo(df_root)
         assert df_sha != reify_sha
         mock_service = _episode_service()
         server = _server(
@@ -424,6 +421,30 @@ class TestVerifiedClaimsAreInert:
             f'{_service_kwargs(mock_service)!r}'
         )
         assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_one_commit_probe_serves_every_episode(self, monkeypatch):
+        """The registry probe caches each repository's resolved git top level,
+        so it is built once per server rather than once per episode."""
+        import fused_memory.server.tools as tools_mod
+
+        commit_probe = MagicMock(return_value=True)
+        commit_probe_factory = MagicMock(return_value=commit_probe)
+        monkeypatch.setattr(tools_mod, 'make_registry_commit_probe', commit_probe_factory)
+        server = _server(_episode_service(), statuses={})
+
+        for sha in ('7bbcd5d815', '1d3aaeb030'):
+            await server._tool_manager.call_tool(
+                'add_episode',
+                {
+                    'content': f'the fix landed in commit {sha}',
+                    'agent_id': 'claude-task-5422-implementer',
+                    'project_id': _PROJECT_ID,
+                },
+            )
+
+        assert commit_probe_factory.call_count == 1, commit_probe_factory.call_args_list
+        assert commit_probe.call_count == 2, commit_probe.call_args_list
 
     @pytest.mark.asyncio
     async def test_filing_claim_about_an_open_task_is_not_tagged(self):
@@ -461,10 +482,12 @@ class TestNoClaimPathIsUntouched:
     ):
         import fused_memory.server.tools as tools_mod
 
-        commit_probe_factory = MagicMock(
+        commit_probe = MagicMock(
             side_effect=AssertionError('git must not be touched without a commit claim')
         )
-        monkeypatch.setattr(tools_mod, 'make_registry_commit_probe', commit_probe_factory)
+        monkeypatch.setattr(
+            tools_mod, 'make_registry_commit_probe', MagicMock(return_value=commit_probe)
+        )
 
         mock_service = _episode_service()
         task_interceptor = MagicMock()
@@ -491,9 +514,9 @@ class TestNoClaimPathIsUntouched:
         # A plain (sync) MagicMock, so call_count rather than an assert_not_*
         # helper: the task-525 style check forbids mixing assert_not_called with
         # assert_not_awaited in one function, and the two above are the async ones.
-        assert commit_probe_factory.call_count == 0, (
-            'git must not be touched without a commit claim; the probe factory '
-            f'was built {commit_probe_factory.call_count} time(s)'
+        assert commit_probe.call_count == 0, (
+            'git must not be touched without a commit claim; the commit probe '
+            f'ran {commit_probe.call_count} time(s)'
         )
         mock_service.add_episode.assert_awaited_once()
         assert set(_service_kwargs(mock_service)) == set(_BASELINE_SERVICE_KWARGS), (

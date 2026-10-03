@@ -15,7 +15,7 @@ exception is the make_commit_probe suite, which builds a throwaway repo).
 from __future__ import annotations
 
 import pytest
-from _fm_helpers import _init_git_repo
+from _distinct_git_repo import init_distinct_git_repo
 
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
@@ -103,7 +103,7 @@ class TestAppliedWorkExtraction:
 
 
 class TestClauseBoundaryIsolation:
-    """The gate shares ``task_filter._CLAUSE_SPLIT_RE``'s widened boundary
+    """The gate shares ``task_filter.WIDE_CLAUSE_BOUNDARY_RE``'s widened boundary
     (task 3403: a dot followed by a word character, as in
     ``orchestrator.yaml`` or ``CLAUDE.md:95``, no longer ends a clause).
 
@@ -281,6 +281,15 @@ class TestProximityBinding:
             ('task', '4213', 'dark_factory'),
         ]
 
+    @pytest.mark.parametrize(
+        'text', ['task 1985 and task 1986 landed', 'task 1985, task 1986 landed'],
+    )
+    def test_coordinated_subject_claims_only_the_nearest_ref(self, text):
+        """An ACCEPTED recall residual, not a defect: one marker binds one ref,
+        so a false completion claim about 1985 goes untagged. Precision over
+        recall, the trade task_filter makes for 'PRs #1 and #2'."""
+        assert [(c.subject, c.ref) for c in _extract(text)] == [('task', '1986')]
+
 
 # The verbatim text from esc-3085-1 instance (2): a reify-authored claim that
 # a task was re-filed into ANOTHER project's tree as a ticket that did not
@@ -353,7 +362,7 @@ class TestFilingDispatchExtraction:
         assert claims[0].subject == 'commit'
         assert claims[0].ref == '7bbcd5d815'
 
-    def test_commit_beats_task_but_ticket_beats_commit(self):
+    def test_marker_binds_forward_to_its_commit_complement(self):
         """The marker binds FORWARD to its complement ('as commit X'), not back to the task."""
         task_and_commit = _extract('task 5422 was merged as commit 7bbcd5d815')
         assert [(c.subject, c.ref) for c in task_and_commit] == [('commit', '7bbcd5d815')]
@@ -801,17 +810,6 @@ class TestMakeCommitProbe:
 _ABSENT_SHA = '0' * 39 + '1'
 
 
-def _init_distinct_repo(root) -> str:
-    """A one-commit repo whose sha no sibling repo shares.
-
-    _init_git_repo's commits are byte-identical across calls in the same
-    second, so a per-repo file is what makes a cross-repo hit observable.
-    """
-    root.mkdir()
-    (root / 'repo-name.txt').write_text(f'{root.name}\n')
-    return _init_git_repo(root)
-
-
 class TestMakeRegistryCommitProbe:
     """A sha is near-globally unique, so a commit claim is checked against
     every registered repository, and absence is asserted only when all of them
@@ -822,8 +820,8 @@ class TestMakeRegistryCommitProbe:
     def repos(self, tmp_path):
         reify_root = tmp_path / 'reify'
         df_root = tmp_path / 'dark_factory'
-        reify_sha = _init_distinct_repo(reify_root)
-        df_sha = _init_distinct_repo(df_root)
+        reify_sha = init_distinct_git_repo(reify_root)
+        df_sha = init_distinct_git_repo(df_root)
         assert reify_sha != df_sha
         return {'reify': str(reify_root), 'dark_factory': str(df_root)}, reify_sha, df_sha
 

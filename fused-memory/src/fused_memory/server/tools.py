@@ -2034,6 +2034,10 @@ def create_mcp_server(
                 )
         return rows
 
+    # Built once per server, so each repository's git top level is resolved once
+    # per process rather than once per episode.
+    _registry_commit_probe = make_registry_commit_probe(_kp)
+
     async def _claim_commit_presence(
         claims: list[Any], project_id: str
     ) -> dict[tuple[str | None, str], bool]:
@@ -2051,11 +2055,12 @@ def create_mcp_server(
         grouped = _group_refs_by_project(claims, 'commit')
         if not grouped:
             return {}
-        probe = make_registry_commit_probe(_kp)
         present: dict[tuple[str | None, str], bool] = {}
         for claimed_project, refs in grouped.items():
             for ref in refs:
-                answer = await asyncio.to_thread(probe, ref, claimed_project)
+                answer = await asyncio.to_thread(
+                    _registry_commit_probe, ref, claimed_project
+                )
                 if answer is None:
                     logger.warning(
                         'completion_claim_gate: commit %r could not be ruled in or '

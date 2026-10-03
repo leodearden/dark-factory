@@ -287,15 +287,23 @@ def extract_batch_plan_task_ids(text: str) -> set[int]:
 # #4521', 'issue #123', 'MR #7') and a '#' attached to a word or path
 # ('PR#4521', 'owner/repo#12', 'dark_factory#2748'), task 4853. A PR, issue or
 # GitHub number is never a task id, and 'project#N' belongs to consumers that
-# know the project registry. Python lookbehinds must be fixed-width, so one
-# pair is generated per cue in _FOREIGN_NUMBER_CUES. Residual: in a coordinated
-# list ('PRs #1 and #2') only the first number is excluded.
+# know the project registry. Python lookbehinds must be fixed-width, so one is
+# generated per cue in _FOREIGN_NUMBER_CUES and per cue-to-'#' gap in
+# _FOREIGN_CUE_GAPS ('PR #1', 'PR  #1', 'issue:#1', 'issue: #1'); the leading
+# (?=#) keeps them from running at positions that hold no '#'. Residuals: a
+# wider gap ('PR   #1', 'PRs:  #1', 'PR (#1)'), and in a coordinated list ('PRs
+# #1 and #2') only the first number is excluded.
 _FOREIGN_NUMBER_CUES: tuple[str, ...] = (
     'pr', 'prs', 'pull', 'request', 'issue', 'issues', 'gh', 'mr',
 )
+_FOREIGN_CUE_GAPS: tuple[str, ...] = (r'\s', r'\s\s', ':', r':\s')
 TASK_REF_RE: re.Pattern[str] = re.compile(
-    r'(?:\btask\b|\bdf\b|(?<![\w/])'
-    + ''.join(rf'(?<!\b{cue})(?<!\b{cue}\s)' for cue in _FOREIGN_NUMBER_CUES)
+    r'(?:\btask\b|\bdf\b|(?=#)(?<![\w/])'
+    + ''.join(
+        rf'(?<!\b{cue}{gap})'
+        for cue in _FOREIGN_NUMBER_CUES
+        for gap in _FOREIGN_CUE_GAPS
+    )
     + r'#)\s*[#/]?\s*(\d+)\b',
     re.IGNORECASE,
 )
@@ -360,7 +368,7 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #         so the trade-off stays visible.
 #
 #         What bounds that over-fire is the CONSUMER SET, not any property of
-#         the detectors — this constant is module-private BY CONTRACT. Its
+#         the detectors — this constant is for ALLOWLISTED consumers only. Its
 #         in-module consumers are:
 #           - find_conflicting_task_status_ids       -> server/tools.py,
 #             conflicting_task_status_framing_write_blocked
@@ -386,22 +394,26 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #         between a ref and its status.
 #   (iii) A missing-space sentence boundary ('done.Task') no longer splits;
 #         rare in LLM prose, and the direction is the same over-firing as (i).
-_CLAUSE_SPLIT_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
+WIDE_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
+# The old private spelling, kept only for scripts/audit_duplicate_memories.py,
+# which task 4853 could not edit; tkt_0RVBV2PMGFWETFNDCRYB4TRFW1 migrates it
+# and deletes this alias. The allowlist test scans both names.
+_CLAUSE_SPLIT_RE = WIDE_CLAUSE_BOUNDARY_RE
 
 # The ORIGINAL, pre-task-3403 clause alphabet: the fail-safe-STRICT variant,
-# exported PUBLICLY for the consumers that must NOT track _CLAUSE_SPLIT_RE's
-# widening. This is the canonical home of that divergence rationale — importers
+# for the consumers that must NOT track WIDE_CLAUSE_BOUNDARY_RE's widening.
+# This is the canonical home of that divergence rationale — importers
 # carry a one-line pointer here plus their own path-specific consequence, and
 # nothing else. (Hoisted here by the task 3403 review, which found the same
 # ~20-line argument written out twice, next to two byte-identical copies of
 # this pattern: free to drift apart, and needing every future fix applied
 # twice.)
 #
-# WHY A SECOND CONSTANT RATHER THAN JUST _CLAUSE_SPLIT_RE:
+# WHY A SECOND CONSTANT RATHER THAN JUST WIDE_CLAUSE_BOUNDARY_RE:
 #
-#   _CLAUSE_SPLIT_RE (above) scopes a task-ref-to-status association read by
-#   find_conflicting_task_status_ids / find_present_tense_completion_claim_
-#   task_ids, both of which feed early-return SOFT-BLOCK write gates in
+#   WIDE_CLAUSE_BOUNDARY_RE (above) scopes a task-ref-to-status association
+#   read by find_conflicting_task_status_ids /
+#   find_present_tense_completion_claim_task_ids, both of which feed early-return SOFT-BLOCK write gates in
 #   server/tools.py. A LONGER clause there costs the author a
 #   rephrase-and-retry and nothing else, so trading a little precision for the
 #   recall win of not shattering dotted technical tokens is the right trade.
@@ -423,8 +435,8 @@ _CLAUSE_SPLIT_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
 #     scopes a dependency-direction assertion that can end in a retired edge
 #
 # A THIRD importer must first show the same fail-safe direction. Wanting the
-# WIDENING instead means wanting _CLAUSE_SPLIT_RE, which is module-private by
-# contract (residual (i) above) — that is a design conversation, not an import.
+# WIDENING instead means joining WIDE_CLAUSE_BOUNDARY_RE's allowlist (residual
+# (i) above) — that is a design conversation, not an import.
 STRICT_CLAUSE_BOUNDARY_RE: re.Pattern[str] = re.compile(r'[.;\n!?]')
 
 
@@ -448,7 +460,7 @@ def find_conflicting_task_status_ids(text: str) -> set[int]:
     non_terminal_ids: set[int] = set()
     terminal_ids: set[int] = set()
 
-    for clause in _CLAUSE_SPLIT_RE.split(text):
+    for clause in WIDE_CLAUSE_BOUNDARY_RE.split(text):
         if not clause:
             continue
         ids_in_clause = {int(m) for m in TASK_REF_RE.findall(clause)}
@@ -568,7 +580,7 @@ def frames_live_task_status_as_current_fact(text: str) -> bool:
 # runs on the rare write that actually contains a completion claim.
 #
 # Detection mirrors find_conflicting_task_status_ids exactly: clause-split on
-# _CLAUSE_SPLIT_RE, extract explicit task refs per clause via TASK_REF_RE
+# WIDE_CLAUSE_BOUNDARY_RE, extract explicit task refs per clause via TASK_REF_RE
 # ('task N'/'df N'/'#N'/'task/N', NOT bare digits), and tag a clause's ids when
 # PRESENT_TENSE_COMPLETION_RE matches a copy of the clause with the
 # NEGATED_TERMINAL_RE and FUTURE_ASPIRATIONAL_RE spans stripped out. Requiring
@@ -666,7 +678,7 @@ def find_present_tense_completion_claim_task_ids(text: str) -> set[int]:
     """
     result: set[int] = set()
 
-    for clause in _CLAUSE_SPLIT_RE.split(text):
+    for clause in WIDE_CLAUSE_BOUNDARY_RE.split(text):
         if not clause:
             continue
         ids_in_clause = {int(m) for m in TASK_REF_RE.findall(clause)}

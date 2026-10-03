@@ -59,10 +59,10 @@ from fused_memory.middleware.recon_claim_verification_guard import (
     _resolve_git_toplevel,
 )
 from fused_memory.reconciliation.task_filter import (
-    _CLAUSE_SPLIT_RE,
     FUTURE_ASPIRATIONAL_RE,
     NEGATED_TERMINAL_RE,
     TASK_REF_RE,
+    WIDE_CLAUSE_BOUNDARY_RE,
 )
 
 logger = logging.getLogger(__name__)
@@ -258,13 +258,16 @@ _ASPIRATIONAL_EXTENSION_RE: re.Pattern[str] = re.compile(
 )
 
 
-# The clause boundary is task_filter._CLAUSE_SPLIT_RE, the widened alphabet in
-# which a dot followed by a word character ('orchestrator.yaml',
+# The clause boundary is task_filter.WIDE_CLAUSE_BOUNDARY_RE, the widened
+# alphabet in which a dot followed by a word character ('orchestrator.yaml',
 # 'CLAUDE.md:95') does not end a clause. It is safe here because attribution is
 # per-marker: each completion marker binds to ONE nearest ref (_bind_marker), so
 # a longer clause adds candidate refs without adding claims. The canonical
-# rationale lives at task_filter._CLAUSE_SPLIT_RE. Pinned by
+# rationale lives at task_filter.WIDE_CLAUSE_BOUNDARY_RE. Pinned by
 # tests/test_completion_claim_gate.py::TestClauseBoundaryIsolation.
+# The accepted cost is recall on a coordinated subject: 'task 1985 and task
+# 1986 landed' claims only 1986, the ref nearest the marker (pinned by
+# TestProximityBinding::test_coordinated_subject_claims_only_the_nearest_ref).
 def _iter_clauses(text: str):
     """Yield ``(clause, start_offset)`` for each clause of *text*.
 
@@ -273,7 +276,7 @@ def _iter_clauses(text: str):
     (INV-2). Empty clauses are skipped, matching the sibling detectors.
     """
     pos = 0
-    for match in _CLAUSE_SPLIT_RE.finditer(text):
+    for match in WIDE_CLAUSE_BOUNDARY_RE.finditer(text):
         if match.start() > pos:
             yield text[pos:match.start()], pos
         pos = match.end()
