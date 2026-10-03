@@ -60,7 +60,13 @@ non-``tools/call`` request or a hand-built envelope.
 
 ``orchestrator.mcp_lifecycle.McpSession`` (the session-handshake transport)
 consumes :data:`MCP_POST_HEADERS`, :func:`mcp_endpoint_url` and
-:func:`decode_mcp_response_body`, so this module is the single copy of each.
+:func:`decode_mcp_response_body`, so the orchestrator holds no copy of them.
+
+ONE TWIN REMAINS.  ``dashboard/src/dashboard/data/memory.py`` still carries
+its own ``MCP_HEADERS``, ``_parse_mcp_response`` and ``_parse_sse_response``.
+The dependency direction already allows it to import this module instead;
+that file was simply outside task 4819's module locks.  Until it is migrated,
+a change to the headers or the decoder here must be mirrored there.
 
 Public API::
 
