@@ -37,6 +37,7 @@ from fused_memory.memory_metadata import (
     MemoryMetadataValidationError,
     MetadataViolation,
     ParentHasChildrenError,
+    check_canonical_routing,
     is_valid_topic_slug,
     parent_liveness_violation,
     validate_memory_metadata,
@@ -585,6 +586,7 @@ async def _apply_memory_metadata_validation(
     storm_detector: UnknownKeyStormDetector,
     project_root: str,
     parent_lookup: Callable[[str, str], Awaitable[dict | None]],
+    reaches_mem0: bool,
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
     baseline: dict | None = None,
@@ -612,7 +614,10 @@ async def _apply_memory_metadata_validation(
     Discharges five obligations:
 
     1. **Normalize + shape-check** via ``validate_memory_metadata`` (the only
-       in-place mutation is ``supersedes`` scalar→list, PRD D2).
+       in-place mutation is ``supersedes`` scalar→list, PRD D2), plus (task
+       3508) ``check_canonical_routing`` — the one shape rule that needs a
+       routing fact the pure validator cannot see: ``canonical: True`` on a
+       write that will not reach Mem0 is refused.
     2. **Resolve ``parent_id`` LIVENESS** (task 3197, leaf δ) — see below.
     3. **Census** every violation, fatal or not, so warn-mode leaves a trace.
     4. **Reject** — but ONLY when ``enforce`` is on AND at least one
@@ -706,6 +711,15 @@ async def _apply_memory_metadata_validation(
     defaultable resolver would let a future third write path construct this
     helper without one and silently skip liveness — reintroducing the exact
     silent-orphan class leaf δ exists to close, and doing it invisibly.
+
+    ``reaches_mem0`` IS THE ROUTING OUTCOME, NOT THE CATEGORY, and is
+    REQUIRED — no default, for the same reason as ``parent_lookup`` above.
+    "Will this land in Mem0", not "is the category Mem0-primary", because
+    ``dual_write=True`` routes a Graphiti-primary category into Mem0 too,
+    where ``canonical`` IS stored and IS enforceable.  ``add_memory`` passes
+    its own ``write_mem0``; ``add_system_record`` and ``update_memory`` pass
+    ``True``, because both always land in Mem0 whatever their ``category``
+    tag.
 
     The enforce flags are read PER CALL off the shared config object rather
     than captured, so a config edit takes effect on the next write.
@@ -846,6 +860,18 @@ async def _apply_memory_metadata_validation(
             or meta.get(v.key, _unset) != before.get(v.key, _unset)
         ]
 
+    # Extended IMMEDIATELY BEFORE the `if violations:` block below, and that
+    # placement is load-bearing (task 3508): folding the routing rule into the
+    # SAME list gives it census emission and the `enforce and any(v.fatal)`
+    # rejection — which precedes the write-ahead Mem0 intent and every backend
+    # call — with zero new machinery.
+    #
+    # AFTER the delta subtraction on purpose: the subtraction scopes only
+    # codes the PURE validator can emit about the record at rest, whereas
+    # this rule is a fact about THIS write's routing.  The only caller that
+    # supplies a baseline (`update_memory`) passes `reaches_mem0=True`, under
+    # which the rule cannot fire, so delta-scoping it would be moot.
+    violations += check_canonical_routing(meta, reaches_mem0=reaches_mem0)
     # NOTE: this is `if violations:`, not an early `return` — the canonical
     # uniqueness re-check below must still run for metadata that is
     # perfectly well-formed, which is the overwhelmingly common case for a
@@ -882,6 +908,7 @@ async def _apply_memory_metadata_validation(
         project_id=project_id,
         agent_id=agent_id,
         config=config,
+        reaches_mem0=reaches_mem0,
         count_canonical=count_canonical,
         find_canonical=find_canonical,
         baseline=baseline,
@@ -901,6 +928,7 @@ async def _check_canonical_uniqueness(
     project_id: str,
     agent_id: str | None,
     config: MemoryMetadataConfig,
+    reaches_mem0: bool,
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
     baseline: dict | None = None,
@@ -917,35 +945,53 @@ async def _check_canonical_uniqueness(
     module-level helper stays decoupled from ``MemoryService`` and trivially
     stubbable.
 
-    SCOPE — THE INVARIANT IS MEM0-SCOPED (3198 amendment, stated because
-    the silence read as coverage).  Both probes go to Mem0/Qdrant payload
-    filters, but this seam deliberately runs BEFORE the
-    ``write_graphiti``/``write_mem0`` branching so that no write path can
-    bypass the vocabulary rules.  The consequence, spelled out rather than
-    left to be discovered: for a Graphiti-primary category
-    (``entities_and_relations``, ``temporal_facts``,
-    ``decisions_and_rationale``) a ``canonical: True`` record never lands
-    in Mem0, so the count cannot see a previously-written Graphiti-primary
-    canonical and the <=1-per-``(project, topic)`` rule does NOT hold for
-    those categories.  This matches the PRD, whose whole vocabulary is
-    framed as the Mem0 metadata vocabulary.
+    SCOPE — THE INVARIANT HOLDS FOR ALL SIX CATEGORIES ONCE ``enforce`` IS
+    ON, NOT TODAY (task 3508; supersedes the 3198 amendment, whose text
+    said the scope limit was permanent and is now wrong).  Both probes are
+    still Mem0/Qdrant payload filters, and this seam still runs BEFORE the
+    ``write_graphiti``/``write_mem0`` branching so no write path can bypass
+    the vocabulary rules.  What changed is what happens to a canonical
+    write that will not reach Mem0: the seam now REFUSES it
+    (``check_canonical_routing`` → ``canonical_on_non_mem0_write``, fatal)
+    instead of admitting it, so either the write lands in Mem0 and this
+    probe checks uniqueness exactly as before, or the assertion never
+    happens — at zero new I/O.
 
-    The probe is nonetheless issued for every canonical write rather than
-    skipped for Graphiti-primary ones, deliberately: ``dual_write`` can
-    route any category into Mem0 too, so a category-based skip would be
-    wrong exactly when it mattered, and a Graphiti-primary canonical that
-    DOES have a Mem0 twin still gets caught.  The cost is one count that
-    can only return 0 on a Graphiti-only canonical write — a rare write on
-    a rare key.  ``TestCanonicalUniquenessAtSeam`` pins this behaviour for
-    ``decisions_and_rationale`` so a later reader cannot mistake it for
-    coverage.  Closing the gap properly needs a Graphiti-side count, which
-    the PRD does not specify — do not fake it here.
+    BUT THAT REFUSAL IS WARN-MODE-FIRST, behind the same
+    ``memory_metadata.enforce`` flag as every sibling check, and the flag
+    SHIPS OFF.  Under the default a doomed canonical write is censused and
+    still proceeds, its marker discarded exactly as before: the mechanism
+    is in place, the closure is not yet live, and the only live-fleet
+    change is one extra census line.  Do not read the paragraph above as
+    describing today's fleet.  Task 3626 is the gate for the flip.
+
+    THE PREDICATE IS ``reaches_mem0``, NOT CATEGORY MEMBERSHIP — and that
+    is the hazard the superseded text correctly identified, preserved
+    rather than lost.  ``dual_write=True`` routes a Graphiti-primary
+    category into Mem0 too, where ``canonical`` genuinely IS stored and IS
+    enforceable; keying on category would be wrong exactly when it
+    mattered.  Keying on the routing OUTCOME is what lets the probe be
+    skipped safely: the old always-probe rule was a conservative PROXY for
+    "dual_write might route this into Mem0", and ``reaches_mem0`` measures
+    that condition exactly instead of approximating it.
+    ``test_dual_write_canonical_is_rejected_when_a_mem0_twin_exists`` pins
+    the dual_write direction specifically so a later reader cannot
+    "simplify" this to ``resolved_category in MEM0_PRIMARY``.
+
+    WHY A GRAPHITI-SIDE COUNT WAS REJECTED RATHER THAN DEFERRED — do not
+    fake one here.  On the Graphiti path the metadata is DISCARDED, not
+    merely uncounted, and there is no filtered count to issue against it
+    even if it were kept.  The measurement (graphiti_core 0.28.2) is
+    single-homed rather than restated: see
+    :func:`~fused_memory.memory_metadata.check_canonical_routing`'s
+    docstring for the discard finding, and the leaf-ε section of
+    ``docs/prds/memory-metadata-vocabulary.md`` for the four findings that
+    make a Graphiti-side count a PRD-sized change rather than a leaf.
 
     PROBE FAILURE (3198 amendment).  Both probes talk to Qdrant and
     ``Mem0Backend.count_by_metadata`` propagates a read timeout by
     contract, so the probe can fail for reasons that have nothing to do
-    with the write — including for a Graphiti-primary write that would
-    never have touched Mem0 at all.  Explicitly decided, not incidental:
+    with the write.  Explicitly decided, not incidental:
 
     * a failure is ALWAYS censused, under ``code``
       ``canonical_uniqueness_check_unavailable`` — degradation is loud, and
@@ -995,9 +1041,12 @@ async def _check_canonical_uniqueness(
        Compared as a PAIR, not on ``canonical`` alone: a canonical record
        re-homed from topic T to topic U changes no ``canonical`` value but
        is acquiring a claim at U, where it genuinely is not the incumbent.
-    4. count == 0 → return.  The happy path pays exactly one exact Qdrant
+    4. the write will not reach Mem0 → return (task 3508).  The seam already
+       censused — and under ``enforce`` refused — it as
+       ``canonical_on_non_mem0_write``; the probe could only ever count 0.
+    5. count == 0 → return.  The happy path pays exactly one exact Qdrant
        count and never scrolls.
-    5. otherwise resolve the incumbent's id and reject.
+    6. otherwise resolve the incumbent's id and reject.
 
     WHY COUNT THEN SCROLL: V1 contract-fixes ``count_memories_by_metadata``
     as the INV-3 mechanism, but also requires the error to name the existing
@@ -1102,6 +1151,13 @@ async def _check_canonical_uniqueness(
     if baseline is not None and (
         (baseline.get('canonical'), baseline.get('topic')) == (True, topic)
     ):
+        return
+
+    # Guard 4 (task 3508) — this write cannot land in Mem0, so the probe could
+    # only ever count 0.  Skipping it saves the round-trip and keeps a probe
+    # failure from censusing `canonical_uniqueness_check_unavailable` for a
+    # write the seam has already censused as `canonical_on_non_mem0_write`.
+    if not reaches_mem0:
         return
 
     filters = {'topic': topic, 'canonical': True}
@@ -6564,6 +6620,15 @@ class MemoryService:
         #   or a half-written Graphiti twin. Being before the branching is also
         #   what makes this cover Graphiti-primary writes, which never reach
         #   Mem0 at all — V1 covers the seam, not just the Mem0 branch.
+        #
+        # `write_mem0` is HOISTED above the call (task 3508) so ONE expression
+        # answers both "does this write go to Mem0" and the seam's
+        # `reaches_mem0`. Never restate it: a copy that forgot `dual_write`
+        # would refuse valid canonical writes that do land in Mem0.
+        write_mem0 = (
+            resolved_category in MEM0_PRIMARY or dual_write
+        )
+
         await _apply_memory_metadata_validation(
             meta,
             project_id=project_id,
@@ -6571,6 +6636,7 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            reaches_mem0=write_mem0,
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
             # how it already takes storm_detector/config as collaborators.
@@ -6582,9 +6648,8 @@ class MemoryService:
         write_graphiti = (
             resolved_category in GRAPHITI_PRIMARY or dual_write
         )
-        write_mem0 = (
-            resolved_category in MEM0_PRIMARY or dual_write
-        )
+        # `write_mem0` is computed above, hoisted to feed the validation
+        # seam's `reaches_mem0`. See the comment at that call site.
 
         _graphiti_error = None
         _mem0_error = None
@@ -6976,6 +7041,11 @@ class MemoryService:
         # drift. Placed after the tagging helpers and before the
         # _journaled_backend_call below, for the reasons spelled out at
         # add_memory's call site.
+        #
+        # `reaches_mem0=True` unconditionally (task 3508): this path never
+        # routes to Graphiti (this method's docstring), and `category` is a
+        # metadata TAG here, so a canonical marker is always stored. Copying
+        # add_memory's category test would refuse valid records on a tag.
         await _apply_memory_metadata_validation(
             meta,
             project_id=project_id,
@@ -6983,6 +7053,7 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            reaches_mem0=True,
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
             # how it already takes storm_detector/config as collaborators.
@@ -9473,6 +9544,12 @@ class MemoryService:
                 config=self.config.memory_metadata,
                 storm_detector=self._metadata_storm_detector,
                 project_root=self._memory_metadata_project_root(),
+                # `True` unconditionally (task 3508), as in add_system_record:
+                # this amends a record that already lives in Mem0 and never
+                # routes to Graphiti, and `category` in a patch is a metadata
+                # TAG. Testing the patched category would wrongly refuse
+                # canonical patches on Graphiti-tagged Mem0 records.
+                reaches_mem0=True,
                 parent_lookup=self.get_memory_by_id,
                 count_canonical=self.count_memories_by_metadata,
                 find_canonical=self.get_memories_by_metadata,

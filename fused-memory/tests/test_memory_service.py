@@ -11897,7 +11897,8 @@ _MM_UPDATE_POINT_ID = 'mm-point-1'
 
 
 async def _mm_write(svc, entry_point, *, metadata, category='observations_and_summaries',
-                    project_id='dark_factory', agent_id='claude-task-3195'):
+                    project_id='dark_factory', agent_id='claude-task-3195',
+                    dual_write=False):
     """Drive one write through any of the three seams.
 
     D8/§2 pin enforcement at the SERVICE seam precisely so
@@ -11912,6 +11913,12 @@ async def _mm_write(svc, entry_point, *, metadata, category='observations_and_su
     record already carries one), so the harness supplies it explicitly rather
     than leaving the shared "caller keys survive alongside category"
     assertion to pass vacuously on two seams and fail on the third.
+
+    *dual_write* (task 3508) is forwarded ONLY on the ``add_memory`` arm:
+    neither ``add_system_record`` nor ``update_memory`` has the parameter,
+    because both always land in Mem0 whatever their ``category`` tag, so
+    there is nothing for the flag to switch.  ``dual_write=True`` is the only
+    state in which a Graphiti-primary category still reaches Mem0.
     """
     if entry_point == 'add_memory':
         return await svc.add_memory(
@@ -11921,6 +11928,7 @@ async def _mm_write(svc, entry_point, *, metadata, category='observations_and_su
             agent_id=agent_id,
             metadata=metadata,
             causation_id='c1',
+            dual_write=dual_write,
         )
     if entry_point == 'update_memory':
         # The §5(c) existence check and leaf δ's parent-liveness lookup share
@@ -12007,6 +12015,13 @@ _MM_ENTRY_POINTS = ['add_memory', 'add_system_record', 'update_memory']
 #: shrinking ``_MM_ENTRY_POINTS``, so the default for a new shared case stays
 #: "runs against all three".
 _MM_ADD_ENTRY_POINTS = ['add_memory', 'add_system_record']
+
+#: The entry points whose writes land in Mem0 REGARDLESS of the ``category``
+#: tag, so they pass ``reaches_mem0=True`` unconditionally (task 3508).
+#: ``add_memory`` is the only entry point whose routing depends on
+#: category/``dual_write``.  A fourth write path must be classified here
+#: explicitly rather than inheriting one side by accident.
+_MM_MEM0_ONLY_ENTRY_POINTS = ['add_system_record', 'update_memory']
 
 
 class TestMemoryMetadataValidationAtSeam:
@@ -12867,24 +12882,38 @@ class TestCanonicalUniquenessAtSeam:
         _mm_backend_mock(service, entry_point).assert_not_called()
         assert 'canonical_uniqueness_check_unavailable' in _mm_census_codes(caplog)
 
-    # -- scope: the invariant is Mem0-scoped -------------------------------
+    # -- scope: closed by the routing refusal (task 3508) -------------------
 
     @pytest.mark.asyncio
-    async def test_graphiti_primary_canonical_is_only_checked_against_mem0(
+    async def test_graphiti_only_canonical_is_refused_and_never_probes(
         self, service, caplog
     ):
-        """PINS the known scope limit so the silence cannot read as coverage.
+        """The scope limit is CLOSED, and the probe is no longer spent on it.
 
-        Both probes are Qdrant payload filters, but the seam deliberately
-        runs BEFORE the write_graphiti/write_mem0 branching. So for a
-        Graphiti-primary category the probe still runs (dual_write can
-        route any category into Mem0, which is why it is not skipped on
-        category alone) but can only ever see Mem0 rows — a
-        previously-written Graphiti-only canonical is invisible to it and
-        the <=1-per-(project, topic) rule does NOT hold there.
+        REWRITTEN, not deleted (task 3508): this test used to pin that the
+        probe IS issued for a Graphiti-primary write and that the write is
+        then ADMITTED. Both are now false, but the scope still needs a pin
+        — it is just a different fact.
+
+        The decisive fact, measured rather than inferred: on a write that
+        reaches only Graphiti the metadata is DISCARDED, not merely
+        uncounted — so `canonical`/`topic` are never stored, unreadable by
+        pick_survivor and uncountable by this very probe, both of which
+        read Mem0. (The graphiti_core measurement behind that is
+        single-homed in `check_canonical_routing`'s docstring.) Admitting
+        such a write would silently destroy the caller's assertion, so the
+        seam refuses it instead (canonical_on_non_mem0_write).
+
+        The probe is therefore SKIPPED: it could only ever return 0 on a
+        write that is already doomed, and the seam promises the ordinary
+        path issues zero wasted round-trips.
+
+        Note the flag: this test runs in WARN mode, the shipped default,
+        where "refused" means censused-and-still-written. The refusal only
+        stops the write once `enforce` is on (task 3626).
         """
         caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
-        service.config.memory_metadata.enforce = True
+        service.config.memory_metadata.enforce = False
         # No Mem0 twin: exactly the state a Graphiti-only canonical leaves.
         service.mem0.count_by_metadata = AsyncMock(return_value=0)
 
@@ -12894,22 +12923,32 @@ class TestCanonicalUniquenessAtSeam:
             category='decisions_and_rationale',
         )
 
-        # The probe IS issued even though this write never reaches Mem0...
-        service.mem0.count_by_metadata.assert_awaited_once()
-        # ...and, seeing no Mem0 row, admits the write. Documented residual,
-        # not an oversight: closing it needs a Graphiti-side count the PRD
-        # does not specify. See _check_canonical_uniqueness's SCOPE note.
-        assert 'canonical_uniqueness_violation' not in _mm_census_codes(caplog)
+        codes = _mm_census_codes(caplog)
+        # Refused at the seam for being unstorable...
+        assert 'canonical_on_non_mem0_write' in codes
+        # ...so the uniqueness probe is never issued. No second census line
+        # either: reporting the one defect twice would render it as two.
+        service.mem0.count_by_metadata.assert_not_awaited()
+        assert 'canonical_uniqueness_violation' not in codes
 
     @pytest.mark.asyncio
-    async def test_graphiti_primary_canonical_is_rejected_when_a_mem0_twin_exists(
+    async def test_dual_write_canonical_is_rejected_when_a_mem0_twin_exists(
         self, service
     ):
-        """POSITIVE CONTROL for the scope test above.
+        """POSITIVE CONTROL for the test above, RE-POINTED at dual_write.
 
-        Without it, "no rejection for decisions_and_rationale" could not
-        distinguish the documented Mem0 scope from the check simply being
-        dead for Graphiti-primary categories.
+        Without a control, "no probe for decisions_and_rationale" could not
+        distinguish the routing refusal from the check simply being dead
+        for Graphiti-primary categories.
+
+        Re-pointed from dual_write=False to True (task 3508) because that
+        is the state which genuinely makes such a write Mem0-reaching — and
+        that makes this a strictly BETTER control than the one it replaces.
+        It now pins the load-bearing property: the predicate is the routing
+        OUTCOME, not category membership. A later reader who "simplifies"
+        `reaches_mem0` to `resolved_category in MEM0_PRIMARY` would break
+        dual_write silently, refusing canonical writes that do land in Mem0
+        and are perfectly enforceable — this test is what stops that.
         """
         from fused_memory.memory_metadata import CanonicalUniquenessViolation
 
@@ -12921,7 +12960,214 @@ class TestCanonicalUniquenessAtSeam:
                 service, 'add_memory',
                 metadata={'topic': self._TOPIC, 'canonical': True},
                 category='decisions_and_rationale',
+                dual_write=True,
             )
+        # The probe RAN — this write really does reach Mem0.
+        service.mem0.count_by_metadata.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_no_probe_and_no_new_code_on_a_graphiti_only_ordinary_write(
+        self, service, caplog
+    ):
+        """GUARD: the ordinary Graphiti-primary path is unregressed.
+
+        `test_no_round_trip_on_the_ordinary_path` covers the Mem0-primary
+        category only, so without this a change that made EVERY
+        Graphiti-primary write pay a round-trip — or censused every one of
+        them as a routing violation — would go unnoticed. Non-canonical
+        writes are the overwhelming majority; they must be untouched.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        _mm_set_canonical_incumbent(service, self._INCUMBENT, topic=self._TOPIC)
+
+        await _mm_write(
+            service, 'add_memory',
+            metadata={'topic': self._TOPIC},
+            category='decisions_and_rationale',
+        )
+
+        service.mem0.count_by_metadata.assert_not_awaited()
+        assert 'canonical_on_non_mem0_write' not in _mm_census_codes(caplog)
+
+
+class TestCanonicalRoutingAtSeam:
+    """`canonical: True` on a write that cannot reach Mem0 (task 3508).
+
+    The seam half of `check_canonical_routing`. Every case drives a REAL
+    write through `_mm_write` rather than calling the rule directly, so
+    what is pinned is the wiring — that the seam computes `reaches_mem0`
+    and consults the rule — not the rule, which
+    `TestCanonicalRoutingRule` (tests/test_memory_metadata.py) already
+    owns.
+
+    The predicate is "will this land in Mem0", NOT "is the category
+    Mem0-primary": `dual_write=True` routes a Graphiti-primary category
+    into Mem0 too, where `canonical` genuinely IS stored and IS
+    enforceable. The CONTROL cases below exist so a later reader
+    cannot collapse the entry points onto one expression.
+    """
+
+    _TOPIC = 'some-topic'
+    _CODE = 'canonical_on_non_mem0_write'
+    _GRAPHITI_PRIMARY = 'decisions_and_rationale'
+
+    @pytest.mark.asyncio
+    async def test_warn_mode_censuses_and_lets_the_write_through(self, service, caplog):
+        """Warn mode's contract is census-and-proceed, not reject.
+
+        This is the SHIPPED default (`enforce = False`), so it is the
+        behaviour the live fleet actually gets: the new rule is inert on
+        the write path until task 3626's measured flip. A version that
+        raised here would be an outage on the day it landed.
+
+        BOTH halves are asserted, not just the census. "Proceeds" verified
+        only by the absence of a raise would still pass if a regression
+        censused correctly and then silently dropped the write (say, an
+        early `return` added after `emit_schema_warnings`) — and on this,
+        the shipped path, the proceed half is the more valuable one. The
+        category is Graphiti-primary, so the durable-queue enqueue IS the
+        write.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        assert service.config.memory_metadata.enforce is False
+
+        await _mm_write(
+            service, 'add_memory',
+            metadata={'topic': self._TOPIC, 'canonical': True},
+            category=self._GRAPHITI_PRIMARY,
+        )
+
+        assert self._CODE in _mm_census_codes(caplog)
+        service.durable_queue.enqueue.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_enforce_mode_rejects_with_the_shape_error_not_the_uniqueness_one(
+        self, service
+    ):
+        """The two rejection contracts must stay distinguishable by `except`.
+
+        `CanonicalUniquenessViolation`'s contracted message asserts a NAMED
+        incumbent exists — a fact this check never observes. "You asserted
+        canonical where it cannot be stored" and "a duplicate already
+        exists" are different facts, and the PRD contract-fixes the two as
+        siblings, not subclasses, for exactly that reason.
+        """
+        from fused_memory.memory_metadata import (
+            CanonicalUniquenessViolation,
+            MemoryMetadataValidationError,
+        )
+
+        service.config.memory_metadata.enforce = True
+
+        with pytest.raises(MemoryMetadataValidationError) as excinfo:
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category=self._GRAPHITI_PRIMARY,
+            )
+        assert self._CODE in {v.code for v in excinfo.value.violations}
+        assert not isinstance(excinfo.value, CanonicalUniquenessViolation)
+
+    @pytest.mark.asyncio
+    async def test_rejection_happens_before_any_persistence(self, service):
+        """Nothing may reach either store once the write is doomed.
+
+        Mirrors `TestCanonicalUniquenessAtSeam`'s test of the same name.
+        Both halves matter: a Mem0 call would persist the record the
+        rejection just refused, and a Graphiti enqueue would durably
+        commit the twin whose missing metadata is the entire defect.
+        """
+        from fused_memory.memory_metadata import MemoryMetadataValidationError
+
+        service.config.memory_metadata.enforce = True
+        journal = _mm_install_journal(service)
+
+        with pytest.raises(MemoryMetadataValidationError):
+            await _mm_write(
+                service, 'add_memory',
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category=self._GRAPHITI_PRIMARY,
+            )
+        # `assert_not_awaited` on all three, not `assert_not_called`: all are
+        # AsyncMocks awaited in production, and the task-525 house convention
+        # (enforced by test_check_asyncmock_assertion_style) forbids mixing
+        # the two styles within one function.
+        service.mem0.add.assert_not_awaited()
+        service.durable_queue.enqueue.assert_not_awaited()
+        journal.log_mem0_intent.assert_not_awaited()
+
+    # -- controls: the code must not fire everywhere ------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('enforce', [False, True])
+    async def test_a_mem0_primary_write_is_untouched(self, service, caplog, enforce):
+        """CONTROL. Without it, "the code fires" cannot be told apart from
+        "the code always fires".
+
+        `observations_and_summaries` is Mem0-primary, so the marker IS
+        stored and IS enforceable — the live uniqueness probe owns that
+        case and this rule must stay silent, under EITHER flag.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = enforce
+
+        await _mm_write(
+            service, 'add_memory',
+            metadata={'topic': self._TOPIC, 'canonical': True},
+        )
+
+        assert self._CODE not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('enforce', [False, True])
+    @pytest.mark.parametrize('entry_point', _MM_MEM0_ONLY_ENTRY_POINTS)
+    async def test_mem0_only_entry_points_are_untouched_even_for_a_graphiti_category(
+        self, service, caplog, entry_point, enforce
+    ):
+        """CONTROL, and a deliberate pin of the ENTRY-POINT ASYMMETRY.
+
+        `add_system_record` never routes to Graphiti, and `update_memory`
+        amends a record that already lives in Mem0; on both, `category` is
+        a metadata TAG, never a routing input. So their canonical markers
+        are always stored, and they pass `reaches_mem0=True` rather than
+        recomputing add_memory's expression — which would refuse a valid
+        record on nothing but its tag.
+        """
+        caplog.set_level(logging.WARNING, logger=_MM_CENSUS_LOGGER)
+        service.config.memory_metadata.enforce = enforce
+
+        await _mm_write(
+            service, entry_point,
+            metadata={'topic': self._TOPIC, 'canonical': True},
+            category=self._GRAPHITI_PRIMARY,
+        )
+
+        assert self._CODE not in _mm_census_codes(caplog)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('entry_point', _MM_MEM0_ONLY_ENTRY_POINTS)
+    async def test_mem0_only_entry_points_still_probe_a_graphiti_tagged_canonical(
+        self, service, entry_point
+    ):
+        """POSITIVE CONTROL for the case above.
+
+        Without it, "no routing code" could not be told apart from "the
+        uniqueness probe was skipped too" — guard 4's early return would
+        make both invisible. On `update_memory` the probe is reachable
+        because `_MM_UPDATE_PRE_IMAGE` holds no claim, so guard 3 is inert.
+        """
+        from fused_memory.memory_metadata import CanonicalUniquenessViolation
+
+        service.config.memory_metadata.enforce = True
+        _mm_set_canonical_incumbent(service, 'incumbent-uuid-1', topic=self._TOPIC)
+
+        with pytest.raises(CanonicalUniquenessViolation):
+            await _mm_write(
+                service, entry_point,
+                metadata={'topic': self._TOPIC, 'canonical': True},
+                category=self._GRAPHITI_PRIMARY,
+            )
+        service.mem0.count_by_metadata.assert_awaited_once()
 
 
 class TestCanonicalClaimChangeOnTheUpdatePath:
