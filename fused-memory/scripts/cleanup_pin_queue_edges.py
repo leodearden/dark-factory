@@ -243,7 +243,7 @@ def scan(graph: Any, live: dict[str, dict]) -> list[dict[str, Any]]:
             targets.append({**c, 'reason': 'reorder-noise', 'subject': None})
             continue
 
-        subject: str | None = None
+        subject: str
         asserted: int | None = None
         attribution = 'lexical'
         if len(ids) == 1:
