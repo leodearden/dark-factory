@@ -503,7 +503,7 @@ class TestAggregateOverLiveArchive:
         # The payload surfaces the corrupt file (+0 for the committed
         # regime-markers file), and answers for the walk it was derived from.
         assert payload['parse_failures'] >= 1
-        assert payload['generated_at'] == corpus.as_of.isoformat()
+        assert payload['generated_at'] == _now().isoformat()
 
     async def test_row11_flow_cube_reconciles_over_live_archive(self, tmp_path: Path) -> None:
         queue = _live_queue(tmp_path)
