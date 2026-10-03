@@ -63,7 +63,7 @@ from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_promp
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
 )
-from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_GROWTH,
     STATE_ACTIVE,
@@ -3532,6 +3532,19 @@ async def _write_escalation_markers(
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
 
+    # ── Inference-bearing payload sections (task 5113) ──────────────────────
+    # INCLUSION CRITERION — a section belongs here iff prompts/stage2.py tells
+    # the model to draw an inference from that section's ABSENCE ("If
+    # `### Live-Workflow Signals` is absent from the payload, no task is live
+    # this cycle …"). Every payload builder renders these via
+    # _render_required_sections(). Enforced by
+    # tests/reconciliation/test_stage2_payload_section_parity.py, whose module
+    # docstring holds the section census: why each other conditional section
+    # stays out.
+    REQUIRED_SECTIONS: tuple[RequiredSection, ...] = (
+        RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'),
+    )
+
     # Remediation support — set by harness for second pass
     remediation_mode: bool = False
 
@@ -4377,16 +4390,8 @@ class TaskKnowledgeSync(BaseStage):
                 f'{overflow_note}'
             )
 
-        # Live-Workflow Signals section: check active tasks for live workflows so the
-        # Stage 2 LLM can skip set_task_status / stranded-work escalation for those tasks.
-        # Only active tasks are inspected (done/cancelled tasks cannot have live workflows).
-        # Empty string when no active tasks are live (keeps the payload tight).
-        live_workflow_section = ''
-        if filtered.active_tasks:
-            live_workflow_section = await render_live_workflow_section(
-                filtered.active_tasks,
-                self.scope.project_root,
-            )
+        # Inference-bearing sections (see REQUIRED_SECTIONS), bound here so their probes run first.
+        required_sections = await self._render_required_sections(filtered)
 
         # Call render_active_section once to get both the visible-task list (for
         # hint-attention slice-then-filter below) and the fully assembled Active
@@ -4712,7 +4717,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Recently Completed Tasks
 {recently_completed_text}
-{provenance_section}{proactive_sample_section}{done_audit_section}{hint_conversion_section}{live_workflow_section}
+{provenance_section}{proactive_sample_section}{done_audit_section}{hint_conversion_section}{required_sections}
 
 ## Your Task
 Reconcile task state against memory:
@@ -4770,6 +4775,35 @@ For cross-project routing see "Known Projects" above.
             marker = '  (current)' if pid == self.project_id else ''
             lines.append(f'- {pid:<{width}}  → {root}{marker}')
         return '\n### Known Projects (for cross-project routing)\n' + '\n'.join(lines) + '\n'
+
+    async def _build_live_workflow_section(self, filtered: FilteredTaskTree) -> str:
+        """Return the Live-Workflow Signals section for *filtered*, or ``''``.
+
+        Takes the payload's RESOLVED tree — harness-injected or self-fetched by
+        :meth:`assemble_payload` — which is why it is not a zero-arg reader of
+        ``self.filtered_task_tree`` like Stage 1's same-named renderer. An empty
+        active list renders ``''`` with no I/O.
+        """
+        return await render_live_workflow_section(filtered.active_tasks, self.scope.project_root)
+
+    async def _render_required_sections(self, filtered: FilteredTaskTree) -> str:
+        """Render every inference-bearing payload section for *filtered*, in registry order.
+
+        Every Stage-2 payload builder MUST interpolate this — enforced
+        structurally by
+        ``tests/reconciliation/test_stage2_payload_section_parity.py``. See
+        :attr:`REQUIRED_SECTIONS` for which sections qualify.
+
+        Renderers receive the payload's resolved *filtered* tree, because
+        :meth:`assemble_payload` may self-fetch it rather than use the
+        harness-injected attribute. Each renderer keeps its own
+        conditional-empty contract, so ``''`` is a normal result and no
+        separator is added. The sections render on remediation passes too: the
+        harness sets the tree there as well.
+        """
+        return ''.join(
+            [await getattr(self, section.renderer)(filtered) for section in self.REQUIRED_SECTIONS]
+        )
 
     @staticmethod
     def _warn_if_count_tasks_mismatch(
