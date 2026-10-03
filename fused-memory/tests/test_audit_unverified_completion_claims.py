@@ -292,17 +292,15 @@ class TestAdjudicate:
         assert findings[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
 
     def test_unresolvable_ticket_registry_is_unverifiable_not_mismatch(self) -> None:
-        """THE CRITICAL ASSERTION — the deliberate divergence from the live gate.
+        """THE CRITICAL ASSERTION: an unreadable registry is never a mismatch.
 
-        ``TaskInterceptor.get_ticket_row`` returns None BOTH for "no such
-        ticket" and for "no ticket store configured" (task_interceptor.py:
-        3006-3012), and ``_verify_ticket`` maps a None row to 'mismatch'
-        (completion_claim_gate.py:575). On the write path that conflation is
-        contained upstream by the _taskmaster_configured guard and costs one
-        spurious tag. In a BATCH sweep it would print a fabrication accusation
-        against every ticket claim in the corpus whenever tickets.db is merely
-        absent. The gate's own module makes this distinction load-bearing at the
-        sentinel level (:123-127, INV-2); honouring it here follows that intent.
+        ``_verify_ticket`` maps a None row to 'mismatch', so None must mean
+        only "no such ticket". The live path gets that from
+        ``TaskInterceptor.get_ticket_row``, which raises
+        ``TicketStoreNotConfiguredError`` when no store is configured; the
+        sweep reads tickets.db itself and passes UNRESOLVABLE when it cannot.
+        Without that, a merely absent tickets.db would print a fabrication
+        accusation against every ticket claim in the corpus (INV-2).
         """
         findings = self._adjudicate(ESC_3085_1_INSTANCE_2, ticket=UNRESOLVABLE)
         assert len(findings) == 1

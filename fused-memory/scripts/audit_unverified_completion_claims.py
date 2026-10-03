@@ -1200,22 +1200,18 @@ async def _build_ticket_probe(
 ) -> Callable[[str], dict[str, Any] | None | Any]:
     """Build the ticket probe, probing store AVAILABILITY exactly once.
 
-    THE DELIBERATE DIVERGENCE from the live write-path gate.
-    ``TaskInterceptor.get_ticket_row`` returns ``None`` BOTH for "no such
-    ticket" and for "no ticket store configured" (task_interceptor.py:
-    3006-3012), and ``completion_claim_gate._verify_ticket`` maps a ``None``
-    row to ``'mismatch'`` (:575). On the write path that conflation is
-    contained upstream by the ``_taskmaster_configured`` guard and costs at
-    most one spurious tag on one episode. In a BATCH sweep the same conflation
-    is a different animal: if tickets.db is merely absent or unopenable, every
-    ticket claim in the entire corpus prints as a fabrication accusation
-    against a named agent.
+    ``completion_claim_gate._verify_ticket`` maps a ``None`` row to
+    ``'mismatch'``, so ``None`` must mean only "no such ticket". The live
+    write path gets that from ``TaskInterceptor.get_ticket_row``, which raises
+    ``TicketStoreNotConfiguredError`` rather than returning ``None`` when no
+    store is configured. This sweep reads tickets.db directly, so it
+    establishes availability itself, to the same effect: if tickets.db is
+    absent or unopenable, every ticket claim in the corpus would otherwise
+    print as a fabrication accusation against a named agent.
 
     So availability is established ONCE, up front, and unavailability yields
-    :data:`UNRESOLVABLE` for every ref — never ``None``. The gate's own module
-    makes this distinction load-bearing at the sentinel level (:123-127,
-    INV-2), so honouring it here follows its stated intent rather than
-    departing from it.
+    :data:`UNRESOLVABLE` for every ref — never ``None``, the distinction the
+    gate's ``UNRESOLVABLE`` sentinel exists to keep (INV-2).
 
     The read runs over :func:`_read_ticket_rows_readonly` rather than
     ``TicketStore``, whose ``initialize()`` mkdirs the parent and applies

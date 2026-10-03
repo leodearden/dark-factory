@@ -74,6 +74,7 @@ from fused_memory.middleware.routing_intent_guard import (
 )
 from fused_memory.middleware.task_interceptor import (
     TERMINAL_STATUSES,
+    TicketStoreNotConfiguredError,
     _is_ticket_id,
     _looks_like_task_id,
 )
@@ -2000,8 +2001,9 @@ def create_mcp_server(
 
         A key mapped to None means the registry answered NO SUCH TICKET (a
         mismatch — esc-3085-1 instance (2)); an ABSENT key means the registry
-        could not be consulted (unverifiable). Conflating the two would put a
-        false accusation in the flag, so they stay distinct (INV-2).
+        could not be consulted (unverifiable), whether the read failed or no
+        ticket store is configured at all. Conflating the two would put a false
+        accusation in the flag, so they stay distinct (INV-2).
         """
         refs = [c.ref for c in claims if c.subject == 'ticket']
         if not refs:
@@ -2019,6 +2021,12 @@ def create_mcp_server(
                 # so it needs no project and answers a cross-project claim
                 # correctly (see TaskInterceptor.get_ticket_row).
                 rows[ref] = await task_interceptor.get_ticket_row(ref)  # type: ignore[union-attr]
+            except TicketStoreNotConfiguredError:
+                logger.warning(
+                    'completion_claim_gate: ticket store not configured; %d ticket '
+                    'claim(s) are UNVERIFIABLE', len(refs),
+                )
+                return {}
             except Exception:
                 logger.warning(
                     'completion_claim_gate: get_ticket_row failed for %r; the claim '
