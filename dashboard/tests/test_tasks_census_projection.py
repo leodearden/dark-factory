@@ -372,3 +372,77 @@ class TestCensusProjectionEndpoint:
             rows = entry['rows']
             assert rows['state'] == 'fresh', (label, rows)
             assert rows['value'] and all(isinstance(row, dict) for row in rows['value'])
+
+
+# ---------------------------------------------------------------------------
+# The two halves meet: the URL the real client polls, served by the real endpoint
+# ---------------------------------------------------------------------------
+
+# The REAL client, in index.html's order and with no `document`, so data.js
+# loads inert (data_poll.test.mjs::loadDataJs records why). `url` prints the
+# /tasks url pollSetFor polls on the Scheduler tab; `apply` runs a served body
+# through the real refreshOne under endpointsFor's /tasks key specs and prints
+# what the rail reads back: censusOver(DF_DATA, null).
+_CENSUS_CLIENT = r"""
+const fs = require('fs');
+const path = require('path');
+const [redux, mode, url] = process.argv.slice(1);
+globalThis.window = { dispatchEvent() {} };
+for (const name of ['endpoint_staleness.js', 'datum.js']) require(path.join(redux, name));
+const api = require(path.join(redux, 'data.js'));
+for (const name of ['task_vocab.js', 'task_snapshot.js']) require(path.join(redux, name));
+const TASKS = '/api/v2/dashboard/tasks';
+if (mode === 'url') {
+  const polled = Object.keys(api.pollSetFor('scheduler', '24h')).filter(u => api.pollKey(u) === TASKS);
+  process.stdout.write(JSON.stringify(polled));
+} else {
+  const body = JSON.parse(fs.readFileSync(0, 'utf8'));
+  api.refreshOne(url, api.endpointsFor('24h')[TASKS], api.createPollState(), {
+    fetchImpl: () => Promise.resolve({ ok: true, json: async () => body }),
+    now: () => Date.now(),
+    setTimeoutImpl: () => 0,
+    clearTimeoutImpl: () => {},
+  }).then(outcome => {
+    const census = window.DF_TASK_SNAPSHOT.censusOver(window.DF_DATA, null);
+    process.stdout.write(JSON.stringify({ outcome, census }));
+  });
+}
+"""
+
+
+def _census_client(mode: str, url: str = '', body: dict | None = None):
+    import json
+    import subprocess
+    from pathlib import Path
+
+    from _lock_chip_matrix import node_path
+
+    redux = Path(__file__).parent.parent / 'src' / 'dashboard' / 'static' / 'redux'
+    result = subprocess.run(
+        [node_path(), '-e', _CENSUS_CLIENT, str(redux), mode, url],
+        input=json.dumps(body or {}), capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, (
+        f'the client driver exited {result.returncode}\n'
+        f'--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}'
+    )
+    return json.loads(result.stdout)
+
+
+def test_the_census_the_client_polls_on_a_rowless_tab_is_the_census_the_rail_reads(two_root_app):
+    (polled,) = _census_client('url')
+    assert polled == _CENSUS, f'the Scheduler tab polls {polled}, not the census projection'
+
+    full, census = _get_all(two_root_app, _canned(), _TASKS, polled)
+    assert census.status_code == 200, census.text
+    applied = _census_client('apply', polled, census.json())
+
+    assert applied['outcome'] == 'applied', applied
+    datum = applied['census']
+    assert datum['state'] == 'fresh', datum
+    served_in_flight = sum(
+        entry['census']['value']['views']['in_flight']
+        for entry in full.json()['TASKS_SNAPSHOT'].values()
+    )
+    assert served_in_flight > 0, 'the substrate must hold in-flight tasks, or this is vacuous'
+    assert datum['value']['views']['in_flight'] == served_in_flight

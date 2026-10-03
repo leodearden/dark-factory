@@ -194,3 +194,60 @@ def test_stale_is_never_read_by_identity_comparison(app_jsx_body: str) -> None:
     assert not re.search(r'(!==|===)\s*[A-Za-z_$][\w$]*__stale', src, re.I), (
         'app.jsx must not compare against a captured __stale seed.'
     )
+
+
+# ---------------------------------------------------------------------------
+# Loading notices (task 5825): a tab path that has not delivered since page load
+# ---------------------------------------------------------------------------
+
+_LOADING_TESTID = 'endpoint-loading-banner'
+
+
+def test_app_reads_loading_notices_through_the_shared_module(app_jsx_body: str) -> None:
+    """`loadingNoticesForTab` comes from the same module-scope destructure, no fallback."""
+    src = strip_js_comments(app_jsx_body)
+    assert re.search(
+        r'const\s*\{[^}]*loadingNoticesForTab[^}]*\}\s*=\s*window\.DF_ENDPOINT_STALENESS',
+        src,
+    ), (
+        'app.jsx must destructure loadingNoticesForTab from '
+        'window.DF_ENDPOINT_STALENESS at module scope, beside staleNoticesForTab.'
+    )
+
+
+def test_app_passes_the_tab_the_receipts_and_the_stale_map(app_jsx_body: str) -> None:
+    """The notices key on the success-only `__receipt` map, deferring to `__stale`.
+
+    A tab opened for the first time since page load shows its pre-fetch seed,
+    which looks exactly like a measured empty payload; the receipt map is what
+    tells the two apart per endpoint.
+    """
+    body = _app_body(app_jsx_body)
+    call = re.search(r'loadingNoticesForTab\(\s*\{(.*?)\}\s*\)', body, re.S)
+    assert call, 'App() must call loadingNoticesForTab({...})'
+    args = call.group(1)
+    assert re.search(r'\btab\b', args), f'the call must pass the CURRENT tab id; got: {args!r}'
+    assert re.search(r'DD\.__receipt', args), (
+        f'the call must read DF_DATA.__receipt, the success-only map; got: {args!r}'
+    )
+    assert re.search(r'DD\.__stale', args), (
+        f'the call must read DF_DATA.__stale, so a stale notice suppresses it; got: {args!r}'
+    )
+
+
+def test_loading_notices_render_beside_the_tab_body(app_jsx_body: str) -> None:
+    """One element per loading notice, inside `.body`, with `renderTab()` unconditional."""
+    body = _app_body(app_jsx_body)
+    assert re.search(r'loadingNotices\s*\.\s*map\s*\(', body), (
+        'App() must render ONE element PER loading notice (a .map over them).'
+    )
+    section = re.search(r'className="body".*?renderTab\(\)', body, re.S)
+    assert section, 'renderTab() must still be rendered inside the .body container'
+    for testid in (_TESTID, _LOADING_TESTID):
+        assert testid in section.group(0), (
+            f'notices (data-testid="{testid}") must render inside .body ALONGSIDE '
+            'renderTab(), never instead of it.'
+        )
+    assert not re.search(r'return\b', section.group(0)), (
+        'no early `return` may separate the notices from renderTab().'
+    )
