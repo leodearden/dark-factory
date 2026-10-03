@@ -1,6 +1,6 @@
 """The single findable home for this suite's steward test-scaffolding invariants.
 
-Consolidation lineage 3461 → 3514 → 3551 → 3647.  Task 3461 merged the two
+Consolidation lineage 3461 → 3514 → 3551 → 3647 → 4452.  Task 3461 merged the two
 near-identical ``_make_steward`` copies from ``test_suggestion_triage.py`` and
 ``test_workflow_state_machine_boundary.py``; task 3514 folded in the two that
 remained (``test_out_of_band_routing.py``'s, and ``test_steward.py``'s
@@ -17,7 +17,8 @@ CHECKABLE invariants, matching the ethos the suite already states elsewhere
 guard).  Task 4389 extended the lineage one further, adjudicating the 17
 absolute-``/tmp`` ``project_root`` literals task 3551's sweep had found and left
 classified as "unknown", and turning that ruling into the fourth concern below.
-Four concerns live here, deliberately in ONE module because the lineage's actual
+Task 4452 folded the verdict-gate steward site onto ``make_steward``, retiring
+its sanction.  Four concerns live here, deliberately in ONE module because the lineage's actual
 failure mode is that they keep getting scattered and re-derived:
 
 1. :class:`TestAssertSandboxedProjectRoot` — the contract of
@@ -574,7 +575,7 @@ class _Sanctioned(NamedTuple):
 
     *sites* is deliberately a COUNT, not just a flag.  Sanctioning a module
     wholesale would pre-approve every FUTURE construction it grows — someone
-    could add a fourth idiom inside an already-listed module and the census
+    could add a new idiom inside an already-listed module and the census
     would stay green, which is the exact silent appearance this guard exists to
     stop.  Pinning the count means a new construction in a sanctioned module
     still trips, and still forces its own adjudication.  Line numbers are
@@ -649,7 +650,7 @@ def _steward_construction_sites(tree: ast.Module) -> list[str]:
     * an ``ast.Call`` whose func is an ``ast.Attribute`` whose ``.attr`` ends in
       ``Steward`` (``harness.TaskSteward(...)``, ``_SpyStewardFactory.Steward()``).
       Matching only the Name form would leave the attribute form invisible, so a
-      fourth idiom could appear silently through a module-qualified or nested
+      new idiom could appear silently through a module-qualified or nested
       name — exactly what this census exists to prevent;
     * an ``ast.ClassDef`` with a base ending in ``Steward`` — a subclass is a
       second steward SHAPE even before it is instantiated, and the standing
@@ -768,7 +769,7 @@ class TestStewardConstructionSitesAreCensused:
             'Unsanctioned steward-construction site(s).\n'
             'This suite has ONE steward factory: the `make_steward` fixture in '
             'conftest.py (task 3461 merged two copies into it, task 3514 folded '
-            'in the two that remained). A construction outside it is a fourth '
+            'in the two that remained). A construction outside it is a new '
             'idiom of the kind this census exists to stop appearing silently.\n'
             'Fix, and it is a real choice between two options:\n'
             '  (a) fold the site onto `make_steward` — extend that fixture '
