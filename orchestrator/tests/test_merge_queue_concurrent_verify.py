@@ -297,8 +297,7 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
     'HEAVY_BARRIER_TEST_TIMEOUT': float(HEAVY_BARRIER_TEST_TIMEOUT),
     # task 3980: `wait_responsive`'s hard wall backstop and the merge-pipeline
     # gate-barrier nominal, so a scanned call site spelling either one
-    # resolves rather than silently contributing 0.0 (which would let the
-    # late-arrival gate barriers vanish from the audited budget entirely).
+    # resolves to its value rather than billing as unbounded.
     'RESPONSIVE_WAIT_WALL_CAP': float(RESPONSIVE_WAIT_WALL_CAP),
     'MERGE_GATE_BARRIER_TIMEOUT': float(MERGE_GATE_BARRIER_TIMEOUT),
 }
@@ -319,21 +318,21 @@ _RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 
 
 def _resolve_wait_value(node: ast.expr | None) -> float:
-    """Resolve a single AST expression to a wait-budget number, or 0.0.
+    """Resolve a wait-value expression to the most wall clock it can allow.
 
-    Never guesses: a literal number resolves directly; a name reference
-    resolves ONLY via ``_KNOWN_WAIT_CONSTANTS``; anything else (a local
-    variable, an attribute access, an arithmetic expression, an unknown
-    name) resolves to 0.0. What that 0.0 means is the caller's call: the
-    ``asyncio.wait_for`` and ``_await_outcome`` nominals take it as "ignore",
-    while ``_wait_responsive_budget`` replaces it with a bound that holds
-    whatever the value was.
+    Never guesses: a numeric literal resolves to itself (a negative one
+    waits no time, so 0.0), and a name ONLY via ``_KNOWN_WAIT_CONSTANTS``.
+    Anything else -- a local variable, an attribute access, arithmetic, an
+    unknown name, the literal None, a missing value -- resolves to
+    ``math.inf``: the scan cannot read it, so it may allow any wall clock,
+    and no timeout mark clears an unbounded bill. Failing closed is what
+    keeps every recognised shape's bill an upper bound.
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
-        return float(node.value)
-    if isinstance(node, ast.Name):
-        return _KNOWN_WAIT_CONSTANTS.get(node.id, 0.0)
-    return 0.0
+        return max(float(node.value), 0.0)
+    if isinstance(node, ast.Name) and node.id in _KNOWN_WAIT_CONSTANTS:
+        return _KNOWN_WAIT_CONSTANTS[node.id]
+    return math.inf
 
 
 def _keyword(call: ast.Call, name: str) -> ast.expr | None:
@@ -348,32 +347,27 @@ def _wait_responsive_budget(call: ast.Call) -> float:
     The helper gives up once its wall clock reaches its cap: an explicit
     ``max_wall_s`` when one is passed, else the nominal ``timeout`` (hidden
     default ``MERGE_RESULT_TIMEOUT``) stretched by ``_RESPONSIVE_WAIT_STRETCH``
-    and clamped to ``RESPONSIVE_WAIT_WALL_CAP``. So:
-
-    - an explicit ``max_wall_s`` other than the literal None is billed
-      verbatim when it resolves to a positive number, and ``math.inf``
-      otherwise -- a cap the scan cannot read may allow any wall clock, and
-      no timeout mark clears an unbounded bill;
-    - otherwise the stretched, clamped nominal is billed. An unresolvable or
-      non-positive nominal bills the clamp itself, which the default cap can
-      never exceed.
+    and clamped to ``RESPONSIVE_WAIT_WALL_CAP``. So an explicit
+    ``max_wall_s`` other than the literal None is billed as resolved -- one
+    the scan cannot read is unbounded -- and otherwise the stretched,
+    clamped nominal is billed, which an unreadable nominal cannot push past
+    the clamp.
     """
     max_wall = _keyword(call, 'max_wall_s')
     explicit_none = isinstance(max_wall, ast.Constant) and max_wall.value is None
     if max_wall is not None and not explicit_none:
-        cap = _resolve_wait_value(max_wall)
-        return cap if cap > 0 else math.inf
+        return _resolve_wait_value(max_wall)
 
-    wall_cap = _KNOWN_WAIT_CONSTANTS['RESPONSIVE_WAIT_WALL_CAP']
     timeout = _keyword(call, 'timeout')
     nominal = (
         _KNOWN_WAIT_CONSTANTS['MERGE_RESULT_TIMEOUT']
         if timeout is None
         else _resolve_wait_value(timeout)
     )
-    if nominal <= 0:
-        return wall_cap
-    return min(nominal * _RESPONSIVE_WAIT_STRETCH, wall_cap)
+    return min(
+        nominal * _RESPONSIVE_WAIT_STRETCH,
+        _KNOWN_WAIT_CONSTANTS['RESPONSIVE_WAIT_WALL_CAP'],
+    )
 
 
 def _call_wait_budget(call: ast.Call) -> float:
@@ -387,8 +381,9 @@ def _call_wait_budget(call: ast.Call) -> float:
     (task 3980), billed by ``_wait_responsive_budget`` as an unconditional
     upper bound on its wall clock, and the ``_stop_worker(...)`` teardown,
     whose join is billed its ``join_timeout=`` kwarg or hidden default
-    ``_STOP_WORKER_JOIN_TIMEOUT``. For the first and last, an unresolvable
-    value contributes 0.0 -- unknown means ignore, never guess. Every
+    ``_STOP_WORKER_JOIN_TIMEOUT``. Within a recognised shape, a value the
+    scan cannot read bills ``math.inf`` (``_resolve_wait_value``), so a
+    recognised wait is never under-billed. Every
     other call shape -- ``asyncio.sleep``, ``.wait()``, ``.result()``,
     ``.join()``, a non-``asyncio`` ``.wait_for(...)``, attribute access,
     arithmetic, unknown names -- contributes 0.0 and is skipped silently
@@ -6391,10 +6386,10 @@ class TestExplicitAwaitOutcome:
             f'hidden default, got {budgets!r}.'
         )
 
-    def test_dynamic_timeout_value_contributes_zero_and_does_not_raise(self) -> None:
-        """A non-literal/dynamic timeout such as `timeout=some_var`
-        contributes 0.0 and does NOT raise -- the helper is conservative:
-        unknown means ignore, never guess.
+    def test_dynamic_timeout_value_is_unbounded_and_does_not_raise(self) -> None:
+        """A non-literal/dynamic timeout such as `timeout=some_var` bills
+        `math.inf` and does NOT raise: the scan cannot read the value, so
+        the wait may run for any wall clock, and no mark clears that.
         """
         source = '''
 class TestDynamicTimeout:
@@ -6403,9 +6398,57 @@ class TestDynamicTimeout:
 '''
         budgets = _worst_per_method_wait_budget(source)
 
-        assert budgets == {'TestDynamicTimeout': 0.0}, (
-            f'Expected an unresolvable dynamic timeout to contribute 0.0 '
+        assert budgets == {'TestDynamicTimeout': math.inf}, (
+            f'Expected an unresolvable dynamic timeout to bill math.inf '
             f'without raising, got {budgets!r}.'
+        )
+
+    def test_wait_for_positional_dynamic_timeout_is_unbounded(self) -> None:
+        """The positional spelling `asyncio.wait_for(x, some_var)` is the
+        same unreadable wait, so it bills `math.inf` too.
+        """
+        source = '''
+class TestPositionalDynamicTimeout:
+    async def test_dynamic(self):
+        await asyncio.wait_for(x, some_var)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestPositionalDynamicTimeout': math.inf}, (
+            f'Expected an unresolvable positional timeout to bill math.inf, '
+            f'got {budgets!r}.'
+        )
+
+    def test_wait_for_none_timeout_is_unbounded(self) -> None:
+        """`asyncio.wait_for(x, timeout=None)` waits forever, so it bills
+        `math.inf`, not the 0.0 a literal zero would.
+        """
+        source = '''
+class TestNoneTimeout:
+    async def test_forever(self):
+        await asyncio.wait_for(x, timeout=None)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestNoneTimeout': math.inf}, (
+            f'Expected timeout=None to bill math.inf, got {budgets!r}.'
+        )
+
+    def test_await_outcome_unresolvable_timeout_is_unbounded(self) -> None:
+        """An explicit `_await_outcome(..., timeout=some_var)` replaces the
+        hidden default with a value the scan cannot read, so it bills
+        `math.inf`.
+        """
+        source = '''
+class TestAwaitOutcomeUnknownTimeout:
+    async def test_it(self):
+        await _await_outcome(req, label='x', timeout=some_var)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestAwaitOutcomeUnknownTimeout': math.inf}, (
+            f'Expected an unresolvable _await_outcome timeout to bill '
+            f'math.inf, got {budgets!r}.'
         )
 
     def test_merge_result_timeout_name_resolves_to_45(self) -> None:
@@ -6597,6 +6640,23 @@ class TestStopWorkerExplicit:
 
         assert budgets == {'TestStopWorkerExplicit': 20.0}, (
             f'Expected an explicit join_timeout=20.0 to be billed, got {budgets!r}.'
+        )
+
+    def test_stop_worker_unresolvable_join_timeout_is_unbounded(self) -> None:
+        """The teardown join is real wall clock, so a `join_timeout=` the
+        scan cannot read bills `math.inf` rather than vanishing from the
+        budget.
+        """
+        source = '''
+class TestStopWorkerUnknownJoin:
+    async def test_it(self):
+        await _stop_worker(worker, worker_task, join_timeout=some_var)
+'''
+        budgets = _worst_per_method_wait_budget(source)
+
+        assert budgets == {'TestStopWorkerUnknownJoin': math.inf}, (
+            f'Expected an unresolvable join_timeout to bill math.inf, '
+            f'got {budgets!r}.'
         )
 
     def test_asyncio_sleep_is_outside_the_counted_shape_set(self) -> None:
