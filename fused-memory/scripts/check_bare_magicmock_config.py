@@ -175,8 +175,7 @@ frozenset for the same reason.  So no class list and no budget threshold decides
 sites are scanned.
 
 Both legs are pure SHAPE, on any receiver (a Name, an Attribute, a Subscript or a
-Call), in any scope of any file.  No receiver name is consulted (task 5269 dropped the
-``gate`` prefix the barrier leg once required, which hid 113 barrier sites):
+Call), in any scope of any file.  No receiver name is consulted:
 
   * the ``req.result`` leg is an ``ast.Attribute`` with ``attr == 'result'``;
   * the barrier leg is a ``.wait()`` method call taking NO arguments.  The
@@ -186,16 +185,13 @@ Call), in any scope of any file.  No receiver name is consulted (task 5269 dropp
 
 The accepted false-positive surface is an asyncio subprocess ``Process.wait()`` and a
 ``Condition``/``Barrier`` ``.wait()``.  The latter two are genuine synchronisation
-points, so flagging them is correct.  ``Process.wait()`` measured ZERO sites in the
-seven scanned dirs at task 5269; ``# noqa: wall-clock-deadline — <reason>`` is the
-escape for one that appears.
+points, so flagging them is correct; ``# noqa: wall-clock-deadline — <reason>`` is the
+escape for a ``Process.wait()``.
 
-Remedy reachability: ``wait_responsive`` is defined in
-``orchestrator/tests/_orch_helpers.py`` and is importable only under orchestrator/tests,
-so the bare-wait_for message says that elsewhere the per-site ``# noqa`` is the remedy,
-and non-orchestrator debt entries can shrink only that way until follow-up ticket
-tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes it reachable from every scanned package.  Scoping
-the leg to orchestrator/tests instead would reintroduce exactly the
+Remedy reachability: ``wait_responsive`` and ``MERGE_RESULT_TIMEOUT`` are defined in
+``orchestrator/tests/_orch_helpers.py`` and importable only under orchestrator/tests,
+so every Rule C message says that elsewhere the per-site ``# noqa`` is the remedy.
+Scoping the rule to orchestrator/tests instead would reintroduce exactly the
 a-list-decides-coverage failure mode the paragraph above rejects.
 
 What is deliberately NOT load-bearing: a wait on a bare ``ast.Name`` target, i.e. the
@@ -705,7 +701,8 @@ def _wall_clock_overrun_msg(budget: int, found: int) -> str:
         ' with a descriptive label=, or by deriving its bound from'
         ' MERGE_RESULT_TIMEOUT instead of writing a number, or by adding'
         ' # noqa: wall-clock-deadline — <reason> above a deliberate one.'
-        ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
+        + _WALL_CLOCK_REMEDY_REACH
+        + ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
     )
 
 # ---------------------------------------------------------------------------
@@ -762,7 +759,15 @@ _WALL_CLOCK_RAW_LITERAL = 'raw-literal'
 # all genuine deadline expiries on tests that had already passed.
 _WALL_CLOCK_CONSEQUENCE = (
     ' A deadline expiry on a load-bearing synchronisation point fails a test whose'
-    ' merge pipeline completed correctly, purely because the worker was descheduled.'
+    ' awaited event did happen, only because the loop was descheduled.'
+)
+
+# Shared by both kinds and the debt overrun: every Rule C remedy names
+# wait_responsive or MERGE_RESULT_TIMEOUT, and both live in
+# orchestrator/tests/_orch_helpers.py while the rule scans every package.
+_WALL_CLOCK_REMEDY_REACH = (
+    ' wait_responsive and MERGE_RESULT_TIMEOUT are importable only under'
+    ' orchestrator/tests, so in another package the # noqa escape is the remedy.'
 )
 
 _WALL_CLOCK_SUPPRESS = (
@@ -794,8 +799,7 @@ def _wall_clock_violation_msg(kind: str, target: str, *, parameter: str | None =
             + ' Route it through wait_responsive(...) with a descriptive label='
             ' (orchestrator/tests/_orch_helpers.py::wait_responsive), which charges its'
             ' budget in loop-responsive time and still reports a genuine hang red.'
-            ' wait_responsive is importable only under orchestrator/tests, so in'
-            ' another package the # noqa escape below is the remedy.'
+            + _WALL_CLOCK_REMEDY_REACH
             + _WALL_CLOCK_SUPPRESS
         )
     return (
@@ -805,6 +809,7 @@ def _wall_clock_violation_msg(kind: str, target: str, *, parameter: str | None =
         + ' Derive the bound from MERGE_RESULT_TIMEOUT instead of writing a number:'
         ' a written literal is a threshold, and task 2376 measured that a policy'
         ' expressed as "literals up to N" cannot catch the one just above N.'
+        + _WALL_CLOCK_REMEDY_REACH
         + _WALL_CLOCK_SUPPRESS
     )
 

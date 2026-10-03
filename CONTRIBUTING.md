@@ -296,12 +296,13 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     (`timeout=`, `max_wall_s=`, or `asyncio.wait_for`'s positional timeout).
     Remedy: `wait_responsive(...)` with a descriptive `label=`, and a bound
     derived from `MERGE_RESULT_TIMEOUT` rather than a written number — a
-    deadline expiry on such a wait fails a test whose pipeline completed
-    correctly. Both legs are pure **shape**: no receiver name, no class list
+    deadline expiry on such a wait fails a test whose awaited event did
+    happen. Both legs are pure **shape**: no receiver name, no class list
     and no budget threshold decides which sites are scanned, and the teardown
     join in `_stop_worker` is exempt structurally (a bare `ast.Name` target).
-    `wait_responsive` lives in `orchestrator/tests/_orch_helpers.py` and is
-    importable only under `orchestrator/tests`, so in any other package the
+    `wait_responsive` and `MERGE_RESULT_TIMEOUT` live in
+    `orchestrator/tests/_orch_helpers.py` and are importable only under
+    `orchestrator/tests`, so in any other package the
     per-site `# noqa: wall-clock-deadline — <reason>` is the remedy. See the
     script's Rule C docstring. Pre-existing debt, across four packages, is
     grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline — the

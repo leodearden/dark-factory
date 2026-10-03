@@ -1644,11 +1644,15 @@ class TestWallClockDeadlineMessage:
     _BOTH_KINDS = 'asyncio.wait_for(req_a.result, timeout=25.0)\n'
 
     def test_the_two_kinds_carry_distinct_remedies(self):
-        """Each kind names its own remedy; conflating them sends the reader down a dead end."""
+        """Each kind names its own remedy; conflating them sends the reader down a dead end.
+
+        Both messages mention both helpers in the shared reachability caveat, so the
+        filters key on the PRESCRIBING clause, not on the helper names.
+        """
         messages = [v.message for v in _rule_c(self._BOTH_KINDS)]
         assert len(messages) == 2, messages
-        bare = [m for m in messages if 'wait_responsive' in m and 'label=' in m]
-        literal = [m for m in messages if 'MERGE_RESULT_TIMEOUT' in m]
+        bare = [m for m in messages if 'through wait_responsive(...) with a descriptive label=' in m]
+        literal = [m for m in messages if 'Derive the bound from MERGE_RESULT_TIMEOUT' in m]
         assert len(bare) == 1, f'exactly one message must prescribe wait_responsive: {messages}'
         assert len(literal) == 1, (
             f'exactly one message must prescribe deriving from MERGE_RESULT_TIMEOUT: {messages}'
@@ -1662,10 +1666,28 @@ class TestWallClockDeadlineMessage:
             assert 'MergeRequest.result future' in v.message
 
     def test_messages_explain_the_consequence(self):
-        """A deadline expiry on a load-bearing sync point fails a test that PASSED."""
+        """A deadline expiry on a load-bearing sync point fails a test that PASSED.
+
+        Stated without merge vocabulary: Rule C scans every package's tests, and an
+        ``Event.wait()`` in fused-memory/tests has no merge pipeline.
+        """
         for v in _rule_c(self._BOTH_KINDS):
             assert 'WALL CLOCK' in v.message or 'wall-clock' in v.message
-            assert 'completed correctly' in v.message, v.message
+            assert 'awaited event did happen' in v.message, v.message
+            assert 'merge pipeline' not in v.message, v.message
+
+    def test_every_rule_c_message_says_where_its_remedy_is_importable(self):
+        """wait_responsive and MERGE_RESULT_TIMEOUT exist only under orchestrator/tests.
+
+        Both offence kinds and the debt overrun prescribe one of them, so each must
+        carry the same caveat naming the per-site noqa as the remedy elsewhere.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        messages = [v.message for v in _rule_c(self._BOTH_KINDS)]
+        messages += [v.message for v in _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)]
+        assert len(messages) == 3, messages
+        for message in messages:
+            assert 'importable only under orchestrator/tests' in message, message
 
     def test_messages_name_the_suppression_code(self):
         """Every rule's message tells the reader how to suppress that rule specifically."""
