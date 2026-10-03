@@ -8,6 +8,10 @@ scheduler_utils.jsx inside a node vm sandbox and asserts the returned
 
 Uses the same node-vm harness established in test_chip_label_disambiguation.py.
 Tests skip when node is absent from PATH (CI requires node).
+
+It is the ONE lock classifier: the Scheduler heatmap's cellStateFor is executed
+below beside it, and must answer every lock state exactly as the task-row
+LockChip does — membership (rowTouchesModule) is the only thing it adds.
 """
 
 from __future__ import annotations
@@ -19,10 +23,12 @@ import shutil
 import subprocess
 
 import pytest
+from _dashboard_helpers import extract_function_body, find_function_params
 
-SCHED_UTILS_PATH = str(
-    pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux/scheduler_utils.jsx'
-)
+_REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux'
+SCHED_UTILS_PATH = str(_REDUX_DIR / 'scheduler_utils.jsx')
+HEATMAP_BOUNDS_PATH = str(_REDUX_DIR / 'scheduler_heatmap_bounds.js')
+HEATMAP_PATH = _REDUX_DIR / 'scheduler_heatmap.jsx'
 
 # Node driver: extracts the pure-JS helper section from scheduler_utils.jsx
 # (everything before the window.DF_SCHED_UTILS export line) and runs it in a
@@ -149,3 +155,138 @@ class TestLockChipStatePrecedence:
         assert result['cls'] != 'lock-parked', (
             "held+parked must NOT yield cls='lock-parked' — holder takes precedence"
         )
+
+
+# ---------------------------------------------------------------------------
+# The heatmap cell is classified by lockChipState too (PRD sketch #12, second
+# half). cellStateFor is EXECUTED, not grepped: its declaration is sliced out
+# of scheduler_heatmap.jsx (raising on a miss) and run in one vm context with
+# the two classic scripts it reaches at runtime — scheduler_heatmap_bounds.js
+# for rowTouchesModule, scheduler_utils.jsx for window.DF_SCHED_UTILS.
+# ---------------------------------------------------------------------------
+
+_CELL_DRIVER = r"""
+const vm = require('vm');
+const fs = require('fs');
+const [boundsPath, utilsPath, cellStateForSrc, argsJson] = process.argv.slice(1);
+const context = vm.createContext({ console, window: {} });
+vm.runInContext(fs.readFileSync(boundsPath, 'utf8'), context, { filename: boundsPath });
+vm.runInContext(fs.readFileSync(utilsPath, 'utf8'), context, { filename: utilsPath });
+vm.runInContext(cellStateForSrc, context, { filename: 'scheduler_heatmap.jsx::cellStateFor' });
+context.__args = JSON.parse(argsJson);
+const out = vm.runInContext(
+  '({ cell: cellStateFor(__args[0], __args[1]), chip: window.DF_SCHED_UTILS.lockChipState(__args[2]) })',
+  context,
+);
+process.stdout.write(JSON.stringify(out) + '\n');
+"""
+
+ROW_TASK = 'B'
+ROW_PROJECT = 'P'
+MODULE_PATH = 'm'
+
+# Each lock state a cell in the row's lock set can be in, as module fields.
+CELL_MATRIX = {
+    'free': {},
+    "held by the row's own task": {'holder': ROW_TASK, 'holder_project': ROW_PROJECT},
+    'held by another task': {'holder': 'A', 'holder_project': ROW_PROJECT},
+    'parked only': {'parked_by': 'C', 'parked_owner_live': True},
+    "parked by the row's own task": {'parked_by': ROW_TASK, 'parked_owner_live': True},
+    'parked and held': {
+        'holder': 'A', 'holder_project': ROW_PROJECT, 'parked_by': ROW_TASK, 'parked_owner_live': True,
+    },
+    'parked by a dead owner': {'parked_by': 'C', 'parked_owner_live': False},
+}
+
+
+def _cell_state_for_source() -> str:
+    """``function cellStateFor(<params>) <body>`` exactly as scheduler_heatmap.jsx declares it."""
+    source = HEATMAP_PATH.read_text()
+    _masked, params_start, params_end = find_function_params(source, 'cellStateFor')
+    body = extract_function_body(source, 'cellStateFor')
+    return f'function cellStateFor({source[params_start:params_end]}) {body}'
+
+
+def heatmap_module(**fields):
+    return {'project': ROW_PROJECT, 'path': MODULE_PATH, 'holder': None, 'holder_project': None,
+            'parked_by': None, 'parked_owner_live': None, **fields}
+
+
+def heatmap_row(module, lock_set=(MODULE_PATH,)):
+    """Task B's scheduler row; parked on the module exactly when the module says B parked it."""
+    parked = [module['path']] if module.get('parked_by') == ROW_TASK else []
+    return {'project': ROW_PROJECT, 'task_id': ROW_TASK, 'lock_set': list(lock_set),
+            'park_state': {'modules': parked} if parked else None}
+
+
+def lock_chip_inputs(row, module):
+    """The lockChipState inputs tabs.jsx::LockChip builds for this task and module."""
+    holder = module.get('holder')
+    holder_project = module.get('holder_project') or row['project']
+    return {
+        'holder': holder,
+        'isMine': bool(holder) and holder == row['task_id'] and holder_project == row['project'],
+        'parkedBy': module.get('parked_by'),
+        'parkedOwnerLive': module.get('parked_owner_live'),
+    }
+
+
+def heatmap_cell_and_chip(row, module):
+    """(cellStateFor(row, module), lockChipState(LockChip's inputs)) from one vm context."""
+    result = subprocess.run(
+        [_node(), '-e', _CELL_DRIVER, HEATMAP_BOUNDS_PATH, SCHED_UTILS_PATH,
+         _cell_state_for_source(), json.dumps([row, module, lock_chip_inputs(row, module)])],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    out = json.loads(result.stdout.strip())
+    return out['cell'], out['chip']
+
+
+def chip_classes_over_the_matrix() -> set[str]:
+    """Every cls lockChipState returns across CELL_MATRIX."""
+    classes = set()
+    for fields in CELL_MATRIX.values():
+        module = heatmap_module(**fields)
+        classes.add(lock_chip_state(**lock_chip_inputs(heatmap_row(module), module))['cls'])
+    return classes
+
+
+class TestHeatmapCellIsTheLockChip:
+    def test_parked_and_held_reads_as_taken_in_both(self):
+        """A cell held by A and parked by this row's own task is lock-taken, as the chip is.
+
+        The heatmap used to rank parked-by-me first and the chip ranks the
+        holder first, so the same lock read 'parked' in one view and 'taken'
+        in the other.
+        """
+        module = heatmap_module(holder='A', holder_project=ROW_PROJECT,
+                                parked_by=ROW_TASK, parked_owner_live=True)
+        row = heatmap_row(module)
+        assert row['park_state'] == {'modules': [MODULE_PATH]}
+        assert lock_chip_inputs(row, module) == {
+            'holder': 'A', 'isMine': False, 'parkedBy': ROW_TASK, 'parkedOwnerLive': True,
+        }
+        cell, chip = heatmap_cell_and_chip(row, module)
+        assert cell == chip, f'heatmap cell {cell!r} disagrees with the lock chip {chip!r}'
+        assert chip['cls'] == 'lock-taken'
+
+    @pytest.mark.parametrize('case', sorted(CELL_MATRIX))
+    def test_every_lock_state_classifies_as_the_chip_does(self, case):
+        module = heatmap_module(**CELL_MATRIX[case])
+        cell, chip = heatmap_cell_and_chip(heatmap_row(module), module)
+        assert cell == chip, f'{case}: heatmap cell {cell!r} disagrees with the lock chip {chip!r}'
+
+    @pytest.mark.parametrize('row_project, lock_set', [
+        (ROW_PROJECT, ()),
+        ('Q', (MODULE_PATH,)),
+    ], ids=['module outside the lock set', 'same path, another project'])
+    def test_a_module_the_row_does_not_lock_is_not_in_set(self, row_project, lock_set):
+        module = heatmap_module(holder='A', holder_project=ROW_PROJECT)
+        row = {**heatmap_row(module, lock_set=lock_set), 'project': row_project}
+        cell, _chip = heatmap_cell_and_chip(row, module)
+        assert isinstance(cell, dict) and set(cell) == {'cls', 'hint', 'ownerLabel'}, (
+            f'cellStateFor does not answer in lockChipState\'s shape: {cell!r}'
+        )
+        assert cell['cls'] == 'not-in-set'
