@@ -164,6 +164,12 @@ PROSE_CITATION_FIELDS: tuple[str, ...] = ('description', 'suggested_action')
 # would extract a 36-char window out of the middle of a 40-hex-digit blob.
 # ``(?<![0-9a-fA-F])`` / ``(?![0-9a-fA-F])`` reject exactly that, while still
 # admitting an id preceded by a dash (``run-<uuid>``) or followed by a period.
+_PROSE_UUID_RE = re.compile(
+    r'(?<![0-9a-fA-F])'
+    r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+    r'(?![0-9a-fA-F])'
+)
+
 # Ceiling on how many DISTINCT prose ids one run will resolve (reviewer
 # finding, task 4818 amendment pass). The structured pass's fan-out is bounded
 # by the model-emitted ``cited_memories`` list; the prose pass's is not — it is
@@ -175,12 +181,6 @@ PROSE_CITATION_FIELDS: tuple[str, ...] = ('description', 'suggested_action')
 # what that counter already means — and the ceiling is logged ONCE per run, so
 # a pathological report is visible rather than merely slow.
 MAX_PROSE_IDS_PER_RUN: int = 200
-
-_PROSE_UUID_RE = re.compile(
-    r'(?<![0-9a-fA-F])'
-    r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-    r'(?![0-9a-fA-F])'
-)
 
 
 def find_prose_uuids(finding: Any) -> dict[str, list[str]]:
@@ -826,7 +826,6 @@ async def scan_prose_citations(
                 },
             )
     return stats
-
 
 
 # --------------------------------------------------------------------------- #
