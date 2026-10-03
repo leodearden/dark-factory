@@ -13,33 +13,25 @@ it: that module builds its own one-field index, so a graph carrying no
 production index at all passes it.
 
 Corpora are SEEDED EPHEMERAL (PRD Open Question 2): every test seeds its own
-``unique_graph_name`` scratch graph and deletes it in ``finally``.
-
-HAZARD compliance mirrors ``test_index_provisioning_wiring_integration.py``:
-scratch graphs only; ``GraphitiBackend.initialize()`` is never called; every
-backend gets an EXPLICIT ``registered_graph_ids`` naming only scratch graphs;
-``_MultiTenantFalkorDriver`` is injected into ``backend._driver`` and a bare
-``FalkorDriver`` is never constructed.
+scratch graph, deleted on exit.  Graphs and backends come only from
+``_falkor_index_live``, which enforces the live-FalkorDB HAZARD rules.
 """
 
 from __future__ import annotations
 
-import contextlib
 from collections import defaultdict
 from dataclasses import dataclass
 
 import pytest
 import pytest_asyncio
-from _fm_helpers import (
-    FALKOR_HOST,
-    FALKOR_PORT,
-    await_index_operational,
-    falkor_skipif,
-    retry_until_observed,
-    unique_graph_name,
+from _falkor_index_live import (
+    injected_driver,
+    live_backends,
+    missing_production_indices,
+    scratch_graphs,
 )
-from falkordb.asyncio import FalkorDB
-from graphiti_core.driver.driver import GraphProvider
+from _fm_helpers import await_index_operational, falkor_skipif, retry_until_observed
+from graphiti_core.driver.driver import GraphDriver, GraphProvider
 from graphiti_core.graph_queries import (
     NEO4J_TO_FALKORDB_MAPPING,
     get_fulltext_indices,
@@ -51,12 +43,10 @@ from graphiti_core.search.search_utils import RELEVANT_SCHEMA_LIMIT, fulltext_qu
 from fused_memory.backends.falkor_indices import (
     IndexSpec,
     expected_index_set,
-    normalize_index_records,
     parse_index_statement,
     unsettled_index_statuses,
 )
-from fused_memory.backends.graphiti_client import GraphitiBackend, _MultiTenantFalkorDriver
-from fused_memory.reconciliation.index_health import summarize_index_health
+from fused_memory.backends.graphiti_client import GraphitiBackend
 
 pytestmark = [
     falkor_skipif(),
@@ -72,9 +62,6 @@ pytestmark = [
 
 # Not a graphiti stopword, alphanumeric, and a single RediSearch token.
 CANARY_TOKEN = 'bm25canary'
-
-# Builds queries only; no connection is ever opened on it.
-_QUERY_BUILDER = object.__new__(_MultiTenantFalkorDriver)
 
 _FULLTEXT_INDEX_NAME_BY_LABEL = {
     label: index_name for index_name, label in NEO4J_TO_FALKORDB_MAPPING.items()
@@ -138,12 +125,15 @@ class CanaryReading:
         return self.rows >= 1
 
 
-async def bm25_canary(graph, target: FulltextTarget, *, group_id: str) -> CanaryReading:
+async def bm25_canary(
+    graph, target: FulltextTarget, *, group_id: str, driver: GraphDriver,
+) -> CanaryReading:
     """Issue graphiti's own BM25 query for ``CANARY_TOKEN`` and count the rows.
 
-    Measures SERVICE only: it never consults ``CALL db.indexes()``.
+    *driver* assembles the query exactly as it would for graphiti.  Measures
+    SERVICE only: it never consults ``CALL db.indexes()``.
     """
-    query = fulltext_query(CANARY_TOKEN, [group_id], _QUERY_BUILDER)
+    query = fulltext_query(CANARY_TOKEN, [group_id], driver)
     if query == '':
         raise AssertionError(
             f'fulltext_query built no query for {CANARY_TOKEN!r} in {group_id!r}; '
@@ -205,13 +195,6 @@ async def _index_unsettled(backend: GraphitiBackend, group_id: str, label: str) 
 
 # --- The production expected-set check --------------------------------------
 
-
-async def missing_production_indices(backend: GraphitiBackend, group_id: str) -> list[IndexSpec]:
-    """Expected-but-absent specs, judged by the reader and summarizer δ's detector uses."""
-    actual = normalize_index_records(await backend.list_indices(group_id=group_id))
-    return summarize_index_health(actual, expected_index_set())['missing']
-
-
 _DROP_KEYWORD_BY_INDEX_TYPE = {'RANGE': '', 'FULLTEXT': 'FULLTEXT '}
 _DROP_PATTERN_BY_ENTITY_TYPE = {'NODE': '(x:{label})', 'RELATIONSHIP': '()-[x:{label}]-()'}
 
@@ -229,45 +212,14 @@ def _drop_statement(spec: IndexSpec) -> str:
 
 @pytest_asyncio.fixture
 async def scratch():
-    """Factory for uuid-suffixed throwaway graphs, each torn down in ``finally``."""
-    clients: list[FalkorDB] = []
-    graphs: list = []
-
-    def _make(slug: str):
-        name = unique_graph_name(f'3710_{slug}')
-        client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
-        clients.append(client)
-        graph = client.select_graph(name)
-        graphs.append(graph)
-        return name, graph
-
-    try:
-        yield _make
-    finally:
-        for graph in graphs:
-            with contextlib.suppress(Exception):
-                await graph.delete()
-        for client in clients:
-            with contextlib.suppress(Exception):
-                await client.aclose()
+    async with scratch_graphs('3710') as make:
+        yield make
 
 
 @pytest_asyncio.fixture
 async def live_backend_factory(mock_config):
-    """Build backends wired to a REAL driver, with an explicit scratch-only registry."""
-    backends: list[GraphitiBackend] = []
-
-    def _make(registered: set[str]) -> GraphitiBackend:
-        backend = GraphitiBackend(mock_config, registered_graph_ids=registered)
-        backend._driver = _MultiTenantFalkorDriver(host=FALKOR_HOST, port=FALKOR_PORT)
-        backends.append(backend)
-        return backend
-
-    try:
-        yield _make
-    finally:
-        for backend in backends:
-            await backend.close()
+    async with live_backends(mock_config) as make:
+        yield make
 
 
 class TestCanaryDistinguishesPresentFromServing:
@@ -279,6 +231,7 @@ class TestCanaryDistinguishesPresentFromServing:
     ):
         name, graph = scratch('under_construction')
         backend = live_backend_factory(set())
+        driver = injected_driver(backend)
         entity = next(t for t in production_fulltext_targets() if t.label == 'Entity')
         statement = _production_fulltext_statement(entity)
         await _seed_filler(graph, entity, group_id=name, count=_UNDER_CONSTRUCTION_CORPUS)
@@ -290,7 +243,7 @@ class TestCanaryDistinguishesPresentFromServing:
             # verdict reads NOT_SERVING would make this test a tautology.
             if not await _index_unsettled(backend, name, entity.label):
                 return None
-            reading = await bm25_canary(graph, entity, group_id=name)
+            reading = await bm25_canary(graph, entity, group_id=name, driver=driver)
             if not await _index_unsettled(backend, name, entity.label):
                 return None
             return reading
@@ -312,7 +265,7 @@ class TestCanaryDistinguishesPresentFromServing:
         assert unready.serving is False, f'served while UNDER CONSTRUCTION: {unready}'
 
         await await_index_operational(graph)
-        ready = await bm25_canary(graph, entity, group_id=name)
+        ready = await bm25_canary(graph, entity, group_id=name, driver=driver)
         assert ready.serving is True, f'not serving once OPERATIONAL: {ready}'
 
 
@@ -331,8 +284,10 @@ class TestProductionIndexesServe:
             await seed_canary_element(graph, target, group_id=name)
 
         assert await backend.list_indices(group_id=name) == []
+        driver = injected_driver(backend)
         verdicts = {
-            t.label: (await bm25_canary(graph, t, group_id=name)).serving for t in targets
+            t.label: (await bm25_canary(graph, t, group_id=name, driver=driver)).serving
+            for t in targets
         }
         assert verdicts == {t.label: False for t in targets}
 
@@ -350,7 +305,10 @@ class TestProductionIndexesServe:
         await backend.provision_registered_graphs()
         await await_index_operational(graph)
 
-        readings = [await bm25_canary(graph, t, group_id=name) for t in targets]
+        driver = injected_driver(backend)
+        readings = [
+            await bm25_canary(graph, t, group_id=name, driver=driver) for t in targets
+        ]
         assert all(r.serving for r in readings), readings
 
 
