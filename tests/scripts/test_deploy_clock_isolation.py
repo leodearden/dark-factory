@@ -29,6 +29,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +63,7 @@ from df_pytest_isolation import (  # noqa: E402
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
     fixture_marker,
+    run_session_token,
 )
 
 # NOT `from df_pytest_isolation import _df_deploy_clocks_unwritten`. Importing a
@@ -1161,6 +1163,36 @@ class TestViolationReasonIsTheFalsifiedHalfOfTheReport:
         assert 'this run' in reason, reason
 
 
+_FRESH_TOKEN = re.compile(r'[0-9a-f]{32}')
+
+
+class TestRunSessionToken:
+    """One deploy-clock token per pytest RUN, shared by its xdist workers.
+
+    Per-worker tokens made a sibling worker's stamp read as another session's
+    (task 5282). The token must never be falsy: an empty ambient token would
+    make every test-spawned writer stamp '' and read as a real redeploy.
+    """
+
+    def test_an_xdist_worker_adopts_the_run_wide_testrunuid(self) -> None:
+        assert run_session_token({'testrunuid': 'abc123'}) == 'abc123'
+
+    def test_a_plain_or_nested_session_mints_its_own(self) -> None:
+        first, second = run_session_token(None), run_session_token(None)
+
+        assert _FRESH_TOKEN.fullmatch(first), first
+        assert _FRESH_TOKEN.fullmatch(second), second
+        assert first != second
+
+    @pytest.mark.parametrize('workerinput', [
+        {'testrunuid': ''}, {}, {'testrunuid': 123},
+    ])
+    def test_an_unusable_testrunuid_falls_back_to_a_fresh_token(
+        self, workerinput: dict[str, object],
+    ) -> None:
+        assert _FRESH_TOKEN.fullmatch(run_session_token(workerinput))
+
+
 class TestGuardIsLiveInThisRun:
     """The fixture is WIRED, not merely defined.
 
@@ -1312,6 +1344,20 @@ def _nested_test_source(*, scenario: str) -> str:
         'foreign_token': f"    _stamp(RELPATH, _provenance({_OTHER_SESSION!r}))\n",
     }[scenario]
     return (
+        _nested_preamble()
+        + 'def test_a_forgetful_spawner():\n'
+        '    """PASSES. The damage is to the checkout, not to this result."""\n'
+        + write
+    )
+
+
+def _nested_preamble() -> str:
+    """The nested module's imports, constants and clock-stamping helpers.
+
+    ``_stamp(relpath, body)`` writes under the nested root; ``_provenance(session)``
+    builds a provenance-bearing body from this module's imported key constants.
+    """
+    return (
         'import json\n'
         'import os\n'
         'from pathlib import Path\n'
@@ -1336,9 +1382,37 @@ def _nested_test_source(*, scenario: str) -> str:
         '    })\n'
         '\n'
         '\n'
-        'def test_a_forgetful_spawner():\n'
-        '    """PASSES. The damage is to the checkout, not to this result."""\n'
-        + write
+    )
+
+
+# Two xdist workers, each stamping with its own ambient token, with BOTH writes
+# landing after BOTH guards snapshotted and before EITHER tears down. File
+# barriers make that overlap deterministic rather than timing luck.
+_XDIST_WORKERS = ('gw0', 'gw1')
+
+
+def _xdist_test_source() -> str:
+    """Source for the nested module run under ``-n 2 --dist each``."""
+    return (
+        _nested_preamble()
+        + 'import time\n'
+        '\n'
+        f'WORKERS = {_XDIST_WORKERS!r}\n'
+        '\n'
+        '\n'
+        'def _barrier(name):\n'
+        '    root = Path(__file__).resolve().parent\n'
+        "    (root / f'{name}-{os.environ[\"PYTEST_XDIST_WORKER\"]}').touch()\n"
+        '    deadline = time.monotonic() + 60\n'
+        "    while not all((root / f'{name}-{w}').exists() for w in WORKERS):\n"
+        '        assert time.monotonic() < deadline, f"barrier {name} timed out"\n'
+        '        time.sleep(0.05)\n'
+        '\n'
+        '\n'
+        'def test_every_worker_stamps_with_its_ambient_token():\n'
+        "    _barrier('snapshotted')\n"
+        '    _stamp(RELPATH, _provenance(os.environ[TOKEN_ENV]))\n'
+        "    _barrier('stamped')\n"
     )
 
 
@@ -1515,6 +1589,34 @@ class TestTheGuardAttributesTheStampEndToEnd:
         assert '1 passed' in combined, combined
         assert 'falsified a REAL deploy clock' in combined, combined
         assert _CONCURRENT_MARK in combined, combined
+
+    def test_every_xdist_worker_attributes_a_sibling_workers_stamp_to_this_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sibling worker of the SAME run is this run, never a concurrent one.
+
+        ``--dist each`` sends the one test to both workers; the harness passes
+        no ``env=``, so the child inherits PYTEST_ADDOPTS. Measured on the
+        per-worker-token fixture (2026-10-03): one worker reported its own
+        token and the other a foreign one.
+        """
+        monkeypatch.setenv('PYTEST_ADDOPTS', '-n 2 --dist each')
+        result = run_nested_pytest(tmp_path / 'xdist', {
+            'conftest.py': binding_conftest(_GUARD_NAME),
+            'test_xdist_stamp.py': _xdist_test_source(),
+        })
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, combined
+        assert '2 passed' in combined, combined
+        assert '2 errors' in combined, (
+            f'both workers\' guards must fire. output={combined!r}'
+        )
+        assert 'falsified a REAL deploy clock' in combined, combined
+        assert _CONCURRENT_MARK not in combined, (
+            'a sibling xdist worker\'s stamp was reported as a concurrent '
+            f'session\'s. output={combined!r}'
+        )
 
 
 # The sibling that used to reach into THIS module for the marker helper. Named
