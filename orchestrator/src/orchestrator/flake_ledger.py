@@ -886,11 +886,12 @@ class FlakeLedgerTaskClient(Protocol):
     ``orchestrator/src/orchestrator/chronic_flake.py::SchedulerChronicFlakeTaskClient``
     is the concrete adapter.  It is NOT imported here, deliberately: this module depends
     on ``shared`` alone and sits BELOW ``chronic_flake``, so importing it would point the
-    dependency backwards through the layer that is meant to build on this one.  (The cost
-    is layering, not import weight -- ``chronic_flake`` imports ``orchestrator.config``
-    only under ``if TYPE_CHECKING``, so an import edge here would pull in stdlib plus
-    ``shared`` and nothing else.  Measured; an earlier version of this docstring asserted
-    the opposite.)
+    dependency backwards through the layer that is meant to build on this one.  (Layering
+    is the reason; import weight now comes with it.  ``chronic_flake`` imports
+    ``orchestrator.mcp_lifecycle`` at runtime, so an import edge here would also load
+    ``orchestrator.config``, ``fm_retry`` and ``routing``, with httpx and anyio behind
+    them, where this module loads no ``orchestrator`` module at all.  Measured with
+    ``sys.modules`` for task 5304.)
 
     Every method must degrade rather than raise where it can, but the ledger does not
     RELY on that — :func:`_ensure_owner_task` and :func:`resolve_debt` guard each call

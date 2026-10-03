@@ -49,6 +49,8 @@ from shared.mcp_envelope import parse_tool_result
 from shared.safe_io import load_json_or_warn
 from shared.task_statuses import TERMINAL
 
+from orchestrator.mcp_lifecycle import tool_error_text
+
 if TYPE_CHECKING:
     from orchestrator.config import OrchestratorConfig
 
@@ -674,6 +676,32 @@ def _extract_results_list(result: object) -> list[dict]:
     return [entry for entry in results if isinstance(entry, dict)]
 
 
+def _server_error_text(envelope: dict) -> str | None:
+    """The server's own account of a failure in an unwrapped *envelope*, or ``None``.
+
+    Two spellings reach this seam: an ``error`` member (fused-memory's structured tool
+    error, ``fused-memory/src/fused_memory/server/tool_errors.py::mcp_tool_errors``,
+    or a JSON-RPC protocol error, where the unwrap stops at the top level) and FastMCP's
+    ``isError`` prose, read by the repo's single reader of it.
+    """
+    if 'error' in envelope:
+        return f'error={envelope.get("error")!r}, error_type={envelope.get("error_type")!r}'
+    return tool_error_text(envelope)
+
+
+def _response_error(
+    summary: str, envelope: dict, *, cause: Exception | None = None,
+) -> ValueError:
+    """A failed read of one tool response, described by its envelope key names, which
+    diagnose a SHAPE problem, and by the server's own text when it gave one.  *envelope*
+    only describes the failure here; it never decides one."""
+    description = f'{summary} (envelope keys={sorted(str(k) for k in envelope)!r})'
+    server_text = _server_error_text(envelope)
+    error = ValueError(f'{description}: {server_text}' if server_text else description)
+    error.__cause__ = cause
+    return error
+
+
 def _is_jsonrpc_response(result: object) -> bool:
     """JSON-RPC 2.0 makes ``jsonrpc`` mandatory on every response, so it tells a real
     ``dispatch_tool`` body from an already-unwrapped payload, which never carries it."""
@@ -686,9 +714,9 @@ def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | N
 
     A JSON-RPC response is parsed by ``shared.mcp_envelope.parse_tool_result(result,
     'statuses', dict)``, the exact call ``scheduler.py::Scheduler.get_statuses`` makes,
-    so the two readers of this tool cannot disagree; its error is returned as is.  Only
-    an already-unwrapped bare shape, which test fakes alone produce, goes through
-    :func:`_unwrap_dispatch_envelope`.
+    so the two readers of this tool cannot disagree; its error becomes the reported
+    error's ``__cause__``.  Only an already-unwrapped bare shape, which test fakes alone
+    produce, goes through :func:`_unwrap_dispatch_envelope`.
 
     The PAIR is what keeps two things that both look like an empty mapping apart.  A
     PRESENT ``statuses`` dict, even an empty one, is a CORROBORATED ABSENCE: the tool
@@ -709,19 +737,21 @@ def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | N
     if _is_jsonrpc_response(result):
         statuses, parse_error = parse_tool_result(result, 'statuses', dict)
         if parse_error is not None:
-            return {}, parse_error
+            return {}, _response_error(
+                f'get_statuses response unreadable ({parse_error})',
+                _unwrap_dispatch_envelope(result),
+                cause=parse_error,
+            )
         assert statuses is not None
     else:
         envelope = _unwrap_dispatch_envelope(result)
         if 'statuses' not in envelope:
-            return {}, ValueError(
-                f'get_statuses response carries no "statuses" key (envelope keys='
-                f'{sorted(str(k) for k in envelope)!r})'
-            )
+            return {}, _response_error('get_statuses response carries no "statuses" key', envelope)
         statuses = envelope['statuses']
         if not isinstance(statuses, dict):
-            return {}, ValueError(
-                f'get_statuses response "statuses" is {type(statuses).__name__}, not a dict'
+            return {}, _response_error(
+                f'get_statuses response "statuses" is {type(statuses).__name__}, not a dict',
+                envelope,
             )
     return {str(key): str(value) for key, value in statuses.items()}, None
 
@@ -754,19 +784,13 @@ def _extract_task(result: object) -> tuple[dict | None, Exception | None]:
     if envelope.get('error_type') == _TASK_NOT_FOUND_ERROR_TYPE:
         return None, None
     if 'error' in envelope:
-        return None, ValueError(
-            f'get_task answered with an error: error={envelope.get("error")!r}, '
-            f'error_type={envelope.get("error_type")!r}'
-        )
+        return None, _response_error('get_task answered with an error', envelope)
     data = envelope.get('data')
     if isinstance(data, dict):
         envelope = data
     if 'status' in envelope:
         return envelope, None
-    return None, ValueError(
-        f'get_task response carries no task (envelope keys='
-        f'{sorted(str(k) for k in envelope)!r})'
-    )
+    return None, _response_error('get_task response carries no task', envelope)
 
 
 # Per-call dispatch_tool timeout for submit_task — matches
@@ -807,13 +831,23 @@ class SchedulerChronicFlakeTaskClient:
         rather than assignment keeps this module's own path — where
         :func:`build_chronic_flake_fix_task_arguments` always sets the key —
         byte-identical on the wire.
+
+        A response naming no id still returns ``''``, but is logged with the
+        server's own text first: this is the only layer holding the raw response,
+        and ``''`` alone would drop why the filing failed.
         """
         arguments = {**arguments}
         arguments.setdefault('project_root', self._project_root)
         result = await self._scheduler.dispatch_tool(
             'submit_task', arguments, timeout=_SUBMIT_TASK_TIMEOUT_SECS,
         )
-        return extract_task_id(result)
+        task_id = extract_task_id(result)
+        if not task_id:
+            logger.warning(
+                'chronic_flake: submit_task filed nothing a caller can own — %s',
+                _response_error('response names no task id', _unwrap_dispatch_envelope(result)),
+            )
+        return task_id
 
     async def get_statuses(self, ids: list[str]) -> tuple[dict[str, str], Exception | None]:
         """Live ``{id: status}`` for *ids* via ``dispatch_tool('get_statuses', ...)``,
