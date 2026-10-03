@@ -8,7 +8,14 @@ import pytest
 
 from dashboard import loops
 from dashboard.data import burndown, census, redux_api
-from dashboard.data.datum import Datum, DatumContractError, DatumInvariant, DatumState
+from dashboard.data.datum import (
+    Datum,
+    DatumContractError,
+    DatumInvariant,
+    DatumState,
+    unknown_datum,
+)
+from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.performance import PerformanceCards
 
 # ---------------------------------------------------------------------------
@@ -1717,318 +1724,205 @@ def test_shape_burndown_aggregate_has_no_summed_concurrency_cap():
 
 
 # ---------------------------------------------------------------------------
-# shape_escalations
+# shape_escalations — task cards and views as served Datums (task 5596)
 # ---------------------------------------------------------------------------
+
+ESC_SERVED_AT = datetime(2026, 10, 1, 12, 0, 30, tzinfo=UTC)
+ESC_MEASURED_AT = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
 
 _EMPTY_SUMMARY = {
     'by_level': {0: 0, 1: 0, 2: 0},
     'by_status': {'pending': 0, 'resolved': 0, 'dismissed': 0},
+    'skipped_count': 0,
 }
 
 
+def _count(value: int, *, state: DatumState = DatumState.FRESH,
+           reason: str | None = None, bound: int = 120) -> Datum:
+    return Datum(value, ESC_MEASURED_AT, state, reason, bound)
+
+
+def _views(queue_pending: int = 0, open_in_history: int = 0) -> dict:
+    return {
+        EscalationView.QUEUE_PENDING: _count(queue_pending),
+        EscalationView.OPEN_IN_HISTORY: _count(open_in_history),
+    }
+
+
+def _esc_row(esc_id: str = 'esc-1-1', **extra) -> dict:
+    return {
+        'id': esc_id, 'task_id': '1', 'level': 0, 'status': 'pending',
+        'summary': 'oops', 'project': 'projA', 'project_root': '/p/projA', **extra,
+    }
+
+
+def _queues(*rows: dict, skipped: list | None = None) -> dict:
+    return {
+        'subsections': [{
+            'id': '/p/projA', 'label': 'projA', 'kind': 'orchestrator',
+            'escalations': list(rows), 'skipped': skipped or [],
+            'summary': dict(_EMPTY_SUMMARY), 'views': _views(1, 3),
+        }],
+        'summary': dict(_EMPTY_SUMMARY),
+        'views': _views(1, 3),
+    }
+
+
+def _card(value: dict | None = None, **kwargs) -> Datum:
+    return Datum(value or {'id': 1, 'title': 'one', 'status': 'pending'},
+                 ESC_MEASURED_AT, DatumState.FRESH, None, kwargs.get('bound', 1200))
+
+
 class TestShapeEscalations:
-    """Tests for redux_api.shape_escalations."""
+    """Rows carry their task card, subsections and the top level carry views — all wired Datums."""
 
-    def test_shape_escalations_basic_envelope(self):
-        """Empty queues → correct envelope with passthrough summary."""
-        queues = {'subsections': [], 'summary': _EMPTY_SUMMARY}
-        body = redux_api.shape_escalations(queues=queues, task_maps={})
-        assert set(body.keys()) == {'ESCALATIONS'}
-        esc = body['ESCALATIONS']
-        assert set(esc.keys()) == {'subsections', 'summary'}
-        assert esc['subsections'] == []
-        assert esc['summary'] == _EMPTY_SUMMARY
+    def test_the_payload_carries_served_at(self):
+        body = redux_api.shape_escalations(_queues(), {}, served_at=ESC_SERVED_AT)
 
-    def test_shape_escalations_preserves_subsection_metadata(self):
-        """Orchestrator subsection metadata passes through unchanged."""
-        subsection = {
-            'id': '/p/projA',
-            'label': 'projA',
-            'kind': 'orchestrator',
-            'escalations': [],
-            'summary': _EMPTY_SUMMARY,
-        }
-        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
-        body = redux_api.shape_escalations(queues=queues, task_maps={})
-        subsections = body['ESCALATIONS']['subsections']
-        assert len(subsections) == 1
-        out = subsections[0]
-        assert out['id'] == '/p/projA'
-        assert out['label'] == 'projA'
-        assert out['kind'] == 'orchestrator'
-        assert out['summary'] == _EMPTY_SUMMARY
-        assert out['escalations'] == []
+        assert set(body) == {'ESCALATIONS', 'served_at'}
+        assert body['served_at'] == ESC_SERVED_AT.isoformat()
 
-    def test_shape_escalations_orchestrator_attaches_task_card(self):
-        """Orchestrator row gets project label and resolved task card."""
-        task = {
-            'id': 42, 'title': 'task-42-title', 'description': 'd',
-            'details': 'D', 'status': 'pending', 'priority': 'high',
-            'dependencies': [], 'metadata': {},
-        }
-        subsection = {
-            'id': '/p/projA',
-            'label': 'projA',
-            'kind': 'orchestrator',
-            'escalations': [{'id': 'esc-1', 'task_id': '42', 'level': 0, 'status': 'pending', 'summary': 'oops'}],
-            'summary': _EMPTY_SUMMARY,
-        }
-        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
-        task_maps = {'/p/projA': [task]}
-        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
-        rows = body['ESCALATIONS']['subsections'][0]['escalations']
-        assert len(rows) == 1
-        row = rows[0]
-        # original esc fields preserved
-        assert row['id'] == 'esc-1'
-        assert row['summary'] == 'oops'
-        # new fields
-        assert row['project'] == 'projA'
-        assert row['task'] == task
-        assert row['task_unresolved'] is False
-
-    def test_shape_escalations_orchestrator_unresolved_task(self):
-        """Orchestrator row with unknown task_id → task=None, task_unresolved=True."""
-        subsection = {
-            'id': '/p/projA',
-            'label': 'projA',
-            'kind': 'orchestrator',
-            'escalations': [
-                {'id': 'esc-99', 'task_id': '999', 'level': 1, 'status': 'pending', 'summary': 'gone'},
-            ],
-            'summary': _EMPTY_SUMMARY,
-        }
-        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
-        # task_maps has no task with id=999
-        task_maps = {'/p/projA': [{'id': 1, 'title': 'other', 'description': '', 'details': '',
-                                    'status': 'done', 'priority': 'low', 'dependencies': [], 'metadata': {}}]}
-        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
-        rows = body['ESCALATIONS']['subsections'][0]['escalations']
-        assert len(rows) == 1
-        row = rows[0]
-        assert row['project'] == 'projA'
-        assert row['task'] is None
-        assert row['task_unresolved'] is True
-        # original esc fields preserved
-        assert row['id'] == 'esc-99'
-        assert row['summary'] == 'gone'
-
-    def test_shape_escalations_reconciliation_resolves_via_worktree(self, tmp_path):
-        """Reconciliation row: worktree under projA root → project='projA', task resolved."""
-        task = {
-            'id': 7, 'title': 'recon-task-7', 'description': 'x',
-            'details': '', 'status': 'pending', 'priority': 'medium',
-            'dependencies': [], 'metadata': {},
-        }
-        projA_root = tmp_path / 'projA'
-        projA_root.mkdir()
-        worktree_path = str(projA_root / '.worktrees' / '7')
-        subsection = {
-            'id': 'reconciliation',
-            'label': 'fused-memory',
-            'kind': 'reconciliation',
-            'escalations': [
-                {
-                    'id': 'esc-r1',
-                    'task_id': '7',
-                    'worktree': worktree_path,
-                    'level': 1,
-                    'status': 'pending',
-                },
-            ],
-            'summary': _EMPTY_SUMMARY,
-        }
-        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
-        task_maps = {str(projA_root): [task]}
-        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
-        rows = body['ESCALATIONS']['subsections'][0]['escalations']
-        assert len(rows) == 1
-        row = rows[0]
-        assert row['project'] == 'projA'
-        assert row['task'] == task
-        assert row['task_unresolved'] is False
-
-    def test_shape_escalations_reconciliation_resolves_via_task_map_probe(self, tmp_path):
-        """Reconciliation row without worktree resolves via task-id probe."""
-        task = {
-            'id': 42, 'title': 'probe-task', 'description': '',
-            'details': '', 'status': 'pending', 'priority': 'low',
-            'dependencies': [], 'metadata': {},
-        }
-        projB_root = tmp_path / 'projB'
-        projB_root.mkdir()
-        subsection = {
-            'id': 'reconciliation',
-            'label': 'fused-memory',
-            'kind': 'reconciliation',
-            'escalations': [
-                {
-                    'id': 'esc-probe', 'task_id': '42',
-                    # no 'worktree' field
-                    'level': 0, 'status': 'pending',
-                },
-            ],
-            'summary': _EMPTY_SUMMARY,
-        }
-        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
-        task_maps = {str(projB_root): [task]}
-        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
-        rows = body['ESCALATIONS']['subsections'][0]['escalations']
-        row = rows[0]
-        assert row['project'] == 'projB'
-        assert row['task'] == task
-        assert row['task_unresolved'] is False
-
-    def test_shape_escalations_reconciliation_unresolvable(self, tmp_path):
-        """Reconciliation row that can't be resolved → project=None, task=None, task_unresolved=True."""
-        projC_root = tmp_path / 'projC'
-        projC_root.mkdir()
-        # worktree is under a completely unrelated path
-        unrelated_worktree = str(tmp_path / 'other_project' / '.worktrees' / '5')
-        subsection = {
-            'id': 'reconciliation',
-            'label': 'fused-memory',
-            'kind': 'reconciliation',
-            'escalations': [
-                {
-                    'id': 'esc-unres',
-                    'task_id': '99',  # not in any task_map
-                    'worktree': unrelated_worktree,
-                    'level': 2,
-                    'status': 'pending',
-                    'summary': 'unresolvable',
-                },
-            ],
-            'summary': _EMPTY_SUMMARY,
-        }
-        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
-        # task_maps only has projC with no matching task
-        task_maps = {str(projC_root): [{'id': 1, 'title': 't', 'description': '', 'details': '',
-                                         'status': 'done', 'priority': 'low', 'dependencies': [], 'metadata': {}}]}
-        body = redux_api.shape_escalations(queues=queues, task_maps=task_maps)
-        rows = body['ESCALATIONS']['subsections'][0]['escalations']
-        assert len(rows) == 1
-        row = rows[0]
-        assert row['project'] is None
-        assert row['task'] is None
-        assert row['task_unresolved'] is True
-        # original esc fields preserved
-        assert row['id'] == 'esc-unres'
-        assert row['summary'] == 'unresolvable'
-
-    def test_shape_escalations_top_level_summary_passthrough(self):
-        """Non-trivial top-level summary passes through verbatim (not recomputed)."""
-        top_summary = {
-            'by_level': {0: 2, 1: 1, 2: 1},
-            'by_status': {'pending': 3, 'resolved': 1, 'dismissed': 0},
-        }
-        queues = {'subsections': [], 'summary': top_summary}
-        body = redux_api.shape_escalations(queues=queues, task_maps={})
-        assert body['ESCALATIONS']['summary'] == top_summary
-
-    def test_shape_escalations_carries_subsection_skipped(self):
-        """The per-subsection ``skipped`` list reaches the shaped payload.
-
-        The out_subsections loop rebuilds each subsection field-by-field, so a
-        new key on build_escalation_queues' output is dropped unless the loop
-        names it.  Without this the corruption facts stop at the data layer and
-        the tab renders one escalation short with nothing saying so (INV-2).
-        """
-        skipped = [{
-            'path': '/p/projA/data/escalations/esc-bad.json',
-            'error': 'Expecting value: line 1 column 1',
-        }]
-        subsection = {
-            'id': '/p/projA',
-            'label': 'projA',
-            'kind': 'orchestrator',
-            'escalations': [],
-            'skipped': skipped,
-            'summary': _EMPTY_SUMMARY,
-        }
-        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
-        body = redux_api.shape_escalations(queues=queues, task_maps={})
-        out = body['ESCALATIONS']['subsections'][0]
-
-        assert 'skipped' in out, (
-            "shape_escalations must carry `skipped` into the shaped subsection — "
-            'add it to the out_subsections dict beside `summary`'
+    def test_a_row_task_is_its_wired_card(self):
+        card = _card()
+        body = redux_api.shape_escalations(
+            _queues(_esc_row()), {('/p/projA', 'esc-1-1'): card}, served_at=ESC_SERVED_AT,
         )
-        assert out['skipped'] == skipped
-        assert len(out['skipped']) == 1
-        assert set(out['skipped'][0].keys()) == {'path', 'error'}
+        (row,) = body['ESCALATIONS']['subsections'][0]['escalations']
 
-    def test_shape_escalations_skipped_defaults_to_empty_list(self):
-        """A subsection with no ``skipped`` key shapes to ``[]``, never None.
+        assert row['task'] == card.to_wire()
+        assert row['id'] == 'esc-1-1' and row['summary'] == 'oops'
+        assert row['project'] == 'projA'
+        assert 'task_unresolved' not in row
+        assert 'project_root' not in row
 
-        Defensive against a stale or partial upstream dict: the JSX iterates the
-        list unconditionally, so a missing key must not become ``undefined``.
-        """
-        subsection = {
-            'id': '/p/projA',
-            'label': 'projA',
-            'kind': 'orchestrator',
-            'escalations': [],
-            'summary': _EMPTY_SUMMARY,
+    def test_a_fresh_card_past_its_bound_arrives_stale(self):
+        card = _card(bound=10)
+        body = redux_api.shape_escalations(
+            _queues(_esc_row()), {('/p/projA', 'esc-1-1'): card}, served_at=ESC_SERVED_AT,
+        )
+        (row,) = body['ESCALATIONS']['subsections'][0]['escalations']
+
+        assert row['task']['state'] == 'stale'
+        assert row['task']['value'] == card.value
+        assert row['task']['reason']
+
+    def test_an_unknown_card_renders_its_reason(self):
+        card = unknown_datum('no task id', 1200)
+        body = redux_api.shape_escalations(
+            _queues(_esc_row()), {('/p/projA', 'esc-1-1'): card}, served_at=ESC_SERVED_AT,
+        )
+        (row,) = body['ESCALATIONS']['subsections'][0]['escalations']
+
+        assert row['task']['value'] is None
+        assert row['task']['state'] == 'unknown'
+        assert row['task']['reason'] == 'no task id'
+
+    def test_a_row_without_a_card_is_a_wiring_bug(self):
+        with pytest.raises(DatumContractError) as raised:
+            redux_api.shape_escalations(_queues(_esc_row()), {}, served_at=ESC_SERVED_AT)
+
+        assert raised.value.invariant is DatumInvariant.DATUM_REQUIRED
+
+    def test_subsection_and_top_level_views_are_wired(self):
+        body = redux_api.shape_escalations(_queues(), {}, served_at=ESC_SERVED_AT)
+        esc = body['ESCALATIONS']
+
+        for views in (esc['views'], esc['subsections'][0]['views']):
+            assert set(views) == {'queue_pending', 'open_in_history'}
+            assert views['queue_pending'] == _count(1).to_wire()
+            assert views['open_in_history'] == _count(3).to_wire()
+
+    def test_a_lower_bound_view_keeps_its_reason(self):
+        queues = _queues()
+        queues['views'][EscalationView.OPEN_IN_HISTORY] = _count(
+            3, state=DatumState.LOWER_BOUND, reason='partial scan',
+        )
+        body = redux_api.shape_escalations(queues, {}, served_at=ESC_SERVED_AT)
+
+        assert body['ESCALATIONS']['views']['open_in_history']['state'] == 'lower_bound'
+        assert body['ESCALATIONS']['views']['open_in_history']['reason'] == 'partial scan'
+
+    def test_a_missing_view_is_a_wiring_bug(self):
+        queues = _queues()
+        queues['subsections'][0]['views'] = {}
+
+        with pytest.raises(DatumContractError) as raised:
+            redux_api.shape_escalations(queues, {}, served_at=ESC_SERVED_AT)
+
+        assert raised.value.invariant is DatumInvariant.DATUM_REQUIRED
+
+    def test_summary_skipped_and_metadata_pass_through_as_copies(self):
+        skipped = [{'path': '/p/projA/data/escalations/esc-bad.json', 'error': 'boom',
+                    'location': 'root'}]
+        queues = _queues(skipped=skipped)
+        queues['summary'] = {**_EMPTY_SUMMARY, 'skipped_count': 1}
+        body = redux_api.shape_escalations(queues, {}, served_at=ESC_SERVED_AT)
+        sub = body['ESCALATIONS']['subsections'][0]
+
+        assert (sub['id'], sub['label'], sub['kind']) == ('/p/projA', 'projA', 'orchestrator')
+        assert sub['skipped'] == skipped
+        assert sub['skipped'] is not skipped and sub['skipped'][0] is not skipped[0]
+        assert sub['summary'] == _EMPTY_SUMMARY
+        assert body['ESCALATIONS']['summary']['skipped_count'] == 1
+
+    def test_one_esc_id_in_two_queues_reads_two_cards(self):
+        queues = _queues(_esc_row('esc-101-1'))
+        queues['subsections'].append({
+            'id': 'reconciliation', 'label': 'fused-memory', 'kind': 'reconciliation',
+            'escalations': [_esc_row('esc-101-1', project=None, project_root=None)],
+            'skipped': [], 'summary': dict(_EMPTY_SUMMARY), 'views': _views(),
+        })
+        cards = {
+            ('/p/projA', 'esc-101-1'): _card(),
+            ('reconciliation', 'esc-101-1'): unknown_datum('no owning project', 1200),
         }
-        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
-        body = redux_api.shape_escalations(queues=queues, task_maps={})
-        out = body['ESCALATIONS']['subsections'][0]
-        assert out['skipped'] == []
+        body = redux_api.shape_escalations(queues, cards, served_at=ESC_SERVED_AT)
+        subs = body['ESCALATIONS']['subsections']
 
-        # An explicit None must degrade the same way.
-        subsection_none = {**subsection, 'skipped': None}
-        queues_none = {'subsections': [subsection_none], 'summary': _EMPTY_SUMMARY}
-        body_none = redux_api.shape_escalations(queues=queues_none, task_maps={})
-        assert body_none['ESCALATIONS']['subsections'][0]['skipped'] == []
+        assert subs[0]['escalations'][0]['task']['state'] == 'fresh'
+        assert subs[1]['escalations'][0]['task']['reason'] == 'no owning project'
 
-    def test_shape_escalations_carries_skipped_count_both_levels(self):
-        """``summary.skipped_count`` survives at BOTH nesting levels.
 
-        Regression pin: the summary blocks pass through by ``dict(...)`` copy
-        today, so this already holds — it exists so a future field-by-field
-        rewrite of a summary block cannot silently drop the count the way the
-        subsection loop drops ``skipped``.
-        """
-        sub_summary = {**_EMPTY_SUMMARY, 'skipped_count': 2}
-        top_summary = {**_EMPTY_SUMMARY, 'skipped_count': 3}
-        subsection = {
-            'id': '/p/projA',
-            'label': 'projA',
-            'kind': 'orchestrator',
-            'escalations': [],
-            'skipped': [],
-            'summary': sub_summary,
+class TestShapeEscalationAnalytics:
+    """The analytics payload passes through, its views wired at served_at."""
+
+    def _payload(self) -> dict:
+        return {
+            'generated_at': ESC_MEASURED_AT.isoformat(),
+            'parse_failures': 0,
+            'regime_markers': [],
+            'per_project': [{'project': 'projA', 'terminal': 0, 'origin': {}, 'lifespan': {},
+                             'workflow': {}, 'views': _views(2, 5)}],
+            'archives_present': True,
+            'archives_reached': True,
+            'views': _views(2, 5),
         }
-        queues = {'subsections': [subsection], 'summary': top_summary}
-        body = redux_api.shape_escalations(queues=queues, task_maps={})
 
-        assert body['ESCALATIONS']['subsections'][0]['summary']['skipped_count'] == 2
-        assert body['ESCALATIONS']['summary']['skipped_count'] == 3
+    def test_views_are_wired_and_the_rest_passes_through(self):
+        payload = self._payload()
 
-    def test_shape_escalations_skipped_does_not_alias_input(self):
-        """The shaped ``skipped`` list and its records are copies, not aliases.
+        body = redux_api.shape_escalation_analytics(payload, served_at=ESC_SERVED_AT)
+        shaped = body['ESCALATION_ANALYTICS']
 
-        Matches the shaper's existing no-alias discipline: mutating the shaped
-        payload must not reach back into build_escalation_queues' output.
-        """
-        entry = {'path': '/p/projA/data/escalations/esc-bad.json', 'error': 'boom'}
-        skipped = [entry]
-        subsection = {
-            'id': '/p/projA',
-            'label': 'projA',
-            'kind': 'orchestrator',
-            'escalations': [],
-            'skipped': skipped,
-            'summary': _EMPTY_SUMMARY,
-        }
-        queues = {'subsections': [subsection], 'summary': _EMPTY_SUMMARY}
-        body = redux_api.shape_escalations(queues=queues, task_maps={})
-        out_skipped = body['ESCALATIONS']['subsections'][0]['skipped']
+        assert body['served_at'] == ESC_SERVED_AT.isoformat()
+        for views in (shaped['views'], shaped['per_project'][0]['views']):
+            assert views == {
+                'queue_pending': _count(2).to_wire(),
+                'open_in_history': _count(5).to_wire(),
+            }
+        assert shaped['per_project'][0]['project'] == 'projA'
+        for key in ('generated_at', 'parse_failures', 'regime_markers',
+                    'archives_present', 'archives_reached'):
+            assert shaped[key] == payload[key]
 
-        assert out_skipped is not skipped, 'shaped list must be a distinct object'
-        assert out_skipped[0] is not entry, 'each shaped record must be a copy'
-        assert out_skipped[0] == entry
+    def test_a_missing_view_is_a_wiring_bug(self):
+        payload = self._payload()
+        payload['per_project'][0]['views'] = {}
+
+        with pytest.raises(DatumContractError) as raised:
+            redux_api.shape_escalation_analytics(payload, served_at=ESC_SERVED_AT)
+
+        assert raised.value.invariant is DatumInvariant.DATUM_REQUIRED
 
 
 # ---------------------------------------------------------------------------

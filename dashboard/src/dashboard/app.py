@@ -60,11 +60,6 @@ from dashboard.data.costs import (
     aggregate_cost_trend,
 )
 from dashboard.data.db import DbPool
-from dashboard.data.escalation_analytics import (
-    archive_scan_succeeded,
-    build_escalation_analytics,
-)
-from dashboard.data.escalations import fetch_pins_recovery
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import (
     FANOUT_FAILURE_EXCEPTIONS,
@@ -619,8 +614,7 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
 #
 # The single-flight probe, and the loop time at which a fan-out last
 # COMPLETED. Module state rather than app.state because /healthz is the only
-# reader and a test hook resets both; _mcp_probe_state_clear mirrors
-# _task_cards_cache_clear.
+# reader and a test hook resets both: _mcp_probe_state_clear.
 
 
 class _LiveProbe(NamedTuple):
@@ -1662,116 +1656,7 @@ async def api_load(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Escalation-analytics TTL cache
-# (mirrors dashboard/api/escalations.py::_task_cards_cache)
-# ---------------------------------------------------------------------------
-
-_ANALYTICS_TTL_SECONDS = 60.0
-_analytics_cache: TTLCache[dict] = TTLCache(ttl_seconds=lambda: _ANALYTICS_TTL_SECONDS)
-
-
-def _analytics_cache_clear() -> None:
-    """Clear the escalation-analytics TTL cache (test hook)."""
-    _analytics_cache.clear()
-
-
-def _analytics_project_dirs(config: DashboardConfig) -> list[tuple[str, Path, Path]]:
-    """Escalation-analytics project dirs: primary root first, then known_project_roots.
-
-    Mirrors build_escalation_queues' primary-first, de-duped root iteration
-    (label=root.name). The primary entry is built from config.escalations_dir /
-    config.runs_db (rather than hand-building `config.project_root / 'data' / ...`)
-    so a DASHBOARD_PROJECT_ROOT env override is honored automatically.
-    """
-    seen: set[Path] = {config.project_root}
-    dirs: list[tuple[str, Path, Path]] = [
-        (config.project_root.name, config.escalations_dir, config.runs_db),
-    ]
-    for root in config.known_project_roots:
-        if root not in seen:
-            seen.add(root)
-            dirs.append((
-                root.name,
-                root / 'data' / 'escalations',
-                root / 'data' / 'orchestrator' / 'runs.db',
-            ))
-    return dirs
-
-
-@app.get('/api/v2/dashboard/escalation-analytics')
-async def api_escalation_analytics(request: Request) -> JSONResponse:
-    """ESCALATION_ANALYTICS — origin/lifespan/workflow aggregates over the escalation archive.
-
-    The archive walk (potentially ~10k records across all project roots) runs
-    in a worker thread via asyncio.to_thread behind a ~60s single-flight TTL
-    cache, so a cold scan never blocks the event loop and repeated polls
-    within the TTL window are free. No clock read here — the aggregator
-    resolves `now` once internally via resolve_now (clock-discipline guard
-    scans dashboard/data/*.py + app.py; resolve_now is the sanctioned site).
-
-    A scan that reached NO archive at all is served but NOT cached
-    (cache_ok=archive_scan_succeeded), matching api_memory_evals'
-    root_scan_succeeded gate — the two routes are one idiom and are kept so
-    deliberately. Both decline to cache a build that walked nothing: it is
-    O(1) to re-derive (one negative is_dir stat per project), while caching it
-    keeps the tab reporting an empty archive for a full TTL window after the
-    volume mounts, and the archive is the thing most likely to appear on the
-    next poll. The only asymmetry is that memory-evals has ONE root, so
-    "reached nothing" and "reached not everything" coincide there.
-
-    A PARTIAL scan IS cached, and archives_present: false rides along in the
-    payload as the diagnostic. That is not a concession — keyed on
-    archives_present (all) instead, this cache is dead in the installed
-    config: measured 2026-08-01 against the unit's own
-    DASHBOARD_KNOWN_PROJECT_ROOTS (9 roots), 2 roots have no data/escalations
-    dir while the other 7 hold ~9.1k records, so the predicate never passes,
-    the 60s TTL never stores anything, and every 3s poll re-runs the whole
-    multi-second walk. Trade-off actually being accepted: an archive that
-    disappears mid-life leaves that project's panel up to one TTL window
-    stale — the right side of it, since the alternative costs the full
-    re-walk on every poll, forever, for every ordinary multi-project config.
-
-    Deliberately NOT keyed on parse_failures: that counts unparseable records
-    and is permanent for a corrupt file, so gating on it would defeat the
-    cache forever in front of the very walk it protects.
-    """
-    config: DashboardConfig = request.app.state.config
-    http_client: httpx.AsyncClient = request.app.state.http_client
-    project_dirs = _analytics_project_dirs(config)
-    key = str(project_dirs)
-
-    async def _refresh() -> dict:
-        # The pins_recovery fan-out is async and MUST stay on this side of the
-        # to_thread boundary: build_escalation_analytics is the pure-sync
-        # archive walker, and an MCP round-trip inside it would block a worker
-        # thread on the network. It runs inside _refresh (not per request) so
-        # it is paid only on a cache miss, giving the annotation the same ~60s
-        # freshness as the payload it rides in — a fresher annotation could not
-        # be shown anyway, since the cache serves the whole dict.
-        #
-        # fetch_pins_recovery already isolates per-project failures (an
-        # unreachable orchestrator maps to None, i.e. unknown, and never sinks
-        # its siblings). This guard covers only the unexpected: whatever the
-        # cause, the analytics tab must still render, one annotation short.
-        try:
-            pins = await fetch_pins_recovery(http_client, config.escalation_urls)
-        except Exception as exc:  # noqa: BLE001 — the tab must survive this
-            logger.warning(
-                'pins_recovery fan-out failed (analytics served unannotated): %s', exc,
-            )
-            pins = None
-        return await asyncio.to_thread(
-            build_escalation_analytics, project_dirs, pins_by_project=pins,
-        )
-
-    result = await _analytics_cache.get_or_refresh(
-        key, _refresh, cache_ok=archive_scan_succeeded,
-    )
-    return JSONResponse({'ESCALATION_ANALYTICS': result})
-
-
-# ---------------------------------------------------------------------------
-# Memory-evals TTL cache (mirrors _analytics_cache above)
+# Memory-evals TTL cache
 # ---------------------------------------------------------------------------
 
 _MEMORY_EVALS_TTL_SECONDS = 60.0
@@ -1796,8 +1681,7 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     resolve_now is the sanctioned site).
 
     A scan that never REACHED the tree is served but NOT cached (cache_ok=
-    root_scan_succeeded), mirroring how _load_task_cards declines to cache an
-    offline marker: an absent root and an unwalkable one are both O(1) to
+    root_scan_succeeded): an absent root and an unwalkable one are both O(1) to
     re-derive, so re-checking each poll costs nothing, while caching them
     would keep reporting "no evals have ever run" for a full TTL window after
     the tree lands. A build-ABORTING bug (a top-level internal_error, carrying
@@ -1809,10 +1693,12 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     to prevent. The issue rides the payload either way, so which side of that
     line a degradation falls on costs the operator no visibility.
 
-    Same idiom as api_escalation_analytics' archive_scan_succeeded: both
-    routes decline to cache only a scan that reached NOTHING. The asymmetry
-    is that memory-evals has ONE root, so "reached nothing" and "reached not
-    everything" coincide here; analytics has N and must distinguish them.
+    Same idiom as the escalation corpus cache
+    (dashboard/src/dashboard/data/escalation_corpus.py::acquire_corpus): both
+    decline to cache only a scan that reached NOTHING. The asymmetry is that
+    memory-evals has ONE root, so "reached nothing" and "reached not
+    everything" coincide here; the corpus has N queues and must distinguish
+    them.
 
     The escalation source is config.reconciliation_escalations_dir: memory-eval
     regressions are filed onto the 8103 recon queue (memory-eval-program.md
@@ -1837,6 +1723,5 @@ __all__: Sequence[str] = (
     'lifespan',
     '_performance_resources',
     '_mcp_probe_state_clear',
-    '_analytics_cache_clear',
     '_memory_evals_cache_clear',
 )
