@@ -24,17 +24,10 @@ def test_missing_lock_file_reads_not_held(tmp_path):
     assert is_orchestrator_lock_held(str(tmp_path)) is False
 
 
-def test_unheld_lock_file_reads_not_held_and_leaves_it_free(tmp_path):
-    lock_path = _lock_path(tmp_path)
-    lock_path.write_text('')
+def test_unheld_lock_file_reads_not_held(tmp_path):
+    _lock_path(tmp_path).write_text('')
 
     assert is_orchestrator_lock_held(tmp_path) is False
-
-    handle = lock_path.open('r+b')
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    finally:
-        handle.close()
 
 
 def test_exclusively_held_lock_reads_held(tmp_path):

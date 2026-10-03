@@ -40,11 +40,12 @@ def is_orchestrator_live_for(project_root: str | Path) -> bool:
 def is_orchestrator_lock_held(project_root: str | Path) -> bool:
     """Return True iff some process holds a flock on the project's orchestrator.lock.
 
-    Probes with ``LOCK_SH | LOCK_NB``, so it never waits and leaves the lock
-    as it found it. Unlike :func:`is_orchestrator_live_for`, this cannot go
-    stale: the kernel drops the lock when its holder dies, whereas a PID in
-    the file can outlive its process. A missing or unopenable lock file reads
-    as not held; any other flock error propagates.
+    Probes with ``LOCK_SH | LOCK_NB`` on its own handle, so it never waits;
+    closing that handle releases the probe's lock. Unlike
+    :func:`is_orchestrator_live_for`, this cannot go stale: the kernel drops
+    the lock when its holder dies, whereas a PID in the file can outlive its
+    process. A missing or unopenable lock file reads as not held; any other
+    flock error propagates.
 
     This is synchronous file I/O, so a coroutine calls it through
     ``asyncio.to_thread``.
@@ -54,14 +55,12 @@ def is_orchestrator_lock_held(project_root: str | Path) -> bool:
     except OSError:
         return False
     try:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        return False
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
     finally:
         handle.close()
+    return False
 
 
 def orchestrator_started_at(project_root: str | Path) -> datetime | None:
