@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from _canned_mcp import CANNED_GET_TASKS_RESULT
+from _canned_mcp import canned_get_tasks_result
 
 import dashboard.data.tasks as tasks_mod
 
@@ -60,7 +60,7 @@ class TestFetchTasksCache:
         import dashboard.data.tasks as tasks_mod
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             result1 = await fetch_tasks(dummy_client, dummy_config, '/proj/A')
             result2 = await fetch_tasks(dummy_client, dummy_config, '/proj/A')
@@ -183,7 +183,7 @@ class TestFetchTasksCache:
         """
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await fetch_tasks(dummy_client, dummy_config, '/proj/D')
             # Mutate the returned list — must NOT affect the cached entry.
@@ -210,7 +210,7 @@ class TestFetchTasksCache:
 
         monkeypatch.setattr(tasks_mod, '_FETCH_TASKS_TTL_SECONDS', 0.0)
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(dummy_client, dummy_config, '/proj/E')
             await fetch_tasks(dummy_client, dummy_config, '/proj/E')
@@ -240,7 +240,7 @@ class TestFetchTasksCache:
         """
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await fetch_tasks(dummy_client, dummy_config, '/proj/G')
             assert first, 'expected at least one task from canned result'
@@ -279,7 +279,7 @@ class TestFetchTasksCache:
 
         async def _gated(client, url, tool, args, **_kw):
             await gate.wait()
-            return CANNED_GET_TASKS_RESULT
+            return canned_get_tasks_result()
 
         mock_mcp = AsyncMock(side_effect=_gated)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
@@ -451,7 +451,7 @@ class TestFetchTasksNegativeCache:
         import dashboard.data.tasks as tasks_mod
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG5')
             second = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG5')
@@ -501,7 +501,7 @@ class TestFetchTasksNegativeCache:
             await asyncio.sleep(0)  # yield, so both callers are in flight
             if mine == 1:
                 raise httpx.ConnectError('refused')
-            return CANNED_GET_TASKS_RESULT
+            return canned_get_tasks_result()
 
         with patch('dashboard.data.tasks.mcp_tool_call', new=_fail_then_succeed):
             first, second = await asyncio.gather(
@@ -650,7 +650,7 @@ class TestFanoutStreakIsolationAcrossProjectRoots:
         root_b = str(tmp_path / 'proj-b')
 
         mock_mcp = AsyncMock(
-            side_effect=self._per_root_side_effect(root_a, CANNED_GET_TASKS_RESULT)
+            side_effect=self._per_root_side_effect(root_a, canned_get_tasks_result())
         )
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'), \
                 patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):

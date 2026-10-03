@@ -12,7 +12,7 @@ import dataclasses
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _canned_mcp import CANNED_GET_TASKS_RESULT
+from _canned_mcp import canned_get_tasks_result
 
 import dashboard.data.tasks as tasks_mod
 
@@ -262,7 +262,7 @@ class TestFetchTasksNarrowing:
         """
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(dummy_client, dummy_config, '/proj/A')
 
@@ -292,7 +292,7 @@ class TestFetchTasksNarrowing:
         """
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(
                 dummy_client, dummy_config, '/proj/A',
@@ -332,7 +332,7 @@ class TestFetchTasksNarrowing:
         """
         from dashboard.data.tasks import fetch_task_page
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_task_page(
                 dummy_client, dummy_config, '/proj/A', page_size=100, offset=25,
@@ -357,7 +357,7 @@ class TestFetchTasksNarrowing:
         """The terminal-window call shape: narrowed statuses PLUS a bounded window."""
         from dashboard.data.tasks import fetch_task_page
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_task_page(
                 dummy_client, dummy_config, '/proj/A',
@@ -386,7 +386,7 @@ class TestFetchTasksNarrowing:
         import dashboard.data.tasks as tasks_mod
 
         read = getattr(tasks_mod, reader)
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await read(dummy_client, dummy_config, '/proj/A', **kwargs)
 
@@ -399,7 +399,7 @@ class TestFetchTasksNarrowing:
         """A caller may tighten the per-request budget further."""
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(dummy_client, dummy_config, '/proj/A', timeout=0.5)
 
@@ -602,7 +602,7 @@ class TestFetchTasksNarrowing:
         """(d) Regression guard — the existing single-flight contract is unchanged."""
         from dashboard.data.tasks import fetch_task_page
 
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await fetch_task_page(
                 dummy_client, dummy_config, '/proj/P',

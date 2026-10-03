@@ -16,7 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _canned_mcp import CANNED_GET_TASKS_RESULT
+from _canned_mcp import canned_get_tasks_result
 
 import dashboard.data.tasks as tasks_mod
 from dashboard.data.tasks import _shape_task
@@ -1309,7 +1309,7 @@ class TestPublicReadContracts:
         the same read. They used to mint `s=a\\x1fb` and `s=b\\x1fa` — two
         entries, two round trips, one answer.
         """
-        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await tasks_mod.fetch_tasks(
                 dummy_client, dummy_config, '/proj/order',
