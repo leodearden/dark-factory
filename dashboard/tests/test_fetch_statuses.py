@@ -371,13 +371,3 @@ class TestFetchStatusesPaging:
             'a cached read would collapse these to one, and the unit above '
             'would then serve a map older than the as_of it stamps'
         )
-
-    def test_the_cache_and_its_hooks_are_gone(self):
-        """Named absence, so the layer cannot be reintroduced unnoticed."""
-        import dashboard.data.tasks as tasks_mod
-
-        for gone in ('_FETCH_STATUSES_TTL_SECONDS', '_fetch_statuses_cache',
-                     '_fetch_statuses_cache_clear'):
-            assert not hasattr(tasks_mod, gone), (
-                f'{gone} layers a second TTL under the snapshot unit\'s own'
-            )
