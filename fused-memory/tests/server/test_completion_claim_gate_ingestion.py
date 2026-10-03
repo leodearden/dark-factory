@@ -389,6 +389,29 @@ class TestVerifiedClaimsAreInert:
         assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
         assert _gate_warnings(caplog) == [], f'Unexpected logs: {_gate_warnings(caplog)!r}'
 
+    @pytest.mark.asyncio
+    async def test_filing_claim_about_an_open_task_is_not_tagged(self):
+        """'filed as task N' asserts the task EXISTS; an in-progress task does
+        (esc-unverified-claim-6169-3)."""
+        mock_service = _episode_service()
+        server = _server(mock_service, statuses={'6169': 'in-progress'})
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': 'the flake ledger debt was filed as task 6169',
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': _PROJECT_ID,
+            },
+        )
+
+        mock_service.add_episode.assert_awaited_once()
+        assert _service_kwargs(mock_service).get('unverified_claim', False) is False, (
+            f'A filing claim about an existing task must not tag; got: '
+            f'{_service_kwargs(mock_service)!r}'
+        )
+        assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
+
 
 class TestNoClaimPathIsUntouched:
     """The control: content carrying no completion claim must not pay for this

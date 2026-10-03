@@ -214,8 +214,6 @@ class TestFilingDispatchExtraction:
             'was submitted as',
             'was queued as',
             'was dispatched as',
-            'was cancelled as',
-            'was closed as duplicate of',
         ],
     )
     def test_filing_dispatch_family_each_yields_a_ticket_claim(self, phrasing):
@@ -226,6 +224,25 @@ class TestFilingDispatchExtraction:
         assert claims[0].kind == 'filing_dispatch'
         assert claims[0].subject == 'ticket'
         assert claims[0].ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+
+    @pytest.mark.parametrize(
+        'phrasing',
+        ['was cancelled as', 'was canceled as', 'was closed as duplicate of'],
+    )
+    def test_disposition_family_each_yields_a_disposition_claim(self, phrasing):
+        text = f'the follow-up {phrasing} ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376'
+        claims = _extract(text)
+
+        assert [(c.kind, c.subject, c.ref) for c in claims] == [
+            ('disposition', 'ticket', 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'),
+        ], f'{text!r} -> {claims!r}'
+
+    def test_cancelled_task_is_a_disposition_claim(self):
+        claims = _extract('task 4540 was cancelled')
+
+        assert [(c.kind, c.subject, c.ref) for c in claims] == [
+            ('disposition', 'task', '4540'),
+        ]
 
     def test_commit_sha_claim_resolves_to_the_commit_subject(self):
         claims = _extract('the de-flake fix landed in commit 7bbcd5d815')
@@ -402,6 +419,48 @@ class TestVerifyClaims:
 
         _verify([self._task_claim(project_id='dark_factory')], task=probe)
         assert seen == [('5422', 'dark_factory')]
+
+    def _task_claim_of_kind(self, kind):
+        return CompletionClaim(
+            kind=kind, subject='task', ref='6169', project_id='reify', span=(0, 40),
+        )
+
+    @pytest.mark.parametrize(
+        'status',
+        ['pending', 'deferred', 'in-progress', 'blocked', 'merge-deferred', 'done',
+         'cancelled'],
+    )
+    def test_filing_claim_verifies_against_any_real_task_status(self, status):
+        """Existence is the truth condition of 'filed as task N' (sweep Class A;
+        esc-unverified-claim-6169-3)."""
+        verdicts = _verify(
+            [self._task_claim_of_kind('filing_dispatch')],
+            task=lambda ref, project: status,
+        )
+
+        assert verdicts[0].status == 'verified'
+        assert verdicts[0].observed == status
+
+    @pytest.mark.parametrize('probed', [None, 'unknown'])
+    def test_filing_claim_with_unresolvable_status_is_unverifiable(self, probed):
+        verdicts = _verify(
+            [self._task_claim_of_kind('filing_dispatch')],
+            task=lambda ref, project: probed,
+        )
+
+        assert verdicts[0].status == 'unverifiable'
+
+    @pytest.mark.parametrize(
+        ('status', 'expected'),
+        [('pending', 'mismatch'), ('cancelled', 'verified'), ('done', 'verified')],
+    )
+    def test_disposition_claim_requires_a_terminal_task_status(self, status, expected):
+        verdicts = _verify(
+            [self._task_claim_of_kind('disposition')],
+            task=lambda ref, project: status,
+        )
+
+        assert verdicts[0].status == expected
 
     def _ticket_claim(self):
         return CompletionClaim(

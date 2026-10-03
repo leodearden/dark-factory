@@ -318,6 +318,12 @@ class TestAdjudicate:
         """Verified claims never appear — the report is a report of problems."""
         assert self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='done') == []
 
+    def test_filing_claim_about_an_open_task_is_not_a_finding(self) -> None:
+        """Filing asserts existence, so a pending task verifies it (sweep Class A)."""
+        assert self._adjudicate(
+            'the regression was refiled as task 4263', task_status='pending',
+        ) == []
+
     def test_open_task_status_is_a_mismatch(self) -> None:
         findings = self._adjudicate(ESC_3085_1_INSTANCE_1, task_status='in-progress')
         assert len(findings) == 1
