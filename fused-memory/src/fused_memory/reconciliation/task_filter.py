@@ -318,9 +318,12 @@ TERMINAL_OUTCOME_RE: re.Pattern[str] = re.compile(
 # is a consistent NON-terminal statement, not a contradiction. Spans matching
 # this are stripped from a clause before running TERMINAL_OUTCOME_RE against it,
 # so a task described only as "not yet merged" isn't mis-tagged terminal.
+# The second alternative is a terminal verb whose object is 'nothing' ("has
+# landed nothing"), the same denial with the negation after the verb.
 NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
     r"\b(?:not|never|hasn't|has\s+not|yet\s+to\s+be)\s+(?:yet\s+|been\s+)*"
-    r'(?:merged|landed|done|cancell?ed|completed|shipped)\b',
+    r'(?:merged|landed|done|cancell?ed|completed|shipped)\b'
+    r'|\b(?:merged|landed|done|cancell?ed|completed|shipped)\s+nothing\b',
     re.IGNORECASE,
 )
 
@@ -604,7 +607,8 @@ PRESENT_TENSE_COMPLETION_RE: re.Pattern[str] = re.compile(
     # commonly transitive-capable words ("resolved"/"completed") are deliberately
     # NOT here — they match only in copula form below, so "task N resolved <obj>"
     # does not false-fire (task 2824 review; see the module comment above).
-    r'landed|merged|shipped|'
+    # The (?<!-) keeps a hyphenated compound ("a merge-landed fix") out.
+    r'(?<!-)(?:landed|merged|shipped)|'
     # copula/auxiliary + (been/already/now/fully)* + completion word
     r'(?:is|are|was|were|has|have|had|been)\s+(?:been\s+|already\s+|now\s+|fully\s+)*'
     r'(?:done|complete|completed|resolved|merged|fixed|landed|shipped|closed)|'

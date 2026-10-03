@@ -130,6 +130,10 @@ UNRESOLVABLE: _Unresolvable = _Unresolvable()
 # ("has been applied"). `landed`/`merged`/`shipped` are intransitive in this
 # register and are safe bare, exactly as task_filter has them.
 #
+# Every BARE marker in the three families carries a (?<!-) guard: a hyphenated
+# compound ('merge-landed', 'auto-filed', 'never-filed') is an adjective, not a
+# completion (sightings esc-unverified-claim-6118-3, -5850-1, -6169-3, -5869-1).
+#
 # THREE verbs here (`applied`/`patched`/`deployed`) are NOT in task_filter's
 # completion vocabulary, so the imported NEGATED_TERMINAL_RE and
 # FUTURE_ASPIRATIONAL_RE strippers have no arm for them — and an unstripped
@@ -163,7 +167,7 @@ _FILING_ANY_FORM: str = (
 )
 
 FILING_DISPATCH_RE: re.Pattern[str] = re.compile(
-    r'\b(?:re[-\s]?filed|filed|submitted|queued|dispatched)\b',
+    r'\b(?<!-)(?:re[-\s]?filed|filed|submitted|queued|dispatched)\b',
     re.IGNORECASE,
 )
 
@@ -171,7 +175,7 @@ FILING_DISPATCH_RE: re.Pattern[str] = re.compile(
 # existence: it is true only of a terminal task, so it is its own kind rather
 # than a filing claim (task 4853).
 DISPOSITION_RE: re.Pattern[str] = re.compile(
-    r'\b(?:'
+    r'\b(?<!-)(?:'
     r'cancell?ed|'
     # "closed as <state>" only — a bare "closed" describes non-task things far
     # too often (task_filter drops it from TERMINAL_OUTCOME_RE for exactly this
@@ -220,7 +224,7 @@ APPLIED_WORK_RE: re.Pattern[str] = re.compile(
     r'\b(?:'
     # bare past-tense/participle completion words that read as a completion of
     # the anchored work even without a copula ("task N landed").
-    r'landed|merged|shipped|'
+    r'(?<!-)(?:landed|merged|shipped)|'
     # copula/auxiliary + (been/already/now/fully)* + completion word
     r'(?:is|are|was|were|has|have|had|been)\s+(?:been\s+|already\s+|now\s+|fully\s+)*'
     r'(?:landed|merged|shipped|' + _APPLIED_PARTICIPLES + r')'
@@ -238,7 +242,8 @@ _EXTENSION_ANY_FORM: str = _APPLIED_ANY_FORM + r'|' + _FILING_ANY_FORM
 
 _NEGATED_EXTENSION_RE: re.Pattern[str] = re.compile(
     r"\b(?:not|never|hasn't|has\s+not|yet\s+to\s+be)\s+(?:yet\s+|been\s+)*"
-    r'(?:' + _EXTENSION_ANY_FORM + r')\b',
+    r'(?:' + _EXTENSION_ANY_FORM + r')\b'
+    r'|\b(?:' + _EXTENSION_ANY_FORM + r')\s+nothing\b',
     re.IGNORECASE,
 )
 _ASPIRATIONAL_EXTENSION_RE: re.Pattern[str] = re.compile(
