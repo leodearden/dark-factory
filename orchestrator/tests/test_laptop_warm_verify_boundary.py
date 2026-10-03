@@ -3426,6 +3426,73 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
             live_leader.wait(timeout=5)
 
 
+def test_kill_holder_tree_sweeps_the_session_escaped_orphan_of_an_already_reaped_leader():
+    """An already-reaped leader's session-escaped orphan is still killed; other holders are not.
+
+    Models the four rows that ``wait()`` the leader inside their ``try``
+    before the ``finally`` tears down: by then the build is reparented away,
+    leads its own session, and the ppid walk provably cannot reach it.  Only
+    the holder's inherited tag still names it.  The bystander is a different
+    holder's tree, which Row 5's waiter teardown must never reach.
+    """
+    sleep_secs = f'272.{os.getpid() % 1000:03d}'
+    leader = TaggedPopen(
+        [
+            sys.executable, '-c',
+            'import subprocess\n'
+            f'child = subprocess.Popen(["sleep", "{sleep_secs}"], start_new_session=True, '
+            'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+            'print(child.pid, flush=True)\n',
+        ],
+        stdout=subprocess.PIPE,
+    )
+    bystander = TaggedPopen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        assert leader.stdout is not None
+        grandchild = int(leader.stdout.readline())
+        leader.wait(timeout=10)
+
+        assert leader.returncode is not None, (
+            "harness bug: the leader must already be reaped, or kill_holder_tree's "
+            'already-reaped short circuit never fires and this test exercises nothing'
+        )
+        orphan_state = read_proc_state(grandchild)
+        assert orphan_state is not None and not orphan_state.exited, (
+            f'harness bug: orphan pid={grandchild} is not running ({orphan_state}) '
+            f'before teardown, so its exit afterwards would prove nothing'
+        )
+        assert orphan_state.ppid != leader.pid, (
+            f'harness bug: orphan pid={grandchild} still names the reaped leader '
+            f'pid={leader.pid} as its parent -- it was never reparented'
+        )
+        assert grandchild not in collect_descendants(leader.pid, read_ppid_map()), (
+            f'harness bug: the ppid walk from pid={leader.pid} still reaches orphan '
+            f'pid={grandchild}, so this test does not isolate the severed-chain case'
+        )
+
+        kill_holder_tree(leader, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+
+        survivors = wait_pids_exited({grandchild}, timeout=5.0)
+        state_by_pid = {pid: (st.state, st.ppid) for pid, st in sorted(survivors.items())}
+        assert not survivors, (
+            f'kill_holder_tree left the session-escaped orphan of already-reaped '
+            f'leader pid={leader.pid} running, as {{pid: (state, ppid)}}: '
+            f'{state_by_pid} -- the #4962 leak'
+        )
+        assert bystander.poll() is None, (
+            "kill_holder_tree reached a different holder's tree -- the sweep "
+            'must be scoped to this holder alone'
+        )
+    finally:
+        for pid in tagged_pids(leader.tag):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+        bystander.kill()
+        bystander.wait(timeout=5)
+        if leader.stdout is not None:
+            leader.stdout.close()
+
+
 # ---------------------------------------------------------------------------
 # Task 5301 -- per-holder env tag.  A TaggedPopen stamps a uuid into its
 # child's environment; every descendant inherits it across fork, setsid and
