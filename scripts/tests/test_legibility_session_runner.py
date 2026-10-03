@@ -30,6 +30,8 @@ from legibility.session_runner import (
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_NEAR_CAP_MESSAGES
 from shared.config_models import UsageCapConfig
 
+from shared import usage_gate
+
 pytestmark = pytest.mark.timeout(60)
 
 
@@ -194,6 +196,33 @@ def test_an_auth_rejected_account_fails_over_and_the_call_completes_next_door(
     assert reply == _PLAIN_VERDICT
     assert gate.auth_failed_account_names == (_P,)
     assert _tokens_called(fake_claude_cli) == [pool_roster.token(_P), pool_roster.token(_Q)]
+
+
+def test_an_auth_failed_account_stays_out_for_the_rest_of_the_process(
+    fake_claude_cli, pool_roster, sentinel_login, monkeypatch,
+):
+    """No auth re-probe on the legibility pool: one would reload ``.env`` into
+    this process (putting back the ``ANTHROPIC_API_KEY`` build_pool stripped)
+    and spend a CLI call on a token rejected minutes earlier. The interval is
+    shrunk to the gate's one-second floor and the second call outlasts it, so
+    a scheduled re-probe would show up here as an extra call on P's token."""
+    real_config = account_pool.UsageCapConfig
+    monkeypatch.setattr(
+        account_pool, 'UsageCapConfig',
+        lambda **fields: real_config(**fields, auth_reprobe_secs=1),
+    )
+    monkeypatch.setattr(usage_gate, 'load_dotenv', lambda *args, **kwargs: None)
+    slow_verdict = {'result': _PLAIN_VERDICT, 'sleep_secs': 2}
+
+    outcomes, gate = _run(
+        fake_claude_cli, pool_roster, {_P: _AUTH_401, _Q: slow_verdict}, _P, _Q, calls=2,
+    )
+
+    assert outcomes == [_PLAIN_VERDICT, _PLAIN_VERDICT]
+    assert _tokens_called(fake_claude_cli) == [
+        pool_roster.token(_P), pool_roster.token(_Q), pool_roster.token(_Q),
+    ]
+    assert gate.auth_failed_account_names == (_P,)
 
 
 def test_a_pool_whose_every_account_rejects_its_credentials_fails_loud_not_deferred(

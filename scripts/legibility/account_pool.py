@@ -128,11 +128,17 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
 
 
 def _pool_config(**roster) -> UsageCapConfig:
-    """Never the operator's own ~/.claude login (fallback off), and no resume
-    probes: those reopen a pool for PARKED callers, and the legibility runner
-    never parks (task 6042)."""
+    """Never the operator's own ~/.claude login (fallback off), and no probes
+    of either kind (task 6042). Resume probes reopen a pool for PARKED
+    callers, and the legibility runner never parks. Auth re-probes reload
+    ``.env`` with override, which would put back the ``ANTHROPIC_API_KEY``
+    ``build_pool`` strips, and spend a call on a token already rejected: an
+    auth-failed account stays out for the rest of the process."""
     return UsageCapConfig(
-        fallback_to_default_credential=False, wait_for_reset=False, **roster,
+        fallback_to_default_credential=False,
+        wait_for_reset=False,
+        auth_reprobe_enabled=False,
+        **roster,
     )
 
 

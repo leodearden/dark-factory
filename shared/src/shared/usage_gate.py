@@ -1950,10 +1950,13 @@ class UsageGate:
         return True
 
     def _start_auth_reprobe(self, acct: AccountState) -> None:
-        """Schedule a background re-probe loop for an auth_failed account."""
+        """Schedule a background re-probe loop for an auth_failed account,
+        unless the config opts out (``auth_reprobe_enabled=False``)."""
         # getattr default: some test fixtures construct UsageGate via
         # __new__ (bypassing __init__) and predate this field.
         if getattr(self, '_shutting_down', False):
+            return
+        if not self._config.auth_reprobe_enabled:
             return
         try:
             loop = asyncio.get_running_loop()

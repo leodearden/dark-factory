@@ -1911,7 +1911,9 @@ legibility-trickle@<project>`). The runner's own lines carry its label:
   the gate's own `Account max-h AUTH-FAILED: ...`. The account's credentials
   were rejected (for example `Your organization has disabled Claude
   subscription access ...`). The digest is retried on the next account, and
-  the gate skips the rejected one for the rest of the process. This is **not**
+  the gate skips the rejected one for the rest of the process: unlike the
+  orchestrator's gate, the legibility pool never re-probes it, because a
+  re-probe reloads `.env` into the process. This is **not**
   weather: the account needs an operator or billing decision, and retiring it
   means editing `config/usage-accounts.yaml` (cf. task 5944). An auth
   rejection is recognised from the CLI's JSON `api_error_status` (401 or 403)
