@@ -9,6 +9,7 @@ through the matching ``shape_*`` function before serialising as JSON.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,6 +39,7 @@ from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.mcp_fanout import project_label
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceCards
+from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
 from dashboard.data.write_journal import MemoryOps
@@ -393,10 +395,16 @@ def shape_recon(
     """Return ``{RECON_STATE: {...}, AGENTS: [...]}``.
 
     ``watermarks`` is converted from a list-of-dicts to a project-keyed dict.
-    ``runs`` and ``burst_state`` are passed through as lists.  ``AGENTS`` is
-    the distinct sorted set of ``agent_id`` values from ``burst_state``.
+    ``runs`` and ``burst_state`` are passed through as lists.  ``burst_state``
+    is :func:`reconciliation.partition_burst_state`'s ACTIVE partition, and
+    ``agent_activity`` partitions it again by the stamp each row carries, so
+    its counts sum to the burst list's length.  A row without a stamp raises:
+    a route that skipped the partition is a wiring bug, not zero agents.
+    ``AGENTS`` is the distinct sorted set of ``agent_id`` values from
+    ``burst_state``.
     """
     burst_list = list(burst_state)
+    activity_counts = Counter(AgentActivity(row['activity']) for row in burst_list)
     wm_map: dict[str, dict] = {}
     for wm in watermarks:
         pid = wm.get('project_id')
@@ -420,6 +428,9 @@ def shape_recon(
         'RECON_STATE': {
             'buffer': buffer_block,
             'burst_state': [dict(b) for b in burst_list],
+            'agent_activity': {
+                activity.value: activity_counts[activity] for activity in AgentActivity
+            },
             'watermarks': wm_map,
             'verdict': dict(verdict) if verdict else None,
             'runs': runs_list,
