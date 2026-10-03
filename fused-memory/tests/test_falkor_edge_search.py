@@ -13,6 +13,7 @@ against a live FalkorDB are pinned in ``test_falkor_edge_search_integration.py``
 
 from __future__ import annotations
 
+import copy
 import inspect
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -45,7 +46,7 @@ def recording_driver(
 
     async def record(cypher: str, **params: Any):
         issued.append(IssuedQuery(cypher, params))
-        return [dict(r) for r in records], [], None
+        return copy.deepcopy(list(records)), [], None
 
     driver.execute_query = record  # pyright: ignore[reportAttributeAccessIssue]
     return driver, issued
@@ -117,6 +118,78 @@ class TestDelegatedLegsReachBuiltinCypher:
 
         assert result == []
         assert len(issued) == 1
+
+
+# One row shaped like graphiti's FalkorDB edge projection (get_entity_edge_return_query).
+CANNED_EDGE_RECORD: dict[str, Any] = {
+    'uuid': 'edge-uuid',
+    'source_node_uuid': 'source-uuid',
+    'target_node_uuid': 'target-uuid',
+    'group_id': 'g',
+    'created_at': '2026-10-03T00:00:00+00:00',
+    'name': 'RELATES_TO',
+    'fact': 'alpha beta',
+    'episodes': ['ep'],
+    'expired_at': None,
+    'valid_at': None,
+    'invalid_at': None,
+    'attributes': {},
+}
+
+
+class TestEdgeFulltextSearch:
+    @staticmethod
+    async def _search(
+        search_filter: SearchFilters | None = None, query: str = 'alpha beta'
+    ) -> tuple[list[Any], list[IssuedQuery]]:
+        driver, issued = recording_driver([CANNED_EDGE_RECORD])
+        edges = await search_utils.edge_fulltext_search(
+            driver, query, search_filter or SearchFilters(), ['g'], 20
+        )
+        return edges, issued
+
+    @pytest.mark.asyncio
+    async def test_hits_are_not_rejoined_by_a_match_after_the_fulltext_call(self) -> None:
+        """Any MATCH after the YIELD re-joins each hit, which FalkorDB plans as a per-row scan."""
+        _, issued = await self._search()
+
+        (query,) = issued
+        assert 'MATCH' not in query.cypher.upper()
+
+    @pytest.mark.asyncio
+    async def test_forwards_graphiti_params(self) -> None:
+        _, issued = await self._search()
+
+        params = issued[0].params
+        assert params['query'] == '(@group_id:"g") (alpha | beta)'
+        assert params['group_ids'] == ['g']
+        assert params['limit'] == 20
+
+    @pytest.mark.asyncio
+    async def test_applies_graphiti_search_filter_predicates(self) -> None:
+        _, issued = await self._search(SearchFilters(edge_uuids=['x']))
+
+        assert issued[0].params['edge_uuids'] == ['x']
+        assert '$edge_uuids' in issued[0].cypher
+
+    @pytest.mark.asyncio
+    async def test_parses_records_into_entity_edges(self) -> None:
+        edges, _ = await self._search()
+
+        (edge,) = edges
+        assert (edge.uuid, edge.source_node_uuid, edge.target_node_uuid) == (
+            'edge-uuid',
+            'source-uuid',
+            'target-uuid',
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_stopword_query_issues_nothing(self) -> None:
+        """graphiti's empty-sentinel contract: no searchable term, no query, no rows."""
+        edges, issued = await self._search(query='the and of')
+
+        assert edges == []
+        assert issued == []
 
 
 OVERRIDDEN_METHODS = (
