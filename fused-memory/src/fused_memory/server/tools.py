@@ -66,6 +66,7 @@ from fused_memory.middleware.operational_suggestion_guard import (
 )
 from fused_memory.middleware.premise_lint_guard import premise_lint_error
 from fused_memory.middleware.recurring_gate_guard import recurring_gate_guard_error
+from fused_memory.middleware.retired_key_modules_guard import retired_key_modules_error
 from fused_memory.middleware.routing_intent_guard import (
     routing_intent_enforced,
     routing_intent_finding,
@@ -8870,6 +8871,10 @@ def create_mcp_server(
                 under project_root that exists and is executable, ``timeout_secs``
                 positive int) and/or ``always_escalates`` (bool) in metadata.
 
+                modules: RETIRED — a submission carrying this key is
+                rejected (error_type='RetiredMetadataKey'); declare scope in
+                ``files``.
+
                 A ``task_kind='normal'`` submission whose declared ``files``
                 are ALL gitignored is flagged (or rejected under
                 FUSED_GITIGNORED_DELIVERABLE_ENFORCE): no commit can deliver
@@ -8923,8 +8928,8 @@ def create_mcp_server(
                 not deprecated.
 
                 Cheaper non-bypassing alternative: supply accurate
-                ``metadata.files`` / ``files_to_modify`` / ``modules``.  When
-                those attest work in the filing project, the task-3106
+                ``metadata.files`` / ``files_to_modify``.  When those attest
+                work in the filing project, the task-3106
                 attribution gate suppresses the prose advisory on its own, with
                 no bypass and no audit record.  Use only when sure the task
                 belongs to the submitting project; if unsure, escalate rather
@@ -8975,6 +8980,17 @@ def create_mcp_server(
         if _det_err is not None:
             return _det_err
         metadata = inject_task_kind(metadata, task_kind)
+
+        # Retired-key guard (task 4529, plans/metadata-modules-retirement-prd.md
+        # decision 3): a NEW submission must not mint a metadata.modules
+        # carrier. Placed after inject_task_kind, which normalises metadata to a
+        # dict, and before the interceptor's planning_mode branch, so both
+        # creation paths are covered. update_task and commit_planning
+        # deliberately do not call it: existing carriers stay re-writable.
+        # It has no bypass flag (docs/task-authoring.md §8).
+        _retired_err = retired_key_modules_error(metadata)
+        if _retired_err is not None:
+            return _retired_err
 
         # model_overrides shape guard ζ (PRD adaptive-model-routing, decision 9):
         # reject a malformed metadata.model_overrides (unknown role name,

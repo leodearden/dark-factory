@@ -8871,23 +8871,19 @@ class TestProseAdvisoryDeliverableAttribution:
         assert calls == [], f'Expected no scope_violation escalation, got: {calls!r}'
 
     @pytest.mark.asyncio
-    async def test_owned_modules_entry_suppresses(
+    async def test_retired_modules_entry_no_longer_attests(
         self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
     ):
-        """The modules leg: a declared DIRECTORY lock key attests too.
-
-        _extract_meta_files does not read `modules` at all, so this case can
-        only pass through the new union extractor — and the entry is a bare
-        directory, which find_paths deliberately does not lex as a path.
+        """A retired key is neutral: a historical ``modules`` carrier that
+        reaches the interceptor directly buys no silence, so the advisory
+        fires unchanged (plans/metadata-modules-retirement-prd.md decision 6).
         """
         result, calls = await self._submit(
             interceptor_with_store, tmp_path,
             metadata={'modules': ['fused-memory/src/fused_memory/middleware']},
         )
 
-        meta = await _persisted_candidate_metadata(ticket_store, result)
-        assert 'possible_scope_mismatch' not in meta, f'got: {meta!r}'
-        assert calls == [], f'got: {calls!r}'
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.asyncio
     async def test_owned_files_to_modify_entry_suppresses(
@@ -8926,17 +8922,16 @@ class TestProseAdvisoryDeliverableAttribution:
 
         await _assert_prose_advisory_fired(ticket_store, result, calls)
 
-    @pytest.mark.parametrize('foreign_key', ['files_to_modify', 'modules'])
     @pytest.mark.asyncio
     async def test_mixed_union_with_foreign_in_unchecked_key_still_advises(
-        self, foreign_key, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
     ):
         """A foreign entry the HARD REJECT never saw must not be suppressed.
 
         check_files_for_scope classifies only _extract_meta_files' output:
-        ``files``, or (when absent) ``files_to_modify`` — never ``modules``,
-        and never a ``files_to_modify`` entry shadowed by a present ``files``
-        key. Attribution reads the wider UNION. Without the foreign-veto in
+        ``files``, or (when absent) ``files_to_modify`` — never a
+        ``files_to_modify`` entry shadowed by a present ``files`` key.
+        Attribution reads the wider UNION. Without the foreign-veto in
         local_attesting_signals this shape would fall through BOTH: the
         reject only classifies the local ``files`` entry and returns ok, then
         the local entry suppresses the advisory — so a submission declaring
@@ -8949,7 +8944,7 @@ class TestProseAdvisoryDeliverableAttribution:
         assert registry.project_for_path('crates/widget.rs') == 'reify'
         metadata = {
             'files': ['fused-memory/src/x.py'],
-            foreign_key: ['crates/widget.rs'],
+            'files_to_modify': ['crates/widget.rs'],
         }
         assert TaskInterceptor._extract_meta_files({'metadata': metadata}) == [
             'fused-memory/src/x.py',
@@ -9187,15 +9182,21 @@ class TestProseAdvisoryConsolidationGateAttribution:
         await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.asyncio
-    async def test_gate_with_foreign_modules_entry_still_advises(
+    async def test_gate_with_foreign_shadowed_files_to_modify_entry_still_advises(
         self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
     ):
         """A declared deliverable hands attribution to the task-3106 rule,
-        whose foreign veto keeps the advisory; the hard reject never reads
-        ``modules``."""
+        whose foreign veto keeps the advisory; the hard reject never reads a
+        ``files_to_modify`` entry shadowed by ``files``."""
+        metadata = self._gate_metadata(
+            files=['fused-memory/src/x.py'], files_to_modify=['crates/widget.rs'],
+        )
+        assert TaskInterceptor._extract_meta_files({'metadata': metadata}) == [
+            'fused-memory/src/x.py',
+        ], 'The hard reject must not see the foreign entry, or this proves nothing'
+
         result, calls = await self._submit_gate(
-            interceptor_with_store, tmp_path,
-            metadata=self._gate_metadata(modules=['crates/widget.rs']),
+            interceptor_with_store, tmp_path, metadata=metadata,
         )
 
         await _assert_prose_advisory_fired(ticket_store, result, calls)
@@ -9205,14 +9206,33 @@ class TestProseAdvisoryConsolidationGateAttribution:
     async def test_gate_with_malformed_deliverable_declaration_still_advises(
         self, malformed, interceptor_with_store, ticket_store, taskmaster, tmp_path,
     ):
-        """An unusable ``modules`` value yields no attesting signal, but the
-        filer still declared a deliverable, so the gate is not pure."""
+        """An unusable ``files_to_modify`` value yields no attesting signal,
+        but the filer still declared a deliverable, so the gate is not pure."""
         result, calls = await self._submit_gate(
             interceptor_with_store, tmp_path,
-            metadata=self._gate_metadata(modules=malformed),
+            metadata=self._gate_metadata(files_to_modify=malformed),
         )
 
         await _assert_prose_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.asyncio
+    async def test_gate_carrying_only_the_retired_modules_key_is_still_pure(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """A retired key declares nothing, so the gate stays pure
+        (plans/metadata-modules-retirement-prd.md decision 6).  The key
+        tuple is shared, so the purity check and the attribution union
+        cannot disagree about it."""
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path,
+            metadata=self._gate_metadata(modules=['crates/widget.rs']),
+        )
+
+        meta = await _persisted_candidate_metadata(ticket_store, result)
+        assert 'possible_scope_mismatch' not in meta, (
+            f'A gate carrying only a retired key must stay pure: {meta!r}'
+        )
+        assert calls == [], f'Expected no scope_violation escalation, got: {calls!r}'
 
     @pytest.mark.asyncio
     async def test_gate_with_foreign_files_still_hard_rejects(
@@ -9432,10 +9452,11 @@ class TestExtractDeliverableSignals:
     """Unit tests for the _extract_deliverable_signals_from_meta static helper.
 
     Deliberately DIVERGES from _extract_meta_files: it takes the UNION of
-    ``files`` ∪ ``files_to_modify`` ∪ ``modules`` rather than the
-    files-over-files_to_modify PRECEDENCE, and is a separate helper rather
-    than a widening of it — the helper's own docstring carries why, and
-    local_attesting_signals carries how the extra keys are then treated.
+    ``files`` ∪ ``files_to_modify`` rather than the files-over-files_to_modify
+    PRECEDENCE, and is a separate helper rather than a widening of it — the
+    helper's own docstring carries why, and local_attesting_signals carries
+    how the extra key is then treated.  ``modules`` is retired
+    (plans/metadata-modules-retirement-prd.md decision 6) and is not read.
     These tests pin the union shape, the coercion rules, and the
     warn-and-discard degrade on malformed values.
     """
@@ -9454,20 +9475,17 @@ class TestExtractDeliverableSignals:
         kwargs = {'metadata': {'files_to_modify': ['b/y.py']}}
         assert self._signals(kwargs) == ['b/y.py']
 
-    def test_modules_key_only(self):
-        """metadata.modules (Tier-A path-like lock keys) is a signal too.
-
-        _extract_meta_files does NOT read this key — attribution does,
-        because a declared module directory is evidence of local work.
-        """
+    def test_retired_modules_key_contributes_no_signal(self):
+        """A historical ``modules`` carrier declares nothing to attribution."""
         kwargs = {'metadata': {'modules': ['c/z']}}
-        assert self._signals(kwargs) == ['c/z']
+        assert self._signals(kwargs) == []
 
-    def test_all_three_keys_union_in_declared_order(self):
+    def test_files_and_files_to_modify_union_in_declared_order(self):
         """UNION, not precedence — contrasted inline with _extract_meta_files.
 
         The contrast assertion pins the divergence as INTENTIONAL: for the
         SAME kwargs the hard-reject extractor still returns only ``files``.
+        The retired ``modules`` key rides along in the input and is ignored.
         """
         kwargs = {
             'metadata': {
@@ -9476,9 +9494,7 @@ class TestExtractDeliverableSignals:
                 'modules': ['c/z'],
             }
         }
-        assert self._signals(kwargs) == [
-            'a/x.py', 'b/y.py', 'c/z',
-        ]
+        assert self._signals(kwargs) == ['a/x.py', 'b/y.py']
         # Divergence pinned: the FILES-certain extractor keeps its precedence.
         assert TaskInterceptor._extract_meta_files(kwargs) == ['a/x.py']
 
@@ -9486,8 +9502,7 @@ class TestExtractDeliverableSignals:
         kwargs = {
             'metadata': {
                 'files': ['a/x.py', 'dup.py'],
-                'files_to_modify': ['dup.py', 'b/y.py'],
-                'modules': ['a/x.py', 'c/z'],
+                'files_to_modify': ['dup.py', 'b/y.py', 'a/x.py', 'c/z'],
             }
         }
         assert self._signals(kwargs) == [
@@ -9496,11 +9511,13 @@ class TestExtractDeliverableSignals:
 
     def test_scalar_string_value_coerced_to_list(self):
         """Matches _extract_meta_files_from_meta's scalar-str coercion."""
-        kwargs = {'metadata': {'modules': 'c/z'}}
-        assert self._signals(kwargs) == ['c/z']
+        kwargs = {'metadata': {'files_to_modify': 'b/y.py'}}
+        assert self._signals(kwargs) == ['b/y.py']
 
     def test_falsy_entries_dropped_and_non_strings_coerced(self):
-        kwargs = {'metadata': {'files': ['', None, 'src/bar.py'], 'modules': [42]}}
+        kwargs = {
+            'metadata': {'files': ['', None, 'src/bar.py'], 'files_to_modify': [42]},
+        }
         assert self._signals(kwargs) == [
             'src/bar.py', '42',
         ]
@@ -9512,18 +9529,17 @@ class TestExtractDeliverableSignals:
         ``_parse_metadata`` warns-and-continues rather than raising, so this
         helper must too: a malformed submission is a graceful degrade (the
         prose advisory then fires unchanged), not a ``TypeError`` escaping
-        ``submit_task`` as an unstructured crash.  ``modules`` is the sharp
-        edge — it was never read on this path before task 3106.
+        ``submit_task`` as an unstructured crash.
         """
         assert self._signals(
-            {'metadata': {'modules': 5}},
+            {'metadata': {'files_to_modify': 5}},
         ) == []
         assert self._signals(
             {'metadata': {'files': 5}},
         ) == []
         # A malformed key discards only ITSELF; well-formed siblings survive.
         assert self._signals(
-            {'metadata': {'files': ['a/x.py'], 'modules': 5}},
+            {'metadata': {'files': ['a/x.py'], 'files_to_modify': 5}},
         ) == ['a/x.py']
 
     def test_dict_value_is_discarded_rather_than_iterated_as_keys(self):
@@ -9534,7 +9550,7 @@ class TestExtractDeliverableSignals:
         meant as a path list.
         """
         assert self._signals(
-            {'metadata': {'modules': {'fused-memory/src': 1}}},
+            {'metadata': {'files_to_modify': {'fused-memory/src': 1}}},
         ) == []
 
     def test_tuple_and_set_values_are_accepted(self):
@@ -9543,13 +9559,13 @@ class TestExtractDeliverableSignals:
             {'metadata': {'files': ('a/x.py', 'b/y.py')}},
         ) == ['a/x.py', 'b/y.py']
         assert self._signals(
-            {'metadata': {'modules': {'c/z'}}},
+            {'metadata': {'files_to_modify': {'c/z'}}},
         ) == ['c/z']
 
     def test_json_string_metadata_parsed_via_same_path(self):
         """JSON-string metadata goes through _parse_metadata, as _extract_meta_files does."""
-        kwargs = {'metadata': '{"files": ["a/x.py"], "modules": ["c/z"]}'}
-        assert self._signals(kwargs) == ['a/x.py', 'c/z']
+        kwargs = {'metadata': '{"files": ["a/x.py"], "files_to_modify": ["b/y.py"]}'}
+        assert self._signals(kwargs) == ['a/x.py', 'b/y.py']
 
     def test_missing_non_dict_or_keyless_metadata_returns_empty(self):
         assert self._signals({}) == []
