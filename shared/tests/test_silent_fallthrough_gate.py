@@ -817,20 +817,23 @@ class TestGateSelfIntegrity:
             f"({_REPO_ROOT})"
         )
 
-    def test_every_scope_root_contributes_a_scanned_module(self, tree_scan_data):
-        """Each scope root yields a real module, not just a stray ``__init__.py``.
+    def test_every_scope_root_contributes_a_scanned_module(self, first_party_tree):
+        """Each DECLARED scope root yields a real module, not just a stray ``__init__.py``.
 
         Keyed on ``SCOPE_ROOTS`` rather than on named files, so renaming a
-        module in a sibling package cannot red this self-check.
+        module in a sibling package cannot red this self-check. Its complement,
+        ``test_auth_failed.py::TestSingleResetsParserOwnership::test_shared_tree_spans_every_production_src_root``,
+        checks the DISCOVERED ``<pkg>/src`` roots with the same relpath idiom.
         """
-        contributing = {
+        silent = [
             root
             for root in SCOPE_ROOTS
-            for f in tree_scan_data.files
-            if Path(f).name != "__init__.py"
-            and Path(f).is_relative_to(_REPO_ROOT / root)
-        }
-        silent = [root for root in SCOPE_ROOTS if root not in contributing]
+            if not any(
+                record.relpath.startswith(f"{root}/")
+                and not record.relpath.endswith("/__init__.py")
+                for record in first_party_tree
+            )
+        ]
         assert not silent, (
             f"Scope roots contributing no scanned module: {silent} — the gate "
             f"is scanning less than SCOPE_ROOTS declares ({_REPO_ROOT})"

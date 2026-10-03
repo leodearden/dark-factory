@@ -558,7 +558,9 @@ class TestSingleResetsParserOwnership:
 
         The ownership scan walks the session's shared first-party tree, whose
         scope is a fixed list. This keeps the discovered contract: a package
-        added later is caught here rather than silently left unscanned.
+        added later is caught here rather than silently left unscanned. Its
+        complement, ``test_silent_fallthrough_gate.py::TestGateSelfIntegrity::test_every_scope_root_contributes_a_scanned_module``,
+        checks the DECLARED roots.
         """
         relpaths = [record.relpath for record in first_party_tree]
         missing = [
