@@ -98,6 +98,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import _run_post_merge_verify, _verify_worktree_contention_sentinel
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
     collect_descendants,
+    kill_process_tree,
     lane_lock_path,
     merge_verify_lock_path,
     pgid_file,
@@ -807,14 +808,11 @@ def kill_holder_tree(
 ) -> None:
     """SIGKILL *proc* and every descendant it forked, including start_new_session escapes.
 
-    Mirrors :func:`orchestrator.verify_cancel.cancel_request`'s algorithm --
-    snapshot the ``/proc`` PPID map before sending any signal, collect
-    descendants, SIGKILL them, SIGKILL the leader, fire a GUARDED
-    ``killpg`` backstop for same-group stragglers while the leader is
-    still an unreaped zombie, and only THEN reap it -- but walks
-    descendants from ``proc.pid`` rather than a recorded pgid, and the
-    ``killpg`` backstop only fires when the holder is provably its own
-    group leader.
+    The snapshot -> walk -> SIGKILL -> killpg algorithm is
+    ``orchestrator/src/orchestrator/verify_cancel.py::kill_process_tree``;
+    this wrapper adds only a test teardown's policies around it: which pid
+    roots the walk, which group (if any) the backstop may hit, degrading a
+    raising snapshot to ``{}``, the reap, and the stdin close.
 
     Walking from ``proc.pid`` (rather than
     ``os.killpg(os.getpgid(proc.pid), SIGKILL)``, the obvious one-liner) is
@@ -829,8 +827,10 @@ def kill_holder_tree(
     os.getpgid(0)``.  An unconditional ``killpg`` there would SIGKILL the
     pytest worker running this very test -- see
     ``test_kill_holder_tree_never_signals_the_callers_own_process_group``.
-    The descendant walk has no such hazard: the caller is always an
-    ANCESTOR of the holder, never a descendant -- the same argument
+    So the backstop is aimed only at a group the holder provably leads and
+    the caller provably is not in.  The descendant walk has no such hazard:
+    the caller is always an ANCESTOR of the holder, never a descendant --
+    the same argument
     :func:`~orchestrator.verify_cancel.start_own_process_group` makes for
     ``sshd`` never being a descendant of the pgid ``cancel_request`` walks.
 
@@ -844,32 +844,33 @@ def kill_holder_tree(
     valid unchanged.
 
     *_ppid_map_provider* / *_kill* / *_killpg* are private injectable seams,
-    mirroring :func:`cancel_request`'s own convention, so tests can pin the
+    passed straight through to ``kill_process_tree``, so tests can pin the
     session-escape reap deterministically with zero risk of signalling
     anything unintended.
 
     ALREADY-REAPED SHORT CIRCUIT: an already-reaped leader means
-    ``proc.pid`` is a FREE pid, so the walk below must never run against
-    it.  Several call sites reap the leader with ``wait()`` inside their
-    ``try`` block BEFORE their ``finally`` runs this helper
+    ``proc.pid`` is a FREE pid, so the walk must never run against it.
+    Several call sites reap the leader with ``wait()`` inside their ``try``
+    block BEFORE their ``finally`` runs this helper
     (``test_watchdog_timeout_env_override_fires_fast_without_heartbeat``,
     ``test_cancel_verify_tree_kills_under_live_watchdog``,
     ``test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive``,
     ``test_heartbeat_starved_hard_partition_tree_killed_via_timeout``) --
-    on their GREEN path ``proc.pid`` no longer refers to the holder at all.  ``os.getpgid(proc.pid)`` and
-    ``collect_descendants(proc.pid, ...)`` would then describe whatever
-    process happens to OWN that recycled pid now, and every descendant of
-    that stranger would be SIGKILLed (and killpg'd by the backstop above,
-    if it happened to be its own group leader) -- precisely what "zero
-    risk of signalling anything unintended" above promises never happens.
-    pid recycling is observed on this fleet, not theoretical
-    (verify_cancel.py:313-315: pid_max=4194304, and the laptop's own pid
-    counter demonstrably wrapped on 2026-08-11).  So liveness is captured
-    ONCE, at entry, strictly before the pgid read and the ppid-map
-    snapshot below: an already-reaped leader's descendants have already
-    been reparented to init (or the nearest subreaper) and are no longer
-    reachable from ``proc.pid`` anyway, so the early return forgoes no
-    reachable kill.
+    on their GREEN path ``proc.pid`` no longer refers to the holder at all.
+    ``os.getpgid(proc.pid)`` and ``collect_descendants(proc.pid, ...)``
+    would then describe whatever process happens to OWN that recycled pid
+    now, and every descendant of that stranger would be SIGKILLed (and
+    killpg'd by the backstop, if it happened to be its own group leader) --
+    precisely what "zero risk of signalling anything unintended" above
+    promises never happens.  pid recycling is observed on this fleet, not
+    theoretical (the stale-file NOTE in
+    ``orchestrator/src/orchestrator/verify_cancel.py::cancel_request``:
+    pid_max=4194304, and the laptop's own pid counter demonstrably wrapped
+    on 2026-08-11).  So liveness is captured ONCE, at entry, strictly
+    before the pgid read and the ppid-map snapshot: an already-reaped
+    leader's descendants have already been reparented to init (or the
+    nearest subreaper) and are no longer reachable from ``proc.pid``
+    anyway, so the early return forgoes no reachable kill.
 
     IT IS NOT FREE, THOUGH -- KNOWN RESIDUE (esc-4092-3, measured
     2026-08-30).  "No longer reachable" is a statement about this helper's
@@ -907,99 +908,41 @@ def kill_holder_tree(
     """
     timeout = ROW5_HOLDER_TEARDOWN_CEILING_SECS if timeout is None else timeout
 
-    # An already-reaped leader means proc.pid is a FREE pid -- see the
-    # ALREADY-REAPED SHORT CIRCUIT paragraph above.  Captured once, via
-    # proc.returncode (a pure read of state this Popen already owns, no
-    # waitpid side effect) rather than a fresh proc.poll(), and not
-    # re-read later in this function.  ``proc.poll()`` is deliberately
-    # called NOWHERE in this helper: a poll() after this point would
-    # ``waitpid``-reap a leader that exited in the meantime and FREE
-    # proc.pid, aiming the killpg backstop below at a recycled group --
-    # see the unguarded leader SIGKILL further down for the full argument.
+    # Read via proc.returncode -- state this Popen already owns -- and never
+    # via proc.poll(), which waitpid-reaps.  ``poll()`` is called NOWHERE in
+    # this helper: a leader that exits after this gate (the Row 5 holder's
+    # finally arms the CLI's stdin-watchdog self-kill just before calling
+    # this) stays an unreaped zombie with its pid PINNED until proc.wait()
+    # below, which is what keeps the backstop's pgid naming the holder's own
+    # group rather than a recycled stranger's.
     if proc.returncode is not None:
         if proc.stdin is not None:
             with contextlib.suppress(OSError):
                 proc.stdin.close()
         return
 
-    # Pre-kill snapshot phase -- BOTH reads must happen before any signal is
-    # sent.  Killing the leader first reparents survivors to init and severs
-    # the /proc parent chain, making a session-escaped descendant unfindable
-    # (the same invariant cancel_request documents at
-    # verify_cancel.py:246-250).  The pgid is read only to gate the killpg
-    # backstop below; a leader already gone by now makes getpgid raise
-    # ProcessLookupError, and a permission mismatch or any other OSError
-    # degrades the same way -- "no group to backstop" -- rather than
-    # propagating out of a finally and masking whatever real assertion
-    # failure the caller was cleaning up after.
+    # Read before any signal: a leader already gone, or any other OSError,
+    # degrades to "no group to backstop" rather than raising out of a finally
+    # and masking the caller's real assertion failure.
     try:
         pgid = os.getpgid(proc.pid)
     except OSError:
         pgid = None
-    # A /proc read losing a race with process exit degrades to an empty map
-    # rather than propagating -- this helper runs almost exclusively inside
-    # a finally block, where an exception would mask whatever real assertion
-    # failure the caller was cleaning up after.
-    try:
-        ppid_map = _ppid_map_provider()
-    except OSError:
-        ppid_map = {}
-    descendants = collect_descendants(proc.pid, ppid_map)
+    self_led_foreign_group = pgid is not None and pgid == proc.pid and pgid != os.getpgid(0)
 
-    # SIGKILL every descendant.  Already-dead and not-ours are both expected
-    # outcomes, not errors.
-    for pid in descendants:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            _kill(pid, signal.SIGKILL)
+    def snapshot_or_empty() -> dict[int, int]:
+        try:
+            return _ppid_map_provider()
+        except OSError:
+            return {}
 
-    # SIGKILL the leader.  UNGUARDED, deliberately: there is no
-    # `if proc.poll() is None:` here, and adding one back would REINTRODUCE
-    # the pid-recycling hazard the backstop below exists to avoid.
-    # ``Popen.poll()`` is not a passive read -- it calls ``_internal_poll()``
-    # -> ``os.waitpid(pid, WNOHANG)``, so if the leader exited at any point
-    # after the entry-time ``proc.returncode is not None`` short circuit
-    # (the Row 5 holder's ``finally`` calls ``stop_heartbeats()`` FIRST,
-    # which arms the CLI's stdin-watchdog self-kill, making exactly that a
-    # DESIGNED behaviour, not an exotic race), a poll() here would REAP it
-    # and FREE proc.pid -- and the backstop below would then evaluate
-    # ``pgid == proc.pid`` against a pgid captured pre-reap and fire
-    # ``killpg`` at a now-free pgid, SIGKILLing a stranger's whole process
-    # group on a shared dev box or CI host.
-    #
-    # Signalling here is safe unguarded and costs nothing: the entry-time
-    # short circuit already established the leader was un-reaped, and this
-    # Popen object is the ONLY thing that can reap it, so with no poll() in
-    # this function the pid stays PINNED (a zombie at worst) until
-    # ``proc.wait()`` below.  SIGKILL to an exited-but-unreaped zombie is a
-    # no-op, and ProcessLookupError/PermissionError are suppressed anyway.
-    # This is what makes the backstop's "still unreaped, pid provably
-    # pinned" premise actually true rather than merely asserted.
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        _kill(proc.pid, signal.SIGKILL)
-
-    # Guarded killpg backstop for same-group stragglers -- fires ONLY when
-    # the holder is PROVABLY its own group leader (setsid ran, i.e. the CLI
-    # was invoked with --request-id) AND that group is PROVABLY not the
-    # caller's own.  Both checks are required, not either alone: cli.py's
-    # os.setsid is gated on --request-id and spawn_verify_merge never passes
-    # start_new_session=, so a holder that never setsid'd (e.g. the
-    # lane-lock site) shares this process's own group -- an unguarded
-    # killpg there would SIGKILL the pytest worker itself (see
-    # test_kill_holder_tree_never_signals_the_callers_own_process_group).
-    #
-    # Fired HERE -- immediately after the leader SIGKILL and BEFORE
-    # proc.wait() reaps it below, not after.  While still unreaped the
-    # leader is a zombie that keeps its pid pinned, so pgid provably still
-    # denotes the holder's own group; group members that outlive it are
-    # killed just as effectively.  Firing this AFTER the reap would let a
-    # pid-recycling race aim killpg at a stranger's group instead -- the
-    # exact hazard the ALREADY-REAPED SHORT CIRCUIT above exists to avoid,
-    # and pid recycling is observed on this fleet, not theoretical
-    # (verify_cancel.py:313-315: pid_max=4194304, and the laptop's own pid
-    # counter demonstrably wrapped on 2026-08-11).
-    if pgid is not None and pgid == proc.pid and pgid != os.getpgid(0):
-        with contextlib.suppress(ProcessLookupError, OSError):
-            _killpg(pgid, signal.SIGKILL)
+    kill_process_tree(
+        proc.pid,
+        backstop_pgid=pgid if self_led_foreign_group else None,
+        ppid_map_provider=snapshot_or_empty,
+        kill=_kill,
+        killpg=_killpg,
+    )
 
     try:
         proc.wait(timeout=timeout)
