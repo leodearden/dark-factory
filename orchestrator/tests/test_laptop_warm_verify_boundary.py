@@ -3385,6 +3385,101 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
 
 
 # ---------------------------------------------------------------------------
+# Task 5301 -- per-holder env tag.  A TaggedPopen stamps a uuid into its
+# child's environment; every descendant inherits it across fork, setsid and
+# exec, so tagged_pids() names the holder's whole tree even after the /proc
+# ppid chain to a session-escaped build is severed.  The real-CLI test pins
+# the premise end to end: verify.py::_target_subprocess_env must pass the tag
+# through to the build it spawns.
+# ---------------------------------------------------------------------------
+
+
+def test_tagged_pids_finds_a_session_escaped_grandchild_and_nothing_else():
+    """tagged_pids(tag) names exactly one holder's tree, session escapes included."""
+    sleep_secs = f'273.{os.getpid() % 1000:03d}'
+    leader = TaggedPopen(
+        [
+            sys.executable, '-c',
+            'import subprocess, time\n'
+            f'child = subprocess.Popen(["sleep", "{sleep_secs}"], start_new_session=True, '
+            'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+            'print(child.pid, flush=True)\n'
+            'time.sleep(300)\n',
+        ],
+        stdout=subprocess.PIPE,
+    )
+    bystander = TaggedPopen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        assert leader.stdout is not None
+        grandchild = int(leader.stdout.readline())
+        assert os.getsid(grandchild) == grandchild, (
+            f'harness bug: grandchild pid={grandchild} must lead its own '
+            f'session, or this test is not exercising the escape the sweep '
+            f'exists for'
+        )
+
+        assert isinstance(leader.tag, str) and leader.tag
+        assert leader.tag != bystander.tag, 'tags are per holder, never shared'
+
+        found = tagged_pids(leader.tag)
+        assert {leader.pid, grandchild} <= found, (
+            f'tagged_pids missed part of the leader pid={leader.pid} tree '
+            f'(grandchild pid={grandchild}): found {sorted(found)}'
+        )
+        assert bystander.pid not in found, (
+            "another holder's tree must never match this holder's tag"
+        )
+        assert os.getpid() not in found
+    finally:
+        for pid in tagged_pids(leader.tag) | tagged_pids(bystander.tag):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+        leader.wait(timeout=5)
+        bystander.wait(timeout=5)
+        if leader.stdout is not None:
+            leader.stdout.close()
+
+
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)
+def test_spawned_verify_merge_build_carries_the_holder_tag(tmp_path):
+    """The real CLI's session-escaped build inherits its holder's tag.
+
+    Anti-vacuity anchor for kill_holder_tree's tag sweep: it only reaches an
+    orphaned build because verify.py::_target_subprocess_env is a denylist
+    (venv/uv/ORCH_*) that passes the tag through.  An allowlist there would
+    silently disable the sweep; this fails loudly instead.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
+    build_pgf = tmp_path / 'build.pgid'
+
+    holder = spawn_verify_merge(
+        sha=head_sha,
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
+        cfg_file=cfg_file,
+    )
+    try:
+        build_pid = wait_for_pgid_file(build_pgf, timeout=row_discovery_ceiling_secs())
+        assert os.getsid(build_pid) == build_pid, (
+            f'harness bug: build pid={build_pid} must lead its own session '
+            f'(verify.py::_run_cmd start_new_session), or this test is not '
+            f'exercising the escape the sweep exists for'
+        )
+        assert build_pid in tagged_pids(holder.tag), (
+            f'the build pid={build_pid} spawned by holder pid={holder.pid} '
+            f'does not carry {HOLDER_TAG_ENV}={holder.tag} -- the target-env '
+            f'scrub dropped it, so kill_holder_tree cannot sweep an orphaned build'
+        )
+    finally:
+        kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+        for pipe in (holder.stdout, holder.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+
+
+# ---------------------------------------------------------------------------
 # Task 3369 -- in-child stopwatch for the flock GATE, replacing task 2921/2941's
 # outer wall-clock subtraction in test_flock_wait_env_override_speeds_up_
 # contention_result below.
