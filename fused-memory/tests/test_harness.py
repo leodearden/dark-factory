@@ -5782,6 +5782,50 @@ async def test_run_full_cycle_keeps_interrupted_runs_config_dir_under_a_second_c
     )
 
 
+@pytest.mark.asyncio
+async def test_remediation_pass_finally_gcs_config_dir_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 5128: the remediation mirror of
+    test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation —
+    the GC must be reached and the cancellation must still propagate."""
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    stage_entered = asyncio.Event()
+    created_dirs: list = []
+    _mock_stage_run(harness.stages[0])
+    harness.stages[1].run = _slow_stage_creating_its_config_dir(
+        journal, harness.stages[1], stage_entered, created_dirs,
+    )
+    _mock_stage_run(harness.stages[2])
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        ),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — no second cancellation was '
+        'delivered, so this test would pass vacuously'
+    )
+    assert len(created_dirs) == 1
+    assert outer_task.cancelled(), (
+        'the second cancellation must still propagate out of _run_remediation_pass'
+    )
+    assert not created_dirs[0].exists(), (
+        'gc_run_config_dir must still run when a second cancellation raises '
+        "at the remediation finally's shielded stage_reports await"
+    )
+
+
 # ── Task 5545: remediation cancellation terminalisation and run-failure evidence ──
 
 
