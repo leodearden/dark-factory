@@ -32,6 +32,18 @@ import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+from _xdist_crash_fixtures import (
+    COMPLETE_SESSION_FAILED_NODEID,
+    PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
+    XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
+    XDIST_IN_FLIGHT_NODEID,
+    XDIST_Q_RECOVERED_OUTPUT,
+    XDIST_Q_TRUNCATED_OUTPUT,
+    XDIST_Q_TRUNCATED_THEN_COMPLETED_MODULE_OUTPUT,
+    XDIST_SESSION_ABORTED_OUTPUT,
+)
+
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.verify import VerifyResult
 
@@ -1503,6 +1515,116 @@ class TestRerunCommandRejectedIsUnconfirmable:
                 f'rejected_prefix={rejected_prefix!r} gave {s.verdict} '
                 f'(reason={s.unconfirmable_reason!r})'
             )
+
+
+# ---------------------------------------------------------------------------
+# Task 5492: a session an xdist worker death truncated is never confirmable.
+# ---------------------------------------------------------------------------
+
+_CALL_SITES = ('merge_gate', 'main_probe')
+
+_WORKER_DEATH_SPECIMENS = [
+    pytest.param(XDIST_Q_TRUNCATED_OUTPUT, id='q_truncated'),
+    pytest.param(XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT, id='bailout_with_attributed_failed'),
+    pytest.param(XDIST_SESSION_ABORTED_OUTPUT, id='bailout_without_failed_line'),
+    pytest.param(
+        XDIST_Q_TRUNCATED_THEN_COMPLETED_MODULE_OUTPUT,
+        id='q_truncated_module_joined_before_a_completed_one',
+    ),
+    pytest.param(XDIST_Q_RECOVERED_OUTPUT, id='recovered_crash_refused_by_design'),
+]
+
+
+class TestTruncatedSessionIsUnconfirmable:
+    """A worker death means the named failures are not the only unmeasured
+    tests: under ``--max-worker-restart=0`` xdist abandons the queued
+    remainder, so an isolated pass of the crash victim cannot speak for the
+    session (INV-1). Both call sites refuse it before spending a re-run, and
+    still name the crash victim so the ledger can count it per test.
+
+    The re-run is patched to PASS throughout, so a refusal here can only come
+    from the precondition, never from the re-run's answer.
+    """
+
+    @staticmethod
+    def _confirm(verify_module, tmp_path, test_output, *, call_site):
+        _materialize(tmp_path, 'orchestrator/tests/test_config.py')
+        rerun = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rerun):
+            s = asyncio.run(
+                verify_module.confirm_isolated_rerun_verdict(
+                    tmp_path, _make_config(tmp_path), [_module_config('orchestrator')],
+                    _failing_result(test_output), call_site=call_site,
+                )
+            )
+        return s, rerun
+
+    @pytest.mark.parametrize('call_site', _CALL_SITES)
+    @pytest.mark.parametrize('test_output', _WORKER_DEATH_SPECIMENS)
+    def test_worker_death_is_unconfirmable_without_a_rerun(
+        self, tmp_path: Path, test_output: str, call_site: str,
+    ) -> None:
+        """Every worker-death shape -> ``unconfirmable('session_truncated')``.
+
+        ``recovered_crash_refused_by_design`` is a DECISION, not an oversight:
+        there xdist replaced the worker (a cap above 0) and the session did
+        complete, but on the '\\n'-joined multi-module -q output the gate
+        reads, recovery and truncation are indistinguishable
+        (``q_truncated_module_joined_before_a_completed_one`` is the
+        truncation that looks complete). The gate fails closed, which keeps a
+        merge red that could have landed; the opposite error lands an unrun
+        suite. A change that wants this case confirmable must flip this pin
+        consciously.
+        """
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeCallSite, FlakeVerdict
+
+        s, rerun = self._confirm(verify_module, tmp_path, test_output, call_site=call_site)
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s
+        assert s.unconfirmable_reason == 'session_truncated', s
+        assert s.test_ids == (XDIST_IN_FLIGHT_NODEID,), s.test_ids
+        assert s.call_site == FlakeCallSite(call_site), s.call_site
+        rerun.assert_not_awaited()
+
+    @pytest.mark.parametrize('call_site', _CALL_SITES)
+    def test_complete_session_failure_is_still_rerun_and_confirmed(
+        self, tmp_path: Path, call_site: str,
+    ) -> None:
+        """The control: a session that ran to [100%] with an ordinary failure
+        is exactly what the isolated re-run exists to judge (task 2768)."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s, rerun = self._confirm(
+            verify_module, tmp_path, PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
+            call_site=call_site,
+        )
+
+        rerun.assert_awaited()
+        assert s.verdict is FlakeVerdict.passes_in_isolation, s
+        assert s.test_ids == (COMPLETE_SESSION_FAILED_NODEID,), s.test_ids
+
+    def test_main_probe_wrapper_keeps_the_preexisting_verdict(
+        self, tmp_path: Path,
+    ) -> None:
+        """At the main-probe wrapper the refusal is ``None``: the caller keeps
+        its ``(True, main_sha)`` verdict instead of downgrading a main whose
+        abandoned remainder nobody ran."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_config.py')
+        rerun = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rerun):
+            downgrade_ids = asyncio.run(
+                verify_module._main_probe_failure_is_isolated_flake(
+                    tmp_path, _make_config(tmp_path), [_module_config('orchestrator')],
+                    _failing_result(XDIST_Q_TRUNCATED_OUTPUT),
+                )
+            )
+
+        assert downgrade_ids is None, downgrade_ids
+        rerun.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
