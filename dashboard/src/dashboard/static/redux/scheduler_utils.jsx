@@ -111,10 +111,10 @@ function labelFor(paths) {
   return disambiguateLabels(paths || []);
 }
 
-// Compute the visual state for a module-lock chip.
-// Encodes the holder > parked > free precedence so both LockChip (tabs.jsx)
-// and the inline Task-detail chip (tab_tasks.jsx) can call this pure helper
-// instead of duplicating the if/else-if chain.
+// The single lock classifier: the holder > parked > free precedence, read by
+// LockChip (tabs.jsx), the Task-detail chips (tab_tasks.jsx) and the Scheduler
+// heatmap's cellStateFor (scheduler_heatmap.jsx), so one lock reads the same in
+// all three.
 // Returns { cls, hint, ownerLabel } where ownerLabel is null when the chip has
 // no owner to display (lock-free or lock-mine without a counterpart label).
 function lockChipState({ holder, isMine, parkedBy, parkedOwnerLive }) {

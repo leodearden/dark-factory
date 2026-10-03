@@ -188,7 +188,7 @@ test('a held module keeps its column at contention 1 when its holder is not a ro
   // When it is not — a stale `current_holders` entry whose task has left
   // active_tasks — one genuinely-blocked waiter scores contention 1, and a
   // bare `contention > 1` filter would drop the column along with that
-  // waiter's red 'held-by-other' cell. cellStateFor still classifies that
+  // waiter's red 'lock-taken' cell. cellStateFor still classifies that
   // state, so the column has something to show.
   const held = makeModule('src/g/held.py', 1, {
     holder: 'T-gone',
