@@ -2218,6 +2218,22 @@ def _merge_speculation_source() -> str:
     return path.read_text(encoding='utf-8')
 
 
+def _strip_exemption_pragmas(source: str, code: str) -> str:
+    """Return *source* without the lines the checker reads as a *code* exemption.
+
+    Matches with ``_EXEMPT_RES[code]`` on the stripped line, the exact predicate
+    ``_is_exempted`` applies, so this proof and the rule cannot disagree about
+    which separators spell a pragma.  Line endings are kept, so the result equals
+    *source* exactly when no line matched.
+    """
+    exempt_re = _checker._EXEMPT_RES[code]
+    return ''.join(
+        line
+        for line in source.splitlines(keepends=True)
+        if not exempt_re.match(line.strip())
+    )
+
+
 class TestRuleCCoversMergeSpeculation:
     """Two-sided proof that Rule C genuinely covers test_merge_speculation.py.
 
@@ -2366,14 +2382,10 @@ class TestRuleBCoversMergeSpeculation:
         assert still_clean == [], (
             f'the respelled pragma must still exempt the site; got {still_clean!r}'
         )
-        stripped = '\n'.join(
-            line
-            for line in source.splitlines()
-            if 'noqa: bare-dataclass-double —' not in line
-        )
+        stripped = _strip_exemption_pragmas(source, _checker._RULE_B_CODE)
         assert stripped != source, (
-            'expected a `# noqa: bare-dataclass-double — <reason>` pragma in the '
-            'module; if it is gone, this proof no longer means anything'
+            "no line matched the checker's own `bare-dataclass-double` exemption "
+            'regex, so there was no pragma to strip and this proof means nothing'
         )
         violations = [
             v
