@@ -40,6 +40,7 @@ from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceCards
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
+from dashboard.data.write_journal import MemoryOps
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATORS + PROJECTS
@@ -342,32 +343,34 @@ def _shape_wal_status(
 
 
 # ---------------------------------------------------------------------------
-# MEMORY_TIMESERIES + MEMORY_OPS_BREAKDOWN
+# MEMORY_OPS
 # ---------------------------------------------------------------------------
 
 
-def shape_memory_graphs(
-    timeseries: Mapping[str, Any], ops: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return ``{MEMORY_TIMESERIES, MEMORY_OPS_BREAKDOWN}``.
+def shape_memory_graphs(ops: MemoryOps) -> dict[str, Any]:
+    """Return ``{MEMORY_OPS}``: one window's operations, both views.
 
-    ``timeseries`` is already in DF_DATA shape; ``ops`` is reshaped from
-    ``{labels, values}`` to ``[{label, value}, ...]``.
+    The hourly ``total`` series and the window ``totals`` are derived here
+    and nowhere else, so the client never re-counts: the reads/writes/other
+    caption and the donut's centre read the same served numbers, and
+    ``totals.total`` equals the ``by_operation`` sum by MemoryOps' invariant.
     """
-    ts_labels = list(timeseries.get('labels') or [])
-    breakdown = [
-        {'label': lbl, 'value': val}
-        for lbl, val in zip(
-            ops.get('labels') or [], ops.get('values') or [], strict=False,
-        )
-    ]
+    reads, writes, other = sum(ops.reads), sum(ops.writes), sum(ops.other)
     return {
-        'MEMORY_TIMESERIES': {
-            'labels': ts_labels,
-            'reads': list(timeseries.get('reads') or []),
-            'writes': list(timeseries.get('writes') or []),
+        'MEMORY_OPS': {
+            'labels': list(ops.labels),
+            'reads': list(ops.reads),
+            'writes': list(ops.writes),
+            'other': list(ops.other),
+            'total': [r + w + o for r, w, o in zip(ops.reads, ops.writes, ops.other, strict=True)],
+            'totals': {
+                'reads': reads, 'writes': writes, 'other': other,
+                'total': reads + writes + other,
+            },
+            'by_operation': [
+                {'label': label, 'value': count} for label, count in ops.by_operation
+            ],
         },
-        'MEMORY_OPS_BREAKDOWN': breakdown,
     }
 
 

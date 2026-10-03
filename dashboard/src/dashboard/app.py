@@ -97,10 +97,7 @@ from dashboard.data.tasks import (
     fetch_tasks,
 )
 from dashboard.data.utils import safe_gather_result
-from dashboard.data.write_journal import (
-    get_memory_timeseries,
-    get_operations_breakdown,
-)
+from dashboard.data.write_journal import MemoryOps, get_memory_ops
 from dashboard.http_pool import reaper_loop
 from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
 from dashboard.project_dbs import _cost_dbs
@@ -958,22 +955,17 @@ async def _performance_resources(
 
 @app.get('/api/v2/dashboard/memory-graphs')
 async def api_memory_graphs(request: Request) -> JSONResponse:
-    """MEMORY_TIMESERIES + MEMORY_OPS_BREAKDOWN from the write journal."""
+    """MEMORY_OPS from the write journal."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.write_journal_db)
-    ts_r, ops_r = await asyncio.gather(
-        get_memory_timeseries(db),
-        get_operations_breakdown(db),
-        return_exceptions=True,
+    (ops_r,) = await asyncio.gather(get_memory_ops(db), return_exceptions=True)
+    ops = safe_gather_result(
+        ops_r,
+        MemoryOps(labels=(), reads=(), writes=(), other=(), by_operation=()),
+        'memory-graphs/ops',
     )
-    timeseries = safe_gather_result(
-        ts_r, {'labels': [], 'reads': [], 'writes': []}, 'memory-graphs/ts'
-    )
-    ops = cast(
-        ChartData, safe_gather_result(ops_r, {'labels': [], 'values': []}, 'memory-graphs/ops')
-    )
-    return JSONResponse(redux_api.shape_memory_graphs(timeseries, ops))
+    return JSONResponse(redux_api.shape_memory_graphs(ops))
 
 
 @app.get('/api/v2/dashboard/recon')
