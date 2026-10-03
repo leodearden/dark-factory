@@ -15,6 +15,7 @@ exception is the make_commit_probe suite, which builds a throwaway repo).
 from __future__ import annotations
 
 import pytest
+from _fm_helpers import _init_git_repo
 
 from fused_memory.services.completion_claim_gate import (
     UNRESOLVABLE,
@@ -23,6 +24,7 @@ from fused_memory.services.completion_claim_gate import (
     build_unverified_flag,
     extract_completion_claims,
     make_commit_probe,
+    make_registry_commit_probe,
     verify_claims,
 )
 
@@ -649,6 +651,69 @@ class TestMakeCommitProbe:
         probe = make_commit_probe(tmp_path / 'does-not-exist')
 
         assert probe('0' * 40) is None
+
+
+_ABSENT_SHA = '0' * 39 + '1'
+
+
+def _init_distinct_repo(root) -> str:
+    """A one-commit repo whose sha no sibling repo shares.
+
+    _init_git_repo's commits are byte-identical across calls in the same
+    second, so a per-repo file is what makes a cross-repo hit observable.
+    """
+    root.mkdir()
+    (root / 'repo-name.txt').write_text(f'{root.name}\n')
+    return _init_git_repo(root)
+
+
+class TestMakeRegistryCommitProbe:
+    """A sha is near-globally unique, so a commit claim is checked against
+    every registered repository, and absence is asserted only when all of them
+    answered. Sweep Class C: 12 confirmed false accusations probed only the
+    writer's repo."""
+
+    @pytest.fixture
+    def repos(self, tmp_path):
+        reify_root = tmp_path / 'reify'
+        df_root = tmp_path / 'dark_factory'
+        reify_sha = _init_distinct_repo(reify_root)
+        df_sha = _init_distinct_repo(df_root)
+        assert reify_sha != df_sha
+        return {'reify': str(reify_root), 'dark_factory': str(df_root)}, reify_sha, df_sha
+
+    def test_sha_in_another_registered_repo_is_present(self, repos):
+        roots, _reify_sha, df_sha = repos
+        probe = make_registry_commit_probe(roots)
+
+        assert probe(df_sha, 'reify') is True
+        assert probe(df_sha, 'dark_factory') is True
+
+    def test_sha_absent_from_every_registered_repo_is_absent(self, repos):
+        roots, _reify_sha, _df_sha = repos
+
+        assert make_registry_commit_probe(roots)(_ABSENT_SHA, 'reify') is False
+
+    def test_unregistered_claimed_project_cannot_assert_absence(self, repos):
+        roots, _reify_sha, df_sha = repos
+        probe = make_registry_commit_probe(roots)
+
+        assert probe(df_sha, 'unregistered') is True
+        assert probe(_ABSENT_SHA, 'unregistered') is None
+
+    def test_one_unanswerable_repo_prevents_a_clean_absence(self, repos, tmp_path):
+        roots, _reify_sha, df_sha = repos
+        not_a_repo = tmp_path / 'not-a-repo'
+        not_a_repo.mkdir()
+        probe = make_registry_commit_probe(
+            {'reify': str(not_a_repo), 'dark_factory': roots['dark_factory']},
+        )
+
+        assert probe(_ABSENT_SHA, 'reify') is None
+        assert probe(df_sha, 'reify') is True
+
+    def test_empty_registry_is_unresolvable(self):
+        assert make_registry_commit_probe({})(_ABSENT_SHA, 'reify') is None
 
 
 class TestEmitUnverifiedClaimEscalation:

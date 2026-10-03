@@ -31,6 +31,7 @@ import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import _init_git_repo
 
 from fused_memory.middleware.task_interceptor import TicketStoreNotConfiguredError
 from fused_memory.server.tools import create_mcp_server
@@ -388,6 +389,41 @@ class TestVerifiedClaimsAreInert:
         )
         assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
         assert _gate_warnings(caplog) == [], f'Unexpected logs: {_gate_warnings(caplog)!r}'
+
+    @pytest.mark.asyncio
+    async def test_commit_in_another_registered_repo_is_not_tagged(self, tmp_path):
+        """A reify writer naming a dark_factory commit (sweep Class C): the sha
+        exists in a registered repository, so the claim verifies."""
+        reify_root = tmp_path / 'reify'
+        df_root = tmp_path / 'dark_factory'
+        df_root.mkdir()
+        # A file only this repo has, so its sha is not also reify's.
+        (df_root / 'repo-name.txt').write_text('dark_factory\n')
+        reify_sha = _init_git_repo(reify_root)
+        df_sha = _init_git_repo(df_root)
+        assert df_sha != reify_sha
+        mock_service = _episode_service()
+        server = _server(
+            mock_service,
+            statuses={},
+            known_projects={'reify': str(reify_root), 'dark_factory': str(df_root)},
+        )
+
+        result = await server._tool_manager.call_tool(
+            'add_episode',
+            {
+                'content': f'the fix landed in commit {df_sha}',
+                'agent_id': 'claude-task-5422-implementer',
+                'project_id': 'reify',
+            },
+        )
+
+        mock_service.add_episode.assert_awaited_once()
+        assert _service_kwargs(mock_service).get('unverified_claim', False) is False, (
+            f'A commit present in a registered repo must not tag; got: '
+            f'{_service_kwargs(mock_service)!r}'
+        )
+        assert 'unverified_claim' not in result, f'Unexpected flag: {result!r}'
 
     @pytest.mark.asyncio
     async def test_filing_claim_about_an_open_task_is_not_tagged(self):

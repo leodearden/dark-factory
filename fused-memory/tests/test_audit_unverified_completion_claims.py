@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_helpers import load_script_module
+from _fm_helpers import _init_git_repo, load_script_module
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'audit_unverified_completion_claims.py'
@@ -1807,3 +1807,21 @@ class TestProbeBuilders:
         repo_root = SCRIPT_PATH.parents[2]
         probe = _mod._build_commit_probe({'dark_factory': str(repo_root)})
         assert probe('0' * 40, 'dark_factory') is False
+
+    async def test_commit_probe_finds_a_sha_in_another_registered_repo(
+        self, tmp_path
+    ) -> None:
+        """Sweep Class C: a reify writer naming a dark_factory commit."""
+        reify_root = tmp_path / 'reify'
+        df_root = tmp_path / 'dark_factory'
+        df_root.mkdir()
+        # A file only this repo has, so its sha is not also reify's.
+        (df_root / 'repo-name.txt').write_text('dark_factory\n')
+        reify_sha = _init_git_repo(reify_root)
+        df_sha = _init_git_repo(df_root)
+        assert df_sha != reify_sha
+
+        probe = _mod._build_commit_probe(
+            {'reify': str(reify_root), 'dark_factory': str(df_root)}
+        )
+        assert probe(df_sha, 'reify') is True
