@@ -1444,7 +1444,8 @@ def test_memory_graphs_serves_one_reconciling_memory_ops_block(client):
     assert totals['total'] == sum(block['total'])
 
 
-def test_memory_graphs_degrades_to_an_empty_block_not_a_500(client):
+def test_memory_graphs_degrades_to_the_zeroed_window_not_a_500(client):
+    """A non-DB failure serves the same 24 zeroed hours a failed DB read does."""
     with patch(
         'dashboard.app.get_memory_ops', new=AsyncMock(side_effect=RuntimeError('boom')),
     ):
@@ -1452,7 +1453,8 @@ def test_memory_graphs_degrades_to_an_empty_block_not_a_500(client):
     assert resp.status_code == 200
     block = resp.json()['MEMORY_OPS']
     assert set(block) == _MEMORY_OPS_KEYS
-    assert block['labels'] == []
+    assert len(block['labels']) == 24
+    assert block['total'] == [0] * 24
     assert block['by_operation'] == []
     assert block['totals']['total'] == 0
 

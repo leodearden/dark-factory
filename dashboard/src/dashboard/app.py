@@ -97,7 +97,7 @@ from dashboard.data.tasks import (
     fetch_tasks,
 )
 from dashboard.data.utils import safe_gather_result
-from dashboard.data.write_journal import MemoryOps, get_memory_ops
+from dashboard.data.write_journal import empty_memory_ops, get_memory_ops
 from dashboard.http_pool import reaper_loop
 from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
 from dashboard.project_dbs import _cost_dbs
@@ -959,12 +959,11 @@ async def api_memory_graphs(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.write_journal_db)
-    (ops_r,) = await asyncio.gather(get_memory_ops(db), return_exceptions=True)
-    ops = safe_gather_result(
-        ops_r,
-        MemoryOps(labels=(), reads=(), writes=(), other=(), by_operation=()),
-        'memory-graphs/ops',
-    )
+    try:
+        ops = await get_memory_ops(db)
+    except Exception:
+        logger.warning('memory-graphs: memory ops read failed', exc_info=True)
+        ops = empty_memory_ops()
     return JSONResponse(redux_api.shape_memory_graphs(ops))
 
 

@@ -337,6 +337,10 @@ class TestDataLayerErrorHandling:
         result = await get_memory_ops(no_table_conn, now=_OPS_NOW)
         assert result == _empty_ops()
 
+    def test_empty_memory_ops_is_the_window_a_failed_read_returns(self):
+        from dashboard.data.write_journal import empty_memory_ops
+        assert empty_memory_ops(now=_OPS_NOW) == _empty_ops()
+
     @pytest.mark.asyncio
     async def test_agents_returns_default_on_operational_error(self, no_table_conn):
         from dashboard.data.write_journal import get_agent_breakdown

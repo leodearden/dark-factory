@@ -93,6 +93,26 @@ class MemoryOps:
             )
 
 
+def _hour_keys(newest_hour: datetime, hours: int) -> tuple[str, ...]:
+    """The *hours* hour keys ending with *newest_hour*, oldest first."""
+    oldest_hour = newest_hour - timedelta(hours=hours - 1)
+    return tuple(
+        (oldest_hour + timedelta(hours=i)).strftime(_HOUR_KEY_FORMAT) for i in range(hours)
+    )
+
+
+def _newest_hour(now: datetime | None) -> datetime:
+    return resolve_now(now).replace(minute=0, second=0, microsecond=0)
+
+
+def empty_memory_ops(*, hours: int = 24, now: datetime | None = None) -> MemoryOps:
+    """The window :func:`get_memory_ops` reads, every bucket zero and no operations.
+
+    What :func:`get_memory_ops` returns when the journal cannot be read.
+    """
+    return _reduce_memory_ops(_hour_keys(_newest_hour(now), hours), ())
+
+
 def _reduce_memory_ops(
     hour_keys: Sequence[str], rows: Iterable[Sequence[Any]],
 ) -> MemoryOps:
@@ -136,8 +156,8 @@ async def get_memory_ops(
     row before the oldest bucket or dated in the future is in neither. (The
     two queries this replaced disagreed: the timeseries dropped the window's
     partial oldest hour and every kind outside read/write, while the
-    breakdown counted both.) On a missing DB or a query error every bucket is
-    zero and there are no operations.
+    breakdown counted both.) On a missing DB or a query error it returns
+    :func:`empty_memory_ops` for the same window.
 
     *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
     pass an explicit value for deterministic results.
@@ -168,12 +188,12 @@ async def get_memory_ops(
     the "Follow-on: α's residual is now owned (added 2026-08-02)" section of
     plans/dashboard-availability-prd.md.
     """
-    newest_hour = resolve_now(now).replace(minute=0, second=0, microsecond=0)
-    oldest_hour = newest_hour - timedelta(hours=hours - 1)
-    hour_keys = tuple(
-        (oldest_hour + timedelta(hours=i)).strftime(_HOUR_KEY_FORMAT) for i in range(hours)
+    newest_hour = _newest_hour(now)
+    hour_keys = _hour_keys(newest_hour, hours)
+    window = (
+        (newest_hour - timedelta(hours=hours - 1)).isoformat(),
+        (newest_hour + timedelta(hours=1)).isoformat(),
     )
-    window = (oldest_hour.isoformat(), (newest_hour + timedelta(hours=1)).isoformat())
 
     async def _query(db: aiosqlite.Connection) -> MemoryOps:
         try:
