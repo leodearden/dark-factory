@@ -24,6 +24,7 @@ from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.scheduler import (
+    BlastRadiusResult,
     ExternalResolverError,
     ModuleLockTable,
     Scheduler,
@@ -4761,7 +4762,7 @@ class TestBlastRadiusRefinement:
             current=['crates/reify-compiler/src/lib.rs'],
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
-        assert ok is True
+        assert ok == BlastRadiusResult(applied=True)
         # lib.rs is free for another task
         assert lt.try_acquire('2035', ['crates/reify-compiler/src/lib.rs'])
         # 936 now holds conformance.rs, not lib.rs
@@ -5262,7 +5263,7 @@ class TestBlastRadiusRequeueEmitsRelease:
         scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
     @staticmethod
-    async def _requeue(scheduler: Scheduler) -> bool:
+    async def _requeue(scheduler: Scheduler) -> BlastRadiusResult:
         return await scheduler.handle_blast_radius_expansion(
             '936',
             current=[TestBlastRadiusRequeueEmitsRelease.HELD],
@@ -5292,9 +5293,12 @@ class TestBlastRadiusRequeueEmitsRelease:
         depth = scheduler.config.lock_depth
         expected = [normalize_lock(self.HELD, depth)]
 
-        ok = await self._requeue(scheduler)
+        result = await self._requeue(scheduler)
 
-        assert ok is False
+        assert result == BlastRadiusResult(applied=False), (
+            'a healthy conflict requeue re-pends the row, so it carries no '
+            f're-pend error; got {result!r}'
+        )
         released = self._lock_released_events(scheduler)
         assert len(released) == 1, (
             'the blast-radius requeue must emit exactly one lock_released '
@@ -5358,15 +5362,21 @@ class TestBlastRadiusRequeueEmitsRelease:
         silently free locks under a running task.
         """
         self._arrange_contention(scheduler)
+        dead = RuntimeError('backend unreachable')
         scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError('backend unreachable')
+            side_effect=dead
         )
         scheduler._dispatched.add('936')
         scheduler._dispatched_priority['936'] = 'medium'
 
-        ok = await self._requeue(scheduler)
+        result = await self._requeue(scheduler)
 
-        assert ok is False
+        assert result.applied is False
+        assert result.repend_error is dead, (
+            'the dead pending write must come back as the exact error, so the '
+            'workflow can report it to its run()-exit write-failure ledger; '
+            f'got {result!r}'
+        )
         # Non-vacuity: the branch under test is only reached if the status
         # write was actually attempted (and raised) — without this the
         # still-held / still-dispatched assertions below would also pass if
@@ -5469,6 +5479,15 @@ class TestBlastRadiusRequeueEmitsRelease:
             're-dispatch straight back into the same contention; got '
             f'{scheduler._requeue_until.get("936")!r}'
         )
+
+
+class TestBlastRadiusResult:
+    @staticmethod
+    def test_applied_refinement_cannot_carry_a_repend_error():
+        """An applied refinement writes no pending row, so a re-pend error
+        alongside it is an impossible shape the type refuses."""
+        with pytest.raises(ValueError):
+            BlastRadiusResult(applied=True, repend_error=RuntimeError('x'))
 
 
 class TestBlastRadiusModuleCacheSeam:
