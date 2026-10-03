@@ -306,6 +306,36 @@ def _known_non_mem0_ids(finding: Any, run_id: str | None = None) -> set[str]:
     return excluded
 
 
+def _tombstone_wiring_gap(memory_service: Any) -> str | None:
+    """Why *memory_service* cannot answer the tombstone probe, or ``None``.
+
+    Returns ``'reader_unavailable'`` when it has no
+    ``get_mem0_deletion_tombstone`` at all, ``'ledger_unavailable'`` when the
+    reader exists but no ``recon_ledger`` is wired, and ``None`` when the probe
+    is usable. Both gaps are WIRING conditions rather than data conditions, so
+    they hold for every id a scan meets, and neither may collapse the four-way
+    split into a two-way one — see the asymmetry comment on
+    :func:`scan_prose_citations`' miss branch.
+
+    It checks USABILITY, not merely PRESENCE (reviewer finding, task 4818
+    amendment pass). ``MemoryService.get_mem0_deletion_tombstone`` is
+    documented and implemented as "fail-safe throughout": it returns ``None``
+    — never raises — on a raising ledger read, an undecodable payload, AND
+    when no ledger is wired at all. So on a ``recon_ledger_enabled=False``
+    deployment (a SUPPORTED production config, not a misconfiguration) the
+    reader would answer ``None`` for every id on earth, INDISTINGUISHABLE by
+    return value from "no tombstone exists", and a presence-only check would
+    manufacture a phantom out of every miss. Mirroring the reader's OWN guard
+    — ``getattr(self, 'recon_ledger', None)`` — is what makes the degradation
+    land on the inconclusive counter instead.
+    """
+    if getattr(memory_service, 'get_mem0_deletion_tombstone', None) is None:
+        return 'reader_unavailable'
+    if getattr(memory_service, 'recon_ledger', None) is None:
+        return 'ledger_unavailable'
+    return None
+
+
 def make_memory_resolver(
     memory_service: Any,
     project_id: str,
@@ -553,6 +583,10 @@ async def scan_prose_citations(
     NEVER raises — it returns ``None`` on a locked/corrupt ledger, on an
     undecodable payload and on no ledger at all — so a presence-only check
     would read those ``None``s as "no tombstone" and collapse the split anyway.
+    The two wiring conditions (a missing reader, an unwired ledger) are
+    per-scan facts warned ONCE per scan, and a raising reader is a per-read
+    fault warned per id; either way every affected pair still lands on
+    ``_prose_citation_verification_errors``.
 
     Two blind spots remain, and NEITHER is closable from here, because both are
     a readable ledger truthfully reporting no row:
@@ -649,52 +683,28 @@ async def scan_prose_citations(
     scanned_ids: set[str] = set()
     cap_logged = False
 
-    # Establish the tombstone reader's USABILITY once — not merely its
-    # PRESENCE (reviewer finding, task 4818 amendment pass). Both are wiring
-    # conditions rather than data conditions, and neither may collapse the
-    # four-way split into a two-way one — see the asymmetry comment on the miss
-    # branch below.
-    #
-    # Presence alone is not enough because
-    # ``MemoryService.get_mem0_deletion_tombstone`` is documented and
-    # implemented as "fail-safe throughout": it returns ``None`` — never raises
-    # — on a raising ledger read, an undecodable payload, AND when no ledger is
-    # wired at all. So on a ``recon_ledger_enabled=False`` deployment (a
-    # SUPPORTED production config, not a misconfiguration) the reader would
-    # answer ``None`` for every id on earth, and a probe-present check alone
-    # would read each of those ``None``s as "no tombstone" and manufacture a
-    # phantom out of every miss. Mirroring the reader's OWN guard —
-    # ``getattr(self, 'recon_ledger', None)`` — is what makes the degradation
-    # land on the inconclusive counter instead.
-    tombstone_reader = getattr(memory_service, 'get_mem0_deletion_tombstone', None)
-    ledger_wired = getattr(memory_service, 'recon_ledger', None) is not None
+    tombstone_wiring_gap = _tombstone_wiring_gap(memory_service)
+    wiring_gap_logged = False
 
     # Per-call memo of the tombstone probe, alongside the resolver's own memo,
     # so a missing id named by N findings costs ONE tombstone read as well as
     # ONE point read. Keeping BOTH memoised is what makes the per-finding
     # counters and warnings independent of lookup count.
-    # Values: ('tombstoned', None) | ('absent', None) | ('inconclusive', <reason>).
+    # Values: ('tombstoned', None) | ('absent', None) | ('inconclusive', <ExcTypeName>).
     tombstone_cache: dict[Any, tuple[str, str | None]] = {}
 
     async def _probe_tombstone(memory_id: Any) -> tuple[str, str | None]:
         cached = tombstone_cache.get(memory_id)
         if cached is not None:
             return cached
-        if tombstone_reader is None:
-            outcome: tuple[str, str | None] = ('inconclusive', 'reader_unavailable')
-        elif not ledger_wired:
-            # The reader exists but has nothing to read: it would short-circuit
-            # to ``None`` on its own ``recon_ledger is None`` guard, which is
-            # INDISTINGUISHABLE from "no tombstone exists" by return value
-            # alone. Refuse to draw the distinction rather than invent it.
-            outcome = ('inconclusive', 'ledger_unavailable')
+        try:
+            tombstone = await memory_service.get_mem0_deletion_tombstone(
+                project_id, memory_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            outcome: tuple[str, str | None] = ('inconclusive', type(exc).__name__)
         else:
-            try:
-                tombstone = await tombstone_reader(project_id, memory_id)
-            except Exception as exc:  # noqa: BLE001
-                outcome = ('inconclusive', type(exc).__name__)
-            else:
-                outcome = ('tombstoned', None) if tombstone else ('absent', None)
+            outcome = ('tombstoned', None) if tombstone else ('absent', None)
         tombstone_cache[memory_id] = outcome
         return outcome
 
@@ -782,6 +792,29 @@ async def scan_prose_citations(
             # the probe runs ONLY here — guarded to the miss branch exactly as
             # ``server/tools.py::get_memory_by_id`` guards it, where it "never
             # runs on the hit branch".
+            if tombstone_wiring_gap is not None:
+                stats[errors_key] += 1
+                # Warned lazily on the first affected miss, not before the
+                # loop: a scan that never misses has no gap worth reporting.
+                if not wiring_gap_logged:
+                    wiring_gap_logged = True
+                    log.warning(
+                        'reconciliation.prose_citation_tombstone_unwired: the %s '
+                        'prose scan of run_id=%s cannot read deletion tombstones '
+                        '(reason=%s); every prose miss in this scan is counted '
+                        'INCONCLUSIVE, NOT reported as fabricated (first affected '
+                        'memory_id=%s in finding=%s)',
+                        stat_prefix, run_id, tombstone_wiring_gap, memory_id,
+                        _finding_id,
+                        extra={
+                            'run_id': run_id,
+                            'stat_prefix': stat_prefix,
+                            'reason': tombstone_wiring_gap,
+                            'finding_id': _finding_id,
+                            'memory_id': memory_id,
+                        },
+                    )
+                continue
             probe, probe_reason = await _probe_tombstone(memory_id)
             if probe == 'tombstoned':
                 stats[tombstoned_key] += 1
