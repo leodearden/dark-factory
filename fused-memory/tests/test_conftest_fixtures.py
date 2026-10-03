@@ -17,16 +17,10 @@ import pytest
 from _fm_helpers import (
     extract_cypher,
     extract_params,
+    lease_dir_fixture,  # also activates the autouse lease-dir isolation here
     load_script_module,
     make_rebuild_detail,
 )
-
-# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
-#
-# Defined once in the sibling module so five importers cannot drift apart;
-# its docstring says why redirecting the directory is a hard boundary rather
-# than a convenience.  Autouse applies to every test in THIS module.
-from _fm_lease_dir_fixture import lease_dir_fixture
 
 CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
 
