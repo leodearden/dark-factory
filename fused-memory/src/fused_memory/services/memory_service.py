@@ -7100,6 +7100,7 @@ class MemoryService:
         _empty_result = not mem0_ids
         # mem0 is claimed only when it returned an id (task 4045).
         stores_written: list[SourceStore] = [] if _empty_result else [SourceStore.mem0]
+        _empty_result_error = 'empty_result: mem0 add_system_record returned zero memory_ids'
         if _empty_result and not _mem0_error:
             logger.warning(
                 'MemoryService.add_system_record: mem0 add_system_record '
@@ -7130,8 +7131,7 @@ class MemoryService:
                 success=not _empty_result,
                 error=(
                     _mem0_error if _mem0_error else
-                    ('empty_result: mem0 add_system_record returned zero memory_ids'
-                     if _empty_result else None)
+                    (_empty_result_error if _empty_result else None)
                 ),
             )
 
@@ -7163,6 +7163,8 @@ class MemoryService:
         msg = f'Memory queued for {[s.value for s in stores_written]}'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
+        elif _empty_result:
+            msg += f' [{_empty_result_error}]'
 
         return AddMemoryResponse(
             memory_ids=mem0_ids,

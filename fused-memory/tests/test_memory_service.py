@@ -700,34 +700,35 @@ class TestAddSystemRecord:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('backend_mock_kwargs', 'expected_stores', 'expect_error'),
+        ('backend_mock_kwargs', 'expected_stores', 'expected_message_suffix'),
         [
             pytest.param(
                 {'return_value': {'results': [{'id': 'sys-1'}]}},
                 [SourceStore.mem0],
-                False,
+                '',
                 id='landed',
             ),
             pytest.param(
                 {'side_effect': RuntimeError('qdrant down')},
                 [],
-                True,
+                ' [mem0_error: qdrant down]',
                 id='raised',
             ),
             pytest.param(
                 {'return_value': {'results': []}},
                 [],
-                False,
+                ' [empty_result: mem0 add_system_record returned zero memory_ids]',
                 id='zero_ids',
             ),
         ],
     )
     async def test_stores_written_and_journal_stores_reflect_mem0_outcome(
-        self, service, backend_mock_kwargs, expected_stores, expect_error,
+        self, service, backend_mock_kwargs, expected_stores, expected_message_suffix,
     ):
         """On the guaranteed-persistence system-write path, the response's
         stores_written and the journal's stores say mem0 only when Mem0
-        actually returned an id (task 4045)."""
+        actually returned an id, and every failure is named in the message
+        itself (task 4045)."""
         service.mem0.add_system_record = AsyncMock(**backend_mock_kwargs)
         mock_journal = MagicMock()
         mock_journal.log_write_op = AsyncMock()
@@ -747,8 +748,7 @@ class TestAddSystemRecord:
         assert result.stores_written == expected_stores
         journal_kwargs = mock_journal.log_write_op.call_args[1]
         assert journal_kwargs['result_summary']['stores'] == expected_store_values
-        assert result.message.startswith(f'Memory queued for {expected_store_values}')
-        assert ('mem0_error' in result.message) is expect_error
+        assert result.message == f'Memory queued for {expected_store_values}{expected_message_suffix}'
 
     # -- Amendment (task 2620 review): same task_id normalization as add_memory --
 
