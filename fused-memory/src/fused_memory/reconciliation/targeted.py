@@ -847,8 +847,7 @@ class TargetedReconciler:
                         # double-count it.  The escalation's durable records
                         # are its own JSON file plus the outcome row already
                         # written above; the run-level signal is the
-                        # result['actions'] entry.  _sweep_escalate_l1 sets the
-                        # same precedent — it journals nothing.
+                        # result['actions'] entry.
                     written = await self._fenced_add_memory(
                         content=_VERDICT_MEMORY_TEMPLATES[verification.verdict].format(
                             title=title, summary=verification.summary,
@@ -1393,12 +1392,13 @@ class TargetedReconciler:
                         'parent_id': parent_id_str,
                     }
                 elif orchestrator_live:
-                    action = self._sweep_escalate_l1(
+                    action = await self._sweep_escalate_l1(
                         task_id=tid,
                         parent_id=parent_id_str,
                         escalation_id=escalation_id,
                         is_dependent=is_dependent,
                         project_root=project_root,
+                        run_id=run_id,
                     )
                 else:
                     action = await self._sweep_block_orphan(
@@ -1664,7 +1664,7 @@ class TargetedReconciler:
             )
         return action
 
-    def _sweep_escalate_l1(
+    async def _sweep_escalate_l1(
         self,
         *,
         task_id: str,
@@ -1672,8 +1672,14 @@ class TargetedReconciler:
         escalation_id: str | None,
         is_dependent: bool,
         project_root: ProjectRoot,
+        run_id: str,
     ) -> dict | None:
-        """File an L1 escalation for an ambiguous descendant when orch is live."""
+        """File an L1 escalation for an ambiguous descendant when orch is live.
+
+        Journals the filing as write/skip under ``escalation``/``submit``,
+        symmetric with :meth:`_sweep_cancel_orphan` and
+        :meth:`_sweep_block_orphan`.
+        """
         # is-None narrows the optional types for pyright (mirrors
         # stage1_stall_detector.py:241).  HAS_ESCALATION is informational.
         if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
@@ -1717,7 +1723,27 @@ class TargetedReconciler:
                 'sweep: L1 escalate failed for orphan %s (parent %s): %s',
                 task_id, parent_id, e,
             )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'escalation', 'submit',
+                {
+                    'task_id': task_id,
+                    'parent_id': parent_id,
+                    'type': 'descendant_escalated',
+                    'error': str(e)[:200],
+                },
+                causation_id=run_id,
+            )
             return None
+        await self.journal.add_run_action(
+            run_id, 'write', 'escalation', 'submit',
+            {
+                'task_id': task_id,
+                'parent_id': parent_id,
+                'type': 'descendant_escalated',
+                'escalation_id': esc_id,
+            },
+            causation_id=run_id,
+        )
         return {
             'type': 'descendant_escalated',
             'task_id': task_id,
