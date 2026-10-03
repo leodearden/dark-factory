@@ -1975,8 +1975,12 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
         monkeypatch.setattr(nightly, '_default_census_launcher', _REAL_DEFAULT_CENSUS_LAUNCHER)
         _run_one_digest_night(tmp_path)
 
+        assert seen['launcher'] is None, (
+            'the trickle leaves the census launch to _default_census_launcher; '
+            'any launcher it injected would bypass the assertion below'
+        )
         launched = _spy_subprocess_run(monkeypatch)
-        (seen['launcher'] or nightly._default_census_launcher)(
+        nightly._default_census_launcher(
             '/some/project', caps=TrickleCensusCaps(max_batches=7),
         )
         assert launched.get('env') is None, (
