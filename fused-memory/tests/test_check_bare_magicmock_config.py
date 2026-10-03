@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import re
 import shutil
 import subprocess
 import sys
@@ -1752,6 +1753,39 @@ class TestWallClockDeadlineCrossCodeIsolation:
         assert _checker._RULE_C_CODE == 'wall-clock-deadline'
 
 
+class TestExemptionSeparatorVariants:
+    """Every rule honours every separator ``_EXEMPT_TEMPLATE`` accepts.
+
+    A uniform cross-rule pin of the exemption contract: em-dash, ASCII hyphen and a
+    repeated hyphen, for all three codes.  A future regex edit cannot then honour a
+    separator for one rule and not for another.
+    """
+
+    @pytest.mark.parametrize(
+        ('code', 'offending'),
+        [
+            ('bare-magicmock', _RULE_A_SOURCE),
+            ('bare-dataclass-double', _RULE_B_SOURCE),
+            ('wall-clock-deadline', _RULE_C_SOURCE),
+        ],
+    )
+    @pytest.mark.parametrize('separator', ['—', '-', '--'])
+    def test_the_pragma_suppresses_its_rule_with_every_separator(
+        self, code: str, offending: str, separator: str
+    ):
+        """``# noqa: <code> <sep> a reason`` on the preceding line suppresses that rule."""
+        def own(violations: list) -> list:
+            return [v for v in violations if f'# noqa: {code}' in v.message]
+
+        assert own(find_violations(offending, _NON_DEBT_FILE)), (
+            f'the offending source must trip {code} unsuppressed, or this pin is vacuous'
+        )
+        source = f'# noqa: {code} {separator} a reason\n' + offending
+        assert own(find_violations(source, _NON_DEBT_FILE)) == [], (
+            f'{code} must honour the {separator!r} separator like every other rule'
+        )
+
+
 # The Rule C census (task 4246, base 1d75322218): 618 violations across 20 files,
 # every one under orchestrator/tests/.  Counted as VIOLATIONS, not sites — one call
 # can produce two.  test_merge_speculation.py measures ZERO (task 3980 migrated it)
@@ -2307,14 +2341,31 @@ class TestRuleBCoversMergeSpeculation:
             'has been grandfathered and its file-local guard must NOT be deleted.'
         )
 
-    def test_stripping_the_pragma_makes_the_deliberate_site_flag(self):
+    @pytest.mark.parametrize('respelled', [False, True], ids=['as-written', 'ascii-hyphen'])
+    def test_stripping_the_pragma_makes_the_deliberate_site_flag(self, respelled: bool):
         """(c) The exemption is the PRAGMA, not an accident of shape matching.
 
         Without this, leg (a) is also satisfied by a deliberate site that Rule B
         simply cannot see — in which case deleting the local guard would silently
         drop coverage rather than transfer it.
+
+        Run once as written and once with the pragma's em-dash respelled as an ASCII
+        hyphen, a separator the checker equally accepts: the proof must hold for
+        every spelling of the pragma the rule honours.
         """
-        source = _merge_speculation_source()
+        original = _merge_speculation_source()
+        source = original
+        if respelled:
+            source = re.sub(r'(noqa: bare-dataclass-double) —', r'\1 -', original)
+            assert source != original, 'the respelling must actually change the pragma'
+        still_clean = [
+            v
+            for v in find_violations(source, _MERGE_SPECULATION)
+            if '_fake_verify_result' in v.message
+        ]
+        assert still_clean == [], (
+            f'the respelled pragma must still exempt the site; got {still_clean!r}'
+        )
         stripped = '\n'.join(
             line
             for line in source.splitlines()
