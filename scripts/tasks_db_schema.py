@@ -12,8 +12,9 @@ created_at``, ``no such table: tasks``, and ``'int' object has no attribute
 
 This tool therefore states no column names of its own. It introspects whatever
 store it is pointed at and prints what is actually there, which is the only
-answer that cannot rot: four hand-maintained copies of the tasks column list
-already exist in this repo and one of them is stale.
+answer that cannot rot. The hand-maintained prose copies of the tasks column
+list were collapsed onto this tool (task 5334); the few DDL copies that remain
+are deliberate SUBSET test fixtures, executed rather than read.
 
 SQLITE IS DYNAMICALLY TYPED, so the reported python type is a statement about
 AFFINITY — what a value is coerced to on the way in — and not a guarantee

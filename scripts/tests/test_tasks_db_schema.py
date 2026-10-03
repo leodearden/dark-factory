@@ -7,8 +7,8 @@ property check against a temp db built by ``scripts/tests/conftest.py``'s
 ``make_tasks_db``: the tool's report must equal what ``PRAGMA table_info``
 says about that same connection, and the python type it claims for a column
 must be the type a real insert/select actually hands back. A test that pinned
-the live tasks columns would make this suite the fifth hand-maintained copy of
-the column list — the very population the tool exists to retire.
+the live tasks columns would make this suite a hand-maintained copy of the
+column list — the very population the tool exists to retire.
 
 NOTHING HERE IMPORTS ``fused_memory.backends.sqlite_task_backend``, and that is
 deliberate rather than an oversight. It hard-imports ``aiosqlite``, which the
@@ -154,7 +154,7 @@ def test_resolve_live_db_path_refuses_a_start_outside_any_git_tree(tmp_path):
 # The tool must be right about a store it has never seen, so every expectation
 # below is derived from the SAME connection through PRAGMA table_info rather
 # than written down here. A test that spelled out the tasks columns would be
-# the fifth hand-maintained copy of them.
+# a hand-maintained copy of them.
 # ---------------------------------------------------------------------------
 
 def _arbitrary_db(tmp_path: Path) -> Path:

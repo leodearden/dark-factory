@@ -155,10 +155,13 @@ def _isolate_legibility_trickle_state(tmp_path_factory, monkeypatch):
 # ---------------------------------------------------------------------------
 # Shared tasks.db fixtures (task 3336).
 #
-# _TASKS_SCHEMA mirrors fused-memory's sqlite_task_backend.py _SCHEMA_SQL so
-# tests exercise real column shapes and NOT NULL constraints rather than
-# invented ones. It stays private to `make_tasks_db`, which executes it on
-# every use — that is the executable check, so no test asserts on the literal.
+# _TASKS_SCHEMA is a deliberate column SUBSET of
+# `fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_SCHEMA_SQL`:
+# it omits claimant_run_id, heartbeat_at and candidate_key, which no sweep
+# script reads, and keeps the real shapes and NOT NULL constraints of the rest
+# rather than invented ones. `python scripts/tasks_db_schema.py` prints the live
+# shape. It stays private to `make_tasks_db`, which executes it on every use —
+# that is the executable check, so no test asserts on the literal.
 #
 # The schema is the SUPERSET of what the three sweep-script test files used
 # privately: audit_wiped_metadata_files' copy carries `priority TEXT`, the two
