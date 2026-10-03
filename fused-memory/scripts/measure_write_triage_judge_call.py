@@ -30,6 +30,7 @@ import collections
 import importlib.util
 import json
 import sys
+import tempfile
 import time
 import types
 import uuid
@@ -88,6 +89,10 @@ _MEASUREMENT_CEILING_SECONDS = 60.0
 
 _DEFAULT_FIXTURE = _PACKAGE_ROOT / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
 _DEFAULT_REPORT_PATH = 'calibration/write_triage_judge_call_cost.json'
+_SMOKE_REPORT_NAME = 'write_triage_judge_call_cost.smoke.json'
+
+#: The call count behind the committed artifact the decision record cites.
+DEFAULT_CALLS_PER_WIDTH = 20
 
 _PROBE_PROJECT_ID = 'dark_factory'
 
@@ -230,6 +235,32 @@ def probe_provenance(service: Any, *, calls_per_width: int) -> dict[str, Any]:
     }
 
 
+def _package_path(report_path: str) -> Path:
+    path = Path(report_path)
+    return path if path.is_absolute() else _PACKAGE_ROOT / path
+
+
+def guard_committed_report(report_path: str, *, calls_per_width: int) -> Path:
+    """The path to write: *report_path*, unless a smoke run would overwrite the artifact.
+
+    The committed artifact is the :data:`DEFAULT_CALLS_PER_WIDTH` measurement
+    the decision record and PRD C1 cite. A run of any other size aimed at it
+    is redirected to a temp path with a warning, and still prints its report.
+    """
+    path = _package_path(report_path)
+    committed = _package_path(_DEFAULT_REPORT_PATH)
+    if calls_per_width == DEFAULT_CALLS_PER_WIDTH or path.resolve() != committed.resolve():
+        return path
+    redirected = Path(tempfile.gettempdir()) / _SMOKE_REPORT_NAME
+    print(
+        f'calls_per_width={calls_per_width} is not the committed '
+        f'{DEFAULT_CALLS_PER_WIDTH}-call measurement at {committed}; writing '
+        f'{redirected} instead. Pass --report-path to choose somewhere else.',
+        file=sys.stderr,
+    )
+    return redirected
+
+
 def build_report(rows: Sequence[dict[str, Any]], *, provenance: dict[str, Any]) -> dict[str, Any]:
     return {
         'provenance': provenance,
@@ -269,13 +300,15 @@ def main() -> int:
                         help='Path to fused-memory config file (sets CONFIG_PATH)')
     parser.add_argument('--fixture', default=str(_DEFAULT_FIXTURE),
                         help='JSONL whose `content` fields supply the slate prose')
-    parser.add_argument('--calls-per-width', dest='calls_per_width', type=int, default=20)
+    parser.add_argument('--calls-per-width', dest='calls_per_width', type=int,
+                        default=DEFAULT_CALLS_PER_WIDTH)
     parser.add_argument('--report-path', dest='report_path', default=_DEFAULT_REPORT_PATH,
                         help='package-relative unless absolute '
                              f'(default: {_DEFAULT_REPORT_PATH})')
     args = parser.parse_args()
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
+    report_path = guard_committed_report(args.report_path, calls_per_width=args.calls_per_width)
 
     service = types.SimpleNamespace(config=FusedMemoryConfig())
     provenance = probe_provenance(service, calls_per_width=args.calls_per_width)
@@ -286,9 +319,6 @@ def main() -> int:
         'generated_at': datetime.now(UTC).isoformat(timespec='seconds'),
         **build_report(rows, provenance=provenance),
     }
-    report_path = Path(args.report_path)
-    if not report_path.is_absolute():
-        report_path = _PACKAGE_ROOT / report_path
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report, indent=2))
     return 0

@@ -266,3 +266,33 @@ class TestProvenanceAndReport:
         report = _mod().build_report(rows, provenance={'field_chars': 4_000})
         assert [r['width'] for r in report['widths']] == [5, 10, 20]
         assert report['provenance'] == {'field_chars': 4_000}
+
+
+class TestCommittedReportGuard:
+    """Only a default-shaped run may overwrite the committed measurement."""
+
+    _COMMITTED = 'calibration/write_triage_judge_call_cost.json'
+
+    def test_a_default_run_writes_the_committed_artifact(self) -> None:
+        path = _mod().guard_committed_report(
+            self._COMMITTED, calls_per_width=_mod().DEFAULT_CALLS_PER_WIDTH,
+        )
+        assert path == SCRIPTS.parent / self._COMMITTED
+
+    @pytest.mark.parametrize('spelling', ['relative', 'absolute'])
+    def test_a_smoke_run_aimed_at_the_committed_artifact_is_redirected(
+        self, spelling: str, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        committed = SCRIPTS.parent / self._COMMITTED
+        requested = self._COMMITTED if spelling == 'relative' else str(committed)
+
+        path = _mod().guard_committed_report(requested, calls_per_width=1)
+
+        assert path.resolve() != committed.resolve()
+        assert '--report-path' in capsys.readouterr().err
+
+    def test_a_smoke_run_aimed_elsewhere_writes_where_it_was_told(
+        self, tmp_path: Path,
+    ) -> None:
+        elsewhere = tmp_path / 'smoke.json'
+        assert _mod().guard_committed_report(str(elsewhere), calls_per_width=1) == elsewhere
