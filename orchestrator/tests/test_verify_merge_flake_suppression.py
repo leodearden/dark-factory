@@ -1072,7 +1072,7 @@ class TestTruncatedSessionIsNeverSuppressed:
                 project_id='dark_factory',
                 merge_sha=_MERGE_SHA,
                 task_id='5492',
-                event_store=es,
+                event_store=es,  # type: ignore[arg-type]
             )
         )
 
