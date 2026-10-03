@@ -515,6 +515,21 @@ landed, have since landed under task 3134 (below).
 
 ### Changed
 
+#### The plan-target drop-guard judges the tip the merge commit merged, not the submitted worktree's HEAD (task 4956)
+
+- **Plan-target drop-guard** — before: the guard took the task's HEAD from the submitted
+  worktree. A worktree left on a foreign commit (a recycled lane, or a resubmit passing a
+  checkout on main) made it cite files the branch never owned, against a speculative base
+  that predated them. After: it reads the merge commit's second parent, the tip
+  `GitOps.merge_to_main` actually merged, and fails open with a WARNING when there is
+  none. Measured: reify task 6249 / `mr-f09b27f5`. Replaying the guard with task_head
+  `995f13fd` (main just after a sibling landed) against the speculative base `433ebac3`
+  reproduces exactly the two cited files; the true branch tip `238c380e` yields none.
+
+**Operator consequence.** A `Merge commit is missing plan target files` block that cites
+paths outside the task's `metadata.files` is no longer expected. Before this fix, the
+correct response to one was to resubmit unchanged.
+
 #### `consolidate_memories` lists its closure as `{id, canonical}` rows, and its step contract now numbers authorization first (task 5275)
 
 - **Projection (wire-visible).** `topic_members` rows lose `content`, `created_at` and

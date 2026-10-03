@@ -1583,7 +1583,6 @@ async def _rename_aware_real_drops(
 
 async def _check_plan_targets_in_tree(
     merge_commit_sha: str,
-    task_worktree: Path,
     git_ops: GitOps,
     main_sha: str,
     *,
@@ -1591,12 +1590,12 @@ async def _check_plan_targets_in_tree(
 ) -> DropGuardResult:
     """Return a :class:`DropGuardResult` listing files dropped by the merger.
 
-    Compares ``task_HEAD`` (the source worktree's HEAD) to the merge commit
-    directly.  A "drop" means the file is on the task tip but absent from
-    the merge commit — i.e. conflict resolution discarded work the branch
-    actually produced.  Plan-vs-tip mismatches (gitignored files listed in
-    ``plan['files']``, prereq-deleted files, amend-deleted files) are out
-    of scope for this gate; catching those belongs to verify/review.
+    Compares ``task_HEAD`` (the merge commit's second parent: the tip
+    ``GitOps.merge_to_main`` merged, never a worktree HEAD, which a recycled
+    or mis-submitted worktree can leave on a foreign commit) to the merge
+    commit.  A "drop" is a file on the task tip but absent from the merge
+    commit: conflict resolution discarded work the branch produced.  Plan-vs-tip
+    mismatches (gitignored, prereq- or amend-deleted files) belong to verify/review.
 
     The raw ``task_HEAD``-minus-``merge_commit`` diff over-flags: a clean
     merge legitimately drops a path that a *sibling* moved or deleted on
@@ -1631,18 +1630,14 @@ async def _check_plan_targets_in_tree(
     flagging a phantom drop on a transient git error is worse than missing
     a real one.  Loud-log so regressions surface in ops.
     """
-    rc, head_out, head_err = await _run(
-        ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
-    )
-    if rc != 0:
+    task_head = await _resolve_second_parent(git_ops, merge_commit_sha)
+    if task_head is None:
         logger.warning(
-            'drop-guard: git rev-parse HEAD failed in %s (rc=%d, stderr=%s); '
-            'failing open. task_id=%s merge_commit_sha=%s',
-            task_worktree, rc, head_err.strip(),
-            task_id or '<unknown>', merge_commit_sha,
+            'drop-guard: merge commit %s has no readable second parent (not a '
+            '--no-ff merge of a branch); failing open. task_id=%s',
+            merge_commit_sha, task_id or '<unknown>',
         )
         return DropGuardResult()
-    task_head = head_out.strip()
 
     # Shared baseline: what the branch and main diverged from.  Subtracting
     # main-side change below is anchored here.

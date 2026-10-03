@@ -42,6 +42,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _live_merge_worker import running_merge_worker
 from _orch_helpers import make_placeholder_future, wait_responsive
+from _resolution_merges import resolution_merge
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -653,13 +654,12 @@ class TestClassifyAndMergeSpeculativeWorker:
 
         worktree = (await git_ops.create_worktree('drop-guard-cm-1')).path
         (worktree / 'retained.py').write_text('retained = 1\n')
-        await git_ops.commit(worktree, 'Add retained')
-        rc, pre_drop_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
-        assert rc == 0
-        pre_drop_sha = pre_drop_sha.strip()
+        pre_drop_sha = await git_ops.commit(worktree, 'Add retained')
+        assert pre_drop_sha
 
         (worktree / 'dropped.py').write_text('dropped = 1\n')
-        await git_ops.commit(worktree, 'Add dropped')
+        task_tip = await git_ops.commit(worktree, 'Add dropped')
+        assert task_tip
 
         artifacts = TaskArtifacts(worktree)
         artifacts.init('drop-guard-cm-1', 'Drop guard cm', 'desc')
@@ -669,11 +669,17 @@ class TestClassifyAndMergeSpeculativeWorker:
             'steps': [],
         })
 
+        main_sha = await git_ops.get_main_sha()
+        merge_sha = await resolution_merge(
+            git_ops.project_root, main_sha=main_sha,
+            branch_tip=task_tip, kept_tree_of=pre_drop_sha,
+        )
+
         async def _fake_merge_to_main(*_args, **_kwargs) -> MergeResult:
             return MergeResult(
                 success=True,
-                merge_commit=pre_drop_sha,
-                pre_merge_sha=pre_drop_sha,
+                merge_commit=merge_sha,
+                pre_merge_sha=main_sha,
                 merge_worktree=None,
             )
 
@@ -683,7 +689,6 @@ class TestClassifyAndMergeSpeculativeWorker:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
         req = _make_request('drop-guard-cm-1', 'drop-guard-cm-1', worktree, config)
-        main_sha = await git_ops.get_main_sha()
 
         result = await classify_and_merge(
             worker, req, main_sha, speculative=False, started_monotonic=time.monotonic(),
@@ -833,7 +838,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         captured_base_shas: list[str] = []
 
         async def _spy_check_plan_targets(
-            merge_commit_sha, task_worktree, git_ops_arg, main_sha, *, task_id=None,
+            merge_commit_sha, git_ops_arg, main_sha, *, task_id=None,
         ):
             captured_base_shas.append(main_sha)
             return DropGuardResult(dropped=[])
@@ -945,31 +950,34 @@ class TestPathEquivalence:
             async def _make_drop_guard_branch(name: str) -> tuple[Path, str]:
                 wt = (await git_ops.create_worktree(name)).path
                 (wt / 'retained.py').write_text('retained = 1\n')
-                await git_ops.commit(wt, 'Add retained')
-                rc, pre_drop_sha, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=wt)
-                assert rc == 0
-                pre_drop_sha = pre_drop_sha.strip()
+                pre_drop_sha = await git_ops.commit(wt, 'Add retained')
+                assert pre_drop_sha
                 (wt / 'dropped.py').write_text('dropped = 1\n')
-                await git_ops.commit(wt, 'Add dropped')
+                task_tip = await git_ops.commit(wt, 'Add dropped')
+                assert task_tip
                 artifacts = TaskArtifacts(wt)
                 artifacts.init(name, 'Drop guard eq', 'desc')
                 artifacts.write_plan({
                     'files': ['retained.py', 'dropped.py'], 'modules': [], 'steps': [],
                 })
-                return wt, pre_drop_sha
+                return wt, await resolution_merge(
+                    git_ops.project_root, main_sha=await git_ops.get_main_sha(),
+                    branch_tip=task_tip, kept_tree_of=pre_drop_sha,
+                )
 
             wt_m, sha_m = await _make_drop_guard_branch('eq-drop-merger')
             wt_r, sha_r = await _make_drop_guard_branch('eq-drop-remerge')
             merger_req = _make_request('eq-drop-merger', 'eq-drop-merger', wt_m, config)
             remerge_req = _make_request('eq-drop-remerge', 'eq-drop-remerge', wt_r, config)
+            main_sha = await git_ops.get_main_sha()
             # task ν: classify_and_merge calls merge_to_main with req.branch.full_name
             # (prefixed), so key the injection by full_name, not the bare id.
             fake_results = {
                 merger_req.branch.full_name: MergeResult(
-                    success=True, merge_commit=sha_m, pre_merge_sha=sha_m, merge_worktree=None,
+                    success=True, merge_commit=sha_m, pre_merge_sha=main_sha, merge_worktree=None,
                 ),
                 remerge_req.branch.full_name: MergeResult(
-                    success=True, merge_commit=sha_r, pre_merge_sha=sha_r, merge_worktree=None,
+                    success=True, merge_commit=sha_r, pre_merge_sha=main_sha, merge_worktree=None,
                 ),
             }
 
@@ -1062,3 +1070,114 @@ class TestPathEquivalence:
             if _item_wt is not None:
                 with contextlib.suppress(Exception):
                     await git_ops.cleanup_merge_worktree(_item_wt)
+
+
+# ---------------------------------------------------------------------------
+# Task 4956: the drop-guard judges the branch the merge commit actually
+# merged, never whatever commit the submitted worktree's HEAD sits on.
+# ---------------------------------------------------------------------------
+
+
+async def _head_sha(cwd: Path) -> str:
+    rc, out, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=cwd)
+    assert rc == 0, err
+    return out.strip()
+
+
+async def _has_object(git_ops: GitOps, spec: str) -> bool:
+    rc, _, _ = await _run(['git', 'cat-file', '-e', spec], cwd=git_ops.project_root)
+    return rc == 0
+
+
+async def _land_on_main(git_ops: GitOps, files: dict[str, str], message: str) -> str:
+    root = git_ops.project_root
+    for rel, content in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(content)
+    await _run(['git', 'add', '--', *files], cwd=root)
+    rc, _, err = await _run(['git', 'commit', '-m', message], cwd=root)
+    assert rc == 0, err
+    return await git_ops.get_main_sha()
+
+
+async def _commit_victim(git_ops: GitOps, name: str) -> str:
+    worktree = (await git_ops.create_worktree(name)).path
+    (worktree / 'victim.py').write_text(
+        'def victim_feature(rows):\n    return sorted(set(rows))\n',
+    )
+    victim_tip = await git_ops.commit(worktree, 'Victim: add victim.py')
+    assert victim_tip
+    return victim_tip
+
+
+def _decided_reason(result: MergedOk | Decided) -> str | None:
+    return result.outcome.reason if isinstance(result, Decided) else None
+
+
+@pytest.mark.asyncio
+class TestDropGuardJudgesTheMergedBranch:
+    """The guard's subject is the tip the merge commit merged (task 4956)."""
+
+    async def test_foreign_head_in_submitted_worktree_does_not_supply_drop_targets(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Reify task 6249 / mr-f09b27f5: a speculative merge onto a
+        never-landed base, submitted with a reused worktree whose HEAD sits
+        on main after a sibling landed there.  The sibling's files are on
+        that HEAD and absent from the base, but the branch never owned them,
+        so the merge dropped nothing."""
+        from orchestrator.merge_lane.worker import classify_and_merge
+
+        victim_tip = await _commit_victim(git_ops, 'victim')
+
+        pred_wt = (await git_ops.create_worktree('pred')).path
+        (pred_wt / 'pred.py').write_text('PREDECESSOR_FLAG = True\n')
+        spec_base = await git_ops.commit(pred_wt, 'Predecessor: add pred.py')
+        assert spec_base
+
+        main_sha = await _land_on_main(git_ops, {
+            'sibling_test.py': (
+                'import unittest\n\n\n'
+                'class SiblingTest(unittest.TestCase):\n'
+                '    def test_columns(self):\n'
+                '        self.assertEqual(len([1, 2, 3]), 3)\n'
+            ),
+            'fixtures/sibling.txt': 'jacobian column member fixture\n',
+        }, 'Sibling lands its test and fixture')
+
+        reused = git_ops.worktree_base / '_reused-lane'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(reused), 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        result: MergedOk | Decided | None = None
+        try:
+            assert await _has_object(git_ops, f'{await _head_sha(reused)}:sibling_test.py')
+            assert not await _has_object(git_ops, f'{victim_tip}:sibling_test.py')
+            assert not await git_ops.is_ancestor(spec_base, main_sha)
+            assert not await git_ops.is_ancestor(main_sha, spec_base)
+
+            queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+            worker = SpeculativeMergeWorker(
+                git_ops, queue, event_store=_make_event_store(tmp_path),
+            )
+            req = _make_request('victim', 'victim', reused, config)
+            req.snapshot_tip = victim_tip
+
+            result = await classify_and_merge(
+                worker, req, spec_base, speculative=True,
+                started_monotonic=time.monotonic(),
+            )
+
+            assert isinstance(result, MergedOk), _decided_reason(result)
+            merge_commit = result.merge_result.merge_commit
+            assert merge_commit is not None
+            assert await _has_object(git_ops, f'{merge_commit}:victim.py')
+        finally:
+            if isinstance(result, MergedOk) and result.merge_wt:
+                await git_ops.cleanup_merge_worktree(result.merge_wt)
+            await _run(
+                ['git', 'worktree', 'remove', '--force', str(reused)],
+                cwd=git_ops.project_root,
+            )

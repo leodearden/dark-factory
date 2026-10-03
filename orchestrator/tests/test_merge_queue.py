@@ -39,6 +39,7 @@ from _orch_helpers import (
     pydantic_spec,
     wait_responsive,
 )
+from _resolution_merges import resolution_merge
 from test_merge_queue_concurrent_verify import _fake_verify_result
 
 from orchestrator.artifacts import TaskArtifacts
@@ -294,7 +295,7 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.merge_commit is not None
         try:
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, worktree, git_ops,
+                merge_result.merge_commit, git_ops,
                 await git_ops.get_main_sha(),
             )
             missing = result.dropped
@@ -331,7 +332,7 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.merge_commit is not None
         try:
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, worktree, git_ops,
+                merge_result.merge_commit, git_ops,
                 await git_ops.get_main_sha(),
             )
             missing = result.dropped
@@ -374,7 +375,7 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.merge_commit is not None
         try:
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, worktree, git_ops,
+                merge_result.merge_commit, git_ops,
                 await git_ops.get_main_sha(),
             )
             missing = result.dropped
@@ -390,23 +391,19 @@ class TestCheckPlanTargetsInTree:
 
         Simulates the real failure mode the guard was built for: conflict
         resolution accepts origin and drops a file the task branch
-        produced. We synthesise the detector input by pointing the
-        `merge_commit_sha` at an earlier task-branch commit that predates
-        the addition of the dropped file — it has the retained file but
-        not the dropped one, matching what a bad conflict resolution would
-        have produced.
+        produced. The merge commit merges the task tip into main but keeps
+        the tree of an earlier task-branch commit that predates the dropped
+        file — it has the retained file but not the dropped one, matching
+        what a bad conflict resolution would have produced.
         """
         worktree = (await git_ops.create_worktree('plan-dropped')).path
         (worktree / 'retained.py').write_text('retained = 1\n')
-        await git_ops.commit(worktree, 'Add retained')
-        rc, pre_drop_sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
-        )
-        assert rc == 0
-        pre_drop_sha = pre_drop_sha.strip()
+        pre_drop_sha = await git_ops.commit(worktree, 'Add retained')
+        assert pre_drop_sha
 
         (worktree / 'dropped.py').write_text('dropped = 1\n')
-        await git_ops.commit(worktree, 'Add dropped')
+        task_tip = await git_ops.commit(worktree, 'Add dropped')
+        assert task_tip
 
         artifacts = TaskArtifacts(worktree)
         artifacts.init('t2c', 'T2c', 'desc')
@@ -416,13 +413,16 @@ class TestCheckPlanTargetsInTree:
             'steps': [],
         })
 
-        # pre_drop_sha has retained.py but not dropped.py, and task HEAD
-        # has both — so only dropped.py should be flagged as a merge drop.
-        # Pass the worktree's real main base: dropped.py is in branch_changed
+        # The resolution kept pre_drop_sha's tree: retained.py but not
+        # dropped.py, while the task tip has both — so only dropped.py
+        # should be flagged.  dropped.py is in branch_changed
         # (base..task_head AM), so it survives the main-side subtraction.
-        result = await _check_plan_targets_in_tree(
-            pre_drop_sha, worktree, git_ops, await git_ops.get_main_sha(),
+        main_sha = await git_ops.get_main_sha()
+        merge_sha = await resolution_merge(
+            git_ops.project_root, main_sha=main_sha,
+            branch_tip=task_tip, kept_tree_of=pre_drop_sha,
         )
+        result = await _check_plan_targets_in_tree(merge_sha, git_ops, main_sha)
         missing = result.dropped
         assert missing == ['dropped.py']
 
@@ -498,7 +498,7 @@ class TestCheckPlanTargetsInTree:
             # tip: contested.py is in branch_changed (the branch added it), so
             # it survives the main-side subtraction and stays flagged.
             result = await _check_plan_targets_in_tree(
-                merge_sha, worktree, git_ops, await git_ops.get_main_sha(),
+                merge_sha, git_ops, await git_ops.get_main_sha(),
             )
             missing = result.dropped
             assert missing == ['contested.py']
@@ -522,7 +522,7 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.merge_commit is not None
         try:
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, worktree, git_ops,
+                merge_result.merge_commit, git_ops,
                 await git_ops.get_main_sha(),
             )
             missing = result.dropped
@@ -543,24 +543,25 @@ class TestCheckPlanTargetsInTree:
         """
         worktree = (await git_ops.create_worktree('struct-warn-drop')).path
         (worktree / 'retained.py').write_text('retained = 1\n')
-        await git_ops.commit(worktree, 'Add retained.py')
-        rc, pre_drop_sha_out, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
-        )
-        assert rc == 0
-        pre_drop_sha = pre_drop_sha_out.strip()
+        pre_drop_sha = await git_ops.commit(worktree, 'Add retained.py')
+        assert pre_drop_sha
 
-        # Add the dropped file so it's on task HEAD but not on pre_drop_sha
-        # — pre_drop_sha plays the role of a merge commit that lost the file.
+        # Add the dropped file so it's on the task tip but not on
+        # pre_drop_sha, whose tree the resolution merge below keeps.
         (worktree / 'dropped.py').write_text('dropped = 1\n')
-        await git_ops.commit(worktree, 'Add dropped.py')
+        task_tip = await git_ops.commit(worktree, 'Add dropped.py')
+        assert task_tip
+        main_sha = await git_ops.get_main_sha()
+        merge_sha = await resolution_merge(
+            git_ops.project_root, main_sha=main_sha,
+            branch_tip=task_tip, kept_tree_of=pre_drop_sha,
+        )
 
         # ── Sub-case 1: dropped is non-empty → structured WARNING ──────────
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             result = await _check_plan_targets_in_tree(
-                pre_drop_sha, worktree, git_ops, await git_ops.get_main_sha(),
-                task_id='warn-test',
+                merge_sha, git_ops, main_sha, task_id='warn-test',
             )
         assert result.dropped == ['dropped.py'], (
             f'Unexpected dropped: {result.dropped!r}'
@@ -572,7 +573,7 @@ class TestCheckPlanTargetsInTree:
         assert 'warn-test' in all_messages, (
             f'Expected task_id "warn-test" in WARNING; got: {all_messages!r}'
         )
-        assert pre_drop_sha in all_messages or pre_drop_sha[:12] in all_messages, (
+        assert merge_sha in all_messages or merge_sha[:12] in all_messages, (
             f'Expected merge_commit_sha in WARNING; got: {all_messages!r}'
         )
         assert 'dropped.py' in all_messages, (
@@ -591,7 +592,7 @@ class TestCheckPlanTargetsInTree:
             caplog.clear()
             with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
                 result2 = await _check_plan_targets_in_tree(
-                    merge_result2.merge_commit, worktree2, git_ops,
+                    merge_result2.merge_commit, git_ops,
                     await git_ops.get_main_sha(),
                     task_id='warn-test-empty',
                 )
@@ -650,7 +651,7 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.merge_commit is not None
         try:
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, worktree, git_ops,
+                merge_result.merge_commit, git_ops,
                 await git_ops.get_main_sha(),
                 task_id='drop-gitignore',
             )
@@ -715,7 +716,7 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.merge_commit is not None
         try:
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, worktree, git_ops,
+                merge_result.merge_commit, git_ops,
                 await git_ops.get_main_sha(),
                 task_id='drop-branch-del',
             )
@@ -780,7 +781,7 @@ class TestCheckPlanTargetsInTree:
         assert merge_result.merge_commit is not None
         try:
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, worktree, git_ops,
+                merge_result.merge_commit, git_ops,
                 await git_ops.get_main_sha(),
                 task_id='drop-amend-del',
             )
@@ -850,7 +851,7 @@ class TestCheckPlanTargetsInTree:
             )
 
             result = await _check_plan_targets_in_tree(
-                merge_result.merge_commit, worktree, git_ops, main_sha,
+                merge_result.merge_commit, git_ops, main_sha,
                 task_id='sibling-move',
             )
             assert result.dropped == [], (
@@ -874,7 +875,8 @@ class TestCheckPlanTargetsInTree:
         """
         worktree = (await git_ops.create_worktree('genuine-drop')).path
         (worktree / 'feature.py').write_text('feature = 1\n')
-        await git_ops.commit(worktree, 'Branch: add feature.py')
+        task_tip = await git_ops.commit(worktree, 'Branch: add feature.py')
+        assert task_tip
 
         # Main moves ahead AFTER the fork (unrelated file) so merge-base is a
         # real ancestor rather than main's tip.
@@ -886,26 +888,59 @@ class TestCheckPlanTargetsInTree:
         )
         main_sha = await git_ops.get_main_sha()
 
-        # Synthetic merge commit = main's tip: the branch's only file never
+        # The resolution kept main's tree: the branch's only file never
         # landed (a resolution that dropped feature.py entirely).
+        merge_sha = await resolution_merge(
+            git_ops.project_root, main_sha=main_sha,
+            branch_tip=task_tip, kept_tree_of=main_sha,
+        )
         result = await _check_plan_targets_in_tree(
-            main_sha, worktree, git_ops, main_sha, task_id='genuine-drop',
+            merge_sha, git_ops, main_sha, task_id='genuine-drop',
         )
         assert result.dropped == ['feature.py']
 
     async def test_drop_guard_fails_open_on_bad_main_sha(
-        self, git_ops: GitOps,
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
     ):
         """A merge-base failure (bogus main_sha) fails open → no drops flagged."""
         worktree = (await git_ops.create_worktree('failopen-drop')).path
         (worktree / 'f.py').write_text('f = 1\n')
-        await git_ops.commit(worktree, 'Add f.py')
-
-        result = await _check_plan_targets_in_tree(
-            await git_ops.get_main_sha(), worktree, git_ops,
-            'definitely-not-a-ref', task_id='failopen-drop',
+        task_tip = await git_ops.commit(worktree, 'Add f.py')
+        assert task_tip
+        merge_sha = await resolution_merge(
+            git_ops.project_root, main_sha=await git_ops.get_main_sha(),
+            branch_tip=task_tip, kept_tree_of=task_tip,
         )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_targets_in_tree(
+                merge_sha, git_ops, 'definitely-not-a-ref', task_id='failopen-drop',
+            )
         assert result.dropped == []
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any('merge-base' in m and 'failing open' in m for m in warnings), warnings
+
+    async def test_drop_guard_fails_open_when_merge_commit_has_no_second_parent(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """A single-parent commit names no merged tip → WARNING, fail open."""
+        worktree = (await git_ops.create_worktree('no-second-parent')).path
+        (worktree / 'f.py').write_text('f = 1\n')
+        single_parent_tip = await git_ops.commit(worktree, 'Add f.py')
+        assert single_parent_tip
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_targets_in_tree(
+                single_parent_tip, git_ops, await git_ops.get_main_sha(),
+                task_id='no-second-parent',
+            )
+
+        assert result.dropped == []
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'second parent' in m and 'failing open' in m and 'no-second-parent' in m
+            for m in warnings
+        ), warnings
 
 
 @pytest.mark.asyncio
@@ -1367,15 +1402,12 @@ class TestMergeLaneSingleRequest:
         """
         worktree = (await git_ops.create_worktree('drop-guard-real')).path
         (worktree / 'retained.py').write_text('retained = 1\n')
-        await git_ops.commit(worktree, 'Add retained')
-        rc, pre_drop_sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
-        )
-        assert rc == 0
-        pre_drop_sha = pre_drop_sha.strip()
+        pre_drop_sha = await git_ops.commit(worktree, 'Add retained')
+        assert pre_drop_sha
 
         (worktree / 'dropped.py').write_text('dropped = 1\n')
-        await git_ops.commit(worktree, 'Add dropped')
+        task_tip = await git_ops.commit(worktree, 'Add dropped')
+        assert task_tip
 
         artifacts = TaskArtifacts(worktree)
         artifacts.init('drop-guard-real', 'Drop guard real', 'desc')
@@ -1388,14 +1420,21 @@ class TestMergeLaneSingleRequest:
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         lane = make_lane(git_ops, queue)
 
-        # Point the "merge commit" at a task-branch SHA that predates the
-        # addition of dropped.py. The real detector sees dropped.py on task
-        # HEAD but absent from that tree → flags it as a drop.
+        # The "merge commit" merges the task tip into main but keeps the tree
+        # of a task-branch commit that predates dropped.py. The real detector
+        # sees dropped.py on the merged tip but absent from that tree → flags
+        # it as a drop.
+        main_sha = await git_ops.get_main_sha()
+        merge_sha = await resolution_merge(
+            git_ops.project_root, main_sha=main_sha,
+            branch_tip=task_tip, kept_tree_of=pre_drop_sha,
+        )
+
         async def _fake_merge_to_main(*_args: Any, **_kwargs: Any) -> MergeResult:
             return MergeResult(
                 success=True,
-                merge_commit=pre_drop_sha,
-                pre_merge_sha=pre_drop_sha,
+                merge_commit=merge_sha,
+                pre_merge_sha=main_sha,
                 merge_worktree=None,
             )
 

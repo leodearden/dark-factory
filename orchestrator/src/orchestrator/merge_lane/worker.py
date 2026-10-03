@@ -5917,7 +5917,7 @@ async def classify_and_merge(
         assert merge_result.merge_commit is not None
         merge_commit = merge_result.merge_commit.strip()
         drop_result = await _check_plan_targets_in_tree(
-            merge_commit, req.worktree, git_ops, base_sha, task_id=req.task_id,
+            merge_commit, git_ops, base_sha, task_id=req.task_id,
         )
         if drop_result.dropped:
             if merge_result.merge_worktree:
