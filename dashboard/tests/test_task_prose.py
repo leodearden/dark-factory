@@ -351,7 +351,7 @@ class TestFetchTask:
     async def test_the_timeout_reaches_the_post_as_the_per_request_budget(
         self, tmp_path, kwargs, expected,
     ):
-        """AsyncMock, as test_tasks.py does: MockTransport never sees the kwarg."""
+        """AsyncMock, as test_tasks_read_record.py::TestFetchTasksNarrowing does: MockTransport never sees the kwarg."""
         root, config = _project(tmp_path, _URL_1)
         mock_mcp = AsyncMock(return_value=_RAW_ROW)
 

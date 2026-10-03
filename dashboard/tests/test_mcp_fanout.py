@@ -926,9 +926,9 @@ class TestTTLCacheCallableTTLExpiry:
         """Proves the mechanism fetch_tasks relies on for its runtime monkeypatch.
 
         _FETCH_TASKS_TTL_SECONDS is monkeypatched at runtime in
-        test_tasks.py::test_fetch_tasks_ttl_expiry_refetches; TTLCache must
-        resolve a callable ttl_seconds at each freshness check (not once at
-        construction) for that to keep working.
+        test_tasks_cached_fanout.py::TestFetchTasksCache::test_fetch_tasks_ttl_expiry_refetches;
+        TTLCache must resolve a callable ttl_seconds at each freshness check
+        (not once at construction) for that to keep working.
         """
         ttl_box = {'v': 60.0}
         cache = TTLCache(ttl_seconds=lambda: ttl_box['v'])
