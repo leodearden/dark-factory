@@ -794,6 +794,30 @@ class _StubScheduler:
         return self.return_value
 
 
+def _jsonrpc_body(inner_result: dict) -> dict:
+    return {'jsonrpc': '2.0', 'id': 1, 'result': inner_result}
+
+
+def _mcp_is_error_body(tool: str) -> dict:
+    """FastMCP's refusal of a tool call (e.g. argument validation): prose, not JSON,
+    flagged by ``isError``."""
+    return _jsonrpc_body({
+        'content': [{'type': 'text', 'text': f'Error executing tool {tool}: boom'}],
+        'isError': True,
+    })
+
+
+_JSONRPC_PROTOCOL_ERROR = {
+    'jsonrpc': '2.0', 'id': 1, 'error': {'code': -32602, 'message': 'Invalid params'},
+}
+
+# fused-memory's structured tool error (server/tool_errors.py::mcp_tool_errors), plus a
+# key that is not part of the server's text, so the key-name report stays observable.
+_GET_STATUSES_REFUSAL = {
+    'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError', 'request_id': 'r-1',
+}
+
+
 class TestSchedulerChronicFlakeTaskClient:
     """``SchedulerChronicFlakeTaskClient``: the concrete adapter over a
     duck-typed scheduler exposing ``dispatch_tool`` — mirrors
@@ -1054,6 +1078,37 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         statuses, error = await client.get_statuses(['42'])
         assert statuses == {}
         assert error is raised
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [mcp_tool_envelope(_GET_STATUSES_REFUSAL), _GET_STATUSES_REFUSAL],
+        ids=['production_jsonrpc_body', 'legacy_bare_payload'],
+    )
+    async def test_get_statuses_refusal_carries_the_servers_text_and_the_key_names(
+        self, envelope,
+    ):
+        """The server's own account of a refusal survives into the error, beside the
+        envelope key names, which stay the diagnosis when the SHAPE is the problem."""
+        _, client = await self._client(envelope)
+        statuses, error = await client.get_statuses(['42'])
+        assert statuses == {}
+        assert 'taskmaster unavailable' in str(error)
+        assert 'TaskmasterError' in str(error)
+        assert 'request_id' in str(error)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('envelope', 'server_text'),
+        [(_mcp_is_error_body('get_statuses'), 'boom'), (_JSONRPC_PROTOCOL_ERROR, 'Invalid params')],
+        ids=['mcp_is_error', 'jsonrpc_protocol_error'],
+    )
+    async def test_get_statuses_failure_carries_the_servers_text(self, envelope, server_text):
+        _, client = await self._client(envelope)
+        statuses, error = await client.get_statuses(['42'])
+        assert statuses == {}
+        assert server_text in str(error)
+
     # ── commit_planning ───────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
@@ -1148,6 +1203,52 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         assert arguments == {'title': 't'}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('envelope', 'server_text'),
+        [
+            (
+                mcp_tool_envelope({'error': 'backlog full', 'error_type': 'BacklogFullError'}),
+                'backlog full',
+            ),
+            (_mcp_is_error_body('submit_task'), 'boom'),
+        ],
+        ids=['structured_refusal', 'mcp_is_error'],
+    )
+    async def test_a_refused_submit_task_logs_the_servers_text_once(
+        self, envelope, server_text, caplog,
+    ):
+        """The refusal behind a ledger row with NO OWNER.  ``''`` still means a failed
+        filing, so control flow is unchanged, but the server's reason is no longer
+        dropped with it: the adapter is the only layer that holds the raw response."""
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.submit_task({'title': 't'}) == ''
+        records = [r for r in caplog.records if r.name == 'orchestrator.chronic_flake']
+        assert [r.levelno for r in records] == [logging.WARNING], [
+            r.getMessage() for r in records
+        ]
+        assert server_text in records[0].getMessage()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope({'task_id': '4242', 'status': 'deferred'}),
+            mcp_tool_envelope({'ticket': 'tkt_abc'}),
+        ],
+        ids=['planning_mode_task_id', 'two_phase_ticket'],
+    )
+    async def test_a_successful_submit_task_is_SILENT(self, envelope, caplog):
+        """The negative control for the refusal warning above, as
+        ``test_commit_planning_is_SILENT_on_success`` is for commit_planning's."""
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.submit_task({'title': 't'})
+        assert [r for r in caplog.records if r.name == 'orchestrator.chronic_flake'] == [], (
+            [r.getMessage() for r in caplog.records]
+        )
+
+    @pytest.mark.asyncio
     async def test_chronic_flakes_own_block_reaches_the_wire_unchanged(self):
         """Regression guard on the shared path: chronic_flake's own builder sets
         ``project_root`` explicitly, so the injection must be a no-op for it."""
@@ -1181,10 +1282,6 @@ class _CannedMcpSession:
         return self.body
 
 
-def _jsonrpc_body(inner_result: dict) -> dict:
-    return {'jsonrpc': '2.0', 'id': 1, 'result': inner_result}
-
-
 class TestGetStatusesHasOneParser:
     """The adapter and ``scheduler.py::Scheduler.get_statuses`` read one tool's answer,
     so they must agree on every JSON-RPC body the transport and the eval stub emit.
@@ -1212,11 +1309,8 @@ class TestGetStatusesHasOneParser:
             }),
             mcp_tool_envelope({'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}),
             mcp_tool_envelope({'statuses': ['not', 'a', 'dict']}),
-            _jsonrpc_body({
-                'content': [{'type': 'text', 'text': 'Error executing tool get_statuses: boom'}],
-                'isError': True,
-            }),
-            {'jsonrpc': '2.0', 'id': 1, 'error': {'code': -32602, 'message': 'Invalid params'}},
+            _mcp_is_error_body('get_statuses'),
+            _JSONRPC_PROTOCOL_ERROR,
         ],
         ids=[
             'known_id',
@@ -1365,6 +1459,24 @@ class TestSchedulerClientReadsOneTaskLive:
         task, error = await client.get_task('7')
         assert task is None
         assert isinstance(error, Exception)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('envelope', 'server_text'),
+        [
+            (
+                mcp_tool_envelope({'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}),
+                'taskmaster unavailable',
+            ),
+            (_mcp_is_error_body('get_task'), 'boom'),
+        ],
+        ids=['other_error_type', 'mcp_is_error'],
+    )
+    async def test_a_failed_read_carries_the_servers_text(self, envelope, server_text):
+        _, client = await self._client(envelope)
+        task, error = await client.get_task('7')
+        assert task is None
+        assert server_text in str(error)
 
     @pytest.mark.asyncio
     async def test_a_raising_dispatch_is_reported_not_raised(self):
