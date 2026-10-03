@@ -4396,16 +4396,8 @@ class TaskKnowledgeSync(BaseStage):
                 f'{overflow_note}'
             )
 
-        # Live-Workflow Signals section: check active tasks for live workflows so the
-        # Stage 2 LLM can skip set_task_status / stranded-work escalation for those tasks.
-        # Only active tasks are inspected (done/cancelled tasks cannot have live workflows).
-        # Empty string when no active tasks are live (keeps the payload tight).
-        live_workflow_section = ''
-        if filtered.active_tasks:
-            live_workflow_section = await render_live_workflow_section(
-                filtered.active_tasks,
-                self.scope.project_root,
-            )
+        # Inference-bearing sections (see REQUIRED_SECTIONS), bound here so their probes run first.
+        required_sections = await self._render_required_sections(filtered)
 
         # Call render_active_section once to get both the visible-task list (for
         # hint-attention slice-then-filter below) and the fully assembled Active
@@ -4731,7 +4723,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Recently Completed Tasks
 {recently_completed_text}
-{provenance_section}{proactive_sample_section}{done_audit_section}{hint_conversion_section}{live_workflow_section}
+{provenance_section}{proactive_sample_section}{done_audit_section}{hint_conversion_section}{required_sections}
 
 ## Your Task
 Reconcile task state against memory:
