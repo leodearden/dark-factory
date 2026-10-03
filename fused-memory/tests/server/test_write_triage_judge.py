@@ -1973,7 +1973,7 @@ class TestAReasoningEffortTheArmCannotSendRaises:
                 content='c', project_id='p',
                 decision=_decision('m1'), candidates=[_result('m1', 0.80)],
             )
-        built.assert_not_called()
+        assert built.call_count == 0
         client.messages.create.assert_not_awaited()
         client.chat.completions.create.assert_not_awaited()
         client.responses.create.assert_not_awaited()
