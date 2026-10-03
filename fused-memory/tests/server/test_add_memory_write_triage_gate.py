@@ -1057,8 +1057,11 @@ class TestC1HoldsEndToEnd:
         the one a reasonable implementation is most tempted to act on — by
         editing, retracting or flagging the parent record itself. Triage
         DETECTS, it does not adjudicate (D3): the contradiction is recorded as
-        a flagged child and the canonical is left exactly as it was, for the
-        existing gate machinery and a human to settle.
+        a flagged child and the canonical is left exactly as it was. Nothing
+        adjudicates that child; its readers surface it, as grouped_read keeps
+        it a full search hit and
+        `orchestrator/src/orchestrator/agents/memory_recall.py::render_memory_results`
+        renders it in the briefing naming its parent.
         """
         _install_counter(monkeypatch)
         scenarios = [
@@ -1772,8 +1775,11 @@ class TestAContestedVerdictLandsAsAFlaggedAmendmentChild:
 
     The judge DETECTS a contradiction; it does not adjudicate one (D3). So a
     contested write lands as a child carrying the full submitted text, flagged
-    with `grouped_read.CONTESTED_METADATA_KEY` for the gate machinery that
-    already reads that flag — and the canonical it contradicts is not touched.
+    with `grouped_read.CONTESTED_METADATA_KEY` for the readers that surface it
+    (`fused-memory/src/fused_memory/server/grouped_read.py::is_contested_child`,
+    and `orchestrator/src/orchestrator/agents/memory_recall.py::render_memory_results`
+    via grouped_read's `contested` marker) — nothing adjudicates it, and the
+    canonical it contradicts is not touched.
     """
 
     @staticmethod
