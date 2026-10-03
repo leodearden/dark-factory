@@ -211,6 +211,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import enum
 import json
 import logging
 import os
@@ -222,6 +223,7 @@ from typing import Any
 
 from fused_memory.reconciliation.flag_dedup import is_content_fingerprint_task_id
 from fused_memory.reconciliation.mem0_tombstone import (
+    is_protected_audit_record,
     is_protected_mirror_record,
     record_mem0_deletion_tombstones,
 )
@@ -557,61 +559,97 @@ def _member_metadata(member: dict) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
-def find_protected_markers(members: list[dict]) -> list[dict]:
-    """Return members this sweep must NEVER delete (task 3041/4435).
+class ProtectionReason(enum.Enum):
+    """Which guard withholds a record from this sweep; see :func:`protection_reason`."""
 
-    A member returned here is a protected ``cycle_summary`` ledger MIRROR —
-    the durable audit anchor a later auditor resolves a memory id against —
-    not a marker. Deleting one is unrecoverable (see the module docstring's
-    "Deletion vs backfill": deletion here is permanent, not self-healing),
-    so it is refused unconditionally, however it reached the delete set.
+    CYCLE_SUMMARY_MIRROR = 'cycle_summary_mirror'
+    PROTECTED_AUDIT_KIND = 'protected_audit_kind'
+    FOREIGN_KIND = 'foreign_kind'
+
+
+def protection_reason(metadata: Any) -> ProtectionReason | None:
+    """Return the FIRST guard that withholds a record with *metadata*, or ``None``.
+
+    Arms, checked in this order:
+
+    - ``CYCLE_SUMMARY_MIRROR`` — ``mem0_tombstone.is_protected_mirror_record``
+      (task 3041/4435).
+    - ``PROTECTED_AUDIT_KIND`` — ``mem0_tombstone.is_protected_audit_record``,
+      the ``PROTECTED_AUDIT_KINDS`` denylist (task 4375).
+    - ``FOREIGN_KIND`` — this sweep's PRIMARY arm (task 5286): a ``kind`` that
+      is present and is not :data:`MARKER_KIND`. The legacy pool's shape is
+      exactly "kind absent or MARKER_KIND", so a declared different kind is
+      positive evidence that the record belongs to another pool. The arm is
+      structurally opt-in: an UNREGISTERED audit kind is protected without
+      anyone editing ``PROTECTED_AUDIT_KINDS``. It does not consult task
+      status, so ``--terminal-drain``, which inverts the in-cycle
+      terminal-closure gate, cannot weaken it. It compares with ``!=``, never
+      set membership, so a list- or dict-valued ``kind`` cannot raise.
+
+    The order IS the attribution: a mirror or audit record is reported under
+    its specific reason, never as merely foreign.
+
+    Pure, sync, no I/O, never raises.
+    """
+    if is_protected_mirror_record(metadata):
+        return ProtectionReason.CYCLE_SUMMARY_MIRROR
+    if is_protected_audit_record(metadata):
+        return ProtectionReason.PROTECTED_AUDIT_KIND
+    if not isinstance(metadata, dict):
+        return None
+    kind = metadata.get('kind')
+    if kind is not None and kind != MARKER_KIND:
+        return ProtectionReason.FOREIGN_KIND
+    return None
+
+
+def find_protected_markers(members: list[dict]) -> list[dict]:
+    """Return members this sweep must NEVER delete (tasks 3041/4435, 4375, 5286).
+
+    A member is protected when :func:`protection_reason` names any arm for
+    it: a ``cycle_summary`` ledger MIRROR (tasks 3041/4435), a
+    deliberately-permanent audit record whose kind is in
+    ``PROTECTED_AUDIT_KINDS`` (task 4375), or a record declaring any other
+    non-marker ``kind`` (the foreign-kind arm, task 5286). Deleting one is
+    unrecoverable (see the module docstring's "Deletion vs backfill":
+    deletion here is permanent, not self-healing), so it is refused
+    unconditionally, however it reached the delete set.
+
+    This one KEEP set feeds all three consumers — the choke point in
+    :func:`delete_orphan_markers`, ``run()``'s enumeration-scoped subtraction
+    and report, and the absolute arm of :func:`find_undrainable_markers` — so
+    each arm widens every one of them at once. Attribution survives the
+    union: :func:`protection_reason` returns which arm matched, and the log
+    lines render it. ``find_orphan_markers`` still nominates foreign-kind
+    records; they are subtracted here, exactly as mirrors always were.
 
     Restores parity with the in-cycle collector
-    ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` ON THIS ONE
-    GUARD, which it applies before its own eligibility test. Parity is not
-    total, and this predicate must not be read as making it so: that
-    collector applies a SECOND protected-record predicate this script still
-    lacks — ``mem0_tombstone.is_protected_audit_record`` (task 4375), a
-    membership test over ``PROTECTED_AUDIT_KINDS`` withholding
-    deliberately-permanent audit records such as ``kind='cadence_check'``.
-    Until that lands (task 5129), this script's ``find_stale_markers`` /
-    ``find_terminal_task_markers`` can still reach such a record if it
-    carries ``source='stage1_flag_marker'``. The two are deliberately
-    separate predicates rather than one — ``mem0_tombstone``'s own docstring
-    gives the reason (they answer different questions, and separate skips
-    keep distinct attribution) — so folding the audit arm in here would be
-    the wrong shape even once it is in scope.
+    ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` on its two
+    denylist guards, and adds the foreign-kind arm that collector does not
+    need. The decision record is ``docs/flag-marker-sweep-recurring.md``.
 
-    The two discriminators are single-sourced in
-    ``fused_memory.reconciliation.mem0_tombstone`` and deliberately IMPORTED
-    rather than copied here. A local copy would be exactly the lockstep
-    literal duplication INV-5 forbids, and ``mem0_tombstone``'s own module
-    docstring records that private copies "kept in sync BY CONVENTION"
-    already produced this half-disabled-guard failure once: an edit to
-    either side would silently protect one pool and not the other. (This is
-    a deliberate exception to the by-value mirroring used for
-    ``FLAG_FOR_STAGE2_FILTERS`` above: that rationale is about staying
-    decoupled from the heavy reconciliation-STAGE module, and
+    The two ``mem0_tombstone`` predicates are deliberately IMPORTED rather
+    than copied here, and stay separate predicates there. A local copy would
+    be exactly the lockstep literal duplication INV-5 forbids, and
+    ``mem0_tombstone``'s own module docstring records that private copies
+    "kept in sync BY CONVENTION" already produced a half-disabled-guard
+    failure once. (This is a deliberate exception to the by-value mirroring
+    used for ``FLAG_FOR_STAGE2_FILTERS`` above: that rationale is about
+    staying decoupled from the heavy reconciliation-STAGE module, and
     ``mem0_tombstone`` is a near-leaf that pulls in neither
     ``fused_memory.services.*`` nor ``task_knowledge_sync``.)
 
-    ``is_protected_mirror_record`` is itself fully defensive — ``None``, a
-    non-dict, and unexpected value types all return ``False`` without
-    raising — so a weird Mem0 payload can never crash the sweep from inside
-    the guard that exists to make it safer.
-
-    Pure, sync, no I/O.
+    Pure, sync, no I/O, never raises on a weird payload.
 
     Args:
         members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
             as returned by ``MemoryService.get_memories_by_metadata``.
 
     Returns:
-        Subset of *members* whose metadata declares ``kind ==
-        'cycle_summary'`` OR ``record_type == 'ledger_stamp'``. Order is
-        preserved. An unprotected input returns ``[]``.
+        Subset of *members* :func:`protection_reason` withholds. Order and
+        object identity are preserved. An unprotected input returns ``[]``.
     """
-    return [m for m in members if is_protected_mirror_record(m.get('metadata'))]
+    return [m for m in members if protection_reason(m.get('metadata')) is not None]
 
 
 def find_undrainable_markers(
