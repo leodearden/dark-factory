@@ -2630,8 +2630,10 @@ class WriteTriageConfig(BaseModel):
         default=None,
         description=(
             'Reasoning effort the judge requests. None OMITS the reasoning '
-            'parameter, which is what a non-reasoning model such as gpt-4o-mini '
-            'needs. A value is sent as reasoning={"effort": value} on the '
+            'parameter and sends temperature=0.0 instead, which is what a '
+            'non-reasoning model such as gpt-4o-mini needs; a reasoning model '
+            'rejects a temperature, so it needs a value here. A value is sent '
+            'as reasoning={"effort": value} on the '
             'Responses API, and only an endpoint that serves that API '
             "(llm.client_class 'openai') can honour it; a set value on any other "
             'arm is refused per call and counted as a fail-open rather than '

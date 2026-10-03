@@ -884,10 +884,8 @@ async def _call_llm(
     ``responses.create``: the system prompt as ``instructions=``, the user turn
     as ``input=``, a JSON-object text format so that arm's happy path is the
     parser's, :data:`_JUDGE_MAX_OUTPUT_TOKENS`, and ``reasoning={'effort': …}``
-    only when ``write_triage.judge_reasoning_effort`` is set. It sends NO
-    ``temperature``: reasoning models reject the parameter. A consequence worth
-    knowing when comparing runs: gpt-4o-mini on this arm samples at the
-    provider default rather than at 0.0.
+    only when ``write_triage.judge_reasoning_effort`` is set, in place of
+    ``temperature=0.0`` (reasoning models reject a temperature).
 
     An OPENAI-COMPATIBLE endpoint (``llm.client_class: openai_generic`` —
     llama.cpp, vLLM, LM Studio) serves chat.completions only, so it keeps the
@@ -976,13 +974,19 @@ async def _call_openai_responses(
     timeout: float,
     reasoning_effort: str | None,
 ) -> _JudgeReply:
-    """Native OpenAI, on the Responses API that frontier reasoning models require."""
+    """Native OpenAI, on the Responses API that frontier reasoning models require.
+
+    Exactly one sampling control is sent. A set *reasoning_effort* goes out as
+    ``reasoning``, with no ``temperature``, which reasoning models reject.
+    Unset means a non-reasoning model, pinned to ``temperature=0.0`` as on the
+    other two arms.
+    """
     import openai  # noqa: PLC0415 — per-call import, matching judge.py
 
-    # Omitted outright when unset, not sent as the SDK's `omit`, so the call's
-    # kwargs say exactly what reaches the wire.
-    reasoning: dict[str, Any] = (
-        {} if reasoning_effort is None else {'reasoning': {'effort': reasoning_effort}}
+    sampling: dict[str, Any] = (
+        {'temperature': 0.0}
+        if reasoning_effort is None
+        else {'reasoning': {'effort': reasoning_effort}}
     )
     async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
         response = await asyncio.wait_for(
@@ -992,7 +996,7 @@ async def _call_openai_responses(
                 input=prompt,
                 max_output_tokens=_JUDGE_MAX_OUTPUT_TOKENS,
                 text={'format': {'type': 'json_object'}},
-                **reasoning,
+                **sampling,
             ),
             timeout=timeout,
         )

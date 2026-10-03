@@ -627,9 +627,10 @@ write_triage:
   # fail-open (INV-4). 15s because the frontier arms measured p95 4.6-6.4s
   # (plans/write-triage-flip-readiness-prd.md §11.2 D15).
   judge_timeout_seconds: 15.0
-  # judge_reasoning_effort: null OMITS the reasoning parameter (what a
-  # non-reasoning model such as gpt-4o-mini needs); none|low|medium|high is
-  # sent as reasoning.effort. Only a Responses-API endpoint (llm.client_class
+  # judge_reasoning_effort: null OMITS the reasoning parameter and sends
+  # temperature 0.0 (what a non-reasoning model such as gpt-4o-mini needs; a
+  # reasoning model rejects a temperature); none|low|medium|high is sent as
+  # reasoning.effort. Only a Responses-API endpoint (llm.client_class
   # 'openai') can send it — elsewhere a set value is a counted fail-open. Set
   # together with judge_model at the 3169 flip; see
   # plans/write-triage-flip-readiness-prd.md §11.3 C1''.

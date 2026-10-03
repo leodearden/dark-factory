@@ -1813,11 +1813,11 @@ class TestJudgeWriteOpenAIArm:
 
     @pytest.mark.asyncio
     async def test_the_call_is_made_once_on_the_responses_api(self) -> None:
-        """Bounded and JSON-forced, one call, no retry loop — and nothing unset is sent.
+        """Bounded and JSON-forced, one call, no retry loop, pinned exactly.
 
-        No ``temperature`` (reasoning models reject it) and, with
-        ``judge_reasoning_effort`` null, no ``reasoning`` either: the request is
-        pinned exactly, so an extra parameter fails here.
+        With ``judge_reasoning_effort`` null the model is a non-reasoning
+        classifier, so it is pinned to ``temperature=0.0`` as on the other two
+        arms and sent no ``reasoning``. An extra parameter fails here.
         """
         candidates = [_result('m1', 0.80)]
         client = _openai_client(_payload('amends', 'm1'))
@@ -1837,11 +1837,13 @@ class TestJudgeWriteOpenAIArm:
             'input': build_judge_prompt('c', candidates),
             'max_output_tokens': judge_module._JUDGE_MAX_OUTPUT_TOKENS,
             'text': {'format': {'type': 'json_object'}},
+            'temperature': 0.0,
         }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('effort', ['none', 'low', 'medium', 'high'])
     async def test_a_configured_effort_reaches_the_wire(self, effort: str) -> None:
+        """A reasoning model rejects a ``temperature``, so a set effort replaces it."""
         client = _openai_client(_payload('amends', 'm1'))
         with patch('openai.AsyncOpenAI', return_value=client):
             await judge_write(

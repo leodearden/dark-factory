@@ -219,10 +219,11 @@ def _answering_both_apis() -> MagicMock:
 class TestTheDefaultModelsSeededVerdictsAreUnchanged:
     """Over the committed seeded fixture, the Responses arm reproduces main's chat verdicts.
 
-    A live byte-identical run is not achievable (the provider samples), so the
-    regression is pinned offline: both arms put the same prompt bytes on the
-    wire, and one answer function of those bytes yields the same verdict per
-    case. The chat arm is main's request, kept for ``openai_generic`` endpoints.
+    A live run is not byte-reproducible even at temperature 0, so the
+    regression is pinned offline: both arms put the same prompt bytes and the
+    same temperature on the wire, and one answer function of those bytes yields
+    the same verdict per case. The chat arm is main's request, kept for
+    ``openai_generic`` endpoints.
     """
 
     def test_both_arms_send_the_same_bytes_and_read_the_same_verdicts(self) -> None:
@@ -244,11 +245,12 @@ class TestTheDefaultModelsSeededVerdictsAreUnchanged:
             clients[arm] = client
 
         sent = [
-            (call.kwargs['instructions'], call.kwargs['input'])
+            (call.kwargs['instructions'], call.kwargs['input'], call.kwargs['temperature'])
             for call in clients['responses'].responses.create.await_args_list
         ]
         main = [
-            tuple(message['content'] for message in call.kwargs['messages'])
+            (*(message['content'] for message in call.kwargs['messages']),
+             call.kwargs['temperature'])
             for call in clients['chat'].chat.completions.create.await_args_list
         ]
         assert len(sent) == len(plan.cases)
