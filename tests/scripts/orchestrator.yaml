@@ -100,9 +100,11 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # ._merge_breadth_is_full agrees; that verify
 # ._merge_config_only_diff_forces_full_gate matches this repo's own
 # operational config; that a config load resolves the OPERATIONAL lock_depth
-# and not defaults.yaml's (the binding option (2) would have inverted); and
-# that every prefix config._discover_module_configs returns is reachable at
-# that depth.
+# and not defaults.yaml's (loader layering); that orchestrator/tests/
+# conftest.py's autouse _isolate_orch_config still binds ORCH_CONFIG_PATH at
+# the operational file (the binding option (2) would have narrowed — the
+# layering assertion alone never reads that fixture); and that every prefix
+# config._discover_module_configs returns is reachable at that depth.
 #
 # It lives in tests/scripts/ NOT by preference but because this is the only
 # lever available: _discover_module_configs skips prefix `.`, so a repo-root

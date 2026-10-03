@@ -19,7 +19,8 @@ This file is the EXECUTABLE half of that record. A documented-but-ungated
 decision is the same defect class these config tasks exist to close, so every
 assertion here is on RUNTIME state — the config as the production loader
 resolves it, the production predicates applied to it, the production
-module-config discovery walk — never on comment or docstring prose.
+module-config discovery walk, the environment the production conftest fixture
+sets — never on comment or docstring prose.
 
 NO PINNED INTEGER CONSTANTS. Every assertion is written in the knob-agnostic
 form: it reads the live value rather than naming ``12`` or ``4``. Two house
@@ -38,7 +39,8 @@ carried had drifted between two passes over the same unchanged code.
 
 MUST-NOT-SKIP CONTRACT. No ``pytest.importorskip``, no try/except-and-skip.
 An unimportable ``orchestrator.config``, ``orchestrator.verify`` or
-``orchestrator.verify_plan`` must FAIL this guard rather than silently pass it
+``orchestrator.verify_plan``, or an unloadable ``orchestrator/tests/conftest.py``,
+must FAIL this guard rather than silently pass it
 (``test_skills_module_config_decision.py``'s precedent).
 
 PLACEMENT IS LOAD-BEARING, NOT STYLISTIC. This file lives in ``tests/scripts/``
@@ -50,19 +52,20 @@ merge-role ``merge_verify_breadth: full``. It is also the only lever available:
 own.
 
 WHY THESE RATCHETS NEED A MEASURED RED, AND WHAT WAS MEASURED. The decision
-this file gates is largely "leave as-is", so three of its four assertions are
+this file gates is largely "leave as-is", so four of its five premises are
 green at HEAD BY CONSTRUCTION and a green run proves nothing about whether the
 guard bites. A vacuously-passing gate is the failure class tasks 3350 / 3445 /
 3485 exist to prevent, and ``test_skills_module_config_decision.py`` sets the
 precedent verbatim: "Each test below therefore records the failure text
-observed against a named scratch mutation." So each assertion below was driven
-red against a NAMED scratch mutation of the operational yaml, the observed
-failure recorded here, and the scratch artifact REVERTED before commit (`git
-status --porcelain` clean, verified after the last revert).
+observed against a named scratch mutation." So each premise below was driven
+red against a NAMED scratch mutation — of the operational yaml for M1-M4, of
+the conftest that binds tests to it for M5 — the observed failure recorded
+here, and the scratch artifact REVERTED before commit (`git status
+--porcelain` clean, verified after the last revert).
 
 MEASURED RED at base main ``a831c052b9`` — this branch's base, the SHA every
 number in the DECIDED block was taken at — on branch ``task/3886`` at
-``f1ea5d54fe``. Command for all four:
+``f1ea5d54fe``. Command for M1-M4 (M5 below reuses it):
 ``uv run --project shared pytest tests/scripts/test_config_retune_gate_decision.py --tb=short -q --timeout=300``.
 Unmutated at the same base: ``3 passed in 1.48s``.
 
@@ -89,7 +92,8 @@ Unmutated at the same base: ``3 passed in 1.48s``.
 
   M3  operational lock_depth 12 -> 4, i.e. set EQUAL to defaults.yaml
       -> ``1 failed, 2 passed in 1.19s``, FAILED
-      ``test_unit_tests_read_the_operational_lock_depth_not_the_package_default``
+      ``test_the_operational_config_layer_wins_over_the_package_defaults``
+      (then named ``test_unit_tests_read_the_operational_lock_depth_not_the_package_default``)
       on the DIFFER check, NOT the equality one:
         E   assert 4 != 4
       WHICH ASSERTION FIRED IS THE POINT, and is why this mutation was chosen
@@ -98,6 +102,10 @@ Unmutated at the same base: ``3 passed in 1.48s``.
       have reported GREEN while proving nothing about which layer won. The
       differ-check is what makes the layering observable, and this is the
       measurement that says so rather than the docstring merely claiming it.
+      WHAT M3 DOES NOT WITNESS: it mutates the operational yaml's lock_depth,
+      so it reddens the loader-LAYERING arm only. It never touches the autouse
+      ``_isolate_orch_config`` binding option (2) would have narrowed, and
+      neither does any of M1-M4 — which is why M5 exists.
 
   M4  operational lock_depth 12 -> 1
       -> ``1 failed, 2 passed in 1.02s``, FAILED
@@ -107,7 +115,7 @@ Unmutated at the same base: ``3 passed in 1.48s``.
       with the message enumerating the discovered set
       ``['cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator',
       'sampler', 'scripts', 'shared', 'tests/scripts']`` — 9 prefixes, matching
-      pre-1's count, deepest at depth 2. Note M4 leaves the binding arm GREEN
+      pre-1's count, deepest at depth 2. Note M4 leaves the layering arm GREEN
       (1 != 4, and resolved 1 == declared 1), so the two lock_depth arms are
       independently falsifiable rather than one masking the other.
 
@@ -131,10 +139,14 @@ Unmutated at the same base: ``3 passed in 1.48s``.
       before M5's test existed this file was GREEN under the one option its
       decision rejected.
 
-Each mutation reddened a DIFFERENT assertion, and no mutation reddened more
-than one test. That is the property worth having: a future edit that breaks one
-premise of the decision reports which premise, rather than collapsing the whole
-file.
+Each of the five mutations reddened a DIFFERENT assertion, and no mutation
+reddened more than one test. That is the property worth having: a future edit
+that breaks one premise of the decision reports which premise, rather than
+collapsing the whole file. The premises are five, not four, because "unit
+tests read OPERATIONAL values" rests on two independent facts — the loader
+lets the operational file win over defaults.yaml (M3), and the conftest binds
+every orchestrator test to that file (M5) — and each can lapse without the
+other.
 
 NOT COVERED BY ANY OF THE ABOVE, stated so a green run here is not over-read.
 These ratchets pin the decision's PREMISES and catch a retune-down that
@@ -321,30 +333,32 @@ def test_merge_lane_already_gates_a_config_only_retune(
     )
 
 
-def test_unit_tests_read_the_operational_lock_depth_not_the_package_default(
+def test_the_operational_config_layer_wins_over_the_package_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The binding arm: option (2) is REJECTED, and this is what says so.
+    """The layering arm: the operational file wins over the package-bundled defaults.
 
-    Option (2) was to narrow ``orchestrator/tests/conftest.py``'s autouse
-    ``_isolate_orch_config`` so unit tests read the package-bundled DECLARED
-    defaults instead of this project's OPERATIONAL config. That is declined.
-    The heal commit for the incident (``c54d7cf81c``) argues against it in its
-    own body: the binding is deliberate "precisely so tests see real
-    operational values", and the three tests that broke failed LOUDLY via
-    self-validating preconditions — "the precondition worked as designed; the
-    fixture data was stale". Under option (2) those same tests would have
-    PASSED at a declared depth the factory does not run at, trading a loud
-    failure for a silent wrong-test. That is against INV-2
-    ``structured-facts-at-failure`` and the repo's loud-over-silent norm, and
-    ``conftest.py`` already ships the sanctioned escape hatch
-    (``code_default_config``, re-pointing ``ORCH_CONFIG_PATH`` at a
-    guaranteed-absent file) for the minority of tests that genuinely want
-    package defaults.
+    Asserts pydantic-settings LAYER PRECEDENCE in the production loader: a
+    ``YamlSettingsSource`` anchored at ``dark-factory-orchestrator.yaml``
+    resolves ``lock_depth`` to that file's declaration and not to
+    ``defaults.yaml``'s. That is one of the two facts "unit tests read
+    OPERATIONAL values" rests on. The other — that
+    ``orchestrator/tests/conftest.py``'s autouse ``_isolate_orch_config``
+    binds every orchestrator test to that file at all, the contract option (2)
+    would have narrowed — is carried by
+    ``test_orchestrator_unit_tests_are_bound_to_the_operational_config_file``.
 
-    This test is the executable statement of the contract that decision
-    PRESERVES: a config load resolves the OPERATIONAL value, not the declared
-    one. If option (2) is ever silently adopted, this fails.
+    CORRECTED IN PLACE (task 3886 review). This test was first named and
+    described as the guard against option (2): "the executable statement of
+    the contract that decision PRESERVES ... If option (2) is ever silently
+    adopted, this fails." Measured false. Under the option-(2) scratch
+    mutation of that conftest (ledger entry M5) this test still PASSED — the
+    review measured ``3 passed in 2.21s`` for the whole then-three-test file
+    at ``8cf95ee8c6``, re-taken as ``3 passed, 1 deselected in 3.11s`` at
+    ``79578bf0a4``. It never reads the fixture: ``tests/scripts/`` does not
+    collect ``orchestrator/tests/conftest.py``, and ``_root_config`` sets
+    ``ORCH_CONFIG_PATH`` itself. The assertions were true and are kept
+    unchanged; only the claim was narrowed to what they assert.
 
     WHY THE DIFFER-CHECK IS NOT REDUNDANT. Asserting only that the resolved
     depth equals the operational declaration would pass VACUOUSLY if a future
@@ -366,12 +380,12 @@ def test_unit_tests_read_the_operational_lock_depth_not_the_package_default(
         'operational declaration would ALSO equal the package default and this '
         'guard could not tell which layer won. That makes assertion (2) below '
         'vacuous rather than false. This is not a failure of the decision — it '
-        'means the binding is no longer OBSERVABLE here and this guard needs a '
+        'means the layering is no longer OBSERVABLE here and this guard needs a '
         'different lever, not that the guard should be deleted'
     )
 
     # (2) A real load through the production loader resolves the OPERATIONAL
-    #     layer — the contract option (2) would have inverted.
+    #     layer, not the package default.
     cfg = _root_config(monkeypatch)
     assert cfg.lock_depth == operational_declared, (
         f'a config loaded through the production loader with ORCH_CONFIG_PATH '
@@ -385,9 +399,9 @@ def test_unit_tests_read_the_operational_lock_depth_not_the_package_default(
     assert cfg.lock_depth != package_declared, (
         f'the production loader resolved lock_depth={cfg.lock_depth!r}, which is '
         f'the package-bundled defaults.yaml value ({package_declared!r}) and not '
-        f'{DF_CONFIG_NAME}\'s ({operational_declared!r}). The operational binding '
-        'has lapsed: tests are now exercising a depth the factory does not run '
-        'at, silently — precisely the failure mode option (2) would have '
+        f'{DF_CONFIG_NAME}\'s ({operational_declared!r}). The loader\'s layer '
+        'precedence has inverted: tests are now exercising a depth the factory '
+        'does not run at, silently — the same outcome option (2) would have '
         'institutionalised and which task 3886 rejected'
     )
 

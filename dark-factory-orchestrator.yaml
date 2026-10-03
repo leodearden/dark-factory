@@ -219,11 +219,16 @@ max_concurrent_tasks: 24
 #
 # ── SCOPE HONESTY — what this decision's guards do NOT buy ───────────────────
 #
-# tests/scripts/test_config_retune_gate_decision.py pins the four premises
+# tests/scripts/test_config_retune_gate_decision.py pins the five premises
 # above (breadth full + its predicate; the manifest-drift glob covering this
-# file; the operational-over-declared binding; every discovered module-config
-# prefix reachable at the live lock_depth) and would catch a retune DOWNWARD
-# that silently unreaches a module config.
+# file; the loader LAYERING, i.e. this file's lock_depth wins over
+# defaults.yaml's; the autouse `_isolate_orch_config` BINDING, i.e. that
+# fixture still points ORCH_CONFIG_PATH at this file, the contract option (2)
+# would have narrowed; every discovered module-config prefix reachable at the
+# live lock_depth) and would catch a retune DOWNWARD that silently unreaches a
+# module config. Layering and binding are separate premises with separate
+# measured REDs: the layering check never reads the fixture, and passed under
+# a scratch adoption of option (2).
 #
 # It does NOT catch the thing 094d634465 actually tripped: a stale fixture
 # literal in some unrelated test, derived from the old value of a knob. Nothing
