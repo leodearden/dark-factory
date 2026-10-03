@@ -1592,6 +1592,15 @@ def _prose_service(*, record=None, tombstone=None, get_raises=None) -> AsyncMock
     return service
 
 
+class _NoTombstoneService:
+    """A memory_service with NO ``get_mem0_deletion_tombstone`` attribute at
+    all. A bare ``AsyncMock`` auto-creates the attribute, so it cannot model
+    this wiring gap."""
+
+    async def get_memory_by_id(self, project_id, memory_id):
+        return None
+
+
 class TestScanProseCitationsBranches:
     """``scan_prose_citations`` splits every prose id FOUR ways and warns on
     exactly one of them (task 4818).
@@ -1810,11 +1819,6 @@ class TestScanProseCitationsSafety:
 
         ``spec=`` is required: a bare ``AsyncMock`` auto-creates the attribute
         and would silently pass a two-way implementation."""
-
-        class _NoTombstoneService:
-            async def get_memory_by_id(self, project_id, memory_id):
-                return None
-
         service = _NoTombstoneService()
         finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
 
@@ -1898,6 +1902,77 @@ class TestScanProseCitationsSafety:
         assert stats['stage1_prose_phantom_citations'] == 1
         assert stats['stage1_prose_citation_verification_errors'] == 0
         assert 'phantom' in caplog.records[0].getMessage().lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'reason', ['ledger_unavailable', 'reader_unavailable'],
+    )
+    async def test_wiring_gap_warns_once_per_scan_not_per_id(self, caplog, reason):
+        """A missing reader or an unwired ledger is a fact about how THIS scan
+        is wired, not about any id, so it warns once per scan. On a
+        ``recon_ledger_enabled=False`` deployment a per-id warning would be one
+        identical line per prose miss. The counters still count every pair."""
+        if reason == 'ledger_unavailable':
+            service: Any = _prose_service(record=None, tombstone=None)
+            service.recon_ledger = None
+        else:
+            service = _NoTombstoneService()
+        third = '0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d'
+        findings = [
+            {
+                'finding_id': 'f1',
+                'description': f'{_SPECIMEN_FABRICATED} and {_SPECIMEN_REAL}',
+            },
+            {'finding_id': 'f2', 'description': f'{_SPECIMEN_FABRICATED} and {third}'},
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                findings, service, 'test_project', run_id='run-unwired',
+            )
+
+            assert stats['stage1_prose_citation_verification_errors'] == 4
+            assert stats['stage1_prose_phantom_citations'] == 0
+            assert len(caplog.records) == 1
+            msg = caplog.records[0].getMessage()
+            assert 'tombstone' in msg.lower()
+            assert reason in msg
+            assert 'run-unwired' in msg
+            assert 'stage1' in msg
+            assert 'phantom' not in msg.lower()
+
+            # Once per SCAN, not once per process: a later run on the same
+            # deployment must still surface the gap.
+            await scan_prose_citations(
+                findings, service, 'test_project', run_id='run-unwired',
+            )
+            assert len(caplog.records) == 2
+
+    @pytest.mark.asyncio
+    async def test_raising_reader_still_warns_per_id(self, caplog):
+        """A raising read is a per-READ fault carrying its own exception type,
+        not a wiring fact, so it must not collapse into the once-per-scan
+        wiring warning."""
+        service = _prose_service(record=None)
+        service.get_mem0_deletion_tombstone = AsyncMock(
+            side_effect=RuntimeError('ledger locked'),
+        )
+        finding = {
+            'finding_id': 'f1',
+            'description': f'{_SPECIMEN_FABRICATED} and {_SPECIMEN_REAL}',
+        }
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 2
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert len(caplog.records) == 2
+        named = [
+            [m for m in (_SPECIMEN_FABRICATED, _SPECIMEN_REAL) if m in r.getMessage()]
+            for r in caplog.records
+        ]
+        assert sorted(named) == sorted([[_SPECIMEN_FABRICATED], [_SPECIMEN_REAL]])
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
