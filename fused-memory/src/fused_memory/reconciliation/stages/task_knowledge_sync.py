@@ -3539,14 +3539,8 @@ class TaskKnowledgeSync(BaseStage):
     # this cycle …"). Every payload builder renders these via
     # _render_required_sections(). Enforced by
     # tests/reconciliation/test_stage2_payload_section_parity.py, whose module
-    # docstring holds the full section census.
-    #
-    # Deliberately NOT registered:
-    #   * Known Projects — per-project membership; no absence-inference.
-    #   * Stale Flags Requiring Escalation — presence-conditional only.
-    #   * Done-Task Audit, Proactive Task Sample, Hint Attention — omitted on
-    #     remediation passes by design.
-    #   * Done-task Provenance — every done task carries an explicit label.
+    # docstring holds the section census: why each other conditional section
+    # stays out.
     REQUIRED_SECTIONS: tuple[RequiredSection, ...] = (
         RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'),
     )
@@ -4788,8 +4782,7 @@ For cross-project routing see "Known Projects" above.
         Takes the payload's RESOLVED tree — harness-injected or self-fetched by
         :meth:`assemble_payload` — which is why it is not a zero-arg reader of
         ``self.filtered_task_tree`` like Stage 1's same-named renderer. An empty
-        active list renders ``''`` with no I/O. Stage 2 does not retain the
-        snapshot: the task-4874 citation guard is Stage-1 only.
+        active list renders ``''`` with no I/O.
         """
         return await render_live_workflow_section(filtered.active_tasks, self.scope.project_root)
 
