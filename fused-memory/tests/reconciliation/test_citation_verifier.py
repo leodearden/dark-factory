@@ -20,7 +20,7 @@ import pytest
 
 from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.citation_verifier import (
-    MAX_PROSE_IDS_PER_RUN,
+    MAX_PROSE_IDS_PER_SCAN,
     PROSE_CITATION_FIELDS,
     STAGE_STAT_PREFIX,
     X_CITATION_TOMBSTONE_KEY,
@@ -2227,13 +2227,13 @@ class TestSharedResolverAndProseCeiling:
         service.get_memory_by_id.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_distinct_prose_ids_are_capped_per_run(self, caplog):
+    async def test_distinct_prose_ids_are_capped_per_scan(self, caplog):
         """A description naming more distinct uuids than the ceiling must not
         stall report assembly with unbounded serial point reads for a WARN-ONLY
         diagnostic. Unlike the structured pass, whose fan-out is bounded by the
         model-emitted citation list, this one is driven by arbitrary free
         text."""
-        over = MAX_PROSE_IDS_PER_RUN + 3
+        over = MAX_PROSE_IDS_PER_SCAN + 3
         ids = [self._uuid(n) for n in range(over)]
         finding = {'finding_id': 'f-flood', 'description': ' '.join(ids)}
         service = _prose_service(record=None, tombstone=None)
@@ -2245,15 +2245,18 @@ class TestSharedResolverAndProseCeiling:
 
         # Exactly the ceiling is resolved; the remainder is INCONCLUSIVE, never
         # phantom — declining to look establishes nothing either way.
-        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_RUN
-        assert stats['stage1_prose_phantom_citations'] == MAX_PROSE_IDS_PER_RUN
+        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_SCAN
+        assert stats['stage1_prose_phantom_citations'] == MAX_PROSE_IDS_PER_SCAN
         assert stats['stage1_prose_citation_verification_errors'] == 3
         # ...and the four counters still account for every distinct pair.
         assert sum(stats.values()) == over
 
         capped = [r for r in caplog.records if 'scan_capped' in r.getMessage()]
-        assert len(capped) == 1, 'the ceiling must be logged ONCE per run, not per id'
+        assert len(capped) == 1, 'the ceiling must be logged ONCE per scan, not per id'
         assert 'run-flood' in capped[0].getMessage()
+        # One run carries one scan per stage, so the line must say WHICH
+        # stage's scan met the ceiling.
+        assert 'stage1' in capped[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_a_report_under_the_ceiling_is_untouched(self):
@@ -2272,7 +2275,7 @@ class TestSharedResolverAndProseCeiling:
         """A repeat of an ALREADY-resolved id is free (the memo answers it), so
         it must not consume ceiling budget — the ceiling bounds reads, and the
         counters keep counting per-finding CLAIMS."""
-        ids = [self._uuid(n) for n in range(MAX_PROSE_IDS_PER_RUN)]
+        ids = [self._uuid(n) for n in range(MAX_PROSE_IDS_PER_SCAN)]
         blob = ' '.join(ids)
         findings = [
             {'finding_id': 'f-a', 'description': blob},
@@ -2282,6 +2285,31 @@ class TestSharedResolverAndProseCeiling:
 
         stats = await scan_prose_citations(findings, service, 'test_project')
 
-        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_RUN
-        assert stats['stage1_prose_phantom_citations'] == 2 * MAX_PROSE_IDS_PER_RUN
+        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_SCAN
+        assert stats['stage1_prose_phantom_citations'] == 2 * MAX_PROSE_IDS_PER_SCAN
         assert stats['stage1_prose_citation_verification_errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_ceiling_is_per_scan_not_per_run(self):
+        """The budget belongs to one ``scan_prose_citations`` call, even when
+        the resolver is shared: ``BaseStage.run()`` hands each stage its own
+        scan over one run-scoped resolver, and each scan gets a full fresh
+        ceiling. Making the budget run-wide would need a rename, not a silent
+        change."""
+        service = _prose_service(record=None, tombstone=None)
+        shared_resolve = make_memory_resolver(service, 'test_project')
+        first = [self._uuid(n) for n in range(MAX_PROSE_IDS_PER_SCAN)]
+        second = [
+            self._uuid(n)
+            for n in range(MAX_PROSE_IDS_PER_SCAN, 2 * MAX_PROSE_IDS_PER_SCAN)
+        ]
+
+        for ids in (first, second):
+            stats = await scan_prose_citations(
+                [{'finding_id': 'f-scan', 'description': ' '.join(ids)}],
+                service, 'test_project', resolve=shared_resolve,
+            )
+            assert stats['stage1_prose_citation_verification_errors'] == 0
+            assert stats['stage1_prose_phantom_citations'] == MAX_PROSE_IDS_PER_SCAN
+
+        assert service.get_memory_by_id.await_count == 2 * MAX_PROSE_IDS_PER_SCAN
