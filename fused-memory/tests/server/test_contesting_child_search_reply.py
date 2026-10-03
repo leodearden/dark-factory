@@ -121,8 +121,7 @@ def _service(hits: list[MemoryResult]) -> AsyncMock:
 @pytest.mark.parametrize('name', sorted(_SCENARIO_HITS))
 async def test_the_recorded_reply_is_what_search_produces(name: str):
     fixture = _FIXTURES / f'{name}.json'
-    if not _FIXTURES.is_dir():
-        pytest.skip(f'sibling orchestrator fixtures absent at {_FIXTURES}')
+    assert fixture.is_file(), f'recorded reply missing at {fixture}'
     server = create_mcp_server(_service(_SCENARIO_HITS[name]))
 
     result = await server._tool_manager.call_tool(
