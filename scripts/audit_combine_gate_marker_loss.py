@@ -2,10 +2,12 @@
 """Audit the blast radius of the curator-combine ``metadata`` wipe.
 
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record,
-a ticket record, or a manifest file. Every database connection it opens is a
-read-only SQLite URI (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
-so the sweep is structurally incapable of writing to the live WAL databases
-the running orchestrator holds open. Manifest YAML on disk is only ever read.
+a ticket record, or a manifest file. Every database connection it opens is
+read-only: the task store goes through ``_task_db_scan.py::connect_ro``, and
+tickets.db through a read-only SQLite URI
+(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
+structurally incapable of writing to the live WAL databases the running
+orchestrator holds open. Manifest YAML on disk is only ever read.
 There is no ``--apply`` flag and no MCP client is ever constructed.
 REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — backfilling a lost key from
 this report is never done by this script (the audit/repair split of tasks
@@ -80,6 +82,7 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    connect_ro,
     decode_metadata,
     format_coverage_block,
     format_kv_line,
@@ -138,14 +141,15 @@ def load_combine_targets(tasks_db_path: str) -> dict[tuple[str, int], CombineTar
     ``master`` tag, but the schema permits the same numeric id under two tags
     and collapsing them would silently merge two distinct tasks.
 
-    Opens the database via a read-only URI (``mode=ro``) so the load is
-    structurally incapable of mutating live task records even while
-    fused-memory holds the same file open in WAL mode. Closed in a
-    ``try/finally`` and never a ``with`` block — a sqlite3 ``with`` is a
-    TRANSACTION, not a close.
+    Opens the database through ``_task_db_scan.py::connect_ro``, a read-only
+    URI (``mode=ro``), so the load is structurally incapable of mutating live
+    task records even while fused-memory holds the same file open in WAL mode;
+    a file that is not a task store is refused with a structured reason.
+    Closed in a ``try/finally`` and never a ``with`` block — a sqlite3
+    ``with`` is a TRANSACTION, not a close.
     """
     targets: dict[tuple[str, int], CombineTarget] = {}
-    conn = sqlite3.connect(f"file:{tasks_db_path}?mode=ro", uri=True)
+    conn = connect_ro(tasks_db_path)
     try:
         cursor = conn.execute("SELECT tag, id, status, metadata FROM tasks")
         for tag, task_id, status, metadata in cursor:
@@ -1146,7 +1150,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
     """Audit ONE project root under the (possibly overridden) project_id.
 
-    Raises ``sqlite3.Error`` for an unreadable project, which is what
+    Raises one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS`` for an
+    unreadable project, which is what
     :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip; every
     other exception propagates. Returns exactly one audit, per that function's
     one-audit-per-root contract.

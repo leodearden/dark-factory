@@ -612,7 +612,8 @@ def test_an_unconvertible_sidecar_descriptor_degrades_to_coverage(
     _check_kind_conditional_fields with DeliveredCheckMeta. The guard exists
     because that coupling is IMPLICIT — if the two models ever diverge, an
     unguarded raise escapes audit_project into _task_db_scan.sweep_project_roots,
-    which catches only sqlite3.Error, aborting every remaining project root.
+    which catches only UNREADABLE_STORE_ERRORS, aborting every remaining
+    project root.
     Injecting the failure is the only way to pin the degradation, and pinning it
     is the point: the alternative is discovering the coupling broke by losing a
     whole multi-root sweep to a traceback.

@@ -2,9 +2,9 @@
 """Retroactive, STATUS-AWARE sweep over checked-in ``delivered_checks`` (task 3500).
 
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record or
-a manifest file. Every database connection it opens is a read-only SQLite URI
-(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
-structurally incapable of writing to the live WAL database the running
+a manifest file. Every database connection it opens goes through
+``_task_db_scan.py::connect_ro``, a read-only SQLite URI (``mode=ro``), so the
+sweep is structurally incapable of writing to the live WAL database the running
 orchestrator holds open. Manifest YAML on disk and git history are only ever
 read. There is no ``--apply`` flag and no MCP client is ever constructed.
 REMEDIATION IS A SEPARATE, REVIEWED FOLLOW-UP — repairing a descriptor from
@@ -84,6 +84,7 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    connect_ro,
     format_coverage_block,
     format_kv_line,
     run_audit_cli,
@@ -402,13 +403,15 @@ class TaskIndex(NamedTuple):
 def load_task_index(db_path: str) -> TaskIndex:
     """Statuses, ``updated_at`` stamps and stamped checks of *db_path*.
 
-    Read-only URI — the guarantee is structural, not a convention. Malformed
-    metadata is SKIPPED rather than raised: a single undecodable row must not
+    Opened through ``_task_db_scan.py::connect_ro``, a read-only URI — the
+    guarantee is structural, not a convention — which refuses a file that is
+    not a task store with a structured reason. Malformed metadata is SKIPPED
+    rather than raised: a single undecodable row must not
     abort a whole-project sweep, and ``extract_delivered_checks`` already
     implements exactly that benign-absent contract (the same one
     ``lock_charter_guard.extract_files`` uses at the wire boundary).
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = connect_ro(db_path)
     try:
         conn.row_factory = sqlite3.Row
         statuses: dict[int, tuple[str, str]] = {}
@@ -629,15 +632,19 @@ def load_open_dependents(db_path: str) -> dict[int, tuple[int, ...]]:
     capability that can never be delivered.
 
     A MISSING ``dependencies`` TABLE IS NOT AN ERROR HERE, and the swallow is
-    narrow and deliberate. ``sweep_project_roots`` catches ``sqlite3.Error``
-    and turns it into "unreadable project"; an ``OperationalError`` escaping
-    this function would therefore demote a perfectly readable project to a
-    skip, and — if it were the only root — turn a healthy sweep into a false
-    exit 3, the exact silent-fail-soft that exit code exists to prevent. Only
-    the "no such table" shape is swallowed; every other ``sqlite3.Error``
-    propagates so a genuinely corrupt database still surfaces.
+    narrow and deliberate. ``sweep_project_roots`` catches
+    ``UNREADABLE_STORE_ERRORS``, every ``sqlite3.Error`` among them, and turns
+    it into "unreadable project"; an ``OperationalError`` escaping this
+    function would therefore demote a perfectly readable project to a skip,
+    and — if it were the only root — turn a healthy sweep into a false exit 3,
+    the exact silent-fail-soft that exit code exists to prevent. Only the "no
+    such table" shape is swallowed; every other ``sqlite3.Error`` propagates
+    so a genuinely corrupt database still surfaces. The open goes through
+    ``_task_db_scan.py::connect_ro``, which refuses a store with NO tables at
+    all before the query runs — it guarantees some table, not this one, so
+    the swallow still has work to do.
     """
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = connect_ro(db_path)
     try:
         conn.row_factory = sqlite3.Row
         try:
@@ -663,7 +670,8 @@ def load_open_dependents(db_path: str) -> dict[int, tuple[int, ...]]:
 def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     """Join tasks.db, the sidecars and the tree; classify every descriptor.
 
-    Raises ``sqlite3.Error`` on an unreadable database, which is the contract
+    Raises one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS`` on an
+    unreadable database, which is the contract
     ``_task_db_scan.sweep_project_roots`` depends on: exactly one audit object
     per root, or a raise. Returning a sentinel to "skip" would silently break
     the exit-3 gate that stops a total-failure sweep reading as clean.
@@ -1007,7 +1015,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
-    """Audit ONE project root. Exactly one audit, or ``sqlite3.Error``.
+    """Audit ONE project root. Exactly one audit, or one of UNREADABLE_STORE_ERRORS.
 
     That is :func:`_task_db_scan.sweep_project_roots`' one-audit-per-root
     contract, and the exit-3 gate depends on it — a sentinel return to "skip"
