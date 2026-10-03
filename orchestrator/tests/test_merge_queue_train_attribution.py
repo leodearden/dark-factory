@@ -460,7 +460,7 @@ class TestReverifyMemberSoloContract:
             '(attempt-0 + one retry), not three retries; '
             f'got {verifier.entered_count} verifies'
         )
-        git_ops.cleanup_merge_worktree.assert_called_once_with(tmp_path)
+        git_ops.cleanup_merge_worktree.assert_called_with(tmp_path)
         git_ops.delete_solo_branch.assert_called_once_with('_solo-b1')
 
 

@@ -5467,7 +5467,11 @@ async def reverify_member_solo(
     Wraps :func:`_run_post_merge_verify` (which provides disk-guard, ENOSPC
     prune-retry, and timeout loop-breaker semantics) but does NOT advance main.
     Fresh per-call ``timeouts`` / ``enospc_retries`` dicts are used so solo
-    attempts do not count against the tip's existing timeout budgets.
+    attempts do not count against the tip's existing timeout budgets.  The
+    solo verify takes the worker's full-reverify retry budget
+    (``SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES``), so an
+    infra-transient or ENOSPC red costs a member at most one re-verify, the
+    same as a worker merge.
 
     Returns a :class:`SoloVerifyResult`:
       - ``passed=True``  when ``_run_post_merge_verify`` returns ``None``.
@@ -5514,7 +5518,7 @@ async def reverify_member_solo(
         timeouts={},
         enospc_retries={},
         max_timeouts=3,
-        max_enospc=3,
+        max_enospc=SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
         event_store=event_store,
         merge_sha=tip_sha,
         verifier=verifier,
