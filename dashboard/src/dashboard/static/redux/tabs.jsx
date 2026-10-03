@@ -19,10 +19,10 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 // a chart with no bands rather than fail. index.html's load order is the
 // enforced contract, pinned per-module by test_index_html.py: both scripts are
 // asserted served-200 and asserted to load before this file.
-const { strandBadgeState, agentCellState, locksCellState } = window.DF_TASK_ROW_CELLS;
+const { strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum } = window.DF_TASK_ROW_CELLS;
 // The Datum readers. Module scope, no fallback, bound under datum.js's own
 // names — see the CANONICAL note in datum.js's header.
-const { plainDatum, derivedDatum, unknownDatum, servedDatum } = window.DF_DATUM;
+const { plainDatum, derivedDatum, servedDatum } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 // Every OrchTab count is a named reading over the served census — task_snapshot.js.
@@ -46,7 +46,7 @@ const EP = Object.freeze({
   orchestrators: '/api/v2/dashboard/orchestrators', performance:  '/api/v2/dashboard/performance',
   memory:        '/api/v2/dashboard/memory',
   recon:         '/api/v2/dashboard/recon',         mergeQueue:   '/api/v2/dashboard/merge-queue',
-  costs:         '/api/v2/dashboard/costs',         scheduler:    '/api/v2/dashboard/scheduler',
+  costs:         '/api/v2/dashboard/costs',
   burndown:      '/api/v2/dashboard/burndown',
 });
 
@@ -220,16 +220,6 @@ function DepsCell({ task }) {
   return <ChipList items={sorted} renderChip={(d) => <DepChip key={d.id} dep={d} />} maxInline={2} persistKey={`df.deps.${task.id}`} />;
 }
 
-// Is anything KNOWN about this project's locks? DF.SCHEDULER is the only source
-// of lock state, so the question is "has the scheduler endpoint delivered a
-// snapshot that claims to cover this project?". One reporting the project
-// offline carries no lock rows for it, and drawing that empty set as chips is
-// the "nothing is held" lie locksCellState exists to refuse.
-const schedLocksDatum = project =>
-  DF.SCHEDULER.offline || (DF.SCHEDULER.offline_projects || []).includes(project)
-    ? unknownDatum('scheduler snapshot does not cover this project')
-    : plainDatum(DF.SCHEDULER, EP.scheduler);
-
 // ── The Locks column of a task row ──
 // `datum` says whether anything is KNOWN about this task's locks. The chips come
 // from DF.SCHEDULER, so a project whose scheduler is offline produced an empty
@@ -388,7 +378,7 @@ function OrchTab({ projectFilter, search }) {
                             <td style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rtCell(t.phase)}</td>
                             <td style={{ color: 'var(--fg-2)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{rtCell(t.lane_state)}</td>
                             <td><DepsCell task={t} /></td>
-                            <td><LocksCell task={t} datum={schedLocksDatum(o.project)} /></td>
+                            <td><LocksCell task={t} datum={schedulerLocksDatum(DF.SCHEDULER, o.project, DF.__receipt)} /></td>
                             <td>
                               <span className={`badge ${
                                 t.status === 'blocked' ? 'bad' :
