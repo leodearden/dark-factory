@@ -96,6 +96,19 @@ def _mcp_search_envelope(results: list[dict]) -> dict:
     }
 
 
+CONTESTING_CHILD_FIXTURES = Path(__file__).parent / 'fixtures' / 'grouped_search_contesting_child'
+
+
+def recorded_search_text(name: str) -> str:
+    """The recorded ``search`` reply *name*, verbatim; see that directory's PROVENANCE.md."""
+    return (CONTESTING_CHILD_FIXTURES / f'{name}.json').read_text(encoding='utf-8')
+
+
+def recorded_search_envelope(name: str) -> dict:
+    """The recorded reply *name* put on the wire byte for byte; see PROVENANCE.md."""
+    return {'result': {'content': [{'type': 'text', 'text': recorded_search_text(name)}]}}
+
+
 def _search_arguments(mcp_call_mock) -> list[dict]:
     """The ``arguments`` of every ``search`` tools/call the assembler made.
 
