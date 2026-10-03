@@ -630,6 +630,7 @@ function PerfTab({ projectFilter }) {
 
 // ── Memory ──
 function MemoryTab({ projectFilter, onNavigate }) {
+  const queue = writeQueue(DF);
   const projects = Object.entries(DF.MEMORY_STATUS.projects).filter(([pid]) => projectFilter.length === 0 || projectFilter.includes(pid));
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
@@ -640,8 +641,8 @@ function MemoryTab({ projectFilter, onNavigate }) {
         <ST label="Mem0 memories" datum={plainDatum(DF.MEMORY_STATUS.mem0.memory_count, EP.memory)} format={fmtCount}
             hint={`${DF.MEMORY_STATUS.graphiti.episode_count.toLocaleString()} episodes`}
             history={(DF.MEMORY_STATUS.mem0.spark?.values || []).slice(-30)} sparkColor={CP.info} />
-        <ST label="Write queue" datum={writeQueue(DF)} format={q => fmtCount(q.pending)}
-            hint={queueHint(writeQueue(DF))}
+        <ST label="Write queue" datum={queue} format={q => fmtCount(q.pending)}
+            hint={queueHint(queue)}
             history={(DF.MEMORY_STATUS.queue.spark?.values || []).slice(-30)} sparkColor={CP.warn} />
         <ST label="Ops / hr" datum={newestHourOps(DF)} format={fmtCount}
             history={DF.MEMORY_OPS.total} sparkColor={CP.accent} hint="last 24h" />

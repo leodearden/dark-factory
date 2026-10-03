@@ -65,13 +65,20 @@ def test_tabs_destructures_the_memory_readers_without_fallback(tabs_jsx_code):
     assert used <= bound, f'tabs.jsx reads {sorted(used - bound)} without binding them'
 
 
-def test_the_write_queue_tile_reads_the_queue_datum(memory_tab_code):
-    tile = _stat_tile(memory_tab_code, 'Write queue')
-    assert re.search(r'datum=\{\s*writeQueue\(', tile), (
-        f'the Write queue tile is not handed writeQueue(...):\n{tile}'
+def test_the_write_queue_tile_reads_one_queue_datum(memory_tab_code):
+    """The tile's reading and its hint come from ONE writeQueue(DF) Datum."""
+    binding = re.search(r'\bconst\s+(\w+)\s*=\s*writeQueue\(\s*DF\s*\)', memory_tab_code)
+    assert binding, 'MemoryTab does not bind writeQueue(DF) to a const'
+    queue = binding.group(1)
+    assert len(re.findall(r'\bwriteQueue\(', memory_tab_code)) == 1, (
+        'MemoryTab builds the write-queue Datum more than once'
     )
-    assert re.search(r'hint=\{\s*queueHint\(', tile), (
-        f'the Write queue tile hint is not queueHint(...):\n{tile}'
+    tile = _stat_tile(memory_tab_code, 'Write queue')
+    assert re.search(rf'datum=\{{\s*{queue}\s*\}}', tile), (
+        f'the Write queue tile is not handed the bound `{queue}` Datum:\n{tile}'
+    )
+    assert re.search(rf'hint=\{{\s*queueHint\(\s*{queue}\s*\)\s*\}}', tile), (
+        f'the Write queue tile hint is not queueHint({queue}):\n{tile}'
     )
 
 
