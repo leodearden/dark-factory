@@ -922,6 +922,30 @@ entries:
     origin_phase: prd
     manifested_phase: architect
     note: 'Task 5980 filed on false premise that dark-factory code caused reify #7919. Architect discovered incident originated in an interactive fleet-recovery session (ad-hoc worktree + sibling sub-agent), not in orchestrator/merge-queue/warm-lane paths. No factual premise verification occurred at filing or dispatch time.'
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 323f1008-c9c7-4b21-b64f-6bdd8e22fae7
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Orchestrated task encountered 'does not exist' at turn 23, indicating a path was assumed to exist before dispatch but did not. Path-scope violation guard fired at turn 125, eventually blocked at turn 174.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 33595183-fe3a-4b7c-96c2-78c478a4d8e3
+    origin_phase: merge
+    manifested_phase: implement
+    note: 'Task dispatch did not verify premises: spawn-brief file path and merge-queue state availability. Agent pivots to polling MCP state without halt condition, suggesting cascading assumption failures.'
+  - date: '2026-10-02'
+    project: dark_factory
+    session: f06c8fb3-4ba3-4916-beb5-0ac926b33da5
+    origin_phase: decompose
+    manifested_phase: review
+    note: Task 3508 implemented on Aug-7 main baseline carrying stale commits. Implementation assumed max_concurrent_tasks was still 48 and memory_service.py lacked task 3523's new _apply_memory_metadata_validation signature, but main had since changed both (2026-09-11 capacity cut, 3523 integration). Review discovered integration conflicts and silently-reversed operator decisions. Premises were never verified against current main before work began.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: a5de2940-5f39-4387-a88f-563b8fac8908
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Task 5232 dispatched without verifying all parametrized test-case targets exist on dispatch-time tree. Six of seven path-check cases reference files pending upstream producers (tasks 6181, 6184-6185, 6188, 6190); these cases RED permanently until those tasks merge, violating dispatch precondition.
 - id: warm-lane-cache-incoherence
   title: Warm-lane warmth transfer and shared caches violate source coherence; no disk GC — phantom compile errors and recurring ENOSPC
   severity: high
@@ -3149,6 +3173,12 @@ entries:
     manifested_phase: verify
     invariant_violated: Agent attempts to call deferred tools (grep_search, glob_search) without first discovering them via ToolSearch or checking the available tool set
     note: Agent guessed non-existent tool names instead of using available tools (Bash with grep/find, or Read for file inspection). Three successive failures across turns 20–24, all on invented tool names not in the deferred or standard tool sets.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: a2937595-d285-4f45-8fb0-a6d01f1a5071
+    origin_phase: verify
+    manifested_phase: verify
+    note: 'Agent called grep_search twice (turns 17, 19) without prior ToolSearch discovery, hitting ''Error: No such tool available''. Later searches succeeded with discovered tools (results 3-9).'
 - id: entry-cand-20260719-2
   title: Graphiti memory search returns self-referential summaries stripped of the actual fact
   severity: medium
@@ -7566,6 +7596,12 @@ entries:
     origin_phase: unknown
     manifested_phase: verify
     note: Task worktree session encounters ModuleNotFoundError and 'command not found' errors during execution. Matches pattern of import/command-resolution failures in worktree environment, though agent_class is orchestrated-task rather than architect.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: f4e36943-1e78-4686-bd32-3efd534a3f88
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'ModuleNotFoundError in turn 176; consistent with venv/import-resolution asymmetry when agent operates in .worktrees/<id> context, per CLAUDE.md §Locating installed code: first-party editable installs resolve to worktree''s OWN checkout, not main checkout'
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -12432,6 +12468,12 @@ entries:
     origin_phase: ops
     manifested_phase: recon
     note: Orchestrated-task session (agent_class=orchestrated-task); digest 'User Corrections' bucket mislabeled an injected escalation briefing (esc-5797-7 risk report with task 5797 gate-fire analysis, measured evidence, hypothesis, and config state) as a user correction.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 998064d7-eef3-4852-9085-f6f520979326
+    origin_phase: recon
+    manifested_phase: recon
+    note: Digest 'User Corrections' extraction mislabels this orchestrated-task session's injected task-framing guidance block ('You are adjudicating...', 'PRIOR-ROUND SUGGESTIONS', instructions distinguishing resolved vs deferred concerns) as a user correction. All signal_counts are zero yet the content appears in the User Corrections bucket, indicating false-positive ingestion of task instructional scaffolding as user feedback.
 - id: entry-cand-20260729-5
   title: Sibling planning sessions race on a shared in-progress design doc
   severity: medium
@@ -16115,6 +16157,67 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: Orchestrated task in worktree (.worktrees/2943) fired 'no such file or directory' at turn 124 with no other diagnostic context
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 9c2115f6-1e9f-4f86-8be8-979cabe1be4d
+    origin_phase: decompose
+    manifested_phase: decompose
+    note: Session shows 9 'not_found' signals + 2 tool_errors with file/directory access failures (.worktrees/6180 missing, prd/write-triage-link-healing ref invalid, brief file inaccessible). Matches pattern of orchestrated worktree task firing repeated file-not-found with no diagnostic context.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: f6fd5c24-7bb3-4b6d-aeb4-e9688d7219da
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated worktree task exhibits 3 not_found signals (turns 31, 76, 179 including ModuleNotFoundError and file-not-found errors) with no other diagnostic context, matching symptom pattern of silent file-resolution failures in .worktrees task execution
+  - date: '2026-10-02'
+    project: dark_factory
+    session: da2769b2-3c0f-49d5-a999-a16809ab8b1a
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated task in worktree 6042 fires 10 repeated file/module not_found errors (no such file, does not exist, modulenotfounderror across turns 92, 145, 541, 655, 664, 716, 763, 789, 941, 957) with zero diagnostic signals or recovery; session output 768 bytes, 0 user turns.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: d85e7ed6-6100-46ad-99eb-99960155aea6
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Orchestrated-task in worktree (.worktrees/5962) fires 3 not_found signals with minimal diagnostic context. Matches known pattern of worktree-confined file-access failures.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: c8b99cfe-7446-4490-a04d-5ec8a4eb99b6
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: Orchestrated-task agent in worktree .worktrees/5035 fires repeated 'no such file or directory' errors across turns 48, 49, 716 plus modulenotfounderror in turn 716. Signal counts show 3 tool_errors and 4 not_found with zero designed_outcome/self_correct, matching descriptor 'no other diagnostic signal'. Consistent with known worktree environment/path resolution defects.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 33595183-fe3a-4b7c-96c2-78c478a4d8e3
+    origin_phase: merge
+    manifested_phase: implement
+    note: Hand-carry task 5036 stage 3 fires file-not-found errors at turns 39 and 227 with no other diagnostic signal, matching the orchestrated-worktree pattern. Extends to non-dispatch hand-carry contexts.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: f3c88cbb-7488-42d9-b7b8-9019d82b6a24
+    origin_phase: implement
+    manifested_phase: implement
+    note: Orchestrated worktree task fires repeated 'no such file or directory' (turns 31, 42) with 1 tool_error signal and a timeout after 229 productive turns. No diagnostic context in the errors themselves.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: f4e36943-1e78-4686-bd32-3efd534a3f88
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Orchestrated worktree task fires repeated 'no such file or directory' (turns 167, 201) with no other diagnostic signal; zero user turns, minimal session score (3.0) matches the pattern of cascading not_found failures in task worktrees without interactive recovery
+  - date: '2026-10-02'
+    project: dark_factory
+    session: a5de2940-5f39-4387-a88f-563b8fac8908
+    origin_phase: unknown
+    manifested_phase: verify
+    note: Orchestrated worktree task (5232) fires 'File does not exist' error (plan.json) with minimal diagnostic context—direct pattern match.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 799b1381-d578-4065-8044-293012aac0d7
+    origin_phase: verify
+    manifested_phase: verify
+    invariant_violated: worktree environment coherence / file access scope
+    note: Orchestrated worktree task (6147, .worktrees/6147) fires repeated 'no such file or directory' errors (turns 23, 39) with no tool_error signal trapped. Test hangs in wait_responsive loop; file-not-found errors in subprocess/test execution context suggest missing ephemeral paths or sandboxing scope breach.
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -16521,6 +16624,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Digest Retry Loops bucket populates 8 Bash calls; 2 are designed outcomes (exit 124 watcher-rearm.sh ceiling) but unseparated from actual retries in the bucket, creating ambiguity about whether re-arms were necessary.
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 8b3965a0-2118-4c60-85e6-8fdb1e8e3fe6
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Digest ''Retry Loops'' bucket flags the watcher''s designed periodic watcher-rearm.sh polling calls (6 total attempts across 4h rotation) as retry loops, despite 2 showing explicit ''designed_outcome: CEILING exit=124'' markers. The watcher''s recurring bounded-wait re-arms are legitimate control flow, not error recovery.'
 - id: entry-cand-20260827-23
   title: Edit's multi-match error hint gets invoked as a nonexistent standalone 'replace_all' tool
   severity: medium
@@ -31769,3 +31878,198 @@ candidates:
     origin_phase: unknown
     manifested_phase: verify
     evidence_quote: '(turn 24) Bash({"command": "echo \"=== metadata.json ===\" && cat .task/metadata.json 2>/dev/null...}) -> [exit 1] Exit code 1'
+- id: cand-20261002-1
+  title: Decompose brief prose-routing pre-conditions unreachable from agent context
+  cause: 'Brief specifies conditional execution paths based on merge-queue state and PRD-landing verification, but agent can''t access: (1) the brief file itself to read fallback instructions, (2) git refs to verify landing, (3) worktree/carrier infrastructure. Agent gets 3 empty merge-queue responses and can''t determine which prose path to follow.'
+  area: decompose, prose-routing-intent, context-access
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 9c2115f6-1e9f-4f86-8be8-979cabe1be4d
+    origin_phase: decompose
+    manifested_phase: decompose
+    evidence_quote: 'cannot access ''.worktrees/6180'': No such file or directory / fatal: Not a valid object name prd/write-triage-link-healing / mcp__escalation__get_merge_queue x3: {} / turn 30: attempted read of spawn brief failed'
+- id: cand-20261002-2
+  title: Spawn-brief file lifecycle fails across multi-stage hand-carry boundaries
+  cause: A spawn-brief written at stage N+1 decision time becomes unavailable by stage N+1 execution time, due to unmanaged working-directory scope, inter-stage cleanup, or file-write-then-read cycle across worktree/main-checkout boundaries.
+  area: hand-carry, task dispatch, file lifecycle
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 33595183-fe3a-4b7c-96c2-78c478a4d8e3
+    origin_phase: merge
+    manifested_phase: implement
+    evidence_quote: 'Turns 39, 227: ''no such file or directory'' and ''does not exist'' while attempting to read /home/leo/.claude/spawn-briefs/chain-5303-5034-5036-2026-10-01.md in stage 3 of a hand-carry chain'
+- id: cand-20261002-3
+  title: Task MCP polling without circuit-breaker or timeout enters indefinite retry on empty state
+  cause: A task polls MCP endpoints for prerequisites (get_merge_queue, merge_status), receiving empty/null results in retry loops, with no defined backoff, timeout, or exit condition to break the loop if the expected state never arrives.
+  area: task execution, MCP polling, orchestration
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 33595183-fe3a-4b7c-96c2-78c478a4d8e3
+    origin_phase: implement
+    manifested_phase: implement
+    evidence_quote: 'Retry loops: mcp__escalation__get_merge_queue x5 (all {}), mcp__escalation__merge_status x3 ({"task_id": "5618"}) with no backoff or halt logic visible'
+- id: cand-20261002-4
+  title: Escalation-watcher generates MCP queries with empty/missing field values
+  cause: Watcher code constructs JSON arguments for MCP calls without verifying all required fields have values before serialization; field-value mapping left incomplete or skipped validation
+  area: escalation-watcher, MCP client code generation
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 8b3965a0-2118-4c60-85e6-8fdb1e8e3fe6
+    origin_phase: implement
+    manifested_phase: ops
+    evidence_quote: 'mcp__escalation__get_task_escalations({..."status": , ...}) -> InputValidationError: could not be parsed as JSON. You sent: {"task_id": "unverified-claim-7921", "level": 2, "status": , "compact": true}'
+- id: cand-20261002-5
+  title: Orchestrated worktree task guard trips reported with no detail or diagnostic context
+  cause: Guard enforcement in orchestrated-task sessions reports only the bare fact 'blocked:' with no explanation of what failed, which guard triggered, or what invariant was violated. Diagnosis requires external state inspection.
+  area: orchestrator, guards, worktree, observability
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 27a07796-2574-4e2c-b28d-9c9d19fdb03d
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: Guard Trips section shows three blocked guards (turns 65, 77, 176) with no detail beyond 'blocked:'; later Bash error on exploratory grep+sed occurs at turn 421. No causal connection visible between the three guard trips and the final Bash exit-2 failure.
+- id: cand-20261002-6
+  title: Partial file-glob failures in compound grep commands
+  cause: A grep command searching across multiple file globs exits with code 2 despite producing output from some matched files, indicating a file-not-found or permission error in a subset of the glob targets — exit code 2 conflates with normal 'no match' case, masking which specific files triggered the error
+  area: bash/grep
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 941499ca-f696-4a5a-8dd8-7c3c28921fbd
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'turn 209: grep -rln ''babel'' dashboard/tests/js/*.mjs; grep -rn ''vendor\\|babel.min'' dashboard/tests/*.py ... [exit 2] with partial output; exit_code=2 but results shown'
+- id: cand-20261002-7
+  title: Three systematic not-found signals in a single task session
+  cause: A single dispatched task session records three 'does not exist' errors at turns 128, 135, and 285 — suggests either stale paths in worktree state, missing build artifacts, or a search/lookup mechanism failing systematically across multiple invocations without surfacing which specific resource was unavailable
+  area: task-execution/path-resolution
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 941499ca-f696-4a5a-8dd8-7c3c28921fbd
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'signal_counts: not_found=3 at turns 128, 135, 285; digest truncated (truncated_items=1), content not shown'
+- id: cand-20261002-8
+  title: Guard trip during ZOT-sweep completion verification despite landed commits
+  cause: done_gate_missing_files and darkfactorypathscopeviolation guard trips (turn 82) fired even after code search located implementation commits and sweeping infrastructure; gate criteria may diverge from commit-presence verification.
+  area: done_gate, path-scope guards
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: a2937595-d285-4f45-8fb0-a6d01f1a5071
+    origin_phase: verify
+    manifested_phase: verify
+    evidence_quote: Turn 82 blocked on darkfactorypathscopeviolation and done_gate_missing_files after Tool Result 9 successfully read task_interceptor.py containing sweep_zot_duplicate infrastructure; commits 5a5900f8, 6bd802b8, 92f145fc show feature landed 2026-10-01/02.
+- id: cand-20261002-9
+  title: Eval-lane containment breach via asymmetric escalation resolution semantics
+  cause: Gate 0 containment path uses `submit_resolved()` → status='resolved' → orchestrator maps to 'resume' → wakes workflows and re-pends blocked tasks. Orphan reaper path correctly uses `dismiss=True` (close_only). Two code paths enforcing the same invariant disagree on disposition, allowing eval-lane escalations to mutate real production task state.
+  area: escalation/orchestrator cross-lane containment and isolation
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 18d64c9d-4d33-4c86-95c1-3fb9ab36b037
+    origin_phase: implement
+    manifested_phase: verify
+    evidence_quote: 'For the eval-worktree signal the task_id is a REAL production id... A human-held blocked row gets re-pended... So containment itself lets the eval lane mutate production task state, which is exactly what this task exists to prevent. The orphan reaper path does not have this problem: it uses `dismiss=True`, which maps to close_only. The two containment sites disagree on disposition (heuristic 11, SPOT, and heuristic 10, uniformly enforced invariants).'
+- id: cand-20261002-10
+  title: Task worktree .task/metadata.json unavailable during post-merge verification
+  cause: Agent investigating post-merge test failure attempts to read task metadata file which does not exist in the worktree .task/ directory
+  area: task worktree structure / metadata provisioning
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: 97089a4c-2a87-4a40-b4f4-0a5a64f9cb72
+    origin_phase: unknown
+    manifested_phase: verify
+    evidence_quote: 'Read(file_path="/home/leo/src/dark-factory/.worktrees/4555/.task/metadata.json") → File does not exist. Note: current working directory is /home/leo/src/dark-factory/.worktrees/4555'
+- id: cand-20261002-11
+  title: Orchestrated-task agent in worktree uses main-checkout-relative paths that don't exist in task context
+  cause: An orchestrated-task agent attempted Bash diagnostics with relative paths (orchestrator/tests/test_merge_queue_coalesce.py) from a task worktree (.worktrees/5215). Task worktrees contain only the task's own deliverables, not the full repository structure, so relative paths to shared orchestrator modules fail. The Bash exit 2 suggests a command error (likely failed glob or file resolution), and the triggering df_guard indicates a Dark Factory safety mechanism caught the anomaly.
+  area: Orchestrated-task execution in worktree environment
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: d4a511c9-18de-4677-9003-242907a8141c
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: 'session cwd: /home/leo/src/dark-factory/.worktrees/5215 | Bash compound command sed + grep on orchestrator/tests/test_merge_queue_coalesce.py -> [exit 2] | signal_counts: tool_error=1, df_guard=1'
+- id: cand-20261002-12
+  title: Implementer does not verify integration-target current state before starting work
+  cause: Task 3508 implementer did not check whether assumptions about orchestrator.yaml and fused_memory/services/memory_service.py were still valid on current main before writing code. By implementation time, task 3523 had added new parameters and obligations; capacity decisions had been deliberately revised. Stale baseline + no pre-work verification = integration conflicts discovered only at review.
+  area: implement
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: f06c8fb3-4ba3-4916-beb5-0ac926b33da5
+    origin_phase: architect
+    manifested_phase: review
+    evidence_quote: The branch is based on an Aug-7 main (merge-base 144e3ee5e4)... main deliberately cut max_concurrent_tasks 48 -> 24 (6cfdb75960, Leo 2026-09-11)... This branch's new required `reaches_mem0` parameter and its 'four obligations' docstring conflict directly with that code... The feature cannot land as reviewed.
+- id: cand-20261002-13
+  title: 'Parametrized suite dispatch without precondition verification: cases structurally red-locked by pending upstream deliverables'
+  cause: Parametrized test suite over path-check corpus was dispatched before verifying all case targets exist at dispatch-time tree. Some targets are in files that pending upstream tasks will add, making those parametrized cases permanently RED; implementer cannot fix without those external deliverables.
+  area: dispatch-gate verification
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: a5de2940-5f39-4387-a88f-563b8fac8908
+    origin_phase: implement
+    manifested_phase: verify
+    evidence_quote: The parametrized RED cases cannot be GREENed by this task's implementer. They only go green when OTHER, unrelated pending tasks deliver the files, and every future correctly-authored adopter re-reds the sweep by construction.
+- id: cand-20261002-14
+  title: Task worktree git commands fail with exit 128 during concurrent merge state
+  cause: Task worktrees share the main checkout's .git directory metadata; when merge-lane operations leave MERGE_HEAD or conflicting state in the shared .git, git commands invoked from the worktree fail with fatal exit 128, blocking task verification or diagnostics
+  area: worktree isolation, merge-lane interaction, git state management
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: a0d0f0f7-005d-4e59-a295-dd5542b567d6
+    origin_phase: merge
+    manifested_phase: verify
+    evidence_quote: Exit 128 on `git status --short | ... && git log --oneline -3 MERGE_HEAD ... && git rev-parse HEAD MERGE_HEAD` in task worktree .worktrees/3651; MERGE_HEAD present in shared .git; orchestrated-task session (1073 bytes, high score 1.0)
+- id: cand-20261002-15
+  title: Orchestrated-task worktree session produces zero output and registers no diagnostic signals
+  cause: Task in .worktrees executes with no user interaction, generates minimal output (416 bytes), and no diagnostic signals (tool_error, self_correct, not_found, df_guard, interrupt, designed_outcome all zero), becoming invisible to downstream analysis
+  area: orchestrated-task agent execution / digest pipeline signal capture
+  first_seen: '2026-10-02'
+  disposition: pending
+  sightings:
+  - date: '2026-10-02'
+    project: dark_factory
+    session: f8ff88a7-44b0-4d24-8191-5ab510c6c09a
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: agent_class=orchestrated-task, cwd=.worktrees/5209, size_bytes=416, n_user_turns=0, truncated_items=0, score=0.0, all signal_counts=0
