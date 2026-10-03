@@ -360,8 +360,8 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #         so the trade-off stays visible.
 #
 #         What bounds that over-fire is the CONSUMER SET, not any property of
-#         the detectors — this constant is module-private BY CONTRACT, and the
-#         bound holds only while its consumers are exactly:
+#         the detectors — this constant is module-private BY CONTRACT. Its
+#         in-module consumers are:
 #           - find_conflicting_task_status_ids       -> server/tools.py,
 #             conflicting_task_status_framing_write_blocked
 #           - find_present_tense_completion_claim_task_ids -> server/tools.py,
@@ -369,17 +369,18 @@ NEGATED_TERMINAL_RE: re.Pattern[str] = re.compile(
 #         Both are early-return SOFT-BLOCK write gates: a hit costs the author
 #         a rephrase-and-retry. No exception, no write, no data corruption.
 #
-#         That claim is VOID the moment a consumer on a destructive or
-#         corpus-tagging path imports this. It already happened once: the
-#         task 3403 review found services/completion_claim_gate.py importing
-#         this constant while tagging episodes durably and filing operator
-#         escalations, which made the shipped bounded-blast-radius claim false.
-#         Such a consumer takes STRICT_CLAUSE_BOUNDARY_RE below instead — the
-#         original alphabet, exported once so the divergence needs neither a
-#         second copy of the pattern nor a second copy of the argument. A new
-#         importer of THIS constant must first show its fail-safe direction
-#         matches; the property is enforced by
-#         TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers.
+#         A consumer on a destructive or corpus-tagging path may import this
+#         only when its attribution does not scale with clause length;
+#         otherwise it takes STRICT_CLAUSE_BOUNDARY_RE below — the original
+#         alphabet, exported once so the divergence needs neither a second copy
+#         of the pattern nor a second copy of the argument.
+#         services/completion_claim_gate qualifies: it binds each completion
+#         marker to its one nearest ref (task 4853), so a longer clause adds
+#         candidate refs without adding claims. (The task 3403 review had found
+#         it importing this constant with clause-wide attribution, which made
+#         the bounded-blast-radius claim false.) Every out-of-module importer
+#         must show its fail-safe direction, and is held to the AST allowlist
+#         in TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers.
 #   (ii)  'e.g.' / 'i.e.' still split at their SECOND dot (the right-side-only
 #         rule). Harmless — that is a genuine phrase boundary, not a break
 #         between a ref and its status.
@@ -418,10 +419,8 @@ _CLAUSE_SPLIT_RE: re.Pattern[str] = re.compile(r'\.(?!\w)|[;\n!?]')
 #   - reconciliation/stale_status_snapshot_edge_sweep._list_segment — closes a
 #     segment from which BARE DIGITS are harvested as task ids, ending in
 #     memory_service.update_edge(invalid_at=...)
-#   - services/completion_claim_gate._iter_clauses — scopes a claim written as
-#     extra['unverified_claim'] into the Graphiti source_description and every
-#     derived Mem0 fact's metadata, plus an operator escalation, on EVERY
-#     add_episode regardless of agent
+#   - middleware/dependency_direction_check.extract_dependency_assertions —
+#     scopes a dependency-direction assertion that can end in a retired edge
 #
 # A THIRD importer must first show the same fail-safe direction. Wanting the
 # WIDENING instead means wanting _CLAUSE_SPLIT_RE, which is module-private by

@@ -24,12 +24,13 @@ whose regex vocabulary this module IMPORTS rather than re-derives. Re-deriving
 the negation/aspirational strippers would leave a second, drifting copy of the
 one thing that keeps "has not yet landed" and "will land" from false-firing.
 
-A claim is only a claim when completion PHRASING and a concrete NAMED REF
-(task id / commit sha / ``tkt_`` id) co-occur in the same clause. Bare "the
-fix was applied" yields nothing: the task scopes detection to claims "that
-name a task or commit", and requiring the ref is also the volume control —
-an unanchored detector would tag a large fraction of ordinary agent narration,
-and a tag that fires constantly stops being read.
+A claim is only a claim when a completion marker is bound to its nearest
+concrete NAMED REF (task id / commit sha / ``tkt_`` id) in the same clause,
+and each marker binds to at most one ref. Bare "the fix was applied" yields
+nothing: the task scopes detection to claims "that name a task or commit",
+and requiring the ref is also the volume control — an unanchored detector
+would tag a large fraction of ordinary agent narration, and a tag that fires
+constantly stops being read.
 
 Verification is split from detection behind INJECTED probes (mirroring
 :func:`middleware.recon_claim_verification_guard.verify_attributed_claims`),
@@ -58,9 +59,9 @@ from fused_memory.middleware.recon_claim_verification_guard import (
     _resolve_git_toplevel,
 )
 from fused_memory.reconciliation.task_filter import (
+    _CLAUSE_SPLIT_RE,
     FUTURE_ASPIRATIONAL_RE,
     NEGATED_TERMINAL_RE,
-    STRICT_CLAUSE_BOUNDARY_RE,
     TASK_REF_RE,
 )
 
@@ -257,51 +258,22 @@ _ASPIRATIONAL_EXTENSION_RE: re.Pattern[str] = re.compile(
 )
 
 
-# The clause boundary is task_filter.STRICT_CLAUSE_BOUNDARY_RE — the
-# fail-safe-STRICT alphabet ('.', ';', newline, '!', '?'), NOT
-# task_filter._CLAUSE_SPLIT_RE, which the gate once imported and which narrowed
-# its dot to '\.(?!\w)' at task 3403 so dotted technical tokens
-# (dark-factory-orchestrator.yaml, CLAUDE.md:95) stop shattering a sentence.
-# The canonical rationale for keeping the two apart lives next to
-# STRICT_CLAUSE_BOUNDARY_RE. This module's stake in it:
-#
-#   A hit here gets WRITTEN. It sets extra['unverified_claim'], which rides
-#   into the Graphiti source_description prefix and every derived Mem0 fact's
-#   metadata (server/tools.py:2805-2807), and it files an operator escalation
-#   (:2815) — on EVERY add_episode regardless of agent, since that call site
-#   is "Deliberately NOT under a recon-stage- guard". A longer clause drags a
-#   still-pending task into a NEIGHBOURING task's completion clause, durably
-#   mislabelling a CORRECT episode as contradicted (INV-2) and injecting a
-#   false escalation into the human queue. MEASURED under the widened form:
-#   'df 1985 landed in orchestrator.yaml and task 1986 is still pending.' ->
-#   claims for BOTH 1985 and 1986.
-#
-# The tie-breaker is this module's own stance, stated in its docstring:
-# requiring a named ref "is also the volume control ... a tag that fires
-# constantly stops being read". Precision over recall — the reverse of the
-# recon detectors' fail-open-on-under-firing default.
-#
-# ACCEPTED RESIDUAL: the gate forgoes the widening's recall win. MEASURED,
-# both pre-3403 and here, 'Task 5252 (see CLAUDE.md:95) has landed and now
-# enforces the gate.' yields NO claim, so a genuine unverifiable completion
-# claim whose sentence contains a dotted token still goes untagged. Fixing
-# that without re-importing the precision loss needs nearest-ref proximity
-# binding instead of whole-clause co-occurrence — an association-algorithm
-# redesign, filed as follow-up ticket tkt_0RSM4JVBN05YSSP1E2ASRZ6VWH.
-#
-# Pinned by tests/test_completion_claim_gate.py::TestClauseBoundaryIsolation.
+# The clause boundary is task_filter._CLAUSE_SPLIT_RE, the widened alphabet in
+# which a dot followed by a word character ('orchestrator.yaml',
+# 'CLAUDE.md:95') does not end a clause. It is safe here because attribution is
+# per-marker: each completion marker binds to ONE nearest ref (_bind_marker), so
+# a longer clause adds candidate refs without adding claims. The canonical
+# rationale lives at task_filter._CLAUSE_SPLIT_RE. Pinned by
+# tests/test_completion_claim_gate.py::TestClauseBoundaryIsolation.
 def _iter_clauses(text: str):
     """Yield ``(clause, start_offset)`` for each clause of *text*.
 
-    Boundaries are '.', ';', newline, '!', '?' — see the block above for why
-    this gate takes ``task_filter.STRICT_CLAUSE_BOUNDARY_RE`` rather than
-    ``task_filter._CLAUSE_SPLIT_RE``, which narrowed its dot at task 3403.
     Offset-preserving, unlike a plain ``split``: a claim's span has to point
     back into the ORIGINAL text so the flag can quote what was claimed
     (INV-2). Empty clauses are skipped, matching the sibling detectors.
     """
     pos = 0
-    for match in STRICT_CLAUSE_BOUNDARY_RE.finditer(text):
+    for match in _CLAUSE_SPLIT_RE.finditer(text):
         if match.start() > pos:
             yield text[pos:match.start()], pos
         pos = match.end()
@@ -309,19 +281,30 @@ def _iter_clauses(text: str):
         yield text[pos:], pos
 
 
-def _strip_exemptions(clause: str) -> str:
-    """Remove negated-terminal and future/aspirational spans from *clause*.
+_EXEMPTION_STRIPPERS: tuple[re.Pattern[str], ...] = (
+    NEGATED_TERMINAL_RE,
+    _NEGATED_EXTENSION_RE,
+    FUTURE_ASPIRATIONAL_RE,
+    _ASPIRATIONAL_EXTENSION_RE,
+)
 
-    Both stripper regexes deliberately swallow the completion verb they govern,
-    so removing their spans removes the completion EVIDENCE — that is what
-    makes "has not yet landed" and "will land" produce no claim. Substituting a
-    space (rather than deleting) preserves word boundaries; offsets are not
-    preserved, which is why refs are extracted from the ORIGINAL clause.
+
+def _blank(match: re.Match[str]) -> str:
+    return ' ' * len(match.group(0))
+
+
+def _strip_exemptions(clause: str) -> str:
+    """Blank out negated-terminal and future/aspirational spans in *clause*.
+
+    Every stripper regex deliberately swallows the completion verb it governs,
+    so blanking its span removes the completion EVIDENCE — that is what makes
+    "has not yet landed" and "will land" produce no claim. Each span becomes
+    the same number of spaces, so an offset in the result is an offset in
+    *clause*, which is what lets a marker found here bind to a ref found there.
     """
-    de_exempted = NEGATED_TERMINAL_RE.sub(' ', clause)
-    de_exempted = _NEGATED_EXTENSION_RE.sub(' ', de_exempted)
-    de_exempted = FUTURE_ASPIRATIONAL_RE.sub(' ', de_exempted)
-    return _ASPIRATIONAL_EXTENSION_RE.sub(' ', de_exempted)
+    for stripper in _EXEMPTION_STRIPPERS:
+        clause = stripper.sub(_blank, clause)
+    return clause
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,9 +344,10 @@ def extract_completion_claims(
 ) -> list[CompletionClaim]:
     """Extract every completion claim in *text* that names a concrete ref.
 
-    A clause produces claims only when BOTH a phrasing hit survives
-    negation/aspirational stripping AND that same clause names a concrete ref.
-    Claims are returned in text order, deduplicated on
+    Each completion marker that survives negation/aspirational stripping binds
+    to at most one named ref in its clause (see :func:`_bind_marker`), and the
+    claim takes its kind from the marker and its subject from the ref. Claims
+    are returned in text order, deduplicated on
     ``(kind, subject, ref, project_id)`` so a repeated assertion costs one
     authority read rather than several.
 
@@ -385,36 +369,28 @@ def extract_completion_claims(
     seen: set[tuple[str, str, str, str | None]] = set()
 
     for clause, offset in _iter_clauses(text):
-        de_exempted = _strip_exemptions(clause)
-        if APPLIED_WORK_RE.search(de_exempted):
-            kind: ClaimKind = 'applied_work'
-        elif DISPOSITION_RE.search(de_exempted):
-            kind = 'disposition'
-        elif FILING_DISPATCH_RE.search(de_exempted):
-            kind = 'filing_dispatch'
-        else:
-            continue
-
-        subject, refs = _refs_in_clause(
+        mentions = _ref_mentions(
             clause,
             default_project_id=default_project_id,
             known_project_ids=known_project_ids,
         )
-        if subject is None:
+        if not mentions:
             continue
-
         span = (offset, offset + len(clause))
-        for ref, project_id in refs:
-            key = (kind, subject, ref, project_id)
+        for marker in _marker_spans(_strip_exemptions(clause)):
+            bound = _bind_marker(clause, marker, mentions, known_project_ids)
+            if bound is None:
+                continue
+            key = (marker.kind, bound.subject, bound.ref, bound.project_id)
             if key in seen:
                 continue
             seen.add(key)
             claims.append(
                 CompletionClaim(
-                    kind=kind,
-                    subject=subject,
-                    ref=ref,
-                    project_id=project_id,
+                    kind=marker.kind,
+                    subject=bound.subject,
+                    ref=bound.ref,
+                    project_id=bound.project_id,
                     span=span,
                 )
             )
@@ -433,74 +409,144 @@ def _qualifying_project(
     return candidate if candidate in known_project_ids else None
 
 
-def _refs_in_clause(
+@dataclass(frozen=True, slots=True)
+class _RefMention:
+    """One named ref in a clause, with the project whose authority answers it.
+
+    ``project_id`` is ``None`` for a ticket, which resolves by globally unique
+    primary key in one shared tickets.db — that is what let esc-3085-1
+    instance (2), a reify writer claiming a dark_factory ticket, be
+    adjudicated correctly.
+    """
+
+    start: int
+    end: int
+    subject: ClaimSubject
+    ref: str
+    project_id: str | None
+
+
+def _ref_mentions(
     clause: str,
     *,
     default_project_id: str,
     known_project_ids: frozenset[str] | set[str],
-) -> tuple[ClaimSubject | None, list[tuple[str, str | None]]]:
-    """Return the MOST SPECIFIC ref family named in *clause*, each ref paired
-    with the project whose authority adjudicates it.
+) -> list[_RefMention]:
+    """Every ticket, commit and task ref named in *clause*, in text order."""
 
-    Precedence is ticket > commit > task, and it is deliberately exclusive: a
-    clause naming both ("task 5638 ... re-filed as ticket tkt_X") is one claim
-    about the ticket, not two. The most specific ref is the one the claim is
-    actually asserting into existence, and it is checked against the cheapest,
-    most exact authority — a primary-key lookup rather than a status read.
+    def owner(start: int) -> str:
+        return _qualifying_project(clause, start, known_project_ids) or default_project_id
+
+    mentions = [
+        _RefMention(m.start(), m.end(), 'ticket', m.group(1), None)
+        for m in TICKET_REF_RE.finditer(clause)
+    ]
+    mentions += [
+        _RefMention(m.start(), m.end(), 'commit', m.group(1), owner(m.start()))
+        for m in COMMIT_REF_RE.finditer(clause)
+    ]
+    mentions += [
+        _RefMention(m.start(), m.end(), 'task', m.group(1), owner(m.start()))
+        for m in TASK_REF_RE.finditer(clause)
+    ]
+    mentions += [
+        _RefMention(m.start(), m.end(), 'task', m.group(2), m.group(1))
+        for m in _EXTERNAL_TASK_REF_RE.finditer(clause)
+        if m.group(1) in known_project_ids
+    ]
+    return sorted(mentions, key=lambda mention: mention.start)
+
+
+@dataclass(frozen=True, slots=True)
+class _Marker:
+    """One completion marker, positioned, carrying its own family's kind."""
+
+    start: int
+    end: int
+    kind: ClaimKind
+
+
+_MARKER_FAMILIES: tuple[tuple[re.Pattern[str], ClaimKind], ...] = (
+    (APPLIED_WORK_RE, 'applied_work'),
+    (DISPOSITION_RE, 'disposition'),
+    (FILING_DISPATCH_RE, 'filing_dispatch'),
+)
+
+
+def _marker_spans(stripped_clause: str) -> list[_Marker]:
+    """Every completion marker in *stripped_clause*, in text order."""
+    markers = [
+        _Marker(m.start(), m.end(), kind)
+        for pattern, kind in _MARKER_FAMILIES
+        for m in pattern.finditer(stripped_clause)
+    ]
+    return sorted(markers, key=lambda marker: marker.start)
+
+
+# What separates a marker from a ref it must not bind to: a comma or colon
+# followed by a space, a spaced dash, or a conjunction that opens a new
+# predicate. "#5467, the seven landed rows" and "task #6077 rather than filed"
+# are two subjects, not one.
+_BINDING_BARRIER_RE: re.Pattern[str] = re.compile(
+    r',(?=\s)|:(?=\s)|\s[—–-]\s|'
+    r'\b(?:and|but|while|whereas|although|though|because|rather\s+than|instead\s+of)\b',
+    re.IGNORECASE,
+)
+
+# The only gap through which a marker reaches FORWARD to a task ref: the task
+# is its direct object ("filed task 4746") or its 'as'-complement ("refiled as
+# task 4263"), optionally through one project word ("filed as dark_factory
+# task 4213") that must be registered. 'filed by task N' and 'had landed (task
+# N)' do not fit, so they do not bind forward.
+_TASK_COMPLEMENT_GAP_RE: re.Pattern[str] = re.compile(
+    r"\s+(?:as\s+)?(?:([A-Za-z][\w-]*)(?:'s)?\s+)?",
+    re.IGNORECASE,
+)
+
+
+def _bind_marker(
+    clause: str,
+    marker: _Marker,
+    mentions: list[_RefMention],
+    known_project_ids: frozenset[str] | set[str],
+) -> _RefMention | None:
+    """The ONE ref *marker* asserts something about, or None.
+
+    FORWARD first, because the complement is what the claim asserts into
+    existence ('task N was merged as commit X' is a claim about X): the first
+    ref after the marker, when :func:`_binds_forward` admits the gap. Otherwise
+    BACKWARD: the nearest ref before the marker, with no barrier between them.
     """
-    tickets = _ordered_unique(TICKET_REF_RE.findall(clause))
-    if tickets:
-        # A ticket id is a globally unique primary key in one shared
-        # tickets.db, so a ticket claim carries no project at all — that is
-        # precisely what let instance (2) (a reify writer claiming a
-        # dark_factory ticket) be adjudicated correctly.
-        return 'ticket', [(ref, None) for ref in tickets]
-
-    commits: list[tuple[str, str | None]] = [
-        (match.group(1), _qualifying_project(clause, match.start(), known_project_ids)
-         or default_project_id)
-        for match in COMMIT_REF_RE.finditer(clause)
-    ]
-    if commits:
-        return 'commit', _ordered_unique_pairs(commits)
-
-    tasks: list[tuple[str, str | None]] = [
-        (match.group(1), _qualifying_project(clause, match.start(), known_project_ids)
-         or default_project_id)
-        for match in TASK_REF_RE.finditer(clause)
-    ]
-    tasks += [
-        (match.group(2), match.group(1))
-        for match in _EXTERNAL_TASK_REF_RE.finditer(clause)
-        if match.group(1) in known_project_ids
-    ]
-    if tasks:
-        return 'task', _ordered_unique_pairs(tasks)
-    return None, []
+    following = next((m for m in mentions if m.start >= marker.end), None)
+    if following is not None and _binds_forward(
+        clause[marker.end:following.start], following, known_project_ids
+    ):
+        return following
+    preceding = next((m for m in reversed(mentions) if m.end <= marker.start), None)
+    if preceding is not None and not _BINDING_BARRIER_RE.search(
+        clause[preceding.end:marker.start]
+    ):
+        return preceding
+    return None
 
 
-def _ordered_unique(values: list[str]) -> list[str]:
-    """De-duplicate *values* preserving first-appearance order."""
-    seen: set[str] = set()
-    out: list[str] = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            out.append(value)
-    return out
+def _binds_forward(
+    gap: str, mention: _RefMention, known_project_ids: frozenset[str] | set[str]
+) -> bool:
+    """Whether a marker reaches across *gap* to the *mention* after it.
 
-
-def _ordered_unique_pairs(
-    values: list[tuple[str, str | None]],
-) -> list[tuple[str, str | None]]:
-    """De-duplicate ``(ref, project_id)`` pairs preserving first-appearance order."""
-    seen: set[tuple[str, str | None]] = set()
-    out: list[tuple[str, str | None]] = []
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            out.append(value)
-    return out
+    A ticket or commit binds across any barrier-free gap; a task only as the
+    marker's direct object or 'as'-complement (:data:`_TASK_COMPLEMENT_GAP_RE`).
+    """
+    if _BINDING_BARRIER_RE.search(gap):
+        return False
+    if mention.subject != 'task':
+        return True
+    complement = _TASK_COMPLEMENT_GAP_RE.fullmatch(gap)
+    if complement is None:
+        return False
+    qualifier = complement.group(1)
+    return qualifier is None or qualifier in known_project_ids
 
 
 # --------------------------------------------------------------------------- #

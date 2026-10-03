@@ -566,9 +566,9 @@ CAVEATS: tuple[str, ...] = (
     'of all of these: every targeted graph WAS asked and returned nothing.',
     'DETECTION BOUND: claims are detected by the deterministic lexical '
     'vocabulary in fused_memory.services.completion_claim_gate, which requires '
-    'completion PHRASING and a concrete NAMED REF (task id / commit sha / tkt_ '
-    'id) to co-occur in one clause. A fabricated completion phrased without a '
-    'named ref is invisible to this sweep by construction.',
+    'a completion marker bound to its nearest concrete NAMED REF (task id / '
+    'commit sha / tkt_ id) in the same clause. A fabricated completion phrased '
+    'without a named ref is invisible to this sweep by construction.',
 )
 """The report's caveats, as DATA rather than docstring prose.
 

@@ -301,8 +301,8 @@ class TestFilingDispatchExtraction:
         assert len(claims) == 1, claims
         claim = claims[0]
         assert claim.kind == 'filing_dispatch'
-        # Ticket beats task: the tkt_ id is the more specific authority, and it
-        # is the one that was actually false in the incident.
+        # 're-filed' binds forward to the ticket it names, the ref that was
+        # actually false in the incident, not back to task 5638.
         assert claim.subject == 'ticket'
         assert claim.ref == 'tkt_0RRRC5AASJ9Z630VP4PCN9H376'
 
@@ -354,7 +354,7 @@ class TestFilingDispatchExtraction:
         assert claims[0].ref == '7bbcd5d815'
 
     def test_commit_beats_task_but_ticket_beats_commit(self):
-        """Subject precedence is ticket > commit > task, per clause."""
+        """The marker binds FORWARD to its complement ('as commit X'), not back to the task."""
         task_and_commit = _extract('task 5422 was merged as commit 7bbcd5d815')
         assert [(c.subject, c.ref) for c in task_and_commit] == [('commit', '7bbcd5d815')]
 
