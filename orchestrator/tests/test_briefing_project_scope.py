@@ -386,7 +386,7 @@ class TestDistilledRendering:
         self, briefing: BriefingAssembler,
     ):
         """A correction recalled with the claim it contests reaches the agent
-        whole and naming that claim, not as a cut digest under it."""
+        whole and marked as contesting it, not as a cut digest under it."""
         results = json.loads(recorded_search_text('child-also-matched'))['results']
         parent = next(entry for entry in results if 'grouped' in entry)
         contesting_id = next(
@@ -399,7 +399,7 @@ class TestDistilledRendering:
         )
 
         assert any(
-            line.startswith(f'  - [contests {parent["id"]} · ') and line.endswith(f'] {full_body}')
+            line.startswith('  - [contests its parent · ') and line.endswith(f'] {full_body}')
             for line in context.splitlines()
         ), context
 

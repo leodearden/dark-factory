@@ -684,6 +684,9 @@ def _top_level(results: tuple, entry_id: str) -> dict:
     return next(entry for entry in results if entry['id'] == entry_id)
 
 
+_CONTESTING_BULLET = '  - [contests its parent · '
+
+
 def _line_index(lines: list[str], predicate) -> int:
     index = next((index for index, line in enumerate(lines) if predicate(line)), None)
     assert index is not None, lines
@@ -698,7 +701,7 @@ class TestContestingChildRender:
     render is tested against the shape the producer actually emits.
     """
 
-    def test_a_contesting_child_renders_in_full_naming_its_parent(self):
+    def test_a_contesting_child_renders_in_full_marked_as_contesting(self):
         results = _recorded_results('child-also-matched')
         parent = _grouped_parent_of(results)
         contesting = _amendment(parent, contested=True)
@@ -709,7 +712,7 @@ class TestContestingChildRender:
 
         contests = [
             line for line in rendered.splitlines()
-            if line.startswith(f'  - [contests {parent["id"]} · ')
+            if line.startswith(_CONTESTING_BULLET)
         ]
         assert len(contests) == 1, rendered
         assert contests[0].endswith(f'] {full_body}')
@@ -725,7 +728,7 @@ class TestContestingChildRender:
         lines = render_memory_results(results).splitlines()
 
         parent_at = _line_index(lines, lambda line: line.endswith(f'] {parent["content"]}'))
-        contests_at = _line_index(lines, lambda line: f'[contests {parent["id"]} · ' in line)
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
         plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
         assert parent_at < contests_at < plain_at, lines
 
@@ -744,9 +747,7 @@ class TestContestingChildRender:
 
         lines = render_memory_results(results).splitlines()
 
-        contests_at = _line_index(
-            lines, lambda line: line.startswith(f'  - [contests {parent["id"]} · '),
-        )
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
         plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
         assert contests_at < plain_at, lines
         assert lines[contests_at].endswith(f'] {contesting["digest"]}')
@@ -782,6 +783,32 @@ class TestContestingChildRender:
         assert any(
             line.startswith('- [') and line.endswith(f'] {full_body}') for line in lines
         ), lines
+
+    def test_a_contesting_hit_renders_under_its_own_store(self):
+        results = _recorded_results('child-also-matched')
+        contesting = _amendment(_grouped_parent_of(results), contested=True)
+        moved = tuple(
+            {**entry, 'source_store': 'graphiti'} if entry['id'] == contesting['id'] else entry
+            for entry in results
+        )
+
+        lines = render_memory_results(moved).splitlines()
+
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
+        assert ' · graphiti] ' in lines[contests_at], lines
+
+    def test_a_digest_only_contesting_child_renders_under_its_parents_store(self):
+        results = _recorded_results('only-parent-matched')
+        parent = _grouped_parent_of(results)
+        moved = tuple(
+            {**entry, 'source_store': 'graphiti'} if entry is parent else entry
+            for entry in results
+        )
+
+        lines = render_memory_results(moved).splitlines()
+
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
+        assert ' · graphiti] ' in lines[contests_at], lines
 
 
 class TestRenderEntityBlock:

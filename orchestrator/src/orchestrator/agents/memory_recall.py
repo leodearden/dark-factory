@@ -297,42 +297,43 @@ def _is_contesting(child: dict) -> bool:
     return child.get(CONTESTED_CHILD_KEY) is True
 
 
+def _entry_store(entry: dict, default: str) -> str:
+    """The store an entry names in ``source_store``, else *default*."""
+    store = entry.get('source_store')
+    return store if isinstance(store, str) and store else default
+
+
 def _contesting_bullet(
-    child: dict, parent_id: str | None, hits_by_id: Mapping[str, dict], store: str,
+    child: dict, hits_by_id: Mapping[str, dict], parent_store: str,
 ) -> str | None:
-    """Render a child that contests its parent, naming the parent it contests.
+    """Render a child that contests its parent, tagged ``contests its parent``.
 
     The child's full body is on the wire only as its own top-level hit, so
-    that hit renders when the reply carries one; the child entry itself is
-    the fallback.
+    that hit renders, under its own store, when the reply carries one. The
+    child entry itself is the fallback, under its parent's store.
     """
-    label = f'contests {parent_id}' if parent_id else 'contests its parent'
+    label = 'contests its parent'
     child_id = _entry_id(child)
-    sources = (hits_by_id.get(child_id) if child_id else None, child)
-    return next(
-        (
-            bullet
-            for source in sources
-            if (bullet := _memory_bullet(source, store, indent='  ', label=label)) is not None
-        ),
-        None,
-    )
+    hit = hits_by_id.get(child_id) if child_id else None
+    if hit is not None:
+        bullet = _memory_bullet(hit, _entry_store(hit, parent_store), indent='  ', label=label)
+        if bullet is not None:
+            return bullet
+    return _memory_bullet(child, parent_store, indent='  ', label=label)
 
 
 def _result_bullets(entry: dict, hits_by_id: Mapping[str, dict]) -> list[str]:
     """One result's bullet, then its contesting children, then its other children."""
-    store = entry.get('source_store')
-    store = store if isinstance(store, str) and store else UNKNOWN_STORE
+    store = _entry_store(entry, UNKNOWN_STORE)
     bullet = _memory_bullet(entry, store)
     if bullet is None:
         return []
     children = _grouped_children(entry)
-    parent_id = _entry_id(entry)
     contesting = [
         child_bullet
         for child in children
         if _is_contesting(child)
-        and (child_bullet := _contesting_bullet(child, parent_id, hits_by_id, store)) is not None
+        and (child_bullet := _contesting_bullet(child, hits_by_id, store)) is not None
     ]
     others = [
         child_bullet
@@ -349,8 +350,9 @@ def render_memory_results(results: Sequence[Any]) -> str:
     Each grouped child (:data:`GROUPED_CHILD_KEYS`) renders as a nested bullet
     tagged with its parent's store, since a collapsed child has none of its own.
     A child marked :data:`CONTESTED_CHILD_KEY` renders first under its parent,
-    tagged ``contests <parent id>``, from its own top-level hit when the reply
-    carries one; that hit is then not rendered again at its own rank.
+    tagged ``contests its parent``, from its own top-level hit and that hit's
+    store when the reply carries one; that hit is then not rendered again at
+    its own rank.
     """
     entries = [entry for entry in results if isinstance(entry, dict)]
     hits_by_id: dict[str, dict] = {}
