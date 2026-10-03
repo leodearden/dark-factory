@@ -29,7 +29,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
 
 
 class ArmClass(StrEnum):
@@ -234,7 +234,7 @@ def open_pairwise(context: ArmContext) -> Iterator[PairwiseScorer]:
         client.close()
 
 
-def _is_number(value: Any) -> bool:
+def _is_number(value: Any) -> TypeGuard[int | float]:
     return isinstance(value, int | float) and not isinstance(value, bool)
 
 
