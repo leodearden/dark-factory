@@ -1102,6 +1102,11 @@ def _readonly_connect(db_path: Path) -> Any:
 
     Raises on a missing/unopenable file; every caller maps that to
     UNVERIFIABLE rather than to an accusation.
+
+    Not ``scripts/_task_db_scan.py::connect_ro``, deliberately:
+    ``fused-memory/scripts`` cannot import that ``scripts/`` sibling, this one
+    opener also serves tickets.db, and every caller degrades a failure to
+    UNVERIFIABLE, so a refusal's remedy would never reach the reader.
     """
     import sqlite3  # noqa: PLC0415
 
