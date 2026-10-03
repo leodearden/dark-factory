@@ -9,6 +9,7 @@ through the matching ``shape_*`` function before serialising as JSON.
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,8 +39,10 @@ from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.mcp_fanout import project_label
 from dashboard.data.outcome_colors import assign_outcome_colors
 from dashboard.data.performance import PerformanceCards
+from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
+from dashboard.data.write_journal import MemoryOps
 
 # ---------------------------------------------------------------------------
 # ORCHESTRATORS + PROJECTS
@@ -147,27 +150,45 @@ def _empty_series_dict() -> dict[str, list]:
     return {'labels': [], 'values': []}
 
 
+def _queue_block(
+    queue: object, queue_spark: Mapping[str, list] | None, served_at: datetime,
+) -> dict[str, Any]:
+    """The write-queue block, identical whichever branch of the status serves it."""
+    spark_q = queue_spark or _EMPTY_SERIES
+    return {
+        'stats': _wire_served(queue, 'MEMORY_STATUS queue.stats', served_at),
+        'spark': {
+            'labels': list(spark_q.get('labels') or []),
+            'values': list(spark_q.get('values') or []),
+        },
+    }
+
+
 def shape_memory(
     status: Mapping[str, Any],
-    queue: Mapping[str, Any],
+    queue: Datum[dict[str, Any]],
     *,
+    served_at: datetime,
     sparks: Mapping[str, Mapping[str, list]] | None = None,
     queue_spark: Mapping[str, list] | None = None,
     delta_24h: Mapping[str, Mapping[str, Any]] | None = None,
     wal: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return ``{MEMORY_STATUS: {...}}`` matching the redux UI's read sites.
+    """Return ``{MEMORY_STATUS: {...}, served_at}`` matching the redux UI's read sites.
 
-    ``sparks`` (optional) carries ``{graphiti_nodes, mem0_memories}`` time
-    series; ``queue_spark`` carries the pending-queue series; ``delta_24h``
-    carries per-project ``{graphiti_nodes, mem0_memories}`` snapshots from
-    ~24h ago for delta rendering.  All three are populated from
-    metrics.db; absent / empty when history is sparse.
+    ``queue`` is the write queue as one Datum (``memory.py::write_queue_datum``)
+    served under ``queue.stats``, aged to *served_at*; the queue block is the
+    same whether ``get_status`` answered or not, because the two probes are
+    independent. ``sparks`` (optional) carries ``{graphiti_nodes,
+    mem0_memories}`` time series; ``queue_spark`` carries the pending-queue
+    series; ``delta_24h`` carries per-project ``{graphiti_nodes,
+    mem0_memories}`` snapshots from ~24h ago for delta rendering.  All three
+    are populated from metrics.db; absent / empty when history is sparse.
     """
     spark_g = (sparks or {}).get('graphiti_nodes') or _EMPTY_SERIES
     spark_m = (sparks or {}).get('mem0_memories') or _EMPTY_SERIES
-    spark_q = queue_spark or _EMPTY_SERIES
     delta_map = delta_24h or {}
+    queue_block = _queue_block(queue, queue_spark, served_at)
 
     def _project_block(pid: str, payload: Mapping[str, Any]) -> dict:
         before = delta_map.get(pid) or {}
@@ -183,16 +204,14 @@ def shape_memory(
                          'spark': _empty_series_dict()},
             'mem0': {'connected': False, 'memory_count': 0, 'spark': _empty_series_dict()},
             'taskmaster': {'connected': False},
-            'queue': {'counts': dict(queue.get('counts') or {}),
-                      'oldest_pending_age_seconds': queue.get('oldest_pending_age_seconds'),
-                      'spark': _empty_series_dict()},
+            'queue': queue_block,
             'projects': {},
             'wal': _shape_wal_status(wal),
             'offline': True,
             'error': status.get('error'),
             'uptime_seconds': None,
             'started_at': None,
-        }}
+        }, 'served_at': served_at.isoformat()}
 
     graphiti = dict(status.get('graphiti') or {})
     graphiti.setdefault('connected', True)
@@ -212,20 +231,6 @@ def shape_memory(
     taskmaster = dict(status.get('taskmaster') or {})
     taskmaster.setdefault('connected', True)
 
-    queue_counts = dict(queue.get('counts') or {})
-    for _ckey in ('pending', 'retry', 'dead'):
-        queue_counts.setdefault(_ckey, 0)
-    queue_block = {
-        'counts': queue_counts,
-        'oldest_pending_age_seconds': queue.get('oldest_pending_age_seconds'),
-        'spark': {
-            'labels': list(spark_q.get('labels') or []),
-            'values': list(spark_q.get('values') or []),
-        },
-    }
-    if queue.get('offline'):
-        queue_block['offline'] = True
-
     raw_projects = dict(status.get('projects') or {})
     enriched_projects = {pid: _project_block(pid, payload) for pid, payload in raw_projects.items()}
 
@@ -240,7 +245,7 @@ def shape_memory(
         'wal': wal_block,
         'uptime_seconds': status.get('uptime_seconds'),
         'started_at': status.get('started_at'),
-    }}
+    }, 'served_at': served_at.isoformat()}
 
 
 # Thresholds for surfacing WAL health alarms in the UI. Aligned with the
@@ -342,32 +347,34 @@ def _shape_wal_status(
 
 
 # ---------------------------------------------------------------------------
-# MEMORY_TIMESERIES + MEMORY_OPS_BREAKDOWN
+# MEMORY_OPS
 # ---------------------------------------------------------------------------
 
 
-def shape_memory_graphs(
-    timeseries: Mapping[str, Any], ops: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return ``{MEMORY_TIMESERIES, MEMORY_OPS_BREAKDOWN}``.
+def shape_memory_graphs(ops: MemoryOps) -> dict[str, Any]:
+    """Return ``{MEMORY_OPS}``: one window's operations, both views.
 
-    ``timeseries`` is already in DF_DATA shape; ``ops`` is reshaped from
-    ``{labels, values}`` to ``[{label, value}, ...]``.
+    The hourly ``total`` series and the window ``totals`` are derived here
+    and nowhere else, so the client never re-counts: the reads/writes/other
+    caption and the donut's centre read the same served numbers, and
+    ``totals.total`` equals the ``by_operation`` sum by MemoryOps' invariant.
     """
-    ts_labels = list(timeseries.get('labels') or [])
-    breakdown = [
-        {'label': lbl, 'value': val}
-        for lbl, val in zip(
-            ops.get('labels') or [], ops.get('values') or [], strict=False,
-        )
-    ]
+    reads, writes, other = sum(ops.reads), sum(ops.writes), sum(ops.other)
     return {
-        'MEMORY_TIMESERIES': {
-            'labels': ts_labels,
-            'reads': list(timeseries.get('reads') or []),
-            'writes': list(timeseries.get('writes') or []),
+        'MEMORY_OPS': {
+            'labels': list(ops.labels),
+            'reads': list(ops.reads),
+            'writes': list(ops.writes),
+            'other': list(ops.other),
+            'total': [r + w + o for r, w, o in zip(ops.reads, ops.writes, ops.other, strict=True)],
+            'totals': {
+                'reads': reads, 'writes': writes, 'other': other,
+                'total': reads + writes + other,
+            },
+            'by_operation': [
+                {'label': label, 'value': count} for label, count in ops.by_operation
+            ],
         },
-        'MEMORY_OPS_BREAKDOWN': breakdown,
     }
 
 
@@ -388,10 +395,16 @@ def shape_recon(
     """Return ``{RECON_STATE: {...}, AGENTS: [...]}``.
 
     ``watermarks`` is converted from a list-of-dicts to a project-keyed dict.
-    ``runs`` and ``burst_state`` are passed through as lists.  ``AGENTS`` is
-    the distinct sorted set of ``agent_id`` values from ``burst_state``.
+    ``runs`` and ``burst_state`` are passed through as lists.  ``burst_state``
+    is :func:`reconciliation.partition_burst_state`'s ACTIVE partition, and
+    ``agent_activity`` partitions it again by the stamp each row carries, so
+    its counts sum to the burst list's length.  A row without a stamp raises:
+    a route that skipped the partition is a wiring bug, not zero agents.
+    ``AGENTS`` is the distinct sorted set of ``agent_id`` values from
+    ``burst_state``.
     """
     burst_list = list(burst_state)
+    activity_counts = Counter(AgentActivity(row['activity']) for row in burst_list)
     wm_map: dict[str, dict] = {}
     for wm in watermarks:
         pid = wm.get('project_id')
@@ -415,6 +428,9 @@ def shape_recon(
         'RECON_STATE': {
             'buffer': buffer_block,
             'burst_state': [dict(b) for b in burst_list],
+            'agent_activity': {
+                activity.value: activity_counts[activity] for activity in AgentActivity
+            },
             'watermarks': wm_map,
             'verdict': dict(verdict) if verdict else None,
             'runs': runs_list,

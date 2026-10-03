@@ -16,7 +16,10 @@ from dashboard.data.datum import (
     unknown_datum,
 )
 from dashboard.data.escalation_corpus import EscalationView
+from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
 from dashboard.data.performance import PerformanceCards
+from dashboard.data.reconciliation import AgentActivity
+from dashboard.data.write_journal import MemoryOps
 
 # ---------------------------------------------------------------------------
 # shape_orchestrators / PROJECTS
@@ -199,30 +202,103 @@ def test_shape_orchestrators_degraded_defaults_false_when_absent():
 # shape_memory
 # ---------------------------------------------------------------------------
 
+_MEMORY_SERVED_AT = datetime(2026, 10, 3, 12, 0, 30, tzinfo=UTC)
+_ONLINE_STATUS = {'graphiti': {}, 'mem0': {}, 'projects': {}}
+_OFFLINE_STATUS = {'offline': True, 'error': 'unreachable'}
+
+
+def _queue_datum(*, pending=0, retry=0, dead=0, oldest=None, measured_at=_MEMORY_SERVED_AT):
+    """A reachable write-queue reading, built by its real producer."""
+    return write_queue_datum(
+        {
+            'counts': {'pending': pending, 'retry': retry, 'dead': dead},
+            'oldest_pending_age_seconds': oldest,
+        },
+        measured_at=measured_at,
+    )
+
+
+def _shape_memory(status, queue=None, **kwargs):
+    return redux_api.shape_memory(
+        status,
+        _queue_datum() if queue is None else queue,
+        served_at=_MEMORY_SERVED_AT,
+        **kwargs,
+    )
+
 
 def test_shape_memory_offline_keeps_required_keys():
-    body = redux_api.shape_memory(
-        {'offline': True, 'error': 'unreachable'},
-        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
-    )
+    body = _shape_memory(_OFFLINE_STATUS)
     ms = body['MEMORY_STATUS']
     assert ms['graphiti']['connected'] is False
     assert ms['mem0']['connected'] is False
     assert ms['taskmaster']['connected'] is False
-    assert ms['queue']['counts'] == {'pending': 0}
+    assert ms['queue']['stats']['value']['pending'] == 0
     assert ms['offline'] is True
+
+
+def test_shape_memory_offline_status_still_renders_a_measured_queue():
+    """get_status offline / get_queue_stats online: the queue's state, not zeros."""
+    body = _shape_memory(_OFFLINE_STATUS, _queue_datum(pending=4, retry=1))
+    stats = body['MEMORY_STATUS']['queue']['stats']
+    assert stats['state'] == 'fresh'
+    assert stats['value']['pending'] == 4
+    assert stats['value']['retry'] == 1
+    assert stats['as_of'] == _MEMORY_SERVED_AT.isoformat()
+
+
+def test_shape_memory_online_status_renders_an_unmeasured_queue_as_unknown():
+    queue = unknown_datum(
+        'http://localhost:8002: ConnectError: refused', WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
+    )
+    body = _shape_memory(_ONLINE_STATUS, queue)
+    block = body['MEMORY_STATUS']['queue']
+    assert block['stats']['state'] == 'unknown'
+    assert block['stats']['value'] is None
+    assert block['stats']['reason'] == 'http://localhost:8002: ConnectError: refused'
+    assert 'counts' not in block
+    assert 'offline' not in block, 'the Datum state carries the offline fact now'
+
+
+@pytest.mark.parametrize('status', [_ONLINE_STATUS, _OFFLINE_STATUS], ids=['online', 'offline'])
+def test_shape_memory_queue_block_is_one_normaliser_for_both_branches(status):
+    queue = _queue_datum(pending=2, oldest=3.0)
+    spark = {'labels': ['2026-10-03T11:00:00+00:00'], 'values': [2]}
+    online = _shape_memory(_ONLINE_STATUS, queue, queue_spark=spark)
+    shaped = _shape_memory(status, queue, queue_spark=spark)
+    assert shaped['MEMORY_STATUS']['queue'] == online['MEMORY_STATUS']['queue']
+    assert shaped['MEMORY_STATUS']['queue']['spark'] == spark
+
+
+def test_shape_memory_refuses_a_queue_that_is_not_a_datum():
+    with pytest.raises(DatumContractError) as raised:
+        _shape_memory(_ONLINE_STATUS, {'counts': {'pending': 0}})
+    assert raised.value.invariant is DatumInvariant.DATUM_REQUIRED
+
+
+def test_shape_memory_ages_a_queue_reading_past_its_bound():
+    measured_at = _MEMORY_SERVED_AT - timedelta(seconds=WRITE_QUEUE_FRESHNESS_BOUND_SECONDS + 30)
+    body = _shape_memory(_ONLINE_STATUS, _queue_datum(pending=1, measured_at=measured_at))
+    stats = body['MEMORY_STATUS']['queue']['stats']
+    assert stats['state'] == 'stale'
+    assert stats['value']['pending'] == 1
+    assert 'freshness bound' in stats['reason']
+
+
+def test_shape_memory_payload_carries_served_at():
+    body = _shape_memory(_ONLINE_STATUS)
+    assert body['served_at'] == _MEMORY_SERVED_AT.isoformat()
 
 
 def test_shape_memory_uptime_threaded_when_present():
     """online status with uptime fields → both appear in MEMORY_STATUS."""
-    body = redux_api.shape_memory(
+    body = _shape_memory(
         {
             'graphiti': {'node_count': 10},
             'mem0': {'memory_count': 5},
             'uptime_seconds': 277020,
             'started_at': '2026-06-12T10:00:00+00:00',
         },
-        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
     )
     ms = body['MEMORY_STATUS']
     assert ms['uptime_seconds'] == 277020
@@ -231,10 +307,7 @@ def test_shape_memory_uptime_threaded_when_present():
 
 def test_shape_memory_uptime_none_when_absent():
     """online status missing uptime fields → keys present but None."""
-    body = redux_api.shape_memory(
-        {'graphiti': {'node_count': 1}, 'mem0': {'memory_count': 1}},
-        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
-    )
+    body = _shape_memory({'graphiti': {'node_count': 1}, 'mem0': {'memory_count': 1}})
     ms = body['MEMORY_STATUS']
     assert ms['uptime_seconds'] is None
     assert ms['started_at'] is None
@@ -242,10 +315,7 @@ def test_shape_memory_uptime_none_when_absent():
 
 def test_shape_memory_offline_uptime_keys_none():
     """offline status → uptime_seconds and started_at present and None."""
-    body = redux_api.shape_memory(
-        {'offline': True, 'error': 'unreachable'},
-        {'counts': {'pending': 0}, 'oldest_pending_age_seconds': None},
-    )
+    body = _shape_memory(_OFFLINE_STATUS)
     ms = body['MEMORY_STATUS']
     assert 'uptime_seconds' in ms
     assert ms['uptime_seconds'] is None
@@ -254,17 +324,17 @@ def test_shape_memory_offline_uptime_keys_none():
 
 
 def test_shape_memory_online_passes_through_plus_defaults():
-    body = redux_api.shape_memory(
+    body = _shape_memory(
         {'graphiti': {'node_count': 100}, 'mem0': {'memory_count': 50},
          'projects': {'dark_factory': {'graphiti_nodes': 100}}},
-        {'counts': {'pending': 4}, 'oldest_pending_age_seconds': 12.5},
+        _queue_datum(pending=4, oldest=12.5),
     )
     ms = body['MEMORY_STATUS']
     assert ms['graphiti']['connected'] is True
     assert ms['graphiti']['node_count'] == 100
     assert ms['mem0']['connected'] is True
-    assert ms['queue']['counts']['pending'] == 4
-    assert ms['queue']['oldest_pending_age_seconds'] == 12.5
+    assert ms['queue']['stats']['value']['pending'] == 4
+    assert ms['queue']['stats']['value']['oldest_pending_age_seconds'] == 12.5
     assert ms['projects']['dark_factory']['graphiti_nodes'] == 100
 
 
@@ -274,15 +344,12 @@ def test_shape_memory_online_passes_through_plus_defaults():
 
 
 def _basic_status_and_queue():
-    return (
-        {'graphiti': {}, 'mem0': {}, 'projects': {}},
-        {'counts': {}, 'oldest_pending_age_seconds': None},
-    )
+    return {'graphiti': {}, 'mem0': {}, 'projects': {}}, _queue_datum()
 
 
 def test_shape_memory_wal_offline_when_wal_missing():
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, wal=None)
+    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal=None)
     wal = body['MEMORY_STATUS']['wal']
     assert wal['status'] == 'offline'
     assert wal['rows'] == []
@@ -291,7 +358,7 @@ def test_shape_memory_wal_offline_when_wal_missing():
 def test_shape_memory_wal_offline_payload_propagates_error():
     status, queue = _basic_status_and_queue()
     body = redux_api.shape_memory(
-        status, queue, wal={'offline': True, 'error': 'unreachable'},
+        status, queue, served_at=_MEMORY_SERVED_AT, wal={'offline': True, 'error': 'unreachable'},
     )
     wal = body['MEMORY_STATUS']['wal']
     assert wal['status'] == 'offline'
@@ -302,7 +369,7 @@ def test_shape_memory_wal_ok_when_all_rows_healthy():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, wal={
+    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
         'stores': {
             'http://srv': {
                 'task_backend': {'ts': now_iso, 'busy': 0, 'log': 12, 'checkpointed': 12,
@@ -324,7 +391,7 @@ def test_shape_memory_wal_red_on_busy_row():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, wal={
+    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
         'stores': {'http://srv': {
             'recon_journal': {'ts': now_iso, 'busy': 1, 'log': 200, 'checkpointed': 0,
                               'detail': None},
@@ -340,7 +407,7 @@ def test_shape_memory_wal_warn_on_log_frames_overflow():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, wal={
+    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
         'stores': {'http://srv': {
             'event_buffer': {'ts': now_iso, 'busy': 0, 'log': 10_000, 'checkpointed': 10_000,
                              'detail': None},
@@ -355,7 +422,7 @@ def test_shape_memory_wal_red_on_stale_ts():
     from datetime import UTC, datetime, timedelta
     old_iso = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, wal={
+    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
         'stores': {'http://srv': {
             'write_journal': {'ts': old_iso, 'busy': 0, 'log': 5, 'checkpointed': 5,
                               'detail': None},
@@ -377,7 +444,7 @@ def test_shape_wal_status_red_on_corrupt_ts(caplog):
 
     status, queue = _basic_status_and_queue()
     with caplog.at_level(logging.WARNING):
-        body = redux_api.shape_memory(status, queue, wal={
+        body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
             'stores': {'http://srv': {
                 'task_backend': {
                     'ts': 'not-a-date',
@@ -415,7 +482,7 @@ def test_shape_wal_status_ok_on_valid_recent_ts():
     from datetime import UTC, datetime
     now_iso = datetime.now(UTC).isoformat()
     status, queue = _basic_status_and_queue()
-    body = redux_api.shape_memory(status, queue, wal={
+    body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
         'stores': {'http://srv': {
             'task_backend': {'ts': now_iso, 'busy': 0, 'log': 0, 'checkpointed': 0,
                              'detail': None},
@@ -432,7 +499,7 @@ def test_shape_wal_status_benign_on_missing_ts(caplog):
 
     status, queue = _basic_status_and_queue()
     with caplog.at_level(logging.WARNING):
-        body = redux_api.shape_memory(status, queue, wal={
+        body = redux_api.shape_memory(status, queue, served_at=_MEMORY_SERVED_AT, wal={
             'stores': {'http://srv': {
                 'task_backend': {'ts': None, 'busy': 0, 'log': 0, 'checkpointed': 0,
                                  'detail': None},
@@ -522,15 +589,63 @@ def test_shape_wal_status_no_now_brackets_real_clock():
 # ---------------------------------------------------------------------------
 
 
-def test_shape_memory_graphs_zips_ops_into_label_value_list():
-    body = redux_api.shape_memory_graphs(
-        {'labels': ['00:00', '01:00'], 'reads': [3, 7], 'writes': [1, 2]},
-        {'labels': ['add_memory', 'search'], 'values': [10, 25]},
+def _memory_ops() -> MemoryOps:
+    return MemoryOps(
+        labels=('11:00', '12:00'),
+        reads=(3, 7),
+        writes=(1, 2),
+        other=(0, 2),
+        by_operation=(('search', 10), ('add_memory', 3), ('compact', 2)),
     )
-    assert body['MEMORY_TIMESERIES']['labels'] == ['00:00', '01:00']
-    assert body['MEMORY_OPS_BREAKDOWN'] == [
-        {'label': 'add_memory', 'value': 10},
-        {'label': 'search', 'value': 25},
+
+
+def test_shape_memory_graphs_serves_one_memory_ops_key():
+    body = redux_api.shape_memory_graphs(_memory_ops())
+
+    assert list(body) == ['MEMORY_OPS'], (
+        'one query, one datum, one key: MEMORY_TIMESERIES and '
+        'MEMORY_OPS_BREAKDOWN are retired'
+    )
+    ops = body['MEMORY_OPS']
+    assert set(ops) == {
+        'labels', 'reads', 'writes', 'other', 'total', 'totals', 'by_operation',
+    }
+    assert ops['labels'] == ['11:00', '12:00']
+    assert ops['reads'] == [3, 7]
+    assert ops['writes'] == [1, 2]
+    assert ops['other'] == [0, 2]
+
+
+def test_shape_memory_graphs_hourly_total_sums_the_three_series():
+    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
+
+    assert ops['total'] == [
+        r + w + o for r, w, o in zip(ops['reads'], ops['writes'], ops['other'], strict=True)
+    ]
+    assert ops['total'] == [4, 11]
+
+
+def test_shape_memory_graphs_window_totals_reconcile_with_by_operation():
+    """PRD sketch #11: the caption's three numbers sum to the donut's total."""
+    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
+    totals = ops['totals']
+
+    assert totals == {'reads': 10, 'writes': 3, 'other': 2, 'total': 15}
+    assert totals['reads'] == sum(ops['reads'])
+    assert totals['writes'] == sum(ops['writes'])
+    assert totals['other'] == sum(ops['other'])
+    assert totals['total'] == totals['reads'] + totals['writes'] + totals['other']
+    assert totals['total'] == sum(row['value'] for row in ops['by_operation'])
+    assert totals['total'] == sum(ops['total'])
+
+
+def test_shape_memory_graphs_by_operation_keeps_memory_ops_order():
+    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
+
+    assert ops['by_operation'] == [
+        {'label': 'search', 'value': 10},
+        {'label': 'add_memory', 'value': 3},
+        {'label': 'compact', 'value': 2},
     ]
 
 
@@ -543,8 +658,10 @@ def test_shape_recon_keys_watermarks_by_project_and_extracts_agents():
     body = redux_api.shape_recon(
         buffer_stats={'buffered_count': 5, 'oldest_event_age_seconds': 10.0},
         burst_state=[
-            {'agent_id': 'claude-task-7', 'state': 'bursting', 'last_write_at': 'x'},
-            {'agent_id': 'claude-interactive', 'state': 'cooling', 'last_write_at': 'y'},
+            {'agent_id': 'claude-task-7', 'state': 'bursting', 'last_write_at': 'x',
+             'activity': AgentActivity.NON_IDLE},
+            {'agent_id': 'claude-interactive', 'state': 'cooling', 'last_write_at': 'y',
+             'activity': AgentActivity.NON_IDLE},
         ],
         watermarks=[
             {'project_id': 'p1', 'last_full_run_completed': 't1'},
@@ -566,6 +683,29 @@ def test_shape_recon_no_verdict_returns_none():
         buffer_stats={}, burst_state=[], watermarks=[], verdict=None, runs=[],
     )
     assert body['RECON_STATE']['verdict'] is None
+
+
+def _shape_recon_over(burst_state):
+    return redux_api.shape_recon(
+        buffer_stats={}, burst_state=burst_state, watermarks=[], verdict=None, runs=[],
+    )
+
+
+def test_shape_recon_counts_agent_activity_over_the_active_partition():
+    burst_state = [
+        {'agent_id': 'a1', 'state': 'bursting', 'activity': AgentActivity.NON_IDLE},
+        {'agent_id': 'a2', 'state': 'idle', 'activity': AgentActivity.RECENT_WRITE},
+    ]
+    rs = _shape_recon_over(burst_state)['RECON_STATE']
+
+    assert rs['agent_activity'] == {'non_idle': 1, 'recent_write': 1}
+    assert sum(rs['agent_activity'].values()) == len(rs['burst_state'])
+
+
+def test_shape_recon_refuses_a_burst_row_the_partition_never_stamped():
+    """A route that skipped partition_burst_state is a wiring bug, not a zero."""
+    with pytest.raises((KeyError, ValueError)):
+        _shape_recon_over([{'agent_id': 'a1', 'state': 'bursting'}])
 
 
 # ---------------------------------------------------------------------------

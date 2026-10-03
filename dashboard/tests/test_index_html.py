@@ -1633,6 +1633,82 @@ def test_escalation_views_js_load_order(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: memory_readings.js is served, versioned, and sits between
+# the modules it reads and the three JSX files that read it (task 5597, PRD
+# leaf theta)
+#
+# memory_readings.js destructures window.DF_DATUM at module scope (datum.js in
+# turn reads window.DF_ENDPOINT_STALENESS), and tabs.jsx, tab_overview.jsx and
+# app.jsx destructure window.DF_MEMORY_READINGS at module scope — none with a
+# fallback. Each edge is its own case because each blanks a different surface.
+# ---------------------------------------------------------------------------
+
+_MEMORY_READINGS_PREFIX = '/static/redux/memory_readings.js'
+
+
+def test_memory_readings_js_is_served(client) -> None:
+    """GET /static/redux/memory_readings.js returns 200.
+
+    The load-order guards below only read tag positions, which a file present
+    in git but not served would still pass — while the Memory tab, the
+    Overview and the topbar throw on their top-level destructure.
+    """
+    resp = client.get(_MEMORY_READINGS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_MEMORY_READINGS_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_memory_readings_js_has_cache_buster(index_html_body: str) -> None:
+    """memory_readings.js is present among the VERSIONED redux assets."""
+    assert re.search(r'/static/redux/memory_readings\.js\?v=\d+', index_html_body), (
+        'memory_readings.js is not present among the versioned /static/redux/* '
+        'assets in index.html — tabs.jsx, tab_overview.jsx and app.jsx '
+        'destructure window.DF_MEMORY_READINGS at top level with no fallback. '
+        'Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+_MEMORY_READINGS_ORDER_CASES = [
+    (_ENDPOINT_STALENESS_PREFIX, 'endpoint_staleness.js', _MEMORY_READINGS_PREFIX, 'memory_readings.js'),
+    (_DATUM_PREFIX, 'datum.js', _MEMORY_READINGS_PREFIX, 'memory_readings.js'),
+    (_MEMORY_READINGS_PREFIX, 'memory_readings.js', _TABS_PREFIX, 'tabs.jsx'),
+    (_MEMORY_READINGS_PREFIX, 'memory_readings.js', _TAB_OVERVIEW_PREFIX, 'tab_overview.jsx'),
+    (_MEMORY_READINGS_PREFIX, 'memory_readings.js', _APP_JSX_PREFIX, 'app.jsx'),
+]
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label',
+    _MEMORY_READINGS_ORDER_CASES,
+    ids=[
+        'staleness-before-memory-readings',
+        'datum-before-memory-readings',
+        'memory-readings-before-tabs',
+        'memory-readings-before-tab-overview',
+        'memory-readings-before-app',
+    ],
+)
+def test_memory_readings_js_load_order(
+    index_html_body: str,
+    before_prefix: str,
+    before_label: str,
+    after_prefix: str,
+    after_label: str,
+) -> None:
+    """The memory readers load after what they read and before what reads them."""
+    assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+        consumer_note=f'{after_label} ' + _READS_AT_MODULE_SCOPE.format(before=before_label),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 

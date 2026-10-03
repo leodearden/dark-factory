@@ -612,6 +612,28 @@ def test_the_locks_cell_site_hands_over_a_datum(census_bodies):
     )
 
 
+def test_the_locks_datum_is_decided_by_scheduler_locks_datum(census_bodies):
+    """The Locks Datum comes from task_row_cells.js::schedulerLocksDatum, not tabs.jsx.
+
+    The decision used to be a tabs.jsx arrow keyed on the snapshot's any-project
+    ``offline`` flag, so ONE offline project blanked every project's Locks
+    column — and, being JSX, nothing could execute it. task_row_cells.test.mjs
+    now runs the decision; this pins that tabs.jsx reaches it and kept no copy.
+    """
+    body = census_bodies['tabs.jsx']
+    (span,) = _tag_spans(body, _LOCKS_CELL_TAG_RE, 'tabs.jsx')
+    assert re.search(r'(?<![\w$])datum\s*=\s*\{\s*schedulerLocksDatum\(', span), (
+        f'<LocksCell> is not handed schedulerLocksDatum(...):\n{span}'
+    )
+    assert not re.search(r'\bschedLocksDatum\b', body), (
+        'tabs.jsx still defines its own schedLocksDatum beside the executable one.'
+    )
+    assert not re.search(r'SCHEDULER\.offline\b', body), (
+        "tabs.jsx still reads the snapshot's any-project `offline` flag, which "
+        "blanks every project's Locks when one project's scheduler is offline."
+    )
+
+
 # ---------------------------------------------------------------------------
 # The endpoint paths that key DF_DATA.__receipt
 #
