@@ -941,6 +941,19 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         scheduler = _StubScheduler(return_value, raises)
         return scheduler, SchedulerChronicFlakeTaskClient(scheduler, '/proj')
 
+    @pytest.mark.asyncio
+    async def test_satisfies_the_protocol_statically(self):
+        """Pyright checks the annotated assignment, so the adapter cannot drift from
+        the seam the ledger consumes (the task-3533 pin,
+        ``escalation/tests/test_pins.py::TestPinRecordProtocol``)."""
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.flake_ledger import FlakeLedgerTaskClient
+
+        client: FlakeLedgerTaskClient = SchedulerChronicFlakeTaskClient(
+            _StubScheduler(mcp_tool_envelope({'statuses': {}})), '/proj',
+        )
+        assert await client.get_statuses(['x']) == ({}, None)
+
     # ── get_statuses ──────────────────────────────────────────────────────────
     #
     # The return shape is the ``(statuses, error)`` PAIR that

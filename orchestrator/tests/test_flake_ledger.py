@@ -1680,6 +1680,20 @@ class _FakeTaskClient:
             raise self._commit_raises
 
 
+@pytest.mark.asyncio
+class TestFakeTaskClientConformance:
+    """ASYNC-ONLY CLASS (see the module docstring)."""
+
+    async def test_satisfies_the_protocol_statically(self) -> None:
+        """Pyright checks the annotated assignment, so this double cannot drift from
+        the seam it stands in for (the task-3533 pin,
+        ``escalation/tests/test_pins.py::TestPinRecordProtocol``)."""
+        from orchestrator.flake_ledger import FlakeLedgerTaskClient
+
+        client: FlakeLedgerTaskClient = _FakeTaskClient()
+        assert await client.get_statuses(['x']) == ({}, None)
+
+
 def _owner(db_path: Path, test_id: str) -> str | None:
     """``owner_task_id`` read with RAW sqlite3 — never through the module under test."""
     (raw,) = _rows(db_path, 'SELECT * FROM flake_debt WHERE test_id = ?', (test_id,))
