@@ -309,6 +309,35 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
             "3972's fused-memory archive-root decision."
         ),
     },
+    {
+        'path': 'scripts/legibility/session_runner.py',
+        'qualname': 'SessionRunner.__init__',
+        'destroyed_by': (
+            'session_runner.py::SessionRunner.close -> TaskConfigDir.cleanup on '
+            'every exit path (nightly run_nightly try/finally, census.main and '
+            'coder.main `with`); cleanup_at_exit=True atexit rmtree; '
+            'session_runner.py::_sweep_stale_session_config_dirs_once -> '
+            'config_dir.py::sweep_stale_pid_dirs in a later process (owner pid '
+            'dead)'
+        ),
+        'disposition': UNARCHIVED_BY_DESIGN,
+        'rationale': (
+            'Per-process legibility trickle / census / coder-CLI dir (task '
+            '6042). Trickle digests are one-shot classifier calls with no '
+            'tools, and census mining and synthesis are classifiers; their '
+            'product (the coding record, the census verdict) is persisted by '
+            'the caller. Census verify calls are bounded read-only '
+            'explorations whose only product is the per-cluster verdict that '
+            'the census records. Archiving would also be harmful, not just '
+            'redundant: scripts/legibility/inventory.py walks the archive '
+            'roots as well as ~/.claude/projects, so archived sessions, which '
+            'quote codebook clusters by construction, would be fed back into '
+            'the corpus the trickle codes. Retention changed knowingly: before '
+            'task 6042 the text-mode `claude -p` left these sessions under the '
+            'operator\'s ambient ~/.claude/projects indefinitely; they are now '
+            'deleted at close.'
+        ),
+    },
 )
 
 

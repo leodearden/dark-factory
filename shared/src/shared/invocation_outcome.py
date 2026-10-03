@@ -4,9 +4,7 @@ Consolidates the cap/near-cap/auth-failure/CLI-error/wedge classification
 logic previously scattered across ``shared.usage_gate`` (Claude/Codex/Gemini
 cap string tables, ``detect_cap_hit``) and ``shared.cli_invoke``
 (``NON_CAP_CLI_ERROR_MARKERS``, ``is_zero_output_timeout``) into one total,
-pure classifier: :func:`classify_invocation`. Text-mode callers, whose
-streams carry no structured status, get the strict auth-rejection sibling
-:func:`classify_text_auth_rejection`.
+pure classifier: :func:`classify_invocation`.
 
 This module is additive only — it does not modify ``usage_gate.py`` or
 ``cli_invoke.py``. Rewiring those consumers to call ``classify_invocation``
@@ -54,11 +52,8 @@ __all__ = [
     'ServerError',
     'ZeroOutputWedge',
     'Failure',
-    'REAL_CLI_AUTH_REJECTIONS',
-    'TextAuthRejection',
     'auth_failure_reason',
     'classify_invocation',
-    'classify_text_auth_rejection',
 ]
 
 
@@ -681,64 +676,3 @@ def classify_invocation(
         return ZeroOutputWedge()
 
     return Failure(kind='unclassified')
-
-
-@dataclass(frozen=True)
-class TextAuthRejection:
-    """One measured text-mode auth rejection.
-
-    ``message`` is the verbatim text, ``lead`` the opening a stream must start
-    with to count as this rejection, and ``status`` the HTTP status measured
-    for that text.
-    """
-
-    message: str
-    lead: str
-    status: int
-
-    def __post_init__(self) -> None:
-        if not self.lead or not self.message.startswith(self.lead):
-            raise ValueError(
-                f'lead {self.lead!r} must be a non-empty opening of message {self.message!r}'
-            )
-
-
-# The SINGLE source for text-mode auth rejections: the classifier and the
-# shared and scripts tests all read it. Add an entry only with a transcript to
-# cite. Keep the U+00B7 byte-exact.
-REAL_CLI_AUTH_REJECTIONS: tuple[TextAuthRejection, ...] = (
-    # Text-mode stdout at exit 1, 2026-09-29 legibility trickle
-    # (esc-legibility-trickle-dark_factory-6). The same text was the JSON
-    # `result` beside api_error_status 403 on CLI 2.1.168, 2026-06-08.
-    TextAuthRejection(
-        message='Your organization has disabled Claude subscription access for Claude Code'
-        ' · Use an Anthropic API key instead, or ask your admin to enable access',
-        lead='Your organization has disabled Claude subscription access',
-        status=403,
-    ),
-    # Every call from max-b, 2026-04-20.
-    TextAuthRejection(
-        message='Your organization does not have access to Claude',
-        lead='Your organization does not have access to Claude',
-        status=403,
-    ),
-)
-
-
-def classify_text_auth_rejection(output: str, stderr: str) -> AuthFailed | None:
-    """Recognise a measured auth rejection from text-mode ``claude -p`` streams.
-
-    Exists beside :func:`classify_invocation` because text mode carries no
-    ``api_error_status``: the rejection is plain text at exit 1. Matching is
-    anchored at the start of the stripped stream (``output`` first, then
-    ``stderr``) because a failed invocation's stream can QUOTE the sentence,
-    and in a loop-less caller an AUTH_FAILED transition lasts the whole
-    process. Consumer: ``scripts/legibility/account_pool.py::pool_invoke``.
-    """
-    for stream in (output, stderr):
-        text = stream.strip()
-        opening = text.lower()
-        for rejection in REAL_CLI_AUTH_REJECTIONS:
-            if opening.startswith(rejection.lead.lower()):
-                return AuthFailed(status=rejection.status, body=_sanitise_auth_body(text))
-    return None

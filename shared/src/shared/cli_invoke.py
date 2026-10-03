@@ -181,6 +181,32 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         give a BIGGER account pool LESS
 #                                         wall-clock patience.
 #
+# scripts/legibility/session_runner.py    NO patience at all: park_on_frozen_
+#   (nightly legibility trickle + census, pool=False + max_cap_retries=
+#    every LLM call they make)            gate.account_count.  The contract is
+#                                         IMMEDIATE defer/taint (task 4736):
+#                                         a nightly oneshot must not block on
+#                                         a cap wait across the NEXT night's
+#                                         timer, and its digests are
+#                                         re-derivable, so patience buys
+#                                         nothing and costs a missed run.  One
+#                                         pass over the pool, then
+#                                         AllAccountsCappedException or
+#                                         PoolFrozen, which the runner types
+#                                         per task 5947 (all-capped defers at
+#                                         exit 0; all-auth-failed fails loud).
+#                                         is_usable_reply per stage: its
+#                                         codebook is dominated by usage-limit
+#                                         clusters, so a verdict QUOTING a
+#                                         banner must not cap a healthy
+#                                         account, while an unparseable exit-0
+#                                         banner still rotates.
+#                                         cap_wait_sanity_secs left at the
+#                                         default: the two bounds above always
+#                                         fire first.  Was an audited
+#                                         NON-caller (own text-mode spawn, no
+#                                         account pool) until task 6042.
+#
 # SCOPE OF EVERY BOUND IN THIS TABLE (task 3630 amendment, reviewer:
 # robustness).  cap_wait_sanity_secs is consulted at exactly one place —
 # _check_cap_wait — which runs in the cap-hit branch AFTER an invocation
@@ -190,82 +216,15 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # ends in an unbounded `await self._open.wait()` (usage_gate.py) released only
 # by a real cap reset or a successful resume probe.  So a caller whose pool is
 # ALREADY frozen when it starts can still block for hours despite a 120 s or
-# 1800 s policy here.  Every caller in this table inherits that gap; none of
-# them currently compensates for it.  Closing it belongs HERE, inside the
-# wrapper, where a wait in before_invoke is definitionally a cap wait and can
-# be attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
+# 1800 s policy here.  Every caller in this table inherits that gap by
+# default.  It is now closable PER CALLER, inside the wrapper as it had to be
+# (task 6042): park_on_frozen_pool=False makes before_invoke raise
+# usage_gate.PoolFrozen where it would have parked, so a caller that must
+# defer rather than wait never blocks on a frozen pool.  The default stays
+# True, so every caller above still parks.  The fix belongs in the wrapper
+# because a wait in before_invoke is definitionally a cap wait and can be
+# attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
 # pool from a slow agent and would misattribute the latter.
-#
-# AUDITED NON-CALLERS (task 4736).  A caller that deliberately does NOT route
-# through invoke_with_cap_retry still gets a row, so the next investigator
-# finds an audit ANSWER here rather than an absence and re-derives nothing.
-#
-# Caller                                  Policy / WHY
-# ───────────────────────────────────────────────────────────────────────────
-# scripts/legibility/coder.py             DELIBERATE NON-CALLER — no
-#   (nightly legibility trickle, spawned  cap_wait_sanity_secs, because there
-#    via scripts/legibility/nightly.py)   is no cap WAIT to bound.  Its
-#                                         contract is IMMEDIATE defer/taint,
-#                                         in the shape of evals/runner.py's
-#                                         `cap_exhausted:` marker above: a
-#                                         capped digest is EXCLUDED (labelled
-#                                         CoderCapExhausted, tallied into
-#                                         RunResult.capped, no record
-#                                         fabricated), and a majority-capped
-#                                         storm defers the whole night at
-#                                         exit 0 (coder.is_cap_deferral).
-#                                         Three measured reasons, not an
-#                                         omission:
-#                                         (1) the systemd unit runs `uv run
-#                                             --frozen --project shared python
-#                                             scripts/legibility/nightly.py`;
-#                                             under that interpreter `import
-#                                             orchestrator` resolves to a
-#                                             NAMESPACE package with
-#                                             __file__ is None, so
-#                                             OrchestratorConfig is
-#                                             unreachable — and the unit
-#                                             exports none of the
-#                                             `oauth_token_env` vars named in
-#                                             config/usage-accounts.yaml, so a
-#                                             UsageGate built here would
-#                                             resolve only the single default
-#                                             ~/.claude/.credentials.json
-#                                             credential.  One account: no
-#                                             failover target to wait FOR.
-#                                         (2) with usage_gate=None this
-#                                             function performs NO cap
-#                                             classification at all
-#                                             (classify_invocation runs only
-#                                             in the gated `else` branch), so
-#                                             any cap_wait_sanity_secs
-#                                             documented for it would be
-#                                             inert, and the caller would
-#                                             still have to detect the cap
-#                                             itself.
-#                                         (3) a nightly systemd oneshot must
-#                                             not block on a cap wait across
-#                                             the NEXT night's timer, and its
-#                                             digests are re-derivable — a
-#                                             deferred night simply re-mines
-#                                             tomorrow, so patience buys
-#                                             nothing and costs a missed run.
-#                                         So the trickle detects the cap with
-#                                         the LOOSE defer-gate matcher
-#                                         shared.cap_markers::
-#                                         looks_like_blocking_banner — exactly
-#                                         as its sibling
-#                                         census.py::preflight_headroom does,
-#                                         and per that module's own docstring
-#                                         on skip-guard vs production-detector
-#                                         contracts — and defers.
-#                                         TO CHANGE THIS: making the trickle a
-#                                         real caller requires first giving it
-#                                         an ACCOUNT POOL (a reachable
-#                                         OrchestratorConfig + the
-#                                         oauth_token_env vars in the unit).
-#                                         Until then a row in the bound table
-#                                         above would be decoration.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
@@ -2088,6 +2047,8 @@ async def invoke_with_cap_retry(
     resume_delivers_prompt: bool = False,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
+    park_on_frozen_pool: bool = True,
+    is_usable_reply: Callable[[str], bool] | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2133,6 +2094,30 @@ async def invoke_with_cap_retry(
     the time-based bound) before the next cooldown sleep.  Defaults to
     ``None``, which preserves the existing patient, count-unbounded wait —
     only *cap_wait_sanity_secs* bounds the retry loop.
+
+    *park_on_frozen_pool* bounds the wait neither of the two above can see:
+    the gate's own park when NO account is admissible (every one capped or
+    AUTH_FAILED, or a scoped model exhausted everywhere).  ``True`` (the
+    default) parks until an account reopens, unchanged.  ``False`` lets
+    ``usage_gate.PoolFrozen`` propagate unconverted, for a caller that must
+    defer rather than wait (task 6042).  It is not converted to
+    ``AllAccountsCappedException`` because a pool frozen on rejected
+    credentials is not a cap and will not clear at a reset.
+
+    *is_usable_reply* decides which SUCCESSFUL results are offered to the cap
+    detector.  ``UsageGate.detect_cap_hit`` builds a synthetic
+    ``success=False`` result before classifying, so a successful reply that
+    merely QUOTES a banner reads as a cap: measured 2026-10-02, a verdict
+    whose evidence quotes ``REAL_CLI_CAP_HIT_MESSAGES[0]`` classifies ``OK()``
+    as it is and ``CapHit`` once forced to fail.  ``None`` (the default)
+    offers every result, unchanged for the fleet.  A predicate offers a
+    successful result only when it REJECTS the output — a reply the caller
+    could not use at all, which is where a banner delivered at exit 0 lands —
+    so a usable reply quoting cap text never costs an account, while an exit-0
+    banner still rotates it (task 5637's route).  The predicate decides only
+    whether to ASK; the gate's strict detector still decides whether it is a
+    cap.  Failed results are always offered.  Consumer: the legibility runner,
+    whose replies routinely quote cap text (task 6042).
 
     *rebuild_prompt*, when provided, is awaited as ``rebuild_prompt(True)``
     on a cap retry whose session cannot be resumed (no ``session_id`` on the
@@ -2406,7 +2391,7 @@ async def invoke_with_cap_retry(
         _cfg = getattr(usage_gate, '_config', None)
         scope = scope_for(model, _cfg) if (backend == 'claude' and _cfg is not None) else None
         while True:
-            async with usage_gate.invoke_slot(scope=scope) as slot:
+            async with usage_gate.invoke_slot(scope=scope, park=park_on_frozen_pool) as slot:
                 # slot.account_name is derived from slot.lease — the SAME
                 # account slot.token came from (task W4-δ, PRD §7.4). This
                 # is what makes the attribution below (and the save_invocation
@@ -2585,7 +2570,14 @@ async def invoke_with_cap_retry(
                     await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
-                if slot.detect_cap_hit(result.stderr, result.output, backend=backend):
+                offered_to_cap_detector = (
+                    not result.success
+                    or is_usable_reply is None
+                    or not is_usable_reply(result.output)
+                )
+                if offered_to_cap_detector and slot.detect_cap_hit(
+                    result.stderr, result.output, backend=backend,
+                ):
                     consecutive_cap_hits += 1
                     full_cycles = (consecutive_cap_hits - 1) // num_accounts
                     cooldown = min(
