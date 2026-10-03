@@ -70,10 +70,11 @@ import sys
 import textwrap
 import threading
 import time
+import uuid
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -293,6 +294,47 @@ def apply_dispatcher_env(monkeypatch) -> None:
     monkeypatch.delenv('ORCH_PROJECT_ROOT', raising=False)
 
 
+#: Deliberately NOT ``ORCH_``-prefixed: verify.py::_target_subprocess_env
+#: scrubs that namespace from every build it spawns.
+HOLDER_TAG_ENV: str = 'DF_TEST_HOLDER_TAG'
+
+
+class TaggedPopen(subprocess.Popen[bytes]):
+    """A Popen whose whole process tree carries ``HOLDER_TAG_ENV=<self.tag>``.
+
+    Every descendant inherits the tag across fork, setsid and exec --
+    including a start_new_session build whose /proc ppid chain is severed
+    the moment the leader dies -- so :func:`tagged_pids` still names it.
+    """
+
+    def __init__(self, args, *, env: Mapping[str, str] | None = None, **kwargs: Any) -> None:
+        self.tag = uuid.uuid4().hex
+        tagged_env = dict(os.environ if env is None else env)
+        tagged_env[HOLDER_TAG_ENV] = self.tag
+        super().__init__(args, env=tagged_env, **kwargs)
+
+
+def tagged_pids(tag: str) -> set[int]:
+    """Pids whose environment holds exactly ``HOLDER_TAG_ENV=<tag>``, never this process.
+
+    An unreadable entry (vanished, or another user's) is skipped, and a
+    zombie reads an empty environ, so only live processes match.
+    """
+    wanted = f'{HOLDER_TAG_ENV}={tag}'.encode()
+    pids: set[int] = set()
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / 'environ').read_bytes()
+        except OSError:
+            continue
+        if wanted in raw.split(b'\0'):
+            pids.add(int(entry.name))
+    pids.discard(os.getpid())
+    return pids
+
+
 def spawn_verify_merge(
     *,
     sha: str,
@@ -302,8 +344,8 @@ def spawn_verify_merge(
     stdin: int | None = subprocess.PIPE,
     extra_env: dict[str, str] | None = None,
     bootstrap: str = STOCK_BOOTSTRAP,
-) -> subprocess.Popen:
-    """Spawn a real ``orchestrator verify-merge`` subprocess.
+) -> TaggedPopen:
+    """Spawn a real ``orchestrator verify-merge`` subprocess, tagged per holder.
 
     ``stdin=subprocess.PIPE`` by default so callers can drive the
     connection-death protocol (heartbeat writer / EOF-on-close); tests that
@@ -312,7 +354,7 @@ def spawn_verify_merge(
     ``bootstrap`` defaults to :data:`STOCK_BOOTSTRAP` (byte-identical to the
     pre-seam argv); see that constant for the only reason to override it.
     """
-    return subprocess.Popen(
+    return TaggedPopen(
         verify_merge_argv(
             sha=sha, spec=spec, cfg_file=cfg_file, request_id=request_id,
             bootstrap=bootstrap,
@@ -2907,7 +2949,7 @@ def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
     pin.
     """
     sleep_secs = f'271.{os.getpid() % 1000:03d}'
-    leader = subprocess.Popen([
+    leader = TaggedPopen([
         sys.executable, '-c',
         f'import subprocess, time\n'
         f'subprocess.Popen(["sleep", "{sleep_secs}"], start_new_session=True)\n'
@@ -2980,7 +3022,7 @@ def test_kill_holder_tree_never_signals_the_callers_own_process_group():
     (killpg-aware) helper: it fails the moment a future edit drops either
     condition, or otherwise makes the backstop unconditional.
     """
-    leader = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    leader = TaggedPopen([sys.executable, '-c', 'import time; time.sleep(300)'])
     try:
         assert os.getpgid(leader.pid) == os.getpgid(0), (
             'harness bug: a plain subprocess.Popen with no start_new_session '
@@ -3045,7 +3087,7 @@ def test_kill_holder_tree_killpg_backstop_fires_for_a_setsid_leader():
     condition actually hold before kill_holder_tree runs, so a pass here
     cannot be a vacuous accident of the harness's own process group.
     """
-    leader = subprocess.Popen(
+    leader = TaggedPopen(
         [sys.executable, '-c', 'import time; time.sleep(300)'],
         start_new_session=True,
     )
@@ -3143,7 +3185,7 @@ def test_kill_holder_tree_does_not_reap_a_leader_that_exits_mid_teardown():
     returncode: the pid was freed before the backstop fired, and the test
     goes RED.
     """
-    leader = subprocess.Popen(
+    leader = TaggedPopen(
         [sys.executable, '-c', 'import time; time.sleep(300)'],
         start_new_session=True,
     )
@@ -3267,7 +3309,7 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
         ``except OSError: ppid_map = {}`` branch stays under test.
     """
     # (a) + (b): one already-reaped leader, shared.
-    leader = subprocess.Popen([sys.executable, '-c', 'pass'], stdin=subprocess.PIPE)
+    leader = TaggedPopen([sys.executable, '-c', 'pass'], stdin=subprocess.PIPE)
     leader.wait(timeout=10)
 
     # (a) REAL-PATH: every seam spied; none may fire for an already-reaped
@@ -3364,7 +3406,7 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
     def raising_ppid_map_provider():
         raise OSError('simulated /proc read racing process exit')
 
-    live_leader = subprocess.Popen(
+    live_leader = TaggedPopen(
         [sys.executable, '-c', 'import time; time.sleep(300)'],
     )
     try:
