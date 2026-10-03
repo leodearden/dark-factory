@@ -5460,6 +5460,7 @@ async def reverify_member_solo(
     task_files: list[str] | None,
     module_configs: list[ModuleConfig],
     event_store: EventStore | None = None,
+    verifier: VerifyPort = PRODUCTION_VERIFIER,
 ) -> SoloVerifyResult:
     """Run post-merge verification on a single train member's un-stacked solo branch.
 
@@ -5491,6 +5492,8 @@ async def reverify_member_solo(
         task_files:     Task-scoped files list for scoped verify (may be None).
         module_configs: Module-level configs for multi-module projects.
         event_store:    Optional EventStore for telemetry (may be None).
+        verifier:       Forwarded to :func:`_run_post_merge_verify`; tests
+                        inject a fake through it.
 
     Returns:
         :class:`SoloVerifyResult` with passed/failed verdict and reason.
@@ -5514,6 +5517,7 @@ async def reverify_member_solo(
         max_enospc=3,
         event_store=event_store,
         merge_sha=tip_sha,
+        verifier=verifier,
     )
     if outcome is None:
         # Pass: hand off the live worktree+branch to _attribute_train_failure.
