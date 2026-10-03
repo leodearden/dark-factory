@@ -1030,6 +1030,62 @@ class TestVerdicts:
             artifacts.clear_verdict(bad_role)
 
 
+class TestJsonSidecarReadersFailSafe:
+    """Every JSON-sidecar reader shares one fail-safe posture: a corrupt
+    sidecar reads as that reader's fallback value and logs a warning."""
+
+    @pytest.mark.parametrize(
+        ('name', 'read', 'expected'),
+        [
+            pytest.param(
+                'review_state.json',
+                lambda ta: ta.read_review_state(),
+                {'amendment_rounds_total': 0, 'review_cycles_total': 0, 'verdicts': {}},
+                id='review_state',
+            ),
+            pytest.param(
+                'agent_session.json',
+                lambda ta: ta.read_agent_session(),
+                None,
+                id='agent_session',
+            ),
+            pytest.param(
+                'reconcile_state.json',
+                lambda ta: ta.read_emitted_step_escalations(),
+                set(),
+                id='reconcile_state',
+            ),
+            pytest.param(
+                'verdicts/judge.json',
+                lambda ta: ta.read_verdict('judge'),
+                None,
+                id='verdict',
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'payload',
+        [
+            pytest.param(b'\xff\xfe{"x": 1}', id='undecodable'),
+            pytest.param(b'{not valid json', id='malformed'),
+            pytest.param(b'[1]', id='non_object'),
+        ],
+    )
+    def test_corrupt_sidecar_reads_as_fail_safe_value(
+        self, artifacts: TaskArtifacts, caplog, name, read, expected, payload
+    ):
+        (artifacts.root / name).write_bytes(payload)
+
+        with caplog.at_level('WARNING'):
+            assert read(artifacts) == expected
+
+        basename = Path(name).name
+        assert any(
+            record.levelname == 'WARNING' and basename in record.getMessage()
+            for record in caplog.records
+        )
+
+
 class TestReviews:
     def test_write_and_read_reviews(self, artifacts: TaskArtifacts):
         artifacts.write_review('test_analyst', {
