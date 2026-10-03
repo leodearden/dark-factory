@@ -3,10 +3,13 @@
 
 READ-ONLY / REPORT-ONLY: this module and its CLI never mutate a task record,
 an event record, or a plan artifact. Every corpus connection it opens is a
-read-only SQLite URI (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
-the identical spelling as ``audit_wiped_metadata_files.load_task_records``,
-so the sweep is structurally incapable of writing to the live WAL databases
-the six running orchestrators hold open. REMEDIATION IS A SEPARATE, REVIEWED
+read-only SQLite URI: the task store goes through
+``_task_db_scan.py::connect_ro``, the same open
+``audit_wiped_metadata_files.load_task_records`` uses, and the runs.db event log
+through :func:`_connect_readonly`
+(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
+structurally incapable of writing to the live WAL databases the six running
+orchestrators hold open. REMEDIATION IS A SEPARATE, REVIEWED
 FOLLOW-UP — nothing here repairs, backfills or clears a stamp.
 
 WHAT THIS IS FOR. PRD task epsilon of ``plans/module-tagger-retirement-prd.md``
@@ -76,6 +79,7 @@ from typing import NamedTuple
 # re-export, the same route repair_wiped_metadata_files.py takes.
 from _task_db_scan import (
     NO_PROJECT_ROOT_RESOLVED_MESSAGE,
+    connect_ro,
     sweep_project_roots,
     tasks_db_path,
 )
@@ -537,18 +541,19 @@ def classify_record(
 
 
 # ---------------------------------------------------------------------------
-# Corpus readers. Every connection below is mode=ro; see the module docstring.
+# Corpus readers. Every connection below is mode=ro: tasks.db through
+# _task_db_scan.connect_ro, runs.db through _connect_readonly.
 # ---------------------------------------------------------------------------
 
 
 def _connect_readonly(path: str) -> sqlite3.Connection:
-    """Open *path* through a read-only SQLite URI.
+    """Open the runs.db event log at *path* through a read-only SQLite URI.
 
-    The IDENTICAL spelling as
-    ``scripts/audit_wiped_metadata_files.py::load_task_records``.
-    Kept as a single named helper so every corpus connection this module opens
-    is provably the same one, and so the "cannot write" property is testable
-    against the opener itself rather than re-asserted per call site.
+    The event-log opener only. The task store goes through
+    ``_task_db_scan.py::connect_ro`` instead, whose refusals speak of tasks.db
+    and would mislead about runs.db. Kept as a named helper so the "cannot
+    write" property is testable against the opener itself rather than
+    re-asserted per call site.
     """
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
@@ -581,7 +586,7 @@ def load_stamped_records(tasks_db_path: str) -> dict[tuple[str, int], StampedRec
     and the repair.
     """
     records: dict[tuple[str, int], StampedRecord] = {}
-    conn = _connect_readonly(tasks_db_path)
+    conn = connect_ro(tasks_db_path)
     try:
         cursor = conn.execute("SELECT tag, id, status, metadata FROM tasks")
         for tag, task_id, status, metadata in cursor:
@@ -761,16 +766,19 @@ def census_project(project_root: str) -> ProjectCensus:
     NO_MERGE_EVENT, and ``coverage.event_log_read`` goes False so a consumer
     can see the axes were unknown rather than measured clean.
 
-    A tasks.db error PROPAGATES. That is the contract
-    ``_task_db_scan.sweep_project_roots`` documents at :444-472 — exactly one
-    result per root, or raise — and its exit-3 gate rests on the resulting
-    ``len(audits) + len(unreadable) == len(roots)`` equality. Returning a
+    A tasks.db error PROPAGATES: a ``sqlite3.Error``, or ``connect_ro``'s
+    ``TaskDbUnreadable`` refusal — together
+    ``_task_db_scan.py::UNREADABLE_STORE_ERRORS``, exactly what
+    ``_task_db_scan.py::sweep_project_roots`` skips. That is the contract it
+    documents — exactly one result per root, or raise — and its exit-3 gate
+    rests on the resulting ``len(audits) + len(unreadable) == len(roots)``
+    equality. Returning a
     partial census here would silently re-open the false green exit 3 closes.
     """
     project_id = project_id_for(project_root)
     tasks_db = tasks_db_path(project_root)
 
-    conn = _connect_readonly(str(tasks_db))
+    conn = connect_ro(tasks_db)
     try:
         (total_tasks,) = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()
     finally:
