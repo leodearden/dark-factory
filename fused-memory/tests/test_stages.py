@@ -13213,6 +13213,64 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         )
 
     @pytest.mark.asyncio
+    async def test_live_workflow_signals_section_present_in_remediation_mode(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """The REMEDIATION pass carries '### Live-Workflow Signals' too (task 5113).
+
+        A characterization pin: Stage 1's remediation payload once dropped this
+        section (task 3839), and prompts/stage2.py reads its absence as "no task
+        is live". This keeps re-routing assemble_payload through
+        _render_required_sections from silently dropping it on the remediation pass.
+        """
+        import fused_memory.reconciliation.live_workflow_section as lws_module
+        from fused_memory.services.live_workflow_detector import WorkflowLiveness
+
+        live_task_id = '4321'
+        not_live_task_id = '100'
+
+        live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
+        other_task = {'id': int(not_live_task_id), 'title': 'Other task', 'status': 'pending'}
+
+        async def _fake_detect(task_id, project_root, **kwargs):
+            if str(task_id) == live_task_id:
+                return WorkflowLiveness(
+                    is_live=True,
+                    worktree_registered=True,
+                    recent_commit=False,
+                    orchestrator_live=False,
+                    branch=f'task/{live_task_id}',
+                    last_commit_at=None,
+                )
+            return WorkflowLiveness(
+                is_live=False,
+                worktree_registered=False,
+                recent_commit=False,
+                orchestrator_live=False,
+                branch=f'task/{task_id}',
+                last_commit_at=None,
+            )
+
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
+
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        stage.filtered_task_tree = self._make_filtered_tree_with_tasks([live_task, other_task])
+        stage.remediation_mode = True
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert '### Live-Workflow Signals' in payload, (
+            "Expected '### Live-Workflow Signals' in the REMEDIATION-mode payload; "
+            f"got snippet:\n{payload[-500:]!r}"
+        )
+        assert live_task_id in payload, (
+            f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals "
+            f"in the remediation-mode payload; got snippet:\n{payload[-500:]!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_live_workflow_signals_section_omitted_when_no_live_tasks(
         self, mock_deps, watermark, monkeypatch
     ):
