@@ -796,6 +796,22 @@ def _is_worker_death_truncated_session(output: str) -> bool:
     return _worker_death_truncation_evidence(output) is not None
 
 
+def _shows_xdist_worker_death(output: str) -> bool:
+    """Return True when *output* carries ANY xdist worker-death marker.
+
+    Deliberately WIDER than ``_is_worker_death_truncated_session``: under
+    ``--max-worker-restart=0`` every worker death aborts the session, and the
+    ``-q`` witness reads only the FINAL progress line, which
+    ``_aggregate_results``'s per-module join can hand to a later, completed
+    module. The accepted cost: a crash xdist recovered from (cap > 0) is
+    refused too, and the merge stays red, the safe direction. Pinned in
+    test_flake_discriminator.py::TestTruncatedSessionIsUnconfirmable.
+    """
+    if not output:
+        return False
+    return bool(_XDIST_WORKER_CRASH_RE.search(output) or _XDIST_SESSION_ABORTED_RE.search(output))
+
+
 def _crash_attributed_nodeids(output: str) -> set[str]:
     """Return the node-ids *output* attributes to a dead worker, not to a verdict.
 
@@ -10103,6 +10119,10 @@ async def confirm_isolated_rerun_verdict(
     ``type_check_command`` nulled, so only the named tests run, serially,
     without pyproject ``addopts`` or its 60s per-test default.
 
+    No re-run is attempted when the failing session shows an xdist worker
+    death: that is ``unconfirmable('session_truncated')`` (task 5492), because
+    the death abandoned tests no re-run of the named ones can vouch for.
+
     That command is one WE BUILD, which is why pytest REJECTING it
     (``FailureCategory.PYTEST_USAGE_ERROR``) is ``unconfirmable`` rather than
     a red: no test ran, so nothing in the result is evidence about the code,
@@ -10205,6 +10225,20 @@ async def confirm_isolated_rerun_verdict(
             )
 
         node_ids = _extract_failing_test_ids(failing_result.test_output)
+        # A worker death means the named failures are not the only unmeasured
+        # tests: the re-run cannot speak for the abandoned remainder (INV-1).
+        # The ids are still named, so the ledger counts the crash victim.
+        if _shows_xdist_worker_death(failing_result.test_output):
+            logger.info(
+                '%s: failing session shows an xdist worker death — '
+                'unconfirmable (session_truncated), not re-running %s',
+                policy.log_label, node_ids[:10],
+            )
+            return _observe(
+                FlakeVerdict.unconfirmable, node_ids,
+                call_site=coerced_site, runner=runner,
+                reason='session_truncated', now=now,
+            )
         if not node_ids:
             # We examined NOTHING — an opaque/lint/type-only failure names no
             # test. test_ids is empty, which §8 permits only on `unconfirmable`.
@@ -10406,7 +10440,8 @@ async def confirm_merge_verify_flake_suppressible(
     became knowable: ``fails_in_isolation`` (a REAL red) and ``unconfirmable``
     (we could not tell — no recoverable node-id from an opaque/lint/type
     failure; a node-id mapping to no given subproject; an infra-sentinel re-run
-    category, which is never trusted as confirmation) are different facts, and
+    category, which is never trusted as confirmation; a session an xdist worker
+    death truncated, ``session_truncated``) are different facts, and
     θ's class-1 health check is an unconfirmable RATE that cannot be computed
     from a ``None``. The caller — ``apply_merge_flake_suppression`` — still
     suppresses on ``passes_in_isolation`` alone, so the GATE's behaviour is
@@ -10495,7 +10530,8 @@ async def _main_probe_failure_is_isolated_flake(
         keeps today's ``(True, main_sha)`` verdict unchanged. Covers
         ``fails_in_isolation`` (the re-run still failed or timed out) and every
         flavour of ``unconfirmable``: a co-occurring lint/type break on main
-        (``other_leg_failed``), no recoverable node-id in
+        (``other_leg_failed``), a probe session an xdist worker death
+        truncated (``session_truncated``), no recoverable node-id in
         ``main_result.test_output`` (an opaque/lint/type-only failure), a
         node-id that maps to no discovered subproject (or *module_configs* is
         empty), and an infra-sentinel re-run category
