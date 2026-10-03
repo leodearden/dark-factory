@@ -1318,16 +1318,13 @@ class TestWallClockLoadBearingTarget:
 
     Exactly two shapes are load-bearing, and both gate a hard assertion
     downstream: a ``MergeRequest.result`` future (its resolution IS the event
-    the test waits for) and a ``gate*.wait()`` ``asyncio.Event`` barrier
-    (already event-driven; only its deadline is wall-clock).
+    the test waits for) and a zero-argument ``.wait()`` barrier (already
+    event-driven; only its deadline is wall-clock).
 
-    The two legs are NOT symmetric and these tests pin the asymmetry rather than
-    hiding it: ``.result`` is selected by pure shape, while the barrier leg also
-    demands a receiver Name starting with ``gate`` — a naming convention, with a
-    measured false-negative surface (102 ``asyncio.wait_for(<expr>.wait())``
-    sites across the scanned dirs). Task 4246's amendment pass declined to drop
-    the prefix because the remedy the rule names, ``wait_responsive``, exists
-    only under orchestrator/tests; see the script's Rule C docstring.
+    Both legs are pure SHAPE, on any receiver — a Name, an Attribute, a
+    Subscript or a Call.  No receiver name is consulted.  The barrier leg's
+    zero-argument requirement is its structural discriminator: it is what keeps
+    ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)`` out.
 
     The Name negative is the load-bearing one: it is what keeps the
     ``_stop_worker`` teardown join — ``asyncio.wait_for(worker_task, ...)``,
@@ -1349,18 +1346,18 @@ class TestWallClockLoadBearingTarget:
         assert 'follower_reqs[tid].result' in described
         assert 'MergeRequest.result future' in described
 
-    def test_gate_wait_call_is_an_event_barrier(self):
-        """``gate_a_entered.wait()`` → described as an asyncio.Event gate barrier."""
+    def test_gate_wait_call_is_a_barrier(self):
+        """``gate_a_entered.wait()`` → described as a .wait() barrier."""
         described = _checker._load_bearing_wait_target(_expr('gate_a_entered.wait()'))
         assert described is not None
         assert 'gate_a_entered.wait()' in described
-        assert 'asyncio.Event gate barrier' in described
+        assert '.wait() barrier' in described
 
-    def test_bare_gate_prefix_wait_call_is_an_event_barrier(self):
-        """``gate_entered.wait()`` → the prefix is 'gate', not 'gate_<letter>_'."""
+    def test_bare_gate_prefix_wait_call_is_a_barrier(self):
+        """``gate_entered.wait()`` → gate-named barriers stay detected."""
         described = _checker._load_bearing_wait_target(_expr('gate_entered.wait()'))
         assert described is not None
-        assert 'asyncio.Event gate barrier' in described
+        assert '.wait() barrier' in described
 
     def test_bare_name_target_is_not_load_bearing(self):
         """``worker_task`` → None.
@@ -1375,22 +1372,47 @@ class TestWallClockLoadBearingTarget:
         """``obj.results`` → None (the attribute must be exactly 'result')."""
         assert _checker._load_bearing_wait_target(_expr('obj.results')) is None
 
-    def test_non_gate_name_wait_call_is_not_load_bearing(self):
-        """``notagate.wait()`` → None (the receiver Name must start with 'gate').
+    def test_a_non_gate_name_wait_call_is_a_barrier(self):
+        """``done.wait()`` → a barrier: no receiver name prefix is required."""
+        described = _checker._load_bearing_wait_target(_expr('done.wait()'))
+        assert described is not None
+        assert 'done.wait()' in described
+        assert '.wait() barrier' in described
 
-        This pins a KNOWN false negative, not a desired exclusion: a real
-        ``done.wait()`` barrier is invisible for the same reason. It is here so
-        the boundary is measured rather than assumed — see the class docstring.
-        """
-        assert _checker._load_bearing_wait_target(_expr('notagate.wait()')) is None
+    @pytest.mark.parametrize(
+        'barrier',
+        [
+            'self._entered.wait()',
+            'drive.first_dispatched.wait()',
+            "verifier.entered[0].wait()",
+            "started['y'].wait()",
+            'some_call().wait()',
+        ],
+        ids=['attribute', 'nested-attribute', 'subscript', 'string-subscript', 'call'],
+    )
+    def test_a_wait_call_on_any_receiver_shape_is_a_barrier(self, barrier: str):
+        """Attribute, Subscript and Call receivers are barriers exactly like a Name."""
+        described = _checker._load_bearing_wait_target(_expr(barrier))
+        assert described is not None, f'{barrier} must be load-bearing'
+        assert '.wait() barrier' in described
 
     def test_wrong_method_on_a_gate_is_not_load_bearing(self):
         """``gate_a.set()`` → None (only ``.wait()`` blocks)."""
         assert _checker._load_bearing_wait_target(_expr('gate_a.set()')) is None
 
-    def test_wait_on_a_non_name_receiver_is_not_load_bearing(self):
-        """``some_call().wait()`` → None (``func.value`` is a Call, not a Name)."""
-        assert _checker._load_bearing_wait_target(_expr('some_call().wait()')) is None
+    @pytest.mark.parametrize(
+        'not_a_barrier',
+        ['asyncio.wait(pending)', 'ev.wait(5)', 'ev.wait(timeout=1)', 'ev.wait'],
+        ids=['asyncio-wait', 'positional-arg', 'keyword-arg', 'uncalled'],
+    )
+    def test_a_wait_taking_arguments_or_uncalled_is_not_a_barrier(self, not_a_barrier: str):
+        """The zero-argument requirement is the structural discriminator.
+
+        ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)`` take arguments;
+        an ``asyncio.Event``'s ``.wait()`` takes none.  An uncalled ``ev.wait`` is
+        not a wait at all.
+        """
+        assert _checker._load_bearing_wait_target(_expr(not_a_barrier)) is None
 
 
 # A brand-new orchestrator test file: NOT on any debt baseline, so Rule C
@@ -1541,6 +1563,26 @@ class TestWallClockDeadlineDetection:
         violations = _rule_c(source)
         assert len(violations) == 1, violations
         assert 'RAW wall-clock literal' in violations[0].message
+
+    def test_a_non_gate_event_barrier_wait_flags_both_kinds(self):
+        """``asyncio.wait_for(done.wait(), timeout=5)`` → routing AND written number."""
+        violations = _rule_c('asyncio.wait_for(done.wait(), timeout=5)\n')
+        assert len(violations) == 2, violations
+
+    def test_a_non_gate_barrier_through_wait_responsive_flags_only_its_literal(self):
+        """A migrated non-gate barrier that kept its number trips the literal kind only."""
+        violations = _rule_c("wait_responsive(self._entered.wait(), timeout=30.0, label='x')\n")
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' in violations[0].message
+
+    def test_asyncio_wait_inside_wait_for_is_not_a_barrier(self):
+        """``asyncio.wait(tasks)`` takes arguments, so it is not a ``.wait()`` barrier."""
+        assert _rule_c('asyncio.wait_for(asyncio.wait(tasks), timeout=5)\n') == []
+
+    def test_a_positional_timeout_on_a_non_gate_barrier_flags_both_kinds(self):
+        """``asyncio.wait_for(entered.wait(), 2.0)`` — the shape of the fused-memory sites."""
+        violations = _rule_c('asyncio.wait_for(entered.wait(), 2.0)\n')
+        assert len(violations) == 2, violations
 
     def test_a_call_with_no_positional_args_does_not_crash(self):
         """``asyncio.wait_for()`` has no args[0] to inspect — it must be skipped, not raise."""
