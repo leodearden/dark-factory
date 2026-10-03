@@ -355,6 +355,58 @@ async def test_main_moving_before_the_merge_commit_retries_the_cas_without_rever
     assert train.mark_member_done.await_args_list == _every_member_flipped(landed)
 
 
+# ─── (J) after a lost CAS, the gate's delta starts at the verified base ─────
+
+
+async def test_rebase_after_a_lost_cas_is_gated_against_the_verified_base_not_the_reread_main(
+    tmp_path: Path,
+) -> None:
+    """A queue-landed overlap that won the CAS sits below the re-read main, not above it.
+
+    advance_main reports ``rebased_from`` as the main it was handed, which
+    after a lost CAS is the re-read main itself, so a delta measured from it
+    is empty and the overlap would land unverified.
+    """
+    scene = await _stacked_train_scene(tmp_path, merge_verify_breadth='scoped')
+    train = _train(scene)
+    verify = _VerifyDouble(scene.repo)
+    store = _RecordingEventStore()
+    drifts: list[str] = []
+    advances: list[str] = []
+    real_merge_to_main = scene.git_ops.merge_to_main
+    real_advance_main = scene.git_ops.advance_main
+
+    async def merge_after_a_drift(*args: Any, **kwargs: Any) -> Any:
+        drifts.append(_disjoint_drift(scene.repo))
+        return await real_merge_to_main(*args, **kwargs)
+
+    async def overlap_lands_after_the_first_advance(*args: Any, **kwargs: Any) -> Any:
+        outcome = await real_advance_main(*args, **kwargs)
+        advances.append(outcome.result)
+        if len(advances) == 1:
+            drifts.append(_queue_landed(_shared_drift)(scene.repo))
+        return outcome
+
+    with (
+        patch.object(scene.git_ops, 'merge_to_main', new=merge_after_a_drift),
+        patch.object(scene.git_ops, 'advance_main', new=overlap_lands_after_the_first_advance),
+    ):
+        outcome = await _run_train(scene, train, verify, store)
+
+    assert outcome.status == 'done', outcome
+    assert advances == ['cas_failed', 'rebased_pending_reverify', 'advanced']
+    assert len(verify.calls) == 2
+    [_, overlap] = drifts
+    landed = _main_sha(scene.repo)
+    assert verify.calls[1] == _VerifyCall(head=landed, main=overlap)
+    landed_shared = _shared_lines_at(scene.repo, 'main')
+    assert landed_shared[1] == _MEMBER_A_LINE_2
+    assert landed_shared[17] == _shared_lines_at(scene.repo, overlap)[17]
+    assert len(_attempts(store, 'cas_retry', train.request.train_id)) == 1
+    assert len(_attempts(store, 'gate_retry', train.request.train_id)) == 1
+    assert train.mark_member_done.await_args_list == _every_member_flipped(landed)
+
+
 # ─── (C/D/E) the _disjoint_skip_blockers matrix, for a train ────────────────
 
 
