@@ -298,76 +298,67 @@ _DEFAULT_JUDGE_CANDIDATE_COUNT = 5
 
 #: The per-field cap when the leaf is unset or invalid: the schema's own
 #: default, whose field description is the one home of why it is 4,000 (the
-#: judge's measured recall loss at the old 1,200).
+#: judge's measured recall loss at the old 1,200). A cap exists at all because
+#: the calibration fixture holds a ~9k-character canonical, and a slate of
+#: untrimmed consolidated topics — exactly where triage matters most — would
+#: multiply the cost of every call.
 _DEFAULT_JUDGE_FIELD_CHARS: int = WriteTriageConfig.model_fields['judge_field_chars'].default
-
-#: Per-field character budget for the rendered prompt. The calibration fixture
-#: holds a ~9k-character canonical, and C1 sizes the judge call at roughly
-#: 2.5k tokens; five untrimmed candidates would blow through that by an order
-#: of magnitude on exactly the consolidated topics where triage matters most.
-_FIELD_CHARS = 1_200
 
 #: Appended to any field this module cut. The marker is not decoration: a
 #: silent truncation hands the model a severed sentence to read as the whole
 #: record, and "this text continues" is information the verdict depends on.
 _ELIDED_MARKER = '…[elided]'
 
-#: C1's ~2.5k-token call budget, expressed in the units this module can
-#: actually count: 2_500 tokens at the conventional 4 chars/token.
+#: The ceiling on the whole judge call at the shipped defaults, in the unit
+#: this module can actually count: characters. It is not a token cap — what a
+#: call costs in tokens per slate width is PRD C1's measured ESTIMATE
+#: (docs/prds/memory-write-path-convergence.md §4 C1).
 #:
 #: WHAT IT BOUNDS is the WHOLE call — :data:`JUDGE_SYSTEM_PROMPT` plus a
 #: worst-case :func:`build_judge_prompt` render, meaning
 #: :data:`_DEFAULT_JUDGE_CANDIDATE_COUNT` candidates and a new entry with
-#: every field over :data:`_FIELD_CHARS`, each candidate carrying the 36-char
-#: uuid a real record has. Not the system prompt alone: the two halves are
-#: summed on every request, so budgeting either in isolation budgets nothing.
-#: And not a construction :func:`judge_write` never makes, for the same reason.
+#: every field over :data:`_DEFAULT_JUDGE_FIELD_CHARS`, each candidate
+#: carrying the 36-char uuid a real record has. Not the system prompt alone:
+#: the two halves are summed on every request, so budgeting either in
+#: isolation budgets nothing. And not a construction :func:`judge_write` never
+#: makes, for the same reason.
 #:
 #: WHY IT IS A CONSTANT rather than a literal in the test that checks it. The
 #: system prompt is the half that grows — a vocabulary word, a worked example,
 #: a decision rule all land there — so the ceiling needs a home next to the
 #: rationale for its value. Raising it is then an edit to the thing being
-#: budgeted, made where C1 is cited, rather than a number quietly relaxed in a
-#: test until it stops failing.
+#: budgeted, made here, rather than a number quietly relaxed in a test until
+#: it stops failing.
 #:
-#: THE TOLERANCE TERM IS NOT PADDING. Both inputs to the headline figure are
-#: approximations: C1 writes "~2.5k", and 4 chars/token is a convention, NOT a
-#: measurement — this package does not depend on a tokenizer, so nothing here
-#: has counted the real tokens and no claim is made about them. Multiplying
-#: two approximations and then treating the product as a hard wall is a false
-#: precision, and it bites asymmetrically: a rendering 0.5% over would read as
-#: a C1 violation when it is inside "~2.5k" on any reading.
+#: WHY THE SLACK STAYS SMALL. What has to stay small is the SLACK, budget minus
+#: the measured worst case, which is what a future addition could spend
+#: without anyone having to come here. That slack is 58 chars. The four worked
+#: examples presently rendered cost 157 to 192 chars apiece including the
+#: blank line between them, so even the cheapest fifth one does not fit and
+#: its author has to either make room or make the case here. A ceiling that
+#: admitted another example would have stopped bounding anything.
 #:
-#: The tolerance is SIZED, not chosen for comfort — but what has to stay
-#: small is the SLACK, budget minus the measured worst case, which is what a
-#: future addition could spend without anyone having to come here. That slack
-#: is 58 chars. The four worked examples presently rendered cost 157 to 192
-#: chars apiece including the blank line between them, so even the cheapest
-#: fifth one does not fit and its author has to either make room or make the
-#: case here. A ceiling that admitted another example would have stopped
-#: bounding anything.
-#:
-#: Measured at task 5794, PRODUCTION-SHAPED and with the elision marker
-#: counted: the worst case is 10_342 chars — system 2_468, plus a 7_874-char
-#: render of six fields each OVER `_FIELD_CHARS`. The ids are not slop: every
-#: stored record's id is a 36-char uuid — all 104 in
+#: Measured at task 6076, PRODUCTION-SHAPED and with the elision marker
+#: counted: the worst case is 27_142 chars — system 2_468, plus a 24_674-char
+#: render of six fields at 4_009 chars each and 620 chars of scaffold. The ids
+#: are not slop: every stored record's id is a 36-char uuid — all 104 in
 #: ``tests/fixtures/write_triage_calibration.jsonl`` are — and
 #: :func:`build_judge_prompt` renders ``- id: {candidate.id}`` UN-elided, so a
 #: full slate costs 155 chars more than 5-char stand-in ids suggest.
 #:
-#: Note "over" `_FIELD_CHARS`, not "at": `_elide` returns a field of exactly
-#: `_FIELD_CHARS` unchanged and cuts a longer one to `_FIELD_CHARS` plus
-#: `_ELIDED_MARKER`, so the widest render is 9 chars per field — 54 across the
-#: six — wider than a slate built at the cap.
-_PROMPT_CHAR_BUDGET = 2_500 * 4 + 400
+#: Note "over" the cap, not "at": `_elide` returns a field of exactly the cap
+#: unchanged and cuts a longer one to the cap plus `_ELIDED_MARKER`, so the
+#: widest render is 9 chars per field — 54 across the six — wider than a slate
+#: built at the cap.
+_PROMPT_CHAR_BUDGET = 27_200
 
 
-def _elide(text: object) -> str:
-    """*text* as a string, bounded by :data:`_FIELD_CHARS` and marked if cut."""
+def _elide(text: object, field_chars: int) -> str:
+    """*text* as a string, bounded by *field_chars* and marked if cut."""
     body = text if isinstance(text, str) else str(text or '')
-    if len(body) <= _FIELD_CHARS:
+    if len(body) <= field_chars:
         return body
-    return body[:_FIELD_CHARS] + _ELIDED_MARKER
+    return body[:field_chars] + _ELIDED_MARKER
 
 
 def select_judge_candidates(
@@ -523,7 +514,12 @@ Reply with a bare JSON object and nothing else:
 """
 
 
-def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
+def build_judge_prompt(
+    content: str,
+    candidates: list[MemoryResult],
+    *,
+    field_chars: int = _DEFAULT_JUDGE_FIELD_CHARS,
+) -> str:
     """Render the user-side prompt: the new entry, then the candidates.
 
     CONTENT ONLY. No metadata is interpolated — not the agent_id, not the
@@ -537,22 +533,24 @@ def build_judge_prompt(content: str, candidates: list[MemoryResult]) -> str:
     No candidate is marked or singled out. The verdict carries its own id, so
     neither slate position nor the band's winner steers the answer.
 
-    Every field is bounded by :data:`_FIELD_CHARS` and marked with
-    :data:`_ELIDED_MARKER` when cut, so the call stays near C1's ~2.5k-token
-    budget regardless of a pathological canonical.
+    Every field is bounded by *field_chars* and marked with
+    :data:`_ELIDED_MARKER` when cut, so a pathological canonical cannot blow
+    up the call. :func:`judge_write` passes ``write_triage.judge_field_chars``,
+    resolved per call; what that costs in tokens per slate width is PRD C1's
+    measured estimate.
 
     Pure, synchronous and total: it renders for an empty candidate list too,
     though :func:`judge_write` never calls it with one.
     """
     lines = [
         'NEW ENTRY:',
-        _elide(content),
+        _elide(content, field_chars),
         '',
         'EXISTING CANDIDATES:',
     ]
     for candidate in candidates:
         lines.append(f'- id: {candidate.id}')
-        lines.append(f'  text: {_elide(candidate.content)}')
+        lines.append(f'  text: {_elide(candidate.content, field_chars)}')
     if not candidates:
         lines.append('(none)')
     lines.append('')
@@ -1152,7 +1150,9 @@ async def judge_write(
     reply = await _call_llm(
         provider=resolve_judge_provider(memory_service),
         model=resolve_judge_model(memory_service),
-        prompt=build_judge_prompt(content, selected),
+        prompt=build_judge_prompt(
+            content, selected, field_chars=resolve_judge_field_chars(memory_service),
+        ),
         memory_service=memory_service,
         timeout=resolve_judge_timeout(memory_service),
         reasoning_effort=resolve_judge_reasoning_effort(memory_service),

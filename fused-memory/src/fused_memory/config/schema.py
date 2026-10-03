@@ -2601,7 +2601,7 @@ class WriteTriageConfig(BaseModel):
         description=(
             'The model the judge calls. None INHERITS llm.model. The PRD\'s '
             '"haiku-class" is a cost/size class, not a vendor pin: this is a '
-            'single-turn ~2.5k-token classification with a four-word closed '
+            'single-turn classification with a four-word closed '
             'output, so the smallest capable model is the right one. Whatever '
             'is resolved here is stamped into the accuracy report\'s provenance '
             'block by scripts/eval_write_triage_judge.py, so the operator at '
