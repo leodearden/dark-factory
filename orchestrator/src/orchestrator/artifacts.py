@@ -1178,7 +1178,8 @@ class TaskArtifacts:
         session").  A v1 sidecar (missing v2 keys) is tolerated via
         :meth:`AgentSession.from_mapping`, which supplies legacy defaults.
         """
-        data = self._read_json_object('agent_session.json')
+        name = 'agent_session.json'
+        data = self._read_json_object(name)
         if data is None:
             return None
         try:
@@ -1188,8 +1189,8 @@ class TaskArtifacts:
             # makes from_mapping's int() coercion raise; map that to the same
             # fail-safe None as any other corruption rather than propagating.
             logger.warning(
-                'Malformed agent_session.json at %s: unparseable field (%s)',
-                self._read_path('agent_session.json'), exc,
+                'Malformed %s at %s: unparseable field (%s)',
+                name, self._read_path(name), exc,
             )
             return None
 
