@@ -2290,6 +2290,68 @@ class TestSharedResolverAndProseCeiling:
         )
 
     @pytest.mark.asyncio
+    async def test_memo_merges_casings_of_a_canonical_uuid(self):
+        """Casing cannot name a different Qdrant point (pinned live by
+        ``tests/test_mem0_qdrant_integration.py::TestUuidPointIdCasing``), so
+        two casings of one canonical uuid share one read and one verdict. The
+        backend still receives the caller's own spelling."""
+        service = _prose_service(record=None, tombstone=None)
+        resolve = make_memory_resolver(service, 'test_project')
+
+        first = await resolve(_SPECIMEN_FABRICATED.upper())
+        second = await resolve(_SPECIMEN_FABRICATED)
+
+        assert first == second == ('missing', None)
+        service.get_memory_by_id.assert_awaited_once_with(
+            'test_project', _SPECIMEN_FABRICATED.upper(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_memo_keys_non_canonical_ids_verbatim(self):
+        """The casing equivalence is established only for the canonical
+        dashed shape. Qdrant resolves ``urn:uuid:<id>`` but rejects
+        ``URN:UUID:<id>``, so merging their verdicts would be wrong."""
+        service = _prose_service(record=None, tombstone=None)
+        resolve = make_memory_resolver(service, 'test_project')
+
+        await resolve('A')
+        await resolve('a')
+        assert service.get_memory_by_id.await_count == 2
+
+        await resolve('urn:uuid:' + _SPECIMEN_REAL)
+        await resolve('URN:UUID:' + _SPECIMEN_REAL)
+        assert service.get_memory_by_id.await_count == 4
+
+        assert isinstance(await resolve(7), tuple)
+
+    @pytest.mark.asyncio
+    async def test_mixed_case_structured_citation_and_prose_mention_cost_one_read(self):
+        """``find_prose_uuids`` lowercases what it finds, while a structured
+        citation keeps the model's casing. One shared resolver must still read
+        the id once, so the two passes cannot reach two verdicts for it."""
+        upper = _SPECIMEN_FABRICATED.upper()
+        service = _prose_service(record=None, tombstone=None)
+        shared_resolve = make_memory_resolver(service, 'test_project')
+        findings = [
+            {
+                'finding_id': 'f1',
+                'description': f'Memory {upper} is stale.',
+                'cited_memories': [{'memory_id': upper, 'store': 'mem0'}],
+            },
+        ]
+
+        s1 = await verify_cited_memories(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+        s2 = await scan_prose_citations(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+
+        assert s1['stage1_phantom_citations_dropped'] == 1
+        assert s2['stage1_prose_phantom_citations'] == 1
+        assert service.get_memory_by_id.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_default_resolve_none_still_builds_a_private_resolver(self):
         """Omitting ``resolve`` keeps every standalone caller on the original
         behaviour — the parameter is an optimisation, not a new requirement."""
