@@ -61,6 +61,12 @@ max_concurrent_tasks: 24
 #
 # RED TIER: lock_depth is not in RELOADABLE_FIELDS. This takes effect at the next
 # orchestrator restart, not on reload_config.
+#
+# Retuning a knob here can turn red any test that pins a value derived from it
+# (094d634465 did, at this knob). Fix such a test to read the value live; never
+# pin the new value. Decision: docs/config-retune-gate.md (task 3886); guards:
+# tests/scripts/test_config_retune_gate_decision.py and
+# orchestrator/tests/test_operational_config_binding.py.
 lock_depth: 12
 
 # Verification commands (dark-factory multi-subproject layout)
@@ -1498,6 +1504,13 @@ git:
   offline_lane_enabled: true
   persistent_offline_deep_worktree: true
   offline_lane_legacy_numeric_enabled: false
+
+  # A config-only merge diff touching this file runs the full gate
+  # (docs/config-retune-gate.md, task 3886). RED TIER: not in
+  # RELOADABLE_FIELDS, so it takes effect at the next orchestrator restart.
+  merge_config_only_full_gate_globs:
+    - "dark-factory-orchestrator.yaml"
+
   offline_lane_commands:
     - name: qdrant-integration
       command: "pytest -m integration"
