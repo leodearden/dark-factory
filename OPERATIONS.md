@@ -483,8 +483,11 @@ findings.
 ### Dashboard
 
 The dashboard (typically `http://127.0.0.1:8080`, a shared process for the
-whole fleet) polls every registered project every few seconds and presents
-these tabs: **Overview**, **Orchestrators**, **Tasks**, **Scheduler**,
+whole fleet) covers every registered project. Every few seconds the browser
+polls only the endpoints the open tab renders, plus an always-on set behind
+the rail badges, the topbar and the filters, whose task counts come from
+`/api/v2/dashboard/tasks?projection=census`. Switching tabs fetches the
+newly-needed data at once. It presents these tabs: **Overview**, **Orchestrators**, **Tasks**, **Scheduler**,
 **Curator**, **Performance**, **Memory**, **Reconciliation**, **Merge
 Queue**, **Costs**, **Burndown**, **Escalations**, and **Analytics**
 (escalation analytics). It's read-only situational awareness across the

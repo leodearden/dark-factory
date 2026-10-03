@@ -6,7 +6,8 @@ const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, Esca
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
-const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
+const { staleNoticesForTab, loadingNoticesForTab } = window.DF_ENDPOINT_STALENESS;
+const { scopePollingToTab } = window.DF_DATA_LOADER;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
 const { inQueueOver } = window.DF_MERGE_QUEUE;
@@ -44,6 +45,20 @@ function LiveClock({ live }) {
     return () => clearInterval(t);
   }, [live]);
   return <>{now.toLocaleTimeString('en-GB', { hour12: false })}</>;
+}
+
+// The per-endpoint notices' shared look; only the left edge says which kind.
+function noticeBannerStyle(edgeColor) {
+  return {
+    padding: '8px 12px',
+    border: '1px solid var(--line)',
+    borderLeft: `3px solid ${edgeColor}`,
+    borderRadius: 4,
+    background: 'var(--bg-2)',
+    color: 'var(--fg-3)',
+    fontFamily: 'var(--mono)',
+    fontSize: 11,
+  };
 }
 
 function App() {
@@ -89,6 +104,14 @@ function App() {
   // chip tab that does not offer the current window resets it.
   uE(() => {
     setWin(w => windowForTab(tab, w));
+  }, [tab]);
+
+  // Tell the poll loop which tab is open, so it polls this tab's endpoints plus
+  // the always-on chrome (data.js::pollSetFor) and fetches anything newly
+  // needed at once. Declared before the chip effect below, so the mount-time
+  // DF_REFRESH(win) already runs against the scoped set.
+  uE(() => {
+    scopePollingToTab(tab);
   }, [tab]);
 
   // Re-fetch with the new window when the chip changes. Unwindowed endpoints
@@ -158,7 +181,12 @@ function App() {
   // already re-renders every poll cycle, so the reported age advances on its
   // own. The wall clock is deliberately NOT a second source of App renders —
   // it lives in LiveClock, whose 1s tick re-renders the timestamp alone.
+  //
+  // TAB_ENDPOINTS plus CHROME_ENDPOINTS now also decide what is POLLED, so a
+  // tab opened for the first time may show its pre-fetch seed until its
+  // endpoints answer: the loading notices name each path with no receipt yet.
   const staleNotices = staleNoticesForTab({ tab, stale: DD.__stale || {}, now: Date.now() });
+  const loadingNotices = loadingNoticesForTab({ tab, receipt: DD.__receipt || {}, stale: DD.__stale || {} });
 
   function renderTab() {
     switch (tab) {
@@ -245,16 +273,14 @@ function App() {
           {staleNotices.map(notice => (
             <div key={notice.path} className="col-span-12"
                  data-testid="endpoint-stale-banner"
-                 style={{
-                   padding: '8px 12px',
-                   border: '1px solid var(--line)',
-                   borderLeft: '3px solid var(--warn)',
-                   borderRadius: 4,
-                   background: 'var(--bg-2)',
-                   color: 'var(--fg-3)',
-                   fontFamily: 'var(--mono)',
-                   fontSize: 11,
-                 }}>
+                 style={noticeBannerStyle('var(--warn)')}>
+              {notice.text}
+            </div>
+          ))}
+          {loadingNotices.map(notice => (
+            <div key={notice.path} className="col-span-12"
+                 data-testid="endpoint-loading-banner"
+                 style={noticeBannerStyle('var(--fg-3)')}>
               {notice.text}
             </div>
           ))}
