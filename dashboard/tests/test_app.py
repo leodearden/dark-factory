@@ -1397,7 +1397,10 @@ def test_memory_returns_memory_status(client):
         new=AsyncMock(return_value={'offline': True, 'error': 'no fused-memory'}),
     ), patch(
         'dashboard.data.memory.get_queue_stats',
-        new=AsyncMock(return_value={'counts': {}, 'oldest_pending_age_seconds': None}),
+        new=AsyncMock(return_value={
+            'counts': {'pending': 2, 'retry': 0, 'dead': 0},
+            'oldest_pending_age_seconds': None,
+        }),
     ):
         resp = client.get('/api/v2/dashboard/memory')
     assert resp.status_code == 200
@@ -1406,6 +1409,12 @@ def test_memory_returns_memory_status(client):
     ms = body['MEMORY_STATUS']
     for key in ('graphiti', 'mem0', 'taskmaster', 'queue'):
         assert key in ms
+    # get_status offline, get_queue_stats online: the queue renders its own
+    # measured state, not the offline branch's zeros.
+    stats = ms['queue']['stats']
+    assert stats['state'] == 'fresh'
+    assert stats['value']['pending'] == 2
+    assert 'served_at' in body
 
 
 _MEMORY_OPS_KEYS = {'labels', 'reads', 'writes', 'other', 'total', 'totals', 'by_operation'}
