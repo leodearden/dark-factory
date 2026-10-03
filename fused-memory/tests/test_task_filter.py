@@ -3350,12 +3350,13 @@ class TestClauseSplitRe:
 
         That contract was already violated once, before anything checked it:
         the task 3403 review found services/completion_claim_gate.py importing
-        this constant while durably tagging episodes as unverified and filing
-        operator escalations, which made the shipped bounded-blast-radius claim
-        false as written. It now takes STRICT_CLAUSE_BOUNDARY_RE instead. Absent
-        this test, the NEXT such importer would invalidate the safety case just
-        as silently — every existing test would still pass, because they pin the
-        splitter's alphabet and arity, not its blast radius.
+        this constant while its attribution still scaled with clause length —
+        every ref in a clause inherited the clause's completion phrasing — so
+        durably tagged episodes and operator escalations absorbed the
+        widening's over-fire. Absent this test, the NEXT such importer would
+        invalidate the safety case just as silently — every existing test would
+        still pass, because they pin the splitter's alphabet and arity, not its
+        blast radius.
 
         The scan is AST-based rather than textual on purpose: the name appears
         in prose all over this subsystem (comment blocks, docstrings,
@@ -3368,7 +3369,15 @@ class TestClauseSplitRe:
         that does not self-heal next cycle — a retired edge, a durable tag, an
         escalation already in the human queue — it wants
         STRICT_CLAUSE_BOUNDARY_RE, and adding itself to the allowlist below is
-        the wrong fix.
+        the wrong fix. The one exception is a corpus-tagging consumer whose
+        attribution does not scale with clause length.
+
+        services/completion_claim_gate.py (task 4853) is that exception. It
+        binds each completion marker to its ONE nearest ref and never lets a
+        binding cross a barrier (', ', 'and', 'while', ...), so a longer clause
+        adds candidate refs without adding claims, and the widening buys back
+        the recall the strict alphabet cost it ('Task 5252 (see CLAUDE.md:95)
+        has landed').
 
         scripts/audit_duplicate_memories.py (task 3891) made that showing and
         is the second allowlist entry. Its
@@ -3393,6 +3402,7 @@ class TestClauseSplitRe:
         allowlist = {
             'src/fused_memory/reconciliation/task_filter.py',
             'scripts/audit_duplicate_memories.py',
+            'src/fused_memory/services/completion_claim_gate.py',
         }
         skip_parts = {'.venv', 'site-packages', '__pycache__'}
 
@@ -3422,10 +3432,11 @@ class TestClauseSplitRe:
         )
         assert consumers == allowlist, (
             f'_CLAUSE_SPLIT_RE gained an out-of-module consumer. The widening is '
-            f'only safe for callers that fail toward a SOFT BLOCK; if a longer '
-            f'clause on this path retires an edge, writes a durable tag, or files '
-            f'an escalation, import task_filter.STRICT_CLAUSE_BOUNDARY_RE instead '
-            f'(see completion_claim_gate for the worked example).'
+            f'only safe for callers that fail toward a SOFT BLOCK, or whose '
+            f'attribution does not scale with clause length (completion_claim_gate '
+            f'binds each marker to one nearest ref); if a longer clause on this '
+            f'path retires an edge, writes a durable tag, or files an escalation, '
+            f'import task_filter.STRICT_CLAUSE_BOUNDARY_RE instead.'
             f'\nunexpected={sorted(consumers - allowlist)!r}'
             f'\nmissing={sorted(allowlist - consumers)!r}'
         )
@@ -3824,9 +3835,10 @@ class TestConflictingTaskStatusFraming:
         claim is contingent, and it was already falsified once: the task 3403
         review found services/completion_claim_gate.py importing the same
         constant while durably tagging episodes and filing operator
-        escalations. That consumer now takes STRICT_CLAUSE_BOUNDARY_RE, the
-        narrow variant task_filter exports for exactly this case, and the
-        consumer set is enforced rather than merely asserted here — see
+        escalations with clause-wide attribution. That consumer now binds each
+        completion marker to its nearest ref (task 4853), so its attribution no
+        longer scales with clause length, and the consumer set is enforced
+        rather than merely asserted here — see
         TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers.
 
         Suppressing the over-fire here instead would require nearest-ref
