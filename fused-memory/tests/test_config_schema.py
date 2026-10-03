@@ -3795,9 +3795,8 @@ class TestWriteTriageConfig:
     def test_judge_field_chars_defaults_to_4000(self):
         """The judge's per-field cap ships at 4,000 chars, not the old 1,200.
 
-        At 1,200 the judge answered `distinct` on 24% of rater-confirmed true
-        links against 11% at 4,000 (task 6076; decision record
-        calibration/write_triage_judge_field_chars_report.md).
+        Why: task 6076's decision record,
+        calibration/write_triage_judge_field_chars_report.md.
         """
         from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
 

@@ -297,9 +297,9 @@ def _named_candidate(
 _DEFAULT_JUDGE_CANDIDATE_COUNT = 5
 
 #: The per-field cap when the leaf is unset or invalid: the schema's own
-#: default, whose field description is the one home of why it is 4,000 (the
-#: judge's measured recall loss at the old 1,200). A cap exists at all because
-#: the calibration fixture holds a ~9k-character canonical, and a slate of
+#: default. Why it is 4,000 is the decision record
+#: calibration/write_triage_judge_field_chars_report.md. A cap exists at all
+#: because the calibration fixture holds a ~9k-character canonical, and a slate of
 #: untrimmed consolidated topics — exactly where triage matters most — would
 #: multiply the cost of every call.
 _DEFAULT_JUDGE_FIELD_CHARS: int = WriteTriageConfig.model_fields['judge_field_chars'].default

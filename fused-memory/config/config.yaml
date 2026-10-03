@@ -640,9 +640,8 @@ write_triage:
   # included regardless of this cap.
   judge_candidate_count: 5
   # judge_field_chars: the per-field character cap on the entry and on every
-  # candidate the judge reads, cut fields marked `…[elided]`. 4000, not 1200:
-  # at 1200 the judge called 24% of rater-confirmed true links `distinct`, at
-  # 4000 11% (calibration/write_triage_judge_field_chars_report.md).
+  # candidate the judge reads, cut fields marked `…[elided]`. Why 4000 and
+  # not the old 1200: calibration/write_triage_judge_field_chars_report.md.
   judge_field_chars: 4000
   # judge_accuracy_report_path: traceability from the judge shipped here back
   # to the run that MEASURED it against leaf alpha's curator-labelled fixture,
