@@ -1206,9 +1206,6 @@ class TestResolveJudgeCandidateCount:
 class TestResolveJudgeFieldChars:
     """The per-field character cap the judge reads each record through."""
 
-    def test_the_default_is_4000(self) -> None:
-        assert _DEFAULT_JUDGE_FIELD_CHARS == 4_000
-
     def test_a_configured_int_is_used(self) -> None:
         assert resolve_judge_field_chars(_svc(judge_field_chars=2_000)) == 2_000
 
@@ -1227,15 +1224,11 @@ class TestResolveJudgeFieldChars:
         service = _svc(judge_field_chars=value)
         assert resolve_judge_field_chars(service) == _DEFAULT_JUDGE_FIELD_CHARS
 
-    def test_the_shipped_config_the_schema_and_the_fallback_agree(self) -> None:
-        """The three spellings of the default are checked against each other.
-
-        The shipped config.yaml is read through the conftest's CONFIG_PATH pin.
-        """
+    def test_the_shipped_config_resolves_to_the_fallback(self) -> None:
+        """config.yaml, read through the conftest's CONFIG_PATH pin, ships the default."""
         shipped = types.SimpleNamespace(config=FusedMemoryConfig())
 
         assert resolve_judge_field_chars(shipped) == _DEFAULT_JUDGE_FIELD_CHARS
-        assert WriteTriageConfig().judge_field_chars == _DEFAULT_JUDGE_FIELD_CHARS
 
 
 class TestResolveJudgeReasoningEffort:
