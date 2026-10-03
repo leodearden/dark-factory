@@ -1120,20 +1120,18 @@ class TestResolveJudgeTimeout:
     def test_the_default_is_bounded_well_under_the_sdk_default(self) -> None:
         assert 0 < _DEFAULT_JUDGE_TIMEOUT_SECONDS <= 60
 
-    def test_the_shipped_default_is_fifteen_seconds_in_every_home(self) -> None:
-        """15 s because the frontier arms measured p95 4.6–6.4 s (PRD §11.2 D15).
+    def test_the_schema_default_is_the_fallback_and_what_config_yaml_ships(self) -> None:
+        """The schema field is the default's one home; its description says why.
 
-        The value is spelled in three places — the module fallback, the schema
-        default and the shipped config.yaml (read here through the conftest's
-        CONFIG_PATH pin) — and this three-way equality is what stops them
-        drifting apart.
+        The resolver's fallback derives from it, and the shipped config.yaml
+        (read here through the conftest's CONFIG_PATH pin) restates it, so the
+        yaml is the one copy that can drift.
         """
         schema_default = WriteTriageConfig.model_fields['judge_timeout_seconds'].default
-        shipped = FusedMemoryConfig().write_triage.judge_timeout_seconds
 
-        assert _DEFAULT_JUDGE_TIMEOUT_SECONDS == 15.0
-        assert schema_default == _DEFAULT_JUDGE_TIMEOUT_SECONDS
-        assert shipped == _DEFAULT_JUDGE_TIMEOUT_SECONDS
+        assert schema_default == 15.0
+        assert resolve_judge_timeout(object()) == schema_default
+        assert FusedMemoryConfig().write_triage.judge_timeout_seconds == schema_default
 
     @pytest.mark.parametrize('value', [1, 2.5, 30, 0.01])
     def test_a_configured_positive_number_is_used(self, value: float) -> None:

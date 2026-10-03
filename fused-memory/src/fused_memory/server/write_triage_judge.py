@@ -45,7 +45,7 @@ import json
 import logging
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeGuard, get_args
 
-from fused_memory.config.schema import JudgeReasoningEffort
+from fused_memory.config.schema import JudgeReasoningEffort, WriteTriageConfig
 from fused_memory.routing.json_extract import extract_json
 from fused_memory.server.grouped_read import PARENT_ID_KEY
 
@@ -617,16 +617,12 @@ _DEFAULT_MODEL_BY_PROVIDER = {
     'anthropic': 'claude-3-5-haiku-latest',
 }
 
-#: No LLM call anywhere in fused-memory sets a timeout today, and the openai
-#: SDK default is 600 seconds. On the SYNCHRONOUS ``add_memory`` write path
-#: that is a wedge, not a degradation: the caller waits ten minutes for a
-#: write C1 promises never to block. This bound keeps a hung provider to one
-#: slow write rather than a hung server. It is 15 s rather than 10 s because
-#: the frontier arms the judge-arm selection chooses between measured p95
-#: 4.6–6.4 s against gpt-4o-mini's 1.7–1.9 s, and 10 s would cut into the tail
-#: of the arm being selected (plans/write-triage-flip-readiness-prd.md §11.2
-#: D15).
-_DEFAULT_JUDGE_TIMEOUT_SECONDS = 15.0
+#: The per-call budget when the leaf is unset or invalid: the schema's own
+#: default, whose field description is the one home of why the bound exists
+#: and why it has its value.
+_DEFAULT_JUDGE_TIMEOUT_SECONDS: float = (
+    WriteTriageConfig.model_fields['judge_timeout_seconds'].default
+)
 
 
 def _judge_attr(memory_service: Any, attr: str) -> Any:

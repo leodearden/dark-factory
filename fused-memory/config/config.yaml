@@ -624,8 +624,8 @@ write_triage:
   # sets a timeout and the openai SDK default is 600s; on the synchronous
   # add_memory write path that is a wedge, not a degradation. A timeout
   # propagates into triage_write's fail-open arm — stored, plus a counted
-  # fail-open (INV-4). 15s because the frontier arms measured p95 4.6-6.4s
-  # (plans/write-triage-flip-readiness-prd.md §11.2 D15).
+  # fail-open (INV-4). Why this value: the field's description in
+  # fused-memory/src/fused_memory/config/schema.py::WriteTriageConfig.
   judge_timeout_seconds: 15.0
   # judge_reasoning_effort: null OMITS the reasoning parameter and sends
   # temperature 0.0 (what a non-reasoning model such as gpt-4o-mini needs; a
