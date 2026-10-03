@@ -2606,11 +2606,10 @@ async def _run(
     A thin adapter over :func:`shared.git_async.run_git` (task 3778), which
     owns the spawn mechanism and its rationale: the ``LC_ALL=C`` locale pin
     :func:`_git_clean_failure_is_benign` depends on, stdin feeding, and the
-    cancellation kill of the child's whole process group, plus its reap
-    (tasks 2608/4155).  What stays here is orchestrator-
-    specific: the :class:`WorktreeMissing` taxonomy and the 3-tuple return.
-    ``run_git`` is imported by bare name so ``git_ops.run_git`` is the single
-    patchable spawn seam.
+    process-group kill+reap on cancellation (tasks 2608/4155).  What stays
+    here is orchestrator-specific: the :class:`WorktreeMissing` taxonomy and
+    the 3-tuple return.  ``run_git`` is imported by bare name so
+    ``git_ops.run_git`` is the single patchable spawn seam.
 
     ``input_text``, when given, is piped to the child's stdin, e.g. a diff
     into ``git patch-id`` (see :meth:`GitOps.find_equivalent_commit`).
