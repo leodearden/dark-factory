@@ -1166,6 +1166,88 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         assert scheduler.calls[0][1] == expected
 
 
+class _CannedMcpSession:
+    """The duck-typed ``call_tool`` seam ``Scheduler.dispatch_tool`` routes an injected
+    session through (the eval runner's ``_StubMcpSession`` pattern), answering every
+    call with one canned JSON-RPC body."""
+
+    def __init__(self, body: dict) -> None:
+        self.body = body
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
+        self.calls.append((name, arguments))
+        return self.body
+
+
+def _jsonrpc_body(inner_result: dict) -> dict:
+    return {'jsonrpc': '2.0', 'id': 1, 'result': inner_result}
+
+
+class TestGetStatusesHasOneParser:
+    """The adapter and ``scheduler.py::Scheduler.get_statuses`` read one tool's answer,
+    so they must agree on every JSON-RPC body the transport and the eval stub emit.
+
+    Driven through BOTH public entry points over the SAME real ``Scheduler`` — the
+    adapter's production composition (``merge_lane/worker.py``, ``workflow.py``) —
+    rather than by inspecting which parser runs.  The data-wrapped and the
+    structuredContent-vs-text cases are the ones where two independent parsers differ.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'body',
+        [
+            mcp_tool_envelope({'statuses': {'42': 'pending'}}),
+            mcp_tool_envelope({'statuses': {}}),
+            _jsonrpc_body({
+                'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}],
+            }),
+            mcp_tool_envelope({'data': {'statuses': {'42': 'pending'}}}),
+            _jsonrpc_body({
+                'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}],
+                'structuredContent': {'statuses': {'42': 'done'}},
+                'isError': False,
+            }),
+            mcp_tool_envelope({'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}),
+            mcp_tool_envelope({'statuses': ['not', 'a', 'dict']}),
+            _jsonrpc_body({
+                'content': [{'type': 'text', 'text': 'Error executing tool get_statuses: boom'}],
+                'isError': True,
+            }),
+            {'jsonrpc': '2.0', 'id': 1, 'error': {'code': -32602, 'message': 'Invalid params'}},
+        ],
+        ids=[
+            'known_id',
+            'corroborated_absence',
+            'content_only_eval_stub_body',
+            'data_wrapped',
+            'structured_content_disagrees_with_text',
+            'structured_refusal',
+            'non_dict_statuses',
+            'mcp_is_error',
+            'jsonrpc_protocol_error',
+        ],
+    )
+    async def test_adapter_and_scheduler_agree(self, body, tmp_path):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.scheduler import Scheduler
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        session = _CannedMcpSession(body)
+        scheduler = Scheduler(config, mcp_session=session)
+        adapter = SchedulerChronicFlakeTaskClient(scheduler, config.project_root)
+
+        scheduler_statuses, scheduler_error = await scheduler.get_statuses(['42'])
+        adapter_statuses, adapter_error = await adapter.get_statuses(['42'])
+
+        assert session.calls[0] == session.calls[1]
+        assert adapter_statuses == scheduler_statuses
+        assert (adapter_error is None) == (scheduler_error is None), (
+            adapter_error, scheduler_error,
+        )
+
+
 _DONE_TASK = {
     'id': '7',
     'status': 'done',
