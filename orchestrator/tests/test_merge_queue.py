@@ -398,12 +398,8 @@ class TestCheckPlanTargetsInTree:
         """
         worktree = (await git_ops.create_worktree('plan-dropped')).path
         (worktree / 'retained.py').write_text('retained = 1\n')
-        await git_ops.commit(worktree, 'Add retained')
-        rc, pre_drop_sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
-        )
-        assert rc == 0
-        pre_drop_sha = pre_drop_sha.strip()
+        pre_drop_sha = await git_ops.commit(worktree, 'Add retained')
+        assert pre_drop_sha
 
         (worktree / 'dropped.py').write_text('dropped = 1\n')
         task_tip = await git_ops.commit(worktree, 'Add dropped')
@@ -547,12 +543,8 @@ class TestCheckPlanTargetsInTree:
         """
         worktree = (await git_ops.create_worktree('struct-warn-drop')).path
         (worktree / 'retained.py').write_text('retained = 1\n')
-        await git_ops.commit(worktree, 'Add retained.py')
-        rc, pre_drop_sha_out, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
-        )
-        assert rc == 0
-        pre_drop_sha = pre_drop_sha_out.strip()
+        pre_drop_sha = await git_ops.commit(worktree, 'Add retained.py')
+        assert pre_drop_sha
 
         # Add the dropped file so it's on the task tip but not on
         # pre_drop_sha, whose tree the resolution merge below keeps.
@@ -934,13 +926,12 @@ class TestCheckPlanTargetsInTree:
         """A single-parent commit names no merged tip → WARNING, fail open."""
         worktree = (await git_ops.create_worktree('no-second-parent')).path
         (worktree / 'f.py').write_text('f = 1\n')
-        await git_ops.commit(worktree, 'Add f.py')
-        rc, tip_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
-        assert rc == 0
+        single_parent_tip = await git_ops.commit(worktree, 'Add f.py')
+        assert single_parent_tip
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
             result = await _check_plan_targets_in_tree(
-                tip_out.strip(), git_ops, await git_ops.get_main_sha(),
+                single_parent_tip, git_ops, await git_ops.get_main_sha(),
                 task_id='no-second-parent',
             )
 
@@ -1411,12 +1402,8 @@ class TestMergeLaneSingleRequest:
         """
         worktree = (await git_ops.create_worktree('drop-guard-real')).path
         (worktree / 'retained.py').write_text('retained = 1\n')
-        await git_ops.commit(worktree, 'Add retained')
-        rc, pre_drop_sha, _ = await _run(
-            ['git', 'rev-parse', 'HEAD'], cwd=worktree,
-        )
-        assert rc == 0
-        pre_drop_sha = pre_drop_sha.strip()
+        pre_drop_sha = await git_ops.commit(worktree, 'Add retained')
+        assert pre_drop_sha
 
         (worktree / 'dropped.py').write_text('dropped = 1\n')
         task_tip = await git_ops.commit(worktree, 'Add dropped')
