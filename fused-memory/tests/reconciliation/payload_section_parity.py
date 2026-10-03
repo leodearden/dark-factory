@@ -1,14 +1,16 @@
 """Shared AST machinery for the recon payload builder-parity guards. (tasks 4708, 5113)
 
-Two guards assert the same structural invariant over two stages: every payload
-builder of a stage routes its payload through that stage's
-``_render_required_sections`` aggregator, on EVERY payload-returning branch.
+Two guards assert the same structural invariants over two stages: the stage's
+``REQUIRED_SECTIONS`` registry is well-formed, and every payload builder of the
+stage routes its payload through that stage's ``_render_required_sections``
+aggregator, on EVERY payload-returning branch.
 
 * ``test_stage1_payload_section_parity.py`` — ``MemoryConsolidator`` (Stage 1).
 * ``test_stage2_payload_section_parity.py`` — ``TaskKnowledgeSync`` (Stage 2).
 
-WHY A MODULE RATHER THAN A COPY, OR A CROSS-SUITE IMPORT. The payload predicate
-and the interpolation check are one definition with two consumers. A verbatim
+WHY A MODULE RATHER THAN A COPY, OR A CROSS-SUITE IMPORT. The registry shape
+check, the payload predicate and the interpolation check are each one
+definition with two consumers. A verbatim
 copy in each guard would let them drift: a fix to one guard's predicate — the
 bare-``AnnAssign`` and every-branch amendments task 4708 needed are the
 precedent — would silently skip the other. Importing the helpers out of the
@@ -30,11 +32,68 @@ from typing import NamedTuple
 
 from _ast_guard import parse_python_module
 
+from fused_memory.reconciliation.stages.base import RequiredSection
+
 AGGREGATOR = '_render_required_sections'
+
+# Every registered section is a level-3 heading inside the payload.
+SECTION_HEADER_PREFIX = '### '
 
 # A payload builder returns a WHOLE payload, which in the recon stage modules
 # always means an f-string opening with the top-level markdown header.
 PAYLOAD_HEADER_PREFIX = '## '
+
+
+def registry_shape_violations(stage_cls: type) -> list[str]:
+    """Every way ``stage_cls.REQUIRED_SECTIONS`` departs from the registry contract.
+
+    Empty when the registry is a non-empty tuple of ``stages.base.RequiredSection``
+    whose headers are level-3 markdown headings and whose renderers NAME
+    callable attributes of *stage_cls*. Which sections a stage must register is
+    stage-specific and pinned as a value in that stage's guard, not here.
+    """
+    registry_name = f'{stage_cls.__name__}.REQUIRED_SECTIONS'
+    registry = getattr(stage_cls, 'REQUIRED_SECTIONS', None)
+    if not isinstance(registry, tuple):
+        return [
+            f'{registry_name} must be a tuple — an immutable class-level '
+            f'declaration read by every payload builder — got {type(registry).__name__}.'
+        ]
+    if not registry:
+        return [
+            f'{registry_name} is empty, which makes the aggregator a no-op and '
+            f'every parity assertion over that stage vacuous.'
+        ]
+    violations: list[str] = []
+    for section in registry:
+        if not isinstance(section, RequiredSection):
+            violations.append(
+                f'{registry_name} member {section!r} is a {type(section).__name__}, '
+                f'not a stages.base.RequiredSection — the one type every stage '
+                f'declares its registry with; do not define a per-stage copy.'
+            )
+            continue
+        if not (isinstance(section.header, str) and section.header.startswith(SECTION_HEADER_PREFIX)):
+            violations.append(
+                f'{registry_name} member {section!r} has header {section.header!r}; '
+                f'it must be the exact markdown header the shipped prompt names, '
+                f'a level-3 heading ({SECTION_HEADER_PREFIX!r}…).'
+            )
+        if not isinstance(section.renderer, str):
+            violations.append(
+                f'{registry_name} member {section!r} has renderer '
+                f'{section.renderer!r}; it must be the NAME of a {stage_cls.__name__} '
+                f'method (a str the aggregator dispatches via getattr), not the method '
+                f'object.'
+            )
+        elif not callable(getattr(stage_cls, section.renderer, None)):
+            violations.append(
+                f'{registry_name} member {section.header!r} names renderer '
+                f'{section.renderer!r}, which is not a callable attribute of '
+                f'{stage_cls.__name__}. A typo in the renderer string must fail in '
+                f'the guard, not as an AttributeError at payload-assembly time.'
+            )
+    return violations
 
 
 class PayloadBuilder(NamedTuple):

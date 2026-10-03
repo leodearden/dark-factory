@@ -93,6 +93,7 @@ from reconciliation.payload_section_parity import (
     PAYLOAD_HEADER_PREFIX,
     branches_missing_the_aggregator,
     discover_payload_builders,
+    registry_shape_violations,
 )
 
 CONSOLIDATOR_SRC = pathlib.Path(consolidator_module.__file__)
@@ -104,29 +105,9 @@ STAGE1_PAYLOAD_BUILDERS = discover_payload_builders(CONSOLIDATOR_SRC, CONSOLIDAT
 class TestRequiredSectionsRegistry:
     """``MemoryConsolidator.REQUIRED_SECTIONS`` is the single declared section set."""
 
-    def test_registry_is_a_non_empty_tuple_of_required_sections(self):
-        registry = MemoryConsolidator.REQUIRED_SECTIONS
-        assert isinstance(registry, tuple), (
-            f'REQUIRED_SECTIONS must be a tuple (immutable — it is a class-level '
-            f'declaration read by every payload builder), got {type(registry).__name__}.'
-        )
-        assert registry, (
-            'REQUIRED_SECTIONS is empty. An empty registry makes the aggregator a '
-            'no-op and every parity assertion in this file vacuous; at least '
-            "'### Live-Workflow Signals' is required by prompts/stage1.py."
-        )
-        for section in registry:
-            assert isinstance(section.header, str) and section.header.startswith('### '), (
-                f'REQUIRED_SECTIONS member {section!r} has header {section.header!r}; '
-                f"it must be the exact markdown header the shipped prompt names, "
-                f"which is a level-3 heading ('### …')."
-            )
-            assert isinstance(section.renderer, str), (
-                f'REQUIRED_SECTIONS member {section!r} has renderer '
-                f'{section.renderer!r}; it must be the NAME of a MemoryConsolidator '
-                f'method (a str resolved via getattr), not the method object — the '
-                f'aggregator dispatches by name.'
-            )
+    def test_registry_is_well_formed(self):
+        violations = registry_shape_violations(MemoryConsolidator)
+        assert not violations, '\n'.join(violations)
 
     def test_registry_contains_the_live_workflow_section(self):
         registry = MemoryConsolidator.REQUIRED_SECTIONS
@@ -141,16 +122,6 @@ class TestRequiredSectionsRegistry:
             f'section prompts/stage1.py draws an absence-inference from, so a builder '
             f'omitting it makes the model conclude no task is live or landed.'
         )
-
-    def test_every_registry_renderer_resolves_to_a_method(self):
-        for section in MemoryConsolidator.REQUIRED_SECTIONS:
-            renderer = getattr(MemoryConsolidator, section.renderer, None)
-            assert callable(renderer), (
-                f'REQUIRED_SECTIONS member {section.header!r} names renderer '
-                f'{section.renderer!r}, which is not a callable attribute of '
-                f'MemoryConsolidator. A typo in the renderer string must fail HERE, '
-                f'not as an AttributeError at payload-assembly time in production.'
-            )
 
 
 class TestRenderRequiredSections:
