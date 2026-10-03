@@ -49,6 +49,18 @@ is absent because only ``get_memory_by_id`` produces it, and recall never
 calls that tool.
 """
 
+CONTESTED_CHILD_KEY = 'contested'
+"""The flag fused-memory stamps on a grouped child that contests its parent.
+
+``fused-memory/src/fused_memory/server/grouped_read.py::_digest_entry`` stamps
+it from ``is_contested_child``, the single definition of contested. It is read
+here exactly as stamped (``is True``), never re-derived from the child's own
+``x_contested`` metadata. A copy rather than an import, because the
+orchestrator has no runtime dependency on fused-memory; the recorded replies
+under ``orchestrator/tests/fixtures/grouped_search_contesting_child/`` pin it
+(see their ``PROVENANCE.md``).
+"""
+
 
 def _canonical_project(value: str) -> str:
     """Canonicalise a project identifier the way fused-memory does.
@@ -229,20 +241,106 @@ def _entry_date(entry: dict) -> str:
     return UNDATED
 
 
-def _memory_bullet(entry: Any, store: str, indent: str = '') -> str | None:
-    """Render one recalled entry as ``- [category · date · store] content``.
+def _entry_id(entry: dict) -> str | None:
+    """An entry's id when it is a non-empty string, the only kind usable as a key."""
+    entry_id = entry.get('id')
+    return entry_id if isinstance(entry_id, str) and entry_id else None
 
-    None for an entry with no text: an empty bullet spends tokens announcing
-    something unreadable. Content renders WHOLE, with continuation lines
-    indented so a multi-paragraph memory stays inside its own bullet.
-    """
+
+def _entry_text(entry: Any) -> str | None:
+    """What an entry has to read, its ``content`` else its ``digest``; None when blank."""
     if not isinstance(entry, dict):
         return None
-    content = entry.get('content') or entry.get('digest')
-    if not isinstance(content, str) or not content.strip():
+    text = entry.get('content') or entry.get('digest')
+    return text if isinstance(text, str) and text.strip() else None
+
+
+def _memory_bullet(
+    entry: Any, store: str, indent: str = '', label: str | None = None,
+) -> str | None:
+    """Render one recalled entry as ``- [category · date · store] content``.
+
+    A *label* leads the tag when given. None for an entry with no text: an
+    empty bullet spends tokens announcing something unreadable. Content
+    renders WHOLE, with continuation lines indented so a multi-paragraph
+    memory stays inside its own bullet.
+    """
+    text = _entry_text(entry)
+    if text is None:
         return None
-    body = content.strip().replace('\n', '\n' + indent + '  ')
-    return f'{indent}- [{_entry_category(entry)} · {_entry_date(entry)} · {store}] {body}'
+    body = text.strip().replace('\n', '\n' + indent + '  ')
+    tag = f'{_entry_category(entry)} · {_entry_date(entry)} · {store}'
+    if label is not None:
+        tag = f'{label} · {tag}'
+    return f'{indent}- [{tag}] {body}'
+
+
+def _grouped_children(entry: dict) -> list[dict]:
+    """The dict children nested in *entry*'s ``grouped`` block, in key order.
+
+    A ``grouped`` value, child collection or child of an unexpected type
+    contributes nothing.
+    """
+    grouped = entry.get('grouped')
+    if not isinstance(grouped, dict):
+        return []
+    return [
+        child
+        for key in GROUPED_CHILD_KEYS
+        if isinstance(children := grouped.get(key), list)
+        for child in children
+        if isinstance(child, dict)
+    ]
+
+
+def _is_contesting(child: dict) -> bool:
+    return child.get(CONTESTED_CHILD_KEY) is True
+
+
+def _contesting_bullet(
+    child: dict, parent_id: str | None, hits_by_id: Mapping[str, dict], store: str,
+) -> str | None:
+    """Render a child that contests its parent, naming the parent it contests.
+
+    The child's full body is on the wire only as its own top-level hit, so
+    that hit renders when the reply carries one; the child entry itself is
+    the fallback.
+    """
+    label = f'contests {parent_id}' if parent_id else 'contests its parent'
+    child_id = _entry_id(child)
+    sources = (hits_by_id.get(child_id) if child_id else None, child)
+    return next(
+        (
+            bullet
+            for source in sources
+            if (bullet := _memory_bullet(source, store, indent='  ', label=label)) is not None
+        ),
+        None,
+    )
+
+
+def _result_bullets(entry: dict, hits_by_id: Mapping[str, dict]) -> list[str]:
+    """One result's bullet, then its contesting children, then its other children."""
+    store = entry.get('source_store')
+    store = store if isinstance(store, str) and store else UNKNOWN_STORE
+    bullet = _memory_bullet(entry, store)
+    if bullet is None:
+        return []
+    children = _grouped_children(entry)
+    parent_id = _entry_id(entry)
+    contesting = [
+        child_bullet
+        for child in children
+        if _is_contesting(child)
+        and (child_bullet := _contesting_bullet(child, parent_id, hits_by_id, store)) is not None
+    ]
+    others = [
+        child_bullet
+        for child in children
+        if not _is_contesting(child)
+        and (child_bullet := _memory_bullet(child, store, indent='  ')) is not None
+    ]
+    return [bullet, *contesting, *others]
 
 
 def render_memory_results(results: Sequence[Any]) -> str:
@@ -250,29 +348,27 @@ def render_memory_results(results: Sequence[Any]) -> str:
 
     Each grouped child (:data:`GROUPED_CHILD_KEYS`) renders as a nested bullet
     tagged with its parent's store, since a collapsed child has none of its own.
+    A child marked :data:`CONTESTED_CHILD_KEY` renders first under its parent,
+    tagged ``contests <parent id>``, from its own top-level hit when the reply
+    carries one; that hit is then not rendered again at its own rank.
     """
+    entries = [entry for entry in results if isinstance(entry, dict)]
+    hits_by_id: dict[str, dict] = {}
+    for entry in entries:
+        if (entry_id := _entry_id(entry)) is not None:
+            hits_by_id.setdefault(entry_id, entry)
+    rendered_under_parent = {
+        child_id
+        for entry in entries
+        if _entry_text(entry) is not None
+        for child in _grouped_children(entry)
+        if _is_contesting(child) and (child_id := _entry_id(child)) is not None
+    }
     bullets: list[str] = []
-    for entry in results:
-        if not isinstance(entry, dict):
+    for entry in entries:
+        if _entry_id(entry) in rendered_under_parent:
             continue
-        store = entry.get('source_store')
-        store = store if isinstance(store, str) and store else UNKNOWN_STORE
-        bullet = _memory_bullet(entry, store)
-        if bullet is None:
-            continue
-        bullets.append(bullet)
-        grouped = entry.get('grouped')
-        if not isinstance(grouped, dict):
-            continue
-        for key in GROUPED_CHILD_KEYS:
-            children = grouped.get(key)
-            if not isinstance(children, list):
-                continue
-            bullets.extend(
-                child_bullet
-                for child in children
-                if (child_bullet := _memory_bullet(child, store, indent='  ')) is not None
-            )
+        bullets.extend(_result_bullets(entry, hits_by_id))
     return '\n'.join(bullets)
 
 
