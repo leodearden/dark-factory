@@ -95,7 +95,7 @@ def test_build_pool_resolves_the_roster_in_file_order(
     gate = mod.build_pool(accounts_file=str(roster_file), env_file=str(empty_env_file))
 
     assert gate.account_count == 3
-    assert [a.name for a in gate._accounts] == ["max-b", "max-c", "max-d"], (
+    assert gate.account_names == ("max-b", "max-c", "max-d"), (
         "order is the failover order — config/usage-accounts.yaml says so in "
         "its own header"
     )
@@ -137,7 +137,7 @@ def test_build_pool_actually_uses_the_default_accounts_file_when_nothing_else_is
 
     gate = mod.build_pool(env_file=str(empty_env_file))
 
-    assert [a.name for a in gate._accounts] == ["only-in-the-default-roster"], (
+    assert gate.account_names == ("only-in-the-default-roster",), (
         "build_pool must resolve the roster through default_accounts_file(), "
         "the only source left once accounts_file and USAGE_ACCOUNTS_FILE are "
         "both unset"
@@ -154,7 +154,7 @@ def test_build_pool_honours_the_USAGE_ACCOUNTS_FILE_override(
 
     gate = mod.build_pool(env_file=str(empty_env_file))
 
-    assert [a.name for a in gate._accounts] == ["max-b", "max-c", "max-d"]
+    assert gate.account_names == ("max-b", "max-c", "max-d")
 
 
 def test_build_pool_hands_the_validator_an_ABSOLUTE_path(
@@ -190,7 +190,8 @@ def test_build_pool_loads_dotenv_before_building_the_gate(tmp_path, monkeypatch)
     gate = mod.build_pool(accounts_file=str(roster), env_file=str(env_file))
 
     assert gate.account_count == 3
-    assert gate._accounts[0].token == "tok-from-dotenv-b", (
+    lease = gate.try_lease()
+    assert lease is not None and lease.token == "tok-from-dotenv-b", (
         "the token must have come from the .env — if the gate were built "
         "first, every account would have resolved token-less"
     )

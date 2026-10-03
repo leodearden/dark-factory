@@ -32,7 +32,6 @@ _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
-import yaml  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 from shared.config_models import UsageCapConfig  # noqa: E402
 from shared.usage_gate import UsageGate  # noqa: E402
@@ -96,7 +95,8 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
         default_accounts_file()
     )
     try:
-        gate = UsageGate(_pool_config(accounts_file=str(Path(resolved).resolve())))
+        config = _pool_config(accounts_file=str(Path(resolved).resolve()))
+        gate = UsageGate(config)
     except Exception as exc:  # noqa: BLE001 — a bad roster defers the night, never crashes it
         logger.warning(
             "legibility account pool could not load its roster %s (%s: %s) — "
@@ -106,10 +106,10 @@ def build_pool(*, accounts_file=None, env_file=None) -> UsageGate:
         )
         return UsageGate(_pool_config())
 
-    # The roster's names, because the gate publishes only a count: the
-    # operator's next move on a short pool is to check which
-    # CLAUDE_OAUTH_TOKEN_* the unit is missing, and only the roster names that.
-    configured = _roster_names(resolved)
+    # Every name the roster declares, resolved or not: the operator's next
+    # move on a short pool is to check which CLAUDE_OAUTH_TOKEN_* the unit is
+    # missing, and the gate keeps no record of an account it skipped.
+    configured = [account.name for account in config.accounts]
     if gate.account_count == 0:
         logger.warning(
             "legibility account pool resolved NO usable accounts from %s "
@@ -140,19 +140,3 @@ def _pool_config(**roster) -> UsageCapConfig:
         auth_reprobe_enabled=False,
         **roster,
     )
-
-
-def _roster_names(accounts_file) -> list[str]:
-    """Account names the roster FILE declares, whether or not their tokens
-    resolved. Read straight back off the YAML because the gate keeps no
-    record of an account it skipped, and "which account is missing its
-    token" is the only question the warning above is asked to answer."""
-    try:
-        data = yaml.safe_load(Path(accounts_file).read_text()) or {}
-        return [entry.get("name", "?") for entry in data.get("accounts", [])]
-    except Exception as exc:  # noqa: BLE001 — a warning's detail must never raise
-        logger.warning(
-            "could not read the configured account names back from roster %s "
-            "(%s: %s)", accounts_file, type(exc).__name__, exc,
-        )
-        return []

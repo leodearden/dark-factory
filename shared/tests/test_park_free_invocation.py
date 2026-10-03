@@ -15,7 +15,8 @@ surfaced through ``invoke_slot`` and ``invoke_with_cap_retry``'s
 byte-identical for the fleet.
 
 Every await is bounded by ``asyncio.wait_for(..., 2.0)``, so a regression that
-parks FAILS this suite rather than hanging it.
+parks FAILS this suite rather than hanging it. Accounts are capped and
+auth-failed through the gate's public slot API, never by writing its state.
 """
 
 from __future__ import annotations
@@ -25,83 +26,100 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from _usage_gate_test_helpers import SCOPE, make_gate, set_scope_cap
+from _usage_gate_test_helpers import SCOPE, make_gate
 
 from shared.cli_invoke import AgentResult, invoke_with_cap_retry
-from shared.usage_gate import AccountPhase, PoolFrozen
+from shared.invocation_outcome import AuthFailed, CapHit, InvocationOutcome
+from shared.usage_gate import PoolFrozen
 
 _BOUND_SECS = 2.0
 
 
-def _cap(acct) -> None:
-    """Cap *acct* until well past any test's runtime, so no refresh reopens it."""
-    acct.capped = True
-    acct.resets_at = datetime.now(UTC) + timedelta(hours=5)
+def _cap() -> CapHit:
+    """A cap resetting well past any test's runtime, so no refresh reopens it."""
+    return CapHit(resets_at=datetime.now(UTC) + timedelta(hours=5), reason='test cap')
 
 
-def _all_capped_gate(names=('a', 'b')):
+_AUTH = AuthFailed(status=401)
+
+
+async def _gate_reporting(names, *outcomes: InvocationOutcome, scope=None):
+    """A gate over *names* with each outcome reported, in order, by the slot
+    each next invocation in *scope* would get: the first outcome lands on the
+    first admissible account, the next on the one after it, and so on."""
     gate = make_gate(list(names))
-    for acct in gate._accounts:
-        _cap(acct)
+    for outcome in outcomes:
+        async with gate.invoke_slot(scope=scope) as slot:
+            slot.report(outcome)
     return gate
 
 
-def _all_auth_failed_gate(names=('a', 'b')):
-    gate = make_gate(list(names))
-    for acct in gate._accounts:
-        acct.auth_failed = True
-    return gate
+@pytest.fixture
+async def gates():
+    """Build gates through this, so each is shut down after the test (an
+    auth failure starts a background re-probe)."""
+    built = []
+
+    async def _build(names, *outcomes, scope=None):
+        gate = await _gate_reporting(names, *outcomes, scope=scope)
+        built.append(gate)
+        return gate
+
+    yield _build
+    for gate in built:
+        await gate.shutdown()
 
 
-async def test_before_invoke_without_park_raises_when_every_account_is_capped():
-    gate = _all_capped_gate()
+async def test_before_invoke_without_park_raises_when_every_account_is_capped(gates):
+    gate = await gates(('a', 'b'), _cap(), _cap())
 
     with pytest.raises(PoolFrozen):
         await asyncio.wait_for(gate.before_invoke(park=False), _BOUND_SECS)
 
 
-async def test_before_invoke_without_park_raises_when_every_account_is_auth_failed():
-    gate = _all_auth_failed_gate()
+async def test_before_invoke_without_park_raises_when_every_account_is_auth_failed(gates):
+    gate = await gates(('a', 'b'), _AUTH, _AUTH)
 
     with pytest.raises(PoolFrozen):
         await asyncio.wait_for(gate.before_invoke(park=False), _BOUND_SECS)
 
 
-async def test_an_exhausted_scope_raises_rather_than_parking_on_the_scope_waiter():
-    """The fleet is NOT frozen here — every account is generally AVAILABLE —
-    so the park that must be refused is the per-scope waiter's, not ``_open``'s."""
-    gate = make_gate(['a', 'b'])
-    for acct in gate._accounts:
-        set_scope_cap(acct, resets_at=datetime.now(UTC) + timedelta(hours=5))
+async def test_an_exhausted_scope_raises_rather_than_parking_on_the_scope_waiter(gates):
+    """The fleet is NOT frozen here — a scoped cap leaves every account
+    generally AVAILABLE — so the park that must be refused is the per-scope
+    waiter's, not ``_open``'s."""
+    gate = await gates(('a', 'b'), _cap(), _cap(), scope=SCOPE)
     assert not gate.is_paused, 'fixture must leave the fleet open, or this is case (a)'
 
-    with pytest.raises(PoolFrozen):
+    with pytest.raises(PoolFrozen) as excinfo:
         await asyncio.wait_for(gate.before_invoke(scope=SCOPE, park=False), _BOUND_SECS)
 
+    assert excinfo.value.scope == SCOPE
 
-async def test_the_default_still_parks_on_a_frozen_pool():
+
+async def test_the_default_still_parks_on_a_frozen_pool(gates):
     """Byte-compat guard: omitting ``park`` keeps the fleet's patient wait."""
-    gate = _all_capped_gate()
+    gate = await gates(('a', 'b'), _cap(), _cap())
 
     with pytest.raises(TimeoutError):
         await asyncio.wait_for(gate.before_invoke(), 0.3)
 
 
-async def test_invoke_slot_without_park_propagates_and_claims_no_account():
-    gate = _all_capped_gate(('a', 'b', 'c'))
-    gate._accounts[1].capped = False
-    gate._accounts[1].auth_failed = True
+async def test_invoke_slot_without_park_propagates_and_claims_no_account(gates):
+    gate = await gates(('a', 'b', 'c'), _cap(), _AUTH, _cap())
 
     async def _enter_slot():
         async with gate.invoke_slot(park=False):
             pytest.fail('a frozen pool must not yield a slot')
 
-    with pytest.raises(PoolFrozen):
+    with pytest.raises(PoolFrozen) as refused:
         await asyncio.wait_for(_enter_slot(), _BOUND_SECS)
+    with pytest.raises(PoolFrozen) as after:
+        await asyncio.wait_for(gate.before_invoke(park=False), _BOUND_SECS)
 
-    assert [a.phase for a in gate._accounts] == [
-        AccountPhase.CAPPED, AccountPhase.AUTH_FAILED, AccountPhase.CAPPED,
-    ]
+    for frozen in (refused.value, after.value):
+        assert frozen.capped_account_names == ('a', 'c')
+        assert frozen.auth_failed_account_names == ('b',)
 
 
 async def test_invoke_with_cap_retry_fails_over_both_auth_rejections_then_raises():
@@ -138,10 +156,8 @@ async def test_invoke_with_cap_retry_fails_over_both_auth_rejections_then_raises
     assert gate.auth_failed_account_names == ('a', 'b')
 
 
-async def test_pool_frozen_names_the_count_and_which_accounts_are_capped_or_auth_failed():
-    gate = _all_capped_gate(('max-x', 'max-y', 'max-z'))
-    gate._accounts[1].capped = False
-    gate._accounts[1].auth_failed = True
+async def test_pool_frozen_names_the_count_and_which_accounts_are_capped_or_auth_failed(gates):
+    gate = await gates(('max-x', 'max-y', 'max-z'), _cap(), _AUTH, _cap())
 
     with pytest.raises(PoolFrozen) as excinfo:
         await asyncio.wait_for(gate.before_invoke(park=False), _BOUND_SECS)

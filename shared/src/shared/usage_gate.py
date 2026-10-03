@@ -2843,6 +2843,12 @@ class UsageGate:
         return len(self._accounts)
 
     @property
+    def account_names(self) -> tuple[str, ...]:
+        """Names of every resolved account, whatever its phase, in roster
+        (failover) order."""
+        return tuple(acct.name for acct in self._accounts)
+
+    @property
     def active_account_name(self) -> str | None:
         """Name of the first non-capped, non-auth-failed account, or None."""
         for acct in self._accounts:
