@@ -193,10 +193,9 @@ def _write_error_code(resp: object) -> str:
     carrying neither key, and the non-dict shapes, collapse to
     ``'unknown'`` so a queryable code is always recorded.
 
-    Sole owner of that precedence and that fallback: six call sites across
-    _on_task_blocked, _sweep_cancel_orphan, _sweep_block_orphan and
-    _unblock_dependent route through here, and hand-rolled copies had
-    already drifted apart on the fallback (task 4977 review).
+    Sole owner of that precedence and that fallback: every classified
+    interceptor write in this module routes through here, and hand-rolled
+    copies had already drifted apart on the fallback (task 4977 review).
     """
     code = (resp.get('error_type') or resp.get('error')) if isinstance(resp, dict) else None
     return str(code) if code else 'unknown'
