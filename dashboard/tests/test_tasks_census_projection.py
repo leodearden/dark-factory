@@ -265,3 +265,110 @@ class TestCollectCensusSnapshots:
             assert census[label].failure is full[label].failure
             assert census[label].rows.state is full[label].rows.state
             assert census[label].census.state is full[label].census.state
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v2/dashboard/tasks?projection=census — the endpoint projection
+# ---------------------------------------------------------------------------
+
+_TASKS = '/api/v2/dashboard/tasks'
+_CENSUS = f'{_TASKS}?projection=census'
+
+_BANNER_KEYS = (
+    'TASKS_OFFLINE', 'TASKS_OFFLINE_PROJECTS', 'TASKS_DEGRADED_PROJECTS',
+    'TASKS_COUNT_UNKNOWN_PROJECTS', 'TASKS_PROJECT_COUNT',
+)
+
+
+@pytest.fixture()
+def two_root_app(client, two_roots):
+    """The app's own client, fanning out over the two-root config."""
+    client.app.state.config = two_roots
+    return client
+
+
+def _get_all(client, canned, *urls):
+    """GET each of *urls* in order over *canned*, sharing one unit cache."""
+    with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+        return [client.get(url) for url in urls]
+
+
+class TestCensusProjectionEndpoint:
+    def test_the_census_render_serves_the_full_renders_census_with_rows_withheld(
+        self, two_root_app,
+    ):
+        full, census = _get_all(two_root_app, _canned(), _TASKS, _CENSUS)
+
+        assert full.status_code == 200, full.text
+        assert census.status_code == 200, census.text
+        full_body, census_body = full.json(), census.json()
+        assert set(census_body['TASKS_SNAPSHOT']) == set(full_body['TASKS_SNAPSHOT']) == {
+            'alpha', 'beta',
+        }
+        for label, entry in census_body['TASKS_SNAPSHOT'].items():
+            assert set(entry) == _WIRE_KEYS
+            assert entry['census']['state'] == 'fresh', entry['census']
+            assert entry['census']['value'] == full_body['TASKS_SNAPSHOT'][label]['census']['value']
+            rows = entry['rows']
+            assert rows['state'] == 'unknown', rows
+            assert rows['value'] is None and rows['as_of'] is None
+            assert 'projection=census' in (rows['reason'] or ''), rows['reason']
+        for key in _BANNER_KEYS:
+            assert census_body[key] == full_body[key], key
+        served_at = datetime.fromisoformat(census_body['served_at'])
+        for label, entry in census_body['TASKS_SNAPSHOT'].items():
+            as_of = datetime.fromisoformat(entry['census']['as_of'])
+            assert as_of <= served_at, (label, entry['census']['as_of'], census_body['served_at'])
+
+    def test_the_census_render_never_reaches_the_full_collector(self, two_root_app):
+        refuse = AsyncMock(side_effect=AssertionError(
+            'the census projection must not run the full collector',
+        ))
+        with patch('dashboard.api.tasks.collect_tasks_with_counts', new=refuse):
+            (resp,) = _get_all(two_root_app, _canned(), _CENSUS)
+
+        assert resp.status_code == 200, resp.text
+        refuse.assert_not_awaited()
+
+    def test_a_root_whose_row_read_failed_is_offline_under_both_projections(
+        self, two_root_app, two_roots,
+    ):
+        dead = str(two_roots.known_project_roots[0])
+        canned = _canned()
+        canned.fail_when = lambda call: (
+            call['tool'] == 'get_tasks' and call['args'].get('project_root') == dead
+        )
+
+        full, census = _get_all(two_root_app, canned, _TASKS, _CENSUS)
+
+        assert full.status_code == 200 and census.status_code == 200
+        assert full.json()['TASKS_OFFLINE_PROJECTS'] == ['beta']
+        assert census.json()['TASKS_OFFLINE_PROJECTS'] == ['beta']
+        rows = census.json()['TASKS_SNAPSHOT']['beta']['rows']
+        assert rows['state'] == 'unknown', rows
+        assert 'ReadTimeout' in (rows['reason'] or ''), (
+            "an unmeasured rows half must carry the producer's verbatim failure, "
+            f'not the withheld text: {rows["reason"]!r}'
+        )
+        assert 'projection=census' not in rows['reason']
+        healthy = census.json()['TASKS_SNAPSHOT']['alpha']['rows']
+        assert healthy['value'] is None and 'projection=census' in (healthy['reason'] or ''), (
+            'the healthy root must be the projection, or this test is vacuous'
+        )
+
+    def test_an_unknown_projection_is_refused_never_served_as_a_full_render(
+        self, two_root_app,
+    ):
+        (resp,) = _get_all(two_root_app, _canned(), f'{_TASKS}?projection=bogus')
+
+        assert resp.status_code == 422, resp.text
+
+    @pytest.mark.parametrize('url', [_TASKS, f'{_TASKS}?projection=full'])
+    def test_no_projection_and_the_full_projection_keep_the_rows(self, two_root_app, url):
+        (resp,) = _get_all(two_root_app, _canned(), url)
+
+        assert resp.status_code == 200, resp.text
+        for label, entry in resp.json()['TASKS_SNAPSHOT'].items():
+            rows = entry['rows']
+            assert rows['state'] == 'fresh', (label, rows)
+            assert rows['value'] and all(isinstance(row, dict) for row in rows['value'])
