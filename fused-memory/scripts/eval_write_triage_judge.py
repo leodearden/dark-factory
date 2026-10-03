@@ -1585,6 +1585,9 @@ def apply_field_chars(config: Any, requested: int | None) -> int:
     ``0`` means NO elision. The leaf is a positive cap, so it is spelled there
     as ``sys.maxsize``, while the returned provenance keeps ``0``. ``None``
     writes nothing and returns the width the config already resolves to.
+
+    A negative width is refused: the resolver would silently read the default
+    instead, so the provenance would record a width the judge never used.
     """
     import sys  # noqa: PLC0415
 
@@ -1594,6 +1597,8 @@ def apply_field_chars(config: Any, requested: int | None) -> int:
 
     if requested is None:
         return resolve_judge_field_chars(types.SimpleNamespace(config=config))
+    if requested < 0:
+        raise ValueError(f'--field-chars must be 0 (no elision) or positive, got {requested}')
     config.write_triage.judge_field_chars = sys.maxsize if requested == 0 else requested
     return requested
 

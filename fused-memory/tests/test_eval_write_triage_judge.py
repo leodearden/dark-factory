@@ -2967,6 +2967,14 @@ class TestApplyFieldChars:
         assert width >= len(text)
         assert _mod()._elision_flags(text, slate, width) == (False, {'a': False})
 
+    def test_a_negative_width_is_refused_rather_than_recorded(self) -> None:
+        """The resolver would fall back to the default, so provenance would lie."""
+        config = self._config()
+        before = config.write_triage.judge_field_chars
+        with pytest.raises(ValueError, match='--field-chars'):
+            _mod().apply_field_chars(config, -5)
+        assert config.write_triage.judge_field_chars == before
+
     def test_none_changes_nothing_and_reports_the_configs_own_width(self) -> None:
         config = self._config()
         before = config.write_triage.judge_field_chars
