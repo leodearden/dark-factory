@@ -2063,6 +2063,47 @@ def test_escalation_analytics_is_derived_once_per_corpus_generation(
     assert len(pins_calls) == 2
 
 
+def test_a_raising_pins_fan_out_serves_the_analytics_unannotated(
+    client, tmp_path, monkeypatch, caplog, escalation_caches,
+):
+    """An exception escaping the pins fan-out costs the annotation, never the tab.
+
+    The unannotated payload is that generation's derivation: the memo serves
+    it for the rest of the walk's TTL rather than re-running the fan-out.
+    """
+    import logging
+
+    from dashboard.api import escalations as escalation_routes
+
+    calls: list[str] = []
+
+    async def _raising(client, escalation_urls, **kwargs):
+        calls.append('pins')
+        raise RuntimeError('fan-out exploded')
+
+    monkeypatch.setattr(escalation_routes, 'fetch_pins_recovery', _raising)
+    config = _esc_config(tmp_path, escalation_urls={tmp_path.name: 'http://127.0.0.1:9/mcp'})
+    _write_esc(config.escalations_dir, _esc_record('esc-1-1'))
+    client.app.state.config = config
+
+    with caplog.at_level(logging.WARNING, logger='dashboard.api.escalations'):
+        first = client.get('/api/v2/dashboard/escalation-analytics')
+    second = client.get('/api/v2/dashboard/escalation-analytics')
+
+    assert first.status_code == second.status_code == 200
+    (project,) = first.json()['ESCALATION_ANALYTICS']['per_project']
+    (item,) = project['lifespan']['open_items']
+    assert item['id'] == 'esc-1-1'
+    assert 'pins_recovery' not in item and 'pins_recovery_task_ids' not in item
+    assert any(
+        'pins_recovery fan-out failed' in record.getMessage()
+        and 'fan-out exploded' in record.getMessage()
+        for record in caplog.records
+    )
+    assert second.json()['ESCALATION_ANALYTICS'] == first.json()['ESCALATION_ANALYTICS']
+    assert calls == ['pins']
+
+
 def test_a_hung_card_read_bounds_the_escalations_request(client, tmp_path, monkeypatch,
                                                          escalation_caches):
     """A get_task that never answers costs the lookup budget once, and is retried next poll.
