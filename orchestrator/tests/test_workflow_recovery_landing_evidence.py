@@ -23,7 +23,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -175,7 +175,7 @@ class TestFallbackStampsTheTasksOwnCitation:
 
         await guard(f)
 
-        f.wf.git_ops.find_task_citation_commit.assert_awaited_once_with(
+        cast(AsyncMock, f.wf.git_ops.find_task_citation_commit).assert_awaited_once_with(
             f.wf.task_id,
             pattern_template=f.wf.git_ops.config.commit_citation_pattern,
         )

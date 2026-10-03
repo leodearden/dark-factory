@@ -4774,7 +4774,7 @@ async def _land_unrelated_task_on_main(git_ops: GitOps, task_id: str = '4321') -
     (info.path / f'unrelated_{task_id}.py').write_text('X = 1\n')
     await git_ops.commit(info.path, f'feat({task_id}): unrelated work')
     result = await git_ops.merge_to_main(info.path, task_id)
-    assert result.success
+    assert result.success and result.merge_commit is not None
     await git_ops.advance_main(result.merge_commit)
     if result.merge_worktree:
         await git_ops.cleanup_merge_worktree(result.merge_worktree)
