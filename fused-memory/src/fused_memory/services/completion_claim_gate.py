@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -79,6 +79,7 @@ __all__ = [
     'build_unverified_flag',
     'emit_unverified_claim_escalation',
     'make_commit_probe',
+    'make_registry_commit_probe',
     'extract_completion_claims',
     'verify_claims',
 ]
@@ -544,8 +545,10 @@ def verify_claims(
       ``None`` when the registry says NO SUCH TICKET (a mismatch — this is
       esc-3085-1 instance (2)), or :data:`UNRESOLVABLE` when the registry could
       not be consulted.
-    * ``commit_probe(ref, project_id) -> bool | None``: ``True`` present,
-      ``False`` absent, ``None`` unresolvable.
+    * ``commit_probe(ref, project_id) -> bool | None``: ``True`` present in
+      some registered repository, ``False`` absent from every one of them
+      (the claimed project's included), ``None`` unresolvable. See
+      :func:`make_registry_commit_probe`.
 
     THE FAIL DIRECTION IS DELIBERATELY INVERTED relative to this module's two
     closest siblings, and copying theirs would silently reproduce the hole this
@@ -638,17 +641,19 @@ def _verify_commit(
     if present is None:
         return ClaimVerdict(
             claim, 'unverifiable',
-            f'commit {claim.ref} could not be checked in project '
-            f'{claim.project_id!r}',
+            f'commit {claim.ref} could not be checked in every registered '
+            f'repository (claimed project {claim.project_id!r})',
         )
     if present:
         return ClaimVerdict(
             claim, 'verified',
-            f'commit {claim.ref} exists in project {claim.project_id!r}',
+            f'commit {claim.ref} exists in a registered repository '
+            f'(claimed project {claim.project_id!r})',
         )
     return ClaimVerdict(
         claim, 'mismatch',
-        f'no commit {claim.ref} in project {claim.project_id!r}',
+        f'no commit {claim.ref} in any registered repository '
+        f'(claimed project {claim.project_id!r})',
     )
 
 
@@ -756,6 +761,45 @@ def make_commit_probe(repo_root: Path | str) -> Callable[[str], bool | None]:
             'under %s — commit existence is UNRESOLVABLE: %s',
             result.returncode, sha, resolved_root, stderr,
         )
+        return None
+
+    return probe
+
+
+def make_registry_commit_probe(
+    project_roots: Mapping[str, str],
+) -> Callable[[str, str | None], bool | None]:
+    """Build a ``probe(sha, claimed_project) -> bool | None`` over every registered repo.
+
+    A sha is a near-globally-unique id, like a ``tkt_`` id, so the claimed
+    project's repository is only the first place to look; the rest of the
+    registry follows in order. ``True`` when any registered repository has the
+    commit. ``False`` only when the claimed project is registered AND every
+    registered repository answered "no such object". ``None`` otherwise: an
+    unregistered claimed project, or any repository that could not answer.
+    Never raises. Why: docs/unverified-completion-claim-sweep-2026-08-11/
+    investigation.md, Class C.
+    """
+    probes: dict[str, Callable[[str], bool | None]] = {}
+
+    def _repo_probe(project: str) -> Callable[[str], bool | None]:
+        if project not in probes:
+            probes[project] = make_commit_probe(project_roots[project])
+        return probes[project]
+
+    def probe(sha: str, claimed_project: str | None) -> bool | None:
+        claimed_is_registered = claimed_project in project_roots
+        # A stable sort: the claimed project first, then registry order.
+        search_order = sorted(project_roots, key=lambda p: p != claimed_project)
+        every_repo_answered_absent = True
+        for project in search_order:
+            answer = _repo_probe(project)(sha)
+            if answer is True:
+                return True
+            if answer is None:
+                every_repo_answered_absent = False
+        if claimed_is_registered and every_repo_answered_absent:
+            return False
         return None
 
     return probe

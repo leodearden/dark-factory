@@ -1298,38 +1298,18 @@ async def _build_task_status_probe(
 def _build_commit_probe(
     project_roots: dict[str, str],
 ) -> Callable[[str, str | None], bool | None]:
-    """Build the commit probe over the IMPORTED :func:`make_commit_probe`.
+    """Build the commit probe: the live gate's IMPORTED registry probe.
 
-    Rooted at the CLAIMED project's repository. An unregistered project is
-    unresolvable, never a miss — reporting "no such commit" because the wrong
-    repo was searched would be a false accusation.
+    :func:`make_registry_commit_probe` looks in the claimed project's
+    repository first and then in every other registered one, and reports a
+    miss only when all of them answered. Delegating keeps the sweep and the
+    write path on one definition of "this commit does not exist".
     """
     from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
-        make_commit_probe,
+        make_registry_commit_probe,
     )
 
-    cache: dict[str, Callable[[str], bool | None]] = {}
-
-    def probe(ref: str, project_id: str | None) -> bool | None:
-        root = project_roots.get(project_id) if project_id else None
-        if not root:
-            return None
-        if project_id not in cache:
-            try:
-                cache[str(project_id)] = make_commit_probe(root)
-            except Exception:
-                logger.warning(
-                    'could not build a commit probe for %r; UNVERIFIABLE',
-                    project_id, exc_info=True,
-                )
-                return None
-        try:
-            return cache[str(project_id)](ref)
-        except Exception:
-            logger.warning('commit probe failed for %r; UNVERIFIABLE', ref)
-            return None
-
-    return probe
+    return make_registry_commit_probe(project_roots)
 
 
 def _default_project_roots() -> dict[str, str]:

@@ -177,7 +177,7 @@ from fused_memory.services.completion_claim_gate import (
     build_unverified_flag,
     emit_unverified_claim_escalation,
     extract_completion_claims,
-    make_commit_probe,
+    make_registry_commit_probe,
     verify_claims,
 )
 from fused_memory.services.consolidation_ops import (
@@ -2039,33 +2039,33 @@ def create_mcp_server(
     ) -> dict[tuple[str | None, str], bool]:
         """Commit existence per commit claim, keyed ``(project_id, sha)``.
 
-        An absent key is unresolvable (unregistered project, or the git probe
-        itself could not answer). The probe is a subprocess, so it runs under
-        asyncio.to_thread — a blocking git call on the event loop would stall
-        every other in-flight MCP request behind one episode's verification.
+        Each sha is looked up in the CLAIMED project's repository first, then
+        in every other registered one (completion_claim_gate.
+        make_registry_commit_probe): a sha is near-globally unique, and the
+        writer often names a commit that landed in another project's repo. An
+        absent key is unresolvable (no repository could rule the sha out). The
+        probe is a subprocess, so it runs under asyncio.to_thread — a blocking
+        git call on the event loop would stall every other in-flight MCP
+        request behind one episode's verification.
         """
         grouped = _group_refs_by_project(claims, 'commit')
         if not grouped:
             return {}
+        probe = make_registry_commit_probe(_kp)
         present: dict[tuple[str | None, str], bool] = {}
         for claimed_project, refs in grouped.items():
-            # Rooted at the CLAIMED project's repository, same reason as the
-            # status read above: a sha claimed for dark_factory is not answered
-            # by reify's object store.
-            root = _kp.get(claimed_project) if claimed_project is not None else None
-            if root is None:
-                logger.warning(
-                    'completion_claim_gate: claimed_project=%r is not registered; %d '
-                    'commit claim(s) are UNVERIFIABLE and will be tagged '
-                    '(writer_project=%r)',
-                    claimed_project, len(refs), project_id,
-                )
-                continue
-            probe = make_commit_probe(root)
             for ref in refs:
-                answer = await asyncio.to_thread(probe, ref)
-                if answer is not None:
-                    present[(claimed_project, ref)] = answer
+                answer = await asyncio.to_thread(probe, ref, claimed_project)
+                if answer is None:
+                    logger.warning(
+                        'completion_claim_gate: commit %r could not be ruled in or '
+                        'out across the registered repositories; the claim is '
+                        'UNVERIFIABLE and will be tagged (claimed_project=%r '
+                        'writer_project=%r)',
+                        ref, claimed_project, project_id,
+                    )
+                    continue
+                present[(claimed_project, ref)] = answer
         return present
 
     async def _completion_claim_gate(

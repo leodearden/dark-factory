@@ -464,7 +464,7 @@ class TestNoClaimPathIsUntouched:
         commit_probe_factory = MagicMock(
             side_effect=AssertionError('git must not be touched without a commit claim')
         )
-        monkeypatch.setattr(tools_mod, 'make_commit_probe', commit_probe_factory)
+        monkeypatch.setattr(tools_mod, 'make_registry_commit_probe', commit_probe_factory)
 
         mock_service = _episode_service()
         task_interceptor = MagicMock()
