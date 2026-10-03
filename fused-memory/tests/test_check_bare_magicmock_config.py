@@ -424,7 +424,10 @@ class TestCliExitCodes:
 
 
 class TestCliDirectoryScan:
-    """Directory-mode scans test_*.py and conftest.py recursively, ignores other .py files."""
+    """Directory-mode scans test_*.py, conftest.py and _*.py helper modules recursively.
+
+    Every other .py file is ignored.
+    """
 
     def test_cli_recursively_scans_directory_for_test_files_and_conftest(self, tmp_path: Path):
         """Dir scan: test_example.py + conftest.py flagged; other_file.py ignored."""
@@ -447,6 +450,44 @@ class TestCliDirectoryScan:
         assert 'test_example.py' in output
         assert 'conftest.py' in output
         assert 'other_file.py' not in output
+
+
+    def test_cli_scans_underscore_helper_modules(self, tmp_path: Path):
+        """``_*.py`` helpers are scanned, at any depth; other non-test files still are not."""
+        (tmp_path / '_helper.py').write_text(_VIOLATION_SOURCE)
+        subdir = tmp_path / 'sub'
+        subdir.mkdir()
+        (subdir / '_nested_helper.py').write_text(_VIOLATION_SOURCE)
+        (tmp_path / 'other_file.py').write_text(_VIOLATION_SOURCE)
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        output = result.stdout
+        assert '_helper.py' in output
+        assert '_nested_helper.py' in output
+        assert 'other_file.py' not in output
+
+    def test_discover_scan_targets_returns_the_sorted_union_of_the_three_globs(
+        self, tmp_path: Path
+    ):
+        """The one discovery seam the CLI and the baseline-integrity census both use."""
+        subdir = tmp_path / 'sub'
+        subdir.mkdir()
+        expected = [
+            tmp_path / 'test_a.py',
+            tmp_path / 'conftest.py',
+            tmp_path / '_h.py',
+            subdir / '_n.py',
+            subdir / 'test_b.py',
+        ]
+        for path in [*expected, tmp_path / 'plain.py']:
+            path.write_text('')
+
+        assert _checker.discover_scan_targets(tmp_path) == sorted(expected)
 
 
 class TestCliErrorHandling:
