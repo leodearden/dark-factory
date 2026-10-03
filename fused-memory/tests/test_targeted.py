@@ -1157,6 +1157,10 @@ def wired_reconciler(reconciler):
     -- note the deliberate absence of a ``success`` key (task_interceptor.py
     :1453-1455); ``interceptor_write_succeeded`` defaults a missing
     ``success`` to True. ``update_task`` returns a plain success dict.
+    ``set_task_claimant`` returns the shape
+    ``sqlite_task_backend.py::SqliteTaskBackend.set_task_claimant`` returns
+    on success (task 5273); left unconfigured it would await to a MagicMock,
+    which ``interceptor_write_succeeded`` classifies as a rejection.
     Mirrors the inline idiom at
     ``test_blocked_routes_update_through_task_interceptor_when_wired``
     below (:1150-1152).
@@ -1171,6 +1175,9 @@ def wired_reconciler(reconciler):
         'tasks': [{'taskId': '2', 'newStatus': 'pending'}],
     })
     interceptor.update_task = AsyncMock(return_value={'success': True})
+    interceptor.set_task_claimant = AsyncMock(return_value={
+        'id': '2', 'message': 'Updated claimant fields for task 2',
+    })
     reconciler.task_interceptor = interceptor
     return reconciler
 
@@ -5361,6 +5368,9 @@ async def test_unblock_dependent_guards(
             'tasks': [{'taskId': '2', 'newStatus': 'pending'}],
         })
         interceptor.update_task = AsyncMock(return_value={'success': True})
+        interceptor.set_task_claimant = AsyncMock(return_value={
+            'id': '2', 'message': 'Updated claimant fields for task 2',
+        })
         reconciler.task_interceptor = interceptor
 
     dependent = {'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1']}
