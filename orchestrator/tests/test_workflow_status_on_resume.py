@@ -34,7 +34,7 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.scheduler import TaskAssignment, files_to_modules
+from orchestrator.scheduler import BlastRadiusResult, TaskAssignment, files_to_modules
 from orchestrator.workflow import (
     IMPLEMENTER,
     TaskWorkflow,
@@ -483,7 +483,7 @@ class TestStatusPreservationOnResume:
             config, git_ops, task_assignment, queue, wt,
         )
         # Granting steward — lock is free (FakeScheduler.blast_radius_result
-        # defaults to True), so the scope-widen must succeed.
+        # defaults to applied), so the scope-widen must succeed.
         workflow._steward_factory = _make_granting_steward(
             queue, task_assignment.task_id, ['new.py'],
         )
@@ -554,7 +554,7 @@ class TestStatusPreservationOnResume:
         workflow.initial_plan = {**dict(PLAN), 'files': [f1]}
         workflow.modules = files_to_modules([f1], config.lock_depth)
         # Granting steward — grant the same-package sibling; lock is free
-        # (blast_radius_result defaults True, though for a same-module widen no
+        # (blast_radius_result defaults to applied, though for a same-module widen no
         # blast-radius call is expected at all).
         workflow._steward_factory = _make_granting_steward(
             queue, task_assignment.task_id, [f2],
@@ -622,7 +622,7 @@ class TestStatusPreservationOnResume:
             config, git_ops, task_assignment, queue, wt,
         )
         # Sibling holds the additional lock the grant needs.
-        scheduler.blast_radius_result = False
+        scheduler.blast_radius_result = BlastRadiusResult(applied=False)
         workflow._steward_factory = _make_granting_steward(
             queue, task_assignment.task_id, ['new.py'],
         )
@@ -778,7 +778,7 @@ class TestSetTaskScope:
         artifacts = workflow.artifacts
         assert artifacts is not None
         original_modules = list(workflow.modules)
-        scheduler.blast_radius_result = False
+        scheduler.blast_radius_result = BlastRadiusResult(applied=False)
 
         result = await workflow._set_task_scope(['lib.py', 'new.py'])
 

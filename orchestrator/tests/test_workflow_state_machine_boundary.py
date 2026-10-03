@@ -41,6 +41,7 @@ import inspect
 import json
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -76,6 +77,7 @@ from _workflow_helpers import (
     _init_git_repo,
     _init_repo,
     _make,
+    _make_review,
     _make_warmlane_workflow,
 )
 from escalation.models import Escalation
@@ -91,6 +93,7 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.landed_outbox import MergeProvenance
+from orchestrator.module_charter import derive_modules
 from orchestrator.scheduler import BlastRadiusResult, TaskAssignment
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
@@ -477,6 +480,46 @@ class _WideningArchitectStub(AgentStub):
         return AgentResult(success=True, output='Plan created', cost_usd=0.50)
 
 
+class _WideningReplanStub(AgentStub):
+    """The first comprehensive review blocks, and the architect's replan
+    widens plan.files to a module the task does not lock, so the replan must
+    ask the scheduler for an additional lock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._blocked = False
+
+    def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+        if self._blocked or role != 'reviewer_comprehensive':
+            return super()._reviewer(role, output_schema)
+        self._blocked = True
+        review = _make_review(role, 'ISSUES_FOUND', [{
+            'severity': 'blocking',
+            'location': 'lib.py:5',
+            'category': 'missing_edge_case',
+            'description': 'No test for empty name',
+            'suggested_fix': 'Add test_farewell_empty',
+        }])
+        return AgentResult(
+            success=True, output=json.dumps(review),
+            structured_output=review, cost_usd=0.10,
+        )
+
+    async def _architect(self, cwd: Path) -> AgentResult:
+        plan_path = TaskArtifacts(cwd).root / 'plan.json'
+        if not plan_path.exists():
+            return await super()._architect(cwd)
+        plan = json.loads(plan_path.read_text())
+        plan['files'] = [*plan['files'], 'locked_module.py']
+        plan['steps'].append({
+            'id': 'step-3', 'type': 'test',
+            'description': 'Add test for empty name',
+            'status': 'pending', 'commit': None,
+        })
+        plan_path.write_text(json.dumps(plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Plan updated', cost_usd=0.40)
+
+
 def _drive_plan_into_lock_conflict(
     config: OrchestratorConfig,
     git_ops: GitOps,
@@ -489,18 +532,41 @@ def _drive_plan_into_lock_conflict(
     test_workflow_e2e.py::TestBlastRadiusExpansion::test_expansion_denied_requeues)."""
     stub = _WideningArchitectStub()
     workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+    scheduler.blast_radius_result = conflict
     monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
     monkeypatch.setattr(
         'orchestrator.workflow.run_scoped_verification',
         AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
     )
+    return workflow, scheduler
 
-    async def _conflict(task_id, current, needed, /, *, persist_files=None):
-        if conflict.repend_error is None:
-            await scheduler.set_task_status(task_id, 'pending')
-        return conflict
 
-    monkeypatch.setattr(scheduler, 'handle_blast_radius_expansion', _conflict)
+def _drive_replan_into_lock_conflict(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: BlastRadiusResult,
+) -> tuple[TaskWorkflow, FakeScheduler]:
+    """Wire a real run() whose post-review replan meets a blast-radius lock
+    conflict the scheduler reports as *conflict*.  The task already locks the
+    first plan's modules, so the only scheduler call is the replan's widen
+    (mirrors test_workflow_e2e.py::TestReviewLoop::test_blocking_review_triggers_replan)."""
+    stub = _WideningReplanStub()
+    planned = replace(
+        task_assignment,
+        modules=derive_modules(PLAN['files'], config.lock_depth),
+    )
+    workflow, scheduler = _build_workflow(config, git_ops, planned, stub)
+    scheduler.blast_radius_result = conflict
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(return_value=VerifyResult(
+            passed=True, test_output='', lint_output='',
+            type_output='', summary='All checks passed',
+        )),
+    )
     return workflow, scheduler
 
 
@@ -753,10 +819,15 @@ class TestStateMachineLegalityAndConsistency:
         assert queue.get_by_task(wf.task_id) == []
 
     @pytest.mark.parametrize('enforce', [False, True])
-    async def test_row6_plan_lock_conflict_with_dead_repend_is_store_unavailable(
-        self, enforce, config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
+    @pytest.mark.parametrize(('drive', 'detail_prefix'), [
+        (_drive_plan_into_lock_conflict, 'Plan expansion blocked'),
+        (_drive_replan_into_lock_conflict, 'Replan expansion blocked'),
+    ], ids=['plan', 'replan'])
+    async def test_row6_lock_conflict_with_dead_repend_is_store_unavailable(
+        self, drive, detail_prefix, enforce,
+        config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
     ):
-        """Relaxation 2 via ``_plan``'s blast-radius lock conflict: the
+        """Relaxation 2 via a blast-radius lock conflict exit: the
         scheduler's re-pend IS this REQUEUED exit's status write, so when it
         dies (the row stays where dispatch put it) the exit is crash-shaped —
         ONE store_unavailable record, never a violation, never an escalation."""
@@ -765,7 +836,7 @@ class TestStateMachineLegalityAndConsistency:
             'set_task_status(42, pending) failed after 4 transient retries: '
             'TimeoutError'
         )
-        workflow, scheduler = _drive_plan_into_lock_conflict(
+        workflow, scheduler = drive(
             config, git_ops, task_assignment, monkeypatch,
             BlastRadiusResult(applied=False, repend_error=dead),
         )
@@ -779,7 +850,9 @@ class TestStateMachineLegalityAndConsistency:
 
         assert report.outcome == WorkflowOutcome.REQUEUED
         assert report.reason == 'plan_blast_radius_lock_conflict'
-        assert report.phase == WorkflowState.PLAN == workflow.machine.state
+        assert report.detail.startswith(detail_prefix)
+        assert report.phase == workflow.machine.state
+        assert len(scheduler.blast_radius_calls) == 1
         assert scheduler.statuses[workflow.task_id][-1] == 'in-progress'
         assert len(_exit_contract_records(caplog, 'store_unavailable')) == 1
         assert _exit_contract_records(caplog, 'violation') == []
@@ -789,12 +862,16 @@ class TestStateMachineLegalityAndConsistency:
         assert 'RuntimeError' in events[0]['failed_write']['error']
         assert queue.get_by_task(workflow.task_id) == []
 
-    async def test_row6_plan_lock_conflict_with_healthy_repend_is_consistent(
-        self, config, git_ops, task_assignment, monkeypatch, caplog,
+    @pytest.mark.parametrize(
+        'drive', [_drive_plan_into_lock_conflict, _drive_replan_into_lock_conflict],
+        ids=['plan', 'replan'],
+    )
+    async def test_row6_lock_conflict_with_healthy_repend_is_consistent(
+        self, drive, config, git_ops, task_assignment, monkeypatch, caplog,
     ):
         """Control: a conflict whose re-pend landed is an ordinary consistent
         REQUEUED exit — nothing is recorded against the exit contract."""
-        workflow, scheduler = _drive_plan_into_lock_conflict(
+        workflow, scheduler = drive(
             config, git_ops, task_assignment, monkeypatch,
             BlastRadiusResult(applied=False),
         )
