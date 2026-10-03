@@ -2909,7 +2909,11 @@ async def _run_post_merge_verify(
             # enospc_retries/max_enospc budget so an unrelated prior ENOSPC event
             # can never starve it.  A non-narrowed retry (flag off, or a payload
             # that could not be built/corroborated) keeps sharing the legacy
-            # budget, byte-identical to before task 2835.
+            # budget: at most `max_enospc` full re-verifies, which matches the
+            # pre-2835 single retry only at max_enospc == 1.  Every caller passes
+            # SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES;
+            # orchestrator/tests/test_merge_queue_train_attribution.py::TestReverifyMemberSoloContract::test_persistent_infra_transient_red_earns_one_full_retry
+            # pins the solo caller.
             retries, budget = (
                 (narrowed_retries, max_narrowed) if narrowed else (enospc_retries, max_enospc)
             )
