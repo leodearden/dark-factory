@@ -210,20 +210,29 @@ class TaskSnapshot:
 
     Attributes:
         census: Every status's population, as a ``Datum``.
-        rows: The project's ACTIVE rows, as a ``Datum``, in one of two shapes
-            depending on which unit holds it. The unit :func:`acquire_snapshot`
-            returns and caches holds the RAW MCP rows. The unit
-            ``active_tasks.collect_tasks_with_counts`` returns holds the shaped
-            ``TaskRow`` list, the same row dicts as ``ACTIVE_TASKS``, and that
-            one crosses the wire. The two cannot be one list. Shaping reads the
-            integer ids, ``dependencies`` and ``metadata`` that only a raw row
-            carries, so the cache must keep raw rows for the next render to
-            shape. And a render's shaped rows belong to that render: they are
-            joined to its runtime probe and its clock, and its external-dep
-            tail overwrites them in place, so a cache shared across renders
-            must never hold them. Raw rows on the wire would ship the whole
-            ``metadata`` blob a second time beside ``ACTIVE_TASKS`` and break
-            the PRD's ``Datum[list[TaskRow]]`` contract.
+        rows: The project's ACTIVE rows, as a ``Datum``, in one of three
+            shapes depending on which unit holds it:
+
+            * RAW — the unit :func:`acquire_snapshot` returns and caches holds
+              the raw MCP rows;
+            * SHAPED — the unit ``active_tasks.collect_tasks_with_counts``
+              returns holds the shaped ``TaskRow`` list, and that one crosses
+              the wire on the full render;
+            * WITHHELD — the unit ``active_tasks.collect_census_snapshots``
+              returns holds no rows at all: :func:`withhold_rows` replaced a
+              measured half with an ``unknown`` ``Datum`` naming the census
+              projection.
+
+            Raw and shaped cannot be one list. Shaping reads the integer ids,
+            ``dependencies`` and ``metadata`` that only a raw row carries, so
+            the cache must keep raw rows for the next render to shape. And a
+            render's shaped rows belong to that render: they are joined to its
+            runtime probe and its clock, and its external-dep tail overwrites
+            them in place, so a cache shared across renders must never hold
+            them. Raw rows on the wire would ship the whole ``metadata`` blob
+            and break the PRD's ``Datum[list[TaskRow]]`` contract, which is
+            why neither wire-bound collector ever returns the cached unit
+            as-is.
         in_progress_live: In-progress rows with a live claimant, or ``None``
             when the rows were never measured — never a fabricated zero.
         in_progress_stranded: The complement of the above, by the same
@@ -566,6 +575,40 @@ def unmeasured_snapshot(
         unknown_datum(reason, FRESHNESS_BOUND_SECONDS),
         _HalfRead(None, failure, reason),
         failure=failure, now=now, project_root=str(project_root),
+    )
+
+
+ROWS_WITHHELD_REASON = (
+    'rows not requested: this poll asked /tasks for the census only '
+    '(?projection=census)'
+)
+"""Why a census-projection unit carries no rows, shown verbatim in a rows tab.
+
+A rows tab opened while the browser is still polling the census reads this
+as its hole placeholder's title until its own full fetch lands.
+"""
+
+
+def withhold_rows(snapshot: TaskSnapshot) -> TaskSnapshot:
+    """*snapshot* with a MEASURED rows half replaced by an ``unknown`` ``Datum``.
+
+    The ``?projection=census`` render's one transformation of a unit. The rows
+    are withheld rather than omitted so the wire keeps the five-key shape and a
+    consumer is told WHY there are none. Fresh and stale rows alike are
+    withheld: both are measured values the projection chose not to ship.
+
+    A rows half that was never measured is returned unchanged. Its reason is
+    already the producer's verbatim failure, and overwriting it with "not
+    requested" would hide a real outage behind a choice nobody made.
+
+    The census, the live/stranded split, the skew and the failure kind are
+    untouched, so every banner routed from this unit routes exactly as the
+    full render's does.
+    """
+    if snapshot.rows.value is None:
+        return snapshot
+    return replace(
+        snapshot, rows=unknown_datum(ROWS_WITHHELD_REASON, FRESHNESS_BOUND_SECONDS),
     )
 
 
