@@ -1408,14 +1408,44 @@ def test_memory_returns_memory_status(client):
         assert key in ms
 
 
-def test_memory_graphs_returns_timeseries_and_breakdown(client):
-    resp = client.get('/api/v2/dashboard/memory-graphs')
+_MEMORY_OPS_KEYS = {'labels', 'reads', 'writes', 'other', 'total', 'totals', 'by_operation'}
+
+
+def test_memory_graphs_serves_one_reconciling_memory_ops_block(client):
+    from dashboard.data.write_journal import MemoryOps
+
+    ops = MemoryOps(
+        labels=('11:00', '12:00'),
+        reads=(3, 7),
+        writes=(1, 2),
+        other=(0, 2),
+        by_operation=(('search', 10), ('add_memory', 3), ('compact', 2)),
+    )
+    with patch('dashboard.app.get_memory_ops', new=AsyncMock(return_value=ops)):
+        resp = client.get('/api/v2/dashboard/memory-graphs')
     assert resp.status_code == 200
     body = resp.json()
-    assert {'MEMORY_TIMESERIES', 'MEMORY_OPS_BREAKDOWN'} <= set(body)
-    ts = body['MEMORY_TIMESERIES']
-    assert {'labels', 'reads', 'writes'} <= set(ts)
-    assert isinstance(body['MEMORY_OPS_BREAKDOWN'], list)
+    assert 'MEMORY_TIMESERIES' not in body
+    assert 'MEMORY_OPS_BREAKDOWN' not in body
+    block = body['MEMORY_OPS']
+    assert set(block) == _MEMORY_OPS_KEYS
+    totals = block['totals']
+    assert totals['total'] == totals['reads'] + totals['writes'] + totals['other'] == 15
+    assert totals['total'] == sum(row['value'] for row in block['by_operation'])
+    assert totals['total'] == sum(block['total'])
+
+
+def test_memory_graphs_degrades_to_an_empty_block_not_a_500(client):
+    with patch(
+        'dashboard.app.get_memory_ops', new=AsyncMock(side_effect=RuntimeError('boom')),
+    ):
+        resp = client.get('/api/v2/dashboard/memory-graphs')
+    assert resp.status_code == 200
+    block = resp.json()['MEMORY_OPS']
+    assert set(block) == _MEMORY_OPS_KEYS
+    assert block['labels'] == []
+    assert block['by_operation'] == []
+    assert block['totals']['total'] == 0
 
 
 def test_recon_returns_recon_state_and_agents(client):

@@ -17,6 +17,7 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.performance import PerformanceCards
+from dashboard.data.write_journal import MemoryOps
 
 # ---------------------------------------------------------------------------
 # shape_orchestrators / PROJECTS
@@ -522,15 +523,63 @@ def test_shape_wal_status_no_now_brackets_real_clock():
 # ---------------------------------------------------------------------------
 
 
-def test_shape_memory_graphs_zips_ops_into_label_value_list():
-    body = redux_api.shape_memory_graphs(
-        {'labels': ['00:00', '01:00'], 'reads': [3, 7], 'writes': [1, 2]},
-        {'labels': ['add_memory', 'search'], 'values': [10, 25]},
+def _memory_ops() -> MemoryOps:
+    return MemoryOps(
+        labels=('11:00', '12:00'),
+        reads=(3, 7),
+        writes=(1, 2),
+        other=(0, 2),
+        by_operation=(('search', 10), ('add_memory', 3), ('compact', 2)),
     )
-    assert body['MEMORY_TIMESERIES']['labels'] == ['00:00', '01:00']
-    assert body['MEMORY_OPS_BREAKDOWN'] == [
-        {'label': 'add_memory', 'value': 10},
-        {'label': 'search', 'value': 25},
+
+
+def test_shape_memory_graphs_serves_one_memory_ops_key():
+    body = redux_api.shape_memory_graphs(_memory_ops())
+
+    assert list(body) == ['MEMORY_OPS'], (
+        'one query, one datum, one key: MEMORY_TIMESERIES and '
+        'MEMORY_OPS_BREAKDOWN are retired'
+    )
+    ops = body['MEMORY_OPS']
+    assert set(ops) == {
+        'labels', 'reads', 'writes', 'other', 'total', 'totals', 'by_operation',
+    }
+    assert ops['labels'] == ['11:00', '12:00']
+    assert ops['reads'] == [3, 7]
+    assert ops['writes'] == [1, 2]
+    assert ops['other'] == [0, 2]
+
+
+def test_shape_memory_graphs_hourly_total_sums_the_three_series():
+    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
+
+    assert ops['total'] == [
+        r + w + o for r, w, o in zip(ops['reads'], ops['writes'], ops['other'], strict=True)
+    ]
+    assert ops['total'] == [4, 11]
+
+
+def test_shape_memory_graphs_window_totals_reconcile_with_by_operation():
+    """PRD sketch #11: the caption's three numbers sum to the donut's total."""
+    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
+    totals = ops['totals']
+
+    assert totals == {'reads': 10, 'writes': 3, 'other': 2, 'total': 15}
+    assert totals['reads'] == sum(ops['reads'])
+    assert totals['writes'] == sum(ops['writes'])
+    assert totals['other'] == sum(ops['other'])
+    assert totals['total'] == totals['reads'] + totals['writes'] + totals['other']
+    assert totals['total'] == sum(row['value'] for row in ops['by_operation'])
+    assert totals['total'] == sum(ops['total'])
+
+
+def test_shape_memory_graphs_by_operation_keeps_memory_ops_order():
+    ops = redux_api.shape_memory_graphs(_memory_ops())['MEMORY_OPS']
+
+    assert ops['by_operation'] == [
+        {'label': 'search', 'value': 10},
+        {'label': 'add_memory', 'value': 3},
+        {'label': 'compact', 'value': 2},
     ]
 
 
