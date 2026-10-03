@@ -57,6 +57,7 @@ from fused_memory.server.write_triage import (
 from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_CANDIDATE_COUNT,
     _DEFAULT_JUDGE_ENABLED,
+    _DEFAULT_JUDGE_FIELD_CHARS,
     _DEFAULT_JUDGE_MODEL,
     _DEFAULT_JUDGE_PROVIDER,
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
@@ -78,6 +79,7 @@ from fused_memory.server.write_triage_judge import (
     parse_judge_verdict,
     resolve_judge_candidate_count,
     resolve_judge_enabled,
+    resolve_judge_field_chars,
     resolve_judge_model,
     resolve_judge_provider,
     resolve_judge_reasoning_effort,
@@ -1190,6 +1192,41 @@ class TestResolveJudgeCandidateCount:
         )
 
 
+class TestResolveJudgeFieldChars:
+    """The per-field character cap the judge reads each record through."""
+
+    def test_the_default_is_4000(self) -> None:
+        assert _DEFAULT_JUDGE_FIELD_CHARS == 4_000
+
+    def test_a_configured_int_is_used(self) -> None:
+        assert resolve_judge_field_chars(_svc(judge_field_chars=2_000)) == 2_000
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_falls_back_to_the_default(
+        self, label: str, service: object,
+    ) -> None:
+        assert resolve_judge_field_chars(service) == _DEFAULT_JUDGE_FIELD_CHARS, label
+
+    @pytest.mark.parametrize('value', [0, -1, 2.5, '4000', True, False, [], None])
+    def test_a_non_positive_or_non_int_cap_falls_back(self, value: object) -> None:
+        """A zero cap would elide every field to nothing — empty records, every write."""
+        service = _svc(judge_field_chars=value)
+        assert resolve_judge_field_chars(service) == _DEFAULT_JUDGE_FIELD_CHARS
+
+    def test_the_shipped_config_the_schema_and_the_fallback_agree(self) -> None:
+        """The three spellings of the default are checked against each other.
+
+        The shipped config.yaml is read through the conftest's CONFIG_PATH pin.
+        """
+        shipped = types.SimpleNamespace(config=FusedMemoryConfig())
+
+        assert resolve_judge_field_chars(shipped) == _DEFAULT_JUDGE_FIELD_CHARS
+        assert WriteTriageConfig().judge_field_chars == _DEFAULT_JUDGE_FIELD_CHARS
+
+
 class TestResolveJudgeReasoningEffort:
     """`judge_reasoning_effort` — sent only when set; ``None`` omits the parameter."""
 
@@ -1238,10 +1275,11 @@ class TestEveryResolverReadsLive:
             (resolve_judge_timeout, 'judge_timeout_seconds', 5.0, 12.0),
             (resolve_judge_candidate_count, 'judge_candidate_count', 3, 4),
             (resolve_judge_reasoning_effort, 'judge_reasoning_effort', 'low', 'high'),
+            (resolve_judge_field_chars, 'judge_field_chars', 1_200, 4_000),
         ],
         ids=[
             'enabled', 'provider', 'model', 'timeout', 'candidate_count',
-            'reasoning_effort',
+            'reasoning_effort', 'field_chars',
         ],
     )
     def test_a_mutation_is_observed_on_the_very_next_call(
