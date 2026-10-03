@@ -170,17 +170,21 @@ _PROSE_UUID_RE = re.compile(
     r'(?![0-9a-fA-F])'
 )
 
-# Ceiling on how many DISTINCT prose ids one run will resolve (reviewer
-# finding, task 4818 amendment pass). The structured pass's fan-out is bounded
-# by the model-emitted ``cited_memories`` list; the prose pass's is not — it is
-# driven by arbitrary LLM free text, so a description naming 200 distinct
-# uuid-shaped substrings would cost 200 serial point reads (plus up to 200
-# tombstone reads) on report assembly's critical path, for a WARN-ONLY
-# diagnostic. Ids past the ceiling are counted INCONCLUSIVE rather than
-# silently dropped — "we did not establish anything about this id" is exactly
-# what that counter already means — and the ceiling is logged ONCE per run, so
-# a pathological report is visible rather than merely slow.
-MAX_PROSE_IDS_PER_RUN: int = 200
+# Ceiling on how many DISTINCT prose ids ONE call of ``scan_prose_citations``
+# will resolve (reviewer finding, task 4818 amendment pass). The structured
+# pass's fan-out is bounded by the model-emitted ``cited_memories`` list; the
+# prose pass's is not — it is driven by arbitrary LLM free text, so a
+# description naming 200 distinct uuid-shaped substrings would cost 200 serial
+# point reads (plus up to 200 tombstone reads) on report assembly's critical
+# path, for a WARN-ONLY diagnostic. The budget is per SCAN, not per run:
+# ``stages/base.py::BaseStage.run`` makes one scan per stage, so a three-stage
+# reconciliation run can resolve up to three times this many. That is intended,
+# because what a pathological description stalls is ONE report's assembly. Ids
+# past the ceiling are counted INCONCLUSIVE rather than silently dropped — "we
+# did not establish anything about this id" is exactly what that counter
+# already means — and the ceiling is logged ONCE per scan, so a pathological
+# report is visible rather than merely slow.
+MAX_PROSE_IDS_PER_SCAN: int = 200
 
 
 def find_prose_uuids(finding: Any) -> dict[str, list[str]]:
@@ -600,13 +604,13 @@ async def scan_prose_citations(
     verdicts. It defaults to ``None`` (build a private one), so a standalone
     caller needs nothing new.
 
-    At most :data:`MAX_PROSE_IDS_PER_RUN` DISTINCT ids are resolved per call.
+    At most :data:`MAX_PROSE_IDS_PER_SCAN` DISTINCT ids are resolved per call.
     Unlike the structured pass — whose fan-out is bounded by the model-emitted
     citation list — this one is driven by arbitrary free text, so the ceiling
     is what stops a pathological description stalling report assembly for a
     warn-only diagnostic. Ids past it land on the inconclusive counter (we
     declined to look, which establishes nothing) and the ceiling is logged
-    ONCE per run.
+    ONCE per scan.
 
     All FOUR keys are ALWAYS present, on every path, so a caller merging them
     into ``report.stats`` never needs a ``.get(..., 0)`` fallback (the
@@ -638,7 +642,7 @@ async def scan_prose_citations(
 
     _resolve = resolve or make_memory_resolver(memory_service, project_id)
 
-    # Ceiling state for MAX_PROSE_IDS_PER_RUN — see the constant for why the
+    # Ceiling state for MAX_PROSE_IDS_PER_SCAN — see the constant for why the
     # prose pass needs one and the structured pass does not. Distinct ids, not
     # pairs: the memo means a repeat costs nothing, so the ceiling belongs on
     # the thing that actually issues reads.
@@ -713,24 +717,26 @@ async def scan_prose_citations(
                 # contradiction about the same id on the same finding.
                 continue
             if memory_id not in scanned_ids:
-                if len(scanned_ids) >= MAX_PROSE_IDS_PER_RUN:
+                if len(scanned_ids) >= MAX_PROSE_IDS_PER_SCAN:
                     # Over the ceiling. Counted INCONCLUSIVE, never phantom: we
                     # declined to look, which establishes nothing either way.
                     stats[errors_key] += 1
                     if not cap_logged:
                         cap_logged = True
                         log.warning(
-                            'reconciliation.prose_citation_scan_capped: run_id=%s '
-                            'named more than %d distinct uuid-shaped substrings in '
-                            'finding prose; the remainder are counted INCONCLUSIVE '
-                            'and NOT resolved (first over-cap id=%s in finding=%s)',
-                            run_id, MAX_PROSE_IDS_PER_RUN, memory_id, _finding_id,
+                            'reconciliation.prose_citation_scan_capped: the %s prose '
+                            'scan of run_id=%s met more than %d distinct uuid-shaped '
+                            'substrings in finding prose; the remainder are counted '
+                            'INCONCLUSIVE and NOT resolved (first over-cap id=%s in '
+                            'finding=%s)',
+                            stat_prefix, run_id, MAX_PROSE_IDS_PER_SCAN, memory_id,
+                            _finding_id,
                             extra={
                                 'run_id': run_id,
                                 'stat_prefix': stat_prefix,
                                 'finding_id': _finding_id,
                                 'memory_id': memory_id,
-                                'cap': MAX_PROSE_IDS_PER_RUN,
+                                'cap': MAX_PROSE_IDS_PER_SCAN,
                             },
                         )
                     continue
