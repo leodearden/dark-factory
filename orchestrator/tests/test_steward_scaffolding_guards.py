@@ -623,19 +623,6 @@ _SANCTIONED_STEWARD_CONSTRUCTION: dict[str, _Sanctioned] = {
             'restate them here'
         ),
     ),
-    'test_verdict_servers_integration_gate.py': _Sanctioned(
-        sites=1,
-        reason=(
-            '`_build_steward_for_triage`: builds a real `TaskSteward` against a '
-            'REAL `OrchestratorConfig` and a real on-disk meta-root, which '
-            "`make_steward`'s `spec_set` MagicMock cannot supply. Rationale and "
-            'the 2488-postdates-3514 history are owned by '
-            '`conftest.make_steward.__doc__`; whether `make_steward` should grow '
-            'a `config=` passthrough is left open and filed as ticket '
-            'tkt_0RSMX59FSJ27QWSS9VKBYRFMFG (task 3647 owned the ADJUDICATION, '
-            'not the redesign)'
-        ),
-    ),
     'test_workflow_e2e.py': _Sanctioned(
         sites=1,
         reason=(
