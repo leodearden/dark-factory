@@ -173,20 +173,17 @@ the delete choke point, so every caller inherits it) and the
 in-cycle ``_sweep_stale_mem0_pool`` does. Closing it changes nothing about the
 boundary: the two surviving reasons are each independently sufficient.
 
-Read that as parity ON THOSE TWO COUNTS, not as equivalence. This script is still
-the looser of the two paths: ``_sweep_stale_mem0_pool`` applies a THIRD
-protected-record predicate that has NOT been ported here —
+Task 5286 ported the THIRD guard ``_sweep_stale_mem0_pool`` applies —
 ``mem0_tombstone.is_protected_audit_record`` / ``PROTECTED_AUDIT_KINDS`` (task
 4375), added after the age-only rule destroyed the 40 ``kind='cadence_check'``
-audit records described above. So ``find_stale_markers`` / ``find_terminal_task_markers`` here can still
-destroy a permanent audit record that happens to carry
-``source='stage1_flag_marker'``, and deletion here is permanent (see "Deletion vs
-backfill"). That divergence is deliberate, not an oversight: task 4435's scope was
-the two counts its own description named, and the audit arm does not port
-mechanically (in ``_sweep_stale_mem0_pool`` it is documented as defence-in-depth
-BEHIND a primary terminal-task-closure gate, whereas this script's
-``--terminal-drain`` deliberately deletes markers BECAUSE their task went
-terminal). Tracked as task 5129.
+audit records described above — and added a primary arm of this script's own,
+the FOREIGN-KIND arm (:func:`protection_reason`): a record declaring any
+``kind`` other than ``MARKER_KIND`` belongs to another pool and is never
+deleted here. The denylist alone is not enough in this script, because
+``find_orphan_markers`` nominates every foreign-kind record on the first run at
+any age, and ``--terminal-drain`` inverts the terminal-task-closure gate that
+is the in-cycle collector's primary defence. The decision record is
+``docs/flag-marker-sweep-recurring.md``.
 
 SINGLE SOURCE OF TRUTH for the dated census (which filter matched how many
 records, in which project, when), for the full censused-never-deleted
@@ -676,9 +673,10 @@ def find_undrainable_markers(
       member sits in ``after.total_source`` whatever a caller believes it is
       deleting, and subtracting it would UNDER-report the floor.
 
-    ``undated_kept_count`` is NOT this floor, and the two differ in both
-    directions. That divergence, the per-arm remedies, and the extension
-    path when task 5129 adds a second protected predicate are stated once in
+    The PROTECTED arm covers every :func:`protection_reason` arm: mirror,
+    audit and foreign-kind records alike. ``undated_kept_count`` is NOT this
+    floor, and the two differ in both directions. That divergence and the
+    per-arm remedies are stated once in
     ``docs/flag-marker-sweep-recurring.md`` §``structural_floor`` — the
     single copy, not restated here.
 
@@ -722,17 +720,19 @@ async def delete_orphan_markers(
     asyncio.gather with return_exceptions=True, per-item WARNING on failure,
     count only successes.
 
-    Protected-mirror guard (task 3041/4435)
-    ---------------------------------------
-    This is the sweep's DELETE CHOKE POINT, so the guard lives here: every
-    current and future caller inherits it, including one that never consults
-    :func:`find_protected_markers` itself. It is UNCONDITIONAL — it overrides
+    Protected-record guard (tasks 3041/4435, 4375, 5286)
+    ----------------------------------------------------
+    Every :func:`protection_reason` arm is enforced here: cycle_summary
+    mirrors, ``PROTECTED_AUDIT_KINDS`` audit records, and foreign-kind
+    records. This is the sweep's DELETE CHOKE POINT, so the guard lives here:
+    every current and future caller inherits it, including one that never
+    consults :func:`find_protected_markers` itself. It is UNCONDITIONAL — it overrides
     ``--delete-ids``, the operator's targeted-correction lever, exactly as
     ``_sweep_stale_mem0_pool``'s guard is a ``continue`` no caller can opt out
     of. The asymmetry that settles it is the one ``mem0_tombstone`` states:
     over-protecting a marker costs one loudly-logged skipped GC, while
-    under-protecting a mirror costs the audit anchor an auditor is about to
-    look for — and here that loss is unrecoverable, since "deletion here is
+    under-protecting a mirror or an audit record costs the record an auditor
+    is about to look for — and here that loss is unrecoverable, since "deletion here is
     permanent, not self-healing" (module docstring). An operator who genuinely
     needs a specific protected record gone has the unguarded, individually
     authorised fused-memory MCP ``delete_memory`` tool.
@@ -746,7 +746,8 @@ async def delete_orphan_markers(
     Returns:
         ``{'deleted': int, 'failed': [ids], 'protected_skipped': [ids],
         'tombstoned': int}``. ``protected_skipped`` lists the members refused
-        by the guard above, in input order. ``tombstoned`` is the number of
+        by the guard above under any of its arms, in input order, each named
+        with its reason in its WARNING. ``tombstoned`` is the number of
         task-3041 ledger rows written for this sweep's confirmed deletes — a
         value below ``deleted`` means records were destroyed with an
         incomplete audit trail (no ``recon_ledger`` wired, or a failed batch
@@ -758,22 +759,23 @@ async def delete_orphan_markers(
         return {'deleted': 0, 'failed': [], 'protected_skipped': [], 'tombstoned': 0}
 
     # Enforcement, checked BEFORE the gather so an over-broad delete set
-    # degrades to a loud skip rather than collateral mirror loss. One WARNING
-    # per member, naming both discriminators — modelled on the message
-    # ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` emits, so an
-    # operator grepping the journal recognises the two skips as one guard.
+    # degrades to a loud skip rather than collateral loss. One WARNING per
+    # member, naming the guard that withheld it, so a mirror skip is never
+    # logged as an audit skip, or vice versa.
     protected = find_protected_markers(orphans)
     if protected:
         protected_ids = {id(m) for m in protected}  # builtin id(), see NOTE below
         for member in protected:
             metadata = _member_metadata(member)
+            reason = protection_reason(member.get('metadata'))
             logger.warning(
-                'sweep_orphan_flag_markers: SKIPPING protected cycle_summary '
-                'mirror memory_id=%s (kind=%s record_type=%s) — this record '
-                'must never be deleted by a marker sweep; reaching this guard '
-                "means this run's delete set was over-broad and the predicate "
-                'or --delete-ids that produced it should be tightened '
-                '(task 3041/4435).',
+                'sweep_orphan_flag_markers: SKIPPING a protected record '
+                '(reason=%s) memory_id=%s (kind=%s record_type=%s) — this '
+                'record must never be deleted by a marker sweep; reaching this '
+                "guard means this run's delete set was over-broad and the "
+                'predicate or --delete-ids that produced it should be '
+                'tightened (task 3041/4435/5286).',
+                reason.value if reason else None,
                 member.get('id'), metadata.get('kind'), metadata.get('record_type'),
                 extra={'project_id': project_id, 'memory_id': member.get('id')},
             )
@@ -899,8 +901,9 @@ async def run(
           composite id) that no automatic predicate can catch.
     A member matched by more than one predicate/list is deleted exactly once.
 
-    Protected ``cycle_summary``/``ledger_stamp`` mirrors are then SUBTRACTED
-    from that union (:func:`find_protected_markers`, task 3041/4435) before
+    Protected records — all three :func:`protection_reason` arms: mirrors,
+    audit records and foreign-kind records — are then SUBTRACTED from that
+    union (:func:`find_protected_markers`, tasks 3041/4435, 4375, 5286) before
     any count is taken, so ``orphan_count``/``orphan_ids``/``bucket_counts``
     all describe the delete set actually taken. The subtraction is
     unconditional and overrides the targeted correction list too — see
@@ -950,7 +953,7 @@ async def run(
             - targeted_correction_ids (list[str]): the subset of
               ``args.delete_ids`` actually found among the enumerated
               members (the found-intersection, not the raw input list).
-              Deliberately NOT narrowed by the protected-mirror subtraction:
+              Deliberately NOT narrowed by the protected-record subtraction:
               it records what the operator's ids MATCHED, which must stay
               visible even when the guard then refuses them, so a refused
               request reads as refused rather than as silently lost.
@@ -966,8 +969,8 @@ async def run(
               ``orphan_ids``. Present unconditionally in BOTH modes
               (``0``/``[]`` when nothing was protected), so the skip is a
               first-class, greppable fact in the nightly JSON. A non-empty
-              subset ALSO emits one aggregate WARNING naming the ids and
-              both discriminators, so the event is greppable in the journal
+              subset ALSO emits one aggregate WARNING naming each id with
+              its reason, so the event is greppable in the journal
               too — the report key and the log line are complements here,
               exactly as they are for ``undated_kept_count``.
             - cross_check (dict): adjacent-population census (task 3897) —
@@ -1215,7 +1218,7 @@ async def run(
             seen_ids.add(m['id'])
             orphans.append(m)
 
-    # Protected-mirror subtraction (task 3041/4435), applied BEFORE
+    # Protected-record subtraction (tasks 3041/4435, 4375, 5286), applied BEFORE
     # orphan_ids/targeted_correction_ids/bucket_counts are computed, so all
     # three stay consistent with the delete set actually taken.
     #
@@ -1261,8 +1264,10 @@ async def run(
         rendered: list[str] = []
         for member in protected:
             metadata = _member_metadata(member)
+            reason = protection_reason(member.get('metadata'))
             rendered.append(
-                f"{member.get('id')}(kind={metadata.get('kind')!r} "
+                f"{member.get('id')}(reason={reason.value if reason else None} "
+                f"kind={metadata.get('kind')!r} "
                 f"record_type={metadata.get('record_type')!r})"
             )
         logger.warning(
@@ -1275,7 +1280,7 @@ async def run(
             'that named one — should be tightened. These records also floor '
             'the residual backlog permanently: no amount of draining removes '
             'them, so a --check/--max-backlog gate set below that floor can '
-            'never pass (task 3041/4435).',
+            'never pass (task 3041/4435/5286).',
             len(protected), len(members), ', '.join(rendered),
             extra={'project_id': project_id},
         )
