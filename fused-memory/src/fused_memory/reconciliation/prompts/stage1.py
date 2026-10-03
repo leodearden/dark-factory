@@ -9,6 +9,10 @@ from fused_memory.reconciliation.gate_owned_finding_phrasing import (
 from fused_memory.reconciliation.internal_writers import (
     INTERNAL_WRITER_POPULATION_NOTE,
 )
+from fused_memory.reconciliation.live_workflow_section import (
+    NOT_LIVE_TOKEN,
+    render_live_workflow_authority_rules,
+)
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
@@ -978,20 +982,23 @@ injected/fabricated" purely because the imperative writing style looked foreign 
 
 ## Live-Workflow Authority
 The payload may include a `### Live-Workflow Signals` section. When present, it lists \
-tasks whose branch `task/<id>` has at least one live-workflow signal: a registered \
-git worktree, a recent branch commit (within the last 6 hours), or an active \
-orchestrator process holding the project lock. These signals indicate that a live \
+tasks whose branch `task/<id>` has a per-task live-workflow signal (a registered git \
+worktree, or a recent branch commit within the last 6 hours), tasks that are live only \
+through the project-wide orchestrator lock (stated once, on the section's own project \
+line), and tasks whose work has already landed on main. A live listing suggests that a \
 pipeline — typically the reify-build orchestrator — is actively driving that task's \
-lifecycle.
+lifecycle; the rules below say how to confirm it.
 
-**For any task listed in `### Live-Workflow Signals`, do NOT emit a stranded-work or \
-blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
+{render_live_workflow_authority_rules()}
+
+**For any task with a LIVE row in `### Live-Workflow Signals` (any row not reading \
+`{NOT_LIVE_TOKEN}`), do NOT emit a stranded-work or blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
 `severity='moderate'` with `actionable=true`.** A task under an active live pipeline is \
 mid-flight, not stranded — asserting a moderate/actionable disposition for it contradicts \
 Stage 2's own Live-Workflow Authority policy (task 1655) and produces two contradictory \
 disposition markers for the same `task_id`+`flag_type` in a single reconciliation cycle.
 
-Instead, for a task listed under `### Live-Workflow Signals`, do one of:
+Instead, for a task with a live row, do one of:
 1. **Downgrade** the flag to `severity='info'` and `actionable=false`, or
 2. **Annotate** the flag's description with "pending Stage 2 live-workflow confirmation" \
    and leave the final disposition to Stage 2, which has direct access to live scheduler \
@@ -1001,12 +1008,13 @@ Either remediation is acceptable; what is NOT acceptable is emitting the flag at
 `severity='moderate'` with `actionable=true` as though the task were genuinely stranded.
 
 **Only treat a stranded / blocked-escalation flag as fully actionable when NO live signal \
-is present** — i.e., the task is absent from `### Live-Workflow Signals` (all three \
-signals are False: no worktree, no recent commits, no active orchestrator). That is the \
-genuinely stranded case that legitimately needs operator attention.
+is present** — i.e., the task has no live row in `### Live-Workflow Signals`, or \
+`get_task` shows no live claimant for it (the tie-breaker above), and its work has not \
+landed. That is the genuinely stranded case that legitimately needs operator attention.
 
-If `### Live-Workflow Signals` is absent from the payload, all three signals are False \
-for every task; no live-workflow suppression applies, and stranded/blocked-escalation \
+If `### Live-Workflow Signals` is absent from the payload, no task is live this cycle — \
+neither through a per-task signal nor through the project-wide lock — and none has \
+landing evidence; no live-workflow suppression applies, and stranded/blocked-escalation \
 flags may be emitted normally.
 
 ## Preserved-Specimen Corroboration

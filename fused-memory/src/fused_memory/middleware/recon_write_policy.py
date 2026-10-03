@@ -35,8 +35,8 @@ Three independent early-return gates in :func:`check`:
    signals are a lingering worktree registration and that same lock is
    downgraded when no fresh per-task signal corroborates it (task 2964 —
    see :func:`check`'s Gate 2 paragraph). Those four inputs are exactly the
-   tuple ``reconciliation/stages/task_knowledge_sync.py``'s
-   ``_render_live_workflow_section`` passes, which is the invariant task
+   tuple ``reconciliation/live_workflow_section.py``'s
+   ``render_live_workflow_section`` passes, which is the invariant task
    2964 exists to establish: this gate and the render-time Live-Workflow
    Signals section must never disagree about the same task.
 3. ``snapshot_token is not None`` AND it disagrees with ``live_status``
@@ -400,7 +400,7 @@ async def check(
     disagree. Both are optional and default to ``None``.
 
     The corroboration gate is IN-PROGRESS-ONLY, mirroring
-    ``_render_live_workflow_section``'s ``task.get('status') ==
+    ``render_live_workflow_section``'s ``task.get('status') ==
     'in-progress'`` guard. It exists because for an in-progress task killed
     by a fleet redeploy the git worktree registration lingers and the
     restarted orchestrator re-acquires the project-wide lock, so
@@ -577,8 +577,8 @@ def _corroboration_verdict(
 ) -> bool | None:
     """Derive :func:`check`'s Gate 2 ``corroborated`` detector input (task 2964).
 
-    Structurally mirrors ``reconciliation/stages/task_knowledge_sync.py``'s
-    ``_render_live_workflow_section`` — the reference implementation this gate
+    Structurally mirrors ``reconciliation/live_workflow_section.py``'s
+    ``render_live_workflow_section`` — the reference implementation this gate
     is being made to agree with: guard on ``status == 'in-progress'``, read the
     two per-project corroboration inputs, delegate to
     :func:`~fused_memory.services.live_workflow_detector.corroboration_for_task`,

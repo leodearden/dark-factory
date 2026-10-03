@@ -15,8 +15,9 @@ tells the model to draw an inference from that section's ABSENCE**. Today that
 set has exactly one member, ``### Live-Workflow Signals``, because
 ``prompts/stage1.py`` says:
 
-    "If `### Live-Workflow Signals` is absent from the payload, all three
-     signals are False for every task; no live-workflow suppression applies …"
+    "If `### Live-Workflow Signals` is absent from the payload, no task is live
+     this cycle — neither through a per-task signal nor through the project-wide
+     lock — and none has landing evidence; no live-workflow suppression applies …"
 
 That sentence makes absence load-bearing: a builder that omits the section is
 not merely terser, it makes the model conclude something FALSE. That — not
@@ -287,7 +288,7 @@ class TestRequiredSectionsRegistry:
             f"RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'); "
             f'got {[(s.header, s.renderer) for s in registry]!r}. This is the one '
             f'section prompts/stage1.py draws an absence-inference from, so a builder '
-            f'omitting it makes the model conclude all three liveness signals are False.'
+            f'omitting it makes the model conclude no task is live or landed.'
         )
 
     def test_every_registry_renderer_resolves_to_a_method(self):
@@ -308,7 +309,7 @@ class TestRenderRequiredSections:
     contracts:
 
     * WHAT IT DISPATCHES TO — driven with a real live-workflow fixture (the
-      detector monkeypatched at its home namespace in ``task_knowledge_sync``,
+      detector monkeypatched at its home namespace in ``live_workflow_section``,
       the established spelling) so the assertion runs against real renderer
       output rather than the empty strings every renderer returns when its
       guard fails.
@@ -332,7 +333,7 @@ class TestRenderRequiredSections:
 
     def _make_live_stage(self, monkeypatch) -> MemoryConsolidator:
         """A consolidator whose every registry section actually renders."""
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -347,7 +348,7 @@ class TestRenderRequiredSections:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_consolidator(project_root='/project')
         stage.filtered_task_tree = self._make_tree(

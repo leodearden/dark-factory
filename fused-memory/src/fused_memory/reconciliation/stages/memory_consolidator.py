@@ -48,6 +48,12 @@ from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     normalize_gate_owned_suggested_actions,
     stamp_curator_gate_sweep_provenance,
 )
+from fused_memory.reconciliation.live_workflow_citation_guard import check_live_workflow_citations
+from fused_memory.reconciliation.live_workflow_section import (
+    CITATION_CONTRADICTIONS_STAT,
+    LiveWorkflowSnapshot,
+    build_live_workflow_snapshot,
+)
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     sweep_orphaned_recon_escalations,
 )
@@ -69,9 +75,6 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     track_human_operator_stalls,
 )
 from fused_memory.reconciliation.stages.base import BaseStage
-from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    _render_live_workflow_section,
-)
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY,
     PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
@@ -173,10 +176,11 @@ class MemoryConsolidator(BaseStage):
     # INCLUSION CRITERION — a section belongs here iff the shipped Stage-1 prompt
     # tells the model to draw an inference from that section's ABSENCE. Today
     # prompts/stage1.py says: "If `### Live-Workflow Signals` is absent from the
-    # payload, all three signals are False for every task; no live-workflow
-    # suppression applies …". That makes absence load-bearing: a payload builder
-    # that omits the section does not merely produce a terser payload, it makes
-    # the model conclude something FALSE. Every builder therefore renders these
+    # payload, no task is live this cycle — neither through a per-task signal nor
+    # through the project-wide lock — and none has landing evidence; no
+    # live-workflow suppression applies …". That makes absence load-bearing: a
+    # payload builder that omits the section does not merely produce a terser
+    # payload, it makes the model conclude something FALSE. Every builder therefore renders these
     # via _render_required_sections() — adding a section is ONE edit here, not
     # one edit per builder. Enforced by
     # tests/reconciliation/test_stage1_payload_section_parity.py.
@@ -260,6 +264,7 @@ class MemoryConsolidator(BaseStage):
         # state across all instances (and across reused-instance runs).
         self._fetch_degraded_sources: list = []
         self._undatable_freshness_records: int = 0
+        self._live_workflow_snapshot: LiveWorkflowSnapshot | None = None
 
     async def run(
         self,
@@ -276,6 +281,7 @@ class MemoryConsolidator(BaseStage):
         point of a remediation pass is to re-emit a curated list, and running
         dedup on those flags would defeat the remediation contract.
         """
+        self._live_workflow_snapshot = None
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
             resume_session_id=resume_session_id,
@@ -450,6 +456,18 @@ class MemoryConsolidator(BaseStage):
                 'passing %d flag(s) through unfiltered this cycle)',
                 self.project_id, len(report.items_flagged or []),
             )
+
+        # Live-workflow citation guard (task 4874): annotate, never drop, a finding
+        # citing a signal THIS run's section did not render (rationale: the module
+        # docstring of live_workflow_citation_guard).  Above the remediation
+        # early-return, like the guard above, so both passes are covered.
+        report.stats[CITATION_CONTRADICTIONS_STAT] = 0
+        try:
+            report.items_flagged, report.stats[CITATION_CONTRADICTIONS_STAT] = (
+                check_live_workflow_citations(report.items_flagged or [], self._live_workflow_snapshot)
+            )
+        except Exception:
+            logger.exception('live-workflow citation guard failed for project %s', self.project_id)
 
         # Always present (task 4814, same convention as the three pre-inits
         # above — tasks 2312 / 2229 / 3084): set BEFORE the remediation
@@ -1817,30 +1835,33 @@ Review the above data and perform memory consolidation:
     async def _build_live_workflow_section(self) -> str:
         """Return the Live-Workflow Signals prompt section, or empty string if inapplicable.
 
-        Mirrors Stage 2's guard/source exactly (task 1655): renders over
-        ``self.filtered_task_tree.active_tasks`` when ``self.filtered_task_tree``
-        is set and ``active_tasks`` is non-empty. A stage is only constructible
-        with a validated ``ProjectScope``, so ``self.project_root`` is always a
-        non-empty absolute path and is not part of this guard (task 2150).
-        Reuses Stage 2's ``_render_live_workflow_section`` renderer (imported from
-        task_knowledge_sync.py) so both stages emit byte-identical section
-        formatting for the same underlying live-workflow signals (task 1977).
+        Renders over Stage 2's source, ``self.filtered_task_tree.active_tasks``
+        (task 1655). A stage is only constructible with a validated
+        ``ProjectScope``, so ``self.project_root`` is always a non-empty
+        absolute path and is not part of this guard (task 2150).
+        Reuses Stage 2's snapshot builder,
+        ``reconciliation/live_workflow_section.py::build_live_workflow_snapshot``,
+        so both stages emit byte-identical section formatting for the same
+        underlying live-workflow signals (task 1977).
         This reuse means detector-layer behavior changes apply here
         automatically with no code change — including the blocked-normal
         bare-orchestrator-signal suppression added in task 2409.
 
-        Returns '' when the guard fails or no active task is currently live —
-        keeps the payload tight, matching _build_task_tree_section's pattern.
+        Returns '' when no task tree is set or no active task is listed — keeps
+        the payload tight, matching _build_task_tree_section's pattern.  The
+        snapshot is retained for :meth:`run`'s citation guard.  A tree with no
+        active task yields a real, empty snapshot, because an absent section
+        tells this stage that no task is live; only an unset tree leaves it
+        None, and the guard inert.
         """
-        if not (self.filtered_task_tree and self.filtered_task_tree.active_tasks):
+        if self.filtered_task_tree is None:
             return ''
-        section = await _render_live_workflow_section(
+        self._live_workflow_snapshot = await build_live_workflow_snapshot(
             self.filtered_task_tree.active_tasks,
             self.scope.project_root,
         )
-        if not section:
-            return ''
-        return '\n' + section
+        section = self._live_workflow_snapshot.render()
+        return '\n' + section if section else ''
 
     def _build_task_count_census_section(self) -> str:
         """Return the Task Count Census payload section, or empty string if unavailable.
