@@ -1194,21 +1194,22 @@ def fire_watchdog_kill(
 
     Invoked by the stdin watchdog (:func:`run_stdin_watchdog` via
     :func:`start_stdin_watchdog`) when the dispatch connection is judged dead.
-    Mirrors :func:`kill_process_tree`'s snapshot -> /proc descendant walk ->
-    signal approach (the same ``start_new_session`` escape problem applies:
-    ``verify.py`` ``_run_cmd`` spawns every build command with
-    ``start_new_session=True``, so cargo/rustc leave the verify-merge process
-    group and a bare ``killpg(pgid)`` would strand them), with two
-    differences required because *this* code runs **inside** the target
-    process group rather than as a separate process:
+    Shares :func:`kill_process_tree`'s snapshot -> /proc descendant walk
+    (the same ``start_new_session`` escape problem applies: ``verify.py``
+    ``_run_cmd`` spawns every build command with ``start_new_session=True``,
+    so cargo/rustc leave the verify-merge process group and a bare
+    ``killpg(pgid)`` would strand them) but does NOT delegate to it, because
+    *this* code runs **inside** the target process group rather than as a
+    separate process:
 
-    * It signals only **descendants** of *pgid* (``collect_descendants``
-      already excludes the root) -- never *pgid* itself / the calling
-      process.  A ``killpg(pgid, ...)`` here would signal the watchdog's own
-      process before it could finish the SIGTERM -> grace -> SIGKILL
-      escalation or reach a controlled exit, so unlike
-      :func:`kill_process_tree` there is no ``killpg`` backstop -- not even as
-      a fallback when the descendant walk fails.
+    * It needs a SIGTERM -> grace -> SIGKILL escalation;
+      :func:`kill_process_tree` is SIGKILL-only.
+    * It must never signal its own group or the calling process: it signals
+      only **descendants** of *pgid* (``collect_descendants`` already
+      excludes the root), with no ``killpg`` -- not even as a fallback when
+      the descendant walk fails -- whereas :func:`kill_process_tree` always
+      SIGKILLs its root.  Either would kill the watchdog before it could
+      finish the escalation or reach a controlled exit.
     * It ends by unconditionally calling ``exit_fn(exit_code)`` -- a
       controlled non-zero self-exit -- rather than returning, so the
       abandoned verify-merge leader always terminates (freeing its flock and

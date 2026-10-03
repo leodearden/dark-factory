@@ -335,6 +335,13 @@ def tagged_pids(tag: str) -> set[int]:
     return pids
 
 
+def sweep_tagged(tag: str, *, kill: Callable[[int, int], None] = os.kill) -> None:
+    """SIGKILL every live process carrying ``HOLDER_TAG_ENV=<tag>``; one already gone is fine."""
+    for pid in tagged_pids(tag):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGKILL)
+
+
 def spawn_verify_merge(
     *,
     sha: str,
@@ -957,16 +964,12 @@ def kill_holder_tree(
     ``start_new_session=True``, so the build is reachable only through the
     /proc ppid chain, which is severed the instant the leader dies, and it
     leads its own group, so no killpg reaches it either.  The tag sweep can:
-    the tag is in the build's environ from fork onward, and it is
-    recycled-pid-safe by construction, since a stranger cannot carry a uuid
-    it never inherited.  Conversely, the sweep would miss a descendant that
-    execs with a scrubbed environment, which the walk still reaches while
-    the leader is pinned.  One sweep pass suffices: a sleeper build is a
-    single exec'd process, and a bash build killed at any phase never
-    reaches its exec.  Rejected: capturing descendants early (via
-    :func:`wait_subtree_live`, or recorded pids checked by /proc starttime)
-    cannot see a build forked after the last capture; and a spawn-time pgid
-    cannot reach a build that setsid's into a group of its own.
+    the tag is in the build's environ from fork onward, and a stranger
+    cannot match a uuid it never inherited -- short of a pid freed and
+    reused between :func:`tagged_pids`'s environ read and the SIGKILL.
+    Conversely, the sweep would miss a descendant that execs with a
+    scrubbed environment, which the walk still reaches while the leader is
+    pinned.
 
     *timeout* defaults to :data:`ROW5_HOLDER_TEARDOWN_CEILING_SECS`,
     resolved when the call actually runs rather than at import time -- the
@@ -992,9 +995,7 @@ def kill_holder_tree(
             killpg=_killpg,
         )
 
-    for pid in tagged_pids(proc.tag):
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            _kill(pid, signal.SIGKILL)
+    sweep_tagged(proc.tag, kill=_kill)
 
     if proc.stdin is not None:
         with contextlib.suppress(OSError):
@@ -3491,9 +3492,7 @@ def test_kill_holder_tree_sweeps_the_session_escaped_orphan_of_an_already_reaped
             'must be scoped to this holder alone'
         )
     finally:
-        for pid in tagged_pids(leader.tag):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
+        sweep_tagged(leader.tag)
         bystander.kill()
         bystander.wait(timeout=5)
         if leader.stdout is not None:
@@ -3547,9 +3546,8 @@ def test_tagged_pids_finds_a_session_escaped_grandchild_and_nothing_else():
         )
         assert os.getpid() not in found
     finally:
-        for pid in tagged_pids(leader.tag) | tagged_pids(bystander.tag):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(pid, signal.SIGKILL)
+        sweep_tagged(leader.tag)
+        sweep_tagged(bystander.tag)
         leader.wait(timeout=5)
         bystander.wait(timeout=5)
         if leader.stdout is not None:

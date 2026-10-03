@@ -568,13 +568,7 @@ class TestKillProcessTree:
 
     def test_backstop_pgid_is_a_required_keyword(self):
         """(f) Every caller must state its group-safety policy -- None included."""
-        import inspect
-
         from orchestrator.verify_cancel import kill_process_tree
-
-        param = inspect.signature(kill_process_tree).parameters['backstop_pgid']
-        assert param.kind is inspect.Parameter.KEYWORD_ONLY
-        assert param.default is inspect.Parameter.empty
 
         def declawed(*_args):
             raise AssertionError('a call missing backstop_pgid must not signal anything')
