@@ -122,7 +122,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Retrieval width, tuned against measured recall on a running server rather
     # than by redeploying. Read live per write, same path as the flag above.
     'write_triage.candidate_k',
-    # The seven write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
+    # The eight write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
     # for exactly the reason the two operator knobs above are: every one of
     # them is read LIVE off the shared memory_service.config.write_triage
     # object per middle-band write by server/write_triage_judge.py's resolvers,
@@ -130,7 +130,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # makes this registration real rather than restart-only in disguise.
     # tests/test_config_reload.py::TestWriteTriageJudgeLeavesAreGreenTier pins
     # both halves, and derives the expected leaf set from
-    # WriteTriageConfig.model_fields, so an EIGHTH judge_* leaf added later
+    # WriteTriageConfig.model_fields, so a NINTH judge_* leaf added later
     # without a line here fails there rather than degrading silently.
     #
     # `judge_enabled` in particular MUST be green-tier, for the same reason
@@ -146,6 +146,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'write_triage.judge_timeout_seconds',
     'write_triage.judge_candidate_count',
     'write_triage.judge_reasoning_effort',
+    'write_triage.judge_field_chars',
     # The traceability pointer to leaf gamma's committed accuracy report, the
     # exact sibling of calibration_report_path above: reloaded alongside the
     # knobs it describes so config never names a stale measurement run. This is

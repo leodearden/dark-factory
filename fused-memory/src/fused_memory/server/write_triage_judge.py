@@ -296,6 +296,11 @@ def _named_candidate(
 #: the top of PRD C1's "top 3–5".
 _DEFAULT_JUDGE_CANDIDATE_COUNT = 5
 
+#: The per-field cap when the leaf is unset or invalid: the schema's own
+#: default, whose field description is the one home of why it is 4,000 (the
+#: judge's measured recall loss at the old 1,200).
+_DEFAULT_JUDGE_FIELD_CHARS: int = WriteTriageConfig.model_fields['judge_field_chars'].default
+
 #: Per-field character budget for the rendered prompt. The calibration fixture
 #: holds a ~9k-character canonical, and C1 sizes the judge call at roughly
 #: 2.5k tokens; five untrimmed candidates would blow through that by an order
@@ -743,6 +748,18 @@ def resolve_judge_candidate_count(memory_service: Any) -> int:
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
     return _DEFAULT_JUDGE_CANDIDATE_COUNT
+
+
+def resolve_judge_field_chars(memory_service: Any) -> int:
+    """The per-field character cap on what the judge reads. Positive ``int`` only.
+
+    A zero or negative cap would elide every field to nothing, silently showing
+    the model empty records on every middle-band write.
+    """
+    value = _judge_attr(memory_service, 'judge_field_chars')
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return _DEFAULT_JUDGE_FIELD_CHARS
 
 
 def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:

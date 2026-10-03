@@ -2559,7 +2559,7 @@ class WriteTriageConfig(BaseModel):
     #
     # OPERATOR KNOBS like `enabled`/`candidate_k` above, NOT calibrated bands:
     # they ship with real defaults, and None on the two inheriting leaves means
-    # "follow llm.*", never "uncalibrated". All seven are green-tier
+    # "follow llm.*", never "uncalibrated". All eight are green-tier
     # hot-reloadable and read LIVE per middle-band write by
     # server/write_triage_judge.py's resolvers — nothing is captured at import
     # or construction, which is what makes the registration in
@@ -2655,6 +2655,23 @@ class WriteTriageConfig(BaseModel):
             'this cap. Bounded ge=1 so a 0 cannot silently empty the slate — '
             'that would answer `stored` on every middle-band write, reducing '
             'triage to its below-t_low behaviour with nothing logged.'
+        ),
+    )
+    judge_field_chars: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            'Per-field character cap applied to the new entry and to every '
+            'candidate before the judge sees them; a cut field is marked '
+            '`…[elided]` so the model knows it is reading a truncation. 4000 '
+            'replaced 1,200 because at 1,200 the judge answered `distinct` on '
+            '24% of rater-confirmed true links against 11% at 4,000 (Jev trial '
+            '2026-09-29, p<1e-7), while on slates it placed no better '
+            '(exploratory, n.s.) — see '
+            'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '
+            'because a zero cap would elide every field to nothing and show the '
+            'model empty records. Green-tier hot-reloadable, read live per '
+            'middle-band write.'
         ),
     )
     judge_accuracy_report_path: str | None = Field(
