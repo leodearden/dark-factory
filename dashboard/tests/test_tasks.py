@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from test_task_snapshot import CannedMCP
+from _canned_mcp import CANNED_GET_TASKS_RESULT, CannedMCP
 
 import dashboard.data.tasks as tasks_mod
 from dashboard.data.tasks import _shape_task
@@ -295,28 +295,6 @@ async def test_fetch_external_statuses_empty_deps_still_returns_empty_dict(dummy
 # (step-1 core-contract tests RED; step-3 TTL-expiry test RED)
 # ---------------------------------------------------------------------------
 
-# Canned raw MCP get_tasks rows used across cache tests.
-_CACHE_DONE_TASK_RAW = {
-    'id': '7',
-    'title': 'A done task',
-    'status': 'done',
-    'updatedAt': '2026-05-29T10:00:00+00:00',
-    'description': 'finished',
-    'details': '',
-    'dependencies': [],
-    'metadata': {},
-}
-_CACHE_PENDING_TASK_RAW = {
-    'id': '8',
-    'title': 'A pending task',
-    'status': 'pending',
-    'description': '',
-    'details': '',
-    'dependencies': [],
-    'metadata': {},
-}
-_CANNED_GET_TASKS_RESULT = {'tasks': [_CACHE_DONE_TASK_RAW, _CACHE_PENDING_TASK_RAW]}
-
 
 class TestTasksReadRecord:
     """The structured cache key: `_OnePage` | `_CompleteRead` inside `_TasksRead`.
@@ -557,7 +535,7 @@ class TestFetchTasksCache:
         import dashboard.data.tasks as tasks_mod
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             result1 = await fetch_tasks(dummy_client, dummy_config, '/proj/A')
             result2 = await fetch_tasks(dummy_client, dummy_config, '/proj/A')
@@ -680,7 +658,7 @@ class TestFetchTasksCache:
         """
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await fetch_tasks(dummy_client, dummy_config, '/proj/D')
             # Mutate the returned list — must NOT affect the cached entry.
@@ -707,7 +685,7 @@ class TestFetchTasksCache:
 
         monkeypatch.setattr(tasks_mod, '_FETCH_TASKS_TTL_SECONDS', 0.0)
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(dummy_client, dummy_config, '/proj/E')
             await fetch_tasks(dummy_client, dummy_config, '/proj/E')
@@ -737,7 +715,7 @@ class TestFetchTasksCache:
         """
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await fetch_tasks(dummy_client, dummy_config, '/proj/G')
             assert first, 'expected at least one task from canned result'
@@ -776,7 +754,7 @@ class TestFetchTasksCache:
 
         async def _gated(client, url, tool, args, **_kw):
             await gate.wait()
-            return _CANNED_GET_TASKS_RESULT
+            return CANNED_GET_TASKS_RESULT
 
         mock_mcp = AsyncMock(side_effect=_gated)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
@@ -840,7 +818,7 @@ class TestFetchTasksNarrowing:
         """
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(dummy_client, dummy_config, '/proj/A')
 
@@ -870,7 +848,7 @@ class TestFetchTasksNarrowing:
         """
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(
                 dummy_client, dummy_config, '/proj/A',
@@ -910,7 +888,7 @@ class TestFetchTasksNarrowing:
         """
         from dashboard.data.tasks import fetch_task_page
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_task_page(
                 dummy_client, dummy_config, '/proj/A', page_size=100, offset=25,
@@ -934,7 +912,7 @@ class TestFetchTasksNarrowing:
         """The terminal-window call shape: narrowed statuses PLUS a bounded window."""
         from dashboard.data.tasks import fetch_task_page
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_task_page(
                 dummy_client, dummy_config, '/proj/A',
@@ -963,7 +941,7 @@ class TestFetchTasksNarrowing:
         import dashboard.data.tasks as tasks_mod
 
         read = getattr(tasks_mod, reader)
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await read(dummy_client, dummy_config, '/proj/A', **kwargs)
 
@@ -976,7 +954,7 @@ class TestFetchTasksNarrowing:
         """A caller may tighten the per-request budget further."""
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             await fetch_tasks(dummy_client, dummy_config, '/proj/A', timeout=0.5)
 
@@ -1179,7 +1157,7 @@ class TestFetchTasksNarrowing:
         """(d) Regression guard — the existing single-flight contract is unchanged."""
         from dashboard.data.tasks import fetch_task_page
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await fetch_task_page(
                 dummy_client, dummy_config, '/proj/P',
@@ -1370,7 +1348,7 @@ class TestFetchTasksNegativeCache:
         import dashboard.data.tasks as tasks_mod
         from dashboard.data.tasks import fetch_tasks
 
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG5')
             second = await fetch_tasks(dummy_client, dummy_config, '/proj/NEG5')
@@ -1420,7 +1398,7 @@ class TestFetchTasksNegativeCache:
             await asyncio.sleep(0)  # yield, so both callers are in flight
             if mine == 1:
                 raise httpx.ConnectError('refused')
-            return _CANNED_GET_TASKS_RESULT
+            return CANNED_GET_TASKS_RESULT
 
         with patch('dashboard.data.tasks.mcp_tool_call', new=_fail_then_succeed):
             first, second = await asyncio.gather(
@@ -1569,7 +1547,7 @@ class TestFanoutStreakIsolationAcrossProjectRoots:
         root_b = str(tmp_path / 'proj-b')
 
         mock_mcp = AsyncMock(
-            side_effect=self._per_root_side_effect(root_a, _CANNED_GET_TASKS_RESULT)
+            side_effect=self._per_root_side_effect(root_a, CANNED_GET_TASKS_RESULT)
         )
         with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'), \
                 patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
@@ -2965,7 +2943,7 @@ class TestPublicReadContracts:
         the same read. They used to mint `s=a\\x1fb` and `s=b\\x1fa` — two
         entries, two round trips, one answer.
         """
-        mock_mcp = AsyncMock(return_value=_CANNED_GET_TASKS_RESULT)
+        mock_mcp = AsyncMock(return_value=CANNED_GET_TASKS_RESULT)
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
             first = await tasks_mod.fetch_tasks(
                 dummy_client, dummy_config, '/proj/order',
