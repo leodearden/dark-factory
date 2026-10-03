@@ -336,6 +336,11 @@ def _tombstone_wiring_gap(memory_service: Any) -> str | None:
     return None
 
 
+def _memo_key(memory_id: Any) -> Any:
+    """Lowercase for an ``is_full_uuid`` id, *memory_id* verbatim otherwise."""
+    return memory_id.lower() if is_full_uuid(memory_id) else memory_id
+
+
 def make_memory_resolver(
     memory_service: Any,
     project_id: str,
@@ -373,6 +378,16 @@ def make_memory_resolver(
     and task 2979 put the structured pass on ALL THREE stages, so the
     repeat-citation case is three times as common as it was.
 
+    The memo is keyed on the lowercase rendering of an ``is_full_uuid`` id, so
+    a mixed-case id cited structurally and named in prose (which
+    :func:`find_prose_uuids` lowercases) is read once and cannot get two
+    verdicts. That is sound because Qdrant resolves a canonical UUID point id
+    case-insensitively, pinned live by
+    ``tests/test_mem0_qdrant_integration.py::TestUuidPointIdCasing``. Every
+    other value is keyed verbatim, because that equivalence is established only
+    for the canonical shape. The backend always receives the caller's own
+    spelling.
+
     The memo is scoped to the RUN, never module-level: a longer-lived cache
     would reintroduce exactly the stale-read TOCTOU these passes exist to
     close. Caching the ``'error'`` outcome too is deliberate — a backend that
@@ -383,7 +398,8 @@ def make_memory_resolver(
     resolution_cache: dict[Any, tuple[str, str | None]] = {}
 
     async def _resolve(memory_id: Any) -> tuple[str, str | None]:
-        cached = resolution_cache.get(memory_id)
+        key = _memo_key(memory_id)
+        cached = resolution_cache.get(key)
         if cached is not None:
             return cached
         try:
@@ -392,7 +408,7 @@ def make_memory_resolver(
             outcome: tuple[str, str | None] = ('error', type(exc).__name__)
         else:
             outcome = ('found', None) if record else ('missing', None)
-        resolution_cache[memory_id] = outcome
+        resolution_cache[key] = outcome
         return outcome
 
     return _resolve
