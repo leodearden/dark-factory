@@ -1531,6 +1531,66 @@
           "current": 31502
         }
       ]
+    },
+    {
+      "task_id": "3203",
+      "reason": "Task 3203 adds exponential log coalescence of the resource-conservation audit WARNING (fingerprint helper, sentinel, coalescer wiring, clear-line INFO) to SpeculativeMergeWorker; net-additive log-hygiene behaviour ported onto merge_lane/worker.py when merging main after task 5036's move, not a refactor that failed.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2128,
+          "current": 2135
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_check_resource_audit",
+          "baseline": 4,
+          "current": 10
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21326,
+          "current": 21556
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_resource_audit.py",
+          "baseline": 118,
+          "current": 153
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12213,
+          "current": 12386
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4751,
+          "current": 4758
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56237,
+          "current": 56467
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6597,
+          "current": 6632
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31502,
+          "current": 31675
+        }
+      ]
     }
   ]
 }
