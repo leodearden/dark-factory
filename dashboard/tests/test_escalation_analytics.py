@@ -85,8 +85,11 @@ def _make_runs_db(tmp_path: Path, rows: list[tuple[str, str, str | None]]) -> Pa
     return db_path
 
 
-def _orchestrator_queue(label: str, esc_dir: Path) -> QueueRef:
-    return QueueRef(id=str(esc_dir), label=label, kind=QueueKind.ORCHESTRATOR, directory=esc_dir)
+def _orchestrator_queue(label: str, esc_dir: Path, runs_db: Path) -> QueueRef:
+    return QueueRef(
+        id=str(esc_dir), label=label, kind=QueueKind.ORCHESTRATOR, directory=esc_dir,
+        runs_db=runs_db,
+    )
 
 
 def _analytics(projects: list[tuple[str, Path, Path]], *, now: datetime, **kwargs) -> dict:
@@ -94,9 +97,8 @@ def _analytics(projects: list[tuple[str, Path, Path]], *, now: datetime, **kwarg
 
     *projects* is ``[(label, escalations_dir, runs_db), ...]``, primary first.
     """
-    queues = tuple(_orchestrator_queue(label, esc_dir) for label, esc_dir, _db in projects)
-    runs_dbs = {queue.id: db for queue, (_l, _d, db) in zip(queues, projects, strict=True)}
-    return build_escalation_analytics(measure_corpus(queues, now=now), runs_dbs, **kwargs)
+    queues = tuple(_orchestrator_queue(*project) for project in projects)
+    return build_escalation_analytics(measure_corpus(queues, now=now), **kwargs)
 
 
 def _aggregate(
@@ -1747,6 +1749,32 @@ class TestCorpusViewsAndProvenance:
             assert datum.as_of == now
             validate_datum(datum, now)
 
+    def test_an_unmeasured_corpus_is_refused_not_served_empty(self):
+        from dashboard.data.datum import unknown_datum
+
+        with pytest.raises(ValueError, match='not measured: volume offline'):
+            build_escalation_analytics(unknown_datum('volume offline', 120))
+
+    def test_each_project_reads_its_own_queues_runs_db(self, tmp_path):
+        now = golden_now()
+        projects = []
+        for label, dones in (('alpha', 1), ('beta', 2)):
+            esc_dir = tmp_path / label / 'escalations'
+            esc_dir.mkdir(parents=True)
+            rows: list[tuple[str, str, str | None]] = [
+                (str(n), 'done', now.isoformat()) for n in range(dones)
+            ]
+            projects.append((label, esc_dir, _make_runs_db(tmp_path / label, rows)))
+        projects.append(('gamma', tmp_path / 'gamma' / 'escalations', tmp_path / 'absent.db'))
+
+        payload = _analytics(projects, now=now)
+
+        done = {
+            entry['project']: sum(day['done'] for day in entry['workflow']['esc_per_done_daily'])
+            for entry in payload['per_project']
+        }
+        assert done == {'alpha': 1, 'beta': 2, 'gamma': 0}
+
     def test_generated_at_is_the_corpus_instant(self, tmp_path):
         now = golden_now()
         esc_dir = tmp_path / 'escalations'
@@ -1772,15 +1800,14 @@ class TestCorpusViewsAndProvenance:
         (recon_dir / 'esc-3-1.json').write_text('{not json')
         bad_markers = tmp_path / 'markers.yaml'
         bad_markers.write_text('date: [unclosed')
-        orchestrator = _orchestrator_queue('dark_factory', esc_dir)
+        orchestrator = _orchestrator_queue('dark_factory', esc_dir, tmp_path / 'runs.db')
         reconciliation = QueueRef(
             id='reconciliation', label='fused-memory', kind=QueueKind.RECONCILIATION,
-            directory=recon_dir,
+            directory=recon_dir, runs_db=None,
         )
 
         payload = build_escalation_analytics(
             measure_corpus((orchestrator, reconciliation), now=now),
-            {orchestrator.id: tmp_path / 'runs.db'},
             regime_markers_path=bad_markers,
         )
 
@@ -1792,15 +1819,14 @@ class TestCorpusViewsAndProvenance:
         _sketch_10(esc_dir, now)
         recon_dir = tmp_path / 'recon'
         _write_pending(recon_dir, 'esc-960-1', now=now, archived=False)
-        orchestrator = _orchestrator_queue('dark_factory', esc_dir)
+        orchestrator = _orchestrator_queue('dark_factory', esc_dir, tmp_path / 'runs.db')
         reconciliation = QueueRef(
             id='reconciliation', label='fused-memory', kind=QueueKind.RECONCILIATION,
-            directory=recon_dir,
+            directory=recon_dir, runs_db=None,
         )
 
         payload = build_escalation_analytics(
             measure_corpus((orchestrator, reconciliation), now=now),
-            {orchestrator.id: tmp_path / 'runs.db'},
         )
 
         assert [p['project'] for p in payload['per_project']] == ['dark_factory']

@@ -55,7 +55,6 @@ from dashboard.data.datum import Datum
 from dashboard.data.escalation_analytics import build_escalation_analytics
 from dashboard.data.escalation_corpus import (
     EscalationCorpus,
-    QueueKind,
     corpus_queues,
     measure_corpus,
 )
@@ -138,16 +137,6 @@ def _clear_escalation_caches() -> None:
 def _walk(tmp_path: Path) -> Datum[EscalationCorpus]:
     """The corpus over *tmp_path*'s queues, walked at the fixed aggregation clock."""
     return measure_corpus(corpus_queues(_make_config(tmp_path)), now=_now())
-
-
-def _analytics_over(corpus: Datum[EscalationCorpus], tmp_path: Path) -> dict:
-    """The analytics payload over *corpus*, each orchestrator queue's runs.db under *tmp_path*."""
-    assert corpus.value is not None
-    runs_dbs = {
-        scan.queue.id: tmp_path / 'runs.db'
-        for scan in corpus.value.scans if scan.queue.kind is QueueKind.ORCHESTRATOR
-    }
-    return build_escalation_analytics(corpus, runs_dbs)
 
 
 def _no_tasks() -> CannedMCP:
@@ -496,7 +485,7 @@ class TestAggregateOverLiveArchive:
         # truth (cascade members + age-out record → benign & stamped; the
         # unstamped resume → actionable & inferred; the rejected row-4 record →
         # pending, unclassified). effective_benign is the shared predicate (INV-5).
-        payload = _analytics_over(corpus, tmp_path)
+        payload = build_escalation_analytics(corpus)
         (entry,) = payload['per_project']
         _assert_origin_matches(entry['origin']['sources'], arch)
 
@@ -510,7 +499,7 @@ class TestAggregateOverLiveArchive:
         server = _make_server(queue)
         arch = await _build_live_boundary_archive(queue, server)
 
-        (entry,) = _analytics_over(_walk(tmp_path), tmp_path)['per_project']
+        (entry,) = build_escalation_analytics(_walk(tmp_path))['per_project']
 
         samples = entry['lifespan']['samples']
         flow_daily = entry['workflow']['flow_daily']

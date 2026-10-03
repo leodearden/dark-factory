@@ -28,7 +28,7 @@ from escalation.classify import classify_resolver_tier, effective_benign
 from escalation.models import RESOLUTION_CLASSES, Escalation
 
 from dashboard.data.datum import Datum
-from dashboard.data.escalation_corpus import EscalationCorpus, QueueKind, views_over
+from dashboard.data.escalation_corpus import EscalationCorpus, views_over
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import parse_utc
 
@@ -713,7 +713,6 @@ def _aggregate_project(
 
 def build_escalation_analytics(
     corpus_datum: Datum[EscalationCorpus],
-    runs_dbs: Mapping[str, Path],
     *,
     regime_markers_path: Path | None = None,
     downsample_threshold: int = 10_000,
@@ -721,8 +720,10 @@ def build_escalation_analytics(
 ) -> dict:
     """Build the full Seam-2 escalation-analytics payload over the corpus' orchestrator queues.
 
-    *runs_dbs* maps each orchestrator queue id to its project's ``runs.db``.
-    The reconciliation queue is not a project and is not aggregated here.
+    *corpus_datum* must be a measured walk; an unknown one raises
+    ``ValueError``. Each orchestrator queue is one project, read against its
+    queue's ``runs_db``. The reconciliation queue is not a project and is not
+    aggregated here.
 
     ``generated_at`` is the corpus' ``as_of``: the payload answers for the
     walk it was derived from, and every age in it is measured against that
@@ -753,21 +754,20 @@ def build_escalation_analytics(
     ``views`` (per project, and across every orchestrator queue at the top
     level) are the corpus' named views, as Datums stamped with its instant.
     """
-    corpus = corpus_datum.value
-    scans = [
-        scan for scan in (corpus.scans if corpus is not None else ())
-        if scan.queue.kind is QueueKind.ORCHESTRATOR
-    ]
-    as_of = corpus_datum.as_of
-    if as_of is None:
+    corpus, as_of = corpus_datum.value, corpus_datum.as_of
+    if corpus is None or as_of is None:
         raise ValueError(f'the escalation corpus was not measured: {corpus_datum.reason}')
+    projects = [
+        (scan, runs_db) for scan in corpus.scans if (runs_db := scan.queue.runs_db) is not None
+    ]
+    scans = [scan for scan, _runs_db in projects]
 
     parse_failures = 0
     per_project = []
-    for scan in scans:
+    for scan, runs_db in projects:
         entry = _aggregate_project(
             scan.queue.label, [record.escalation for record in scan.records],
-            runs_dbs[scan.queue.id], now=as_of,
+            runs_db, now=as_of,
             downsample_threshold=downsample_threshold,
             pins_by_id=(pins_by_project or {}).get(scan.queue.label),
         )

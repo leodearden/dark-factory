@@ -26,7 +26,6 @@ import asyncio
 import logging
 from collections.abc import Sequence
 from datetime import datetime
-from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Request
@@ -118,20 +117,9 @@ def _analytics_memo_clear() -> None:
     _analytics_memo.clear()
 
 
-def _runs_dbs(config: DashboardConfig, queues: Sequence[QueueRef]) -> dict[str, Path]:
-    """Each orchestrator queue's ``runs.db``: the configured one for the primary root."""
-    primary = str(config.project_root)
-    return {
-        root: config.runs_db if root == primary
-        else Path(root) / 'data' / 'orchestrator' / 'runs.db'
-        for root in _orchestrator_roots(queues)
-    }
-
-
 async def _derive_analytics(
     client: httpx.AsyncClient,
     config: DashboardConfig,
-    queues: Sequence[QueueRef],
     corpus: Datum[EscalationCorpus],
 ) -> dict:
     """The analytics payload over *corpus*, annotated with each project's pins.
@@ -148,9 +136,7 @@ async def _derive_analytics(
     except Exception as exc:  # noqa: BLE001 — the tab must survive this
         logger.warning('pins_recovery fan-out failed (analytics served unannotated): %s', exc)
         pins = None
-    return await asyncio.to_thread(
-        build_escalation_analytics, corpus, _runs_dbs(config, queues), pins_by_project=pins,
-    )
+    return await asyncio.to_thread(build_escalation_analytics, corpus, pins_by_project=pins)
 
 
 @router.get('/api/v2/dashboard/escalation-analytics')
@@ -163,7 +149,7 @@ async def api_escalation_analytics(request: Request) -> JSONResponse:
     corpus = await acquire_corpus(queues, now=resolve_now(None))
 
     async def _refresh() -> dict:
-        return await _derive_analytics(http_client, config, queues, corpus)
+        return await _derive_analytics(http_client, config, corpus)
 
     payload = await _analytics_memo.get_or_refresh((queues, corpus.as_of), _refresh)
     return JSONResponse(

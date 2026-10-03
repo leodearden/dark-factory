@@ -58,12 +58,25 @@ class QueueKind(enum.StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class QueueRef:
-    """One escalation queue: its payload id and label, and the directory it lives in."""
+    """One escalation queue: its payload id and label, and the directory it lives in.
+
+    An orchestrator queue belongs to a project, and ``runs_db`` is that
+    project's run ledger. The reconciliation queue belongs to no project and
+    has none.
+    """
 
     id: str
     label: str
     kind: QueueKind
     directory: Path
+    runs_db: Path | None
+
+    def __post_init__(self) -> None:
+        if (self.kind is QueueKind.ORCHESTRATOR) != (self.runs_db is not None):
+            raise ValueError(
+                f'queue {self.id!r}: an orchestrator queue has a runs_db and only it '
+                f'(kind={self.kind.value}, runs_db={self.runs_db})'
+            )
 
 
 class Location(enum.StrEnum):
@@ -127,21 +140,23 @@ class EscalationCorpus:
         return any(scan.reached for scan in self.scans)
 
 
+def _orchestrator_queue(root: Path) -> QueueRef:
+    """The escalation queue of the project at *root*, beside that project's run ledger."""
+    data = root / 'data'
+    return QueueRef(
+        id=str(root), label=root.name, kind=QueueKind.ORCHESTRATOR,
+        directory=data / 'escalations', runs_db=data / 'orchestrator' / 'runs.db',
+    )
+
+
 def corpus_queues(config: DashboardConfig) -> tuple[QueueRef, ...]:
     """Every escalation queue: the primary root, the other known roots, reconciliation."""
-    roots = list(dict.fromkeys([config.project_root, *config.known_project_roots]))
-    orchestrators = tuple(
-        QueueRef(
-            id=str(root), label=root.name, kind=QueueKind.ORCHESTRATOR,
-            directory=root / 'data' / 'escalations',
-        )
-        for root in roots
-    )
+    roots = dict.fromkeys([config.project_root, *config.known_project_roots])
     reconciliation = QueueRef(
         id='reconciliation', label='fused-memory', kind=QueueKind.RECONCILIATION,
-        directory=config.reconciliation_escalations_dir,
+        directory=config.reconciliation_escalations_dir, runs_db=None,
     )
-    return (*orchestrators, reconciliation)
+    return (*(_orchestrator_queue(root) for root in roots), reconciliation)
 
 
 def _scan(queue: QueueRef) -> QueueScan:

@@ -25,7 +25,7 @@ import json
 import logging
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 
@@ -110,29 +110,34 @@ def load_queue_escalations(
     return results
 
 
+Owner = TypeVar('Owner')
+
+
 def resolve_owning_project(
-    esc: dict,
-    roots: list[tuple[Path, list[dict]]],
-) -> str | None:
+    esc: Mapping[str, Any],
+    candidates: Sequence[tuple[Owner, Path, Sequence[Mapping[str, Any]]]],
+) -> Owner | None:
     """Resolve the owning project for a reconciliation escalation.
 
     Two-pass probe (first match wins in each pass):
 
     1. **Worktree prefix** — if ``esc['worktree']`` is a path under ``root``
-       (i.e. ``Path(worktree).is_relative_to(root)``), return ``root.name``.
+       (i.e. ``Path(worktree).is_relative_to(root)``), that candidate owns it.
        This matches the conventional ``.worktrees/<task_id>`` layout (where
        ``.worktrees/`` lives inside ``root``) as well as any other subdirectory.
     2. **Task-map probe** — if ``str(esc['task_id'])`` matches ``str(t['id'])``
-       for any task *t* in a root's task map, return ``root.name``.
+       for any task *t* in a candidate's task rows, that candidate owns it.
 
     Args:
         esc: Escalation dict (fields ``worktree`` and ``task_id`` are probed).
-        roots: Ordered list of ``(root_path, task_map)`` tuples.  The first
-            matching root wins, so callers should put the primary root first.
+        candidates: Ordered ``(owner, root_path, task_rows)`` triples.  The
+            first matching candidate wins, so callers should put the primary
+            root first.
 
     Returns:
-        The matching root's basename (``root.name``), or ``None`` if neither
-        probe finds a match.
+        The matching candidate's *owner*, exactly as passed, or ``None`` if
+        neither probe finds a match.  Returning the owner rather than a name
+        keeps two roots that share a basename distinct.
     """
     worktree = esc.get('worktree') or ''
 
@@ -153,16 +158,16 @@ def resolve_owning_project(
     # arm would be logically redundant (it matches a strict subset of the first arm).
     if worktree:
         wt = Path(worktree).resolve(strict=False)
-        for root, _task_map in roots:
+        for owner, root, _task_rows in candidates:
             if wt.is_relative_to(root):
-                return root.name
+                return owner
 
     # Pass 2: task-map probe
     task_id = str(esc.get('task_id', ''))
     if task_id:
-        for root, task_map in roots:
-            if any(str(t.get('id')) == task_id for t in task_map):
-                return root.name
+        for owner, _root, task_rows in candidates:
+            if any(str(t.get('id')) == task_id for t in task_rows):
+                return owner
 
     return None
 
@@ -249,19 +254,11 @@ def _reconciliation_owners(
     The probe population is each root's ACTIVE rows, never its whole tree
     (PRD decision 12): a task active in no root has no owner.
     """
-    roots = [
-        (Path(queue.id).resolve(strict=False), list(active_rows.get(queue.id, ())))
+    candidates = [
+        (queue, Path(queue.id).resolve(strict=False), active_rows.get(queue.id, ()))
         for queue in orchestrators
     ]
-    by_name: dict[str, QueueRef] = {}
-    for (root, _rows), queue in zip(roots, orchestrators, strict=True):
-        by_name.setdefault(root.name, queue)
-
-    def owner(esc: dict) -> QueueRef | None:
-        name = resolve_owning_project(esc, roots)
-        return None if name is None else by_name[name]
-
-    return owner
+    return lambda esc: resolve_owning_project(esc, candidates)
 
 
 def build_escalation_queues(

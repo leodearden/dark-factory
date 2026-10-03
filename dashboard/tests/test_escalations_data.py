@@ -32,6 +32,11 @@ def _esc(esc_id: str, task_id: str = '1', level: int = 0, status: str = 'pending
     return d
 
 
+def _named(roots: list[tuple[Path, list[dict]]]) -> list[tuple[str, Path, list[dict]]]:
+    """Each ``(root, task_rows)`` as a ``resolve_owning_project`` candidate owned by its basename."""
+    return [(root.name, root, rows) for root, rows in roots]
+
+
 def _write_esc(directory: Path, filename: str, data: dict) -> Path:
     """Write escalation dict to a JSON file in directory."""
     path = directory / filename
@@ -280,7 +285,7 @@ class TestResolveOwningProjectWorktreeArm:
 
         esc = _esc('esc-1', task_id='42',
                    worktree=str(proj_a / '.worktrees' / '42'))
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projA'
 
     def test_worktree_directly_under_root_resolves(self, tmp_path):
@@ -292,7 +297,7 @@ class TestResolveOwningProjectWorktreeArm:
 
         esc = _esc('esc-2', task_id='55',
                    worktree=str(proj_b / 'some-subdir'))
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projB'
 
     def test_dot_worktrees_prefix_form_also_matches(self, tmp_path):
@@ -305,7 +310,7 @@ class TestResolveOwningProjectWorktreeArm:
         # Worktree string exactly starts with str(proj_c / '.worktrees')
         wt = str(proj_c / '.worktrees' / '99')
         esc = _esc('esc-3', task_id='99', worktree=wt)
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projC'
 
     def test_first_root_wins_when_multiple_could_match(self, tmp_path):
@@ -323,7 +328,7 @@ class TestResolveOwningProjectWorktreeArm:
         esc = _esc('esc-4', task_id='10', worktree=wt)
 
         roots = [(proj_first, []), (proj_second, [])]
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         # first root wins
         assert result == 'workspace'
 
@@ -336,7 +341,7 @@ class TestResolveOwningProjectWorktreeArm:
 
         esc = _esc('esc-5', task_id='7',
                    worktree='/completely/different/path')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None
 
     def test_missing_worktree_returns_none(self, tmp_path):
@@ -347,7 +352,7 @@ class TestResolveOwningProjectWorktreeArm:
         roots = [(proj_a, [])]
 
         esc = _esc('esc-6', task_id='8')  # no worktree field
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None
 
 
@@ -369,7 +374,7 @@ class TestResolveOwningProjectTaskMapArm:
         roots = [(proj_a, []), (proj_b, task_map_b)]
 
         esc = _esc('esc-1', task_id='42', worktree='/no-match/path')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projB'
 
     def test_first_root_wins_when_multiple_task_maps_contain_same_task_id(self, tmp_path):
@@ -384,7 +389,7 @@ class TestResolveOwningProjectTaskMapArm:
         roots = [(proj_a, task_map_a), (proj_b, task_map_b)]
 
         esc = _esc('esc-1', task_id='42')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projA'
 
     def test_no_match_in_any_task_map_returns_none(self, tmp_path):
@@ -395,7 +400,7 @@ class TestResolveOwningProjectTaskMapArm:
         roots = [(proj_a, [{'id': 99, 'title': 'other task'}])]
 
         esc = _esc('esc-1', task_id='55')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None
 
     def test_task_id_string_vs_int_coercion(self, tmp_path):
@@ -409,8 +414,25 @@ class TestResolveOwningProjectTaskMapArm:
 
         # esc.task_id is a string
         esc = _esc('esc-1', task_id='42')
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projA'
+
+    def test_the_owner_is_returned_as_passed_so_shared_basenames_stay_distinct(self, tmp_path):
+        """Two roots named ``proj`` are two owners: the match is the candidate, never its name."""
+        from dashboard.data.escalations import resolve_owning_project
+
+        first = object()
+        second = object()
+        candidates = [
+            (first, tmp_path / 'a' / 'proj', [{'id': 8}]),
+            (second, tmp_path / 'b' / 'proj', [{'id': 7}]),
+        ]
+
+        assert resolve_owning_project(_esc('esc-1', task_id='7'), candidates) is second
+        worktree = str(tmp_path / 'b' / 'proj' / '.worktrees' / '9')
+        assert resolve_owning_project(
+            _esc('esc-2', task_id='9', worktree=worktree), candidates,
+        ) is second
 
     def test_no_worktree_falls_back_to_task_map(self, tmp_path):
         """Escalation without worktree field falls back to task map probe."""
@@ -421,7 +443,7 @@ class TestResolveOwningProjectTaskMapArm:
         roots = [(proj_a, task_map_a)]
 
         esc = _esc('esc-1', task_id='7')  # no worktree key
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'projA'
 
 
@@ -716,6 +738,23 @@ class TestOwnerAttribution:
 
         assert row['project_root'] == str(primary.resolve())
 
+    def test_roots_sharing_a_basename_attribute_to_the_root_the_task_is_active_in(
+        self, tmp_path,
+    ):
+        primary = tmp_path / 'a' / 'proj'
+        other = tmp_path / 'b' / 'proj'
+        config = _config(primary, [other])
+        _put(_recon_dir(config), _record('esc-7-1', task_id='7'))
+        active = {
+            str(primary.resolve()): [{'id': 8}],
+            str(other.resolve()): [{'id': 7}],
+        }
+
+        (row,) = _sub(_build(config, active), 'reconciliation')['escalations']
+
+        assert row['project'] == 'proj'
+        assert row['project_root'] == str(other.resolve())
+
     def test_a_reconciliation_row_active_nowhere_has_no_owner(self, tmp_path):
         primary = tmp_path / 'primary'
         config = _config(primary)
@@ -934,7 +973,7 @@ class TestResolveOwningProjectPrefixRegression:
 
         wt = str(ws2 / '.worktrees' / '42')
         esc = _esc('esc-reg-1', task_id='42', worktree=wt)
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result == 'workspace-2', (
             f"Expected 'workspace-2' but got {result!r} — "
             "sibling-prefix false positive not fixed"
@@ -954,7 +993,7 @@ class TestResolveOwningProjectPrefixRegression:
 
         wt = str(ws_extra / '.worktrees' / '42')
         esc = _esc('esc-reg-2', task_id='42', worktree=wt)
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None, (
             f"Expected None but got {result!r} — "
             "sibling-prefix false positive not fixed"
@@ -985,7 +1024,7 @@ class TestResolveOwningProjectPrefixRegression:
         # Its name string-starts-with ".worktrees" but it is NOT under worktrees_root.
         wt = str(proj_a / '.worktrees-archive' / '42')
         esc = _esc('esc-reg-3', task_id='42', worktree=wt)
-        result = resolve_owning_project(esc, roots)
+        result = resolve_owning_project(esc, _named(roots))
         assert result is None, (
             f"Expected None but got {result!r} — "
             ".worktrees-archive false-matched .worktrees root via string prefix"

@@ -68,6 +68,7 @@ def _write(queue_dir: Path, record: dict, *, archived: bool = False) -> Path:
 def _queue(directory: Path, label: str = 'proj') -> QueueRef:
     return QueueRef(
         id=str(directory), label=label, kind=QueueKind.ORCHESTRATOR, directory=directory,
+        runs_db=directory / 'runs.db',
     )
 
 
@@ -112,17 +113,31 @@ class TestCorpusQueues:
             QueueRef(
                 id=str(primary.resolve()), label='primary',
                 kind=QueueKind.ORCHESTRATOR, directory=config.escalations_dir,
+                runs_db=config.runs_db,
             ),
             QueueRef(
                 id=str(reify.resolve()), label='reify', kind=QueueKind.ORCHESTRATOR,
                 directory=reify.resolve() / 'data' / 'escalations',
+                runs_db=reify.resolve() / 'data' / 'orchestrator' / 'runs.db',
             ),
             QueueRef(
                 id='reconciliation', label='fused-memory',
                 kind=QueueKind.RECONCILIATION,
-                directory=config.reconciliation_escalations_dir,
+                directory=config.reconciliation_escalations_dir, runs_db=None,
             ),
         )
+
+
+class TestQueueRef:
+    """An orchestrator queue is a project's and carries its run ledger; reconciliation has none."""
+
+    @pytest.mark.parametrize(('kind', 'runs_db'), [
+        (QueueKind.ORCHESTRATOR, None),
+        (QueueKind.RECONCILIATION, Path('/srv/proj/data/orchestrator/runs.db')),
+    ])
+    def test_a_runs_db_belongs_to_an_orchestrator_queue_and_only_to_one(self, kind, runs_db):
+        with pytest.raises(ValueError, match='orchestrator queue has a runs_db'):
+            QueueRef(id='q', label='q', kind=kind, directory=Path('/srv/q'), runs_db=runs_db)
 
 
 class TestWalkCorpus:

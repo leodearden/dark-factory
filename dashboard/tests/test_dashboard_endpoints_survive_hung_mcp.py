@@ -206,7 +206,7 @@ def hung_mcp(monkeypatch, tmp_path, client):
         'corpus_queues',
         lambda config: (QueueRef(
             id=str(proj), label='probe', kind=QueueKind.ORCHESTRATOR,
-            directory=escalation_dir,
+            directory=escalation_dir, runs_db=proj / 'data' / 'orchestrator' / 'runs.db',
         ),),
     )
     # /merge-queue looks up only the ids its rows name, so it needs a row.
