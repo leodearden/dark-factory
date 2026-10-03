@@ -1009,7 +1009,8 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
 
         THE FIRST CASE IS THE ONLY ONE PRODUCTION EVER SENDS, and it is listed first
         for that reason.  The other four are already-unwrapped spellings this seam
-        tolerates because fakes and the eval-mode ``_StubMcpSession`` produce them;
+        tolerates because test fakes produce them (the eval-mode ``_StubMcpSession``
+        does not: it emits the full JSON-RPC body);
         ``{'result': {'statuses': …}}`` in particular is a shape the transport never
         emits — the real inner ``result`` carries ``content``/``structuredContent``/
         ``isError``, never the payload keys directly.  A suite made only of those

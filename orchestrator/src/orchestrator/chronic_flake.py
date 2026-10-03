@@ -45,6 +45,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from shared.mcp_envelope import parse_tool_result
 from shared.safe_io import load_json_or_warn
 from shared.task_statuses import TERMINAL
 
@@ -586,10 +587,10 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     Generalises ``Harness._extract_task_id``'s envelope normalisation
     (``{'task_id': ...}`` direct, ``{'structuredContent': {...}}`` /
     ``{'result': {...}}`` nested, or a ``content`` list of text blocks
-    carrying JSON) so every parser here — :func:`extract_task_id`,
-    :func:`_extract_results_list`, :func:`_extract_statuses_map`,
-    :func:`_extract_task` — shares one seam. Returns ``{}`` for a non-dict
-    *result* or when no known shape unwraps.
+    carrying JSON) so the parsers here — :func:`extract_task_id`,
+    :func:`_extract_results_list`, :func:`_extract_task`, and
+    :func:`_extract_statuses_map` for bare shapes — share one seam. Returns
+    ``{}`` for a non-dict *result* or when no known shape unwraps.
 
     UNWRAPS ITERATIVELY, and that is the whole correctness of it.  The
     production shape is TWO layers deep, not one: ``dispatch_tool`` hands back
@@ -608,11 +609,12 @@ def _unwrap_dispatch_envelope(result: object) -> dict:
     parser that requires exactly ``result['result']['content'][i]['text']``.
 
     The loop STOPS at the first dict no transport key descends out of, so the
-    already-unwrapped shapes the fakes and the eval-mode ``_StubMcpSession``
-    hand back (a bare ``{'statuses': …}``) are returned untouched, exactly as
-    before.  ``shared.mcp_envelope.parse_tool_result`` is deliberately NOT used
-    in its place: it accepts ONLY the strict ``result.content[].text`` spelling
-    and would reject every bare-dict shape this seam exists to tolerate.
+    already-unwrapped shapes test fakes hand back (a bare ``{'task_id': …}``)
+    are returned untouched.  ``shared.mcp_envelope.parse_tool_result`` cannot
+    stand in for this generic unwrap, because it accepts ONLY the strict
+    ``result.content[].text`` spelling and rejects every bare shape; where one
+    tool's reader must match the scheduler's, as :func:`_extract_statuses_map`
+    does, it is used for JSON-RPC bodies and this unwrap only for bare ones.
     """
     if not isinstance(result, dict):
         return {}
@@ -672,15 +674,21 @@ def _extract_results_list(result: object) -> list[dict]:
     return [entry for entry in results if isinstance(entry, dict)]
 
 
+def _is_jsonrpc_response(result: object) -> bool:
+    """JSON-RPC 2.0 makes ``jsonrpc`` mandatory on every response, so it tells a real
+    ``dispatch_tool`` body from an already-unwrapped payload, which never carries it."""
+    return isinstance(result, dict) and 'jsonrpc' in result
+
+
 def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | None]:
     """Extract a ``get_statuses`` response's ``statuses`` mapping from a
-    ``dispatch_tool`` envelope (see :func:`_unwrap_dispatch_envelope`), as a
-    ``(statuses, error)`` pair.
+    ``dispatch_tool`` result, as a ``(statuses, error)`` pair.
 
-    Written beside :func:`_extract_results_list` and over the same seam so every
-    response parser shares ONE envelope-shape policy — a second, independently-evolved
-    unwrapper is exactly how one of them would silently stop handling a shape the
-    others still do.
+    A JSON-RPC response is parsed by ``shared.mcp_envelope.parse_tool_result(result,
+    'statuses', dict)``, the exact call ``scheduler.py::Scheduler.get_statuses`` makes,
+    so the two readers of this tool cannot disagree; its error is returned as is.  Only
+    an already-unwrapped bare shape, which test fakes alone produce, goes through
+    :func:`_unwrap_dispatch_envelope`.
 
     The PAIR is what keeps two things that both look like an empty mapping apart.  A
     PRESENT ``statuses`` dict, even an empty one, is a CORROBORATED ABSENCE: the tool
@@ -692,26 +700,29 @@ def _extract_statuses_map(result: object) -> tuple[dict[str, str], Exception | N
     missing id as a deleted task and files a replacement de-flake task for it.
 
     Construct-don't-raise, matching ``scheduler.py::SchedulerFacade.get_statuses``'
-    ``({}, exception)`` convention: an unreadable envelope yields ``({}, ValueError(…))``
-    describing the shape, never a raise.  That facade parses the SAME tool's response
-    with ``shared.mcp_envelope.parse_tool_result`` instead — a deliberate, named
-    non-convergence whose reasons and shape divergences are recorded on
-    :meth:`SchedulerChronicFlakeTaskClient.get_statuses`.
+    ``({}, exception)`` convention: an unreadable response yields ``({}, error)``
+    describing it, never a raise.
 
     Keys and values are coerced to ``str``: the tool returns JSON, but a caller may
     hand ints and the consumer (``flake_ledger``) looks the id up as a ``str``.
     """
-    envelope = _unwrap_dispatch_envelope(result)
-    if 'statuses' not in envelope:
-        return {}, ValueError(
-            f'get_statuses response carries no "statuses" key (envelope keys='
-            f'{sorted(str(k) for k in envelope)!r})'
-        )
-    statuses = envelope['statuses']
-    if not isinstance(statuses, dict):
-        return {}, ValueError(
-            f'get_statuses response "statuses" is {type(statuses).__name__}, not a dict'
-        )
+    if _is_jsonrpc_response(result):
+        statuses, parse_error = parse_tool_result(result, 'statuses', dict)
+        if parse_error is not None:
+            return {}, parse_error
+        assert statuses is not None
+    else:
+        envelope = _unwrap_dispatch_envelope(result)
+        if 'statuses' not in envelope:
+            return {}, ValueError(
+                f'get_statuses response carries no "statuses" key (envelope keys='
+                f'{sorted(str(k) for k in envelope)!r})'
+            )
+        statuses = envelope['statuses']
+        if not isinstance(statuses, dict):
+            return {}, ValueError(
+                f'get_statuses response "statuses" is {type(statuses).__name__}, not a dict'
+            )
     return {str(key): str(value) for key, value in statuses.items()}, None
 
 
@@ -828,32 +839,11 @@ class SchedulerChronicFlakeTaskClient:
         Ids are coerced to ``str`` — the ledger's ``owner_task_id`` column is
         TEXT, and an int on the wire would match nothing.
 
-        A SECOND IMPLEMENTATION OF ONE TOOL CALL, KNOWINGLY.
-        ``scheduler.py::SchedulerFacade.get_statuses`` dispatches the same
-        tool with the same arguments and returns the same ``(statuses,
-        error)`` pair, and in production the object wrapped here IS the real
-        ``Scheduler``, which already exposes it.  Delegating to it when
-        present (``hasattr``-and-call, falling back to this body for
-        ``dispatch_tool``-only doubles) was considered and REJECTED, because
-        it would put the two parsers on opposite sides of the test boundary:
-        production would run ``parse_tool_result``, every fake and the
-        eval-mode ``_StubMcpSession`` would run this one, and the parser
-        production actually executes would be exercised by no test at all.
-        That is the same structural escape
-        ``test_flake_ledger.py::TestOpenDebtOverTheRealAdapter`` was added to
-        close — each side proved against a double encoding its own
-        assumption, with the disagreement living in the seam between them.
-        The duplication is the cheaper failure: it is one function, tested,
-        and the seam it serves is duck-typed over ``dispatch_tool`` ALONE.
-
-        THE TWO PARSERS ARE NOT INTERCHANGEABLE, so do not "converge" them
-        without reading both.  ``parse_tool_result`` accepts ONLY the strict
-        ``result['result']['content'][i]['text']`` spelling and would reject
-        every bare-dict shape this seam exists to tolerate; it also unwraps a
-        ``{'data': {…}}`` layer that :func:`_unwrap_dispatch_envelope` does
-        not; and this path coerces keys and values to ``str`` where the
-        facade returns whatever the tool sent.  A shape added to one is not a
-        shape handled by the other.
+        The dispatch stays here so the seam remains ``dispatch_tool`` alone, but
+        the response is read by ``scheduler.py::Scheduler.get_statuses``' own
+        parser (see :func:`_extract_statuses_map`); ``orchestrator/tests/
+        test_chronic_flake.py::TestGetStatusesHasOneParser`` pins the two to
+        one answer over the real composition.
         """
         try:
             result = await self._scheduler.dispatch_tool(
