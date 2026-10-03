@@ -277,6 +277,10 @@ def _is_ticket_id(value: object) -> bool:
     return isinstance(value, str) and value.startswith('tkt_')
 
 
+class TicketStoreNotConfiguredError(RuntimeError):
+    """Raised by a read that needs the ticket store when the interceptor has none."""
+
+
 def _looks_like_task_id(value: object) -> bool:
     """Return True when *value* parses as a non-negative integer task id.
 
@@ -3857,17 +3861,16 @@ class TaskInterceptor:
         a dark_factory ticket) be adjudicated without knowing the writer's
         project.
 
-        Returns None — never raises — when no ticket store is configured, so
-        the ingestion path can map that onto "unresolvable" and tag the episode
-        instead of failing the write.
+        None means only "the registry has no such ticket". A missing store
+        raises :class:`TicketStoreNotConfiguredError` instead, so a caller
+        cannot mistake misconfiguration for absence; the gate would otherwise
+        report every ``tkt_`` claim as a fabricated ticket.
         """
         if self._ticket_store is None:
-            logger.warning(
-                'get_ticket_row: ticket_store not configured; '
-                'existence of ticket %s is unresolvable',
-                ticket_id,
+            raise TicketStoreNotConfiguredError(
+                f'ticket_store not configured; existence of ticket {ticket_id} '
+                f'cannot be read',
             )
-            return None
         return await self._ticket_store.get(ticket_id)
 
     async def cancel_ticket(self, ticket_id: str) -> dict:

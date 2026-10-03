@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
+import pytest
 from _fm_helpers import assert_id_title_pairing, make_8df8_scenario
 
 from fused_memory.reconciliation.task_filter import (
@@ -3225,12 +3226,12 @@ class TestDiffStatusCorrection:
 
 
 # ---------------------------------------------------------------------------
-# Clause boundary grammar — _CLAUSE_SPLIT_RE (task 3403)
+# Clause boundary grammar — WIDE_CLAUSE_BOUNDARY_RE (task 3403)
 # ---------------------------------------------------------------------------
 
 
 class TestClauseSplitRe:
-    """Tests for _CLAUSE_SPLIT_RE in task_filter.py — the clause boundary shared
+    """Tests for WIDE_CLAUSE_BOUNDARY_RE in task_filter.py — the clause boundary shared
     by find_conflicting_task_status_ids() and
     find_present_tense_completion_claim_task_ids().
 
@@ -3268,7 +3269,7 @@ class TestClauseSplitRe:
         single, unsplit clause. Under the pre-3403 ``[.;\\n!?]`` alphabet every
         one of them was broken into two or more pieces.
         """
-        from fused_memory.reconciliation.task_filter import _CLAUSE_SPLIT_RE
+        from fused_memory.reconciliation.task_filter import WIDE_CLAUSE_BOUNDARY_RE
 
         for text in (
             'dark-factory-orchestrator.yaml',
@@ -3278,7 +3279,7 @@ class TestClauseSplitRe:
             '1.5s',
             'task_filter.TASK_REF_RE',
         ):
-            assert _CLAUSE_SPLIT_RE.split(text) == [text], (
+            assert WIDE_CLAUSE_BOUNDARY_RE.split(text) == [text], (
                 f'Expected a dotted technical token to yield exactly one '
                 f'non-empty clause, unsplit.\ntext={text!r}'
             )
@@ -3295,7 +3296,7 @@ class TestClauseSplitRe:
         lookbehind-based narrowing would stop splitting it, which is what makes
         the two-different-ids precision tests pass.
         """
-        from fused_memory.reconciliation.task_filter import _CLAUSE_SPLIT_RE
+        from fused_memory.reconciliation.task_filter import WIDE_CLAUSE_BOUNDARY_RE
 
         for text, expected in (
             ('a. b', ['a', ' b']),
@@ -3305,7 +3306,7 @@ class TestClauseSplitRe:
             ('a!b', ['a', 'b']),
             ('a?b', ['a', 'b']),
         ):
-            assert _CLAUSE_SPLIT_RE.split(text) == expected, (
+            assert WIDE_CLAUSE_BOUNDARY_RE.split(text) == expected, (
                 f'Expected the clause splitter to still break on this sentence '
                 f'terminator.\ntext={text!r}'
             )
@@ -3321,11 +3322,11 @@ class TestClauseSplitRe:
         uses a non-capturing lookahead precisely for this reason; the arity is
         pinned so a later edit cannot reintroduce a group.
         """
-        from fused_memory.reconciliation.task_filter import _CLAUSE_SPLIT_RE
+        from fused_memory.reconciliation.task_filter import WIDE_CLAUSE_BOUNDARY_RE
 
-        assert _CLAUSE_SPLIT_RE.groups == 0, (
-            f'Expected _CLAUSE_SPLIT_RE to carry zero capture groups so re.split '
-            f'returns clauses only.\npattern={_CLAUSE_SPLIT_RE.pattern!r}'
+        assert WIDE_CLAUSE_BOUNDARY_RE.groups == 0, (
+            f'Expected WIDE_CLAUSE_BOUNDARY_RE to carry zero capture groups so '
+            f're.split returns clauses only.\npattern={WIDE_CLAUSE_BOUNDARY_RE.pattern!r}'
         )
 
     # ------------------------------------------------------------------ #
@@ -3333,8 +3334,10 @@ class TestClauseSplitRe:
     # ------------------------------------------------------------------ #
 
     def test_clause_split_re_has_no_out_of_module_consumers(self):
-        """_CLAUSE_SPLIT_RE is module-private BY CONTRACT — scanned, not asserted
-        in prose.
+        """WIDE_CLAUSE_BOUNDARY_RE is for ALLOWLISTED consumers only — scanned,
+        not asserted in prose. The scan also covers its old private spelling,
+        _CLAUSE_SPLIT_RE, which task_filter keeps as an alias until
+        tkt_0RVBV2PMGFWETFNDCRYB4TRFW1 migrates its last importer.
 
         Widening the splitter is only defensible because of who reads it: both
         consumers (find_conflicting_task_status_ids,
@@ -3349,12 +3352,13 @@ class TestClauseSplitRe:
 
         That contract was already violated once, before anything checked it:
         the task 3403 review found services/completion_claim_gate.py importing
-        this constant while durably tagging episodes as unverified and filing
-        operator escalations, which made the shipped bounded-blast-radius claim
-        false as written. It now takes STRICT_CLAUSE_BOUNDARY_RE instead. Absent
-        this test, the NEXT such importer would invalidate the safety case just
-        as silently — every existing test would still pass, because they pin the
-        splitter's alphabet and arity, not its blast radius.
+        this constant while its attribution still scaled with clause length —
+        every ref in a clause inherited the clause's completion phrasing — so
+        durably tagged episodes and operator escalations absorbed the
+        widening's over-fire. Absent this test, the NEXT such importer would
+        invalidate the safety case just as silently — every existing test would
+        still pass, because they pin the splitter's alphabet and arity, not its
+        blast radius.
 
         The scan is AST-based rather than textual on purpose: the name appears
         in prose all over this subsystem (comment blocks, docstrings,
@@ -3367,7 +3371,15 @@ class TestClauseSplitRe:
         that does not self-heal next cycle — a retired edge, a durable tag, an
         escalation already in the human queue — it wants
         STRICT_CLAUSE_BOUNDARY_RE, and adding itself to the allowlist below is
-        the wrong fix.
+        the wrong fix. The one exception is a corpus-tagging consumer whose
+        attribution does not scale with clause length.
+
+        services/completion_claim_gate.py (task 4853) is that exception. It
+        binds each completion marker to its ONE nearest ref and never lets a
+        binding cross a barrier (', ', 'and', 'while', ...), so a longer clause
+        adds candidate refs without adding claims, and the widening buys back
+        the recall the strict alphabet cost it ('Task 5252 (see CLAUDE.md:95)
+        has landed').
 
         scripts/audit_duplicate_memories.py (task 3891) made that showing and
         is the second allowlist entry. Its
@@ -3388,10 +3400,12 @@ class TestClauseSplitRe:
         from pathlib import Path
 
         package_root = Path(__file__).resolve().parents[1]
-        # Every file allowed to reference the private constant in CODE.
+        # Every file allowed to reference the widened constant in CODE.
+        names = {'WIDE_CLAUSE_BOUNDARY_RE', '_CLAUSE_SPLIT_RE'}
         allowlist = {
             'src/fused_memory/reconciliation/task_filter.py',
             'scripts/audit_duplicate_memories.py',
+            'src/fused_memory/services/completion_claim_gate.py',
         }
         skip_parts = {'.venv', 'site-packages', '__pycache__'}
 
@@ -3405,11 +3419,11 @@ class TestClauseSplitRe:
                 tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
                 for node in ast.walk(tree):
                     if (
-                        (isinstance(node, ast.Name) and node.id == '_CLAUSE_SPLIT_RE')
-                        or (isinstance(node, ast.Attribute) and node.attr == '_CLAUSE_SPLIT_RE')
+                        (isinstance(node, ast.Name) and node.id in names)
+                        or (isinstance(node, ast.Attribute) and node.attr in names)
                         or (
                             isinstance(node, ast.ImportFrom)
-                            and any(alias.name == '_CLAUSE_SPLIT_RE' for alias in node.names)
+                            and any(alias.name in names for alias in node.names)
                         )
                     ):
                         consumers.add(path.relative_to(package_root).as_posix())
@@ -3420,11 +3434,12 @@ class TestClauseSplitRe:
             f'were parsed, so a passing result would be vacuous.\nroot={package_root}'
         )
         assert consumers == allowlist, (
-            f'_CLAUSE_SPLIT_RE gained an out-of-module consumer. The widening is '
-            f'only safe for callers that fail toward a SOFT BLOCK; if a longer '
-            f'clause on this path retires an edge, writes a durable tag, or files '
-            f'an escalation, import task_filter.STRICT_CLAUSE_BOUNDARY_RE instead '
-            f'(see completion_claim_gate for the worked example).'
+            f'WIDE_CLAUSE_BOUNDARY_RE gained an out-of-module consumer. The widening is '
+            f'only safe for callers that fail toward a SOFT BLOCK, or whose '
+            f'attribution does not scale with clause length (completion_claim_gate '
+            f'binds each marker to one nearest ref); if a longer clause on this '
+            f'path retires an edge, writes a durable tag, or files an escalation, '
+            f'import task_filter.STRICT_CLAUSE_BOUNDARY_RE instead.'
             f'\nunexpected={sorted(consumers - allowlist)!r}'
             f'\nmissing={sorted(allowlist - consumers)!r}'
         )
@@ -3521,6 +3536,61 @@ class TestTaskRefRe:
                 f'Expected [] — this must not read as an explicit task '
                 f'reference.\ntext={text!r}'
             )
+
+    # ------------------------------------------------------------------ #
+    # foreign numbers — a PR/issue/GitHub '#N' is never a task id (task 4853)
+    # ------------------------------------------------------------------ #
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'Merged PR #4521 into main',
+            'Merged PR#4521 into main',
+            'pull request #4521',
+            'merge request #4521',
+            'the upstream issue #123',
+            'issues #123',
+            'GH #12',
+            'MR #7',
+            'see owner/repo#123',
+            'dark_factory#2748',
+            # Every cue-to-'#' gap in _FOREIGN_CUE_GAPS, not only one space.
+            'PR  #4521 merged',
+            'PR\t#4521 merged',
+            'issue:#12 was closed as dup',
+            'issue: #12 was closed as dup',
+        ],
+    )
+    def test_negative_foreign_number_cues_are_not_task_refs(self, text):
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        assert TASK_REF_RE.findall(text) == [], (
+            f'Expected [] — a cue-preceded or word-attached #N names a PR, an '
+            f'issue or another repository, not a task.\ntext={text!r}'
+        )
+
+    @pytest.mark.parametrize(
+        ('text', 'refs'),
+        [('PR   #4521 merged', ['4521']), ('PRs #1 and #2', ['2'])],
+    )
+    def test_wider_gaps_and_coordinated_lists_are_accepted_residuals(self, text, refs):
+        """Pinned so the residuals named at TASK_REF_RE stay visible: a gap
+        wider than _FOREIGN_CUE_GAPS spells out, and every number after the
+        first in a coordinated list, still read as task refs."""
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        assert TASK_REF_RE.findall(text) == refs
+
+    @pytest.mark.parametrize(
+        'text',
+        ['#94', '(#94)', 'see #94 for details', 'task #94', 'df #94', 'blocked on #94'],
+    )
+    def test_positive_bare_hash_refs_still_match(self, text):
+        from fused_memory.reconciliation.task_filter import TASK_REF_RE
+
+        assert TASK_REF_RE.findall(text) == ['94'], (
+            f"Expected ['94'] — a bare '#N' is still a task reference.\ntext={text!r}"
+        )
 
     # ------------------------------------------------------------------ #
     # arity: exactly one capture group
@@ -3774,8 +3844,8 @@ class TestConflictingTaskStatusFraming:
         after. It moves these two detectors off the module's
         fail-open-on-under-firing default toward over-firing.
 
-        What bounds the blast radius is the CONSUMER SET of the private
-        _CLAUSE_SPLIT_RE, not any property of these detectors. It holds while
+        What bounds the blast radius is the allowlisted CONSUMER SET of
+        WIDE_CLAUSE_BOUNDARY_RE, not any property of these detectors. It holds while
         the consumers are exactly find_conflicting_task_status_ids
         (conflicting_task_status_framing_write_blocked) and
         find_present_tense_completion_claim_task_ids
@@ -3785,9 +3855,10 @@ class TestConflictingTaskStatusFraming:
         claim is contingent, and it was already falsified once: the task 3403
         review found services/completion_claim_gate.py importing the same
         constant while durably tagging episodes and filing operator
-        escalations. That consumer now takes STRICT_CLAUSE_BOUNDARY_RE, the
-        narrow variant task_filter exports for exactly this case, and the
-        consumer set is enforced rather than merely asserted here — see
+        escalations with clause-wide attribution. That consumer now binds each
+        completion marker to its nearest ref (task 4853), so its attribution no
+        longer scales with clause length, and the consumer set is enforced
+        rather than merely asserted here — see
         TestClauseSplitRe.test_clause_split_re_has_no_out_of_module_consumers.
 
         Suppressing the over-fire here instead would require nearest-ref
@@ -3803,6 +3874,15 @@ class TestConflictingTaskStatusFraming:
             f'Expected {{1985, 1986}} — the widened clause tags every id in a '
             f'sentence carrying both a terminal and a non-terminal marker.'
             f'\ntext={text!r}'
+        )
+
+    def test_landed_nothing_is_a_denial_not_a_terminal_outcome(self):
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'task 5623 has landed nothing (still pending)'
+        assert find_conflicting_task_status_ids(text) == set(), (
+            f"Expected set() — 'has landed nothing' says the task is NOT terminal, "
+            f'which agrees with "still pending".\ntext={text!r}'
         )
 
 
@@ -4397,7 +4477,7 @@ class TestFindPresentTenseCompletionClaimTaskIds:
         """The same over-fire as the sibling detector's — pinned HERE because
         this is the arm that actually rejects an author's write.
 
-        Task 3403 widened _CLAUSE_SPLIT_RE's dot to '\\.(?!\\w)' so dotted
+        Task 3403 widened WIDE_CLAUSE_BOUNDARY_RE's dot to '\\.(?!\\w)' so dotted
         technical tokens stop shattering a sentence. Residual (i) of that change
         is that clauses are longer, so the clause-granularity caveat documented
         above (a clause naming several ids tags ALL of them — the detector binds
@@ -4432,6 +4512,33 @@ class TestFindPresentTenseCompletionClaimTaskIds:
             f'Expected {{1985, 1986}} — the widened clause carries the completion '
             f'phrase across every id in the sentence, including the one the '
             f'sentence calls pending.\ntext={text!r}'
+        )
+
+    @pytest.mark.parametrize('text', ['Merged PR #4521 into main', 'PR  #4521 was merged'])
+    def test_merged_pull_request_number_is_not_a_task_completion(self, text):
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f'Expected set() — PR #4521 is not task 4521.\ntext={text!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'task 5623 has landed nothing (still pending)',
+            'task 6118 is a merge-landed fix',
+        ],
+    )
+    def test_denial_and_hyphenated_compound_are_not_completions(self, text):
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f"Expected set() — 'landed nothing' is a denial and 'merge-landed' "
+            f'an adjective.\ntext={text!r}'
         )
 
 

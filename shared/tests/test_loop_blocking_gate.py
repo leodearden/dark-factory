@@ -414,7 +414,7 @@ class TestCallerSideEnumeration:
         ``make_commit_probe.probe`` and ``_verify_task``'s ``probe``
         parameter), and it was blessed in the ledger as a real defect.  The
         genuine site next door -- ``_claim_commit_presence ->
-        make_commit_probe`` -- is unaffected and still reported.
+        make_commit_probe`` -- was unaffected and still reported.
         """
         sources = {
             'pkg/mod.py': _module(

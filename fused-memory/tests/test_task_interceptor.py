@@ -32,7 +32,10 @@ from fused_memory.middleware.task_curator import (
     TaskCurator,
     is_combine_eligible_status,
 )
-from fused_memory.middleware.task_interceptor import TaskInterceptor
+from fused_memory.middleware.task_interceptor import (
+    TaskInterceptor,
+    TicketStoreNotConfiguredError,
+)
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
@@ -14639,15 +14642,11 @@ async def test_get_ticket_row_returns_none_for_an_absent_id(interceptor_facade):
 
 
 @pytest.mark.asyncio
-async def test_get_ticket_row_without_a_store_warns_and_returns_none(
-    interceptor, caplog,
-):
-    """A misconfigured store must not raise into the ingestion path — the gate
-    maps the None onto UNRESOLVABLE and tags rather than failing the write."""
-    with caplog.at_level(logging.WARNING):
-        assert await interceptor.get_ticket_row('tkt_0RRRC5AASJ9Z630VP4PCN9H376') is None
-
-    assert any('ticket_store' in record.message for record in caplog.records)
+async def test_get_ticket_row_without_a_store_raises_not_configured(interceptor):
+    """None is reserved for 'no such ticket', so a missing store must not
+    return it: the gate would read misconfiguration as a fabricated ticket."""
+    with pytest.raises(TicketStoreNotConfiguredError):
+        await interceptor.get_ticket_row('tkt_0RRRC5AASJ9Z630VP4PCN9H376')
 
 
 # --------------------------------------------------------------------------- #
