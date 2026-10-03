@@ -6830,11 +6830,15 @@ async def _do_train_merge(
     despite being present in ``SpeculativeMergeWorker``'s own single-branch
     advance path:
 
-    1. No ``reverify_on_rebase``: the 1595 disjoint-delta gate is CAS-loop
-       machinery that lives ONLY in
-       ``SpeculativeMergeWorker._verify_and_advance``'s CAS loop — adding it
-       here would duplicate speculative-worker-specific logic that has no
-       business in the train's own atomic pipeline.
+    1. Its own CAS loop (:func:`_advance_train`), sharing only the gate and
+       the write-ahead advance with the single-branch one.  The train passes
+       ``reverify_on_rebase=True``: a main that moved under the train verify
+       rebases the train's merge worktree, and the rebased tip goes through
+       ``gates.py::_reverify_rebased_tree``, whose footprint is the tip
+       worktree's stacked delta, i.e. every member's files.  Under
+       ``_disjoint_skip_blockers`` a moved main costs at most one re-verify
+       (always one on a ``merge_verify_breadth='full'`` project or after a
+       direct commit), never a derail.
 
     2. Pyright redundant-but-harmless: the train always rebases its tip onto
        main before merging, so the type surface is fresh.  The post-merge
@@ -6852,11 +6856,11 @@ async def _do_train_merge(
        workspace-green gate.  The single-task ``skip_verify`` path is triggered
        by a pre-rebased branch; trains always start from a fresh rebase.
 
-    5. ``cas_failed`` → ``blocked``: ``advance_main`` already retried internally
-       up to ``max_advance_attempts``; the workflow re-parks an incomplete train
-       for retry.  Mapping a residual ``cas_failed`` to ``blocked`` (not
-       re-enqueuing directly) is correct — the orchestrator will re-dispatch on
-       the next scheduler tick.
+    5. A lost CAS (``cas_failed``) is retried against a re-read main, bounded
+       by ``MAX_CAS_RETRIES`` together with item 1's gate retries.  Only
+       exhaustion maps to ``blocked`` + ``train_derailed``, keeping the reason
+       ``'Train merge advance failed: cas_failed'`` beside a ``cas_exhausted``
+       merge_attempt.
 
     6. ``wip_halted`` / ``done_wip_recovery`` / ``wip_recovery_no_advance`` /
        ``unmerged_state`` / ``stash_failed`` → halt-owning L1 escalation for
@@ -6900,7 +6904,9 @@ async def _do_train_merge(
         (which, by stacking, already carries all member commits).
     (d) Workspace verify — ``run_scoped_verification`` with ``is_merge_verify=True``
         enforces the workspace-wide post-merge green gate (scenario 5).
-    (e) CAS advance — ``advance_main`` atomically updates the main ref.
+    (e) CAS advance — :func:`_advance_train`'s bounded loop atomically
+        updates the main ref, re-verifying a tip rebased onto a moved main
+        (item 1) and retrying a lost CAS (item 5).
     (f) Member callbacks — ``req.mark_member_done`` is called for each member
         ONLY after advance + _finalize_advanced_merge succeed (invariant: members
         flip iff main lands AND post-merge gates pass).  On that same
@@ -7119,9 +7125,9 @@ async def _do_train_merge(
         logger.info('Train %s: advance_main returned %r', req.train_id, adv)
         _emit_merge_attempt(event_store, req.task_id, OutcomeKind.advance_failed, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
         if adv == 'cas_failed':
-            # advance_main already retried internally; workflow re-parks the
-            # train.  Return a simple blocked rather than routing through
-            # _map_advance_failure (which does not handle cas_failed).
+            # _advance_train exhausted MAX_CAS_RETRIES.  Return a simple
+            # blocked rather than routing through _map_advance_failure (which
+            # does not handle cas_failed).
             _emit_train_event(
                 event_store, EventType.train_derailed,
                 task_id=req.task_id, train_id=req.train_id,
@@ -9672,8 +9678,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # The most recent request whose merge commit was handed to the verifier
         # and has NOT yet been finalized (verified + CAS-advanced).  Read ONLY by
         # _await_unadvanced_predecessor, which parks a train behind it — see that
-        # method for why a train, unlike a single, cannot survive main moving
-        # under it.  Set at the post-put success site in _merger_loop; never
+        # method for why parking spares the train a re-verify of its rebased
+        # tip.  Set at the post-put success site in _merger_loop; never
         # explicitly cleared, because a finalized request's Future is already
         # done and the wait is then a no-op.
         self._last_merged_request: MergeRequest | None = None
@@ -15115,31 +15121,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Returns True when it actually waited (the caller must then re-read main).
 
-        Why a train needs this and a single does not.  Both CAS-advance main
-        against an ``expected_main`` captured before their verify, and
-        ``git_ops.py::GitOps.advance_main`` does NOT re-derive that value on a
-        CAS loss — its ``max_attempts`` loop only rebases the merge worktree
-        until the merge commit is a descendant; the ``update-ref --stdin``
-        compare-and-swap itself is one-shot and returns ``'cas_failed'``.  For a
-        SINGLE that is recoverable: the call site passes
-        ``reverify_on_rebase=True`` and ``_finalize_inflight``'s CAS loop
-        (``MAX_CAS_RETRIES``) re-merges and re-verifies.  For a TRAIN it is
-        terminal — ``_do_train_merge`` maps ``cas_failed`` straight to
-        ``MergeOutcome('blocked')`` + a ``train_derailed`` event, and every
-        absorbed member is re-driven to a solo merge.  So a train that starts
-        while a predecessor's merge commit is still unadvanced pays a full train
-        verify and then throws it away.
-
-        The window is not narrow: ``_do_train_merge`` reads main after its own
-        rebase and then holds it across the entire train verify, while the
-        predecessor's verify runs concurrently on the verifier coroutine.
-        Whichever finishes first advances main and the other loses the CAS.
+        What the wait buys.  ``_do_train_merge`` reads main after its own
+        rebase and then holds it across the entire train verify, while an
+        unadvanced predecessor's verify runs concurrently on the verifier
+        coroutine.  If the predecessor lands first, main has moved under the
+        train: ``_advance_train`` rebases the train's tip onto it and puts it
+        through ``_reverify_rebased_tree``, which re-runs the full train verify
+        unless the predecessor's delta is trustably disjoint from the train's
+        footprint.  The train still lands, but often only after a second full
+        verify; parked, it starts on the predecessor's main and verifies once.
 
         Waiting costs no pipelining.  ``_do_train_merge`` is awaited INLINE on
         the merger coroutine, so no further merge can start until the train
         finishes either way — the only thing this defers is the train's own
-        start.  Fail-safe: on timeout it logs and proceeds, i.e. degrades to
-        exactly the pre-wait behaviour rather than stalling the merger forever.
+        start.  Fail-safe: on timeout it logs and proceeds, degrading to that
+        re-verify rather than stalling the merger forever.
         """
         pred = self._last_merged_request
         if pred is None or pred.result.done():
@@ -15149,8 +15145,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             or _TRAIN_PREDECESSOR_SETTLE_FALLBACK_SECS
         ) + _TRAIN_PREDECESSOR_SETTLE_SLACK_SECS
         logger.info(
-            'Train %s: parking behind unadvanced predecessor %s — a train '
-            'cannot recover from a lost CAS (timeout=%.0fs)',
+            'Train %s: parking behind unadvanced predecessor %s to spare a '
+            're-verify of its rebased tip (timeout=%.0fs)',
             train_id, pred.task_id, timeout,
         )
         t_wait = self._clock.monotonic()
@@ -15164,7 +15160,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         if not pred.result.done():
             logger.warning(
                 'Train %s: predecessor %s still unfinalized after %.1fs — '
-                'proceeding anyway; the train may lose the CAS and derail',
+                'proceeding anyway; the train may have to re-verify its rebased tip',
                 train_id, pred.task_id, self._clock.monotonic() - t_wait,
             )
         else:
@@ -15662,8 +15658,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # SpeculationController.can_coalesce).  Enforce it HERE, at
                     # the dequeue, where the condition is actually knowable:
                     # park the train until the previous merge commit has been
-                    # CAS-advanced, because a train — unlike a single — has no
-                    # recovery path from a lost CAS.  See
+                    # CAS-advanced, so that main does not move under the train
+                    # verify and cost it a re-verify of its rebased tip.  See
                     # _await_unadvanced_predecessor.
                     if isinstance(req, GroupMergeRequest):
                         if await self._await_unadvanced_predecessor(req.train_id):
