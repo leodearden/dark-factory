@@ -65,8 +65,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _workflow_helpers import (
     AgentStub,
-    FakeBriefing,
-    FakeMcp,
     _build_workflow,
     _init_repo,
 )
@@ -88,12 +86,11 @@ from orchestrator.steward import TaskSteward
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
-# Fixtures — file-local, mirroring test_workflow_e2e.py:147-191. A REAL
-# OrchestratorConfig is required (not _workflow_helpers._make's MagicMock)
-# because the real _invoke calls resolve_route(route_inputs, self.config),
-# and the real _pre_triage_suggestions calls resolve_and_record_route(...,
-# config=self.config, ...) — both do real attribute/membership reads against
-# config.routing.* that a MagicMock can't satisfy.
+# Fixtures — file-local, mirroring test_workflow_e2e.py:147-191. The WORKFLOW
+# half needs a REAL OrchestratorConfig (not _workflow_helpers._make's
+# MagicMock): the real _invoke calls resolve_route(route_inputs, self.config).
+# The steward half takes conftest's make_steward, whose stamped routing.*
+# containers satisfy resolve_and_record_route — see make_steward.__doc__.
 # ---------------------------------------------------------------------------
 
 
@@ -354,26 +351,17 @@ def _make_triage_escalation(
     )
 
 
-def _build_steward_for_triage(
-    config: OrchestratorConfig, worktree: Path, *, task_id: str = '42',
-) -> TaskSteward:
-    """A real TaskSteward against a real on-disk meta-root (pre-initialized
-    so _pre_triage_suggestions's "meta-root missing" diagnostic branch never
-    fires — mirrors production, where TaskWorkflow._setup always creates it
-    first). usage_gate=None (default) takes invoke_with_cap_retry's no-gate
-    fast path — a single invocation, no cap-retry machinery.
+@pytest.fixture
+def triage_steward(make_steward) -> TaskSteward:
+    """conftest's ``make_steward`` steward, its .task-meta root pre-initialised
+    as ``TaskWorkflow._setup`` does in production, so
+    ``_pre_triage_suggestions``'s "meta-root missing" branch never fires.
     """
-    worktree.mkdir(parents=True, exist_ok=True)
-    _artifacts_for(worktree).init(task_id, 'Verdict boundary task', 'exercise triage boundary')
-    return TaskSteward(
-        task_id=task_id,
-        task={'id': task_id, 'title': 'Verdict boundary task', 'description': 'd'},
-        worktree=worktree,
-        config=config,
-        mcp=FakeMcp(),  # type: ignore[arg-type]
-        escalation_queue=MagicMock(),
-        briefing=FakeBriefing(),  # type: ignore[arg-type]
+    steward = make_steward()
+    _artifacts_for(steward.worktree).init(
+        steward.task_id, 'Verdict boundary task', 'exercise triage boundary',
     )
+    return steward
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +749,8 @@ class TestTriageBoundary:
     its REAL invoke seam — monkeypatch ``orchestrator.steward.invoke_agent``
     (NOT ``workflow.invoke_agent``; the steward binds its own module-level
     ``invoke_agent`` symbol, steward.py:33/790-793).
+
+    The steward comes from the ``triage_steward`` fixture.
     """
 
     _SUGGESTIONS = [
@@ -775,15 +765,15 @@ class TestTriageBoundary:
     ]
 
     async def test_written_verdict_produces_modified_pretriaged_escalation(
-        self, config, tmp_path, monkeypatch,
+        self, triage_steward, monkeypatch,
     ):
         """(10) fake writes verdicts/triage.json via submit_triage =>
         _pre_triage_suggestions returns a MODIFIED escalation whose detail
         carries the pre-triaged markdown (accepted/skipped counts, proposed
         task groups) — extract_triage_verdict consumed the real artifact.
         """
-        worktree = tmp_path / 'wt'
-        steward = _build_steward_for_triage(config, worktree)
+        steward = triage_steward
+        worktree = steward.worktree
         escalation = _make_triage_escalation(self._SUGGESTIONS)
         monkeypatch.setattr(
             'orchestrator.steward.invoke_agent',
@@ -811,7 +801,7 @@ class TestTriageBoundary:
         assert '1 accepted, 1 skipped' in result.summary
 
     async def test_absent_verdict_falls_back_to_original_escalation(
-        self, config, tmp_path, monkeypatch,
+        self, triage_steward, monkeypatch,
     ):
         """(11) fake writes NO verdict (cleared slot) => read_verdict absent
         => returns the ORIGINAL escalation unchanged (inline-triage
@@ -820,8 +810,8 @@ class TestTriageBoundary:
         cleared before this spawn (I-FRESH) — proven here because it does
         NOT leak through as a modified escalation.
         """
-        worktree = tmp_path / 'wt'
-        steward = _build_steward_for_triage(config, worktree)
+        steward = triage_steward
+        worktree = steward.worktree
         escalation = _make_triage_escalation(self._SUGGESTIONS)
         _artifacts_for(worktree).write_verdict(
             'triage',
