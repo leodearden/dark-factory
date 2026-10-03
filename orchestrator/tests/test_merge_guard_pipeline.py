@@ -1062,3 +1062,157 @@ class TestPathEquivalence:
             if _item_wt is not None:
                 with contextlib.suppress(Exception):
                     await git_ops.cleanup_merge_worktree(_item_wt)
+
+
+# ---------------------------------------------------------------------------
+# Task 4956: the drop-guard judges the branch the merge commit actually
+# merged, never whatever commit the submitted worktree's HEAD sits on.
+# ---------------------------------------------------------------------------
+
+
+async def _head_sha(cwd: Path) -> str:
+    rc, out, err = await _run(['git', 'rev-parse', 'HEAD'], cwd=cwd)
+    assert rc == 0, err
+    return out.strip()
+
+
+async def _has_object(git_ops: GitOps, spec: str) -> bool:
+    rc, _, _ = await _run(['git', 'cat-file', '-e', spec], cwd=git_ops.project_root)
+    return rc == 0
+
+
+async def _land_on_main(git_ops: GitOps, files: dict[str, str], message: str) -> str:
+    root = git_ops.project_root
+    for rel, content in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(content)
+    await _run(['git', 'add', '--', *files], cwd=root)
+    rc, _, err = await _run(['git', 'commit', '-m', message], cwd=root)
+    assert rc == 0, err
+    return await git_ops.get_main_sha()
+
+
+async def _commit_victim(git_ops: GitOps, name: str) -> tuple[Path, str]:
+    worktree = (await git_ops.create_worktree(name)).path
+    (worktree / 'victim.py').write_text(
+        'def victim_feature(rows):\n    return sorted(set(rows))\n',
+    )
+    await git_ops.commit(worktree, 'Victim: add victim.py')
+    return worktree, await _head_sha(worktree)
+
+
+def _decided_reason(result: MergedOk | Decided) -> str | None:
+    return result.outcome.reason if isinstance(result, Decided) else None
+
+
+@pytest.mark.asyncio
+class TestDropGuardJudgesTheMergedBranch:
+    """The guard's subject is the tip the merge commit merged (task 4956)."""
+
+    async def test_foreign_head_in_submitted_worktree_does_not_supply_drop_targets(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Reify task 6249 / mr-f09b27f5: a speculative merge onto a
+        never-landed base, submitted with a reused worktree whose HEAD sits
+        on main after a sibling landed there.  The sibling's files are on
+        that HEAD and absent from the base, but the branch never owned them,
+        so the merge dropped nothing."""
+        from orchestrator.merge_lane.worker import classify_and_merge
+
+        _victim_wt, victim_tip = await _commit_victim(git_ops, 'victim')
+
+        pred_wt = (await git_ops.create_worktree('pred')).path
+        (pred_wt / 'pred.py').write_text('PREDECESSOR_FLAG = True\n')
+        await git_ops.commit(pred_wt, 'Predecessor: add pred.py')
+        spec_base = await _head_sha(pred_wt)
+
+        sibling_targets = ['sibling_test.py', 'fixtures/sibling.txt']
+        main_sha = await _land_on_main(git_ops, {
+            'sibling_test.py': (
+                'import unittest\n\n\n'
+                'class SiblingTest(unittest.TestCase):\n'
+                '    def test_columns(self):\n'
+                '        self.assertEqual(len([1, 2, 3]), 3)\n'
+            ),
+            'fixtures/sibling.txt': 'jacobian column member fixture\n',
+        }, 'Sibling lands its test and fixture')
+
+        reused = git_ops.worktree_base / '_reused-lane'
+        rc, _, err = await _run(
+            ['git', 'worktree', 'add', '--detach', str(reused), 'main'],
+            cwd=git_ops.project_root,
+        )
+        assert rc == 0, err
+        result: MergedOk | Decided | None = None
+        try:
+            artifacts = TaskArtifacts(reused)
+            artifacts.init('sibling', 'Sibling', 'desc')
+            artifacts.write_plan({'files': sibling_targets, 'modules': [], 'steps': []})
+
+            assert await _has_object(git_ops, f'{await _head_sha(reused)}:sibling_test.py')
+            assert not await _has_object(git_ops, f'{victim_tip}:sibling_test.py')
+            assert not await git_ops.is_ancestor(spec_base, main_sha)
+            assert not await git_ops.is_ancestor(main_sha, spec_base)
+
+            queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+            worker = SpeculativeMergeWorker(
+                git_ops, queue, event_store=_make_event_store(tmp_path),
+            )
+            req = _make_request('victim', 'victim', reused, config)
+            req.snapshot_tip = victim_tip
+
+            result = await classify_and_merge(
+                worker, req, spec_base, speculative=True,
+                started_monotonic=time.monotonic(),
+            )
+
+            assert isinstance(result, MergedOk), _decided_reason(result)
+            merge_commit = result.merge_result.merge_commit
+            assert merge_commit is not None
+            assert await _has_object(git_ops, f'{merge_commit}:victim.py')
+        finally:
+            if isinstance(result, MergedOk) and result.merge_wt:
+                await git_ops.cleanup_merge_worktree(result.merge_wt)
+            await _run(
+                ['git', 'worktree', 'remove', '--force', str(reused)],
+                cwd=git_ops.project_root,
+            )
+
+    async def test_main_side_file_in_merged_tree_is_not_flagged_though_combined_diff_is_silent(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """A file a sibling landed on main is in the merged TREE yet absent
+        from the merge commit's combined diff; the guard compares trees, so
+        the file is not a drop."""
+        from orchestrator.merge_lane.worker import classify_and_merge
+
+        victim_wt, _victim_tip = await _commit_victim(git_ops, 'victim-tree')
+        main_sha = await _land_on_main(
+            git_ops, {'planned.py': 'planned = 1\n'}, 'Sibling lands planned.py',
+        )
+
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(
+            git_ops, queue, event_store=_make_event_store(tmp_path),
+        )
+        req = _make_request('victim-tree', 'victim-tree', victim_wt, config)
+
+        result = await classify_and_merge(
+            worker, req, main_sha, speculative=False,
+            started_monotonic=time.monotonic(),
+        )
+        try:
+            assert isinstance(result, MergedOk), _decided_reason(result)
+            merge_commit = result.merge_result.merge_commit
+            assert merge_commit is not None
+            assert await _has_object(git_ops, f'{merge_commit}:planned.py')
+            rc, combined, err = await _run(
+                ['git', 'diff-tree', '--cc', '--no-commit-id', '--name-only', '-r',
+                 merge_commit],
+                cwd=git_ops.project_root,
+            )
+            assert rc == 0, err
+            assert 'planned.py' not in combined.split()
+        finally:
+            if isinstance(result, MergedOk) and result.merge_wt:
+                await git_ops.cleanup_merge_worktree(result.merge_wt)

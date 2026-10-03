@@ -907,6 +907,29 @@ class TestCheckPlanTargetsInTree:
         )
         assert result.dropped == []
 
+    async def test_drop_guard_fails_open_when_merge_commit_has_no_second_parent(
+        self, git_ops: GitOps, caplog: pytest.LogCaptureFixture,
+    ):
+        """A single-parent commit names no merged tip → WARNING, fail open."""
+        worktree = (await git_ops.create_worktree('no-second-parent')).path
+        (worktree / 'f.py').write_text('f = 1\n')
+        await git_ops.commit(worktree, 'Add f.py')
+        rc, tip_out, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=worktree)
+        assert rc == 0
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+            result = await _check_plan_targets_in_tree(
+                tip_out.strip(), git_ops, await git_ops.get_main_sha(),
+                task_id='no-second-parent',
+            )
+
+        assert result.dropped == []
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any(
+            'second parent' in m and 'failing open' in m and 'no-second-parent' in m
+            for m in warnings
+        ), warnings
+
 
 @pytest.mark.asyncio
 class TestResolveQueuedBranchRef:
