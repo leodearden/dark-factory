@@ -1032,13 +1032,34 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 
 
+# The files a DIRECTORY argument expands to, recursively: test modules, conftest
+# files and ``_*.py`` test-helper modules (task 5269).  Helpers hold mock factories
+# and waits as surely as test modules do.  ``__init__.py`` matches ``_*.py`` and is
+# deliberately included as harmless.  Explicit file arguments bypass this.
+_DISCOVERY_GLOBS: tuple[str, ...] = ('test_*.py', 'conftest.py', '_*.py')
+
+
+def discover_scan_targets(directory: Path) -> list[Path]:
+    """Return every file under *directory* the checker scans, sorted.
+
+    The one home of directory discovery: ``main`` and the baseline-integrity census
+    in fused-memory/tests/test_check_bare_magicmock_config.py both call it, so the
+    gate and its census cannot scan different file sets.
+    """
+    found: set[Path] = set()
+    for pattern in _DISCOVERY_GLOBS:
+        found.update(directory.rglob(pattern))
+    return sorted(found)
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.  Accepts file paths and/or directories.
 
     Runs all three rules — ``bare-magicmock``, ``bare-dataclass-double`` and
     ``wall-clock-deadline`` — in a single AST pass per file.
 
-    For directories, recursively scans for test_*.py and conftest.py files only.
+    For directories, recursively scans test_*.py, conftest.py and _*.py helper
+    modules only (``discover_scan_targets``).
     Prints violations to stdout in 'path:lineno:col: message' format (ruff-style).
 
     Explicit file paths are validated up front; a missing explicit path fails
@@ -1067,7 +1088,7 @@ def main(argv: list[str] | None = None) -> int:
     for path_str in args.paths:
         p = Path(path_str)
         if p.is_dir():
-            files_to_scan.extend(sorted(set(p.rglob('test_*.py')) | set(p.rglob('conftest.py'))))
+            files_to_scan.extend(discover_scan_targets(p))
         else:
             if not p.exists():
                 print(f'error: {p}: No such file or directory', file=sys.stderr)

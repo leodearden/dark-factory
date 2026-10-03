@@ -2263,7 +2263,7 @@ class TestWallClockDeadlineBaselineIntegrity:
             root = _REPO_ROOT / scanned
             if not root.is_dir():
                 continue
-            for path in sorted(set(root.rglob('test_*.py')) | set(root.rglob('conftest.py'))):
+            for path in _checker.discover_scan_targets(root):
                 entry = str(path.relative_to(_REPO_ROOT))
                 if entry in listed:
                     continue
