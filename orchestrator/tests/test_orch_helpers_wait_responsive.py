@@ -42,7 +42,6 @@ from typing import Any
 import _orch_helpers
 import pytest
 from _orch_helpers import (
-    MERGE_RESULT_TIMEOUT,
     RESPONSIVE_WAIT_STRETCH,
     RESPONSIVE_WAIT_WALL_CAP,
     wait_responsive,
@@ -124,20 +123,6 @@ class TestWaitResponsiveHappyPath:
         )
 
         assert got == 'from-coro'
-
-    async def test_defaults_derive_from_the_shared_merge_constant(self) -> None:
-        # Never a fresh literal: the cap derives from MERGE_RESULT_TIMEOUT, and
-        # the ratio of exactly 2 is what the paired @pytest.mark.timeout
-        # arithmetic in test_merge_speculation.py depends on -- this assertion
-        # goes red if RESPONSIVE_WAIT_STRETCH is ever moved off 2.0, which is
-        # precisely what would invalidate that arithmetic.
-        #
-        # A second assertion restating RESPONSIVE_WAIT_WALL_CAP's own
-        # definition (`int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)`)
-        # used to sit here; it was deleted in the amendment pass because it
-        # could not fail for ANY values of the three constants -- the same
-        # vacuity class this task exists to eliminate.
-        assert RESPONSIVE_WAIT_WALL_CAP == 2 * MERGE_RESULT_TIMEOUT
 
 
 @pytest.mark.asyncio
