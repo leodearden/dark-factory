@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import DeliveredChecksConfig, OrchestratorConfig
@@ -39,10 +40,23 @@ def _make(
     task_id: str = '50',
     commit_on_main: bool = True,
     main_sha: str = 'mainsha123',
+    declared_files: tuple[str, ...] = ('helpers/foo.py',),
+    commit_files: tuple[str, ...] = ('helpers/foo.py',),
+    effect_present: bool = True,
 ) -> _Fixture:
+    """A workflow whose architect report will be judged against git stubs.
+
+    ``declared_files`` is the task's ``metadata.files``; ``commit_files`` is
+    what the reported commit's own diff touches; ``effect_present`` is the
+    effect-present guard's answer.  The defaults describe a corroborated
+    claim — the commit touches the one file the task declares.
+    """
     assignment = MagicMock()
     assignment.task_id = task_id
-    assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
+    assignment.task = {
+        'id': task_id, 'title': 'T', 'description': 'd',
+        'metadata': {'files': list(declared_files)},
+    }
     assignment.modules = ['mod_a']
 
     _spec = pydantic_spec(OrchestratorConfig)
@@ -55,6 +69,7 @@ def _make(
     config.steward_completion_timeout = 300.0
     config.claimant_heartbeat_interval_secs = 60.0
     config.project_root = project_root
+    config.git.branch_prefix = 'task/'
 
     set_task_status = AsyncMock()
     scheduler = MagicMock()
@@ -81,6 +96,10 @@ def _make(
     git_ops = MagicMock()
     git_ops.is_ancestor = is_ancestor
     git_ops.get_main_sha = get_main_sha
+    git_ops.get_merge_commit_diff_files = AsyncMock(
+        return_value=(list(commit_files), None),
+    )
+    git_ops.commit_effect_present_in_main = AsyncMock(return_value=effect_present)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -435,9 +454,14 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
 
     # --- row 3: no delivered_checks -> unchanged, but still DELEGATED -----
 
-    async def test_check_less_task_delegates_and_stamps(self, tmp_path: Path):
-        """The overwhelmingly common case — it MUST NOT regress."""
-        f = _arm_already_done_fixture(tmp_path, metadata={})
+    async def test_check_less_task_that_declares_files_delegates_and_stamps(
+        self, tmp_path: Path,
+    ):
+        """The common case — a task declaring files its reported commit
+        touches — MUST NOT regress: it still reaches the guard and stamps."""
+        f = _arm_already_done_fixture(
+            tmp_path, metadata={'files': ['helpers/foo.py']},
+        )
         guard = AsyncMock(return_value=None)
 
         with patch(_AD_GATE_TARGET, guard):
@@ -448,6 +472,22 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
         guard.assert_awaited_once()
         assert guard.await_args is not None
         assert guard.await_args.args[1] == f.wf.task['metadata']
+
+    async def test_check_less_file_less_task_never_reaches_the_guard(
+        self, tmp_path: Path,
+    ):
+        """Nothing declared means nothing to corroborate the claim with — it
+        is refused before the capability half runs (task 4704)."""
+        f = _arm_already_done_fixture(tmp_path, metadata={})
+        f.wf.config.unblock_auto.enabled = False
+        guard = AsyncMock(return_value=None)
+
+        with patch(_AD_GATE_TARGET, guard):
+            outcome = await f.wf._handle_already_done_report()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        guard.assert_not_awaited()
+        cast(AsyncMock, f.wf.scheduler.mark_done).assert_not_awaited()
 
     # --- rows 4 & 5: fail-safe blocks also produce a VISIBLE blocked task --
 
@@ -552,3 +592,130 @@ class TestHandleAlreadyDoneReportDeliveredChecksGuard:
         assert kwargs['project_root'] != str(f.wf.worktree)
         assert kwargs['check_timeout_secs'] == 7.5
         assert guard.await_args.args[0] == f.wf.task_id
+
+
+# ---------------------------------------------------------------------------
+# TestHandleAlreadyDoneReportAttribution (task 4704)
+#
+# Reachability proves the cited commit EXISTS on main; it never proved the
+# commit is THIS task's work.  The report is now corroborated against the
+# task's own declared metadata.files / delivered_checks
+# (validate_reported_landing).  An uncorroborated report is held BLOCKED
+# behind exactly one provenance_unattributed L1 instead of being stamped.
+# Every test runs the REAL _mark_blocked against a real EscalationQueue, so a
+# hold is observed as the escalation and status it actually produces.
+# ---------------------------------------------------------------------------
+
+
+def _arm_queue(f: _Fixture, tmp_path: Path) -> EscalationQueue:
+    """A real escalation queue, and no fire-and-forget dry-run investigation."""
+    f.wf.escalation_queue = EscalationQueue(tmp_path / 'escalations')
+    f.wf.config.unblock_auto.enabled = False
+    return f.wf.escalation_queue
+
+
+def _status_writes(f: _Fixture) -> list[tuple[str, str]]:
+    return [
+        (c.args[0], c.args[1]) for c in f.set_task_status.await_args_list
+        if len(c.args) >= 2
+    ]
+
+
+@pytest.mark.asyncio
+class TestHandleAlreadyDoneReportAttribution:
+
+    def _report(self, f: _Fixture) -> None:
+        f.artifacts.write_already_done(
+            commit=_AD_COMMIT, evidence='helpers.foo on main at task 42',
+        )
+
+    def _assert_held_behind_one_provenance_l1(
+        self, f: _Fixture, queue: EscalationQueue, outcome: WorkflowOutcome,
+    ):
+        assert outcome == WorkflowOutcome.BLOCKED
+        cast(AsyncMock, f.wf.scheduler.mark_done).assert_not_awaited()
+        assert ('50', 'done') not in _status_writes(f)
+        assert ('50', 'blocked') in _status_writes(f)
+        everything = queue.get_by_task('50')
+        assert len(everything) == 1, [(e.level, e.category) for e in everything]
+        (esc,) = queue.get_by_task('50', status='pending')
+        assert esc.level == 1
+        assert esc.category == 'provenance_unattributed'
+        assert esc.citation_sha == _AD_COMMIT
+        assert esc.agent_role == 'orchestrator-workflow'
+        assert esc.filing_claimant_run_id == f.wf._filing_claimant_run_id
+        return esc
+
+    async def test_nothing_declared_holds_instead_of_stamping(self, tmp_path: Path):
+        """THE RED: a task declaring neither files nor checks used to be
+        stamped done on the architect's word alone."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.task['metadata'] = {'files': [], 'delivered_checks': []}
+        queue = _arm_queue(f, tmp_path)
+        self._report(f)
+
+        outcome = await f.wf._handle_already_done_report()
+
+        esc = self._assert_held_behind_one_provenance_l1(f, queue, outcome)
+        assert 'no_attribution' in esc.summary
+        assert f.artifacts.read_already_done() is None
+
+    async def test_declared_files_the_commit_never_touched_hold(self, tmp_path: Path):
+        f = _make(
+            worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+            commit_files=('other/bar.py',),
+        )
+        queue = _arm_queue(f, tmp_path)
+        self._report(f)
+
+        outcome = await f.wf._handle_already_done_report()
+
+        esc = self._assert_held_behind_one_provenance_l1(f, queue, outcome)
+        assert 'no_attribution' in esc.summary
+
+    async def test_declared_files_in_the_commits_diff_stamp_done(self, tmp_path: Path):
+        """POSITIVE CONTROL: the commit's own diff carries the declared file."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        queue = _arm_queue(f, tmp_path)
+        self._report(f)
+
+        outcome = await f.wf._handle_already_done_report()
+
+        assert outcome == WorkflowOutcome.DONE
+        mark_done = cast(AsyncMock, f.wf.scheduler.mark_done)
+        mark_done.assert_awaited_once()
+        assert mark_done.await_args is not None
+        kwargs = mark_done.await_args.kwargs
+        assert kwargs['kind'] == 'found_on_main'
+        assert kwargs['sha'] == _AD_COMMIT
+        assert kwargs['note'].startswith('architect-reported task already on main')
+        assert queue.get_by_task('50') == []
+
+    async def test_no_queue_still_holds_and_never_stamps(self, tmp_path: Path):
+        """Nothing to file into: the existing non-escalating block still runs,
+        so the task is held visibly rather than stamped or dropped."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.task['metadata'] = {}
+        f.wf.escalation_queue = None
+        f.wf.config.unblock_auto.enabled = False
+        self._report(f)
+
+        outcome = await f.wf._handle_already_done_report()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        cast(AsyncMock, f.wf.scheduler.mark_done).assert_not_awaited()
+        assert ('50', 'done') not in _status_writes(f)
+        assert ('50', 'blocked') in _status_writes(f)
+
+    async def test_attributed_claim_whose_effect_is_gone_holds(self, tmp_path: Path):
+        f = _make(
+            worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
+            effect_present=False,
+        )
+        queue = _arm_queue(f, tmp_path)
+        self._report(f)
+
+        outcome = await f.wf._handle_already_done_report()
+
+        esc = self._assert_held_behind_one_provenance_l1(f, queue, outcome)
+        assert 'effect_absent' in esc.summary
