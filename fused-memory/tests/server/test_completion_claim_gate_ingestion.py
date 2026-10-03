@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from fused_memory.middleware.task_interceptor import TicketStoreNotConfiguredError
 from fused_memory.server.tools import create_mcp_server
 
 # An applied-work completion claim naming task 5422 — the esc-5603-1 shape.
@@ -608,12 +609,21 @@ class TestUnresolvableAuthoritiesTag:
 
     @pytest.mark.asyncio
     async def test_ticket_store_unconfigured_tags(self):
-        """The real get_ticket_row returns None (never raises) when no ticket
-        store is configured. The tools layer cannot tell that from "no such
-        ticket" — both are non-verified, so both tag.
+        """get_ticket_row raises TicketStoreNotConfiguredError when no ticket
+        store is configured, so a missing store reads as UNVERIFIABLE and is
+        never reported as a ticket that does not exist.
         """
         mock_service = _episode_service()
-        server = _server(mock_service, statuses={})
+        task_interceptor = MagicMock()
+        task_interceptor.get_statuses = AsyncMock(return_value={})
+        task_interceptor.get_ticket_row = AsyncMock(
+            side_effect=TicketStoreNotConfiguredError('no store'),
+        )
+        server = create_mcp_server(
+            mock_service,
+            task_interceptor=task_interceptor,
+            known_projects=_KNOWN_PROJECTS,
+        )
 
         result = await server._tool_manager.call_tool(
             'add_episode',
@@ -624,7 +634,13 @@ class TestUnresolvableAuthoritiesTag:
             },
         )
 
-        _assert_tagged(result, mock_service, ref=_TICKET_ID)
+        entry = _assert_tagged(result, mock_service, ref=_TICKET_ID)
+        assert entry.get('status') == 'unverifiable', (
+            f'An unconfigured registry is unchecked, not contradicted; got: {entry!r}'
+        )
+        assert 'exists in the registry' not in entry.get('observed', ''), (
+            f'The flag must not accuse the writer of a fabricated ticket; got: {entry!r}'
+        )
 
     @pytest.mark.asyncio
     async def test_unresolvable_commit_probe_tags(self, tmp_path):
