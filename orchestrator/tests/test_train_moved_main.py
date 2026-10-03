@@ -84,6 +84,10 @@ def _main_sha(repo: Path) -> str:
     return _git(repo, 'rev-parse', 'main')
 
 
+def _parents(repo: Path, rev: str) -> list[str]:
+    return _git(repo, 'rev-list', '--parents', '-n', '1', rev).split()[1:]
+
+
 def _files_at(repo: Path, rev: str) -> set[str]:
     return set(_git(repo, 'ls-tree', '-r', '--name-only', rev).splitlines())
 
@@ -281,8 +285,8 @@ async def test_unmoved_main_verifies_once_and_lands_the_merge_commit(tmp_path: P
     assert len(verify.calls) == 1
     assert advance.await_count == 1
     landed = _main_sha(scene.repo)
-    parents = _git(scene.repo, 'rev-list', '--parents', '-n', '1', landed).split()
-    assert parents[1:2] == [pre_train_main] and len(parents) == 3, parents
+    parents = _parents(scene.repo, landed)
+    assert len(parents) == 2 and parents[0] == pre_train_main, parents
     assert train.mark_member_done.await_args_list == _every_member_flipped(landed)
     assert not _attempts(store, 'gate_retry', train.request.train_id)
     assert not _attempts(store, 'cas_retry', train.request.train_id)
@@ -316,6 +320,39 @@ async def test_direct_commit_during_verify_reverifies_the_rebased_tip_and_lands(
     outbox = LandedOutbox(scene.repo / 'data' / 'orchestrator' / 'landed_outbox.json')
     row = outbox.lookup(_TIP)
     assert row is not None and row.advanced_sha == landed
+
+
+# ─── (F) main moves between the train reading it and building its merge ─────
+
+
+async def test_main_moving_before_the_merge_commit_retries_the_cas_without_reverifying(
+    tmp_path: Path,
+) -> None:
+    scene = await _stacked_train_scene(tmp_path)
+    train = _train(scene)
+    verify = _VerifyDouble(scene.repo)
+    store = _RecordingEventStore()
+    drifts: list[str] = []
+    real_merge_to_main = scene.git_ops.merge_to_main
+
+    async def merge_after_a_drift(*args: Any, **kwargs: Any) -> Any:
+        drifts.append(_disjoint_drift(scene.repo))
+        return await real_merge_to_main(*args, **kwargs)
+
+    with patch.object(scene.git_ops, 'merge_to_main', new=merge_after_a_drift):
+        outcome = await _run_train(scene, train, verify, store)
+
+    assert outcome.status == 'done', outcome
+    assert len(verify.calls) == 1
+    [drift] = drifts
+    landed = _main_sha(scene.repo)
+    parents = _parents(scene.repo, landed)
+    assert len(parents) == 2 and parents[0] == drift, parents
+    assert {'unrelated.txt', 'a.txt', 'b.txt', 'c.txt'} <= _files_at(scene.repo, 'main')
+    assert len(_attempts(store, 'cas_retry', train.request.train_id)) == 1
+    assert not _attempts(store, 'gate_retry', train.request.train_id)
+    assert not _events(store, 'train_derailed')
+    assert train.mark_member_done.await_args_list == _every_member_flipped(landed)
 
 
 # ─── (C/D/E) the _disjoint_skip_blockers matrix, for a train ────────────────
