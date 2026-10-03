@@ -491,15 +491,16 @@ class _WideningReplanStub(AgentStub):
 
     def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
         if self._blocked or role != 'reviewer_comprehensive':
-            return super()._reviewer(role, output_schema)
-        self._blocked = True
-        review = _make_review(role, 'ISSUES_FOUND', [{
-            'severity': 'blocking',
-            'location': 'lib.py:5',
-            'category': 'missing_edge_case',
-            'description': 'No test for empty name',
-            'suggested_fix': 'Add test_farewell_empty',
-        }])
+            review = _make_review(role)
+        else:
+            self._blocked = True
+            review = _make_review(role, 'ISSUES_FOUND', [{
+                'severity': 'blocking',
+                'location': 'lib.py:5',
+                'category': 'missing_edge_case',
+                'description': 'No test for empty name',
+                'suggested_fix': 'Add test_farewell_empty',
+            }])
         return AgentResult(
             success=True, output=json.dumps(review),
             structured_output=review, cost_usd=0.10,
@@ -507,17 +508,19 @@ class _WideningReplanStub(AgentStub):
 
     async def _architect(self, cwd: Path) -> AgentResult:
         plan_path = TaskArtifacts(cwd).root / 'plan.json'
-        if not plan_path.exists():
-            return await super()._architect(cwd)
-        plan = json.loads(plan_path.read_text())
-        plan['files'] = [*plan['files'], 'locked_module.py']
-        plan['steps'].append({
-            'id': 'step-3', 'type': 'test',
-            'description': 'Add test for empty name',
-            'status': 'pending', 'commit': None,
-        })
+        if plan_path.exists():
+            plan = json.loads(plan_path.read_text())
+            plan['files'] = [*plan['files'], 'locked_module.py']
+            plan['steps'].append({
+                'id': 'step-3', 'type': 'test',
+                'description': 'Add test for empty name',
+                'status': 'pending', 'commit': None,
+            })
+        else:
+            plan = {**PLAN, '_schema_version': 1}
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan_path.write_text(json.dumps(plan, indent=2) + '\n')
-        return AgentResult(success=True, output='Plan updated', cost_usd=0.40)
+        return AgentResult(success=True, output='Plan written', cost_usd=0.50)
 
 
 def _drive_plan_into_lock_conflict(
