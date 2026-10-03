@@ -20,6 +20,13 @@ const {
   unknownDatum: unknownDatumPlaceholder,
 } = window.DF_DATUM;
 
+// The surface -> endpoint maps that decide what is polled (pollSetFor). Module
+// scope, no fallback, RENAMED, for the same reason as the destructure above.
+const {
+  TAB_ENDPOINTS: POLL_TAB_ENDPOINTS,
+  CHROME_ENDPOINTS: POLL_CHROME_ENDPOINTS,
+} = window.DF_ENDPOINT_STALENESS;
+
 // How the wire delivers a key: 'plain' is a bare value, 'datum' is the
 // five-key envelope data/datum.py::Datum.to_wire() emits. Two shared frozen
 // objects rather than a fresh literal per row — a spec is a declaration, not
@@ -69,6 +76,15 @@ function endpointsFor(win) {
     '/api/v2/dashboard/memory-evals':                 { 'MEMORY_EVALS': PLAIN },
   };
 }
+
+// The ONE narrowed poll url: path -> the url polled when only the chrome needs
+// that endpoint. The chrome reads only TASKS_SNAPSHOT's census, which
+// ?projection=census serves with each rows half withheld as an UNKNOWN Datum
+// (api/tasks.py::api_tasks), so a tab that renders no task rows never pays for
+// the full multi-MB render.
+const NARROWED_POLL_URLS = Object.freeze({
+  '/api/v2/dashboard/tasks': '/api/v2/dashboard/tasks?projection=census',
+});
 
 // Keys fetched on a USER ACTION rather than by the poll loop, each parameterised
 // by the one value its caller already holds. Two declared rows today:
@@ -690,6 +706,43 @@ async function refreshOne(url, keySpecs, state, deps, stateKey = pollKey(url)) {
 // so chip changes take effect on the next tick without restarting the loop.
 let currentWin = '24h';
 
+// Module-scope tab — announced by app.jsx through scopePollingToTab(tab).
+//
+// THE POLL SET IS CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[tab] (pollSetFor): the open
+// tab's own endpoints in full, plus the always-on chrome, with /tasks narrowed
+// to ?projection=census whenever the tab itself does not list it.
+//
+// UNTIL A TAB IS NAMED, OR FOR A TAB ID WITH NO TAB_ENDPOINTS ENTRY, EVERY
+// ENDPOINT IS POLLED. The script-load first poll runs before the text/babel
+// App mounts, so no tab is known then; polling everything populates every key
+// once, and a missed announcement costs extra load rather than a frozen tab.
+//
+// SCOPED-OUT ENDPOINTS ARE LAST-GOOD-BUT-UNWATCHED: their DF_DATA values,
+// __loaded, __receipt and __stale stay exactly as last written, so
+// datum.js::plainDatum ages keep growing and nothing claims to be fresh when
+// the tab is reopened.
+//
+// FLOW CONTROL STAYS KEYED BY pollKey, so both /tasks forms share one
+// in-flight/backoff/__stale/__receipt entry. A census request already in
+// flight when a rows tab opens therefore makes that tab's full fetch
+// skippedInFlight, and its rows arrive at most one tick later; the withheld
+// rows Datum's own reason covers the gap.
+let currentTab = null;
+
+// The {url: keySpecs} map one poll cycle fetches for `tab` at window `win`.
+function pollSetFor(tab, win) {
+  const all = endpointsFor(win);
+  const tabPaths = POLL_TAB_ENDPOINTS[tab];
+  if (!Array.isArray(tabPaths)) return all;
+  const set = {};
+  for (const [url, keySpecs] of Object.entries(all)) {
+    const path = pollKey(url);
+    if (tabPaths.includes(path)) set[url] = keySpecs;
+    else if (POLL_CHROME_ENDPOINTS.includes(path)) set[NARROWED_POLL_URLS[path] || url] = keySpecs;
+  }
+  return set;
+}
+
 // Real (browser) deps; opts.deps overrides individual entries (tests inject
 // a controllable clock/RNG/fetch instead of these).
 //
@@ -721,22 +774,67 @@ const DEFAULT_POLL_DEPS = {
 // and a controllable clock/RNG/fetch; production callers fall back to the
 // shared DF_POLL_STATE singleton and the real fetch/timers.
 //
+// Polls pollSetFor(currentTab, currentWin) — every endpoint until app.jsx
+// names a tab; see currentTab.
+//
 // A chip change (explicit non-empty `win`, app.jsx:71) bypasses backoff ONLY
-// for the 4 windowed endpoints whose URL actually changes on that chip click
-// — the other 9 endpoints have no bearing on the chip and must keep
-// respecting whatever backoff the TIMER path already accumulated for them,
-// otherwise a chip click during an outage would re-hammer every endpoint,
-// recreating exactly the load this task removes. The same bypass skips
-// slowness pacing, which shares nextAllowedAt (see recordSuccess). A forced
-// attempt that still fails does not touch failures/nextAllowedAt (see
-// recordFailure), so repeated chip clicks cannot escalate the timer path's
-// own backoff schedule. The in-flight check in refreshOne is unconditional
-// regardless of ignoreBackoff, so a chip change still cannot stack a second
-// concurrent request for an endpoint that's already running.
+// for the windowed endpoints whose URL actually changes on that chip click —
+// every other endpoint has no bearing on the chip and must keep respecting
+// whatever backoff the TIMER path already accumulated for it, otherwise a chip
+// click during an outage would re-hammer every endpoint, recreating exactly
+// the load this task removes. The same bypass skips slowness pacing, which
+// shares nextAllowedAt (see recordSuccess). A forced attempt that still fails
+// does not touch failures/nextAllowedAt (see recordFailure), so repeated chip
+// clicks cannot escalate the timer path's own backoff schedule. The in-flight
+// check in refreshOne is unconditional regardless of ignoreBackoff, so a chip
+// change still cannot stack a second concurrent request for an endpoint
+// that's already running.
 async function refreshDFData(win, opts) {
-  const o = opts || {};
   const isChipChange = typeof win === 'string' && win;
   if (isChipChange) currentWin = win;
+  await refreshPollSet(
+    pollSetFor(currentTab, currentWin),
+    opts,
+    url => !!(isChipChange && url.includes('?window=')),
+  );
+}
+
+// Announce the open tab, and fetch at once whatever it needs that the previous
+// tab's poll set did not fetch — so a tab switch never waits a whole interval.
+//
+// NEWLY NEEDED means a pollKey the old set did not fetch at all, or fetched
+// only narrowed while the new set needs it in full. A full -> narrowed
+// downgrade fetches nothing: the full payload already holds the census, and
+// the next tick polls the narrowed form. Backoff and the in-flight guard are
+// honoured, so tab clicks during an outage cannot re-hammer a failing
+// endpoint. It does not check __DF_PAUSE: a user action fetches even while
+// paused, as a chip change does, and only pollTick is paused.
+//
+// An unchanged tab fetches and dispatches nothing.
+async function scopePollingToTab(tab, opts) {
+  if (tab === currentTab) return;
+  const before = pollSetFor(currentTab, currentWin);
+  currentTab = tab;
+  const after = pollSetFor(currentTab, currentWin);
+  const needed = Object.fromEntries(
+    Object.entries(after).filter(([url]) => isNewlyNeeded(url, before)),
+  );
+  await refreshPollSet(needed, opts, () => false);
+}
+
+function isNewlyNeeded(url, before) {
+  const path = pollKey(url);
+  const previous = Object.keys(before).find(prior => pollKey(prior) === path);
+  if (previous === undefined) return true;
+  return previous === NARROWED_POLL_URLS[path] && url !== previous;
+}
+
+// The ONE per-url fetch loop behind every poll-set refresh, so the poll deps
+// (including pollIntervalMs, which arms slowness pacing) and the per-endpoint
+// flow control have one copy. `ignoreBackoffFor(url)` says which urls a user
+// action may force past their backoff. Dispatches df-data-refresh once.
+async function refreshPollSet(pollSet, opts, ignoreBackoffFor) {
+  const o = opts || {};
   const state = o.state || DF_POLL_STATE;
   const baseDeps = {
     ...DEFAULT_POLL_DEPS,
@@ -744,10 +842,9 @@ async function refreshDFData(win, opts) {
     jitterMaxMs: o.jitterMaxMs ?? JITTER_MAX_MS,
     pollIntervalMs: POLL_INTERVAL_MS,
   };
-  await Promise.all(Object.entries(endpointsFor(currentWin)).map(([url, keySpecs]) => {
-    const ignoreBackoff = !!(isChipChange && url.includes('?window='));
-    return refreshOne(url, keySpecs, state, { ...baseDeps, ignoreBackoff });
-  }));
+  await Promise.all(Object.entries(pollSet).map(([url, keySpecs]) => (
+    refreshOne(url, keySpecs, state, { ...baseDeps, ignoreBackoff: ignoreBackoffFor(url) })
+  )));
   window.dispatchEvent(new CustomEvent('df-data-refresh'));
 }
 
@@ -925,6 +1022,8 @@ const DF_DATA_LOADER_API = {
   ON_DEMAND_VIEWS,
   onDemandView,
   onDemandDatum,
+  pollSetFor,
+  scopePollingToTab,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
