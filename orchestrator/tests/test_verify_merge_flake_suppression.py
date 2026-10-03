@@ -291,14 +291,14 @@ class TestWithPytestTimeoutStr:
 
 # --- Node-id fixtures for the confirm gate ------------------------------------
 
-# B1: a real FAILED node-id plus an xdist `node down`-preceding node-id, both
-# owned by orchestrator/tests/test_x.py so they group into one isolated re-run.
+# B1: two FAILED node-ids from a session that ran to completion, both owned by
+# orchestrator/tests/test_x.py so they group into one isolated re-run.
 _B1_FAILED_ID = 'orchestrator/tests/test_x.py::test_y'
-_B1_CRASH_ID = 'orchestrator/tests/test_x.py::test_z'
+_B1_SECOND_FAILED_ID = 'orchestrator/tests/test_x.py::test_z'
 _B1_TEST_OUTPUT = (
     f'FAILED {_B1_FAILED_ID}\n'
-    f'{_B1_CRASH_ID}\n'
-    '[gw3] node down: Not properly terminated\n'
+    f'FAILED {_B1_SECOND_FAILED_ID}\n'
+    '2 failed, 21081 passed in 1500.00s\n'
 )
 
 # B3: a bare whole-file collection ERROR (no ::nodeid) — _extract_failing_test_ids
@@ -348,10 +348,10 @@ class TestConfirmMergeVerifyFlakeSuppressible:
     # -- B1: suppress a confirmed flake -----------------------------------
 
     def test_b1_suppresses_when_isolated_rerun_passes(self, tmp_path: Path) -> None:
-        """FAILED + node-down node-ids both pass on isolated re-run -> a
-        `passes_in_isolation` observation naming the extracted node-ids, and the
-        isolated ModuleConfig carries the serial + generous-timeout recovery
-        command with null lint/type."""
+        """Two FAILED node-ids from a completed session both pass on isolated
+        re-run -> a `passes_in_isolation` observation naming the extracted
+        node-ids, and the isolated ModuleConfig carries the serial +
+        generous-timeout recovery command with null lint/type."""
         from orchestrator import verify as verify_module
         from orchestrator.flake_ledger import FlakeVerdict
 
@@ -367,7 +367,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
             result = self._run(config, failing, tmp_path, [_orch_module_config()])
 
         assert result.verdict is FlakeVerdict.passes_in_isolation, result
-        assert list(result.test_ids) == [_B1_FAILED_ID, _B1_CRASH_ID], result
+        assert list(result.test_ids) == [_B1_FAILED_ID, _B1_SECOND_FAILED_ID], result
         assert result.unconfirmable_reason is None, result
 
         rv.assert_awaited()
@@ -550,7 +550,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         config = _make_config(tmp_path)
         mc = _orch_module_config()
 
-        spy = MagicMock(return_value={'orchestrator': [_B1_FAILED_ID, _B1_CRASH_ID]})
+        spy = MagicMock(return_value={'orchestrator': [_B1_FAILED_ID, _B1_SECOND_FAILED_ID]})
         rv = AsyncMock(return_value=_result(True))
         with (
             patch.object(verify_module, '_group_node_ids_by_subproject', spy),
@@ -565,7 +565,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         call = spy.call_args
         assert call.args[0] == tmp_path, call.args[0]
         assert call.args[1] == {'orchestrator': mc}, call.args[1]
-        assert call.args[2] == [_B1_FAILED_ID, _B1_CRASH_ID], call.args[2]
+        assert call.args[2] == [_B1_FAILED_ID, _B1_SECOND_FAILED_ID], call.args[2]
         assert call.kwargs['log_label'] == 'confirm_merge_verify_flake_suppressible', (
             call.kwargs
         )
@@ -573,7 +573,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         from orchestrator.flake_ledger import FlakeVerdict
 
         assert result.verdict is FlakeVerdict.passes_in_isolation, result
-        assert list(result.test_ids) == [_B1_FAILED_ID, _B1_CRASH_ID], result
+        assert list(result.test_ids) == [_B1_FAILED_ID, _B1_SECOND_FAILED_ID], result
 
     def test_helper_returning_none_fails_closed_without_rerunning(
         self, tmp_path: Path

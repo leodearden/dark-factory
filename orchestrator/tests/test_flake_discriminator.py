@@ -105,16 +105,18 @@ def _fmt_log(call) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Shared fixtures: two node-ids owned by one subproject file, so they group
-# into ONE isolated re-run (mirrors test_verify_merge_flake_suppression's B1).
+# Shared fixtures: two FAILED node-ids owned by one subproject file, so they
+# group into ONE isolated re-run (mirrors test_verify_merge_flake_suppression's
+# B1), from a session that ran to completion. A worker-death output is refused
+# before any re-run (task 5492); that is TestTruncatedSessionIsUnconfirmable's.
 # ---------------------------------------------------------------------------
 
 FAILED_ID = 'orchestrator/tests/test_x.py::test_y'
-CRASH_ID = 'orchestrator/tests/test_x.py::test_z'
+SECOND_FAILED_ID = 'orchestrator/tests/test_x.py::test_z'
 TEST_OUTPUT = (
     f'FAILED {FAILED_ID}\n'
-    f'{CRASH_ID}\n'
-    '[gw3] node down: Not properly terminated\n'
+    f'FAILED {SECOND_FAILED_ID}\n'
+    '2 failed, 21081 passed in 1500.00s\n'
 )
 
 #: A test_output with no recoverable pytest node-id (a lint-shaped failure).
@@ -456,7 +458,7 @@ class TestConfirmIsolatedRerunVerdictMergeGate:
         assert s.verdict is FlakeVerdict.passes_in_isolation, s.verdict
         # RAW extracted node-ids in extraction order — never the
         # prefix-qualified group ids the re-run command is built from.
-        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.test_ids == (FAILED_ID, SECOND_FAILED_ID), s.test_ids
         assert s.call_site == FlakeCallSite.merge_gate, s.call_site
         assert s.unconfirmable_reason is None, s.unconfirmable_reason
         assert s.runner == 'local', s.runner
@@ -645,7 +647,7 @@ class TestConfirmIsolatedRerunVerdictTotality:
 
         assert s is not None, s
         assert s.verdict is FlakeVerdict.unconfirmable, s.verdict
-        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.test_ids == (FAILED_ID, SECOND_FAILED_ID), s.test_ids
         assert s.unconfirmable_reason == 'node_ids_unmapped_to_subproject', (
             s.unconfirmable_reason
         )
@@ -725,7 +727,7 @@ class TestConfirmIsolatedRerunVerdictTotality:
             )
 
         assert s.verdict is FlakeVerdict.fails_in_isolation, s.verdict
-        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.test_ids == (FAILED_ID, SECOND_FAILED_ID), s.test_ids
         assert s.unconfirmable_reason is None, s.unconfirmable_reason
 
     def test_infra_sentinel_rerun_is_unconfirmable_naming_the_category(
@@ -755,7 +757,7 @@ class TestConfirmIsolatedRerunVerdictTotality:
             s.unconfirmable_reason
         )
         assert _INFRA_CATEGORY in s.unconfirmable_reason, s.unconfirmable_reason
-        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.test_ids == (FAILED_ID, SECOND_FAILED_ID), s.test_ids
 
     def test_unconfirmable_is_never_conflated_with_not_a_flake(
         self, tmp_path: Path,
@@ -1039,7 +1041,7 @@ class TestConfirmIsolatedRerunVerdictMainProbe:
             )
 
         assert s.verdict is FlakeVerdict.passes_in_isolation, s.verdict
-        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.test_ids == (FAILED_ID, SECOND_FAILED_ID), s.test_ids
         assert s.call_site == FlakeCallSite.main_probe, s.call_site
 
     def test_uses_the_bounded_two_attempt_engine(self, tmp_path: Path) -> None:
@@ -1409,7 +1411,7 @@ class TestRerunCommandRejectedIsUnconfirmable:
         ), s.unconfirmable_reason
         # §8 permits empty test_ids only when NOTHING was examined; these
         # node-ids were examined, the re-run of them just never started.
-        assert s.test_ids == (FAILED_ID, CRASH_ID), s.test_ids
+        assert s.test_ids == (FAILED_ID, SECOND_FAILED_ID), s.test_ids
 
     def test_main_probe_names_the_same_reason(self, tmp_path: Path) -> None:
         """INV-5: both gates share the ONE discriminator, so neither may
