@@ -16,9 +16,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import FakeVerifier, lane_scene_config
 from _orch_helpers import make_placeholder_future, pydantic_spec
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import AdvanceOutcome, MergeResult
 from orchestrator.landed_outbox import LandedOutbox
 from orchestrator.merge_queue import (
@@ -397,6 +398,32 @@ class TestReverifyMemberSoloContract:
         assert result.solo_branch is None, (
             f'Expected solo_branch=None on fail path, got {result.solo_branch!r}'
         )
+
+    async def test_injected_verifier_runs_the_solo_verify(self, tmp_path: Path) -> None:
+        """The verifier passed to reverify_member_solo is the one that verifies the solo tip."""
+        from orchestrator.merge_queue import reverify_member_solo
+
+        verifier = FakeVerifier()
+        git_ops = _make_git_ops_mock()
+        git_ops.delete_solo_branch = AsyncMock()
+        config = lane_scene_config(tmp_path, GitConfig())
+
+        result = await reverify_member_solo(
+            git_ops=git_ops,
+            member_id='b2',
+            solo_wt=tmp_path,
+            solo_branch='_solo-b2',
+            tip_sha='cafe1234solo',
+            config=config,
+            task_files=None,
+            module_configs=[],
+            verifier=verifier,
+        )
+
+        assert result.passed is True
+        assert result.merge_sha == 'cafe1234solo'
+        assert verifier.entered_count == 1
+        git_ops.advance_main.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
