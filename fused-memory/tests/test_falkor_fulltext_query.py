@@ -505,10 +505,10 @@ class TestEmptyTermListShortCircuits:
         survived somewhere the short-circuit no longer runs.
 
         No connection is opened.  ``provider`` and ``search_interface`` are class
-        attributes (measured: ``GraphProvider.FALKORDB`` and ``None``), so
+        attributes (``GraphProvider.FALKORDB`` and ``FalkorEdgeSearch``, which
+        delegates ``node_fulltext_search`` to graphiti's built-in branch), so
         ``object.__new__`` is enough for ``fulltext_query()`` to route through our
-        hardened ``build_fulltext_query`` and for the non-``search_interface``
-        branch to execute.
+        hardened ``build_fulltext_query`` and for the built-in branch to execute.
         """
         driver, issued = self._recording_driver()
 
