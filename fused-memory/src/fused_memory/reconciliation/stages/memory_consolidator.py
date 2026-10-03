@@ -7,7 +7,7 @@ import json
 import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -74,7 +74,7 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
 )
-from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY,
     PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
@@ -120,16 +120,6 @@ logger = logging.getLogger(__name__)
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
-
-
-class RequiredSection(NamedTuple):
-    """One payload section every Stage-1 payload builder must emit (task 4708).
-
-    See :attr:`MemoryConsolidator.REQUIRED_SECTIONS` for the inclusion criterion.
-    """
-
-    header: str  # exact markdown header the shipped Stage-1 prompt names
-    renderer: str  # name of the MemoryConsolidator method that renders it
 
 
 async def write_stage1_cycle_summary(

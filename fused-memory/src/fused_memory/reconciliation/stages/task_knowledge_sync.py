@@ -63,7 +63,7 @@ from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_promp
 from fused_memory.reconciliation.recon_pool_map import (
     STAGE2_CYCLE_SUMMARY_RECON_POOL as _STAGE2_CYCLE_SUMMARY_RECON_POOL,
 )
-from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_GROWTH,
     STATE_ACTIVE,
@@ -3532,6 +3532,25 @@ async def _write_escalation_markers(
 class TaskKnowledgeSync(BaseStage):
     """Stage 2: Reconcile tasks against memory, attach hints, fix inconsistencies."""
 
+    # ── Inference-bearing payload sections (task 5113) ──────────────────────
+    # INCLUSION CRITERION — a section belongs here iff prompts/stage2.py tells
+    # the model to draw an inference from that section's ABSENCE ("If
+    # `### Live-Workflow Signals` is absent from the payload, no task is live
+    # this cycle …"). Every payload builder renders these via
+    # _render_required_sections(). Enforced by
+    # tests/reconciliation/test_stage2_payload_section_parity.py, whose module
+    # docstring holds the full section census.
+    #
+    # Deliberately NOT registered:
+    #   * Known Projects — per-project membership; no absence-inference.
+    #   * Stale Flags Requiring Escalation — presence-conditional only.
+    #   * Done-Task Audit, Proactive Task Sample, Hint Attention — omitted on
+    #     remediation passes by design.
+    #   * Done-task Provenance — every done task carries an explicit label.
+    REQUIRED_SECTIONS: tuple[RequiredSection, ...] = (
+        RequiredSection('### Live-Workflow Signals', '_build_live_workflow_section'),
+    )
+
     # Remediation support — set by harness for second pass
     remediation_mode: bool = False
 
@@ -4770,6 +4789,17 @@ For cross-project routing see "Known Projects" above.
             marker = '  (current)' if pid == self.project_id else ''
             lines.append(f'- {pid:<{width}}  → {root}{marker}')
         return '\n### Known Projects (for cross-project routing)\n' + '\n'.join(lines) + '\n'
+
+    async def _build_live_workflow_section(self, filtered: FilteredTaskTree) -> str:
+        """Return the Live-Workflow Signals section for *filtered*, or ``''``.
+
+        Takes the payload's RESOLVED tree — harness-injected or self-fetched by
+        :meth:`assemble_payload` — which is why it is not a zero-arg reader of
+        ``self.filtered_task_tree`` like Stage 1's same-named renderer. An empty
+        active list renders ``''`` with no I/O. Stage 2 does not retain the
+        snapshot: the task-4874 citation guard is Stage-1 only.
+        """
+        return await render_live_workflow_section(filtered.active_tasks, self.scope.project_root)
 
     @staticmethod
     def _warn_if_count_tasks_mismatch(

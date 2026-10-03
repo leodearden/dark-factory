@@ -7,7 +7,7 @@ import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
 from shared.cli_invoke import read_transcript_records
@@ -44,6 +44,18 @@ if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
 
 logger = logging.getLogger(__name__)
+
+
+class RequiredSection(NamedTuple):
+    """One inference-bearing payload section every payload builder of a stage must emit (tasks 4708, 5113).
+
+    A stage declares these in a class-level ``REQUIRED_SECTIONS`` tuple; the
+    inclusion criterion (the shipped stage prompt draws an inference from the
+    section's absence) is recorded beside each such tuple.
+    """
+
+    header: str  # exact markdown header the shipped stage prompt names
+    renderer: str  # name of the stage method that renders it, dispatched via getattr
 
 
 class BaseStage:

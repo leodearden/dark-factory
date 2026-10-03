@@ -84,10 +84,8 @@ import pytest
 from _ast_guard import calls_named
 
 import fused_memory.reconciliation.stages.memory_consolidator as consolidator_module
-from fused_memory.reconciliation.stages.memory_consolidator import (
-    MemoryConsolidator,
-    RequiredSection,
-)
+from fused_memory.reconciliation.stages.base import RequiredSection
+from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.task_filter import FilteredTaskTree
 from reconciliation.consolidator_fixtures import make_consolidator
 from reconciliation.payload_section_parity import (
