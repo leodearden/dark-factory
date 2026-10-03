@@ -618,7 +618,7 @@ def _dataclass_double_violation(
 # module's file-local copy of this guard.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     'orchestrator/tests/test_merge_queue.py': 239,
-    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 90,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 81,
     'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
     'orchestrator/tests/test_merge_queue_permit_conservation.py': 27,
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 26,

@@ -892,13 +892,12 @@ RESPONSIVE_WAIT_STRETCH = 2.0
 # task 3980: ABSOLUTE hard wall-clock backstop for `wait_responsive` below,
 # DERIVED from MERGE_RESULT_TIMEOUT rather than written as a literal so a
 # reviewer can check the arithmetic instead of trusting a number.  It bounds
-# the scaled per-call cap above whatever nominal a call site passes.  Sizing
-# check: the worst per-method budget the auditor computes for
-# test_merge_speculation.py is 240s (TestLateArrivalCleanCAS /
-# TestLateArrivalFailCascade / TestLateArrivalSubmissionOrderCAS: 2 gate
-# barriers x 30 + 2 result waits x 90), under HEAVY_BARRIER_TEST_TIMEOUT
-# (300s, itself `5 * MERGE_RESULT_TIMEOUT + 75` in
-# test_merge_queue_concurrent_verify.py).  Never-narrow.
+# the scaled per-call cap above whatever nominal a call site passes.  Whether
+# the waits a test stacks on it fit that test's timeout mark is checked, not
+# restated here: each guarded module's TestTimeoutMarkCoverage recomputes
+# every class's budget from source
+# (test_merge_queue_concurrent_verify.py::_worst_per_method_wait_budget).
+# Never-narrow.
 RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  # 90s
 
 # task 3980: nominal budget for the merge-pipeline `asyncio.Event` GATE
@@ -918,11 +917,14 @@ RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  
 #      that has not been observed to fail is a plain widening, which this repo
 #      forbids as a flake fix (plans/flake-ledger-prd.md:216-223).
 #   2. It would be actively harmful.  Gates at a 45s nominal are billed 90s
-#      each, taking the worst per-method budget from 240s to 360s and blowing
-#      the paired @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT) (300s) —
-#      under `timeout_method = "thread"` plus `--max-worker-restart=0` that is
-#      an os._exit() of the xdist worker, i.e. a worker death instead of a
-#      clean failure.
+#      each, raising a late-arrival method's bill by 120s (two gate
+#      barriers, 60s more each) -- more than the heaviest of them has left
+#      under its paired
+#      @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT), as
+#      test_merge_speculation.py::TestTimeoutMarkCoverage would report.
+#      Under `timeout_method = "thread"` plus `--max-worker-restart=0`, a
+#      blown mark is an os._exit() of the xdist worker, i.e. a worker death
+#      instead of a clean failure.
 #   3. It is not tight.  Every barrier in the LateArrival suite resolves inside
 #      a test that completes in ~5s end to end, against a 15s nominal and a 30s
 #      ceiling.
@@ -1061,31 +1063,28 @@ async def wait_responsive(
     COUPLED OBLIGATION
     ------------------
     Any class using this MUST carry an adequate ``@pytest.mark.timeout`` —
-    exactly as ``CANCEL_SCOPE_BARRIER_TIMEOUT`` above already states.
-    orchestrator/pyproject.toml sets ``timeout = 300`` with
-    ``timeout_method = "thread"`` and ``--max-worker-restart=0``: exceeding
-    the per-test timeout does not fail the test, it ``os._exit()``s the xdist
-    worker, degrading a clean per-test failure into a worker death.  A
+    exactly as ``CANCEL_SCOPE_BARRIER_TIMEOUT`` above already states.  An
+    unmarked test runs under ``PYPROJECT_DEFAULT_TIMEOUT`` locally and under
+    ``VERIFY_CLI_PER_TEST_TIMEOUT`` on verify, with ``timeout_method =
+    "thread"`` and ``--max-worker-restart=0``: exceeding the per-test timeout
+    does not fail the test, it ``os._exit()``s the xdist worker, degrading a
+    clean per-test failure into a worker death.  A
     stretched wait without a paired mark is therefore strictly worse than the
     flake it fixes.
 
     The default ``cap`` SCALES WITH THE NOMINAL rather than defaulting flat to
     the 90s ceiling, and that is what makes the paired marks checkable:
-    ``_call_wait_budget``'s ``min(nominal * RESPONSIVE_WAIT_STRETCH,
+    ``_wait_responsive_budget``'s ``min(nominal * RESPONSIVE_WAIT_STRETCH,
     RESPONSIVE_WAIT_WALL_CAP)`` is then an EXACT upper bound on this helper,
     not an under-count.  With a flat default a ``timeout=15`` site the auditor
     billed at 30s could consume 90s, and TestLateArrivalCleanCAS's true worst
-    case would be 360s against a 300s mark.
+    case would overrun its ``HEAVY_BARRIER_TEST_TIMEOUT`` mark.
 
-    That exactness carries ONE qualifier, load-bearing and currently a
-    CONVENTION rather than a structural guarantee: an explicit ``max_wall_s``
-    wins over the scaled default and the auditor does not scan for it, so a
-    hypothetical ``wait_responsive(f, timeout=1.0, max_wall_s=1000.0)`` would
-    be billed 2.0s while being allowed 1000s.  No scanned site passes
-    ``max_wall_s`` — only the hermetic unit tests in
-    test_orch_helpers_wait_responsive.py do, and they carry no mark obligation
-    — so the marks hold today.  Teaching the auditor to resolve ``max_wall_s``
-    (or to reject any scanned site passing it) is tracked as follow-up.
+    The bound is structural, not a convention: an explicit ``max_wall_s``
+    wins over the scaled default, so the auditor
+    (``_wait_responsive_budget``) bills it verbatim, and one it cannot
+    resolve bills as unbounded — which no mark clears, so the timeout-mark
+    guard rejects the site rather than under-billing it.
 
     The kwarg is named literally ``timeout`` so task 3492's AST wait-budget
     scanner (``_call_wait_budget`` in test_merge_queue_concurrent_verify.py)
