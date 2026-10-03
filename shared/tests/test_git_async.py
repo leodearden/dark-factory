@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest import mock
@@ -427,3 +429,29 @@ async def test_own_timeout_kills_a_backgrounded_grandchild(
         assert result.timed_out
     finally:
         _abandon(task, leaked_pid)
+
+
+# ---------------------------------------------------------------------------
+# (k) every child leads its own session, so it has no controlling terminal
+# ---------------------------------------------------------------------------
+
+_SESSION_PROBE = '''\
+import errno, json, os
+try:
+    os.close(os.open('/dev/tty', os.O_RDWR))
+    tty = 'opened'
+except OSError as exc:
+    tty = errno.errorcode[exc.errno]
+print(json.dumps({'pid': os.getpid(), 'pgid': os.getpgid(0), 'sid': os.getsid(0), 'tty': tty}))
+'''
+
+
+async def test_child_leads_its_own_session_with_no_controlling_terminal() -> None:
+    """The group kill signals the child's pid as its pgid, and a git credential
+    prompt must fail rather than block on a tty; both rest on a new session."""
+    result = await run_git([sys.executable, '-c', _SESSION_PROBE])
+
+    assert result.ok, result.stderr
+    child = json.loads(result.stdout)
+    assert child['pid'] == child['pgid'] == child['sid'], child
+    assert child['tty'] == 'ENXIO', child
