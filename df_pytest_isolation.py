@@ -609,11 +609,11 @@ def deploy_clock_guard_roots(
     main-checkout one — was accepted deliberately, and
     :func:`deploy_clock_change_report` has since removed most of it by
     attributing such a stamp rather than failing on it.  What remains is the
-    fail-closed default for a stamp bearing NO provenance, so widening the
-    guarded roots is still a decision about how loudly to fail on an
-    unattributable change — and it is why the message prints the absolute path
-    plus both observed bodies, so "real redeploy" stays one glance away from
-    "test bug" for exactly that residue.
+    fail-closed default for a stamp bearing NO provenance or another run's
+    token, so widening the guarded roots is still a decision about how loudly
+    to fail on a change this run cannot clear — and it is why the message
+    prints the absolute path plus both observed bodies, so "real redeploy"
+    stays one glance away from "test bug" for exactly that residue.
 
     Own checkout FIRST and deduped, so the message names the run's own checkout
     when both were touched, and so a suite running in the main checkout (where
@@ -805,6 +805,36 @@ class ClockVerdict(enum.Enum):
     EXTERNAL_REDEPLOY = 'external_redeploy'
 
 
+class _StampAttribution(enum.Enum):
+    """Who the surviving stamp says wrote it, relative to this run."""
+
+    UNATTRIBUTABLE = 'unattributable'
+    NO_RUN_TOKEN = 'no_run_token'
+    THIS_RUN = 'this_run'
+    OTHER_RUN = 'other_run'
+    NO_PYTEST_ANCESTOR = 'no_pytest_ancestor'
+
+
+def _attribute_stamp(
+    provenance: dict[str, str] | None, session_token: str | None,
+) -> _StampAttribution:
+    """Classify a parsed stamp against this run's *session_token*.
+
+    The falsy-token check precedes the empty-stamp one: an unstamped run must
+    fail closed, never read an empty stamp token as "no pytest ancestor".
+    """
+    if provenance is None:
+        return _StampAttribution.UNATTRIBUTABLE
+    if not session_token:
+        return _StampAttribution.NO_RUN_TOKEN
+    stamp_token = provenance[CLOCK_PROVENANCE_SESSION_KEY]
+    if not stamp_token:
+        return _StampAttribution.NO_PYTEST_ANCESTOR
+    if stamp_token == session_token:
+        return _StampAttribution.THIS_RUN
+    return _StampAttribution.OTHER_RUN
+
+
 def deploy_clock_change_report(
     before: dict[str, tuple[bytes, int] | None],
     after: dict[str, tuple[bytes, int] | None],
@@ -820,8 +850,8 @@ def deploy_clock_change_report(
         The change cannot be attributed to anything but this run, or cannot be
         attributed at all.  This is the DEFAULT — today's behaviour, unchanged —
         and it covers a provenance-free (pre-4823) body, an unparseable one, a
-        DELETED file, a missing *session_token*, a stamp carrying THIS session's
-        token, and a stamp carrying some other pytest session's token.
+        DELETED file, a missing *session_token*, a stamp carrying THIS run's
+        token, and a stamp carrying another pytest RUN's token.
     :attr:`ClockVerdict.EXTERNAL_REDEPLOY`
         A provenance-aware writer stamped the clock with an EMPTY session token,
         i.e. no pytest session was an ancestor of the write.  A REAL fleet or
@@ -848,13 +878,21 @@ def deploy_clock_change_report(
     would silently forgive every write the first time the fixture failed to
     stamp one.
 
-    A FOREIGN token is deliberately left failing rather than downgraded to
-    "somebody else's problem".  Under ``merge_verify_breadth: "full"`` many
-    worktrees run this suite against the same main checkout, so a foreign token
-    means another session falsified a shared clock — but that session's OWN
-    guard sees its own token and fails, so the signal is never lost, and this
-    run must not become the arbiter of another run's bug on the strength of a
-    token it cannot verify.
+    THE TASK 5282 RULING on a FOREIGN token (neither empty nor this run's):
+    KEEP-AND-CLARIFY.  It stays :attr:`~ClockVerdict.FALSIFIED`; only its
+    headline and remedy change, to name a CONCURRENT pytest session rather than
+    accuse this run.  No downgrade to a warning, for three reasons.  (1) A run
+    killed before its teardown (verify timeout, OOM, operator kill) never runs
+    its own guard, so a warning in a green log could be the only trace of a
+    live clock that disarms the watchdog's staleness pass for 8h.  (2) A
+    foreign token is not proof of an independent run: a nested pytest session
+    mints its own, and writer tests in ``tests/scripts/`` set
+    ``$DF_PYTEST_SESSION_TOKEN`` to sentinels themselves, so both stamp one
+    from INSIDE this run.  (3) Since task 5299's suite-wide redirect a foreign
+    stamp needs a genuine spawner bug in some branch, so the innocent run's
+    cost is rare and a rerun clears it.  A cross-run token registry was
+    rejected: it could tell a sibling run from a descendant, but it cannot
+    guarantee the other run reaches teardown, which is what a downgrade needs.
 
     PRECEDENCE: :attr:`~ClockVerdict.FALSIFIED` anywhere outranks
     :attr:`~ClockVerdict.EXTERNAL_REDEPLOY` anywhere, so EVERY protected relpath
@@ -904,9 +942,9 @@ def deploy_clock_change_report(
             f'observed after:  {_describe_clock_entry(after_entry)}\n'
         )
         provenance = clock_stamp_provenance(after_entry)
-        if provenance is not None and session_token and not provenance[
-            CLOCK_PROVENANCE_SESSION_KEY
-        ]:
+        attribution = _attribute_stamp(provenance, session_token)
+        if attribution is _StampAttribution.NO_PYTEST_ANCESTOR:
+            assert provenance is not None
             # Hold it, keep scanning: a later clock may still be falsified, and
             # that outranks this.  Only the FIRST benign change is kept, so the
             # reported one stays first in protected order.
@@ -922,23 +960,25 @@ def deploy_clock_change_report(
         return (
             ClockVerdict.FALSIFIED,
             _falsified_message(
-                relpath, where, kind, observed, provenance, session_token,
+                relpath, where, kind, observed, provenance, attribution,
             ),
         )
     return benign
 
 
 def _clock_attribution_line(
-    provenance: dict[str, str] | None, session_token: str | None,
+    provenance: dict[str, str] | None, attribution: _StampAttribution,
 ) -> str:
     """One line saying what provenance the stamp carried and why it did not clear.
 
     Appended to the falsified message so a reader is never left guessing whether
     attribution was attempted — the difference between "this write is provably
     yours" and "nothing in this file says who wrote it" is the whole reason the
-    two readings below can be told apart at all.
+    two readings below can be told apart at all.  Never handed
+    :attr:`_StampAttribution.NO_PYTEST_ANCESTOR`: that member is the benign
+    verdict, which has its own message.
     """
-    if provenance is None:
+    if attribution is _StampAttribution.UNATTRIBUTABLE or provenance is None:
         return (
             'Attribution: the stamp carries no usable provenance (no '
             f'{CLOCK_PROVENANCE_SOURCE_KEY!r}/{CLOCK_PROVENANCE_SESSION_KEY!r} '
@@ -947,25 +987,25 @@ def _clock_attribution_line(
             'pytest session would have been reported as a benign redeploy.'
         )
     source = provenance[CLOCK_PROVENANCE_SOURCE_KEY]
-    token = provenance[CLOCK_PROVENANCE_SESSION_KEY]
-    if not session_token:
+    if attribution is _StampAttribution.NO_RUN_TOKEN:
         return (
             f'Attribution: the stamp names {source!r} as its writer, but this '
             f'run has no ${PYTEST_SESSION_TOKEN_ENV} of its own to compare it '
             'against, so nothing here can be cleared. Fail-closed by design — '
             'an unstamped token must never read as "every write is external".'
         )
-    if token == session_token:
+    if attribution is _StampAttribution.THIS_RUN:
         return (
             f'Attribution: {source!r} wrote this stamp FROM INSIDE this run — it '
             f'carries this run\'s own ${PYTEST_SESSION_TOKEN_ENV}, so a real '
             'redeploy is ruled out and a test spawned the writer.'
         )
     return (
-        f'Attribution: {source!r} wrote this stamp from inside another pytest '
-        f'session (its ${PYTEST_SESSION_TOKEN_ENV} is not this run\'s). That '
-        'session\'s own guard fails on it too, so the signal is not lost here; '
-        'this run reports it rather than absolving a token it cannot verify.'
+        f'Attribution: {source!r} wrote this stamp under a '
+        f'${PYTEST_SESSION_TOKEN_ENV} that is neither this run\'s nor empty, so '
+        'a real redeploy is ruled out and some other pytest session ran the '
+        'writer. This run reports it rather than absolving a token it cannot '
+        'verify.'
     )
 
 
@@ -975,26 +1015,45 @@ def _falsified_message(
     kind: str,
     observed: str,
     provenance: dict[str, str] | None,
-    session_token: str | None,
+    attribution: _StampAttribution,
 ) -> str:
-    """The accusing message — as before task 4823, plus one attribution line.
+    """The accusing message: one of two headlines sharing one signature string.
 
-    Its headline is kept byte-for-byte because it is the message four years of
-    triage notes, ``OPERATIONS.md`` and two end-to-end tests key on: the literal
-    ``'falsified a REAL deploy clock'`` is what
-    ``TestTheGuardFailsTheRunEndToEnd`` asserts on, in both directions.  Only
-    the "Fix" line moved, with task 5299: it now names the suite-wide redirect
-    in :func:`_df_deploy_clocks_unwritten` rather than the ``scripts/tests``
-    conftest fixture that no longer defines one.
+    The literal ``'falsified a REAL deploy clock'`` is in BOTH headlines because
+    triage notes, ``OPERATIONS.md`` and the end-to-end tests key on it, and
+    ``_external_redeploy_message`` must never contain it.  A stamp carrying
+    another run's token (task 5282) gets the CONCURRENT-session headline and
+    remedy; every other reading keeps this run's headline and remedy
+    byte-for-byte.  Both end with the attribution line.
     """
-    env_var = PROTECTED_DEPLOY_CLOCK_ENV_VARS[relpath]
+    if attribution is _StampAttribution.OTHER_RUN:
+        headline = (
+            'a CONCURRENT pytest session, not this run, falsified a REAL '
+            'deploy clock'
+        )
+        remedy = _concurrent_session_remedy()
+    else:
+        headline = 'this test run falsified a REAL deploy clock'
+        remedy = _own_run_remedy(PROTECTED_DEPLOY_CLOCK_ENV_VARS[relpath])
     return (
-        f'this test run falsified a REAL deploy clock: {where} was {kind}.\n'
+        f'{headline}: {where} was {kind}.\n'
         + observed
         + 'scripts/orchestrator-watchdog.py reads that file as "this component '
         'was redeployed at <ts>" and SKIPS its staleness pass while the '
         'min-interval window is open (8h by default), so the stamp silently '
         'disarms staleness recovery for the rest of the day.\n'
+        + remedy
+        + _clock_attribution_line(provenance, attribution)
+    )
+
+
+def _own_run_remedy(env_var: str) -> str:
+    """The Fix and Benign-alternative paragraphs for a stamp this run may own.
+
+    The Fix names the suite-wide redirect in :func:`_df_deploy_clocks_unwritten`
+    (task 5299), not the ``scripts/tests`` conftest fixture that used to own it.
+    """
+    return (
         f'Fix (the usual cause): a test spawned a process that resolved its '
         f'clock path from the environment and reached the live checkout '
         f'anyway. Since task 5299 the suite-wide redirect in '
@@ -1012,7 +1071,24 @@ def _falsified_message(
         'this suite was running. That is a genuine stamp and not a test bug — '
         'the two bodies printed above ARE that comparison: check the {ts, iso} '
         'against the deploy you expect.\n'
-        + _clock_attribution_line(provenance, session_token)
+    )
+
+
+def _concurrent_session_remedy() -> str:
+    """The remedy for a stamp carrying another run's token.
+
+    No real-redeploy alternative: a non-empty token already rules one out.
+    """
+    return (
+        'This run is most likely NOT the writer: re-run it. The writer is the '
+        f'pytest run whose token is the {CLOCK_PROVENANCE_SESSION_KEY!r} value '
+        'in the "observed after" body above, and that run\'s own guard prints '
+        'the same body — search the concurrent verify logs for that token and '
+        'fix that branch\'s spawner. If no log carries it, that run was killed '
+        'before its teardown and this report is the only record.\n'
+        'Rule out first: a nested pytest session spawned by this run (it mints '
+        f'its own token), or a test here that sets ${PYTEST_SESSION_TOKEN_ENV} '
+        'itself before running a real writer.\n'
     )
 
 
@@ -1097,7 +1173,8 @@ def _df_deploy_clocks_unwritten(tmp_path_factory: pytest.TempPathFactory):
     :data:`PYTEST_SESSION_TOKEN_ENV` and hands it to
     :func:`deploy_clock_change_report` at teardown, which decides what a moved
     clock means — fail, or warn with :class:`DeployClockRedeployWarning` and
-    leave the run green — and states why.
+    leave the run green — and states why, including why another run's token
+    still fails.
 
     The token lives in the ENVIRONMENT for the same reason
     :data:`LEAK_TOKEN_ENV` does, and that fixture established the mechanism:
