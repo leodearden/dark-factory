@@ -1,568 +1,106 @@
-"""Decision gate: pre-merge gating for a retune of an operational config knob.
+"""Executable premises of the config-retune gate decision (task 3886).
 
-Task 3886, spun out of task 3866. The QUESTION: commit ``094d634465`` retuned
-``lock_depth`` 4 -> 12 in ``dark-factory-orchestrator.yaml`` and turned main
-red, because ``orchestrator/tests/conftest.py``'s autouse
-``_isolate_orch_config`` binds every orchestrator test to that operational
-file, and three tests carried fixture literals derived from the OLD depth. The
-task framed three options: (1) add a pre-merge gate for yaml retunes, (2)
-narrow the ``_isolate_orch_config`` contract so unit tests read package
-defaults, (3) accept the exposure.
+The decision and its rationale live in ``docs/config-retune-gate.md``. Each
+test here asserts one of its premises on runtime state: the config as the
+production loader resolves it, and the production predicates applied to it.
+The premise that every orchestrator unit test is bound to the operational
+config file is asserted where that binding runs, in
+``orchestrator/tests/test_operational_config_binding.py``.
 
-The DECISION — reject (2), reject (1) as framed, adopt (3) qualified, and name
-the fourth option the task did not list (the knob-agnostic assertion form) —
-lives in the ``DECIDED — pre-merge gate for operational config retunes`` block
-in ``dark-factory-orchestrator.yaml``, sited next to ``lock_depth`` where a
-future retuner will read it.
-
-This file is the EXECUTABLE half of that record. A documented-but-ungated
-decision is the same defect class these config tasks exist to close, so every
-assertion here is on RUNTIME state — the config as the production loader
-resolves it, the production predicates applied to it, the production
-module-config discovery walk, the environment the production conftest fixture
-sets — never on comment or docstring prose.
-
-NO PINNED INTEGER CONSTANTS. Every assertion is written in the knob-agnostic
-form: it reads the live value rather than naming ``12`` or ``4``. Two house
-rules converge on this. ``test_tests_scripts_module_config.py`` carries two
-CORRECTED-IN-PLACE repairs of exactly this task's defect class (made by task
-3866) and names the remedy — read ``cfg.lock_depth`` live so the next retune
-of that knob falsifies nothing. And a guard written to prevent
-constant-pinning breakage must not itself pin a constant, or the next retune
-red-walls it and the fix becomes the disease.
-
-Production code is cited BY SYMBOL throughout this file and never by
-file:line — task 3445's explicit correction of the convention task 3350
-established, after every line pin copied forward had already rotted at HEAD.
-This task re-confirmed that the hard way: every line anchor its own plan
-carried had drifted between two passes over the same unchanged code.
-
-MUST-NOT-SKIP CONTRACT. No ``pytest.importorskip``, no try/except-and-skip.
-An unimportable ``orchestrator.config``, ``orchestrator.verify`` or
-``orchestrator.verify_plan``, or an unloadable ``orchestrator/tests/conftest.py``,
-must FAIL this guard rather than silently pass it
-(``test_skills_module_config_decision.py``'s precedent).
-
-PLACEMENT IS LOAD-BEARING, NOT STYLISTIC. This file lives in ``tests/scripts/``
-because that directory carries its own module config, so the guard actually
-runs under FULL_SUITE, on every review checkpoint, ``run_main_tip_sweep`` and
-merge-role ``merge_verify_breadth: full``. It is also the only lever available:
-``_discover_module_configs`` skips prefix ``.``, so a repo-root artifact like
-``dark-factory-orchestrator.yaml`` cannot be routed to a module config of its
-own.
-
-WHY THESE RATCHETS NEED A MEASURED RED, AND WHAT WAS MEASURED. The decision
-this file gates is largely "leave as-is", so four of its five premises are
-green at HEAD BY CONSTRUCTION and a green run proves nothing about whether the
-guard bites. A vacuously-passing gate is the failure class tasks 3350 / 3445 /
-3485 exist to prevent, and ``test_skills_module_config_decision.py`` sets the
-precedent verbatim: "Each test below therefore records the failure text
-observed against a named scratch mutation." So each premise below was driven
-red against a NAMED scratch mutation — of the operational yaml for M1-M4, of
-the conftest that binds tests to it for M5 — the observed failure recorded
-here, and the scratch artifact REVERTED before commit (`git status
---porcelain` clean, verified after the last revert).
-
-MEASURED RED at base main ``a831c052b9`` — this branch's base, the SHA every
-number in the DECIDED block was taken at — on branch ``task/3886`` at
-``f1ea5d54fe``. Command for M1-M4 (M5 below reuses it):
-``uv run --project shared pytest tests/scripts/test_config_retune_gate_decision.py --tb=short -q --timeout=300``.
-Unmutated at the same base: ``3 passed in 1.48s``.
-
-  M1  merge_verify_breadth: "full" -> "scoped"
-      -> ``1 failed, 2 passed in 1.95s``, FAILED
-      ``test_merge_lane_already_gates_a_config_only_retune`` on the
-      ``cfg.merge_verify_breadth == 'full'`` assertion:
-        E   assert 'scoped' == 'full'
-      The ``_merge_breadth_is_full`` assertion never runs, being second in the
-      pair — which is the ordering intended: the declared value is the thing a
-      retuner edits.
-
-  M2  the wired glob "dark-factory-orchestrator.yaml" -> "no-such-config-file.yaml"
-      -> ``1 failed, 2 passed in 1.47s``, FAILED the SAME test but on the
-      ``verify._merge_config_only_diff_forces_full_gate`` assertion:
-        E   assert False is True
-        E    +  where False = <function _merge_config_only_diff_forces_full_gate ...>(OrchestratorConfig(...), ['dark-factory-orchestrator.yaml'])
-      with the message reporting
-      ``git.merge_config_only_full_gate_globs=['no-such-config-file.yaml']``.
-      This is the ratchet on the one PRODUCTION change this task makes: it
-      proves the ``git:`` block entry is what carries assertion (2) and that
-      the arm reads the wired value rather than passing on the field's mere
-      presence.
-
-  M3  operational lock_depth 12 -> 4, i.e. set EQUAL to defaults.yaml
-      -> ``1 failed, 2 passed in 1.19s``, FAILED
-      ``test_the_operational_config_layer_wins_over_the_package_defaults``
-      (then named ``test_unit_tests_read_the_operational_lock_depth_not_the_package_default``)
-      on the DIFFER check, NOT the equality one:
-        E   assert 4 != 4
-      WHICH ASSERTION FIRED IS THE POINT, and is why this mutation was chosen
-      over a simpler one. Under M3 the equality assertion (resolved ==
-      operational) still passes, and a guard that checked only resolution would
-      have reported GREEN while proving nothing about which layer won. The
-      differ-check is what makes the layering observable, and this is the
-      measurement that says so rather than the docstring merely claiming it.
-      WHAT M3 DOES NOT WITNESS: it mutates the operational yaml's lock_depth,
-      so it reddens the loader-LAYERING arm only. It never touches the autouse
-      ``_isolate_orch_config`` binding option (2) would have narrowed, and
-      neither does any of M1-M4 — which is why M5 exists.
-
-  M4  operational lock_depth 12 -> 1
-      -> ``1 failed, 2 passed in 1.02s``, FAILED
-      ``test_every_discovered_module_config_is_reachable_at_the_operational_lock_depth``
-      naming the offending prefix and its depth:
-        E   assert not {'tests/scripts': 2}
-      with the message enumerating the discovered set
-      ``['cockpit', 'dashboard', 'escalation', 'fused-memory', 'orchestrator',
-      'sampler', 'scripts', 'shared', 'tests/scripts']`` — 9 prefixes, matching
-      pre-1's count, deepest at depth 2. Note M4 leaves the layering arm GREEN
-      (1 != 4, and resolved 1 == declared 1), so the two lock_depth arms are
-      independently falsifiable rather than one masking the other.
-
-  M5  option (2) itself — in ``orchestrator/tests/conftest.py``'s
-      ``_isolate_orch_config``, ``str(REPO_ROOT / "dark-factory-orchestrator.yaml")``
-      -> ``str(tmp_path / "no-such-config.yaml")``, verbatim the
-      ``code_default_config`` body promoted to autouse. Taken at base main
-      ``03585022af`` on branch ``task/3886`` at ``79578bf0a4``, same command;
-      unmutated there: ``4 passed in 6.37s``.
-      -> ``1 failed, 3 passed in 4.90s``, FAILED
-      ``test_orchestrator_unit_tests_are_bound_to_the_operational_config_file``
-      on the path-equality assertion:
-        E   AssertionError: fixture bound ORCH_CONFIG_PATH at
-            '/tmp/pytest-of-leo/pytest-48467/test_orchestrator_unit_tests_a0/no-such-config.yaml',
-            not the operational
-            /home/leo/src/dark-factory/.worktrees/3886/dark-factory-orchestrator.yaml.
-      THE FIRST ENTRY TO MUTATE A FILE OTHER THAN THE OPERATIONAL YAML, and
-      that is the gap it closes. Under the same mutation, with that test
-      deselected, the three tests M1-M4 cover still report
-      ``3 passed, 1 deselected in 3.11s``: none of them reads the fixture, so
-      before M5's test existed this file was GREEN under the one option its
-      decision rejected.
-
-Each of the five mutations reddened a DIFFERENT assertion, and no mutation
-reddened more than one test. That is the property worth having: a future edit
-that breaks one premise of the decision reports which premise, rather than
-collapsing the whole file. The premises are five, not four, because "unit
-tests read OPERATIONAL values" rests on two independent facts — the loader
-lets the operational file win over defaults.yaml (M3), and the conftest binds
-every orchestrator test to that file (M5) — and each can lapse without the
-other.
-
-NOT COVERED BY ANY OF THE ABOVE, stated so a green run here is not over-read.
-These ratchets pin the decision's PREMISES and catch a retune-down that
-unreaches a module. They do NOT catch a stale fixture literal of the kind
-``094d634465`` actually tripped — a test elsewhere in the tree that hard-codes
-a value derived from a knob. Nothing at commit time catches that; the merge
-gate and the main-tip sweep do. The full scope-honesty statement is in the
-DECIDED block.
+No assertion names a knob's value. Each reads the live value or derives its
+fixture from it, so retuning a knob cannot falsify anything here. Nothing
+skips: an unimportable production module fails the guard.
 """
 from __future__ import annotations
 
-import importlib.util
-import os
 import pathlib
-import sys
+from collections.abc import Callable
 
 import pytest
 import yaml
-from orchestrator.config import (
-    OrchestratorConfig,
-    _discover_module_configs,
-    _load_defaults,
-)
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+from shared.locking import normalize_lock
 
 from orchestrator import verify, verify_plan
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
-
-# The repo-root config carrying the DECIDED block this file gates, and the
-# subject of the decision itself: the operational file a retune edits.
-# ``dark-factory-orchestrator.yaml`` is the canonical, REQUIRED filename for a
-# project's top-level orchestrator config (it is what the dashboard's
-# escalation-URL discovery keys on); the legacy spellings are a discovery
-# fallback for unmigrated projects, not a choice this repo has.
 DF_CONFIG_NAME = 'dark-factory-orchestrator.yaml'
-ROOT_CONFIG_PATH = REPO_ROOT / DF_CONFIG_NAME
-
-# The conftest carrying the autouse ``_isolate_orch_config`` binding that
-# option (2) would have narrowed — the contract this decision PRESERVES.
-ORCH_CONFTEST = REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py'
+DECISION_DOC = 'docs/config-retune-gate.md'
 
 
-def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
-    """Load the repo-root config through the PRODUCTION loader, anchored at ROOT_CONFIG_PATH.
-
-    COPIED (task 3886) from ``test_tests_scripts_module_config.py``, which is
-    itself a copy of the same helper in ``test_scripts_module_config.py`` and
-    ``test_module_verify_budgets.py``. A test file importing a sibling test
-    file couples two guards that must be able to fail independently, and this
-    anchor is load-bearing enough that it must be visibly present in the file
-    that depends on it.
-
-    THE COST OF THAT, RECORDED RATHER THAN LEFT IMPLICIT, per the house
-    record-rather-than-absorb idiom (task 3460). This makes a FOURTH verbatim
-    copy of a helper that is pure setup, and the no-cross-import argument —
-    sound for ASSERTIONS — does not reach ``tests/scripts/conftest.py``, which
-    already exists and is pytest's idiomatic home for exactly this. That
-    de-triplication is ALREADY FILED as a follow-up by task 3703 (see the
-    corresponding docstring in ``test_tests_scripts_module_config.py``); this
-    file adds a fourth copy to a known, tracked debt rather than a silent one.
-    It is not reached for here for the same reason 3703 declined it:
-    ``conftest.py`` is outside this task's locked file list, and editing a file
-    five sibling guards depend on would widen the blast radius of a decision
-    task.
-
-    ANCHORING ``ORCH_CONFIG_PATH`` IS LOAD-BEARING, not hygiene.
-    ``project_root`` is only a model FIELD and selects nothing:
-    ``OrchestratorConfig.settings_customise_sources`` builds its
-    ``YamlSettingsSource`` from ``os.environ['ORCH_CONFIG_PATH']`` alone,
-    falling back to a CWD-relative ``config.yaml``. Both ambient states are
-    wrong here, in OPPOSITE directions:
-
-      * UNSET — the state INSIDE VERIFY, because
-        ``verify._target_subprocess_env`` deliberately scrubs the whole
-        ``ORCH_`` prefix (task 2957) — finds no file, so every value collapses
-        to the pydantic DEFAULTS, a config this repo does not declare. That
-        failure mode is this task's own subject matter one level up: the
-        decision below turns on unit tests reading OPERATIONAL rather than
-        DECLARED values, and a guard that silently read declared values would
-        report green on the very substitution it exists to forbid.
-      * SET, as an operator's shell has it, points at whichever checkout that
-        orchestrator serves — typically the MAIN one, not this worktree. Every
-        assertion would then be about a different checkout's yaml and report
-        GREEN on a worktree that had actually regressed.
-
-    Setting the env var IS the production load path (``config.load_config``
-    stamps ``os.environ['ORCH_CONFIG_PATH']`` before constructing), so this
-    stays a read through the real loader, pinned to THIS worktree's committed
-    yaml rather than left to the ambient environment.
-
-    Fails LOUDLY on a missing file rather than silently: ``YamlSettingsSource``
-    SKIPS a non-existent ``config_path`` instead of raising, so a bad path
-    would yield the pydantic DEFAULTS with no error at all.
-    """
-    assert ROOT_CONFIG_PATH.is_file(), (
-        f'{ROOT_CONFIG_PATH} does not exist, so anchoring ORCH_CONFIG_PATH at '
-        'it would silently load the pydantic DEFAULTS instead (YamlSettingsSource '
-        'skips a non-existent path rather than raising), and every value read '
-        'from the returned config would be about a config this repo does not '
-        f'declare. {DF_CONFIG_NAME} is the canonical, required filename for a '
-        "project's top-level orchestrator config"
-    )
-    monkeypatch.setenv('ORCH_CONFIG_PATH', str(ROOT_CONFIG_PATH))
-    return OrchestratorConfig(project_root=REPO_ROOT)
-
-
-def test_merge_lane_already_gates_a_config_only_retune(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The merge-lane arm: option (1) as framed buys nothing not already held.
-
-    This is the executable form of the DECIDED block's CORRECTION 1 — the
-    task's framed premise "there is NO pre-merge gate" is HALF-FALSE. Both
-    halves of what makes it false are asserted here on runtime state, because
-    the decision to decline a NEW merge-lane gate rests entirely on the two
-    that already exist. If either lapses, this decision needs re-taking and
-    this guard is what says so.
-
-    (1) ``merge_verify_breadth: "full"`` makes merge-role verify run every
-    REGISTERED module's full suite regardless of what the diff touches —
-    ``verify_plan.derive_verify_plan`` gates on ``_merge_breadth_is_full`` and
-    fans out through ``_derive_full_suite_runs``. Asserted through that
-    production predicate rather than only against the raw field, so the guard
-    cannot drift from the function that consumes it.
-
-    (2) The deterministic manifest-drift backstop
-    ``verify._merge_config_only_diff_forces_full_gate`` matches this repo's own
-    operational config, so a merge-role config-only diff that touches it is
-    forced onto the full per-subproject gate. Asserted through the production
-    predicate rather than by re-implementing ``fnmatch``, so the guard cannot
-    drift from the matcher it guards.
-
-    WHY (2) NEEDS TO BE WIRED AT ALL, given (1) — the fact that carries the one
-    production change this task makes, and the reason this is not INV-5
-    duplication of a gate already held. Both call sites of that predicate sit
-    in the ``else:`` of ``if role == 'merge' and is_merge_verify:``. So when
-    ``is_merge_verify`` is True, INV-1's nothing-to-run escalation already
-    covers a no-.py/.rs diff and the glob is irrelevant. It is the
-    ``is_merge_verify`` FALSE merge-role probe path where ``should_override``
-    reduces to this predicate OR the async reify verify-pipeline-guard consult
-    — and that consult falls open for dark-factory, so with empty globs (the
-    shipped default, short-circuiting to False in O(1)) NOTHING can force the
-    full gate there. Wiring the glob closes that path and converts "a
-    config-only diff forces the full gate" from an incidental side effect of
-    breadth into a DECLARED intent.
-    """
-    cfg = _root_config(monkeypatch)
-
-    # (1) The broad merge gate is declared AND the production predicate agrees.
-    assert cfg.merge_verify_breadth == 'full', (
+def test_merge_lane_already_gates_a_config_only_retune(root_config: OrchestratorConfig) -> None:
+    """A config retune that enters the merge lane is verified against every module's suite."""
+    assert root_config.merge_verify_breadth == 'full', (
         f'{DF_CONFIG_NAME} declares merge_verify_breadth='
-        f'{cfg.merge_verify_breadth!r}, not "full". Task 3886 declined to add a '
-        'new pre-merge gate for yaml retunes SPECIFICALLY because this one '
-        'already runs every registered module\'s full suite on a merge '
-        'regardless of what the diff touches. Narrowing it re-opens the '
-        'exposure that decision accepted, so re-take the decision in the '
-        f'DECIDED block in {DF_CONFIG_NAME} rather than editing this assertion'
+        f'{root_config.merge_verify_breadth!r}, not "full". Task 3886 declined a '
+        'new pre-merge gate for config retunes because this one already runs '
+        "every registered module's suite on a merge. Re-take the decision in "
+        f'{DECISION_DOC} rather than editing this assertion.'
     )
-    assert verify_plan._merge_breadth_is_full(cfg) is True, (
-        'verify_plan._merge_breadth_is_full rejects the operational config even '
-        f'though it declares merge_verify_breadth={cfg.merge_verify_breadth!r}. '
-        'That predicate is what verify_plan.derive_verify_plan actually gates '
-        'on before fanning out via _derive_full_suite_runs, so the declared '
-        'value alone does not establish the gate — this pair is asserted '
-        'together precisely so the guard cannot drift from its consumer'
+    assert verify_plan._merge_breadth_is_full(root_config) is True, (
+        'verify_plan._merge_breadth_is_full rejects a config declaring '
+        f'merge_verify_breadth={root_config.merge_verify_breadth!r}, so the '
+        'declared value no longer drives the full merge gate.'
     )
-
-    # (2) The deterministic config-only backstop covers this repo's own config,
-    #     evaluated through the production matcher rather than a local fnmatch.
-    assert verify._merge_config_only_diff_forces_full_gate(cfg, [DF_CONFIG_NAME]) is True, (
-        f'a merge-role config-only diff touching {DF_CONFIG_NAME} does NOT force '
-        'the full per-subproject gate: '
-        'verify._merge_config_only_diff_forces_full_gate returns False for it '
-        f'against git.merge_config_only_full_gate_globs='
-        f'{cfg.git.merge_config_only_full_gate_globs!r}. Empty globs (the '
-        'shipped default) short-circuit to False in O(1). This matters on the '
-        'is_merge_verify=False merge-role probe path, where both call sites sit '
-        "in the else: of `if role == 'merge' and is_merge_verify:` — INV-1's "
-        'nothing-to-run escalation does NOT reach there, and the reify '
-        'verify-pipeline-guard consult falls open for dark-factory, so this '
-        'predicate is the only thing that can force the full gate. Task 3886 '
-        f'wired it in the git: block of {DF_CONFIG_NAME}; restore that entry '
-        'rather than deleting this assertion'
+    assert verify._merge_config_only_diff_forces_full_gate(root_config, [DF_CONFIG_NAME]) is True, (
+        f'a config-only merge diff touching {DF_CONFIG_NAME} does not force the '
+        'full gate: git.merge_config_only_full_gate_globs='
+        f'{root_config.git.merge_config_only_full_gate_globs!r}. Restore the '
+        f'entry in the git: block of {DF_CONFIG_NAME}; {DECISION_DOC} says why '
+        'it is needed.'
     )
 
 
-def test_the_operational_config_layer_wins_over_the_package_defaults(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The layering arm: the operational file wins over the package-bundled defaults.
-
-    Asserts pydantic-settings LAYER PRECEDENCE in the production loader: a
-    ``YamlSettingsSource`` anchored at ``dark-factory-orchestrator.yaml``
-    resolves ``lock_depth`` to that file's declaration and not to
-    ``defaults.yaml``'s. That is one of the two facts "unit tests read
-    OPERATIONAL values" rests on. The other — that
-    ``orchestrator/tests/conftest.py``'s autouse ``_isolate_orch_config``
-    binds every orchestrator test to that file at all, the contract option (2)
-    would have narrowed — is carried by
-    ``test_orchestrator_unit_tests_are_bound_to_the_operational_config_file``.
-
-    CORRECTED IN PLACE (task 3886 review). This test was first named and
-    described as the guard against option (2): "the executable statement of
-    the contract that decision PRESERVES ... If option (2) is ever silently
-    adopted, this fails." Measured false. Under the option-(2) scratch
-    mutation of that conftest (ledger entry M5) this test still PASSED — the
-    review measured ``3 passed in 2.21s`` for the whole then-three-test file
-    at ``8cf95ee8c6``, re-taken as ``3 passed, 1 deselected in 3.11s`` at
-    ``79578bf0a4``. It never reads the fixture: ``tests/scripts/`` does not
-    collect ``orchestrator/tests/conftest.py``, and ``_root_config`` sets
-    ``ORCH_CONFIG_PATH`` itself. The assertions were true and are kept
-    unchanged; only the claim was narrowed to what they assert.
-
-    WHY THE DIFFER-CHECK IS NOT REDUNDANT. Asserting only that the resolved
-    depth equals the operational declaration would pass VACUOUSLY if a future
-    retune set the operational value back to the package default — equal to
-    both, proving nothing about which layer won. The pair is what makes the
-    layering observable at all.
-
-    Written in the knob-agnostic form throughout: it names neither the
-    operational value nor the package default, reading both live. Naming
-    either is the exact defect this whole task decides about.
-    """
-    operational_declared = yaml.safe_load(ROOT_CONFIG_PATH.read_text())['lock_depth']
-    package_declared = _load_defaults()['lock_depth']
-
-    # (1) The layering is observable at all: the two layers genuinely differ.
-    assert operational_declared != package_declared, (
-        f'{DF_CONFIG_NAME} and the package-bundled defaults.yaml both declare '
-        f'lock_depth={operational_declared!r}, so a resolved value equal to the '
-        'operational declaration would ALSO equal the package default and this '
-        'guard could not tell which layer won. That makes assertion (2) below '
-        'vacuous rather than false. This is not a failure of the decision — it '
-        'means the layering is no longer OBSERVABLE here and this guard needs a '
-        'different lever, not that the guard should be deleted'
-    )
-
-    # (2) A real load through the production loader resolves the OPERATIONAL
-    #     layer, not the package default.
-    cfg = _root_config(monkeypatch)
-    assert cfg.lock_depth == operational_declared, (
-        f'a config loaded through the production loader with ORCH_CONFIG_PATH '
-        f'anchored at {DF_CONFIG_NAME} resolves lock_depth={cfg.lock_depth!r}, '
-        f'but that file declares {operational_declared!r}. The operational layer '
-        'must win over the package-bundled defaults.yaml; unit tests reading '
-        'OPERATIONAL rather than DECLARED values is the contract task 3886 '
-        'decided to PRESERVE (option (2) rejected). Re-take that decision in the '
-        f'DECIDED block in {DF_CONFIG_NAME} rather than editing this assertion'
-    )
-    assert cfg.lock_depth != package_declared, (
-        f'the production loader resolved lock_depth={cfg.lock_depth!r}, which is '
-        f'the package-bundled defaults.yaml value ({package_declared!r}) and not '
-        f'{DF_CONFIG_NAME}\'s ({operational_declared!r}). The loader\'s layer '
-        'precedence has inverted: tests are now exercising a depth the factory '
-        'does not run at, silently — the same outcome option (2) would have '
-        'institutionalised and which task 3886 rejected'
-    )
-
-
-def _exec_orchestrator_conftest(monkeypatch: pytest.MonkeyPatch):
-    """Execute ``ORCH_CONFTEST`` as a module, its import-time side effects contained to this test.
-
-    Loaded under the UNIQUE name ``_orch_conftest_under_test`` and never as
-    ``conftest``: that file's own docstring records that sibling subprojects'
-    conftests collide under ``sys.modules['conftest']``, and ``tests/scripts``
-    already owns that name in this session.
-
-    Executing it is not inert. At import it inserts five entries into
-    ``sys.path`` (``orchestrator/tests`` among them, at the front) and
-    ``setdefault``s ``ORCH_DEBUG_ASSERTS`` in the environment. Both are handed
-    to ``monkeypatch`` first so they are undone at teardown rather than
-    leaking into every ``tests/scripts`` test collected after this one.
-
-    No skip on failure: an unloadable conftest FAILS this guard (the
-    MUST-NOT-SKIP contract above).
-    """
-    assert ORCH_CONFTEST.is_file(), (
-        f'{ORCH_CONFTEST} does not exist. That file carries the autouse '
-        '_isolate_orch_config binding which task 3886 decided to PRESERVE '
-        '(option (2) rejected), so the binding has MOVED: re-anchor this guard '
-        'at its new home rather than deleting it'
-    )
-    monkeypatch.setattr(sys, 'path', [*sys.path])
-    monkeypatch.setenv('ORCH_DEBUG_ASSERTS', os.environ.get('ORCH_DEBUG_ASSERTS', '1'))
-    spec = importlib.util.spec_from_file_location('_orch_conftest_under_test', ORCH_CONFTEST)
-    assert spec is not None and spec.loader is not None, (
-        f'importlib could not build a module spec for {ORCH_CONFTEST}'
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_orchestrator_unit_tests_are_bound_to_the_operational_config_file(
+def test_a_config_file_layer_wins_over_the_package_defaults(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: pathlib.Path,
 ) -> None:
-    """The binding arm: option (2) is REJECTED, and this is what says so.
+    """A value the file at ``ORCH_CONFIG_PATH`` declares beats the package-bundled default.
 
-    Option (2) was to narrow ``orchestrator/tests/conftest.py``'s autouse
-    ``_isolate_orch_config`` so unit tests read the package-bundled DECLARED
-    defaults instead of this project's OPERATIONAL config. That is declined.
-    The heal commit for the incident (``c54d7cf81c``) argues against it in its
-    own body: the binding is deliberate "precisely so tests see real
-    operational values", and the three tests that broke failed LOUDLY via
-    self-validating preconditions — "the precondition worked as designed; the
-    fixture data was stale". Under option (2) those same tests would have
-    PASSED at a declared depth the factory does not run at, trading a loud
-    failure for a silent wrong-test. That is against INV-2
-    ``structured-facts-at-failure`` and the repo's loud-over-silent norm, and
-    ``conftest.py`` already ships the sanctioned escape hatch
-    (``code_default_config``, re-pointing ``ORCH_CONFIG_PATH`` at a
-    guaranteed-absent file) for the minority of tests that genuinely want
-    package defaults.
-
-    This asserts the FIXTURE'S RUNTIME EFFECT — the ``ORCH_CONFIG_PATH`` the
-    production fixture actually sets when invoked — so it is falsifiable by
-    option (2) itself (ledger entry M5). It names a PATH, not a knob value, so
-    no retune of any knob can disturb it.
-
-    Three details are load-bearing:
-
-      * ``ORCH_CONFIG_PATH`` is deleted BEFORE the call, so an ambient value
-        cannot satisfy the assertion without the fixture doing anything.
-      * Both sides are ``.resolve()``d: the conftest derives its ``REPO_ROOT``
-        resolved, this module's is not, and a symlinked checkout would
-        otherwise compare unequal while bound correctly.
-      * ``.is_file()`` on the bound path is what separates the operational
-        binding from option (2)'s shape — ``code_default_config``'s
-        guaranteed-ABSENT path promoted to autouse.
-
-    A returned generator is driven to its first yield, so converting the
-    fixture to a yield-fixture cannot silently no-op this guard.
+    The declared value is derived from the package default, so the two differ
+    whatever either is tuned to.
     """
-    conftest = _exec_orchestrator_conftest(monkeypatch)
-    fixture = conftest._isolate_orch_config
-    isolate_orch_config = getattr(fixture, '__wrapped__', fixture)
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(tmp_path / 'absent.yaml'))
+    package_default = OrchestratorConfig(project_root=tmp_path).lock_depth
 
-    monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
-    result = isolate_orch_config(monkeypatch, tmp_path)
-    if hasattr(result, '__next__'):
-        next(result)
+    declared = package_default + 1
+    config_file = tmp_path / DF_CONFIG_NAME
+    config_file.write_text(yaml.safe_dump({'lock_depth': declared}))
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(config_file))
+    resolved = OrchestratorConfig(project_root=tmp_path).lock_depth
 
-    bound = os.environ.get('ORCH_CONFIG_PATH')
-    operational = ROOT_CONFIG_PATH.resolve()
-    assert bound is not None, (
-        f'{ORCH_CONFTEST}::_isolate_orch_config no longer sets ORCH_CONFIG_PATH '
-        'at all, so every orchestrator unit test falls back to a CWD-relative '
-        f'config.yaml or the package DEFAULTS instead of {DF_CONFIG_NAME}. Task '
-        '3886 rejected narrowing that binding (option (2)); re-take the decision '
-        f'in the DECIDED block in {DF_CONFIG_NAME} rather than editing this assertion'
-    )
-    assert pathlib.Path(bound).resolve() == operational, (
-        f'fixture bound ORCH_CONFIG_PATH at {bound!r}, not the operational '
-        f'{operational}. Orchestrator unit tests would then read values the '
-        'factory does not run at — option (2), which task 3886 rejected. Re-take '
-        f'the decision in the DECIDED block in {DF_CONFIG_NAME} rather than '
-        'editing this assertion'
-    )
-    assert pathlib.Path(bound).is_file(), (
-        f'fixture bound ORCH_CONFIG_PATH at {bound!r}, which does not exist. '
-        'YamlSettingsSource skips a missing file without raising, so every '
-        'orchestrator unit test would silently load the package DEFAULTS — the '
-        'code_default_config escape hatch promoted to autouse, i.e. option (2)'
+    assert resolved == declared, (
+        f'the production loader resolved lock_depth={resolved!r} from a config '
+        f'file declaring {declared!r}, over a package default of '
+        f'{package_default!r}. The config-file layer no longer wins, so '
+        'orchestrator unit tests no longer read operational values.'
     )
 
 
 def test_every_discovered_module_config_is_reachable_at_the_operational_lock_depth(
-    monkeypatch: pytest.MonkeyPatch,
+    root_config: OrchestratorConfig,
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
 ) -> None:
-    """The retune-coherence arm: the generic invariant a retune DOWNWARD breaks silently.
+    """No module config's prefix is truncated by the lock depth the scheduler applies.
 
-    ``load_config`` only WARNS when a discovered module-config prefix is deeper
-    than ``lock_depth`` — it does not fail. The reason it can only warn is that
-    such a config is HALF-applied rather than unapplied: its test/lint commands
-    still run under full verification, while the scheduler (``_limit_for``) and
-    workflow (``_resolve_module_configs``) truncate module paths to
-    ``lock_depth`` components via ``normalize_lock``, so its scheduling limits
-    (``max_per_module``, ``module_overrides``) are silently ignored. A log line
-    nobody reads is the whole exposure.
-
-    This is the same reachability assertion
-    ``test_tests_scripts_module_config.py`` makes for the single
-    ``tests/scripts`` prefix, GENERALISED to every prefix the production
-    discovery walk returns — so a retune of ``lock_depth`` downward is caught
-    for ANY module, not only the one that happened to have a guard.
-
-    It reads ``cfg.lock_depth`` live and names no constant, so the next retune
-    of that knob falsifies nothing written here. The depth is computed with
-    ``prefix.count('/') + 1`` — the production expression from ``load_config``'s
-    own warn branch, copied rather than re-derived so the guard cannot disagree
-    with the warning it upgrades.
+    ``load_config`` only warns about such a config, which is then half-applied:
+    its commands still run, but the scheduler and workflow see module paths
+    through ``shared.locking.normalize_lock`` and never match its scheduling
+    limits. A downward retune of ``lock_depth`` would cause that silently.
     """
-    cfg = _root_config(monkeypatch)
-    discovered = _discover_module_configs(REPO_ROOT)
-
+    discovered = discover_module_configs()
     assert discovered, (
-        'config._discover_module_configs found NO module configs under '
-        f'{REPO_ROOT}, so this guard would pass vacuously. That is itself a '
-        'routing failure: an empty module_configs list is the sole trigger for '
-        "verify._build_fallback_config's __fallback__ branch"
+        'config._discover_module_configs found no module configs, so this guard '
+        'would pass vacuously.'
     )
 
-    unreachable = {
-        prefix: prefix.count('/') + 1
-        for prefix in discovered
-        if prefix.count('/') + 1 > cfg.lock_depth
+    seen_by_scheduler = {
+        prefix: normalize_lock(prefix, root_config.lock_depth) for prefix in discovered
     }
-    assert not unreachable, (
-        f'module config(s) {unreachable!r} have a prefix DEEPER than the '
-        f'operational lock_depth={cfg.lock_depth}. load_config only WARNS about '
-        'this, so such a config is silently HALF-applied: its test/lint commands '
-        'still run under full verification while the scheduler (_limit_for) and '
-        'workflow (_resolve_module_configs) truncate module paths via '
-        'normalize_lock, so its max_per_module and module_overrides are ignored. '
-        f'Either move the orchestrator.yaml up, or raise lock_depth in '
-        f'{DF_CONFIG_NAME} — do not weaken this assertion. Discovered prefixes: '
-        f'{sorted(discovered)}'
+    truncated = {prefix: seen for prefix, seen in seen_by_scheduler.items() if seen != prefix}
+    assert not truncated, (
+        f'at the operational lock_depth={root_config.lock_depth}, the scheduler '
+        f'truncates these module-config prefixes (prefix -> seen as): {truncated!r}. '
+        'Their max_per_module and module_overrides are silently ignored. Move '
+        f'the orchestrator.yaml up or raise lock_depth in {DF_CONFIG_NAME}. '
+        f'Discovered prefixes: {sorted(discovered)}'
     )
