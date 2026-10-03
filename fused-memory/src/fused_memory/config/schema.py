@@ -2479,6 +2479,12 @@ def _default_curator_usage_cap() -> UsageCapConfig:
     )
 
 
+#: The reasoning efforts the write-triage judge may send on the Responses API.
+#: The single home of that vocabulary: the judge's resolver reads it with
+#: ``typing.get_args`` rather than restating the words.
+JudgeReasoningEffort = Literal['none', 'low', 'medium', 'high']
+
+
 class WriteTriageConfig(BaseModel):
     """Server-owned band thresholds for add_memory write triage (task 3130).
 
@@ -2553,7 +2559,7 @@ class WriteTriageConfig(BaseModel):
     #
     # OPERATOR KNOBS like `enabled`/`candidate_k` above, NOT calibrated bands:
     # they ship with real defaults, and None on the two inheriting leaves means
-    # "follow llm.*", never "uncalibrated". All six are green-tier
+    # "follow llm.*", never "uncalibrated". All seven are green-tier
     # hot-reloadable and read LIVE per middle-band write by
     # server/write_triage_judge.py's resolvers — nothing is captured at import
     # or construction, which is what makes the registration in
@@ -2603,7 +2609,7 @@ class WriteTriageConfig(BaseModel):
         ),
     )
     judge_timeout_seconds: float = Field(
-        default=10.0,
+        default=15.0,
         gt=0,
         description=(
             'Per-call wall-clock budget for the judge, enforced with '
@@ -2615,7 +2621,25 @@ class WriteTriageConfig(BaseModel):
             'TimeoutError propagates into triage_write\'s fail-open arm, which '
             'is exactly C1\'s "judge error/timeout => stored + storm counter" '
             '(INV-4). Bounded gt=0 because a zero budget would fail every call '
-            'and read as a total judge outage caused by nothing.'
+            'and read as a total judge outage caused by nothing. 15 s rather '
+            'than 10 s because the frontier judge arms measured p95 4.6-6.4 s '
+            '(plans/write-triage-flip-readiness-prd.md §11.2 D15).'
+        ),
+    )
+    judge_reasoning_effort: JudgeReasoningEffort | None = Field(
+        default=None,
+        description=(
+            'Reasoning effort the judge requests. None OMITS the reasoning '
+            'parameter and sends temperature=0.0 instead, which is what a '
+            'non-reasoning model such as gpt-4o-mini needs; a reasoning model '
+            'rejects a temperature, so it needs a value here. A value is sent '
+            'as reasoning={"effort": value} on the '
+            'Responses API, and only an endpoint that serves that API '
+            "(llm.client_class 'openai') can honour it; a set value on any other "
+            'arm is refused per call and counted as a fail-open rather than '
+            'silently dropped. Set together with judge_model from the judge-arm '
+            "selection at the task-3169 flip. PRD: "
+            "plans/write-triage-flip-readiness-prd.md §11.3 C1''."
         ),
     )
     judge_candidate_count: int = Field(

@@ -99,6 +99,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
+    JudgeUsage,
 )
 
 logger = logging.getLogger(__name__)
@@ -642,7 +643,7 @@ class JudgeAnswer:
     verdict: str | None = None
     entry_elided: bool | None = None
     candidates_elided: Mapping[str, bool] | None = None
-    usage: Mapping[str, int] | None = None
+    usage: Mapping[str, int | None] | None = None
     candidate_id: str | None = None
 
     def __post_init__(self) -> None:
@@ -897,11 +898,11 @@ def _band_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
 
 
 def _spend(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Tokens billed across the run, or ``None`` where the client reported none.
+    """Tokens billed across the run, or ``None`` where the provider reported none.
 
-    ``judge_write`` discards the provider response's ``usage``, so this is
-    populated only when the run installed a recording client; an ``anthropic``
-    run and an injected stub judge both report ``None`` rather than zero.
+    Usage arrives on the shipped judge's verdict (``TriageJudgeVerdict.usage``),
+    so every provider arm is priced; a dry run, an injected stub judge, or a
+    call whose usage could not be read reports ``None`` rather than zero.
     """
     used = [row['usage'] for row in rows if row['usage']]
     if not used:
@@ -1604,47 +1605,6 @@ def field_chars_override(field_chars: int | None) -> Iterator[int]:
         write_triage_judge._FIELD_CHARS = shipped
 
 
-@contextlib.contextmanager
-def usage_recording_openai() -> Iterator[list[Any]]:
-    """Collect every openai completion's ``usage`` for the duration of the block.
-
-    ``_call_llm`` discards the response's usage, and the operator deciding the
-    3169 flip is deciding about a per-write cost. The client is wrapped rather
-    than the production call changed: the wrapper adds one append and returns
-    the provider's own response untouched.
-
-    It swaps ``openai.AsyncOpenAI`` for a plain factory process-wide, so enter
-    it around the judge calls alone: a client anything else built inside it,
-    as the retrieved plan's ``MemoryService`` stores do, would not be the SDK's
-    class.
-
-    Yields the sink. It stays EMPTY on the anthropic arm and for an injected
-    stub judge, which is why the spend block reports ``None`` rather than 0.
-    """
-    import openai  # noqa: PLC0415
-
-    recorded: list[Any] = []
-    shipped = openai.AsyncOpenAI
-
-    def factory(**kwargs: Any) -> Any:
-        client = shipped(**kwargs)
-        create = client.chat.completions.create
-
-        async def recording_create(**call: Any) -> Any:
-            response = await create(**call)
-            recorded.append(response.usage)
-            return response
-
-        client.chat.completions.create = recording_create
-        return client
-
-    openai.AsyncOpenAI = factory
-    try:
-        yield recorded
-    finally:
-        openai.AsyncOpenAI = shipped
-
-
 def _elision_flags(
     content: str, slate: Sequence[Any],
 ) -> tuple[bool, dict[str, bool]]:
@@ -1661,14 +1621,21 @@ def _elision_flags(
     )
 
 
-def _usage_of(recorded: Sequence[Any]) -> dict[str, int] | None:
-    """The last recorded completion's token counts, or ``None`` if none was."""
-    if not recorded:
+def _usage_row(usage: JudgeUsage | None) -> dict[str, int] | None:
+    """The verdict's usage under the artifact's ESTABLISHED keys, or ``None``.
+
+    The key names are kept because ``_spend`` and
+    ``fused-memory/scripts/score_write_triage_pairs.py::JudgedCase.from_row``
+    read them, and the row carries nothing they do not read. The mapping is
+    exact: output (``completion_tokens``) already includes reasoning on both
+    OpenAI APIs.
+    """
+    if usage is None:
         return None
-    usage = recorded[-1]
     return {
-        field: int(getattr(usage, field, 0) or 0)
-        for field in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+        'prompt_tokens': usage.input_tokens,
+        'completion_tokens': usage.output_tokens,
+        'total_tokens': usage.input_tokens + usage.output_tokens,
     }
 
 
@@ -1680,7 +1647,6 @@ def _ask_judge(
     outcome: str,
     band_winner_id: str | None,
     similarity: float | None,
-    recorded: Sequence[Any],
 ) -> JudgeAnswer:
     """Drive the SHIPPED judge for one case, or restate a band that decided itself.
 
@@ -1701,7 +1667,6 @@ def _ask_judge(
         return JudgeAnswer(outcome=outcome)
 
     entry_elided, candidates_elided = _elision_flags(content, slate)
-    before = len(recorded)
     verdict = asyncio.run(judge_write(
         memory_service=service,
         content=content,
@@ -1720,7 +1685,7 @@ def _ask_judge(
         verdict=verdict.outcome,
         entry_elided=entry_elided,
         candidates_elided=candidates_elided,
-        usage=_usage_of(recorded[before:]),
+        usage=_usage_row(verdict.usage),
         candidate_id=verdict.candidate_id,
     )
 
@@ -1738,7 +1703,7 @@ def _as_memory_result(record: Mapping[str, Any], metadata: Mapping[str, Any]) ->
     )
 
 
-def build_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
+def build_judge_fn(config: Any) -> Any:
     """The SEEDED live edge: drive the SHIPPED judge, not a re-implementation.
 
     ``server/write_triage_judge.judge_write`` is called with a duck-typed
@@ -1771,13 +1736,12 @@ def build_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
             outcome=OUTCOME_JUDGE,
             band_winner_id=slate[0].id if slate else None,
             similarity=_SYNTHETIC_TOP_SCORE,
-            recorded=recorded,
         )
 
     return judge_fn
 
 
-def build_retrieved_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
+def build_retrieved_judge_fn(config: Any) -> Any:
     """The RETRIEVED live edge: the case already carries production's routing.
 
     The slate, the band winner, the band and the similarity all came from
@@ -1802,7 +1766,6 @@ def build_retrieved_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
             outcome=str(case['band']),
             band_winner_id=case['band_winner_id'],
             similarity=case['similarity'],
-            recorded=recorded,
         )
 
     return judge_fn
@@ -1985,10 +1948,7 @@ def _run(args: Any) -> int:
     else:
         plan = seeded_plan(records, distractors=args.distractors, aliases=aliases)
 
-    with (
-        field_chars_override(args.field_chars) as field_chars,
-        usage_recording_openai() as recorded,
-    ):
+    with field_chars_override(args.field_chars) as field_chars:
         if args.dry_run:
             judge_fn = _dry_run_judge_fn()
             provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
@@ -1998,9 +1958,9 @@ def _run(args: Any) -> int:
             # while the run is still free to abort.
             logger.info('Judge resolves to provider=%s model=%s', provider, model)
             judge_fn = (
-                build_retrieved_judge_fn(config, recorded)
+                build_retrieved_judge_fn(config)
                 if args.slate_mode == SLATE_RETRIEVED
-                else build_judge_fn(config, recorded)
+                else build_judge_fn(config)
             )
 
         report = run_judge_eval(
