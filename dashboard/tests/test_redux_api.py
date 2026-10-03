@@ -18,6 +18,7 @@ from dashboard.data.datum import (
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
 from dashboard.data.performance import PerformanceCards
+from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.write_journal import MemoryOps
 
 # ---------------------------------------------------------------------------
@@ -657,8 +658,10 @@ def test_shape_recon_keys_watermarks_by_project_and_extracts_agents():
     body = redux_api.shape_recon(
         buffer_stats={'buffered_count': 5, 'oldest_event_age_seconds': 10.0},
         burst_state=[
-            {'agent_id': 'claude-task-7', 'state': 'bursting', 'last_write_at': 'x'},
-            {'agent_id': 'claude-interactive', 'state': 'cooling', 'last_write_at': 'y'},
+            {'agent_id': 'claude-task-7', 'state': 'bursting', 'last_write_at': 'x',
+             'activity': AgentActivity.NON_IDLE},
+            {'agent_id': 'claude-interactive', 'state': 'cooling', 'last_write_at': 'y',
+             'activity': AgentActivity.NON_IDLE},
         ],
         watermarks=[
             {'project_id': 'p1', 'last_full_run_completed': 't1'},
@@ -680,6 +683,29 @@ def test_shape_recon_no_verdict_returns_none():
         buffer_stats={}, burst_state=[], watermarks=[], verdict=None, runs=[],
     )
     assert body['RECON_STATE']['verdict'] is None
+
+
+def _shape_recon_over(burst_state):
+    return redux_api.shape_recon(
+        buffer_stats={}, burst_state=burst_state, watermarks=[], verdict=None, runs=[],
+    )
+
+
+def test_shape_recon_counts_agent_activity_over_the_active_partition():
+    burst_state = [
+        {'agent_id': 'a1', 'state': 'bursting', 'activity': AgentActivity.NON_IDLE},
+        {'agent_id': 'a2', 'state': 'idle', 'activity': AgentActivity.RECENT_WRITE},
+    ]
+    rs = _shape_recon_over(burst_state)['RECON_STATE']
+
+    assert rs['agent_activity'] == {'non_idle': 1, 'recent_write': 1}
+    assert sum(rs['agent_activity'].values()) == len(rs['burst_state'])
+
+
+def test_shape_recon_refuses_a_burst_row_the_partition_never_stamped():
+    """A route that skipped partition_burst_state is a wiring bug, not a zero."""
+    with pytest.raises((KeyError, ValueError)):
+        _shape_recon_over([{'agent_id': 'a1', 'state': 'bursting'}])
 
 
 # ---------------------------------------------------------------------------
