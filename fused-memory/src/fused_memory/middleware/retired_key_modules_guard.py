@@ -1,15 +1,7 @@
-"""Reject the retired ``metadata.modules`` key on NEW task submissions.
+"""Reject the retired ``metadata.modules`` key on new task submissions.
 
-Wired into ``server/tools.py::submit_task`` after ``inject_task_kind``, which
-normalises metadata to a dict; one placement covers both creation paths.
-
-``update_task`` and ``commit_planning`` deliberately do not call it: existing
-carriers are re-written whole by amendments, and that must keep working
-(plans/metadata-modules-retirement-prd.md decision 3).
-
-There is no bypass flag (PRD open question 2): only the top-level metadata
-key trips the guard, so quoting ``metadata.modules`` in prose or nesting it
-under an ``x_`` key never does.
+Only the top-level key counts: ``modules`` quoted in prose or nested under
+another key is not a carrier.
 """
 
 from __future__ import annotations
@@ -24,7 +16,7 @@ _REPLACEMENT_KEY = 'files'
 
 
 def retired_key_modules_error(metadata: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Return a ``RetiredMetadataKey`` error dict iff *metadata* carries ``modules``.
+    """Return a ``RetiredMetadataKey`` error dict iff *metadata* has a top-level ``modules``.
 
     PRESENCE is the violation, whatever the value: ``modules: []`` would
     still mint a new carrier.

@@ -8987,6 +8987,7 @@ def create_mcp_server(
         # dict, and before the interceptor's planning_mode branch, so both
         # creation paths are covered. update_task and commit_planning
         # deliberately do not call it: existing carriers stay re-writable.
+        # It has no bypass flag (docs/task-authoring.md §8).
         _retired_err = retired_key_modules_error(metadata)
         if _retired_err is not None:
             return _retired_err
