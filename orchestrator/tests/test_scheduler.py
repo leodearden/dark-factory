@@ -2063,6 +2063,32 @@ class TestUpdateTaskStructuredRejection:
         ok = await scheduler.update_task('1', {'files': ['backend/src/main.py']})
         assert ok is True, 'update_task must return True on a success envelope'
 
+    @pytest.mark.asyncio
+    async def test_update_task_returns_false_and_logs_on_is_error_envelope(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """A tool that reports its own failure through isError must not read as success."""
+        wire_envelope = {
+            'result': {
+                'isError': True,
+                'content': [{'type': 'text', 'text': 'Error: backend refused'}],
+            }
+        }
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            return wire_envelope
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.scheduler'):
+            ok = await scheduler.update_task('1', {'files': ['x.py']})
+
+        assert ok is False
+        assert any(
+            r.levelno == logging.ERROR and 'backend refused' in r.getMessage()
+            for r in caplog.records
+        )
+
 
 class TestRequeueCooldown:
     """Tests for the requeue cooldown that prevents ghost loops."""

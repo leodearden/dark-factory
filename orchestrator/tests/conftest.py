@@ -659,7 +659,7 @@ def forbid_live_mcp(monkeypatch):
     NOT ``orchestrator.scheduler.mcp_call`` — because ``scheduler.py`` binds
     ``mcp_call`` via ``from ... import``, a distinct binding from the
     canonical ``orchestrator.mcp_lifecycle.mcp_call`` (and
-    ``orchestrator.agents.briefing.mcp_call``).  Every alias, however,
+    ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
     ultimately constructs/uses an ``McpSession`` and issues its first
     network I/O through ``McpSession.initialize`` -> ``_raw_call`` (the
     one-shot fallback path inside ``mcp_call``, since the module-global

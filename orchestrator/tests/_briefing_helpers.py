@@ -1,11 +1,10 @@
 """Shared fixtures and wire-shape builders for the briefing test files.
 
-One home (SPOT) for the three things ``test_briefing.py`` and
-``test_briefing_project_scope.py`` both need: an assembler to drive, the
-``search`` reply envelope to answer it with, and the read-back of what it
-asked. All three were hand-copied between the two files, and the copies had
-already diverged — one carried the explanatory docstring the other lacked,
-and a third hand-built envelope spelled the same FastMCP shape a fourth way.
+One home (SPOT) for what ``test_briefing.py``, ``test_briefing_project_scope.py``
+and ``test_memory_recall.py`` share: an assembler to drive, the ``search`` and
+``get_entity`` reply shapes to answer it with, and the read-back of what it
+asked. Hand-copies of these between files had already diverged before they
+were gathered here.
 
 A module rather than ``conftest.py`` for the same reason ``_orch_helpers.py``
 is: a uniquely-named sibling can be imported by name from a test file
@@ -19,6 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -38,6 +38,19 @@ def briefing(tmp_path: Path) -> BriefingAssembler:
         ),
     )
     return BriefingAssembler(config)
+
+
+MEMORY_TRANSPORT = 'orchestrator.agents.memory_recall.mcp_call'
+"""The one patch target for answering briefing memory recall in a test.
+
+It is the network boundary, so patching it lets the real recall, parse,
+filter, render and compose pipeline run.
+"""
+
+
+def memory_transport(mock):
+    """Answer every memory call the briefing makes with *mock*."""
+    return patch(MEMORY_TRANSPORT, new=mock)
 
 
 def _result(
@@ -67,15 +80,12 @@ def _result(
 
 
 def _mcp_search_envelope(results: list[dict]) -> dict:
-    """Build the real ``tools/call`` response envelope ``_mcp_search`` reads.
+    """Build the real ``tools/call`` response envelope memory recall reads.
 
-    Mirrors ``BriefingAssembler._mcp_search``: FastMCP returns
-    ``{'result': {'content': [{'type': 'text', 'text': ...}]}}`` where
-    ``text`` is the JSON-serialised ``search`` tool payload. Used to patch
-    ``orchestrator.agents.briefing.mcp_call`` directly (unlike most briefing
-    tests, which patch ``_get_memory_context`` itself away to a stub) so the
-    real ``_get_memory_context`` / ``_scoped_search`` /
-    ``filter_foreign_project_results`` pipeline actually runs end-to-end.
+    FastMCP returns ``{'result': {'content': [{'type': 'text', 'text': ...}]}}``
+    where ``text`` is the JSON-serialised ``search`` tool payload. Handed to
+    :func:`memory_transport` so the real ``orchestrator.agents.memory_recall``
+    pipeline runs end to end.
     """
     return {
         'result': {
@@ -98,3 +108,68 @@ def _search_arguments(mcp_call_mock) -> list[dict]:
         for call in mcp_call_mock.await_args_list
         if call.args[2].get('name') == 'search'
     ]
+
+
+def _grouped_parent(id_: str = 'p1', *, grouped: dict | None = None) -> dict:
+    """A NATIVE canonical hit carrying a ``grouped`` block, as the server nests it.
+
+    Mirrors what ``fused_memory.server.grouped_read.group_search_results``
+    emits: the block is hung on a KEPT parent entry at ``entry['grouped']``,
+    with bounded amendment digests under
+    ``amendments`` and full swallowed bodies under ``matched_children``.
+    """
+    entry = _result('x', 'placeholder', metadata=None, source_store='mem0')
+    entry['id'] = id_
+    entry['content'] = 'Native canonical.'
+    entry['metadata'] = {'project_id': 'dark_factory'}
+    entry['grouped'] = _grouped_block() if grouped is None else grouped
+    return entry
+
+
+def _grouped_block() -> dict:
+    return {
+        'amendments': [
+            {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
+             'kind': 'amendment', 'metadata': {'src_project': 'reify'}},
+            {'id': 'a2', 'digest': 'NATIVE AMENDMENT BODY', 'created_at': None,
+             'kind': 'amendment', 'metadata': {'project_id': 'dark_factory'}},
+            {'id': 'a3', 'digest': 'UNTAGGED AMENDMENT BODY', 'created_at': None,
+             'kind': 'amendment'},
+        ],
+        'matched_children': [
+            {'id': 's1', 'content': 'FOREIGN SIGHTING BODY', 'created_at': None,
+             'kind': 'sighting', 'matched': True, 'metadata': {'src_project': 'reify'}},
+        ],
+        'amendment_count': 3,
+        'sighting_count': 1,
+    }
+
+
+def _entity_envelope(nodes: list[dict], edges: list[dict]) -> dict:
+    """The ``get_entity`` reply envelope, in the shape the server sends it.
+
+    Mirrors ``fused_memory.services.memory_service``'s ``_node_to_dict`` /
+    ``_edge_to_dict``: nodes carry ``{uuid, name, summary, labels}`` and edges
+    ``{uuid, fact, temporal}``, where ``temporal`` is ``None`` on the
+    exact-match path (EdgeDict has no valid_at) and a
+    ``{valid_at, invalid_at}`` dict on the fuzzy path.
+    """
+    return {
+        'result': {
+            'content': [
+                {'type': 'text', 'text': json.dumps({'nodes': nodes, 'edges': edges})},
+            ],
+        },
+    }
+
+
+def _node(name: str, summary: str = 'A task node.') -> dict:
+    return {'uuid': 'n1', 'name': name, 'summary': summary, 'labels': ['Entity']}
+
+
+def _edge(fact: str, valid_at: str | None = None) -> dict:
+    return {
+        'uuid': 'e1',
+        'fact': fact,
+        'temporal': None if valid_at is None else {'valid_at': valid_at, 'invalid_at': None},
+    }
