@@ -2068,7 +2068,9 @@ class TargetedReconciler:
         interceptor-wired guard (above) -> ``_unblock_veto_reason`` (pure,
         no I/O) -> the escalation-pin veto (one memoized store scan per
         sweep, via :meth:`_escalation_pin_index_for`) -> the live status
-        re-read (one memoized ``get_tasks`` per sweep) -> the write itself.
+        re-read (one memoized ``get_tasks`` per sweep) -> the claimant
+        clear (:meth:`_clear_claimant_before_unblock`) -> the status write
+        itself.
 
         The live re-read closes a TOCTOU window. The decision to flip comes
         from the caller's ``get_tasks`` snapshot, but ``reconcile_task`` is
@@ -2083,7 +2085,7 @@ class TargetedReconciler:
         standing between a stale snapshot and a live task -- the same
         staleness class ``targeted.py::_sweep_cancelled_descendants`` guards
         with ``_live_status_map``. It is placed last, immediately before the
-        write, to keep the window as small as possible.
+        writes, to keep the window as small as possible.
 
         Everything past the interceptor guard — the veto checks, the re-read,
         the write, and classifying its response — runs inside one try/except
@@ -2176,6 +2178,21 @@ class TargetedReconciler:
                     'live_status': live_status,
                 }
 
+            # A re-pended task must not keep a claimant that no longer owns
+            # it, or the scheduler's live-claimant dispatch gate holds it
+            # until the heartbeat TTL lapses -- the clear
+            # orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_redispatch_stranded_blocked
+            # also makes. Before the flip, so a late-landing clear cannot
+            # clobber a fresh dispatch stamp; after the re-read, because
+            # clearing an in-progress task's claimant is the incident-2588
+            # un-claim class.
+            claimant_clear = await self._clear_claimant_before_unblock(
+                dep_id=dep_id,
+                satisfied_by=satisfied_by,
+                project_root=project_root,
+                run_id=run_id,
+            )
+
             resp = await self.task_interceptor.set_task_status(
                 task_id=dep_id,
                 status='pending',
@@ -2253,6 +2270,8 @@ class TargetedReconciler:
             # to a real write.
             if no_op:
                 action['no_op'] = True
+            if claimant_clear is not None:
+                action['claimant_clear'] = claimant_clear
 
             # Second write: stamp the audit onto the dependent's own metadata,
             # so the task row itself explains why it became pending, not just
@@ -2358,6 +2377,65 @@ class TargetedReconciler:
                 'satisfied_by': satisfied_by,
                 'error': str(e)[:200],
             }
+
+    async def _clear_claimant_before_unblock(
+        self,
+        *,
+        dep_id: str,
+        satisfied_by: str,
+        project_root: ProjectRoot,
+        run_id: str,
+    ) -> str | None:
+        """Clear *dep_id*'s claimant columns ahead of its blocked->pending flip.
+
+        Journals a write/skip row under ``taskmaster``/``set_task_claimant``
+        and returns ``None`` when the clear landed, ``'rejected'`` for a
+        classified refusal, or ``'failed'`` for a raise. It never raises: like
+        the metadata stamp in :meth:`_unblock_dependent`, a clear that did not
+        land is recorded on the action, never a veto on the flip.
+        """
+        assert self.task_interceptor is not None  # narrowed by caller
+        detail = {
+            'task_id': dep_id,
+            'satisfied_by': satisfied_by,
+            'type': 'unblock_claimant_clear',
+        }
+        try:
+            resp = await self.task_interceptor.set_task_claimant(
+                task_id=dep_id,
+                project_root=project_root,
+                claimant_run_id=None,
+                heartbeat_at=None,
+            )
+        except Exception as e:
+            logger.warning(
+                'sweep: claimant clear failed for dependent %s (satisfied by %s): %s',
+                dep_id, satisfied_by, e,
+            )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'taskmaster', 'set_task_claimant',
+                {**detail, 'error': str(e)[:200]},
+                causation_id=run_id,
+            )
+            return 'failed'
+        if not interceptor_write_succeeded(resp):
+            error_code = _write_error_code(resp)
+            logger.warning(
+                'sweep: claimant clear rejected for dependent %s (satisfied by %s): '
+                'error=%r',
+                dep_id, satisfied_by, error_code,
+            )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'taskmaster', 'set_task_claimant',
+                {**detail, 'error': error_code},
+                causation_id=run_id,
+            )
+            return 'rejected'
+        await self.journal.add_run_action(
+            run_id, 'write', 'taskmaster', 'set_task_claimant', detail,
+            causation_id=run_id,
+        )
+        return None
 
     async def _on_task_deferred(
         self, task_id: str, scope: ProjectScope, task_before: dict, run_id: str
