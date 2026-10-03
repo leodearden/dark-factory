@@ -364,9 +364,16 @@ async def apply_cleanup(
     }
 
 
-async def run(args: argparse.Namespace, memory: Any = None) -> dict[str, Any]:
+def connect_graph(args: argparse.Namespace) -> Any:
+    """Open the falkordb graph handle for ``args.project_id``."""
     from falkordb import FalkorDB  # noqa: PLC0415
 
+    return FalkorDB(host=args.falkor_host, port=args.falkor_port).select_graph(args.project_id)
+
+
+async def run(
+    args: argparse.Namespace, memory: Any = None, graph: Any = None
+) -> dict[str, Any]:
     generated_at = datetime.now(UTC)
 
     if args.apply:
@@ -384,7 +391,8 @@ async def run(args: argparse.Namespace, memory: Any = None) -> dict[str, Any]:
             )
             raise
 
-    graph = FalkorDB(host=args.falkor_host, port=args.falkor_port).select_graph(args.project_id)
+    if graph is None:
+        graph = connect_graph(args)
     live = read_live_overrides(args.project_root)
     targets = scan(graph, live)
 
