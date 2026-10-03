@@ -1,4 +1,4 @@
-"""A SUCCESSFUL reply is a result, not a cap — for a caller that opts in (task 6042).
+"""A SUCCESSFUL reply the caller can use is a result, not a cap (task 6042).
 
 ``invoke_with_cap_retry`` offers every result it does not early-exit on to
 ``slot.detect_cap_hit``, successes included, and ``UsageGate.detect_cap_hit``
@@ -9,10 +9,12 @@ as the success it is, and ``CapHit`` once ``success`` is forced False.
 
 The legibility codebook is dominated by usage-limit clusters, so for that
 caller one cap-themed verdict would cap a healthy account, and every retry
-would cap the next. ``detect_caps_in_successful_output=False`` confines cap
-detection to failed results. The default is unchanged for the fleet, and (c)
-deliberately does NOT pin the default's false positive — only that it still
-returns.
+would cap the next. ``is_usable_reply`` lets such a caller say which successful
+replies are replies: one it accepts is never offered to the cap detector, one
+it rejects still is, so a banner delivered as an exit-0 reply keeps rotating
+the account (task 5637's route). The default is unchanged for the fleet, and
+the last test deliberately does NOT pin the default's false positive — only
+that it still returns.
 """
 
 from __future__ import annotations
@@ -34,6 +36,13 @@ _CAP_QUOTING_VERDICT = json.dumps({
     'candidates': [],
 })
 _PLAIN_VERDICT = json.dumps({'matches': [], 'candidates': []})
+
+
+def _is_json_object(reply: str) -> bool:
+    try:
+        return isinstance(json.loads(reply), dict)
+    except ValueError:
+        return False
 
 
 def _scripted(by_token):
@@ -62,14 +71,14 @@ async def _run(gate, invoke_fn, **knobs):
             await gate.shutdown()
 
 
-async def test_a_successful_reply_quoting_a_banner_is_returned_and_caps_nothing():
+async def test_a_usable_successful_reply_quoting_a_banner_is_returned_and_caps_nothing():
     gate = make_gate(['a', 'b'])
     invoke_fn, calls = _scripted({
         'fake-token-a': AgentResult(success=True, output=_CAP_QUOTING_VERDICT),
         'fake-token-b': AgentResult(success=True, output=_PLAIN_VERDICT),
     })
 
-    result = await _run(gate, invoke_fn, detect_caps_in_successful_output=False)
+    result = await _run(gate, invoke_fn, is_usable_reply=_is_json_object)
 
     assert result.output == _CAP_QUOTING_VERDICT
     assert calls == ['fake-token-a']
@@ -77,15 +86,47 @@ async def test_a_successful_reply_quoting_a_banner_is_returned_and_caps_nothing(
     assert gate.soonest_resets_at is None
 
 
+async def test_an_unusable_successful_reply_that_is_a_banner_caps_and_fails_over():
+    """The exit-0 banner: the CLI declined to answer but did not fail."""
+    gate = make_gate(['a', 'b'])
+    invoke_fn, calls = _scripted({
+        'fake-token-a': AgentResult(success=True, output=_BANNER),
+        'fake-token-b': AgentResult(success=True, output=_PLAIN_VERDICT),
+    })
+
+    result = await _run(gate, invoke_fn, is_usable_reply=_is_json_object)
+
+    assert result.output == _PLAIN_VERDICT
+    assert calls == ['fake-token-a', 'fake-token-b']
+    assert gate.active_account_name == 'b'
+
+
+async def test_an_unusable_successful_reply_that_is_no_banner_is_returned_and_caps_nothing():
+    """The predicate decides only whether to ASK; the gate still decides
+    whether it is a cap, and garbage is not one."""
+    gate = make_gate(['a', 'b'])
+    garbage = "I'm sorry, I cannot help with that request."
+    invoke_fn, calls = _scripted({
+        'fake-token-a': AgentResult(success=True, output=garbage),
+        'fake-token-b': AgentResult(success=True, output=_PLAIN_VERDICT),
+    })
+
+    result = await _run(gate, invoke_fn, is_usable_reply=_is_json_object)
+
+    assert result.output == garbage
+    assert calls == ['fake-token-a']
+    assert gate.active_account_name == 'a'
+
+
 async def test_a_failed_reply_carrying_a_banner_still_caps_and_fails_over():
-    """The knob narrows only the SUCCESS path: a real cap still rotates."""
+    """The predicate narrows only the SUCCESS path: a real cap still rotates."""
     gate = make_gate(['a', 'b'])
     invoke_fn, calls = _scripted({
         'fake-token-a': AgentResult(success=False, output=_BANNER),
         'fake-token-b': AgentResult(success=True, output=_PLAIN_VERDICT),
     })
 
-    result = await _run(gate, invoke_fn, detect_caps_in_successful_output=False)
+    result = await _run(gate, invoke_fn, is_usable_reply=lambda _reply: True)
 
     assert result.output == _PLAIN_VERDICT
     assert calls == ['fake-token-a', 'fake-token-b']

@@ -25,10 +25,11 @@ What this module still takes from ``shared`` directly is one pure function,
 ``cap_markers.looks_like_blocking_banner``: the loose OR-substring DEFER GATE
 ``census.preflight_headroom`` also uses, applied on one path only -- a reply
 that came back as a SUCCESS yet could not be parsed into a verdict. The runner
-deliberately never cap-scans a successful reply for this caller, because a
-verdict that QUOTES a banner is a verdict and this codebook is full of them,
-so a banner delivered as an ordinary reply reaches this scan instead. A loose
-false positive there can only re-label a digest that was failing anyway.
+puts such a reply to the gate's STRICT detector first
+(``TRICKLE_CODER_STAGE.is_usable_reply``), which rotates on a recognised cap;
+what still arrives unparseable is a banner the strict detector does not know,
+such as an auth banner. A loose false positive there can only re-label a
+digest that was failing anyway.
 
 Never-fabricate contract (codebook lesson ``one-shot-subagent-contract`` —
 the fail-soft fallback that hid a total outage): a CLI-invocation error,
@@ -301,6 +302,15 @@ def parse_coder_output(raw: str) -> dict:
 # TRICKLE_CODER_STAGE — how one trickle digest calls the model
 # ---------------------------------------------------------------------------
 
+def reply_parses_as_judgment(reply: str) -> bool:
+    """Could ``code_digest`` parse *reply* into a judgment at all?"""
+    try:
+        parse_coder_output(reply)
+    except CoderParseError:
+        return False
+    return True
+
+
 TRICKLE_CODER_STAGE = session_runner.StageSpec(
     name="trickle-coder",
     cwd=None,
@@ -308,10 +318,20 @@ TRICKLE_CODER_STAGE = session_runner.StageSpec(
     max_turns=2,
     max_budget_usd=1.0,
     tools=session_runner.CLASSIFIER,
+    is_usable_reply=reply_parses_as_judgment,
 )
 """A pure classifier: the codebook index and the digest are both in the
 prompt, so it needs no tools and no project cwd. 120s, sized for one Haiku
-coding call, is the binding bound; turns and budget are ceilings."""
+coding call, is the binding bound; turns and budget are ceilings.
+
+A successful reply that does not parse is put to the gate's STRICT cap
+detector, so a banner delivered at exit 0 caps that account and the same
+digest is retried on the next (task 5637), while a parsed verdict quoting a
+banner is never offered. Every real banner fails to parse
+(``test_the_trickle_stage_offers_every_real_banner_to_the_pool``). Known
+residual, accepted since task 5637: a verdict TRUNCATED mid-JSON after a
+cap-quoting ``evidence_quote`` is unparseable AND strictly a cap, so it caps
+a healthy account for the night."""
 
 
 # ---------------------------------------------------------------------------
@@ -375,10 +395,12 @@ def code_digest(
     except CoderParseError as exc:
         # The coder's one cap scan, and its placement INSIDE this arm is
         # load-bearing. The CLI does not always FAIL when it declines to
-        # answer -- it can deliver the banner as an ordinary successful reply,
-        # which the session runner deliberately does not cap-scan for this
-        # caller. So the "reply" arrives here as prose that could not be
-        # parsed into a verdict, and this is what still labels it capped.
+        # answer -- it can deliver the banner as an ordinary successful reply.
+        # The session runner offers an unparseable reply to the gate's STRICT
+        # detector, which rotates on a cap it recognises; a banner it does not
+        # recognise (an auth banner, a new wording) still arrives here as
+        # prose that could not be parsed into a verdict, and this is what
+        # labels it capped.
         #
         # Scanning only AFTER the parse has failed is census's
         # split-on-parse-success rule, adopted unchanged (see

@@ -195,16 +195,17 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         PoolFrozen, which the runner types
 #                                         per task 5947 (all-capped defers at
 #                                         exit 0; all-auth-failed fails loud).
-#                                         detect_caps_in_successful_output=
-#                                         False: its codebook is dominated by
-#                                         usage-limit clusters, so a verdict
-#                                         QUOTING a banner must not cap a
-#                                         healthy account.  cap_wait_sanity_secs
-#                                         left at the default: the two bounds
-#                                         above always fire first.  Was an
-#                                         audited NON-caller (own text-mode
-#                                         spawn, no account pool) until task
-#                                         6042.
+#                                         is_usable_reply per stage: its
+#                                         codebook is dominated by usage-limit
+#                                         clusters, so a verdict QUOTING a
+#                                         banner must not cap a healthy
+#                                         account, while an unparseable exit-0
+#                                         banner still rotates.
+#                                         cap_wait_sanity_secs left at the
+#                                         default: the two bounds above always
+#                                         fire first.  Was an audited
+#                                         NON-caller (own text-mode spawn, no
+#                                         account pool) until task 6042.
 #
 # SCOPE OF EVERY BOUND IN THIS TABLE (task 3630 amendment, reviewer:
 # robustness).  cap_wait_sanity_secs is consulted at exactly one place —
@@ -2047,7 +2048,7 @@ async def invoke_with_cap_retry(
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
     park_on_frozen_pool: bool = True,
-    detect_caps_in_successful_output: bool = True,
+    is_usable_reply: Callable[[str], bool] | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2103,16 +2104,20 @@ async def invoke_with_cap_retry(
     ``AllAccountsCappedException`` because a pool frozen on rejected
     credentials is not a cap and will not clear at a reset.
 
-    *detect_caps_in_successful_output* decides whether a SUCCESSFUL result is
-    offered to the cap detector at all.  ``UsageGate.detect_cap_hit`` builds a
-    synthetic ``success=False`` result before classifying, so a successful
-    reply that merely QUOTES a banner reads as a cap: measured 2026-10-02, a
-    verdict whose evidence quotes ``REAL_CLI_CAP_HIT_MESSAGES[0]`` classifies
-    ``OK()`` as it is and ``CapHit`` once forced to fail.  ``False`` confines
-    cap detection to failed results, for a caller whose replies routinely
-    quote cap text (the legibility coder, task 6042).  The default ``True``
-    is unchanged for the fleet until it is measured whether a JSON-mode cap
-    can ever arrive with ``is_error`` false.
+    *is_usable_reply* decides which SUCCESSFUL results are offered to the cap
+    detector.  ``UsageGate.detect_cap_hit`` builds a synthetic
+    ``success=False`` result before classifying, so a successful reply that
+    merely QUOTES a banner reads as a cap: measured 2026-10-02, a verdict
+    whose evidence quotes ``REAL_CLI_CAP_HIT_MESSAGES[0]`` classifies ``OK()``
+    as it is and ``CapHit`` once forced to fail.  ``None`` (the default)
+    offers every result, unchanged for the fleet.  A predicate offers a
+    successful result only when it REJECTS the output — a reply the caller
+    could not use at all, which is where a banner delivered at exit 0 lands —
+    so a usable reply quoting cap text never costs an account, while an exit-0
+    banner still rotates it (task 5637's route).  The predicate decides only
+    whether to ASK; the gate's strict detector still decides whether it is a
+    cap.  Failed results are always offered.  Consumer: the legibility runner,
+    whose replies routinely quote cap text (task 6042).
 
     *rebuild_prompt*, when provided, is awaited as ``rebuild_prompt(True)``
     on a cap retry whose session cannot be resumed (no ``session_id`` on the
@@ -2565,7 +2570,12 @@ async def invoke_with_cap_retry(
                     await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
-                if (detect_caps_in_successful_output or not result.success) and slot.detect_cap_hit(
+                offered_to_cap_detector = (
+                    not result.success
+                    or is_usable_reply is None
+                    or not is_usable_reply(result.output)
+                )
+                if offered_to_cap_detector and slot.detect_cap_hit(
                     result.stderr, result.output, backend=backend,
                 ):
                     consecutive_cap_hits += 1

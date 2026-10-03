@@ -14,9 +14,10 @@ coming?".  Three independent consumers share it:
   Deciding whether an ACCOUNT is out is not the coder's: every trickle and
   census call runs through the shared session runner
   (``shared.cli_invoke.invoke_with_cap_retry``, task 6042), whose strict
-  detector owns that — and which, for these callers, never cap-scans a
-  SUCCESSFUL reply, so a banner delivered as one reaches this loose scan
-  instead.  Two contracts, two consequences, two matchers.
+  detector owns that — and which, for these callers, cap-scans a SUCCESSFUL
+  reply only when the stage could not use it, so a banner that detector does
+  not recognise reaches this loose scan instead.  Two contracts, two
+  consequences, two matchers.
 
 **Why this lives in ``src/`` rather than ``tests/``.**  The list started in
 ``shared/tests/_capacity_skip.py``, which is importable solely via that

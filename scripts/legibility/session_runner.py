@@ -162,6 +162,11 @@ READ_ONLY_EXPLORER = ToolPolicy(
 text-mode ``claude -p`` had before task 6042."""
 
 
+def every_reply_is_usable(reply: str) -> bool:
+    """A stage with no reply contract: no successful reply is cap-scanned."""
+    return True
+
+
 @dataclass(frozen=True)
 class StageSpec:
     """How one stage calls the model.
@@ -170,6 +175,10 @@ class StageSpec:
     loads no project ``CLAUDE.md`` or memory into every call.
     *max_turns* and *max_budget_usd* are ceilings the CLI requires, set well
     above any measured call; *timeout_secs* is the binding bound.
+    *is_usable_reply* says which successful replies the stage can use; only
+    one it rejects is offered to the gate's cap detector, so a banner
+    delivered at exit 0 rotates the account while a reply QUOTING a banner
+    stays a reply (``invoke_with_cap_retry``'s knob of the same name).
     """
 
     name: str
@@ -178,6 +187,7 @@ class StageSpec:
     max_turns: int
     max_budget_usd: float
     tools: ToolPolicy
+    is_usable_reply: Callable[[str], bool] = every_reply_is_usable
 
 
 class SessionRunner:
@@ -187,9 +197,10 @@ class SessionRunner:
     process; ``close()`` (or leaving the ``with`` block) shuts the gate down
     and releases both. Every call is park-free and bounded:
     ``park_on_frozen_pool=False`` (a frozen pool defers instead of waiting for
-    a reset), ``max_cap_retries`` of one pass over the pool, and
-    ``detect_caps_in_successful_output=False`` (a verdict that QUOTES a cap
-    banner is a verdict — this codebook is full of them).
+    a reset) and ``max_cap_retries`` of one pass over the pool. A successful
+    reply reaches the cap detector only when the stage's ``is_usable_reply``
+    rejects it: a verdict that QUOTES a cap banner is a verdict, and this
+    codebook is full of them.
     """
 
     def __init__(self, gate, *, label: str) -> None:
@@ -227,7 +238,7 @@ class SessionRunner:
                 config_dir=self._config_dir,
                 max_cap_retries=self._gate.account_count,
                 park_on_frozen_pool=False,
-                detect_caps_in_successful_output=False,
+                is_usable_reply=stage.is_usable_reply,
                 prompt=prompt,
                 model=model,
                 cwd=cwd,
