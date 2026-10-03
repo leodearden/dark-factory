@@ -2520,7 +2520,8 @@ def _df_no_synthetic_heartbeats_in_live_fleet():
 
 # The vars that retarget git WITHOUT walking anywhere. Deliberately NARROW:
 # only names that change WHICH repository (or which config) a command acts on.
-# Identity vars (GIT_AUTHOR_*, GIT_COMMITTER_*) are left alone -- they change
+# GIT_CONFIG_PARAMETERS is git's own `-c` propagation channel, read at
+# command-line precedence (it can inject a core.hooksPath). Identity vars (GIT_AUTHOR_*, GIT_COMMITTER_*) are left alone -- they change
 # what a commit says, never where it lands, and tests legitimately set them for
 # determinism.
 #
@@ -2538,10 +2539,12 @@ _GIT_REDIRECT_ENV = (
     'GIT_CONFIG_GLOBAL',
     'GIT_CONFIG_SYSTEM',
     'GIT_CONFIG_COUNT',
+    'GIT_CONFIG_PARAMETERS',
 )
 
-# `git -c` pairs are passed as an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0, ...),
-# so they cannot be enumerated by name.
+# GIT_CONFIG_COUNT's pairs are an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0, ...),
+# so they cannot be enumerated by name. (`git -c` itself propagates through
+# GIT_CONFIG_PARAMETERS above, not through this family.)
 _GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 
 
