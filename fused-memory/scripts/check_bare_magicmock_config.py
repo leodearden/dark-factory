@@ -226,6 +226,8 @@ hooks/project-checks can invoke it via plain python3 without uv env-resolution o
 Adding a third-party dependency here would break that fast path.  This is why
 ``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
 describes: ``import orchestrator.verify`` would need pydantic and break every caller.
+The hardcoded copy's drift guard lives in the test, which CAN import it:
+fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry::test_verify_result_fields_match_the_real_dataclass.
 """
 
 from __future__ import annotations
@@ -282,12 +284,12 @@ class _DataclassShape(NamedTuple):
 # all seven package lint_commands can run it under bare ``python3`` with no venv
 # resolution.  ``import orchestrator.verify`` would need pydantic and break every caller.
 #
-# VerifyResult's field list mirrors orchestrator/src/orchestrator/verify.py::VerifyResult.
-# Drift is absorbed structurally rather than by keeping this list exhaustive:
-# matching keys on the ``passed`` anchor plus a 2-field overlap floor, so adding,
-# renaming or removing a peripheral field cannot silently disable detection.  Only
-# removing ``passed`` itself could, and that is a VerifyResult refactor that would
-# break the orchestrator far more loudly first.
+# VerifyResult's field list is a stdlib-only copy of
+# orchestrator/src/orchestrator/verify.py::VerifyResult, kept EXHAUSTIVE: a field
+# missing here does not count toward the overlap floor, so a double built from it
+# slips through.  Its drift guard is
+# fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry::test_verify_result_fields_match_the_real_dataclass,
+# which compares this literal against ``dataclasses.fields(VerifyResult)`` at runtime.
 _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
     _DataclassShape(
         name='VerifyResult',
@@ -309,6 +311,7 @@ _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
             'failing_leg_categories',
             'trivial',
             'duration_secs',
+            'flake_suppression',
         }),
         anchors=frozenset({'passed'}),
         min_field_matches=2,
