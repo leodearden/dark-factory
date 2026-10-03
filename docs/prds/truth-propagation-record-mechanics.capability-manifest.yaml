@@ -1,0 +1,81 @@
+prd: docs/prds/truth-propagation-record-mechanics.md
+schema_version: 1
+tasks:
+- label: alpha
+  task_id: 4697
+  title: Add amend_escalation MCP verb (append-only, bumps updated_at)
+  capabilities:
+  - name: amendment-machinery-reusable
+    binding: capability→substrate — Amendment model + fold append/cap machinery verified
+      present to reuse (models.py, queue.py::add_members_to_l2, sole updated_at writer
+      today); 0-today with control def-resolve_issue=present
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def amend_escalation
+      paths:
+      - escalation/src/escalation/
+      expect: present
+  - name: updated-at-bump-on-amend
+    binding: behavioural — signal compares get_escalation before/after (updated_at
+      newer than triaged_at post-amend)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: before/after field comparison is behavioural, judged by the leaf's fixtures
+  - name: terminal-record-refusal
+    binding: rejection-mechanism — refuses resolved/archived records without mutation
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: refusal-without-mutation is a behavioural fixture
+- label: beta
+  task_id: 4698
+  title: Return a sideways census from resolve_issue (same-task + shared-member pending
+    records)
+  capabilities:
+  - name: sideways-census-in-response
+    binding: capability→producer (this task) — reuses the existing pending-queue read
+      path; response field name is PRD OQ1
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: field name is PRD OQ1 (decided at impl); a name grep now would prejudge
+        it — judged by the leaf's fixture signal
+  - name: report-only-no-mutation
+    binding: rejection-mechanism — no listed record's file changes (byte-identity
+      fixture)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: byte-identity of listed records is behavioural
+- label: gamma
+  task_id: 4699
+  title: 'Backstop decision gate: does the convention tier suffice?'
+  capabilities:
+  - name: decision-recorded
+    binding: pure human gate (deterministic + always_escalates, dated milestone —
+      task-authoring.md §5-6 preset verified) — the decision lives in the gate's resolution
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a human ruling has no mechanical twin; the resolution text is the record
+- label: delta
+  task_id: 4700
+  title: 'delivered_check premise-recheck: dated world-claim premises, warn-never-block'
+  capabilities:
+  - name: premise-shape-validated
+    binding: capability→producer (this task) — delivered_checks write-time validation
+      substrate verified; field shape is PRD OQ2
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: field shape is PRD OQ2 (decided at impl); judged by the leaf's ValidationError
+        fixture
+  - name: warn-never-block
+    binding: rejection-mechanism — stale-premise fixture evaluates green AND files
+      exactly one deduped info escalation
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: warn-not-block plus dedup is behavioural fault-injection, not greppable

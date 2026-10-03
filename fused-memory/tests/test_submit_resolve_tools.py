@@ -3,9 +3,11 @@
 import json
 import logging
 import os
+import shutil
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import _init_git_repo
 
 from fused_memory.server.tools import create_mcp_server
 
@@ -412,3 +414,231 @@ async def test_routing_intent_warning_merged_into_planning_mode_result(
     assert result.get('status') == 'deferred'
     assert result.get('planning_mode') is True
     assert 'routing_intent_warning' in result, f'Expected warning payload, got: {result!r}'
+
+
+@pytest.mark.asyncio
+async def test_routing_intent_stage2_stamp_does_not_blind_submit_boundary(
+    mcp_server, task_interceptor, monkeypatch,
+):
+    """WARN mode + a marker-bearing submission whose description carries a
+    machine-injected Stage-2 doc-drift stamp ("DOC-DRIFT FIX ...") -> the
+    boundary still flags it. The stamp's bare "FIX" previously armed the
+    code-change suppression and blinded the guard for that task (4532)."""
+    monkeypatch.delenv('FUSED_ROUTING_INTENT_ENFORCE', raising=False)
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'DO NOT IMPLEMENT this; escalate to a human instead of implementing.',
+            'description': (
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding 4e06f01a-cacb-4688-9670-ff6d6ce41baf): the '
+                '`dependencies` array carries 32 entries, but this prose '
+                'previously itemized only 31.'
+            ),
+            'task_kind': 'normal',
+        },
+    )
+    assert 'routing_intent_warning' in result, f'Expected warning payload, got: {result!r}'
+    task_interceptor.submit_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_routing_intent_enforce_mode_rejects_a_stamped_submission(
+    mcp_server, task_interceptor, monkeypatch,
+):
+    """ENFORCE mode + a marker-bearing submission whose description carries a
+    machine-injected Stage-2 doc-drift stamp -> the finding RECOVERED by the
+    provenance-stamp carve-out flows all the way into the
+    routing_intent_reject payload and the interceptor is never reached.
+
+    Pins the consequential direction of task 4532: a stamp-recovered finding
+    is a real hard reject under FUSED_ROUTING_INTENT_ENFORCE, not merely an
+    advisory warning, so the carve-out's precision boundaries are
+    load-bearing at the wire."""
+    monkeypatch.setenv('FUSED_ROUTING_INTENT_ENFORCE', '1')
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': '/project',
+            'title': 'DO NOT IMPLEMENT this; escalate to a human instead of implementing.',
+            'description': (
+                '[Stage 2 task-knowledge sync 2026-07-07] DOC-DRIFT FIX '
+                '(finding abc): re-derived the dependency count.'
+            ),
+            'task_kind': 'normal',
+        },
+    )
+    assert result.get('error_type') == 'ValidationError', f'Expected ValidationError, got: {result!r}'
+    assert 'do_not_implement' in result.get('error', ''), (
+        f'Reject payload must name the recovered marker, got: {result!r}'
+    )
+    task_interceptor.submit_task.assert_not_called()
+
+
+# ------------------------------------------------------------------
+# gitignored-deliverable lint guard — MCP-boundary integration (task 3611)
+#
+# The unit-level matrix lives in test_gitignored_deliverable_guard.py; these
+# tests assert the guard is WIRED into submit_task, against a REAL git repo
+# (the probe is not monkeypatched) with the interceptor mocked. The declared
+# path is .taskmaster/tasks/tasks.json rather than tasks.db: '.db' is not on
+# the lock-charter extension allowlist, so lock-charter guard γ refuses
+# tasks.db as a "directory" before this guard is reached.
+# ------------------------------------------------------------------
+
+_IGNORED_DELIVERABLE = '.taskmaster/tasks/tasks.json'
+
+
+@pytest.fixture
+def ignored_project(tmp_path):
+    """A real git repo whose .gitignore ignores tasks.db and .taskmaster/."""
+    if shutil.which('git') is None:
+        pytest.skip('git is not available')
+    _init_git_repo(tmp_path)
+    (tmp_path / '.gitignore').write_text('tasks.db\n.taskmaster/\n')
+    return tmp_path
+
+
+@pytest.mark.asyncio
+async def test_gitignored_deliverable_warn_mode_flags_and_still_submits(
+    mcp_server, task_interceptor, ignored_project, monkeypatch, caplog,
+):
+    monkeypatch.delenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', raising=False)
+    with caplog.at_level(logging.WARNING):
+        result = await mcp_server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': str(ignored_project),
+                'title': 'Edit the task store',
+                'task_kind': 'normal',
+                'metadata': {'files': [_IGNORED_DELIVERABLE]},
+            },
+        )
+    assert 'gitignored_deliverable_warning' in result, f'Expected warning payload, got: {result!r}'
+    assert "task_kind='deterministic'" in result['gitignored_deliverable_warning']['hint']
+    task_interceptor.submit_task.assert_called_once()
+    assert any(
+        'gitignored_deliverable_lint.flagged' in rec.getMessage() for rec in caplog.records
+    ), f'Expected a gitignored_deliverable_lint.flagged census WARNING, got: {caplog.records!r}'
+
+
+@pytest.mark.asyncio
+async def test_gitignored_deliverable_deterministic_filing_passes(
+    mcp_server, task_interceptor, ignored_project, monkeypatch,
+):
+    monkeypatch.delenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', raising=False)
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(ignored_project),
+            'title': 'Edit the task store',
+            'task_kind': 'deterministic',
+            'metadata': {'files': [_IGNORED_DELIVERABLE], 'always_escalates': True},
+        },
+    )
+    assert 'gitignored_deliverable_warning' not in result
+    task_interceptor.submit_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_gitignored_deliverable_committable_path_not_flagged(
+    mcp_server, task_interceptor, ignored_project, monkeypatch,
+):
+    monkeypatch.delenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', raising=False)
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(ignored_project),
+            'title': 'Change foo',
+            'task_kind': 'normal',
+            'metadata': {'files': ['src/foo.py']},
+        },
+    )
+    assert 'gitignored_deliverable_warning' not in result
+    task_interceptor.submit_task.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_gitignored_deliverable_enforce_mode_rejects(
+    mcp_server, task_interceptor, ignored_project, monkeypatch,
+):
+    monkeypatch.setenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', '1')
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(ignored_project),
+            'title': 'Edit the task store',
+            'task_kind': 'normal',
+            'metadata': {'files': [_IGNORED_DELIVERABLE]},
+        },
+    )
+    assert result.get('error_type') == 'ValidationError', f'Expected ValidationError, got: {result!r}'
+    assert _IGNORED_DELIVERABLE in result['error']
+    task_interceptor.submit_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gitignored_deliverable_warning_merged_into_planning_mode_result(
+    mcp_server, task_interceptor, ignored_project, monkeypatch,
+):
+    monkeypatch.delenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', raising=False)
+    task_interceptor.submit_task = AsyncMock(
+        return_value={'task_id': '5', 'status': 'deferred', 'planning_mode': True}
+    )
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(ignored_project),
+            'title': 'Edit the task store',
+            'task_kind': 'normal',
+            'metadata': {'files': [_IGNORED_DELIVERABLE]},
+            'planning_mode': True,
+        },
+    )
+    assert result.get('task_id') == '5'
+    assert result.get('status') == 'deferred'
+    assert result.get('planning_mode') is True
+    assert 'gitignored_deliverable_warning' in result, f'Expected warning payload, got: {result!r}'
+
+
+@pytest.mark.asyncio
+async def test_gitignored_deliverable_warning_not_merged_into_error_result(
+    mcp_server, task_interceptor, ignored_project, monkeypatch, caplog,
+):
+    monkeypatch.delenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', raising=False)
+    task_interceptor.submit_task = AsyncMock(
+        return_value={'error': 'x', 'error_type': 'ValidationError'}
+    )
+    with caplog.at_level(logging.WARNING):
+        result = await mcp_server._tool_manager.call_tool(
+            'submit_task',
+            {
+                'project_root': str(ignored_project),
+                'title': 'Edit the task store',
+                'task_kind': 'normal',
+                'metadata': {'files': [_IGNORED_DELIVERABLE]},
+            },
+        )
+    assert result.get('error') == 'x'
+    assert 'gitignored_deliverable_warning' not in result
+    assert not any(
+        'gitignored_deliverable_lint.flagged' in rec.getMessage() for rec in caplog.records
+    ), 'The census counts accepted filings only, not ones the interceptor rejected'
+
+
+@pytest.mark.asyncio
+async def test_gitignored_deliverable_operational_class_is_exempt(
+    mcp_server, task_interceptor, ignored_project, monkeypatch,
+):
+    monkeypatch.delenv('FUSED_GITIGNORED_DELIVERABLE_ENFORCE', raising=False)
+    result = await mcp_server._tool_manager.call_tool(
+        'submit_task',
+        {
+            'project_root': str(ignored_project),
+            'title': 'Edit the task store',
+            'metadata': {'execution_class': 'operational', 'files': [_IGNORED_DELIVERABLE]},
+        },
+    )
+    assert 'gitignored_deliverable_warning' not in result
+    task_interceptor.submit_task.assert_called_once()

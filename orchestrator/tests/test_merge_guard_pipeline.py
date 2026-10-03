@@ -2,7 +2,7 @@
 kappa / task 1995).
 
 Extracts the duplicated pre-merge guard+merge+drop-guard pipeline shared by
-``MergeWorker._do_merge``, ``SpeculativeMergeWorker._merger_loop`` (inline
+the retired serial ``_do_merge``, ``SpeculativeMergeWorker._merger_loop`` (inline
 body), and ``SpeculativeMergeWorker._remerge`` into one module-level async
 function, ``classify_and_merge(worker, req, base_sha, *, speculative,
 started_monotonic) -> MergedOk | Decided``, and routes all three consumers
@@ -15,7 +15,7 @@ Steps covered (TDD order):
   step-3  RED   — classify_and_merge guard matrix on SpeculativeMergeWorker
   step-4  GREEN — implement classify_and_merge
   step-5  GREEN — adopt classify_and_merge in _merger_loop
-  step-6  RED   — classify_and_merge guard matrix on MergeWorker (serial)
+  step-6  RED   — snapshot_tip / base_sha guards (the serial-worker matrix retired with task 5034)
   step-7  GREEN — capability-gate SpeculativeMergeWorker-only behaviour
   step-8  GREEN — adopt classify_and_merge in _do_merge
   step-9  RED   — parameterized path-equivalence (merger loop vs _remerge)
@@ -40,18 +40,18 @@ from typing import Literal
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _orch_helpers import make_placeholder_future
-from _serial_merge_worker import MergeWorker
+from _live_merge_worker import running_merge_worker
+from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.merge_lane.gates import DropGuardResult
 from orchestrator.merge_queue import (
     DROPPED_PLAN_TARGETS_REASON_PREFIX,
     Decided,
     DecidedItem,
-    DropGuardResult,
     MergedOk,
     MergeOutcome,
     MergeRequest,
@@ -451,6 +451,28 @@ class TestClassifyAndMergeSpeculativeWorker:
         containment and eject the task with its novel commit unmerged.  Green
         both pre- and post-impl (pre-impl there is no backstop); it pins the
         safety arm against a future over-trigger.
+
+        NOT separately pinned any more (task 5031): the helper's FAIL-OPEN arm
+        — content genuinely patch-id-contained, helper answers False anyway
+        (``git cherry`` rc != 0), guard must still merge.  The deleted
+        ``test_patch_id_fail_open_falls_through_to_merge`` forced that answer by
+        monkeypatching ``merge_queue.patch_content_contained``, and this test
+        cannot substitute for it: here the content really is not contained, so
+        it cannot tell "the guard trusts the helper's return" apart from "the
+        guard re-derives containment itself".
+
+        There is no in-scope way to force the real helper to False on contained
+        content.  Its only lever is ``cwd=git_ops.project_root``
+        (``merge_queue.py::patch_content_contained``) — the same root
+        ``classify_and_merge`` re-resolves ``actual_main`` from via
+        ``git_ops.get_main_sha()`` and then merges in, so pointing it at a
+        non-git directory (the real-fail-open trick
+        test_merge_queue_store.py::test_divergence_replaces_and_warns uses at
+        the ``recover_pending_merges`` call site, where nothing else needs the
+        root) breaks the merge this test must observe.  Retiring the residue
+        needs one production change: thread the containment predicate into
+        ``classify_and_merge`` as an injectable port, as ``verifier=`` already
+        is for verification.
         """
         from orchestrator.merge_queue import classify_and_merge, patch_content_contained
 
@@ -538,50 +560,6 @@ class TestClassifyAndMergeSpeculativeWorker:
         )
         assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
 
-    async def test_patch_id_fail_open_falls_through_to_merge(
-        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        """Safety arm (task 2945, signal 4): the guard honors a False return
-        from patch_content_contained even when the content is genuinely on main
-        — the helper's fail-open (git cherry rc!=0 → False) must fall through to
-        a normal merge, never a spurious skip.  Locks the fail-open contract.
-        """
-        import orchestrator.merge_queue as mq_mod
-        from orchestrator.merge_queue import classify_and_merge
-
-        # Rebased-landing contained setup (content genuinely on main).
-        worktree = await _make_branch_with_file(git_ops, 'failopen-2945', 'reb.py', 'x = 1\n')
-        branch_sha = await git_ops.resolve_branch_sha('task/failopen-2945')
-        assert branch_sha is not None
-        (git_ops.project_root / 'other.py').write_text('other = 1\n')
-        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
-        await _run(['git', 'commit', '-m', 'Unrelated main advance'], cwd=git_ops.project_root)
-        await _run(['git', 'cherry-pick', branch_sha], cwd=git_ops.project_root)
-        main_reb = await git_ops.get_main_sha()
-        assert not await git_ops.is_ancestor(branch_sha, main_reb)
-
-        # Simulate the helper's fail-open (git cherry rc!=0 → False) even though
-        # the content IS genuinely patch-id-contained on main.
-        async def _fail_open(head, upstream, git_ops):
-            return False
-
-        monkeypatch.setattr(mq_mod, 'patch_content_contained', _fail_open)
-
-        es = _make_event_store(tmp_path)
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
-        req = _make_request('failopen-2945', 'failopen-2945', worktree, config)
-
-        result = await classify_and_merge(
-            worker, req, main_reb, speculative=False, started_monotonic=time.monotonic(),
-        )
-
-        assert isinstance(result, MergedOk), (
-            f'fail-open (False) must fall through to a normal merge; got {result!r}'
-        )
-        assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
-
     async def test_real_conflict_returns_decided_conflict_and_records_drift_sample(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
@@ -604,7 +582,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         # sites per design — NOT part of classify_and_merge), so
         # _note_conflict_detected has a real stashed base to pop.
         worker._note_merge_started(req.request_id)
-        drift_count_before = worker._merge_metrics.drift_summary()['count']
+        drift_count_before = worker.snapshot()['metrics']['drift_at_detection']['count']
 
         result = await classify_and_merge(
             worker, req, main_sha, speculative=False, started_monotonic=time.monotonic(),
@@ -614,7 +592,7 @@ class TestClassifyAndMergeSpeculativeWorker:
         assert result.outcome.status == 'conflict'
         assert result.outcome.conflict_details  # non-empty
         assert _merge_attempt_subtypes(es.db_path) == ['conflict']
-        drift_count_after = worker._merge_metrics.drift_summary()['count']
+        drift_count_after = worker.snapshot()['metrics']['drift_at_detection']['count']
         assert drift_count_after == drift_count_before + 1, (
             'expected _note_conflict_detected to record one drift sample'
         )
@@ -788,88 +766,6 @@ class TestClassifyAndMergeSpeculativeWorker:
         if result.merge_wt:
             await git_ops.cleanup_merge_worktree(result.merge_wt)
 
-
-# ---------------------------------------------------------------------------
-# step-6: classify_and_merge on the SERIAL worker (MergeWorker) preserves
-# _do_merge's exact quirks (no drift bookkeeping, no rich diagnostic).
-#
-# classify_and_merge already capability-gates the SpeculativeMergeWorker-only
-# calls (isinstance check added in step-4, ahead of the plan's step-7), so
-# this suite is GREEN on first run rather than RED — see the commit message
-# for the full accounting. Written as originally scoped for the guard-matrix
-# coverage regardless.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-class TestClassifyAndMergeSerialWorker:
-    """Direct-drive guard-matrix coverage for classify_and_merge on the plain
-    (non-capability) serial worker (step-6, task 1995).
-    """
-
-    async def test_real_conflict_returns_decided_conflict_no_drift_side_effect(
-        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
-    ):
-        from orchestrator.merge_queue import classify_and_merge
-
-        worktree = (await git_ops.create_worktree('conflict-serial-1')).path
-        (git_ops.project_root / 'README.md').write_text('# Main version\n')
-        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
-        await _run(['git', 'commit', '-m', 'Main change'], cwd=git_ops.project_root)
-        (worktree / 'README.md').write_text('# Task version\n')
-        await git_ops.commit(worktree, 'Task change')
-
-        es = _make_event_store(tmp_path)
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        # MergeWorker has neither _merge_metrics nor _note_conflict_detected —
-        # classify_and_merge must not raise AttributeError reaching for them.
-        worker = MergeWorker(git_ops, queue, event_store=es)
-        req = _make_request('conflict-serial-1', 'conflict-serial-1', worktree, config)
-        main_sha = await git_ops.get_main_sha()
-
-        result = await classify_and_merge(
-            worker, req, main_sha, speculative=False, started_monotonic=time.monotonic(),
-        )
-
-        assert isinstance(result, Decided)
-        assert result.outcome.status == 'conflict'
-        assert result.outcome.conflict_details
-        assert _merge_attempt_subtypes(es.db_path) == ['conflict']
-
-    async def test_non_conflict_merge_failure_returns_plain_reason_no_diagnostic(
-        self,
-        git_ops: GitOps,
-        config: OrchestratorConfig,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        from orchestrator.merge_queue import classify_and_merge
-
-        worktree = await _make_branch_with_file(
-            git_ops, 'nonconflict-serial-1', 'f.py', 'x = 1\n',
-        )
-        main_sha = await git_ops.get_main_sha()
-
-        async def _fake_merge_to_main(wt, br, base_sha=None):
-            return MergeResult(success=False, conflicts=False, details='boom')
-
-        monkeypatch.setattr(git_ops, 'merge_to_main', _fake_merge_to_main)
-
-        es = _make_event_store(tmp_path)
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=es)
-        req = _make_request('nonconflict-serial-1', 'nonconflict-serial-1', worktree, config)
-
-        result = await classify_and_merge(
-            worker, req, main_sha, speculative=False, started_monotonic=time.monotonic(),
-        )
-
-        assert isinstance(result, Decided)
-        assert result.outcome.status == 'blocked'
-        assert result.outcome.reason == 'boom'
-        assert result.outcome.failure_diagnostic is None
-        assert _count_events(es.db_path, 'merge_attempt') == 0
-
     async def test_already_merged_honors_snapshot_tip(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
@@ -907,7 +803,7 @@ class TestClassifyAndMergeSerialWorker:
 
         es = _make_event_store(tmp_path)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=es)
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
         req = _make_request('snap-cm-1', 'snap-cm-1', wt, config)
         req.snapshot_tip = snap  # the already-merged tip — check must use this
         main_sha = await git_ops.get_main_sha()
@@ -944,7 +840,7 @@ class TestClassifyAndMergeSerialWorker:
 
         es = _make_event_store(tmp_path)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=es)
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
         req = _make_request('dropguard-base-1', 'dropguard-base-1', worktree, config)
 
         with patch(
@@ -1122,11 +1018,15 @@ class TestPathEquivalence:
             worker1, '_bounce_conflicting_suffix_items',
             AsyncMock(return_value=None),
         )
-        worker1_task = asyncio.create_task(worker1.run())
-        await queue.put(merger_req)
-        merger_outcome = await asyncio.wait_for(merger_req.result, timeout=30)
-        await worker1.stop()
-        await worker1_task
+        async with running_merge_worker(worker1):
+            await queue.put(merger_req)
+            merger_outcome = await wait_responsive(
+                merger_req.result,
+                label=(
+                    f'merger-path outcome for the {scenario!r} '
+                    'classify_and_merge equivalence scenario'
+                ),
+            )
 
         # ── Drive the REMERGE path ──────────────────────────────────────────
         es_remerge = _make_event_store(tmp_path / 'remerge')

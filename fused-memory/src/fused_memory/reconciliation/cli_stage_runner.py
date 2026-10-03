@@ -7,7 +7,7 @@ import logging
 import shutil
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
@@ -64,6 +64,13 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__add_memory',
     'mcp__fused-memory__delete_memory',
     'mcp__fused-memory__update_memory',
+    # consolidate_memories (task 3133) is classified in the SAME change that
+    # adds the tool, deliberately: it writes a canonical, patches N retained
+    # peers, re-homes their children and DELETES its supersedes, so shipping
+    # it unlisted would repeat the update_memory incident above with a larger
+    # blast radius. Stage 1's ADVERTISEMENT of the op is task 3134's — this
+    # is the safety classification, which belongs with the tool.
+    'mcp__fused-memory__consolidate_memories',
     'mcp__fused-memory__delete_episode',
     'mcp__fused-memory__redact_episode_content',
     'mcp__fused-memory__replay_to_graphiti',
@@ -76,6 +83,36 @@ DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__delete_entity',
     'mcp__fused-memory__rebuild_entity_summaries',
     'mcp__fused-memory__update_edge',
+    # ensure_entity_node (task 4932) is the identity-MINT primitive — strictly
+    # more CREATIVE than every sibling in this list, all of which only mutate or
+    # remove an ALREADY-EXISTING node. It is classified in the SAME change that
+    # adds the tool, deliberately, so it does not repeat the update_memory
+    # incident the block comment at the head of this list records.
+    #
+    # The tool-level denial here is LOAD-BEARING, not redundant with the tool's
+    # own authorization gate: the shipped
+    # entity_mint.allowed_agent_prefixes=['recon-stage-', 'curator-']
+    # (config/schema.py::EntityMintConfig) admits every reconciliation stage's
+    # canonical f'recon-stage-{stage_id}' agent_id (reconciliation/stages/base.py,
+    # reconciliation/stage_stats.py), so
+    # server/entity_mint_authz.py::resolve_entity_mint_authorization ALONE would
+    # NOT turn Stage 3 away — the same two-layer gap the update_memory incident
+    # describes, where a write primitive was in no disallow list AND was admitted
+    # by an allowlist whose default covers every recon stage.
+    #
+    # And nothing sweeps orphan minted nodes (as server/entity_mint_authz.py and
+    # the tool docstring both state), so a Stage 3 mint would leave a durable,
+    # un-reversed artifact — created by the stage that is read-only by contract
+    # and that is itself the DETECTOR of identity anomalies, collapsing
+    # detect-and-repair into one unaccountable actor. That is the same rationale
+    # the repair_memory_citation carve-out below records.
+    #
+    # Stage 1 and the curator are the sanctioned callers, so STAGE1_DISALLOWED
+    # and STAGE2_DISALLOWED are deliberately untouched (neither folds this list).
+    # Stage 1's ADVERTISEMENT of the op in the stage prompts is separate work —
+    # the same split the consolidate_memories entry above records for task 3134;
+    # this is the safety classification, which belongs with the tool.
+    'mcp__fused-memory__ensure_entity_node',
 ]
 
 # Recon-report tools that perform DURABLE writes (disallowed outside Stage 2).
@@ -87,6 +124,28 @@ DISALLOW_MEMORY_WRITES = [
 # would miss Stage 1) or DISALLOW_TASK_WRITES (semantically wrong).
 DISALLOW_RECON_REPORT_LEDGER_WRITES = [
     'mcp__recon-report__write_entity_standing_decision',
+]
+
+# Recon-report tools that write to the reconciliation JOURNAL (disallowed in
+# Stage 3 only).
+# task 3065: repair_memory_citation is the second recon-report tool that writes
+# past in-process ReconReportState — it rewrites the durable `runs.stage_reports`
+# blob of an ALREADY-COMPLETED run, to re-point or drop a cited memory id that no
+# longer resolves. It is a SEPARATE sublist from the ledger writes above because
+# the journal is not the ledger: same class of hazard, different store, and
+# keeping them distinct keeps each name honest and each stage's grant
+# independently adjustable.
+#
+# Denied in Stage 3 alone. Stage 3 (integrity_check) is read-only by contract AND
+# is the stage that DETECTS a dangling cross-run citation; letting it also repair
+# would break that contract and collapse detect-and-repair into one unaccountable
+# actor. Stage 1 keeps it because Stage 1 is where a supersession deletes the
+# predecessor memory — i.e. where cross-run citations become dangling in the
+# first place — and it is already citation_verifier's own caller, so repair-at-
+# source belongs there. Stage 2 keeps it because Stage 2 is the remediation stage
+# whose blocked repair attempt originated this task.
+DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
+    'mcp__recon-report__repair_memory_citation',
 ]
 
 # Escalation READ tools (disallowed in every stage — task 3163,
@@ -164,6 +223,7 @@ STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_RECON_REPORT_JOURNAL_WRITES
     + DISALLOW_ESCALATION_READS
     + DISALLOW_BUILTIN
 )
@@ -175,6 +235,17 @@ STAGE3_DISALLOWED = (
 # CARVE-OUT (task 2895 β): write_entity_standing_decision is the exception — the first
 # recon-report tool with a durable SQLite-ledger write. It IS blocked in Stage 1 and
 # Stage 3 (via DISALLOW_RECON_REPORT_LEDGER_WRITES above) and callable only in Stage 2.
+# CARVE-OUT (task 3065): repair_memory_citation is the SECOND such exception — the first
+# recon-report tool that writes to the reconciliation JOURNAL, rewriting the durable
+# `runs.stage_reports` blob of an already-completed run to re-point or drop a cited
+# memory id that no longer resolves. It is denied in Stage 3 ONLY (via
+# DISALLOW_RECON_REPORT_JOURNAL_WRITES above), because Stage 3 is read-only by contract
+# and is the stage that DETECTS dangling citations — detect and repair must not be the
+# same actor. Stage 1 keeps it (Stage 1's supersessions are what strand the citation in
+# the first place, and it already calls citation_verifier); Stage 2 keeps it (it is the
+# remediation stage whose blocked attempt originated the task). The two carve-outs stay
+# on separate sublists on purpose: the ledger and the journal are different stores, and a
+# single list named for one of them would lie about the other.
 
 # Output schema for stage reports
 STAGE_REPORT_SCHEMA: dict[str, Any] = {
@@ -376,8 +447,106 @@ def recon_config_base_dir(data_dir: Path) -> Path:
     (``BaseStage.run``) and the GC (``harness``) derive the same path from
     ``(journal.data_dir, run_id)`` without passing a ``TaskConfigDir`` across
     scopes.
+
+    The returned root is always ABSOLUTE, and that is load-bearing (task 4592).
+    It becomes ``TaskConfigDir.path``, which is BOTH the ``CLAUDE_CONFIG_DIR``
+    handed to the CLI child (``shared/src/shared/cli_invoke.py::invoke_claude_agent``
+    sets ``env['CLAUDE_CONFIG_DIR'] = str(config_dir)``) and the path the parent
+    verifies for sandbox containment
+    (``fused-memory/src/fused_memory/reconciliation/sandbox_guard.py::_assert_config_dir_writable``).
+    A RELATIVE string is resolved against two DIFFERENT cwds: the child's — the
+    wrapped argv is spawned with ``cwd=`` ``config.explore_codebase_root``, see
+    ``run_stage_via_cli`` below — and the parent's, where every
+    ``os.path.realpath`` in the guard runs. Verified path A, written path B: the
+    fail-closed containment check reports PASS while the kernel denies every
+    transcript write, which is exactly the 2026-07-18 -> 2026-08-11 silent
+    transcript loss that task 4003's check exists to make impossible.
+    ``data_dir`` really can be relative: ``fused-memory/config/config.yaml``
+    supplies ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``, the
+    ``${VAR:default}`` expander
+    (``fused-memory/src/fused_memory/config/schema.py::YamlSettingsSource._expand_env_vars``)
+    is plain string substitution with no abspath, and
+    ``scripts/fused-memory.service.template`` sets ``WorkingDirectory`` and
+    ``PROJECT_ROOT`` but NOT ``RECONCILIATION_DATA_DIR`` — so the relative default
+    is what a standalone/systemd launch actually uses. Only a MANAGED spawn
+    escapes it, because ``orchestrator/src/orchestrator/mcp_lifecycle.py`` injects
+    an absolute XDG path. The two cwds agree today only because that unit sets
+    ``WorkingDirectory`` == ``PROJECT_ROOT``; nothing enforces it.
+
+    THIS DOCSTRING IS THE CANONICAL STATEMENT of that deployment story. The other
+    sites that depend on it — ``journal.py::ReconciliationJournal.__init__``,
+    ``config/schema.py``'s ``data_dir`` and ``sandbox_recon_writable_extras``
+    comments, ``sandbox_guard.py``'s module docstring, and the two test modules —
+    state only their LOCAL invariant and cite back here, so a change to the
+    deployment story (the unit starts setting ``RECONCILIATION_DATA_DIR``, or the
+    expander gains an abspath) has exactly one place to be corrected.
+
+    The anchor is ``Path.cwd()`` and deliberately NOT
+    ``config.explore_codebase_root``. This function's job is only to make the
+    parent and the child NAME THE SAME DIRECTORY, which either anchor achieves
+    once the path is absolute — so the tie-break is "relocate no byte". The
+    process cwd is the anchor every existing ``data_dir`` consumer already uses
+    implicitly: ``fused-memory/src/fused_memory/reconciliation/journal.py::ReconciliationJournal.initialize``
+    mkdirs ``data_dir`` and opens ``reconciliation.db`` under it, and
+    ``fused-memory/src/fused_memory/server/main.py`` builds ten sibling paths
+    (``WriteJournal``, ``EventBuffer``, ``TicketStore``, curator/report state,
+    the dead-letter JSONL) the same way. Anchoring here therefore renames nothing
+    on disk; anchoring at ``explore_codebase_root`` would silently relocate the
+    per-run config dirs into a different tree from the journal DB they are keyed
+    to whenever the two diverge — trading a silent write-denial for a silent
+    relocation. Capturing ``Path.cwd()`` per call is safe because ``os.chdir``
+    appears nowhere in ``shared/src``, ``orchestrator/src`` or
+    ``fused-memory/src``, so the process cwd is stable for the life of a run.
+
+    ``Path.cwd() / base`` rather than ``.resolve()`` / ``.absolute()`` is also
+    deliberate: it leaves an already-absolute input BYTE-IDENTICAL. ``.resolve()``
+    would additionally collapse symlink components, rewriting the string handed to
+    the child and to ``landlock-exec`` for every existing absolute deployment
+    (including the XDG ``RECONCILIATION_DATA_DIR`` that
+    ``orchestrator/src/orchestrator/mcp_lifecycle.py`` injects under a managed
+    spawn). Symlink resolution is not needed here anyway — ``sandbox_guard``
+    realpaths both sides of the containment comparison, which is the semantics
+    Landlock itself uses (it resolves rules by O_PATH fd).
+
+    ``data_dir`` is used AS GIVEN rather than re-wrapped in ``Path(...)``, which
+    honours the annotation instead of widening it to "anything os.PathLike".
+    Both production construction sites already pass a real ``Path``
+    (``fused-memory/src/fused_memory/server/main.py`` and
+    ``fused-memory/scripts/repair_recon_citation.py`` each build
+    ``Path(config.reconciliation.data_dir)`` before handing it to
+    ``ReconciliationJournal``), so the wrap would buy nothing there — while
+    costing something real elsewhere: ``MagicMock``/``AsyncMock`` implement
+    ``__fspath__``, so ``Path(mock)`` silently coerces a mock journal's
+    ``data_dir`` into the RELATIVE path ``AsyncMock/mock.data_dir/<id>``, which
+    this function would then anchor at the cwd and ``TaskConfigDir.__init__``
+    would really ``mkdir(parents=True)`` — littering the repo with directories on
+    every suite run. Used as given, a mock's ``__truediv__`` returns another mock
+    and nothing reaches the filesystem, exactly as before this function
+    absolutized anything.
+
+    The ``isinstance(base, PurePath)`` guard extends that "leave a duck type
+    strictly alone" contract from the coercion to the CALL. Without it,
+    ``is_absolute()`` is invoked on the mock, and for the ``AsyncMock`` journal
+    the stage suite actually uses (``fused-memory/tests/reconciliation/test_base_stage_cutover.py``)
+    that returns a COROUTINE, not a bool: truthy, so the branch is skipped and no
+    directory is created, but the coroutine is never awaited and CPython emits
+    ``RuntimeWarning: coroutine 'AsyncMockMixin._execute_mock_call' was never
+    awaited``. ``orchestrator/pyproject.toml`` already promotes that exact
+    warning to an error in its ``filterwarnings``, so leaking one here would
+    plant an anti-pattern the repo has decided to fail on — and would break
+    fused-memory's suite the day it adopts the same filters. Testing the type
+    first also states the real precondition: absolutization is a ``PurePath``
+    operation, and anything else is none of this function's business.
+
+    Shape precedent:
+    ``fused-memory/src/fused_memory/reconciliation/harness.py::ReconciliationHarness._start_escalation_server``.
+    ``gc_run_config_dir`` inherits the fix for free — it derives its rmtree target
+    from this function.
     """
-    return data_dir / 'recon-config'
+    base = data_dir
+    if isinstance(base, PurePath) and not base.is_absolute():
+        base = Path.cwd() / base
+    return base / 'recon-config'
 
 
 def gc_run_config_dir(data_dir: Path, run_id: str) -> None:
@@ -422,6 +591,12 @@ async def run_stage_via_cli(
     call sites keep today's behavior. BaseStage.run mints/persists the session
     before calling here (mint-before-spawn); this runner stays generic.
 
+    ``config_dir`` is ALSO the sandbox grant (task 4003), not merely a CLI env
+    var: when confinement is on, ``config_dir.path`` is appended to the writable
+    extras so the CLI can actually write the transcript inside it. Setting
+    ``config_dir`` without that grant is the 2026-07-18 defect — the CLI is told
+    where to write and then denied the write, silently.
+
     ``resume_session_id`` / ``resume_delivers_prompt`` (task 2717 σ) are likewise
     forwarded straight to ``invoke_with_cap_retry`` for the startup
     adopt-and-resume path: when set, the stage subprocess ``--resume``s an
@@ -447,12 +622,63 @@ async def run_stage_via_cli(
     # Fail-CLOSED: if confinement is requested but no backend is available,
     # return an error StageResult WITHOUT calling invoke_with_cap_retry (never
     # run an unconfined agent when confinement is explicitly enabled).
+    #
+    # The PER-RUN config dir is granted as a computed writable extra (task 4003).
+    # Without it the CLI cannot write its session JSONL: from task 2744
+    # (2026-07-18) until 2026-08-11 the recon config dir lived under
+    # `recon_config_base_dir(data_dir)` — neither /tmp nor <cwd>/.task, i.e.
+    # outside every writable root either backend grants — so every recon stage
+    # silently produced zero transcripts, the liveness watchdog went inert
+    # (count_transcript_turns returned None) and every cap-retry force-freshed
+    # instead of resuming.
+    #
+    # It is the PER-RUN dir that is granted, NEVER `recon_config_base_dir(...)`:
+    # the base is the root under which EVERY run's `claude-config-<run_id>` (and
+    # its `.credentials.json`) lives, so granting it would hand every recon stage
+    # write access to every other run's OAuth credentials — a capability that
+    # does not exist today. (PRD open question 5 / D7, decided under task 4003's
+    # Amendment finding 1.) The append is deliberate: operator-configured
+    # `sandbox_recon_writable_extras` must survive, never be replaced.
+    #
+    # `TaskConfigDir.__init__` has already mkdir'ed the path by the time
+    # `BaseStage.run` reaches here, which is load-bearing: `landlock_exec._add_path`
+    # returns SILENTLY for a non-existent dir, so a grant issued before creation
+    # would be vacuous.
     sandbox_wrap: Callable[[list[str]], list[str]] | None = None
     if config.sandbox_recon_agents:
+        writable_extras = list(config.sandbox_recon_writable_extras)
+        if config_dir is not None:
+            writable_extras.append(str(config_dir.path))
+        else:
+            # The ONE configuration that bypasses the containment guard, so it
+            # must not be silent. With no config_dir there is nothing to grant
+            # and nothing to verify, and the CLI falls back to the process
+            # default ~/.claude — which NEITHER backend makes writable. That is
+            # the identical silent-transcript-loss shape this grant exists to
+            # end, merely arrived at from the other direction. Unreachable in
+            # production today (BaseStage.run always mints a TaskConfigDir), but
+            # nothing in this runner enforces that and the module's docstrings
+            # now advertise the invariant as machine-checked — so say so rather
+            # than let a future caller rediscover it by three weeks of silence.
+            logger.warning(
+                'Reconciliation sandboxing is ON but this stage was given no '
+                'config_dir: the CLI will fall back to the process-default '
+                '~/.claude, which is NOT in the sandbox writable set, so it can '
+                'write no session transcript (count_transcript_turns -> None, '
+                'liveness watchdog inert, every cap-retry force-freshes). The '
+                'containment check is skipped for this invocation because there '
+                'is no path to check. Pass a TaskConfigDir (BaseStage.run does) '
+                'or set reconciliation.sandbox_recon_agents=false.',
+            )
         try:
             sandbox_wrap = resolve_recon_sandbox_wrap(
                 effective_cwd,
-                list(config.sandbox_recon_writable_extras),
+                writable_extras,
+                # Hand the dir back to the guard so the grant above is VERIFIED,
+                # not merely intended: if a future edit drops the append, the
+                # guard fails closed instead of launching a stage that can never
+                # write a transcript. Policy here, verification there.
+                config_dir=config_dir.path if config_dir is not None else None,
             )
         except RemediationSandboxUnavailable as exc:
             logger.error(

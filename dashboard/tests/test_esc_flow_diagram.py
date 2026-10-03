@@ -16,27 +16,39 @@ geometry/wiring regression that happens to keep the tokens would pass
 silently. That behavioral correctness is already covered by the .mjs suite
 above.
 
-Helpers below (_client, _extract_function_body, _ScriptTagCollector,
-_find_script_position, _assert_script_loads_before) are copied — not
-imported — from test_tab_escalation_analytics.py, per that suite's
-established copy-not-import convention for these cross-file test helpers.
+This file used to carry its own copies of `_client` and
+`_extract_function_body`, per what was then this suite's established
+copy-not-import convention for cross-file test helpers.  Task 3549 retired
+that convention: nine modules held a copy, under two names covering four
+distinct implementations, so a fix to any of them had to be applied nine
+times or not at all — and the one worth making (scoping to a NESTED
+declaration) went unmade for exactly that reason.  `_client` is now the
+module-scoped fixture in conftest.py and `extract_function_body` is imported
+from `_dashboard_helpers`; test_jsx_source_helpers.py owns their contract and
+guards against the copies returning.
+
+Task 4881 finished the job that retirement started, so the paragraph above is
+now the whole story rather than a claim scoped to two helpers.  The
+script-order trio this file uses (`ScriptTagCollector`,
+`find_script_position`, `assert_script_loads_before`) is imported from
+`_dashboard_helpers` rather than copied here and into four other modules;
+`extract_df_data_block` likewise replaced three copies; and
+test_charts_axis_labels.py's `_extract_signature` is now a projection over the
+same `find_function_params` paren walk `extract_function_body` is built on,
+instead of re-deriving it.  test_jsx_source_helpers.py owns every one of those
+contracts.
 """
 
 from __future__ import annotations
 
-import html.parser
 import re
 
 import pytest
-from starlette.testclient import TestClient
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
+from _dashboard_helpers import (
+    assert_script_loads_before,
+    extract_function_body,
+    find_script_position,
+)
 
 
 @pytest.fixture(scope='module')
@@ -47,149 +59,6 @@ def esc_flow_diagram_jsx_response(_client):
 @pytest.fixture(scope='module')
 def esc_flow_diagram_jsx_body(esc_flow_diagram_jsx_response) -> str:
     return esc_flow_diagram_jsx_response.text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client) -> str:
-    return _client.get('/static/redux/index.html').text
-
-
-@pytest.fixture(scope='module')
-def tab_analytics_jsx_body(_client) -> str:
-    return _client.get('/static/redux/tab_escalation_analytics.jsx').text
-
-
-# ---------------------------------------------------------------------------
-# Helper: extract a named JS/JSX function body (brace-aware).
-# Copied from test_tab_escalation_analytics.py (itself copied from
-# test_tab_escalations.py) — scopes token-presence checks to a specific
-# function body rather than searching the entire file.
-# ---------------------------------------------------------------------------
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Paren-depth walks past the parameter list before looking for the body's
-    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
-    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
-    taking the first ``{`` after the opening ``(`` would return just the
-    destructuring pattern instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
-
-
-# ---------------------------------------------------------------------------
-# Load-order helpers (copied from test_tab_escalation_analytics.py, itself
-# copied from test_tab_escalations.py / test_index_html.py)
-# ---------------------------------------------------------------------------
-
-
-class _ScriptTagCollector(html.parser.HTMLParser):
-    """Collects the attribute dicts for every <script> start-tag encountered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.script_attrs: list[dict[str, str | None]] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag == 'script':
-            self.script_attrs.append(dict(attrs))
-
-
-def _find_script_position(
-    body: str, src_prefix: str
-) -> tuple[int, dict[str, str | None]] | None:
-    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
-    starts with ``src_prefix``, or ``None`` if no such tag exists.
-    """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for i, attrs in enumerate(collector.script_attrs):
-        if (attrs.get('src') or '').startswith(src_prefix):
-            return i, attrs
-    return None
-
-
-def _assert_script_loads_before(
-    body: str,
-    before_src_prefix: str,
-    after_src_prefix: str,
-    before_label: str,
-    after_label: str,
-    consumer_note: str = '',
-) -> None:
-    """Assert that the script for ``before_src_prefix`` loads BEFORE the
-    script for ``after_src_prefix`` in ``body``.  Combines a
-    defer/async/type=module false-pass guard with the document-order
-    position comparison.
-    """
-    before_result = _find_script_position(body, before_src_prefix)
-    assert before_result is not None, (
-        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
-    before_pos, before_attrs = before_result
-    before_src = before_attrs.get('src')
-
-    after_result = _find_script_position(body, after_src_prefix)
-    assert after_result is not None, (
-        f'<script src="{after_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {before_label}.'
-    )
-    after_pos, after_attrs = after_result
-
-    # Both tags must be classic synchronous scripts — otherwise document order
-    # diverges from execution order and the position comparison below is moot.
-    for _label, _attrs in [
-        (before_label, before_attrs),
-        (after_label, after_attrs),
-    ]:
-        assert 'defer' not in _attrs, (
-            f'{_label} has a defer attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert 'async' not in _attrs, (
-            f'{_label} has an async attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert (_attrs.get('type') or '').lower() != 'module', (
-            f'{_label} has type="module"; ES modules are deferred by default, '
-            f'so document order no longer implies execution order.'
-        )
-
-    assert before_pos < after_pos, (
-        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
-        f'BEFORE {after_label} (position {after_pos}). '
-        f'{consumer_note}'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,14 +112,14 @@ def test_index_html_registers_esc_flow_layout_load_order(index_html_body: str) -
     _DIAGRAM_PREFIX = '/static/redux/esc_flow_diagram.jsx'
     _TAB_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
 
-    result = _find_script_position(index_html_body, _LAYOUT_PREFIX)
+    result = find_script_position(index_html_body, _LAYOUT_PREFIX)
     assert result is not None, (
         f'No <script src="{_LAYOUT_PREFIX}..."> tag found in index.html — '
         'add it as a classic script (e.g. after runtime_format.js).'
     )
 
     # (a) esc_flow_layout.js loads before esc_flow_diagram.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _LAYOUT_PREFIX,
         _DIAGRAM_PREFIX,
@@ -261,7 +130,7 @@ def test_index_html_registers_esc_flow_layout_load_order(index_html_body: str) -
     )
 
     # (c) esc_flow_layout.js loads before tab_escalation_analytics.jsx too
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _LAYOUT_PREFIX,
         _TAB_ANALYTICS_PREFIX,
@@ -280,7 +149,7 @@ def test_index_html_registers_esc_flow_diagram_load_order(index_html_body: str) 
     _DIAGRAM_PREFIX = '/static/redux/esc_flow_diagram.jsx'
     _TAB_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
 
-    result = _find_script_position(index_html_body, _DIAGRAM_PREFIX)
+    result = find_script_position(index_html_body, _DIAGRAM_PREFIX)
     assert result is not None, (
         f'No <script src="{_DIAGRAM_PREFIX}..."> tag found in index.html — '
         'add it as a Babel script before tab_escalation_analytics.jsx.'
@@ -301,7 +170,7 @@ def test_index_html_registers_esc_flow_diagram_load_order(index_html_body: str) 
     )
 
     # (b) Loads after charts.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _CHARTS_PREFIX,
         _DIAGRAM_PREFIX,
@@ -311,7 +180,7 @@ def test_index_html_registers_esc_flow_diagram_load_order(index_html_body: str) 
     )
 
     # (b) Loads before tab_escalation_analytics.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _DIAGRAM_PREFIX,
         _TAB_ANALYTICS_PREFIX,
@@ -371,8 +240,7 @@ def test_workflow_panel_mounts_lifecycle_flow_diagram_in_slot(tab_analytics_jsx_
     invariants).
     """
     body = tab_analytics_jsx_body
-    panel_body = _extract_function_body(body, 'WorkflowPanel')
-    assert panel_body, 'Could not locate the WorkflowPanel( function body.'
+    panel_body = extract_function_body(body, 'WorkflowPanel')
 
     # (c) regression guard — δ's seam markers must survive this edit.
     assert 'esc-flow-slot' in panel_body, (

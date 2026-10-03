@@ -17,5 +17,38 @@
       "description": "The new logging block accesses verify.passed etc. which will silently succeed if verify is a coroutine (coroutines are truthy), producing misleading log output rather than an error.",
       "mutation_type": "missing_await"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Log verification outcomes per eval task in collect_metrics",
+      "description": "`orchestrator/src/orchestrator/evals/metrics.py::collect_metrics` re-runs verification for a completed workflow and folds the result into `EvalMetrics`, but the run log says nothing about what verification actually returned for a given eval task. When a cell scores `tests_pass=False`, an operator has to re-derive the reason from the worktree by hand. Emit one INFO log line just before the `EvalMetrics` is constructed, naming the task id, the tests/lint/typecheck outcomes and the plan-completion percentage. This is observability only: the metric fields and the values they carry must come out unchanged. Add a complexity `noqa` if the extra block pushes `collect_metrics` past the lint threshold.",
+      "test_strategy": "Add a case to `orchestrator/tests/test_metrics.py` that drives `collect_metrics` over a stub workflow with `caplog` at INFO and asserts the emitted line carries the task id and the three verification outcomes it reports. Assert the returned `EvalMetrics` is unchanged from the pre-change result for the same stub, then run `ruff check orchestrator`.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "orchestrator/src/orchestrator/evals/metrics.py"
+    ],
+    "base_sha": "597594951a1e51274259cd1c8b2cd06b3b07c630",
+    "branch_sha": null,
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": {
+      "method": "git apply --cached --check against a temporary index",
+      "applies_cleanly": true,
+      "tolerance_flags": [
+        "--recount"
+      ],
+      "candidates_tested": 1,
+      "reason": "Newest first-parent ancestor of edf348e39127bed3759a82d72e5414d263a6a95d^ that touches orchestrator/src/orchestrator/evals/metrics.py (commit '597594951a: feat(eval): wire env_overrides through invoke chain for local vLLM model evaluation', 2026-04-05 14:17:32+0100). Plain `git apply --cached --check` reports 'corrupt patch at line 39': hunk 3's header (@@ -108,6 +108,14@@) understates its own new-side line count by 1 (actual body has 6 context + 9 added = 15 new-side lines, header claims 14) -- a hand-authoring miscount, not a base-tree mismatch. `git apply --recount --cached --check` against this commit's tree succeeds (rc=0), confirming the pre-image content (collect_metrics signature/body around old lines 77-121) matches this tree exactly.",
+      "verified_at": "2026-09-11"
+    }
+  }
 }

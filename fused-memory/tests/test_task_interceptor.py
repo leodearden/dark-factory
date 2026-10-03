@@ -2,9 +2,11 @@
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,20 +14,30 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
+from shared.cli_invoke import AgentResult
 from shared.task_statuses import TaskStatus
 
 from fused_memory.backends.sqlite_task_backend import _merge_metadata, _resolve_metadata_mode
 from fused_memory.backends.task_backend_errors import TaskmasterError
 from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware import scope_violation_escalator as sve_mod
+from fused_memory.middleware.curator_escalator import CuratorEscalator
+from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
+    CuratorFailureError,
+    PreparedCandidate,
     RewrittenTask,
+    TaskCurator,
     is_combine_eligible_status,
 )
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.scope import resolve_project_id
+from fused_memory.reconciliation.consolidation_gate import (
+    GATE_METADATA_KEY,
+    build_consolidation_gate_task,
+)
 from fused_memory.reconciliation.event_buffer import EventBuffer
 
 
@@ -1829,6 +1841,15 @@ async def test_curator_combine_refuses_gated_candidate_into_ungated_target(
         'combine-guard' in msg and '50' in msg and 'always_escalates' in msg
         for msg in messages
     ), f'expected a WARNING naming target 50 and the gate markers; got {messages}'
+    # An ABSENT gate, not an unreadable blob — the other branch of that
+    # conditional is pinned by
+    # test_curator_combine_refusal_names_an_unreadable_target_blob.
+    assert any('does not declare a gate' in msg for msg in messages), (
+        f'expected the refusal to blame the missing gate; got {messages}'
+    )
+    assert not any('corrupt/unparseable' in msg for msg in messages), (
+        f'a readable, ungated target must not be reported as corrupt; got {messages}'
+    )
 
 
 @pytest.mark.asyncio
@@ -1904,6 +1925,54 @@ async def test_curator_combine_gate_predicate_ignores_malformed_metadata(
 
 
 @pytest.mark.asyncio
+async def test_curator_combine_refusal_names_an_unreadable_target_blob(
+    curator_interceptor,
+    taskmaster,
+    audit_dir,
+    caplog,
+):
+    """A gated candidate against a CORRUPT target blob says so in the refusal.
+
+    ``_is_gate_metadata`` is permissive-on-parse-failure, so an unreadable
+    target and a genuinely ungated one both answer False and both refuse
+    identically. Only the WARNING's wording separates them, so only a test on
+    that wording can hold the two apart: blaming "does not declare a gate"
+    sends an operator hunting a missing gate on a task whose metadata simply
+    could not be read. Paired with
+    ``test_curator_combine_refuses_gated_candidate_into_ungated_target``,
+    which pins the other branch of the same conditional — without both, an
+    edit that collapses the branch (e.g. dropping the ``target_metadata and``
+    guard) ships green.
+    """
+    _set_target(taskmaster, None)
+    # _set_target json.dumps() whatever it is given; overwrite with a raw blob
+    # that cannot round-trip through json.loads at all.
+    taskmaster.get_task.return_value['metadata'] = '{not json'
+    curator_interceptor._curator = _mock_curator(_combine_decision('unreadable target'))
+
+    with caplog.at_level(logging.WARNING):
+        result = await _submit_and_resolve(
+            curator_interceptor,
+            '/project',
+            title='Human gate: consolidate the duplicate cluster',
+            metadata=dict(_GATE_CANDIDATE_METADATA),
+        )
+
+    # Same refuse-and-degrade-to-create outcome as the ungated case; only the
+    # explanation differs.
+    assert result == {'id': '2', 'title': 'New Task'}
+    taskmaster.update_task.assert_not_called()
+    assert _combine_audit_lines(audit_dir) == []
+    messages = [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.WARNING]
+    assert any(
+        'combine-guard' in msg and 'corrupt/unparseable' in msg for msg in messages
+    ), f'expected the refusal to name the unreadable target blob; got {messages}'
+    assert not any('does not declare a gate' in msg for msg in messages), (
+        f'an unreadable blob must not be reported as a declared-nothing target; got {messages}'
+    )
+
+
+@pytest.mark.asyncio
 async def test_concurrent_add_task_produces_single_task(
     taskmaster,
     reconciler,
@@ -1923,13 +1992,14 @@ async def test_concurrent_add_task_produces_single_task(
     """
     from fused_memory.middleware.task_curator import (
         CuratorDecision,
+        PoolWithheld,
         TaskCurator,
     )
 
     # Use a real curator so the exact-match cache is exercised; stub
     # corpus + LLM so we don't spin up Qdrant.
     async def empty_corpus(*a, **k):
-        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+        return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
 
     real_curator = TaskCurator(config=curator_enabled_config, taskmaster=taskmaster)
     real_curator.record_task = AsyncMock()
@@ -4777,6 +4847,41 @@ async def test_done_provenance_accepts_deterministic_gate(
 
 
 @pytest.mark.asyncio
+async def test_done_provenance_deterministic_gate_persists_escalation_id(
+    taskmaster, reconciler, event_buffer, tmp_path
+):
+    """kind='deterministic-gate' with escalation_id survives to the persisted blob.
+
+    DeterministicRunner cites the resolving gate escalation via
+    escalation_id on this kind (deterministic_runner.py, `_build_done_provenance(
+    'deterministic-gate', ..., escalation_id=_gate_esc_id)`), and the
+    _validate_done_provenance docstring promises the same. The field is
+    optional (unlike 'operational-verified', where it is required), but when
+    supplied it must not be silently dropped at the persistence chokepoint —
+    Stage-2 audit and any operator reading the stored blob rely on it to
+    find the gate record.
+    """
+    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+    result = await interceptor.set_task_status(
+        '1',
+        'done',
+        str(tmp_path),
+        done_provenance={
+            'kind': 'deterministic-gate',
+            'note': 'pure gate resolved',
+            'escalation_id': 'esc-4064-gate',
+        },
+    )
+
+    assert 'error' not in result, f'expected acceptance but got: {result}'
+    taskmaster.set_status_and_stamp_audit.assert_called_once()
+    persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs['audit_fields']['done_provenance']
+    assert persisted['kind'] == 'deterministic-gate'
+    assert persisted['escalation_id'] == 'esc-4064-gate'
+
+
+@pytest.mark.asyncio
 async def test_done_provenance_accepts_deterministic_deploy_scheduled(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
@@ -4935,6 +5040,65 @@ async def test_validate_done_provenance_operational_verified_rejects_recon_stage
     assert err is not None
     assert err['error'] == 'done_provenance_invalid'
     assert 'recon' in err['reason'].lower()
+
+
+@pytest.mark.asyncio
+async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
+    """Every kind declared by DoneProvenance.kind is ACCEPTED given its
+    minimal valid payload (behavioral acceptance, not message wording).
+
+    The rejection paths are covered elsewhere
+    (test_done_provenance_rejects_missing_kind, the invalid-kind repair
+    test), and 'merged'/'found_on_main'/'operational-verified' each have
+    dedicated tests, but nothing previously asserted that
+    'deterministic-gate' and 'deterministic-milestone' — commitless,
+    runner-stamped kinds with no dedicated acceptance test at this boundary
+    — are actually accepted. The lockstep assertion below means an 8th kind
+    added to the Literal without a matching entry here fails loudly (a
+    KeyError-free, explicit mismatch) instead of being silently skipped;
+    a conditional-requirement branch that accidentally rejects an
+    already-covered kind fails just as loudly via the per-kind assertion.
+    """
+    from typing import get_args
+
+    from shared.task_metadata import DoneProvenance
+
+    from fused_memory.middleware.task_interceptor import _validate_done_provenance
+
+    sha = _init_git_repo(tmp_path)  # backs the 'merged'/'found_on_main' commit field
+
+    minimal_payloads = {
+        'merged': {'kind': 'merged', 'commit': sha},
+        'found_on_main': {
+            'kind': 'found_on_main',
+            'commit': sha,
+            'note': 'covered by a sibling task',
+        },
+        'deterministic-deploy': {'kind': 'deterministic-deploy'},
+        'deterministic-deploy-scheduled': {'kind': 'deterministic-deploy-scheduled'},
+        'deterministic-gate': {'kind': 'deterministic-gate'},
+        'deterministic-milestone': {'kind': 'deterministic-milestone'},
+        'operational-verified': {
+            'kind': 'operational-verified',
+            'escalation_id': 'esc-123',
+            'note': 'restarted fused-memory',
+        },
+    }
+
+    declared_kinds = get_args(DoneProvenance.model_fields['kind'].annotation)
+    assert set(minimal_payloads) == set(declared_kinds), (
+        'minimal_payloads must stay in lockstep with the DoneProvenance.kind '
+        f'Literal; declared={sorted(declared_kinds)} vs covered='
+        f'{sorted(minimal_payloads)}'
+    )
+
+    for kind in declared_kinds:
+        err, resolved = await _validate_done_provenance(
+            '1', minimal_payloads[kind], str(tmp_path), require=True,
+        )
+        assert err is None, f'kind={kind!r} minimal payload rejected: {err}'
+        assert resolved is not None, f'kind={kind!r} resolved to None with no error'
+        assert resolved['kind'] == kind
 
 
 # ── Task 3455: honest git-probe rejection wording ───────────────────────
@@ -5811,6 +5975,73 @@ async def test_update_task_rejects_metadata_done_provenance(event_buffer, tmp_pa
         )
 
         assert result == done_provenance_via_update_task_error('1')
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_retires_a_key_on_a_done_task(event_buffer, tmp_path):
+    """The public write path can RETIRE a key from a done task's metadata: a
+    whole-blob replace that carries the stamped done_provenance through
+    verbatim is accepted, and the same replace with done_provenance omitted is
+    refused with the canonical rejection dict rather than raising.
+
+    Drives a live backend because a bare AsyncMock cannot enforce the floor.
+    The wait-anchor keys are machine-authored and stripped from any
+    caller-supplied payload (sqlite_task_backend.py::strip_machine_authored_metadata),
+    so under replace they do not survive the round trip either.
+    """
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.backends.task_backend_errors import done_provenance_via_update_task_error
+    from fused_memory.config.schema import TaskmasterConfig
+    from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+
+    project_root = str(tmp_path)
+    sha = _init_git_repo(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(
+            project_root=project_root, title='T',
+            metadata=json.dumps({'files': ['x.py'], 'stale_key': 1}),
+        )
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        done = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={'kind': 'merged', 'commit': sha},
+        )
+        assert 'error' not in done, done
+        stamped = (await backend.get_task('1', project_root=project_root))['metadata']
+        assert stamped['done_provenance']['commit'] == sha
+
+        without_done_provenance = {
+            key: value for key, value in stamped.items()
+            if key not in ('stale_key', 'done_provenance')
+        }
+        refused = await interceptor.update_task(
+            '1', project_root,
+            metadata=json.dumps(without_done_provenance),
+            metadata_mode='replace',
+        )
+        assert refused == done_provenance_via_update_task_error('1')
+
+        passthrough = {key: value for key, value in stamped.items() if key != 'stale_key'}
+        accepted = await interceptor.update_task(
+            '1', project_root,
+            metadata=json.dumps(passthrough),
+            metadata_mode='replace',
+        )
+        assert interceptor_write_succeeded(accepted), accepted
+
+        task = await backend.get_task('1', project_root=project_root)
+        assert task['status'] == 'done'
+        wait_anchor_keys = {'pending_since', 'pending_since_backfilled'}
+        assert task['metadata'] == {
+            key: value for key, value in passthrough.items()
+            if key not in wait_anchor_keys
+        }
+        assert 'stale_key' not in task['metadata']
+        assert task['metadata']['done_provenance'] == stamped['done_provenance']
     finally:
         await backend.close()
 
@@ -8510,6 +8741,90 @@ class TestProseRightBoundarySignal:
 # ---------------------------------------------------------------------------
 
 
+async def _submit_foreign_prose_task(
+    interceptor, tmp_path, *, title, description, metadata=None, **fields,
+):
+    """Submit under dark_factory a task whose *description* cites reify's tree.
+
+    Returns ``(result, calls)``, *calls* being every ``report_rejection`` the
+    scope-violation escalator received.  Extra *fields* go to ``submit_task``.
+
+    Anti-vacuity first: *description* must still lex as a ``crates/`` hit, so
+    a suppression assertion cannot pass merely because the lexer stopped
+    matching rather than because attribution fired.
+    """
+    registry = _two_project_registry(tmp_path)
+    interceptor._prefix_registry = registry
+    assert registry.project_for_prefix('crates/') == 'reify'
+    probe = interceptor._path_guard_check(
+        None, {'description': description}, 'dark_factory',
+    )
+    assert probe.is_rejection and probe.matched_paths == ('crates/',), (
+        f'Expected the prose scan to still hit crates/, got: {probe!r}'
+    )
+
+    spy = _SpyEscalator()
+    interceptor._scope_violation_escalator = spy
+    if metadata is not None:
+        fields['metadata'] = metadata
+    try:
+        result = await interceptor.submit_task(
+            project_root=str(tmp_path / 'dark-factory'),
+            title=title,
+            description=description,
+            **fields,
+        )
+    finally:
+        await _cancel_interceptor_workers(interceptor)
+    return result, spy.calls
+
+
+async def _assert_prose_advisory_fired(ticket_store, result, calls):
+    """The unchanged advisory: a crates/ stamp naming reify, and ONE advisory escalation."""
+    meta = await _persisted_candidate_metadata(ticket_store, result)
+    marker = meta.get('possible_scope_mismatch')
+    assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
+    assert marker['matched_paths'] == ['crates/']
+    assert marker['suggested_project'] == 'reify'
+    assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
+    assert calls[0].get('advisory') is True
+
+
+def _suppression_records(caplog):
+    """INFO records from the interceptor that report a guard suppression.
+
+    Selected by the stable greppable token an operator would search for,
+    deliberately NOT by exact sentence wording — callers pin the FACTS the
+    record carries, so the sentence stays free to change.
+    """
+    return [
+        rec for rec in caplog.records
+        if rec.name == 'fused_memory.middleware.task_interceptor'
+        and 'path-guard' in rec.getMessage()
+        and 'suppress' in rec.getMessage().lower()
+    ]
+
+
+def _assert_one_suppression_record(caplog, facts):
+    """Exactly one INFO suppression record, carrying every one of *facts*.
+
+    INFO, not WARNING: a suppression is a CORRECT attribution decision, so it
+    is a log-trail fact rather than an operator-queue item — but never silent.
+    """
+    records = _suppression_records(caplog)
+    assert len(records) == 1, (
+        f'Expected exactly one suppression record, got: '
+        f'{[r.getMessage() for r in records]!r}'
+    )
+    record = records[0]
+    assert record.levelno == logging.INFO
+    message = record.getMessage()
+    for fact in facts:
+        assert fact in message, (
+            f'Suppression record must carry {fact!r}; got: {message!r}'
+        )
+
+
 class TestProseAdvisoryDeliverableAttribution:
     """Suppression and retained-protection halves, end-to-end via submit_task.
 
@@ -8526,41 +8841,12 @@ class TestProseAdvisoryDeliverableAttribution:
 
     async def _submit(self, interceptor, tmp_path, metadata=None):
         """Submit the foreign-prose task under dark_factory; return (result, calls)."""
-        registry = _two_project_registry(tmp_path)
-        interceptor._prefix_registry = registry
-
-        # Anti-vacuity: the prose really does still lex as a foreign-path hit.
-        # Without this, a suppression assertion below could pass merely because
-        # the lexer stopped matching rather than because attribution fired.
-        assert registry.project_for_prefix('crates/') == 'reify'
-        probe = interceptor._path_guard_check(
-            None, {'description': self._FOREIGN_PROSE}, 'dark_factory',
+        return await _submit_foreign_prose_task(
+            interceptor, tmp_path,
+            title='Port the engine edit path',
+            description=self._FOREIGN_PROSE,
+            metadata=metadata,
         )
-        assert probe.is_rejection and probe.matched_paths == ('crates/',), (
-            f'Expected the prose scan to still hit crates/, got: {probe!r}'
-        )
-
-        calls: list = []
-
-        class SpyEscalator:
-            def report_rejection(self, **kwargs):
-                calls.append(kwargs)
-
-        interceptor._scope_violation_escalator = SpyEscalator()
-
-        kwargs = {}
-        if metadata is not None:
-            kwargs['metadata'] = metadata
-        try:
-            result = await interceptor.submit_task(
-                project_root=str(tmp_path / 'dark-factory'),
-                title='Port the engine edit path',
-                description=self._FOREIGN_PROSE,
-                **kwargs,
-            )
-        finally:
-            await _cancel_interceptor_workers(interceptor)
-        return result, calls
 
     # -- SUPPRESSION: a locally-owned declared deliverable attests ----------
 
@@ -8635,13 +8921,7 @@ class TestProseAdvisoryDeliverableAttribution:
             interceptor_with_store, tmp_path, metadata={'files': ['README.md']},
         )
 
-        meta = await _persisted_candidate_metadata(ticket_store, result)
-        marker = meta.get('possible_scope_mismatch')
-        assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
-        assert marker['matched_paths'] == ['crates/']
-        assert marker['suggested_project'] == 'reify'
-        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
-        assert calls[0].get('advisory') is True
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.parametrize('foreign_key', ['files_to_modify', 'modules'])
     @pytest.mark.asyncio
@@ -8679,15 +8959,7 @@ class TestProseAdvisoryDeliverableAttribution:
         # Still CREATED — the veto only declines to suppress; it never
         # promotes the advisory into a rejection (task 2206 blast radius
         # unchanged).
-        meta = await _persisted_candidate_metadata(ticket_store, result)
-        marker = meta.get('possible_scope_mismatch')
-        assert marker is not None, (
-            f'A foreign {foreign_key} entry must veto the suppression: {meta!r}'
-        )
-        assert marker['matched_paths'] == ['crates/']
-        assert marker['suggested_project'] == 'reify'
-        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
-        assert calls[0].get('advisory') is True
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     @pytest.mark.asyncio
     async def test_no_declared_deliverable_still_advises(
@@ -8696,31 +8968,9 @@ class TestProseAdvisoryDeliverableAttribution:
         """No metadata at all → no attribution → the advisory is unchanged."""
         result, calls = await self._submit(interceptor_with_store, tmp_path)
 
-        meta = await _persisted_candidate_metadata(ticket_store, result)
-        marker = meta.get('possible_scope_mismatch')
-        assert marker is not None, f'Expected the advisory stamp to fire: {meta!r}'
-        assert marker['matched_paths'] == ['crates/']
-        assert marker['suggested_project'] == 'reify'
-        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
-        assert calls[0].get('advisory') is True
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
 
     # -- LEGIBILITY: a suppression is RECORDED, never silent ----------------
-
-    @staticmethod
-    def _suppression_records(caplog):
-        """INFO records from the interceptor that report a guard suppression.
-
-        Selected by the stable greppable token an operator would search for,
-        deliberately NOT by exact sentence wording — the assertions below
-        pin the FACTS the record carries, so the sentence stays free to
-        change.
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'fused_memory.middleware.task_interceptor'
-            and 'path-guard' in rec.getMessage()
-            and 'suppress' in rec.getMessage().lower()
-        ]
 
     @pytest.mark.asyncio
     async def test_suppression_is_logged_with_structured_facts(
@@ -8745,26 +8995,12 @@ class TestProseAdvisoryDeliverableAttribution:
         assert 'possible_scope_mismatch' not in meta
         assert calls == []
 
-        records = self._suppression_records(caplog)
-        assert len(records) == 1, (
-            f'Expected exactly one suppression record, got: '
-            f'{[r.getMessage() for r in records]!r}'
-        )
-        record = records[0]
-        assert record.levelno == logging.INFO, (
-            'A correct attribution decision is INFO, not WARNING — it is a '
-            'log-trail fact, not an operator-queue item'
-        )
-        message = record.getMessage()
-        for fact in (
+        _assert_one_suppression_record(caplog, (
             'crates/',                 # the matched prose prefix
             'fused-memory/src/x.py',   # the attesting deliverable signal
             'dark_factory',            # the filing project
             'reify',                   # the prose-suggested owner
-        ):
-            assert fact in message, (
-                f'Suppression record must carry {fact!r}; got: {message!r}'
-            )
+        ))
 
     @pytest.mark.asyncio
     async def test_no_suppression_record_when_advisory_fires(
@@ -8782,7 +9018,7 @@ class TestProseAdvisoryDeliverableAttribution:
         assert meta.get('possible_scope_mismatch') is not None
         assert len(calls) == 1
 
-        records = self._suppression_records(caplog)
+        records = _suppression_records(caplog)
         assert records == [], (
             f'Expected no suppression record when the advisory fires, got: '
             f'{[r.getMessage() for r in records]!r}'
@@ -8813,6 +9049,187 @@ class TestProseAdvisoryDeliverableAttribution:
         )
         assert 'crates/widget.rs' in result.get('matched_paths', [])
         assert result.get('suggested_project') == 'reify'
+
+
+# Task 2948, the reify-7319 shape: a consolidation gate filed in its own project whose rationale quotes a member memory's foreign path.
+class TestProseAdvisoryConsolidationGateAttribution:
+    """A PURE consolidation gate's declared topic attributes it to the filing
+    project; every other gate shape keeps the unchanged rules."""
+
+    _FOREIGN = 'Member 338b4868 confirms the mechanism at crates/reify-eval/src/engine_edit.rs'
+    _GATE_TOPIC = 'review-issues-detail-omits-suggestions'
+
+    def _spec(self):
+        return build_consolidation_gate_task(
+            topic=self._GATE_TOPIC, rationale=self._FOREIGN,
+        )
+
+    def _gate_metadata(self, **extra):
+        metadata = copy.deepcopy(self._spec().metadata)
+        metadata.update(extra)
+        return metadata
+
+    async def _submit_gate(self, interceptor, tmp_path, metadata=None):
+        """Submit the gate under dark_factory; return (result, calls)."""
+        spec = self._spec()
+        return await _submit_foreign_prose_task(
+            interceptor, tmp_path,
+            title=spec.title,
+            description=spec.description,
+            priority=spec.priority,
+            metadata=copy.deepcopy(spec.metadata) if metadata is None else metadata,
+        )
+
+    # -- SUPPRESSION: the builder's own shape ---------------------------------
+
+    @pytest.mark.parametrize('encode', [copy.deepcopy, json.dumps], ids=['dict', 'json'])
+    @pytest.mark.asyncio
+    async def test_pure_consolidation_gate_suppresses_stamp_and_escalation(
+        self, encode, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path, metadata=encode(self._spec().metadata),
+        )
+
+        meta = await _persisted_candidate_metadata(ticket_store, result)
+        assert 'possible_scope_mismatch' not in meta, (
+            f'A pure consolidation gate must suppress the stamp: {meta!r}'
+        )
+        assert calls == [], f'Expected no scope_violation escalation, got: {calls!r}'
+
+    @pytest.mark.asyncio
+    async def test_gate_suppression_is_logged_with_structured_facts(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path, caplog,
+    ):
+        with caplog.at_level(
+            logging.INFO, logger='fused_memory.middleware.task_interceptor',
+        ):
+            await self._submit_gate(interceptor_with_store, tmp_path)
+
+        _assert_one_suppression_record(
+            caplog, ('crates/', 'dark_factory', 'reify', self._GATE_TOPIC),
+        )
+
+    @pytest.mark.asyncio
+    async def test_pure_gate_without_prose_hit_still_gets_soft_signal_adjudication(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """The gate attribution sits after the fileless early return, so a pure
+        gate quoting an absolute foreign root (no repo-relative prefix) still
+        reaches the task-3122 soft-signal adjudicator."""
+        registry = _soft_scope_registry(interceptor_with_store, tmp_path)
+        stub = _stub_adjudicator(interceptor_with_store)
+        spec = build_consolidation_gate_task(
+            topic=self._GATE_TOPIC,
+            rationale=f"Member 338b4868 cites {registry.root_for_project('reify')}",
+        )
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'dark-factory'),
+                title=spec.title,
+                description=spec.description,
+                priority=spec.priority,
+                metadata=copy.deepcopy(spec.metadata),
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        await _persisted_candidate_metadata(ticket_store, result)
+        stub.adjudicate.assert_awaited_once()
+
+    # -- RETAINED PROTECTION: any other gate shape keeps the advisory ---------
+
+    @pytest.mark.parametrize('encode', [copy.deepcopy, json.dumps], ids=['dict', 'json'])
+    @pytest.mark.asyncio
+    async def test_generic_human_gate_without_block_still_advises(
+        self, encode, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """The json case is the anti-vacuity pair for the json suppression case:
+        string metadata really is parsed, so a missing block keeps the advisory."""
+        metadata = self._gate_metadata()
+        metadata.pop(GATE_METADATA_KEY)
+
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path, metadata=encode(metadata),
+        )
+
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.asyncio
+    async def test_malformed_gate_topic_still_advises(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        metadata = self._gate_metadata()
+        metadata[GATE_METADATA_KEY]['topic'] = 'Not A Slug'
+
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path, metadata=metadata,
+        )
+
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.asyncio
+    async def test_block_on_non_gate_task_still_advises(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        metadata = self._gate_metadata()
+        metadata.pop('operational_mode')
+        metadata.pop('execution_class')
+
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path, metadata=metadata,
+        )
+
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.asyncio
+    async def test_gate_with_foreign_modules_entry_still_advises(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """A declared deliverable hands attribution to the task-3106 rule,
+        whose foreign veto keeps the advisory; the hard reject never reads
+        ``modules``."""
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path,
+            metadata=self._gate_metadata(modules=['crates/widget.rs']),
+        )
+
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.parametrize('malformed', [5, {'fused-memory/src/x.py': 1}])
+    @pytest.mark.asyncio
+    async def test_gate_with_malformed_deliverable_declaration_still_advises(
+        self, malformed, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        """An unusable ``modules`` value yields no attesting signal, but the
+        filer still declared a deliverable, so the gate is not pure."""
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path,
+            metadata=self._gate_metadata(modules=malformed),
+        )
+
+        await _assert_prose_advisory_fired(ticket_store, result, calls)
+
+    @pytest.mark.asyncio
+    async def test_gate_with_foreign_files_still_hard_rejects(
+        self, interceptor_with_store, ticket_store, taskmaster, tmp_path,
+    ):
+        result, calls = await self._submit_gate(
+            interceptor_with_store, tmp_path,
+            metadata=self._gate_metadata(
+                files=['crates/widget.rs', 'fused-memory/src/x.py'],
+            ),
+        )
+
+        assert isinstance(result, dict)
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
+            f'Expected the FILES-certain hard reject, got: {result}'
+        )
+        assert 'crates/widget.rs' in result.get('matched_paths', [])
+        assert result.get('suggested_project') == 'reify'
+        assert len(calls) == 1, f'Expected exactly one escalation, got: {calls!r}'
+        assert calls[0].get('advisory') is False
 
 
 # ---------------------------------------------------------------------------
@@ -9004,12 +9421,12 @@ class TestExtractMetaFiles:
 
 
 # ---------------------------------------------------------------------------
-# Unit tests for TaskInterceptor._extract_deliverable_signals (task 3106)
+# Unit tests for TaskInterceptor._extract_deliverable_signals_from_meta (task 3106)
 # ---------------------------------------------------------------------------
 
 
 class TestExtractDeliverableSignals:
-    """Unit tests for the _extract_deliverable_signals static helper.
+    """Unit tests for the _extract_deliverable_signals_from_meta static helper.
 
     Deliberately DIVERGES from _extract_meta_files: it takes the UNION of
     ``files`` ∪ ``files_to_modify`` ∪ ``modules`` rather than the
@@ -9020,13 +9437,19 @@ class TestExtractDeliverableSignals:
     warn-and-discard degrade on malformed values.
     """
 
+    @staticmethod
+    def _signals(kwargs):
+        """Parse then extract, as _path_guard_or_skip composes the two."""
+        meta = TaskInterceptor._parse_metadata(kwargs)
+        return TaskInterceptor._extract_deliverable_signals_from_meta(meta)
+
     def test_files_key_only(self):
         kwargs = {'metadata': {'files': ['a/x.py']}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['a/x.py']
+        assert self._signals(kwargs) == ['a/x.py']
 
     def test_files_to_modify_key_only(self):
         kwargs = {'metadata': {'files_to_modify': ['b/y.py']}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['b/y.py']
+        assert self._signals(kwargs) == ['b/y.py']
 
     def test_modules_key_only(self):
         """metadata.modules (Tier-A path-like lock keys) is a signal too.
@@ -9035,7 +9458,7 @@ class TestExtractDeliverableSignals:
         because a declared module directory is evidence of local work.
         """
         kwargs = {'metadata': {'modules': ['c/z']}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['c/z']
+        assert self._signals(kwargs) == ['c/z']
 
     def test_all_three_keys_union_in_declared_order(self):
         """UNION, not precedence — contrasted inline with _extract_meta_files.
@@ -9050,7 +9473,7 @@ class TestExtractDeliverableSignals:
                 'modules': ['c/z'],
             }
         }
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == [
+        assert self._signals(kwargs) == [
             'a/x.py', 'b/y.py', 'c/z',
         ]
         # Divergence pinned: the FILES-certain extractor keeps its precedence.
@@ -9064,18 +9487,18 @@ class TestExtractDeliverableSignals:
                 'modules': ['a/x.py', 'c/z'],
             }
         }
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == [
+        assert self._signals(kwargs) == [
             'a/x.py', 'dup.py', 'b/y.py', 'c/z',
         ]
 
     def test_scalar_string_value_coerced_to_list(self):
         """Matches _extract_meta_files_from_meta's scalar-str coercion."""
         kwargs = {'metadata': {'modules': 'c/z'}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['c/z']
+        assert self._signals(kwargs) == ['c/z']
 
     def test_falsy_entries_dropped_and_non_strings_coerced(self):
         kwargs = {'metadata': {'files': ['', None, 'src/bar.py'], 'modules': [42]}}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == [
+        assert self._signals(kwargs) == [
             'src/bar.py', '42',
         ]
 
@@ -9089,14 +9512,14 @@ class TestExtractDeliverableSignals:
         ``submit_task`` as an unstructured crash.  ``modules`` is the sharp
         edge — it was never read on this path before task 3106.
         """
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'modules': 5}},
         ) == []
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'files': 5}},
         ) == []
         # A malformed key discards only ITSELF; well-formed siblings survive.
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'files': ['a/x.py'], 'modules': 5}},
         ) == ['a/x.py']
 
@@ -9107,31 +9530,31 @@ class TestExtractDeliverableSignals:
         silently suppress a prose advisory on metadata the author never
         meant as a path list.
         """
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'modules': {'fused-memory/src': 1}}},
         ) == []
 
     def test_tuple_and_set_values_are_accepted(self):
         """Sequence shapes other than list still carry signal."""
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'files': ('a/x.py', 'b/y.py')}},
         ) == ['a/x.py', 'b/y.py']
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'modules': {'c/z'}}},
         ) == ['c/z']
 
     def test_json_string_metadata_parsed_via_same_path(self):
         """JSON-string metadata goes through _parse_metadata, as _extract_meta_files does."""
         kwargs = {'metadata': '{"files": ["a/x.py"], "modules": ["c/z"]}'}
-        assert TaskInterceptor._extract_deliverable_signals(kwargs) == ['a/x.py', 'c/z']
+        assert self._signals(kwargs) == ['a/x.py', 'c/z']
 
     def test_missing_non_dict_or_keyless_metadata_returns_empty(self):
-        assert TaskInterceptor._extract_deliverable_signals({}) == []
-        assert TaskInterceptor._extract_deliverable_signals({'metadata': None}) == []
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals({}) == []
+        assert self._signals({'metadata': None}) == []
+        assert self._signals(
             {'metadata': ['some', 'list']},
         ) == []
-        assert TaskInterceptor._extract_deliverable_signals(
+        assert self._signals(
             {'metadata': {'priority': 'low'}},
         ) == []
 
@@ -9423,25 +9846,32 @@ class TestPathGuardOrSkip:
         assert result.get('matched_paths') == ['orchestrator/harness.py']
         assert result.get('suggested_project') == 'dark_factory'
 
-    # -- Case 5: routing override skips both guards -----------------------
-    async def test_routing_override_skips_heuristic_and_adjudicator(
+    # -- Case 5: routing override REPORTS but does not ENFORCE -------------
+    async def test_routing_override_reports_but_does_not_enforce(
         self,
         interceptor,
         monkeypatch,
         caplog,
     ):
-        """When routing_override_reason is set (non-empty), _path_guard_or_skip
-        returns None immediately without calling _path_guard_check or the
-        adjudicator — and emits a WARNING audit log containing the reason.
+        """Task 3123 repoint (was ``..._skips_heuristic_and_adjudicator``).
+
+        The override is now an AUDITED bypass, so the contract changed on one
+        axis and is unchanged on every other: ``_path_guard_check`` IS invoked
+        — the verdicts are computed purely to populate the audit record — but
+        NOTHING is enforced from them.  The adjudicator is still never
+        consulted, the helper still returns ``None``, and the greppable
+        WARNING still carries the reason.
         """
-        # Monkeypatch _path_guard_check to track calls (should not be called)
+        # Spy on _path_guard_check: it must now BE called (for reporting), and
+        # must return a real verdict the audit record can be built from.
         guard_calls: list = []
+        original_check = TaskInterceptor._path_guard_check
 
-        def failing_check(self, candidate, kwargs, project_id):
+        def spying_check(self, candidate, kwargs, project_id):
             guard_calls.append((candidate, kwargs, project_id))
-            raise AssertionError('_path_guard_check must NOT be called on override')
+            return original_check(self, candidate, kwargs, project_id)
 
-        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', failing_check)
+        monkeypatch.setattr(TaskInterceptor, '_path_guard_check', spying_check)
 
         # Wire a fake adjudicator so we can assert it's not called
         fake_adjudicator = AsyncMock()
@@ -9457,7 +9887,9 @@ class TestPathGuardOrSkip:
             )
 
         assert result is None, f'Expected None on override, got: {result!r}'
-        assert guard_calls == [], '_path_guard_check must NOT be called'
+        assert len(guard_calls) == 1, (
+            f'_path_guard_check must be called ONCE for reporting, got: {guard_calls}'
+        )
         fake_adjudicator.adjudicate.assert_not_called()
 
         # Must emit a WARNING containing the reason
@@ -9963,21 +10395,24 @@ class TestMultiProjectRoutingWiring:
         assert result is not None
         assert result['error_type'] == 'DarkFactoryPathScopeViolation'
 
-    async def test_routing_override_short_circuits_files_certain_reject(
+    async def test_routing_override_reports_files_certain_reject_without_enforcing_it(
         self,
         interceptor,
         tmp_path,
     ):
-        """Task 2206: routing_override_reason must skip BOTH the FILES-certain
-        reject and the PROSE advisory — it is checked first, before
-        ``_files_scope_check`` even runs.
+        """Task 2206 + task 3123 repoint (was ``..._short_circuits_...``).
 
-        Drives a genuine metadata.files owner-mismatch (the same shape that
-        rejects hard in test_escalator_failure_swallowed) but with a
-        non-empty override reason: the submission must be allowed, the
-        escalator must NOT fire, and no possible_scope_mismatch marker may
-        be attached — a silent files-certain reject would otherwise still
-        leak a loud advisory even though the caller asked to bypass it.
+        routing_override_reason must skip BOTH the FILES-certain reject and
+        the PROSE advisory.  Since task 3123 the verdicts ARE computed on this
+        path — but purely to populate the audit record, so every ENFORCEMENT
+        assertion below is unchanged: the submission is allowed, no rejection
+        escalation fires, and no possible_scope_mismatch marker is attached (a
+        silent files-certain reject would otherwise still leak a loud advisory
+        even though the caller asked to bypass it).
+
+        What is NEW: the bypass is now recorded.  ``report_routing_override``
+        fires exactly once carrying the reason and the paths that WOULD have
+        hard-rejected — that record is the whole point of task 3123.
         """
         from fused_memory.middleware.project_prefix_registry import (
             ProjectPrefixRegistry,
@@ -9989,10 +10424,14 @@ class TestMultiProjectRoutingWiring:
         interceptor._prefix_registry = registry
 
         escalator_calls: list = []
+        override_calls: list = []
 
         class SpyEscalator:
             def report_rejection(self, **kwargs):
                 escalator_calls.append(kwargs)
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
 
         interceptor._scope_violation_escalator = SpyEscalator()
 
@@ -10014,6 +10453,497 @@ class TestMultiProjectRoutingWiring:
         assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {}), (
             f"Override must not leave a possible_scope_mismatch marker: {kwargs['metadata']!r}"
         )
+        # No cross-repo allow-and-tag either — that is an enforcement-path
+        # outcome and the override branch must reach none of them.
+        meta = kwargs.get('metadata') or {}
+        assert 'cross_repo' not in meta and 'cross_repo_project' not in meta, (
+            f'Override must not attach a cross_repo marker: {meta!r}'
+        )
+
+        assert len(override_calls) == 1, (
+            f'Expected exactly one routing-override audit record, got: {override_calls}'
+        )
+        rec = override_calls[0]
+        assert rec['reason'] == 'deliberate cross-cutting change'
+        assert rec['project_id'] == 'other'
+        assert rec['project_root'] == '/foo'
+        assert rec['matched_paths'] == ('crates/widget.rs',)
+        assert rec['suggested_project'] == 'reify'
+
+    async def test_routing_override_reports_prose_only_hit(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """A PROSE-only override hit is audited too, carrying the prose prefix."""
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'dark-factory')])
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        kwargs = {'title': 'Investigate orchestrator/harness.py deadlock'}
+        result = await interceptor._path_guard_or_skip(
+            kwargs,
+            '/foo',
+            'some_other_project',
+            routing_override_reason='incidental mention of the other repo',
+        )
+
+        assert result is None
+        assert escalator_calls == []
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+
+        assert len(override_calls) == 1, override_calls
+        rec = override_calls[0]
+        assert rec['suggested_project'] == 'dark_factory'
+        assert 'orchestrator/' in rec['matched_paths'], rec['matched_paths']
+
+    async def test_routing_override_reports_union_of_both_signals(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """Both signals contribute to ONE record: files-certain paths first,
+        then any prose prefixes not already present, order-stable and deduped."""
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'reify' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                raise AssertionError('report_rejection must not fire on an override')
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        kwargs = {
+            # Foreign FILES entry (exact owner lookup) AND foreign prose (regex
+            # prefix hit) — two independent signals, one audit record.
+            'title': 'Mirror the orchestrator/harness.py logic',
+            'metadata': {'files': ['crates/widget.rs']},
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs,
+            '/foo',
+            'other',
+            routing_override_reason='cross-cutting by design',
+        )
+
+        assert result is None
+        assert len(override_calls) == 1, override_calls
+        paths = override_calls[0]['matched_paths']
+        assert paths[0] == 'crates/widget.rs', f'files-certain paths come first: {paths}'
+        assert 'orchestrator/' in paths, f'prose prefix must be unioned in: {paths}'
+        assert len(paths) == len(set(paths)), f'matched_paths must be deduped: {paths}'
+
+    async def test_no_override_leaves_enforcement_unchanged(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """Anti-regression: with NO override the FILES-certain hard reject and
+        its rejection escalation are exactly as before (task 2206)."""
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'generic title',
+                'metadata': {'files': ['crates/widget.rs']},
+            },
+            '/foo',
+            'other',
+            routing_override_reason='',
+        )
+
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        assert len(escalator_calls) == 1, escalator_calls
+        assert override_calls == [], (
+            f'No override supplied — no override record may be filed: {override_calls}'
+        )
+
+    # -- Residual seam cases (task 3123 step-7) ---------------------------
+
+    async def test_override_with_clean_verdicts_still_escalates(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """THE CORE CENSUS CASE.
+
+        The defect being fixed is "a bypass leaves no operator-visible
+        record", not "a bypass that MATTERED leaves no record".  An override
+        whose verdicts both came back clean is precisely the evidence that the
+        parameter was reached for unnecessarily — the measured data any later
+        tightening of it has to stand on — so it must still be recorded.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'dark-factory')])
+        interceptor._prefix_registry = registry
+
+        escalator_calls: list = []
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                escalator_calls.append(kwargs)
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                # Nothing foreign anywhere: the file is owned by the FILING
+                # project, and the prose cites no other project's paths.
+                'title': 'Tidy up the local helper',
+                'metadata': {'files': ['fused-memory/src/x.py']},
+            },
+            str(tmp_path / 'dark-factory'),
+            'dark_factory',
+            routing_override_reason='belt and braces',
+        )
+
+        assert result is None
+        assert escalator_calls == []
+        assert len(override_calls) == 1, (
+            f'A clean-verdict override must STILL be recorded: {override_calls}'
+        )
+        assert override_calls[0]['matched_paths'] == ()
+        assert override_calls[0]['suggested_project'] is None
+
+    async def test_override_escalator_failure_does_not_break_submission(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """A raising escalator must not convert an ALLOWED submission into an
+        exception — the submission has already been permitted at this point."""
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        class BoomEscalator:
+            def report_rejection(self, **kwargs):
+                raise RuntimeError('boom')
+
+            def report_routing_override(self, **kwargs):
+                raise RuntimeError('boom')
+
+        interceptor._scope_violation_escalator = BoomEscalator()
+
+        # Must not raise.
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'generic title',
+                'metadata': {'files': ['crates/widget.rs']},
+            },
+            '/foo',
+            'other',
+            routing_override_reason='deliberate',
+        )
+        assert result is None, f'submission must stay allowed, got: {result!r}'
+
+    async def test_raising_guard_check_does_not_break_an_override_submission(
+        self,
+        interceptor,
+        tmp_path,
+        caplog,
+    ):
+        """The verdicts are computed for REPORTING ONLY, so a defect in the
+        guard machinery must not break a submission that asked to bypass it.
+
+        Before task 3123 this branch did literally nothing, which made an
+        override caller STRUCTURALLY immune to any guard defect.  Buying the
+        audit record its paths must not hand that immunity back: a raise from
+        _path_guard_check (a future extractor meeting a malformed metadata
+        shape, a registry/regex change, a path string that trips
+        normpath/expanduser) would otherwise turn an explicitly-bypassed
+        submission into an exception out of submit_task.  Mirrors
+        test_override_escalator_failure_does_not_break_submission one call
+        earlier in the same branch.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+
+        def boom(*a, **kw):
+            raise RuntimeError('guard machinery defect')
+
+        interceptor._path_guard_check = boom
+
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                raise AssertionError('report_rejection must not fire on an override')
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        with caplog.at_level(logging.WARNING):
+            # Must not raise.
+            result = await interceptor._path_guard_or_skip(
+                {
+                    'title': 'Mirror the orchestrator/harness.py logic',
+                    'metadata': {'files': ['crates/widget.rs']},
+                },
+                '/foo',
+                'other',
+                routing_override_reason='deliberate',
+            )
+
+        assert result is None, f'submission must stay allowed, got: {result!r}'
+        # The audit record is still filed — degraded to no paths, which is
+        # honest: the guard genuinely produced none.
+        assert len(override_calls) == 1, override_calls
+        assert override_calls[0]['matched_paths'] == ()
+        assert override_calls[0]['reason'] == 'deliberate'
+        # NOT SILENT: the swallowed defect is on the record.
+        assert any(
+            'ROUTING-OVERRIDE reporting path' in r.message
+            for r in caplog.records if r.levelno >= logging.ERROR
+        ), f'the swallowed defect must be logged: {[r.message for r in caplog.records]}'
+
+    async def test_override_suggestion_falls_through_to_prose_when_files_is_ambiguous(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """A files verdict can REJECT and still name no owner: with two
+        distinct foreign owners in metadata.files, check_files_for_scope
+        cannot pick one and returns suggested_project=None.  The audit record
+        must then fall through to the prose verdict's suggestion rather than
+        discarding an available hint — the same degradation
+        _override_matched_paths already makes for the path union.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'know-live').mkdir()
+        (tmp_path / 'know-live' / 'corpus').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([
+            str(tmp_path / 'reify'),
+            str(tmp_path / 'know-live'),
+            str(tmp_path / 'dark-factory'),
+        ])
+        interceptor._prefix_registry = registry
+
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                raise AssertionError('report_rejection must not fire on an override')
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                # TWO distinct foreign owners -> files verdict rejects with
+                # suggested_project=None...
+                'title': 'Touch the orchestrator/harness.py path too',
+                'metadata': {'files': ['crates/widget.rs', 'corpus/loader.py']},
+            },
+            '/foo',
+            'other',
+            routing_override_reason='cross-cutting by design',
+        )
+
+        assert result is None
+        assert len(override_calls) == 1, override_calls
+        call = override_calls[0]
+        # ...but the prose signal DID name one, so the record reports it.
+        assert call['suggested_project'] == 'dark_factory', (
+            f'ambiguous files owner must degrade to the prose suggestion: {call!r}'
+        )
+        # Both signals still union into the path list, as before.
+        paths = call['matched_paths']
+        assert 'crates/widget.rs' in paths
+        assert 'corpus/loader.py' in paths
+        assert 'orchestrator/' in paths
+
+    async def test_override_with_no_escalator_configured_is_a_noop(
+        self,
+        interceptor,
+        tmp_path,
+        caplog,
+    ):
+        """With no escalator wired the WARNING is the LAST-RESORT record.
+
+        Minimal environments without the escalation package still need the
+        bypass to leave a trace, so the audit log fires independently of the
+        escalation attempt.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+        interceptor._prefix_registry = registry
+        interceptor._scope_violation_escalator = None
+
+        with caplog.at_level(logging.WARNING):
+            result = await interceptor._path_guard_or_skip(
+                {
+                    'title': 'generic title',
+                    'metadata': {'files': ['crates/widget.rs']},
+                },
+                '/foo',
+                'other',
+                routing_override_reason='deliberate',
+            )
+
+        assert result is None
+        assert any(
+            'ROUTING OVERRIDE' in r.message and 'deliberate' in r.message
+            for r in caplog.records if r.levelno >= logging.WARNING
+        ), f'audit WARNING must still fire: {[r.message for r in caplog.records]}'
+
+    async def test_override_with_no_registry_still_escalates(
+        self,
+        interceptor,
+    ):
+        """A None registry must not reach root_for_project — and must not
+        suppress the record either."""
+        interceptor._prefix_registry = None
+
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                raise AssertionError('report_rejection must not fire on an override')
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'Investigate orchestrator/harness.py deadlock',
+                'metadata': {'files': ['crates/widget.rs']},
+            },
+            '/foo',
+            'other',
+            routing_override_reason='deliberate',
+        )
+
+        assert result is None
+        assert len(override_calls) == 1, override_calls
+        assert override_calls[0]['matched_paths'] == ()
+        assert override_calls[0]['suggested_root'] is None
+
+    async def test_override_prompt_only_submission_escalates(
+        self,
+        interceptor,
+        tmp_path,
+    ):
+        """Prompt-only kwargs (no title, so _build_candidate returns None)
+        still produce a record with a usable candidate_title."""
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'dark-factory').mkdir()
+        (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+        registry = ProjectPrefixRegistry.from_roots([str(tmp_path / 'dark-factory')])
+        interceptor._prefix_registry = registry
+
+        override_calls: list = []
+
+        class SpyEscalator:
+            def report_rejection(self, **kwargs):
+                raise AssertionError('report_rejection must not fire on an override')
+
+            def report_routing_override(self, **kwargs):
+                override_calls.append(kwargs)
+
+        interceptor._scope_violation_escalator = SpyEscalator()
+
+        result = await interceptor._path_guard_or_skip(
+            {'prompt': 'Investigate the orchestrator/harness.py deadlock'},
+            '/foo',
+            'some_other_project',
+            routing_override_reason='deliberate',
+        )
+
+        assert result is None
+        assert len(override_calls) == 1, override_calls
+        assert override_calls[0]['candidate_title'], 'candidate_title must not be empty'
+        assert 'orchestrator' in override_calls[0]['candidate_title']
 
     @pytest.mark.asyncio
     async def test_no_hit_adjudicator_not_consulted(
@@ -10273,6 +11203,174 @@ class TestPathGuardEscalationWordingEndToEnd:
         payload = self._written_payload(tmp_path)
         assert payload['summary'].startswith('Misrouted task rejected: cites '), payload
         assert payload['suggested_action'] == 'resubmit_to_dark_factory', payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not sve_mod.HAS_ESCALATION,
+    reason='escalation package not installed in this environment',
+)
+class TestRoutingOverrideEndToEndAudit:
+    """Task 3123's USER-OBSERVABLE SIGNAL, end-to-end through ``submit_task``.
+
+    Both halves have to hold at once, so both are asserted on the same call:
+    the override KEEPS WORKING (the task is still created and the reason is
+    still persisted), and the bypass is now AUDITED (a record an operator can
+    actually find exists on disk).  A REAL ``ScopeViolationEscalator`` writing
+    into ``tmp_path`` is used rather than a double — the signal is the record
+    in the operator's queue, so a doubles-only assertion would not check it.
+    """
+
+    REASON = 'self-referential: this task is about the guard'
+
+    @staticmethod
+    def _registry(tmp_path):
+        """A registry that knows ONLY the foreign ``reify`` root.
+
+        Leaving the filing project UNKNOWN is deliberate: it keeps the
+        esc-3004-2 cross-repo allow-and-tag narrowing out of the way, so the
+        no-override control below is a genuine FILES-certain hard reject.
+        """
+        from fused_memory.middleware.project_prefix_registry import (
+            ProjectPrefixRegistry,
+        )
+
+        (tmp_path / 'reify').mkdir()
+        (tmp_path / 'reify' / 'crates').mkdir()
+        (tmp_path / 'dark-factory').mkdir()
+        return ProjectPrefixRegistry.from_roots([str(tmp_path / 'reify')])
+
+    @staticmethod
+    def _payloads(tmp_path):
+        """Escalations written into the FILING project's queue."""
+        queue_dir = tmp_path / 'dark-factory' / 'data' / 'escalations'
+        return [
+            json.loads(f.read_text())
+            for f in sorted(queue_dir.glob('esc-*.json'))
+        ]
+
+    def _wire(self, interceptor_with_store, tmp_path):
+        from fused_memory.middleware.scope_violation_escalator import (
+            ScopeViolationEscalator,
+        )
+
+        interceptor_with_store._prefix_registry = self._registry(tmp_path)
+        interceptor_with_store._scope_violation_escalator = ScopeViolationEscalator()
+
+    async def test_override_submission_creates_task_and_files_audit_escalation(
+        self,
+        interceptor_with_store,
+        ticket_store,
+        taskmaster,
+        tmp_path,
+    ):
+        self._wire(interceptor_with_store, tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'dark-factory'),
+                title='Harden the path-scope guard override',
+                description='the guard itself',
+                metadata={'files': ['crates/widget.rs']},
+                routing_override_reason=self.REASON,
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        # HALF ONE — the override still works.
+        assert 'error_type' not in result, (
+            f'the override must still bypass the hard reject, got: {result}'
+        )
+        ticket_id = result.get('ticket', '')
+        assert ticket_id.startswith('tkt_'), f'expected a ticket, got: {result}'
+
+        db = ticket_store._db
+        assert db is not None
+        cursor = await db.execute(
+            'SELECT candidate_json FROM tickets WHERE ticket_id = ?', (ticket_id,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None, f'expected persisted row for {ticket_id!r}'
+        blob = json.loads(row['candidate_json'])
+        assert (blob.get('metadata') or {}).get('routing_override_reason') == self.REASON
+        # Re-pins the no-leak invariant THROUGH the new code path.
+        assert 'routing_override_reason' not in blob.get('kwargs', {})
+
+        # HALF TWO — the bypass is now audited.
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1, f'expected exactly one audit record, found: {payloads}'
+        payload = payloads[0]
+        assert payload['category'] == 'scope_violation'
+        assert payload['id'].startswith('esc-task-path-guard-override'), payload['id']
+        assert self.REASON in payload['detail']
+        assert 'dark_factory' in payload['detail']
+        # The path that WOULD have hard-rejected is named in the record.
+        assert 'crates/widget.rs' in payload['detail']
+
+    async def test_override_submission_planning_mode_also_audits(
+        self,
+        interceptor_with_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """``_path_guard_or_skip`` runs BEFORE the planning-mode split, so one
+        mechanism has to cover both submission paths."""
+        self._wire(interceptor_with_store, tmp_path)
+
+        result = await interceptor_with_store.submit_task(
+            project_root=str(tmp_path / 'dark-factory'),
+            title='Harden the path-scope guard override',
+            description='the guard itself',
+            metadata={'files': ['crates/widget.rs']},
+            planning_mode=True,
+            routing_override_reason=self.REASON,
+        )
+
+        assert 'error_type' not in result, result
+        assert result.get('status') == 'deferred', result
+        assert result.get('task_id') is not None, result
+
+        taskmaster.add_task.assert_called_once()
+        decoded = json.loads(taskmaster.add_task.call_args.kwargs['metadata'])
+        assert decoded.get('routing_override_reason') == self.REASON
+
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1, f'expected exactly one audit record, found: {payloads}'
+        assert payloads[0]['id'].startswith('esc-task-path-guard-override')
+        assert self.REASON in payloads[0]['detail']
+
+    async def test_no_override_submission_files_no_override_escalation(
+        self,
+        interceptor_with_store,
+        taskmaster,
+        tmp_path,
+    ):
+        """The control: the two records are distinguishable ON DISK.
+
+        Without the override the same submission still hard-rejects, and the
+        record it writes is a rejection — not an override audit.
+        """
+        self._wire(interceptor_with_store, tmp_path)
+
+        try:
+            result = await interceptor_with_store.submit_task(
+                project_root=str(tmp_path / 'dark-factory'),
+                title='Harden the path-scope guard override',
+                description='the guard itself',
+                metadata={'files': ['crates/widget.rs']},
+                # routing_override_reason intentionally omitted
+            )
+        finally:
+            await _cancel_interceptor_workers(interceptor_with_store)
+
+        assert result.get('error_type') == 'DarkFactoryPathScopeViolation', result
+
+        payloads = self._payloads(tmp_path)
+        assert len(payloads) == 1, f'expected exactly one record, found: {payloads}'
+        assert not payloads[0]['id'].startswith('esc-task-path-guard-override'), (
+            f'a rejection must not be filed as an override audit: {payloads[0]["id"]}'
+        )
+        assert payloads[0]['summary'].startswith('Misrouted task rejected: ')
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -10823,7 +11921,14 @@ async def test_planning_mode_end_to_end_batch_with_dependencies(tmp_path):
         statuses[tid] = kwargs.get('status', 'pending')
         return {'id': tid, 'title': kwargs.get('title') or 'untitled'}
 
-    async def fake_set_status(task_id, status, project_root, tag=None):
+    async def fake_set_status(
+        task_id, status, project_root, tag=None, *, pending_since_now=None,
+    ):
+        # `pending_since_now` is the one batch clock the CSV branch computes
+        # once and threads to every id (task 3816); this fake mirrors the real
+        # backend signature rather than swallowing it with **kwargs, so a
+        # future mis-spelled pass-through still fails here. Its VALUE is
+        # asserted against a real backend in test_pending_since_anchor.py.
         statuses[task_id] = status
         return {'success': True, 'task_id': task_id, 'status': status}
 
@@ -13543,3 +14648,1292 @@ async def test_get_ticket_row_without_a_store_warns_and_returns_none(
         assert await interceptor.get_ticket_row('tkt_0RRRC5AASJ9Z630VP4PCN9H376') is None
 
     assert any('ticket_store' in record.message for record in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Gate ORDER in _apply_status_transition (task 3112, step-15b)
+#
+# The consolidation-closure gate was inserted between two existing gates. These
+# pin that insertion point mechanically: the pre-done hook gate must still run
+# BEFORE it, and the transition-legality gate must still run AFTER it. Without
+# this, a later edit could hoist the new gate above the hook (spending a store
+# read on a transition the hook was going to refuse anyway) or drop it below
+# the legality check (letting a log-mode illegal_transition WARNING be emitted
+# for a transition that is then refused) and nothing would notice.
+# --------------------------------------------------------------------------- #
+
+
+_ORDER_TOPIC = 'gate-order-topic'
+
+
+def _order_gate_metadata():
+    from fused_memory.reconciliation.consolidation_gate import GATE_METADATA_KEY
+
+    return {
+        'execution_class': 'operational',
+        'operational_mode': 'gate',
+        'task_kind': 'deterministic',
+        'always_escalates': True,
+        GATE_METADATA_KEY: {'topic': _ORDER_TOPIC},
+    }
+
+
+def _order_member(n, *, canonical=None):
+    meta: dict[str, Any] = {'topic': _ORDER_TOPIC}
+    if canonical is not None:
+        meta['canonical'] = canonical
+    return {
+        'id': f'00000000-0000-4000-8000-{n:012d}',
+        'created_at': '2026-08-24T00:00:00+00:00',
+        'metadata': meta,
+    }
+
+
+def _wire_order_spies(interceptor, monkeypatch, *, members, hook_result=None):
+    """Install three ordered spies and return the shared call-order list.
+
+    One list, three appenders — an ORDER assertion, not three independent
+    called/not-called assertions, because "ran at all" is exactly what a
+    reordering edit would keep satisfying.
+    """
+    order: list[str] = []
+
+    async def _spy_run_hook(task_id, project_root, **kwargs):
+        order.append('pre_done_hook')
+        return hook_result
+
+    monkeypatch.setattr(
+        'fused_memory.middleware.task_interceptor._run_hook', _spy_run_hook
+    )
+
+    async def _scroll(filters, *, limit, project_id):
+        order.append('consolidation_scroll')
+        return list(members)
+
+    def _spy_is_legal_transition(old_status, status, actor, **kwargs):
+        order.append('transition_legality')
+        return True
+
+    monkeypatch.setattr(
+        'fused_memory.middleware.task_interceptor.is_legal_transition',
+        _spy_is_legal_transition,
+    )
+    # No count collaborator: the count call would be a second 'consolidation'
+    # entry and would blur the single ordering signal this asserts.
+    interceptor.set_consolidation_scroll(_scroll)
+    return order
+
+
+@pytest.fixture
+def order_interceptor(taskmaster, reconciler, event_buffer):
+    taskmaster.get_task = AsyncMock(
+        return_value={
+            'id': '1',
+            'status': 'pending',
+            'title': 'Consolidation gate',
+            'metadata': _order_gate_metadata(),
+        }
+    )
+    return TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+
+@pytest.mark.asyncio
+async def test_gate_chain_order_is_hook_then_consolidation_then_legality(
+    order_interceptor, taskmaster, monkeypatch
+):
+    """The documented chain, end to end, on a transition every gate passes."""
+    order = _wire_order_spies(
+        order_interceptor,
+        monkeypatch,
+        members=[_order_member(1, canonical=True), _order_member(2)],
+    )
+
+    result = await order_interceptor.set_task_status('1', 'done', '/project')
+
+    assert 'error' not in result, result
+    assert order == ['pre_done_hook', 'consolidation_scroll', 'transition_legality']
+    taskmaster.set_task_status.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_pre_done_hook_still_runs_before_the_consolidation_gate(
+    order_interceptor, taskmaster, monkeypatch
+):
+    """A hook refusal short-circuits: the closure scroll is never spent.
+
+    The cluster here is MALFORMED (no canonical), so if the new gate had been
+    hoisted above the hook the returned error would be
+    ``consolidation_not_closed`` instead.
+    """
+    order = _wire_order_spies(
+        order_interceptor,
+        monkeypatch,
+        members=[_order_member(1), _order_member(2)],
+        hook_result={
+            'success': False,
+            'error': 'pre_done_hook_rejected',
+            'task_id': '1',
+        },
+    )
+
+    result = await order_interceptor.set_task_status('1', 'done', '/project')
+
+    assert result['error'] == 'pre_done_hook_rejected'
+    assert order == ['pre_done_hook']
+    taskmaster.set_task_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transition_legality_gate_still_runs_after_the_consolidation_gate(
+    order_interceptor, taskmaster, monkeypatch
+):
+    """A closure refusal short-circuits before the legality gate.
+
+    Log-mode legality (the default) emits a would-reject WARNING rather than
+    returning, so running it on a transition that is about to be refused would
+    put a phantom illegal_transition line in the log for a write that never
+    happened.
+    """
+    order = _wire_order_spies(
+        order_interceptor,
+        monkeypatch,
+        members=[_order_member(1), _order_member(2)],  # no canonical
+    )
+
+    result = await order_interceptor.set_task_status('1', 'done', '/project')
+
+    assert result['error'] == 'consolidation_not_closed'
+    assert order == ['pre_done_hook', 'consolidation_scroll']
+    taskmaster.set_task_status.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 3122: the FILELESS soft-signal trigger for the dormant adjudicator
+# ---------------------------------------------------------------------------
+
+
+def _soft_scope_registry(interceptor, tmp_path):
+    """Wire a two-project (reify + dark-factory) registry onto *interceptor*."""
+    from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+
+    (tmp_path / 'reify').mkdir()
+    (tmp_path / 'reify' / 'crates').mkdir()
+    (tmp_path / 'reify' / 'gui').mkdir()
+    (tmp_path / 'dark-factory').mkdir()
+    (tmp_path / 'dark-factory' / 'fused-memory').mkdir()
+    (tmp_path / 'dark-factory' / 'orchestrator').mkdir()
+    registry = ProjectPrefixRegistry.from_roots(
+        [str(tmp_path / 'reify'), str(tmp_path / 'dark-factory')]
+    )
+    interceptor._prefix_registry = registry
+    return registry
+
+
+def _stub_adjudicator(interceptor, verdict=None):
+    """Attach a recording stub adjudicator and return it."""
+    from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+    stub = MagicMock()
+    stub.adjudicate = AsyncMock(
+        return_value=verdict
+        or AdjudicationVerdict(verdict='allow', reason='incidental', llm_used=True)
+    )
+    interceptor._path_scope_adjudicator = stub
+    return stub
+
+
+class _SpyEscalator:
+    def __init__(self):
+        self.calls: list = []
+
+    def report_rejection(self, **kwargs):
+        self.calls.append(kwargs)
+
+
+@pytest.mark.asyncio
+class TestSoftScopeSignalTrigger:
+    """The trigger contract only — marker/escalation behaviour is later steps.
+
+    The class this exists for is the FILELESS misfile: no metadata.files and
+    no repo-relative prose prefix, so every existing guard returns a
+    non-rejection verdict and _path_guard_or_skip leaves at its EARLY return.
+    """
+
+    async def test_fileless_strong_signal_adjudicates_and_never_blocks(
+        self, interceptor, tmp_path,
+    ):
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None, f'soft signal must never block, got {result!r}'
+        stub.adjudicate.assert_awaited_once()
+        call = stub.adjudicate.await_args.kwargs
+        assert call['project_id'] == 'reify'
+        assert call['suggested_project'] == 'dark_factory'
+        assert call['title'] == 'dark-factory: wire the recurring timer'
+        assert df_root in call['description']
+        assert call['matched_paths']
+
+    async def test_weak_only_signal_never_spends_an_llm_call(
+        self, interceptor, tmp_path,
+    ):
+        """The bare-name rule fires at 20.6% / 3.2%. It must not pay."""
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+
+        result = await interceptor._path_guard_or_skip(
+            {
+                'title': 'wire the recurring timer',
+                'description': 'this is dark-factory-side context, work is local',
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is None
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_no_signal_at_all_never_adjudicates(self, interceptor, tmp_path):
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+
+        result = await interceptor._path_guard_or_skip(
+            {'title': 'wire the recurring timer', 'description': 'ordinary work'},
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        assert result is None
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_no_adjudicator_configured_is_todays_behaviour(
+        self, interceptor, tmp_path,
+    ):
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        interceptor._path_scope_adjudicator = None
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+
+
+@pytest.mark.asyncio
+class TestSoftScopeTriggerLeavesExistingExitsAlone:
+    """One pin per pre-existing exit of _path_guard_or_skip.
+
+    Each asserts the exit's own observable outcome is unchanged AND that the
+    adjudicator was never awaited — the soft branch attaches to exactly one
+    exit and must not re-open a decision another branch already made.
+    """
+
+    async def test_routing_override_stays_a_bypass(self, interceptor, tmp_path):
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs,
+            str(tmp_path / 'reify'),
+            'reify',
+            routing_override_reason='operator confirmed this belongs here',
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_files_certain_reject_still_rejects(self, interceptor, tmp_path):
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': 'mixed declaration',
+            'metadata': {'files': ['orchestrator/scheduler.py', 'crates/foo.rs']},
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is not None
+        assert result['error_type'] == 'DarkFactoryPathScopeViolation'
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_cross_repo_allow_and_tag_is_untouched(self, interceptor, tmp_path):
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': 'the deliverable lands on the dark-factory branch',
+            'metadata': {
+                'files': ['orchestrator/scheduler.py', 'fused-memory/src/x.py']
+            },
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        meta = kwargs.get('metadata') or {}
+        assert meta.get('cross_repo') is True
+        assert meta.get('cross_repo_project') == 'dark_factory'
+        assert 'possible_scope_mismatch' not in meta
+        stub.adjudicate.assert_not_awaited()
+
+    async def test_attribution_suppressed_prose_is_not_reopened(
+        self, interceptor, tmp_path, caplog,
+    ):
+        """Task 3106 decided this with the CERTAIN classifier. Leave it decided."""
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': 'mirror the logic in fused-memory/src/harness.py',
+            'metadata': {'files': ['crates/foo.rs']},
+        }
+        with caplog.at_level(logging.INFO):
+            result = await interceptor._path_guard_or_skip(
+                kwargs, str(tmp_path / 'reify'), 'reify',
+            )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert any(
+            'PROSE ADVISORY SUPPRESSED' in record.message for record in caplog.records
+        )
+        stub.adjudicate.assert_not_awaited()
+        assert interceptor._scope_violation_escalator.calls == []
+
+    async def test_prose_advisory_stamps_exactly_one_marker(
+        self, interceptor, tmp_path,
+    ):
+        _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': 'edit fused-memory/src/harness.py directly',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
+        assert marker is not None
+        assert marker['source'] == 'prose'
+        assert marker['suggested_project'] == 'dark_factory'
+        assert len(interceptor._scope_violation_escalator.calls) == 1
+        stub.adjudicate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+class TestSoftScopeCensusWarnOnly:
+    """Warn-only is the DEFAULT disposition; the census line is its product.
+
+    The enforce-flip decision needs precision = confirmations / firings.  The
+    firing rate is already known from corpus measurement; what is not known is
+    the CONFIRMATION rate, and only actually running the adjudicator produces
+    it.  So the census line is emitted on every adjudication — allow,
+    uncertain and failed included — or the census would have a numerator and
+    no denominator.
+    """
+
+    def _kwargs(self, df_root):
+        return {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+
+    async def _run(self, interceptor, tmp_path, caplog, verdict):
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        _stub_adjudicator(interceptor, verdict)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        kwargs: dict[str, Any] = self._kwargs(registry.root_for_project('dark_factory'))
+        with caplog.at_level(logging.WARNING):
+            result = await interceptor._path_guard_or_skip(
+                kwargs, str(tmp_path / 'reify'), 'reify',
+            )
+        census = [
+            r.getMessage()
+            for r in caplog.records
+            if 'soft_scope_lint.flagged' in r.getMessage()
+        ]
+        return result, kwargs, census
+
+    async def test_confirmed_misroute_logs_census_but_acts_on_nothing(
+        self, interceptor, tmp_path, caplog, monkeypatch,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        result, kwargs, census = await self._run(
+            interceptor,
+            tmp_path,
+            caplog,
+            AdjudicationVerdict(verdict='reject', reason='all dark-factory side'),
+        )
+
+        assert result is None
+        assert len(census) == 1, f'expected exactly one census line, got {census!r}'
+        line = census[0]
+        assert 'title_project_prefix' in line
+        assert 'absolute_foreign_root' in line
+        assert 'dark_factory' in line
+        assert 'reject' in line
+        # Warn-only: observed, not acted on.
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert interceptor._scope_violation_escalator.calls == []
+
+    @pytest.mark.parametrize(
+        ('verdict', 'failed'),
+        [('allow', False), ('uncertain', False), ('reject', True)],
+    )
+    async def test_census_records_the_denominator_too(
+        self, interceptor, tmp_path, caplog, monkeypatch, verdict, failed,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        result, kwargs, census = await self._run(
+            interceptor,
+            tmp_path,
+            caplog,
+            AdjudicationVerdict(verdict=verdict, failed=failed, reason='r'),
+        )
+
+        assert result is None
+        assert len(census) == 1
+        assert verdict in census[0]
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert interceptor._scope_violation_escalator.calls == []
+
+    async def test_weak_only_emits_no_census_line(
+        self, interceptor, tmp_path, caplog, monkeypatch,
+    ):
+        """No adjudication ran, so there is nothing to census."""
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        _soft_scope_registry(interceptor, tmp_path)
+        _stub_adjudicator(interceptor)
+
+        with caplog.at_level(logging.WARNING):
+            result = await interceptor._path_guard_or_skip(
+                {
+                    'title': 'wire the recurring timer',
+                    'description': 'dark-factory-side context only',
+                },
+                str(tmp_path / 'reify'),
+                'reify',
+            )
+
+        assert result is None
+        assert not [
+            r for r in caplog.records if 'soft_scope_lint.flagged' in r.getMessage()
+        ]
+
+
+@pytest.mark.asyncio
+class TestSoftScopeEnforceMode:
+    """FUSED_SOFT_SCOPE_ENFORCE=1 — the maximum action is still ADVISORY.
+
+    Enforcement here means "stamp a marker and file a non-blocking
+    escalation", never "reject". The measured prose precision of this signal
+    family is 10.7%, so hard-gating on it is forbidden by the task's own
+    scope note.
+    """
+
+    async def _run(self, interceptor, tmp_path, verdict, *, metadata=..., raises=False):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        if raises:
+            stub = MagicMock()
+            stub.adjudicate = AsyncMock(side_effect=RuntimeError('boom'))
+            interceptor._path_scope_adjudicator = stub
+        else:
+            _stub_adjudicator(interceptor, verdict or AdjudicationVerdict())
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        df_root = registry.root_for_project('dark_factory')
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        if metadata is not ...:
+            kwargs['metadata'] = metadata
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+        return result, kwargs, interceptor._scope_violation_escalator.calls
+
+    async def test_confirmed_misroute_stamps_and_escalates_without_blocking(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        result, kwargs, calls = await self._run(
+            interceptor,
+            tmp_path,
+            AdjudicationVerdict(
+                verdict='reject',
+                reason='the asked work is entirely dark-factory-side',
+                llm_used=True,
+            ),
+        )
+
+        assert result is None, 'enforce mode must still never block creation'
+
+        marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
+        assert marker is not None
+        assert marker['source'] == 'soft-signal'
+        assert marker['suggested_project'] == 'dark_factory'
+        assert marker['matched_paths']
+
+        assert len(calls) == 1
+        call = calls[0]
+        assert call['advisory'] is True
+        assert call['suggested_project'] == 'dark_factory'
+        assert call['suggested_root'] is not None
+        assert call['llm_reason'] == 'the asked work is entirely dark-factory-side'
+
+    @pytest.mark.parametrize(
+        'metadata',
+        [None, '{"execution_class": "code_tdd"}', {'execution_class': 'code_tdd'}],
+    )
+    async def test_metadata_normalisation_is_inherited(
+        self, interceptor, tmp_path, monkeypatch, metadata,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', 'yes')
+        _, kwargs, _ = await self._run(
+            interceptor,
+            tmp_path,
+            AdjudicationVerdict(verdict='reject', reason='r'),
+            metadata=metadata,
+        )
+
+        meta = kwargs.get('metadata') or {}
+        assert meta.get('possible_scope_mismatch', {}).get('source') == 'soft-signal'
+
+    @pytest.mark.parametrize(
+        ('verdict', 'failed'),
+        [('allow', False), ('uncertain', False), ('reject', True)],
+    )
+    async def test_only_a_confirmed_misroute_acts(
+        self, interceptor, tmp_path, monkeypatch, verdict, failed,
+    ):
+        """The step-7 polarity contract, observed at the call site."""
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        result, kwargs, calls = await self._run(
+            interceptor,
+            tmp_path,
+            AdjudicationVerdict(verdict=verdict, failed=failed, reason='r'),
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert calls == []
+
+    async def test_adjudicator_exception_degrades_to_silence(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """Infrastructure failure must not manufacture a false accusation."""
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        result, kwargs, calls = await self._run(
+            interceptor, tmp_path, None, raises=True,
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert calls == []
+
+    async def test_no_adjudicator_configured_stamps_nothing(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The confirmation step is MANDATORY — a soft signal alone never acts."""
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        interceptor._path_scope_adjudicator = None
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: wire the recurring timer',
+            'description': f'ALL of the asked work is in {df_root}',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert interceptor._scope_violation_escalator.calls == []
+
+    async def test_existing_prose_advisory_keeps_source_prose(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The discriminator must actually discriminate: 3119's marker is unmoved."""
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        _soft_scope_registry(interceptor, tmp_path)
+        _stub_adjudicator(interceptor)
+        interceptor._scope_violation_escalator = _SpyEscalator()
+
+        kwargs: dict[str, Any] = {
+            'title': 'investigate a deadlock',
+            'description': 'edit fused-memory/src/harness.py directly',
+        }
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
+        assert marker is not None
+        assert marker['source'] == 'prose'
+
+
+@pytest.mark.asyncio
+class TestSoftScopeFilelessEndToEnd:
+    """The two USER-OBSERVABLE cases this task exists to separate.
+
+    Both are FILELESS — ``metadata`` present, ``files`` empty/absent,
+    ``details`` empty — mirroring reify 5575's actual submit blob, and both
+    carry the SAME strong soft signals.  What distinguishes them is not
+    anything mechanical in the submission; it is what the prose MEANS.  That
+    is precisely why the confirmation step is mandatory and why hard-gating
+    on the signal alone is forbidden.
+    """
+
+    async def test_the_misfile_raises_a_signal_where_today_there_is_none(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        _stub_adjudicator(
+            interceptor,
+            AdjudicationVerdict(
+                verdict='reject',
+                reason='every deliverable named is in the dark-factory tree',
+                llm_used=True,
+            ),
+        )
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        df_root = registry.root_for_project('dark_factory')
+
+        # The reify-5575 shape: fileless, details empty, metadata present.
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: do the thing',
+            'description': (
+                'The recurring timer and the request consumer both live in '
+                f'{df_root} and need wiring together there.'
+            ),
+            'details': '',
+            'metadata': {'execution_class': 'code_tdd', 'files': []},
+        }
+
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None, 'a soft signal never blocks creation'
+
+        marker = (kwargs.get('metadata') or {}).get('possible_scope_mismatch')
+        assert marker is not None, 'the misfile must now raise a scope signal'
+        assert marker['source'] == 'soft-signal'
+        assert marker['suggested_project'] == 'dark_factory'
+
+        calls = interceptor._scope_violation_escalator.calls
+        assert len(calls) == 1
+        assert calls[0]['suggested_project'] == 'dark_factory'
+        assert calls[0]['suggested_root'] == df_root
+        assert calls[0]['advisory'] is True
+
+        # THE COUNTERFACTUAL that motivates the whole task: neither existing
+        # path-based guard sees this submission at all.  Without the soft
+        # branch the operator gets nothing.
+        candidate = interceptor._build_candidate(kwargs)
+        assert (
+            interceptor._files_scope_check(candidate, kwargs, 'reify').outcome == 'ok'
+        )
+        assert (
+            interceptor._path_guard_check(candidate, kwargs, 'reify').outcome == 'ok'
+        )
+
+    async def test_the_legitimate_citation_is_left_alone(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The adjudicator earning its keep — same signal, opposite meaning."""
+        from fused_memory.middleware.path_scope_adjudicator import AdjudicationVerdict
+
+        monkeypatch.setenv('FUSED_SOFT_SCOPE_ENFORCE', '1')
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(
+            interceptor,
+            AdjudicationVerdict(
+                verdict='allow',
+                reason='the foreign path is cited as a model, not as the deliverable',
+                llm_used=True,
+            ),
+        )
+        interceptor._scope_violation_escalator = _SpyEscalator()
+        df_root = registry.root_for_project('dark_factory')
+
+        kwargs: dict[str, Any] = {
+            'title': 'dark-factory: mirror the scheduler backoff here',
+            'description': (
+                'this mirrors how '
+                f'{df_root}/orchestrator/scheduler.py '
+                'already does it; do the equivalent here'
+            ),
+            'details': '',
+            'metadata': {'execution_class': 'code_tdd'},
+        }
+
+        result = await interceptor._path_guard_or_skip(
+            kwargs, str(tmp_path / 'reify'), 'reify',
+        )
+
+        assert result is None
+        stub.adjudicate.assert_awaited_once()
+        assert 'possible_scope_mismatch' not in (kwargs.get('metadata') or {})
+        assert interceptor._scope_violation_escalator.calls == []
+
+    async def test_adjudicator_receives_self_describing_evidence(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The confirmation step must be able to tell the evidence apart.
+
+        ``PathScopeAdjudicator._build_user_prompt`` renders whatever it is
+        handed under the fixed label 'Flagged matched path prefixes'.  A soft
+        signal's evidence is NOT a path prefix — it is a title run, an
+        absolute root, or a bare project name — so handing the raw values over
+        presents a project NAME to the classifier as though it were a path,
+        with nothing to say which rule found what.  Tag them at this call
+        site rather than reshaping the adjudicator's prompt or schema: the
+        trigger adapts to the confirmation step, not the reverse.
+        """
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        df_root = registry.root_for_project('dark_factory')
+
+        await interceptor._path_guard_or_skip(
+            {
+                'title': 'dark-factory: do the thing',
+                'description': f'all of the asked work is in {df_root}',
+                'details': '',
+                'metadata': {'files': []},
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        paths = stub.adjudicate.await_args.kwargs['matched_paths']
+        assert any(p.startswith('title-prefix:') for p in paths), paths
+        assert f'abs-root:{df_root}' in paths, paths
+        assert any(p.startswith('project-name:') for p in paths), paths
+        # Every value is tagged — an untagged one would read as a path prefix.
+        assert all(
+            p.split(':', 1)[0]
+            in {'title-prefix', 'abs-root', 'project-name'}
+            for p in paths
+        ), paths
+
+    async def test_evidence_found_only_in_details_reaches_the_adjudicator(
+        self, interceptor, tmp_path, monkeypatch,
+    ):
+        """The classifier must see the text the signals actually matched.
+
+        ``collect_soft_scope_signals`` scans title/description/details joined,
+        so a strong signal can be found in ``details`` alone.  Adjudicating
+        that on a title+description prompt asks the confirmation step to rule
+        on evidence it was never shown.
+        """
+        monkeypatch.delenv('FUSED_SOFT_SCOPE_ENFORCE', raising=False)
+        registry = _soft_scope_registry(interceptor, tmp_path)
+        stub = _stub_adjudicator(interceptor)
+        df_root = registry.root_for_project('dark_factory')
+
+        await interceptor._path_guard_or_skip(
+            {
+                'title': 'wire the recurring timer',
+                'description': 'see the details for where this lands',
+                'details': f'the consumer lives in {df_root}/orchestrator/',
+                'metadata': {'files': []},
+            },
+            str(tmp_path / 'reify'),
+            'reify',
+        )
+
+        stub.adjudicate.assert_awaited_once()
+        assert df_root in stub.adjudicate.await_args.kwargs['description']
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Task 5491: post-ZOT duplicate sweep wiring (end-to-end VERIFY criterion)
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _ScoredCorpusCurator(_FakeCorpusCurator):
+    """Fake corpus whose search returns every stored row at a configured score."""
+
+    def __init__(self, scores: dict[str, float], *, search_error: Exception | None = None) -> None:
+        super().__init__()
+        self._scores = scores
+        self._search_error = search_error
+        self.search_calls: list[dict] = []
+
+    async def search_corpus(
+        self,
+        query: str,
+        project_id: str,
+        *,
+        limit: int = 10,
+        score_threshold: float = 0.3,
+    ) -> list[dict]:
+        self.search_calls.append({'limit': limit, 'score_threshold': score_threshold})
+        if self._search_error is not None:
+            raise self._search_error
+        hits = [
+            {
+                'task_id': task_id,
+                'title': candidate.title,
+                'description': candidate.description,
+                'files_to_modify': candidate.files_to_modify,
+                'priority': candidate.priority,
+                'updated_at': None,
+                'score': self._scores[task_id],
+            }
+            for task_id, candidate in self._by_project.get(project_id, {}).items()
+            if self._scores.get(task_id, 0.0) >= score_threshold
+        ]
+        hits.sort(key=lambda hit: hit['score'], reverse=True)
+        return hits[:limit]
+
+
+_ZOT_PROJECT_ROOT = '/project'
+_NEW_TASK_ID = '77'
+_DUP_TASK_ID = '42'
+
+
+def _zot_agent_result() -> AgentResult:
+    return AgentResult(
+        success=False, output='', subtype='error_empty_output',
+        timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+    )
+
+
+def _stamp_calls(tm) -> list:
+    return [
+        call for call in tm.update_task.await_args_list
+        if 'x_zot_duplicate_candidate' in (call.kwargs.get('metadata') or '')
+    ]
+
+
+class TestZotDuplicateSweepWiring:
+    """A create degraded by a curator ZOT is swept for a near-duplicate."""
+
+    @pytest.fixture
+    def stub_escalator(self):
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value='esc-curator-9')
+        escalator.report_zot_duplicate = AsyncMock(return_value=None)
+        return escalator
+
+    @pytest.fixture
+    def status_map(self) -> dict[str, str]:
+        return {_DUP_TASK_ID: 'pending', _NEW_TASK_ID: 'pending'}
+
+    @pytest.fixture
+    def zot_taskmaster(self, taskmaster, status_map):
+        taskmaster.add_task = AsyncMock(
+            return_value={'id': _NEW_TASK_ID, 'title': 'Re-filed gate fix'},
+        )
+        taskmaster.get_statuses = AsyncMock(
+            side_effect=lambda project_root, ids=None, **kw: {
+                i: status_map[i] for i in (ids or []) if i in status_map
+            },
+        )
+        return taskmaster
+
+    @staticmethod
+    async def _real_curator(cfg, stub_escalator, corpus, monkeypatch, project_id):
+        curator = TaskCurator(config=cfg, taskmaster=None, escalator=stub_escalator)
+        monkeypatch.setattr(curator, 'search_corpus', corpus.search_corpus)
+        monkeypatch.setattr(curator, 'record_task', corpus.record_task)
+        await corpus.record_task(
+            _DUP_TASK_ID, CandidateTask(title='Existing gate fix'), project_id,
+        )
+        return curator
+
+    @staticmethod
+    async def _zot_decision(curator: TaskCurator, candidate: CandidateTask, project_id: str):
+        prepared = PreparedCandidate(
+            candidate=candidate, pool=[],
+            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            prompt_tokens=0,
+        )
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_zot_agent_result())):
+            return await curator.curate(
+                candidate, project_id, _ZOT_PROJECT_ROOT, prepared=prepared,
+            )
+
+    async def _dispatch(self, interceptor, curator, candidate, decision, project_id):
+        return await interceptor._dispatch_ticket_decision(
+            ticket_id='tkt-zot',
+            project_root=_ZOT_PROJECT_ROOT,
+            project_id=project_id,
+            candidate=candidate,
+            decision=decision,
+            kwargs={'title': candidate.title},
+            metadata=None,
+            curator=curator,
+        )
+
+    async def _run(
+        self, *, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+        scores, cfg=None, wire_config=True, search_error=None,
+        decision=None,
+    ):
+        cfg = cfg if cfg is not None else _curator_cfg()
+        project_id = resolve_project_id(_ZOT_PROJECT_ROOT)
+        corpus = _ScoredCorpusCurator(scores, search_error=search_error)
+        curator = await self._real_curator(cfg, stub_escalator, corpus, monkeypatch, project_id)
+        interceptor = TaskInterceptor(
+            zot_taskmaster, reconciler, event_buffer,
+            config=cfg if wire_config else None,
+            escalator=stub_escalator,
+        )
+        candidate = CandidateTask(title='Re-filed gate fix', description='same fix again')
+        if decision is None:
+            decision = await self._zot_decision(curator, candidate, project_id)
+        outcome = await self._dispatch(interceptor, curator, candidate, decision, project_id)
+        return corpus, decision, outcome
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_zot_flags_the_near_duplicate(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+        )
+        status, task_id, _reason, _result, _degrade = outcome
+
+        assert decision.degraded_by_zot is True
+        assert status == 'created'
+        assert task_id == _NEW_TASK_ID
+        assert zot_taskmaster.update_task.await_count == 1
+        [stamp] = _stamp_calls(zot_taskmaster)
+        assert stamp.kwargs['task_id'] == _NEW_TASK_ID
+        assert stamp.kwargs['metadata_mode'] == 'merge'
+        value = json.loads(stamp.kwargs['metadata'])['x_zot_duplicate_candidate']
+        assert value['duplicate_task_id'] == _DUP_TASK_ID
+        assert value['score'] == pytest.approx(0.80)
+        assert value['zot_escalation_id'] == 'esc-curator-9'
+
+        stub_escalator.report_zot_duplicate.assert_awaited_once()
+        kwargs = stub_escalator.report_zot_duplicate.await_args.kwargs
+        assert kwargs['finding'] == DuplicateFinding(
+            task_id=_NEW_TASK_ID, duplicate_task_id=_DUP_TASK_ID,
+            duplicate_title='Existing gate fix', score=0.80,
+        )
+        assert kwargs['zot_escalation_id'] == 'esc-curator-9'
+        assert kwargs['project_root'] == _ZOT_PROJECT_ROOT
+        assert kwargs['candidate_title'] == 'Re-filed gate fix'
+        assert kwargs['stamped'] is True
+
+    @pytest.mark.asyncio
+    async def test_control_no_hit_above_threshold_flags_nothing(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.50, _NEW_TASK_ID: 1.0},
+        )
+        assert outcome[0] == 'created'
+        assert len(corpus.search_calls) == 1
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_only_hit_reads_no_statuses(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.0, _NEW_TASK_ID: 1.0},
+        )
+        assert outcome[0] == 'created'
+        assert len(corpus.search_calls) == 1
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+        zot_taskmaster.get_statuses.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_healthy_create_never_searches(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+            decision=CuratorDecision(action='create'),
+        )
+        assert outcome[0] == 'created'
+        assert corpus.search_calls == []
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disabled_sweep_never_searches(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        cfg = _curator_cfg()
+        cfg.curator.zot_duplicate_sweep_enabled = False
+        corpus, decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0}, cfg=cfg,
+        )
+        assert decision.degraded_by_zot is True
+        assert outcome[0] == 'created'
+        assert corpus.search_calls == []
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_config_sweeps_with_curator_config_defaults(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0}, wire_config=False,
+        )
+        defaults = CuratorConfig()
+        assert outcome[0] == 'created'
+        assert corpus.search_calls == [{
+            'limit': defaults.zot_duplicate_search_limit,
+            'score_threshold': defaults.zot_duplicate_score_threshold,
+        }]
+        assert len(_stamp_calls(zot_taskmaster)) == 1
+        stub_escalator.report_zot_duplicate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_search_failure_still_created(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        _corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+            search_error=RuntimeError('qdrant down'),
+        )
+        assert outcome[0] == 'created'
+        assert _stamp_calls(zot_taskmaster) == []
+        stub_escalator.report_zot_duplicate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stamp_failure_is_a_post_create_warning(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        async def _update_task(**kwargs):
+            if 'x_zot_duplicate_candidate' in (kwargs.get('metadata') or ''):
+                raise RuntimeError('db locked')
+            return {'success': True}
+
+        zot_taskmaster.update_task = AsyncMock(side_effect=_update_task)
+        _corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+        )
+        status, _task_id, _reason, result_dict, _degrade = outcome
+        assert status == 'created'
+        assert result_dict is not None
+        stages = [w['stage'] for w in result_dict.get('post_create_warnings', [])]
+        assert 'zot_duplicate_stamp' in stages
+        stub_escalator.report_zot_duplicate.assert_awaited_once()
+        assert stub_escalator.report_zot_duplicate.await_args.kwargs['stamped'] is False
+
+    @pytest.mark.asyncio
+    async def test_escalation_failure_is_a_post_create_warning(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        stub_escalator.report_zot_duplicate = AsyncMock(side_effect=OSError('queue down'))
+        _corpus, _decision, outcome = await self._run(
+            zot_taskmaster=zot_taskmaster, reconciler=reconciler, event_buffer=event_buffer,
+            stub_escalator=stub_escalator, monkeypatch=monkeypatch,
+            scores={_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0},
+        )
+        status, _task_id, _reason, result_dict, _degrade = outcome
+        assert status == 'created'
+        assert result_dict is not None
+        stages = [w['stage'] for w in result_dict.get('post_create_warnings', [])]
+        assert 'zot_duplicate_escalation' in stages
+        assert len(_stamp_calls(zot_taskmaster)) == 1
+
+    @pytest.mark.asyncio
+    async def test_only_the_stamp_holds_the_write_lock(
+        self, zot_taskmaster, reconciler, event_buffer, stub_escalator, monkeypatch,
+    ):
+        cfg = _curator_cfg()
+        project_id = resolve_project_id(_ZOT_PROJECT_ROOT)
+        corpus = _ScoredCorpusCurator({_DUP_TASK_ID: 0.80, _NEW_TASK_ID: 1.0})
+        curator = await self._real_curator(cfg, stub_escalator, corpus, monkeypatch, project_id)
+        interceptor = TaskInterceptor(
+            zot_taskmaster, reconciler, event_buffer, config=cfg, escalator=stub_escalator,
+        )
+        write_lock = interceptor._write_lock(project_id)
+        held: dict[str, bool] = {}
+
+        async def _search(*args, **kwargs):
+            held['search'] = write_lock.locked()
+            return await corpus.search_corpus(*args, **kwargs)
+
+        async def _update_task(**kwargs):
+            held['stamp'] = write_lock.locked()
+            return {'success': True}
+
+        async def _report(**kwargs):
+            held['escalation'] = write_lock.locked()
+
+        monkeypatch.setattr(curator, 'search_corpus', _search)
+        zot_taskmaster.update_task = AsyncMock(side_effect=_update_task)
+        stub_escalator.report_zot_duplicate = AsyncMock(side_effect=_report)
+        candidate = CandidateTask(title='Re-filed gate fix', description='same fix again')
+        decision = await self._zot_decision(curator, candidate, project_id)
+
+        outcome = await self._dispatch(interceptor, curator, candidate, decision, project_id)
+
+        assert outcome[0] == 'created'
+        assert held == {'search': False, 'stamp': True, 'escalation': False}
+
+
+class _ZotRaisingCurator(_ScoredCorpusCurator):
+    """Corpus fake whose curate re-raises a ZOT, as it does with no orchestrator."""
+
+    def __init__(self, scores: dict[str, float], *, prepares: bool) -> None:
+        super().__init__(scores)
+        self._prepares = prepares
+
+    def note_created(self, project_id: str, candidate: CandidateTask, task_id: str) -> None:
+        pass
+
+    async def prepare_candidate(
+        self, candidate: CandidateTask, project_id: str, project_root: str,
+    ) -> PreparedCandidate:
+        if not self._prepares:
+            raise RuntimeError('prepare unavailable')
+        return PreparedCandidate(
+            candidate=candidate, pool=[],
+            pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+            prompt_tokens=0,
+        )
+
+    async def curate_batch_prepared(self, prepared, project_id: str, project_root: str):
+        raise CuratorFailureError('batch call escaped its bisect')
+
+    async def curate(self, candidate, project_id: str, project_root: str, *, prepared=None):
+        raise CuratorFailureError('no orchestrator is running', zero_output_timeout=True)
+
+
+class TestZotDuplicateSweepWithoutOrchestrator:
+    """With no orchestrator the ZOT re-raises, yet the create is still swept and stamped."""
+
+    @pytest_asyncio.fixture
+    async def setup(self, taskmaster, reconciler, event_buffer, ticket_store, tmp_path):
+        project_root = str(tmp_path / 'zot-project')
+        project_id = resolve_project_id(project_root)
+        taskmaster.add_task = AsyncMock(return_value={'id': _NEW_TASK_ID, 'title': 'Re-filed'})
+        taskmaster.get_statuses = AsyncMock(return_value={_DUP_TASK_ID: 'pending'})
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer,
+            config=_curator_cfg(), ticket_store=ticket_store, escalator=CuratorEscalator(),
+        )
+        ticket_id = await ticket_store.submit(
+            project_id=project_id,
+            candidate_json=json.dumps({
+                'project_root': project_root,
+                'kwargs': {'title': 'Re-filed gate fix', 'description': 'same fix again'},
+                'metadata': None,
+            }),
+        )
+        return interceptor, ticket_id, project_root, project_id
+
+    @staticmethod
+    async def _install_curator(interceptor, project_id: str, *, prepares: bool):
+        curator = _ZotRaisingCurator({_DUP_TASK_ID: 0.80}, prepares=prepares)
+        await curator.record_task(_DUP_TASK_ID, CandidateTask(title='Existing gate fix'), project_id)
+        interceptor._curator = curator
+
+    @staticmethod
+    async def _assert_stamped_but_not_escalated(taskmaster, ticket_store, ticket_id, project_root):
+        row = await ticket_store.get(ticket_id)
+        assert row is not None and row['status'] == 'created'
+        [stamp] = _stamp_calls(taskmaster)
+        value = json.loads(stamp.kwargs['metadata'])['x_zot_duplicate_candidate']
+        assert value['duplicate_task_id'] == _DUP_TASK_ID
+        assert value['zot_escalation_id'] is None
+        assert not list((Path(project_root) / 'data' / 'escalations').glob('esc-*.json'))
+
+    @pytest.mark.asyncio
+    async def test_single_ticket_path(self, setup, taskmaster, ticket_store):
+        interceptor, ticket_id, project_root, project_id = setup
+        await self._install_curator(interceptor, project_id, prepares=False)
+
+        await interceptor._process_add_ticket(ticket_id)
+
+        await self._assert_stamped_but_not_escalated(taskmaster, ticket_store, ticket_id, project_root)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('prepares', [False, True], ids=['backfill', 'batch-fallback'])
+    async def test_batch_paths(self, setup, taskmaster, ticket_store, prepares):
+        interceptor, ticket_id, project_root, project_id = setup
+        await self._install_curator(interceptor, project_id, prepares=prepares)
+
+        await interceptor._process_add_tickets_batch([ticket_id])
+
+        await self._assert_stamped_but_not_escalated(taskmaster, ticket_store, ticket_id, project_root)
+
+
+def _curator_cfg() -> FusedMemoryConfig:
+    cfg = FusedMemoryConfig()
+    cfg.curator = CuratorConfig(enabled=True)
+    return cfg

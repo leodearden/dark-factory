@@ -283,6 +283,32 @@ AUDITED_SITES: tuple[dict[str, Any], ...] = (
             'that task 3271 filed and 3619 discharged.'
         ),
     },
+    {
+        'path': 'fused-memory/src/fused_memory/middleware/task_curator.py',
+        'qualname': 'TaskCurator._transcript_config_dir',
+        'destroyed_by': (
+            'task_curator.py::_sweep_stale_curator_config_dirs_once -> '
+            'config_dir.py::sweep_stale_pid_dirs in a later process (owner pid '
+            'dead, dir >=300s old); cleanup_at_exit=False'
+        ),
+        'disposition': UNARCHIVED_GAP,
+        'rationale': (
+            'Per-pid curator dir, built only on the gated path (usage_cap '
+            'enabled, i.e. production). Nothing archives it. Per-failure '
+            'evidence survives: at failure time transcript_turns/tools_used are '
+            'copied into the escalation. The population corpus does not — it '
+            'used to accumulate indefinitely under '
+            '~/.claude/projects/-tmp-fm-neutral-classifier-cwd-*, and is now '
+            'deleted at the first sweep after the owning process dies. Not '
+            'archived in task 3995 because fused-memory has no archive root '
+            'yet; see entries 3/4 and task 3972.'
+        ),
+        'follow_up': (
+            'Filed from esc-3995-8 (ticket tkt_0RV5C7TGH7495ZW43KCPSE38KH): '
+            'archive the curator dir before the dead-pid sweep; reuse task '
+            "3972's fused-memory archive-root decision."
+        ),
+    },
 )
 
 

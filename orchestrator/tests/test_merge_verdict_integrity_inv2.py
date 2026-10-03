@@ -402,3 +402,230 @@ class TestInv2MirrorPushDivergedProjectMain:
         assert _merge_sha_pushed(calls), 'merge-sha push stays load-bearing even when main push fails'
         # No mirror event when the force also failed.
         assert store.events_of(EventType.runner_synced) == []
+
+
+# ---------------------------------------------------------------------------
+# (4) Task 4539 — the auto-sync must not DESTROY the host it is syncing.
+#
+# dark-factory's root pyproject.toml declares a uv WORKSPACE
+# ([tool.uv.workspace].members).  In a workspace a bare `uv sync` syncs only the
+# ROOT project's environment and PRUNES what the root does not declare —
+# including the workspace MEMBERS' console-script entry points.  MEASURED on the
+# real second host (leo-laptop, /home/leo/src/dark-factory at main): before,
+# `.venv/bin/orchestrator` existed and `orchestrator verify-merge --help`
+# returned rc=0; after a bare `uv sync` the entry point was GONE and the ssh
+# entry-point wrapper failed rc=127; `uv sync --all-packages` restored it.
+#
+# So wiring df_checkout_path for a remote runner meant the FIRST stale-sync
+# deleted the very CLI the runner then invokes over ssh, and every later
+# dispatch raised RunnerUnavailable — fail-SAFE (the pool falls back to local)
+# but a SILENT disabling of the remote host that presents as transport
+# flakiness.
+#
+# `_FakeWorkspaceHost` below models exactly that measured behaviour, including
+# the load-bearing detail that the destructive bare sync EXITS 0.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWorkspaceHost:
+    """A remote host holding a uv-WORKSPACE dark-factory checkout.
+
+    Models the measured uv semantics:
+
+      * ``uv sync --all-packages`` installs every workspace member, so the
+        ``orchestrator`` console script exists  -> entry point ANSWERS (rc 0).
+      * a bare ``uv sync`` syncs the workspace ROOT only and prunes the members'
+        console scripts                          -> entry point GONE (rc 127).
+      * BOTH return 0.  The sync's own exit code cannot distinguish them; that
+        is precisely why keying success on the return codes alone reproduces
+        this defect.
+
+    ``restore_on_all_packages=False`` models a host whose install is broken for
+    some other reason — even the correct sync command leaves no working CLI —
+    so the liveness assertion is exercised independently of the flag fix.
+    """
+
+    def __init__(self, *, entry_point_present: bool = True,
+                 restore_on_all_packages: bool = True) -> None:
+        self.entry_point_present = entry_point_present
+        self.restore_on_all_packages = restore_on_all_packages
+        self.sync_commands: list[str] = []
+
+    def uv_sync(self, remote_cmd: str) -> tuple[int, str, str]:
+        self.sync_commands.append(remote_cmd)
+        if '--all-packages' in remote_cmd:
+            # A healthy host reinstalls every member's console script; a host
+            # whose install is broken for some OTHER reason still ends the sync
+            # with no runnable CLI, and the sync still exits 0.
+            self.entry_point_present = self.restore_on_all_packages
+        else:
+            # Workspace-root-only sync: the members' entry points are pruned.
+            self.entry_point_present = False
+        return (0, '', '')  # rc 0 EITHER WAY — the whole point.
+
+    def run_entry_point(self) -> tuple[int, str, str]:
+        """What the ssh entry-point wrapper does for `orchestrator ...`."""
+        if not self.entry_point_present:
+            return (127, '', 'bash: line 1: orchestrator: command not found')
+        return (0, '', '')
+
+
+def _make_workspace_remote(
+    *,
+    host: _FakeWorkspaceHost,
+    local_head: str = 'NEW_DISPATCHER_HEAD',
+    remote_head: str = 'ONE_COMMIT_STALE',
+    name: str = 'laptop',
+) -> tuple[RemoteRunner, list[tuple[list[str], Any]], VerifyResult]:
+    """REAL RemoteRunner whose ssh transport is serviced by *host*.
+
+    Differs from ``_make_capstone_remote`` only in that the ``uv sync`` and
+    ``orchestrator ...`` legs are answered by the stateful host rather than by
+    canned return codes — so a sync that breaks the CLI actually breaks the
+    subsequent dispatch, exactly as it did on the real second host.
+    """
+    calls: list[tuple[list[str], Any]] = []
+    state = {'pulled': False}
+    expected = VerifyResult(
+        passed=True, test_output='ok', lint_output='', type_output='', summary='remote-ok',
+    )
+
+    async def fake_run(argv, *, cwd=None):
+        calls.append((list(argv), cwd))
+        if argv[:3] == ['git', 'rev-parse', 'HEAD']:
+            return (0, local_head, '')
+        if argv[:3] == ['git', 'rev-parse', 'main']:
+            return (0, 'MAINSHA', '')
+        if argv[:3] == ['git', 'rev-parse', '@{upstream}']:
+            return (128, '', 'fatal: no upstream configured')
+        if argv[:2] == ['git', 'push']:
+            return (0, '', '')
+        if argv and argv[0] == 'ssh':
+            remote_cmd = argv[-1]
+            if 'pull --ff-only' in remote_cmd:
+                state['pulled'] = True
+                return (0, '', '')
+            if 'uv sync' in remote_cmd:
+                return host.uv_sync(remote_cmd)
+            if 'rev-parse HEAD' in remote_cmd:
+                return (0, local_head if state['pulled'] else remote_head, '')
+            if remote_cmd.startswith('orchestrator '):
+                rc, _out, err = host.run_entry_point()
+                if rc != 0:
+                    return (rc, '', err)
+                if '--help' in remote_cmd:
+                    return (0, 'Usage: orchestrator verify-merge [OPTIONS]', '')
+                return (0, result_to_json(expected), '')
+            return (0, '', '')
+        return (0, '', '')
+
+    runner = RemoteRunner(
+        name=name,
+        ssh_host='laptop.local',
+        git_remote='origin',
+        cwd='/repo',
+        main_branch='main',
+        df_remote_checkout='/remote/dark-factory',
+        df_local_checkout='/local/dark-factory',
+        run=fake_run,
+        id_factory=lambda: 'fixed-id',
+    )
+    return runner, calls, expected
+
+
+@pytest.mark.asyncio
+class TestInv2SyncDoesNotBreakTheWorkspaceHost:
+    """The user-observable signal for task 4539."""
+
+    async def test_stale_workspace_host_still_answers_after_sync_and_verdict_parses(self):
+        """Against a workspace-layout checkout deliberately set ONE COMMIT STALE,
+        a dispatch through sync_if_stale leaves the remote's
+        ``orchestrator verify-merge --help`` returning rc=0, and the verify
+        dispatch returns a parseable VerifyResult rather than RunnerUnavailable.
+
+        Asserting rc=0 AFTER the sync is the load-bearing half: a test that only
+        checked the sync's own exit code would pass against the very defect this
+        exists to fix (the destructive bare ``uv sync`` exits 0).
+        """
+        host = _FakeWorkspaceHost(entry_point_present=True)
+        remote, calls, expected = _make_workspace_remote(host=host)
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote], event_store=store, task_id=_TASK_ID)
+
+        result = await pool.dispatch('mergesha', _make_spec())
+
+        # The sync ran (the checkout WAS stale) ...
+        assert len(store.events_of(EventType.runner_stale)) == 1
+        assert host.sync_commands, 'the stale checkout must have been synced'
+
+        # ... and the host's CLI still answers rc=0 afterwards.
+        assert host.entry_point_present is True, (
+            f'the sync deleted the remote orchestrator entry point; '
+            f'sync commands issued: {host.sync_commands!r}'
+        )
+        assert host.run_entry_point()[0] == 0, (
+            '`orchestrator verify-merge --help` must return rc=0 on the remote '
+            'AFTER the sync'
+        )
+
+        # ... and the dispatch produced a parseable VerifyResult, not a bench.
+        assert result == expected
+        assert result.summary == 'remote-ok'
+        assert pool.is_quarantined('laptop') is False
+        assert _merge_sha_pushed(calls)
+        assert len(store.events_of(EventType.runner_synced)) == 1
+        assert store.events_of(EventType.runner_synced)[0]['kind'] == 'df_checkout'
+
+    async def test_second_dispatch_is_not_disabled_by_the_first_sync(self):
+        """The silent-disabling shape: the FIRST stale-sync deleted the CLI, so
+        every LATER dispatch raised RunnerUnavailable and the remote host was
+        effectively off — read as transport flakiness, not as a broken sync.
+
+        Both dispatches must adopt the remote verdict.
+        """
+        host = _FakeWorkspaceHost(entry_point_present=True)
+        remote, calls, expected = _make_workspace_remote(host=host)
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote], event_store=store, task_id=_TASK_ID)
+
+        first = await pool.dispatch('mergesha-1', _make_spec())
+        second = await pool.dispatch('mergesha-2', _make_spec())
+
+        assert first == expected
+        assert second == expected, (
+            'the first sync disabled the remote host for every later dispatch'
+        )
+        assert pool.is_quarantined('laptop') is False
+
+    async def test_a_sync_that_breaks_the_host_benches_it_loudly_before_dispatch(self):
+        """When the sync leaves no working CLI for ANY reason, the runner is
+        benched at the gate — not dispatched to and rediscovered as rc=127.
+
+        With a local trust anchor present the pool adopts the LOCAL verdict; the
+        remote's merge-sha push must never fire, which is what distinguishes
+        "benched by the liveness assertion" from "dispatched, then failed".
+        """
+        host = _FakeWorkspaceHost(
+            entry_point_present=True, restore_on_all_packages=False,
+        )
+        remote, calls, _expected = _make_workspace_remote(host=host)
+        local = _CapstoneLocal()
+        store = _RecordingEventStore()
+        pool = VerifyRunnerPool([remote, local], event_store=store, task_id=_TASK_ID)
+
+        result = await pool.dispatch('mergesha', _make_spec())
+
+        assert result.summary == 'local-ok'
+        assert pool.is_quarantined('laptop') is True
+        # Benched BEFORE the wasted dispatch: no merge-sha push on the remote.
+        assert not _merge_sha_pushed(calls), (
+            'the liveness assertion must bench the runner at the gate, not let '
+            f'the dispatch proceed to an rc=127; pushes: {_push_refspecs(calls)!r}'
+        )
+        # A broken sync is not a sync success.
+        assert len(store.events_of(EventType.runner_stale)) == 1
+        assert store.events_of(EventType.runner_synced) == []
+        # The verdict is attributed to the local anchor.
+        mv = store.events_of(EventType.merge_verify)
+        assert len(mv) == 1
+        assert mv[0]['runner'] == 'local'

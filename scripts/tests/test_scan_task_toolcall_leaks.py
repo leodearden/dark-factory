@@ -25,6 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from cli_subprocess_timeout import cli_timeout_from_env
 from scan_task_toolcall_leaks import (
     LeakMatch,
     detect_leak,
@@ -301,18 +302,45 @@ def test_format_json_empty_list_is_empty_array():
 
 # ---------------------------------------------------------------------------
 # CLI (main), driven via subprocess.run — mirrors test_recon_busy_check.py
+#
+# The budget comes from cli_subprocess_timeout.py, shared with
+# test_recon_busy_check.py and test_drain_check.py.
 # ---------------------------------------------------------------------------
 
 SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"
+_CLI_TIMEOUT = cli_timeout_from_env("SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT")
 
 
-def _run_cli(*args, timeout=10):
+def _run_cli(*args, timeout=_CLI_TIMEOUT):
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
         capture_output=True,
         text=True,
         timeout=timeout,
     )
+
+
+def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
+    captured = {}
+    captured_args = []
+
+    def spy(*args, **kwargs):
+        captured_args.append(args[0])
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args, returncode=2, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _run_cli("--db", "/nonexistent.db")
+    # No bound on the magnitude: the 60.0 default is pinned in
+    # test_cli_subprocess_timeout.py, and a bound here would break
+    # SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT whenever it lowers the budget.
+    assert captured["timeout"] == _CLI_TIMEOUT
+    # The script imports `shared` (and its third-party deps), so it needs the
+    # project interpreter, unlike its stdlib-only siblings run as python3.
+    assert captured_args[0][0] == sys.executable
+
+    _run_cli("--db", "/nonexistent.db", timeout=3)
+    assert captured["timeout"] == 3
 
 
 def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(make_tasks_db):
@@ -406,6 +434,12 @@ class TestDetectorIsTheSharedDefinition:
         from fused_memory.utils import toolcall_xml_leak
 
         assert scan_task_toolcall_leaks.detect_leak is toolcall_xml_leak.detect_leak
+
+    def test_scanned_columns_is_the_shared_tuple_object(self):
+        import scan_task_toolcall_leaks
+        from fused_memory.utils import toolcall_xml_leak
+
+        assert scan_task_toolcall_leaks.SCANNED_COLUMNS is toolcall_xml_leak.SCANNED_COLUMNS
 
     def test_patching_the_shared_detector_changes_the_script_behaviour(self, monkeypatch, make_tasks_db):
         """Delegation is real, not a same-valued copy captured at import."""

@@ -16,16 +16,22 @@ import inspect
 import json
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
 
+from fused_memory.models.reconciliation import StageId
+from fused_memory.reconciliation import citation_repair
 from fused_memory.services.memory_service import MemoryNotFoundError
 from fused_memory.utils.validation import is_full_uuid
 
 logger = logging.getLogger(__name__)
+
+# The stage vocabulary the production factory passes as ``known_stages``;
+# ``StageId`` is its single source, so a new pipeline stage is accepted as-is.
+KNOWN_RECON_STAGES: frozenset[str] = frozenset(s.value for s in StageId)
 
 
 def _normalize_description(description: str) -> str:
@@ -182,6 +188,24 @@ def _cited_task_key(project_id: str, task_id: str) -> str:
     return f'{project_id}:{task_id}'
 
 
+def _citation_failure_key(marker: Any) -> tuple[Any, Any, Any]:
+    """Identity of a ``citation_failures`` marker for dedupe (task 2979).
+
+    ``(memory_id, store, reason)`` — deliberately EXCLUDING ``error_type``.
+    Two ``verification_error`` markers for the same citation record the same
+    fact ("this id could not be resolved") no matter which exception class
+    surfaced it, and including ``error_type`` would let a flapping backend
+    append an unbounded run of near-identical markers across repeat passes.
+
+    Tolerates a non-dict marker (returns a key derived from its repr) so a
+    malformed entry that somehow reached the durable record can still be
+    compared instead of raising inside the write-back.
+    """
+    if not isinstance(marker, dict):
+        return (repr(marker), None, None)
+    return (marker.get('memory_id'), marker.get('store'), marker.get('reason'))
+
+
 def _traces_exclusively_to_stage1(
     finding: dict,
     stage1_identities: set[str],
@@ -266,6 +290,15 @@ def _apply_cross_project_routing_guard(finding: dict) -> dict:
 # carry the same pathological-length risk as the three free-text fields.
 _MAX_FINDING_TEXT_CHARS = 10_000
 _TRUNCATION_MARKER = '…[truncated]'
+# Cap on description/suggested_action inside a cite_task fold's purge record
+# (task 4865).  Deliberately far below the finding cap: _persist_run
+# re-serializes every reachable entry of the run on EVERY mutation, so each
+# record's text is rewritten to SQLite again on every later write.
+_MAX_PURGED_TEXT_CHARS = 2_000
+# Records kept per entry before later purges only count as overflow.  Worst
+# case ~20 x 2 x 2_000 chars of text per entry, plus citation lists; the
+# fold's WARNING stays the unbounded channel, firing for every purge.
+_MAX_PURGED_FINDINGS = 20
 
 
 def _truncate_field(value: str, cap: int) -> tuple[str, bool]:
@@ -310,6 +343,37 @@ class _Finding:
     # cited entity carries an active decision; defaults None so old persisted
     # rows hydrate round-trip-safe via _Finding(**fd).
     standing_decision_id: str | None = None
+    # Task 2979: markers for cited memories that failed post-assembly
+    # re-verification — {memory_id, store, reason} (plus error_type on a
+    # verification_error). Written by apply_citation_verification, so a phantom
+    # claim is SURFACED rather than silently vanishing when it is stripped from
+    # cited_memories. Defaulted for the same round-trip-safety reason as
+    # standing_decision_id above: rows persisted before this field existed must
+    # still hydrate via _Finding(**fd) with no migration.
+    citation_failures: list[dict] = field(default_factory=list)
+    # Task 4653: the finding_id of the LATER finding that makes this one
+    # historical, or None. Written by add_finding's ``supersedes`` argument;
+    # re-pointed or cleared by _purge_finding when that superseder is itself
+    # retracted, so the pointer can never dangle. Defaults None for the same
+    # round-trip-safety reason as standing_decision_id/citation_failures above:
+    # recon_report_store holds entry_json as an opaque TEXT blob, so rows
+    # persisted before this field existed still hydrate via _Finding(**fd) with
+    # no schema change and no migration script.
+    superseded_by: str | None = None
+    # Task 4653: the REVERSE edge — the finding_id this finding was filed to
+    # retire (its add_finding ``supersedes`` target), or None. The two fields
+    # are not redundant and cannot disagree: `supersedes` is the immutable
+    # record of the assertion THIS finding made, while `superseded_by` is the
+    # target's single EFFECTIVE pointer, which later stamps move forward. Only
+    # the reverse edge survives that move, so it is what lets _purge_finding
+    # re-point a target at a superseder that still stands instead of un-retiring
+    # it when the newest superseder is retracted. Invariant: a non-None
+    # `superseded_by` always names a finding whose `supersedes` is this row's id.
+    # Internal — deliberately not projected into flagged_items or
+    # get_findings_for_run: `superseded_by` is the direction a consumer needs
+    # (this claim is dead, here is what replaced it), and projecting both would
+    # put two spellings of one relation on the agent-facing surface.
+    supersedes: str | None = None
 
 
 @dataclass
@@ -323,6 +387,14 @@ class _ReportEntry:
     summary_warnings: list[str] = field(default_factory=list)
     completed_at: float | None = None  # clock() — None when in-progress
     created_at: float = 0.0  # clock() — for diagnostics
+    # Forensic copy of findings cite_task's in-run folds purged, recorded on
+    # the CITING stage's entry (task 4865; see
+    # ReconReportState._record_cite_task_fold_purge).  Persisted, but not
+    # part of get_assembled_report's contract.
+    purged_findings: list[dict] = field(default_factory=list)
+    # Folds whose structured copy the _MAX_PURGED_FINDINGS cap dropped: the
+    # operator's cue that the log is the only copy of that many purges.
+    purged_findings_overflow: int = 0
     # in-run dedup: (task_id, flag_type) → finding_id.  Mirrors the entries
     # this ONE stage contributed to the run-scoped ReconReportState._run_sig_index.
     # Not consulted for eviction teardown: since task-2088, run-level indices
@@ -343,7 +415,9 @@ class _ReportEntry:
 #
 # entry_json's shape is an internal implementation detail of the persistence
 # write-through path (ReconReportState._persist_run / hydrate_from_store) and
-# ReconReportStore rows — never surfaced to MCP tool callers.
+# ReconReportStore rows — never surfaced to MCP tool callers.  Its
+# purged_findings / purged_findings_overflow keys (task 4865) are forensic-only:
+# an operator reads them from the row, and no tool returns them.
 
 
 def _encode_sig_map(
@@ -389,6 +463,15 @@ def _serialize_entry(
     ``_Finding`` and the entry's own scalar/collection fields are all built from
     JSON-safe primitives already (str / bool / float / None / list[dict]), so
     ``dataclasses.asdict`` needs no custom encoder.
+
+    ``recon_report_store`` holds the result in one opaque ``entry_json`` TEXT
+    column, so ADDING a ``_Finding`` field costs no schema change: give it a
+    default and ``asdict`` starts writing it here while
+    :func:`_deserialize_entry` keeps hydrating rows persisted before it
+    existed.  No migration script has ever been needed for one.  An
+    ENTRY-level field is different: only findings go through ``asdict``, so
+    it must be added to the payload below and to :func:`_deserialize_entry`
+    by hand.
     """
     payload = {
         'run_id': entry.run_id,
@@ -400,6 +483,8 @@ def _serialize_entry(
         'summary_warnings': list(entry.summary_warnings),
         'completed_at': entry.completed_at,
         'created_at': entry.created_at,
+        'purged_findings': [dict(r) for r in entry.purged_findings],
+        'purged_findings_overflow': entry.purged_findings_overflow,
         'signature_to_finding': _encode_sig_map(entry._signature_to_finding),
         'deschash_to_finding': dict(entry._deschash_to_finding),
         'sig_anchor_slice': _encode_sig_map(sig_anchor_slice),
@@ -414,6 +499,13 @@ def _deserialize_entry(entry_json: str) -> _ReportEntry:
     Does NOT restore the fold-anchor slices — call
     :func:`_deserialize_fold_anchor_slices` on the same *entry_json* for those;
     they are run-level, not part of ``_ReportEntry``.
+
+    ``_Finding(**fd)`` is what makes a newly-added DEFAULTED field readable on
+    an older blob: the key is simply absent and the default supplies it.  A
+    field added WITHOUT a default would instead raise ``TypeError`` on every
+    pre-existing row — see :func:`_serialize_entry` for the other half.
+    Entry-level fields get the same no-migration property from a ``.get()``
+    default on their key (``purged_findings`` / ``purged_findings_overflow``).
     """
     data = json.loads(entry_json)
     findings = [_Finding(**fd) for fd in data['findings']]
@@ -427,6 +519,8 @@ def _deserialize_entry(entry_json: str) -> _ReportEntry:
         summary_warnings=list(data['summary_warnings']),
         completed_at=data['completed_at'],
         created_at=data['created_at'],
+        purged_findings=[dict(r) for r in data.get('purged_findings', [])],
+        purged_findings_overflow=data.get('purged_findings_overflow', 0),
         _signature_to_finding=_decode_sig_map(data['signature_to_finding']),
         _deschash_to_finding=dict(data['deschash_to_finding']),
     )
@@ -467,11 +561,25 @@ _ERR_ALREADY_COMPLETED: dict[str, str] = {
 }
 
 
+def _unknown_stage_error(stage: str, known: frozenset[str]) -> dict[str, Any]:
+    """Build the unknown_stage error dict; the sorted vocabulary lets a
+    confused caller self-correct from the response alone."""
+    return {
+        'error': 'unknown_stage',
+        'error_type': 'ReconReportUnknownStage',
+        'stage': stage,
+        'known_stages': sorted(known),
+    }
+
+
 def _duplicate_finding_error(
-    existing_id: str, warnings: list[str] | None = None
+    existing_id: str,
+    warnings: list[str] | None = None,
+    *,
+    supersedes_dropped: bool = False,
 ) -> dict[str, Any]:
     """Build the duplicate_finding error dict, optionally carrying truncation
-    warnings (task-2410).
+    warnings (task-2410) and a dropped-supersession warning (task-4653).
 
     add_finding truncates description/suggested_action/category BEFORE the
     dedup check runs (see its docstring), so a caller whose overlength input turns
@@ -479,14 +587,28 @@ def _duplicate_finding_error(
     truncated text itself is discarded (a duplicate is never stored), but
     the warning is not.  Mirrors the success-path contract: ``'warnings'``
     is present only when *warnings* is non-empty.
+
+    *supersedes_dropped* extends that same "the input is discarded, the
+    warning is not" contract to a ``supersedes`` that resolved but was never
+    stamped because this filing deduped (add_finding is validate-early /
+    stamp-late, so the duplicate return precedes the stamp).  Reporting it is
+    what keeps that path from reinstating the defect ``supersedes`` exists to
+    close: the caller asked for a retirement, got ``duplicate_finding`` back,
+    and would otherwise have no signal that the relation went unrecorded.
+    The stamp is deliberately still NOT applied here — mutating on a return
+    documented to mutate nothing would produce exactly the half-applied case
+    the whole-call-atomicity contract rules out.
     """
     error: dict[str, Any] = {
         'error': 'duplicate_finding',
         'error_type': 'ReconReportDuplicateFinding',
         'existing_finding_id': existing_id,
     }
-    if warnings:
-        error['warnings'] = warnings
+    all_warnings = list(warnings) if warnings else []
+    if supersedes_dropped:
+        all_warnings.append(f'supersedes not applied: duplicate of {existing_id}')
+    if all_warnings:
+        error['warnings'] = all_warnings
     return error
 
 
@@ -552,6 +674,14 @@ _ERR_SERVICE_UNAVAILABLE: dict[str, str] = {
     'error_type': 'ReconReportServiceUnavailable',
 }
 
+# task 3065: returned by repair_memory_citation when this server was built
+# without a ReconciliationJournal (reconciliation disabled). Refusing loudly
+# beats half-working: the durable blob is the only thing a repair can act on.
+_ERR_JOURNAL_UNAVAILABLE: dict[str, str] = {
+    'error': 'journal_unavailable',
+    'error_type': 'ReconReportJournalUnavailable',
+}
+
 # task 2895 β: returned by write_entity_standing_decision when the grounds value
 # is outside GROUNDS_ENUM (the ledger's ValueError). A ``hint`` carrying the
 # ledger message is added at return time.
@@ -586,6 +716,11 @@ class ReconReportState:
                         from it at startup. ``None`` (the default) makes
                         persistence a complete no-op — fresh in-process runs are
                         byte-identical whether or not a store is attached.
+        known_stages:   Keyword-only stage vocabulary (task 4865). When set,
+                        :meth:`start_report` rejects any stage outside it with
+                        an ``unknown_stage`` error. ``None`` (the default) means
+                        no vocabulary is configured — byte-identical to the
+                        pre-4865 behaviour, where every stage name is accepted.
     """
 
     def __init__(
@@ -596,6 +731,9 @@ class ReconReportState:
         memory_service: Any = None,
         task_interceptor: Any = None,
         store: Any = None,
+        journal: Any = None,
+        *,
+        known_stages: Iterable[str] | None = None,
     ) -> None:
         self._ttl_seconds = ttl_seconds
         self._clock_fn = clock
@@ -640,6 +778,14 @@ class ReconReportState:
         self.known_projects: dict[str, str] = {}  # project_id → project_root
         # SQLite write-through persistence (task 2716); None = fully inert.
         self._store = store
+        # ReconciliationJournal for repair_memory_citation (task 3065) — the ONE
+        # tool here that writes outside this process's own state. None (the
+        # reconciliation-disabled server) keeps every other behaviour
+        # byte-identical and makes that tool refuse with journal_unavailable.
+        self._journal = journal
+        self._known_stages: frozenset[str] | None = (
+            None if known_stages is None else frozenset(known_stages)
+        )
 
     def _clock(self) -> float:
         if self._clock_fn is not None:
@@ -649,6 +795,67 @@ class ReconReportState:
     # ------------------------------------------------------------------
     # Persistence (task 2716)
     # ------------------------------------------------------------------
+
+    def _reachable_run_entries(self, run_id: str) -> list[_ReportEntry]:
+        """Every entry of *run_id* a mutation can still REACH, one per stage.
+
+        The union of this run's ``_state`` entries and the distinct entries
+        behind ``_run_finding_index[run_id]``.  The two differ because
+        :meth:`tick` evicts a completed entry from ``_state`` at its own TTL
+        but deliberately keeps it in ``_run_finding_index`` until the whole RUN
+        quiesces (see that method's docstring), so its findings stay citable —
+        and supersedable — from a still-live sibling stage.
+
+        The invariant, named once here so the two scopes cannot drift apart:
+        an entry a mutation can reach through :meth:`_resolve_finding` is an
+        entry :meth:`_persist_run` must WRITE and :meth:`_purge_finding` must
+        SWEEP.  Before task 4653 both walked ``_state`` alone, so every
+        mutation of an evicted-but-indexed finding — the whole ``cite_*``
+        family as well as the ``supersedes`` stamp — was applied in memory and
+        then silently dropped on the way to the store.
+
+        Deduped by ``(run_id, stage)`` — the store's PRIMARY KEY — and NOT by
+        object identity, with the ``_state`` entry winning any collision.  Two
+        distinct entry objects can share one stage: :meth:`start_report`'s
+        docstring documents the evict-then-restart path (task 3988) where an
+        evicted-but-still-indexed entry is shadowed by a fresh same-name entry
+        in ``_state``.  Identity-deduping returned BOTH, and since
+        :meth:`_persist_run` upserts them in one ``executemany`` against
+        ``ON CONFLICT(run_id, stage) DO UPDATE``, the stale twin landed last and
+        overwrote the live stage's row — persisted state silently diverging from
+        memory, and :meth:`hydrate_from_store` resurrecting the dead entry while
+        dropping every finding the live stage had filed.  The live ``_state``
+        row is therefore the one persisted; the evicted twin's stamps are
+        unpersistable because the store has no key to hold them under.
+
+        Deliberately NOT for READS.  :meth:`get_assembled_report` stays
+        ``_state``-scoped on purpose: an evicted stage dropping out of the
+        assembled report is that method's intended semantics, and widening it
+        with this helper would change what the report CONTAINS — far beyond
+        aligning write reach with mutation reach.
+
+        SCOPE CAVEAT, because the invariant above is only as wide as its inputs:
+        the evicted half of the union is derived from ``_run_finding_index``, so
+        an evicted entry is reachable only while it still OWNS at least one
+        indexed finding.  Purging its last finding therefore drops it out of
+        this set — and out of the next :meth:`_persist_run` — leaving its
+        persisted row carrying the purged finding until run quiescence GCs it,
+        or until a restart hydrates it back.  Not reachable today: an evicted
+        entry is by definition completed, :meth:`delete_finding` refuses a
+        completed owning entry, and :meth:`cite_task`'s fold purges only the
+        in-flight new finding, which its own live entry owns.  It is stated
+        rather than relied on silently: a future mutator that can purge from a
+        completed entry needs the write reach pinned some other way (e.g. a
+        per-run set of ``(run_id, stage)`` keys ever persisted) rather than
+        derived from the findings that happen to remain.
+        """
+        by_key: dict[tuple[str, str], _ReportEntry] = {}
+        for entry in self._run_finding_index.get(run_id, {}).values():
+            by_key[(entry.run_id, entry.stage)] = entry
+        for (rid, stage), entry in self._state.items():
+            if rid == run_id:
+                by_key[(rid, stage)] = entry  # _state is authoritative
+        return list(by_key.values())
 
     def _persist_run(self, run_id: str) -> None:
         """Write every ``(run_id, *)`` entry through to the store.  No-op if
@@ -661,6 +868,14 @@ class ReconReportState:
         folds purge the losing finding from ITS owning entry) — upserting the
         whole run is trivially correct where "persist only what changed" would
         need fragile per-method reasoning about which stage's row to write.
+
+        The entries written are :meth:`_reachable_run_entries`, NOT the run's
+        ``_state`` rows.  Task 4653's supersession stamp is what forced that
+        reach to widen: its target is routinely an earlier stage that completed
+        and then aged out of ``_state`` while the run stayed live, so writing
+        only ``_state`` dropped the stamp — and, identically, every ``cite_*``
+        citation recorded on an evicted entry's finding.  See that helper for
+        the invariant binding mutation reach and write reach together.
 
         For each entry, computes its OWNED slice of the two run-level fold
         anchors (``_run_cited_task_index`` / the derived-signature entries in
@@ -685,9 +900,8 @@ class ReconReportState:
         active_stage = self._active.get(run_id)
         updated_at = self._clock()
         rows: list[dict[str, Any]] = []
-        for (rid, stage), entry in self._state.items():
-            if rid != run_id:
-                continue
+        for entry in self._reachable_run_entries(run_id):
+            rid, stage = entry.run_id, entry.stage
             # Serialize each entry independently so a single un-serializable
             # entry is skipped-and-logged without dropping the rest of the run.
             # This loop touches ONLY in-memory state (never the store), so the
@@ -930,6 +1144,18 @@ class ReconReportState:
     ) -> dict[str, Any]:
         """Create a new in-progress report entry, or no-op on a repeat call.
 
+        Unknown-stage guard (task 4865), the FIRST check — ahead of the
+        existing-entry branch below: when the state was built with a
+        ``known_stages`` vocabulary and *stage* is outside it, the call logs a
+        WARNING and returns ``{error: 'unknown_stage', error_type:
+        'ReconReportUnknownStage', stage, known_stages}``. It creates no entry,
+        leaves ``self._active`` untouched and writes nothing to the store, so a
+        hallucinated stage name can neither open a phantom entry nor re-point
+        the run's live stage onto one. Because it precedes the existing-entry
+        branch, an out-of-vocabulary entry hydrated from a row persisted before
+        the vocabulary was configured is also left exactly as it was. With
+        ``known_stages is None`` there is no guard and every name is accepted.
+
         Idempotent per PRD §9.2/§9.4. A FIRST call for a given ``(run_id,
         stage)`` creates a fresh entry and returns ``{run_id, stage,
         already_started: False}``. A REPEAT call for an ``(run_id, stage)``
@@ -978,21 +1204,34 @@ class ReconReportState:
         2's findings into stage 1's entry and close the wrong stage — the
         exact cross-stage corruption this guard closes elsewhere.
 
-        This guard is keyed solely on ``(run_id, stage)`` PRESENCE in
-        ``self._state`` — it deliberately does not (and cannot, without a
-        known-stage vocabulary) police a stage name that does not yet exist
-        for this run; that remains a legal fresh-create, matching a normal
-        stage transition within a run. Consequently the never-stolen
-        guarantee above LAPSES once the earlier stage's entry evicts from
-        ``self._state`` (TTL past :meth:`complete`, via :meth:`tick`): a
-        call naming that now-absent ``(run_id, stage)`` no longer matches
-        ``existing is not None`` below, so it takes the fresh-create path,
-        which unconditionally sets ``self._active[run_id] = stage`` — still
-        capable of stealing the pointer from a different, live stage of the
-        same run. Closing that residual needs the same known-stage
-        vocabulary this docstring already disclaims; it is an explicit scope
-        boundary of this guard (task 3988), not a guarantee made here.
+        This repeat-call guard is keyed solely on ``(run_id, stage)``
+        PRESENCE in ``self._state`` — it does not police a stage name that
+        does not yet exist for this run; that remains a legal fresh-create,
+        matching a normal stage transition within a run. Consequently the
+        never-stolen guarantee above LAPSES once the earlier stage's entry
+        evicts from ``self._state`` (TTL past :meth:`complete`, via
+        :meth:`tick`): a call naming that now-absent ``(run_id, stage)`` no
+        longer matches ``existing is not None`` below, so it takes the
+        fresh-create path, which unconditionally sets ``self._active[run_id]
+        = stage`` — still capable of stealing the pointer from a different,
+        live stage of the same run. The unknown-stage guard at the top closes
+        that residual for every name outside the configured vocabulary (the
+        orphaning a hallucinated stage name used to cause); the residual
+        remains in full only when ``known_stages is None``, and for an
+        in-vocabulary name it is a genuine stage transition, not a stray call.
         """
+        if self._known_stages is not None and stage not in self._known_stages:
+            logger.warning(
+                'recon_report: start_report rejected unknown stage run_id=%r '
+                'stage=%r project_id=%r active_stage=%r; no entry created, '
+                'active stage unchanged',
+                run_id,
+                stage,
+                project_id,
+                self._active.get(run_id),
+            )
+            return _unknown_stage_error(stage, self._known_stages)
+
         existing = self._state.get((run_id, stage))
         if existing is not None:
             warning = (
@@ -1067,6 +1306,7 @@ class ReconReportState:
         actionable: bool | None = None,
         task_id: str | None = None,
         flag_type: str | None = None,
+        supersedes: str | None = None,
     ) -> dict[str, Any]:
         """Append a finding to the current report entry, with in-run dedup.
 
@@ -1102,20 +1342,23 @@ class ReconReportState:
         silently defaulting to ``actionable=True``), which is the exact bug
         class this default exists to close. As of this writing,
         ``'cross_project_routing'`` is the only production category
-        matching the prefix — filed with an explicit ``actionable=False``
-        by ``autopilot_video.py`` and the Stage 2 prompt template. The
-        Stage 3 prompt template also omits ``actionable`` for its
-        ``cross_project_routing`` example, so it likewise inherits this
-        computed default — but that example (``severity='serious'``,
-        "get_task returned task from project X, expected Y") is a
-        wrong-``project_root`` data-integrity signal, not an
-        informational routing note, so this docstring does not assert
-        that relying on the default there is correct; combined with the
-        read-time-suppression ripple below, such a finding is a candidate
-        to silently vanish from ``flagged_items`` if its citations happen
-        to trace exclusively to Stage 1. Whether the Stage 3 template
-        should instead pass ``actionable=True`` explicitly is tracked as
-        a follow-up rather than fixed in this docstring-only pass.
+        matching the prefix, and every one of its filers now passes
+        ``actionable`` EXPLICITLY rather than relying on this computed
+        default. ``autopilot_video.py`` and the Stage 2 prompt template
+        pass ``actionable=False``: those findings are informational
+        routing notes ("this work belongs to another project, please
+        route"). The Stage 3 prompt template passes ``actionable=True``:
+        its example (``severity='serious'``, "get_task returned task from
+        project X, expected Y") is a wrong-``project_root``
+        data-integrity signal, not a routing note, and must never become
+        a candidate for the read-time suppression described below — which
+        the computed default would have made it whenever its citations
+        traced exclusively to Stage 1 (task 4347). Same category,
+        opposite actionability, which is exactly why neither filer may
+        rely on a single computed value here. The Stage 3 template's
+        kwarg is machine-checked by
+        ``tests/test_stage3_cross_project_routing_actionable.py``; this
+        paragraph is not the source of truth for it.
 
         Prefix breadth is local to *this* default only: downstream
         consumers that also branch on the ``cross_project_routing``
@@ -1185,6 +1428,72 @@ class ReconReportState:
         surfaced verbatim in the assembled report; ``severity`` is left
         unbounded as it is expected to be a short enum-like label (see the
         module-level comment above ``_MAX_FINDING_TEXT_CHARS``).
+
+        ``supersedes`` (task-4653) names the finding_id of an EARLIER finding
+        in this run that the new one makes historical; on success the TARGET's
+        ``superseded_by`` is stamped with the NEW finding's id (a forward
+        pointer, never the reverse).  It exists because in-run dedup cannot
+        see the relationship: dedup keys on ``(task_id, flag_type)`` and a
+        finding that RESOLVES an earlier claim legitimately carries a
+        DIFFERENT flag_type (``memory_mechanism_contradiction`` vs
+        ``..._resolved``), so the claim and its own refutation both survive as
+        live rows.  Hence the key is an EXPLICIT finding_id and never a
+        ``(task_id, flag_type)`` heuristic, which would re-inherit exactly
+        that blind spot.
+
+        Supersession STAMPS, it does not purge — unlike
+        :meth:`delete_finding` / :meth:`_purge_finding`, which destroy the row
+        and its citations.  The superseded claim stays readable in
+        ``flagged_items`` carrying a forward pointer to its replacement, so
+        the record of what was believed and then retired survives.
+
+        That is also why the TARGET's owning entry may already be COMPLETED,
+        where :meth:`delete_finding` rejects exactly that case: deleting
+        changes ``len(entry.findings)`` and so corrupts the ``flagged_count``
+        :meth:`complete` has already cached, whereas stamping writes one field
+        and changes no count.  Only the guard on the entry being WRITTEN to
+        (above) applies here.  The asymmetry is deliberate and load-bearing:
+        the only real use of supersession is a later stage retiring an
+        earlier — by then completed — stage's finding, so inheriting
+        delete_finding's guard would make the mechanism dead on arrival.
+
+        Re-stamping an already-superseded target moves the pointer FORWARD to
+        the newest superseder (logged at INFO when overwriting a non-None
+        pointer): the most recent assertion about a claim is the one a reader
+        should follow.  The overwritten assertion is not forgotten — each
+        superseder records its own target in ``_Finding.supersedes`` — so
+        retracting the newest superseder re-points the target at a survivor
+        instead of un-retiring it (see :meth:`_purge_finding`).
+
+        A ``supersedes`` that does not resolve to a finding THIS RUN owns
+        (unknown id, or an id belonging to another run —
+        :meth:`_resolve_finding` is run-scoped) fails the WHOLE call with
+        ``finding_unknown``, rather than filing the finding with the
+        supersession silently dropped.  A silently-unstamped supersession is
+        the original defect reinstated: the new claim goes live beside the
+        claim it refutes with no relation recorded, which is precisely the
+        state this argument exists to prevent.
+
+        Validate-early / stamp-late: the target is resolved before any
+        truncation, dedup or allocation work, so the reject path mutates
+        nothing and needs no index cleanup; the stamp is written only after
+        the new finding is allocated and appended (it needs the new
+        finding_id), so a ``duplicate_finding`` return never stamps anything.
+
+        That duplicate return therefore DROPS a resolved ``supersedes``, and
+        says so: it carries a ``supersedes not applied: duplicate of <id>``
+        warning.  Not stamping is deliberate — the deduping call filed no new
+        finding, so there is no new finding_id for the pointer to name, and
+        stamping the pre-existing duplicate would mutate state on a return
+        documented to mutate nothing, i.e. exactly the half-applied case the
+        whole-call-atomicity contract above rules out.  But dropping it
+        SILENTLY would reinstate the defect from the caller's side: a Stage-2
+        agent re-filing its ``..._resolved`` finding (a retry, a re-raise)
+        would be told only ``duplicate_finding`` while the claim it meant to
+        retire stayed live.  Warning instead of failing keeps the retry
+        idempotent for the finding itself while leaving the unrecorded
+        relation visible; re-file with the ORIGINAL superseder's finding_id,
+        or retract it first, to record it.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -1200,6 +1509,25 @@ class ReconReportState:
                 entry.stage,
             )
             return _ERR_ALREADY_COMPLETED.copy()
+
+        # task-4653 validate-early: resolve the supersession target BEFORE any
+        # truncation, dedup or allocation work, so an unresolvable target fails
+        # the whole call with nothing mutated — no finding row, no dedup index
+        # entry, nothing to clean up on the reject path.  The stamp itself is
+        # written late (after the new finding is appended), since the forward
+        # pointer needs the new finding_id.
+        supersedes_target: _Finding | None = None
+        if supersedes is not None:
+            resolved_target = self._resolve_finding(run_id, supersedes)
+            if resolved_target is None:
+                logger.warning(
+                    'recon_report: add_finding supersedes=%r does not resolve in run_id=%r; '
+                    'rejected',
+                    supersedes,
+                    run_id,
+                )
+                return _ERR_FINDING_UNKNOWN.copy()
+            _target_entry, supersedes_target = resolved_target
 
         # Fix 2 (task-2410): gracefully cap pathologically long text fields
         # BEFORE dedup hashing, so the stored text, the assembled-report
@@ -1269,7 +1597,9 @@ class ReconReportState:
         if sig != (None, None):
             existing_id = self._run_sig_index.get(run_id, {}).get(sig)
             if existing_id is not None:
-                return _duplicate_finding_error(existing_id, warnings)
+                return _duplicate_finding_error(
+                    existing_id, warnings, supersedes_dropped=supersedes is not None
+                )
         else:
             # Blank/whitespace-only descriptions normalize to '' — skip dedup so
             # each blank informational finding allocates independently.  The empty
@@ -1279,7 +1609,9 @@ class ReconReportState:
                 desc_hash = _description_hash(description)
                 existing_id = self._run_desc_index.get(run_id, {}).get(desc_hash)
                 if existing_id is not None:
-                    return _duplicate_finding_error(existing_id, warnings)
+                    return _duplicate_finding_error(
+                        existing_id, warnings, supersedes_dropped=supersedes is not None
+                    )
 
         finding_id = str(uuid.uuid4())
         if actionable is None:
@@ -1293,6 +1625,13 @@ class ReconReportState:
             actionable=actionable,
             task_id=c_task_id,
             flag_type=c_flag_type,
+            # The RESOLVED target's id, not the raw argument: an unresolvable
+            # supersedes never reaches here (validate-early returns
+            # finding_unknown), and deriving it from the resolved object is what
+            # keeps this field from ever holding an id that names nothing.
+            supersedes=(
+                supersedes_target.finding_id if supersedes_target is not None else None
+            ),
         )
         entry.findings.append(finding)
         if sig != (None, None):
@@ -1303,6 +1642,26 @@ class ReconReportState:
                 entry._deschash_to_finding[desc_hash] = finding_id
                 self._run_desc_index.setdefault(run_id, {})[desc_hash] = finding_id
         self._run_finding_index.setdefault(run_id, {})[finding_id] = entry
+
+        # task-4653: stamp-late.  The new finding now exists, so the forward
+        # pointer we write onto the target resolves.  _resolve_finding is
+        # run-scoped and cross-stage, so a later stage can retire an earlier
+        # stage's claim — including one whose entry has already aged out of
+        # _state, which is the ORDINARY case rather than a corner.  _persist_run
+        # below writes every entry the run can still REACH
+        # (_reachable_run_entries), not just its _state rows, so the stamp on
+        # the earlier stage's row is durable either way.
+        if supersedes_target is not None:
+            if supersedes_target.superseded_by is not None:
+                logger.info(
+                    'recon_report: finding_id=%r was already superseded by %r; '
+                    'moving the pointer forward to %r (run_id=%r)',
+                    supersedes,
+                    supersedes_target.superseded_by,
+                    finding_id,
+                    run_id,
+                )
+            supersedes_target.superseded_by = finding_id
 
         result: dict[str, Any] = {'finding_id': finding_id}
         if warnings:
@@ -1327,6 +1686,15 @@ class ReconReportState:
         add_finding/set_stat/inc_stat post-completion guard, and protects
         complete()'s cached ``flagged_count``/``stats`` from silent
         corruption.  Retraction is intended for in-progress stages.
+
+        To retire an earlier stage's claim after that stage has closed — the
+        common case, and the one this guard refuses — use
+        :meth:`add_finding`'s ``supersedes`` argument instead (task-4653).
+        It deliberately carries no owning-entry guard because it stamps a
+        field rather than removing a row, so the cached ``flagged_count``
+        this guard protects is unaffected; see add_finding's docstring for
+        the full asymmetry.  Deletion remains the right tool only for
+        retracting a finding filed in error by a stage still in progress.
 
         Removes the finding from ``entry.findings`` and every dedup index
         it may be registered under — ``_run_finding_index``, whichever of
@@ -1364,6 +1732,120 @@ class ReconReportState:
         self._persist_run(run_id)
 
         return {'status': 'deleted', 'finding_id': finding_id}
+
+    def apply_citation_verification(
+        self, run_id: str, results: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Write a post-assembly citation-verification outcome back to the
+        AUTHORITATIVE findings, then persist once (task 2979).
+
+        Each entry of *results* is
+        ``{'finding_id': str, 'cited_memories': list[dict],
+        'citation_failures': list[dict]}`` — the surviving citations and the
+        failure markers that ``citation_verifier.verify_cited_memories``
+        produced for that finding. ``cited_memories`` REPLACES the finding's
+        list (the verifier returns the kept set, not a delta);
+        ``citation_failures`` is EXTENDED — so markers from an earlier pass are
+        never lost — but the extend is DEDUPED on ``(memory_id, store,
+        reason)``, which is what makes a repeat pass idempotent.
+
+        The dedupe is load-bearing, not belt-and-braces. Callers send the FULL
+        marker list off the assembled projection, not the delta this pass
+        appended, and ``get_assembled_report`` projects the already-persisted
+        ``citation_failures`` back out — so a plain extend would duplicate
+        every prior marker on any second pass over the same (run_id, stage).
+        A repeat is architecturally reachable: ``start_report`` is deliberately
+        idempotent and RETAINS prior findings, and the resume path can
+        re-invoke ``stage.run()`` under the same ``run_id``. ``error_type`` is
+        NOT part of the key: two verification errors for the same citation are
+        the same failure regardless of which exception class surfaced it, and
+        keying on it would let a flapping backend grow the list without bound.
+
+        Why this exists: ``get_assembled_report`` builds a fresh dict per
+        finding with ``'cited_memories': list(f.cited_memories)`` — a NEW list
+        object. Verification therefore corrects only that throwaway projection,
+        while the authoritative ``_Finding`` and its durable row (written inside
+        the CLI subprocess at add_finding/cite_memory/complete time, strictly
+        BEFORE verification runs) keep the phantom. Without this write-back the
+        report and the store permanently disagree, and whether a consumer sees
+        the phantom depends on which one it happens to read.
+
+        Findings are resolved via :meth:`_resolve_finding`, so this is
+        cross-stage capable exactly as the ``cite_*`` tools are.
+
+        **Deliberately NOT guarded by ``_ERR_ALREADY_COMPLETED``**, unlike
+        :meth:`delete_finding`. That guard exists to stop an in-flight agent
+        RETRACTING a finding after ``complete()`` cached ``flagged_count`` /
+        ``stats``. This is a harness-side integrity correction that by
+        construction runs after the subprocess has already called
+        ``complete()``, so the guard would reject every legitimate call. It is
+        also strictly narrower than a retraction: it only edits citation lists,
+        never adds or removes a finding, so the cached ``flagged_count`` stays
+        accurate.
+
+        ``_persist_run`` — which re-serialises and upserts EVERY entry of the
+        run — fires only when a finding's citation lists actually changed. The
+        common case by far is a clean run where verification resolved every
+        citation and dropped nothing; re-writing the whole run's rows to record
+        "nothing moved" is pure cost.
+
+        Never raises, and never returns an error for an unresolvable
+        ``run_id``/``finding_id`` — this is a post-hoc hygiene pass, and turning
+        a citation-hygiene miss into a failed reconciliation stage would be a
+        far worse outcome than a stale marker. Skips are logged (WARNING,
+        structured) rather than swallowed silently. Returns
+        ``{'status': 'applied', 'findings_updated': int, 'findings_changed':
+        int, 'findings_skipped': int}`` — ``findings_updated`` counts the
+        results that RESOLVED to a finding, ``findings_changed`` the subset
+        that actually mutated it (and so drove the persist).
+        """
+        updated = 0
+        changed = 0
+        skipped = 0
+        for result in results:
+            finding_id = (result or {}).get('finding_id')
+            if not finding_id:
+                skipped += 1
+                continue
+            resolved = self._resolve_finding(run_id, finding_id)
+            if resolved is None:
+                logger.warning(
+                    'recon_report: apply_citation_verification could not resolve '
+                    'run_id=%r finding_id=%r; skipping (citation correction not '
+                    'applied to the durable record)',
+                    run_id,
+                    finding_id,
+                )
+                skipped += 1
+                continue
+            _owning_entry, finding = resolved
+            new_cited = list(result.get('cited_memories') or [])
+            finding_changed = new_cited != finding.cited_memories
+            finding.cited_memories = new_cited
+            seen = {_citation_failure_key(m) for m in finding.citation_failures}
+            for marker in result.get('citation_failures') or []:
+                key = _citation_failure_key(marker)
+                if key in seen:
+                    continue
+                seen.add(key)
+                finding.citation_failures.append(marker)
+                finding_changed = True
+            updated += 1
+            changed += 1 if finding_changed else 0
+
+        # One persist for the whole batch — _persist_run upserts every entry of
+        # the run, so a per-finding call would re-write the same rows N times —
+        # and only when something actually moved, so a clean verification pass
+        # (no drops, no errors, no new markers) costs zero writes.
+        if changed:
+            self._persist_run(run_id)
+
+        return {
+            'status': 'applied',
+            'findings_updated': updated,
+            'findings_changed': changed,
+            'findings_skipped': skipped,
+        }
 
     def set_stat(
         self,
@@ -1490,6 +1972,19 @@ class ReconReportState:
         Suppression is skipped entirely when ``stage == 'memory_consolidator'``
         to prevent two sibling non-actionable Stage-1 findings that cite the
         same target from mutually suppressing each other.
+
+        Supersession (task-4653): a finding carrying ``superseded_by`` is
+        projected with ``actionable`` forced False — neutered as an
+        instruction for every ``actionable``-keyed consumer, while the row
+        itself stays in ``flagged_items`` as a readable record of a claim that
+        was made and then retired.  The flip runs AFTER the Fix-1 check above,
+        never before: ``actionable is False`` is that predicate's first
+        necessary condition, so flipping earlier would newly qualify a
+        superseded row for the drop and delete exactly the record supersession
+        exists to keep.  Like :func:`_apply_cross_project_routing_guard`, the
+        mutation is on the freshly-built projection dict only — the stored
+        ``_Finding.actionable`` is untouched, so reads stay idempotent and
+        ``cite_*`` resolution is unaffected.
         """
         entry = self._state.get((run_id, stage))
         if entry is None:
@@ -1542,6 +2037,8 @@ class ReconReportState:
                 'cited_memories': list(f.cited_memories),
                 'cited_runs': list(f.cited_runs),  # task-2595
                 'standing_decision_id': f.standing_decision_id,  # task 2897 δ
+                'citation_failures': list(f.citation_failures),  # task 2979
+                'superseded_by': f.superseded_by,  # task 4653
             }
             # Cross-project routing taxonomy guard (task-2453): downgrade an
             # anchor-less cross_project_routing claim before the Fix-1 check
@@ -1559,6 +2056,14 @@ class ReconReportState:
                 # to a same-run Stage-1 finding.  Finding row remains in _state
                 # so cite_* resolution is unaffected.
                 continue
+            # task-4653: neuter a superseded finding as an INSTRUCTION while
+            # keeping it in the report as a RECORD.  Runs after the Fix-1
+            # check above, never before: actionable is False is that
+            # predicate's first necessary condition, so flipping it earlier
+            # would newly qualify the row for the drop and destroy the very
+            # readability supersession exists to preserve.
+            if f.superseded_by is not None:
+                finding_dict['actionable'] = False
             flagged_items.append(finding_dict)
 
         return {
@@ -1595,6 +2100,14 @@ class ReconReportState:
         findings through this channel should use :meth:`get_assembled_report`
         instead if it needs the guarded/downgraded taxonomy.
 
+        ``superseded_by`` (task-4653) is surfaced on every row, but this
+        method deliberately does not act on it: unlike
+        :meth:`get_assembled_report` it does NOT force ``actionable`` False
+        on a superseded row.  Suppression happens at the poll site
+        (``stages/task_knowledge_sync.py::_query_recon_report_findings``),
+        mirroring the task-2453 guard's precedent named above, so this
+        channel's raw, no-suppression contract stays intact.
+
         Returns ``[]`` for an unknown ``run_id`` (never raises).
         """
         results: list[dict[str, Any]] = []
@@ -1617,6 +2130,8 @@ class ReconReportState:
                     'cited_memories': list(f.cited_memories),
                     'cited_runs': list(f.cited_runs),  # task-2595
                     'standing_decision_id': f.standing_decision_id,  # task 2897 δ
+                    'citation_failures': list(f.citation_failures),  # task 2979
+                    'superseded_by': f.superseded_by,  # task 4653
                 })
         return results
 
@@ -1693,6 +2208,28 @@ class ReconReportState:
         fold anchor (task-2432) — see :meth:`cite_task`'s docstring for both
         folds.
 
+        Also repairs every ``superseded_by`` back-reference AT *finding*
+        anywhere in this run (task-4653).  A dangling forward pointer is
+        exactly the class of stale pointer this helper exists to prevent:
+        left in place it would keep the superseded finding neutered forever,
+        pointing at a row that no longer exists.  The sweep covers the run's
+        REACHABLE entries (:meth:`_reachable_run_entries`) — the same union
+        :meth:`_persist_run` writes — because a superseder routinely lives in
+        a later stage's entry than its target, and that target's stage has
+        routinely been EVICTED from ``_state`` by then while staying
+        resolvable and persisted.  Doing it here covers BOTH removal paths
+        for free, so they cannot drift apart.
+
+        A target is restored to live-actionable only when NO superseder is left.
+        Several findings can assert supersession of one target — the target
+        carries a single effective pointer that each new stamp moves forward —
+        so purging the newest of them re-points at a surviving one (found
+        through the reverse ``_Finding.supersedes`` edge) rather than clearing
+        to None.  Clearing unconditionally would silently un-retire a claim that
+        a live finding still refutes, projecting it ``actionable`` again and
+        handing it back to remediation: the exact failure class supersession
+        exists to close, reintroduced by the cleanup meant to protect it.
+
         Single-sourced (task-2425) by :meth:`delete_finding` and the in-run
         cited-task fold's retract path in :meth:`cite_task`, so the
         run-level dedup indices can never drift out of sync between the two
@@ -1712,9 +2249,11 @@ class ReconReportState:
         earlier one contributes no new information, so citations already
         attached to it are not worth preserving. A caller that records
         cite_entity/cite_edge/cite_memory citations on a null-task_id finding
-        BEFORE its first cite_task call should know those citations vanish
-        silently if that cite_task later folds the finding into an existing
-        duplicate.
+        BEFORE its first cite_task call should know those citations leave the
+        report if that cite_task later folds the finding into an existing
+        duplicate; the fold keeps them only in its recovery record (a WARNING
+        plus ``purged_findings`` — see :meth:`_record_cite_task_fold_purge`).
+        :meth:`delete_finding` keeps no such record.
         """
         owning_entry.findings[:] = [f for f in owning_entry.findings if f is not finding]
         self._run_finding_index.get(run_id, {}).pop(finding.finding_id, None)
@@ -1750,6 +2289,37 @@ class ReconReportState:
             run_sig_index = self._run_sig_index.get(run_id, {})
             if run_sig_index.get(derived_sig) == finding.finding_id:
                 run_sig_index.pop(derived_sig, None)
+
+        # task-4653: repair every forward pointer AT this finding.  The reach is
+        # the run's REACHABLE entries — the same union _persist_run writes, not
+        # just its _state rows.  Entry-scoped would be too narrow because the
+        # superseder routinely lives in a later stage's entry than its target
+        # (see add_finding's supersedes); _state-scoped would be too narrow
+        # because that target's stage has routinely been evicted by then, and
+        # an evicted stage's finding is still resolvable and still persisted,
+        # so a pointer at it is still live and still able to dangle.
+        #
+        # Repair, not clear: a target can carry assertions from SEVERAL
+        # superseders (each stamp moves its single effective pointer forward),
+        # and clearing to None would un-retire a claim a surviving superseder
+        # still refutes.  The survivors are found through the reverse
+        # `supersedes` edge each one records, so the pointer falls back to one of
+        # them; only a target with no superseder left goes back to live.  Any
+        # survivor will do — each is an independent assertion that the target is
+        # retired — so the first in reach order is taken.
+        remaining = [
+            f
+            for other_entry in self._reachable_run_entries(run_id)
+            for f in other_entry.findings
+            if f is not finding
+        ]
+        for other in remaining:
+            if other.superseded_by != finding.finding_id:
+                continue
+            other.superseded_by = next(
+                (f.finding_id for f in remaining if f.supersedes == other.finding_id),
+                None,
+            )
 
     def _derived_sig_anchor_project_id(
         self, run_id: str, anchor_finding_id: str, c_cited_task_id: str | None
@@ -1799,28 +2369,71 @@ class ReconReportState:
             return None
         return primary['project_id']
 
-    def _log_cite_task_fold_purge(
+    def _record_cite_task_fold_purge(
         self,
         *,
         run_id: str,
         fold: Literal['project_scoped', 'entity_scoped'],
         owning_entry: _ReportEntry,
+        record_entry: _ReportEntry,
         finding: _Finding,
         surviving_finding_id: str,
         attempted_project_id: str,
         attempted_task_id: str,
     ) -> None:
-        """Emit the recovery WARNING for a finding :meth:`cite_task` is about
-        to fold away, and call it BEFORE :meth:`_purge_finding` runs.
+        """Record a finding :meth:`cite_task` is about to fold away — a
+        WARNING plus a structured copy on *record_entry* — and call it BEFORE
+        :meth:`_purge_finding` runs.
 
         The purge is WHOLESALE (see :meth:`_purge_finding`'s docstring): the
         losing finding is dropped from ``owning_entry.findings`` entirely, so
         its ``description`` / ``suggested_action`` and every citation already
-        attached to it are destroyed with no other trace — the returned
-        ``duplicate_finding`` error carries only the SURVIVOR's id. This log
-        line is therefore the SOLE recovery channel for that content: an
-        operator reconstructing what a fold discarded has nothing else to
-        read. Keep it exhaustive, and keep it ahead of the purge.
+        attached to it leave the report — the returned ``duplicate_finding``
+        error carries only the SURVIVOR's id. Two channels keep that content
+        recoverable, with different lifetimes:
+
+        - the WARNING is the operator-VISIBLE, long-retention signal: it
+          fires for every purge and lasts as long as the process log does;
+        - the record appended to ``record_entry.purged_findings`` is the
+          machine-readable copy. It rides in the entry's persisted
+          ``entry_json``, so it survives process restarts and does not depend
+          on logging configuration — but only for the RUN's lifetime: it is
+          GC'd with the run's rows at quiescence (:meth:`tick` ->
+          ``store.delete_run``), so it does not outlive log retention.
+
+        The record is bounded: an entry keeps the FIRST
+        ``_MAX_PURGED_FINDINGS`` records, and each later purge only increments
+        ``record_entry.purged_findings_overflow`` — the count of folds for
+        which the log is the only copy. Not a ring buffer: keep-first-N is
+        deterministic and needs no shifting, and dropping a later copy loses
+        nothing unrecoverable, because the WARNING still fires and its
+        ``structural_copy`` field says whether this purge's copy was kept.
+
+        *record_entry* is the CITING stage's entry (the one :meth:`cite_task`
+        resolved through ``_active``), not *owning_entry*. The citing entry
+        is resident in ``_state`` by construction, so it is always among
+        :meth:`_reachable_run_entries` and the fold branch's existing
+        :meth:`_persist_run` writes it. An owning entry from an EVICTED stage
+        is not: once this purge removes its last indexed finding it falls out
+        of that reach, and a record placed on it would never be persisted.
+        The record's ``owning_stage`` keeps it attributable; on a same-stage
+        fold the two entries coincide.
+
+        The record is structured: ``fold``, ``owning_stage``,
+        ``surviving_finding_id``, ``attempted_citation`` (``{project_id,
+        task_id}``), ``finding`` and ``truncated_fields``. ``finding`` is
+        ``asdict`` of the purged finding — the projection
+        :func:`_serialize_entry` persists findings with, so every
+        ``_Finding`` field is captured without a second field list — with
+        ``description`` / ``suggested_action`` capped to
+        ``_MAX_PURGED_TEXT_CHARS``; ``truncated_fields`` names the ones that
+        were cut. The WARNING carries them uncapped: :meth:`add_finding`
+        already bounded both to ``_MAX_FINDING_TEXT_CHARS``. No timestamp:
+        this module's clock is the monotonic loop clock, which is not
+        comparable across restarts, so append order is the ordering.
+
+        :meth:`delete_finding`, the other :meth:`_purge_finding` caller,
+        records nothing: that removal is explicit and caller-requested.
 
         *fold* discriminates the two folds that share this helper — the
         project-scoped null+null one (task-2425) and the entity-scoped
@@ -1829,7 +2442,7 @@ class ReconReportState:
         supplies the stage that FILED the purged finding, which on a
         cross-stage fold is not the stage that is citing.
 
-        ``cited_tasks`` is deliberately absent from the payload: at fold time
+        ``cited_tasks`` is deliberately absent from the WARNING: at fold time
         it is empty by construction (the citation is appended only after the
         fold check succeeds — see the comment in ``_purge_finding`` above and
         the append at the end of :meth:`cite_task`). The attempted
@@ -1838,26 +2451,27 @@ class ReconReportState:
 
         Lazy ``%``-style args (never an f-string), matching this module's
         other warnings, so nothing is rendered when WARNING is disabled.
-        ``description`` / ``suggested_action`` need no capping here —
-        :meth:`add_finding` already truncates both to
-        ``_MAX_FINDING_TEXT_CHARS`` before storage.
 
         KEYWORD-ONLY deliberately: four of the parameters are plain ``str``
         (``run_id``, ``surviving_finding_id``, ``attempted_project_id``,
-        ``attempted_task_id``), so a transposed pair at a call site — most
-        plausibly a future third one — would type-check, run, and emit a
-        silently WRONG recovery log on the one path that has no other record
-        to cross-check against. Keeping them named makes that class of
-        mistake unrepresentable rather than merely untested.
+        ``attempted_task_id``) and two are ``_ReportEntry``, so a transposed
+        pair at a call site — most plausibly a future third one — would
+        type-check, run, and record a silently WRONG copy of content that
+        has no other record to cross-check against. Keeping them named makes
+        that class of mistake unrepresentable rather than merely untested.
         """
+        kept = len(record_entry.purged_findings) < _MAX_PURGED_FINDINGS
         logger.warning(
             'recon_report: cite_task fold purged finding %r (%s fold) — its content is '
-            'discarded and recoverable ONLY from this line. run_id=%r stage=%r '
+            'dropped from the report. structural_copy=%s (purged_findings on the '
+            'persisted entry of recorded_on_stage=%r). run_id=%r stage=%r '
             'surviving_finding_id=%r severity=%r category=%r flag_type=%r '
             'description=%r suggested_action=%r attempted_citation=%r '
             'cited_entities=%r cited_edges=%r cited_memories=%r cited_runs=%r',
             finding.finding_id,
             fold,
+            'kept' if kept else 'dropped: purged_findings cap reached',
+            record_entry.stage,
             run_id,
             owning_entry.stage,
             surviving_finding_id,
@@ -1872,6 +2486,23 @@ class ReconReportState:
             finding.cited_memories,
             finding.cited_runs,
         )
+        if not kept:
+            record_entry.purged_findings_overflow += 1
+            return
+        snapshot = asdict(finding)
+        truncated_fields: list[str] = []
+        for name in ('description', 'suggested_action'):
+            snapshot[name], was_truncated = _truncate_field(snapshot[name], _MAX_PURGED_TEXT_CHARS)
+            if was_truncated:
+                truncated_fields.append(name)
+        record_entry.purged_findings.append({
+            'fold': fold,
+            'owning_stage': owning_entry.stage,
+            'surviving_finding_id': surviving_finding_id,
+            'attempted_citation': {'project_id': attempted_project_id, 'task_id': attempted_task_id},
+            'finding': snapshot,
+            'truncated_fields': truncated_fields,
+        })
 
     # ------------------------------------------------------------------
     # cite_* tools (task β)
@@ -2014,7 +2645,25 @@ class ReconReportState:
         task's title has since changed, a re-citation is still skipped and
         the stored citation keeps the original title rather than refreshing
         it. Titles are cosmetic display text, not part of the citation's
-        identity, so this staleness is accepted rather than reconciled.
+        identity.
+
+        THE CONSUMER NOW AGREES (task 4864). That last sentence used to end
+        "so this staleness is accepted rather than reconciled", which was only
+        half true: the consumer disagreed. ``flag_dedup._cited_fix_task_live``
+        required the cited title to EQUAL the live record's, so an ordinary
+        retitle silently disabled the cross-project fix-task suppression gate
+        for that citation, permanently. That contradiction is resolved in
+        THIS side's favour — titles are cosmetic — and the consumer was
+        changed to match: it admits on live presence plus a non-abandoned
+        status, and a stale or absent title downgrades the decision to a
+        WARNING (``cross_project_fix_task_title_uncorroborated``) instead of
+        disabling suppression. A title this method cannot resolve at all is
+        likewise cited (the existence check passed) and logged at WARNING
+        here, rather than written silently as ``title=''``. Note the STRICT
+        sibling ``flag_dedup._cited_task_corroborated``, used by the phantom
+        task-creation guard, still requires title equality — a wrong drop
+        there has no bounded expiry — so a title-less citation genuinely does
+        cost corroborating power on that path.
 
         Two in-run folds anchor on this call — BOTH are CHECKED before
         EITHER registers, so a call that folds under either one always
@@ -2084,16 +2733,18 @@ class ReconReportState:
            fold 2 only ever ADDS survivors relative to the old behaviour;
            it never rescues a finding fold 1 would have collapsed.
 
-        BOTH folds emit a WARNING carrying the losing finding's full content
-        (:meth:`_log_cite_task_fold_purge`) immediately BEFORE purging it.
-        The purge is wholesale and the returned ``duplicate_finding`` error
-        names only the SURVIVOR, so that line is the only recovery channel
-        for the discarded ``description`` / ``suggested_action`` and for any
-        cite_entity / cite_edge / cite_memory / cite_run citations already
-        attached to the folded finding. Keep the log ahead of the purge, and
-        keep it on both branches: a fold that purges silently is
-        unrecoverable, and the entity-scoped one has no stage carve-out so
-        it can fire from any stage.
+        BOTH folds record the losing finding's full content
+        (:meth:`_record_cite_task_fold_purge`) immediately BEFORE purging it:
+        a WARNING, plus a structured copy in the CITING stage's persisted
+        ``purged_findings``. The purge is wholesale and the returned
+        ``duplicate_finding`` error names only the SURVIVOR, so those two are
+        the only recovery channels for the discarded ``description`` /
+        ``suggested_action`` and for any cite_entity / cite_edge /
+        cite_memory / cite_run citations already attached to the folded
+        finding. Keep the record ahead of the purge, and keep it on both
+        branches: a fold that purges silently is unrecoverable, and the
+        entity-scoped one has no stage carve-out so it can fire from any
+        stage.
         """
         entry = self._resolve_entry(run_id)
         if entry is None:
@@ -2119,6 +2770,26 @@ class ReconReportState:
         # Guard against data=None (some get_task paths return data: null explicitly)
         data = result.get('data') if isinstance(result.get('data'), dict) else {}
         title = result.get('title') or data.get('title', '')
+        if not title:
+            # The one permanently-degraded citation this VALIDATING producer
+            # mints itself (task 4864).  The existence check above PASSED, so
+            # the citation stands — a title is cosmetic display text, not part
+            # of the citation's identity, and dropping the citation here would
+            # discard the very evidence the consumer gate needs.  But an empty
+            # title is a real loss of corroborating signal, and it used to
+            # happen in total silence: downstream,
+            # ``flag_dedup._titles_corroborate`` can never match ``''``, so
+            # every consumer that reads a title degrades to its weak path for
+            # the life of this citation (titles are never refreshed — see the
+            # first-cited-title-wins contract in the docstring above).  Say so
+            # once, here, where the project/task is still in hand.
+            logger.warning(
+                'recon_report.cite_task_title_unresolved project_id=%s task_id=%s'
+                ' — the task exists but neither the top-level record nor its'
+                ' data sub-dict carried a title; citing with title=%r, which'
+                ' downstream consumers cannot corroborate',
+                project_id, task_id, title,
+            )
         citation = {'project_id': project_id, 'task_id': task_id, 'title': title}
 
         # In-run cited-task folds (task-2425 project-scoped; task-2432
@@ -2189,7 +2860,7 @@ class ReconReportState:
                 # contained numerically-colliding cross-project task ids —
                 # which is why it is WARNING and not INFO.  Nothing is
                 # destroyed here (both findings survive), so it needs no
-                # _log_cite_task_fold_purge-style content record; but the
+                # _record_cite_task_fold_purge-style content record; but the
                 # UNGUARDABLE add_finding→derived-sig half (see
                 # ``_run_sig_index``) may have silently folded two projects'
                 # findings elsewhere in this same run, and nothing detects
@@ -2219,10 +2890,11 @@ class ReconReportState:
         # narrow. Semantics are unchanged: project fold takes priority when
         # both would hit, purge runs exactly once, either way.
         if project_existing_id is not None and project_existing_id != finding.finding_id:
-            self._log_cite_task_fold_purge(
+            self._record_cite_task_fold_purge(
                 run_id=run_id,
                 fold='project_scoped',
                 owning_entry=finding_entry,
+                record_entry=entry,
                 finding=finding,
                 surviving_finding_id=project_existing_id,
                 attempted_project_id=project_id,
@@ -2236,10 +2908,11 @@ class ReconReportState:
             and entity_existing_id != finding.finding_id
             and not entity_project_mismatch
         ):
-            self._log_cite_task_fold_purge(
+            self._record_cite_task_fold_purge(
                 run_id=run_id,
                 fold='entity_scoped',
                 owning_entry=finding_entry,
+                record_entry=entry,
                 finding=finding,
                 surviving_finding_id=entity_existing_id,
                 attempted_project_id=project_id,
@@ -2290,7 +2963,12 @@ class ReconReportState:
         # duplicate rows. Keyed on (project_id, task_id) only, NOT title —
         # first-cited title wins; a re-citation after the upstream title
         # changed is still skipped rather than refreshing the stored title
-        # (see cite_task's docstring).
+        # (see cite_task's docstring). Task 4864 reconciled the CONSUMER to
+        # that contract rather than the other way round: flag_dedup's
+        # cross-project fix-task gate no longer treats title equality as
+        # identity, so a title left stale here downgrades that gate to a
+        # WARNING instead of silently disabling it. The strict phantom guard
+        # (flag_dedup._cited_task_corroborated) still requires equality.
         already_cited = any(
             c['project_id'] == project_id and c['task_id'] == task_id
             for c in finding.cited_tasks
@@ -2429,6 +3107,99 @@ class ReconReportState:
         finding.cited_runs.append(citation)
         self._persist_run(run_id)
         return citation
+
+    async def repair_memory_citation(
+        self,
+        run_id: str,
+        target_run_id: str,
+        finding_id: str,
+        memory_id: str,
+        store: str,
+        replacement_memory_id: str | None = None,
+        reason: str = 'memory_not_found',
+        justification: str | None = None,
+    ) -> dict[str, Any]:
+        """Repair a defective citation on a finding owned by a COMPLETED run (task 3065).
+
+        This tool exists because the ``cite_*`` tools structurally cannot reach
+        such a finding: they all resolve through ``_resolve_entry(run_id)``,
+        which requires a currently ACTIVE stage, and ``_resolve_finding`` keys
+        strictly on the caller's own ``run_id``. Relaxing either would not help —
+        a closed run's report state is TTL-evicted (300s by default) and its
+        shadow-store rows are deleted at run quiescence, so there is nothing left
+        to resolve against. See ``reconciliation/citation_repair``.
+
+        ``run_id`` keeps its usual meaning (the CALLER's current run) and is
+        resolved unchanged, which also supplies the ``repaired_by`` attribution;
+        ``target_run_id`` is the run that OWNS the finding. The two are
+        deliberately separate rather than one overloaded parameter.
+
+        ``reason`` and ``justification`` pass straight through (task 5552) to
+        ``citation_repair.py::repair_memory_citation``, which owns every gate
+        they select and states the contract: this wrapper adds no branching,
+        duplicates no validation and restates no rule.
+
+        This is the ONLY recon-report tool that writes to the reconciliation
+        journal. It never touches in-process state — no ``_persist_run``, no
+        ``_Finding`` field — so every existing behaviour here is unaffected.
+
+        The caller's entry also supplies the PROJECT the repair is confined to:
+        ``reconciliation.data_dir`` is a single per-process journal holding runs
+        for every project, so ``caller_project_id=entry.project_id`` is passed
+        down and a ``target_run_id`` owned by another project is refused with
+        ``project_mismatch`` before any Mem0 read or journal write. That keeps
+        this path inside the same containment every ``cite_*`` tool already has
+        (``cite_memory`` scopes its backend read to ``finding_entry.project_id``).
+
+        Returns ``citation_repair``'s outcome, or ``run_id_unknown`` /
+        ``journal_unavailable`` / ``service_not_configured``.
+        """
+        entry = self._resolve_entry(run_id)
+        if entry is None:
+            return _ERR_RUN_UNKNOWN.copy()
+
+        if self._journal is None:
+            return _ERR_JOURNAL_UNAVAILABLE.copy()
+
+        if self._memory_service is None:
+            return _ERR_SERVICE_UNAVAILABLE.copy()
+
+        return await citation_repair.repair_memory_citation(
+            self._journal,
+            self._memory_service,
+            target_run_id=target_run_id,
+            finding_id=finding_id,
+            memory_id=memory_id,
+            store=store,
+            replacement_memory_id=replacement_memory_id,
+            reason=reason,
+            justification=justification,
+            repaired_by=f'run:{run_id}',
+            caller_project_id=entry.project_id,
+            # A run is live iff it holds at least one IN-PROGRESS stage entry —
+            # i.e. a stage that can still rewrite the whole stage_reports blob.
+            # Resident state alone is not enough: a COMPLETED entry lingers for
+            # recon_report_state_ttl_seconds (300s by default) before tick()
+            # sweeps it, so counting it would keep a genuinely finished run
+            # "live" for minutes after its journal row already reads completed.
+            # ``completed_at is None`` is tick()'s own eviction discriminator,
+            # so what may still be written has ONE definition in this class.
+            #
+            # The window this narrowing gives up — the harness calling
+            # complete() BEFORE its trailing update_run_stage_reports() — is
+            # now closed at the owner's write:
+            # fused-memory/src/fused_memory/reconciliation/journal.py::ReconciliationJournal.update_run_stage_reports
+            # carries persisted citation repairs forward, so the narrowing
+            # costs no correctness. The trade is also deliberate on its own
+            # terms: the resident-entry set refused EVERY in-agent repair
+            # of any run this process had touched in the last 300s, terminal
+            # row or not, which is the refusal this narrowing exists to lift.
+            live_run_ids=frozenset(
+                rid
+                for (rid, _stage), entry in self._state.items()
+                if entry.completed_at is None
+            ),
+        )
 
     async def write_entity_standing_decision(
         self,
@@ -2626,12 +3397,67 @@ class ReconReportState:
 # FastMCP server factory
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Tool classification (task 3878)
+# ---------------------------------------------------------------------------
+# REGISTERING A NEW @mcp.tool() BELOW MEANS CLASSIFYING IT INTO EXACTLY ONE OF
+# THREE BUCKETS. Two of them are declared here; the third is the derived
+# remainder, so most tools need no edit at all:
+#
+#   shared guidance  — every OTHER registered tool, i.e. the derived remainder
+#                      (`set(get_recon_report_tool_signatures()) -
+#                      HARNESS_CALLED_REPORT_TOOLS - STAGE_GATED_REPORT_TOOLS`).
+#                      These are rendered into the STAGE-AGNOSTIC guidance block
+#                      that reconciliation/prompts/__init__.py's
+#                      render_recon_report_tool_guidance() interpolates into ALL
+#                      THREE stage prompts. A new tool lands here by default and
+#                      is rendered automatically — that default is deliberate:
+#                      it is what makes silently omitting a tool from the
+#                      guidance structurally impossible.
+#   harness-called   — the harness calls it for the agent before the stage
+#                      begins, so a call example would be actively wrong.
+#                      start_report is the only one.
+#   stage-gated      — held by some stages but DENIED in others, so it must stay
+#                      out of the stage-agnostic block.
+#
+# Why stage-gated needs its own bucket rather than being swept into the shared
+# block: `--disallowed-tools` OMITS a denied tool rather than surfacing it and
+# rejecting the call (cli_stage_runner.py). So naming a denied tool in the
+# shared block does not produce a clean refusal — it tells Stage 1 and Stage 3
+# about an action they cannot take, and in write_entity_standing_decision's case
+# licenses a durable SQLite-ledger write from stages that are read-only with
+# respect to the ledger (repair_memory_citation is the same shape one level
+# over: denied in Stage 3 via DISALLOW_RECON_REPORT_JOURNAL_WRITES because it
+# writes the durable ReconciliationJournal, and Stage 3 is read-only by
+# contract). That is precisely the norm
+# render_escalation_boundary_note() codifies in reconciliation/prompts/__init__.py:
+# never tell a stage about an action it is not sanctioned to take, and never
+# license a durable write from a read-only stage.
+#
+# Counter-example, so the boundary is not over-applied: delete_finding is NOT
+# stage-gated. It writes only in-process ReconReportState, sits in no disallow
+# list, and cli_stage_runner.py's carve-out NOTE plus stage3.py's own
+# post-guidance NOTE sanction it in every stage — so it is a shared-guidance
+# tool and belongs in the block.
+#
+# tests/test_recon_report_guidance_drift.py fails loudly until a newly
+# registered tool is classified: TestReportToolClassificationPartitionsTheLiveToolSet
+# additionally cross-checks STAGE_GATED_REPORT_TOOLS against
+# DISALLOW_RECON_REPORT_LEDGER_WRITES + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+# (cli_stage_runner.py) — the lists that actually reach --disallowed-tools — so
+# these must move together.
+HARNESS_CALLED_REPORT_TOOLS: frozenset[str] = frozenset({'start_report'})
+STAGE_GATED_REPORT_TOOLS: frozenset[str] = frozenset(
+    {'write_entity_standing_decision', 'repair_memory_citation'}
+)
+
 RECON_REPORT_INSTRUCTIONS = """\
 This server provides the recon_report MCP namespace for the Dark Factory
 reconciliation pipeline.
 
 Tools: start_report, add_finding, set_stat, inc_stat, complete, delete_finding,
-       cite_entity, cite_edge, cite_task, cite_memory, cite_run.
+       cite_entity, cite_edge, cite_task, cite_memory, cite_run,
+       write_entity_standing_decision, repair_memory_citation.
 
 Usage pattern (per PRD §9.2):
 1. start_report — open a new report at the start of a stage run.  Idempotent:
@@ -2657,6 +3483,19 @@ Usage pattern (per PRD §9.2):
                   trigger condition) -- pass actionable=True explicitly
                   if a null-task_id/cross_project* finding must still
                   surface there.
+                  supersedes=<finding_id> marks an EARLIER finding of this
+                  run historical: use it when your finding RESOLVES or
+                  refutes that claim rather than restating it.  Dedup
+                  cannot do this for you — a resolving finding carries a
+                  different flag_type, so without supersedes the claim and
+                  its refutation both stay live and a reader acts on
+                  whichever comes first.  The target is STAMPED, not
+                  removed: it stays readable with a forward pointer and
+                  stops being actionable.  Prefer it over tool 5 below,
+                  which destroys the row; and unlike tool 5 it works on a
+                  target whose stage has already completed, which is the
+                  usual case.  An unresolvable supersedes fails the whole
+                  call — nothing is filed.
 3. set_stat / inc_stat — track numeric metrics during the run.
 4. complete — stamp the summary and close the report; idempotent.
 5. delete_finding(run_id, finding_id) — IRREVERSIBLE retraction of a
@@ -2672,6 +3511,60 @@ Citation tools (call after add_finding, before or after complete):
                   (via mem0 count) and attach it.  Copy cited_run_id verbatim
                   from a fresh tool result's run_id/metadata.run_id field —
                   never re-type or paraphrase it from memory.
+
+Ledger write (Stage 2 ONLY):
+11. write_entity_standing_decision(project_id, entity_uuid, grounds, [evidence])
+                  — record that a class of complaint about entity_uuid,
+                  identified by grounds (a closed-enum value), has been
+                  investigated and dismissed, so later stages can filter or
+                  annotate future recon flags instead of re-raising them.
+                  Stage-2 ONLY: blocked in Stage 1 and Stage 3 via
+                  DISALLOW_RECON_REPORT_LEDGER_WRITES
+                  (reconciliation/cli_stage_runner.py), because this is the
+                  first recon-report tool that writes past in-process
+                  ReconReportState — it upserts a row into the durable SQLite
+                  reconciliation ledger.  It takes NO run_id (the decision is
+                  about an entity, not scoped to a report entry) and NO
+                  authorized_by: the write is ALWAYS evidence-gated, and
+                  succeeds only if EITHER arm holds — arm 1: >=1 cited,
+                  locally-resolvable, human-authored mem0 evidence record;
+                  arm 2: >=3 investigation_outcome mem0 records for this
+                  entity with actionable=false and distinct run_ids.
+                  evidence is OPTIONAL (bracketed above, matching the
+                  generated guidance block's convention): a list of cited-ref
+                  dicts ({type, id, ...}), defaulting to none.  Omit it when
+                  relying on arm 2, which is satisfied by the mem0 record
+                  history alone and cites nothing — do NOT fabricate an
+                  evidence list to reach that path.  Supply it for arm 1: mem0
+                  refs are resolved for provenance, foreign refs
+                  (escalation/task ids) are recorded but never count toward a
+                  gate arm.  Returns {status: 'written', entity_uuid, grounds,
+                  edge_count_at_decision, expires_at, decided_at} on success,
+                  or a structured error dict: insufficient_evidence
+                  (unmet_arms + hint) when neither arm is satisfied,
+                  invalid_grounds when grounds is outside the enum, or
+                  service_not_configured when the memory service is
+                  unavailable.
+
+Cross-run repair (exceptional, evidence-gated — not part of the normal loop):
+12. repair_memory_citation(run_id, target_run_id, finding_id, memory_id, store,
+                  replacement_memory_id=None, reason='memory_not_found',
+                  justification=None) — re-point (or, with no replacement,
+                  drop) a citation that does not back its finding, on a finding
+                  owned by a PRIOR, ALREADY-COMPLETED run. The cite_* tools
+                  cannot reach such a finding at all: they require the owning
+                  run to have a live active stage, and a closed run's report
+                  state is TTL-evicted within minutes.
+                  run_id stays YOUR current run; target_run_id is the run that
+                  OWNS the finding — these are two different things, and
+                  passing the target's id as run_id will just fail with
+                  run_id_unknown.
+                  reason names the DEFECT CLASS and is CHECKED, not trusted:
+                  'memory_not_found' (the default) requires the cited memory to
+                  be CONFIRMED ABSENT, 'wrong_memory' requires it to RESOLVE
+                  and then REQUIRES a justification. Read the tool's own
+                  description for the rest — every gate and every structured
+                  error is listed there, once.
 """
 
 
@@ -2695,6 +3588,9 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         report untouched and returns {run_id, stage, already_started: True,
         project_id, finding_count, completed, warning} describing the
         retained report instead of resetting it.
+        A stage outside the server's configured stage vocabulary returns
+        {error: unknown_stage, error_type, stage, known_stages} and opens
+        nothing; retry with one of known_stages.
         """
         return state.start_report(run_id=run_id, stage=stage, project_id=project_id)
 
@@ -2708,6 +3604,7 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         actionable: bool | None = None,
         task_id: str | None = None,
         flag_type: str | None = None,
+        supersedes: str | None = None,
     ) -> dict:
         """Append a diagnostic finding.
 
@@ -2733,6 +3630,21 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         get_assembled_report for the exact trigger condition, and pass
         actionable=True explicitly if a null-task_id/cross_project*
         finding must still surface there.
+
+        supersedes (task-4653): the finding_id of an earlier finding in this
+        run that this one makes HISTORICAL — use it when your finding
+        RESOLVES or refutes an earlier claim rather than restating it.  Keyed
+        on the explicit finding_id, because the (task_id, flag_type) dedup
+        above cannot relate a claim to its resolution: the resolving finding
+        legitimately carries a different flag_type, so both otherwise survive
+        as live rows and a reader acts on whichever comes first.  The target
+        is STAMPED, not retracted — it stays readable in flagged_items with a
+        forward pointer, and is projected actionable=False so nothing acts on
+        it again.  Contrast delete_finding, which is irreversible and refuses
+        a target whose stage has completed; supersedes deliberately accepts
+        one, since retiring an earlier stage's claim is its whole purpose.
+        A supersedes that does not resolve in this run fails the WHOLE call
+        with finding_unknown — nothing is filed.
         """
         return state.add_finding(
             run_id=run_id,
@@ -2743,6 +3655,7 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
             actionable=actionable,
             task_id=task_id,
             flag_type=flag_type,
+            supersedes=supersedes,
         )
 
     @mcp.tool()
@@ -2869,6 +3782,90 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         """
         return await state.cite_run(
             run_id=run_id, finding_id=finding_id, cited_run_id=cited_run_id
+        )
+
+    @mcp.tool()
+    async def repair_memory_citation(
+        run_id: str,
+        target_run_id: str,
+        finding_id: str,
+        memory_id: str,
+        store: Literal['graphiti', 'mem0'],
+        replacement_memory_id: str | None = None,
+        reason: Literal['memory_not_found', 'wrong_memory'] = 'memory_not_found',
+        justification: str | None = None,
+    ) -> dict:
+        """Repair a defective citation on a PRIOR, already-completed run's finding (task 3065).
+
+        Use when a memory cited by an older run's finding does not back the
+        claim — because it no longer resolves (a Stage-1 consolidation
+        superseded it), or because it resolves but is the wrong memory. The
+        cite_* tools cannot reach such a finding: they require the owning run to
+        have a live active stage, and a closed run's report state is TTL-evicted
+        within minutes. This writes the reconciliation journal's durable
+        stage_reports blob instead.
+
+        run_id is YOUR current run (unchanged from every other tool here);
+        target_run_id is the run that OWNS the finding. Omit
+        replacement_memory_id to DROP the citation instead of re-pointing it.
+
+        reason names the defect CLASS, and is checked rather than trusted
+        because it is written verbatim into the durable provenance record:
+        'memory_not_found' (the default) requires the cited memory to be
+        CONFIRMED ABSENT; 'wrong_memory' requires it to RESOLVE, and requires a
+        non-blank justification saying why it does not back the finding — that
+        record is the only surviving account of removing a citation that was
+        still live. Picking the wrong class is a refusal naming the other one.
+
+        The repair is confined to YOUR OWN project: the reconciliation journal
+        is shared across every project this process reconciles, so a
+        target_run_id owned by another project is refused (project_mismatch)
+        before any lookup or write. A genuine cross-project correction goes
+        through the out-of-band repair_recon_citation operator script.
+
+        Structured errors: invalid_uuid_shape (either id is not a canonical
+        36-char UUID); replacement_is_victim (the replacement IS the cited
+        memory — that swap changes nothing; pass None to drop it);
+        invalid_reason (reason is outside the enum, which is listed under
+        'accepted'); justification_required (reason='wrong_memory' with a blank
+        justification); unsupported_store (only 'mem0' can be corroborated —
+        get_memory_by_id is a Mem0/Qdrant point read and would false-flag every
+        graphiti citation as dangling); target_run_not_found; project_mismatch
+        (the target run belongs to another project); finding_unknown;
+        citation_not_present (also the idempotent no-op on a re-run);
+        citation_not_dangling (reason='memory_not_found' but the cited memory
+        still resolves); citation_not_resolving (reason='wrong_memory' but it
+        does not resolve — the other class applies);
+        replacement_not_found; verification_error (a lookup RAISED — unknown is
+        not absent, so nothing is written); run_still_live (the target run is
+        not finished — use cite_memory/delete_finding within a live run; it
+        reports the row's own status under run_status, never under status);
+        journal_error (journal I/O raised — 'phase' says read/write/verify and
+        the hint says whether anything was written); concurrent_modification
+        (another writer rewrote the run's stage_reports between this call's read
+        and its write, so NOTHING was written and the durable blob is untouched
+        — re-run, and an already-repaired finding then answers
+        citation_not_present); repair_clobbered (the write was made but a re-read
+        does not show it, so another writer rewrote the blob AFTER it — retry
+        when the run is quiescent); malformed_citation_repairs (the finding's
+        existing citation_repairs key is not a list, so the provenance append
+        cannot be made safely — nothing was written and no memory lookup was
+        issued, and the blob needs hand-inspection); run_id_unknown;
+        journal_unavailable;
+        service_not_configured.
+
+        On success 'status' is 'repaired'; every refusal above is keyed by
+        'error' and carries no 'status', so 'status' is safe to branch on.
+        """
+        return await state.repair_memory_citation(
+            run_id=run_id,
+            target_run_id=target_run_id,
+            finding_id=finding_id,
+            memory_id=memory_id,
+            store=store,
+            replacement_memory_id=replacement_memory_id,
+            reason=reason,
+            justification=justification,
         )
 
     @mcp.tool()

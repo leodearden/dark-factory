@@ -32,5 +32,40 @@
     "runs_db_path": "/home/leo/src/dark-factory/data/orchestrator/runs.db",
     "runs_db_query": "SELECT task_id, project_id, outcome, review_cycles, verify_attempts FROM task_results WHERE review_cycles >= 1, cross-referenced with events (escalation_created, merge_finalized) -- see mining.mine_fn_candidates.",
     "escalation_refs": []
+  },
+  "context": {
+    "task": {
+      "title": "Surface legible per-project diagnostic when two_projects_do_not_serialise rendezvous times out",
+      "description": "In `test_two_projects_do_not_serialise` (test_task_interceptor.py:2558-2567), the two-Event rendezvous replaces a flaky 50-tick sleep loop with a deterministic barrier. However, if a future regression drops one project's ticket before it reaches `add_task`, the surviving project hangs until the 10s `asyncio.wait_for` fires and raises `TimeoutError` with an asyncio traceback rather than a clear 'only one project entered add_task' message.\n\nWrap each wait in `try/except asyncio.TimeoutError` and `pytest.fail(...)` with the entered-flag state, e.g.:\n\n```python\ntry:\n    await asyncio.wait_for(projB_entered.wait(), timeout=10.0)\nexcept asyncio.TimeoutError:\n    pytest.fail(\n        f\"project A entered but B never did \u2014 \"\n        f\"projA_entered={projA_entered.is_set()} projB_entered={projB_entered.is_set()}\"\n    )\n```\n\nso a regression produces a legible per-project failure message rather than an opaque timeout traceback.\n\nLocation: fused-memory/tests/test_task_interceptor.py:2558-2567",
+      "test_strategy": "",
+      "details": "",
+      "authored": false,
+      "id": "988",
+      "record_source": {
+        "path": ".taskmaster/tasks/tasks.db",
+        "tag": "master",
+        "read_at": "2026-09-11",
+        "updated_at": "2026-04-24T08:26:17.958Z",
+        "updated_after_merge": false,
+        "run_time_title_matches": true
+      }
+    },
+    "changed_files": [
+      "fused-memory/tests/test_task_interceptor.py"
+    ],
+    "base_sha": "783c4cb990cf4665efed3b2a4597be92a6c3e791",
+    "branch_sha": "f1891987f25f85add3a9dd38770e1d71063a16a4",
+    "base_sha_reason": null,
+    "plan": null,
+    "plan_reason": "no plan.json survives for this task. Absent: .worktrees/.task-meta/<id>/plan.json; data/orchestrator/agent-transcripts/<id>/; ~/.claude/projects/-home-leo-src-dark-factory--worktrees-<id>/; runs.db events with a plan payload (design_decisions/steps); runs.db plan-phase events (other than invocation/routing/phase bookkeeping) with a payload; data/orchestrator/landed_outbox.json entry. Wider hunt (escalations archive, fleet sessions, branch commit messages, branch tree, fused-memory) found nothing for this task",
+    "verification": {
+      "merge_sha": "f2a77625c44a8588f3567299e1d11429962bb40d",
+      "merge_base_sha": "783c4cb990cf4665efed3b2a4597be92a6c3e791",
+      "diff_reproduces_from": "git diff 783c4cb990 f2a77625c4",
+      "diff_reproduces": true,
+      "merge_tree_equals_merge_commit_tree": true,
+      "changed_files_match_diff_headers": true,
+      "verified_at": "2026-09-11"
+    }
   }
 }

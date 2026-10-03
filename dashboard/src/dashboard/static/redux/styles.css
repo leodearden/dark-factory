@@ -20,6 +20,7 @@
   --warn: oklch(0.80 0.14 80);
   --bad:  oklch(0.68 0.18 25);
   --info: oklch(0.62 0.20 305);
+  --stranded: oklch(0.66 0.19 330);
   --merge-deferred:        oklch(0.74 0.15 60);
   --merge-deferred-bg:     oklch(0.74 0.15 60 / 0.10);
   --merge-deferred-border: oklch(0.74 0.15 60 / 0.4);
@@ -298,6 +299,7 @@ table { border-collapse: collapse; width: 100%; }
 
 /* utility grids */
 .grid { display: grid; gap: 12px; }
+.cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -531,6 +533,12 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node.s-cancelled.in-tree          { --sel-color: var(--fg-3); }
 .taskgraph .node.s-cancelled       .status-pip { background: var(--fg-3); }
 .taskgraph .node.s-cancelled { opacity: 0.6; }
+.taskgraph .node.s-review.selected            { --sel-color: var(--info); }
+.taskgraph .node.s-review.in-tree             { --sel-color: var(--info); }
+.taskgraph .node.s-review          .status-pip { background: var(--info); }
+.taskgraph .node.s-infra-hold.selected        { --sel-color: var(--stranded); }
+.taskgraph .node.s-infra-hold.in-tree         { --sel-color: var(--stranded); }
+.taskgraph .node.s-infra-hold      .status-pip { background: var(--stranded); }
 .taskgraph .empty-tier { color: var(--fg-3); font-size: 10px; font-family: var(--mono); padding: 4px; }
 /* Component-block: one weakly-connected component's stacked tier rows, set
    off from neighboring components by a left accent bar + bottom margin. */
@@ -585,10 +593,6 @@ table { border-collapse: collapse; width: 100%; }
    width set inline (data-driven) by the JSX; color comes from the class. */
 .prd-bar { height: 4px; background: var(--bg-2); display: flex; overflow: hidden; }
 .prd-bar-seg { display: block; height: 100%; }
-.prd-bar-seg.s-done        { background: var(--ok); }
-.prd-bar-seg.s-in-progress { background: var(--accent); }
-.prd-bar-seg.s-blocked     { background: var(--bad); }
-.prd-bar-seg.s-pending     { background: var(--warn); }
 
 .prd-box-body { padding-top: 2px; } /* the nested .taskgraph supplies its own 12px padding */
 
@@ -748,6 +752,12 @@ table { border-collapse: collapse; width: 100%; }
 .sched-empty {
   padding: 32px 16px; color: var(--fg-3); font-size: 12px; text-align: center;
   font-style: italic;
+}
+
+/* Truncation disclosure above a capped heatmap — a muted caption, because it
+   qualifies the grid rather than warning about it. */
+.sched-heatmap-cap {
+  padding: 4px 2px 6px; color: var(--fg-3); font-size: 11px;
 }
 
 /* Override drawer — slides in from the right */

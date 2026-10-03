@@ -21,7 +21,14 @@ load_dotenv()
 
 from functools import partial  # noqa: E402
 
+from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
+from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
+
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
+    closure_exists_probe,
+)
+from fused_memory.server.markup_guard import install_markup_guard  # noqa: E402
 from fused_memory.server.tools import (  # noqa: E402
     _checkpoint_overrides_db_if_exists,
     create_mcp_server,
@@ -42,6 +49,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -116,6 +124,21 @@ _CHECKPOINT_INTERVAL = 300.0
 # ``_CHECKPOINT_STATUS``) so both this module (writer — periodic loop)
 # and ``tools.py`` (reader — the ``get_wal_status`` MCP tool) share
 # state without a circular import.
+
+# Event-loop lag heartbeat sampling interval (task 3778). Deliberately much
+# shorter than _thread_monitor's 60s: the signal is how late a timer actually
+# ran, so a stall is only measured when it OVERLAPS a deadline. At 5s, a 15-43s
+# wedge overlaps several deadlines and is reported at close to full magnitude;
+# at 60s it would be caught roughly half the time and under-reported.
+_LOOP_LAG_INTERVAL = 5.0
+
+# How many consecutive BELOW-threshold samples pass before one routine INFO
+# heartbeat is emitted (12 x 5s ≈ 60s, matching _thread_monitor's cadence).
+# Frequent sampling is what makes a stall observable; logging every one of
+# those samples would be ~17k INFO lines a day. Threshold CROSSINGS bypass
+# this entirely and are always reported on the sample they occur (INV-4
+# loud-over-silent) — the throttle only bounds routine chatter.
+_LOOP_LAG_INFO_EVERY = 12
 
 
 def _sd_notify(state: str) -> None:
@@ -532,6 +555,7 @@ async def run_server():
     logger.info(f'  Graphiti: {config.graphiti.provider} ({config.graphiti.falkordb.uri})')
     logger.info(f'  Mem0/Qdrant: {config.mem0.qdrant_url}')
     logger.info(f'  Transport: {config.server.transport}')
+    systemd_listeners = take_systemd_listeners()
 
     # Initialize memory service
     memory_service = MemoryService(config)
@@ -569,6 +593,30 @@ async def run_server():
     if _idempotent_pruned:
         logger.info(
             f'idempotent_ops retention prune at startup: {_idempotent_pruned} rows'
+        )
+
+    # Bounded retention: age out old write_ops so the journal does not grow
+    # without bound. UNLIKE its two siblings above this prune is BATCHED,
+    # ROW-BUDGETED and DEADLINE-BOUNDED: write_ops was measured at 35.4M rows /
+    # 16 GB, and an unbounded DELETE here would hold the write lock past the
+    # watchdog's 120 s startup grace (STARTUP_GRACE_SECS in
+    # scripts/orchestrator-watchdog.py) while silently dropping journal rows —
+    # log_write_op swallows its own errors and busy_timeout is only 5000 ms — so
+    # it would corrupt the very telemetry it is pruning. A first run against the
+    # current backlog will legitimately need many restarts to drain, which the
+    # prune discloses at WARNING rather than hiding. Fire-and-forget.
+    _wj = config.write_journal
+    _write_ops_pruned = await write_journal.prune_write_ops(
+        read_older_than_days=_wj.read_retention_days,
+        search_older_than_days=_wj.search_retention_days,
+        write_older_than_days=_wj.write_retention_days,
+        batch_size=_wj.prune_batch_size,
+        max_rows=_wj.prune_max_rows_per_run,
+        max_seconds=_wj.prune_max_seconds,
+    )
+    if _write_ops_pruned:
+        logger.info(
+            f'write_ops retention prune at startup: {_write_ops_pruned} rows'
         )
 
     # Initialize task backend (SqliteTaskBackend).
@@ -704,6 +752,7 @@ async def run_server():
     event_queue = None
     sqlite_watchdog = None
     backlog_policy = None
+    topic_cluster_store: TopicClusterStore | None = None
     # PRD γ (task 1546): pre-initialize so the reconciliation-enabled branch can
     # populate recon_report_state before the harness is constructed, threading the
     # SAME ReconReportState object into both ReconciliationHarness and the uvicorn
@@ -719,6 +768,7 @@ async def run_server():
     # PRD γ §11: fail loudly before harness construction if reconciliation is
     # enabled but the transport cannot host the recon-report MCP server.
     _require_http_transport_for_reconciliation(config)
+
     if config.reconciliation and config.reconciliation.enabled:
         from fused_memory.middleware.task_interceptor import TaskInterceptor
         from fused_memory.reconciliation.backlog_policy import BacklogPolicy
@@ -736,6 +786,12 @@ async def run_server():
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
         recon_journal.set_write_journal(write_journal)
+        # Read-only runs-table source for get_cycle_summary_presence (task
+        # 3731). Deliberately wired ABOVE the recon_ledger_enabled gate below:
+        # the journal exists whenever reconciliation does, while the ledger is
+        # feature-gated, so the presence payload reports the two availability
+        # signals separately rather than inferring one from the other.
+        memory_service.set_recon_journal(recon_journal)
 
         if config.reconciliation.recon_ledger_enabled:
             recon_ledger = await _build_recon_ledger_store(Path(config.reconciliation.data_dir))
@@ -869,6 +925,7 @@ async def run_server():
             targeted.task_interceptor = task_interceptor
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
+        _wire_closure_collaborators(task_interceptor, memory_service)
 
         # PRD γ (task 1546): Pre-build recon_report components here — before
         # ReconciliationHarness is constructed — so the SAME ReconReportState
@@ -886,6 +943,12 @@ async def run_server():
             memory_service=memory_service,
             task_interceptor=task_interceptor,
             known_projects=_known_projects_map,
+            # task 3065: repair_memory_citation needs the durable journal to
+            # reach a CLOSED run's findings — recon-report's own in-process
+            # state is TTL-evicted (300s) and GC'd at run quiescence, so it
+            # cannot serve a repair of a run that completed days ago. Safe to
+            # pass here: recon_journal was constructed and initialize()d above.
+            recon_journal=recon_journal,
         )
 
         # Task 2624: wire the code-enforced before/after live-task-write
@@ -914,6 +977,9 @@ async def run_server():
             known_projects=_known_projects_map,
             recon_report_state=recon_report_state,
             server_ready_event=recon_server_ready,
+            escalation_listener=_claim_listener(
+                systemd_listeners, config.reconciliation.escalation_port,
+            ),
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -940,6 +1006,13 @@ async def run_server():
         )
         await task_interceptor.start()
         task_interceptor.set_write_journal(write_journal)
+        _wire_closure_collaborators(task_interceptor, memory_service)
+
+    # Machine-derived topic clusters (task 3135). Built in both branches above
+    # and never gated on reconciliation.enabled or the autoseed leaf: both of
+    # its consumers (consolidate_memories and the add_memory guard) run either
+    # way, and the leaf is read live at each of them.
+    topic_cluster_store = build_topic_cluster_store(wj_data_dir)
 
     # Create MCP server with both memory and task tools
     mcp = create_mcp_server(
@@ -949,14 +1022,14 @@ async def run_server():
         event_queue=event_queue,
         curator_usage_gate=curator_usage_gate,
         known_projects=_known_projects_map,
+        topic_cluster_store=topic_cluster_store,
     )
 
-    # Defence-in-depth wrapper at FastMCP's central tool-dispatch chokepoint.
-    # Catches BaseException escapes (SystemExit, BaseExceptionGroup, etc.) that
-    # would otherwise poison StreamableHTTPSessionManager's shared task group
-    # and cascade into uvicorn's main loop. Re-raises CancelledError because
-    # it is required for asyncio cancellation semantics.
-    _install_safe_tool_wrapper(mcp)
+    # Both ToolManager.call_tool wrappers, in the ONE order that works. The
+    # ordering rationale lives on the helper, and is pinned by
+    # tests/test_markup_guard_fused_memory.py::TestInstallationOrder rather
+    # than by this comment.
+    _install_tool_dispatch_guards(mcp, known_projects=_known_projects_map)
 
     mcp.settings.host = config.server.host
     mcp.settings.port = config.server.port
@@ -973,6 +1046,15 @@ async def run_server():
             prev = _thread_monitor_iteration(prev, _warn_threshold)
 
     asyncio.create_task(_thread_monitor())
+
+    # Event-loop lag heartbeat (task 3778) — the ON-loop complement to the
+    # off-loop _watchdog_thread_loop. That thread keeps pinging systemd even
+    # when the loop is wedged, which is exactly why a 15-43s stall could run
+    # for days looking healthy. This probe measures whether the loop is still
+    # being scheduled and WARNs when it is not. Handle retained (unlike
+    # _thread_monitor above) so teardown can cancel it — see
+    # _start_loop_lag_monitor.
+    loop_lag_task: asyncio.Task[None] = _start_loop_lag_monitor(config)
 
     # Ticket janitor — periodic sweep that surfaces failed tickets to the
     # orchestrator as info-severity ticket_failure escalations. Replaces the
@@ -1080,7 +1162,7 @@ async def run_server():
             import uvicorn
 
             display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
-            logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')
+            logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')  # mcp-url-sweep: allow display string in a startup log line, never fetched
             configure_uvicorn_logging()
             starlette_app = mcp.streamable_http_app()
 
@@ -1101,6 +1183,12 @@ async def run_server():
                 keepalive_timeout=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
+            primary_socket = _claim_listener(systemd_listeners, config.server.port)
+            if systemd_listeners:
+                logger.warning(
+                    'systemd passed listening sockets for ports %s that nothing here serves',
+                    sorted(systemd_listeners),
+                )
 
             # Second uvicorn: recon_report MCP namespace on port recon_report_port.
             # Constructed BEFORE _install_operator_stop_handler so that the stop
@@ -1113,6 +1201,10 @@ async def run_server():
             # so the harness and the uvicorn server share the SAME ReconReportState
             # object. For reconciliation-disabled runs, build them now.
             if recon_report_state is None:
+                # No recon_journal here, deliberately (task 3065): this is the
+                # reconciliation-DISABLED path, where no journal was ever opened.
+                # repair_memory_citation then answers journal_unavailable, which
+                # is the honest result — there is no durable run history to repair.
                 recon_report_state, _, _pre_recon_uv_config = _build_recon_report_components(
                     config,
                     memory_service=memory_service,
@@ -1146,7 +1238,7 @@ async def run_server():
             recon_report_state.start_persistence()
             await recon_report_state.start_reaper()
             logger.info(
-                '  Recon Report Endpoint: http://%s:%d/mcp/',
+                '  Recon Report Endpoint: http://%s:%d/mcp/',  # mcp-url-sweep: allow display string in a startup log line, never fetched
                 display_host,
                 config.server.recon_report_port,
             )
@@ -1159,7 +1251,10 @@ async def run_server():
             # but does NOT cancel the sibling on first failure — the surviving
             # Task would continue serving while the finally block runs, emitting
             # "Task was destroyed but it is pending!" on loop teardown.
-            _primary_task = asyncio.create_task(server.serve(), name='fused_memory_primary')
+            _primary_task = asyncio.create_task(
+                server.serve(sockets=[primary_socket] if primary_socket else None),
+                name='fused_memory_primary',
+            )
             _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
             # Signal the harness once the recon-report server is accepting connections.
@@ -1197,6 +1292,9 @@ async def run_server():
             # so a close hiccup can't mask the original shutdown cause.
             with contextlib.suppress(BaseException):
                 recon_report_state.stop_persistence()
+        if topic_cluster_store is not None:
+            with contextlib.suppress(BaseException):
+                topic_cluster_store.close()
         # Symmetrically tear down both servers so that a failure in either
         # (e.g. recon_server port-already-bound) doesn't leave the primary
         # server serving while the rest of the app shuts down.
@@ -1221,6 +1319,9 @@ async def run_server():
             rebuild_summaries_task.cancel()
             with contextlib.suppress(BaseException):
                 await rebuild_summaries_task
+        loop_lag_task.cancel()
+        with contextlib.suppress(BaseException):
+            await loop_lag_task
         await _shutdown_with_watchdog(
             memory_service=memory_service,
             task_interceptor=task_interceptor,
@@ -1374,6 +1475,121 @@ def _thread_monitor_iteration(prev: int, threshold: int) -> int:
         # omitted from the message to avoid a misleading constant "delta=+0" token.
         logger.info('thread_monitor: threads=%d transient=true', count)
     return count
+
+
+def _loop_lag_iteration(overshoot_ms: float, threshold_ms: float) -> None:
+    """Log one event-loop-lag sample: INFO below *threshold_ms*, WARNING at/above.
+
+    *overshoot_ms* is how much LATER than requested a timer callback actually
+    ran — i.e. how long the loop thread was occupied by something that did not
+    yield. It is the on-loop counterpart to :func:`_watchdog_thread_loop`,
+    which pings systemd from a dedicated OS thread precisely so a wedged loop
+    cannot suppress the heartbeat. That off-loop design is what let task 3778's
+    defect run for days: the watchdog kept pinging, the process stayed alive,
+    and the only visible symptom was ``/health`` timing out for 15-43s while
+    the reconciliation renderer fanned ~500 synchronous ``git`` probes out on
+    the loop thread. This function is the missing half — it reports that the
+    loop itself stopped being scheduled.
+
+    The measured lag is rendered INTO the message rather than only exposed as a
+    queryable field: the failure mode was that nobody was told, so the signal
+    has to be loud at the moment it occurs (INV-4 loud-over-silent).
+
+    At/above (not merely above) the threshold warns, so a lag sitting exactly
+    on an operator's configured bar is not silently rounded into the quiet
+    branch.
+
+    Extracted from the :func:`_loop_lag_monitor` coroutine for the same reason
+    :func:`_thread_monitor_iteration` was extracted from ``_thread_monitor`` —
+    so unit tests can exercise the logging logic without mocking
+    ``asyncio.sleep``.
+    """
+    if overshoot_ms >= threshold_ms:
+        logger.warning(
+            'loop_lag: lag=%.1fms threshold=%.0fms — event loop was blocked '
+            '(on-loop heartbeat; see _watchdog_thread_loop for the off-loop one)',
+            overshoot_ms, threshold_ms,
+        )
+    else:
+        logger.info(
+            'loop_lag: lag=%.1fms threshold=%.0fms', overshoot_ms, threshold_ms,
+        )
+
+
+async def _loop_lag_monitor(threshold_ms: float, interval: float | None = None) -> None:
+    """Sample event-loop scheduling delay forever, reporting via _loop_lag_iteration.
+
+    Each pass records ``loop.time()``, sleeps *interval*, and measures how far
+    past the deadline the callback actually ran. A healthy loop overshoots by
+    microseconds-to-milliseconds; a loop occupied by blocking work overshoots
+    by however long that work took.
+
+    *interval* defaults to the module-level :data:`_LOOP_LAG_INTERVAL` at CALL
+    time (not as a bound default argument) so a test can move the constant.
+
+    Reporting policy: every at/above-threshold sample is reported immediately —
+    a crossing is never deferred or aggregated away — while below-threshold
+    samples are throttled to one INFO per :data:`_LOOP_LAG_INFO_EVERY` samples
+    so the routine heartbeat matches ``_thread_monitor``'s ~60s cadence instead
+    of logging every sample.
+
+    A raising :func:`_loop_lag_iteration` is caught and logged rather than
+    allowed to end the loop, for the same reason :func:`_watchdog_thread_loop`
+    guards its ping (task 1731): a dead heartbeat is indistinguishable from a
+    healthy one, which is exactly the failure class this probe exists to close.
+    """
+    loop = asyncio.get_running_loop()
+    quiet_samples = 0
+    while True:
+        sample_interval = _LOOP_LAG_INTERVAL if interval is None else interval
+        started = loop.time()
+        await asyncio.sleep(sample_interval)
+        overshoot_ms = max(0.0, (loop.time() - started - sample_interval) * 1000)
+        crossed = overshoot_ms >= threshold_ms
+        quiet_samples += 1
+        if crossed or quiet_samples >= _LOOP_LAG_INFO_EVERY:
+            quiet_samples = 0
+            try:
+                _loop_lag_iteration(overshoot_ms, threshold_ms)
+            except Exception:
+                logger.exception(
+                    'loop_lag: heartbeat report failed (lag=%.1fms); continuing',
+                    overshoot_ms,
+                )
+
+
+def _start_loop_lag_monitor(config) -> asyncio.Task[None]:
+    """Spawn the loop-lag heartbeat and RETURN its handle for teardown.
+
+    Returning the task is the load-bearing difference from the adjacent
+    ``_thread_monitor``, which is spawned with a bare unreferenced
+    ``asyncio.create_task``: an un-referenced task can be garbage-collected
+    mid-flight and emits a "Task was destroyed but it is pending" line on
+    shutdown. ``checkpoint_task`` is the correct in-file precedent — retain the
+    handle, then ``cancel()`` + ``await`` it in ``run_server``'s teardown.
+
+    The threshold is read from :class:`ServerConfig` (``loop_lag_warn_ms``)
+    rather than hardcoded, so an operator can tune it per box — across a
+    RESTART, exactly like the adjacent ``thread_warn_threshold``, which is
+    captured into a local the same way ``threshold_ms`` is below.
+
+    It is deliberately NOT hot-reloadable, and saying so here is the point:
+    ``server.loop_lag_warn_ms`` is absent from
+    :data:`fused_memory.config.reload.RELOADABLE_FIELDS`, so ``reload_config``
+    reports the leaf ``restart_required`` and leaves the running monitor
+    alone. It could not simply be allowlisted either — the value is captured BY
+    VALUE here and closed over by a task that runs for the process lifetime,
+    which is the "captured at construction" shape ``reload.py``'s docstring
+    names as the disqualifying condition. Promoting it to the green tier means
+    BOTH halves: pass the config object down and re-read the leaf per sample,
+    then add the allowlist entry with the live-consumer test its neighbours
+    carry.
+    """
+    threshold_ms = float(config.server.loop_lag_warn_ms)
+    return asyncio.create_task(
+        _loop_lag_monitor(threshold_ms=threshold_ms),
+        name='loop_lag_monitor',
+    )
 
 
 async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
@@ -1548,6 +1764,23 @@ async def _build_ticket_store(data_dir: Path) -> TicketStore:
     return store
 
 
+def build_topic_cluster_store(data_dir: Path) -> TopicClusterStore:
+    """Construct and open a :class:`TopicClusterStore` at ``data_dir/'topic_clusters.db'``.
+
+    Sibling to ``tickets.db`` and ``reconciliation.db``. Sync, because the
+    store is. A :class:`~fused_memory.server.topic_cluster_store.TopicClusterStoreError`
+    from a corrupt row propagates on purpose, failing startup the way an
+    invalid config cluster does.
+
+    Mirrors :func:`_build_ticket_store`.
+    """
+    from fused_memory.server.topic_cluster_store import TopicClusterStore
+
+    store = TopicClusterStore(data_dir / 'topic_clusters.db')
+    store.open()
+    return store
+
+
 async def _build_recon_ledger_store(data_dir: Path) -> ReconLedgerStore:
     """Construct and initialise a :class:`ReconLedgerStore` for the given data directory.
 
@@ -1702,6 +1935,59 @@ def _install_safe_tool_wrapper(mcp: Any) -> None:
     tool_manager._fused_memory_safe_wrapped = True
 
 
+def _install_tool_dispatch_guards(
+    mcp: Any, *, known_projects: dict[str, str] | None = None
+) -> None:
+    """Install both ``ToolManager.call_tool`` wrappers, in the ONE order that works.
+
+    Two independent concerns share this chokepoint, and the order they are
+    installed in is not cosmetic — it decides which one ends up OUTSIDE, and
+    therefore what the caller sees when both fire:
+
+    1. :func:`_install_safe_tool_wrapper` — defence-in-depth. Catches
+       BaseException escapes (SystemExit, BaseExceptionGroup, ...) that would
+       otherwise poison StreamableHTTPSessionManager's shared task group and
+       cascade into uvicorn's main loop. Re-raises CancelledError, which
+       asyncio cancellation semantics require.
+    2. :func:`~fused_memory.server.markup_guard.install_markup_guard` — the
+       write-boundary markup guard (task 4458, PRD
+       ``plans/toolcall-markup-containment-prd.md``). Rejects a call whose
+       argument absorbed MCP tool-call envelope markup and hands the caller a
+       ``repaired_call`` to resubmit verbatim.
+
+    DO NOT tidy these two calls into the other order. The guard REJECTS by
+    raising :class:`fastmcp.exceptions.ToolError` — measured as the only shape
+    that survives every output schema, since a returned dict is destroyed by
+    the output validation of any tool annotated ``-> str``. Installed second it
+    is the OUTER wrapper, so that ToolError reaches the lowlevel server intact.
+    Installed FIRST it ends up inside ``_safe_call_tool``, which catches
+    BaseException and flattens the rejection into its own
+    ``{'error': str, 'error_type': 'ToolError'}`` shape: ``repaired_call``
+    stops being a key the caller can read and survives only as text inside an
+    opaque string, so the agent cannot resubmit the repair.
+
+    Nor can that be fixed by teaching ``_safe_call_tool`` to re-raise ToolError:
+    the bundled ``Tool.run`` wraps EVERY tool-body exception into ToolError, so
+    such an exemption would gut the containment ``tests/test_tool_safe_wrapper.py``
+    pins. Order is the whole mechanism.
+
+    *known_projects* is run_server's ``project_id -> project_root`` registry,
+    which the guard's storm-escalation sink uses to place a burst in the right
+    queue.
+
+    REJECT_WITH_REPAIR is the PRD's declared tier for fused-memory (section 4,
+    C2), declared HERE at the interception point rather than inferred per tool
+    (INV-1). This is also the primary server only: the recon-report server
+    hosts no write tools and keeps the bare defence-in-depth wrapper.
+    """
+    _install_safe_tool_wrapper(mcp)
+    install_markup_guard(
+        mcp,
+        policy=RepairPolicy.REJECT_WITH_REPAIR,
+        known_projects=known_projects,
+    )
+
+
 def _build_uvicorn_config(
     app: Any,
     *,
@@ -1736,11 +2022,26 @@ def _build_uvicorn_config(
     return uvicorn.Config(app, **kwargs)
 
 
+def _claim_listener(listeners: dict[int, socket.socket], port: int) -> socket.socket | None:
+    """Remove and return the systemd-held listening socket for *port*, if any.
+
+    Under ``fused-memory.socket`` the port stays bound across restarts, so
+    clients queue instead of being refused. None means the caller binds the
+    port itself (not socket-activated, or systemd holds no socket for it).
+    """
+    sock = listeners.pop(port, None)
+    if sock is not None:
+        logger.info('  Port %d: serving on the systemd-held socket (survives restarts)', port)
+    return sock
+
+
 def _build_recon_report_components(
     config: FusedMemoryConfig,
     memory_service: Any = None,
     task_interceptor: Any = None,
     known_projects: dict[str, str] | None = None,
+    *,
+    recon_journal: Any = None,
 ) -> tuple[Any, Any, Any]:  # (ReconReportState, FastMCP, uvicorn.Config)
     """Construct the recon_report state, FastMCP server, and uvicorn.Config.
 
@@ -1750,10 +2051,26 @@ def _build_recon_report_components(
     Optional service args (task β): when provided they are injected into the
     returned ReconReportState so cite_* tools can validate citations at call time.
 
+    Production enforces the known-stage vocabulary here (task 4865), not as a
+    ``ReconReportState`` default, because many test modules construct the state
+    directly with ad-hoc stage names.
+
+    Args:
+        recon_journal: the open ReconciliationJournal (task 3065), used solely by
+            ``repair_memory_citation`` to reach the durable ``runs.stage_reports``
+            blob of an already-completed run.  Only the reconciliation-ENABLED
+            boot path has one; the disabled path passes nothing and the tool then
+            degrades to a structured ``journal_unavailable`` refusal rather than
+            half-working against a store that does not exist.
+
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
     """
-    from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+    from fused_memory.server.recon_report import (
+        KNOWN_RECON_STAGES,
+        ReconReportState,
+        create_recon_report_server,
+    )
     from fused_memory.server.recon_report_store import ReconReportStore
 
     ttl = config.reconciliation.recon_report_state_ttl_seconds
@@ -1774,6 +2091,8 @@ def _build_recon_report_components(
         memory_service=memory_service,
         task_interceptor=task_interceptor,
         store=recon_report_store,
+        journal=recon_journal,
+        known_stages=KNOWN_RECON_STAGES,
     )
     if known_projects is not None:
         state.known_projects = known_projects
@@ -2054,6 +2373,67 @@ def _acquire_singleton_lock() -> None:
             'Kill it first or use systemctl --user restart fused-memory'
         )
         raise SystemExit(1) from None
+
+
+def _wire_closure_collaborators(task_interceptor: Any, memory_service: Any) -> None:
+    """Hand the interceptor all three consolidation-gate closure collaborators.
+
+    Task 3112 wired the deterministic metadata *scroll* (and its *count*):
+    the gate is DORMANT until wired, so this call is the ONLY thing that arms
+    the close-time refusal at all. Task 4808 added *exists* as the THIRD
+    collaborator — it is what makes the ``unstamped_cluster_member`` refusal
+    reachable in production, because without a probe an observed member that
+    is live but never stamped into the topic stays invisible (and an id
+    missing from the scroll cannot be told apart from one that was absorbed
+    and deleted).
+
+    All three are ``project_id``-adapting wrappers: the ``MemoryService``
+    methods take that scope FIRST positionally, while the interceptor passes
+    it by keyword because it resolves scope per task. *exists* is NOT built
+    here — it comes from the shared
+    ``consolidation_gate.py::closure_exists_probe``, the same factory
+    ``scripts/check_consolidation_closure.py`` binds, so the CLI and the seam
+    cannot disagree about that argument adaptation (INV-5). Its docstring
+    carries the fail-closed ``TimeoutError`` contract.
+
+    ONE wiring block, called from both ``TaskInterceptor`` construction sites
+    in ``server/main.py::run_server`` (reconciliation enabled and disabled).
+    "Both construction sites wire all three collaborators" therefore holds BY
+    CONSTRUCTION rather than by assertion — which is why the source-text test
+    that used to guard it (``'exists=' in`` an ``inspect.getsource`` fragment)
+    is gone rather than replaced in kind: it could not distinguish an armed
+    probe from ``exists=None``. What guards this now is
+    ``tests/test_consolidation_closure_seam.py::TestClosureCollaboratorWiring``,
+    which awaits each captured collaborator against a recording stub.
+
+    The extraction also RETIRES the ``NameError`` hazard the previous comment
+    recorded: the collaborator definitions used to sit in ``run_server``'s own
+    scope, above the reconciliation branch, because defining them inside the
+    enabled arm left the disabled arm raising ``NameError`` at startup. They
+    now live in this helper's scope, so neither arm can reference an
+    undefined name.
+
+    RESIDUAL RISK, stated rather than papered over: a future construction arm
+    could still forget to CALL this helper. That failure is strictly smaller
+    and louder than the one the deleted test allowed — one missing call
+    leaves the whole gate visibly dormant for that config, versus a silently
+    half-armed gate that passed a green ``'exists=' in call`` check. It is
+    not worth a second meta-test.
+    """
+
+    async def _closure_scroll(filters, *, limit, project_id):
+        return await memory_service.get_memories_by_metadata(
+            project_id, filters, limit=limit
+        )
+
+    async def _closure_count(filters, *, project_id):
+        return await memory_service.count_memories_by_metadata(project_id, filters)
+
+    task_interceptor.set_consolidation_scroll(
+        _closure_scroll,
+        count=_closure_count,
+        exists=closure_exists_probe(memory_service),
+    )
 
 
 def main():

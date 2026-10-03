@@ -206,6 +206,34 @@ Recorded rather than silently guessed:
   same session. An excluded canonical never takes ownership, so its
   members fall through to the surviving one rather than being orphaned.
 
+### `write_triage_calibration.canonical_aliases.json`
+
+A **live-store** sidecar, not part of the curator-session extraction above
+and deliberately kept out of the `.jsonl` fixture's own row shape (the
+fixture's records must never change once labeled — see the schema note).
+Maps `{old_cluster_canonical_id: current_memory_id}` for a `cluster_id`
+that has since rotated out of the live `reify` store via a later
+re-consolidation the curation session predates. Two consumers read it:
+
+- `calibrate_write_triage.py --canonical-aliases` (`compute_recall_at_k`'s
+  `aliases` kwarg), so a rotated cluster's recall is measured against its
+  live successor instead of being silently excluded as a corpus gap forever;
+- `eval_write_triage_judge.py --canonical-aliases`, where an attach to the
+  successor counts as an attach to the cluster's canonical.
+
+As of 2026-09-23, three of this fixture's 20 clusters have rotated:
+
+| old `cluster_id` | current successor | evidence |
+|---|---|---|
+| `0e954870-bba1-44a7-81e9-5be94d5f6255` | `9b01e961-e086-428a-ad7e-68323b22f21a` | live `topic='docs-prd-landing'` closure record names `0e954870` explicitly as retired in favour of `9b01e961` (a same-cluster curator race, ~100min apart) |
+| `168c3a6b-55dd-4f53-88e4-3a829ea210fc` | `bbc063a7-ea8f-4262-b9dd-eef3002a99a8` | live successor's `metadata.supersedes` names `168c3a6b` directly |
+| `417d86d0-36fe-42c8-851a-9ed0a18c64bb` | `11ed0e22-b3ae-4635-909b-fa1eb4ae2f13` | live successor's `metadata.supersedes` names `417d86d0` directly; matches the pointer recorded in `plans/memory-subsystem-eval-design.md` §4 (the *Live-store probe facts* paragraph) |
+
+This file is a **point-in-time observation of the live store**, not derived
+data: as the `reify` corpus keeps consolidating, a successor id recorded
+here can itself rotate again. Re-verify each entry (`get_memory_by_id`)
+before trusting it in a future run rather than assuming it is still live.
+
 ---
 
 ## `memory_eval_topic_registry.json`
@@ -214,7 +242,9 @@ The probed-topic registry for the **E1 retrieval-health** eval
 (`docs/prds/memory-eval-program.md` §5 leaf β, task 3208). Read by
 `fused-memory/scripts/memory_eval_retrieval_probe.py` via
 `load_topic_registry()`; its shape is contract-tested in
-`fused-memory/tests/test_memory_eval_retrieval_probe.py`.
+`fused-memory/tests/test_memory_eval_retrieval_probe.py`, and its
+`briefing_query` topics are pinned to their source in
+`fused-memory/tests/test_memory_eval_briefing_topics.py`.
 
 ### Purpose
 
@@ -243,6 +273,8 @@ below. Per entry:
 | `claim_queries[]` | `{query, needles}`. A claim is recalled when **all** needles appear in some returned entry — deliberately weaker than canonical identity, so a consolidation that moved a claim into a different entry does not read as knowledge loss. |
 | `members[]` | Content hashes of entries the curator adjudicated as the same claim. |
 | `supersedes_pairs[]` | `{superseded_hash, successor_hash}`, recorded **offline**. |
+| `search_scope` | Optional `{stores, categories}` the probe forwards to `search`, for a topic whose real caller scopes its own search. Absent means unscoped (the router picks). Parsed strictly: an empty or misspelt scope is a load failure, not a silent widening. |
+| `briefing_scopes[]` | `briefing_query` topics only: the pinned `BriefingScope` inputs (`task_id`, `title`, `files`) the tuned phrasings are rendered from. Read only by `test_memory_eval_briefing_topics.py`; the probe carries it in `RegistryEntry.extra`. |
 
 Unknown keys on an entry load untouched (the loader is required-strict /
 additive-tolerant), so 3201's widened derivation is an improvement rather
@@ -268,7 +300,7 @@ relation is therefore recorded at derivation time from committed sources, and
 the runtime metric reduces to "is `index(superseded) < index(successor)` in
 this one result list" — no pointer-shape knowledge at runtime at all.
 
-### Provenance (32 topics)
+### Provenance
 
 - **20 `curator_gate`** — one per adjudicated cluster in
   `write_triage_calibration.jsonl` (17 `esc-55xx`/`56xx` gates). The
@@ -281,15 +313,23 @@ this one result list" — no pointer-shape knowledge at runtime at all.
   `fused_memory/config/schema.py:_default_topic_guard_clusters()`.
 - **4 `census_topic`** — multi-entry topics from
   `plans/memory-metadata-census-report.json`.
-- **1 `briefing_query`** — `g7-design-invariants`, carrying the four
-  briefing-assembler queries (`briefing.py:978-1013`) as its phrasings. This
-  is the highest-leverage query surface in the system: those four run against
-  every dispatched task's context window.
+- **3 `briefing_query`** — one per query spec in
+  `shared/src/shared/briefing_queries.py::QUERY_SPECS`, keyed by the spec's
+  own `slug` (PRD `docs/prds/memory-briefing-and-fusion.md` D9). This is the
+  highest-leverage query surface in the system: these queries run against
+  every dispatched task's context window. The tuned phrasings are the
+  queries `queries_for()` fires for the pinned `briefing_scopes`, and the
+  conventions topics carry the conventions channel's `search_scope`; both are
+  **pinned by `test_memory_eval_briefing_topics.py`, not hand-maintained**,
+  so a reworded template fails that test rather than silently leaving the
+  probe measuring a query nobody issues. These topics key a query the
+  briefing fires, not a `metadata.topic` value, so the metadata census does
+  not gauge them.
 - **3 `hand`** — single-entry dark_factory topics.
 
 ### What the registry does **not** cover (`_disclosures`)
 
-32 topics is a *selection*. `scripts/memory_eval_retrieval_probe.py
+The committed topics are a *selection*. `scripts/memory_eval_retrieval_probe.py
 --derive-registry` emits 74 candidates from the committed offline sources,
 and the census tail it never offered at all is larger still. Every one of
 those narrowings is recorded in the top-level `_disclosures` block and
@@ -313,11 +353,14 @@ A `_disclosures` value that is not an integer is a **named load failure**,
 not a silently dropped key — dropping it would erase the record that a
 narrowing happened, which is exactly the state the block exists to prevent.
 
-The `topic_guard_cluster`, `census_topic`, `hand` and `briefing_query`
-canonicals were resolved by a **read-only Qdrant payload scroll** on
-2026-07-30 (no embedder, no writes), because unlike the curator clusters their
-content is not committed anywhere in this repo. Their hashes are therefore
-re-derivable only against a live store; the curator-gate 20 are not.
+The `topic_guard_cluster`, `census_topic` and `hand` canonicals were resolved
+by a **read-only Qdrant payload scroll** on 2026-07-30 (no embedder, no
+writes), because unlike the curator clusters their content is not committed
+anywhere in this repo. The `briefing_query` canonicals were hand-adjudicated
+on 2026-09-30 by read-only searches under each topic's own `search_scope`,
+chosen as the entry that SHOULD answer the query rather than whatever ranked
+first. Both sets of hashes are therefore re-derivable only against a live
+store; the curator-gate 20 are not.
 
 ### Exclusions
 
@@ -635,3 +678,186 @@ is that no distractor may accidentally be a right answer:
 
 Verified on the committed file: 300/300 ids unique, zero α id or content
 overlap, zero reserved vocabulary keys present.
+
+---
+
+## `e2_regrowth_injection.jsonl`
+
+The fixture the E2 **+1-re-emission regrowth probe** (task 4012,
+`scripts/bake_off_storage_shape.py`) injects. It is consumed **only** by
+that probe — no other fixture, script, or test reads it, and the five
+fixtures above are unaffected by its existence.
+
+### Purpose
+
+esc-3200-3 ratified Option C's *write* shape and delegated the *read*
+transform to task 4004, which selected the promoting topic pin. Neither
+decision answered the question the 3111 implementer is owed: what does
+**one** organic re-emission of an already-canonical claim cost
+retrieval under that ratified shape, and does the selected transform
+absorb it? The probe answers it by materialising the `c_peers` arm
+twice more — once per injection mode — with exactly one extra
+near-duplicate record per topic, and reporting the per-metric delta
+against the un-injected arm's own rankings.
+
+The **+1** is the experiment. One re-emission per topic, never two: the
+quantity is the independent variable, so a second injection on any topic
+is a fixture defect and cross-validation rejects it.
+
+### Record schema
+
+20 rows — **exactly one per topic** in `e2_arm_claims.jsonl`:
+
+| field | meaning |
+|---|---|
+| `injection_id` | `<topic>-regrowth-01`; unique across the file |
+| `topic` | the topic slug, **verbatim** from the claims fixture (which took it verbatim from the E1 registry — one namespace, no slug invented here) |
+| `cluster_id` | that topic's α cluster; must agree with the claims fixture |
+| `reemits_claim_id` | the claim this row re-emits — pinned by cross-validation to be that cluster's `canonical: true` claim |
+| `text` | a fresh near-duplicate body restating the canonical claim |
+
+### Join keys
+
+`topic` joins to `e2_arm_claims.jsonl` (and through it to
+`memory_eval_topic_registry.json`); `cluster_id` joins to the α
+`write_triage_calibration.jsonl` cluster; `reemits_claim_id` joins to a
+`claim_id` in the claims fixture. `cross_validate_regrowth_injections`
+checks all three on every probe run, before any collection is created.
+
+`reemits_claim_id` is named in the fixture rather than derived because
+the materialised record carries `claim_ids = [reemits_claim_id]`: a
+near-duplicate that restates the canonical's claim genuinely *does*
+realize it, and crediting it is both the truthful modelling and the
+conservative one (scoring it as realizing nothing would make claim
+recall able only to fall under injection, rigging the probe toward the
+conclusion it exists to test). Naming the re-emitted claim in the
+fixture keeps that choice auditable here rather than buried in the
+materializer.
+
+### Authoring rules
+
+Each `text` **restates** its canonical claim in different words — the
+organic re-emission pattern esc-3200-3 documents, where four
+near-verbatim re-emissions of a trigger signature arrived for a claim
+the canonical already documented in full. It is neither a copy of the
+canonical's sentence nor a reuse of any existing `e2_arm_claims.jsonl`
+body, and its length sits in the same band as the peer claims it
+competes with, so the probe measures **displacement** rather than a
+token-count artifact.
+
+Measured on the committed file, following the sibling convention of
+reporting ratios rather than asserting a bound on them: injected-vs-
+canonical `difflib.SequenceMatcher` ratio **median 0.371, min 0.040,
+max 0.779**; body length **227–382 chars** (median 294) against the
+claims fixture's 139–473. Zero injected bodies are byte-identical to any
+claim body. No test asserts any similarity threshold — a bound here
+would be a guess dressed as a finding (gate G6).
+
+### Blind authoring — **not** claimed
+
+Unlike the three fixtures above, this one carries **no** blind-authoring
+protection and must not be read as if it did. The E2 protocol mechanized
+blindness by commit ordering — arms and queries committed while
+`scripts/bake_off_storage_shape.py` was still a docstring-only stub — and
+that is **unrecoverable** for this probe, because the whole metric
+apparatus was already in the tree when these rows were written. The
+fixture was committed on its own, ahead of any probe code, as a partial
+audit trail and nothing more. The rendered report says so in its own
+voice; see `REGROWTH_BLIND_AUTHORING_DISCLOSURE`.
+
+### Exclusions
+
+A row carries **no** `canonical`, `parent_id`, `contested` or `kind`
+key, and the materializer never writes one: a second `canonical: true`
+on a topic would make `build_canonical_by_topic` raise, and `contested`
+has no writer in the live system, so an injection must not inherit
+contested-ness from the claim it re-emits. The `topic` key is written
+into record metadata only under the `stamped` mode — the `unstamped`
+mode, which models reality today, carries no `topic` key at all.
+
+---
+
+## `curator_transcripts/`
+
+Five **redacted structural copies** of real TaskCurator CLI transcripts:
+the Exhibit A for each branch of the curator's timeout classification, and
+for the rule that only a verdict the CLI ACCEPTED is ever salvaged (task
+3995). Consumed by `fused-memory/tests/test_task_curator_timeout_evidence.py`,
+which materializes each file at
+`<curator config dir>/projects/<slug>/<session_id>.jsonl` and drives
+`TaskCurator.curate` against it, and which also feeds the records straight
+to `shared.cli_invoke.transcript_evidence`.
+
+The source files live in the operator's home under random neutral-cwd slugs
+and are subject to CLI retention, so a test reading them would skip on every
+other machine. These copies make the classification reproducible in CI.
+
+### Provenance
+
+The first three sources were read on 2026-09-27. Turn counts and tool
+sequences were re-measured at extraction and match the counts cited in the
+task.
+
+| fixture | source (`~/.claude/projects/…`) | session id | assistant records | tool_use sequence | evidences |
+|---|---|---|---|---|---|
+| `esc_curator_33_salvageable.jsonl` | `-tmp-fm-neutral-classifier-cwd-wgm-f3h8/` | `d9b60a7a-a675-40cb-964d-eb5a2e20ff1e` | 2 | `StructuredOutput` | esc-curator-33: the verdict was COMPLETED in the transcript but never reached stdout |
+| `esc_curator_2_tool_wandering.jsonl` | `-tmp-fm-neutral-classifier-cwd-ds70bqzs/` | `91c4bcfd-d262-4f77-8df8-09a60321cc4c` | 6 | `ToolSearch` → `TaskGet` → `ToolSearch` | esc-curator-2: a "pure classifier" loading and running deferred tools, no verdict |
+| `esc_curator_4_pre_turn_stall.jsonl` | `-tmp-fm-neutral-classifier-cwd-3zgf473k/` | `42efe70b-26b4-426b-8adc-682b8544175e` | 0 | none | esc-curator-4: the only genuine pre-turn stall of the three |
+
+The other two are **rejected-only** transcripts: the model called
+`StructuredOutput` with a dict input, the CLI answered with an `is_error`
+tool_result, and no `structured_output` attachment (the CLI's acceptance
+record) was ever written. Each is one of the 24 rejected-only curator
+transcripts measured on 2026-09-28, when both sources were read and their
+turn counts re-measured. Salvaging either would turn a rejected attempt into
+a verdict.
+
+| fixture | source (`~/.claude/projects/…`) | session id | CLI | assistant records | tool_use sequence | rejection |
+|---|---|---|---|---|---|---|
+| `schema_tool_denied_rejected_only.jsonl` | `-tmp-fm-neutral-classifier-cwd-5daj6zhy/` | `33f5159c-b127-43a1-87cf-a71013b1471d` | 2.1.222 | 2 | `StructuredOutput` (denied) | permission denial, "The user doesn't want to proceed with this tool use...": the shape of a `--tools ''` regression that denies the schema tool |
+| `schema_rejected_only.jsonl` | `-tmp-fm-neutral-classifier-cwd-6nd89svh/` | `50df7bda-6c99-48ee-8cfa-72c524161007` | 2.1.283 | 2 | `StructuredOutput` (rejected) | schema mismatch, "Output does not match required schema: /rewritten_task: must be object,null" |
+
+### What is preserved, and what is redacted
+
+Preserved exactly, because classification depends on it:
+- every record's `type`, in the original ORDER, including the interleaved
+  `queue-operation` / `attachment` / `last-prompt` / `user` records a parser
+  must skip;
+- the `record['message']['content']` nesting, plus `message.role`,
+  `message.model` and `message.stop_reason` on assistant records;
+- every `tool_use` block's `name`, and the KEY SET of each `input`;
+- `timestamp`, which carries the latency evidence (for example, the
+  salvageable run's first assistant record arrived ~102s after its prompt);
+- the `tool_reference` lists a `ToolSearch` returned, which show which
+  deferred tools the model loaded.
+
+Redacted to the placeholder `"redacted"`: all prose (prompts, `thinking`
+text and signatures, justification strings, `ToolSearch` queries, `TaskGet`
+ids, and string tool results). `tool_use` ids are renumbered
+`toolu_fixture_NN`, consistently across a file, so each `tool_use` still
+pairs with its `tool_result`. Every other record key (`cwd`, `uuid`,
+`sessionId`, `version`, attachment bodies, …) is dropped.
+
+The two rejected-only fixtures additionally keep each tool_result's
+`is_error` flag and its text verbatim, plus the trailing
+`[Request interrupted by user for tool use]` marker: these are CLI output,
+not prose, and the error text is the evidence of why the call was rejected.
+`action` and `priority` are enum values and are kept; `schema_rejected_only`'s
+real `target_id` is replaced by the synthetic `"9001"`, and its other string
+inputs (including the malformed string `rewritten_task` the schema rejected)
+become `"redacted"`, so the value types the rejection depends on survive.
+
+**One value is deliberately changed.** The real esc-curator-33 verdict was
+`action: "create"` with a null `target_id`. The fixture's `StructuredOutput`
+input (and the matching `structured_output` attachment's `data`) is
+`action: "drop"`, `target_id: "9001"`. The curator's failure path degrades
+to `create`, so a `create` verdict could not show whether it was salvaged or
+defaulted, while a salvaged `drop` can only come from the transcript. A test
+using it must put a pool entry with id `9001` in the pool.
+
+### Regenerating
+
+These are hand-checkable plain JSONL (< 4 KB each). Edit them directly. A
+change to a record type, its order, a tool name or the `StructuredOutput`
+key set changes what the fixture is evidence of: re-measure it against the
+source, and update the table above in the same commit.

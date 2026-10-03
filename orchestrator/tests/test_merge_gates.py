@@ -11,17 +11,6 @@ mirroring task α's test_merge_types.py:
    logger name (not ``orchestrator.merge_gates``) so existing ``caplog``
    assertions filtered to the merge_queue logger keep capturing the moved
    gates' fail-open/fail-closed warnings.
-3. Reach-back / string-path monkeypatch routing — the existing test suite
-   monkeypatches merge-gate dependencies by STRING PATH
-   ``orchestrator.merge_queue.<name>``.  A moved function must resolve a
-   monkeypatched-or-staying sibling via a function-local deferred import so
-   those patches stay effective even though the function body now lives in
-   this module.  Each test below patches BOTH namespaces with CONTRASTING
-   return values — the merge_gates-local (naive) patch would steer the
-   outcome one way, the merge_queue (reach-back target) patch the other —
-   so the assertion is unambiguous about which one governed.
-4. Shim re-export identity (added in a later step, once merge_queue.py's
-   shim swap lands).
 """
 
 from __future__ import annotations
@@ -97,107 +86,47 @@ def test_merge_gates_logger_name_is_merge_queue() -> None:
 
 
 @pytest.mark.asyncio
-class TestReachBackRouting:
-    """Reach-back / string-path monkeypatch routing contract.
+class TestFinalizeRecordsQueueVerifiedTip:
+    """Which landings ``_finalize_advanced_merge`` records as queue-verified."""
 
-    Each test patches the SAME logical dependency in both namespaces with
-    CONTRASTING values: the merge_gates-local (naive bare-global) patch
-    steers the outcome one way, the merge_queue (reach-back target) patch
-    the other.  Asserting on the merge_queue-steered outcome proves the
-    call went through the deferred import rather than the co-located
-    merge_gates sibling.
-    """
+    async def test_finalize_advanced_merge_records_queue_verified_tip(self) -> None:
+        """A clean landing records the advanced SHA as a queue-verified main tip.
 
-    async def test_reverify_rebased_tree_reachback_to_rebase_delta_overlap(self) -> None:
-        """(a) _reverify_rebased_tree must resolve _rebase_delta_touched_overlap
-        via orchestrator.merge_queue, not the co-located merge_gates copy."""
-        from orchestrator.merge_gates import _reverify_rebased_tree
-
-        git_ops = MagicMock()
-        req = MagicMock()
-        req.task_id = 'task-rvrt-reachback'
-        req.worktree = MagicMock()
-        merge_wt = MagicMock()
-        sentinel_outcome = MagicMock(name='sentinel-verify-outcome')
-
-        with (
-            # Naive-resolution target: disjoint (empty) → would return None
-            # WITHOUT ever calling _run_post_merge_verify.
-            patch(
-                'orchestrator.merge_gates._rebase_delta_touched_overlap',
-                AsyncMock(return_value=[]),
-            ),
-            # Reach-back target: overlapping → must delegate to
-            # _run_post_merge_verify (itself already reach-back, per step-2).
-            patch(
-                'orchestrator.merge_queue._rebase_delta_touched_overlap',
-                AsyncMock(return_value=['overlap.py']),
-            ),
-            patch(
-                'orchestrator.merge_queue._run_post_merge_verify',
-                AsyncMock(return_value=sentinel_outcome),
-            ),
-        ):
-            result = await _reverify_rebased_tree(
-                git_ops, req, merge_wt,
-                rebased_from='from-sha',
-                rebased_onto='onto-sha',
-                timeouts={},
-                enospc_retries={},
-                max_timeouts=3,
-                max_enospc=1,
-            )
-
-        assert result is sentinel_outcome, (
-            f'expected the orchestrator.merge_queue-patched overlap to govern '
-            f'the re-verify decision and return its sentinel outcome, got {result!r}'
+        This is the PRODUCER for premise P2 of ``_disjoint_skip_blockers``: a
+        later request rebased onto this tip may trust footprint-disjointness
+        precisely because a green gate run was observed on it here.  A tip that
+        never reaches this return — a nightly job's commit, a direct human
+        commit, a push — is never recorded and is therefore never trusted.
+        """
+        from orchestrator.merge_gates import (
+            _finalize_advanced_merge,
+            main_tip_is_queue_verified,
         )
-
-    async def test_finalize_advanced_merge_reachback_to_equivalence_and_pyright(self) -> None:
-        """(b) _finalize_advanced_merge must resolve _check_post_merge_equivalence
-        and _check_post_merge_pyright via orchestrator.merge_queue, not the
-        co-located merge_gates copies."""
-        from orchestrator.merge_gates import _finalize_advanced_merge
 
         git_ops = MagicMock()
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
-        # NOTE (task 1997): the post-rebase SHA is threaded via the explicit
-        # advanced_sha= kwarg below, NOT the git_ops._last_advanced_sha side
-        # channel — deliberately left unset here.
         req = MagicMock()
-        req.task_id = 'task-finalize-reachback'
-        req.branch = 'br-finalize-reachback'
+        req.task_id = 'task-finalize-records-tip'
+        req.branch = 'br-finalize-records-tip'
         req.worktree = MagicMock()
         req.config = MagicMock()
         req.module_configs = []
-        cas_retries = {req.task_id: 1}
-        timeouts = {req.task_id: 1}
-        enospc_retries = {req.task_id: 1}
 
-        naive_broken_pyright = MagicMock(broken=True, failing_subprojects=['naive-pkg'], detail='naive-detail')
-        reachback_clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
+        landed = 'deadbeefcafe0001'
+        assert not main_tip_is_queue_verified(landed), (
+            'precondition: the tip must not already be registered'
+        )
 
+        clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
-            # Naive-resolution targets: equivalence diverged + pyright broken →
-            # would return 'blocked' before ever reaching push_main.
             patch(
-                'orchestrator.merge_gates._check_post_merge_equivalence',
-                AsyncMock(return_value=['naive-diverged.py']),
-            ),
-            patch(
-                'orchestrator.merge_gates._check_post_merge_pyright',
-                AsyncMock(return_value=naive_broken_pyright),
-            ),
-            # Reach-back targets: equivalence clean + pyright clean → must
-            # reach the 'done' path and call push_main.
-            patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                AsyncMock(return_value=reachback_clean_pyright),
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
+                AsyncMock(return_value=clean_pyright),
             ),
         ):
             outcome = await _finalize_advanced_merge(
@@ -205,92 +134,71 @@ class TestReachBackRouting:
                 merge_commit_fallback='fallback-sha',
                 base_sha='base-sha',
                 started_monotonic=0.0,
-                cas_retries=cas_retries,
-                timeouts=timeouts,
-                enospc_retries=enospc_retries,
+                cas_retries={},
+                timeouts={},
+                enospc_retries={},
                 merged_branch_tip='trusted-tip',
-                advanced_sha='abc123def',
+                advanced_sha=landed,
             )
 
-        assert outcome.status == 'done', (
-            f'expected the orchestrator.merge_queue-patched equivalence/pyright '
-            f'results to govern the outcome (done), got {outcome.status}: {outcome.reason!r}'
+        assert outcome.status == 'done', f'expected done, got {outcome!r}'
+        assert main_tip_is_queue_verified(landed), (
+            'a clean landing must record its advanced SHA as queue-verified, '
+            'otherwise every subsequent rebase-under-drift re-verifies forever'
         )
-        git_ops.push_main.assert_awaited_once()
 
-    async def test_check_post_merge_pyright_reachback_to_run_unscoped_typechecks(self) -> None:
-        """(c) _check_post_merge_pyright must resolve _run_unscoped_typechecks
-        via orchestrator.merge_queue (it has no merge_gates-local copy at all —
-        this reach-back was added directly in step-2, not deferred)."""
-        from orchestrator.config import ModuleConfig, OrchestratorConfig
-        from orchestrator.merge_gates import PostMergePyrightResult, _check_post_merge_pyright
+    async def test_finalize_advanced_merge_blocked_does_not_record_tip(self) -> None:
+        """A landing BLOCKED by a post-advance gate records nothing.
+
+        Main has already advanced at that point, but the gate chain says the
+        landed content is not what was verified — so the tip carries no green
+        verdict and must not license a later disjointness skip.
+        """
+        from orchestrator.merge_gates import (
+            _finalize_advanced_merge,
+            main_tip_is_queue_verified,
+        )
 
         git_ops = MagicMock()
-        git_ops._create_merge_worktree = AsyncMock(return_value=('fake-merge-wt', None))
+        git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
-        module_configs = [ModuleConfig(prefix='pkg', type_check_command='pyright src/')]
-        patched_result = PostMergePyrightResult(
-            failing_subprojects=['pkg'], detail='patched-detail',
-        )
+        req = MagicMock()
+        req.task_id = 'task-finalize-blocked-tip'
+        req.branch = 'br-finalize-blocked-tip'
+        req.worktree = MagicMock()
+        req.config = MagicMock()
+        req.module_configs = []
 
-        with patch(
-            'orchestrator.merge_queue._run_unscoped_typechecks',
-            AsyncMock(return_value=patched_result),
+        landed = 'deadbeefcafe0002'
+        broken_pyright = MagicMock(
+            broken=True, failing_subprojects=['pkg'], detail='boom',
+        )
+        with (
+            patch(
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
+                AsyncMock(return_value=broken_pyright),
+            ),
         ):
-            result = await _check_post_merge_pyright(
-                'deadbeef', git_ops, OrchestratorConfig(), module_configs,
-                task_id='task-pyright-reachback',
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries={},
+                timeouts={},
+                enospc_retries={},
+                merged_branch_tip='trusted-tip',
+                advanced_sha=landed,
             )
 
-        assert result is patched_result, (
-            f'expected the orchestrator.merge_queue-patched _run_unscoped_typechecks '
-            f'result to be returned unchanged, got {result!r}'
-        )
-        git_ops.cleanup_merge_worktree.assert_awaited_once()
-
-
-def test_merge_queue_reexports_identical_objects() -> None:
-    """merge_queue re-exports the SAME objects from merge_gates (shim identity).
-
-    Covers every one of the 20 moved names.
-
-    RED (pre-shim): merge_queue.py still defines its own independent copies
-    of these names (the duplicate definitions left in place by the EXPAND
-    step), so ``getattr(merge_queue, name) is getattr(merge_gates, name)``
-    fails for every name — two distinct objects that merely share a name.
-    """
-    import orchestrator.merge_gates as merge_gates
-    import orchestrator.merge_queue as merge_queue
-
-    moved_names = [
-        'DROPPED_PLAN_TARGETS_REASON_PREFIX',
-        'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX',
-        'POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX',
-        'POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX',
-        'DropGuardResult',
-        'PlanFilesTouchedResult',
-        'PostMergePyrightResult',
-        '_GenerationChainContext',
-        '_OVERLAP_GIT_ERROR_SENTINEL',
-        '_check_plan_targets_in_tree',
-        '_normalize_plan_path',
-        '_check_plan_files_touched_in_branch',
-        '_check_post_merge_equivalence',
-        '_rebase_delta_touched_overlap',
-        '_reverify_rebased_tree',
-        '_check_post_merge_pyright',
-        '_resolve_second_parent',
-        '_commit_is_linear',
-        '_finalize_advanced_merge',
-        '_map_advance_failure',
-    ]
-
-    for name in moved_names:
-        mq_obj = getattr(merge_queue, name)
-        mg_obj = getattr(merge_gates, name)
-        assert mq_obj is mg_obj, (
-            f'{name}: orchestrator.merge_queue.{name} and '
-            f'orchestrator.merge_gates.{name} must be the identical object'
+        assert outcome.status != 'done', f'expected a blocked outcome, got {outcome!r}'
+        assert not main_tip_is_queue_verified(landed), (
+            'a tip whose post-advance gates failed must NOT be recorded as '
+            'queue-verified'
         )
 
 
@@ -379,10 +287,7 @@ def test_gate_and_context_construct() -> None:
 
 def test_post_advance_gates_registry_shape() -> None:
     """POST_ADVANCE_GATES is [equivalence, pyright], in order; only the
-    equivalence gate carries the γ2 auto-chain on_blocked hook; the shim
-    re-exports the identical list object (not a copy)."""
-    import orchestrator.merge_gates as merge_gates
-    import orchestrator.merge_queue as merge_queue
+    equivalence gate carries the γ2 auto-chain on_blocked hook."""
     from orchestrator.merge_gates import POST_ADVANCE_GATES, Gate
 
     assert isinstance(POST_ADVANCE_GATES, list)
@@ -396,17 +301,10 @@ def test_post_advance_gates_registry_shape() -> None:
     assert callable(equivalence_gate.on_blocked)
     assert pyright_gate.on_blocked is None
 
-    assert merge_queue.POST_ADVANCE_GATES is merge_gates.POST_ADVANCE_GATES
-
 
 @pytest.mark.asyncio
-class TestGateFunctionsReachBack:
-    """_run_equivalence_gate / _run_pyright_gate unit + reach-back contract.
-
-    Mirrors ``TestReachBackRouting`` above: each block-path test patches the
-    SAME dependency in both namespaces with CONTRASTING values so the
-    assertion is unambiguous about which one governed the verdict.
-    """
+class TestGateFunctions:
+    """_run_equivalence_gate / _run_pyright_gate unit contract."""
 
     def _make_ctx(self, **overrides: object):
         from orchestrator.merge_gates import _PostAdvanceContext
@@ -439,31 +337,23 @@ class TestGateFunctionsReachBack:
 
         ctx = self._make_ctx()
         with patch(
-            'orchestrator.merge_queue._check_post_merge_equivalence',
+            'orchestrator.merge_lane.gates._check_post_merge_equivalence',
             AsyncMock(return_value=[]),
         ):
             verdict = await _run_equivalence_gate(ctx)
 
         assert verdict.passed is True
 
-    async def test_run_equivalence_gate_reachback_governs_block(self) -> None:
+    async def test_run_equivalence_gate_blocks_when_diverged(self) -> None:
         from orchestrator.merge_gates import (
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
             _run_equivalence_gate,
         )
 
         ctx = self._make_ctx()
-        with (
-            # Naive-resolution target: clean → would pass if this governed.
-            patch(
-                'orchestrator.merge_gates._check_post_merge_equivalence',
-                AsyncMock(return_value=[]),
-            ),
-            # Reach-back target: diverged → must govern the verdict.
-            patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
-                AsyncMock(return_value=['x.py']),
-            ),
+        with patch(
+            'orchestrator.merge_lane.gates._check_post_merge_equivalence',
+            AsyncMock(return_value=['x.py']),
         ):
             verdict = await _run_equivalence_gate(ctx)
 
@@ -473,39 +363,86 @@ class TestGateFunctionsReachBack:
         assert verdict.reason is not None
         assert verdict.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
 
+    async def test_equivalence_block_reason_invites_the_correct_triage(
+        self,
+    ) -> None:
+        """A confirmed drop must name the triage diff AND its direction.
+
+        The complement of the two gates' rename awareness (task 5342): a
+        block that SURVIVES rename resolution is a genuine candidate
+        drop, and the message is the only thing steering what the reader
+        does next.  In the measured esc-5694-5 incident it steered the
+        RCA to the opposite of the truth — it named no diff direction, so
+        the diff was read backwards, and it never mentioned ``--follow``,
+        without which a relocated path's history looks empty and the file
+        reads as missing.
+
+        Only load-bearing properties are pinned here, not prose:
+        ``startswith`` because ``unblock_types.py`` and ``workflow.py``
+        both dispatch on the prefix; the branch-tip-FIRST argument order
+        because reading it the other way inverts the meaning of every
+        ``+``/``-`` line; and the structured routing fields, so a reword
+        cannot silently change the verdict.
+        """
+        from orchestrator.merge_gates import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _run_equivalence_gate,
+        )
+        from orchestrator.merge_types import OutcomeKind
+
+        advanced_sha = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+        merged_tip = 'f0e1d2c3b4a5968778695a4b3c2d1e0f'
+        ctx = self._make_ctx(
+            advanced_sha=advanced_sha, resolved_merged_tip=merged_tip,
+        )
+        with patch(
+            'orchestrator.merge_lane.gates._check_post_merge_equivalence',
+            AsyncMock(return_value=['pkg/sub/mod.py']),
+        ):
+            verdict = await _run_equivalence_gate(ctx)
+
+        assert verdict.passed is False
+        assert verdict.reason is not None
+        reason = verdict.reason
+
+        assert reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+
+        # Branch tip FIRST, advanced main SECOND.  A correctness property,
+        # not wording: the opposite order inverts the RCA.
+        assert (
+            f'git diff {merged_tip[:12]} {advanced_sha[:12]}'
+        ) in reason, reason
+
+        assert '--follow' in reason, reason
+        assert 'pkg/sub/mod.py' in reason, reason
+
+        assert verdict.emit_subtype == OutcomeKind.post_merge_equivalence_failed
+        assert verdict.merge_sha == advanced_sha
+
     async def test_run_pyright_gate_ok_when_clean(self) -> None:
         from orchestrator.merge_gates import _run_pyright_gate
 
         ctx = self._make_ctx()
         clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with patch(
-            'orchestrator.merge_queue._check_post_merge_pyright',
+            'orchestrator.merge_lane.gates._check_post_merge_pyright',
             AsyncMock(return_value=clean),
         ):
             verdict = await _run_pyright_gate(ctx)
 
         assert verdict.passed is True
 
-    async def test_run_pyright_gate_reachback_governs_block(self) -> None:
+    async def test_run_pyright_gate_blocks_when_broken(self) -> None:
         from orchestrator.merge_gates import (
             POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
             _run_pyright_gate,
         )
 
         ctx = self._make_ctx()
-        naive_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
-        reachback_broken = MagicMock(broken=True, failing_subprojects=['pkg'], detail='boom')
-        with (
-            # Naive-resolution target: clean → would pass if this governed.
-            patch(
-                'orchestrator.merge_gates._check_post_merge_pyright',
-                AsyncMock(return_value=naive_clean),
-            ),
-            # Reach-back target: broken → must govern the verdict.
-            patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                AsyncMock(return_value=reachback_broken),
-            ),
+        broken = MagicMock(broken=True, failing_subprojects=['pkg'], detail='boom')
+        with patch(
+            'orchestrator.merge_lane.gates._check_post_merge_pyright',
+            AsyncMock(return_value=broken),
         ):
             verdict = await _run_pyright_gate(ctx)
 
@@ -572,11 +509,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args()
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
         ):
@@ -593,11 +530,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args()
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
@@ -624,7 +561,7 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args(chain_ctx=None)
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=['f.py']),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
@@ -664,11 +601,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args(chain_ctx=None)
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=broken_pyright),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
@@ -694,10 +631,12 @@ class TestFinalizeDrivesRegistry:
         from orchestrator.merge_gates import _finalize_advanced_merge, _GenerationChainContext
         from orchestrator.merge_types import MergeOutcome
 
+        chained_outcome = MergeOutcome('superseded', merge_sha='chained-sha')
+        maybe_chain_mock = AsyncMock(return_value=chained_outcome)
         chain_ctx = _GenerationChainContext(
             queue=MagicMock(), counts={}, max_auto_generations=3,
+            maybe_auto_chain_generation=maybe_chain_mock,
         )
-        chained_outcome = MergeOutcome('superseded', merge_sha='chained-sha')
         event_store = MagicMock()
         args = self._make_finalize_args(
             chain_ctx=chain_ctx, merged_branch_tip='trusted-tip', event_store=event_store,
@@ -705,14 +644,10 @@ class TestFinalizeDrivesRegistry:
 
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=['f.py']),
             ),
-            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
-            patch(
-                'orchestrator.merge_queue._maybe_auto_chain_generation',
-                AsyncMock(return_value=chained_outcome),
-            ) as maybe_chain_mock,
+            patch('orchestrator.merge_lane.gates.AUTO_CHAIN_GENERATIONS_ENABLED', True),
         ):
             outcome = await _finalize_advanced_merge(**args)
 
@@ -736,11 +671,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args(advanced_sha=None)
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
         ):
@@ -1116,3 +1051,445 @@ class TestIsCrossRepoTask:
         assert is_cross_repo_task([str(inside)], project_root, None) is False
         # A falsy marker is treated as absent.
         assert is_cross_repo_task([str(inside)], project_root, {'cross_repo': False}) is False
+
+
+class TestParkLockContendedIsNotAHaltResult:
+    """The structural contract that makes task 3060's fix work.
+
+    Because `park_lock_contended` is absent from `_HALT_ADVANCE_RESULTS`,
+    merge_queue's existing plumbing already routes it past the halt path
+    untouched — the explicit mapper branch only upgrades the reason text to
+    structured facts. The fix is therefore safe-by-default: an unhandled new
+    code already means "no halt".
+
+    NOTE: test_merge_queue.py::TestHaltAdvanceResults already asserts EXACT
+    frozenset equality against a literal 5-element set, so that pin passes
+    unchanged and that file needs no edit. This assertion is the explicit,
+    NAMED contract for this code, not a duplicate of it — it records WHY
+    park_lock_contended must stay out.
+    """
+
+    def test_park_lock_contended_is_not_a_halt_result(self) -> None:
+        from orchestrator.merge_queue import _HALT_ADVANCE_RESULTS
+
+        assert 'park_lock_contended' not in _HALT_ADVANCE_RESULTS, (
+            'park_lock_contended must NEVER halt the merge queue — adding it '
+            'here reinstates the 2+/day queue halt task 3060 exists to remove'
+        )
+
+
+@pytest.mark.asyncio
+class TestMapAdvanceFailureParkLockContended:
+    """`park_lock_contended` must be disposed of PER TASK, never as a queue
+    halt — the structural contract that makes task 3060's fix work.
+
+    Contrast `stash_failed` (above): that is a SHARED main-checkout-hygiene
+    fault that recurs identically for every subsequent task, so halting
+    collapses N silent per-task blocks into one loud signal.
+    `park_lock_contended` is the opposite — a FOREIGN git process (dominantly
+    a `git commit --only` holding the index lock across its pre-commit hook)
+    owns project_root's index for a bounded, SELF-CLEARING window. Halting
+    the queue for it is the 2+/day halt this task exists to remove.
+    """
+
+    def _make_git_ops(self) -> MagicMock:
+        git_ops = MagicMock()
+        git_ops.push_main = AsyncMock(return_value='pushed')
+        # Same gotcha as TestMapAdvanceFailureStashFailed._make_git_ops: a
+        # bare MagicMock auto-vivifies a TRUTHY child attribute, which would
+        # defeat the mapper's `getattr(..., None) or <default>` fallback. Any
+        # side channel not deliberately set must be deleted.
+        del git_ops._last_stash_dirty_files
+        del git_ops._last_park_lock_info
+        return git_ops
+
+    async def test_park_lock_contended_blocks_without_halting(self) -> None:
+        """Per-task 'blocked' with structured facts; halt/unhalt untouched."""
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        git_ops._last_park_lock_info = {
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 301.0,
+            'waited_seconds': 300.0,
+            # A coherent real shape: the lock was ~1s old when first observed
+            # and the full 300s grace was waited out. (This test asserts
+            # nothing about recovery advice — see the dedicated tests below.)
+            'initial_age_seconds': 1.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        }
+        halt = MagicMock()
+        unhalt = MagicMock()
+        cas_retries = {'t1': 2}
+
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t1',
+            merge_commit_fallback='deadbeef',
+            halt=halt,
+            unhalt=unhalt,
+            cas_retries=cas_retries,
+        )
+
+        # (1)/(2) The queue is left strictly alone.
+        halt.assert_not_called()
+        unhalt.assert_not_called()
+
+        # (3) Per-task disposition, reusing the existing status.
+        assert outcome.status == 'blocked'
+
+        # (4) The reason carries the SUBSTANTIVE facts an operator needs —
+        # asserted on the path and the numbers, never on prose wording.
+        assert '/p/.git/index.lock' in outcome.reason
+        assert '301' in outcome.reason, (
+            f'reason must report the observed lock age; got {outcome.reason!r}'
+        )
+        assert '300' in outcome.reason, (
+            f'reason must report how long we waited; got {outcome.reason!r}'
+        )
+        assert 'transient' in outcome.reason.lower(), (
+            f'reason must state this is transient/retried; got {outcome.reason!r}'
+        )
+
+        # (5) Terminal-for-this-attempt bookkeeping.
+        assert 't1' not in cas_retries
+
+    async def test_park_lock_contended_survives_an_unset_side_channel(self) -> None:
+        """Defensive: with _last_park_lock_info unset the mapper must still
+        return a per-task 'blocked' without halting, never raise.
+
+        Mirrors the `getattr(git_ops, '_last_stash_dirty_files', None) or []`
+        idiom — a missing side channel degrades the reason's detail, never
+        the disposition.
+        """
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()  # side channel deliberately deleted
+        halt = MagicMock()
+
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t2',
+            merge_commit_fallback='deadbeef',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+
+    async def _map(self, info: dict | None) -> tuple:
+        """Map a `park_lock_contended` with *info* as the side channel.
+
+        Returns ``(outcome, halt)`` so each caller can assert both the
+        recovery text and the (invariant) non-halting disposition.
+        """
+        from orchestrator.merge_gates import _map_advance_failure
+
+        git_ops = self._make_git_ops()
+        if info is not None:
+            git_ops._last_park_lock_info = info
+        halt = MagicMock()
+        outcome = await _map_advance_failure(
+            git_ops, 'park_lock_contended',
+            task_id='t9',
+            merge_commit_fallback='deadbeef',
+            halt=halt,
+            unhalt=MagicMock(),
+            cas_retries={},
+        )
+        return (outcome, halt)
+
+    async def test_live_commit_shape_gets_no_destructive_advice(self) -> None:
+        """A live `git commit --only` must NEVER be told to `rm -f` its lock.
+
+        This is the headline regression.  Telling an operator to delete a
+        live commit's index.lock corrupts that in-flight commit — the exact
+        destruction the implementation forbids ITSELF from doing elsewhere
+        (see test_foreign_lock_file_is_never_deleted, and git_ops' "the
+        foreign lock left strictly alone").
+
+        The shape below is an ordinary docs-direct-commit-on-main: the lock
+        was 2s old when we first saw it and its pre-commit hook (this repo's
+        runs pyright; CLAUDE.md instructs `timeout: 300000`) merely outlived
+        the 300s grace by a couple of seconds.  Note `age_seconds` (302) is
+        greater than `waited_seconds` (300) — which is why a staleness test
+        keyed on the POST-wait age fires here, wrongly.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 302.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 2.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+
+        assert 'rm -f' not in outcome.reason, (
+            'a live commit must never be offered destructive lock removal; '
+            f'got {outcome.reason!r}'
+        )
+        assert 'crashed' not in outcome.reason.lower(), (
+            'a 2-second-old lock must not be described as a crashed leftover; '
+            f'got {outcome.reason!r}'
+        )
+
+        # Suppressing the ADVICE must not suppress the DIAGNOSIS.
+        assert '/p/.git/index.lock' in outcome.reason
+        assert '302' in outcome.reason, (
+            f'reason must still report the observed age; got {outcome.reason!r}'
+        )
+        assert '300' in outcome.reason, (
+            f'reason must still report how long we waited; got {outcome.reason!r}'
+        )
+
+    async def test_crashed_leftover_shape_still_gets_the_advice(self) -> None:
+        """A lock already older than a full grace when FIRST observed is the
+        one shape for which `rm -f` is defensible."""
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+
+        assert 'rm -f /p/.git/index.lock' in outcome.reason, (
+            'an hour-old leftover must carry actionable recovery; got '
+            f'{outcome.reason!r}'
+        )
+        # Asserted on the substantive token, never on prose wording: the
+        # advice is only safe when paired with the liveness check.
+        assert 'no git process' in outcome.reason.lower(), (
+            'destructive advice must tell the operator to confirm no git '
+            f'process is running in project_root first; got {outcome.reason!r}'
+        )
+
+    async def test_zero_grace_young_lock_gets_no_destructive_advice(self) -> None:
+        """grace=0 must not turn EVERY lock into a "crashed leftover".
+
+        `git.merge_park_lock_grace_seconds` is tunable to 0 — a blessed,
+        documented probe-only fail-fast off-switch (GitConfig's docstring
+        and test_zero_is_accepted_as_probe_only_off_switch).  A staleness
+        test keyed on the grace ALONE (`initial_age > grace`) makes every
+        non-zero age exceed it, so an ordinary live `git commit --only`
+        whose lock is half a second old gets told to `rm -f` it — deleting
+        a live commit's index.lock and corrupting that in-flight commit.
+
+        Staleness must therefore clear max(grace, _STALE_LOCK_FLOOR_S):
+        how the operator tuned the WAIT carries no information about
+        whether the lock's owner is alive.
+        """
+        for initial_age in (0.5, 2.0, 299.0):
+            outcome, halt = await self._map({
+                'lock_path': '/p/.git/index.lock',
+                'age_seconds': initial_age,
+                'waited_seconds': 0.0,
+                'initial_age_seconds': initial_age,
+                'grace_seconds': 0.0,
+                'dirty_files': [],
+            })
+
+            halt.assert_not_called()
+            assert outcome.status == 'blocked'
+            assert 'rm -f' not in outcome.reason, (
+                f'a {initial_age}s-old lock under a grace=0 off-switch is a '
+                'live commit, not a crashed leftover, and must never be '
+                f'offered destructive lock removal; got {outcome.reason!r}'
+            )
+            assert 'crashed' not in outcome.reason.lower(), (
+                f'a {initial_age}s-old lock must not be described as a '
+                f'crashed leftover; got {outcome.reason!r}'
+            )
+            # Suppressing the ADVICE must not suppress the DIAGNOSIS.
+            assert '/p/.git/index.lock' in outcome.reason
+
+    async def test_zero_grace_still_reaches_the_floor_for_a_real_leftover(
+        self,
+    ) -> None:
+        """The floor SUPPRESSES false positives; it must not suppress the
+        one true positive.  An hour-old lock is a crashed-git leftover
+        whatever the grace is tuned to — including the grace=0 off-switch.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3600.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 0.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'rm -f /p/.git/index.lock' in outcome.reason, (
+            'an hour-old leftover must still carry actionable recovery even '
+            f'when the wait is switched off; got {outcome.reason!r}'
+        )
+        assert 'no git process' in outcome.reason.lower(), (
+            'destructive advice must remain paired with the liveness check; '
+            f'got {outcome.reason!r}'
+        )
+
+    async def test_a_grace_above_the_floor_still_governs(self) -> None:
+        """The floor is a FLOOR, not a replacement.  With a grace tuned
+        ABOVE the floor, a lock older than the floor but younger than the
+        grace is still an ordinary slow pre-commit hook, not a leftover.
+        """
+        outcome, _halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 400.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 400.0,   # > 300s floor, < 900s grace
+            'grace_seconds': 900.0,
+            'dirty_files': [],
+        })
+
+        assert 'rm -f' not in outcome.reason, (
+            'an operator who RAISED the grace has declared hooks that long '
+            f'to be normal; got {outcome.reason!r}'
+        )
+
+    async def test_floor_matches_the_documented_pre_commit_budget(self) -> None:
+        """The floor is a literal (orchestrator.config is TYPE_CHECKING-only
+        in merge_gates), so pin it against the config default it mirrors —
+        otherwise the two drift silently.
+
+        (`async` only to satisfy this module's global asyncio pytestmark.)
+        """
+        from orchestrator.config import GitConfig
+        from orchestrator.merge_gates import _STALE_LOCK_FLOOR_S
+
+        assert GitConfig().merge_park_lock_grace_seconds == pytest.approx(
+            _STALE_LOCK_FLOOR_S
+        ), (
+            '_STALE_LOCK_FLOOR_S must track '
+            'GitConfig.merge_park_lock_grace_seconds\'s default (this repo\'s '
+            'documented pre-commit budget)'
+        )
+
+    async def test_missing_staleness_keys_default_to_no_advice(self) -> None:
+        """Absent evidence of staleness is not evidence of staleness.
+
+        A pre-step-15 (legacy) side-channel dict carries neither
+        `initial_age_seconds` nor `grace_seconds`.  The failure mode of a
+        false positive here is data loss, so the conservative default is no
+        advice — and never a raise.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'rm -f' not in outcome.reason, (
+            'a side channel with no staleness evidence must not produce '
+            f'destructive advice; got {outcome.reason!r}'
+        )
+
+    async def test_reason_is_not_miscategorised_as_a_ff_failure(self) -> None:
+        """The reason must not trip workflow.py's merge-failure category
+        heuristic into calling an index-lock stand-off a fast-forward failure.
+
+        `workflow.py`'s blocked path infers the review category with a bare
+        substring test:
+
+            elif 'ff' in reason.lower() or 'advanced' in reason.lower():
+                category = 'merge_ff_failed'
+
+        The original wording ("advance_main stood off: ...") contains 'ff'
+        inside "off", so every park_lock_contended block was filed as
+        `merge_ff_failed` — a category that flows into
+        `_write_merge_failure_review`, the `merge_blocked` event's
+        `data.category`, and the signature-aware L1 dedup key, durably
+        polluting the very observability this task adds.
+
+        Asserted by REPLAYING the heuristic verbatim rather than by pinning
+        prose, so any future reword is checked against the real consumer.
+        (A cleaner fix — an explicit reason-prefix short-circuit in
+        workflow.py, as DROPPED_PLAN_TARGETS/TRANSIENT_INFRA/MAIN_HEALTH_RED
+        already have — needs workflow.py, which is outside this task's lock
+        set; filed as follow-up.)
+        """
+        # Benign fixture strings: the substring test also sees the lock path
+        # and any at-risk filenames, which are runtime values this code
+        # cannot constrain — the CONSTANT prose is what is pinned here.
+        outcome, _halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 3900.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 3600.0,
+            'grace_seconds': 300.0,
+            'dirty_files': ['docs/notes.md'],
+        })
+
+        lowered = outcome.reason.lower()
+        assert 'verification failed' not in lowered
+        assert 'ff' not in lowered, (
+            "the reason must not contain the token 'ff' — workflow.py would "
+            f'file it as merge_ff_failed; got {outcome.reason!r}'
+        )
+        assert 'advanced' not in lowered, (
+            "the reason must not contain 'advanced' — workflow.py would file "
+            f'it as merge_ff_failed; got {outcome.reason!r}'
+        )
+
+    async def test_toctou_dirty_files_are_named_in_the_reason(self) -> None:
+        """The side channel's `dirty_files` must reach the operator.
+
+        On the mid-park (TOCTOU) path advance_main already knows which
+        uncommitted tracked files were about to be parked when the foreign
+        lock appeared.  That is the same fact `stash_failed` reports, and it
+        is what tells an operator whether real WIP is implicated — so it must
+        be named rather than collected and dropped.
+        """
+        outcome, halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 2.0,
+            'waited_seconds': 0.0,
+            'initial_age_seconds': 2.0,
+            'grace_seconds': 300.0,
+            'dirty_files': ['CLAUDE.md', 'docs/task-authoring.md'],
+        })
+
+        halt.assert_not_called()
+        assert outcome.status == 'blocked'
+        assert 'CLAUDE.md' in outcome.reason, (
+            'the dirty tracked files carried on the side channel must be '
+            f'named in the blocked reason; got {outcome.reason!r}'
+        )
+        assert 'docs/task-authoring.md' in outcome.reason
+
+    async def test_empty_dirty_files_adds_no_wip_clause(self) -> None:
+        """The gate path knows of no WIP, so it must claim none.
+
+        `dirty_files` is `[]` by construction there (the dirty snapshot is
+        taken only AFTER the lock clears), and an empty "WIP at risk:" clause
+        would contradict the reason's own "NOTHING in project_root was
+        modified" statement.
+        """
+        outcome, _halt = await self._map({
+            'lock_path': '/p/.git/index.lock',
+            'age_seconds': 301.0,
+            'waited_seconds': 300.0,
+            'initial_age_seconds': 1.0,
+            'grace_seconds': 300.0,
+            'dirty_files': [],
+        })
+
+        assert 'WIP' not in outcome.reason, (
+            'with no known dirty files the reason must not imply WIP is at '
+            f'risk; got {outcome.reason!r}'
+        )

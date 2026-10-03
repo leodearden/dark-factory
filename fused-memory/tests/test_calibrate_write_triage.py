@@ -13,7 +13,6 @@ and retrievals are injected.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import json
 import re
 import types
@@ -21,6 +20,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
@@ -45,32 +45,9 @@ CANONICAL_5626 = '70fd0700'
 EXCLUDED_IDS = ('8d79e0e4', '43a47400')
 
 
-def _load_module() -> types.ModuleType:
-    """Load calibrate_write_triage.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'calibrate_write_triage'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
 @functools.cache
 def _mod() -> types.ModuleType:
-    return _load_module()
+    return load_script_module(SCRIPT_PATH, mod_name='calibrate_write_triage')
 
 
 # ---------------------------------------------------------------------------
@@ -1267,7 +1244,9 @@ def _report(scores: dict, t_high, t_low, reason=None, recall=None, **kwargs) -> 
         t_high=t_high,
         t_low=t_low,
         reason=reason,
-        recall=recall if recall is not None else {'per_k': [], 'canonical_absent': []},
+        recall=recall if recall is not None else {
+            'per_k': [], 'canonical_absent': [], 'absent_in_denominator': False,
+        },
         provenance=dict(_PROVENANCE),
         **kwargs,
     )
@@ -1317,7 +1296,7 @@ class TestBuildReport:
 
     def test_carries_the_recall_block(self) -> None:
         recall = {'per_k': [{'k': 1, 'hits': 2, 'total': 3, 'recall': 2 / 3}],
-                  'canonical_absent': []}
+                  'canonical_absent': [], 'absent_in_denominator': False}
         got = _report(CLEAN_SCORES, 0.70, 0.60, recall=recall)
         assert got['recall_at_k'] == recall
 
@@ -1686,6 +1665,170 @@ write_triage:
 """
 
 
+# The shipped config.yaml's actual layout since task 3127: the two hand-set
+# OPERATOR KNOBS sit at the top of the block, above the calibration fence, each
+# carrying its own explanatory comment. They are NOT calibration outputs and
+# this writer does not own them.
+WITH_OPERATOR_KNOBS = """\
+# Leading comment that must survive.
+server:
+  host: localhost
+
+write_triage:
+  # OPERATOR KNOBS — hand-set, NOT calibration outputs.
+  enabled: true
+  # candidate_k: retrieval width, not a threshold.
+  candidate_k: 32
+  # CALIBRATION OUTPUT — do not hand-edit.
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+
+curator:
+  enabled: true
+"""
+
+# A nested value with an interior comment AND an interior blank separator.
+# Both used to reset the "keep this key's children" flag, so every child after
+# the first one was silently dropped -- config data loss on exactly the failure
+# mode preservation exists to prevent, and config.yaml's commenting style makes
+# a commented nested value near-certain.
+WITH_A_COMMENTED_NESTED_VALUE = """\
+write_triage:
+  # a future knob
+  future_map:
+    a: 1
+    # explanatory note about b
+    b: 2
+  another: 3
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+# The narrower sibling of WITH_A_COMMENTED_NESTED_VALUE: the interior comment
+# is the LAST line of the nested value, with no child beneath it to carry it
+# through. It is the shape a hand-added knob acquires the moment someone
+# annotates its final entry.
+WITH_A_COMMENT_TRAILING_A_NESTED_VALUE = """\
+write_triage:
+  future_map:
+    a: 1
+    # explanatory note about a
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+# Both readings of a comment run in the same position, so the split is pinned
+# rather than merely the keep: the deep line trails `future_map`, the indent-2
+# line heads the OWNED `t_high` and is the fence-style comment the rebuilt
+# block re-emits its own copy of.
+WITH_A_MIXED_COMMENT_RUN_BEFORE_AN_OWNED_KEY = """\
+write_triage:
+  future_map:
+    a: 1
+    # explanatory note about a
+  # a header note for t_high, which this writer owns
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+# The end-of-body case: the same trailing interior comment with NOTHING after
+# it, where the ambiguity is between the nested value above and the block-level
+# operator prose `trailing` exists for.
+WITH_A_COMMENT_TRAILING_THE_LAST_NESTED_VALUE = """\
+write_triage:
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+  future_map:
+    a: 1
+    # explanatory note about a
+"""
+
+# The SHIPPED config.yaml shape: hand-written operator prose in two
+# paragraphs, sitting at the very end of the block below an OWNED key
+# (`t_high_by_category`). `keeping_children` is therefore False across the
+# whole run, which is the branch that used to discard it.
+WITH_A_PARAGRAPHED_TRAILING_NOTE_BELOW_AN_OWNED_KEY = """\
+write_triage:
+  enabled: true
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+  t_high_by_category:
+    procedural_knowledge: 0.83
+  # EVIDENCE STATUS (hand-added operator prose, paragraph one).
+  # - procedural_knowledge: has its own cutoff above.
+
+  # - observations_and_summaries: NO cutoff, insufficient_pairs.
+  # - preferences_and_norms: NO cutoff, empty_class.
+"""
+
+WITH_A_BLANK_INSIDE_A_NESTED_VALUE = """\
+write_triage:
+  future_map:
+    a: 1
+
+    b: 2
+  another: 3
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+# config.yaml's actual shape since task 3357: a hand-written prose run at the
+# very END of the block, belonging to no key.
+WITH_A_TRAILING_COMMENT_RUN = """\
+write_triage:
+  enabled: true
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+  # EVIDENCE STATUS (hand-added prose — no numbers here).
+  # - procedural_knowledge: has its own cutoff above.
+
+curator:
+  enabled: true
+"""
+
+
+# A knob this writer has never heard of. The preservation rule is "keep what
+# this writer does not own", not an allowlist of two names -- a future leaf's
+# knob must not be silently dropped by a recalibration that predates it.
+WITH_AN_UNKNOWN_KNOB = """\
+write_triage:
+  # A knob a later leaf added.
+  some_future_knob: 7
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+"""
+
+
+def _block_lines(text: str) -> list[str]:
+    """The ``write_triage:`` line plus its indented body, as a line list.
+
+    The exact complement of ``_without_write_triage_block``: between them the
+    two partition the file, so a line can never be asserted twice or lost.
+    """
+    kept: list[str] = []
+    in_block = False
+    for line in text.splitlines():
+        if line.startswith('write_triage:'):
+            in_block = True
+            kept.append(line)
+            continue
+        if in_block:
+            if line[:1].isspace():
+                kept.append(line)
+                continue
+            in_block = False
+    return kept
+
+
 def _without_write_triage_block(text: str) -> list[str]:
     """Every line NOT belonging to a ``write_triage:`` block.
 
@@ -1784,6 +1927,297 @@ class TestWriteTriageConfigBlock:
         with pytest.raises(ValueError):
             _mod().write_triage_config_block(WITH_BLOCK, None, None, 'r.json')
         assert 'write_triage' in WITH_BLOCK and '0.11' in WITH_BLOCK, 'input untouched'
+
+    # -- operator-knob preservation (task 3127) -----------------------------
+    #
+    # This writer OWNS exactly four keys: t_high, t_low,
+    # calibration_report_path, t_high_by_category. Everything else that a
+    # human put in the block is not its business, and dropping it is a silent
+    # failure in the UNSAFE direction.
+
+    # The four keys this writer derives and is therefore entitled to replace.
+    CALIBRATION_OWNED = ('t_high', 't_low', 'calibration_report_path',
+                         't_high_by_category')
+
+    def test_the_operator_knobs_survive_a_recalibration(self) -> None:
+        """A --write-config run must not revert `write_triage.enabled` to off.
+
+        The failure this prevents is silent and points the wrong way.
+        `write_triage_config_block` rebuilds the block from scratch out of the
+        four calibration keys and replaces every line from `write_triage:` to
+        the next top-level key, so an operator who set `enabled: true` would
+        have triage reverted to OFF by the next recalibration, with nothing
+        logged and nothing to grep — the operator would keep reading a system
+        that silently stopped triaging as one that was quietly fine.
+
+        It is not merely cosmetic that the knob lives in config.yaml:
+        `write_triage.enabled` is green-tier hot-reloadable and `reload_config`
+        re-reads config.yaml, so a key that cannot SURVIVE in that file cannot
+        be flipped at runtime at all, and its RELOADABLE_FIELDS registration
+        would be decorative.
+        """
+        out = _call(WITH_OPERATOR_KNOBS)
+        parsed = yaml.safe_load(out)['write_triage']
+
+        assert parsed['enabled'] is True, (
+            'the operator kill switch must survive a recalibration; a rewrite '
+            'that drops it silently reverts triage to off'
+        )
+        assert parsed['candidate_k'] == 32, 'the retrieval width is hand-set too'
+        # ...while every key this writer DOES own is replaced.
+        assert parsed['t_high'] == pytest.approx(0.87)
+        assert parsed['t_low'] == pytest.approx(0.61)
+        assert parsed['calibration_report_path'] == 'calibration/r.json'
+        assert '0.11' not in out and 'old/report.json' not in out
+
+    def test_a_comment_attached_to_a_preserved_key_survives(self) -> None:
+        """The knobs' explanatory comments are the operator-facing half.
+
+        config.yaml's comments are load-bearing — that is the stated reason
+        this is a surgical text edit rather than a safe_dump round-trip. A
+        preserved key whose "hand-set operator knob, not a calibration output"
+        note was dropped is a key the next reader will assume is derived.
+        """
+        out = _call(WITH_OPERATOR_KNOBS)
+        assert '# OPERATOR KNOBS — hand-set, NOT calibration outputs.' in out
+        assert '# candidate_k: retrieval width, not a threshold.' in out
+
+    def test_an_unknown_extra_key_is_preserved_too(self) -> None:
+        """The rule is "preserve what this writer does not own", not a
+        two-name allowlist — otherwise a knob added by a later leaf is
+        silently dropped by a recalibration that predates it."""
+        out = _call(WITH_AN_UNKNOWN_KNOB)
+        parsed = yaml.safe_load(out)['write_triage']
+        assert parsed['some_future_knob'] == 7
+        assert '# A knob a later leaf added.' in out
+
+    def test_preservation_is_idempotent_and_order_stable(self) -> None:
+        """Two runs over the same measurement produce the same bytes.
+
+        The function's docstring already claims this for the sorted
+        per-category keys; preservation must not break it. A writer that
+        re-emitted preserved lines in a different place (or twice) each run
+        would make every recalibration a spurious config diff.
+        """
+        once = _call(WITH_OPERATOR_KNOBS)
+        twice = _call(once)
+        assert twice == once, 'the writer must be a fixed point over its own output'
+
+    def test_the_preserved_knobs_sit_above_the_calibration_fence(self) -> None:
+        """Round-trips the shipped file's layout unchanged.
+
+        config.yaml puts the hand-set knobs at the TOP of the block, above the
+        `# CALIBRATION OUTPUT — do not hand-edit.` fence, precisely so the
+        derived and hand-set halves are visually separable. Re-emitting them
+        below the fence would file them under a comment that tells the next
+        operator not to touch them.
+        """
+        body = _block_lines(_call(WITH_OPERATOR_KNOBS))
+        fence = body.index('  # CALIBRATION OUTPUT — do not hand-edit.')
+        assert body.index('  enabled: true') < fence
+        assert body.index('  candidate_k: 32') < fence
+
+    def test_a_block_with_no_operator_knobs_is_byte_identical_to_today(self) -> None:
+        """No regression for a config that has nothing to preserve.
+
+        Compared as a LINE LIST, not via ``in`` or ``yaml.safe_load``: both are
+        blind to a stray blank line or a duplicated comment, which is exactly
+        what a preservation preamble emitted unconditionally would leave
+        behind.
+        """
+        assert _block_lines(_call(WITH_BLOCK)) == [
+            'write_triage:',
+            '  # CALIBRATION OUTPUT — do not hand-edit.',
+            '  # Derived from measured similarity distributions by',
+            '  # scripts/calibrate_write_triage.py; both values are order statistics of',
+            '  # the observed curator-labeled corpus, not chosen constants.',
+            '  # Report: calibration/r.json',
+            "  # -- records the measured distributions and the deterministic band's",
+            '  # false-positive count. Re-run the script to change these values.',
+            '  t_high: 0.87',
+            '  t_low: 0.61',
+            '  calibration_report_path: calibration/r.json',
+        ]
+
+    def test_the_owned_keys_are_replaced_not_preserved(self) -> None:
+        """The complement of the rule above, stated as its own assertion.
+
+        A preservation pass that scooped up the calibration keys too would
+        emit each of them twice — once preserved, once derived — and pyyaml
+        takes the last, so the bug would be invisible to a safe_load check
+        while leaving a stale number in the file for a human to read.
+        """
+        body = _block_lines(_call(WITH_OPERATOR_KNOBS))
+        for key in self.CALIBRATION_OWNED:
+            emitted = [ln for ln in body if ln.startswith(f'  {key}:')]
+            assert len(emitted) <= 1, f'{key} emitted {len(emitted)} times: {emitted}'
+
+    def test_a_refused_write_cannot_strip_the_knobs_either(self) -> None:
+        """The never-mutate-the-input guarantee covers the preserved keys.
+
+        An uncalibrated run still raises, and the caller's string is untouched
+        — so the refusal path cannot become a way to lose the kill switch.
+        """
+        with pytest.raises(ValueError):
+            _mod().write_triage_config_block(WITH_OPERATOR_KNOBS, None, None, 'r.json')
+        assert 'enabled: true' in WITH_OPERATOR_KNOBS
+        assert 'candidate_k: 32' in WITH_OPERATOR_KNOBS
+
+    def test_a_comment_inside_a_nested_value_does_not_sever_its_children(self) -> None:
+        """A commented nested value must round-trip WHOLE.
+
+        The child run is decided by the key above it, not by whatever
+        punctuation sits between two children. Resetting the keep-children
+        flag on an interior comment dropped `b: 2` outright — silent config
+        data loss, invisible to any assertion that only checks the first
+        child.
+        """
+        out = _call(WITH_A_COMMENTED_NESTED_VALUE)
+        parsed = yaml.safe_load(out)['write_triage']
+        assert parsed['future_map'] == {'a': 1, 'b': 2}
+        assert parsed['another'] == 3
+        assert '    # explanatory note about b' in out.splitlines()
+
+    def test_a_blank_line_inside_a_nested_value_does_not_sever_its_children(self) -> None:
+        """The blank-line branch had the same defect as the comment branch.
+
+        Asserted separately because the two are separate branches: a fix that
+        only re-arms on comments would leave this one losing children.
+        """
+        parsed = yaml.safe_load(_call(WITH_A_BLANK_INSIDE_A_NESTED_VALUE))['write_triage']
+        assert parsed['future_map'] == {'a': 1, 'b': 2}
+        assert parsed['another'] == 3
+
+    def test_a_blank_line_never_discards_the_comment_run_above_it(self) -> None:
+        """The shipped-config data loss: a paragraph break ate a paragraph.
+
+        `pending.clear()` on a blank line discarded the comment run ABOVE it
+        whenever `keeping_children` was False — and nobody re-emits that run,
+        so it was simply gone. config.yaml ships exactly this shape (the
+        `# EVIDENCE STATUS` note follows the OWNED `t_high_by_category`), so
+        one blank line typed into that note deleted the paragraph above it:
+        nine lines of hand-written task-3357 prose, with nothing logged.
+
+        Worse, the deletion was IDEMPOTENT — `_call(out) == out` held on the
+        damaged output — so no later run produced a diff to notice it by. Both
+        halves are asserted: every comment line survives, and the result is
+        stable.
+
+        The blank SEPARATOR itself is still dropped, matching the benign
+        preserved-key path; only content is promised, not spacing.
+        """
+        source = WITH_A_PARAGRAPHED_TRAILING_NOTE_BELOW_AN_OWNED_KEY
+        out = _call(source)
+
+        comments = [ln for ln in source.splitlines() if ln.strip().startswith('#')]
+        assert len(comments) == 4, 'fixture must hold both paragraphs'
+        survivors = out.splitlines()
+        for line in comments:
+            assert line in survivors, f'operator prose dropped: {line!r}\n{out}'
+        assert _call(out) == out, 'and it must survive a SECOND run'
+
+    def test_a_blank_line_with_no_comment_above_it_is_still_dropped(self) -> None:
+        """The bound on the fix: separators must not accumulate.
+
+        The discarding branch existed for a reason — without it the rebuilt
+        block grows a run of blank lines across successive runs. Only a blank
+        that would take hand-written text with it is buffered now, so a bare
+        separator is still consumed and the output stays stable.
+        """
+        out = _call(WITH_A_PARAGRAPHED_TRAILING_NOTE_BELOW_AN_OWNED_KEY)
+        assert _call(_call(out)) == out, 'blank separators must not accumulate'
+        assert '\n\n\n' not in out, f'blank run grew: {out!r}'
+
+    def test_a_comment_trailing_a_nested_value_is_not_severed_either(self) -> None:
+        """The narrower sibling of the severed-children defect.
+
+        An interior comment reached the next OWNED key with nothing after it
+        to carry it into `kept`, so the whole pending run was cleared and the
+        note vanished. Same class of hand-written-config loss as dropping
+        `b: 2`, just one line of it — and idempotent, so once dropped it stays
+        dropped with nothing to notice.
+        """
+        out = _call(WITH_A_COMMENT_TRAILING_A_NESTED_VALUE)
+        parsed = yaml.safe_load(out)['write_triage']
+        assert parsed['future_map'] == {'a': 1}
+        assert '    # explanatory note about a' in out.splitlines(), out
+        assert _call(out) == out, 'and it must survive a SECOND run'
+
+    def test_a_comment_run_splits_by_indent_between_the_value_and_the_next_key(
+        self,
+    ) -> None:
+        """The discriminator, asserted in both directions at once.
+
+        A run in this position is genuinely ambiguous — it either trails the
+        value above or heads the key below — and indent is what decides, the
+        same rule that decides child membership everywhere else in this
+        parser. Keeping the whole run would smuggle the fence-style header
+        comment of an owned key back in, which the rebuilt block then emits a
+        second copy of.
+        """
+        body = _block_lines(_call(WITH_A_MIXED_COMMENT_RUN_BEFORE_AN_OWNED_KEY))
+        assert '    # explanatory note about a' in body, body
+        assert '  # a header note for t_high, which this writer owns' not in body, body
+
+    def test_a_comment_trailing_the_LAST_nested_value_stays_with_its_value(
+        self,
+    ) -> None:
+        """End of body: interior to a preserved value, not block-level prose.
+
+        `trailing` re-emits its run BELOW the derived keys, so treating this
+        note as trailing would silently relocate it out of the value it
+        annotates and park it under the calibration fence.
+        """
+        out = _call(WITH_A_COMMENT_TRAILING_THE_LAST_NESTED_VALUE)
+        body = _block_lines(out)
+        assert '    # explanatory note about a' in body, body
+        assert body.index('    # explanatory note about a') > body.index('    a: 1')
+        assert body.index('    # explanatory note about a') < body.index(
+            '  # CALIBRATION OUTPUT — do not hand-edit.'
+        ), f'the note was relocated below the fence: {body!r}'
+        assert _call(out) == out, 'and it must survive a SECOND run'
+
+    def test_a_trailing_comment_run_survives_and_stays_at_the_end(self) -> None:
+        """Hand-written prose that belongs to no key is still operator content.
+
+        config.yaml carries exactly this shape (the `# EVIDENCE STATUS` note).
+        Position is load-bearing, not cosmetic: re-emitted ABOVE the fence it
+        would become "a comment run followed by an owned key" on the next
+        parse and be dropped, so it would survive one run and vanish on the
+        second. Keeping it at the end is what makes it a fixed point.
+        """
+        out = _call(WITH_A_TRAILING_COMMENT_RUN)
+        body = _block_lines(out)
+        assert '  # EVIDENCE STATUS (hand-added prose — no numbers here).' in body
+        assert '  # - procedural_knowledge: has its own cutoff above.' in body
+        fence = body.index('  # CALIBRATION OUTPUT — do not hand-edit.')
+        assert body.index('  # EVIDENCE STATUS (hand-added prose — no numbers here).') > fence
+        assert body.index('  enabled: true') < fence
+        assert _call(out) == out, 'the trailing run must survive a SECOND run too'
+
+    def test_the_shipped_config_block_round_trips_byte_for_byte(self) -> None:
+        """The end-to-end guard: recalibrating to the values already in the
+        file must be a no-op diff. Any preserved-content bug — a dropped
+        nested child, a dropped prose run, a moved line — shows up here as a
+        spurious diff on the real file rather than on a fixture."""
+        shipped = (
+            Path(__file__).resolve().parents[1] / 'config' / 'config.yaml'
+        ).read_text()
+        block = yaml.safe_load(shipped)['write_triage']
+        assert _mod().write_triage_config_block(
+            shipped,
+            block['t_high'],
+            block['t_low'],
+            block['calibration_report_path'],
+            t_high_by_category=block.get('t_high_by_category'),
+        ) == shipped
+
+    def test_the_surrounding_config_still_survives_with_knobs_present(self) -> None:
+        """Preservation must not widen (or narrow) what the span scan eats."""
+        out = _call(WITH_OPERATOR_KNOBS)
+        assert _without_write_triage_block(out) == _without_write_triage_block(
+            WITH_OPERATOR_KNOBS,
+        )
 
 
 class TestWriteTriageConfigBlockSpanScan:
@@ -1959,7 +2393,8 @@ def _search_fn(hits: dict[str, list[str]] | None = None, present: set[str] | Non
     return search
 
 
-def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5)):
+def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5), aliases_map=None,
+         count_absent_as_miss=False):
     return _mod().run_calibration(
         records=records if records is not None else _e2e_records(),
         embed_fn=embed if embed is not None else _embed_fn(),
@@ -1968,6 +2403,8 @@ def _run(tmp_path: Path, records=None, embed=None, search=None, ks=(1, 5)):
         ks=list(ks),
         provenance={'fixture_path': 'x.jsonl', 'embedder_model': 'text-embedding-3-small',
                     'embedder_dimensions': 1536},
+        aliases=aliases_map,
+        count_absent_as_miss=count_absent_as_miss,
     )
 
 
@@ -2485,3 +2922,242 @@ class TestCommittedPerCategoryEvidenceIsRecorded:
                 f'appears in config as {by_category[category]!r} — "uncalibrated" '
                 f'must have exactly one spelling: absent'
             )
+
+
+# ---------------------------------------------------------------------------
+# compute_recall_at_k: aliases, count_absent_as_miss, parent_id child-hoist
+# ---------------------------------------------------------------------------
+
+def _retrieval_with_parents(
+    mid: str, canonical: str, candidates: list[str],
+    candidate_parents: dict[str, str] | None = None, *, present: bool = True,
+) -> dict:
+    return {
+        'memory_id': mid,
+        'canonical_id': canonical,
+        'canonical_present': present,
+        'candidates': candidates,
+        'candidate_parents': candidate_parents or {},
+    }
+
+
+class TestComputeRecallAtKAliasesAndPopulation:
+    """Production parity (task's retrieval-recall leaf): rotated-canonical
+    resolution and the child-hoist rule mirroring
+    write_triage.py::_canonical_id_of."""
+
+    def test_default_behaviour_is_byte_identical_to_the_legacy_call(self) -> None:
+        """No aliases, no count_absent_as_miss kwarg: must match the original
+        two-positional-arg call exactly — this is the reproducibility
+        contract the committed report depends on."""
+        retrievals = [
+            _retrieval('d1', 'c1', ['c1', 'z']),
+            _retrieval('d2', 'gone', ['z'], present=False),
+        ]
+        assert _mod().compute_recall_at_k(retrievals, [1]) == (
+            _mod().compute_recall_at_k(retrievals, [1], None)
+        )
+
+    def test_an_alias_widens_the_match_to_the_rotated_successor(self) -> None:
+        """A candidate carrying the ALIAS id (not the deleted original
+        canonical id) must count as a hit once an alias map is given."""
+        retrievals = [_retrieval('d1', 'old-canonical', ['x', 'new-canonical'], present=False)]
+        got = _mod().compute_recall_at_k(
+            retrievals, [1, 5], aliases={'old-canonical': 'new-canonical'},
+            count_absent_as_miss=True,
+        )
+        by_k = _recall_by_k(got)
+        assert by_k[1] == pytest.approx(0.0), 'rank 2 must not count at k=1'
+        assert by_k[5] == pytest.approx(1.0), 'the alias hit counts at k=5'
+
+    def test_without_count_absent_as_miss_an_absent_canonical_stays_excluded(
+        self,
+    ) -> None:
+        """Supplying aliases alone must not silently change the denominator —
+        that is a separate, explicit choice (count_absent_as_miss)."""
+        retrievals = [_retrieval('d1', 'gone', ['z'], present=False)]
+        got = _mod().compute_recall_at_k(retrievals, [1], aliases={'gone': 'z'})
+        assert got['per_k'][0]['total'] == 0, (
+            'aliases without count_absent_as_miss must not widen the denominator'
+        )
+
+    def test_count_absent_as_miss_widens_the_denominator_with_no_aliases(self) -> None:
+        """The (b) population: every retrieval counted, an absent canonical
+        that cannot be resolved scores a forced miss."""
+        retrievals = [
+            _retrieval('d1', 'c1', ['c1']),
+            _retrieval('d2', 'gone', ['z', 'y'], present=False),
+        ]
+        got = _mod().compute_recall_at_k(retrievals, [1, 5], count_absent_as_miss=True)
+        by_k = _recall_by_k(got)
+        assert got['per_k'][0]['total'] == 2, 'both retrievals must be in the denominator'
+        assert by_k[1] == pytest.approx(0.5)
+        assert by_k[5] == pytest.approx(0.5), (
+            'an unresolved absent canonical can never appear in candidates, '
+            'at any k — it does not exist'
+        )
+
+    def test_canonical_absent_is_still_reported_even_when_scored(self) -> None:
+        """canonical_absent stays informational regardless of the population
+        toggle — a reader must still be able to see which records were
+        corpus gaps even when count_absent_as_miss folds them into scoring."""
+        retrievals = [_retrieval('d1', 'gone', ['z'], present=False)]
+        got = _mod().compute_recall_at_k(retrievals, [1], count_absent_as_miss=True)
+        assert len(got['canonical_absent']) == 1
+
+    @pytest.mark.parametrize(('aliases', 'count_absent_as_miss'), [
+        (None, False), ({}, False), (None, True), ({'other': 'x'}, True),
+    ])
+    def test_a_child_candidate_hoists_to_its_parent_whatever_the_other_choices(
+        self, aliases, count_absent_as_miss,
+    ) -> None:
+        """Production files a sighting/amendment winner against its parent
+        (write_triage.py::_canonical_id_of), and the judge eval's
+        canonical_in_slate counts it the same way. So the hoist is not an
+        alias feature: it holds under every alias map and every population."""
+        retrievals = [
+            _retrieval_with_parents(
+                'd1', 'c1', ['z', 'child-of-c1'], {'child-of-c1': 'c1'},
+            ),
+        ]
+        got = _mod().compute_recall_at_k(
+            retrievals, [1, 5], aliases=aliases, count_absent_as_miss=count_absent_as_miss,
+        )
+        assert [(row['k'], row['hits']) for row in got['per_k']] == [(1, 0), (5, 1)]
+
+    def test_a_child_of_an_alias_also_hoists(self) -> None:
+        """A child of the ROTATED SUCCESSOR (not the original canonical)
+        must also count — the hoist target is matched against the full
+        {canonical, alias} set."""
+        retrievals = [
+            _retrieval_with_parents(
+                'd1', 'old', ['z', 'child-of-new'], {'child-of-new': 'new'},
+                present=False,
+            ),
+        ]
+        got = _mod().compute_recall_at_k(
+            retrievals, [5], aliases={'old': 'new'}, count_absent_as_miss=True,
+        )
+        assert got['per_k'][0]['hits'] == 1
+
+
+# ---------------------------------------------------------------------------
+# compute_first_hit_ranks
+# ---------------------------------------------------------------------------
+
+class TestComputeFirstHitRanks:
+    def test_reports_the_one_based_rank_of_the_canonical(self) -> None:
+        retrievals = [_retrieval('d1', 'c1', ['z', 'c1', 'y'])]
+        got = _mod().compute_first_hit_ranks(retrievals)
+        assert got == [{
+            'memory_id': 'd1', 'canonical_id': 'c1',
+            'canonical_present': True, 'rank': 2,
+        }]
+
+    def test_reports_minus_one_when_the_canonical_never_appears(self) -> None:
+        retrievals = [_retrieval('d1', 'c1', ['z', 'y'])]
+        got = _mod().compute_first_hit_ranks(retrievals)
+        assert got[0]['rank'] == -1
+
+    def test_a_child_of_the_canonical_reaches_it_as_recall_scores_it(self) -> None:
+        """The rank recall@k counts: a hoisted child reaches the canonical."""
+        retrievals = [
+            _retrieval_with_parents('d1', 'c1', ['z', 'child-of-c1'], {'child-of-c1': 'c1'}),
+        ]
+        assert _mod().compute_first_hit_ranks(retrievals)[0]['rank'] == 2
+
+    def test_omits_alias_fields_when_no_alias_is_known_for_the_canonical(self) -> None:
+        retrievals = [_retrieval('d1', 'c1', ['c1'])]
+        got = _mod().compute_first_hit_ranks(retrievals, aliases={'other': 'x'})
+        assert 'alias_id' not in got[0]
+        assert 'rank_with_aliases' not in got[0]
+
+    def test_rank_with_aliases_can_improve_on_the_plain_rank(self) -> None:
+        retrievals = [_retrieval('d1', 'old', ['z', 'new', 'y'], present=False)]
+        got = _mod().compute_first_hit_ranks(retrievals, aliases={'old': 'new'})
+        row = got[0]
+        assert row['rank'] == -1, 'the plain (unaliased) rank must not resolve'
+        assert row['alias_id'] == 'new'
+        assert row['rank_with_aliases'] == 2
+
+    def test_covers_every_non_canonical_retrieval(self) -> None:
+        retrievals = [
+            _retrieval('d1', 'c1', ['c1']),
+            _retrieval('d2', 'c2', ['z'], present=False),
+        ]
+        got = _mod().compute_first_hit_ranks(retrievals)
+        assert {row['memory_id'] for row in got} == {'d1', 'd2'}
+
+
+# ---------------------------------------------------------------------------
+# load_canonical_aliases
+# ---------------------------------------------------------------------------
+
+class TestLoadCanonicalAliases:
+    def test_reads_a_valid_map(self, tmp_path: Path) -> None:
+        path = tmp_path / 'aliases.json'
+        path.write_text(json.dumps({'old': 'new'}))
+        assert _mod().load_canonical_aliases(path) == {'old': 'new'}
+
+    def test_rejects_malformed_json(self, tmp_path: Path) -> None:
+        path = tmp_path / 'aliases.json'
+        path.write_text('{not json')
+        with pytest.raises(ValueError, match='malformed JSON'):
+            _mod().load_canonical_aliases(path)
+
+    def test_rejects_a_non_object_top_level(self, tmp_path: Path) -> None:
+        path = tmp_path / 'aliases.json'
+        path.write_text(json.dumps(['old', 'new']))
+        with pytest.raises(ValueError, match='expected a JSON object'):
+            _mod().load_canonical_aliases(path)
+
+    def test_rejects_a_non_string_value(self, tmp_path: Path) -> None:
+        path = tmp_path / 'aliases.json'
+        path.write_text(json.dumps({'old': 123}))
+        with pytest.raises(ValueError, match='str -> str'):
+            _mod().load_canonical_aliases(path)
+
+
+# ---------------------------------------------------------------------------
+# run_calibration: aliases wiring + retrievals in the returned result
+# ---------------------------------------------------------------------------
+
+class TestRunCalibrationAliasesWiring:
+    def test_the_result_carries_the_raw_retrievals(self, tmp_path: Path) -> None:
+        got = _run(tmp_path)
+        assert 'retrievals' in got
+        memory_ids = {r['memory_id'] for r in got['retrievals']}
+        assert memory_ids == {'d1', 'd2'}, 'one retrieval per non-canonical fixture record'
+
+    def test_no_aliases_keeps_the_legacy_present_only_population(self, tmp_path: Path) -> None:
+        got = _run(
+            tmp_path,
+            search=_search_fn(hits={'d1': ['c1']}, present={'c1'}),
+        )
+        assert got['report']['recall_at_k']['per_k'][0]['total'] == 1, (
+            'd2 (canonical absent) must stay excluded when aliases is not given'
+        )
+
+    def test_aliases_alone_do_not_choose_the_population(self, tmp_path: Path) -> None:
+        """Alias lookup and population are independent choices (heuristic 3)."""
+        got = _run(
+            tmp_path,
+            search=_search_fn(hits={'d1': ['c1']}, present={'c1'}),
+            aliases_map={'c2': 'c2-alias'},
+        )
+        recall = got['report']['recall_at_k']
+        assert (recall['per_k'][0]['total'], recall['absent_in_denominator']) == (1, False)
+
+    def test_count_absent_as_miss_chooses_the_full_population(self, tmp_path: Path) -> None:
+        got = _run(
+            tmp_path,
+            search=_search_fn(hits={'d1': ['c1']}, present={'c1'}),
+            aliases_map={'c2': 'c2-alias'},
+            count_absent_as_miss=True,
+        )
+        assert got['report']['recall_at_k']['per_k'][0]['total'] == 2, (
+            'd2 must now be scored (as a miss, since its alias never appears '
+            "among the fake search_fn's candidates) rather than excluded"
+        )
+
+

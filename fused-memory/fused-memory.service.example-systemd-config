@@ -1,7 +1,11 @@
 [Unit]
 Description=Fused Memory MCP Server (dark-factory)
 Documentation=file:///home/leo/src/dark-factory/DESIGN.md
-After=network.target
+After=network.target fused-memory.socket
+# fused-memory.socket holds the port so it stays bound across restarts (see
+# that unit). Wants=, not Requires=: if the socket cannot start, the service
+# still starts and binds the port itself.
+Wants=fused-memory.socket
 
 # Restart-rate guard: 10 starts within 600s is generous enough for cap-rotation
 # churn and recoverable cascades, but blocks a true tight loop. No
@@ -25,10 +29,14 @@ Type=notify
 NotifyAccess=all
 WatchdogSec=120
 WorkingDirectory=/home/leo/src/dark-factory
-ExecStart=/home/leo/.local/bin/uv run --project fused-memory \
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project fused-memory \
   python -m fused_memory.server.main \
   --transport http \
   --config /home/leo/src/dark-factory/fused-memory/config/config.yaml
+
+# A deliberate stop also stops fused-memory.socket, so no later connection
+# can restart the service; a restart or crash keeps the port bound.
+ExecStopPost=-/home/leo/src/dark-factory/scripts/stop-socket-unless-restarting.sh %n
 
 # Environment: secrets loaded by dotenv from fused-memory/.env
 # These are the non-secret vars the config.yaml ${} expansion needs
@@ -71,3 +79,4 @@ StandardError=journal
 
 [Install]
 WantedBy=default.target
+Also=fused-memory.socket

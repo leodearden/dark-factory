@@ -67,7 +67,16 @@ class TestResolveEntityByName:
     async def test_raises_ambiguous_error_when_multiple_match(
         self, mock_config, make_backend, make_graph_mock
     ):
-        """Raises AmbiguousEntityError when multiple entities share the same name."""
+        """Raises AmbiguousEntityError when multiple entities share the same name.
+
+        Also pins the class's structured-field invariant AT THIS RAISE SITE.
+        The invariant spans both sites by design — a consumer keys off
+        .name/.group_id/.uuids without parsing the message — so checking it at
+        only one of them would let this one drift while the class docstring
+        still named it. The sibling pin is
+        test_write_time_identity.py::TestEnsureEntityNodeNoMerge::
+        test_refusal_carries_structured_name_group_and_uuids.
+        """
         backend = make_backend(mock_config)
         rows = [['uuid-1', 'Alice'], ['uuid-2', 'Alice']]
         graph = make_graph_mock(rows)
@@ -77,6 +86,13 @@ class TestResolveEntityByName:
         # Error message should include both UUIDs so callers can disambiguate
         assert 'uuid-1' in str(exc_info.value)
         assert 'uuid-2' in str(exc_info.value)
+        # ... and the same facts as DATA, so nothing downstream parses that
+        # message. group_id is the CANONICALIZED one the method actually
+        # queried, not the raw argument.
+        assert exc_info.value.name == 'Alice'
+        assert exc_info.value.group_id == 'test'
+        assert exc_info.value.uuids == ('uuid-1', 'uuid-2')
+        assert isinstance(exc_info.value.uuids, tuple)
 
     @pytest.mark.asyncio
     async def test_raises_when_not_initialized(self, mock_config):

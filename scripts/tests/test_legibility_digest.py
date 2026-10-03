@@ -21,15 +21,23 @@ no package __init__ needed).
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 
+import coder as coder_mod
 import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
-from orchestrator.agents.briefing import MEMORY_CONTEXT_CAVEAT
+from orchestrator.agents.briefing import (
+    MEMORY_CONTEXT_CAVEAT,
+    MEMORY_DEGRADED_STORES_NOTICE,
+    MEMORY_EMPTY_NOTICE,
+    MEMORY_OUTAGE_NOTICE,
+    MEMORY_SECTION_FAILURE_NOTICE,
+)
 from shared.cli_invoke import CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT
 
 
@@ -386,6 +394,22 @@ class TestIterUserTurns:
         assert [t['text'] for t in turns] == ['first', 'second']
         assert [t['index'] for t in turns] == [0, 3]
 
+    def test_excludes_reingested_content_through_the_shared_predicate(self):
+        """A user turn whose whole text is a coder judgment was NOT observed:
+        no dark-factory transcript on disk on 2026-09-23 carries one. It is
+        pinned so the gold bucket and every scalar detector answer
+        "is this re-ingested?" with ONE predicate. The genuine and briefing
+        turns pin that sharing it neither widens nor narrows the filter."""
+        records = [
+            _user_text(_coder_judgment()),
+            _user_text('please redo the merge'),
+            _user_text(_briefing_text()),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, 'please redo the merge')]
+
 
 # ---------------------------------------------------------------------------
 # iter_error_neighborhoods — is_error tool_result blocks ONLY (never a
@@ -463,9 +487,37 @@ class TestIterErrorNeighborhoods:
         assert len(neighborhoods) == 2
         for n in neighborhoods:
             assert set(n) == {
-                'index', 'attempt_tool', 'attempt_input_summary',
+                'index', 'tool_use_id', 'attempt_tool', 'attempt_input_summary',
                 'error_content', 'exit_code', 'designed_outcome',
             }
+
+    def test_neighborhood_carries_the_pairing_tool_use_id(self):
+        # The JOIN KEY (task 4751 / confusion-census-2026-08-26 R1): a
+        # caller holding this scan can relate a classified result back to
+        # the assistant attempt that produced it WITHOUT a second scan.
+        # Record index cannot serve: a retry group's `indices` are tool_use
+        # positions while a neighborhood's `index` is the tool_result one.
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'false'}, id='tu-1')),
+            _tool_result('tu-1', 'boom, no code here', is_error=True),
+            _assistant(_tool_use('Bash', {'command': 'watcher'}, id='tu-2')),
+            _tool_result('tu-2', _CEILING_DECLARATION, is_error=True),
+        ]
+
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert [n['tool_use_id'] for n in neighborhoods] == ['tu-1', 'tu-2']
+
+    def test_tool_use_id_survives_an_unmatched_attempt(self):
+        # Read off the RESULT block, so it is populated even when the
+        # attempt was truncated off the front of the window -- the same
+        # degradation contract the None attempt fields already document.
+        records = [_tool_result('tu-orphan', 'boom', is_error=True)]
+
+        n = mod.iter_error_neighborhoods(records)[0]
+
+        assert n['attempt_tool'] is None
+        assert n['tool_use_id'] == 'tu-orphan'
 
     def test_ceiling_result_is_enriched_with_code_and_label(self):
         records = [
@@ -832,6 +884,46 @@ class TestIterSelfCorrections:
 
         assert mod.iter_self_corrections(records) == []
 
+    def test_ignores_a_whole_block_coder_judgment(self):
+        # The b203a05c record-22 sighting: a prior trickle-coder answer whose
+        # note quotes "that's wrong" from the digest it coded.
+        records = [_assistant(_text(_coder_judgment()))]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_ignores_a_json_fenced_coder_judgment(self):
+        records = [_assistant(_text(_json_fenced(_coder_judgment())))]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_ignores_a_coder_judgment_quoting_i_was_wrong(self):
+        # The 6a527d51 record-10 marker.
+        records = [_assistant(_text(
+            _coder_judgment(note='I was wrong to keep reporting it as stuck'),
+        ))]
+
+        assert mod.iter_self_corrections(records) == []
+
+    def test_coder_judgment_does_not_mask_a_prose_self_correction(self):
+        records = [
+            _assistant(_text(_coder_judgment())),
+            _assistant(_text('My mistake, the lease check belongs in the watcher.')),
+        ]
+
+        hits = mod.iter_self_corrections(records)
+
+        assert [(h['index'], h['pattern']) for h in hits] == [(1, 'my mistake')]
+
+    def test_prose_quoting_the_schema_inline_still_self_corrects(self):
+        records = [_assistant(_text(
+            'Earlier I said the coder answers {"matches": [], "candidates": []} '
+            "on every run. That's wrong: it answers that only when nothing matches."
+        ))]
+
+        hits = mod.iter_self_corrections(records)
+
+        assert [h['pattern'] for h in hits] == ["that's wrong"]
+
 
 # ---------------------------------------------------------------------------
 # iter_not_found / iter_df_guards / iter_interrupts — secondary scalar
@@ -909,6 +1001,172 @@ class TestSecondarySignals:
         records = [_sidechain(_user_text('[Request interrupted by user for tool use]'))]
 
         assert mod.iter_interrupts(records) == []
+
+
+# ---------------------------------------------------------------------------
+# Re-ingested content is excluded from EVERY signal bucket (task 5685), not
+# only the one it was first sighted in. Fixture shapes mirror a 2026-09-23
+# read-only scan of all 35,888 dark-factory transcripts: the harness-injected
+# trickle-coder prompt embeds the digest it codes (901 sessions carried
+# phantom df_guard or interrupt hits from it), and a coder answer quotes that
+# digest back (246 of the 301 sessions it contaminated had df_guard hits).
+# ---------------------------------------------------------------------------
+
+def _trickle_coder_session_records():
+    """A synthetic whole-session reproduction of the b203a05c shape: the
+    harness-injected trickle-coder prompt, embedding the digest it codes, as
+    the one user turn, and the coder's answer as the one assistant text
+    block. Every signal literal in it is re-ingested."""
+    prompt = (
+        f'{_TRICKLE_CODER_PREAMBLE}\n\n=== SESSION DIGEST ===\n'
+        '## Guard Trips\n- (turn 21) blocked:\n'
+    )
+    answer = _coder_judgment(note="that's wrong: its turn 21 reads blocked: twice")
+    return [
+        _with_session_meta(_user_text(prompt)),
+        _with_session_meta(_assistant(_text(answer))),
+    ]
+
+
+class TestReingestedContentIsBucketAgnostic:
+    def test_df_guard_ignores_the_digest_a_coder_prompt_embeds(self):
+        records = [_user_text(f'{_TRICKLE_CODER_PREAMBLE}\n\n- (turn 21) blocked:')]
+
+        assert mod.iter_df_guards(records) == []
+
+    def test_df_guard_ignores_a_coder_judgment_quoting_a_trip(self):
+        records = [_assistant(_text(_coder_judgment(note='its turn 21 reads blocked:')))]
+
+        assert mod.iter_df_guards(records) == []
+
+    @pytest.mark.parametrize(
+        'record',
+        [_user_text('the merge got BLOCKED: again, why?'), _tool_result('tu-1', 'BLOCKED: real block')],
+        ids=['user_turn', 'tool_result'],
+    )
+    def test_df_guard_still_hits_the_same_literal_in_dialogue(self, record):
+        assert [h['pattern'] for h in mod.iter_df_guards([record])] == ['blocked:']
+
+    def test_not_found_ignores_foreign_material_carrying_a_harness_prompt(self):
+        # The measured Read-of-source / transcript-dump shape: a tool_result
+        # holding another session's material, harness marker and all. It is
+        # dropped WHOLE, so a genuine error printed beside the marker would
+        # go too: the accepted trade-off _dialogue_text_sources states.
+        records = [_tool_result(
+            'tu-1', f'{_TRICKLE_CODER_PREAMBLE}\n## Not Found\n- (turn 3) no such file or directory',
+        )]
+
+        assert mod.iter_not_found(records) == []
+
+    def test_not_found_ignores_a_tool_result_that_is_a_coder_judgment(self):
+        records = [_tool_result('tu-1', _coder_judgment(note='cat: x.py: No such file or directory'))]
+
+        assert mod.iter_not_found(records) == []
+
+    def test_not_found_still_hits_the_same_literal_in_an_ordinary_tool_result(self):
+        records = [_tool_result('tu-1', 'cat: x.py: No such file or directory', is_error=True)]
+
+        assert [h['pattern'] for h in mod.iter_not_found(records)] == ['no such file or directory']
+
+    @pytest.mark.parametrize(
+        ('detect', 'record', 'pattern'),
+        [
+            (
+                mod.iter_not_found,
+                _tool_result('tu-1', (
+                    '# Task\n\n'
+                    'Mirror the `# Context` and `## Agent Identity` headings in the new test.\n'
+                    'cat: missing.md: No such file or directory'
+                ), is_error=True),
+                'no such file or directory',
+            ),
+            (
+                mod.iter_self_corrections,
+                _assistant(_text(
+                    'My mistake: `# Context` comes from _get_memory_context, '
+                    'and `## Agent Identity` from _agent_identity.'
+                )),
+                'my mistake',
+            ),
+        ],
+        ids=['tool_result', 'assistant_text'],
+    )
+    def test_a_carrier_merely_naming_harness_headings_keeps_its_signal(self, detect, record, pattern):
+        """The boundary of the whole-carrier drop on NON-user carriers: a
+        carrier is dropped for HOLDING a harness prompt or briefing, never
+        for naming its headings, as this session's own file dump or prose
+        routinely does."""
+        assert [h['pattern'] for h in detect([record])] == [pattern]
+
+    def test_interrupt_ignores_the_digest_a_harness_prompt_embeds(self):
+        records = [_user_text(
+            f'{_TRICKLE_CODER_PREAMBLE}\n\n## Interrupts\n- (turn 7) request interrupted by user',
+        )]
+
+        assert mod.iter_interrupts(records) == []
+
+    def test_a_trickle_coder_session_reports_every_signal_zero(self):
+        counts = mod.signal_counts(_trickle_coder_session_records())
+
+        assert counts == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+
+    def test_classify_agent_class_still_reads_the_raw_carriers(self):
+        """Exists to stop _dialogue_text_sources being wired into
+        classify_agent_class, which classifies a session BY its injected
+        markers: reading the filtered layer would delete its own evidence and
+        collapse this orchestrated session to 'interactive'. The first
+        assertion is the premise that makes the second one discriminate."""
+        text = _briefing_text(
+            body_filler='Task ID: 42\nWorktree: /home/leo/src/dark-factory/.worktrees/42',
+        )
+        records = [_user_text(text)]
+
+        assert mod.is_reingested_content(text) is True
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+
+class TestTrickleCoderSessionDigest:
+    """The rendered ARTIFACT a census reads, not just the counters: a
+    trickle-coder session renders no trace of the signals it re-ingested."""
+
+    def test_renders_none_of_the_sections_the_contamination_fed(self):
+        digest = mod.render_digest(_trickle_coder_session_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+        lines = digest.splitlines()
+
+        for key in ('self_corrections', 'user_corrections', 'df_guard'):
+            assert f'## {mod.SECTION_HEADINGS[key]}' not in lines
+        assert meta['signal_counts'] == dict.fromkeys(mod.SIGNAL_COUNT_KEYS, 0)
+        assert meta['n_user_turns'] == 0
+
+    def test_frontmatter_names_a_generation_that_excludes_reingested_content(self):
+        """Generation 3 is the first whose signal_counts exclude re-ingested
+        content, so a census can tell a pre-fix coder-JSON self-correction
+        trace (generation 2) from a live regression -- the discriminator
+        plans/confusion-reduction-prd.md §7.2.2 exists for. A floor, not a
+        freeze: a later legitimate bump must never have to edit a test named
+        for this decision (see §7.2.2's task-4751 note that no test freezes
+        the constant)."""
+        digest = mod.render_digest(_trickle_coder_session_records(), agent_class='interactive')
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 3
+
+    def test_frontmatter_names_a_generation_that_excludes_non_human_origin_turns(self):
+        """Generation 4 is the first whose gold section and user-text signal
+        carriers exclude non-human-origin records, so a census can tell a
+        pre-fix task-notification "User Correction" from a live regression.
+        A floor, not a freeze, exactly like the generation-3 test above."""
+        digest = mod.render_digest(
+            [_with_session_meta(_task_notification())], agent_class='interactive',
+        )
+
+        frontmatter_yaml, _ = _split_frontmatter(digest)
+
+        assert yaml.safe_load(frontmatter_yaml)['instrument_version'] >= 4
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1250,237 @@ class TestFindRetryLoops:
         assert len(loops) == 1
         assert loops[0]['tool'] == 'Bash'
         assert loops[0]['count'] == 3
+
+
+# ---------------------------------------------------------------------------
+# find_retry_loops designed-outcome ANNOTATION -- confusion-census-2026-08-26
+# §1.1 / R1 (task 4751). A healthy 4-hour escalation-watcher rotation makes
+# one date-check and one re-arm call per ~3600s cycle, so ANY rotation of
+# >= RETRY_MIN cycles necessarily crosses the threshold and renders under
+# '## Retry Loops' -- while the SAME digest's signal_counts correctly report
+# tool_error=0 and tally the ceilings under designed_outcome. Two layers of
+# one instrument told contradictory stories about one session. The fix joins
+# the retry groups against task 3610's EXISTING classification on
+# tool_use_id and ANNOTATES; it never suppresses, so a genuine retry storm
+# interleaved with ceilings stays fully visible (PRD Sec 7.2.1's
+# fail-toward-genuine principle).
+# ---------------------------------------------------------------------------
+
+_DATE_CHECK = {'command': 'date -u +"%Y-%m-%dT%H:%M:%S%z"'}
+_REARM = {
+    'command': (
+        'cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh '
+        '--queue-dir /home/leo/src/dark-factory/data/escalations '
+        '--level 1 --timeout 3600'
+    ),
+    'timeout': 3660000,
+}
+
+
+def _watcher_rotation_records():
+    """The 631e7374 sighting shape: 3 healthy watcher cycles, each a
+    non-error `date -u` check plus a re-arm that ends in a DECLARED
+    bounded-wait CEILING. Nothing here is confusion."""
+    records = []
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', _DATE_CHECK, id=f'tu-d{i}')))
+        records.append(_tool_result(f'tu-d{i}', '2026-08-26T12:00:00+0000'))
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-r{i}')))
+        records.append(_tool_result(f'tu-r{i}', _CEILING_DECLARATION, is_error=True))
+    return records
+
+
+def _mixed_rotation_records():
+    """One 4-call re-arm group whose results split 2 designed / 2 GENUINE."""
+    records = []
+    for i in range(4):
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-m{i}')))
+        content = (
+            _CEILING_DECLARATION if i < 2
+            else 'DARK_FACTORY_ROOT unset, exit code 2'
+        )
+        records.append(_tool_result(f'tu-m{i}', content, is_error=True))
+    return records
+
+
+_BARE_CEILING = 'command timed out after 60m, exit code 124'
+
+
+def _two_rule_rotation_records():
+    """One 3-call re-arm group whose designed results fire TWO different
+    classification rules -- a self-declared WATCHER_REARM_OUTCOME first,
+    then a bare bounded-wait 124 with no declaration, then the declaration
+    again. Both are designed, both carry exit 124, and they are distinct
+    ``(exit_code, label)`` pairs, so this is the only shape that exercises
+    dedup ACROSS distinct pairs and the renderer's multi-rule join."""
+    contents = [_CEILING_DECLARATION, _BARE_CEILING, _CEILING_DECLARATION]
+    records = []
+    for i, content in enumerate(contents):
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-t{i}')))
+        records.append(_tool_result(f'tu-t{i}', content, is_error=True))
+    return records
+
+
+def _codeless_rotation_records():
+    """One 3-call re-arm group whose designed declarations carry NO exit
+    code -- ``FIRED`` with no ``exit=`` and no code anywhere in the blob,
+    which classify_error_content resolves to ``(None, label)``. Pins that
+    the None-code pair is REACHABLE, not a hypothetical of the type."""
+    records = []
+    for i in range(3):
+        records.append(_assistant(_tool_use('Bash', _REARM, id=f'tu-n{i}')))
+        records.append(
+            _tool_result(f'tu-n{i}', 'WATCHER_REARM_OUTCOME: FIRED', is_error=True)
+        )
+    return records
+
+
+def _idless_rotation_records():
+    """>= RETRY_MIN attempts whose tool_use blocks carry NO 'id', beside a
+    DESIGNED tool_result whose 'tool_use_id' is likewise absent -- both
+    sides of the join degrade to None. Nothing here may join to anything."""
+    records = []
+    for _ in range(3):
+        block = _tool_use('Bash', _REARM)
+        del block['id']
+        records.append(_assistant(block))
+    orphan = _tool_result('unused', _CEILING_DECLARATION, is_error=True)
+    del orphan['message']['content'][0]['tool_use_id']
+    records.append(orphan)
+    return records
+
+
+def _by_signature(loops):
+    return {loop['signature']: loop for loop in loops}
+
+
+class TestRetryLoopDesignedOutcomeJoin:
+    def test_both_rotation_groups_are_still_returned_at_their_true_count(self):
+        # Annotation, never suppression: the date-check and the re-arm
+        # groups both survive at x3 exactly as before the join.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        assert len(loops) == 2
+        assert loops[mod._input_signature(_DATE_CHECK)]['count'] == 3
+        assert loops[mod._input_signature(_REARM)]['count'] == 3
+
+    def test_rearm_group_reports_its_designed_outcome_count(self):
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        rearm = loops[mod._input_signature(_REARM)]
+
+        assert rearm['designed_outcome_count'] == 3
+
+    def test_rearm_group_names_the_distinct_rules_that_fired(self):
+        # DISTINCT (exit_code, label) pairs -- 3 identical ceilings collapse
+        # to one pair, so the annotation stays one line long however many
+        # cycles the rotation ran.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        rearm = loops[mod._input_signature(_REARM)]
+
+        assert rearm['designed_outcomes'] == [(124, 'watcher-rearm-declared')]
+        assert rearm['designed_outcomes'] == [
+            mod.classify_error_content(_CEILING_DECLARATION)
+        ]
+
+    def test_two_distinct_rules_are_ordered_by_first_appearance(self):
+        # The non-degenerate case: 3 designed results collapsing to TWO
+        # distinct pairs, not one. Both carry exit 124, so only the LABEL
+        # separates them -- and the declaration is asserted first because
+        # ordering is transcript order (a seen-set, never a sort: exit_code
+        # is int | None, so sorted() would raise the moment a declaration
+        # carries no code).
+        loops = mod.find_retry_loops(_two_rule_rotation_records())
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 3
+        assert loops[0]['designed_outcome_count'] == 3
+        assert loops[0]['designed_outcomes'] == [
+            (124, 'watcher-rearm-declared'),
+            (124, 'bounded-wait-ceiling'),
+        ]
+
+    def test_repeat_of_an_earlier_rule_does_not_re_emit_its_pair(self):
+        # Dedup is across DISTINCT pairs, so the third call's repeat of the
+        # first call's declaration adds to the count but not to the list --
+        # the annotation stays one line long however long the rotation ran.
+        loops = mod.find_retry_loops(_two_rule_rotation_records())
+
+        assert loops[0]['designed_outcome_count'] == 3
+        assert len(loops[0]['designed_outcomes']) == 2
+
+    def test_declaration_without_an_exit_code_yields_a_none_coded_pair(self):
+        # classify_error_content can return (None, label): the pattern's
+        # `code` group is optional and _declared_exit_code falls through to
+        # a text scan that finds nothing. The join must carry that None
+        # through rather than dropping the pair or coercing a code.
+        loops = mod.find_retry_loops(_codeless_rotation_records())
+
+        assert loops[0]['designed_outcome_count'] == 3
+        assert loops[0]['designed_outcomes'] == [(None, 'watcher-rearm-declared')]
+
+    def test_idless_blocks_never_join_to_an_idless_neighborhood(self):
+        # Both sides of the join degrade to None independently, so an
+        # unrestricted {id: neighborhood} map would let a malformed id-less
+        # attempt COLLIDE with an orphan designed result and annotate a
+        # group that has no designed outcome at all. The map excludes a
+        # None key precisely to make that collision unrepresentable.
+        loops = mod.find_retry_loops(_idless_rotation_records())
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 3
+        assert loops[0]['designed_outcome_count'] == 0
+        assert loops[0]['designed_outcomes'] == []
+
+    def test_group_with_no_error_results_annotates_nothing(self):
+        # The zero-cost default: the date-check group's results are not
+        # is_error at all, so it joins to no neighborhood.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        date_check = loops[mod._input_signature(_DATE_CHECK)]
+
+        assert date_check['designed_outcome_count'] == 0
+        assert date_check['designed_outcomes'] == []
+
+    def test_mixed_group_fails_toward_genuine(self):
+        # 2 of 4 designed: the group keeps its FULL x4 count and is not
+        # dropped. Suppressing a partly-designed group would hide a genuine
+        # retry storm interleaved with bounded-wait ceilings -- the
+        # detector lying in the opposite direction.
+        loops = mod.find_retry_loops(_mixed_rotation_records())
+
+        assert len(loops) == 1
+        assert loops[0]['count'] == 4
+        assert loops[0]['designed_outcome_count'] == 2
+
+    def test_accepts_a_precomputed_scan(self):
+        # Mirrors test_partition_accepts_a_precomputed_scan: a caller
+        # holding a scan annotates from it instead of paying for a fresh
+        # one -- what keeps render_digest at two scans, not three.
+        records = _watcher_rotation_records()
+        neighborhoods = mod.iter_error_neighborhoods(records)
+
+        assert (
+            mod.find_retry_loops(records, neighborhoods=neighborhoods)
+            == mod.find_retry_loops(records)
+        )
+
+    def test_preexisting_group_fields_are_unchanged(self):
+        # Backward compat: the positional call still works and every field
+        # a pre-4751 caller read is byte-identical.
+        records = [
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-1')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-2')),
+            _assistant(_tool_use('Bash', {'command': 'pytest'}, id='tu-3')),
+        ]
+
+        loop = mod.find_retry_loops(records)[0]
+
+        assert loop['tool'] == 'Bash'
+        assert loop['signature'] == json.dumps({'command': 'pytest'}, sort_keys=True)
+        assert loop['count'] == 3
+        assert loop['indices'] == [0, 1, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -1613,29 +2102,49 @@ _DROP_NOTE_EXAMPLE = (
 (``f'{foreign_dropped} memory result slot(s) across {queries_fired} '
 f'{query_word} were tagged to another project and filtered out'``)."""
 
-_NO_RECALLED_SECTIONS_VARIANTS = (
-    '# Context\n\n_Memory unavailable — proceed with codebase exploration._',
-    (
-        '# Context\n\n_Memory unavailable — proceed with codebase '
-        f'exploration. Note: {_DROP_NOTE_EXAMPLE} before the failure._'
-    ),
-    '# Context\n\n_No memory context available._',
-    f'# Context\n\n_No memory context available ({_DROP_NOTE_EXAMPLE})._',
-)
-"""The four literal shapes ``_get_memory_context`` returns when
-``recalled_sections`` is empty
-(orchestrator/src/orchestrator/agents/briefing.py:1321-1331) -- two
-literal families (memory-unavailable / no-memory-context available), each
-with a plain and a drop_note-bearing variant. Not lockstep-importable
-like MEMORY_CONTEXT_CAVEAT: these are inlined string literals in
-``_get_memory_context``'s body, not a module-level constant."""
+_SECTION_NOTICES_EXAMPLE = '\n\n'.join((
+    MEMORY_SECTION_FAILURE_NOTICE.format(section='Task Context', reason='transport'),
+    MEMORY_DEGRADED_STORES_NOTICE.format(section='Conventions & Gotchas', stores='graphiti'),
+))
+"""Representative per-section notice text -- one broken query and one
+server-reported store outage, the two lines ``_section_notices`` emits."""
+
+
+def _no_recalled_sections_variants() -> tuple[str, ...]:
+    """Every shape ``_get_memory_context`` returns with no section recalled.
+
+    Two families -- MEMORY_OUTAGE_NOTICE (nothing worked) and
+    MEMORY_EMPTY_NOTICE (the corpus had nothing to say) -- each in three
+    shapes: plain, drop_note-bearing, and notices-bearing. The third arrived
+    with task 3659 step 20, which stopped discarding the per-section notices
+    on this path; before it, a broken dispatch rendered the empty-corpus
+    sentence verbatim.
+
+    Built by composing the PRODUCTION constants exactly as
+    ``_get_memory_context`` composes them -- family line first, notices
+    joined after it, drop_note appended last -- so a rewording of either
+    family turns this red instead of silently un-covering the marker it
+    pins. Lockstep-importable since task 3659 hoisted both families out of
+    ``_get_memory_context``'s body into module-level constants.
+    """
+    variants = []
+    for family in (MEMORY_OUTAGE_NOTICE.format(reasons='transport'), MEMORY_EMPTY_NOTICE):
+        variants.extend((
+            f'# Context\n\n{family}',
+            f'# Context\n\n{family}\n\n_Note: {_DROP_NOTE_EXAMPLE}._',
+            f'# Context\n\n{family}\n\n{_SECTION_NOTICES_EXAMPLE}',
+        ))
+    return tuple(variants)
+
+
+_NO_RECALLED_SECTIONS_VARIANTS = _no_recalled_sections_variants()
 
 
 def _recalled_sections_with_trailing_unavailable_note():
     """The recalled-sections return path's fullest composite shape
-    (orchestrator/src/orchestrator/agents/briefing.py:1339-1350) -- the
-    fifth of ``_get_memory_context``'s five return paths, distinct from
-    the four ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
+    (``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``)
+    -- ``_get_memory_context``'s OTHER return, distinct from
+    the ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
     have recalled_sections EMPTY; this one has it non-empty). Builds a
     caveat carrying its own drop_note suffix (a foreign-tagged result was
     filtered from an earlier query), a genuinely recalled section, AND
@@ -1651,6 +2160,34 @@ def _recalled_sections_with_trailing_unavailable_note():
         '\n\n---\n\n_Memory unavailable for the remaining queries — proceed '
         'with codebase exploration for anything not covered above._'
     )
+
+
+def _merger_prompt(tmp_path):
+    """The real text ``BriefingAssembler.build_merger_prompt`` injects
+    (orchestrator/src/orchestrator/agents/briefing.py), built by calling the
+    production builder rather than restating its headings here — the same
+    lockstep discipline ``test_resume_prompt_is_excluded_lockstep`` applies
+    to the cli_invoke resume constants.
+
+    The builder is async and touches no I/O and no config, so a throwaway
+    assembler over *tmp_path* and a plain ``asyncio.run`` suffice; this file
+    is otherwise synchronous and stays that way."""
+    from orchestrator.agents.briefing import BriefingAssembler
+    from orchestrator.config import GitConfig, OrchestratorConfig
+
+    assembler = BriefingAssembler(OrchestratorConfig(
+        project_root=tmp_path,
+        git=GitConfig(
+            main_branch='main',
+            branch_prefix='task/',
+            remote='origin',
+            worktree_dir='.worktrees',
+        ),
+    ))
+    return asyncio.run(assembler.build_merger_prompt(
+        conflicts='<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs',
+        task_intent='Rescope the briefing memory block.',
+    ))
 
 
 def _resume_and_context_block_records():
@@ -1867,6 +2404,41 @@ class TestHarnessInjectedTurnFilter:
         # resume prompt is covered by adding one more row.
         assert mod.is_harness_injected_turn(resume_prompt) is True
 
+    def test_merger_prompt_is_excluded_lockstep(self, tmp_path):
+        # LOCKSTEP: built by the REAL prompt builder, not a hand-copied
+        # literal, the same way test_resume_prompt_is_excluded_lockstep
+        # pins the cli_invoke constants -- so a future merger-prompt
+        # rewording turns this red instead of silently dropping the role
+        # out of coverage.
+        #
+        # The merger is the one dispatched role with NO memory block
+        # (task 3659, D7), so it emits no '# Context' anchor and the
+        # briefing anchor+corroborator rule cannot see it at all. Before
+        # 3659 it was classified via that anchor; MERGER_HEADINGS is what
+        # keeps merge-conflict dispatches (7 per 14 days, measured) out of
+        # the digest's gold user_corrections section.
+        assert mod.is_harness_injected_turn(_merger_prompt(tmp_path)) is True
+
+    def test_merger_prompt_is_excluded_from_iter_user_turns(self, tmp_path):
+        # The end-to-end consequence of the lockstep pin above: a merger
+        # dispatch transcript presents no user turn to mine.
+        records = [_user_text(_merger_prompt(tmp_path))]
+
+        assert mod.iter_user_turns(records) == []
+
+    def test_human_turn_with_one_merger_heading_is_retained(self, tmp_path):
+        # The all-of guard MERGER_HEADINGS is matched under: a human turn
+        # writing '# Action' (an ordinary spec-writing heading, emitted by
+        # every role template and deliberately NOT a briefing corroborator
+        # since task 3610) must stay gold.
+        human = (
+            '# Action\n\n'
+            'Please resolve the conflict in briefing.py by hand -- the '
+            'merge queue keeps picking the wrong side.\n'
+        )
+
+        assert mod.is_harness_injected_turn(human) is False
+
     def test_crash_recovery_resume_prompt_excluded_from_iter_user_turns(self):
         # The sibling of the usage-limit resume prompt: same defect class
         # (harness-injected continuation boilerplate typed into the
@@ -1936,13 +2508,13 @@ class TestHarnessInjectedTurnFilter:
     @pytest.mark.parametrize(
         'text', _NO_RECALLED_SECTIONS_VARIANTS,
         ids=[
-            'memory_unavailable', 'memory_unavailable_with_drop_note',
-            'no_memory_context', 'no_memory_context_with_drop_note',
+            'outage', 'outage_with_drop_note', 'outage_with_notices',
+            'empty', 'empty_with_drop_note', 'empty_with_notices',
         ],
     )
     def test_no_recalled_sections_variant_is_excluded(self, text):
-        # Exhaustive over _get_memory_context's four no-recalled-sections
-        # return paths, not just the caveat-bearing happy path covered
+        # Exhaustive over _get_memory_context's no-recalled-sections
+        # return shapes, not just the caveat-bearing happy path covered
         # above -- the marker set must cover every output of that
         # function, not merely its most common case.
         records = [_user_text(text)]
@@ -2039,6 +2611,372 @@ class TestHarnessInjectedTurnFilter:
 
         assert mod.iter_user_turns(records) == []
         assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+
+# ---------------------------------------------------------------------------
+# Non-human-origin records (task 5956). Claude Code stamps a queued prompt
+# with a structured top-level ``origin`` dict, and a background task's
+# completion or failure arrives as an ordinary user record with isMeta ABSENT
+# and origin={'kind': 'task-notification'} -- so no text rule saw it, and it
+# rendered as a gold "User Correction". Census sighting: reify session
+# 50e12d17's only gold turn was record 196, a sub-agent's weekly-limit
+# failure notification (_TASK_NOTIFICATION_TEXT, verbatim).
+# ---------------------------------------------------------------------------
+
+_TASK_NOTIFICATION_TEXT = (
+    '<task-notification>\n'
+    '<task-id>a1ab810a169bbb353</task-id>\n'
+    '<tool-use-id>toolu_019A8emLVkosytrg3s2up7AD</tool-use-id>\n'
+    '<output-file>/tmp/claude-1000/-home-leo-src-warm-lanes-worktrees--lane-20/'
+    '50e12d17-9e73-4686-a364-7ae08109140c/tasks/a1ab810a169bbb353.output</output-file>\n'
+    '<status>failed</status>\n'
+    '<summary>Agent "Find .ri fixture test harness patterns" failed: Agent terminated'
+    " early due to an API error: You've hit your weekly limit · resets Aug 26, 11am"
+    ' (Europe/London)</summary>\n'
+    '<note>A task-notification fires each time this agent stops with no live background'
+    ' children of its own. The user can send it another message and resume it, so the'
+    ' same task-id may notify more than once.</note>\n'
+    '<result>Now the harness and builtin tests.</result>\n'
+    '</task-notification>'
+)
+
+_GENUINE_CORRECTION = 'This is wrong, please redo it.'
+
+_UNKNOWN_PROVENANCE_TEXT = 'please redo the merge'
+
+
+def _with_origin(rec, kind):
+    """Return a copy of *rec* stamped with Claude Code's structured
+    provenance ``origin={'kind': kind}`` and with its 'isMeta' key REMOVED:
+    a real origin-stamped record carries isMeta absent, not False."""
+    out = dict(rec)
+    out.pop('isMeta', None)
+    out['origin'] = {'kind': kind}
+    return out
+
+
+_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS = (
+    '<task-notification>\n'
+    '<task-id>b2bc921b279ccc464</task-id>\n'
+    '<status>completed</status>\n'
+    '<summary>Background command "merge the branch" completed (exit code 1)</summary>\n'
+    '<result>BLOCKED: merge gate refused the branch\n'
+    '[Request interrupted by user for tool use]</result>\n'
+    '</task-notification>'
+)
+
+
+def _task_notification(text=_TASK_NOTIFICATION_TEXT):
+    """A background-task notification record, shaped like census record 196."""
+    return _with_origin(_user_text(text), 'task-notification')
+
+
+class TestNonHumanOriginFilter:
+    def test_census_task_notification_is_excluded_from_iter_user_turns(self):
+        assert mod.iter_user_turns([_task_notification()]) == []
+
+    @pytest.mark.parametrize(
+        ('kind', 'text'),
+        [
+            ('task-notification', _TASK_NOTIFICATION_TEXT),
+            (
+                'auto-continuation',
+                'Implement the following plan:\n\n# Fix: the laptop verify host is benched'
+                '\n\n## Objective\n\nMake the sync find uv on the remote host.',
+            ),
+            (
+                'auto-continuation',
+                'Your claude.ai usage limit has reset. Continue the task you were working on'
+                ' when the limit was reached; do not repeat work that is already complete.',
+            ),
+            (
+                'coordinator',
+                'The coordinator sent a message while you were working:\n'
+                'Task 5878 has landed; stop now and make no further changes.',
+            ),
+            (
+                'peer',
+                'Another Claude session sent a message:\n'
+                '<cross-session-message from="uds:/run/user/1000/cc-socks/1.sock"'
+                ' from-name="dark-factory-19">\nplease pick up the dedup scope\n'
+                '</cross-session-message>',
+            ),
+            ('a-future-kind', _UNKNOWN_PROVENANCE_TEXT),
+        ],
+        ids=[
+            'task_notification', 'auto_continuation_plan',
+            'auto_continuation_usage_limit_reset', 'coordinator', 'peer',
+            'unseen_future_kind',
+        ],
+    )
+    def test_every_non_human_origin_kind_is_excluded(self, kind, text):
+        # The text alone is ordinary dialogue to the content classifier, so
+        # only the record's provenance can exclude it -- and the rule is
+        # "anything but human", never an allowlist of known machine kinds.
+        rec = _with_origin(_user_text(text), kind)
+
+        assert mod.is_reingested_content(text) is False
+        assert mod.has_non_human_origin(rec) is True
+        assert mod.iter_user_turns([rec]) == []
+
+    def test_human_origin_record_quoting_a_notification_mid_prose_is_kept(self):
+        text = 'why did the <task-notification> for the lint run say failed? please look again'
+        rec = _with_origin(_user_text(text), 'human')
+
+        assert mod.has_non_human_origin(rec) is False
+        assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
+
+    def test_human_origin_record_opening_with_a_pasted_notification_is_kept(self):
+        # PROVENANCE decides, not text: there is no '<task-notification>'
+        # prefix fallback, so a human who pastes one to ask about it stays gold.
+        text = _TASK_NOTIFICATION_TEXT + '\n\nwhat does this failure mean? redo it'
+        rec = _with_origin(_user_text(text), 'human')
+
+        assert [t['text'] for t in mod.iter_user_turns([rec])] == [text]
+
+    @pytest.mark.parametrize(
+        'record',
+        [
+            _user_text(_UNKNOWN_PROVENANCE_TEXT),
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': 'task-notification'},
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {}},
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'kind': None}},
+            {**_user_text(_UNKNOWN_PROVENANCE_TEXT), 'origin': {'body': 'x'}},
+        ],
+        ids=['absent', 'bare_string', 'empty_dict', 'none_kind', 'no_kind_key'],
+    )
+    def test_unknown_provenance_falls_through_to_text_rules(self, record):
+        assert mod.has_non_human_origin(record) is False
+        assert [t['text'] for t in mod.iter_user_turns([record])] == [
+            _UNKNOWN_PROVENANCE_TEXT,
+        ]
+
+    def test_genuine_turn_between_notifications_keeps_its_record_index(self):
+        records = [
+            _task_notification(),
+            _with_origin(_user_text(_GENUINE_CORRECTION), 'human'),
+            _task_notification(),
+        ]
+
+        turns = mod.iter_user_turns(records)
+
+        assert [(t['index'], t['text']) for t in turns] == [(1, _GENUINE_CORRECTION)]
+
+    def test_render_digest_notification_only_session_has_no_gold_section(self):
+        # The census 50e12d17 shape at render level.
+        records = [_with_session_meta(_task_notification())]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        assert '## User Corrections' not in digest
+        assert meta['n_user_turns'] == 0
+        assert meta['score'] == mod.score_signals(meta['signal_counts'], 0)
+        assert '<task-notification>' not in body
+
+    def test_render_digest_keeps_only_the_genuine_correction_beside_notifications(self):
+        records = [
+            _with_session_meta(_task_notification()),
+            _with_session_meta(_with_origin(_user_text(_GENUINE_CORRECTION), 'human')),
+            _with_session_meta(_task_notification()),
+        ]
+
+        digest = mod.render_digest(records, agent_class='interactive')
+
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        meta = yaml.safe_load(frontmatter_yaml)
+
+        correction_lines = [line for line in body.splitlines() if line.startswith('- (turn')]
+        assert correction_lines == [f'- (turn 1) {_GENUINE_CORRECTION}']
+        assert meta['n_user_turns'] == 1
+
+    def test_df_guard_and_interrupt_ignore_a_task_notification_carrier(self):
+        records = [_task_notification(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS)]
+
+        assert mod.iter_df_guards(records) == []
+        assert mod.iter_interrupts(records) == []
+
+    def test_same_literals_under_human_origin_still_fire(self):
+        # The carrier filter keys on provenance, not on the text.
+        records = [_with_origin(_user_text(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS), 'human')]
+
+        assert len(mod.iter_df_guards(records)) == 1
+        assert len(mod.iter_interrupts(records)) == 1
+
+    def test_non_human_origin_drops_the_records_tool_result_carrier_too(self):
+        # Provenance is a property of the RECORD, so it filters every carrier
+        # the record holds -- not only its user text.
+        content = 'BLOCKED: gate refused\nls: cannot access x: No such file or directory'
+        stamped = [_with_origin(_tool_result('tool-1', content), 'task-notification')]
+        unstamped = [_tool_result('tool-1', content)]
+
+        assert mod.iter_df_guards(stamped) == []
+        assert mod.iter_not_found(stamped) == []
+        assert len(mod.iter_df_guards(unstamped)) == 1
+        assert len(mod.iter_not_found(unstamped)) == 1
+
+    def test_signal_counts_unaffected_by_a_task_notification_turn(self):
+        base = _all_signals_records()
+        with_notification = [_task_notification(_TASK_NOTIFICATION_WITH_SIGNAL_LITERALS)] + base
+
+        assert mod.signal_counts(with_notification) == mod.signal_counts(base)
+
+    def test_classify_agent_class_still_reads_markers_inside_a_notification(self):
+        # classify_agent_class reads the RAW carriers, which stay unfiltered.
+        text = (
+            _TASK_NOTIFICATION_TEXT
+            + 'Task ID: 5956\nWorktree: /home/leo/src/dark-factory/.worktrees/5956\n'
+        )
+        records = [_task_notification(text)]
+
+        assert mod.iter_user_turns(records) == []
+        assert mod.classify_agent_class(records) == 'orchestrated-task'
+
+
+# ---------------------------------------------------------------------------
+# is_coder_judgment_payload -- the re-ingestion content classifier's
+# machine-answer half (task 5685). A prior trickle-coder answer re-enters a
+# transcript as ONE carrier holding the coder's whole {"matches",
+# "candidates"} object (scripts/legibility/coder.py::build_prompt), and its
+# notes quote the digest being coded, so every signal literal they carry
+# used to fire as this session's own. The classifier PARSES the whole
+# carrier, bare or inside one outer ```json fence; it never substring-matches
+# or brace-slices, so prose that merely quotes the schema stays dialogue.
+# ---------------------------------------------------------------------------
+
+def _coder_judgment(note="that's wrong: the watcher re-armed on a stale lease"):
+    """A trickle-coder answer as it lands in a transcript: the whole
+    judgment on ONE line, shaped after session b203a05c record 22. *note*
+    rides inside a match, where a real coder quotes the digest it codes."""
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'watcher-loop-harness-mismatch',
+            'origin_phase': 'unknown',
+            'manifested_phase': 'recon',
+            'invariant_violated': None,
+            'note': note,
+        }],
+        'candidates': [{
+            'title': 'Recon reaper closes a filed task with its escalation',
+            'cause': 'closure keys off escalation linkage, not task merit',
+            'area': 'recon',
+            'origin_phase': 'unknown',
+            'manifested_phase': 'recon',
+            'evidence_quote': 'Re-filing without an escalation_id.',
+        }],
+    })
+
+
+def _json_fenced(payload):
+    """*payload* inside one outer ```json fence, trailing newline included."""
+    return f'```json\n{payload}\n```\n'
+
+
+class TestCoderJudgmentPayloadClassifier:
+    @pytest.mark.parametrize(
+        'text',
+        [
+            _coder_judgment(),
+            '{"matches": [], "candidates": []}',
+            _json_fenced(_coder_judgment()),
+            f'\n\n  {_coder_judgment()}  \n\n',
+            json.dumps({'matches': [], 'candidates': [], 'rationale': 'nothing fits'}),
+        ],
+        ids=['bare', 'empty_judgment', 'json_fenced', 'surrounding_whitespace', 'extra_key'],
+    )
+    def test_whole_carrier_judgment_is_recognised(self, text):
+        assert mod.is_coder_judgment_payload(text) is True
+
+    def test_the_reply_the_coder_prompt_prescribes_is_recognised_lockstep(self):
+        """LOCKSTEP with scripts/legibility/coder.py::build_prompt, the one
+        copy of the response schema CODER_JUDGMENT_KEYS restates. The reply
+        is read out of the prompt, never hand-built: a hand-built reply stays
+        green when that schema is renamed, and a rename is the drift this
+        pins."""
+        prompt = coder_mod.build_prompt(digest_text='', codebook_index='')
+        [prescribed_reply] = [line for line in prompt.splitlines() if line.startswith('{')]
+
+        assert mod.is_coder_judgment_payload(prescribed_reply) is True
+
+    def test_prose_quoting_the_schema_inline_is_not_a_payload(self):
+        # A genuine self-correction that merely MENTIONS the schema is this
+        # session's own dialogue and must never be suppressed.
+        text = (
+            'The coder answers with {"matches": [], "candidates": []} '
+            "— that's wrong, it should be a single object per session."
+        )
+
+        assert mod.is_coder_judgment_payload(text) is False
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            '{"matches": []}',
+            '{"candidates": []}',
+            '[{"matches": [], "candidates": []}]',
+            '{"results": [{"id": "ccf73ca4", "content": "Task 1470 wired /audit."}]}',
+            'not json at all',
+            '',
+        ],
+        ids=[
+            'matches_only', 'candidates_only', 'top_level_array',
+            'unrelated_object', 'non_json', 'empty',
+        ],
+    )
+    def test_anything_but_a_judgment_object_is_not_a_payload(self, text):
+        assert mod.is_coder_judgment_payload(text) is False
+
+    def test_pathologically_nested_object_answers_false_without_raising(self):
+        # json.loads raises RecursionError, which is not a ValueError, on
+        # this input under CPython 3.13. The predicate runs on every carrier
+        # of arbitrary transcripts, tool_results included, so it must
+        # answer rather than abort the whole digest.
+        text = '{"a":' * 200_000 + '1' + '}' * 200_000
+
+        assert mod.is_coder_judgment_payload(text) is False
+
+
+# ---------------------------------------------------------------------------
+# is_reingested_content -- the ONE predicate every signal bucket consults
+# (task 5685). It answers "is this carrier machine content re-ingested as
+# session material rather than this session's own dialogue?", and its two
+# known members are a prior coder judgment and a harness-injected prompt or
+# briefing.
+# ---------------------------------------------------------------------------
+
+class TestReingestedContentClassifier:
+    @pytest.mark.parametrize(
+        'text', [_coder_judgment(), _json_fenced(_coder_judgment())],
+        ids=['bare', 'json_fenced'],
+    )
+    def test_a_coder_judgment_is_reingested(self, text):
+        assert mod.is_reingested_content(text) is True
+
+    @pytest.mark.parametrize(
+        'text', [_briefing_text(), _CENSUS_MEMORY_CONTEXT_TURN, _TRICKLE_CODER_PREAMBLE],
+        ids=['briefing', 'census_memory_context', 'trickle_coder_prompt'],
+    )
+    def test_a_harness_prompt_or_briefing_is_reingested(self, text):
+        assert mod.is_reingested_content(text) is True
+
+    @pytest.mark.parametrize(
+        'resume_prompt', [CAP_HIT_RESUME_PROMPT, CRASH_RECOVERY_RESUME_PROMPT],
+        ids=['usage_limit', 'crash_recovery'],
+    )
+    def test_resume_prompt_is_reingested_lockstep(self, resume_prompt):
+        # LOCKSTEP, as in test_resume_prompt_is_excluded_lockstep: asserted
+        # against each canonical constant, never a restated literal.
+        assert mod.is_reingested_content(resume_prompt) is True
+
+    @pytest.mark.parametrize(
+        'text',
+        ['please fix the bug in the merge worker', "Actually, that's wrong — use the other branch", ''],
+        ids=['ordinary_turn', 'genuine_self_correction', 'empty'],
+    )
+    def test_dialogue_is_not_reingested(self, text):
+        assert mod.is_reingested_content(text) is False
 
 
 # ---------------------------------------------------------------------------
@@ -2741,6 +3679,188 @@ class TestDesignedOutcomesSection:
         assert body.strip() != ''
         assert '## Designed Outcomes' in body
         assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
+# Retry Loops designed-outcome annotation, RENDERED -- census 2026-08-26 R1
+# (task 4751). The annotation must report the designed count against the
+# group's TOTAL (never replacing it), and a group with zero designed results
+# must render byte-identically to the pre-4751 format so a genuine retry
+# storm's rendering is provably untouched.
+# ---------------------------------------------------------------------------
+
+def _retry_item(count, designed_outcome_count=0, designed_outcomes=(), tool='Bash'):
+    """One find_retry_loops group, shaped for _render_retry_loops."""
+    return {
+        'tool': tool,
+        'signature': mod._input_signature(_REARM),
+        'count': count,
+        'indices': list(range(count)),
+        'designed_outcome_count': designed_outcome_count,
+        'designed_outcomes': list(designed_outcomes),
+    }
+
+
+class TestRetryLoopAnnotationRendering:
+    def test_annotation_reports_designed_count_against_the_group_total(self):
+        # The two numbers are DIFFERENT on purpose: 6 calls, 3 of which
+        # ended in a declared ceiling. A reader must be able to see both.
+        item = _retry_item(
+            6, designed_outcome_count=3,
+            designed_outcomes=[(124, 'watcher-rearm-declared')],
+        )
+
+        line = mod._render_retry_loops([item])[0]
+
+        assert 'x6' in line
+        assert '3 designed-outcome results' in line
+
+    def test_zero_designed_group_renders_the_preexisting_format_exactly(self):
+        # REGRESSION GUARD, asserted against the literal pre-4751 f-string:
+        # the annotation is purely additive, so a genuine retry storm's
+        # line is unchanged byte for byte.
+        item = _retry_item(4)
+
+        line = mod._render_retry_loops([item])[0]
+
+        assert line == f"- {item['tool']} x{item['count']}: {item['signature']}"
+
+    def test_mixed_group_still_renders_its_full_call_volume(self):
+        # 2 of 4 designed -- the annotation explains the churn, it never
+        # hides how much churn there was.
+        loops = mod.find_retry_loops(_mixed_rotation_records())
+
+        line = mod._render_retry_loops(loops)[0]
+
+        assert 'x4' in line
+        assert '2 designed-outcome results' in line
+
+    def test_annotation_names_the_rule_that_fired(self):
+        # Mirrors test_designed_outcome_line_names_the_rule_that_fired:
+        # ONE vocabulary across both sections, so a reader (and the nightly
+        # trickle coder) never re-derives the classification from the raw
+        # command to learn WHY these calls were designed.
+        loops = _by_signature(mod.find_retry_loops(_watcher_rotation_records()))
+
+        line = mod._render_retry_loops([loops[mod._input_signature(_REARM)]])[0]
+
+        assert '[exit 124]' in line
+        assert '[watcher-rearm-declared]' in line
+
+    def test_multiple_rules_render_comma_joined_in_first_appearance_order(self):
+        # The multi-rule path asserted as an EXACT substring: separator,
+        # ordering and per-pair spelling in one literal, so a future edit
+        # to any of the three has to say so out loud.
+        loops = mod.find_retry_loops(_two_rule_rotation_records())
+
+        line = mod._render_retry_loops(loops)[0]
+
+        assert (
+            '(3 designed-outcome results: '
+            '[exit 124] [watcher-rearm-declared], '
+            '[exit 124] [bounded-wait-ceiling])'
+        ) in line
+
+    def test_pair_without_an_exit_code_renders_the_bare_label(self):
+        # _exit_marker renders '' for a None code, so the rule shows as a
+        # bare [label] with no empty '[exit ]' stub -- the same degradation
+        # the Designed Outcomes section's lines already take.
+        loops = mod.find_retry_loops(_codeless_rotation_records())
+
+        line = mod._render_retry_loops(loops)[0]
+
+        assert '(3 designed-outcome results: [watcher-rearm-declared])' in line
+        assert '[exit' not in line
+
+    def test_annotation_survives_the_per_item_byte_cap(self):
+        # _cap_item truncates from the RIGHT, so an annotation placed after
+        # the signature would be the first thing lost on exactly the
+        # long-command groups that most need explaining -- the hazard
+        # _exit_marker was introduced to solve for exit codes. 160 bytes is
+        # below the ~242 the annotated re-arm line needs, so the signature
+        # is eaten and the annotation must remain.
+        sections, _ = mod._build_sections(
+            _watcher_rotation_records(), item_max_bytes=160,
+        )
+
+        line = next(
+            ln for ln in sections['retry_loops'] if 'watcher-rearm' in ln
+        )
+
+        assert mod.ITEM_TRUNCATION_MARKER in line  # the signature WAS eaten
+        assert 'x3' in line
+        assert 'designed-outcome' in line
+        assert '[exit 124]' in line
+
+
+class TestRetryLoopAnnotationEndToEnd:
+    def _retry_block(self, records):
+        digest = mod.render_digest(records, agent_class='interactive')
+        frontmatter_yaml, body = _split_frontmatter(digest)
+        assert '## Retry Loops' in body
+        block = body.split('## Retry Loops', 1)[1].split('\n##', 1)[0]
+        return yaml.safe_load(frontmatter_yaml), block
+
+    def test_rearm_line_is_annotated_and_the_date_line_is_not(self):
+        # The whole point of the census finding: one healthy rotation, two
+        # groups, and only the one whose results were classified designed
+        # says so. The date-check group's calls never errored at all.
+        _, block = self._retry_block(_watcher_rotation_records())
+
+        rearm_line = next(ln for ln in block.splitlines() if 'watcher-rearm' in ln)
+        date_line = next(ln for ln in block.splitlines() if 'date -u' in ln)
+
+        assert '3 designed-outcome results' in rearm_line
+        assert '[exit 124]' in rearm_line
+        assert 'designed-outcome' not in date_line
+        assert date_line.endswith(f': {mod._input_signature(_DATE_CHECK)}')
+
+    def test_rendered_instrument_version_is_wired_to_the_live_constant(self):
+        # Named for what it can actually detect. PRD Sec 7.2.2's own test,
+        # applied deliberately (census R1 asks the implementer to DECIDE
+        # rather than default), concluded that the annotation does not bump:
+        # it adds no signal_counts key and no detector hit, and leaves the
+        # gold section and the section partition alone -- textbook renderer
+        # cosmetics, which the policy says does NOT bump. Bumping would
+        # falsely tell a future census that signal semantics moved,
+        # corrupting the pre-fix / live-regression discriminator the version
+        # exists to provide. Those PREMISES are what the two tests below pin
+        # at runtime; the CONCLUSION (the constant still reads 2) is a
+        # diff-level fact, and nothing in this file freezes it -- deliberately,
+        # because a legitimate future bump must not have to edit a test named
+        # for the 4751 decision, which would point its implementer at the
+        # wrong decision record. What this test does pin is that a bump would
+        # PROPAGATE: the rendered frontmatter reports the live constant, not
+        # a literal that could go stale behind it.
+        meta, _ = self._retry_block(_watcher_rotation_records())
+
+        assert meta['instrument_version'] == mod.DIGEST_INSTRUMENT_VERSION
+
+    def test_signal_counts_are_unchanged_by_the_annotation(self):
+        records = _watcher_rotation_records()
+        meta, _ = self._retry_block(records)
+
+        assert meta['signal_counts'] == mod.signal_counts(records)
+        assert meta['signal_counts']['tool_error'] == 0
+        assert meta['signal_counts']['designed_outcome'] == 3
+        assert meta['signal_counts']['self_correct'] == 0
+
+    def test_section_partition_is_unchanged_by_the_annotation(self):
+        # The same groups appear in the same section at the same counts --
+        # only their rendered line TEXT grows.
+        records = _watcher_rotation_records()
+
+        groups = {
+            (loop['tool'], loop['signature'], loop['count'])
+            for loop in mod.find_retry_loops(records)
+        }
+
+        assert groups == {
+            ('Bash', mod._input_signature(_DATE_CHECK), 3),
+            ('Bash', mod._input_signature(_REARM), 3),
+        }
+        assert mod.SECTION_PRIORITY.index('retry_loops') == 1
+        assert 'retry_loops' not in mod.SIGNAL_WEIGHTS
 
 
 # ---------------------------------------------------------------------------

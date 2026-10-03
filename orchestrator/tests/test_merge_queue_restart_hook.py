@@ -17,23 +17,29 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
-from _orch_helpers import make_placeholder_future
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
+from _merge_lane_fakes import (
+    FakeVerifier,
+    fails,
+    hangs_until,
+    lane_scene_config,
+    main_health_probe_spawned,
+)
+from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
 from orchestrator.merge_queue import (
     MERGE_WORKER_SHUTDOWN_REASON,
-    InflightEntry,
     MergeOutcome,
     MergeRequest,
     SpeculativeMergeWorker,
-)
-from orchestrator.merge_queue import (
-    _journal_landed_then_advance as _real_journal_landed_then_advance,
 )
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_types import QueuedBranch
@@ -78,7 +84,7 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
 
 @pytest.fixture
 def config(git_repo: Path, git_config: GitConfig) -> OrchestratorConfig:
-    return OrchestratorConfig(project_root=git_repo, git=git_config)
+    return lane_scene_config(git_repo, git_config)
 
 
 async def _make_branch_with_file(
@@ -94,9 +100,26 @@ async def _make_branch_with_file(
     return worktree
 
 
-def _mock_verify_pass():
-    """Return a mock that makes run_scoped_verification always pass."""
-    return AsyncMock(return_value=type('VR', (), {'passed': True, 'summary': '', 'failing_test_ids': None})())
+class _GatedAdvanceGitOps:
+    """The real GitOps with ``advance_main`` gated on an Event.
+
+    Injected through ``SpeculativeMergeWorker``'s existing ``git_ops``
+    constructor argument. ``advance_main`` is what ``_journal_landed_then_advance``
+    calls from inside ``_finalize_inflight``'s CAS loop, so gating it there
+    holds the finalize head at FINALIZING (verify already done) without
+    patching a module-level function.
+    """
+
+    def __init__(self, inner: GitOps, gate: asyncio.Event) -> None:
+        self._inner = inner
+        self._gate = gate
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._inner, name)
+
+    async def advance_main(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        await self._gate.wait()
+        return await self._inner.advance_main(*args, **kwargs)
 
 
 def _make_request(
@@ -124,52 +147,54 @@ def _make_request(
 async def _wait_for_finalizing_head(
     worker: SpeculativeMergeWorker,
     store: MergeQueueStore,
-    request_id: str,
-) -> InflightEntry:
-    """Poll until *request_id* is the popped-for-finalize VERIFYING entry.
+    req: MergeRequest,
+) -> None:
+    """Poll until *req* is the popped-for-finalize VERIFYING entry.
 
-    Bounded ~200 x 0.05s poll (mirrors test_restart_recovery_integration)
-    for worker._finalizing_head_entry() to surface *request_id* (popped off
-    _inflight, verify_task in progress) AND the request to already be
+    Bounded ~200 x 0.05s poll (mirrors test_restart_recovery_integration) for
+    the PUBLIC snapshot to show *req* at the head of line still verifying
+    (popped off _inflight, verify in progress) AND the request to already be
     durably journaled in *store* — the exact window this task's fix targets.
     """
     for _ in range(200):
-        entry = worker._finalizing_head_entry()
+        snap = worker.snapshot()
+        vip = snap['verify_in_progress']
         if (
-            entry is not None
-            and entry.item.request.request_id == request_id
-            and any(r.request_id == request_id for r in store.load())
+            snap['head_of_line'] == req.task_id
+            and vip is not None
+            and vip['phase'] == 'verifying'
+            and any(r.request_id == req.request_id for r in store.load())
         ):
-            return entry
+            return
         await asyncio.sleep(0.05)
     pytest.fail(
-        f'{request_id} never reached the finalize-head verifying state; '
+        f'{req.request_id} never reached the finalize-head verifying state; '
         f'store contents: {store.load()!r}'
     )
 
 
 async def _wait_for_finalizing_head_mid_advance(
     worker: SpeculativeMergeWorker,
-    request_id: str,
-) -> InflightEntry:
-    """Poll until *request_id* is the finalize head AND its verify_task has
-    already completed -- i.e. the entry is genuinely FINALIZING (inside
-    _finalize_inflight's CAS advance_main loop), not merely VERIFYING.
+    req: MergeRequest,
+) -> Path:
+    """Poll until *req* is the finalize head in the FINALIZING phase -- i.e.
+    inside _finalize_inflight's CAS advance_main loop, verify already done,
+    not merely VERIFYING. Returns the head entry's merge worktree.
 
     Bounded ~200 x 0.05s poll, mirroring _wait_for_finalizing_head.
     """
     for _ in range(200):
-        entry = worker._finalizing_head_entry()
+        snap = worker.snapshot()
+        vip = snap['verify_in_progress']
         if (
-            entry is not None
-            and entry.item.request.request_id == request_id
-            and entry.verify_task is not None
-            and entry.verify_task.done()
+            snap['head_of_line'] == req.task_id
+            and vip is not None
+            and vip['phase'] == 'finalizing'
         ):
-            return entry
+            return Path(snap['entries'][0]['worktree'])
         await asyncio.sleep(0.05)
     pytest.fail(
-        f'{request_id} never reached the finalize-head FINALIZING '
+        f'{req.request_id} never reached the finalize-head FINALIZING '
         f'(mid-advance) state'
     )
 
@@ -194,33 +219,31 @@ async def test_on_merge_landed_invoked_on_done(
 
     callback = AsyncMock()
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    worker = SpeculativeMergeWorker(git_ops, queue, on_merge_landed=callback)
-    worker_task = asyncio.create_task(worker.run())
-
-    with patch(
-        'orchestrator.merge_queue.run_scoped_verification',
-        _mock_verify_pass(),
-    ):
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, on_merge_landed=callback, verifier=FakeVerifier(),
+    )
+    async with running_merge_worker(worker):
         req = _make_request('hook-test', 'hook-test', wt, config)
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
+        outcome = await wait_responsive(
+            req.result,
+            timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+            label='hook-test outcome (on_merge_landed invoked on done)',
+        )
 
-    assert outcome.status == 'done', f'Expected done, got: {outcome}'
-    assert outcome.merge_sha is not None
+        assert outcome.status == 'done', f'Expected done, got: {outcome}'
+        assert outcome.merge_sha is not None
 
-    # The callback must have been awaited exactly once
-    callback.assert_awaited_once()
-    called_task_id, called_base_sha, called_advanced_sha = callback.call_args.args
-    assert called_task_id == 'hook-test'
-    assert called_base_sha == pre_merge_main, (
-        f'base_sha should be pre-merge main tip; got {called_base_sha!r}'
-    )
-    assert called_advanced_sha == outcome.merge_sha, (
-        f'advanced_sha should equal outcome.merge_sha; got {called_advanced_sha!r}'
-    )
-
-    await worker.stop()
-    await worker_task
+        # The callback must have been awaited exactly once
+        callback.assert_awaited_once()
+        called_task_id, called_base_sha, called_advanced_sha = callback.call_args.args
+        assert called_task_id == 'hook-test'
+        assert called_base_sha == pre_merge_main, (
+            f'base_sha should be pre-merge main tip; got {called_base_sha!r}'
+        )
+        assert called_advanced_sha == outcome.merge_sha, (
+            f'advanced_sha should equal outcome.merge_sha; got {called_advanced_sha!r}'
+        )
 
 
 @pytest.mark.asyncio
@@ -234,24 +257,22 @@ async def test_on_merge_landed_fail_open(
         raise RuntimeError('Simulated callback failure')
 
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    worker = SpeculativeMergeWorker(git_ops, queue, on_merge_landed=_exploding_callback)
-    worker_task = asyncio.create_task(worker.run())
-
-    with patch(
-        'orchestrator.merge_queue.run_scoped_verification',
-        _mock_verify_pass(),
-    ):
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, on_merge_landed=_exploding_callback, verifier=FakeVerifier(),
+    )
+    async with running_merge_worker(worker):
         req = _make_request('hook-fail', 'hook-fail', wt, config)
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
+        outcome = await wait_responsive(
+            req.result,
+            timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+            label='hook-fail outcome (on_merge_landed raises, merge fails open)',
+        )
 
-    # Merge must still succeed despite the callback raising
-    assert outcome.status == 'done', (
-        f'Merge should not fail because of the callback; got: {outcome}'
-    )
-
-    await worker.stop()
-    await worker_task
+        # Merge must still succeed despite the callback raising
+        assert outcome.status == 'done', (
+            f'Merge should not fail because of the callback; got: {outcome}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -277,13 +298,10 @@ async def test_worker_merge_store_record_and_clear(
 
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
     # Pass merge_store — fails until step-14 adds the parameter.
-    worker = SpeculativeMergeWorker(git_ops, queue, merge_store=store)
-    worker_task = asyncio.create_task(worker.run())
-
-    with patch(
-        'orchestrator.merge_queue.run_scoped_verification',
-        _mock_verify_pass(),
-    ):
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, merge_store=store, verifier=FakeVerifier(),
+    )
+    async with running_merge_worker(worker):
         await queue.put(req)
 
         # Poll until the worker records the request (drains into lane buffer).
@@ -292,33 +310,32 @@ async def test_worker_merge_store_record_and_clear(
                 break
             await asyncio.sleep(0.05)
         else:
-            await worker.stop()
-            await worker_task
             pytest.fail(
                 f'Worker never recorded {req.request_id} in the store; '
                 f'store contents: {store.load()!r}'
             )
 
         # Now await the merge result (should be 'done').
-        outcome = await asyncio.wait_for(req.result, timeout=60)
+        outcome = await wait_responsive(
+            req.result,
+            timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+            label='store-test outcome (journal entry cleared on terminal)',
+        )
 
-    assert outcome.status == 'done', f'Expected done, got: {outcome}'
+        assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
-    # After terminal, the store entry must have been removed.
-    # Allow brief async teardown by polling a short window.
-    for _ in range(20):
-        if not any(r.request_id == req.request_id for r in store.load()):
-            break
-        await asyncio.sleep(0.05)
+        # After terminal, the store entry must have been removed.
+        # Allow brief async teardown by polling a short window.
+        for _ in range(20):
+            if not any(r.request_id == req.request_id for r in store.load()):
+                break
+            await asyncio.sleep(0.05)
 
-    remaining_ids = {r.request_id for r in store.load()}
-    assert req.request_id not in remaining_ids, (
-        f'{req.request_id} was NOT removed from the store after terminal outcome; '
-        f'store: {store.load()!r}'
-    )
-
-    await worker.stop()
-    await worker_task
+        remaining_ids = {r.request_id for r in store.load()}
+        assert req.request_id not in remaining_ids, (
+            f'{req.request_id} was NOT removed from the store after terminal outcome; '
+            f'store: {store.load()!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -345,32 +362,32 @@ async def test_restart_recovery_integration(
     req = _make_request('restart-test', branch_name, wt, config)
 
     # --- Phase 1: start worker A, block verification, let it journal the request ---
+    # block_event is never set: verify blocks indefinitely (simulates a crash
+    # before the request reaches 'done').
     block_event = asyncio.Event()
 
-    async def _blocking_verify(*args, **kwargs):  # type: ignore[no-untyped-def]
-        await block_event.wait()  # block indefinitely (simulates crash before done)
-        return type('VR', (), {'passed': True, 'summary': '', 'failing_test_ids': None})()
-
     queue_a: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    worker_a = SpeculativeMergeWorker(git_ops, queue_a, merge_store=store)
+    worker_a = SpeculativeMergeWorker(
+        git_ops, queue_a, merge_store=store,
+        verifier=FakeVerifier(default=hangs_until(block_event)),
+    )
 
-    with patch('orchestrator.merge_queue.run_scoped_verification', _blocking_verify):
-        worker_task_a = asyncio.create_task(worker_a.run())
-        await queue_a.put(req)
+    worker_task_a = asyncio.create_task(worker_a.run())
+    await queue_a.put(req)
 
-        # Wait until worker A has journaled the request (owns it in lane buffer).
-        for _ in range(200):
-            if any(r.request_id == req.request_id for r in store.load()):
-                break
-            await asyncio.sleep(0.05)
-        else:
-            worker_task_a.cancel()
-            pytest.fail('Worker A never recorded the request in the journal')
-
-        # Simulate crash: cancel the worker WITHOUT calling stop().
+    # Wait until worker A has journaled the request (owns it in lane buffer).
+    for _ in range(200):
+        if any(r.request_id == req.request_id for r in store.load()):
+            break
+        await asyncio.sleep(0.05)
+    else:
         worker_task_a.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker_task_a
+        pytest.fail('Worker A never recorded the request in the journal')
+
+    # Simulate crash: cancel the worker WITHOUT calling stop().
+    worker_task_a.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await worker_task_a
 
     # The journal must still hold the request after the crash.
     persisted_ids = {r.request_id for r in store.load()}
@@ -389,6 +406,8 @@ async def test_restart_recovery_integration(
         event_store=None,
         main_branch=config.git.main_branch,
         branch_prefix=config.git.branch_prefix,
+        enqueue_merge_request=enqueue_merge_request,
+        select_recovery_winner=select_recovery_winner,
     )
 
     assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
@@ -404,37 +423,35 @@ async def test_restart_recovery_integration(
         f'got {recovered_req.request_id}'
     )
 
-    worker_b = SpeculativeMergeWorker(git_ops, queue_b, merge_store=store)
-    with patch(
-        'orchestrator.merge_queue.run_scoped_verification',
-        _mock_verify_pass(),
-    ):
-        worker_task_b = asyncio.create_task(worker_b.run())
-
+    worker_b = SpeculativeMergeWorker(
+        git_ops, queue_b, merge_store=store, verifier=FakeVerifier(),
+    )
+    async with running_merge_worker(worker_b):
         # Await the recovered merge to complete.
-        outcome = await asyncio.wait_for(recovered_req.result, timeout=60)
+        outcome = await wait_responsive(
+            recovered_req.result,
+            timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+            label='recovered restart-test outcome on fresh worker B',
+        )
 
-    assert outcome.status == 'done', f'Expected done on recovered merge; got: {outcome}'
+        assert outcome.status == 'done', f'Expected done on recovered merge; got: {outcome}'
 
-    # Confirm the branch tip is now an ancestor of main (truly merged).
-    full_branch = f'{config.git.branch_prefix}{branch_name}'
-    is_on_main = await git_ops.is_ancestor(full_branch, config.git.main_branch)
-    assert is_on_main, (
-        f'Branch {full_branch} not an ancestor of main after recovery merge'
-    )
+        # Confirm the branch tip is now an ancestor of main (truly merged).
+        full_branch = f'{config.git.branch_prefix}{branch_name}'
+        is_on_main = await git_ops.is_ancestor(full_branch, config.git.main_branch)
+        assert is_on_main, (
+            f'Branch {full_branch} not an ancestor of main after recovery merge'
+        )
 
-    # Journal entry must be cleaned up.
-    for _ in range(20):
-        if not any(r.request_id == req.request_id for r in store.load()):
-            break
-        await asyncio.sleep(0.05)
-    remaining = {r.request_id for r in store.load()}
-    assert req.request_id not in remaining, (
-        f'Journal entry not removed after successful recovery merge; store: {store.load()!r}'
-    )
-
-    await worker_b.stop()
-    await worker_task_b
+        # Journal entry must be cleaned up.
+        for _ in range(20):
+            if not any(r.request_id == req.request_id for r in store.load()):
+                break
+            await asyncio.sleep(0.05)
+        remaining = {r.request_id for r in store.load()}
+        assert req.request_id not in remaining, (
+            f'Journal entry not removed after successful recovery merge; store: {store.load()!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -468,18 +485,18 @@ async def test_idempotency_already_landed_branch_dropped(
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
     store_path = tmp_path / 'data' / 'orchestrator' / 'merge_queue.json'
     store = MergeQueueStore(store_path)
-    worker = SpeculativeMergeWorker(git_ops, queue, merge_store=store)
-    with patch(
-        'orchestrator.merge_queue.run_scoped_verification',
-        _mock_verify_pass(),
-    ):
-        worker_task = asyncio.create_task(worker.run())
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, merge_store=store, verifier=FakeVerifier(),
+    )
+    async with running_merge_worker(worker):
         first_req = _make_request('idempotency-test', branch_name, wt, config)
         await queue.put(first_req)
-        first_outcome = await asyncio.wait_for(first_req.result, timeout=60)
-    assert first_outcome.status == 'done', f'Pre-merge failed: {first_outcome}'
-    await worker.stop()
-    await worker_task
+        first_outcome = await wait_responsive(
+            first_req.result,
+            timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+            label='idempotency-test first merge outcome (lands before recovery)',
+        )
+        assert first_outcome.status == 'done', f'Pre-merge failed: {first_outcome}'
 
     # Record main's tip SHA — must be unchanged after recovery.
     _, main_sha_raw, _ = await _run(
@@ -502,6 +519,8 @@ async def test_idempotency_already_landed_branch_dropped(
         event_store=None,
         main_branch=config.git.main_branch,
         branch_prefix=config.git.branch_prefix,
+        enqueue_merge_request=enqueue_merge_request,
+        select_recovery_winner=select_recovery_winner,
     )
 
     # Record must be dropped (not re-enqueued).
@@ -525,82 +544,60 @@ async def test_idempotency_already_landed_branch_dropped(
 
 
 # ---------------------------------------------------------------------------
-# step-21 (task 1772) — _buffer_owned_request terminal-removal discriminates
-#                        by MergeOutcome.reason, NOT by status == 'blocked'
+# step-21 (task 1772) — a CANCELLED owned request stays in the durable journal
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_buffer_owned_request_terminal_removal_policy(
+async def test_cancelled_owned_request_is_kept_in_the_journal(
     git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
 ) -> None:
-    """_buffer_owned_request's done-callback must discriminate by reason, not status.
+    """A cancelled result Future must be KEPT, so the next boot re-enqueues it.
 
-    Cases:
-      (a) blocked / reason != shutdown  → REMOVED  (fails until step-22)
-      (b) blocked / reason == shutdown  → KEPT
-      (c) done                          → REMOVED
-      (d) cancelled future              → KEPT
+    The owned-request done-callback discriminates by MergeOutcome.reason, not
+    by status. Its other three cases are each covered end-to-end elsewhere in
+    this module, so only the cancelled one is driven here:
+
+      blocked / reason != shutdown -> REMOVED
+        test_anti_retry_deterministic_failure_not_requeued
+      blocked / reason == shutdown -> KEPT
+        test_verifying_merge_survives_graceful_restart_and_recovers
+      done                         -> REMOVED
+        test_worker_merge_store_record_and_clear
+
+    A cancellation carries no MergeOutcome at all, so it is the one case with
+    no outcome-carrying end-to-end driver; it is reached here by cancelling a
+    real enqueued request while its verify hangs.
     """
-    store_path = tmp_path / 'data' / 'orchestrator' / 'merge_queue.json'
-    store = MergeQueueStore(store_path)
+    store = MergeQueueStore(tmp_path / 'data' / 'orchestrator' / 'merge_queue.json')
+    wt = await _make_branch_with_file(
+        git_ops, 'cancelled-kept', 'cancelled_kept.py', 'e = 5\n',
+    )
+    req = _make_request('cancelled-kept', 'cancelled-kept', wt, config)
+
+    block_event = asyncio.Event()  # never set: the verify hangs so the worker keeps ownership
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    worker = SpeculativeMergeWorker(git_ops, queue, merge_store=store)
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, merge_store=store,
+        verifier=FakeVerifier(default=hangs_until(block_event)),
+    )
+    worker_task = asyncio.create_task(worker.run())
+    try:
+        await queue.put(req)
+        await _wait_for_finalizing_head(worker, store, req)
 
-    _SHUTDOWN_REASON = 'Merge worker shutting down'
+        req.result.cancel()
+        await asyncio.sleep(0)
 
-    def _unit_req(label: str) -> MergeRequest:
-        fut: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-        return MergeRequest(
-            task_id=label,
-            branch=QueuedBranch.parse(label, config.git.branch_prefix),
-            worktree=tmp_path,
-            pre_rebased=False,
-            task_files=None,
-            module_configs=[],
-            config=config,
-            result=fut,
+        ids = {r.request_id for r in store.load()}
+        assert req.request_id in ids, (
+            f'a cancelled request must be KEPT so the next boot can re-enqueue '
+            f'it; ids={ids}'
         )
-
-    # (a) deterministic blocked terminal (error) → REMOVED
-    req_a = _unit_req('unit-a')
-    worker._buffer_owned_request(req_a)
-    req_a.result.set_result(MergeOutcome('blocked', reason='Merge worker error: boom'))
-    await asyncio.sleep(0)
-    ids = {r.request_id for r in store.load()}
-    assert req_a.request_id not in ids, (
-        f'Case (a): blocked/error entry should be REMOVED but found in store; ids={ids}'
-    )
-
-    # (b) graceful-shutdown blocked terminal → KEPT
-    req_b = _unit_req('unit-b')
-    worker._buffer_owned_request(req_b)
-    req_b.result.set_result(MergeOutcome('blocked', reason=_SHUTDOWN_REASON))
-    await asyncio.sleep(0)
-    ids = {r.request_id for r in store.load()}
-    assert req_b.request_id in ids, (
-        f'Case (b): shutdown blocked entry should be KEPT but was removed; ids={ids}'
-    )
-
-    # (c) done terminal → REMOVED
-    req_c = _unit_req('unit-c')
-    worker._buffer_owned_request(req_c)
-    req_c.result.set_result(MergeOutcome('done'))
-    await asyncio.sleep(0)
-    ids = {r.request_id for r in store.load()}
-    assert req_c.request_id not in ids, (
-        f'Case (c): done entry should be REMOVED but found in store; ids={ids}'
-    )
-
-    # (d) cancelled future → KEPT
-    req_d = _unit_req('unit-d')
-    worker._buffer_owned_request(req_d)
-    req_d.result.cancel()
-    await asyncio.sleep(0)
-    ids = {r.request_id for r in store.load()}
-    assert req_d.request_id in ids, (
-        f'Case (d): cancelled entry should be KEPT but was removed; ids={ids}'
-    )
+    finally:
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
 
 
 # ---------------------------------------------------------------------------
@@ -617,8 +614,8 @@ async def test_anti_retry_deterministic_failure_not_requeued(
     and is NOT re-enqueued by recover_pending_merges on the next restart.
 
     Procedure:
-      1. Worker A processes a request; run_scoped_verification raises, yielding
-         MergeOutcome('blocked', reason='Verification error: ...').
+      1. Worker A processes a request; the injected verifier reports a
+         deterministic test failure, yielding MergeOutcome('blocked', ...).
       2. Assert the journal entry is REMOVED (not kept).
       3. Simulate restart: fresh queue + recover_pending_merges finds nothing.
 
@@ -632,24 +629,27 @@ async def test_anti_retry_deterministic_failure_not_requeued(
     wt = await _make_branch_with_file(git_ops, branch_name, 'anti_retry.py', 'x = 42\n')
     req = _make_request('anti-retry-test', branch_name, wt, config)
 
-    async def _failing_verify(*args, **kwargs):  # type: ignore[no-untyped-def]
-        raise RuntimeError('Test verification failure')
-
     queue_a: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    worker_a = SpeculativeMergeWorker(git_ops, queue_a, merge_store=store)
-
-    with patch('orchestrator.merge_queue.run_scoped_verification', _failing_verify):
-        worker_task_a = asyncio.create_task(worker_a.run())
-        await queue_a.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-
-    assert outcome.status == 'blocked', f'Expected blocked, got: {outcome}'
-    assert 'Merge worker shutting down' not in outcome.reason, (
-        f'Expected a non-shutdown reason; got {outcome.reason!r}'
+    worker_a = SpeculativeMergeWorker(
+        git_ops, queue_a, merge_store=store,
+        verifier=FakeVerifier(default=fails(
+            category='test_failure', summary='Test verification failure',
+        )),
     )
 
-    await worker_a.stop()
-    await worker_task_a
+    async with running_merge_worker(worker_a):
+        await queue_a.put(req)
+        outcome = await wait_responsive(
+            req.result,
+            timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+            label='anti-retry-test outcome (deterministic verify failure)',
+        )
+
+        assert outcome.status == 'blocked', f'Expected blocked, got: {outcome}'
+        assert not main_health_probe_spawned(outcome), outcome.reason
+        assert 'Merge worker shutting down' not in outcome.reason, (
+            f'Expected a non-shutdown reason; got {outcome.reason!r}'
+        )
 
     # Branch is still live but NOT an ancestor of main (verification failed,
     # so main was not advanced).
@@ -682,6 +682,8 @@ async def test_anti_retry_deterministic_failure_not_requeued(
         event_store=None,
         main_branch=config.git.main_branch,
         branch_prefix=config.git.branch_prefix,
+        enqueue_merge_request=enqueue_merge_request,
+        select_recovery_winner=select_recovery_winner,
     )
 
     assert report['recovered'] == 0, (
@@ -724,25 +726,20 @@ async def test_stop_resolves_finalizing_head_verifying_to_shutdown(
     req = _make_request('finalize-head-shutdown', branch_name, wt, config)
     req.request_id = 'mr-a5b5b69b'
 
-    block_event = asyncio.Event()
-
-    async def _blocking_verify(*args, **kwargs):  # type: ignore[no-untyped-def]
-        await block_event.wait()  # never set: verify blocks for the test's lifetime
-        return type(
-            'VR', (), {'passed': True, 'summary': '', 'failing_test_ids': None},
-        )()
+    block_event = asyncio.Event()  # never set: verify blocks for the test's lifetime
 
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    worker = SpeculativeMergeWorker(git_ops, queue, merge_store=store)
-    worker._shutdown_timeout = 0.2  # fast shutdown for tests
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, merge_store=store,
+        verifier=FakeVerifier(default=hangs_until(block_event)),
+    )
 
-    with patch('orchestrator.merge_queue.run_scoped_verification', _blocking_verify):
-        worker_task = asyncio.create_task(worker.run())
-        await queue.put(req)
+    worker_task = asyncio.create_task(worker.run())
+    await queue.put(req)
 
-        entry = await _wait_for_finalizing_head(worker, store, req.request_id)
+    await _wait_for_finalizing_head(worker, store, req)
 
-        await worker.stop()
+    await worker.stop()
 
     assert req.result.done(), (
         'stop() must resolve the finalize-head request Future to a terminal '
@@ -753,9 +750,10 @@ async def test_stop_resolves_finalizing_head_verifying_to_shutdown(
         f'Expected the shutdown terminal; got {outcome!r}'
     )
 
-    assert entry.verify_task is not None and entry.verify_task.done(), (
-        'finalize-head verify_task must be torn down (cancelled) by stop(), '
-        'mirroring the _inflight drain teardown'
+    assert worker.snapshot()['verify_in_progress'] is None, (
+        'the finalize-head verify must be torn down (cancelled) by stop(), '
+        'mirroring the _inflight drain teardown — the public projection of '
+        'that teardown is the verify no longer being in progress'
     )
 
     ids = {r.request_id for r in store.load()}
@@ -768,6 +766,70 @@ async def test_stop_resolves_finalizing_head_verifying_to_shutdown(
     worker_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await worker_task
+
+
+@pytest.mark.asyncio
+async def test_stop_resolves_deque_head_verifying_before_its_first_await(
+    git_ops: GitOps, config: OrchestratorConfig,
+) -> None:
+    """stop() must resolve the head's VERIFYING request before its first
+    `await` even while the head is still at _inflight[0] (task 5303).
+
+    FINALIZE-HEAD waits on a running head verify with the head still on the
+    deque, so the _inflight drain would reach it only after stop()'s earlier
+    awaits -- here the worktree cleanup of an item awaiting verify -- and the
+    verifier loop can finalize it during any of them.
+    """
+    head_wt = await _make_branch_with_file(
+        git_ops, 'deque-head-shutdown', 'deque_head.py', 'h = 1\n',
+    )
+    waiter_wt = await _make_branch_with_file(
+        git_ops, 'deque-waiter-shutdown', 'deque_waiter.py', 'w = 1\n',
+    )
+    head = _make_request('deque-head-shutdown', 'deque-head-shutdown', head_wt, config)
+    waiter = _make_request(
+        'deque-waiter-shutdown', 'deque-waiter-shutdown', waiter_wt, config,
+    )
+
+    block_event = asyncio.Event()
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, verifier=FakeVerifier(default=hangs_until(block_event)),
+    )
+    worker_task = asyncio.create_task(worker.run())
+    await queue.put(head)
+    await queue.put(waiter)
+
+    for _ in range(200):
+        snap = worker.snapshot()
+        vip = snap['verify_in_progress']
+        states = {e['task_id']: e['state'] for e in snap['entries']}
+        if (
+            vip is not None and vip['task_id'] == head.task_id
+            and states.get(waiter.task_id) == 'awaiting_verify'
+        ):
+            break
+        await asyncio.sleep(0.05)
+    else:
+        pytest.fail(f'never reached head verifying + waiter queued: {worker.snapshot()!r}')
+
+    stop_task = asyncio.ensure_future(worker.stop())
+    await asyncio.sleep(0)
+
+    try:
+        assert head.result.done(), (
+            "stop()'s first await was reached with the deque head's Future "
+            'still pending'
+        )
+        assert head.result.result() == MergeOutcome(
+            'blocked', reason=MERGE_WORKER_SHUTDOWN_REASON,
+        )
+    finally:
+        block_event.set()
+        await stop_task
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
 
 
 @pytest.mark.asyncio
@@ -797,38 +859,33 @@ async def test_verifying_merge_survives_graceful_restart_and_recovers(
     req.request_id = 'mr-a891f5fb'
 
     gate_event = asyncio.Event()
-
-    async def _failing_verify_after_gate(*args, **kwargs):  # type: ignore[no-untyped-def]
-        await gate_event.wait()
-        return type(
-            'VR', (), {
-                'passed': False,
-                'summary': 'induced verify failure (task 2788 regression test)',
-                'failing_test_ids': None,
-                'test_output': '',
-            },
-        )()
+    _failing_verify_after_gate = dataclasses.replace(
+        fails(
+            category='test_failure',
+            summary='induced verify failure (task 2788 regression test)',
+        ),
+        release=gate_event,
+    )
 
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    worker = SpeculativeMergeWorker(git_ops, queue, merge_store=store)
-    worker._shutdown_timeout = 0.2  # fast shutdown for tests
+    worker = SpeculativeMergeWorker(
+        git_ops, queue, merge_store=store,
+        verifier=FakeVerifier(default=_failing_verify_after_gate),
+    )
 
-    with patch(
-        'orchestrator.merge_queue.run_scoped_verification', _failing_verify_after_gate,
-    ):
-        worker_task = asyncio.create_task(worker.run())
-        await queue.put(req)
+    worker_task = asyncio.create_task(worker.run())
+    await queue.put(req)
 
-        await _wait_for_finalizing_head(worker, store, req.request_id)
+    await _wait_for_finalizing_head(worker, store, req)
 
-        # Release the gate so the verify-fail is ready to complete at the next
-        # scheduling opportunity, then immediately call stop(): with the fix,
-        # stop()'s synchronous shutdown-resolution (before its first await)
-        # pre-empts the verify-fail; without it, stop()'s own later awaits let
-        # the verify-fail land first and _on_terminal removes the record.
-        gate_event.set()
-        await worker.stop()
-        await worker_task
+    # Release the gate so the verify-fail is ready to complete at the next
+    # scheduling opportunity, then immediately call stop(): with the fix,
+    # stop()'s synchronous shutdown-resolution (before its first await)
+    # pre-empts the verify-fail; without it, stop()'s own later awaits let
+    # the verify-fail land first and _on_terminal removes the record.
+    gate_event.set()
+    await worker.stop()
+    await worker_task
 
     ids_after_stop = {r.request_id for r in store.load()}
     assert req.request_id in ids_after_stop, (
@@ -845,6 +902,8 @@ async def test_verifying_merge_survives_graceful_restart_and_recovers(
         event_store=None,
         main_branch=config.git.main_branch,
         branch_prefix=config.git.branch_prefix,
+        enqueue_merge_request=enqueue_merge_request,
+        select_recovery_winner=select_recovery_winner,
     )
 
     assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
@@ -879,9 +938,9 @@ async def test_stop_does_not_preempt_finalizing_head_mid_advance(
     `asyncio.wait(tasks_to_wait, timeout)` on self._verifier_task (which
     runs _finalize_inflight) give the advance a chance to finish naturally.
 
-    Gates _journal_landed_then_advance (called from inside the CAS advance
-    loop, well past the verify_task await) on an Event so the head reaches
-    FINALIZING — verify_task done() — before stop() runs.
+    Gates git_ops.advance_main (what _journal_landed_then_advance calls from
+    inside the CAS advance loop, well past the verify await) on an Event so
+    the head reaches FINALIZING before stop() runs.
     """
     wt = await _make_branch_with_file(
         git_ops, 'finalize-head-advancing', 'finalize_advancing.py', 'c = 3\n',
@@ -891,45 +950,39 @@ async def test_stop_does_not_preempt_finalizing_head_mid_advance(
 
     advance_gate = asyncio.Event()
 
-    async def _gated_advance(*args, **kwargs):  # type: ignore[no-untyped-def]
-        await advance_gate.wait()
-        return await _real_journal_landed_then_advance(*args, **kwargs)
-
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-    worker = SpeculativeMergeWorker(git_ops, queue)
-    # Generous shutdown timeout: stop() must let the real (gated) CAS advance
-    # complete naturally rather than pre-empting it — unlike the fast
-    # (0.2s) timeout used by the VERIFYING-sub-case tests above, where
-    # stop() is expected to resolve the request itself.
-    worker._shutdown_timeout = 5.0
+    # The default 5.0s shutdown timeout is generous on purpose here: stop()
+    # must let the real (gated) CAS advance complete naturally rather than
+    # pre-empting it — unlike the VERIFYING-sub-case tests above, where stop()
+    # is expected to resolve the request itself.
+    worker = SpeculativeMergeWorker(
+        _GatedAdvanceGitOps(git_ops, advance_gate),  # type: ignore[arg-type]
+        queue,
+        verifier=FakeVerifier(),
+    )
 
-    with (
-        patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()),
-        patch('orchestrator.merge_queue._journal_landed_then_advance', _gated_advance),
-    ):
-        worker_task = asyncio.create_task(worker.run())
-        await queue.put(req)
+    worker_task = asyncio.create_task(worker.run())
+    await queue.put(req)
 
-        entry = await _wait_for_finalizing_head_mid_advance(worker, req.request_id)
-        assert not req.result.done(), (
-            'sanity: the request must still be gated (mid-advance) before '
-            'stop() runs'
-        )
-        pre_stop_wt = entry.merge_wt
-        assert pre_stop_wt is not None and pre_stop_wt.exists(), (
-            'sanity: the merge worktree must still exist while the advance '
-            'is gated'
-        )
+    pre_stop_wt = await _wait_for_finalizing_head_mid_advance(worker, req)
+    assert not req.result.done(), (
+        'sanity: the request must still be gated (mid-advance) before '
+        'stop() runs'
+    )
+    assert pre_stop_wt.exists(), (
+        'sanity: the merge worktree must still exist while the advance '
+        'is gated'
+    )
 
-        # Release the gate, then immediately call stop(): the gated
-        # _finalize_inflight coroutine cannot resume until this coroutine
-        # yields control, so stop()'s (synchronous, up to its own first
-        # await) finalize-head check runs first — mirroring the race
-        # construction in test_verifying_merge_survives_graceful_restart_
-        # and_recovers above, but here proving stop() stays hands-off.
-        advance_gate.set()
-        await worker.stop()
-        await worker_task
+    # Release the gate, then immediately call stop(): the gated
+    # _finalize_inflight coroutine cannot resume until this coroutine
+    # yields control, so stop()'s (synchronous, up to its own first
+    # await) finalize-head check runs first — mirroring the race
+    # construction in test_verifying_merge_survives_graceful_restart_
+    # and_recovers above, but here proving stop() stays hands-off.
+    advance_gate.set()
+    await worker.stop()
+    await worker_task
 
     assert req.result.done(), 'the gated advance must eventually resolve the request'
     outcome = req.result.result()

@@ -34,6 +34,15 @@ import { createRequire } from 'node:module';
 
 import mef from '../../src/dashboard/static/redux/memory_evals_fmt.js';
 
+// spark_path.js resolves as CommonJS for the same reason, hence the same
+// default-import-then-destructure. It is imported here ONLY so this suite can
+// assert that `trendGaps` and `isPlottable` agree on what a hole is — see the
+// mirror-agreement block below. memory_evals_fmt.js itself does NOT depend on
+// spark_path.js in production.
+import sp from '../../src/dashboard/static/redux/spark_path.js';
+
+const { isPlottable } = sp;
+
 const {
   dash,
   ageText,
@@ -348,8 +357,11 @@ test('chartForKind: the tag vocabulary is exactly {step, spark, null}', () => {
 });
 
 // ---------------------------------------------------------------------------
-// trendGaps — count the deliberate holes in a trend series. A `null` (or
-// `undefined`) in `trend.values` means that run produced no sample.
+// trendGaps — count the runs a trend series has no USABLE sample for. This
+// block covers the classic hole: a `null` (or `undefined`) in `trend.values`,
+// a run that produced nothing. The other hole kind — a run that produced
+// something unplottable — is covered by the mirror-agreement block below, and
+// is why every caller-facing sentence says "usable".
 //
 // DETECT WITHOUT DROPPING is the load-bearing property. The array is handed on
 // UNMODIFIED: all metrics share one `run_stamps` x-axis, so compacting one
@@ -413,6 +425,60 @@ test('trendGaps: counts holes WITHOUT dropping them from the series', () => {
   assert.equal(values.length, pristine.length, 'the series length must not change');
   assert.equal(values[1], null, 'the null hole must stay at its own index');
   assert.equal(values[3], undefined, 'the undefined hole must stay at its own index');
+});
+
+// ---------------------------------------------------------------------------
+// trendGaps ⇄ spark_path.isPlottable — the MIRROR AGREEMENT (task 3490).
+//
+// These two modules hold ONE definition of "a hole" in TWO places, by
+// deliberate design: no classic script under static/redux depends on another
+// classic script (each is a leaf consumed only by .jsx), so importing
+// spark_path.js from memory_evals_fmt.js would make this the first such edge —
+// a dual-resolution shim plus a new index.html load-order contract, for a
+// four-token predicate. The duplication is therefore accepted and the
+// AGREEMENT is pinned here, executably, instead.
+//
+// WHY IT IS LOAD-BEARING: tab_memory_evals.jsx derives `plotted = points -
+// gaps` and gates the trend chart on `plotted > 0` — "will the primitive draw
+// at least one sample?". That subtraction only means what its name says while
+// trendGaps counts EXACTLY what isPlottable rejects. If trendGaps under-counts
+// (as it did before this task, seeing only null/undefined), an all-NaN series
+// yields gaps === 0, `plotted` overstates the drawable samples, the gate
+// passes, sparkPaths returns an empty line, Sparkline returns null — and the
+// cell renders a blank 26px box, the exact failure the gate exists to prevent.
+// ---------------------------------------------------------------------------
+
+test('trendGaps: a hole is exactly what spark_path.isPlottable rejects', () => {
+  // One shared sample vocabulary, walked by BOTH predicates. Holes and real
+  // measurements are deliberately interleaved: the honest 0 and -0 must stay
+  // plottable (a measured zero is a measurement), while NaN/±Infinity, the
+  // numeric STRING (which would coerce silently through the path arithmetic
+  // and plot as if measured) and the non-numbers must all count as holes.
+  const VOCABULARY = [
+    0, -0, 1, -4, 0.95, 1e308,
+    null, undefined, NaN, Infinity, -Infinity,
+    '3', '', true, false, {}, [],
+  ];
+
+  for (const v of VOCABULARY) {
+    const label = `${typeof v} ${String(v)}`;
+    assert.equal(
+      trendGaps([v]),
+      isPlottable(v) ? 0 : 1,
+      `trendGaps and isPlottable disagree on ${label} — ` +
+        'the two modules must hold one definition of a hole',
+    );
+  }
+});
+
+test('trendGaps: non-finite garbage counts as a hole, not as a measurement', () => {
+  // The cases that motivated the realignment. Each of these returned 0 (or an
+  // under-count) before task 3490, so each is a sample the chart gate would
+  // have believed was drawable.
+  assert.equal(trendGaps([1, NaN, 3]), 1, 'NaN is not a measurement');
+  assert.equal(trendGaps([Infinity, -Infinity]), 2, '±Infinity is not a measurement');
+  assert.equal(trendGaps(['3']), 1, 'a numeric string was never measured as a number');
+  assert.equal(trendGaps([1, null, NaN, undefined, 5]), 3, 'every hole kind counts once');
 });
 
 // ---------------------------------------------------------------------------

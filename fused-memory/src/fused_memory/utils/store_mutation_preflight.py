@@ -35,48 +35,151 @@ which is what :func:`assert_store_mutation_allowed` does.
 
 WHERE THIS IS ENFORCED (a rule, and a dated audit of where it holds)
 --------------------------------------------------------------------
+SCOPE -- what "the shared store" means in the columns below (task 4319)
+------------------------------------------------------------------------
+Those columns enumerate mutators of the mem0 / Qdrant / Graphiti substrate
+ONLY, because this guard exists for the two-substrate tear described above and
+for nothing else.
+
+``tasks.db`` and the durable escalation queue ARE shared production state, and
+they ARE mutated in-process by scripts in ``fused-memory/scripts/`` -- and they
+are DELIBERATELY in neither column. Task 4319 measured both and found no tear
+to prevent: each is a single substrate with no network half, and each is
+already atomic or lock-first
+(``sqlite_task_backend.py::SqliteTaskBackend._txn``'s one BEGIN/COMMIT, which
+every mutating method enters through; the ``os.open(O_CREAT)`` lockfile in
+``escalation/queue.py::escalation_id_lock``, the first write-requiring syscall
+in every mutating queue path, taken outside any handler). A capability probe
+would also be actively misleading for them: their measured failure is
+MIS-TARGETING, where the target directory is writable and a probe passes
+exactly when the danger is present. They get a different guard for that,
+``target_store_preflight.py::assert_target_store_exists`` -- an existence
+assertion rather than a probe.
+
+The consequence, which is the point of writing this down: an audit counting
+"shared production store" mutators will legitimately return a LARGER number
+than one counting :func:`assert_store_mutation_allowed` call sites. Neither is
+wrong, and the two must not be reconciled by widening either column. Different
+failure mode -> different guard -> different population. (No count is quoted
+here on purpose: a number copied into a second home is a number that drifts.)
+
 THE RULE, for authors: if you write a code path in ``fused-memory/scripts/``
 that mutates the shared store in-process -- it constructs its own
 ``MemoryService``, or reaches Qdrant or the graph directly -- call
 :func:`assert_store_mutation_allowed` before the first mutation AND before the
 scan.
 
-COVERAGE IS PARTIAL. That rule is a norm, not an invariant: nothing enforces
-it mechanically yet, and task 4280 is where the static conformance check that
-would lands. What follows is a dated audit, not a live guarantee.
+COVERAGE IS NOW PARTIALLY MECHANICAL. ``tests/test_store_mutation_conformance.py``
+(task 4280, landed by task 4848) enforces this rule for every script whose AST
+contains a CALL-SHAPED mutation -- a distinctive mutating callee name, or a
+generic verb (``delete``/``update``/``add``/``save``) on a receiver whose
+dotted name hints at a substrate (``qdrant``/``mem0``/``graph``/``driver``/
+``backend``) -- by requiring a call to :func:`assert_store_mutation_allowed`
+imported from this module. ``PREFLIGHT_EXEMPT_SCRIPTS`` below is that check's
+only escape hatch, and its entries are policed for staleness: one that stops
+matching a live, unguarded candidate must be deleted, not left behind. What
+follows is still a dated audit, not a live guarantee -- the check enforces
+the RULE, not this prose, and it is call-shaped only. See below for what
+that still misses.
 
-GUARDED, as of task 4127 -- ``audit_duplicate_memories``,
-``clear_malformed_empty_memory``, ``prune_recon_cycle_summaries``,
-``purge_knowlive_namespace``, ``sweep_orphan_flag_markers``,
-``sweep_toolcall_xml_leak``. This column IS exhaustive, because calling this
-function is what "guarded" MEANS: ``grep -rln assert_store_mutation_allowed
-fused-memory/scripts/`` re-derives it, and re-dates it, in one line.
-
-KNOWN UNGUARDED, same date -- ``cgl_eta_auto_apply_impl``,
-``cleanup_count_snapshots``, ``clear_false_dependency_invalidations``,
+GUARDED, as of task 4848 -- ``amend_stale_resume_cwd_records``,
+``audit_duplicate_memories``, ``backfill_entity_standing_decision``,
+``cleanup_count_snapshots``, ``cleanup_pin_queue_edges``,
+``clear_false_dependency_invalidations``, ``clear_malformed_empty_memory``,
 ``consolidate_namespace_families``, ``invalidate_fabricated_shipping_edges``,
-``migrate_cross_graph_leak``, ``retro_stamp_topics``,
-``tag_cgl_eta_rehome_scope``. Note ``cgl_eta_auto_apply_impl`` in particular:
-it has NO argparse at all -- it builds ``SimpleNamespace(apply=True)`` and
-drives ``migrate_cross_graph_leak.run()``'s three-phase graph write in
-process, so "under ``--apply``" does not even describe it.
+``migrate_cross_graph_leak``, ``normalize_topic_slugs``,
+``prune_recon_cycle_summaries``, ``purge_knowlive_namespace``,
+``retro_stamp_topics``, ``sweep_orphan_flag_markers``,
+``sweep_toolcall_xml_leak``, ``tag_cgl_eta_rehome_scope`` (17 call sites).
+This column IS exhaustive, because CALLING this function is what "guarded"
+MEANS: ``grep -rln 'assert_store_mutation_allowed(' fused-memory/scripts/
+--include='*.py'`` re-derives it, and re-dates it, in one line.
 
-That second column is NOT provably exhaustive, and must not be restated as
-though it were. Two reasons, both measured:
+Note the trailing ``(`` in that command, which task 4293 had to add. The older
+bare-name spelling now over-reports by three: ``bake_off_storage_shape`` and
+``cleanup_test_collections`` NAME this function in the docstring notes
+explaining why they deliberately do not call it, and ``cgl_eta_auto_apply_impl``
+names it in the comment explaining that it inherits the guard instead. Prose
+about the rule is not conformance to it, and a re-derivation that cannot tell
+them apart is not one.
+
+GUARDED BY INHERITANCE, same date -- ``cgl_eta_auto_apply_impl``. It is the one
+entry that is NOT a call site and that the grep above will never name, so it
+has to be listed by hand or it reads as a gap. It has NO argparse at all: it
+builds ``SimpleNamespace(apply=True)`` unconditionally and drives
+``migrate_cross_graph_leak.run()``'s three-phase graph write in process, so
+"under ``--apply``" does not even describe it. That single call is its entire
+mutation surface, and it reaches it by EXECUTING the real
+``migrate_cross_graph_leak.py`` through ``importlib.spec_from_file_location``
+(never via ``sys.modules``), so migrate's probe runs for it exactly as it does
+for the CLI. It carries no probe of its own on purpose -- a second one would
+double-probe every run -- which makes the coverage conditional: it holds for
+exactly as long as the guard stays inside migrate's ``run()``. Moved to
+migrate's ``main()``/``build_arg_parser()``, this script becomes the only
+unguarded bulk-apply in the tree, silently.
+``tests/test_cgl_eta_auto_apply_impl.py`` pins both halves.
+
+KNOWN UNGUARDED, same date -- as of task 4848, NONE. No shared-store mutator in
+``fused-memory/scripts/`` is currently KNOWN to be unguarded.
+
+That is a dated measurement, NOT an invariant, and it must not be restated as
+one. A script added tomorrow that makes a call-shaped mutation without calling the
+guard is now caught the next time the suite runs -- but the check is
+call-shaped only, so it is not omniscient. Raw Cypher/SQL assembled inside a
+STRING LITERAL is invisible to it: ``migrate_cross_graph_leak.py``'s graph
+``DETACH DELETE`` is classified a non-candidate for exactly this reason, and
+stays guarded by hand rather than by the mechanism. ``cgl_eta_auto_apply_impl``
+is a second, deliberate non-candidate one level removed: its only mutation is
+invoking ``migrate_cross_graph_leak.run()`` via ``importlib``, not a mutating
+callee itself, so it is never flagged and carries NO allowlist entry --
+being undetected and being exempt are different dispositions, and the
+GUARDED BY INHERITANCE column above, not ``PREFLIGHT_EXEMPT_SCRIPTS``, is
+still the only place that records it. "Guarded" also means only what the column
+says -- the script's OWN mutations, from its ``run()``-level probe onward. It
+does not cover the writes ``MemoryService.initialize()`` performs before
+``run()`` is ever called (Graphiti index creation plus the W6-ε dup-uuid-edge
+scan-and-repair), which no probe in this repo currently dominates; that gap is
+systemic and is tracked by tasks 4318 and 4350. The empty column is also NOT
+provably exhaustive, for two reasons that have not changed and are still
+measured:
 
   * mutation reaches the store under too many spellings to sweep for --
     ``delete_memory``, ``update_edge``, ``delete_collection``, a raw
     ``qdrant_client.delete``, a graph ``DETACH DELETE``/``SET``, and in
-    ``tag_cgl_eta_rehome_scope`` a bare ``memory.mem0.update`` that no pattern
-    search finds and that cannot be grepped for safely, because ``.update(``
-    also matches every dict update in the repo;
+    ``tag_cgl_eta_rehome_scope`` a bare ``memory.mem0.update`` -- now guarded,
+    but still the example of a mutation no pattern search finds, because
+    ``.update(`` also matches every dict update in the repo. What a sweep
+    cannot find, it cannot report missing;
   * membership needs judgement a grep cannot make -- ``bake_off_storage_shape``
     and ``cleanup_test_collections`` also mutate unguarded, but only ever touch
     scratch ``_test_*`` substrate and never the shared store, so they are
-    deliberately in neither column.
+    deliberately in neither column. Task 4293 wrote that reasoning, with the
+    premises that would kill it, into each of those two files.
 
-Task 4280 is the mechanism that derives that column mechanically instead of by
-hand; this list is the interim, hand-checked stand-in.
+``tests/test_store_mutation_conformance.py`` is that mechanism now, for the
+RULE. The three columns above are all still hand-written prose rather than
+generated output, but they no longer share one disposition:
+
+  * the GUARDED column is TRIPWIRED.
+    ``test_guarded_script_census_matches_the_reviewed_column`` re-derives the
+    set of guard-calling scripts from the tree and fails the moment it differs
+    from a pinned census, naming THIS column as the second edit to make.
+    Detected-on-change, not derived -- and emphatically not self-maintaining:
+    an author who updates that test's constant without touching this column
+    still ships a stale column. All the tripwire buys is that forgetting is
+    LOUD. (It exists because this column drifted twice, the second time inside
+    the very commit that re-dated it and re-asserted its exhaustiveness.)
+  * GUARDED BY INHERITANCE and KNOWN UNGUARDED have NO tripwire, and cannot
+    be given one, because neither is mechanically derivable: inheritance is a
+    judgement about code reached through ``importlib``, and an empty column is
+    a claim about ABSENCE, which no discovery pass can confirm. Both stay
+    purely hand-checked, and keeping them accurate after a script changes is
+    on the author, same as before. Do not generalise the tripwire above to
+    these two.
+
+Nor does the check reach ``MemoryService.initialize()``'s pre-``run()`` writes
+(Graphiti startup maintenance) at all -- that gap is systemic, outside this
+check's scope entirely, and stays tracked by tasks 4318 and 4350.
 
 Two placement rules, which are the non-obvious part:
 
@@ -87,7 +190,16 @@ Two placement rules, which are the non-obvious part:
     N irreversible deletions plus N log lines instead of an abort.
     (``clear_malformed_empty_memory`` is the single-target exception -- one
     required ``--memory-id``, one delete, no fan-out -- where the rule holds
-    trivially.)
+    trivially.) The rule now rests on BOTH fan-out shapes rather than just
+    ``gather``: every site task 4293 added is a sequential loop whose body is
+    wrapped in a per-record ``except Exception``, and because
+    :class:`StoreMutationUnavailable` subclasses ``RuntimeError`` those
+    handlers SWALLOW a refusal raised inside the loop -- converting it into N
+    error rows while the remaining records mutate, and in several of them into
+    a zero exit code a caller reads as a clean run. In five of task 4293's
+    eight scripts the natural-looking site -- the existing ``--apply`` gate --
+    sits inside exactly such a loop, which is why placement had to be
+    re-derived per script rather than pattern-matched.
   * A refusal RAISES; it does not return a report-shaped refusal. Several of
     these scripts already refuse ``--apply`` through their normal return path
     on other grounds (an empty scan, a truncated scan, a safety cap). Those are
@@ -129,6 +241,7 @@ import uuid
 from pathlib import Path
 
 __all__ = [
+    'PREFLIGHT_EXEMPT_SCRIPTS',
     'StoreMutationUnavailable',
     'assert_store_mutation_allowed',
     'resolve_history_dir',
@@ -247,3 +360,62 @@ def assert_store_mutation_allowed(*, operation: str) -> None:
         # create leaves nothing to remove, hence the suppressed OSError.
         with contextlib.suppress(OSError):
             probe.unlink()
+
+
+# ---------------------------------------------------------------------------
+# The static conformance check's escape hatch (task 4280 / 4848)
+# ---------------------------------------------------------------------------
+#
+# tests/test_store_mutation_conformance.py asserts that every script under
+# fused-memory/scripts/ whose AST contains a mutating call (see that module's
+# docstring for the exact two-tier definition) also calls
+# assert_store_mutation_allowed. This dict is its ONLY escape hatch. It lives
+# HERE, beside the guard, rather than in the test module, for the same reason
+# this file's docstring carries the hand-maintained GUARDED /
+# GUARDED-BY-INHERITANCE / KNOWN-UNGUARDED audit as its main content: this
+# module IS the repo's self-audit surface, so keeping the machine-checked
+# exemption set one edit away from the prose audit is what keeps the two from
+# drifting apart the way the policy claim drifted from the code for a whole
+# task cycle before task 4293 caught it. It also makes the exemptions
+# importable by a future non-pytest consumer (an operator audit script, a
+# hooks/project-checks lint) rather than trapped behind a test module.
+#
+# The VALUE TYPE is what forces a justification: a bare set could not hold
+# one, but a str value can be inspected, and
+# tests/test_store_mutation_conformance.py's anti-rot suite polices that it
+# is non-empty, still accurate, and matches this exact key set -- so entries
+# cannot merely accumulate. Keyed by bare filename, not line number: line
+# numbers churn on every unrelated edit and would rot silently.
+PREFLIGHT_EXEMPT_SCRIPTS: dict[str, str] = {
+    'bake_off_storage_shape.py': (
+        "Its two unprobed mutations (drop_collections's delete_collection, "
+        "seed_arm's backend.add) are bounded to scratch substrate: the "
+        'collection prefix is force-set from the reaper\'s own '
+        'load_cleanup_script().E2_BAKEOFF_PREFIX on the run\'s own config '
+        "copy, and no CLI flag reaches it (--project-suffix moves only the "
+        "suffix), so neither call can be pointed at a 'fused'-prefixed "
+        'production collection; seed_arm also stubs mem0\'s shared '
+        'add_history writer before the first add, so it writes no shared '
+        'SQLite history either. Measured against this file as it stands '
+        '(task 4293), not a standing exemption: it dies the moment a CLI '
+        'flag reaches the collection prefix, or seed_arm stops stubbing the '
+        'shared history writer. Does not cover the live path\'s '
+        'MemoryService.initialize() call (Graphiti startup maintenance '
+        'against production FalkorDB) -- that residual is unaddressed here '
+        'and stays tracked by tasks 4318 and 4350.'
+    ),
+    'cleanup_test_collections.py': (
+        'Blast radius is statically bounded: only collection names starting '
+        'with a member of PREFIXES are deleted, and the production '
+        "'fused' collection_prefix default cannot match one. It never "
+        'constructs a MemoryService, so it writes no mem0 SQLite history '
+        'and needs none of the capability this probe tests for. It is also '
+        'an unattended cron job contracted to always exit 0 -- every '
+        "failure path here is a bare `return`, never `sys.exit` -- and this "
+        'probe refuses by raising, which would break that contract. '
+        'Measured against this file as it stands (task 4293), not a '
+        'standing exemption: it dies the moment this script constructs a '
+        'MemoryService, or any input can widen PREFIXES past its two '
+        'test-only names.'
+    ),
+}

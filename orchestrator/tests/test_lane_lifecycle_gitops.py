@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import TASK_META_DIRNAME, GitConfig
@@ -32,6 +33,20 @@ from orchestrator.lane_lifecycle import (
     AcquireRoute,
     LaneState,
 )
+
+# HONEST EXCEPTION in this family, recorded rather than papered over:
+# TestSingleWriterSourceScan does sweep every *.py under orchestrator/src via
+# rglob, but with a plain `'.note_assigned(' in py.read_text()` SUBSTRING test
+# and NO ast.parse -- MEASURED at 0.05s/call here, three orders of magnitude
+# below the 60s default. Marked for family consistency and future-proofing,
+# NOT because it is near the cliff: the whole-tree walk is already in place, so
+# the day this scan grows an AST step (as every other member has) the cost
+# jumps by those three orders with no other signal.
+# WHY 300s, the thread-mode os._exit() cost model it clears, and the guard that
+# ENFORCES this mark rather than trusting it to be sprinkled: see
+# WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
+# test_whole_tree_scan_timeout_guard.py (task 4215).
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # ---------------------------------------------------------------------------
 # Repo fixture (mirrors test_warm_lane_abort_teardown.py)

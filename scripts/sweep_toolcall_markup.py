@@ -2,27 +2,72 @@
 
 Task 3691, PRD ``plans/toolcall-markup-containment-prd.md`` contract C3.
 
-## What this sweeps — two pinned path sets, and nothing else
+## What this sweeps — three pinned path sets, and nothing else
 
 * ``data/escalations/**/*.json`` — escalation records, recursively (59 of the
   60 corrupted records measured live sit under ``archive/<date>/``). Only
   records in a TERMINAL status are rewritten; see :data:`TERMINAL_STATUSES`.
 * ``.worktrees-orphaned/*/.task/plan.json`` — the plan artifacts of reclaimed
   worktree lanes. The exact ``.task/plan.json`` tail, never ``**/*.json``.
+* ``.worktrees/.task-meta/*/plan.json`` — the DURABLE per-lane plan store the
+  two shapes above only ever pointed AT (task 4696). The W11 relocation moved
+  plan state out of the lane and into this store, so the orphaned glob reaches
+  it only through a lane that still exists to hold the link: once a lane is
+  reclaimed AND its link is gone, its plan was unreachable here while remaining
+  the durable artifact. Measured 2026-08-25: 1564 plans, 79 corrupted (5.1%).
 
-Discovery is an ALLOWLIST of those two shapes rather than a repo-wide ``.json``
-walk, because the dominant hazard here is over-reach: an orphaned worktree is a
-full checkout, so a ``**/*.json`` walk beneath one would find committed
-evidence that legitimately QUOTES leak specimens and "repair" it. See
+Discovery is an ALLOWLIST of those three shapes rather than a repo-wide
+``.json`` walk, because the dominant hazard here is over-reach: an orphaned
+worktree is a full checkout, so a ``**/*.json`` walk beneath one would find
+committed evidence that legitimately QUOTES leak specimens and "repair" it. See
 :data:`NEVER_TOUCH`.
 
 ## What it does NOT do
 
 It never repairs LIVE state. PRD D4 splits the corpus: terminal records and
-orphaned lanes are this sweep's; a live lane's plan.json belongs to task 3692's
-lazy write-back at the plan-tools boundary. That split is enforced
-mechanically, not by assumption — an orphaned plan whose symlink resolves into
-a meta-root a LIVE ``.worktrees/<id>`` still shares is skipped and reported.
+DEAD lanes are this sweep's; a live lane's plan.json belongs to plan-tools'
+lazy read-back at the MCP boundary, which repairs it atomically on the next
+read. That split is enforced mechanically, not by assumption — any plan
+resolving into a meta-root a LIVE ``.worktrees/<id>`` still shares is skipped
+and reported under :data:`REASON_LIVE_LANE_PRESENT`, whichever lane found it.
+The two mechanisms therefore PARTITION the corpus rather than racing over it,
+which matters because both write, and the read-back's write is atomic only with
+respect to other readers.
+
+## Running it as the periodic CHECK
+
+The DEFAULT dry run answers BOTH operator questions — but through two
+different channels, and conflating them is what made this section wrong until
+task 5283. Read the REPORT, not only the status::
+
+    uv run --project shared python scripts/sweep_toolcall_markup.py \
+        --lane meta-plans --json
+
+* **"Is there DEAD-LANE WORK PENDING?"** — the EXIT CODE. :data:`EXIT_CLEAN`
+  when nothing actionable remains, :data:`EXIT_REPAIRABLE_REMAINS` when some
+  does. NOTHING observed about a REFUSED file feeds it (see
+  :meth:`Summary.exit_code`) — not ``skipped``, not
+  :attr:`Summary.skipped_with_markup`, and not
+  :attr:`Summary.skipped_did_not_converge` — so a file this sweep refuses to
+  write can never redden the status. That is a property of the counters, not of
+  the scan: since the scan now runs BEFORE the gates it sees those files, and
+  each refused observation is banked into a report-only counter of its own.
+* **"Is it STILL HAPPENING?"** — ``strings_detected``,
+  :attr:`Summary.skipped_with_markup` and
+  :attr:`Summary.skipped_did_not_converge`. Every LOADED target is scanned,
+  including ones a write gate then refuses, so a corrupt plan under a LIVE lane
+  is reported. It was not, before: detection ran after the write gate, which made
+  this check structurally blind to live lanes — and new corruption is by
+  definition written by a RUNNING task into a LIVE lane, i.e. exactly the
+  population it claims to watch. A non-zero ``skipped_with_markup`` means
+  "corruption seen, not actionable here"; plan-tools' lazy read-repair (PRD D4)
+  owns that half of the corpus.
+
+A separate detector script was deliberately NOT written: it would have had to
+enumerate the envelope literals a second time, which is the one thing INV-5
+forbids. The lane's ``--apply`` mode is the disposition mechanism for the same
+population, so one command still answers both questions — through its report,
+not through its status.
 
 ## Running it
 
@@ -82,6 +127,7 @@ from shared.toolcall_markup import (  # noqa: E402
     PREFILTER_NEEDLES,
     Repair,
     detect,
+    detect_for,
     repair,
 )
 
@@ -96,6 +142,7 @@ __all__ = [
     'EXIT_WRITE_FAILED',
     'INVOKE_CLOSER',
     'LANE_ESCALATIONS',
+    'LANE_META_PLANS',
     'LANE_PLANS',
     'NEVER_TOUCH',
     'PREFILTER_NEEDLES',
@@ -157,6 +204,18 @@ LANE_PLANS = 'plans'
 #: Where the escalations lane is rooted, relative to the repo root.
 _ESCALATIONS_DIR = ('data', 'escalations')
 
+#: Plan artifacts in the DURABLE per-lane store at
+#: ``.worktrees/.task-meta/*/plan.json``. Same rules as :data:`LANE_PLANS` and
+#: gated by the same live-lane check — the difference is REACH, not policy.
+#:
+#: The worktree-lane-lifecycle W11 relocation moved plan state out of the lane
+#: and into this store, which a live lane's ``.task/plan.json`` merely symlinks
+#: INTO. The orphaned glob therefore reaches it only through a lane that still
+#: exists to hold the link: once a lane is reclaimed AND its link is gone, its
+#: plan became unreachable by this sweep while remaining the durable artifact.
+#: Measured 2026-08-25 over that store: 1564 plans, 79 corrupted (5.1%).
+LANE_META_PLANS = 'meta-plans'
+
 #: Where the plans lane is rooted, relative to the repo root.
 _ORPHANED_DIR = '.worktrees-orphaned'
 
@@ -176,7 +235,8 @@ class Target(NamedTuple):
     #: Absolute path as discovered — NOT yet realpath-resolved. Resolution is
     #: :func:`resolve_write_target`'s job and happens only on the write path.
     path: Path
-    #: :data:`LANE_ESCALATIONS` or :data:`LANE_PLANS`.
+    #: :data:`LANE_ESCALATIONS`, :data:`LANE_PLANS` or
+    #: :data:`LANE_META_PLANS`.
     lane: str
 
 
@@ -194,10 +254,11 @@ def _has_dot_component(relative: Path) -> bool:
 def discover_targets(root: Path | str) -> list[Target]:
     """Every sweepable file under *root*, sorted, deterministic.
 
-    Returns the union of the two pinned path sets described in the module
+    Returns the union of the three pinned path sets described in the module
     docstring. An absent lane directory yields nothing rather than raising:
     ``.worktrees-orphaned`` only exists once the reclaim timer has rotated at
-    least one lane, so a fresh checkout legitimately has neither.
+    least one lane and ``.worktrees/.task-meta`` only once a lane has been
+    provisioned, so a fresh checkout legitimately has none of the three.
 
     Dot-prefixed files under ``data/escalations`` are EXCLUDED, explicitly.
     ``data/escalations/.watch-fire.json`` carries a full escalation-record
@@ -235,6 +296,19 @@ def discover_targets(root: Path | str) -> list[Target]:
             # rather than silently dropped here.
             if candidate.is_file() or candidate.is_symlink():
                 targets.append(Target(path=candidate, lane=LANE_PLANS))
+
+    # The DURABLE store the two path shapes above only ever pointed AT. Both of
+    # its components are dot-prefixed, which is precisely why
+    # ``_has_dot_component`` is applied relative to a lane root and never to
+    # the absolute path — the same argument that constant already carries.
+    meta_dir = root_path.joinpath(*_META_ROOT)
+    if meta_dir.is_dir():
+        for lane_dir in meta_dir.iterdir():
+            if not lane_dir.is_dir():
+                continue
+            candidate = lane_dir / 'plan.json'
+            if candidate.is_file() or candidate.is_symlink():
+                targets.append(Target(path=candidate, lane=LANE_META_PLANS))
 
     return sorted(targets)
 
@@ -295,6 +369,13 @@ REASON_LIVE_LANE_PRESENT = 'live-lane-present'
 #: The shared meta-root a lane's plan.json is symlinked into.
 _META_ROOT = ('.worktrees', '.task-meta')
 
+#: The lanes governed by the PLAN rules: the sanctioned-location gate, the
+#: dangling-link refusal and the live-lane check. Both lanes reach the same
+#: file population from different directions, so they are gated identically —
+#: keyed off ONE tuple rather than two lane comparisons that could drift apart
+#: and leave a lane containment-ungated.
+_PLAN_LANES = (LANE_PLANS, LANE_META_PLANS)
+
 
 class ResolvedTarget(NamedTuple):
     """A target cleared for writing, with the path the swap will land on."""
@@ -305,8 +386,8 @@ class ResolvedTarget(NamedTuple):
     #: The ``os.path.realpath``-resolved file. THIS is what ``os.replace``
     #: must land on. Landing on the LINK instead would replace it with a
     #: regular file and re-fork the lane and meta-root copies — the esc-5205-9
-    #: stale-plan divergence ``plan_tools._atomic_write_plan`` documents at
-    #: line 715.
+    #: stale-plan divergence ``TaskArtifacts._write_json`` documents
+    #: (orchestrator/src/orchestrator/artifacts.py).
     write_path: Path
 
 
@@ -394,7 +475,7 @@ def resolve_write_target(target: Target, root: Path | str) -> ResolvedTarget | R
                 reason=REASON_UNSANCTIONED_ESCALATION_LOCATION,
             )
 
-    if target.lane == LANE_PLANS:
+    if target.lane in _PLAN_LANES:
         if not _is_sanctioned_plan_location(resolved, root_real):
             return Refusal(
                 path=target.path,
@@ -499,7 +580,7 @@ def dedupe_by_realpath(targets: list[Target]) -> list[Target]:
 #: A repair was applied: the field was truncated to its clean prefix and every
 #: recovered sibling restored.
 ACTION_REPAIRED = 'repaired'
-#: The string was flagged by detect() but repair() declined. The value is left
+#: The string was flagged by the gate but repair() declined. The value is left
 #: BYTE-IDENTICAL and the reason is reported for human adjudication.
 ACTION_REFUSED = 'refused'
 
@@ -520,11 +601,32 @@ REASON_UNREPAIRABLE = 'unrepairable'
 #: behaviour has changed, not something to paper over.
 ACTION_DID_NOT_CONVERGE = 'did-not-converge'
 
-#: How many times the walk may repeat before giving up. Small on purpose: a
+#: How many times the walk may repeat before giving up — and THE ONE PLACE the
+#: bound's grounds are written down. Every other site that needs them cites this
+#: name instead of restating them (task **5620**): the fact below stood in six
+#: wordings across this module and its tests, which is how five of them came to
+#: be confidently false at once.
+#:
+#: THE ORIGINAL GROUNDS WERE DEPTH, AND DEPTH IS NOT WHAT BOUNDS THIS. "A
 #: recovered value can carry markup at most one level deep before B5 refuses
-#: the parse, so anything past two rounds already means repair() is behaving
-#: differently than measured. Four leaves headroom without turning a runaway
-#: into a hang.
+#: the parse" was true when written and was falsified by task **4502**, which
+#: narrowed B5 so a recovered value may QUOTE a closing tag and still parse.
+#: Task **5620** widened the rule again — a well-formed parameter OPENER in a
+#: recovered value now blocks — WITHOUT restoring the old premise: a quoted
+#: closer still repairs, which is 4502's whole carve-out. So a second round is
+#: reachable in principle, and :func:`repair_document`'s loop is load-bearing
+#: rather than merely structural.
+#:
+#: WHAT JUSTIFIES THE SMALL CEILING is the round count actually recorded for
+#: both live corpora: every document converges in one round, a second yielding
+#: zero repairs, and the bound has never been OBSERVED to be reached. That is
+#: an observation about those corpora rather than a guarantee from the
+#: repairer, and it is inherited rather than re-measured here — ``data/`` is
+#: gitignored, so a task worktree cannot see either corpus. Anything past two
+#: rounds therefore still means repair() is behaving differently than measured;
+#: the conclusion is unchanged, only its grounds. Four leaves headroom, and the
+#: ceiling's real job is to turn a runaway into a LOUD
+#: :data:`ACTION_DID_NOT_CONVERGE` failure rather than a hang.
 _MAX_REPAIR_ROUNDS = 4
 
 #: Paired with :data:`ACTION_DID_NOT_CONVERGE`.
@@ -548,7 +650,13 @@ REASON_LIST_ELEMENT_NO_OBJECT = 'list-element-no-object'
 
 
 class Outcome(NamedTuple):
-    """What happened to one detect()-flagged string, and where."""
+    """What happened to one flagged string, and where.
+
+    "Flagged" is ``detect_for`` inside an object — where the field name and the
+    record's own keys are in hand — and the blanket ``detect`` for a bare list
+    element, which has neither. One enumeration, two named predicates over it
+    (INV-5).
+    """
 
     #: Dotted/indexed location within the document, e.g.
     #: ``design_decisions[1].rationale``. Built for the operator's report.
@@ -641,12 +749,22 @@ def _repair_dict(node: dict, path: str, outcomes: list[Outcome]) -> tuple[dict, 
         value = working[key]
 
         if isinstance(value, str):
-            if detect(value) is None:
-                continue
             # Recomputed per FIELD, not once per object: a hole filled by an
             # earlier repair in this same pass is no longer a hole, and two
-            # corrupted fields must never both claim it.
+            # corrupted fields must never both claim it. Hoisted above the gate
+            # because the gate now needs it too.
             schema = set(working.keys())
+            # PARAMETER-AWARE (task 4696). The blanket ``detect`` spells none of
+            # the writing tools' own parameter names, so a field mis-closed with
+            # its OWN tag was skipped here and reached NEITHER the repair nor the
+            # residue counters — silently absent from the human-adjudication
+            # queue, which is the one thing this sweep must never do with
+            # unrepaired leak. This object's own keys ARE the schema the repair
+            # below is already qualified against, so asking the wider predicate
+            # costs one set() that was being built two lines later anyway, and
+            # re-spells nothing (INV-5).
+            if detect_for(value, key, schema) is None:
+                continue
             targets = _string_holes(working) - {key}
             result = repair(value, key, schema, schema - targets - {key})
 
@@ -716,6 +834,11 @@ def _repair_list(node: list, path: str, outcomes: list[Outcome]) -> tuple[list, 
     changed = False
     for index, item in enumerate(node):
         if isinstance(item, str):
+            # The BLANKET predicate here, deliberately, and NOT the
+            # parameter-aware one the object gate uses (task 4696): a bare list
+            # element has no field name and no sibling keys, so there is no
+            # parameter context to be aware of. The asymmetry is a consequence
+            # of the shape, not a missed site.
             if detect(item) is not None:
                 outcomes.append(Outcome(
                     json_path=f'{path}[{index}]',
@@ -781,12 +904,12 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     Landing such a value in a hole and stopping would leave a repairable string
     behind and break the binding "a second run reports 0" invariant.
 
-    Measured today, the loop never runs twice: ``_parse_tail`` refuses outright
-    when a recovered item contains a further mis-close (B5), so on every shape
-    repair() accepts, one pass already converges and a second yields zero
-    repairs on both live corpora. The loop is therefore INSURANCE — it makes
-    the second-run-zero invariant STRUCTURAL rather than an empirical
-    observation that a future widening of repair() could quietly invalidate.
+    A SECOND ROUND IS REACHABLE IN PRINCIPLE, which is what makes this loop
+    LOAD-BEARING rather than merely structural: two widenings of ``repair()``
+    have landed (tasks **4502** and **5620**) and neither restored the premise
+    this paragraph used to rest on. No document in either live corpus has been
+    OBSERVED to need a second round — a different claim, and a weaker one. See
+    :data:`_MAX_REPAIR_ROUNDS`, where both are stated once.
 
     Exceeding the bound is reported LOUDLY as a
     :data:`ACTION_DID_NOT_CONVERGE` outcome naming the path that was still
@@ -799,9 +922,11 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     LOUDLY means all the way to the operator, not merely into this return
     value: :func:`run_sweep` counts it into ``Summary.did_not_converge``,
     :func:`main` prints it, and it forces :data:`EXIT_DID_NOT_CONVERGE`. The
-    outcome is unreachable with today's repair() (B5 refuses a nested parse),
-    which is precisely why the wiring has to exist BEFORE a future widening
-    makes it reachable — a tripwire connected to nothing is not a tripwire.
+    outcome has never been OBSERVED on either live corpus, which is precisely
+    why the wiring has to exist BEFORE something makes it reachable — a
+    tripwire connected to nothing is not a tripwire. Never observed is all it
+    is: unreachability was never a guarantee from B5, and that correction is
+    written once, at :data:`_MAX_REPAIR_ROUNDS`.
     """  # noqa: D205
     # The two outcome classes accumulate DIFFERENTLY across rounds, because
     # they mean different things:
@@ -988,9 +1113,10 @@ def round_trips(raw: str, obj: Any) -> bool:
     time rather than asserted once in a test.
 
     It also fail-safes any hand-edited or unusually-formatted file for free.
-    Reusing ``plan_tools._atomic_write_plan`` was rejected for the same reason:
-    it stamps ``_schema_version`` and re-indents, which would put changes in
-    the diff that the corrupted strings did not cause.
+    Reusing ``TaskArtifacts.write_plan`` — the single plan.json writer — was
+    rejected for the same reason: it stamps ``_schema_version`` and re-indents,
+    which would put changes in the diff that the corrupted strings did not
+    cause.
     """
     return serialize_like(raw, obj) == raw
 
@@ -1035,7 +1161,8 @@ class WriteFailure(NamedTuple):
 def _target_file_mode(path: Path) -> int | None:
     """The target's current permission bits, or ``None`` if it does not exist.
 
-    Mirrors ``plan_tools._target_file_mode``. Without this the swapped-in file
+    Mirrors ``orchestrator.artifacts._existing_mode``. Without this the
+    swapped-in file
     inherits ``mkstemp``'s 0600 and the record silently becomes unreadable to
     every other process that shares the queue directory.
     """
@@ -1055,7 +1182,7 @@ def write_repaired(
     is either its old bytes or its new bytes — never a mixture, and never
     truncated.
 
-    The ordering is load-bearing and follows ``plan_tools._atomic_write_plan``:
+    The ordering is load-bearing and follows ``TaskArtifacts._write_json``:
 
     1. ``mkstemp`` in the RESOLVED TARGET'S OWN DIRECTORY — ``os.replace`` is
        only atomic within a filesystem, so a ``/tmp`` scratch file would
@@ -1182,7 +1309,7 @@ EXIT_WRITE_FAILED = 2
 #: measured contract no longer holding for this corpus.
 EXIT_DID_NOT_CONVERGE = 3
 
-_LANE_CHOICES = (LANE_ESCALATIONS, LANE_PLANS, 'all')
+_LANE_CHOICES = (LANE_ESCALATIONS, LANE_PLANS, LANE_META_PLANS, 'all')
 
 
 class Summary(NamedTuple):
@@ -1205,6 +1332,23 @@ class Summary(NamedTuple):
     repaired_not_written: int = 0
     #: Documents that were still changing when the round bound ran out.
     did_not_converge: int = 0
+    #: Files a write gate refused that WERE carrying repairable markup. This is
+    #: what makes "not looked at" distinguishable from "clean": a corrupt plan
+    #: under a live lane and a clean one used to produce the same report.
+    #: Deliberately NOT read by :meth:`exit_code` — the status answers "is
+    #: there DEAD-lane work pending", and this counter answers "is it still
+    #: happening". Defaulted and trailing, so every positional construction
+    #: keeps working.
+    skipped_with_markup: int = 0
+    #: Non-convergence observed on a file a write gate then REFUSED. The same
+    #: split as :attr:`skipped_with_markup`, for the same reason: the scan now
+    #: runs before the gates, so it SEES documents this sweep will never write,
+    #: and folding their stalls into :attr:`did_not_converge` would hand
+    #: :meth:`exit_code` a red it can never clear — a non-converging plan under
+    #: a LIVE lane would redden the periodic check on every run forever, with
+    #: no action the sweep is permitted to take. Report-only, like every other
+    #: counter describing a refused file.
+    skipped_did_not_converge: int = 0
 
     def as_dict(self) -> dict:
         return dict(self._asdict())
@@ -1226,6 +1370,15 @@ class Summary(NamedTuple):
         document is still WRITTEN, ``failed`` and ``pending`` both stay 0, and
         exiting 0 there would be exactly the false "second run reports 0"
         signal this task is measured by.
+
+        A REFUSED file is outside every clause above. Nothing this status
+        reports can be true of a document the sweep declines to write, so
+        non-convergence seen on one goes to
+        :attr:`skipped_did_not_converge` and is read off the report — the same
+        rule ``skipped`` and :attr:`skipped_with_markup` already follow. It has
+        to be a separate counter rather than a narrower read here, because by
+        this point the two populations are indistinguishable: one integer
+        cannot say which of its stalls belonged to a writable file.
         """
         if self.did_not_converge:
             return EXIT_DID_NOT_CONVERGE
@@ -1237,11 +1390,21 @@ class Summary(NamedTuple):
 def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
     """Sweep *root*; return ``(summary, diffs)``.
 
-    Pipeline order is deliberate: load-and-gate, then resolve-the-write-target,
-    THEN repair. Resolving before repairing means a gate-skip (a live lane, a
-    dangling link, committed evidence) is counted as ``skipped`` and never as
-    pending work — otherwise a permanently-skipped file would keep the exit
-    code at 1 forever and break the second-run-zero invariant.
+    Pipeline order is deliberate: LOAD, then SCAN, then resolve-the-write-target
+    and the remaining gates. Scanning first is what lets the report see a file
+    this sweep will never write (task 5283); it is safe because
+    :func:`repair_document` is non-mutating and returns a NEW object, so the
+    scan changes what is COUNTED and nothing about what is WRITTEN.
+
+    The invariant that order used to defend is now carried by the ``continue``s
+    instead, and is stronger for it: EVERY gate refusal continues before the
+    ``pending``, ``repaired`` and ``did_not_converge`` increments, so a
+    permanently-skipped file (a live lane, a dangling link, committed evidence)
+    contributes to no counter :meth:`Summary.exit_code` reads and can never
+    keep the status non-zero forever. What it DOES contribute to is the
+    report-only pair ``skipped_with_markup`` / ``skipped_did_not_converge``,
+    which is how "refused, and it was dirty" stays distinguishable from
+    "clean" now that the scan can tell them apart.
 
     ``repaired`` counts what is ON DISK. Under ``--apply`` a file's repairs are
     added only AFTER its write returns success; a failed write puts them in
@@ -1261,7 +1424,7 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
     skipped: dict[str, int] = {}
     diffs: list[str] = []
     scanned = detected = repaired_count = leaks = quotes = failed = pending = 0
-    not_written = stalled = 0
+    not_written = stalled = skipped_with_markup = skipped_stalled = 0
 
     for target in targets:
         scanned += 1
@@ -1271,18 +1434,17 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
             skipped[loaded.reason] = skipped.get(loaded.reason, 0) + 1
             continue
 
-        resolved = resolve_write_target(target, root_path)
-        if isinstance(resolved, Refusal):
-            skipped[resolved.reason] = skipped.get(resolved.reason, 0) + 1
-            continue
-
-        if not round_trips(loaded.raw, loaded.obj):
-            reason = REASON_FORMAT_NOT_REPRODUCIBLE
-            skipped[reason] = skipped.get(reason, 0) + 1
-            continue
-
+        # DETECTION RUNS BEFORE THE WRITE GATES, deliberately (task 5283).
+        # ``repair_document`` is non-mutating and returns a NEW object, so
+        # scanning here changes what is COUNTED without changing what is
+        # WRITTEN. Gating the scan behind the write decision made this sweep
+        # structurally blind to live lanes — and new corruption is BY
+        # DEFINITION written by a RUNNING task into a LIVE lane, so the check
+        # advertised as the silent-write detector could not see the one
+        # population it exists to watch. ``load_target`` stays first: nothing
+        # can be scanned that cannot be loaded.
         new_obj, outcomes = repair_document(loaded.obj)
-        file_repairs = 0
+        file_repairs = file_stalls = 0
         for outcome in outcomes:
             if outcome.action == ACTION_REPAIRED:
                 detected += 1
@@ -1299,7 +1461,41 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
                 # would corrupt the one-outcome-per-string arithmetic the
                 # residue counters rest on. It gets its own counter, its own
                 # report line, and its own exit code.
-                stalled += 1
+                #
+                # Tallied PER FILE and banked past the gates below, never
+                # straight into `stalled`: this scan sees files the sweep is
+                # about to refuse, and `did_not_converge` is the one residue
+                # counter `exit_code()` DOES read. Banking it here would give a
+                # non-converging plan under a live lane a permanent red the
+                # sweep is not allowed to clear.
+                file_stalls += 1
+
+        # ...and only NOW the write gates. A refusal still increments
+        # ``skipped[reason]`` and leaves ``pending`` untouched, so the
+        # second-run-zero invariant and the exit-code contract are preserved
+        # verbatim; the one addition is ``skipped_with_markup``, which is what
+        # makes "not looked at" distinguishable from "clean" in the report.
+        resolved = resolve_write_target(target, root_path)
+        if isinstance(resolved, Refusal):
+            skipped[resolved.reason] = skipped.get(resolved.reason, 0) + 1
+            if file_repairs:
+                skipped_with_markup += 1
+            skipped_stalled += file_stalls
+            continue
+
+        if not round_trips(loaded.raw, loaded.obj):
+            reason = REASON_FORMAT_NOT_REPRODUCIBLE
+            skipped[reason] = skipped.get(reason, 0) + 1
+            if file_repairs:
+                skipped_with_markup += 1
+            skipped_stalled += file_stalls
+            continue
+
+        # Past every gate: this file is one the sweep may write, so its stalls
+        # are the operator-actionable kind the exit code exists to surface.
+        # Banked BEFORE the no-repairs shortcut below, so a document that
+        # stalls without landing a repair is still reported.
+        stalled += file_stalls
 
         if not file_repairs:
             continue
@@ -1334,6 +1530,8 @@ def run_sweep(root: Path | str, lane: str = 'all', apply: bool = False):
         pending=pending,
         repaired_not_written=not_written,
         did_not_converge=stalled,
+        skipped_with_markup=skipped_with_markup,
+        skipped_did_not_converge=skipped_stalled,
     ), diffs
 
 
@@ -1344,8 +1542,14 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             'Retro-sweep leaked tool-call markup out of TERMINAL persisted '
             'state: data/escalations/**/*.json (resolved/dismissed records '
-            'only) and .worktrees-orphaned/*/.task/plan.json. Dry run by '
-            'default. Never touches '
+            'only), .worktrees-orphaned/*/.task/plan.json and '
+            '.worktrees/.task-meta/*/plan.json (dead lanes only — a plan a '
+            'live lane still shares is refused). Dry run by default, which is '
+            'also the periodic silent-write CHECK: the exit code answers "is '
+            'there dead-lane work pending" (0 none, 1 some), while '
+            '"strings detected" and "skipped w/ markup" answer "is it still '
+            'happening" — every loaded file is scanned, including ones the '
+            'write gate refuses. Never touches '
             'docs/task-recovery-2026-05-13/worktree-inventory.json or '
             'docs/toolcall-xml-leak-sweep-2026-08-05/dry-run-report.json, '
             'which are committed evidence that legitimately quotes specimens.'
@@ -1360,7 +1564,13 @@ def main(argv: list[str] | None = None) -> int:
         '--apply', action='store_true',
         help='actually rewrite files (default: report only)',
     )
-    parser.add_argument('--lane', choices=_LANE_CHOICES, default='all')
+    parser.add_argument(
+        '--lane', choices=_LANE_CHOICES, default='all',
+        help=(
+            'restrict the sweep to one lane. %(prog)s --lane meta-plans is the '
+            'periodic check over the durable per-lane plan store'
+        ),
+    )
     parser.add_argument(
         '--json', action='store_true', dest='as_json',
         help='emit the summary as JSON instead of text',
@@ -1383,6 +1593,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f'write failures     : {summary.failed}')
     print(f'repairs not written: {summary.repaired_not_written}')
     print(f'did not converge   : {summary.did_not_converge}')
+    print(f'skipped w/ markup  : {summary.skipped_with_markup}')
+    print(f'skipped/no converge: {summary.skipped_did_not_converge}')
     for reason in sorted(summary.skipped):
         print(f'skipped/{reason:<10}: {summary.skipped[reason]}')
     return summary.exit_code()

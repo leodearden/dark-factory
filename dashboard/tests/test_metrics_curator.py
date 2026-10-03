@@ -6,7 +6,6 @@ Built incrementally — one step at a time in TDD order.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import sqlite3
@@ -17,8 +16,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiosqlite
 import httpx
 import pytest
+from _dashboard_helpers import (
+    drive_metrics_loop,
+    mcp_init_response,
+    mcp_notify_response,
+    mcp_tool_response,
+)
 
-from dashboard.app import _metrics_loop, _MetricsStore
 from dashboard.config import DashboardConfig
 from dashboard.data.db import DbPool
 from dashboard.data.metrics import (
@@ -26,6 +30,7 @@ from dashboard.data.metrics import (
     collect_metrics_snapshot,
     downsample_metrics,
 )
+from dashboard.loops import _MetricsStore
 
 # ---------------------------------------------------------------------------
 # Shared schemas (minimal for tests)
@@ -53,48 +58,6 @@ CREATE TABLE IF NOT EXISTS account_events (
 );
 """
 
-# ---------------------------------------------------------------------------
-# MCP mock helpers (mirrors test_memory.py pattern)
-# ---------------------------------------------------------------------------
-
-
-def _make_mcp_response(inner_dict: dict, request_id: int = 1) -> httpx.Response:
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'content': [
-                {'type': 'text', 'text': json.dumps(inner_dict)},
-            ],
-        },
-    }
-    return httpx.Response(
-        200,
-        json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_init_response(request_id: int = 1) -> httpx.Response:
-    body = {
-        'jsonrpc': '2.0',
-        'id': request_id,
-        'result': {
-            'protocolVersion': '2025-03-26',
-            'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'test', 'version': '0.1'},
-        },
-    }
-    return httpx.Response(
-        200,
-        json=body,
-        headers={'mcp-session-id': 'test-session-id'},
-    )
-
-
-def _make_notify_response() -> httpx.Response:
-    return httpx.Response(202, headers={'mcp-session-id': 'test-session-id'})
-
 
 class _ListTicketsHandler:
     """Mock MCP handler that returns a fixed count for list_tickets calls."""
@@ -110,13 +73,13 @@ class _ListTicketsHandler:
         request_id = body.get('id', 1)
 
         if method == 'initialize':
-            return _make_init_response(request_id)
+            return mcp_init_response(request_id)
         if method.startswith('notifications/'):
-            return _make_notify_response()
+            return mcp_notify_response()
 
         # tools/call
         self.calls.append(body)
-        return _make_mcp_response(
+        return mcp_tool_response(
             {'count': self.count, 'tickets': [], 'project_id': self.project_id},
             request_id,
         )
@@ -752,20 +715,14 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
 
     Calls _metrics_loop directly against a hand-built app-state stub so the
     real lifespan — and its _burndown_loop side task — are never started.
-    Only _metrics_loop is exercised; collect_metrics_snapshot is patched to
-    record the call and set an event, then the task is cancelled cleanly.
+    Only _metrics_loop is exercised, via
+    dashboard/tests/_dashboard_helpers.py::drive_metrics_loop, which records
+    each collect_metrics_snapshot call and stops after the first.
 
     tickets.db is created on disk at the canonical path so DbPool.get() returns
     a real connection.  This pins the path-to-connection wiring: a wrong-but-
     missing path would make get() return None, failing the is-not-None assertion.
     """
-    called_event = asyncio.Event()
-
-    async def _side_effect(*args, **kwargs):
-        called_event.set()
-
-    mock_collect = AsyncMock(side_effect=_side_effect)
-
     # Minimal app-state stub — no real lifespan, no side tasks.
     fixed_config = DashboardConfig(
         project_root=tmp_path,
@@ -787,24 +744,14 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         MagicMock()
     )  # collect_metrics_snapshot is patched; client never used
 
-    # _metrics_loop now takes a _MetricsStore, not a raw aiosqlite.Connection.
-    metrics_store = _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000)
-    await metrics_store.open()
-
-    expected_conn = None
-    loop_opened = False
     try:
-        with patch('dashboard.app.collect_metrics_snapshot', mock_collect):
-            # _metrics_loop calls _run_once() immediately before entering the
-            # aligned-sleep loop.  We cancel the task once the event fires.
-            task = asyncio.create_task(_metrics_loop(metrics_store, mock_app))
-            try:
-                # 2 s is generous for a single fast AsyncMock _run_once() cycle.
-                await asyncio.wait_for(called_event.wait(), timeout=2.0)
-            finally:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+        async with _MetricsStore(tmp_path / 'metrics.db', busy_timeout_ms=5000) as metrics_store:
+            calls = await drive_metrics_loop(
+                metrics_store,
+                mock_app,
+                pool=pool,
+                http_client=mock_app.state.http_client,
+            )
         # Verify the loop opened the connection BEFORE calling pool.get() ourselves.
         # pool.open_count > 0 means _metrics_loop._run_once() actually called pool.get();
         # without this check, pool.get() below would lazily open the connection and mask
@@ -814,13 +761,12 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
         # DbPool.get() is idempotent: returns the same cached object on repeat call.
         expected_conn = await pool.get(fixed_config.tickets_db)
     finally:
-        await metrics_store.close()
         await pool.close_all()
 
-    assert mock_collect.called, 'collect_metrics_snapshot was never called'
-    call_kwargs = mock_collect.call_args.kwargs if mock_collect.call_args else {}
+    assert calls, 'collect_metrics_snapshot was never called'
+    call_kwargs = calls[0]
     assert 'tickets_db' in call_kwargs, (
-        f'tickets_db not in kwargs: {call_kwargs}. All calls: {mock_collect.call_args_list}'
+        f'tickets_db not in kwargs: {call_kwargs}. All calls: {calls}'
     )
     assert loop_opened, (
         f'_metrics_loop._run_once() never called pool.get(); '
@@ -838,7 +784,7 @@ async def test_metrics_loop_passes_tickets_db_kwarg(tmp_path: Path):
     assert call_kwargs['tickets_db'] is expected_conn, (
         f'tickets_db should be the DbPool connection for {fixed_config.tickets_db} '
         f'but got {call_kwargs["tickets_db"]!r}. '
-        f'All calls: {mock_collect.call_args_list}'
+        f'All calls: {calls}'
     )
 
 

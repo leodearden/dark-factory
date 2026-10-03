@@ -8,12 +8,19 @@ STEWARD's route, not yours ... Filing at level 1 to jump the queue buys no
 faster resolution, only an audit trail showing you bypassed your handler." So
 the LAST thing the steward read about escalation levels reframed the very
 recourse its own body mandates four times — in STEWARD's own prompt body, at
-Rule 2 (be conservative), Rule 6 (wip_conflict/unmerged_state, the
+Rule 2 (be conservative), Rule 6 (the merge-halt categories, the
 never-auto-resolve class), and the MAX_TURNS and CLI_INPUT_REJECTED
 classification entries — as a queue-jumping bypass rather than the mandated
 recourse it actually is. (Cite these sites by name, not line number: roles.py
 churns and a hand-copied offset goes stale silently -- see
 test_roles_wait_pattern.py's module docstring for the prior incident.)
+
+Rule 6 is enumerated in `roles.MERGE_HALT_ESCALATION_CATEGORIES` and carried
+by `roles.MERGE_HALT_SAFETY_RULE`; `test_roles_merge_halt_safety.py` (task
+4130) guards it.  Earlier revisions of this file spelled that rule
+"wip_conflict/unmerged_state", naming two of its three categories -- the same
+drift task 4130 fixed at the source.  Say "the merge-halt categories" rather
+than re-spelling the membership here.
 
 The fix splits the literal at its existing blank line into
 ``ESCALATION_LADDER_CORE`` (the mechanics: what ``escalate_info`` /
@@ -31,9 +38,21 @@ non-containment / identity check against a NAMED constant — never a string
 literal pinned to a constant's prose. A prose pin "passes on prose reworded to
 say the opposite and fails on a legitimate tightening" and only taxes future
 prompt edits; it has no correctness content in either direction.
+
+Task 5368 adds containment checks for `escalation.models`' filer-facing action
+tokens, and they are NOT that banned shape even though what they search is
+prose. The tokens are a cross-package WIRE VALUE: `escalate_blocker` emits one
+in its response and no code reads it, so the prompt's verbatim copy is the
+entire mechanism by which an agent learns what the value means. Pinning them
+here therefore survives any rewording of the surrounding sentence and fails
+only when the prompt and the emitted value genuinely disagree -- which is a
+real defect, not a prompt-edit tax. That is also why they are imported rather
+than spelled: a literal would carry no coupling to the emission site at all.
 """
 
 from __future__ import annotations
+
+from escalation.models import ACTION_KEEP_DRIVING, ACTION_TERMINATE_CLEANLY
 
 from orchestrator.agents.roles import (
     _ESCALATION_INSTRUCTIONS,
@@ -45,7 +64,7 @@ from orchestrator.agents.roles import (
 
 # The one role whose own prompt body mandates `escalate_blocker(..., level=1)`
 # re-escalation -- at Rule 2 (be conservative), Rule 6
-# (wip_conflict/unmerged_state), and the MAX_TURNS and CLI_INPUT_REJECTED
+# (the merge-halt categories), and the MAX_TURNS and CLI_INPUT_REJECTED
 # classification entries. This is the role the fix is FOR: it must keep
 # reading the ladder mechanics (ESCALATION_LADDER_CORE) but must stop reading
 # the non-steward gate telling it that its own mandated recourse is a
@@ -102,7 +121,7 @@ def test_l1_filer_roles_carry_the_ladder_core() -> None:
     assert offenders == [], (
         f'Role(s) missing ESCALATION_LADDER_CORE from system_prompt: {offenders}. '
         'These roles mandate `escalate_blocker(..., level=1)` re-escalation in '
-        'their own body (Rule 2 be-conservative, Rule 6 wip_conflict/unmerged_state, '
+        'their own body (Rule 2 be-conservative, Rule 6 merge-halt categories, '
         'MAX_TURNS, CLI_INPUT_REJECTED) and need the ladder mechanics to know what '
         'level=1 does and that only 0 and 1 are accepted.'
     )
@@ -115,7 +134,7 @@ def test_l1_filer_roles_omit_the_non_steward_gate() -> None:
     `_ESCALATION_INSTRUCTIONS` block, so the LAST thing it read about escalation
     levels was `NON_STEWARD_LEVEL_GATE` telling it that `level=1` -- the exact
     call its own body mandates at Rule 2 (be conservative), Rule 6
-    (wip_conflict/unmerged_state), and the MAX_TURNS and CLI_INPUT_REJECTED
+    (the merge-halt categories), and the MAX_TURNS and CLI_INPUT_REJECTED
     classification entries -- is "not yours" and "buys no faster resolution,
     only an audit trail showing you bypassed your handler". This is both the
     fix and the regression guard: a future refactor that re-splices the full
@@ -214,4 +233,79 @@ def test_unclassified_roles_carry_neither_escalation_half() -> None:
         f'Role(s) not listed in _L1_FILER_ROLES or _NON_STEWARD_ESCALATING_ROLES '
         f'but whose system_prompt carries escalation-ladder text: {offenders}. '
         'Classify them into the appropriate tuple above.'
+    )
+
+
+def test_ladder_core_names_both_filer_action_tokens() -> None:
+    """(a)+(b) The prompt tells the agent both values of the `action` key.
+
+    `escalate_blocker` appends `action` to its response, and NO CODE READS IT
+    -- the only consumer is the agent. Since task 5368 that key is
+    two-valued: `terminate_cleanly` when persistence was observed,
+    `keep_driving` when a post-write re-read could not confirm the record, in
+    which case no handler will ever see the filing and stopping would strand
+    the task. An agent that has never been told the second token exists reads
+    the unconditional "STOP" instruction and does exactly the wrong thing.
+
+    Both tokens are required, not just the new one: naming only the exception
+    would leave the default unstated, so the agent would have to infer what an
+    unnamed `action` value means instead of discriminating on a value it can
+    read straight off the response.
+    """
+    missing = [
+        token for token in (ACTION_TERMINATE_CLEANLY, ACTION_KEEP_DRIVING)
+        if token not in ESCALATION_LADDER_CORE
+    ]
+    assert missing == [], (
+        f'ESCALATION_LADDER_CORE does not name filer action token(s): {missing}. '
+        'These are wire values emitted by `escalate_blocker` and defined in '
+        '`escalation.models.FILER_ACTIONS`; the prompt quotes them verbatim '
+        '(role prompts are plain literals, not f-strings), so the prompt and '
+        'the emission site must move together.'
+    )
+
+
+def test_non_steward_gate_names_neither_filer_action_token() -> None:
+    """(c) The amendment belongs to the mechanics half, which the steward reads.
+
+    `NON_STEWARD_LEVEL_GATE` is the one half the steward is deliberately NOT
+    composed with (`test_l1_filer_roles_omit_the_non_steward_gate`). Putting
+    the `keep_driving` discrimination there would silently exempt the role
+    that files the most blockers -- the same split-audience bug task 4169
+    created this file to prevent. This assertion makes the placement
+    structural rather than a convention someone has to remember.
+    """
+    misplaced = [
+        token for token in (ACTION_TERMINATE_CLEANLY, ACTION_KEEP_DRIVING)
+        if token in NON_STEWARD_LEVEL_GATE
+    ]
+    assert misplaced == [], (
+        f'NON_STEWARD_LEVEL_GATE names filer action token(s): {misplaced}. '
+        'The steward is composed from ESCALATION_LADDER_CORE alone, so anything '
+        'in the gate half is invisible to the heaviest filer of blockers. Move '
+        'it into the core.'
+    )
+
+
+def test_every_escalating_role_reads_both_filer_action_tokens() -> None:
+    """(d) Derived coverage: the composed prompts, not just the constant.
+
+    Iterates the hand-classified tuples rather than re-listing role names, and
+    `test_escalation_tool_grant_matches_hand_classification` independently
+    pins those tuples to `ROLES`' actual tool grants -- so a newly-wired
+    escalating role is covered here without editing this test. Checks the
+    COMPOSED `system_prompt`, which is what an agent actually receives: a role
+    spliced with some other escalation text, or with none, fails here even
+    while the constant itself stays correct.
+    """
+    offenders = sorted(
+        name for name in _L1_FILER_ROLES + _NON_STEWARD_ESCALATING_ROLES
+        if ACTION_TERMINATE_CLEANLY not in ROLES[name].system_prompt
+        or ACTION_KEEP_DRIVING not in ROLES[name].system_prompt
+    )
+    assert offenders == [], (
+        f'Escalating role(s) whose composed system_prompt is missing one or both '
+        f'filer action tokens: {offenders}. Every role that can file a blocker '
+        'receives the `action` key in its response and must be told how to read '
+        'both of its values.'
     )

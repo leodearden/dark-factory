@@ -7,13 +7,13 @@ chains, and the three §5.6 health counters — and renders them as text.
 
 BINDING CONTRACT — READ ONLY.  Nothing in this module opens debt, files a task,
 resolves anything, or escalates.  All ledger DATA comes from α's public READ API
-(``list_open_debt`` / ``read_occurrences`` / ``read_debt``); the only SQL of its own is
-:func:`probe_ledger`'s single ``sqlite_master`` SELECT, which mutates strictly less than
-those readers do (no DDL, no journal-mode pragma).  One consequence is not obvious and
-is enforced by :func:`build_report`'s guards: α's readers PROVISION on read (``_open``
-does ``parent.mkdir`` → ``connect`` → ``executescript(_SCHEMA)``), so calling one
-against a project that has no ledger would create ``data/orchestrator/runs.db`` plus its
-WAL sidecars as a side effect of PRINTING a report — and calling one against a
+(``list_open_debt`` / ``read_occurrences`` / ``read_debt_many``); the only SQL of its
+own is :func:`probe_ledger`'s single ``sqlite_master`` SELECT, which mutates strictly
+less than those readers do (no DDL, no journal-mode pragma).  One consequence is not
+obvious and is enforced by :func:`build_report`'s guards: α's readers PROVISION on read
+(``_open`` does ``parent.mkdir`` → ``connect`` → ``executescript(_SCHEMA)``), so calling
+one against a project that has no ledger would create ``data/orchestrator/runs.db`` plus
+its WAL sidecars as a side effect of PRINTING a report — and calling one against a
 ``runs.db`` that has no flake tables yet would CREATE those tables in it.  Absence and
 unreadability are therefore both established BEFORE any read, and reported honestly
 rather than papered over by a freshly-provisioned empty result.
@@ -54,7 +54,7 @@ from orchestrator.flake_ledger import (
     FlakeOccurrenceRow,
     FlakeVerdict,
     list_open_debt,
-    read_debt,
+    read_debt_many,
     read_occurrences,
 )
 
@@ -87,6 +87,46 @@ DEFAULT_SYSTEMIC_WINDOW_MINUTES = 60
 # design — α's module docstring, §11 Q1).  A read that fills this limit is surfaced as
 # truncated rather than silently yielding a rate over an unknown window.
 DEFAULT_OCCURRENCE_READ_LIMIT = 20000
+
+# --- the merge-gate splice defect (task 5580) --------------------------------
+#
+# Until task 5580, `verify.confirm_isolated_rerun_verdict` built the merge gate's
+# isolated re-run as a STRING and a second rewrite re-parsed it, splicing `--junitxml`
+# between `--timeout` and its value.  pytest rejected the resulting argv
+# (rc=4, `argument --timeout: expected one argument`) before running a single test, and
+# the discriminator scored that rejection `fails_in_isolation`.  Such a row is a fact
+# about the command the gate rendered, not about the test it names.
+#
+# MEASURED on the live dark_factory ledger at 2026-09-20T01:24Z: the `merge_gate` call
+# site carried 357 `fails_in_isolation`, 4 `unconfirmable` and ZERO
+# `passes_in_isolation` over its entire history (2026-08-30T16:20Z -> 2026-09-19T20:43Z).
+# A gate that has never once cleared a test in three weeks was not discriminating.
+# (Task 5580's title says 350: that was the same population read 3 days earlier, still
+# growing because main runs the defective code until this lands.)
+#
+# The cutoff is the instant THIS FIX WAS AUTHORED.  What that buys is exact: no
+# observation stamped at or before it can have come from the fixed code, because the
+# fixed code did not exist yet.  The residual is real and is not papered over —
+# `merge_gate` rows observed between authoring and landing are still noise and are NOT
+# excluded.  That count is small and bounded by the merge lane's latency, whereas
+# pushing the cutoff past the fix would start discarding genuine reds, which is the one
+# direction the discriminator's doctrine forbids.
+#
+# SUNSET — 2026-09-27, one read window past the cutoff.  This whole cluster (the
+# constant, `_MERGE_GATE_SPLICE_DEFECT_END_AT`, `is_spliced_merge_gate_row`,
+# `FlakeLedgerReport.excluded_non_evidence`, `render_report`'s NOTE branch and
+# `TestSplicedMergeGateRowsAreNotEvidence`) is DELETABLE TOGETHER after that date, and
+# ticket tkt_0RTVQE7709R0J2GWDKAVWVWX53 asks for exactly that.  `build_report` windows
+# the occurrence read at `now - window_hours`, and its only production caller
+# (cli.py's `flake-ledger`) takes the DEFAULT_GATE_BLIND_WINDOW_HOURS=168h default — so
+# from 2026-09-27T01:24Z no report an operator can run reaches a row stamped at or
+# before the cutoff: the predicate can never return True again, the count is always 0
+# and the NOTE never renders.  Stated here rather than left to be inferred from the
+# window constant, because a filter whose horizon has silently passed is the same
+# not-quite-lying machinery this module exists to keep out of a report.  It is a DATE
+# and not an assert because a caller passing a wider `window_hours` can still reach
+# those rows, and for such a caller the exclusion is still correct.
+MERGE_GATE_SPLICE_DEFECT_END = '2026-09-20T01:24:27+00:00'
 
 
 # --- ledger reachability -----------------------------------------------------
@@ -174,6 +214,42 @@ def _parse_stamp(raw: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+#: :data:`MERGE_GATE_SPLICE_DEFECT_END` parsed ONCE, at import.  The predicate below
+#: runs on every occurrence of every report and the row count is the ledger's, not
+#: ours, so the parse does not belong inside it.  ``None`` only if the constant itself
+#: were malformed, which the predicate reads as "exclude nothing" — the safe direction,
+#: since it keeps every row as evidence.
+_MERGE_GATE_SPLICE_DEFECT_END_AT = _parse_stamp(MERGE_GATE_SPLICE_DEFECT_END)
+
+
+def is_spliced_merge_gate_row(row: FlakeOccurrenceRow) -> bool:
+    """True for an occurrence the merge-gate splice defect manufactured — see
+    :data:`MERGE_GATE_SPLICE_DEFECT_END`.
+
+    The ONE place the rule is written, so the count an operator is shown and the rows
+    the counters never see can never be two different sets (INV-5).
+
+    Narrow on every axis, because each one is what the defect could actually reach.
+    ``main_probe`` is excluded on evidence, not caution: its engine passes
+    ``role='task'``, so no junit path was ever computed and the second rewrite never
+    happened there.  Only ``fails_in_isolation`` is excluded, because that is the
+    verdict a rejected command produced — the rejection classified as an unknown test
+    failure, which is not infra-transient, so it became a confirmed red.  And a row
+    whose ``observed_at`` will not parse is KEPT: an unreadable clock does not place a
+    row before the fix, and degrading a parse failure into a deletion is the silent
+    data loss this module exists to refuse.
+    """
+    if row.call_site != FlakeCallSite.merge_gate:
+        return False
+    if row.verdict != FlakeVerdict.fails_in_isolation:
+        return False
+    observed = _parse_stamp(row.observed_at)
+    cutoff = _MERGE_GATE_SPLICE_DEFECT_END_AT
+    # INCLUSIVE at the bound: the cutoff is the authoring instant, so a row stamped
+    # exactly at it still predates the fixed code.
+    return observed is not None and cutoff is not None and observed <= cutoff
 
 
 def format_age(delta: timedelta | None) -> str:
@@ -490,6 +566,30 @@ class ChainRow:
     last_observed_at: str | None
 
 
+def _chain_universe(
+    occurrences: Sequence[FlakeOccurrenceRow],
+    open_debt_rows: Sequence[DebtRow],
+) -> set[str]:
+    """The set of test_ids a chain is built for — the ONE spelling of that union.
+
+    :func:`build_chains` iterates it and :func:`build_report` pre-fetches debt for it,
+    and those two sets must not merely happen to agree.  INV-5 (no-lockstep-duplication)
+    is the failure this module's docstrings already name twice, and :func:`_is_over_age`
+    was extracted here for exactly this reason after a count and a per-row marker
+    "agreed only by coincidence".  Spelled twice, a later change to the universe — say,
+    including tests named only by a RESOLVED debt row — would desynchronise the
+    pre-fetched set from the looked-up set, and the symptom would be a silently blank
+    ``debt:`` line on a chain rather than an error.
+
+    ``UNKNOWN_TEST_ID`` is excluded: a sentinel names no test, so it can own no chain —
+    ``open_debt`` itself refuses it for the same reason.  It still counts toward the
+    gate-blind rate, where it is the entire point.
+    """
+    universe: set[str] = {row.test_id for row in open_debt_rows}
+    universe |= {row.test_id for row in occurrences if row.test_id != UNKNOWN_TEST_ID}
+    return universe
+
+
 def build_chains(
     occurrences: Sequence[FlakeOccurrenceRow],
     open_debt_rows: Sequence[DebtRow],
@@ -501,7 +601,8 @@ def build_chains(
     filters on ``resolved_at IS NULL``, so a chain built from it alone goes blank
     exactly when a test is BETWEEN cycles — hiding the PRD's motivating case
     (``test_spawn_claude.py``, 7 de-flake tasks in 7 weeks) at the very moment each fix
-    appears to have worked.  ``debt_lookup`` therefore reaches ``read_debt``, which
+    appears to have worked.  ``debt_lookup`` therefore reaches α's debt reader (today,
+    :func:`build_report` backs it with a batched ``read_debt_many`` pre-fetch), which
     returns RESOLVED rows too (§5.2 retains them deliberately, because the recurrence
     trigger reads them).
 
@@ -531,11 +632,8 @@ def build_chains(
     for row in occurrences:
         by_test.setdefault(row.test_id, []).append(row)
 
-    universe: set[str] = {row.test_id for row in open_debt_rows}
-    universe |= {test_id for test_id in by_test if test_id != UNKNOWN_TEST_ID}
-
     chains: list[ChainRow] = []
-    for test_id in universe:
+    for test_id in _chain_universe(occurrences, open_debt_rows):
         mine = by_test.get(test_id, ())
         counts: dict[str, int] = {}
         for row in mine:
@@ -586,6 +684,12 @@ class FlakeLedgerReport:
     should ask — including task θ, which must not act on counters that were never read.
     It defaults to :data:`LEDGER_OK` so a hand-built report (the render tests build them
     directly) means what it looks like it means.
+
+    ``excluded_non_evidence`` counts the rows :func:`is_spliced_merge_gate_row` kept out
+    of every counter below.  It is carried rather than discarded because an exclusion an
+    operator cannot see is a lie by omission — the same rule the ``truncated`` and
+    ``unparseable_opened_at`` caveats already follow.  It defaults to ``0`` for the same
+    reason ``db_status`` defaults: a hand-built report must mean what it looks like.
     """
 
     db_path: Path
@@ -598,6 +702,7 @@ class FlakeLedgerReport:
     non_convergence: NonConvergenceCounter
     systemic: SystemicCounter
     db_status: str = LEDGER_OK
+    excluded_non_evidence: int = 0
 
     @property
     def measured(self) -> bool:
@@ -662,7 +767,7 @@ def build_report(
     """Read the ledger at *db_path* and aggregate it into a :class:`FlakeLedgerReport`.
 
     All ledger DATA comes from α's public read API — ``list_open_debt`` /
-    ``read_occurrences`` / ``read_debt``; the only SQL of this module's own is
+    ``read_occurrences`` / ``read_debt_many``; the only SQL of this module's own is
     :func:`probe_ledger`'s ``sqlite_master`` SELECT, which decides whether those readers
     are safe to call at all.  *now* defaults to the wall clock and is injectable so the
     whole report is deterministic under test.
@@ -727,24 +832,43 @@ def build_report(
 
     since = (now - timedelta(hours=window_hours)).isoformat()
     open_rows = list_open_debt(db_path)
-    occurrences = read_occurrences(db_path, since=since, limit=occurrence_limit)
-    truncated = len(occurrences) >= occurrence_limit
+    read_rows = read_occurrences(db_path, since=since, limit=occurrence_limit)
+    # `truncated` is a property of the READ, so it is measured before the partition:
+    # a filled limit means the window is partial no matter what was later excluded.
+    truncated = len(read_rows) >= occurrence_limit
 
-    # Every OPEN debt row is already in hand from the single `list_open_debt` scan above,
-    # so the chain build must not re-read it per test: each `read_debt` goes through α's
-    # `_open`, which opens a fresh connection, applies the durability pragmas (including
-    # a `journal_mode=WAL` switch) and runs `executescript(_SCHEMA)` against the LIVE
-    # runs.db the merge lane is also using.  N+1 of those turns a nominally read-only
-    # report into N schema executions contending on that database.  What remains is only
-    # the BETWEEN-CYCLES remainder — a test with occurrences whose debt is currently
-    # RESOLVED, and so absent from `list_open_debt` — which is the case the chain exists
-    # to show and which α exposes no batched reader for (a `read_debt_many` belongs in α,
-    # not here; ι writes no SQL of its own).
+    # Partitioned ONCE, here, so every counter downstream takes its input as given and
+    # not one of them learns about this defect (task 5580).  The rows stay in the
+    # ledger: `flake_occurrence` is append-only by contract and these rows are a TRUE
+    # record of what the gate emitted — including the only surviving evidence of the
+    # defect's reach.  What is false is reading them as verdicts about the code, and
+    # that is a reporting question, so it is answered in the reporting layer.
+    occurrences = [row for row in read_rows if not is_spliced_merge_gate_row(row)]
+    excluded_non_evidence = len(read_rows) - len(occurrences)
+
+    # The chain build reads debt for every test in the universe, and it must cost a
+    # CONSTANT number of ledger connections rather than one per test: each `read_debt`
+    # would go through α's `_open`, which opens a fresh connection, applies the
+    # durability pragmas (including a `journal_mode=WAL` switch) and runs
+    # `executescript(_SCHEMA)` against the LIVE runs.db the merge lane is also using —
+    # so an N+1 turns a nominally read-only report into N schema executions contending
+    # on that database.  Two reads cover the whole universe here.  Every OPEN row is
+    # already in hand from the single `list_open_debt` scan above; the remainder is the
+    # BETWEEN-CYCLES case — a test with occurrences whose debt is currently RESOLVED,
+    # and so absent from that scan — which the chain exists to show, and which α now
+    # exposes `read_debt_many` for.  ι still writes no SQL of its own.
     open_by_test = {row.test_id: row for row in open_rows}
+    # `_chain_universe` rather than a second spelling of the union: this pre-fetched set
+    # and the set `build_chains` iterates must not merely happen to agree (INV-5).
+    resolved_by_test = read_debt_many(
+        db_path, _chain_universe(occurrences, open_rows) - open_by_test.keys()
+    )
 
     def _debt_lookup(test_id: str) -> DebtRow | None:
+        # `is not None` rather than `or`, so a falsy-but-present row can never be
+        # misread as a miss and silently fall through to the second lookup.
         hit = open_by_test.get(test_id)
-        return hit if hit is not None else read_debt(db_path, test_id)
+        return hit if hit is not None else resolved_by_test.get(test_id)
 
     # `list_open_debt`'s `opened_at, test_id` ordering is contractual (its docstring
     # names ι as the reason), so it is relied on directly and never re-sorted here.
@@ -776,6 +900,7 @@ def build_report(
             distinct_tests=systemic_distinct_tests,
             window_minutes=systemic_window_minutes,
         ),
+        excluded_non_evidence=excluded_non_evidence,
     )
 
 
@@ -824,6 +949,17 @@ def render_report(report: FlakeLedgerReport) -> str:
         lines.append(
             '  WARNING: the occurrence read was TRUNCATED at its limit — the counters '
             'below cover a PARTIAL window, not the full one.'
+        )
+    if report.excluded_non_evidence:
+        # Fixed position (with the other read caveats, ahead of section 1) so the render
+        # stays byte-deterministic, and silent for a zero count so no report that has
+        # nothing to declare grows a line.  Count, cutoff and CAUSE on one line: a count
+        # whose reason an operator has to go and look up is not actionable.
+        lines.append(
+            f'  NOTE: {report.excluded_non_evidence} merge_gate observation(s) stamped at '
+            f'or before {MERGE_GATE_SPLICE_DEFECT_END} are EXCLUDED from every counter '
+            'below — the isolated re-run died on a pytest usage error without running a '
+            'test, so they are not evidence about any test (task 5580).'
         )
 
     # --- section 1: open debt ---

@@ -61,6 +61,8 @@ class TestRecoveryAction:
         assert RecoveryAction.MARK_DONE_WITH_PROVENANCE == 'mark_done_with_provenance'
         assert RecoveryAction.REVERT_TO_PENDING == 'revert_to_pending'
         assert RecoveryAction.RE_FILE_ESCALATION == 're_file_escalation'
+        # Task 3539 — see test_convert_to_blocked.py for its table contract.
+        assert RecoveryAction.CONVERT_TO_BLOCKED == 'convert_to_blocked'
         assert RecoveryAction.LEAVE == 'leave'
 
 
@@ -289,14 +291,19 @@ class TestClassifyRecovery:
         )
         assert classify_recovery(report) == RecoveryAction.LEAVE
 
-    def test_f_on_main_open_l1_vetoes_auto_flip(self) -> None:
+    def test_f_on_main_open_l1_converts_to_blocked(self) -> None:
+        # Task 3539: row (f) used to map to LEAVE, so the sweep held
+        # SILENTLY and the row churned `in-progress` forever.  It now names
+        # the honest resting status.  The surviving guarantee — the veto
+        # proper — is that it is still NOT a mark-done.
         report = self._report(
             branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-f'),
             open_escalations=[EscalationRef(id='esc-1-1', level=1)],
         )
-        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+        assert classify_recovery(report) != RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
-    def test_f2_on_main_open_l2_also_vetoes_auto_flip(self) -> None:
+    def test_f2_on_main_open_l2_also_converts_to_blocked(self) -> None:
         # The veto is "any open escalation, any level" — not L1-only.
         # Before review finding #1's fix, `_shape` checked `level == 1`
         # only, so an open L2 (the actual human-facing tier — see
@@ -306,7 +313,8 @@ class TestClassifyRecovery:
             branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-f2'),
             open_escalations=[EscalationRef(id='esc-1-2', level=2)],
         )
-        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+        assert classify_recovery(report) != RecoveryAction.MARK_DONE_WITH_PROVENANCE
 
     def test_g_blocked_no_claimant_gone_no_marker_no_open_escalation_refiles(self) -> None:
         report = self._report(db_status='blocked', branch_state=BranchState(BranchStateKind.GONE_NO_MARKER))
@@ -477,6 +485,22 @@ def _make_ground_truth(
         worktree_resolver or (lambda tid: Path('/nonexistent-worktree') / tid),
         **kwargs,
     )
+
+
+def _plan_lock_artifacts(worktree: Path) -> TaskArtifacts:
+    """``TaskArtifacts`` addressed where the resolver actually READS plan.lock.
+
+    ``<worktree_base>/.task-meta/<worktree_name>`` — a SIBLING of the worktree,
+    derived through ``TaskArtifacts.meta_root_for`` (the single owner of that
+    path shape) rather than hand-joined, exactly as the sole production writer
+    does (``TaskWorkflow``, workflow.py) and as
+    ``TaskGroundTruth._resolve_live_claimant`` does on the read side (task
+    4028).  Every fixture in this module that manufactures a lock for the
+    resolver to find must go through here; a bare ``TaskArtifacts(worktree)``
+    writes the LEGACY ``<worktree>/.task`` path, which the resolver
+    deliberately never consults.
+    """
+    return TaskArtifacts(worktree, TaskArtifacts.meta_root_for(worktree.parent, worktree.name))
 
 
 @pytest.mark.asyncio
@@ -718,9 +742,10 @@ class TestDeriveTruthLiveClaimant:
         # task 3563: the lock records the process run_id, so the resolved
         # identity is the FULL composed shape — not the bare session id it
         # used to return.  The raw session id survives under session_id.
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123', run_id='run-13')
-        lock_data = TaskArtifacts(tmp_path).read_plan_lock()
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        artifacts.lock_plan('sess-13-abc123', run_id='run-13')
+        lock_data = artifacts.read_plan_lock()
         assert lock_data is not None
         locked_at = lock_data['locked_at']
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
@@ -742,8 +767,9 @@ class TestDeriveTruthLiveClaimant:
         # A present-but-stale db claimant must collapse straight to None —
         # it must NOT fall through to the plan.lock fallback, which exists
         # only for rows with no db claimant at all (pre-2182 rows).
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        TaskArtifacts(tmp_path).lock_plan('sess-14-abc123')
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        artifacts.lock_plan('sess-14-abc123')
         fixed_now = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
         task = {
             'status': 'in-progress',
@@ -796,8 +822,9 @@ class TestDeriveTruthLiveClaimant:
         # test_pid_alive_contract.py's identical convention) — so a
         # plan.lock whose owner process has died must NOT be treated as a
         # live claimant (review finding #3).
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        lock_path = artifacts.root / 'plan.lock'
         lock_path.write_text(json.dumps({
             'session_id': 'sess-dead-abc123',
             'locked_at': '2026-07-12T00:00:00+00:00',
@@ -823,8 +850,9 @@ class TestDeriveTruthLiveClaimant:
         # out from under its own still-live claimant). The db-claimant
         # branch (task_ground_truth.py:368-376) must win: it returns
         # BEFORE the stale plan.lock at line 378+ is ever consulted.
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        lock_path = artifacts.root / 'plan.lock'
         lock_path.write_text(json.dumps({
             'session_id': 'sess-dead-abc123',
             'locked_at': '2026-07-12T00:00:00+00:00',
@@ -856,8 +884,9 @@ class TestDeriveTruthLiveClaimant:
         # A non-numeric owner_pid must be swallowed by the int(owner_pid)
         # TypeError/ValueError guard rather than raise out of derive_truth
         # (review finding #3).
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        lock_path = artifacts.root / 'plan.lock'
         lock_path.write_text(json.dumps({
             'session_id': 'sess-malformed-abc123',
             'locked_at': '2026-07-12T00:00:00+00:00',
@@ -882,8 +911,9 @@ class TestDeriveTruthLiveClaimant:
         # coincidentally-alive owner_pid must not read as a phantom-live
         # claimant, or it would silently block recovery of a genuinely
         # stranded task (review finding).
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        lock_path = artifacts.root / 'plan.lock'
         lock_path.write_text(json.dumps({
             'session_id': 'sess-reused-pid-abc123',
             'locked_at': '2026-07-01T00:00:00+00:00',
@@ -908,8 +938,9 @@ class TestDeriveTruthLiveClaimant:
         # crash this resolver recovers from) must degrade to "no plan-lock
         # claimant", not propagate json.JSONDecodeError out of derive_truth
         # (review finding #1).
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        lock_path = artifacts.root / 'plan.lock'
         lock_path.write_text('{not valid json')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
@@ -928,14 +959,44 @@ class TestDeriveTruthLiveClaimant:
         # pre-fix (json.JSONDecodeError, OSError) guard let it escape
         # uncaught (amendment review finding #2). Must degrade to "no
         # plan-lock claimant", same as the corrupt-JSON case above.
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        lock_path = TaskArtifacts(tmp_path).root / 'plan.lock'
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        lock_path = artifacts.root / 'plan.lock'
         lock_path.write_bytes(b'\xff\xfe\x00\x01garbage')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
         resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
 
         report = await resolver.derive_truth('33')
+
+        assert report.live_claimant is None
+
+    async def test_non_dict_plan_lock_json_returns_none_not_raise(self, tmp_path: Path) -> None:
+        # read_plan_lock's `-> dict | None` hint is aspirational: it is a bare
+        # json.loads, so syntactically VALID but non-dict JSON (a lock
+        # truncated to a list/number/string) passes through without raising
+        # and would crash the `.get()` below on an AttributeError. The
+        # explicit `isinstance(lock_data, dict)` guard degrades it to "no
+        # plan-lock claimant" instead, same intent as the corrupt-JSON and
+        # non-UTF-8 cases above.
+        #
+        # This is the guard's ONLY live coverage. It previously cited a
+        # [non-dict-json] case in test_reconcile_stranded.py's sweep-level
+        # lock-format parametrization, but those fixtures stage their lock at
+        # the LEGACY <worktree>/.task address on purpose (they pin the
+        # applier's defensive unlink, not the resolver), so the resolver never
+        # saw the non-dict payload there and the citation was vacuous. That
+        # parametrization has since collapsed into
+        # test_vestigial_worktree_lock_is_inert_and_unlinked (task 4028).
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        lock_path = artifacts.root / 'plan.lock'
+        lock_path.write_text('["not", "an", "object"]')
+        task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+        scheduler = _fake_scheduler(is_actively_held=False, task=task)
+        resolver = _make_ground_truth(scheduler=scheduler, worktree_resolver=lambda tid: tmp_path)
+
+        report = await resolver.derive_truth('34')
 
         assert report.live_claimant is None
 
@@ -958,6 +1019,151 @@ class TestDeriveTruthLiveClaimant:
 
 
 # ---------------------------------------------------------------------------
+# task 4028 — the plan.lock read is addressed at the `.task-meta` root
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPlanLockIsReadFromTheMetaRoot:
+    """The plan.lock leg reads the `.task-meta` sibling, never the legacy path.
+
+    The lock's sole writer is ``TaskWorkflow``, which constructs its
+    ``TaskArtifacts`` with ``_meta_root_for_worktree(self.worktree)``
+    (workflow.py) — so it writes ``<base>/.task-meta/<name>/plan.lock``.  Until
+    task 4028 the reader constructed ``TaskArtifacts(worktree_path)`` with no
+    ``meta_root`` and therefore looked under ``<worktree>/.task``: a live lock
+    was invisible and the whole leg (with it ``ClaimantSource.PLAN_LOCK`` and
+    task 3563's composed identity) was inert in production.
+
+    The POSITIVE half of this pair is
+    ``TestDeriveTruthLiveClaimant::test_no_db_claimant_live_plan_lock_returns_
+    plan_lock_claimant``, which drives a real ``lock_plan`` acquisition at the
+    meta root and asserts the full resolved ``Claimant`` — it is not duplicated
+    here.  What lives here is the half no other test can express: the repoint
+    is deliberately SINGLE-PATH, with no new-then-old fallback.  Nothing has
+    written ``<worktree>/.task/plan.lock`` since the meta-root migration, so a
+    legacy fallback would be dead code on arrival — the exact confusion this
+    task removes.  Pinning "legacy is ignored" keeps a future reader from
+    mistaking the omission for an oversight.
+    """
+
+    @staticmethod
+    def _unclaimed_task() -> dict:
+        # The ONLY task shape that reaches the plan.lock leg: no in-memory
+        # hold and no db claimant to take precedence over it.
+        return {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+
+    async def _resolve(self, worktree: Path, tid: str = '40') -> Claimant | None:
+        scheduler = _fake_scheduler(is_actively_held=False, task=self._unclaimed_task())
+        resolver = _make_ground_truth(
+            scheduler=scheduler, worktree_resolver=lambda _tid: worktree,
+        )
+        return (await resolver.derive_truth(tid)).live_claimant
+
+    async def test_lock_at_the_legacy_root_is_ignored(self, tmp_path: Path) -> None:
+        # Equally fresh, equally well-formed, equally alive — and still None,
+        # because it is at the address nothing writes any more.
+        worktree = tmp_path / 'wt-4028'
+        worktree.mkdir()
+        legacy = TaskArtifacts(worktree)  # no meta_root -> <worktree>/.task
+        legacy.root.mkdir(parents=True)
+        assert legacy.lock_plan('sess-legacy-abc123', run_id='run-legacy-abc123')
+        assert not _plan_lock_artifacts(worktree).root.exists()
+
+        assert await self._resolve(worktree) is None
+
+
+@pytest.mark.asyncio
+class TestPlanLockAttributionIsByAddress:
+    """A lock at the task's resolved meta root is ITS lock — no session check.
+
+    ``_resolve_live_claimant`` attributes any fresh, live-pid lock found at
+    ``<base>/.task-meta/<worktree_name>/plan.lock`` to the task being
+    resolved, WITHOUT requiring ``session_id`` to carry the ``'{tid}-'``
+    prefix that ``TaskArtifacts.clear_stale_plan_lock`` keys on.  That
+    asymmetry is deliberate; these tests exist so it is a pinned decision
+    rather than an unexamined one (task 4028).
+
+    Why no gate:
+
+    * A warm lane's meta root is keyed by LANE name and, unlike the legacy
+      ``<worktree>/.task``, survives worktree cleanup — so a previous
+      occupant's lock genuinely can outlive it.  Every DIFFERENT-task
+      acquisition route clears it first (``GitOps._clear_foreign_meta_root``);
+      the same-task reuse routes preserve it precisely because those
+      artifacts belong to the task being resolved.
+    * The dominant real stale lock is a crashed PRIOR incarnation of the SAME
+      task, whose session id DOES match the prefix — a gate would not catch
+      the case that actually happens.
+    * A gate fails DANGEROUS: rejecting a lock that cannot be positively
+      attributed makes a LIVE task read as unclaimed, which is the task-2588
+      un-claim incident class.  Mis-attributing the other way only delays
+      recovery, and only until ``_lock_fresh`` expires.
+
+    So the exposure is real but BOUNDED, and the bound is freshness — not pid
+    liveness, since ``owner_pid`` is the orchestrator's own pid and outlives
+    any single task.  Both halves are asserted below.
+    """
+
+    @staticmethod
+    def _unclaimed_task() -> dict:
+        return {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
+
+    async def _resolve(self, worktree: Path, tid: str) -> Claimant | None:
+        scheduler = _fake_scheduler(is_actively_held=False, task=self._unclaimed_task())
+        resolver = _make_ground_truth(
+            scheduler=scheduler, worktree_resolver=lambda _tid: worktree,
+        )
+        return (await resolver.derive_truth(tid)).live_claimant
+
+    async def test_fresh_foreign_session_lock_is_attributed_to_this_task(
+        self, tmp_path: Path,
+    ) -> None:
+        """A lane's leftover lock from task 999 resolves as task 42's claimant.
+
+        Pins the CURRENT behaviour, with eyes open: the lock is driven through
+        a real ``lock_plan`` (so ``owner_pid`` is this live process, exactly as
+        production stamps it) and its session id belongs to a different task.
+        The resolver still returns it — address, not identity, decides.
+        """
+        lane = tmp_path / '_lane-0'
+        lane.mkdir()
+        artifacts = _plan_lock_artifacts(lane)
+        artifacts.root.mkdir(parents=True)
+        assert artifacts.lock_plan('999-aaaaaaaa', run_id='run-999')
+
+        claimant = await self._resolve(lane, tid='42')
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        # Verbatim — the resolver does not reinterpret or reject it.
+        assert claimant.session_id == '999-aaaaaaaa'
+
+    async def test_the_exposure_is_bounded_by_freshness_not_pid_liveness(
+        self, tmp_path: Path,
+    ) -> None:
+        """The same foreign lock, aged past heartbeat_ttl, resolves to None.
+
+        ``owner_pid`` is deliberately THIS process (alive, as production's
+        orchestrator pid always is), so ``_pid_alive`` cannot be what rejects
+        it — only ``_lock_fresh`` can.  That is what caps how long a leftover
+        lane lock can suppress another task's recovery.
+        """
+        lane = tmp_path / '_lane-0'
+        lane.mkdir()
+        artifacts = _plan_lock_artifacts(lane)
+        artifacts.root.mkdir(parents=True)
+        (artifacts.root / 'plan.lock').write_text(json.dumps({
+            'session_id': '999-aaaaaaaa',
+            'run_id': 'run-999',
+            'owner_pid': os.getpid(),
+            'locked_at': (datetime.now(UTC) - timedelta(hours=3)).isoformat(),
+        }))
+
+        assert await self._resolve(lane, tid='42') is None
+
+
+# ---------------------------------------------------------------------------
 # task 3563 — Claimant.run_id is homogeneous across all three sources
 # ---------------------------------------------------------------------------
 
@@ -968,8 +1174,15 @@ def _write_plan_lock(root: Path, payload: dict) -> Path:
     Used for the malformed/legacy shapes ``lock_plan`` itself can no longer
     produce — exactly the locks already sitting on disk from before this
     change, which the resolver must still degrade safely on.
+
+    *root* is the WORKTREE; the lock lands under its ``.task-meta`` sibling,
+    where the resolver reads (``_plan_lock_artifacts``, task 4028).  It must
+    stay a raw ``json.dumps`` write that bypasses ``lock_plan`` — that is the
+    only way to produce the malformed shapes ``lock_plan`` can no longer emit
+    — but writing it at an address the resolver never consults would make
+    every degradation assertion below vacuous.
     """
-    artifacts = TaskArtifacts(root)
+    artifacts = _plan_lock_artifacts(root)
     artifacts.root.mkdir(parents=True, exist_ok=True)
     lock_path = artifacts.root / 'plan.lock'
     lock_path.write_text(json.dumps(payload))
@@ -1007,11 +1220,43 @@ class TestClaimantRunIdIsComposedOrNone:
         )
         return (await resolver.derive_truth(tid)).live_claimant
 
+    async def test_well_formed_raw_payload_resolves_to_composed_identity(
+        self, tmp_path: Path,
+    ) -> None:
+        """POSITIVE CONTROL for the whole ``_write_plan_lock`` family.
+
+        Every other test fed by that helper asserts a DEGRADED outcome
+        (``run_id is None``), which a lock the resolver simply cannot SEE
+        would satisfy just as well as a guard that actually fired.  This one
+        asserts the opposite — a well-formed, fresh, live-pid payload MUST
+        compose — so if the helper ever writes somewhere the resolver does not
+        read, that goes red HERE instead of silently hollowing out the
+        ``except (ValueError, OSError)`` arm, the non-dict guard,
+        ``_lock_fresh`` and ``_pid_alive`` coverage its siblings provide
+        (task 4028).
+        """
+        _write_plan_lock(tmp_path, {
+            'session_id': 'sess-control-abc123',
+            'locked_at': datetime.now(UTC).isoformat(),
+            'owner_pid': os.getpid(),
+            'run_id': 'run-control-abc',
+        })
+
+        claimant = await self._resolve(tmp_path)
+
+        assert claimant is not None
+        assert claimant.source == ClaimantSource.PLAN_LOCK
+        assert claimant.run_id == compose_claimant_run_id(
+            'run-control-abc', 'sess-control-abc123', os.getpid(),
+        )
+        assert claimant.session_id == 'sess-control-abc123'
+
     async def test_lock_with_run_id_resolves_to_composed_identity(
         self, tmp_path: Path,
     ) -> None:
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123', run_id='run-abc')
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        artifacts.lock_plan('sess-13-abc123', run_id='run-abc')
 
         claimant = await self._resolve(tmp_path)
 
@@ -1173,8 +1418,9 @@ class TestClaimantRunIdIsComposedOrNone:
         to unknown.  ``None`` is the honest unknown and is allowed; any
         NON-None value must carry the ``/pid=`` marker.
         """
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        TaskArtifacts(tmp_path).lock_plan('sess-13-abc123', run_id='run-abc')
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        artifacts.lock_plan('sess-13-abc123', run_id='run-abc')
 
         claimant = await self._resolve(tmp_path)
 
@@ -1465,8 +1711,9 @@ class TestDeriveTruthRemainingFields:
         # mirroring the task-row single-fetch discipline above (review
         # finding #2). A bound plan.lock (and no db claimant) is required
         # to exercise the plan.lock leg that previously re-resolved.
-        TaskArtifacts(tmp_path).root.mkdir(parents=True)
-        TaskArtifacts(tmp_path).lock_plan('sess-29-abc123')
+        artifacts = _plan_lock_artifacts(tmp_path)
+        artifacts.root.mkdir(parents=True)
+        artifacts.lock_plan('sess-29-abc123')
         task = {'status': 'pending', 'claimant_run_id': None, 'heartbeat_at': None}
         scheduler = _fake_scheduler(is_actively_held=False, task=task)
         worktree_resolver = MagicMock(side_effect=lambda tid: tmp_path)
@@ -1752,15 +1999,22 @@ class TestLeaveReason:
         )
         assert leave_reason(report) == LeaveReason.live_claimant
 
-    def test_recovery_row_f_is_escalation_pinned(self):
+    def test_a_pinned_leave_is_escalation_pinned(self):
         """Boundary #9's classification half.
 
-        IN_PROGRESS + no claimant + ON_MAIN + an open record: the MARK_DONE
-        that row (a) would otherwise take is VETOED by the record.
+        RE-ANCHORED by task 3539.  This used to key on row (f) —
+        IN_PROGRESS + no claimant + ON_MAIN + an open record — but that shape
+        now classifies CONVERT_TO_BLOCKED, so ``leave_reason`` correctly
+        returns None for it (the contract: never mislabel an ACTION as a
+        hold; see test_convert_to_blocked.py).  The ``escalation_pinned``
+        PRECEDENCE link is what this test exists to cover, so it is re-keyed
+        onto a shape that still classifies LEAVE while carrying an open
+        record: BLOCKED + no claimant + ON_MAIN + pinned, which is exactly
+        the post-conversion resting state.
         """
         from orchestrator.task_ground_truth import LeaveReason, leave_reason
 
-        report = _leave_report()
+        report = _leave_report(db_status='blocked')
         assert classify_recovery(report) == RecoveryAction.LEAVE
         assert leave_reason(report) == LeaveReason.escalation_pinned
 
@@ -1878,3 +2132,267 @@ class TestRecoveryShapeStr:
         from orchestrator.task_ground_truth import _shape, recovery_shape_str
 
         assert recovery_shape_str(report) == render_shape(*_shape(report))
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — the resolver seam becomes PIN-CLASS-AWARE.
+#
+# `_shape`'s escalation element stops being `bool(report.open_escalations)` and
+# becomes `classify_pins(...).vetoes_done_flip`.  That attribute, not `.pins`,
+# is deliberate and load-bearing: a DEAD_L0 must keep vetoing a done-flip (PRD
+# boundary #9 / D3 "any non-info open record still vetoes MARK_DONE"), while
+# `.pins`'s dead-L0 relaxation is consumed at the RECOVERY/REDISPATCH sites
+# instead.  The ONE disposition this seam changes is boundary #8: an
+# info-severity-only strand stops keying True and takes the plain
+# revert-to-pending path.
+# ---------------------------------------------------------------------------
+
+
+def _pin_report(
+    *,
+    db_status: str = 'in-progress',
+    branch_state: BranchState,
+    open_escalations: list[EscalationRef],
+    live_claimant: Claimant | None = None,
+    deploy_phase: DeployPhase | None = None,
+    escalation_store_unavailable: bool = False,
+) -> TruthReport:
+    return TruthReport(
+        db_status=db_status,
+        live_claimant=live_claimant,
+        branch_state=branch_state,
+        worktree_present=True,
+        open_escalations=open_escalations,
+        deploy_phase=deploy_phase,
+        escalation_store_unavailable=escalation_store_unavailable,
+    )
+
+
+def _info_ref(esc_id: str = 'esc-3541-info', *, level: int = 0) -> EscalationRef:
+    """An annotation, never a handoff — link 1 of the pins precedence chain."""
+    return EscalationRef(
+        id=esc_id, level=level, category='risk_identified', severity='info',
+    )
+
+
+def _dead_l0_ref(esc_id: str = 'esc-3541-l0') -> EscalationRef:
+    """A blocking L0 with an unknown filer.
+
+    At these fixtures' `live_claimant=None` the classifier's link 4 reaches its
+    identity-INDEPENDENT branch ("no incarnation is live at all, so the filing
+    one is necessarily dead"), so this is a genuine DEAD_L0 without needing a
+    composed identity on either side.
+    """
+    return EscalationRef(
+        id=esc_id, level=0, category='task_failure', severity='blocking',
+    )
+
+
+class TestResolverKeysOnVetoesDoneFlip:
+    """PRD boundary rows #7/#8/#9/#21 at the `_RECOVERY` seam."""
+
+    def test_info_only_off_main_strand_reverts_to_pending(self) -> None:
+        """Boundary #8 — the ONE disposition this seam changes.
+
+        Today an info record keys the escalation element True and lands row
+        (j)'s CONVERT_TO_BLOCKED.  An info record is an ANNOTATION: it must not
+        hold a strand out of the plain revert path.
+        """
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN),
+            open_escalations=[_info_ref()],
+        )
+        assert classify_recovery(report) == RecoveryAction.REVERT_TO_PENDING
+
+    def test_dead_l0_off_main_strand_still_converts_to_blocked(self) -> None:
+        """Boundary #7 — a dead-L0 pin does NOT relax the done-flip veto.
+
+        `.pins` would call this unpinned; `.vetoes_done_flip` (what the
+        resolver keys on) still says True, so the row rests in `blocked`
+        rather than being re-dispatched.
+        """
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN),
+            open_escalations=[_dead_l0_ref()],
+        )
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+
+    def test_dead_l0_on_main_strand_never_marks_done(self) -> None:
+        """Boundary #9/#21 — the PROTECTIVE half of the veto family.
+
+        Keying the resolver on `.pins` instead would drop this shape into row
+        (a) and phantom-complete a task past an unconsumed handoff: the exact
+        inverse hazard the already-landed dispatch gate closed.
+        """
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-dead-l0'),
+            open_escalations=[_dead_l0_ref()],
+        )
+        action = classify_recovery(report)
+        assert action != RecoveryAction.MARK_DONE_WITH_PROVENANCE
+        assert action == RecoveryAction.CONVERT_TO_BLOCKED
+
+    def test_info_only_on_main_strand_marks_done(self) -> None:
+        """An annotation does not hold back landing evidence either."""
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-info'),
+            open_escalations=[_info_ref()],
+        )
+        assert classify_recovery(report) == RecoveryAction.MARK_DONE_WITH_PROVENANCE
+
+    def test_blank_severity_still_keys_true(self) -> None:
+        """`EscalationRef`'s `severity=''` default is UNKNOWN, which fails safe.
+
+        This is why EVERY pre-existing fixture in this file — all of which omit
+        `severity` — keeps its current disposition across this change.
+        """
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-blank'),
+            open_escalations=[EscalationRef(id='esc-blank', level=1)],
+        )
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+
+    def test_mixed_info_and_blocking_keys_true(self) -> None:
+        """One non-info record is enough — `vetoes_done_flip` is an ANY, not an all."""
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-mixed'),
+            open_escalations=[_info_ref(), _dead_l0_ref()],
+        )
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+
+    @pytest.mark.parametrize('level', [0, 1, 2])
+    def test_info_never_keys_true_at_any_level(self, level: int) -> None:
+        from orchestrator.task_ground_truth import _shape
+
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-any'),
+            open_escalations=[_info_ref(level=level)],
+        )
+        assert _shape(report)[3] is False
+
+
+class TestLeaveReasonIsPinClassAware:
+    """Link 3 reads the SAME answer `_shape` does — never a second derivation."""
+
+    @staticmethod
+    def _blocked_off_main(records: list[EscalationRef]) -> TruthReport:
+        """A shape absent from `_RECOVERY`, so it classifies LEAVE on its merits."""
+        return _pin_report(
+            db_status='blocked',
+            branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN),
+            open_escalations=records,
+        )
+
+    def test_info_only_leave_is_not_labelled_escalation_pinned(self) -> None:
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = self._blocked_off_main([_info_ref()])
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.unmapped_shape
+
+    def test_dead_l0_leave_is_still_labelled_escalation_pinned(self) -> None:
+        """`vetoes_done_flip` keeps a dead-L0 on link 3, matching `_shape`."""
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = self._blocked_off_main([_dead_l0_ref()])
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_l1_leave_is_still_labelled_escalation_pinned(self) -> None:
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = self._blocked_off_main(
+            [EscalationRef(id='esc-l1', level=1, severity='blocking')],
+        )
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+
+class TestRecoveryTableIsUnchanged:
+    """TG-2 "one table": task eta adds NO rows and changes no key's alphabet."""
+
+    #: The ten rows the table shipped with before task eta — (a) (b) (c) (d)
+    #: (f) (i) (j) (k) (g) (h).  A COUNT alone would not catch a swap, so the
+    #: key SET is pinned too.
+    _EXPECTED_ROWS = 10
+
+    def test_row_count_is_untouched(self) -> None:
+        from orchestrator.task_ground_truth import _RECOVERY
+
+        assert len(_RECOVERY) == self._EXPECTED_ROWS, (
+            'task eta rewires the KEY ELEMENT, never the table: a new row here '
+            'means a disposition was added rather than reclassified'
+        )
+
+    def test_every_key_keeps_a_bool_escalation_element(self) -> None:
+        from orchestrator.task_ground_truth import _RECOVERY
+
+        for key in _RECOVERY:
+            assert isinstance(key[3], bool), key
+
+    def test_shape_still_produces_a_bool_for_the_escalation_element(self) -> None:
+        from orchestrator.task_ground_truth import _shape
+
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-bool'),
+            open_escalations=[_dead_l0_ref()],
+        )
+        assert isinstance(_shape(report)[3], bool)
+
+    def test_recovery_shape_str_still_renders_that_bool(self) -> None:
+        """The emitted shape alphabet is unchanged: still 'true' / 'false'.
+
+        An operator reading a `recovery_vetoed` row must see the same element
+        spelling after the rewiring as before it, and the two pin classes must
+        still be DISTINGUISHABLE there.
+        """
+        from orchestrator.task_ground_truth import _shape, recovery_shape_str
+
+        rendered = {}
+        for label, records in (('pinning', [_dead_l0_ref()]), ('info', [_info_ref()])):
+            report = _pin_report(
+                branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-render'),
+                open_escalations=records,
+            )
+            element = recovery_shape_str(report).split('|')[3]
+            assert element == str(_shape(report)[3]).lower()
+            assert element in {'true', 'false'}
+            rendered[label] = element
+
+        assert rendered == {'pinning': 'true', 'info': 'false'}
+
+
+class TestShapeNeverFakesAStoreOutage:
+    """`_shape` performs NO read, so it may never pass `records=None`.
+
+    `classify_pins`'s store-correctness obligation 2 binds a caller that
+    PERFORMED a failed read.  `_shape` is handed a report; the third state
+    travels separately on `report.escalation_store_unavailable` and is already
+    surfaced by `leave_reason` link 2.  Passing `records=None` here would
+    silently fold the outage into the table key — the disposition change task
+    eta deliberately declined.
+    """
+
+    @pytest.mark.parametrize('store_unavailable', [False, True])
+    def test_records_argument_is_always_the_report_list(
+        self, store_unavailable: bool,
+    ) -> None:
+        from unittest.mock import patch
+
+        from orchestrator.task_ground_truth import _shape
+
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-store'),
+            open_escalations=[],
+            escalation_store_unavailable=store_unavailable,
+        )
+        with patch(
+            'orchestrator.task_ground_truth.classify_pins', wraps=classify_pins,
+        ) as spy:
+            _shape(report)
+
+        assert spy.call_count == 1
+        records = spy.call_args.args[1] if len(spy.call_args.args) > 1 else (
+            spy.call_args.kwargs['records']
+        )
+        assert records is report.open_escalations
+        assert records is not None

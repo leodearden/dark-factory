@@ -48,35 +48,21 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 from shared.task_statuses import TERMINAL as TERMINAL_TASK_STATUSES
 
+from fused_memory.middleware._folded_escalation import file_folded_escalation
 from fused_memory.middleware.recon_claim_verification_guard import (
     _GIT_PROBE_TIMEOUT_SECS,
     _resolve_git_toplevel,
 )
 from fused_memory.reconciliation.task_filter import (
-    _CLAUSE_SPLIT_RE,
     FUTURE_ASPIRATIONAL_RE,
     NEGATED_TERMINAL_RE,
+    STRICT_CLAUSE_BOUNDARY_RE,
     TASK_REF_RE,
 )
-
-if TYPE_CHECKING:
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
-# Defensive import of the optional ``escalation`` workspace package, mirroring
-# server/markup_tripwire.py: when it is missing (minimal CI envs, deployments
-# that have not installed it) the escalation becomes a logged no-op. This module
-# sits on the MCP write path, so it must never make a write fail — the episode is
-# already ingested and tagged by the time escalation is attempted.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
-    HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    HAS_ESCALATION = False
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +94,8 @@ VerdictStatus = Literal['verified', 'mismatch', 'unverifiable']
 #: never persists its ``metadata`` argument, so a metadata key could not carry
 #: it; and the harm in the motivating incident was the DERIVED edges, not the
 #: tool response, so a response-only tag would have labelled none of it.
+#: ``add_memory`` carries it too (task 4715): the same payload key on its
+#: Graphiti leg, and this key in the Mem0 record's own metadata.
 UNVERIFIED_CLAIM_TAG: str = 'unverified_claim'
 
 
@@ -251,16 +239,51 @@ _ASPIRATIONAL_EXTENSION_RE: re.Pattern[str] = re.compile(
 )
 
 
+# The clause boundary is task_filter.STRICT_CLAUSE_BOUNDARY_RE — the
+# fail-safe-STRICT alphabet ('.', ';', newline, '!', '?'), NOT
+# task_filter._CLAUSE_SPLIT_RE, which the gate once imported and which narrowed
+# its dot to '\.(?!\w)' at task 3403 so dotted technical tokens
+# (dark-factory-orchestrator.yaml, CLAUDE.md:95) stop shattering a sentence.
+# The canonical rationale for keeping the two apart lives next to
+# STRICT_CLAUSE_BOUNDARY_RE. This module's stake in it:
+#
+#   A hit here gets WRITTEN. It sets extra['unverified_claim'], which rides
+#   into the Graphiti source_description prefix and every derived Mem0 fact's
+#   metadata (server/tools.py:2805-2807), and it files an operator escalation
+#   (:2815) — on EVERY add_episode regardless of agent, since that call site
+#   is "Deliberately NOT under a recon-stage- guard". A longer clause drags a
+#   still-pending task into a NEIGHBOURING task's completion clause, durably
+#   mislabelling a CORRECT episode as contradicted (INV-2) and injecting a
+#   false escalation into the human queue. MEASURED under the widened form:
+#   'df 1985 landed in orchestrator.yaml and task 1986 is still pending.' ->
+#   claims for BOTH 1985 and 1986.
+#
+# The tie-breaker is this module's own stance, stated in its docstring:
+# requiring a named ref "is also the volume control ... a tag that fires
+# constantly stops being read". Precision over recall — the reverse of the
+# recon detectors' fail-open-on-under-firing default.
+#
+# ACCEPTED RESIDUAL: the gate forgoes the widening's recall win. MEASURED,
+# both pre-3403 and here, 'Task 5252 (see CLAUDE.md:95) has landed and now
+# enforces the gate.' yields NO claim, so a genuine unverifiable completion
+# claim whose sentence contains a dotted token still goes untagged. Fixing
+# that without re-importing the precision loss needs nearest-ref proximity
+# binding instead of whole-clause co-occurrence — an association-algorithm
+# redesign, filed as follow-up ticket tkt_0RSM4JVBN05YSSP1E2ASRZ6VWH.
+#
+# Pinned by tests/test_completion_claim_gate.py::TestClauseBoundaryIsolation.
 def _iter_clauses(text: str):
     """Yield ``(clause, start_offset)`` for each clause of *text*.
 
-    Same boundaries as ``task_filter._CLAUSE_SPLIT_RE.split`` ('.', ';',
-    newline, '!', '?'), but offset-preserving: a claim's span has to point back
-    into the ORIGINAL text so the flag can quote what was claimed (INV-2).
-    Empty clauses are skipped, matching the sibling detectors.
+    Boundaries are '.', ';', newline, '!', '?' — see the block above for why
+    this gate takes ``task_filter.STRICT_CLAUSE_BOUNDARY_RE`` rather than
+    ``task_filter._CLAUSE_SPLIT_RE``, which narrowed its dot at task 3403.
+    Offset-preserving, unlike a plain ``split``: a claim's span has to point
+    back into the ORIGINAL text so the flag can quote what was claimed
+    (INV-2). Empty clauses are skipped, matching the sibling detectors.
     """
     pos = 0
-    for match in _CLAUSE_SPLIT_RE.finditer(text):
+    for match in STRICT_CLAUSE_BOUNDARY_RE.finditer(text):
         if match.start() > pos:
             yield text[pos:match.start()], pos
         pos = match.end()
@@ -717,13 +740,11 @@ def make_commit_probe(repo_root: Path | str) -> Callable[[str], bool | None]:
 # Operator-facing escalation
 # --------------------------------------------------------------------------- #
 #
-# Copied shape-for-shape from server/markup_tripwire.emit_markup_storm_escalation
-# (task 3141), including its choice of channel. The recon_report filer is NOT
-# usable here: it silently DROPS findings when no Stage-2 run is active, and an
-# episode arrives at arbitrary times, so a gate that filed through it would go
-# quiet exactly when nothing else is watching. Opening the project's queue
-# directly is what makes the finding survive to an operator.
-_QUEUE_DIRNAME: str = 'data/escalations'
+# Filed through ``middleware/_folded_escalation`` into the project's own queue.
+# The recon_report filer is NOT usable here: it silently DROPS findings when no
+# Stage-2 run is active, and an episode arrives at arbitrary times, so a gate
+# that filed through it would go quiet exactly when nothing else is watching.
+# Anchors must be unique across filers — see that module's docstring.
 _ANCHOR_PREFIX: str = 'unverified-claim'
 _AGENT_ROLE: str = 'fused-memory/completion-claim-gate'
 _CATEGORY: str = 'unverified_completion_claim'
@@ -739,7 +760,11 @@ def emit_unverified_claim_escalation(
     escalation for this ``(project_root, ref)`` (dedup) — or ``None`` when
     filing is impossible or fails.
 
-    NEVER raises. The episode is already ingested and tagged by the time this
+    Call it only once the service has accepted the write, as
+    ``server/tools.py::create_mcp_server``'s ``_report_unverified_claims``
+    does: the record it files tells the operator the write was ingested.
+
+    NEVER raises. The write is already ingested and tagged by the time this
     runs, so escalation is purely ADDITIVE: every failure mode degrades to
     ``None`` plus a log line rather than changing the write's outcome.
 
@@ -751,7 +776,7 @@ def emit_unverified_claim_escalation(
     The anchor is per-REF rather than per-project (the markup sibling's choice):
     two different false claims are two different findings and each deserves its
     own record, while a writer repeating the SAME claim collapses onto the one
-    open escalation instead of minting a new one per episode.
+    open escalation instead of minting a new one per write.
     """
     entries = (flag or {}).get('claims') or []
     if not entries:
@@ -759,50 +784,7 @@ def emit_unverified_claim_escalation(
     ref = str(entries[0].get('ref') or '').strip()
     if not ref:
         return None
-    if project_root is None:
-        logger.debug(
-            'completion_claim_gate: no project_root resolved; unverified claim '
-            'about %r will not be escalated', ref,
-        )
-        return None
-    if not HAS_ESCALATION:
-        logger.debug(
-            'completion_claim_gate: escalation package unavailable; unverified '
-            'claim about %r in project_root=%r will not be escalated',
-            ref, project_root,
-        )
-        return None
-
     anchor = f'{_ANCHOR_PREFIX}-{ref}'
-    try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
-    except Exception:
-        logger.exception(
-            'completion_claim_gate: failed to open the escalation queue for '
-            'project_root=%r; unverified claim about %r not escalated',
-            project_root, ref,
-        )
-        return None
-
-    # Best-effort dedup: a read failure falls THROUGH to filing rather than
-    # bailing out — losing duplicate-suppression is strictly better than losing
-    # the finding.
-    try:
-        existing = queue.get_by_task(anchor, status='pending')
-    except Exception:
-        logger.exception(
-            'completion_claim_gate: failed to check for an existing open '
-            'escalation for anchor=%r in project_root=%r; proceeding to file',
-            anchor, project_root,
-        )
-        existing = []
-    if existing:
-        logger.info(
-            'completion_claim_gate: %s already open for anchor=%r in '
-            'project_root=%r; not filing a duplicate',
-            existing[0].id, anchor, project_root,
-        )
-        return existing[0].id
 
     detail = '\n'.join(
         [f'project_root={project_root!r}', '']
@@ -818,12 +800,13 @@ def emit_unverified_claim_escalation(
         ]
         + [
             '',
-            'An episode was ingested carrying a completion claim that the live '
+            'A write was ingested carrying a completion claim that the live '
             'authority CONTRADICTS (verdict=mismatch) or could not confirm '
-            '(verdict=unverifiable). The episode was TAGGED, not rejected: its '
-            "Graphiti source_description is prefixed '[unverified_claim] ' and "
-            "every derived Mem0 fact carries metadata['unverified_claim']=True, "
-            'so the derived edges are labelled at the point of harm.',
+            '(verdict=unverifiable). It was TAGGED, not rejected: its Graphiti '
+            "episode's source_description is prefixed '[unverified_claim] ' and "
+            'its Mem0 record (or, for add_episode, every derived Mem0 fact) '
+            "carries metadata['unverified_claim']=True, so what it stored is "
+            'labelled at the point of harm.',
             '',
             'Check the claim against the authority named above. If it is false, '
             'the derived facts need correcting at the source — a tag marks them, '
@@ -837,41 +820,28 @@ def emit_unverified_claim_escalation(
         ]
     )
 
-    try:
-        esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(anchor),
-            task_id=anchor,
-            agent_role=_AGENT_ROLE,
-            # 'info', not 'blocking': nothing is stuck. The episode landed, the
-            # tag is on it, and this record exists so the claim gets checked —
-            # filing it as blocking would put routine write-path noise in front
-            # of work that genuinely cannot proceed.
-            severity='info',
-            category=_CATEGORY,
-            summary=(
-                f'unverified completion claim about {entries[0].get("subject")} '
-                f'{ref} ({entries[0].get("status")}: '
-                f'{entries[0].get("observed")!r})'
-            ),
-            detail=detail,
-            suggested_action=(
-                'check the claim against the named authority; if it is false, '
-                'correct the derived facts at the source'
-            ),
-        )
-        esc_id = queue.submit(esc)
-    except Exception:
-        # A queue I/O failure must not propagate: the episode is already
-        # ingested and tagged, and the WARNING at the call site has already
-        # recorded the finding. The operator simply loses the queued heads-up.
-        logger.exception(
-            'completion_claim_gate: failed to submit the unverified-claim '
-            'escalation for project_root=%r anchor=%r', project_root, anchor,
-        )
-        return None
-
-    logger.warning(
-        'completion_claim_gate: queued %s for project_root=%r anchor=%r',
-        esc_id, project_root, anchor,
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=anchor,
+        agent_role=_AGENT_ROLE,
+        category=_CATEGORY,
+        # 'info', not 'blocking': nothing is stuck. The write landed, the
+        # tag is on it, and this record exists so the claim gets checked —
+        # filing it as blocking would put routine write-path noise in front
+        # of work that genuinely cannot proceed.
+        severity='info',
+        summary=(
+            f'unverified completion claim about {entries[0].get("subject")} '
+            f'{ref} ({entries[0].get("status")}: '
+            f'{entries[0].get("observed")!r})'
+        ),
+        detail=detail,
+        suggested_action=(
+            'check the claim against the named authority; if it is false, '
+            'correct the derived facts at the source'
+        ),
+        logger=logger,
+        log_label='completion_claim_gate',
+        context=f'unverified claim about {ref!r}',
+        level=0,
     )
-    return esc_id

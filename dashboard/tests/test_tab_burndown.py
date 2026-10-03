@@ -8,32 +8,14 @@ from __future__ import annotations
 
 import re
 
-import pytest
-from starlette.testclient import TestClient
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def tabs_jsx_body(_client):
-    return _client.get('/static/redux/tabs.jsx').text
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def charts_jsx_body(_client):
-    return _client.get('/static/redux/charts.jsx').text
-
+from _dashboard_helpers import (
+    DF_CHARTS_DESTRUCTURE_RE,
+    DF_CHARTS_EXPORT_RE,
+    destructure_bindings,
+    extract_function_body,
+    strip_js_comments,
+    walk_balanced,
+)
 
 # ---------------------------------------------------------------------------
 # Chart labels/values pairing probe
@@ -59,14 +41,23 @@ def charts_jsx_body(_client):
 _LABELS_PROP_RE = re.compile(r'\blabels=\{')
 _LABELS_RE = re.compile(r'labels=\{([^{}]+)\}')
 _VALUES_RE = re.compile(r'values[:=]\s*\{?([^,}\n]+)')
+# A stacks prop built by a helper — `stacks={burndownStacks(pb, CP)}` — names
+# its series object as the builder's FIRST argument rather than in inline
+# `values:` entries.  Task 4361 extracted the two status-mix stack literals into
+# burndown_bands.js (so that per-band wiring could be covered behaviourally by
+# node --test instead of by JSX source-text greps), which would otherwise have
+# left both <SA> sites with NO parsed values expressions — silently dropping
+# them out of the pairing sweep below while every test here stayed green. That
+# is coverage loss wearing the costume of success, so the probe learns the new
+# spelling instead. The CONTRACT is unchanged: labels and values must still
+# come off the same series object. Only where the values root is written moved.
+_STACKS_BUILDER_RE = re.compile(r'stacks=\{\s*\w+\(\s*([A-Za-z_$][\w$.]*)\s*[,)]')
 _TAG_START_RE = re.compile(r'<([A-Za-z_$][\w$]*)')
 # Any tag start or end inside an element's attribute list means the element is
 # not flat self-closing, so a regex chunk cannot be attributed to it safely.
 _TAG_BOUNDARY_RE = re.compile(r'</?[A-Za-z_$]')
 # A trailing call suffix such as `.map(String)` is presentation, not series identity.
 _CALL_SUFFIX_RE = re.compile(r'\.\w+\([^()]*\)$')
-_DF_CHARTS_DESTRUCTURE_RE = re.compile(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_CHARTS')
-_DF_CHARTS_EXPORT_RE = re.compile(r'window\.DF_CHARTS\s*=\s*\{([^{}]*)\}')
 
 
 def _series_root(expr):
@@ -90,30 +81,18 @@ def _chart_component_aliases(src):
     window.DF_CHARTS` line, so the known-component list is never a hardcoded
     second copy that can drift from what the file actually renders.
     """
-    m = _DF_CHARTS_DESTRUCTURE_RE.search(src)
+    m = DF_CHARTS_DESTRUCTURE_RE.search(src)
     if not m:
         return {}
-    aliases = {}
-    for part in m.group(1).split(','):
-        part = part.strip()
-        if not part:
-            continue
-        canonical, _, alias = part.partition(':')
-        canonical = canonical.strip()
-        aliases[alias.strip() or canonical] = canonical
-    return aliases
+    return {local: canonical for canonical, local in destructure_bindings(m.group(1))}
 
 
 def _df_charts_exports(src):
     """Names exported by charts.jsx's `window.DF_CHARTS = { ... }` line."""
-    m = _DF_CHARTS_EXPORT_RE.search(src)
+    m = DF_CHARTS_EXPORT_RE.search(src)
     if not m:
         return set()
-    return {
-        part.split(':', 1)[0].strip()
-        for part in m.group(1).split(',')
-        if part.strip()
-    }
+    return {canonical for canonical, _local in destructure_bindings(m.group(1))}
 
 
 def _element_at(src, pos):
@@ -162,6 +141,10 @@ def _chart_sites(src):
         labels_m = _LABELS_RE.search(chunk)
         labels_expr = labels_m.group(1).strip() if labels_m else None
         values_exprs = [v.strip() for v in _VALUES_RE.findall(chunk)]
+        # Plus any helper-built stacks prop, whose series object is the
+        # builder's first argument. Additive, so a site mixing inline `values:`
+        # entries with a builder call is still checked on both.
+        values_exprs += [v.strip() for v in _STACKS_BUILDER_RE.findall(chunk)]
         sites.append({
             'tag': tag,
             'labels_expr': labels_expr,
@@ -337,13 +320,16 @@ class TestBurnTabSmoothingChip:
 
 class TestVelocitySparkWiring:
     def test_net_velocity_tile_uses_derive(self, tabs_jsx_body):
-        """Net velocity StatTile spark must use deriveVelocitySeries, not raw b.done.
+        """Net velocity StatTile history must use deriveVelocitySeries, not raw b.done.
 
-        The regex ties the tile's label attribute to its spark attribute within the
-        same element, so the test fails if the Net velocity tile reverts to spark={b.done}.
+        The regex ties the tile's label attribute to its history attribute within the
+        same element, so the test fails if the Net velocity tile reverts to
+        history={b.done}.  The prop was named `spark` until task 5588 renamed it
+        `history` — the series is the tile's PAST, and `spark` named the drawing
+        rather than the data beside a `datum` that carries the present value.
         """
         assert re.search(
-            r'label=["\']Net velocity["\'].*?spark=\{deriveVelocitySeries\(',
+            r'label=["\']Net velocity["\'].*?history=\{deriveVelocitySeries\(',
             tabs_jsx_body,
             re.DOTALL,
         )
@@ -364,18 +350,184 @@ class TestVelocitySparkWiring:
         assert re.search(r'deriveVelocitySeries\(pb\.pending', tabs_jsx_body)
 
     def test_status_mix_area_stays_cumulative(self, tabs_jsx_body):
-        """Status-mix StackedArea charts must still use raw values (not derived)."""
-        # The SA stacks for the aggregate view use b.done directly.
-        assert re.search(r"values:\s*b\.done", tabs_jsx_body)
+        """Status-mix StackedArea charts must still use raw values (not derived).
+
+        Was `re.search(r"values:\\s*b\\.done", tabs_jsx_body)` — a source-text
+        grep that task 4361 made unsatisfiable by extracting the stack literals
+        into burndown_bands.js. Repointed rather than deleted, because the
+        CONTRACT is still real: the status-mix bands plot the raw cumulative
+        series, unlike the velocity charts this class otherwise covers, which
+        legitimately derive theirs.
+
+        The contract is now split across two homes, and both halves are
+        covered:
+
+        * WHICH series each band plots — that `done` carries `block.done` and
+          not some neighbour or derivative — is asserted BY IDENTITY for all
+          five bands in dashboard/tests/js/burndown_bands.test.mjs
+          ("each band is sourced from its OWN same-named block field"). That is
+          strictly stronger than the grep it replaces, which only proved the
+          characters `values: b.done` appeared somewhere in the file.
+
+        * WHICH object is handed to the builder at the call site is what
+          remains checkable here, and is what this test asserts: the raw
+          burndown block, not a derived series.
+        """
+        sites = [
+            s for s in _chart_sites(tabs_jsx_body)
+            if s['tag'] == 'SA' and set(s['values_roots']) == {'b'}
+        ]
+        assert len(sites) == 1, (
+            f'expected exactly one aggregate <SA> site, found {len(sites)}'
+        )
+        for expr in sites[0]['values_exprs']:
+            assert 'derive' not in expr and 'velocity' not in expr.lower(), (
+                'the aggregate status-mix chart is plotting a DERIVED series '
+                f'({expr!r}); its bands must stay raw and cumulative.'
+            )
 
     def test_completed_window_tile_stays_cumulative(self, tabs_jsx_body):
-        """'Completed (window)' tile spark must remain on raw b.done.
+        """'Completed (window)' tile history must remain on raw b.done.
 
-        Ties the label and spark attributes within the same element so that
+        Ties the label and history attributes within the same element so that
         a regression swapping this tile to deriveVelocitySeries is caught.
+        (`spark` -> `history`: see the Net velocity test above.)
         """
         assert re.search(
-            r'label=["\']Completed \(window\)["\'].*?spark=\{b\.done\}',
+            r'label=["\']Completed \(window\)["\'].*?history=\{b\.done\}',
             tabs_jsx_body,
             re.DOTALL,
+        )
+
+
+# ---------------------------------------------------------------------------
+# tabs.jsx BurnTab — every tile, pip and cell reads a SERVED burndown Datum
+# ---------------------------------------------------------------------------
+#
+# The burndown payload carries its own staleness: each block (the aggregate and
+# every project) serves `latest` and `forecast` Datums whose state says whether
+# a project was carried forward, is missing from the window, or is fresh.
+# plainDatum/derivedDatum wrap a bare number in the ENDPOINT's receipt, which
+# knows only when the payload arrived — so a tile built that way would read a
+# carried project's hours-old count as fresh. BurnTab therefore builds no
+# Datum of its own; burndown_bands.js::burndownDatum stamps the served one.
+
+_BURN_TILE_LABELS = {'Net velocity', 'Completed (window)', 'Pending', 'Forecast clear'}
+
+
+def _burn_tab_body(tabs_jsx_body):
+    return strip_js_comments(extract_function_body(tabs_jsx_body, 'BurnTab'))
+
+
+def _self_closing_elements(src, tag):
+    """Every flat ``<tag ... />`` element's attribute text, braces respected.
+
+    Walks brace depth so an arrow's ``=>`` or a nested JSX value inside a
+    ``{...}`` prop cannot end the element early; only a ``/>`` at depth 0 does.
+    """
+    elements = []
+    for m in re.finditer(rf'<{tag}\b', src):
+        depth = 0
+        for i in range(m.end(), len(src)):
+            c = src[i]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+            elif depth == 0 and src.startswith('/>', i):
+                elements.append(src[m.end():i])
+                break
+        else:
+            raise AssertionError(f'<{tag} at offset {m.start()} is never closed')
+    return elements
+
+
+def _prop_expr(attrs, name):
+    """The expression inside ``name={...}``, or None when the prop is absent."""
+    m = re.search(rf'\b{name}=\{{', attrs)
+    if not m:
+        return None
+    return walk_balanced(attrs, m.end() - 1)[1:-1].strip()
+
+
+def _prop_label(attrs):
+    m = re.search(r'\blabel=["\']([^"\']*)["\']', attrs)
+    return m.group(1) if m else None
+
+
+def _burn_tiles(body):
+    return {_prop_label(a): a for a in _self_closing_elements(body, 'ST')}
+
+
+def _assert_served_datum(body, where, expr):
+    """``expr`` is a burndownDatum call, or a name bound to one inside ``body``."""
+    assert expr, f'{where} passes no datum'
+    if expr.startswith('burndownDatum('):
+        return
+    assert re.fullmatch(r'[A-Za-z_$][\w$]*', expr), (
+        f'{where} datum {expr!r} is neither a burndownDatum call nor a name bound to one'
+    )
+    assert re.search(rf'\bconst\s+{re.escape(expr)}\s*=\s*burndownDatum\(', body), (
+        f'{where} datum {expr!r} is not bound to a burndownDatum result'
+    )
+
+
+class TestBurnTabReadsServedDatums:
+    def test_burntab_reads_the_latest_and_forecast_datums(self, tabs_jsx_body):
+        body = _burn_tab_body(tabs_jsx_body)
+        for field in ('latest', 'forecast'):
+            assert re.search(rf'burndownDatum\([^()]*["\']{field}["\']\s*\)', body), (
+                f'BurnTab never reads the served {field!r} Datum through burndownDatum'
+            )
+
+    def test_tabs_jsx_binds_the_datum_reader_and_forecast_formatter(self, tabs_jsx_body):
+        m = re.search(r'const\s*\{([^{}]*)\}\s*=\s*window\.DF_BURNDOWN_BANDS', tabs_jsx_body)
+        assert m, 'tabs.jsx no longer destructures window.DF_BURNDOWN_BANDS'
+        locals_bound = {local for _, local in destructure_bindings(m.group(1))}
+        assert {'burndownDatum', 'forecastText'} <= locals_bound
+
+    def test_every_aggregate_tile_renders_a_served_datum(self, tabs_jsx_body):
+        """Each tile's datum is a burndownDatum result, never a wrapped bare number."""
+        body = _burn_tab_body(tabs_jsx_body)
+        tiles = _burn_tiles(body)
+        assert set(tiles) == _BURN_TILE_LABELS
+        for label, attrs in tiles.items():
+            _assert_served_datum(body, f'the {label!r} tile', _prop_expr(attrs, 'datum'))
+
+    def test_every_pip_and_cell_renders_a_served_datum(self, tabs_jsx_body):
+        """The per-project pips and table cells read the same served Datums as the tiles."""
+        body = _burn_tab_body(tabs_jsx_body)
+        for tag in ('Pip', 'DatumReading'):
+            elements = _self_closing_elements(body, tag)
+            assert elements, f'BurnTab renders no <{tag}>'
+            for attrs in elements:
+                _assert_served_datum(body, f'a <{tag}>', _prop_expr(attrs, 'datum'))
+
+    def test_forecast_tile_formats_the_served_range(self, tabs_jsx_body):
+        """No client point estimate: the server refuses to synthesise one on sparse history."""
+        body = _burn_tab_body(tabs_jsx_body)
+        assert _prop_expr(_burn_tiles(body)['Forecast clear'], 'format') == 'forecastText'
+
+
+# ---------------------------------------------------------------------------
+# OrchTab "Completed / day" — the server's per-day series, never re-derived
+# ---------------------------------------------------------------------------
+#
+# The spark plots the project's served `completed_per_day`
+# (burndown.py::compute_window_completion): one entry per ISO day, the same
+# N-day window its velocity divides by, so the spark and the velocity beside it
+# agree about the same window.
+
+
+class TestCompletedPerDayIsServerSeries:
+    def test_orchtab_spark_plots_the_served_completed_per_day(self, tabs_jsx_body):
+        body = strip_js_comments(extract_function_body(tabs_jsx_body, 'OrchTab'))
+        label_at = body.find('Completed / day')
+        assert label_at != -1, "OrchTab no longer labels a 'Completed / day' spark"
+        sparks = _self_closing_elements(body[label_at:], 'SP')
+        assert sparks, "no <SP> follows OrchTab's 'Completed / day' label"
+        values = _prop_expr(sparks[0], 'values')
+        assert values and 'BURNDOWN_BY_PROJECT' in values and 'completed_per_day' in values, (
+            f"the 'Completed / day' spark plots {values!r}, not the project's served "
+            'completed_per_day series'
         )

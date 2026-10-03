@@ -1,0 +1,567 @@
+"""Repo-invariant guard: no orchestrator config the loader reads repeats a mapping key.
+
+THE DEFECT, stated once. A YAML document may declare the same mapping key twice
+— most consequentially a second top-level ``verify_env:`` block appended below
+an existing one. Both blocks read as intentional, and a diff that adds the
+second is TEXTUALLY CLEAN TO MERGE: it touches no line the first block owns, so
+no merge conflict, no reviewer prompt, nothing. But PyYAML's SafeLoader keeps
+only the LAST occurrence and reports nothing at all, so every key declared in
+the earlier block silently ceases to exist in the effective config. Task 4635
+hit exactly this: a second ``verify_env:`` carrying ``DF_REQUIRE_SANDBOX_TESTS``
+landed below the one carrying the merge-leg ``PYTEST_XDIST_AUTO_NUM_WORKERS``
+pin, and the pin — the live arm of an A/B experiment — vanished from the running
+fleet with no signal anywhere.
+
+WHY A TEST AND NOT A STRICTER LOADER. The remedy deliberately lives at TEST
+time. Teaching ``orchestrator/src/orchestrator/config.py`` to reject a duplicate
+key would turn the next occurrence into a failed orchestrator restart — a dead
+fleet — where a red test turns it into a merge-gate failure on the branch that
+introduced it. Catch it where it is cheap to fix, not where it is expensive to
+survive.
+
+THE SCOPE IS THE FILE SET THE LOADER ACTUALLY READS, which is three classes of
+file and nothing else:
+
+  * ``orchestrator/src/orchestrator/config.py::_load_defaults`` — the
+    package-bundled ``defaults.yaml``;
+  * ``orchestrator/src/orchestrator/config.py::YamlSettingsSource`` — the
+    project config, ``dark-factory-orchestrator.yaml``;
+  * ``orchestrator/src/orchestrator/config.py::_discover_module_configs`` —
+    every discovered ``<prefix>/orchestrator.yaml``.
+
+Only in those does a duplicate key degrade a RUNNING orchestrator silently. A
+repo-wide ``*.yaml`` sweep would also pass today, but it would pull capability
+manifests, docker-compose files and PRD fixtures into a guard whose failure mode
+is orchestrator misconfiguration.
+"""
+from __future__ import annotations
+
+from collections.abc import Callable, Collection, Hashable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from orchestrator.config import ModuleConfig, OrchestratorConfig
+
+REPO_ROOT = Path(__file__).parents[2]
+
+ROOT_CONFIG_PATH = REPO_ROOT / 'dark-factory-orchestrator.yaml'
+DEFAULTS_PATH = REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'defaults.yaml'
+
+
+@dataclass(frozen=True)
+class DuplicateKey:
+    """One repeated mapping key, as data rather than as a rendered message.
+
+    A caller that must aggregate findings across files, count them, or render
+    them into a failure message should not have to parse prose back out of a
+    formatted string to do it.
+    """
+
+    path: Path
+    key: object
+    first_line: int
+    duplicate_line: int
+
+
+class _DuplicateKeyError(yaml.constructor.ConstructorError):
+    """Raised at the first repeated key in a document, carrying both key nodes' marks."""
+
+    def __init__(self, key: object, first_mark: Any, duplicate_mark: Any) -> None:
+        super().__init__(
+            context=f'while constructing a mapping that already declares {key!r}',
+            context_mark=first_mark,
+            problem=f'found a duplicate key {key!r}',
+            problem_mark=duplicate_mark,
+        )
+        self.key = key
+        self.first_mark = first_mark
+        self.duplicate_mark = duplicate_mark
+
+
+class _NoDuplicateKeysLoader(yaml.SafeLoader):
+    """A SafeLoader that raises on a repeated mapping key instead of keeping the last.
+
+    A SUBCLASS, and never a mutation of ``yaml.SafeLoader`` itself: registering
+    the constructor on the shared class would change the behaviour of every
+    other yaml consumer in the same pytest process — including the production
+    loaders under test here, which must keep parsing the way they do in the
+    fleet for this file's reproduction tests to mean anything.
+
+    The pure-Python loader rather than ``CSafeLoader``: node ``start_mark``
+    line numbers are what every finding is built from, and the C loader's
+    speed argument is about hot paths, not about parsing eleven small files
+    once.
+    """
+
+
+_MERGE_TAG = 'tag:yaml.org,2002:merge'
+
+
+def _construct_mapping_rejecting_duplicates(
+    loader: yaml.SafeLoader, node: yaml.nodes.MappingNode
+) -> dict[Any, Any]:
+    """Walk the key nodes for a repeat, then delegate the actual construction.
+
+    MERGE KEYS (``<<: *anchor``) ARE SKIPPED rather than inspected, and that is
+    a correctness requirement rather than a convenience. ``<<`` is not a key at
+    all — ``SafeConstructor.flatten_mapping`` folds the anchored mapping in
+    later — and SafeLoader registers no constructor for its tag, so putting one
+    through ``construct_object`` raises a ConstructorError ABOUT TAGS. That
+    error is not a ``_DuplicateKeyError``, so under the propagation rule in
+    ``duplicate_keys`` it would escape and turn the sweep red, naming the wrong
+    defect, on a config the PRODUCTION loader parses perfectly well. Repeating
+    ``<<`` within one mapping is legal YAML that PyYAML supports — both anchors
+    are merged — so skipping is the semantically correct answer too, not a
+    blind spot traded for a green run.
+    """
+    seen: dict[Any, yaml.nodes.Node] = {}
+    for key_node, _value_node in node.value:
+        if key_node.tag == _MERGE_TAG:
+            continue
+        key = loader.construct_object(key_node, deep=True)
+        if not isinstance(key, Hashable):
+            # Not ours to report: the delegate below raises the proper
+            # "found unhashable key" ConstructorError for this shape.
+            continue
+        if key in seen:
+            raise _DuplicateKeyError(key, seen[key].start_mark, key_node.start_mark)
+        seen[key] = key_node
+    return yaml.SafeLoader.construct_mapping(loader, node)
+
+
+_NoDuplicateKeysLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping_rejecting_duplicates,
+)
+
+
+def duplicate_keys(path: Path) -> list[DuplicateKey]:
+    """Report the first repeated mapping key in *path*, at any nesting level.
+
+    Returns at most one finding per file — the loader stops at the first
+    repeat, which is the earliest possible stop inside one document and is
+    enough to turn the sweep red and name a file to fix.
+
+    Any OTHER ``yaml.YAMLError`` deliberately PROPAGATES. An orchestrator
+    config that does not parse at all is a louder defect than one with a
+    duplicate key, and swallowing it into a green empty list would report
+    exactly the silence this guard exists to remove.
+    """
+    try:
+        yaml.load(path.read_text(), _NoDuplicateKeysLoader)
+    except _DuplicateKeyError as exc:
+        return [
+            DuplicateKey(
+                path=path,
+                key=exc.key,
+                first_line=exc.first_mark.line + 1,
+                duplicate_line=exc.duplicate_mark.line + 1,
+            )
+        ]
+    return []
+
+
+def _yaml_file(tmp_path: Path, text: str) -> Path:
+    """Write *text* to a scratch YAML file and return its path."""
+    path = tmp_path / 'config.yaml'
+    path.write_text(text)
+    return path
+
+
+def test_a_repeated_top_level_key_is_reported_with_both_line_numbers(tmp_path: Path) -> None:
+    """The simplest shape: one key declared twice at the top level."""
+    path = _yaml_file(
+        tmp_path,
+        'project_root: /one\n'
+        'max_concurrent_tasks: 4\n'
+        'project_root: /two\n',
+    )
+
+    findings = duplicate_keys(path)
+
+    assert len(findings) == 1, f'expected exactly one finding, got {findings!r}'
+    finding = findings[0]
+    assert finding.path == path
+    assert finding.key == 'project_root'
+    assert (finding.first_line, finding.duplicate_line) == (1, 3), (
+        'line numbers must be 1-based and name the FIRST occurrence and the '
+        f'duplicate, in that order; got {finding!r}'
+    )
+
+
+def test_a_key_repeated_inside_a_nested_mapping_is_reported(tmp_path: Path) -> None:
+    """The "at any level" clause: the duplicate need not be top-level to bite."""
+    path = _yaml_file(
+        tmp_path,
+        'verify_env:\n'
+        '  PYTEST_XDIST_AUTO_NUM_WORKERS: "8"\n'
+        '  DF_REQUIRE_SANDBOX_TESTS: "1"\n'
+        '  PYTEST_XDIST_AUTO_NUM_WORKERS: "16"\n',
+    )
+
+    findings = duplicate_keys(path)
+
+    assert len(findings) == 1, f'expected exactly one finding, got {findings!r}'
+    finding = findings[0]
+    assert finding.key == 'PYTEST_XDIST_AUTO_NUM_WORKERS'
+    assert (finding.first_line, finding.duplicate_line) == (2, 4)
+
+
+def test_a_clean_multi_level_document_yields_no_findings(tmp_path: Path) -> None:
+    """No false positives: the same key name under DIFFERENT parents is fine."""
+    path = _yaml_file(
+        tmp_path,
+        'verify_env:\n'
+        '  PYTEST_XDIST_AUTO_NUM_WORKERS: "8"\n'
+        'roles:\n'
+        '  implementer:\n'
+        '    model: opus\n'
+        '  architect:\n'
+        '    model: opus\n',
+    )
+
+    assert duplicate_keys(path) == []
+
+
+def test_a_merge_key_is_not_a_repeated_key_and_is_not_reported(tmp_path: Path) -> None:
+    """``<<: *anchor`` must stay silent, including when one mapping carries two.
+
+    The loaded value is asserted FIRST because it is the premise the guard hangs
+    on: this document is one the production loader accepts, so any noise here —
+    a finding, or the tag-constructor error a naive key walk raises on ``<<`` —
+    would be a red sweep about the wrong defect on a healthy config.
+    """
+    text = (
+        'role_defaults: &role_defaults\n'
+        '  model: opus\n'
+        'effort_defaults: &effort_defaults\n'
+        '  effort: high\n'
+        'roles:\n'
+        '  implementer:\n'
+        '    <<: *role_defaults\n'
+        '    max_turns: 200\n'
+        '  architect:\n'
+        '    <<: *role_defaults\n'
+        '    <<: *effort_defaults\n'
+    )
+    path = _yaml_file(tmp_path, text)
+
+    architect = yaml.safe_load(text)['roles']['architect']
+    assert architect == {'model': 'opus', 'effort': 'high'}, (
+        'the premise: PyYAML merges BOTH anchors, so a mapping carrying two `<<` '
+        f'keys is legal YAML the fleet reads fine; got {architect!r}'
+    )
+
+    assert duplicate_keys(path) == []
+
+
+def test_a_second_verify_env_block_is_silently_last_wins_and_is_reported(tmp_path: Path) -> None:
+    """Task 4635's exact shape, with the silent-degradation mechanism pinned alongside.
+
+    Two assertions, and the first is the point: it records PyYAML's OBSERVED
+    behaviour on these bytes, so the guard below is demonstrably protecting
+    against something real rather than against a theory about a parser.
+    """
+    text = (
+        'verify_env:\n'
+        '  PYTEST_XDIST_AUTO_NUM_WORKERS: "8"\n'
+        'max_concurrent_tasks: 4\n'
+        'verify_env:\n'
+        '  DF_REQUIRE_SANDBOX_TESTS: "1"\n'
+    )
+    path = _yaml_file(tmp_path, text)
+
+    loaded = yaml.safe_load(text)
+    assert loaded['verify_env'] == {'DF_REQUIRE_SANDBOX_TESTS': '1'}, (
+        'the mechanism under guard: PyYAML keeps only the LAST block, so the '
+        f'earlier one is gone without a word; got {loaded["verify_env"]!r}'
+    )
+
+    findings = duplicate_keys(path)
+
+    assert len(findings) == 1, f'expected exactly one finding, got {findings!r}'
+    finding = findings[0]
+    assert finding.key == 'verify_env'
+    assert (finding.first_line, finding.duplicate_line) == (1, 4)
+
+
+def test_a_config_that_does_not_parse_at_all_propagates_rather_than_reporting_green(
+    tmp_path: Path,
+) -> None:
+    """The other half of ``duplicate_keys``'s contract, as an executable claim.
+
+    A duplicate key is REPORTED as a finding; anything else that leaves a config
+    unparseable is RAISED. Pinning both halves is what keeps the two classes
+    distinguishable by test rather than by prose — and the merge-key case above
+    is correct precisely because it belongs to NEITHER of them.
+    """
+    path = _yaml_file(tmp_path, 'roles: [implementer, architect\nverify_env:\n  A: "1"\n')
+
+    with pytest.raises(yaml.YAMLError) as caught:
+        duplicate_keys(path)
+
+    assert not isinstance(caught.value, _DuplicateKeyError), (
+        'an unparseable config must surface as itself rather than be dressed up '
+        f'as a duplicate-key finding; got {caught.value!r}'
+    )
+
+
+_MUTANT_MARKER_KEY = 'DF_DUPLICATE_KEY_GUARD_MARKER'
+
+
+def _declared_verify_env(path: Path) -> dict[str, str]:
+    """The ``verify_env`` mapping as the file DECLARES it, read through the strict loader.
+
+    Through ``_NoDuplicateKeysLoader`` rather than ``yaml.safe_load``, and that
+    is redundant enforcement of the same invariant at a second site rather than
+    an accident: if the root config ever regains a duplicate key, this helper
+    RAISES instead of quietly handing back the surviving block — which would
+    otherwise leave the survival test comparing the survivor against itself and
+    agreeing.
+    """
+    document = yaml.load(path.read_text(), _NoDuplicateKeysLoader) or {}
+    return document.get('verify_env') or {}
+
+
+def _with_second_verify_env_block(text: str) -> str:
+    """Append a SECOND top-level ``verify_env:`` block, reproducing task 4635's shape.
+
+    A TEXT transform, never a yaml round trip: this is applied to a copy of
+    ``dark-factory-orchestrator.yaml``, ~1400 lines of load-bearing comments a
+    parse-and-dump would erase — the same reason
+    ``scripts/merge-pytest-n-ab-switch.sh`` edits that file by line. Appending
+    below the existing block is also precisely how the real defect arrived:
+    it conflicts with nothing.
+    """
+    return text.rstrip('\n') + f'\n\nverify_env:\n  {_MUTANT_MARKER_KEY}: "1"\n'
+
+
+def test_every_verify_env_key_declared_in_the_root_config_survives_into_the_effective_config(
+    root_config: OrchestratorConfig,
+) -> None:
+    """Nothing else in this repo reads the EFFECTIVE verify_env, and that was the gap.
+
+    Task 4635's duplicate ``verify_env:`` block was invisible precisely because
+    no test ever compared what the yaml DECLARES against what the production
+    loader ends up serving. This is that comparison, through the real loader,
+    against this worktree's own config.
+
+    KEYS ONLY, NEVER VALUES, and the distinction is load-bearing rather than
+    cautious: ``scripts/merge-pytest-n-ab-switch.sh`` legitimately flips
+    ``PYTEST_XDIST_AUTO_NUM_WORKERS`` between arms and commits the result, and
+    ``config.py::YamlSettingsSource._expand_env_vars`` rewrites any ``${VAR}``
+    value between file and effective config — so a value pin would go red on a
+    sanctioned operator action. A whole entry VANISHING is exactly where the
+    duplicate-key defect bites, and keys are what catch it.
+
+    A SUPERSET, not an equality, for the same reason: ``config.py::load_config``
+    folds ``effective_verify_env`` back in for sccache, so the effective mapping
+    may legitimately carry keys the file never declared.
+    """
+    declared = _declared_verify_env(ROOT_CONFIG_PATH)
+
+    assert declared, (
+        f'{ROOT_CONFIG_PATH} declares an EMPTY verify_env, so this test would '
+        'pass while comparing nothing. Either the block was deleted, or it was '
+        'renamed and this guard is now reading the wrong key'
+    )
+    missing = sorted(set(declared) - set(root_config.verify_env))
+    assert not missing, (
+        f'{sorted(missing)!r} are declared in {ROOT_CONFIG_PATH.name} but absent '
+        'from the effective config the orchestrator serves. The usual cause is a '
+        'SECOND top-level `verify_env:` block: PyYAML keeps only the last one and '
+        'says nothing. Remedy: fold the blocks into a single mapping'
+    )
+
+
+def test_a_second_top_level_verify_env_block_silently_drops_the_earlier_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control: prove the test above is guarding a real failure.
+
+    A guard that has never been seen to fail is a guard nobody knows the
+    polarity of. This reproduces task 4635's defect against the PRODUCTION
+    loader — on a mutated COPY, never on the tracked file — and asserts that
+    the real loader really does drop the earlier block's keys without a word.
+
+    The mutant is built as a TEXT transform for the reason
+    ``scripts/merge-pytest-n-ab-switch.sh`` gives for its own line-based edit of
+    the same file: it is ~1400 lines of load-bearing comments that a parse-and-
+    dump round trip would destroy.
+
+    ``ORCH_CONFIG_PATH`` is re-pointed BEFORE the config is constructed, which
+    is the whole point — ``OrchestratorConfig.settings_customise_sources`` reads
+    that env var at construction time, so a config built earlier would still be
+    describing the tracked file.
+
+    KEYS ``defaults.yaml`` ALSO DECLARES ARE EXCLUDED, because shadowing the
+    project block does not unset the default: the effective config is
+    ``_deep_merge(_load_defaults(), project_config)`` and that merge RECURSES
+    into ``verify_env``, so a key declared in both layers legitimately survives
+    the mutation. Intersecting without the subtraction would couple this
+    reproduction to ``defaults.yaml`` currently declaring ``verify_env: {}`` —
+    and a later harmless edit there would go red pointing at the duplicate-key
+    guard rather than at the edit that caused it.
+    """
+    droppable = set(_declared_verify_env(ROOT_CONFIG_PATH)) - set(
+        _declared_verify_env(DEFAULTS_PATH)
+    )
+    assert droppable, (
+        f'{ROOT_CONFIG_PATH.name} declares no verify_env key that '
+        f'{DEFAULTS_PATH.name} does not also declare, so the mutation below has '
+        'nothing it could drop and this reproduction would pass while reproducing '
+        'nothing'
+    )
+
+    mutant = tmp_path / ROOT_CONFIG_PATH.name
+    mutant.write_text(_with_second_verify_env_block(ROOT_CONFIG_PATH.read_text()))
+
+    monkeypatch.setenv('ORCH_CONFIG_PATH', str(mutant))
+    effective = OrchestratorConfig(project_root=REPO_ROOT).verify_env
+
+    assert _MUTANT_MARKER_KEY in effective, (
+        f'the mutant copy at {mutant} was not the file the loader read — '
+        f'effective verify_env is {effective!r}. Without this check the '
+        'assertion below would pass vacuously against the pydantic defaults, '
+        'which is the reports-green-while-checking-something-else failure this '
+        'whole directory exists to prevent'
+    )
+    survivors = sorted(droppable & set(effective))
+    assert not survivors, (
+        f'expected the second `verify_env:` block to shadow the first entirely, but '
+        f'{survivors!r} survived. Keys {DEFAULTS_PATH.name} also declares are already '
+        'excluded — _deep_merge layers the project mapping over the defaults, so those '
+        'survive legitimately. Anything else means the reproduction no longer '
+        'reproduces, and the guard above may be passing for a reason other than the '
+        'one claimed'
+    )
+    assert [f.key for f in duplicate_keys(mutant)] == ['verify_env'], (
+        'the detector must flag the very shape the production loader just '
+        'swallowed, or it would not have caught task 4635 either'
+    )
+
+
+def _orchestrator_config_paths(module_configs: dict[str, ModuleConfig]) -> list[Path]:
+    """Every yaml file the orchestrator's own loaders read, in a deterministic order.
+
+    TAKES THE ALREADY-DISCOVERED MAPPING, never the callable that produces it.
+    ``_discover_module_configs`` is a full recursive walk of the repo — its own
+    docstring flags the cost on a large tree — so a caller that wants both the
+    paths and the prefixes behind them would run it twice, and would then be
+    reasoning about two separate OBSERVATIONS of discovery rather than one.
+    Neither test here poisons ``ORCH_CONFIG_PATH`` between construction and the
+    walk, so there is no reason to defer it the way this directory's
+    ``executed_for_touched`` guards must.
+
+    THE MAPPING MUST COME FROM the production walk, never from an
+    ``rglob('orchestrator.yaml')``: delegating is what inherits config.py's
+    pruning of ``.worktrees/``, ``.venv/``, ``node_modules/``, ``build/`` and
+    nested checkouts. A hand-rolled glob run from the main checkout would descend every
+    sibling worktree and sweep other branches' copies of these same files, so it
+    could fail for a config this branch does not contain — and, worse, could
+    drift from the set the orchestrator actually registers.
+
+    ``defaults.yaml`` IS ANCHORED AT ``REPO_ROOT``, deliberately NOT at
+    ``importlib.resources.files('orchestrator')`` as ``_load_defaults`` resolves
+    it in production. First-party members are installed editable and an agent
+    shell inherits the MAIN checkout's ``VIRTUAL_ENV``, so that resource path
+    can resolve into a DIFFERENT checkout's tree; the guard would then report
+    green about a file this branch never changed. Identical trap and identical
+    remedy to ``tests/scripts/conftest.py::ROOT_CONFIG_PATH``.
+    """
+    return [
+        ROOT_CONFIG_PATH,
+        DEFAULTS_PATH,
+        *(REPO_ROOT / prefix / 'orchestrator.yaml' for prefix in module_configs),
+    ]
+
+
+def _is_module_config_of(path: Path, prefixes: Collection[str]) -> bool:
+    """True when *path* is the ``<prefix>/orchestrator.yaml`` of a discovered prefix."""
+    if path.name != 'orchestrator.yaml' or not path.parent.is_relative_to(REPO_ROOT):
+        return False
+    return path.parent.relative_to(REPO_ROOT).as_posix() in prefixes
+
+
+def test_every_orchestrator_config_the_loader_reads_has_no_duplicate_keys(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """The guard itself: no config the orchestrator loads repeats a mapping key.
+
+    Aggregated across the whole set rather than stopping at the first offender,
+    so one red run names every file that needs folding.
+    """
+    findings = [
+        finding
+        for path in _orchestrator_config_paths(discover_module_configs())
+        for finding in duplicate_keys(path)
+    ]
+
+    assert not findings, (
+        'duplicate mapping key(s) in orchestrator config(s) the loader reads:\n'
+        + '\n'.join(
+            f'  {finding.path.relative_to(REPO_ROOT)}: {finding.key!r} declared at '
+            f'line {finding.first_line} and again at line {finding.duplicate_line}'
+            for finding in findings
+        )
+        + '\nPyYAML keeps only the LAST occurrence and reports nothing, so every key '
+        'in the earlier block is silently absent from the effective config. Remedy: '
+        'fold the blocks into a single mapping.'
+    )
+
+
+def test_the_swept_set_is_the_set_the_loader_actually_reads(
+    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+) -> None:
+    """The scope-honesty assertion, because a sweep over an empty set reports green.
+
+    The expectation is DERIVED from the same production walk the sweep uses, not
+    written down as a roster: a literal list or count of today's module configs
+    rots on the next one added, and this directory has already recorded
+    hard-coded counts of directory contents going stale as a measured defect.
+
+    DERIVED, BUT NOT A COPY OF THE CONSTRUCTION. An earlier form of this test
+    asserted set equality against the very expression ``_orchestrator_config_
+    paths`` builds its list from, fed by a second call to the same walk: it could
+    only have failed if two consecutive walks disagreed, never for the drift its
+    own message named. What is asserted instead is the SHAPE every swept path
+    must have — ``<prefix>/orchestrator.yaml`` under a prefix discovery actually
+    registered, and a file that exists — which does go red if the construction
+    rule changes.
+    """
+    module_configs = discover_module_configs()
+    paths = _orchestrator_config_paths(module_configs)
+
+    assert module_configs, (
+        'the production module-config walk found NO module configs, which would '
+        'make the sweep above pass while checking almost nothing. Either discovery '
+        'broke, or every <prefix>/orchestrator.yaml in the repo was removed'
+    )
+    assert ROOT_CONFIG_PATH in paths, (
+        f'{ROOT_CONFIG_PATH} is the file YamlSettingsSource reads and the one task '
+        '4635 actually regressed; a sweep that skips it guards nothing that matters'
+    )
+    assert DEFAULTS_PATH in paths, (
+        f'{DEFAULTS_PATH} is the package-bundled layer _load_defaults reads, and a '
+        'duplicate key there degrades every project this orchestrator serves'
+    )
+    strays = [
+        path
+        for path in paths
+        if path not in (ROOT_CONFIG_PATH, DEFAULTS_PATH)
+        and not _is_module_config_of(path, module_configs)
+    ]
+    assert not strays, (
+        f'{strays!r} are swept but are not the <prefix>/orchestrator.yaml of any '
+        f'prefix the production walk registered ({sorted(module_configs)!r}), so the '
+        'sweep is reading files the orchestrator does not — a guard whose scope has '
+        'drifted from the loader it claims to cover'
+    )
+    missing = [path for path in paths if not path.is_file()]
+    assert not missing, (
+        f'{missing!r} do not exist, so duplicate_keys was never going to read them. '
+        'A swept path that is not a file is a silently empty leg of this guard'
+    )

@@ -124,3 +124,51 @@ class TestWriteMergeHeartbeatFailOpen:
             await harness._write_merge_heartbeat()  # must not raise
 
         assert 'merge heartbeat write failed' in caplog.text
+
+    async def test_empty_unit_writes_nothing_and_is_logged_not_raised(
+        self, harness: Harness, tmp_path: Path, monkeypatch, caplog
+    ):
+        """An unset ORCH_UNIT is refused LOUDLY but never stops the run loop.
+
+        The producer-level half of the behaviour pinned at unit level by
+        ``test_fleet_heartbeat.py``'s ``TestMalformedUnitIsRefused``, exercised
+        through the REAL ``write_heartbeat`` (no patch) so the two halves cannot
+        drift.  All three properties matter and are asserted together:
+
+        1. it does NOT raise — harness.py's ``except Exception`` fail-open is a
+           documented invariant, and propagating would trade a corrupt heartbeat
+           for a dead orchestrator, which is strictly worse;
+        2. the existing ``merge heartbeat write failed`` WARNING fires, which is
+           where the loudness actually lands at the production call site; and
+        3. nothing is created — the substantive half, which holds regardless of
+           what the caller does with the exception.  Asserted UNCONDITIONALLY on
+           the fleet dir itself: ``write_heartbeat`` refuses before any
+           filesystem work, so the directory must not exist AT ALL.  An
+           ``if fleet_dir.exists():``-guarded emptiness check would be dead code
+           here and would still pass if the refusal were ever moved after
+           ``safe_io.atomic_write_text(..., mkdir=True)`` created the parent —
+           precisely the regression worth catching.  One line also subsumes the
+           retired ``unknown-unit.json`` name and any ``.json.tmp`` residue.
+
+        ``delenv`` is REQUIRED, not defensive: ORCH_UNIT is AMBIENT-SET in an
+        orchestrator-dispatched session (measured: ``orchestrator-dark-factory.service``,
+        inherited from the systemd unit), so a test relying on it being absent
+        would pass vacuously on a developer box and write a REAL unit's
+        heartbeat name on the factory.
+        """
+        fleet_dir = tmp_path / 'fleet'
+        monkeypatch.delenv('ORCH_UNIT', raising=False)
+        monkeypatch.setenv('ORCH_FLEET_DIR', str(fleet_dir))
+        worker = MagicMock()
+        worker.snapshot.return_value = {'depth': 0}
+        harness._merge_worker = worker
+
+        with caplog.at_level(logging.WARNING):
+            await harness._write_merge_heartbeat()  # must not raise
+
+        assert 'merge heartbeat write failed' in caplog.text
+        assert not fleet_dir.exists(), (
+            f'{fleet_dir} exists, so the refusal ran AFTER filesystem work had '
+            'already begun. write_heartbeat must reject a blank unit name before '
+            'safe_io.atomic_write_text(..., mkdir=True) can create the parent.'
+        )

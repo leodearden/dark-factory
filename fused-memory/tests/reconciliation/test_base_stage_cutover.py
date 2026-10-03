@@ -7,6 +7,7 @@ import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.jcodemunch_launch import JCODEMUNCH_COMMAND, JCODEMUNCH_ENV
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import StageId, Watermark
@@ -14,6 +15,7 @@ from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from reconciliation.consolidator_fixtures import make_consolidator
 
 
 class _StubStage(BaseStage):
@@ -50,29 +52,6 @@ def _make_stage(
         recon_report_port=recon_report_port,
         recon_report_state=recon_report_state,
     )
-    return stage
-
-
-def _make_consolidator(recon_report_port: int = 8003) -> MemoryConsolidator:
-    """Build a MemoryConsolidator with mocked deps for _build_mcp_config tests."""
-    config = ReconciliationConfig()
-    memory_mock = AsyncMock()
-    memory_mock.get_episodes = AsyncMock(return_value=[])
-    memory_mock.mem0 = AsyncMock()
-    memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
-    memory_mock.get_status = AsyncMock(return_value={})
-
-    stage = MemoryConsolidator(
-        StageId.memory_consolidator,
-        memory_mock,
-        AsyncMock(),  # taskmaster
-        AsyncMock(),  # journal
-        config,
-        scope=ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
-        recon_report_port=recon_report_port,
-    )
-    stage.episode_limit = 5
-    stage.memory_limit = 10
     return stage
 
 
@@ -268,7 +247,20 @@ class TestReconStateFallbackToEmpty:
             report = await stage.run([], watermark, [], run_id='run-none')
 
         assert report.items_flagged == [], 'items_flagged must be empty on None assembled'
-        assert report.stats == {}, 'stats must be empty on None assembled'
+        # stats carries ONLY the citation-verification triple, all zero. Task
+        # 2979 hoisted verify_cited_memories into BaseStage.run()'s shared
+        # assembly, and it sets its three counters unconditionally (the
+        # explicit-zero convention) so downstream consumers never need a
+        # .get(..., 0) fallback — including on this empty-report path, where
+        # there are no findings to verify. The claim is report-level, not just
+        # function-level: the only return that bypasses this assembly, the
+        # start_report_failed short-circuit, stamps the same zeroed triple
+        # itself (pinned in TestStartReportErrorHandling).
+        assert report.stats == {
+            'stage1_phantom_citations_dropped': 0,
+            'stage1_citations_verified': 0,
+            'stage1_citation_verification_errors': 0,
+        }, 'stats must carry only the zeroed citation triple on None assembled'
 
     @pytest.mark.asyncio
     async def test_timestamps_still_set_on_none_assembled(self):
@@ -386,8 +378,8 @@ class TestBuildMcpConfigReconReport:
     """_build_mcp_config must inject a recon-report HTTP entry from the configured port."""
 
     def test_recon_report_entry_default_port(self):
-        """recon-report server entry present with default port 8003."""
-        stage = _make_consolidator(recon_report_port=8003)
+        """recon-report server entry present with BaseStage's default port 8003."""
+        stage = make_consolidator()
         mcp_config = stage._build_mcp_config()
         servers = mcp_config['mcpServers']
         assert 'recon-report' in servers, 'recon-report must be in mcpServers'
@@ -396,17 +388,41 @@ class TestBuildMcpConfigReconReport:
 
     def test_recon_report_entry_custom_port(self):
         """recon-report entry uses the port passed at construction, not a hard-coded value."""
-        stage = _make_consolidator(recon_report_port=9999)
+        stage = make_consolidator(recon_report_port=9999)
         mcp_config = stage._build_mcp_config()
         entry = mcp_config['mcpServers']['recon-report']
         assert entry == {'type': 'http', 'url': 'http://127.0.0.1:9999/mcp/'}
 
     def test_existing_entries_preserved(self):
         """fused-memory and jcodemunch entries still present after recon-report injection."""
-        stage = _make_consolidator(recon_report_port=8003)
+        stage = make_consolidator()
         servers = stage._build_mcp_config()['mcpServers']
         assert 'fused-memory' in servers, 'fused-memory entry must remain'
         assert 'jcodemunch' in servers, 'jcodemunch entry must remain'
+
+
+class TestReconJcodemunchLaunchPinned:
+    """The recon-stage jcodemunch entry uses the launch contract in shared/jcodemunch_launch.py."""
+
+    def test_command_matches_shared_constant(self):
+        stage = make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['command'] == JCODEMUNCH_COMMAND
+
+    def test_env_matches_shared_constant(self):
+        """Full dict equality, so a dropped or extra key fails."""
+        stage = make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['env'] == JCODEMUNCH_ENV
+
+    def test_env_is_a_copy_not_the_shared_dict(self):
+        """A caller mutating the returned config must not corrupt the process-wide constant."""
+        stage = make_consolidator()
+        jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
+
+        assert jc['env'] is not JCODEMUNCH_ENV
 
 
 class TestStartReportErrorHandling:
@@ -438,7 +454,16 @@ class TestStartReportErrorHandling:
         assert report.items_flagged == [], (
             'Degraded stage must produce empty items_flagged, not the assembled report'
         )
-        assert report.stats == {}
+        # The degraded early return still stamps the zeroed citation triple: it
+        # is the one path that never reaches BaseStage.run's shared assembly,
+        # so without the stamp it would be the one StageReport missing the
+        # counters, and a consumer indexing report.stats['stage1_*'] would
+        # KeyError on exactly the degraded run it most needs to account for.
+        assert report.stats == {
+            'stage1_phantom_citations_dropped': 0,
+            'stage1_citations_verified': 0,
+            'stage1_citation_verification_errors': 0,
+        }
         # get_assembled_report must NOT have been called (no successful start)
         get_calls = [c for c in state.calls if c[0] == 'get_assembled_report']
         assert get_calls == [], (
@@ -505,7 +530,11 @@ class TestStartReportErrorHandling:
             f'short-circuit broken, was awaited {cli_mock.await_count} time(s)'
         )
         assert result.items_flagged == []
-        assert result.stats == {}
+        assert result.stats == {
+            'stage1_phantom_citations_dropped': 0,
+            'stage1_citations_verified': 0,
+            'stage1_citation_verification_errors': 0,
+        }
         assert result.llm_calls == 0
         assert result.tokens_used == 0
 

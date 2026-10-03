@@ -27,7 +27,9 @@ import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _git_root_helper import make_git_root
 from pydantic import ValidationError
+from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
@@ -40,6 +42,21 @@ from fused_memory.reconciliation.verify import CodebaseVerifier
 def _default_config() -> ReconciliationConfig:
     """ReconciliationConfig with all defaults — suffices for unit tests."""
     return ReconciliationConfig()
+
+
+@pytest.fixture
+def git_root(tmp_path):
+    """A usable per-call codebase root for verify() (task 4722).
+
+    ``verify()`` now takes ``codebase_root`` as a required keyword and refuses
+    a root that does not look like a checkout, so every call below needs a
+    real one.  The assertions in this file are unchanged — it remains task
+    4343's failure-token census guard; only the call shape moved.
+
+    The shape itself comes from the shared ``make_git_root`` helper so this
+    file cannot drift from the other two that build the same thing.
+    """
+    return make_git_root(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +73,7 @@ def _default_config() -> ReconciliationConfig:
     ids=['no_tool_calls', 'max_steps_reached'],
 )
 async def test_verify_agent_failure_emits_warning_and_sentinel_summary(
-    agent_return, caplog
+    agent_return, caplog, git_root
 ):
     """When AgentLoop.run() returns a warning shape, verify() must:
 
@@ -79,7 +96,7 @@ async def test_verify_agent_failure_emits_warning_and_sentinel_summary(
         verifier = CodebaseVerifier(_default_config())
 
         with caplog.at_level(logging.WARNING):
-            result = await verifier.verify(claim='Task X completed')
+            result = await verifier.verify(claim='Task X completed', codebase_root=git_root)
 
     assert result.verdict == 'inconclusive', (
         f'Expected inconclusive but got {result.verdict!r}'
@@ -114,7 +131,7 @@ async def test_verify_agent_failure_emits_warning_and_sentinel_summary(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_verify_agent_failure_non_dict_uses_error_summary(caplog):
+async def test_verify_agent_failure_non_dict_uses_error_summary(caplog, git_root):
     """When AgentLoop.run() returns a non-dict result (e.g. None),
     extract_agent_verdict falls back to error_summary='verify_failed' as the
     token.  verify() must:
@@ -136,7 +153,7 @@ async def test_verify_agent_failure_non_dict_uses_error_summary(caplog):
         verifier = CodebaseVerifier(_default_config())
 
         with caplog.at_level(logging.WARNING):
-            result = await verifier.verify(claim='Task X completed')
+            result = await verifier.verify(claim='Task X completed', codebase_root=git_root)
 
     assert result.verdict == 'inconclusive', (
         f'Expected inconclusive but got {result.verdict!r}'
@@ -175,7 +192,7 @@ async def test_verify_agent_failure_non_dict_uses_error_summary(caplog):
     'origin_token',
     ['cli_output_empty', 'cli_output_unparseable'],
 )
-async def test_verify_failure_token_prefers_cli_warning_origin(origin_token):
+async def test_verify_failure_token_prefers_cli_warning_origin(origin_token, git_root):
     """failure_token must prefer `warning_origin` over the generic `warning`.
 
     The shape below is exactly what AgentLoop.run() now emits for a CLI
@@ -196,7 +213,7 @@ async def test_verify_failure_token_prefers_cli_warning_origin(origin_token):
         MockAgentLoop.return_value = mock_agent_instance
 
         verifier = CodebaseVerifier(_default_config())
-        result = await verifier.verify(claim='Task X completed')
+        result = await verifier.verify(claim='Task X completed', codebase_root=git_root)
 
     assert result.agent_failed is True, (
         f'Expected agent_failed=True but got {result.agent_failed!r}'
@@ -215,7 +232,7 @@ async def test_verify_failure_token_prefers_cli_warning_origin(origin_token):
 
 
 @pytest.mark.asyncio
-async def test_verify_failure_token_falls_back_when_no_origin():
+async def test_verify_failure_token_falls_back_when_no_origin(git_root):
     """With no `warning_origin`, failure_token degrades to the generic token.
 
     Guards that the preference chain DEGRADES rather than blanking the token:
@@ -228,7 +245,7 @@ async def test_verify_failure_token_falls_back_when_no_origin():
         MockAgentLoop.return_value = mock_agent_instance
 
         verifier = CodebaseVerifier(_default_config())
-        result = await verifier.verify(claim='Task X completed')
+        result = await verifier.verify(claim='Task X completed', codebase_root=git_root)
 
     assert result.agent_failed is True
     assert result.failure_token == 'max_steps_reached', (
@@ -249,7 +266,7 @@ async def test_verify_failure_token_falls_back_when_no_origin():
     ],
     ids=['dict', 'int', 'none', 'empty', 'stripped', 'bounded'],
 )
-async def test_verify_failure_token_coerces_malformed_origin(raw_origin, expected_token):
+async def test_verify_failure_token_coerces_malformed_origin(raw_origin, expected_token, git_root):
     """A malformed `warning_origin` must degrade, never raise.
 
     AgentLoop.run() gates the key on its closed CLI_WARNING_ORIGINS vocabulary,
@@ -269,7 +286,7 @@ async def test_verify_failure_token_coerces_malformed_origin(raw_origin, expecte
         MockAgentLoop.return_value = mock_agent_instance
 
         verifier = CodebaseVerifier(_default_config())
-        result = await verifier.verify(claim='Task X completed')
+        result = await verifier.verify(claim='Task X completed', codebase_root=git_root)
 
     assert result.agent_failed is True, (
         f'Expected agent_failed=True but got {result.agent_failed!r}'
@@ -277,6 +294,43 @@ async def test_verify_failure_token_coerces_malformed_origin(raw_origin, expecte
     assert result.failure_token == expected_token, (
         f'Expected failure_token={expected_token!r} for raw origin '
         f'{raw_origin!r} but got {result.failure_token!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_api_refusal_is_an_audited_agent_failure(git_root):
+    """Task 6022: an API usage-policy refusal must reach the census as
+    failure_token='api_refusal', not escape verify() as a RuntimeError.
+
+    The escaping exception is what produced the production 'error' rows that
+    could not be told apart from any other crash.  Patched at the CLI seam
+    (not verify.AgentLoop) so the whole chain is exercised: the shared
+    classifier, agent_loop's refusal branch, run()'s warning_origin, and
+    verify()'s preference chain.
+    """
+    refused = AgentResult(
+        success=False,
+        output=(
+            "API Error: Sonnet 5.5's safeguards flagged this message "
+            '(https://www.anthropic.com/legal/aup).'
+        ),
+        subtype='success',
+        stop_reason='refusal',
+        session_id='sess-r',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = refused
+        verifier = CodebaseVerifier(_default_config())
+        result = await verifier.verify(claim='Task X completed', codebase_root=git_root)
+
+    assert result.verdict == 'inconclusive'
+    assert result.agent_failed is True
+    assert result.failure_token == 'api_refusal', (
+        f"Expected failure_token='api_refusal' but got {result.failure_token!r}"
     )
 
 
@@ -339,7 +393,7 @@ class TestFailureFieldsCannotDesync:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_verify_success_path_preserved(caplog):
+async def test_verify_success_path_preserved(caplog, git_root):
     """When AgentLoop.run() returns a terminal verification_complete dict,
     verify() must preserve all fields and emit NO WARNING.
 
@@ -368,7 +422,7 @@ async def test_verify_success_path_preserved(caplog):
         verifier = CodebaseVerifier(_default_config())
 
         with caplog.at_level(logging.WARNING):
-            result = await verifier.verify(claim='Feature X was shipped')
+            result = await verifier.verify(claim='Feature X was shipped', codebase_root=git_root)
 
     assert result.verdict == 'confirmed'
     assert result.summary == 'looks good'

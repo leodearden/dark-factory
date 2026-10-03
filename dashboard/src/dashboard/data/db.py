@@ -16,41 +16,16 @@ from pathlib import Path
 from typing import TypeVar
 
 import aiosqlite
+from shared.asyncio_tasks import track_task
 
 logger = logging.getLogger(__name__)
 
 _T = TypeVar('_T')
 
-def track_task(task: asyncio.Task, *registries: set[asyncio.Task]) -> None:
-    """Keep a fire-and-forget *task* alive in every *registries* set until it ends.
-
-    The event loop holds only a WEAK reference to a Task, so one that nothing
-    else references can be garbage-collected mid-flight; membership in a
-    registry is what supplies the strong reference.  The single done-callback
-    installed here removes the task from ALL the registries and consumes its
-    exception ONCE, so asyncio does not log "exception was never retrieved".
-
-    Shared (rather than re-spelled per call site) because this repo now has
-    three of these registries — ``_PENDING_CLOSES``, ``DbPool._pending_closes``
-    and ``_ABANDONED_PROBES`` in dashboard/app.py — and two of them track the
-    SAME task, which previously meant two callbacks running the identical three
-    lines and retrieving the same exception twice.
-    """
-    for registry in registries:
-        registry.add(task)
-
-    def _release(finished: asyncio.Task) -> None:
-        for registry in registries:
-            registry.discard(finished)
-        if not finished.cancelled():
-            finished.exception()  # consume so "never retrieved" isn't logged
-
-    task.add_done_callback(_release)
-
 
 # Fire-and-forget close() tasks for connections that landed with no owner (see
 # DbPool._adopt_or_close).  Registry semantics and why the strong reference is
-# needed: see track_task above.  Mirrors _ABANDONED_PROBES in dashboard/app.py.
+# needed: shared/src/shared/asyncio_tasks.py::track_task.
 _PENDING_CLOSES: set[asyncio.Task] = set()
 
 
@@ -395,8 +370,8 @@ class DbPool:
         loop = asyncio.get_running_loop()
         close_task = loop.create_task(self._close_once(conn, path))
         # Registered in BOTH sets by one call — see the __init__ comment for why
-        # neither is redundant, and track_task for why one shared done-callback
-        # replaced the two identical ones this used to install.
+        # neither is redundant, and shared/src/shared/asyncio_tasks.py::track_task
+        # for why one done-callback serves both.
         track_task(close_task, _PENDING_CLOSES, self._pending_closes)
 
     @property

@@ -7,33 +7,20 @@ Follows the idiom established in test_tab_curator.py and test_index_html.py.
 
 from __future__ import annotations
 
-import html.parser
 import re
 
 import pytest
-from starlette.testclient import TestClient
+from _dashboard_helpers import (
+    assert_script_loads_before,
+    extract_df_data_block,
+    extract_function_body,
+    find_script_position,
+    strip_js_comments,
+)
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope='module')
-def _client():
-    from dashboard.app import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-@pytest.fixture(scope='module')
-def data_js_body(_client):
-    return _client.get('/static/redux/data.js').text
-
-
-@pytest.fixture(scope='module')
-def tab_escalations_jsx_body(_client):
-    return _client.get('/static/redux/tab_escalations.jsx').text
 
 
 @pytest.fixture(scope='module')
@@ -45,194 +32,13 @@ def tab_escalations_jsx_code(tab_escalations_jsx_body):
     of the identifiers the render code also names, so a whole-file substring
     grep is satisfied by a MENTION — delete the render site, leave the comment,
     and the assertion stays green.
-
-    Safe to strip naively: the source contains no `//` inside a string literal
-    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_escalations_jsx_body)
-
-
-@pytest.fixture(scope='module')
-def app_jsx_body(_client):
-    return _client.get('/static/redux/app.jsx').text
-
-
-@pytest.fixture(scope='module')
-def shell_jsx_body(_client):
-    return _client.get('/static/redux/shell.jsx').text
-
-
-@pytest.fixture(scope='module')
-def index_html_body(_client):
-    return _client.get('/static/redux/index.html').text
-
-
-# ---------------------------------------------------------------------------
-# Helper: extract a named seed block from window.DF_DATA (brace-aware)
-# ---------------------------------------------------------------------------
-
-
-def _extract_df_data_block(src: str, key: str) -> str:
-    """Return the body of the ``<key>: { ... }`` seed object, braces included.
-
-    Locates ``<key>:`` followed by ``{`` (allowing arbitrary whitespace), then
-    walks forward counting ``{``/``}`` to find the matching close brace.
-    This is brace-aware: a simple regex ``[^}]*`` would stop at the first
-    nested ``}`` and miss later keys.
-    Returns the empty string if no matching block is found.
-
-    Note: the brace-depth walk does not skip ``{``/``}`` inside JS string
-    literals.  This is acceptable because the data.js seed block uses simple
-    numeric/array values and does not embed brace characters inside quoted
-    strings.
-    """
-    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
-    if m is None:
-        return ''
-    start = m.end() - 1  # index of the opening `{`
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
+    return strip_js_comments(tab_escalations_jsx_body)
 
 
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware)
 # ---------------------------------------------------------------------------
-
-
-def _extract_function_body(src: str, fn_name: str) -> str:
-    """Return the body block of a ``function <fn_name>(`` declaration, braces included.
-
-    Uses the same brace-depth walk as ``_extract_df_data_block``.  Only matches
-    named ``function`` declarations — not arrow functions or class methods.
-    Returns the empty string if the function is not found.
-
-    Paren-depth walks past the parameter list before looking for the body's
-    opening ``{`` — a destructured parameter (``function Foo({ a, b }) {``)
-    contains its own ``{``/``}`` pair *inside* the parameter list, so naively
-    taking the first ``{`` after the opening ``(`` would return just the
-    destructuring pattern (e.g. ``{ a, b }``) instead of the function body.
-    """
-    m = re.search(rf'\bfunction\s+{re.escape(fn_name)}\s*\(', src)
-    if m is None:
-        return ''
-    paren_depth = 1
-    i = m.end()
-    while i < len(src) and paren_depth > 0:
-        if src[i] == '(':
-            paren_depth += 1
-        elif src[i] == ')':
-            paren_depth -= 1
-        i += 1
-    if paren_depth != 0:
-        return ''
-    start = src.find('{', i)
-    if start == -1:
-        return ''
-    depth = 0
-    for j in range(start, len(src)):
-        c = src[j]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : j + 1]
-    return ''
-
-
-# ---------------------------------------------------------------------------
-# Load-order helpers (copied from test_index_html.py)
-# ---------------------------------------------------------------------------
-
-
-class _ScriptTagCollector(html.parser.HTMLParser):
-    """Collects the attribute dicts for every <script> start-tag encountered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.script_attrs: list[dict[str, str | None]] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag == 'script':
-            self.script_attrs.append(dict(attrs))
-
-
-def _find_script_position(
-    body: str, src_prefix: str
-) -> tuple[int, dict[str, str | None]] | None:
-    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
-    starts with ``src_prefix``, or ``None`` if no such tag exists.
-    """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for i, attrs in enumerate(collector.script_attrs):
-        if (attrs.get('src') or '').startswith(src_prefix):
-            return i, attrs
-    return None
-
-
-def _assert_script_loads_before(
-    body: str,
-    before_src_prefix: str,
-    after_src_prefix: str,
-    before_label: str,
-    after_label: str,
-    consumer_note: str = '',
-) -> None:
-    """Assert that the script for ``before_src_prefix`` loads BEFORE the
-    script for ``after_src_prefix`` in ``body``.  Combines a
-    defer/async/type=module false-pass guard with the document-order
-    position comparison.
-    """
-    before_result = _find_script_position(body, before_src_prefix)
-    assert before_result is not None, (
-        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
-    before_pos, before_attrs = before_result
-    before_src = before_attrs.get('src')
-
-    after_result = _find_script_position(body, after_src_prefix)
-    assert after_result is not None, (
-        f'<script src="{after_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {before_label}.'
-    )
-    after_pos, after_attrs = after_result
-
-    # Both tags must be classic synchronous scripts — otherwise document order
-    # diverges from execution order and the position comparison below is moot.
-    for _label, _attrs in [
-        (before_label, before_attrs),
-        (after_label, after_attrs),
-    ]:
-        assert 'defer' not in _attrs, (
-            f'{_label} has a defer attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert 'async' not in _attrs, (
-            f'{_label} has an async attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert (_attrs.get('type') or '').lower() != 'module', (
-            f'{_label} has type="module"; ES modules are deferred by default, '
-            f'so document order no longer implies execution order.'
-        )
-
-    assert before_pos < after_pos, (
-        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
-        f'BEFORE {after_label} (position {after_pos}). '
-        f'{consumer_note}'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +62,7 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
         "data.js does not reference 'ESCALATIONS' — add it as the mapped key "
         "for '/api/v2/dashboard/escalations' in endpointsFor."
     )
-    seed_block = _extract_df_data_block(data_js_body, 'ESCALATIONS')
+    seed_block = extract_df_data_block(data_js_body, 'ESCALATIONS')
     assert seed_block, (
         'data.js does not contain an `ESCALATIONS: { ... }` seed block — '
         'add the initializer to the window.DF_DATA assignment so applyKey has '
@@ -272,9 +78,9 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
         'add it to the window.DF_DATA ESCALATIONS initializer in data.js.'
     )
     # summary sub-block: check by_level and by_status are nested under summary.
-    summary_block = _extract_df_data_block(seed_block, 'summary')
+    summary_block = extract_df_data_block(seed_block, 'summary')
     assert summary_block, (
-        'ESCALATIONS seed summary block not found via _extract_df_data_block — '
+        'ESCALATIONS seed summary block not found via extract_df_data_block — '
         'ensure summary is an object, not a scalar.'
     )
     assert re.search(r'\bby_level\s*:', summary_block), (
@@ -449,7 +255,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     _TAB_ESC_PREFIX = '/static/redux/tab_escalations.jsx'
 
     # (a) tab_escalations.jsx script tag must exist
-    result = _find_script_position(index_html_body, _TAB_ESC_PREFIX)
+    result = find_script_position(index_html_body, _TAB_ESC_PREFIX)
     assert result is not None, (
         f'No <script src="{_TAB_ESC_PREFIX}..."> tag found in index.html — '
         'add it after tabs.jsx and before app.jsx.'
@@ -470,7 +276,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     )
 
     # (b) Loads after data.js
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/data.js',
         _TAB_ESC_PREFIX,
@@ -480,7 +286,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     )
 
     # (c) Loads after shell.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/shell.jsx',
         _TAB_ESC_PREFIX,
@@ -490,7 +296,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     )
 
     # (d) Loads after tabs.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/tabs.jsx',
         _TAB_ESC_PREFIX,
@@ -500,7 +306,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     )
 
     # (e) Loads before app.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TAB_ESC_PREFIX,
         '/static/redux/app.jsx',
@@ -545,11 +351,7 @@ def test_tab_escalations_task_sort_and_expand_collapse(tab_escalations_jsx_body:
     )
     # Numeric-aware comparator uses Number() — scoped to the sortRows function body
     # so we don't get a false pass from Number() appearing in an unrelated context.
-    sort_fn = _extract_function_body(tab_escalations_jsx_body, 'sortRows')
-    assert sort_fn, (
-        'tab_escalations.jsx does not define a `function sortRows(` — '
-        'add a named sortRows function to sort escalation rows by numeric task_id.'
-    )
+    sort_fn = extract_function_body(tab_escalations_jsx_body, 'sortRows')
     assert 'Number(' in sort_fn, (
         "sortRows function does not use Number( for numeric task_id conversion — "
         'add `Number(a.task_id)` / `Number(b.task_id)` for numeric-aware sort.'
@@ -895,11 +697,7 @@ def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) 
 
     # (3) Scoped to the EscalationStatStrip body: reads the analytics payload,
     # renders StatTile.
-    strip_fn = _extract_function_body(body, 'EscalationStatStrip')
-    assert strip_fn, (
-        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
-        'add the component definition.'
-    )
+    strip_fn = extract_function_body(body, 'EscalationStatStrip')
     assert 'ESCALATION_ANALYTICS' in strip_fn, (
         'EscalationStatStrip does not reference ESCALATION_ANALYTICS — it should read '
         'the analytics payload (e.g. `analytics || DF.ESCALATION_ANALYTICS`).'
@@ -910,10 +708,7 @@ def test_tab_escalations_strip_mounted_and_wired(tab_escalations_jsx_body: str) 
 
     # (4) Scoped to the EscalationsTab body: strip mounts before the level-filter
     # controls (top-of-tab placement).
-    tab_fn = _extract_function_body(body, 'EscalationsTab')
-    assert tab_fn, (
-        'tab_escalations.jsx does not define a `function EscalationsTab(` body.'
-    )
+    tab_fn = extract_function_body(body, 'EscalationsTab')
     strip_idx = tab_fn.find('<EscalationStatStrip')
     assert strip_idx != -1, (
         'EscalationsTab does not render <EscalationStatStrip — mount it as the first '
@@ -949,11 +744,7 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
     (d) churn — references churn_daily.
     (e) at least four <C.StatTile tiles are rendered.
     """
-    strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
-    assert strip_fn, (
-        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body — '
-        'add the component definition.'
-    )
+    strip_fn = extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
 
     # (a) benign-rate substrate
     assert 'flow_daily' in strip_fn, (
@@ -1026,12 +817,7 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
     body = tab_escalations_jsx_body
 
     # (1) windowCutoffDate helper, generatedAt-anchored, no Date.now()
-    cutoff_fn = _extract_function_body(body, 'windowCutoffDate')
-    assert cutoff_fn, (
-        'tab_escalations.jsx does not define `function windowCutoffDate(` — add a '
-        'local generated_at-anchored cutoff helper (copy the pattern from '
-        'tab_escalation_analytics.jsx).'
-    )
+    cutoff_fn = extract_function_body(body, 'windowCutoffDate')
     assert 'generatedAt' in cutoff_fn, (
         'windowCutoffDate does not reference `generatedAt` in its body — it must '
         'anchor the cutoff to the payload clock, not the browser clock.'
@@ -1042,10 +828,7 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
     )
 
     # (2)/(3) EscalationStatStrip anchors to generated_at, never Date.now()
-    strip_fn = _extract_function_body(body, 'EscalationStatStrip')
-    assert strip_fn, (
-        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
-    )
+    strip_fn = extract_function_body(body, 'EscalationStatStrip')
     assert 'generated_at' in strip_fn, (
         'EscalationStatStrip does not reference generated_at — anchor the window '
         'cutoff to analytics.generated_at.'
@@ -1075,38 +858,45 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
 
 def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx_body: str) -> None:
     """The strip must feed trend sparklines for the three series-backed tiles
-    (benign-rate, esc-per-done, churn) via StatTile's spark prop, and
+    (benign-rate, esc-per-done, churn) via StatTile's history prop, and
     churn-24h must be RETAINED — not the first tile dropped — per the
     open-question-4 decision (all four tiles kept; responsive grid instead).
 
+    The prop was named `spark` until task 5588 renamed it `history`: the series
+    is the tile's PAST, and `spark` named the drawing rather than the data,
+    which reads badly beside the `datum` carrying the tile's present value.
+
     Asserts:
-    (1) at least three `spark=` props are passed to <C.StatTile within the
+    (1) at least three `history=` props are passed to <C.StatTile within the
         EscalationStatStrip body (one each for the series-backed tiles).
-    (2) churn-24h is retained: a `spark=` occurs within ~200 chars of a churn
+    (2) churn-24h is retained: a `history=` occurs within ~200 chars of a churn
         tile label / churn_daily reference (co-occurrence, not bare
-        presence — a stray spark= elsewhere wouldn't prove churn has one).
+        presence — a stray history= elsewhere wouldn't prove churn has one).
     """
-    strip_fn = _extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
-    assert strip_fn, (
-        'tab_escalations.jsx does not define a `function EscalationStatStrip(` body.'
-    )
+    strip_fn = extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
 
-    # (1) at least three spark= props within <C.StatTile tiles
-    spark_count = len(re.findall(r'<C\.StatTile[^>]*\bspark=', strip_fn))
+    # (1) at least three history= props within <C.StatTile tiles.
+    #
+    # Split at each tile and read only as far as that tile's `/>`, rather than
+    # the `<C\.StatTile[^>]*` this used to be: every tile now carries a `format`
+    # callback, and an arrow function puts a `>` inside the tag, which truncated
+    # the old class mid-prop and read every tile as series-less.
+    tiles = re.split(r'(?=<C\.StatTile\b)', strip_fn)[1:]
+    spark_count = sum(1 for tile in tiles if 'history=' in tile.split('/>')[0])
     assert spark_count >= 3, (
-        f'EscalationStatStrip passes spark= to only {spark_count} <C.StatTile tiles, '
-        'expected >= 3 (benign rate, esc/done, and churn are series-backed).'
+        f'EscalationStatStrip passes history= to only {spark_count} <C.StatTile '
+        'tiles, expected >= 3 (benign rate, esc/done, and churn are series-backed).'
     )
 
-    # (2) churn-24h retained: spark= co-occurs near a churn reference
+    # (2) churn-24h retained: history= co-occurs near a churn reference
     found_churn_spark = False
     for m in re.finditer(r'churn', strip_fn, re.IGNORECASE):
         window = strip_fn[max(0, m.start() - 200): m.end() + 200]
-        if 'spark=' in window:
+        if 'history=' in window:
             found_churn_spark = True
             break
     assert found_churn_spark, (
-        'No `spark=` prop found within ~200 chars of a churn tile label / '
+        'No `history=` prop found within ~200 chars of a churn tile label / '
         'churn_daily reference — churn-24h must be RETAINED with its own '
         'sparkline per the open-question-4 decision (keep all four tiles).'
     )
@@ -1183,8 +973,7 @@ def test_focus_handoff_retries_then_reports_a_miss(
     #     module-scope seed capture reads `DF.ESCALATIONS` too, and it is a
     #     different thing — the frozen pre-fetch reference, which correctly
     #     must NOT appear in the deps.
-    tab_body = _extract_function_body(code, 'EscalationsTab')
-    assert tab_body, 'could not extract the EscalationsTab body.'
+    tab_body = extract_function_body(code, 'EscalationsTab')
     esc_local = re.search(r'const\s+(\w+)\s*=\s*DF\.ESCALATIONS', tab_body)
     assert esc_local is not None, (
         'EscalationsTab must read `DF.ESCALATIONS` into a local.'
@@ -1277,8 +1066,7 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
 
     # (a) data.js records the marker inside applyKey — the one place that knows
     #     a real server value was applied.
-    apply_body = _extract_function_body(data_js_body, 'applyKey')
-    assert apply_body, 'could not extract data.js\'s applyKey body.'
+    apply_body = extract_function_body(data_js_body, 'applyKey')
     marker = re.search(r'([\w.$]+)\[\s*key\s*\]\s*=\s*true', apply_body)
     assert marker is not None, (
         'data.js\'s applyKey records no per-key first-success marker '
@@ -1309,8 +1097,7 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
     )
 
     # (d) tab_escalations.jsx reads THAT marker, keyed on its own payload key.
-    loaded_body = _extract_function_body(code, 'escalationsLoaded')
-    assert loaded_body, 'could not extract the escalationsLoaded body.'
+    loaded_body = extract_function_body(code, 'escalationsLoaded')
     assert leaf in loaded_body, (
         f'escalationsLoaded does not read data.js\'s `{leaf}` marker registry: '
         f'{loaded_body.strip()!r}'

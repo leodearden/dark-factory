@@ -1,0 +1,3494 @@
+"""Post-merge gates, finalize, and reason-prefix constants (MQ-refactor task β).
+
+The plan-target / plan-files-touched / post-merge-equivalence /
+post-merge-pyright gates, the advance-finalize and advance-failure-mapping
+functions, the ``merge_attempt`` event emitter they share with the worker,
+and their supporting types and reason-prefix constants.
+
+Verify EXECUTION (``_run_post_merge_verify`` and its cluster) stays in the
+worker — this module owns gate POLICY, not verify execution (PRD Open Q1).
+Where a gate needs a worker function, the worker injects it: the re-verify
+through ``_reverify_rebased_tree``'s *run_post_merge_verify*, the γ2
+auto-chain through :class:`_GenerationChainContext`.  This module never
+imports the worker.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import logging
+import os
+import posixpath
+import re
+import tempfile
+import time
+from collections.abc import Awaitable, Callable, Collection
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+
+from orchestrator.event_store import EventStore, EventType
+from orchestrator.git_ops import _INDEX_LOCK_STALE_FLOOR_S, GitOps, _run
+from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.merge_lane.types import (
+    MergeOutcome,
+    MergeRequest,
+    OutcomeKind,
+    TerminalOutcomeRetention,
+)
+from orchestrator.verify import VerifyResult, run_verification
+
+if TYPE_CHECKING:
+    from orchestrator.config import ModuleConfig, OrchestratorConfig
+
+logger = logging.getLogger('orchestrator.merge_queue')
+
+
+AUTO_CHAIN_GENERATIONS_ENABLED: bool = False
+"""Kill-switch for the γ2 generation auto-chaining producer.
+
+MUST remain False until the sole remaining γ3 precondition lands:
+  1. ✓ DONE (task/1717): The workflow.py 'superseded' consumer handler — the
+     single-task merge consumer in ``_submit_to_merge_queue`` now parks
+     'superseded' outcomes as merge-deferred via ``_handle_superseded`` instead
+     of falling through to ``_mark_blocked`` with an empty reason.
+  2. The gen-(n+1) registry slot handoff via ATTACH_AND_CHAIN (re-acquiring the
+     branch slot in InFlightMergeRegistry for the chained request without tripping
+     the gen-1 done-callback double-release, and threading TerminalOutcomeRetention
+     from the harness into the workers — harness.py:3238 omits both today).
+
+While False, _finalize_advanced_merge ignores chain_ctx on equivalence failures
+and returns 'blocked' exactly as before γ2, so no 'superseded' outcome can reach
+the workflow consumer."""
+
+
+# Maximum number of characters to include in the detail field of a
+# ``PostMergePyrightResult`` — keeps the blocked reason string in the
+# escalation payload under reasonable size limits.
+_POST_MERGE_PYRIGHT_MAX_DETAIL = 2000
+
+
+async def _run_unscoped_typechecks(
+    worktree: Path,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    *,
+    block_on_timeout: bool,
+    task_id: str | None = None,
+) -> PostMergePyrightResult:
+    """Run each module's ``type_check_command`` unscoped against a caller-owned worktree.
+
+    This helper operates on a worktree supplied by the caller — it does **not**
+    create or clean up any worktree itself.
+
+    Args:
+        worktree: Path to the worktree to run type-checks in.  Caller owns it.
+        config: Orchestrator config (passed through to ``run_verification``).
+        module_configs: List of module configs.  Modules without a
+            ``type_check_command`` are silently skipped.
+        block_on_timeout: When ``True``, a timed-out module is appended to
+            *both* ``timed_out_subprojects`` and ``failing_subprojects``, making
+            the result ``broken`` (fail-closed, for the pre-advance gate).
+            When ``False``, a timed-out module is appended only to
+            ``timed_out_subprojects`` (fail-open, for the post-advance check).
+        task_id: Optional task identifier for log messages.
+
+    Returns:
+        :class:`PostMergePyrightResult` with the classification of each
+        module's type-check outcome.
+    """
+    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    if not active:
+        return PostMergePyrightResult()
+
+    async def _run_one(mc: ModuleConfig) -> tuple[ModuleConfig, VerifyResult]:
+        # Run only the type-check command verbatim (unscoped).
+        # Null out test/lint so run_verification skips them (None => skip).
+        # is_merge_verify=True forces cold semantics; the per-command timeout
+        # used is `merge_verify_cold_command_timeout_secs` (config default 7200 s)
+        # if set, falling back to `verify_cold_command_timeout_secs` then warm.
+        type_only_mc = dataclasses.replace(mc, test_command=None, lint_command=None)
+        return mc, await run_verification(
+            worktree, config, type_only_mc,
+            max_retries=0, is_merge_verify=True, role='merge',
+        )
+
+    # Run all subproject type-checks concurrently to minimise wall-clock
+    # impact on the merge queue's push_main delay.
+    pairs = await asyncio.gather(*(_run_one(mc) for mc in active))
+
+    failing_subprojects: list[str] = []
+    timed_out_subprojects: list[str] = []
+    detail_parts: list[str] = []
+
+    for mc, verify in pairs:
+        if verify.timed_out:
+            timed_out_subprojects.append(mc.prefix)
+            if block_on_timeout:
+                failing_subprojects.append(mc.prefix)
+            continue
+
+        if not verify.passed:
+            failing_subprojects.append(mc.prefix)
+            # Collect bounded detail from the FIRST failing subproject only
+            # (matches PostMergePyrightResult.detail docstring).
+            if not detail_parts:
+                raw = verify.failure_report() or verify.type_output or ''
+                if isinstance(raw, str) and raw:
+                    detail_parts.append(raw[:_POST_MERGE_PYRIGHT_MAX_DETAIL])
+
+    detail = '\n'.join(detail_parts)
+    return PostMergePyrightResult(
+        failing_subprojects=failing_subprojects,
+        timed_out_subprojects=timed_out_subprojects,
+        detail=detail,
+    )
+
+
+def _elapsed_ms(start: float | None) -> int | None:
+    """Milliseconds since *start* (a ``time.monotonic()`` value).
+
+    Returns ``None`` when *start* is ``None`` so callers can safely forward
+    the result to ``event_store.emit(duration_ms=...)`` without special-casing.
+    """
+    if start is None:
+        return None
+    return round((time.monotonic() - start) * 1000)
+
+
+# Bound on how many SHAs / paths a single merge_attempt row spells out (task
+# 3178). Driver: reify 5566 attempt-2 cited 22 SHAs touching 7 files, and an
+# unbounded list would bloat runs.db rows. The TRUE count is persisted alongside
+# each truncated slice as ``<key>_total``, so the bounding is never silent.
+#
+# Deliberately LARGER than merge_disposition._MAX_LOGGED_EVIDENCE_ITEMS (5),
+# which bounds the same bundle on the degrade WARNING: that cap is tuned for
+# one-line log readability, this one for runs.db row size — a census querying
+# these rows wants more of the citation than a human grepping a log line does.
+# The two truncation points differ on purpose; neither is drift from the other.
+_MAX_EVENT_EVIDENCE_ITEMS = 10
+
+
+def _emit_merge_attempt(
+    event_store: EventStore | None,
+    task_id: str,
+    outcome: OutcomeKind,
+    *,
+    attempt: int | None = None,
+    duration_ms: int | None = None,
+    train_id: str | None = None,
+    member_task_ids: list[str] | None = None,
+    disposition: MergeFailureDisposition | None = None,
+    origin_host: Literal['local', 'remote'] | None = None,
+    probe_host: Literal['local', 'remote'] | None = None,
+    skew_evidence: SkewEvidence | None = None,
+) -> None:
+    """Emit a ``merge_attempt`` event for the given outcome.
+
+    Note: certain terminal outcomes are intentionally NOT emitted here —
+    specifically ``blocked`` outcomes from ``not merge_result.success`` paths
+    (e.g. merge infrastructure failures unrelated to conflicts) and from
+    ``advance_main`` non-CAS failure codes (``not_descendant``, ``contaminated``,
+    ``stash_failed``).  These are rare infrastructure errors rather than
+    normal merge-latency outcomes and omitting them keeps dashboard latency
+    percentiles free of unbounded outliers from external failures.
+
+    ``blocked`` outcomes that carry a specific diagnostic outcome code
+    (e.g. ``dropped_plan_targets``, ``cas_exhausted``) ARE emitted here;
+    only ``blocked`` outcomes from infrastructure failures are not.
+
+    When called from ``_do_train_merge``, *train_id* and *member_task_ids* are
+    set so downstream reconciliation can correlate ``merge_attempt`` rows with
+    the specific train — not just the tip task_id.
+
+    *disposition* is the optional merge-skew attribution verdict (task 2381 α
+    ``MergeFailureDisposition``, e.g. ``INTEGRATION_SKEW``/``BRANCH_BUG``).
+    When supplied, its ``.value`` is stored under the ``'disposition'`` payload
+    key so ``digest.merge_disposition_counts`` can separate integration-skew
+    failures from branch bugs/indeterminate in runs.db stats (task 2384 γ,
+    mechanism M2). When omitted (the default), no ``'disposition'`` key is
+    added — existing callers' payloads stay byte-identical. Production
+    call sites are threaded by task 2383 β; this parameter's mechanism is
+    proven independently by a direct-emit unit test.
+
+    *origin_host* / *probe_host* are the optional HOST-AFFINITY placement
+    record for a ``main_health_red`` outcome (task 2565): ``origin_host`` is
+    ``'local'``/``'remote'`` depending on which host ran the failing
+    post-merge verify that triggered the main-health probe; ``probe_host``
+    is always ``'local'`` — the probe itself never runs remote-affine (see
+    :func:`verify_failure_is_preexisting_on_main`'s LEASE-SAFETY &
+    HOST-AFFINITY contract). Recording both makes the deliberate local-only
+    placement decision OBSERVABLE in telemetry even when the triggering
+    verify ran remote. When omitted (the default; every non-main-health-red
+    call site), neither key is added — existing callers' payloads stay
+    byte-identical.
+
+    *skew_evidence* is the optional :class:`SkewEvidence` bundle GATHERED by
+    ``classify_merge_failure_disposition`` (task 3178; motivation in
+    merge_disposition's module docstring, THE I7 INCIDENT). When supplied, its
+    ``failing_tests`` / ``implicated_commits`` / ``overlap_files`` are written as
+    json-serialisable lists, each BOUNDED at ``_MAX_EVENT_EVIDENCE_ITEMS`` with
+    the true length recorded under ``<key>_total`` — a silent cap would let a
+    reader infer "3 commits were cited" from a truncated row, so the truncation
+    is made self-describing. When omitted or None (every pre-3178 call site), no
+    key is added — existing callers' payloads stay byte-identical.
+
+    This helper is deliberately disposition-AGNOSTIC about evidence: it writes
+    whatever bundle it is handed, and deciding *when* to emit at all is the
+    caller's guard. That is what lets one code path serve both the
+    ``integration_skew`` row and the ADJUDICATED ``indeterminate`` row.
+    """
+    if event_store is not None:
+        data: dict = {'outcome': outcome}
+        if attempt is not None:
+            data['attempt'] = attempt
+        if train_id is not None:
+            data['train_id'] = train_id
+        if member_task_ids is not None:
+            data['member_task_ids'] = member_task_ids
+        if disposition is not None:
+            data['disposition'] = disposition.value
+        if origin_host is not None:
+            data['origin_host'] = origin_host
+        if probe_host is not None:
+            data['probe_host'] = probe_host
+        if skew_evidence is not None:
+            for key, items in (
+                ('failing_tests', skew_evidence.failing_tests),
+                ('implicated_commits', skew_evidence.implicated_commits),
+                ('overlap_files', skew_evidence.overlap_files),
+            ):
+                data[key] = list(items[:_MAX_EVENT_EVIDENCE_ITEMS])
+                # Recorded unconditionally: a reader never has to know the cap
+                # to tell a short citation from a truncated one.
+                data[f'{key}_total'] = len(items)
+        event_store.emit(
+            EventType.merge_attempt, task_id=task_id, phase='merge',
+            data=data, duration_ms=duration_ms,
+        )
+
+
+#: Bounded FIFO of main-tip SHAs this process's merge queue itself landed —
+#: i.e. the main tips a GREEN gate run has actually been observed on.
+#:
+#: Written at the single clean-landing return of :func:`_finalize_advanced_merge`
+#: (shared by SpeculativeMergeWorker's CAS advance and the train pipeline), read
+#: by :func:`_reverify_rebased_tree` to decide whether footprint-disjointness may
+#: be trusted (see :func:`_disjoint_skip_blockers`).
+#:
+#: Process-global rather than worker-owned on purpose: there is exactly one merge
+#: queue per orchestrator process, both landing paths funnel through
+#: ``_finalize_advanced_merge``, and the alternative (threading a handle through
+#: the module-level finalize/advance helpers and the ``_TrainMergeHost`` protocol)
+#: would fan the same one fact out across four signatures.  Same shape as
+#: ``verify._suppressed_flake_records`` and ``MergeProvenance``'s process-global
+#: facade.
+#:
+#: NOT durable, and deliberately so: after a restart the set is empty, every
+#: rebase-under-drift re-verifies, and the registry refills from the first
+#: landing onward.  Empty means "I have not seen this tip go green", which is
+#: the fail-SAFE answer — the same direction ``_OVERLAP_GIT_ERROR_SENTINEL``
+#: fails.
+_QUEUE_VERIFIED_MAIN_TIPS: list[str] = []
+
+#: Cap on :data:`_QUEUE_VERIFIED_MAIN_TIPS`.  Only the most recent tips can ever
+#: be a rebase target (a rebase is onto CURRENT main), so a short window is
+#: sufficient; the bound exists so a long-lived process cannot grow the list
+#: without limit.
+_QUEUE_VERIFIED_MAIN_TIPS_CAP = 64
+
+
+def note_queue_verified_main_tip(sha: str) -> None:
+    """Record *sha* as a main tip this queue landed after a green gate run."""
+    if not sha:
+        return
+    if sha in _QUEUE_VERIFIED_MAIN_TIPS:
+        return
+    _QUEUE_VERIFIED_MAIN_TIPS.append(sha)
+    del _QUEUE_VERIFIED_MAIN_TIPS[:-_QUEUE_VERIFIED_MAIN_TIPS_CAP]
+
+
+def main_tip_is_queue_verified(sha: str) -> bool:
+    """True iff *sha* is a main tip this queue landed after a green gate run."""
+    return bool(sha) and sha in _QUEUE_VERIFIED_MAIN_TIPS
+
+
+@dataclass
+class DropGuardResult:
+    """Structured return value from :func:`_check_plan_targets_in_tree`.
+
+    Attributes:
+        dropped: Paths present on task HEAD but absent from the merge
+            commit — i.e. files the merger discarded.  Empty list means
+            the merge preserved everything the task branch produced.
+    """
+
+    dropped: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PlanFilesTouchedResult:
+    """Structured return value from :func:`_check_plan_files_touched_in_branch`.
+
+    Attributes:
+        not_touched: Plan-file entries that the branch's history did NOT
+            touch.  Non-empty means the architect declared work that the
+            branch never actually delivered.  Empty list means every plan
+            entry is covered by some commit on the branch.
+        missing_from_tree: Declared entries that do NOT exist in the branch
+            tree at ``branch_head`` and for which no rename resolved.
+            ALWAYS a subset of ``not_touched`` (a stale entry is reported in
+            both), so fail-closed behaviour and every existing
+            ``not_touched``-only consumer are unchanged.  A non-empty value
+            means the declared PATH is stale — renamed away or never created
+            — NOT that the branch under-delivered: the touched-set was never
+            consulted for these entries, so no claim about the branch's
+            commits can be made from them.  Entries whose absence could not
+            be measured (a git error on the existence probe) are deliberately
+            NOT listed here; they land in ``not_touched`` only.  Entries that
+            RESOLVED are likewise never listed here, and safely so: a
+            resolution's target is always verified to exist at
+            ``branch_head`` (see :func:`_resolve_renamed_plan_path`), so the
+            file is genuinely present under a known new name.
+        resolved_renames: Declared entry → the current path it resolved to,
+            recorded whether or not that resolved path was touched, as the
+            gate's audit trail.  Keyed by the ORIGINAL declared string (the
+            architect's spelling, pre-normalization) so the diagnostic names
+            exactly what plan.json says.  A resolution alone never passes the
+            gate — the resolved path must additionally be in the touched set.
+    """
+
+    not_touched: list[str] = field(default_factory=list)
+    missing_from_tree: list[str] = field(default_factory=list)
+    resolved_renames: dict[str, str] = field(default_factory=dict)
+
+
+DROPPED_PLAN_TARGETS_REASON_PREFIX = 'Merge commit is missing plan target files'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the drop-guard
+detects work on the task tip that the merge commit dropped.  Workflow-side
+short-circuits use this prefix to route the outcome straight to L1 without
+invoking the steward (the gate fires only on real merger drops post-rewrite,
+which is the human-judgement case the gate was built for)."""
+
+
+PLAN_FILES_NOT_TOUCHED_REASON_PREFIX = 'Plan files not touched by branch'
+"""Prefix of the ``MergeOutcome.reason`` string emitted by the pre-merge
+Decision-1 check.  When the architect declared specific plan files but
+the branch's history (``base..HEAD``) doesn't touch them, the implementation
+hasn't actually delivered against the plan — short-circuit straight to L1
+without involving the steward (mutating plan.json to silence the gate
+would defeat its purpose)."""
+
+
+CROSS_REPO_DELIVERABLE_REASON_PREFIX = 'Cross-repo deliverable'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the pre-merge
+Decision-1 gate recognizes a *cross-repo deliverable* — a task whose declared
+plan files ALL belong to a different project.  The reify-task 5308 shape: the
+task's branch is legitimately EMPTY because the deliverable lands on the other
+project's branch, so the ``base..HEAD`` history touches none of the declared
+(foreign) files.  Rather than false-flag this as
+``PLAN_FILES_NOT_TOUCHED_REASON_PREFIX`` (which would force the architect
+through a dishonest narrowing pass — drop = falsify provenance, confirm =
+mislabel complete work — and escalate straight to a human), the workflow
+short-circuits to the honest ``OutcomeKind.plan_files_cross_repo`` terminal
+outcome on the NORMAL ladder (``category='cross_repo_deliverable'``,
+``suggested_action='verify_external_landing'``) so triage can verify the
+external landing instead of re-running the empty branch."""
+
+
+ALREADY_LANDED_REASON_PREFIX = 'Plan files already landed on main'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the pre-merge
+Decision-1 gate recognizes an *already-landed* branch — a task whose declared
+plan files are demonstrably ON MAIN already, so its own ``base..HEAD`` range
+is legitimately EMPTY.
+
+Same "the branch is legitimately empty" family as
+``CROSS_REPO_DELIVERABLE_REASON_PREFIX``, reached by a different route.  After
+a task's work merges, re-dispatching it re-cuts ``task/<id>`` from
+post-landing main, which correctly drops every commit as already-upstream and
+parks the ref on one of MAIN'S OWN commits at 0 commits ahead of its recorded
+base (measured parking spots: 3604 on ``9ab336bd6e``, 3779 on ``f16803d748``,
+3717 on ``ce5b830caf``, 3572 on ``6d7487b2ef`` — each an unrelated task's merge
+commit).  The gate then reads that empty range and emits the exact INVERSE of
+the truth: ``PLAN_FILES_NOT_TOUCHED_REASON_PREFIX``, through
+``_mark_blocked(..., escalate_to_human=True)``, whose default
+``category='task_failure'`` mints the escalation that PINS the task — which in
+turn vetoes the recovery that would have marked it done, so the row churns and
+is re-dispatched, repeating (measured: 39 consecutive ``recovery_vetoed`` over
+10.5h on task 3717).
+
+Rather than false-flag that as under-delivery — which would force the
+architect through the same dishonest narrowing pass the cross-repo docstring
+names (drop = falsify provenance, confirm = mislabel complete work) and
+escalate straight to a human — the workflow short-circuits to the honest
+``OutcomeKind.plan_files_already_landed`` terminal outcome on the NORMAL
+ladder, so this path mints no ``escalate_to_human=True`` L1 pin of its own and
+the ``task_failure`` half of the loop has no fuel.
+
+SCOPE OF THAT CLAIM, stated precisely (amendment pass, review finding #4).  It
+covers the L1 ``task_failure`` PIN and nothing more.  The terminal outcome
+still routes through ``_mark_blocked`` on the NORMAL ladder, which files an L0
+in ``category='already_landed'`` and starts a steward, exactly as the
+``cross_repo_deliverable`` sibling does.  Two consequences are deliberate and
+pinned by tests rather than claimed away:
+
+  * ``has_open_l1`` dedup is CATEGORY-SCOPED, so a legacy row still carrying a
+    stale ``task_failure`` L1 from a pre-carve-out cycle gets an ADDITIONAL
+    ``already_landed`` record rather than none.  That is the wanted direction:
+    the stale record asserts the branch under-delivered (false); the new one
+    names what is actually true and what to do about it.  Retiring the stale
+    pin is the EXIT half's job (``RecoveryAction.CONVERT_TO_BLOCKED``), not
+    this one's.
+  * A ``StewardResolved`` verdict returns ``REQUEUED`` into
+    ``_run_merge_phase``'s ``for _merge_attempt in
+    range(self.config.max_merge_retries)`` loop, which re-enters the carve-out
+    on the same legitimately-empty branch.  That retry is BOUNDED by
+    ``max_merge_retries`` and then falls through to the terminal BLOCKED arm —
+    a capped re-check, not the unbounded churn this task exists to end.
+
+See :func:`resolve_already_landed_branch` for the four signals required
+before this prefix may be used, and for the three traps a naive version misses.
+"""
+
+
+ALREADY_LANDED_CITATION_PATTERN: str = (
+    r'^(merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
+    r'\(#?{tid}\)!?:'
+    r'|^Merge task/{tid} into '
+)
+r"""STRICTER citation template for :func:`_resolve_already_landed_branch`.
+
+``GitOps.DEFAULT_COMMIT_CITATION_PATTERN`` is deliberately permissive — it
+also accepts the UNANCHORED ``\(#?{tid}\)`` / ``\(task {tid}\)`` alternatives
+and an anchored ``^<token>.*\btask/{tid}\b`` arm, which is right for the
+reconciler's "did anything on main ever mention this task" question.  It is
+wrong for THIS question, which is "is this commit this task's own delivery":
+
+  * ``Revert "impl(3717): ..."`` matches the bare-paren alternative, and
+  * ``fix(4200): back out task/3717 changes`` matches the ``task/{tid}`` arm,
+
+and both touch exactly the paths the original landing touched, so signal 3
+(coverage) passes too and the branch is declared already-landed on a commit
+that is the OPPOSITE of its delivery.  Requiring the id in the
+conventional-commit SCOPE position — ``impl(3717):`` — is what separates an
+AUTHORED delivery from a commit that merely mentions the id.
+
+Measured before narrowing, on this repo's last 4000 main commits: 1298
+subjects match this strict form, and exactly ONE subject matched only the
+dropped arms (itself a body-line false-cite, not a real citation).  So the
+narrowing costs no real attribution and removes the whole false-cite class.
+Anything it does miss falls through to the UNCHANGED
+``plan_files_not_touched`` path — fail-closed, per this predicate's contract.
+
+Valid as both a git ``--extended-regexp`` pattern and a Python ``re``, which
+``find_task_citation_commit`` requires of any override.
+"""
+
+
+_REVERT_SUBJECT_RE = re.compile(r'^\s*(Revert\b|revert[(:!])', re.IGNORECASE)
+"""Subjects that mean "this commit UNDOES a delivery", not "this IS one".
+
+Applied to the ATTRIBUTING commit in :func:`_resolve_already_landed_branch`,
+uniformly across BOTH attribution mechanisms, as DEFENCE IN DEPTH: neither
+probe answers with a revert today.  ``git revert -m 1 <M>`` writes the subject
+``Revert "Merge task/<id> into main"``, which QUOTES the marker, but since task
+5765 ``GitOps.find_merge_marker`` requires the WHOLE subject to equal the merge
+subject, so after a revert it answers with ``M`` itself, and signal 4
+(SURVIVAL) declines ``M``.  :data:`ALREADY_LANDED_CITATION_PATTERN` rejects
+revert subjects through its anchored delivery prefixes.  The guard stays so a
+future widening of either probe cannot silently re-admit a revert, whose OWN
+effect (the deletion) is present at main HEAD and would pass every later
+signal.
+"""
+
+
+POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX = 'Post-merge content equivalence failed'
+"""Prefix of the ``MergeOutcome.reason`` string emitted by the post-merge
+Decision-2 check.  After ``advance_main`` succeeds, we verify that
+``branch_HEAD`` and the advanced main SHA have the same tree (modulo
+``.task/``).  Any divergence indicates conflict resolution dropped or
+rewrote work and needs human judgement, not a steward retry."""
+
+
+POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX = 'Post-merge unscoped type-check failed'
+"""Prefix of the ``MergeOutcome.reason`` string emitted when the post-merge
+unscoped pyright check detects a cross-PR union break.  After
+``advance_main`` succeeds, a full package-wide type-check is run against the
+advanced main SHA for each subproject that declares a ``type_check_command``
+in its ``ModuleConfig``.  Unlike per-PR scoped verify, this catches the case
+where PR A widens a Protocol and PR B (verified against pre-A main) adds a
+conformer satisfying the OLD Protocol — after both land the union has a
+conformer missing the new method; each PR verified clean, but only the
+post-merge whole-package check sees it.
+
+This is a SIGNAL, not a gate: the merge has already landed (``update-ref``
+ran), so we do NOT revert.  We skip ``push_main`` (same as the equivalence
+check), emit an L1 blocked outcome, and route to human / auto-watcher for a
+fix-forward task.  Consistent with ``POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX``:
+a landed merge must never be blocked by a flaky hang or infra error, so the
+check fails open on timeouts and worktree-create exceptions."""
+
+
+@dataclass
+class PostMergePyrightResult:
+    """Structured return value from :func:`_check_post_merge_pyright`.
+
+    Attributes:
+        failing_subprojects: Prefixes of subprojects whose unscoped
+            type-check command exited non-zero (genuine type failure, not
+            a timeout or infra error).  Empty list means clean.
+        timed_out_subprojects: Prefixes of subprojects whose unscoped
+            type-check command timed out.  A subproject can appear in both
+            this list and ``failing_subprojects`` when ``block_on_timeout=True``
+            (pre-advance gate), or only here when ``block_on_timeout=False``
+            (post-advance fail-open path).  Empty list means no timeouts.
+        detail: Bounded human-readable detail from the first failing
+            subproject's output, for inclusion in the escalation reason.
+    """
+
+    failing_subprojects: list[str] = field(default_factory=list)
+    timed_out_subprojects: list[str] = field(default_factory=list)
+    detail: str = ''
+
+    @property
+    def broken(self) -> bool:
+        """True when at least one subproject's type-check genuinely failed."""
+        return bool(self.failing_subprojects)
+
+    @property
+    def timed_out(self) -> bool:
+        """True when at least one subproject's type-check timed out."""
+        return bool(self.timed_out_subprojects)
+
+
+@dataclasses.dataclass(frozen=True)
+class _GenerationChainContext:
+    """Bundle passed from a worker into _finalize_advanced_merge for γ2 auto-chaining.
+
+    Carries the worker's queue, the per-branch generation counter dict, the
+    configured maximum, and the worker's ``_maybe_auto_chain_generation`` so
+    _finalize_advanced_merge can delegate to it without a direct worker
+    reference.
+
+    Defaulting to None in _finalize_advanced_merge preserves the function's
+    behaviour for trains (_do_train_merge passes None, per PRD D9) and all
+    existing callers.
+    """
+
+    queue: asyncio.Queue
+    counts: dict  # dict[str, int] — per-branch chain counter
+    max_auto_generations: int
+    maybe_auto_chain_generation: Callable[..., Awaitable[MergeOutcome | None]]
+    retention: TerminalOutcomeRetention | None = None
+    """Retention ring to pass to enqueue_merge_request for the chained gen-(n+1)
+    request so its terminal outcome is recorded (provenance: superseded_by resolves).
+    The in-flight-registry SLOT HANDOFF for gen-(n+1) belongs to γ3's ATTACH_AND_CHAIN
+    scope and is the second precondition guarded by AUTO_CHAIN_GENERATIONS_ENABLED."""
+
+
+async def _resolve_second_parent(git_ops: GitOps, sha: str) -> str | None:
+    """Return the second parent (``sha^2``) of a merge commit, or None.
+
+    Runs ``git rev-parse <sha>^2`` in *git_ops.project_root*.  Returns the
+    stripped SHA string on success (rc==0) or ``None`` if the commit has no
+    second parent or the command fails (e.g. fast-forward commit, transient
+    git error, or missing worktree).
+
+    Used by :func:`_finalize_advanced_merge` to derive the branch tip that was
+    actually merged into the ``--no-ff`` merge commit so the post-merge
+    equivalence gate compares the right tree (drift-proof vs a lane whose
+    worktree HEAD has been hijacked or rebased after snapshotting).
+
+    Fail-open: any exception returns ``None`` so the caller falls back to the
+    next tier (``merged_branch_tip`` or ``req.snapshot_tip``).
+    """
+    try:
+        rc, out, _err = await _run(
+            ['git', 'rev-parse', f'{sha}^2'],
+            cwd=git_ops.project_root,
+        )
+    except Exception:
+        # Abnormal failure (subprocess spawn error etc.) — the routine
+        # "commit has no second parent" case returns rc != 0 below, NOT here.
+        # Log so the fail-open to the next tip-resolution tier is observable
+        # (task 1917 added this fail-open silently; greens the shared
+        # silent-fallthrough gate, which requires WARN+ logging or re-raise).
+        logger.warning(
+            '_resolve_second_parent: git rev-parse %s^2 raised — '
+            'falling open to None (caller uses next tip tier)',
+            sha,
+            exc_info=True,
+        )
+        return None
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+async def _commit_is_linear(git_ops: GitOps, sha: str) -> bool:
+    """Return ``True`` iff *sha* is a commit with at most one parent (linear/rebase).
+
+    Runs ``git rev-list --parents -n 1 <sha>`` in *git_ops.project_root*.  The
+    output is a single line of the form ``<sha> [<parent1> [<parent2> ...]]``.
+    A linear (rebase-flattened) commit has ≤1 parent token after its own SHA,
+    so the split yields ≤2 tokens total.
+
+    Returns ``False`` on any git error or if the commit has ≥2 parents (a real
+    ``--no-ff`` merge commit).  Fail-closed: returns ``False`` on error so the
+    caller does NOT suppress the worktree-HEAD fallback when the linearity check
+    is inconclusive (defense-in-depth — never masks a drop).
+
+    Used by :func:`_finalize_advanced_merge` as the gating condition for the
+    task-1928 fail-safe: the fail-safe (``allow_worktree_head_fallback=False``)
+    is applied ONLY when (a) no trusted branch tip is recoverable via the
+    three-term chain AND (b) the advanced SHA is *positively* linear.  This
+    distinguishes a genuinely rebase-flattened landing (safe to skip the
+    redundant gate — the tree was already re-verified by ``_reverify_rebased_tree``)
+    from a transient ``^2`` git error on a real merge commit (must keep the
+    legacy HEAD check to avoid masking a real drop).
+    """
+    try:
+        rc, out, _err = await _run(
+            ['git', 'rev-list', '--parents', '-n', '1', sha],
+            cwd=git_ops.project_root,
+        )
+    except Exception:
+        logger.warning(
+            '_commit_is_linear: git rev-list raised for %s — '
+            'returning False (fail-closed: keep legacy HEAD check)',
+            sha,
+            exc_info=True,
+        )
+        return False
+    if rc != 0:
+        return False
+    # Output: "<sha> [parent1] [parent2] ..."
+    # Linear commit → ≤1 parent → ≤2 tokens.
+    tokens = out.strip().split()
+    return len(tokens) <= 2
+
+
+@dataclasses.dataclass(frozen=True)
+class GateVerdict:
+    """Outcome of a single post-advance gate: pass, or block with a reason.
+
+    A 2-state value object — either the gate passed (``passed=True``, every
+    other field ``None``) or it blocked (``passed=False`` with ``reason``,
+    ``merge_sha``, and ``emit_subtype`` all populated).  Construct via the
+    :meth:`ok` / :meth:`block` factories rather than the constructor directly.
+    """
+
+    passed: bool
+    reason: str | None = None
+    merge_sha: str | None = None
+    emit_subtype: OutcomeKind | None = None
+
+    @classmethod
+    def ok(cls) -> GateVerdict:
+        """The gate passed."""
+        return cls(passed=True)
+
+    @classmethod
+    def block(cls, *, reason: str, merge_sha: str | None, emit_subtype: OutcomeKind) -> GateVerdict:
+        """The gate blocked the merge.
+
+        *reason* becomes the terminal ``MergeOutcome.reason``, *merge_sha*
+        its ``merge_sha`` (the merge already landed on main), and
+        *emit_subtype* the ``merge_attempt`` subtype the caller emits.
+        """
+        return cls(passed=False, reason=reason, merge_sha=merge_sha, emit_subtype=emit_subtype)
+
+
+@dataclasses.dataclass(frozen=True)
+class Gate:
+    """A single post-advance gate: a name, a run callable, and an optional
+    failure interceptor.
+
+    *run* takes a :class:`_PostAdvanceContext` and returns a
+    :class:`GateVerdict`.  *on_blocked*, consulted only when *run* blocks,
+    may return a substitute :class:`MergeOutcome` (e.g. the γ2 auto-chain's
+    ``'superseded'``) to short-circuit the default outcome, or ``None`` to
+    fall through to the ``'blocked'`` outcome built from the verdict.
+    ``None`` (the default) means "no interceptor" — a pure registration.
+    """
+
+    name: str
+    run: Callable[[_PostAdvanceContext], Awaitable[GateVerdict]]
+    on_blocked: Callable[[_PostAdvanceContext], Awaitable[MergeOutcome | None]] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _PostAdvanceContext:
+    """Everything a post-advance gate (or its on_blocked hook) needs.
+
+    Bundles the post-``advance_main`` state :func:`_finalize_advanced_merge`
+    computes once — notably ``resolved_merged_tip`` and
+    ``allow_worktree_head_fallback``, each derived via a single git
+    subprocess call — so every gate that consults them shares the same
+    value instead of re-deriving it.
+    """
+
+    git_ops: GitOps
+    req: MergeRequest
+    event_store: EventStore | None
+    advanced_sha: str
+    base_sha: str
+    resolved_merged_tip: str | None
+    allow_worktree_head_fallback: bool
+    started_monotonic: float | None
+    train_id: str | None
+    member_task_ids: list[str] | None
+    chain_ctx: _GenerationChainContext | None
+    merged_branch_tip: str | None
+    log_label: str
+
+
+async def _run_equivalence_gate(ctx: _PostAdvanceContext) -> GateVerdict:
+    """Decision-2 post-merge content-equivalence gate."""
+    equiv_failed = await _check_post_merge_equivalence(
+        ctx.req.worktree, ctx.advanced_sha, ctx.git_ops, ctx.base_sha,
+        task_id=ctx.req.task_id,
+        merged_tip=ctx.resolved_merged_tip,
+        allow_worktree_head_fallback=ctx.allow_worktree_head_fallback,
+    )
+    if not equiv_failed:
+        return GateVerdict.ok()
+
+    logger.warning(
+        'Task %s%s: post-merge equivalence failed — '
+        'branch HEAD and advanced main %s diverge in: %r',
+        ctx.req.task_id, ctx.log_label, ctx.advanced_sha[:12], equiv_failed,
+    )
+    tip12 = (ctx.resolved_merged_tip or '<branch-tip>')[:12]
+    return GateVerdict.block(
+        reason=(
+            f'{POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX}: '
+            f'branch and main diverge in '
+            f'{", ".join(equiv_failed)}. '
+            f'Conflict resolution may have dropped or rewritten work. '
+            f'Triage with `git diff {tip12} {ctx.advanced_sha[:12]} '
+            f'-- <path>` (that order): "+" lines are content that IS on '
+            f'main, "-" lines are content only the branch tip had. '
+            f'On a relocated path use `git log --follow <path>` — '
+            f'without --follow the history looks empty and the file '
+            f'reads as missing.'
+        ),
+        merge_sha=ctx.advanced_sha,
+        emit_subtype=OutcomeKind.post_merge_equivalence_failed,
+    )
+
+
+async def _auto_chain_on_equivalence_blocked(ctx: _PostAdvanceContext) -> MergeOutcome | None:
+    """γ2: on equivalence-gate failure, try to auto-chain a gen-(n+1) request.
+
+    Returns the chained ``'superseded'`` (or bound-exceeded ``'blocked'``)
+    outcome when the kill-switch is on and the branch tip advanced mid-verify;
+    ``None`` when auto-chaining does not apply (no *chain_ctx*, kill-switch
+    off, or the tip genuinely did not advance), so the caller falls through
+    to the default ``'blocked'`` outcome built from the gate's verdict.
+    """
+    if ctx.chain_ctx is None or not AUTO_CHAIN_GENERATIONS_ENABLED:
+        return None
+
+    chained = await ctx.chain_ctx.maybe_auto_chain_generation(
+        ctx.req, ctx.advanced_sha, ctx.git_ops, ctx.event_store,
+        merged_branch_tip=ctx.merged_branch_tip or ctx.resolved_merged_tip,
+        counts=ctx.chain_ctx.counts,
+        queue=ctx.chain_ctx.queue,
+        max_auto_generations=ctx.chain_ctx.max_auto_generations,
+        retention=ctx.chain_ctx.retention,
+    )
+    if chained is None:
+        return None
+
+    _emit_merge_attempt(
+        ctx.event_store, ctx.req.task_id,
+        OutcomeKind.post_merge_generation_chained,
+        duration_ms=_elapsed_ms(ctx.started_monotonic),
+        train_id=ctx.train_id,
+        member_task_ids=ctx.member_task_ids,
+    )
+    return chained
+
+
+async def _run_pyright_gate(ctx: _PostAdvanceContext) -> GateVerdict:
+    """Decision-3 post-merge unscoped type-check gate."""
+    pyright_result = await _check_post_merge_pyright(
+        ctx.advanced_sha, ctx.git_ops, ctx.req.config, ctx.req.module_configs,
+        task_id=ctx.req.task_id,
+    )
+    if not pyright_result.broken:
+        return GateVerdict.ok()
+
+    logger.warning(
+        'Task %s%s: post-merge unscoped type-check failed for %s on %s',
+        ctx.req.task_id, ctx.log_label,
+        ', '.join(pyright_result.failing_subprojects),
+        ctx.advanced_sha[:12],
+    )
+    return GateVerdict.block(
+        reason=(
+            f'{POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX}: '
+            f'post-merge unscoped type-check failed for '
+            f'{", ".join(pyright_result.failing_subprojects)} '
+            f'on {ctx.advanced_sha[:12]}. {pyright_result.detail}'
+        ),
+        merge_sha=ctx.advanced_sha,
+        emit_subtype=OutcomeKind.post_merge_pyright_broken,
+    )
+
+
+POST_ADVANCE_GATES: list[Gate] = [
+    Gate('equivalence', _run_equivalence_gate, on_blocked=_auto_chain_on_equivalence_blocked),
+    Gate('pyright', _run_pyright_gate),
+]
+"""Declarative post-advance gate chain, run in order by
+:func:`_finalize_advanced_merge`.  Registering a new gate is an append to
+this list — "a registration, not surgery" — rather than an edit to
+``_finalize_advanced_merge``'s body.  A test — or a future gate author —
+can register a gate by replacing/monkeypatching this module attribute."""
+
+
+async def _finalize_advanced_merge(
+    git_ops: GitOps,
+    req: MergeRequest,
+    event_store: EventStore | None,
+    *,
+    merge_commit_fallback: str,
+    base_sha: str,
+    started_monotonic: float | None,
+    cas_retries: dict[str, int],
+    timeouts: dict[str, int],
+    enospc_retries: dict[str, int],
+    log_label: str = '',
+    train_id: str | None = None,
+    member_task_ids: list[str] | None = None,
+    chain_ctx: _GenerationChainContext | None = None,
+    merged_branch_tip: str | None = None,
+    advanced_sha: str | None = None,
+) -> MergeOutcome:
+    """Post-advance success block shared by MergeWorker and SpeculativeMergeWorker.
+
+    Pops per-task counters, resolves the advanced SHA, runs the
+    equivalence and pyright gates, and returns a :class:`MergeOutcome`.
+    Does **not** touch *merge_wt* — callers must clean it up before
+    calling this function (MergeWorker already does so right after
+    ``advance_main``; SpeculativeMergeWorker moves its pre-pyright
+    cleanup to before this call).
+
+    *log_label* is interpolated into warning log messages so each
+    worker can retain its current log prefix
+    (``''`` for MergeWorker, ``' (speculative)'`` for
+    SpeculativeMergeWorker).
+
+    *train_id* and *member_task_ids* are optional train-correlation tags
+    forwarded to every ``_emit_merge_attempt`` call inside this function.
+    MergeWorker and SpeculativeMergeWorker pass ``None`` (no behavior
+    change); ``_do_train_merge`` passes the request's train metadata so
+    ``merge_attempt`` events stay tagged for downstream reconciliation.
+
+    *chain_ctx* + *merged_branch_tip* enable γ2 generation auto-chaining
+    when :data:`AUTO_CHAIN_GENERATIONS_ENABLED` is ``True``.  While the
+    kill-switch is ``False`` (the default, pending γ3), equivalence failures
+    always return ``'blocked'`` and no ``'superseded'`` outcome is produced.
+    When enabled and *chain_ctx* is not None, :func:`_maybe_auto_chain_generation`
+    is consulted: if the branch tip advanced during verify a gen-(n+1) request
+    is enqueued and a ``'superseded'`` outcome is returned instead of ``'blocked'``.
+    On a clean ``'done'`` landing, chain_ctx.counts pops the branch key
+    (resetting the lineage counter).  Passing ``None`` (the default)
+    preserves all existing behaviour — trains pass ``None`` (PRD D9).
+
+    *advanced_sha* is the post-rebase SHA actually placed on main, threaded
+    from :class:`~orchestrator.git_ops.AdvanceOutcome`.advanced_sha (task
+    1997) — callers must pass ``outcome.advanced_sha`` from the
+    ``advance_main`` call that preceded this one.  ``None`` (e.g. no rebase
+    occurred) falls back to *merge_commit_fallback*.
+    """
+    cas_retries.pop(req.task_id, None)
+    timeouts.pop(req.task_id, None)
+    enospc_retries.pop(req.task_id, None)
+    # Use the post-rebase SHA actually placed on main (advance_main
+    # rebases on CAS retry; merge_commit_fallback is the stale
+    # pre-rebase SHA and would fail done_provenance ancestor check).
+    advanced_sha = advanced_sha or merge_commit_fallback
+
+    # Resolve the branch tip that was actually merged (second parent of the
+    # --no-ff merge commit).  Preferred over the live worktree HEAD so the
+    # equivalence gate is drift-proof when a warm lane's worktree HEAD has
+    # been rebased or hijacked after the snapshot was taken.
+    # Fallback chain: advanced_sha^2 → merged_branch_tip (caller) → req.snapshot_tip.
+    resolved_merged_tip = (
+        (await _resolve_second_parent(git_ops, advanced_sha))
+        or merged_branch_tip
+        or getattr(req, 'snapshot_tip', None)
+    )
+
+    # Task-1928 fail-safe: if no trusted branch tip is recoverable via any of the
+    # three terms AND advanced_sha is positively linear (confirmed single-parent),
+    # suppress the live worktree-HEAD fallback.  A positively-linear advanced_sha
+    # means the landed tree is a fast-forward or rebase-flattened projection of the
+    # branch tip, so the HEAD-drift comparison can only produce phantom failures —
+    # the tree is already equivalent by construction.  This holds for both rebase
+    # landings (where _reverify_rebased_tree also ran) and ff-style landings (where
+    # it did not): in both cases a genuine file drop would require the branch itself
+    # to have differed from what was merged, which the linear commit topology rules
+    # out.  The positive-linearity check (_commit_is_linear) distinguishes a confirmed
+    # linear commit from a transient ^2 git error on a real merge commit —
+    # the latter must keep the legacy HEAD check to avoid masking a real drop.
+    allow_worktree_head_fallback = True
+    if resolved_merged_tip is None and await _commit_is_linear(git_ops, advanced_sha):
+        allow_worktree_head_fallback = False
+
+    ctx = _PostAdvanceContext(
+        git_ops=git_ops,
+        req=req,
+        event_store=event_store,
+        advanced_sha=advanced_sha,
+        base_sha=base_sha,
+        resolved_merged_tip=resolved_merged_tip,
+        allow_worktree_head_fallback=allow_worktree_head_fallback,
+        started_monotonic=started_monotonic,
+        train_id=train_id,
+        member_task_ids=member_task_ids,
+        chain_ctx=chain_ctx,
+        merged_branch_tip=merged_branch_tip,
+        log_label=log_label,
+    )
+
+    # Declarative post-advance gate chain (task λ): iterate the registered
+    # gates in order.  Registering a new gate is an append to
+    # POST_ADVANCE_GATES — "a registration, not surgery" — not an edit to
+    # this loop.
+    ran = []
+    terminal = None
+    for gate in POST_ADVANCE_GATES:
+        ran.append(gate.name)
+        verdict = await gate.run(ctx)
+        if verdict.passed:
+            continue
+        # GateVerdict.block() always populates reason/emit_subtype; the
+        # field type is Optional only because it's shared with the
+        # all-None .ok() case.  Bind to locals and narrow once for pyright.
+        # An explicit guard (not `assert`) so a mis-constructed verdict —
+        # e.g. a future gate building GateVerdict(passed=False, ...)
+        # directly instead of via .block() — fails loudly even under `-O`,
+        # rather than silently emitting a None subtype.
+        emit_subtype = verdict.emit_subtype
+        reason = verdict.reason
+        if emit_subtype is None or reason is None:
+            raise AssertionError(
+                f'gate {gate.name!r} returned a blocked GateVerdict with '
+                f'reason/emit_subtype unset (reason={reason!r}, '
+                f'emit_subtype={emit_subtype!r}); construct blocked verdicts '
+                f'via GateVerdict.block(), which always populates both'
+            )
+        _emit_merge_attempt(
+            event_store, req.task_id, emit_subtype,
+            duration_ms=_elapsed_ms(started_monotonic),
+            train_id=train_id,
+            member_task_ids=member_task_ids,
+        )
+        # A gate's on_blocked hook (e.g. the equivalence gate's γ2
+        # auto-chain) may substitute a chained outcome; None means "no
+        # interceptor" or "interceptor declined" — fall through to the
+        # default blocked outcome built from the verdict.
+        if gate.on_blocked is not None:
+            terminal = await gate.on_blocked(ctx)
+        if terminal is None:
+            terminal = MergeOutcome(
+                'blocked', merge_sha=verdict.merge_sha, reason=reason,
+            )
+        break
+
+    logger.info(
+        'Task %s%s: post-advance gates run: %s',
+        req.task_id, log_label, ', '.join(ran),
+    )
+    if terminal is not None:
+        return terminal
+
+    logger.info(f'Task {req.task_id}: merged to main successfully')
+    _emit_merge_attempt(
+        event_store, req.task_id, OutcomeKind.done,
+        duration_ms=_elapsed_ms(started_monotonic),
+        train_id=train_id,
+        member_task_ids=member_task_ids,
+    )
+    # γ2: clean landing — reset the per-branch generation chain counter
+    # so consecutive tip-advances count is cleared for this branch.
+    if chain_ctx is not None:
+        chain_ctx.counts.pop(req.branch.bare_id, None)
+    # Main is now at *advanced_sha* and every post-advance gate passed, so this
+    # tip is one a green gate run has been observed on.  Recorded here — the
+    # single clean-landing return shared by the speculative CAS advance and the
+    # train pipeline — so that a LATER request rebased onto it may trust the
+    # disjoint-delta fast path (premise P2 in _disjoint_skip_blockers).  A tip
+    # produced by any other writer (nightly job, direct commit, push) never
+    # reaches this line and is therefore never trusted.
+    note_queue_verified_main_tip(advanced_sha)
+    push_status = await git_ops.push_main()
+    return MergeOutcome('done', merge_sha=advanced_sha, push_status=push_status)
+
+
+async def _map_advance_failure(
+    git_ops: GitOps,
+    result: str,
+    *,
+    task_id: str,
+    merge_commit_fallback: str,
+    halt: Callable[[str], None],
+    unhalt: Callable[[str], None],
+    cas_retries: dict[str, int],
+    advanced_sha: str | None = None,
+) -> MergeOutcome:
+    """Advance-failure result → MergeOutcome mapping shared by both workers.
+
+    Handles ``wip_overlap``, ``pop_conflict``, ``unmerged_state``,
+    ``pop_conflict_no_advance``, ``not_descendant``, ``contaminated``,
+    ``stash_failed``, and ``park_lock_contended``.
+
+    ``stash_failed`` (task 2758) HALTS the queue and returns a distinct
+    ``stash_failed`` outcome — it is a SHARED main-checkout-hygiene fault
+    (advance_main could not park project_root's dirty tracked WIP) that
+    recurs identically for every subsequent task, so it takes the
+    single-escalation halt path (parallel to ``unmerged_state``), NOT the
+    per-task ``blocked`` catch-all.  ``not_descendant``/``contaminated``
+    remain per-branch, per-task ``blocked`` with no halt — they are content
+    problems specific to one branch that do NOT recur for other tasks (same
+    reasoning as the ``conflict_markers`` per-branch → no-halt branch).
+
+    ``park_lock_contended`` (task 3060) does **NOT** halt, and its absence
+    from ``merge_queue._HALT_ADVANCE_RESULTS`` is deliberate.  The
+    superficial similarity to ``stash_failed`` (both mean "advance_main
+    could not safely touch project_root") hides the distinction that
+    matters: ``stash_failed`` reports a shared main-checkout-hygiene fault
+    that PERSISTS until a human cleans up, so every subsequent task would
+    fail identically; ``park_lock_contended`` reports a foreign git process
+    transiently owning project_root's index — dominantly a
+    ``git commit --only`` holding the lock across its pre-commit hook —
+    which SELF-CLEARS in seconds-to-minutes.  advance_main has already stood
+    off for the whole ``git.merge_park_lock_grace_seconds`` budget before
+    returning it, and modified nothing, so the correct disposition is a
+    per-task ``blocked`` that retries on re-dispatch.  Halting the queue for
+    it is exactly the recurring halt task 3060 removed.
+
+    Does **not** handle ``cas_failed``
+    (per-worker retry orchestration is a preserved difference) or the
+    request-abandoned early-out (kept per-worker because the two workers
+    differ on what to clean up).  Does **not** touch *merge_wt* — callers
+    must clean it up separately.
+
+    *halt* is the worker's ``halt_for_wip`` callable; *unhalt* is the
+    worker's ``unhalt_wip`` callable.  *unhalt* is invoked in an
+    ``except BaseException`` guard around the post-halt ``push_main`` call
+    in the ``pop_conflict`` branch so that a push failure (including
+    ``CancelledError``) never leaves the queue silently halted with no
+    escalation owner registered (task 1671 orphan-halt window).
+    *cas_retries* is mutated for the terminal result codes (popped) but
+    NOT for ``wip_overlap`` (which is a recoverable halt, not a terminal
+    outcome).
+
+    *advanced_sha* is the post-rebase SHA actually placed on main, threaded
+    from :class:`~orchestrator.git_ops.AdvanceOutcome`.advanced_sha (task
+    1997) — only consulted on the ``pop_conflict`` branch (main did land in
+    that case).  ``None`` falls back to *merge_commit_fallback*.
+    """
+    if result in ('wip_overlap', 'pop_conflict'):
+        halt(f'advance_main: {result}')
+        if result == 'pop_conflict':
+            # Main was advanced — push origin even though stash pop failed.
+            # Guard: if push_main raises (git failure, CancelledError) AFTER
+            # halt() above, the done_wip_recovery outcome is never produced and
+            # no halt-owner escalation is registered downstream — leaving the
+            # queue silently halted with owner=None (task 1671 orphan-halt
+            # window).  unhalt-on-raise restores the queue before re-raising.
+            try:
+                push_status = await git_ops.push_main()
+                recovery = getattr(git_ops, '_last_recovery_branch', None)
+                # Main IS on the post-rebase SHA — propagate it so workflow's
+                # _handle_wip_recovery → set_task_status('done') has valid
+                # done_provenance (otherwise the call hits "kind required").
+                advanced_sha = advanced_sha or merge_commit_fallback
+                return MergeOutcome(
+                    'done_wip_recovery',
+                    reason=f'Merge advanced but stash pop conflicted. Recovery branch: {recovery}',
+                    recovery_branch=recovery,
+                    push_status=push_status,
+                    merge_sha=advanced_sha,
+                )
+            except BaseException:
+                # pop_conflict push_main raised — unhalt to avoid orphan halt
+                # (task 1671): the done_wip_recovery outcome was never returned
+                # so no halt-owner escalation will be registered; un-halt here
+                # so the queue can accept new work without requiring
+                # force_unhalt_merge_queue.
+                unhalt('pop_conflict push_main raised — unhalting to avoid orphan halt')
+                raise
+        else:
+            overlap = getattr(git_ops, '_last_overlap_files', None)
+            return MergeOutcome(
+                'wip_halted',
+                reason=f'WIP overlaps merge diff: {", ".join(overlap or [])}',
+                overlap_files=overlap,
+            )
+
+    if result == 'unmerged_state':
+        # Permanent block — pre-existing UU markers in project_root.
+        # Halt the queue and route to human escalation (not steward).
+        halt(
+            'advance_main: unmerged_state — project_root has unresolved merge '
+            'conflicts. Manual investigation required before any retry.'
+        )
+        cas_retries.pop(task_id, None)
+        return MergeOutcome(
+            'unmerged_state',
+            reason=(
+                f'advance_main returned unmerged_state: project_root has '
+                f'unresolved (UU/AA/DD) merge conflicts — halting queue; '
+                f'manual investigation required before any retry. '
+                f'(task {task_id})'
+            ),
+        )
+
+    if result == 'pop_conflict_no_advance':
+        # Stash pop conflicted during CAS-failure recovery — merge did NOT land.
+        # Halt queue and return distinct outcome for human-level escalation.
+        halt('advance_main: pop_conflict_no_advance')
+        recovery = getattr(git_ops, '_last_recovery_branch', None)
+        cas_retries.pop(task_id, None)
+        return MergeOutcome(
+            'wip_recovery_no_advance',
+            reason=(
+                f'Merge did not advance AND WIP stash pop conflicted. '
+                f'Recovery branch: {recovery}. '
+                f'Manual intervention required — do not retry automatically. '
+                f'(task {task_id})'
+            ),
+            recovery_branch=recovery,
+        )
+
+    if result == 'conflict_markers':
+        # esc-2128-8 Layer-2 backstop: the merge tree carries tracked
+        # file(s) with unresolved (column-0) conflict markers. A per-branch
+        # content problem, not a queue-wide condition — no halt (contrast
+        # unmerged_state/wip_overlap above, which halt the whole queue).
+        cas_retries.pop(task_id, None)
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'advance_main refused to advance: branch contains git '
+                f'conflict marker(s) in tracked file(s); resolve the '
+                f'conflict marker(s) and re-run. (task {task_id})'
+            ),
+        )
+
+    if result == 'stash_failed':
+        # SHARED main-checkout-hygiene fault (task 2758): advance_main parks
+        # project_root's uncommitted WIP onto a private ref before advancing;
+        # a park failure (MergeParkContentionError/MergeParkError) means
+        # project_root's tree carries dirty TRACKED file(s) that could not be
+        # stashed.  Because project_root is shared, this fails IDENTICALLY for
+        # every subsequent task's landing — so halt the whole queue (exactly
+        # ONE escalation is filed, by the halt owner) instead of silently
+        # blocking N tasks one at a time (the 2026-07-12 reify pileup).
+        # Contrast not_descendant/contaminated below, which are per-branch and
+        # do NOT recur for other tasks (kept per-task-blocked, no halt).
+        halt(
+            'advance_main: stash_failed — park of project_root WIP failed; '
+            'project_root has dirty tracked file(s) that could not be stashed. '
+            'Manual main-checkout hygiene required before any retry.'
+        )
+        cas_retries.pop(task_id, None)
+        dirty = getattr(git_ops, '_last_stash_dirty_files', None) or []
+        return MergeOutcome(
+            'stash_failed',
+            reason=(
+                f'advance_main returned stash_failed: could not park '
+                f'project_root WIP — dirty tracked file(s): '
+                f'{", ".join(dirty) if dirty else "(unknown)"}. Halting queue; '
+                f'manual main-checkout hygiene required before any retry. '
+                f'(task {task_id})'
+            ),
+            dirty_files=dirty,
+        )
+
+    if result == 'park_lock_contended':
+        # TRANSIENT foreign-process contention (task 3060) — deliberately NOT
+        # a halt, and deliberately absent from merge_queue._HALT_ADVANCE_
+        # RESULTS.  Contrast stash_failed above: that is a shared
+        # main-checkout-HYGIENE fault that recurs identically for every
+        # subsequent task until a human intervenes, so collapsing it to one
+        # halt is right.  This one is a bounded, SELF-CLEARING window — a
+        # foreign `git commit --only <path>` holds project_root's index lock
+        # across its pre-commit hook — and advance_main already stood off for
+        # the whole configured grace before giving up, having modified
+        # NOTHING.  Halting the queue for it produced the 2+/day halt this
+        # branch exists to remove.
+        cas_retries.pop(task_id, None)
+        info = getattr(git_ops, '_last_park_lock_info', None) or {}
+        lock_path = info.get('lock_path') or '<unknown>'
+        age = info.get('age_seconds')
+        waited = info.get('waited_seconds')
+        age_txt = f'{age:.0f}s' if isinstance(age, int | float) else 'unknown'
+        waited_txt = f'{waited:.0f}s' if isinstance(waited, int | float) else 'unknown'
+        # Staleness keys ONLY on the age observed BEFORE the stand-off.
+        #
+        # The previous test (`waited > 0 and age > waited`) was wrong and must
+        # not be reintroduced: on the gate path `age_seconds` is re-probed
+        # AFTER the wait (git_ops.advance_main), so it always equals
+        # initial_age + waited + epsilon.  `age > waited` therefore reduces to
+        # `initial_age > -epsilon` — true for a 2-second-old live commit
+        # exactly as for an hour-old leftover — and handed destructive `rm -f`
+        # advice to every ordinary docs-direct-commit-on-main that outlived
+        # the grace.  Only a pre-wait age carries staleness information.
+        #
+        # Both isinstance guards are load-bearing: a missing key yields None,
+        # which must degrade to not-stale (no destructive advice), never
+        # raise.  And the grace is read from the side channel, NEVER through
+        # git_ops.config — this mapper's tests pass a bare MagicMock whose
+        # auto-vivified attribute would make the comparison raise TypeError.
+        # The dict is the whole input, by the same discipline as the
+        # `getattr(git_ops, '_last_park_lock_info', None) or {}` read above.
+        #
+        # And the bar is max(grace, _STALE_LOCK_FLOOR_S), never the grace
+        # alone: grace is tunable to 0 (the blessed probe-only fail-fast
+        # off-switch), at which value EVERY age exceeds it and a live
+        # half-second-old commit would be handed `rm -f`.  See
+        # _STALE_LOCK_FLOOR_S for the full rationale.
+        initial_age = info.get('initial_age_seconds')
+        grace = info.get('grace_seconds')
+        threshold = (
+            max(float(grace), _STALE_LOCK_FLOOR_S)
+            if isinstance(grace, int | float) and not isinstance(grace, bool)
+            else None
+        )
+        stale = (
+            isinstance(initial_age, int | float)
+            and not isinstance(initial_age, bool)
+            and threshold is not None
+            and initial_age > threshold
+        )
+        recovery = (
+            f' The lock was ALREADY {initial_age:.0f}s old when the merge '
+            f'worker FIRST observed it — older than the {threshold:.0f}s '
+            f'staleness floor (max of the configured {grace:.0f}s grace and '
+            f'the {_STALE_LOCK_FLOOR_S:.0f}s pre-commit budget) — so it is '
+            f'likely a crashed-git leftover rather than a live commit: '
+            f'confirm no git process is running in project_root, then clear '
+            f'it with `rm -f {lock_path}`.'
+            if stale else ''
+        )
+        # WIP-at-risk clause.  Populated ONLY on the mid-park (TOCTOU) path,
+        # where advance_main had already taken the dirty snapshot before the
+        # foreign lock appeared; empty on the pre-snapshot gate path, where
+        # no WIP is known.  Mirrors what `stash_failed` above already reports,
+        # so an operator reading either reason learns the same thing about
+        # which uncommitted work is implicated.
+        at_risk = [str(f) for f in (info.get('dirty_files') or [])]
+        wip_txt = (
+            f' Uncommitted tracked WIP in project_root at the moment of '
+            f'contention: {", ".join(at_risk[:20])}'
+            f'{f" (+{len(at_risk) - 20} more)" if len(at_risk) > 20 else ""}.'
+            if at_risk else ''
+        )
+        # WORDING CONSTRAINT — do not reintroduce the token 'ff' (as in
+        # "stood off") or the word 'advanced' anywhere in this reason.
+        # workflow.py's blocked path infers the merge-failure review category
+        # with a bare substring test
+        # (`'ff' in reason.lower() or 'advanced' in reason.lower()`
+        # -> category 'merge_ff_failed'), which then flows into
+        # `_write_merge_failure_review`, the merge_blocked event's
+        # data.category, and the signature-aware L1 dedup key.  "stood off"
+        # matched it, durably filing every index-lock stand-off as a
+        # fast-forward failure.  Pinned by
+        # test_reason_is_not_miscategorised_as_a_ff_failure.
+        return MergeOutcome(
+            'blocked',
+            reason=(
+                f'advance_main deferred: a foreign git process held '
+                f'{lock_path} for {age_txt} (waited {waited_txt}). The merge '
+                f'did NOT land and NOTHING in project_root was modified. This '
+                f'is the docs-direct-commit-on-main window — a '
+                f'`git commit --only` holding the index lock across its '
+                f'pre-commit hook — which is transient and will be retried on '
+                f're-dispatch.{wip_txt}{recovery} (task {task_id})'
+            ),
+        )
+
+    # not_descendant / contaminated — per-branch permanent failure (no halt)
+    cas_retries.pop(task_id, None)
+    return MergeOutcome(
+        'blocked',
+        reason=f'advance_main failed ({result}) for task {task_id}',
+    )
+
+
+async def _rename_pairs(
+    from_ref: str,
+    to_ref: str,
+    git_ops: GitOps,
+    *,
+    log_prefix: str,
+    task_id: str | None = None,
+) -> list[tuple[str, str]] | None:
+    """Return ``(old_path, new_path)`` for every rename between two trees.
+
+    The one place in this module that asks git "what was renamed between
+    these two trees".  Both rename-aware gates are built on it, on
+    opposite ranges: the equivalence gate resolves the BRANCH side
+    (``base..branch_head``) and the plan-target drop-guard the MERGE side
+    (``task_head..merge_commit``).
+
+    A tree-to-tree ``-M`` diff collapses a multi-commit rename chain into
+    a single pair, so no hop-by-hop walk is needed here — contrast
+    :func:`_rename_pair_for` / :func:`_resolve_renamed_plan_path`, which
+    must walk commits because they start from a path that no longer
+    exists rather than from two trees.
+
+    ``-M``'s default 50% similarity threshold is deliberate: a rename
+    edited too heavily for git to pair simply does not appear here, and
+    the caller degrades to its pre-rename-awareness behaviour — a
+    possible false block, which is the fail-CLOSED direction and the safe
+    way to be wrong.  ``-C`` (copy detection) is deliberately NOT passed:
+    a copy leaves its source in place, so treating a copy target as
+    accounted-for, or a copy source as relocated, would suppress a path
+    whose content genuinely could have been dropped.
+
+    Returns ``None`` — never a partial list — on rc != 0, so every caller
+    can tell "git could not answer" from "git answered: no renames".
+    """
+    rc, out, err = await _run(
+        ['git', 'diff', '-M', '--name-status', from_ref, to_ref],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: rename-pair diff %s..%s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            log_prefix, from_ref, to_ref, rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return None
+
+    pairs: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        fields = line.split('\t')
+        if len(fields) < 3:
+            continue
+        status, old_path, new_path = fields[0], fields[1], fields[2]
+        if status.startswith('R') and old_path and new_path:
+            pairs.append((old_path, new_path))
+    return pairs
+
+
+async def _branch_delta_survives(
+    before: tuple[str, str],
+    after: tuple[str, str],
+    merged: tuple[str, str],
+    git_ops: GitOps,
+    *,
+    log_prefix: str,
+    task_id: str | None = None,
+) -> bool:
+    """True only when the branch's own delta is demonstrably in the merge.
+
+    Each argument is a ``(rev, path)`` pair: what the branch started
+    from, what it produced, and where the merge landed it.  A rename pair
+    alone proves nothing — ``git diff -M`` pairs at ~50% similarity, so a
+    resolution that relocates a file and discards the branch's edit still
+    pairs.  A pair is therefore only a CANDIDATE for suppression; this is
+    the check that confirms one.
+
+    EVERY failure mode returns False, i.e. "keep flagging".  That is the
+    safe direction even though the surrounding gates fail OPEN on git
+    errors: declining an unproven suppression merely restores the
+    pre-rename-awareness behaviour, which by construction cannot
+    introduce a false block relative to main, whereas failing open here
+    would hide genuine work loss.
+
+    Evidence is gathered in three ascending steps, each cheaper and
+    stronger than the one below it:
+
+    1. The merged path must RESOLVE TO A BLOB.  This is checked first and
+       unconditionally, because a branch delta can legitimately be EMPTY —
+       a pure relocation edits nothing — and an empty patch reverse-applies
+       against anything, including a resolution that deleted the file
+       outright.  Existence is the whole of the branch's claim in that
+       case and the only thing separating "relocated" from "dropped"; an
+       empty delta may be trusted only once it holds.
+    2. Byte identity.  When the merged blob is identical to the one the
+       branch produced, its content landed verbatim and nothing need be
+       read at all — which is also what makes a binary or otherwise
+       undecodable file suppressible in the common case where only the
+       branch touched it.
+    3. Reverse-application of the branch's patch against the merged blob,
+       for the case where main edited the same content on top.
+
+    Deliberately conservative in four known ways, every one erring
+    toward a false flag and never toward a false negative.  ``git apply`` matches
+    exact context with no fuzz, so a main-side edit landing inside the
+    branch hunk's three context lines yields a flag (measured: an edit
+    three lines away still reverse-applies cleanly).  A blob that is not
+    valid UTF-8 — binary, or text in a legacy encoding — cannot reach step
+    3 at all, because ``_run`` decodes stdout strictly; the read is
+    therefore guarded and flags.  (Step 3 is reached only when step 2
+    failed, i.e. main also edited it — a binary file the branch alone
+    touched suppresses at step 2 without a read.)  A third follows from
+    ``_run`` stripping stdout: a patch whose final context line carries
+    trailing whitespace loses it and will not apply — again a flag, never
+    a silent suppression.  A fourth is step 2's asymmetry: OID equality
+    proves survival but inequality proves nothing, so it may only
+    short-circuit toward True.
+    """
+    rc, patch, err = await _run(
+        ['git', 'diff', f'{before[0]}:{before[1]}', f'{after[0]}:{after[1]}'],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: branch-delta diff %s:%s..%s:%s failed (rc=%d, stderr=%s); '
+            'not suppressing. task_id=%s',
+            log_prefix, before[0], before[1], after[0], after[1],
+            rc, err.strip(), task_id or '<unknown>',
+        )
+        return False
+    rc, _oid, err = await _run(
+        ['git', 'rev-parse', '--verify', f'{merged[0]}:{merged[1]}'],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            '%s: merged path %s:%s resolves to no blob (rc=%d, stderr=%s); '
+            'the branch delta did not survive, not suppressing. task_id=%s',
+            log_prefix, merged[0], merged[1], rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return False
+
+    if not patch.strip():
+        return True
+
+    # ``--quiet`` implies ``--exit-code`` and prints nothing, so this asks
+    # "are these two blobs identical?" without decoding either — the one
+    # question about an undecodable payload that can still be answered.
+    rc, _out, _err = await _run(
+        ['git', 'diff', '--quiet',
+         f'{after[0]}:{after[1]}', f'{merged[0]}:{merged[1]}'],
+        cwd=git_ops.project_root,
+    )
+    if rc == 0:
+        return True
+
+    try:
+        rc, blob, err = await _run(
+            ['git', 'show', f'{merged[0]}:{merged[1]}'],
+            cwd=git_ops.project_root,
+        )
+    except UnicodeDecodeError:
+        logger.warning(
+            '%s: merged blob %s:%s is not valid UTF-8 and cannot be '
+            'patch-verified; not suppressing. task_id=%s',
+            log_prefix, merged[0], merged[1], task_id or '<unknown>',
+        )
+        return False
+    if rc != 0:
+        logger.warning(
+            '%s: merged blob %s:%s unreadable (rc=%d, stderr=%s); '
+            'not suppressing. task_id=%s',
+            log_prefix, merged[0], merged[1], rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        # ``_run`` returns ``stdout.decode().strip()``, and ``git apply``
+        # rejects a patch with no final newline as "corrupt patch at line
+        # N".  Re-terminate rather than reaching for an unstripped runner.
+        (tmp / 'delta.patch').write_text(patch + '\n')
+        # The AFTER path, NOT the merged path: `git apply -R` locates the
+        # file by the patch's ``b/`` (new) side.  A fresh tmpdir is also
+        # required — with differing a/b paths, reverse-apply additionally
+        # demands the ``a/`` path be absent.
+        staged = tmp / after[1]
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(blob)
+        rc, _, _ = await _run(
+            ['git', 'apply', '--check', '-R', '-p1', 'delta.patch'], cwd=tmp,
+        )
+    return rc == 0
+
+
+async def _rename_aware_real_drops(
+    dropped_in_merge: list[str],
+    branch_changed: set[str],
+    base: str,
+    task_head: str,
+    merge_commit_sha: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> list[str] | None:
+    """Intersect the drop set with branch-authored work, discounting renames.
+
+    A path can disappear from ``task_head`` for two very different
+    reasons: the merge DISCARDED it, or the merge carried it to a new
+    name.  Under ``--no-renames`` those look identical, so a rename
+    SOURCE in ``task_head..merge_commit`` is a candidate for exclusion.
+
+    A pair alone is NOT sufficient to discount a drop.  ``git diff -M``
+    pairs at ~50% similarity, so a resolution that relocates a file and
+    throws the branch's edit away still pairs (measured ``R095``) — the
+    two outcomes are indistinguishable by pairing alone.  The candidate
+    is therefore confirmed by :func:`_branch_delta_survives`, which
+    re-applies the branch's own delta against the merged blob; only a
+    confirmed pair is discounted.
+
+    Merge-diff order is preserved, as the caller's warning reports it.
+
+    Returns ``None`` when the rename map is unreadable, so the caller can
+    fail open rather than flagging a phantom drop on a transient error.
+    """
+    pairs = await _rename_pairs(
+        task_head, merge_commit_sha, git_ops,
+        log_prefix='drop-guard', task_id=task_id,
+    )
+    if pairs is None:
+        return None
+
+    relocated = {old: new for old, new in pairs}
+    authored = [p for p in dropped_in_merge if p in branch_changed]
+
+    real_drops: list[str] = []
+    suppressed: list[tuple[str, str]] = []
+    for p in authored:
+        new = relocated.get(p)
+        if new is not None and await _branch_delta_survives(
+            (base, p), (task_head, p), (merge_commit_sha, new),
+            git_ops, log_prefix='drop-guard', task_id=task_id,
+        ):
+            suppressed.append((p, new))
+        else:
+            real_drops.append(p)
+
+    if suppressed:
+        logger.info(
+            'drop-guard: content verified at the new name, not flagging '
+            '%r (old, new). task_id=%s merge_commit_sha=%s',
+            suppressed, task_id or '<unknown>', merge_commit_sha,
+        )
+    return real_drops
+
+
+async def _check_plan_targets_in_tree(
+    merge_commit_sha: str,
+    task_worktree: Path,
+    git_ops: GitOps,
+    main_sha: str,
+    *,
+    task_id: str | None = None,
+) -> DropGuardResult:
+    """Return a :class:`DropGuardResult` listing files dropped by the merger.
+
+    Compares ``task_HEAD`` (the source worktree's HEAD) to the merge commit
+    directly.  A "drop" means the file is on the task tip but absent from
+    the merge commit — i.e. conflict resolution discarded work the branch
+    actually produced.  Plan-vs-tip mismatches (gitignored files listed in
+    ``plan['files']``, prereq-deleted files, amend-deleted files) are out
+    of scope for this gate; catching those belongs to verify/review.
+
+    The raw ``task_HEAD``-minus-``merge_commit`` diff over-flags: a clean
+    merge legitimately drops a path that a *sibling* moved or deleted on
+    main, even though this branch carried the old copy and never touched
+    it.  To subtract main-side change, we intersect the drop set with the
+    files the branch itself ADDED or MODIFIED since the shared merge-base
+    (``merge-base(task_HEAD, main_sha)``).  ``main_sha`` is the pre-merge
+    main tip the merge was computed against (actual or speculative), not
+    the post-merge advanced SHA — using it keeps the subtraction robust to
+    ``advance_main``'s CAS-retry rebase.
+
+    That intersection alone covers only HALF of the sibling-rename case,
+    and the missing half is what produced a measured false block
+    (esc-6436-4).  When the branch never touched the relocated path, the
+    old path is absent from the branch's add/modify set and the
+    intersection correctly discards it (the esc-3861 case, pinned by
+    ``test_merge_queue.py::TestCheckPlanTargetsInTree::
+    test_sibling_moved_file_not_flagged``).  When the branch MODIFIED it,
+    the old path IS in ``branch_changed`` — so the intersection fires and
+    reports a drop of work that is sitting, intact, at the new name.
+    ``--no-renames`` is retained on both set-building diffs, whose ``AM``
+    / ``D`` filters are what make the intersection meaningful; rename
+    resolution is applied instead as a separate, additive ``-M`` pass over
+    ``task_head..merge_commit`` (:func:`_rename_aware_real_drops`), which
+    treats an apparently-dropped path that is really a rename SOURCE as a
+    CANDIDATE for exclusion — and, because ``-M`` pairs at ~50%
+    similarity and so cannot distinguish a faithful relocation from one
+    that discarded the branch's edit, confirms it by re-applying the
+    branch's own delta against the merged blob before discounting it.
+
+    Fail-open on rc != 0: post-merge verify is the next safety net, and
+    flagging a phantom drop on a transient git error is worse than missing
+    a real one.  Loud-log so regressions surface in ops.
+    """
+    rc, head_out, head_err = await _run(
+        ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
+    )
+    if rc != 0:
+        logger.warning(
+            'drop-guard: git rev-parse HEAD failed in %s (rc=%d, stderr=%s); '
+            'failing open. task_id=%s merge_commit_sha=%s',
+            task_worktree, rc, head_err.strip(),
+            task_id or '<unknown>', merge_commit_sha,
+        )
+        return DropGuardResult()
+    task_head = head_out.strip()
+
+    # Shared baseline: what the branch and main diverged from.  Subtracting
+    # main-side change below is anchored here.
+    rc, base_out, base_err = await _run(
+        ['git', 'merge-base', task_head, main_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'drop-guard: merge-base %s %s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            task_head, main_sha, rc, base_err.strip(),
+            task_id or '<unknown>',
+        )
+        return DropGuardResult()
+    base = base_out.strip()
+
+    # Files the branch itself ADDED or MODIFIED since the merge-base.  A
+    # legitimately-dropped path the branch never touched (e.g. sibling-moved
+    # on main) is absent here, so the intersection below excludes it.
+    rc, changed_out, changed_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            '--diff-filter=AM', base, task_head,
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'drop-guard: branch-changed diff %s..%s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            base, task_head, rc, changed_err.strip(),
+            task_id or '<unknown>',
+        )
+        return DropGuardResult()
+    branch_changed = {ln.strip() for ln in changed_out.splitlines() if ln.strip()}
+
+    rc, out, err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            '--diff-filter=D', task_head, merge_commit_sha,
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'drop-guard: git diff %s..%s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            task_head, merge_commit_sha, rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return DropGuardResult()
+
+    dropped_in_merge = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    # Subtract main-side change: only a path the branch actually produced
+    # AND the merge discarded — not merely relocated — is a real drop.
+    real_drops = await _rename_aware_real_drops(
+        dropped_in_merge, branch_changed, base, task_head, merge_commit_sha,
+        git_ops, task_id=task_id,
+    )
+    if real_drops is None:
+        return DropGuardResult()
+    if real_drops:
+        logger.warning(
+            'drop-guard: dropped_plan_targets '
+            'task_id=%s merge_commit_sha=%s task_head=%s dropped=%r',
+            task_id or '<unknown>', merge_commit_sha, task_head, real_drops,
+        )
+    return DropGuardResult(dropped=real_drops)
+
+
+def is_cross_repo_task(
+    plan_files: list[str],
+    project_root: Path,
+    metadata: dict | None,
+) -> bool:
+    """Return True iff a task's declared files identify a *cross-repo deliverable*.
+
+    A cross-repo deliverable is a task whose plan files ALL belong to a
+    *different* project, so its own branch is legitimately empty (the reify
+    task 5308 shape).  Recognizing it lets the pre-merge Decision-1 gate route
+    to the honest ``OutcomeKind.plan_files_cross_repo`` outcome instead of
+    false-flagging the empty branch as "plan files not touched".
+
+    An orchestrator owns exactly one ``project_root`` and has NO cross-project
+    registry, so it cannot classify a *relative* foreign path on its own.  Two
+    signals are therefore honored:
+
+    * ``metadata['cross_repo']`` truthy — the marker set by the fused-memory
+      submit path when it recognizes (via its ``ProjectPrefixRegistry``) that
+      every declared file is owned by one other project.  This covers the
+      relative-foreign 5308 shape the orchestrator cannot see unaided.
+    * Every declared entry is an ABSOLUTE path resolving OUTSIDE
+      ``project_root`` — the absolute-foreign shape, which the orchestrator can
+      classify by path containment alone (no registry needed).
+
+    Returns False for an empty ``plan_files`` (evaluated first, before the
+    marker), for any mix of foreign + local/relative entries, and when a
+    declared absolute path resolves INSIDE ``project_root``.  Conservative by
+    design: a genuine, still-undelivered NEW local file is a relative in-tree
+    path with no marker, so it is never mistaken for cross-repo.
+    """
+    if not plan_files:
+        return False
+    if metadata and metadata.get('cross_repo'):
+        return True
+    entries = [entry for entry in plan_files if entry]
+    if not entries:
+        return False
+    root = project_root.resolve()
+    for entry in entries:
+        if not os.path.isabs(entry):
+            return False
+        if Path(entry).resolve().is_relative_to(root):
+            return False
+    return True
+
+
+@dataclasses.dataclass(frozen=True)
+class AlreadyLandedResult:
+    """Structured return value from :func:`resolve_already_landed_branch`.
+
+    Attributes:
+        landed_sha: The commit on main that ATTRIBUTES the landing to this
+            task — a per-task merge commit, or (for a coalesce-train member,
+            which has none) the task's own commit whose subject cites it.
+        mechanism: Which attribution probe answered — ``'merge_marker'`` or
+            ``'task_citation'``.  Recorded so an operator reading the
+            outcome can tell the two landing shapes apart without re-running
+            the probes.
+        matched_files: The declared plan entries this landing was shown to
+            cover, in the architect's own spelling (pre-normalization), so
+            the diagnostic names exactly what plan.json says.  ALWAYS the
+            complete declared set — a partial match returns None rather than
+            a partial result.
+    """
+
+    landed_sha: str
+    mechanism: str
+    matched_files: list[str]
+
+
+async def resolve_already_landed_branch(
+    plan_files: list[str],
+    base_sha: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str,
+    branch: str,
+) -> AlreadyLandedResult | None:
+    """Never-raises guard around :func:`_resolve_already_landed_branch`.
+
+    The predicate's whole contract is that it fails CLOSED — None means
+    "carve nothing out", i.e. exactly today's behaviour.  A RAISE is not
+    failing closed: it would propagate out of the already-failing
+    ``_submit_to_merge_queue`` arm and take down the entire merge submission
+    for what is a purely advisory recognition step.  And the probes really do
+    raise: ``_run`` raises :class:`WorktreeMissing` when ``cwd`` is gone, and
+    every ``git_ops`` probe can surface an unexpected error of its own.
+
+    ``asyncio.CancelledError`` is re-raised: cancellation is not a git error
+    and swallowing it would strand the awaiting task.
+
+    See :func:`_resolve_already_landed_branch` for the four signals.
+    """
+    try:
+        return await _resolve_already_landed_branch(
+            plan_files, base_sha, branch_head, git_ops,
+            task_id=task_id, branch=branch,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            'already-landed: probe raised for task_id=%s branch=%s — failing '
+            'closed (the unchanged plan_files_not_touched path runs)',
+            task_id, branch, exc_info=True,
+        )
+        return None
+
+
+async def _resolve_already_landed_branch(
+    plan_files: list[str],
+    base_sha: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str,
+    branch: str,
+) -> AlreadyLandedResult | None:
+    """Recognize a branch that is empty BECAUSE its work already landed.
+
+    Returns a result only when ALL FOUR independent signals hold, and None
+    on any unmet signal or any git error.  Fails CLOSED by construction: None
+    means "carve nothing out", i.e. exactly today's behaviour, so a
+    mis-measurement can never excuse real non-delivery.
+
+    **1. EMPTY RANGE** — ``git rev-list --count <base>..<head>`` parses to
+    exactly 0.  This is the signal that SEPARATES "ref parked on one of
+    main's own commits after a rebase dropped every commit as already
+    upstream" from the genuine non-delivery case of a branch that HAS commits
+    which simply missed the declared files.  Without it the carve-out would
+    be a blanket amnesty for under-delivery, which is the opposite of what
+    the gate is for.
+
+    **2. ATTRIBUTION** — :meth:`GitOps.find_merge_marker` with
+    ``gate_on_existing_ref=False``, falling back to
+    :meth:`GitOps.find_task_citation_commit` under the STRICTER
+    :data:`ALREADY_LANDED_CITATION_PATTERN` (amendment pass, review finding
+    #2 — the default template also accepts unanchored bare-paren mentions, so
+    ``Revert "impl(3717): ..."`` and ``fix(4200): back out task/3717 changes``
+    would both attribute a landing to task 3717 while touching exactly the
+    paths that make signal 3 pass too).  ``gate_on_existing_ref=False`` is not
+    optional here: the parked ref still EXISTS (that is the whole shape), and
+    the default gate would return None for every case this predicate cares
+    about.
+
+    Whichever probe answers, the attributing commit is then required NOT to
+    have a revert-shaped subject (:data:`_REVERT_SUBJECT_RE`), a
+    defence-in-depth guard — see that constant for why it is kept.
+
+    **TRAP 1 — the citation fallback is mandatory, not belt-and-braces.**  A
+    non-tip coalesce-train member lands with NO per-task merge marker: the
+    TRAIN carries the merge subject, its members do not (live specimen: task
+    4104 inside train ``coalesce-4181-b2a290cd`` at ``d25b24468c``).  The
+    member's own commits are still on main carrying task-id subjects, so the
+    citation probe is what keeps that whole population from being
+    false-negatived and left in the loop.
+
+    **3. COVERAGE** — every declared entry must appear in the LANDING'S OWN
+    touched set, computed as ``get_files_touched_in_branch(f'{sha}^1', sha)``
+    against the attributing sha.  For a merge commit ``^1..`` enumerates
+    exactly the merged-in commits (the task's own work); for a plain commit
+    ``^1`` is ``^``, so the same call is correct for both.  Comparison goes
+    through :func:`_entry_covered`, which is the SAME normalization and
+    directory-prefix code the gate itself runs (extracted in the amendment
+    pass, review finding #5, so the two sites cannot drift), so a declared
+    directory is satisfied by a file beneath it.
+
+    This is the guard against a task that landed a PARTIAL earlier increment,
+    was re-dispatched for the rest, and delivered nothing this time —
+    attribution alone would wrongly excuse it.  It matches the measured
+    evidence exactly: 3604's landed file set equals its 3 declared plan
+    files, 3572's equals its 7.
+
+    **4. SURVIVAL** — :meth:`GitOps.commit_effect_present_in_main` says the
+    attributing commit's own effect is STILL PRESENT at main's current HEAD
+    (amendment pass, review finding #1).  Signals 1-3 are all statements about
+    IMMUTABLE HISTORY: a merge commit stays an ancestor of main forever, and
+    ``M^1..M`` keeps reporting the pre-revert content, so a landing that was
+    subsequently REVERTED on main satisfies every one of them and the gate
+    would tell an operator to "verify the landing and CLOSE this task" for
+    work that is no longer there.  This is the exact same post-hoc-revert
+    blind spot the reconcile sweep closes before MARK_DONE (task 2500/2678),
+    closed here by REUSING that sweep's primitive rather than re-deriving a
+    weaker one: it diffs every merged-in parent against current main and
+    requires each one's added lines to survive, so it covers both the merge
+    and the plain-commit (train-member) attribution shapes.
+
+    **TRAP 3 — the rename gap, documented rather than silently closed.**  The
+    gate itself has a rename-resolution arm (:func:`_resolve_renamed_plan_path`,
+    task 3110) for a declared entry that main has since relocated; this
+    predicate deliberately does NOT.  A plan entry whose path was renamed on
+    main BEFORE the task landed (so the landing touched the NEW path while
+    plan.json still names the old one) therefore fails signal 3 and falls
+    through to the UNCHANGED ``plan_files_not_touched`` path.  That is
+    fail-closed and safe, but it is a real population (measured on
+    reify-5196), and the honest reading is that this carve-out does not cover
+    it yet — not that it cannot happen.  Stated here, and pinned by a test,
+    for the same loud-over-silent reason as TRAP 2.
+
+    **TRAP 2 — a knowingly invisible class.**  A rebase landing with no merge
+    commit and no task-id citation anywhere (specimen: task 3916, findable
+    only by ``git cherry`` patch-id equivalence) cannot be seen by any
+    grep-based predicate.  It falls through to the UNCHANGED
+    ``plan_files_not_touched`` path exactly as today.  That limitation is
+    stated here loudly rather than silently accepted, per the repo's
+    loud-over-silent-degradation norm, and is pinned by a test.
+
+    **NOT task 3560's defect.**  Task 3560 was a SINGLE-REF misread — two refs
+    existed (``task/3560`` empty, ``task/3560-skip-attempt`` with 40 commits)
+    and the gate read the wrong one.  Here ``git branch -a --list '*<id>*'``
+    finds exactly one ref and the emptiness is real.  Same gate, sibling
+    mechanism: do NOT widen this predicate to fold the two together, or it
+    stops requiring evidence that the work is on main at all.
+
+    Args:
+        plan_files: The architect's declared entries, original spelling.
+        base_sha: The branch's recorded base — the left side of the range.
+        branch_head: The branch tip — the right side of the range.
+        git_ops: Provides ``project_root`` and the three probes.
+        task_id: Bare task id (no ``task/`` prefix), for the citation probe.
+        branch: Full prefixed branch name, for the merge-marker probe.
+    """
+    if not plan_files:
+        return None
+
+    # --- signal 1: the range is measurably EMPTY ---------------------------
+    rc, out, err = await _run(
+        ['git', 'rev-list', '--count', f'{base_sha}..{branch_head}'],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'already-landed: rev-list --count %s..%s failed task_id=%s '
+            'rc=%s stderr=%s — failing closed',
+            base_sha, branch_head, task_id, rc, (err or '').strip()[:400],
+        )
+        return None
+    try:
+        ahead = int(out.strip())
+    except ValueError:
+        # Unparseable output is an unmeasured range, not an empty one.
+        logger.warning(
+            'already-landed: rev-list --count %s..%s returned unparseable '
+            'output task_id=%s out=%r — failing closed',
+            base_sha, branch_head, task_id, (out or '')[:200],
+        )
+        return None
+    if ahead != 0:
+        # The branch did real work; if it missed the declared files that is
+        # genuine non-delivery and belongs to the unchanged gate.
+        return None
+
+    # --- signal 2: the landing is ATTRIBUTABLE to this task ----------------
+    mechanism = 'merge_marker'
+    landed_sha = await git_ops.find_merge_marker(
+        branch, gate_on_existing_ref=False,
+    )
+    if not landed_sha:
+        mechanism = 'task_citation'
+        landed_sha = await git_ops.find_task_citation_commit(
+            task_id, pattern_template=ALREADY_LANDED_CITATION_PATTERN,
+        )
+    if not landed_sha:
+        # TRAP 2 — no marker and no citation.  Invisible here by design.
+        logger.info(
+            'already-landed: empty range for task_id=%s branch=%s but no '
+            'merge marker and no task-id citation on main — failing closed '
+            '(a patch-id-only rebase landing is not visible to a '
+            'grep-based probe)',
+            task_id, branch,
+        )
+        return None
+    landed_sha = landed_sha.strip()
+
+    # ATTRIBUTION, part 2: the commit that answered must be a DELIVERY, not a
+    # revert of one.  Defence in depth: see `_REVERT_SUBJECT_RE` for why
+    # neither probe answers with a revert today, and why a revert that did
+    # answer would pass every later signal.
+    rc, subject, err = await _run(
+        ['git', 'log', '-1', '--format=%s', landed_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'already-landed: could not read the subject of attributing '
+            'commit %s (mechanism=%s) task_id=%s rc=%s stderr=%s — failing '
+            'closed',
+            landed_sha, mechanism, task_id, rc, (err or '').strip()[:400],
+        )
+        return None
+    if _REVERT_SUBJECT_RE.match(subject.strip()):
+        logger.warning(
+            'already-landed: the commit attributing task_id=%s is %s, whose '
+            'subject %r is a REVERT — that undoes a delivery rather than '
+            'being one, so the work is not on main; failing closed',
+            task_id, landed_sha, subject.strip()[:200],
+        )
+        return None
+
+    # --- signal 3: the landing COVERS every declared entry -----------------
+    touched = await git_ops.get_files_touched_in_branch(
+        f'{landed_sha}^1', landed_sha,
+    )
+    touched_set = set(touched)
+    if not touched_set:
+        # `get_files_touched_in_branch` fails OPEN with [] on a git error, so
+        # an empty set is indistinguishable from "could not measure".  Either
+        # way there is no coverage evidence, so decline.
+        logger.warning(
+            'already-landed: attributing commit %s (mechanism=%s) touched no '
+            'measurable files task_id=%s — failing closed',
+            landed_sha, mechanism, task_id,
+        )
+        return None
+
+    matched: list[str] = []
+    for entry in plan_files:
+        if not entry:
+            continue
+        norm = _normalize_plan_path(entry)
+        # `_entry_covered` IS the gate's own exact-hit + directory-prefix
+        # pair, shared rather than re-spelled (review finding #5).  See
+        # TRAP 3 above for the one arm this site deliberately does not
+        # inherit: rename resolution.
+        if _entry_covered(norm, touched_set):
+            matched.append(entry)
+            continue
+        # One uncovered entry is enough: a PARTIAL earlier landing must not
+        # excuse a later empty branch.
+        logger.info(
+            'already-landed: declared entry %r is not covered by landing %s '
+            '(mechanism=%s) task_id=%s — failing closed',
+            entry, landed_sha, mechanism, task_id,
+        )
+        return None
+
+    if not matched:
+        return None
+
+    # --- signal 4: the landing SURVIVES at main's current HEAD -------------
+    # Signals 1-3 are all claims about immutable history and stay true after
+    # a revert; this is the only one that reads CURRENT main.  Same primitive
+    # the reconcile sweep applies before MARK_DONE (harness.py, the FIX 1'
+    # effect-present refinement), so the two seams answer "is it still there"
+    # identically instead of drifting.
+    if not await git_ops.commit_effect_present_in_main(landed_sha):
+        logger.warning(
+            'already-landed: landing %s (mechanism=%s) for task_id=%s is an '
+            'ancestor of main but its effect is NOT present at current HEAD '
+            '(post-hoc revert) — failing closed rather than telling an '
+            'operator to close a task whose work is no longer on main',
+            landed_sha, mechanism, task_id,
+        )
+        return None
+
+    logger.info(
+        'already-landed: task_id=%s branch=%s is empty because its work '
+        'landed at %s (mechanism=%s, %d declared entr%s covered)',
+        task_id, branch, landed_sha, mechanism, len(matched),
+        'y' if len(matched) == 1 else 'ies',
+    )
+    return AlreadyLandedResult(
+        landed_sha=landed_sha,
+        mechanism=mechanism,
+        matched_files=matched,
+    )
+
+
+def _normalize_plan_path(entry: str) -> str:
+    """Return a git-canonical form of a declared plan path for comparison.
+
+    Strips leading ``./`` and collapses redundant separators via
+    ``posixpath.normpath`` (always POSIX-style, regardless of host OS, so
+    the canonical form always matches git's forward-slash output).  Guards
+    the degenerate case where normpath maps ``'.'`` / ``'./'`` to ``'.'``
+    (the repo root), which would spuriously prefix-match every touched path —
+    in that case the original string is returned so the entry falls through
+    and is correctly flagged.
+
+    Examples::
+
+        './.jcodemunch.jsonc' → '.jcodemunch.jsonc'
+        './src/a.py'          → 'src/a.py'
+        './src/pkg'           → 'src/pkg'
+        './src/pkg/'          → 'src/pkg'   (trailing slash collapsed)
+        'src//pkg'            → 'src/pkg'   (redundant separator collapsed)
+        'src/b.py'            → 'src/b.py'  (unchanged)
+    """
+    norm = posixpath.normpath(entry)
+    # normpath maps '' / '.' / './' → '.', which denotes the repo root.
+    # Empty entries are already filtered by the caller; guard '.' so it
+    # can't spuriously match the repo root prefix.
+    return entry if norm == '.' else norm
+
+
+def _entry_touched_exactly(norm: str, touched_set: set[str]) -> bool:
+    """Does a NORMALIZED plan entry name a path the landing touched outright?
+
+    Extracted (amendment pass, review finding #5) so
+    :func:`_check_plan_files_touched_in_branch` and
+    :func:`_resolve_already_landed_branch` cannot drift on what "touched"
+    means.  Both sides are already git-canonical here: *touched_set* is raw
+    git output and *norm* has been through :func:`_normalize_plan_path`.
+    """
+    return norm in touched_set
+
+
+def _entry_touched_beneath(norm: str, touched_set: set[str]) -> bool:
+    """Does the landing touch any path BENEATH a declared directory entry?
+
+    The directory arm, single-sourced for the same reason as its sibling
+    above.  Prefix-matching alone, with no ls-tree object-type probe: a
+    directory's touched CONTENTS are the evidence, so if nothing beneath it
+    was touched the entry is uncovered whatever its object type is.  The
+    ``rstrip('/')`` + ``'/'`` re-append is what keeps ``src/pkg`` from
+    matching ``src/pkgx/a.py``.
+
+    Callers that DO care about the object type (the gate itself, which must
+    not let a blob prefix-match) gate this call on their own ls-tree probe.
+    """
+    prefix = norm.rstrip('/') + '/'
+    return any(t.startswith(prefix) for t in touched_set)
+
+
+def _entry_covered(norm: str, touched_set: set[str]) -> bool:
+    """Exact hit OR a hit beneath a declared directory.
+
+    The whole coverage question for :func:`_resolve_already_landed_branch`,
+    which — unlike the gate — has no separate existence probe to gate the
+    directory arm on: it is asking about a LANDING that already happened, so
+    the touched set is the only evidence there is.
+    """
+    return (
+        _entry_touched_exactly(norm, touched_set)
+        or _entry_touched_beneath(norm, touched_set)
+    )
+
+
+_MAX_RENAME_HOPS = 8
+"""Upper bound on how many consecutive rename hops the resolver will follow.
+
+A relocation staged as several ``git mv`` commits (``a → b`` then
+``b → c``) is one logical move to a human but N pair-hops to git, so
+mechanism 1 must chase the chain rather than stop at the first pair.  The
+bound exists purely so a pathological history cannot turn one stale plan
+entry into an unbounded subprocess fan-out; 8 is far above any observed
+real chain (the measured reify harness-consolidation moves were 1-2 hops)
+and a chain that exceeds it simply falls through to mechanism 2.
+"""
+
+
+def _ls_tree_object_type(ls_out: str) -> str | None:
+    """Return the git object type named by the first ``git ls-tree`` record.
+
+    ``git ls-tree`` prints ``<mode> <type> <sha>\\t<path>`` — the metadata
+    is TAB-separated from the path, so the type must be read out of the
+    left half only.  Substring-sniffing the whole line for ``' tree '``
+    misclassifies any blob whose repo-relative path happens to contain
+    that substring (e.g. ``docs/my tree notes.md``), which matters because
+    the existence probe's type classification now gates three arms, not
+    one.
+
+    Returns ``None`` for empty or unparseable output (defensive: the
+    caller then treats the object as a non-directory, which is the
+    conservative reading — a directory misread as a blob only costs a
+    prefix-match, never a spurious pass).
+    """
+    for line in ls_out.splitlines():
+        if not line.strip():
+            continue
+        fields = line.split('\t', 1)[0].split()
+        return fields[1] if len(fields) >= 2 else None
+    return None
+
+
+class _RenameProbeUnmeasurable:
+    """Sentinel type: git could not ANSWER the rename probe.
+
+    Distinct from ``None`` ("git answered, and there is no rename pair
+    here") so the resolver can fail CLOSED on an unmeasurable probe
+    instead of silently degrading to the weaker basename heuristic.
+
+    An out-of-band sentinel TYPE, not the in-band ``_OVERLAP_GIT_ERROR_SENTINEL``
+    value idiom used elsewhere in this module: that sentinel is a
+    non-empty list, safely distinguishable because its callers never
+    expect a real list back, but ``_rename_pair_for``'s real return value
+    IS a tuple, so only a distinct type is safely distinguishable from a
+    genuine result.  Not an ``Exception`` subclass, to match this module's
+    control flow (rc-checking plus sentinel returns, no private
+    control-flow exceptions) — named without "Error"/"Exception" so a
+    future reader is not tempted to ``raise`` or ``except`` it (either
+    would be a ``TypeError`` at runtime, since it inherits from neither).
+    """
+
+    __slots__ = ()
+
+
+_RENAME_PROBE_UNMEASURABLE = _RenameProbeUnmeasurable()
+
+
+async def _rename_pair_for(
+    path: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> tuple[str, str] | _RenameProbeUnmeasurable | None:
+    """One hop of git's own rename detection for *path*.
+
+    Finds the commit reachable from *branch_head* that DELETED *path*
+    (``git log --diff-filter=D -1``), then re-reads that commit with
+    rename detection on (``git show --name-status -M``) looking for an
+    ``R<score>\\t<old>\\t<new>`` pair whose old side is *path*.
+
+    Three-valued outcome: returns ``(new_path, deleting_sha)`` when a pair
+    is found; ``None`` when git answered and there genuinely is no
+    deleting commit or no pairable rename; and ``_RENAME_PROBE_UNMEASURABLE`` when
+    a git error means the question could not be answered at all.  Callers
+    MUST distinguish the last from ``None`` — see
+    :func:`_resolve_renamed_plan_path`, which fails CLOSED on it rather
+    than falling through to the basename heuristic on unmeasured evidence.
+    """
+    rc, del_out, del_err = await _run(
+        ['git', 'log', '--diff-filter=D', '-1', '--format=%H', branch_head, '--', path],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
+            'cmd=%r rc=%s stderr=%s',
+            task_id or '<unknown>', path,
+            'git log --diff-filter=D -1 --format=%H <head> -- <entry>',
+            rc, (del_err or '').strip()[:400],
+        )
+        return _RENAME_PROBE_UNMEASURABLE
+
+    del_sha = del_out.strip().splitlines()[0].strip() if del_out.strip() else ''
+    if not del_sha:
+        return None
+
+    rc, show_out, show_err = await _run(
+        ['git', 'show', '--name-status', '-M', '--format=', del_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: rename-probe git error task_id=%s entry=%s '
+            'cmd=%r rc=%s stderr=%s',
+            task_id or '<unknown>', path,
+            f'git show --name-status -M --format= {del_sha[:12]}',
+            rc, (show_err or '').strip()[:400],
+        )
+        return _RENAME_PROBE_UNMEASURABLE
+
+    for line in show_out.splitlines():
+        fields = line.split('\t')
+        if len(fields) < 3:
+            continue
+        status, old_path, new_path = fields[0], fields[1], fields[2]
+        if status.startswith('R') and old_path == path and new_path:
+            return new_path, del_sha
+    return None
+
+
+async def _path_existed_in_branch_history(
+    norm: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> bool:
+    """True when some commit reachable from *branch_head* touched *norm*.
+
+    This is the evidence gate on the basename heuristic: it establishes
+    that the declared path was ever REAL under that exact name.  Without
+    it, a path the architect simply invented (``docs/foo.md``, never
+    created) would fall straight into the basename fallback and could be
+    "rename-resolved" to a coincidentally-unique ``other/place/foo.md`` —
+    a category error (nothing was renamed) that weakens the gate for the
+    one case it must always block.
+
+    Fails CLOSED: a git error returns ``False``, so the heuristic is not
+    consulted on evidence we could not measure.
+    """
+    rc, out, err = await _run(
+        ['git', 'log', '-1', '--format=%H', branch_head, '--', norm],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'plan-files-touched: history-probe git error task_id=%s entry=%s '
+            'head=%s rc=%s stderr=%s',
+            task_id or '<unknown>', norm, branch_head, rc,
+            (err or '').strip()[:400],
+        )
+        return False
+    return bool(out.strip())
+
+
+async def _resolve_renamed_plan_path(
+    norm: str,
+    branch_head: str,
+    git_ops: GitOps,
+    tree_paths: Callable[[], Awaitable[list[str] | None]],
+    *,
+    task_id: str | None = None,
+) -> list[tuple[str, str]]:
+    """Resolve a declared path that is ABSENT from the branch tree to its
+    current name(s), or ``[]`` when no resolution is recoverable.
+
+    Returns a PREFERENCE-ORDERED list of ``(resolved_path, mechanism)``
+    candidates, where *mechanism* is a short human-readable description
+    for the audit log.  A LIST rather than a single winner deliberately:
+    mechanism 2 can produce two independently-bounded candidates (the
+    last resolved hop's basename and the originally declared path's), and
+    the tie-breaker that actually matters — which candidate the branch
+    TOUCHED — is known only to the caller, which owns the touched set.
+    Picking a single winner here would let a coincidental hop match
+    SHADOW a declared-key candidate that the branch genuinely delivered,
+    re-introducing the very false-positive class this gate exists to
+    remove (task 4158 review).  The caller
+    (:func:`_check_plan_files_touched_in_branch`) selects the first
+    candidate that is in the touched set, and falls back to the first
+    candidate overall for the audit trail when none is touched.  Ordering
+    is therefore the resolver's only preference statement: mechanism 1's
+    authoritative answer, else hop-key before declared-key.
+
+    **Invariant: every returned ``resolved_path`` always EXISTS in the
+    branch tree at ``branch_head``.**  Both mechanisms enforce it
+    (mechanism 1 verifies each hop against the tree listing; mechanism 2
+    draws its candidates from that listing), so a resolution can never
+    point a human at a second phantom path, and an entry that resolved is
+    never ``missing_from_tree``.
+
+    Mechanism 1 (authoritative — git's own rename detection): follow the
+    rename CHAIN from *norm*, hop by hop, via :func:`_rename_pair_for`.
+    Each hop's target is checked against the branch tree: a hop that lands
+    on a live path is the answer; a hop that lands on a path which was
+    itself relocated again keeps walking (bounded by
+    :data:`_MAX_RENAME_HOPS`, with a cycle guard).  Stopping at the FIRST
+    pair would answer a two-step ``a → b → c`` relocation with the dead
+    intermediate ``b`` — blocking a branch that delivered exactly what was
+    asked, and naming a path that does not exist at branch HEAD in the
+    audit trail.  Staged multi-step moves are precisely the shape the
+    reify harness-consolidation programme used.
+
+    Mechanism 2 (heuristic fallback, tried only when the chain dead-ends):
+    a UNIQUE basename match against the branch tree listing supplied by
+    *tree_paths*.  Mechanism 1 cannot see a relocation staged as SEPARATE
+    delete and add commits (git pairs renames only within one commit),
+    which is exactly how the reify harness-consolidation programme staged
+    its moves.  TWO keys are tried and BOTH surviving candidates are
+    RETURNED, in preference order: the LAST RESOLVED HOP (``current``)
+    first, then the ORIGINALLY DECLARED path (``norm``).  The hop is
+    ordered first because it is the more RECENTLY PROVEN name — mechanism 1
+    produced authoritative git rename evidence for it — whereas ``norm`` is
+    the one name mechanism 1 already showed is stale (``current == norm``
+    when the chain never advanced, so the no-chain case yields a single
+    candidate because the two keys coincide).  The declared path is kept,
+    not discarded, because a chain hop can CHANGE a file's basename and a
+    LATER hop can RESTORE it: the hop is evidence of the file's current
+    name only when it actually HAS a match, not strictly better evidence
+    in every shape.  Critically, the hop candidate does NOT SHADOW the
+    declared one — both are handed to the caller, which prefers whichever
+    the branch actually TOUCHED, and only falls back to this ordering when
+    the touched set cannot break the tie.  That is what makes the two-key
+    lookup a genuine SUPERSET of either single-key behaviour at the GATE:
+    every resolution the ``norm`` key made in production before task 4158
+    still passes the gate, and the chained-rename resolutions the
+    ``current`` key added pass too.  (Ordering alone would NOT be a
+    superset — a coincidental, untouched hop match would shadow a touched
+    declared match and wrongly block; measured against real git in the
+    task 4158 review.)  Both keys are
+    bounded the SAME four ways: each requires EXACTLY ONE candidate; the
+    lookup only runs for a path that exists nowhere in the branch tree; it
+    only runs for a path with actual history under its ORIGINALLY DECLARED
+    name, checked via :func:`_path_existed_in_branch_history` on ``norm``
+    (never ``current``, which would be vacuous — a hop only exists because
+    a commit deleted it; an invented path is a stale declaration, not a
+    rename); and a resolution never passes the gate on its own — the
+    caller additionally requires the resolved path to be in the touched
+    set.  So an ambiguous or coincidental basename cannot silently satisfy
+    the gate on EITHER key, and returning a second candidate escapes none
+    of these bounds — it only widens which name they are evaluated
+    against.  Ambiguity WITHIN a key fails closed (``len(matches) == 1``);
+    ambiguity ACROSS keys is not silently collapsed here at all — both
+    candidates are returned and the caller breaks the tie on the touched
+    set, which is the only evidence that distinguishes them.
+
+    Known, ACCEPTED limitation, shared by BOTH keys: none of the four
+    bounds above can distinguish "the file was relocated again as separate
+    delete+add commits" (the case the two-key lookup exists to resolve)
+    from "the file was genuinely DELETED OUTRIGHT" (removed, never
+    re-added anywhere).  If an unrelated file elsewhere in the tree
+    happens to share a dead hop's (or the declared path's) basename,
+    mechanism 2 resolves the declared path to that unrelated file even
+    though nothing on the branch actually delivered against it.  This is
+    NOT a new class of risk introduced by trying ``current`` — the
+    no-chain case (``current == norm``) already has it, since a path that
+    was committed and later deleted outright still has git history under
+    its own name, so :func:`_path_existed_in_branch_history` does not stop
+    it either; the hop key only extends the SAME accepted tradeoff to
+    chained renames, where a hop's basename is more likely to be generic
+    (``mod.rs``, ``__init__.py``, ``index.ts``) than the originally
+    declared path's.  A tighter bound is possible (e.g. requiring the
+    candidate to have been ADDED at-or-after the commit that deleted the
+    lookup key) but is deliberately not implemented here.  The tradeoff is
+    bounded in practice by the surrounding invariants — EXACTLY ONE
+    candidate, the resolved path must additionally be in the touched set —
+    and every resolution that passes is logged loudly at WARNING regardless
+    of mechanism or key, so the false-positive class this paragraph
+    documents is never silent.  The declared-path fallback key carries the
+    identical tradeoff under the identical bounds — a coincidental
+    basename match on the declared name is exactly as unable to
+    distinguish a re-relocation from an outright deletion as one on a hop
+    is.  See ``TestHopBasenameAcceptedTradeoff`` in the test module for the
+    pinned shape on the hop key.
+
+    *tree_paths* is an async provider, not a list, so the (single) tree
+    listing is shelled out at most ONCE per gate invocation, shared across
+    every stale entry and every hop, and never computed at all when no
+    entry is stale.  It returns ``None`` on a git error, which fails this
+    resolver closed for BOTH mechanisms — without a tree listing neither
+    the hop-liveness check nor the basename bound can be evaluated, so no
+    entry resolves.
+
+    Anchored on *branch_head* rather than main's live HEAD deliberately:
+    this gate has no ``main_sha`` parameter, and reading ``HEAD`` in
+    ``project_root`` would make a merge gate depend on a ref the merge
+    worker itself advances concurrently — a nondeterministic gate.
+    ``branch_head`` is deterministic and strictly sufficient for this
+    false-positive class: the branch touched the POST-rename paths, so the
+    renaming commit is necessarily an ancestor of ``branch_head``.
+
+    Fails CLOSED — any git error, missing deleting commit, or unmatched
+    rename pair returns ``[]`` (NO candidates) and the caller still
+    blocks.  (Contrast
+    with the whole-gate fail-OPEN on the touched-set fetch: a transient
+    error there would block every plan entry at once, whereas a per-entry
+    probe failure can only leave one already-suspect entry flagged.)
+    """
+    tree_set: set[str] | None = None
+
+    async def _tree_set() -> set[str] | None:
+        nonlocal tree_set
+        if tree_set is None:
+            paths = await tree_paths()
+            if paths is None:
+                return None
+            tree_set = set(paths)
+        return tree_set
+
+    # ── Mechanism 1: follow the deleting commits' rename chain ──────────
+    current = norm
+    seen = {norm}
+    shas: list[str] = []
+    for _hop in range(_MAX_RENAME_HOPS):
+        pair = await _rename_pair_for(current, branch_head, git_ops, task_id=task_id)
+        if isinstance(pair, _RenameProbeUnmeasurable):
+            logger.warning(
+                'plan-files-touched: rename-probe UNMEASURABLE for %s (declared %s) '
+                'at head=%s — resolution abandoned and the basename fallback '
+                'deliberately not attempted (fail CLOSED: never resolve on evidence '
+                'we could not measure). task_id=%s',
+                current, norm, branch_head, task_id or '<unknown>',
+            )
+            return []
+        if pair is None:
+            break
+        new_path, del_sha = pair
+        if new_path in seen:
+            # Degenerate a → b → a history; stop rather than loop.
+            break
+        seen.add(new_path)
+        shas.append(del_sha)
+        current = new_path
+
+        live = await _tree_set()
+        if live is None:
+            return []
+        if current in live:
+            mechanism = (
+                f'rename in {shas[0][:12]}' if len(shas) == 1
+                else f'{len(shas)}-hop rename chain ending in {shas[-1][:12]}'
+            )
+            # Authoritative: git's own rename evidence, verified live in
+            # the tree.  A single candidate — mechanism 2 never runs.
+            return [(current, mechanism)]
+        # The hop landed on a path that is itself gone from the tree: it was
+        # relocated again.  Keep walking rather than returning a dead answer.
+
+    # ── Mechanism 2: unique basename match in the branch tree ───────────
+    # Reached when no commit deleted the path (never created, or the
+    # relocation predates any reachable delete), when the deleting commit
+    # carried no pairable rename (separate delete+add commits), or when
+    # the chain dead-ended on a path that is absent from the tree.  TWO
+    # keys are tried and BOTH surviving candidates are RETURNED, ordered:
+    # `current` — the LAST RESOLVED HOP, which equals `norm` when the
+    # chain never advanced — FIRST, because mechanism 1 produced
+    # authoritative git rename evidence for it; then `norm` — the
+    # ORIGINALLY DECLARED path — because a chain hop can CHANGE a file's
+    # basename and a LATER hop can RESTORE it, so a hop with no unique
+    # candidate is not evidence that the declared name has none.
+    #
+    # The hop candidate must NOT SHADOW the declared one: a hop match can
+    # be a coincidental, untouched file while the declared key resolves
+    # to the file the branch actually delivered (task 4158 review,
+    # reproduced against real git).  Only the caller holds the touched
+    # set, so only the caller can break that tie — hand it both, ordered.
+    if not await _path_existed_in_branch_history(
+        norm, branch_head, git_ops, task_id=task_id,
+    ):
+        logger.warning(
+            'plan-files-touched: declared %s has NO history under that name at '
+            'head=%s — basename fallback deliberately not attempted (a path that '
+            'never existed is an invented declaration, not a rename). task_id=%s',
+            norm, branch_head, task_id or '<unknown>',
+        )
+        return []
+
+    live = await _tree_set()
+    if live is None:
+        return []
+
+    # `live` is narrowed to `set[str]` above; rebind so the closure below
+    # keeps that narrowing (pyright does not carry narrowing into a nested
+    # function through the original name).
+    live_set = live
+
+    def _sole_candidate(key: str) -> str | None:
+        """The ONE tree path sharing *key*'s basename, or None.
+
+        None covers both "no candidate" and "ambiguous" — mechanism 2's
+        `len(candidates) == 1` bound applies identically to BOTH lookup
+        keys, so the fallback can never be looser than the first attempt.
+        """
+        base = posixpath.basename(key)
+        if not base:
+            return None
+        matches = [p for p in live_set if posixpath.basename(p) == base]
+        return matches[0] if len(matches) == 1 else None
+
+    candidates: list[tuple[str, str]] = []
+
+    # First candidate: the LAST RESOLVED HOP.  Mechanism 1 produced
+    # authoritative git rename evidence for it, whereas `norm` is the one
+    # name already PROVEN stale — so when the touched set cannot break
+    # the tie, this ordering makes the hop win.
+    hop_match = _sole_candidate(current)
+    if hop_match is not None:
+        candidates.append((
+            hop_match,
+            'unique basename match' if current == norm
+            else f'unique basename match on {current} (after {len(shas)}-hop rename chain)',
+        ))
+
+    # Second candidate: the ORIGINALLY DECLARED path.  A chain hop can
+    # CHANGE the basename and a later hop can RESTORE it, so a hop match
+    # is not evidence that the declared name's match is wrong — it is
+    # offered alongside, never overwritten by, the hop's.  Skipped when
+    # the chain never advanced (`current == norm`: the two keys coincide,
+    # so the lookup would be identical) or when both keys land on the
+    # same tree path (one candidate, not two).
+    if current != norm:
+        declared_match = _sole_candidate(norm)
+        if declared_match is not None and declared_match != hop_match:
+            candidates.append((
+                declared_match,
+                f'unique basename match on declared {norm} '
+                f'(after {len(shas)}-hop rename chain dead-ended on {current})',
+            ))
+
+    return candidates
+
+
+async def _check_plan_files_touched_in_branch(
+    plan_files: list[str],
+    base_sha: str,
+    branch_head: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> PlanFilesTouchedResult:
+    """Pre-merge Decision-1 check: every plan file must be touched on the branch.
+
+    For each entry in ``plan_files``, classify as touched if either:
+        (a) the entry appears verbatim in
+            ``git log --name-only base..branch_head`` (file path), OR
+        (b) the entry resolves to a directory in the branch tree (via
+            ``git ls-tree``) and at least one touched file path has it as
+            a path-prefix (directory entries are valid plan targets when
+            an agent stages multiple files inside), OR
+        (c) the entry is ABSENT from the branch tree entirely and
+            :func:`_resolve_renamed_plan_path` maps it to a current path
+            that IS in the touched set — i.e. the declared path was
+            renamed on main after the architect declared it, and the
+            branch delivered against the file's current name (task 3110,
+            measured on reify-5196 / esc-5196-22).
+
+    The ``git ls-tree`` call is read as a three-way existence probe:
+    ``rc == 0`` with non-empty output means the path EXISTS at
+    ``branch_head`` (as a tree, which takes arm (b), or as a blob);
+    ``rc == 0`` with EMPTY output means the path is genuinely ABSENT,
+    which takes arm (c); ``rc != 0`` means git could not tell us, so the
+    entry is flagged UNCLASSIFIED — never claim an absence we did not
+    measure.
+
+    Empty ``plan_files`` returns no entries — vacuously satisfied.
+
+    Fail-open on git error (matches :func:`_check_plan_targets_in_tree`):
+    return an empty ``PlanFilesTouchedResult`` so a transient diff error
+    doesn't block a real merge.  Loud-log so regressions surface in ops.
+    """
+    if not plan_files:
+        return PlanFilesTouchedResult()
+
+    touched = await git_ops.get_files_touched_in_branch(base_sha, branch_head)
+    touched_set = set(touched)
+
+    # Lazily-computed, once-per-invocation listing of every path in the
+    # branch tree, used by the rename resolver to verify each chain hop
+    # landed on a path that still EXISTS and to bound its basename
+    # fallback.  It is reached only on the already-failing absent-path
+    # arm, so the cost is off the hot path — and it is paid at most once
+    # per gate invocation even when several declared entries are stale
+    # (the reify-5196 shape had two) and each walks several hops.
+    tree_listing: list[str] | None = None
+    tree_listing_failed = False
+
+    async def _tree_paths() -> list[str] | None:
+        nonlocal tree_listing, tree_listing_failed
+        if tree_listing is not None or tree_listing_failed:
+            return tree_listing
+        rc, out, err = await _run(
+            ['git', 'ls-tree', '-r', '--name-only', branch_head],
+            cwd=git_ops.project_root,
+        )
+        if rc != 0:
+            # Fail closed: without a tree listing we cannot bound the
+            # basename heuristic, so no entry resolves through it.
+            tree_listing_failed = True
+            logger.warning(
+                'plan-files-touched: tree-listing failed task_id=%s head=%s '
+                'rc=%s stderr=%s',
+                task_id or '<unknown>', branch_head, rc,
+                (err or '').strip()[:400],
+            )
+            return None
+        tree_listing = [line for line in out.splitlines() if line]
+        return tree_listing
+
+    not_touched: list[str] = []
+    missing_from_tree: list[str] = []
+    resolved_renames: dict[str, str] = {}
+    for entry in plan_files:
+        if not entry:
+            continue
+        # Normalize the declared path to git-canonical form (strip leading ./)
+        # before comparison.  The touched_set is already canonical git output.
+        # Keep the original `entry` for diagnostics so the escalation message
+        # reflects exactly what the architect wrote in plan.json.
+        norm = _normalize_plan_path(entry)
+        if _entry_touched_exactly(norm, touched_set):
+            continue
+
+        # Existence probe: ask the branch tree what kind of object the
+        # entry names.  ``git ls-tree`` prints "<mode> tree <sha>\t<path>"
+        # for directories and "<mode> blob <sha>\t<path>" for files, and
+        # exits 0 with EMPTY output when the path is absent from the tree
+        # (rc != 0 is reserved for a real git error, e.g. an unresolvable
+        # rev) — which is why this call, and not `git cat-file -e`, is the
+        # existence oracle: cat-file returns 128 for BOTH a missing path
+        # and a bad rev, so it cannot distinguish "the declared path is
+        # stale" from "we could not measure anything".
+        rc, ls_out, ls_err = await _run(
+            ['git', 'ls-tree', branch_head, '--', norm],
+            cwd=git_ops.project_root,
+        )
+        if rc != 0:
+            # Could not measure existence — flag UNCLASSIFIED rather than
+            # asserting an absence we never established.
+            logger.warning(
+                'plan-files-touched: ls-tree probe failed task_id=%s entry=%s '
+                'head=%s rc=%s stderr=%s',
+                task_id or '<unknown>', entry, branch_head, rc,
+                (ls_err or '').strip()[:400],
+            )
+            not_touched.append(entry)
+            continue
+
+        if ls_out.strip():
+            # Path EXISTS at branch_head.  Read the object type out of the
+            # TAB-separated metadata half only — sniffing the whole line for
+            # the substring ' tree ' misreads any blob whose path contains
+            # it (e.g. 'docs/my tree notes.md').
+            # Directory: prefix-match against the touched set.  The prefix
+            # arm is shared with the already-landed predicate (review
+            # finding #5) so the two sites cannot drift on it; the
+            # object-type gate stays HERE, because only this site has an
+            # existence probe to gate on.
+            if (
+                _ls_tree_object_type(ls_out) == 'tree'
+                and _entry_touched_beneath(norm, touched_set)
+            ):
+                continue
+            not_touched.append(entry)
+            continue
+
+        # Path is ABSENT from the branch tree: the declared path is stale,
+        # so the touched set can say nothing about it.  Try to resolve the
+        # rename before blaming the branch (task 3110).
+        candidates = await _resolve_renamed_plan_path(
+            norm, branch_head, git_ops, _tree_paths, task_id=task_id,
+        )
+        if candidates:
+            # The resolver hands back every candidate that survived its
+            # bounds, in ITS preference order, because only this site holds
+            # the touched set — the evidence that actually distinguishes a
+            # coincidental basename match from the file the branch
+            # delivered.  Prefer the first TOUCHED candidate; when none is
+            # touched the tie is unbreakable, so fall back to the
+            # resolver's own ordering for the audit trail (task 4158).
+            chosen, mechanism = next(
+                ((c, m) for c, m in candidates if c in touched_set),
+                candidates[0],
+            )
+            # Key on the ORIGINAL declared string so the diagnostic names
+            # exactly what plan.json says (composes with task 1587's
+            # ./-prefix normalization instead of re-solving it).
+            resolved_renames[entry] = chosen
+            if chosen in touched_set:
+                # A resolved rename means the task's declared metadata.files
+                # is stale — a real data-quality signal on a path that
+                # otherwise produces no output at all.  Log it LOUD even
+                # though the gate passes (no-silent-fail-soft).
+                logger.warning(
+                    'plan-files-touched: declared %s resolved to %s via %s; '
+                    'branch touched the resolved path — gate PASSES. task_id=%s',
+                    entry, chosen, mechanism, task_id or '<unknown>',
+                )
+                continue
+        else:
+            # Absent AND unresolvable: the declared PATH is stale.  Recorded
+            # in BOTH lists (subset invariant) so every existing
+            # not_touched-only consumer is unchanged while the diagnosis
+            # can distinguish "the branch under-delivered" from "the plan
+            # names a path that isn't there".  Entries reaching here via
+            # the git-error arm above are deliberately NOT classified —
+            # their absence was never measured.
+            missing_from_tree.append(entry)
+
+        not_touched.append(entry)
+
+    if not_touched:
+        logger.warning(
+            'plan-files-touched: not_touched task_id=%s '
+            'base=%s head=%s entries=%r '
+            'missing_from_tree=%r resolved_renames=%r',
+            task_id or '<unknown>', base_sha, branch_head, not_touched,
+            missing_from_tree, resolved_renames,
+        )
+    return PlanFilesTouchedResult(
+        not_touched=not_touched,
+        missing_from_tree=missing_from_tree,
+        resolved_renames=resolved_renames,
+    )
+
+
+async def _rename_aware_compare_set(
+    branch_touched: list[str],
+    main_touched: set[str],
+    base_sha: str,
+    branch_head: str,
+    advanced_sha: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> list[str] | None:
+    """Subtract main-side change from *branch_touched*, following renames.
+
+    The string-only rule — "keep a branch-touched path main did not touch"
+    — misses the case where the branch RELOCATED a path main edited: the
+    two halves of the rename are unrelated strings, so main's edit lands
+    in ``main_touched`` under the SOURCE name while the branch's work is
+    compared under the TARGET name.
+
+    A pair whose source main touched is only a CANDIDATE for exclusion,
+    never a licence to skip the path.  ``git diff -M`` pairs at ~50%
+    similarity, so a resolution that keeps the relocation and throws the
+    branch's edit away still pairs (measured ``R095``) — and nothing else
+    covers that case, since the branch's old path is already absent from
+    ``task_head`` and so never reaches the drop-guard's ``D`` set.
+    Exclusion therefore requires :func:`_branch_delta_survives` to
+    re-apply the branch's delta against the merged blob.
+
+    The branch's OLD path deliberately stays in the compare set when main
+    did not touch it: a resolution that RESURRECTS a path the branch
+    deleted is caught precisely because that path is still compared.
+
+    Returns ``None`` when the rename map is unreadable, so the caller can
+    fail open rather than silently running the buggy string-only rule.
+    """
+    pairs = await _rename_pairs(
+        base_sha, branch_head, git_ops,
+        log_prefix='post-merge-equiv', task_id=task_id,
+    )
+    if pairs is None:
+        return None
+
+    sources = {new: old for old, new in pairs}
+    compare_set: list[str] = []
+    suppressed: list[tuple[str, str]] = []
+    for p in branch_touched:
+        if p in main_touched:
+            continue
+        old = sources.get(p)
+        # The branch's delta SPANS the rename here (base:old ->
+        # branch_head:new), unlike the drop-guard's case where the branch
+        # edited in place and the MERGE relocated.  The blob-to-blob diff
+        # form absorbs both without special-casing.
+        if old is not None and old in main_touched and await _branch_delta_survives(
+            (base_sha, old), (branch_head, p), (advanced_sha, p),
+            git_ops, log_prefix='post-merge-equiv', task_id=task_id,
+        ):
+            suppressed.append((p, old))
+        else:
+            compare_set.append(p)
+
+    if suppressed:
+        logger.info(
+            'post-merge-equiv: content verified at the new name, not '
+            'comparing %r (target, source). task_id=%s',
+            suppressed, task_id or '<unknown>',
+        )
+    return compare_set
+
+
+async def _check_post_merge_equivalence(
+    task_worktree: Path,
+    advanced_sha: str,
+    git_ops: GitOps,
+    main_sha: str,
+    *,
+    task_id: str | None = None,
+    merged_tip: str | None = None,
+    allow_worktree_head_fallback: bool = True,
+) -> list[str]:
+    """Return branch-touched paths whose ``advanced_sha`` blob differs from ``branch_HEAD``.
+
+    Decision-2 post-merge gate: every file the branch touched must appear
+    in the advanced main commit with identical content.  Files the branch
+    did NOT touch are excluded — main legitimately includes work from
+    siblings or earlier merges that the branch never saw.
+
+    Scope (compare set): the merge-base of branch and ``main_sha`` (the
+    pre-merge main tip, NOT ``advanced_sha``) is the pre-branch baseline;
+    ``git diff --name-only base..branch_head`` lists every path the branch
+    produced.  We then subtract the paths main *also* changed since that
+    baseline (``base..main_sha``): a clean 3-way merge legitimately combines
+    the branch's and a sibling's edits to a shared path (e.g. ``Cargo.lock``),
+    so merged main differs from the branch tip there without anything being
+    dropped.  Anchoring the base on ``main_sha`` rather than ``advanced_sha``
+    keeps the gate robust to ``advance_main``'s CAS-retry rebase.
+
+    That subtraction is on path STRINGS, so it needs a rename
+    correspondence to be sound: when the branch RELOCATED a path main
+    edited, main's edit is recorded under the rename SOURCE and the
+    branch's work under the TARGET, and the target survives a subtraction
+    that should have removed it.  :func:`_rename_aware_compare_set`
+    therefore treats a branch-touched path whose rename SOURCE main
+    touched as a CANDIDATE for exclusion (task 5342; measured as reify
+    task 5694 / esc-5694-5) — and, because ``-M`` pairs at ~50%
+    similarity and so cannot tell a faithful relocation from one that
+    discarded the branch's edit, takes the exclusion only when the
+    branch's own delta re-applies against the merged blob.  Nothing else
+    covers that case: the branch's old path is already absent from
+    ``task_head`` and so never reaches the drop-guard's ``D`` set.
+    ``--no-renames`` on both set-building diffs is retained
+    and is load-bearing in that design: main's own rename must stay
+    DECOMPOSED so its source path appears in ``main_touched`` — that is
+    exactly the set the branch's rename sources are looked up in, and a
+    rename-collapsed main diff would hide the source and reintroduce the
+    miss.  The branch's OLD path likewise stays in the compare set when
+    main did not touch it, so a merge that RESURRECTS a path the branch
+    deleted is still flagged.
+
+    The surviving compare set is the branch's own work that main did not
+    touch; we ask git whether any of those paths differ between
+    ``branch_HEAD`` and ``advanced_sha`` — non-empty = the merge dropped or
+    rewrote that work.
+
+    Empty list = clean preservation (ff-merge, --no-ff with no conflicts,
+    clean rebase).  Non-empty = caller treats as a hard failure.
+
+    Fail-open on git error: returns an empty list and logs a WARNING.
+    The call is a defense-in-depth check; a transient git error must
+    not block a successful merge from being recorded.
+
+    *merged_tip* — when provided, it is used directly as the branch tip to
+    compare against ``advanced_sha``, bypassing the ``git rev-parse HEAD``
+    read in ``task_worktree``.  Pass the tip *actually merged* (e.g. the
+    second parent of the merge commit, ``advanced_sha^2``) so that the gate
+    is drift-proof when the worktree HEAD has been rebased or hijacked after
+    the snapshot was taken.  When ``None`` (the default) the existing
+    worktree-HEAD behaviour is preserved for back-compat.
+
+    *allow_worktree_head_fallback* — when ``False`` and ``merged_tip`` is
+    ``None``, return ``[]`` immediately WITHOUT reading the live worktree
+    HEAD.  This is set to ``False`` by :func:`_finalize_advanced_merge`
+    when no trusted branch tip is recoverable AND ``advanced_sha`` is
+    positively linear (confirmed single-parent commit).  A linear
+    ``advanced_sha`` means the landed tree is a fast-forward or
+    rebase-flattened projection of the branch tip, so the HEAD-drift
+    comparison can only produce phantom failures — the tree is equivalent
+    by construction regardless of whether ``_reverify_rebased_tree`` ran on
+    this path.  Default ``True`` preserves byte-for-byte back-compat for
+    all existing callers.
+    """
+    if merged_tip is not None:
+        branch_head = merged_tip
+    elif not allow_worktree_head_fallback:
+        # No trusted tip and caller explicitly suppressed the worktree-HEAD
+        # fallback (advanced_sha is a positively-linear commit — the landed
+        # tree is equivalent to the branch tip by construction).  Return []
+        # rather than reading a potentially drifted live HEAD.
+        logger.debug(
+            'post-merge-equiv: allow_worktree_head_fallback=False with '
+            'merged_tip=None — skipping gate (no HEAD read). '
+            'task_id=%s advanced_sha=%s',
+            task_id or '<unknown>', advanced_sha,
+        )
+        return []
+    else:
+        rc, head_out, head_err = await _run(
+            ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
+        )
+        if rc != 0:
+            logger.warning(
+                'post-merge-equiv: git rev-parse HEAD failed in %s '
+                '(rc=%d, stderr=%s); failing open. task_id=%s advanced_sha=%s',
+                task_worktree, rc, head_err.strip(),
+                task_id or '<unknown>', advanced_sha,
+            )
+            return []
+        branch_head = head_out.strip()
+
+    # Determine the branch's touched set against the merge-base with the
+    # PRE-merge main tip (main_sha).  Using main_sha rather than advanced_sha
+    # lets us subtract main-side change below and stays rebase-robust.
+    rc, mb_out, mb_err = await _run(
+        ['git', 'merge-base', branch_head, main_sha],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'post-merge-equiv: merge-base failed for %s..%s '
+            '(rc=%d, stderr=%s); failing open. task_id=%s',
+            branch_head, main_sha, rc, mb_err.strip(),
+            task_id or '<unknown>',
+        )
+        return []
+    base_sha = mb_out.strip()
+
+    rc, touched_out, touched_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            base_sha, branch_head,
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'post-merge-equiv: branch-touched diff failed for %s..%s '
+            '(rc=%d, stderr=%s); failing open. task_id=%s',
+            base_sha, branch_head, rc, touched_err.strip(),
+            task_id or '<unknown>',
+        )
+        return []
+    branch_touched = [ln.strip() for ln in touched_out.splitlines() if ln.strip()]
+    if not branch_touched:
+        return []
+
+    # Paths main independently changed since the shared baseline.  A clean
+    # merge combining the branch's and a sibling's edits to such a path makes
+    # merged main differ from the branch tip there with nothing dropped, so
+    # subtract them from the compare set.
+    #
+    # Edge: when base == main_sha (speculative merge against a base that is
+    # itself the pre-merge tip), this diff is empty and we degrade to strict
+    # equivalence — the correct conservative fallback.  When a CAS re-merge
+    # advanced main past main_sha, main_touched may be a subset of what main
+    # really changed, making the gate slightly more conservative (a rare
+    # re-introduced FP) but never masking a drop — the safe direction.
+    rc, main_touched_out, main_touched_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            base_sha, main_sha,
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'post-merge-equiv: main-touched diff failed for %s..%s '
+            '(rc=%d, stderr=%s); failing open. task_id=%s',
+            base_sha, main_sha, rc, main_touched_err.strip(),
+            task_id or '<unknown>',
+        )
+        return []
+    main_touched = {ln.strip() for ln in main_touched_out.splitlines() if ln.strip()}
+
+    compare_set = await _rename_aware_compare_set(
+        branch_touched, main_touched, base_sha, branch_head, advanced_sha,
+        git_ops, task_id=task_id,
+    )
+    if compare_set is None:
+        return []
+    if not compare_set:
+        # Empty pathspec on ``git diff -- `` means *all files*, not none, so
+        # short-circuit rather than running an unscoped diff.
+        return []
+
+    # Compare branch_head vs advanced_sha restricted to the surviving paths.
+    rc, out, err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            branch_head, advanced_sha, '--', *compare_set,
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'post-merge-equiv: scoped diff %s..%s failed (rc=%d, stderr=%s); '
+            'failing open. task_id=%s',
+            branch_head, advanced_sha, rc, err.strip(),
+            task_id or '<unknown>',
+        )
+        return []
+
+    return [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+# Sentinel returned by _rebase_delta_touched_overlap when a git error makes
+# the overlap status unknowable.  Any non-empty list causes the caller to
+# re-verify (fail-CLOSED policy).
+_OVERLAP_GIT_ERROR_SENTINEL = ['<git-error: re-verify required>']
+
+# Floor (seconds) an index.lock's PRE-wait age must clear before
+# `_map_advance_failure` will call it a crashed-git leftover and offer the
+# destructive `rm -f <lock>` recovery (task 3060, step-19).
+#
+# The threshold CANNOT be the configured grace alone.  `git.merge_park_lock_
+# grace_seconds` is operator-tunable all the way down to 0 — a blessed,
+# documented probe-only fail-fast off-switch (see GitConfig.merge_park_lock_
+# grace_seconds and test_zero_is_accepted_as_probe_only_off_switch) — and at
+# grace=0 EVERY age exceeds the grace, so a keyed-on-grace-alone test hands
+# `rm -f` advice to a live 0.5s-old `git commit --only`.  Deleting a live
+# commit's index.lock corrupts that in-flight commit, so staleness keys on
+# max(grace, this floor): a lock older than this repo's documented pre-commit
+# budget is the only defensible crashed-leftover signal, INDEPENDENT of how
+# the operator tuned the WAIT.  Equal to the GitConfig default (pinned by
+# test_floor_matches_the_documented_pre_commit_budget); not imported FROM
+# orchestrator.config because that is a TYPE_CHECKING-only import here.
+#
+# Aliased from git_ops rather than re-declared: `_await_index_lock_clear`
+# short-circuits its stand-off on the SAME bar (waiting cannot change a
+# verdict that is already "crashed leftover"), and a drift between the two
+# would mean skipping the wait without then explaining why.  The import
+# direction merge_gates -> git_ops is already established above.
+_STALE_LOCK_FLOOR_S = _INDEX_LOCK_STALE_FLOOR_S
+
+
+async def _rebase_delta_touched_overlap(
+    task_worktree: Path,
+    rebased_from: str,
+    rebased_onto: str,
+    git_ops: GitOps,
+    *,
+    task_id: str | None = None,
+) -> list[str]:
+    """Return the sorted intersection of branch-touched and intervening-delta files.
+
+    Determines whether the post-rebase tree needs re-verification by checking
+    whether the intervening main churn (``rebased_from`` → ``rebased_onto``)
+    overlaps with the files the branch itself changed.
+
+    Algorithm
+    ---------
+    1. Resolve ``branch_head`` from ``task_worktree`` HEAD.
+    2. Compute ``base = merge-base(branch_head, rebased_from)`` — the common
+       ancestor of the branch and the pre-churn main.
+    3. ``branch_touched = diff(base..branch_head) --no-renames``
+    4. ``intervening   = diff(rebased_from..rebased_onto) --no-renames``
+    5. Return ``sorted(set(branch_touched) & set(intervening))``.
+
+    Fail-CLOSED policy
+    ------------------
+    Any non-zero git return code causes the function to return the module-level
+    ``_OVERLAP_GIT_ERROR_SENTINEL`` (a non-empty list), so the caller
+    re-verifies rather than skipping the gate on uncertainty.  This is the
+    opposite of ``_check_post_merge_equivalence``, which fails open, because
+    here a false-skip of re-verify risks landing a broken main (catastrophic),
+    whereas a false-trigger of re-verify costs only throughput.
+
+    Parameters
+    ----------
+    task_worktree:
+        Worktree whose HEAD is the branch tip.
+    rebased_from:
+        The main SHA the branch was originally merged against (original
+        ``expected_main`` before main moved).
+    rebased_onto:
+        The current main SHA the branch was rebased onto.
+    git_ops:
+        Provides ``project_root`` for cross-worktree git operations.
+    task_id:
+        Optional task identifier for log messages.
+    """
+    label = task_id or '<unknown>'
+
+    # Fail-CLOSED guard: rebased_from is required to compute the intervening
+    # delta.  If it is falsy (e.g. a future caller passes
+    # reverify_on_rebase=True with expected_main=None), we cannot safely
+    # determine whether the rebase is disjoint, so return the sentinel to
+    # force re-verification rather than silently passing None to git.
+    if not rebased_from:
+        logger.warning(
+            'rebase-delta-overlap: rebased_from is falsy (%r); failing '
+            'closed. task_id=%s',
+            rebased_from, label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+
+    # 1. Resolve branch HEAD
+    rc, head_out, head_err = await _run(
+        ['git', 'rev-parse', 'HEAD'], cwd=task_worktree,
+    )
+    if rc != 0:
+        logger.warning(
+            'rebase-delta-overlap: rev-parse HEAD failed in %s '
+            '(rc=%d, err=%s); failing closed. task_id=%s',
+            task_worktree, rc, head_err.strip(), label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+    branch_head = head_out.strip()
+
+    # 2. merge-base(branch_head, rebased_from) → common fork point
+    rc, mb_out, mb_err = await _run(
+        ['git', 'merge-base', branch_head, rebased_from],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'rebase-delta-overlap: merge-base %s %s failed '
+            '(rc=%d, err=%s); failing closed. task_id=%s',
+            branch_head[:8], rebased_from[:8] if len(rebased_from) >= 8 else rebased_from,
+            rc, mb_err.strip(), label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+    base = mb_out.strip()
+
+    # 3. branch_touched: files the branch changed since the fork point
+    rc, bt_out, bt_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            base, branch_head,
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'rebase-delta-overlap: branch-touched diff %s..%s failed '
+            '(rc=%d, err=%s); failing closed. task_id=%s',
+            base[:8], branch_head[:8], rc, bt_err.strip(), label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+    branch_touched = {ln.strip() for ln in bt_out.splitlines() if ln.strip()}
+
+    if not branch_touched:
+        # Branch touched nothing — no overlap possible.
+        return []
+
+    # 4. intervening: files changed on main from rebased_from to rebased_onto
+    rc, iv_out, iv_err = await _run(
+        [
+            'git', 'diff', '--name-only', '--no-renames',
+            rebased_from, rebased_onto,
+        ],
+        cwd=git_ops.project_root,
+    )
+    if rc != 0:
+        logger.warning(
+            'rebase-delta-overlap: intervening diff %s..%s failed '
+            '(rc=%d, err=%s); failing closed. task_id=%s',
+            rebased_from[:8] if len(rebased_from) >= 8 else rebased_from,
+            rebased_onto[:8], rc, iv_err.strip(), label,
+        )
+        return _OVERLAP_GIT_ERROR_SENTINEL
+    intervening = {ln.strip() for ln in iv_out.splitlines() if ln.strip()}
+
+    # 5. Intersection → sorted for deterministic output
+    return sorted(branch_touched & intervening)
+
+
+def _disjoint_skip_blockers(
+    req: MergeRequest,
+    *,
+    rebased_onto: str,
+) -> list[str]:
+    """Reasons footprint-disjointness may NOT be trusted for this rebase.
+
+    Empty list means the disjoint fast path in :func:`_reverify_rebased_tree`
+    is sound and the post-rebase re-verify may be skipped.
+
+    WHY THIS EXISTS (the 2026-09-22 whole-tree-drift incident).  On that day an
+    unattended nightly job committed prose straight onto main at 03:20:36
+    carrying a stale test-path citation.  That reddened a WHOLE-TREE merge gate
+    — one every merge runs regardless of its own diff.  At 03:48:49 a request
+    whose own verify had run against the PRE-drift tip was rebased onto the
+    drift, this function found the two footprints disjoint (``docs/prds/**`` vs
+    ``docs/legibility/**``), skipped re-verification, and the queue advanced —
+    and reported "merged to main successfully" for — a tree no verification had
+    ever seen green.
+
+    The inference "disjoint footprints, therefore still green" rests on two
+    premises, and the overlap probe on its own checks NEITHER:
+
+    P1 (compositionality)
+        The gate's verdict decomposes over disjoint file sets — i.e. every check
+        it runs is diff-scoped.  A whole-tree check violates this by
+        construction: its entire premise is that an unrelated file can fail you.
+        Signal used: ``merge_verify_breadth == 'full'``, the EXISTING per-project
+        declaration that the merge gate runs every registered module's suite
+        rather than just the touched ones.  It is a declaration, not a gate name,
+        so this stays project-agnostic.  It is also only a PARTIAL detector of a
+        non-compositional gate (a project whose own verify script runs whole-tree
+        checks internally reads as 'scoped' here — reify is exactly that), which
+        is why P2 below, not P1, is the arm that actually closes the incident.
+
+    P2 (the drift is itself green)
+        Main at *rebased_onto* passes the gate on its own.  This premise is
+        needed even for a perfectly diff-scoped gate — a merge onto an
+        already-red base is red — and it is the one the incident violated.
+        Signal used: :func:`main_tip_is_queue_verified`, i.e. *rebased_onto* is
+        a tip THIS queue landed after a green gate run.  Drift from any other
+        writer (an unattended job, a direct commit, a push) has unknown health.
+        Generic and observed, not declared: it needs no project config at all.
+
+    FAIL-SAFE DIRECTION.  Both arms answer "distrust" when the answer is
+    unknown — an unrecognised tip, a missing/partial ``req.config`` — matching
+    ``_OVERLAP_GIT_ERROR_SENTINEL``'s fail-CLOSED policy above.  The cost of a
+    false distrust is one extra verify; the cost of a false trust was nine hours
+    of laundered red main.
+
+    WHY THE OPTIMISATION IS NOT REMOVED WHOLESALE.  It is not unsound in all
+    cases: when main drifted because ANOTHER queued merge landed, P2 holds by
+    observation, and for a diff-scoped gate P1 holds too — which is the common
+    case and the case the optimisation was built for.  Only the premises are
+    now checked instead of assumed.
+
+    TRANSITIVITY.  A tip landed via this fast path is itself recorded as
+    queue-verified by :func:`_finalize_advanced_merge`, so trust chains.  That
+    is sound under P1 ∧ P2 by the same argument: those premises make the landed
+    tree green, not merely unverified.  The one exception is the operator
+    kill switch below, which by definition restores the pre-fix (unsound)
+    inference; that is what "restore the previous behaviour" means.
+    """
+    blockers: list[str] = []
+    config = getattr(req, 'config', None)
+
+    # P1 — project-declared whole-tree merge gate.  Deliberately NOT covered by
+    # the kill switch: a project that has declared its merge gate whole-tree has
+    # declared this skip unsound outright, not merely expensive.
+    if getattr(config, 'merge_verify_breadth', None) == 'full':
+        blockers.append('whole-tree merge gate (merge_verify_breadth=full)')
+
+    # P2 — drift provenance.  Guarded by the green-tier kill switch so ops can
+    # trade the extra re-verifies back under load without a fleet restart.
+    requires_verified_drift = getattr(
+        config, 'merge_disjoint_skip_requires_verified_drift', True,
+    )
+    if requires_verified_drift is not False and not main_tip_is_queue_verified(
+        rebased_onto,
+    ):
+        blockers.append(
+            f'intervening main tip {rebased_onto[:8]} was not landed green by '
+            f'this queue (unverified drift)'
+        )
+
+    return blockers
+
+
+async def _reverify_rebased_tree(
+    git_ops: GitOps,
+    req: MergeRequest,
+    merge_wt: Path,
+    *,
+    rebased_from: str,
+    rebased_onto: str,
+    timeouts: dict[str, int],
+    enospc_retries: dict[str, int],
+    max_timeouts: int,
+    max_enospc: int,
+    merge_sha: str = '',
+    keep_worktrees: Collection[Path] | None = None,
+    run_post_merge_verify: Callable[..., Awaitable[MergeOutcome | None]],
+) -> MergeOutcome | None:
+    """Shared gate for the disjoint-delta re-verify check.
+
+    Called by the SpeculativeMergeWorker CAS loop after
+    ``advance_main`` returns ``'rebased_pending_reverify'``.
+
+    Algorithm
+    ---------
+    1. Call ``_rebase_delta_touched_overlap`` to compute the intersection of
+       the branch-touched file set and the intervening main delta.
+    2. **Disjoint** (empty intersection): consult
+       :func:`_disjoint_skip_blockers`.  With NO blockers, return ``None`` —
+       the caller can advance immediately and no extra verify call is made.
+       With blockers, fall through to the re-verify in step 3 exactly as an
+       overlap would, logging which premise of the disjointness inference could
+       not be established.  Disjointness alone is NOT sufficient: see that
+       function's docstring for the two premises and the incident that proved
+       skipping on the intersection alone unsound.
+    3. **Overlapping** (non-empty intersection): log a warning and delegate to
+       ``_run_post_merge_verify``, which runs the full post-merge scoped
+       verification against the rebased *merge_wt*.
+
+       * ``None`` return → verification passed; caller may advance.
+       * ``MergeOutcome`` return → verification failed or disk-guard fired;
+         *merge_wt* has already been cleaned up by ``_run_post_merge_verify``.
+
+    Parameters
+    ----------
+    git_ops:
+        GitOps instance.
+    req:
+        The MergeRequest whose worktree and task_id are inspected.
+    merge_wt:
+        The merge worktree, currently positioned at the rebased SHA.
+    rebased_from:
+        The original ``expected_main`` SHA (pre-churn main tip).
+    rebased_onto:
+        The current main SHA the branch was rebased onto.
+    timeouts / enospc_retries / max_timeouts / max_enospc:
+        Forwarded verbatim to ``_run_post_merge_verify``.
+    keep_worktrees:
+        Additional worktrees to protect from disk-guard pruning — forwarded
+        verbatim to ``_run_post_merge_verify``.  Default ``None`` produces
+        legacy single-keep behaviour (only ``merge_wt`` is protected).
+    run_post_merge_verify:
+        The worker's ``_run_post_merge_verify``, which this gate delegates the
+        re-verify to when the delta overlaps.
+    """
+    overlap = await _rebase_delta_touched_overlap(
+        req.worktree, rebased_from, rebased_onto, git_ops,
+        task_id=req.task_id,
+    )
+
+    if not overlap:
+        blockers = _disjoint_skip_blockers(req, rebased_onto=rebased_onto)
+        if not blockers:
+            # Disjoint AND both premises hold: the intervening main churn does
+            # not intersect the branch's touched files, and that churn is itself
+            # a tip this queue landed green.  Safe to advance without re-verify.
+            logger.debug(
+                'Task %s: rebased tree disjoint from intervening delta (%s..%s) '
+                '— skipping re-verify',
+                req.task_id, rebased_from[:8], rebased_onto[:8],
+            )
+            return None
+        logger.warning(
+            'Task %s: rebased tree is disjoint from the intervening delta '
+            '(%s..%s) but disjointness is NOT trustworthy here [%s] — '
+            'triggering re-verify. Footprint-disjointness only licenses a skip '
+            'when the gate is diff-scoped AND the drift is itself known green; '
+            'see _disjoint_skip_blockers.',
+            req.task_id, rebased_from[:8], rebased_onto[:8],
+            ', '.join(blockers),
+        )
+    else:
+        logger.warning(
+            'Task %s: rebased tree overlaps intervening delta (%s..%s) '
+            'on %d file(s) [%s] — triggering re-verify',
+            req.task_id, rebased_from[:8], rebased_onto[:8],
+            len(overlap), ', '.join(overlap[:5]),
+        )
+    return await run_post_merge_verify(
+        git_ops, req, merge_wt,
+        timeouts=timeouts,
+        enospc_retries=enospc_retries,
+        max_timeouts=max_timeouts,
+        max_enospc=max_enospc,
+        merge_sha=merge_sha,
+        keep_worktrees=keep_worktrees,
+    )
+
+
+async def _check_post_merge_pyright(
+    advanced_sha: str,
+    git_ops: GitOps,
+    config: OrchestratorConfig,
+    module_configs: list[ModuleConfig],
+    *,
+    task_id: str | None = None,
+) -> PostMergePyrightResult:
+    """Run an unscoped, package-wide type-check against the post-merge main SHA.
+
+    Second post-merge "equivalence" signal: after ``advance_main`` succeeds,
+    runs each subproject's ``type_check_command`` VERBATIM (unscoped —
+    ``scope_module_config``/``_scope_command`` are NOT called) in a fresh
+    detached worktree at ``advanced_sha``.
+
+    Delegates the per-module classification loop to
+    :func:`_run_unscoped_typechecks` with ``block_on_timeout=False`` —
+    the merge has already landed; we never block a landed merge on a flaky
+    hang or transient infra error (fail-open on timeout).
+
+    Returns a :class:`PostMergePyrightResult` whose ``broken`` property is
+    ``True`` when at least one subproject's type-check reports a genuine
+    failure (``not passed AND not timed_out``).
+
+    Early returns:
+    - Empty or no-type-check-command module_configs → clean (no-op).
+
+    Fail-open:
+    - Timeouts (``verify.timed_out``) → skip, log WARNING, treat as clean.
+    - Any exception creating the worktree or during verify → log WARNING,
+      treat as clean.
+
+    The merge has already landed via ``update-ref`` before this runs; we NEVER
+    block a landed merge on a flaky hang or transient infra error.
+
+    .. note::
+        **Pre-condition**: This check has no baseline. If a subproject's
+        unscoped ``type_check_command`` is already failing on main *before*
+        the merge, every subsequent merge will be blocked for that subproject.
+        Opting into ``type_check_command`` requires the unscoped check to pass
+        on main as a standing pre-condition.  Fix the pre-existing failure
+        forward to unblock the queue.
+    """
+    # Quick-exit: if no module defines a type_check_command there is nothing to check.
+    active = [mc for mc in module_configs if mc.type_check_command is not None]
+    if not active:
+        return PostMergePyrightResult()
+
+    merge_wt: Path | None = None
+    try:
+        # NOTE: _create_merge_worktree is a private GitOps method.  This helper
+        # is its only cross-module caller; promoting it to public (drop the
+        # leading underscore) is tracked as a follow-up task.
+        merge_wt, _ = await git_ops._create_merge_worktree(advanced_sha)
+
+        result = await _run_unscoped_typechecks(
+            merge_wt, config, module_configs,
+            block_on_timeout=False, task_id=task_id,
+        )
+        # Log timeouts explicitly (fail-open path: not in failing_subprojects).
+        for prefix in result.timed_out_subprojects:
+            logger.warning(
+                'post-merge-pyright: type-check for %r timed out on %s; '
+                'failing open. task_id=%s',
+                prefix, advanced_sha[:12], task_id or '<unknown>',
+            )
+        return result
+
+    except Exception as exc:
+        logger.warning(
+            'post-merge-pyright: infra error checking %s — failing open. '
+            'task_id=%s error=%s',
+            advanced_sha[:12], task_id or '<unknown>', exc,
+        )
+        return PostMergePyrightResult()
+
+    finally:
+        if merge_wt is not None:
+            await git_ops.cleanup_merge_worktree(merge_wt)

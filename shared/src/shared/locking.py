@@ -160,6 +160,7 @@ FILE_EXTENSIONS: frozenset[str] = frozenset(
         'svg',
         'template',
         'timer',
+        'tombstones',
         'toml',
         'ts',
         'tsx',

@@ -109,7 +109,7 @@ tasks:
       kind: grep
       pattern: effective_merge_module_configs\(
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: helper-home-and-inline-rebinding-site
     binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:5916-5917
@@ -196,9 +196,9 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: flake_suppression['"]?\s*[:=]
+      pattern: record_merge_flake_suppression
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: storm-streak-sentinel-to-bump
     binding: capability→producer (wired) — grep:orchestrator/src/orchestrator/verify.py:7791
@@ -354,9 +354,9 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: owner_task_id
+      pattern: owner=\{d\.owner_task_id\}
       paths:
-      - orchestrator/src/orchestrator/cli.py
+      - orchestrator/src/orchestrator/flake_report.py
       expect: present
 - label: κ
   task_id: 3794

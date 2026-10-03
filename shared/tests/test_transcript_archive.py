@@ -14,6 +14,7 @@ from shared.transcript_archive import (
     archive_before_delete,
     archive_task_transcripts,
     durable_archive_path,
+    restore_archived_transcript,
 )
 
 # A representative encoded-project directory name (Claude Code encodes the
@@ -1300,3 +1301,429 @@ class TestDurableArchivePathLookup:
         assert durable_archive_path(root, task_id, sid) is not None
 
         assert _snapshot() == before
+
+
+class TestRestoreArchivedTranscript:
+    """The write-back sibling of :func:`durable_archive_path` (task 3578).
+
+    ``restore_archived_transcript`` rehydrates one session's archived main
+    transcript back into a live ``CLAUDE_CONFIG_DIR`` so ``--resume`` works
+    after the original config dir was destroyed — the pooled-warm-lane case
+    where the orchestrator recovers a session id but the lane it re-dispatches
+    into has never seen that session's JSONL.
+
+    Every archive in this class is written by the REAL producer
+    (:func:`archive_task_transcripts`) rather than hand-placed, so the layout
+    under test can never drift from the layout actually shipped.
+    """
+
+    @staticmethod
+    def _seed_archive(tmp_path, sid: str, task_id: str, payload: bytes):
+        """Archive *payload* as *sid*'s transcript via the real producer.
+
+        Returns ``(archive_root, archived_path)``. The source config dir is a
+        throwaway: it stands in for the lane that has since been destroyed,
+        which is precisely the situation the restore exists to repair.
+        """
+        source_config = tmp_path / 'lane-a' / 'claude-config'
+        root = tmp_path / 'archive'
+        _write(source_config / 'projects' / ENC / f'{sid}.jsonl', payload)
+
+        assert archive_task_transcripts(
+            source_config, task_id, sid, archive_root=root
+        ) == 1
+        archived = root / task_id / ENC / f'{sid}.jsonl'
+        assert archived.is_file()
+        return root, archived
+
+    def test_restores_the_transcript_into_the_config_dir(self, tmp_path):
+        """Happy path: an archived session is rehydrated into a fresh lane.
+
+        Pins the four properties the dispatch path leans on: the destination
+        path is RETURNED (not a bool), the archive's own ``<enc>/<name>``
+        relative path is mirrored VERBATIM with no cwd re-encoding, the bytes
+        round-trip, and — the property the CLI actually keys on —
+        :func:`shared.cli_invoke.transcript_exists` now answers True.
+        """
+        from shared.cli_invoke import transcript_exists
+
+        sid = 'sess-restore-happy'
+        task_id = '42'
+        payload = b'{"type":"user"}\n{"type":"assistant"}\n'
+        root, archived = self._seed_archive(tmp_path, sid, task_id, payload)
+
+        # A DIFFERENT lane's config dir, freshly created and empty — the
+        # pooled-warm-lane shape. It knows nothing about ENC.
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        restored = restore_archived_transcript(root, task_id, sid, config_dir)
+
+        # (a) the destination path is returned.
+        assert restored is not None
+        assert isinstance(restored, Path)
+        # (b) the archive's relative path is mirrored VERBATIM: the encoded-cwd
+        # dir name is carried across untouched, NOT re-derived from lane-b's
+        # cwd. Measured on Claude Code CLI 2.1.236: the CLI scans every
+        # ``projects/*/`` subdir by session id and ignores both the directory
+        # name and the ``cwd`` recorded inside the records, so mirroring is
+        # correct AND lane-portable.
+        assert restored == config_dir / 'projects' / ENC / f'{sid}.jsonl'
+        # (c) bytes round-trip exactly.
+        assert restored.read_bytes() == payload
+        # (d) the predicate the CLI keys on.
+        assert transcript_exists(config_dir, sid) is True
+
+    def test_the_restored_copy_carries_the_archived_mtime(self, tmp_path):
+        """The archive's mtime is mirrored onto the restored copy.
+
+        Same reason :func:`_archive_one` mirrors it on the way out: a
+        restored transcript stamped ``now`` would read to the next
+        ``archive_task_transcripts`` pass as newer than its own archive and be
+        pointlessly re-archived over it. int-truncated, dodging FS
+        mtime-granularity mismatch exactly as the producer's own skip test does.
+        """
+        sid = 'sess-restore-mtime'
+        task_id = '42'
+        root, archived = self._seed_archive(tmp_path, sid, task_id, b'payload\n')
+        # Back-date the archive so "mirrored" is distinguishable from "now".
+        os.utime(archived, (1_700_000_000, 1_700_000_000))
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        restored = restore_archived_transcript(root, task_id, sid, config_dir)
+
+        assert restored is not None
+        assert int(restored.stat().st_mtime) == int(archived.stat().st_mtime)
+        # And therefore the next archival pass treats it as already-current.
+        assert archive_task_transcripts(
+            config_dir, task_id, sid, archive_root=root
+        ) == 0
+
+    def test_a_gzipped_pre_3618_archive_is_restored_decompressed(self, tmp_path):
+        """I-C: the ``.jsonl.gz`` corpus restores as plain, usable JSONL.
+
+        :func:`durable_archive_path` is deliberately format-agnostic because
+        archives written BEFORE task 3618's flag day are still ``.jsonl.gz`` on
+        disk, so a restore that only handled plain files would silently no-op
+        on the older corpus — the exact population most likely to need a
+        rehydrate, since it is the oldest.
+
+        The destination DROPS the ``.gz``: the CLI parses plain JSONL and would
+        reject a gzip blob named ``.jsonl`` exactly as it rejects a zero-byte
+        one (measured — a zero-byte file and a preamble-only file both yield
+        ``No conversation found with session ID`` on CLI 2.1.236), and
+        ``transcript_exists`` globs ``*.jsonl``, so a ``.gz``-suffixed
+        destination would not even be seen.
+        """
+        import gzip
+
+        from shared.cli_invoke import transcript_exists
+
+        sid = 'sess-restore-gz'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        payload = b'{"type":"user"}\n{"type":"assistant"}\n'
+        # Hand-placed rather than produced: today's producer emits only plain
+        # .jsonl, so the pre-3618 shape can only be reconstructed directly.
+        _write(root / task_id / ENC / f'{sid}.jsonl.gz', gzip.compress(payload))
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        restored = restore_archived_transcript(root, task_id, sid, config_dir)
+
+        assert restored is not None
+        assert restored == config_dir / 'projects' / ENC / f'{sid}.jsonl'
+        assert restored.read_bytes() == payload
+        assert transcript_exists(config_dir, sid) is True
+
+    def test_a_miss_returns_none_and_leaves_no_trace(self, tmp_path):
+        """(a) No archive for this (task_id, session_id) -> None, nothing made.
+
+        A MISS is the common case (the PRD §2 reference measurement puts ~36%
+        of sessions there), so it must be free: no ``projects/`` skeleton
+        created, no log noise. Creating the directory eagerly would leave every
+        missed lookup with a half-built config dir a later reader could mistake
+        for a partially-restored one.
+        """
+        root = tmp_path / 'archive'
+        task_id = '42'
+        _write(root / task_id / ENC / 'sess-other.jsonl', b'other\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        assert restore_archived_transcript(root, task_id, 'sess-missing', config_dir) is None
+        assert not (config_dir / 'projects').exists()
+
+    def test_a_live_transcript_is_never_clobbered(self, tmp_path):
+        """(b) A transcript already live in the config dir wins, always.
+
+        A resumed session's transcript only ever GROWS — the same premise
+        durable_archive_path's I-F newest-mtime rule rests on — so a live copy
+        is by construction at least as complete as any archive. Overwriting it
+        would destroy context on the exact path meant to preserve it.
+
+        Seeded here under a DIFFERENT encoded-cwd dir than the archive's, which
+        is the realistic shape (the live copy was written by this lane, the
+        archive by another) and also proves the guard keys on the session id
+        via transcript_exists rather than on the destination path.
+        """
+        sid = 'sess-live-wins'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'ARCHIVED-older\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        live = _write(
+            config_dir / 'projects' / ENC_B / f'{sid}.jsonl', b'LIVE-newer-and-longer\n'
+        )
+
+        restored = restore_archived_transcript(root, task_id, sid, config_dir)
+
+        assert restored == live
+        assert live.read_bytes() == b'LIVE-newer-and-longer\n'
+        # And the archive's own encoded-cwd dir was never even created.
+        assert not (config_dir / 'projects' / ENC).exists()
+
+    def test_a_genuine_fault_returns_none_loudly_and_never_raises(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """(c) Totality: a real I/O fault yields None + a structured WARNING.
+
+        Mirrors durable_archive_path's I-A: this runs on the production
+        dispatch path, so nothing may escape onto it. But silence would be the
+        silent degradation design-invariants INV-2/INV-4 forbid, so a genuine
+        fault (as distinct from a plain miss, which stays quiet) is logged at
+        WARNING with the same structured ``extra`` shape _record_failure and
+        durable_archive_path already emit — path/task_id/errno — so all three
+        archive-side failure signals stay greppable the same way.
+        """
+        sid = 'sess-fault'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'payload\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _boom(src, dst, **kwargs):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(transcript_archive_module.shutil, 'copyfile', _boom)
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(root, task_id, sid, config_dir) is None
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        rec = warnings[0]
+        assert rec.task_id == task_id
+        assert rec.errno == errno.ENOSPC
+        assert sid in rec.getMessage()
+
+    def test_a_plain_miss_logs_nothing(self, tmp_path, caplog):
+        """(a, cont.) The ~36% miss population must never become log noise."""
+        root = tmp_path / 'archive'
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        with caplog.at_level(logging.DEBUG, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(root, '42', 'sess-nope', config_dir) is None
+
+        assert caplog.records == []
+
+    def test_an_interrupted_restore_publishes_nothing_at_all(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """A torn restore must be indistinguishable from NO restore.
+
+        Not defensive decoration. The gate measurement proved the CLI PARSES
+        the transcript rather than stat-ing it — on CLI 2.1.236 a zero-byte
+        file and a preamble-only file BOTH yield ``No conversation found with
+        session ID`` — so a truncated restore would arm ``--resume`` against a
+        file the CLI then rejects, converting a cheap fresh dispatch into a
+        wasted invocation plus a spurious cap-net candidate. Exactly the
+        argument :func:`_archive_one` already records for the write side.
+
+        The fake writes bytes and THEN raises, which is the real shape of an
+        interrupted copy: a mock that raised before writing anything would pass
+        against an in-place write too, and prove nothing about where the
+        partial bytes went.
+        """
+        sid = 'sess-torn'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'{"a":1}\n{"b":2}\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _dies_part_way(src, dst, **kwargs):
+            Path(dst).write_bytes(b'{"a":1}\n{"b')
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(
+            transcript_archive_module.shutil, 'copyfile', _dies_part_way
+        )
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(root, task_id, sid, config_dir) is None
+
+        # No transcript published at the canonical name...
+        assert not (config_dir / 'projects' / ENC / f'{sid}.jsonl').exists()
+        # ...and no staging residue either. Debris that survived would be inert
+        # (it matches no reader's *.jsonl glob) but is still a leak.
+        assert list((config_dir / 'projects' / ENC).glob('*')) == []
+        # The predicate the dispatch path corroborates on still says "absent",
+        # so the arm-site veto fires and the invocation starts fresh — cheap —
+        # instead of resuming into a file the CLI will reject.
+        from shared.cli_invoke import transcript_exists
+
+        assert transcript_exists(config_dir, sid) is False
+
+    def test_an_interrupted_gz_restore_publishes_nothing_either(
+        self, tmp_path, monkeypatch
+    ):
+        """The staging discipline spans the decompressing branch too.
+
+        A gunzip stream is the likelier place to tear (a corrupt member raises
+        part-way through, after bytes have already landed), so pinning only the
+        plain-copy branch would leave the riskier path unguarded.
+        """
+        import gzip
+
+        from shared.cli_invoke import transcript_exists
+
+        sid = 'sess-torn-gz'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(
+            root / task_id / ENC / f'{sid}.jsonl.gz',
+            gzip.compress(b'{"a":1}\n{"b":2}\n'),
+        )
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _dies_part_way(src_fh, dest_fh, *args, **kwargs):
+            dest_fh.write(b'{"a":1}\n{"b')
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(
+            transcript_archive_module.shutil, 'copyfileobj', _dies_part_way
+        )
+
+        assert restore_archived_transcript(root, task_id, sid, config_dir) is None
+        assert list((config_dir / 'projects' / ENC).glob('*')) == []
+        assert transcript_exists(config_dir, sid) is False
+
+    def test_strict_propagates_a_genuine_fault_after_logging_it(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """(a) ``strict=True``: a real fault RAISES — and still logs first.
+
+        The miss/fault distinction has to survive the helper boundary. Total
+        by default, this function answers a plain miss and a broken restore
+        with the same ``None``, so its one production caller — which brackets
+        the call in its own blanket ``except`` — can only ever bucket an
+        internal fault as ``restore='miss'``: an operator is then sent to chase
+        archive COVERAGE while the restore path itself is the broken thing.
+        That mis-bucketing covers nearly every real fault, since the only
+        exception the caller can catch unaided comes from ``resolve_archive_root``.
+
+        Logged AND raised, not one or the other: the WARNING is the greppable
+        helper-layer record carrying ``errno``/``path``, and the raise is what
+        makes the fault classifiable one frame up. Asserting the record after
+        the raise escapes pins the order — emit, then propagate.
+        """
+        sid = 'sess-strict-fault'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'payload\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _boom(src, dst, **kwargs):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(transcript_archive_module.shutil, 'copyfile', _boom)
+
+        with (
+            caplog.at_level(logging.WARNING, logger='shared.transcript_archive'),
+            pytest.raises(OSError) as excinfo,
+        ):
+            restore_archived_transcript(root, task_id, sid, config_dir, strict=True)
+
+        assert excinfo.value.errno == errno.ENOSPC
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        rec = warnings[0]
+        # The helper-layer half of the fault pair, deliberately named apart
+        # from the dispatch layer's session_resume_restore_fault so one fault
+        # cannot be double-counted under a single greppable key.
+        assert rec.event == 'transcript_restore_fault'
+        assert rec.task_id == task_id
+        assert rec.errno == errno.ENOSPC
+        assert sid in rec.getMessage()
+        # Nothing published, exactly as in the non-strict tear: strict changes
+        # who learns about the fault, never what lands on disk.
+        assert list((config_dir / 'projects' / ENC).glob('*')) == []
+
+    def test_strict_leaves_a_plain_miss_a_quiet_none(self, tmp_path, caplog):
+        """(b) ``strict=True`` + a MISS still returns None, silently.
+
+        Load-bearing, not symmetry. A miss is not a fault: it is the ~36%
+        common case. If ``strict`` ever regressed into raising on misses, the
+        caller's ``except`` would stamp that whole population ``fault`` and
+        INVERT the diagnosis this seam exists to restore — the archive-coverage
+        signal would read as a broken restore path. By construction the miss
+        returns from a branch ABOVE the blanket handler, so it can never reach
+        the ``raise``; this pins that structure rather than trusting it.
+        """
+        root = tmp_path / 'archive'
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        with caplog.at_level(logging.DEBUG, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(
+                root, '42', 'sess-nope', config_dir, strict=True
+            ) is None
+
+        assert caplog.records == []
+
+    def test_the_default_call_stays_total_and_gains_the_event_key(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """(c) No ``strict`` kwarg: the published total contract is preserved.
+
+        ``strict`` is an additive seam for the ONE caller that can hold the
+        totality at the composite level, not a migration: every other caller
+        keeps a helper that cannot fail (the I-A sibling contract
+        ``test_a_genuine_fault_returns_none_loudly_and_never_raises`` pins).
+        The WARNING gains ``event=`` so OPERATIONS.md's grep-by-event-name
+        instruction resolves against a record that today has no such key.
+        """
+        sid = 'sess-default-fault'
+        task_id = '42'
+        root = tmp_path / 'archive'
+        _write(root / task_id / ENC / f'{sid}.jsonl', b'payload\n')
+
+        config_dir = tmp_path / 'lane-b' / 'claude-config'
+        config_dir.mkdir(parents=True)
+
+        def _boom(src, dst, **kwargs):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+
+        monkeypatch.setattr(transcript_archive_module.shutil, 'copyfile', _boom)
+
+        with caplog.at_level(logging.WARNING, logger='shared.transcript_archive'):
+            assert restore_archived_transcript(root, task_id, sid, config_dir) is None
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert warnings[0].event == 'transcript_restore_fault'
+        assert warnings[0].errno == errno.ENOSPC

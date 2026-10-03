@@ -5,43 +5,46 @@ without sys.path pollution — mirrors the pattern in test_audit_duplicate_tasks
 """
 from __future__ import annotations
 
-import importlib.util
+import asyncio
 import json
+import logging
 import sys
-import types
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import complete_paged_read, incomplete_paged_read, load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
+
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_PAGE_CAP,
+    INCOMPLETE_SHORT_READ,
+    IncompleteEnumerationError,
+)
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'cleanup_count_snapshots.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load cleanup_count_snapshots.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    mod_name = 'cleanup_count_snapshots'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='cleanup_count_snapshots')
 EdgeMatch = _mod.EdgeMatch
 EntityScanResult = _mod.EntityScanResult
+
+
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it enumerates or
+    scans (task 4293). This suite is deliberately MOCK-unit (a
+    MagicMock/AsyncMock memory, no live Graphiti).
+    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
+    to record, or to pass -- so the guard's own behaviour is still pinned
+    explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -343,6 +346,150 @@ class TestBuildAuditReport:
         report = _mod.build_audit_report({}, set(), [], True, 1000, 'now')
         assert report['failed_invalidations'] == []
 
+    # -- enumeration completeness (task 4386) -------------------------------
+    #
+    # ``run()`` reads the whole graph twice per project and the counts above
+    # describe whatever those two reads returned.  Threading the per-read
+    # completeness into the report is what lets an operator tell a clean audit
+    # over the WHOLE corpus from an equally clean-looking audit over a
+    # truncated one.  Exercised here against the pure helper, so the shape is
+    # pinned independently of the async plumbing that supplies it.
+
+    def test_enumeration_keys_are_merged_into_the_named_project(self):
+        """Each project gets ITS OWN read's verdict, not a run-wide one."""
+        results = {
+            'p1': [self._make_result('p1', 'e1', 'edg1')],
+            'p2': [self._make_result('p2', 'e2', 'edg2')],
+        }
+        report = _mod.build_audit_report(
+            scan_results_by_project=results,
+            applied_edges=set(),
+            failed_refreshes=[],
+            dry_run=True,
+            limit_per_project=1000,
+            generated_at='now',
+            enumeration_by_project={
+                'p1': {
+                    'entities_complete': True,
+                    'entities_incomplete_kind': None,
+                    'edges_complete': False,
+                    'edges_incomplete_kind': INCOMPLETE_SHORT_READ,
+                },
+                'p2': {
+                    'entities_complete': True,
+                    'entities_incomplete_kind': None,
+                    'edges_complete': True,
+                    'edges_incomplete_kind': None,
+                },
+            },
+        )
+        assert report['projects']['p1']['edges_complete'] is False, (
+            f"p1's edge read was partial; got {report['projects']['p1']!r}"
+        )
+        assert report['projects']['p1']['edges_incomplete_kind'] == INCOMPLETE_SHORT_READ
+        assert report['projects']['p2']['edges_complete'] is True, (
+            "p2's own read was complete — a partial read for p1 must not mark "
+            f"it; got {report['projects']['p2']!r}"
+        )
+        assert report['projects']['p2']['edges_incomplete_kind'] is None
+
+    def test_a_project_absent_from_the_mapping_still_gets_all_four_keys(self):
+        """Uniform shape on EVERY path, so a consumer never has to branch.
+
+        The keys are absent from the mapping for the paths that return before
+        a read happens at all.  Defaulting to None there — rather than
+        omitting them — keeps `report['projects'][pid]['edges_complete']` a
+        safe subscript everywhere, and None already means exactly the right
+        thing: no corpus was observed, so nothing is claimed about it.
+        """
+        results = {'proj': [self._make_result('proj', 'e1', 'edg1')]}
+        report = _mod.build_audit_report(
+            scan_results_by_project=results,
+            applied_edges=set(),
+            failed_refreshes=[],
+            dry_run=True,
+            limit_per_project=1000,
+            generated_at='now',
+            enumeration_by_project={},
+        )
+        p = report['projects']['proj']
+        for key in (
+            'entities_complete', 'entities_incomplete_kind',
+            'edges_complete', 'edges_incomplete_kind',
+        ):
+            assert key in p, f'{key} must be present even when unknown; got {p!r}'
+            assert p[key] is None, f'{key} must default to None (unknown); got {p!r}'
+
+    def test_enumeration_defaults_to_unknown_when_the_argument_is_omitted(self):
+        """The parameter is optional, and omitting it is not a completeness claim."""
+        results = {'proj': [self._make_result('proj', 'e1', 'edg1')]}
+        report = _mod.build_audit_report(results, set(), [], True, 1000, 'now')
+        p = report['projects']['proj']
+        assert p['entities_complete'] is None
+        assert p['edges_complete'] is None
+        assert report['totals']['incomplete_enumerations'] == 1, (
+            'A project whose reads are UNKNOWN is not a project known to be '
+            f"whole; got totals={report['totals']!r}"
+        )
+
+    def test_incomplete_enumerations_counts_projects_not_reads(self):
+        """One project with BOTH reads partial counts ONCE, not twice.
+
+        The total answers "how many projects is this report unreliable for",
+        which is a per-project question.  Counting reads would report 2 for a
+        single affected project and read as twice the damage.
+        """
+        results = {
+            'p1': [self._make_result('p1', 'e1', 'edg1')],
+            'p2': [self._make_result('p2', 'e2', 'edg2')],
+        }
+        report = _mod.build_audit_report(
+            scan_results_by_project=results,
+            applied_edges=set(),
+            failed_refreshes=[],
+            dry_run=True,
+            limit_per_project=1000,
+            generated_at='now',
+            enumeration_by_project={
+                'p1': {
+                    'entities_complete': False,
+                    'entities_incomplete_kind': INCOMPLETE_SHORT_READ,
+                    'edges_complete': False,
+                    'edges_incomplete_kind': INCOMPLETE_SHORT_READ,
+                },
+                'p2': {
+                    'entities_complete': True,
+                    'entities_incomplete_kind': None,
+                    'edges_complete': True,
+                    'edges_incomplete_kind': None,
+                },
+            },
+        )
+        assert report['totals']['incomplete_enumerations'] == 1, (
+            'p1 is ONE partial project even though BOTH of its reads were '
+            f"partial; got totals={report['totals']!r}"
+        )
+
+    def test_incomplete_enumerations_is_zero_when_every_read_is_proven_complete(self):
+        results = {'proj': [self._make_result('proj', 'e1', 'edg1')]}
+        report = _mod.build_audit_report(
+            scan_results_by_project=results,
+            applied_edges=set(),
+            failed_refreshes=[],
+            dry_run=True,
+            limit_per_project=1000,
+            generated_at='now',
+            enumeration_by_project={
+                'proj': {
+                    'entities_complete': True,
+                    'entities_incomplete_kind': None,
+                    'edges_complete': True,
+                    'edges_incomplete_kind': None,
+                },
+            },
+        )
+        assert report['totals']['incomplete_enumerations'] == 0
+
 
 class TestFormatSummaryTable:
     """Tests for format_summary_table(report)."""
@@ -373,6 +520,214 @@ class TestFormatSummaryTable:
     def test_contains_totals_row(self):
         table = _mod.format_summary_table(self._report())
         assert 'TOTAL' in table.upper() or 'total' in table.lower()
+
+    # -- corpus completeness column + warning (task 4386) -------------------
+    #
+    # This table is what an operator actually reads (it goes to stderr, beside
+    # the machine-readable JSON on stdout).  The whole point of the task is
+    # that a truncated corpus stops being a WARNING buried in a backend log
+    # and becomes something the person deciding whether to --apply sees.
+    #
+    # Asserted via ONE stable substring per contract, never on exact prose or
+    # column alignment: pinning the layout would make every future column
+    # widening a test failure, which teaches the next reader to edit the
+    # assertion rather than think about it.
+
+    def _report_with(self, enumeration_by_project, pids=('p1',)):
+        return _mod.build_audit_report(
+            scan_results_by_project={
+                pid: [EntityScanResult(pid, f'e-{pid}', f'E-{pid}', [
+                    EdgeMatch(f'edg-{pid}', 'snap', pid, [f'e-{pid}']),
+                ])]
+                for pid in pids
+            },
+            applied_edges=set(),
+            failed_refreshes=[],
+            dry_run=True,
+            limit_per_project=1000,
+            generated_at='2026-05-28',
+            enumeration_by_project=enumeration_by_project,
+        )
+
+    @staticmethod
+    def _row_for(table: str, pid: str) -> str:
+        matches = [line for line in table.splitlines() if line.startswith(pid)]
+        assert len(matches) == 1, f'expected exactly one {pid!r} row in:\n{table}'
+        return matches[0]
+
+    @staticmethod
+    def _warning_lines(table: str) -> list[str]:
+        """The trailing warning line(s), isolated from the table body.
+
+        Asserting against the WHOLE table cannot distinguish "the warning
+        names p1" from "a p1 row exists", which is always true — so the
+        contract has to be checked against this line specifically.
+        """
+        return [line for line in table.splitlines() if line.startswith('WARNING:')]
+
+    def test_a_whole_corpus_renders_ok_and_warns_about_nothing(self):
+        table = _mod.format_summary_table(self._report_with({
+            'p1': {
+                'entities_complete': True, 'entities_incomplete_kind': None,
+                'edges_complete': True, 'edges_incomplete_kind': None,
+            },
+        }))
+        assert 'ok' in self._row_for(table, 'p1'), (
+            f'A proven-whole corpus must be marked ok; got:\n{table}'
+        )
+        assert 'PARTIAL' not in table, (
+            f'Nothing was partial, so nothing may claim it was; got:\n{table}'
+        )
+
+    def test_a_partial_corpus_renders_PARTIAL(self):
+        table = _mod.format_summary_table(self._report_with({
+            'p1': {
+                'entities_complete': True, 'entities_incomplete_kind': None,
+                'edges_complete': False, 'edges_incomplete_kind': INCOMPLETE_SHORT_READ,
+            },
+        }))
+        assert 'PARTIAL' in self._row_for(table, 'p1'), (
+            f'Either read being partial makes the project partial; got:\n{table}'
+        )
+
+    def test_an_unknown_corpus_renders_a_question_mark(self):
+        """UNKNOWN is not ok.
+
+        Rendering an unmeasured read as ok would be the one failure this whole
+        signal exists to prevent: a run that never looked reading as a run that
+        looked and found everything.
+        """
+        table = _mod.format_summary_table(self._report_with({}))
+        row = self._row_for(table, 'p1')
+        assert '?' in row, f'An unmeasured corpus must not render as ok; got:\n{table}'
+        assert 'ok' not in row, f'got:\n{table}'
+
+    def test_a_partial_corpus_appends_a_loud_warning_line(self):
+        """The operator's next move is to invalidate edges, which is exactly
+        the move that is unsafe on a partial read — so the table says plainly
+        that an absence of matches there proves nothing."""
+        table = _mod.format_summary_table(self._report_with({
+            'p1': {
+                'entities_complete': False, 'entities_incomplete_kind': INCOMPLETE_SHORT_READ,
+                'edges_complete': True, 'edges_incomplete_kind': None,
+            },
+        }))
+        warnings = self._warning_lines(table)
+        assert len(warnings) == 1, (
+            f'A partial corpus must append exactly one warning; got:\n{table}'
+        )
+        assert 'not proof' in warnings[0].lower(), (
+            'A partial corpus must carry the "absence of matches is not proof '
+            f'of cleanliness" warning; got:\n{table}'
+        )
+        assert 'p1' in warnings[0], (
+            f'The warning must name the affected project; got:\n{table}'
+        )
+
+    def test_the_warning_names_the_partial_project_and_not_the_whole_one(self):
+        """The naming is the whole point of the warning.
+
+        With one project the "names the affected project" assertion is
+        untestable against the table as a whole — 'p1' is in it either way,
+        because 'p1' has a ROW. Two projects, one partial, makes the
+        interpolation load-bearing: drop it and the warning still fires but
+        stops telling the operator WHERE it is unsafe to --apply, which on a
+        many-project run is the difference between a usable warning and one
+        that condemns everything.
+        """
+        table = _mod.format_summary_table(self._report_with(
+            {
+                'p1': {
+                    'entities_complete': False,
+                    'entities_incomplete_kind': INCOMPLETE_SHORT_READ,
+                    'edges_complete': True, 'edges_incomplete_kind': None,
+                },
+                'p2': {
+                    'entities_complete': True, 'entities_incomplete_kind': None,
+                    'edges_complete': True, 'edges_incomplete_kind': None,
+                },
+            },
+            pids=('p1', 'p2'),
+        ))
+        warnings = self._warning_lines(table)
+        assert len(warnings) == 1, f'expected exactly one warning; got:\n{table}'
+        assert 'p1' in warnings[0], (
+            f'The warning must name the PARTIAL project; got:\n{table}'
+        )
+        assert 'p2' not in warnings[0], (
+            'The warning must not condemn a project whose corpus was proven '
+            f'whole; got:\n{table}'
+        )
+        # And the per-project cells still disagree, so the row and the warning
+        # tell the same story.
+        assert 'PARTIAL' in self._row_for(table, 'p1'), f'got:\n{table}'
+        assert 'ok' in self._row_for(table, 'p2'), f'got:\n{table}'
+
+    # -- the TOTALS row's Corpus cell --------------------------------------
+    #
+    # The roll-up is a count of PROJECTS, but it lands in a column whose
+    # per-project vocabulary is words.  Rendered bare it put a `0` or a `2`
+    # in a column of `ok`/`PARTIAL`/`?` — and `0` is not `ok`, so the one
+    # cell summarising whether the whole report is trustworthy read
+    # ambiguously.  (amendment, reviewer_comprehensive observability finding)
+
+    @staticmethod
+    def _total_row(table: str) -> str:
+        matches = [line for line in table.splitlines() if line.startswith('TOTAL')]
+        assert len(matches) == 1, f'expected exactly one TOTAL row in:\n{table}'
+        return matches[0]
+
+    def test_the_totals_corpus_cell_reads_ok_when_every_project_is_whole(self):
+        table = _mod.format_summary_table(self._report_with({
+            'p1': {
+                'entities_complete': True, 'entities_incomplete_kind': None,
+                'edges_complete': True, 'edges_incomplete_kind': None,
+            },
+        }))
+        total = self._total_row(table)
+        assert total.rstrip().endswith('ok'), (
+            'With nothing partial the roll-up must speak the column\'s own '
+            f'vocabulary, not render a bare 0; got:\n{table}'
+        )
+        assert not total.rstrip().endswith('0'), (
+            f'A bare 0 in a column of words reads ambiguously; got:\n{table}'
+        )
+
+    def test_the_totals_corpus_cell_labels_the_partial_count(self):
+        """Two not-ok projects for two DIFFERENT reasons — one observed and
+        found partial, one never measured — because the count rolls both up.
+        That is also why the label is lowercase `partial` rather than the
+        per-project `PARTIAL` token: p2 was never observed, so claiming it
+        was observed-and-incomplete would overstate what is known."""
+        table = _mod.format_summary_table(self._report_with(
+            {
+                'p1': {
+                    'entities_complete': False,
+                    'entities_incomplete_kind': INCOMPLETE_SHORT_READ,
+                    'edges_complete': True, 'edges_incomplete_kind': None,
+                },
+                # p2 deliberately absent -> UNKNOWN, which is also not `ok`.
+            },
+            pids=('p1', 'p2'),
+        ))
+        total = self._total_row(table)
+        assert '2 partial' in total, (
+            'The roll-up must be an explicitly-labelled count, not a bare '
+            f'integer; got:\n{table}'
+        )
+        assert 'PARTIAL' in self._row_for(table, 'p1'), f'got:\n{table}'
+        assert '?' in self._row_for(table, 'p2'), f'got:\n{table}'
+
+    def test_a_whole_corpus_appends_no_warning_line(self):
+        table = _mod.format_summary_table(self._report_with({
+            'p1': {
+                'entities_complete': True, 'entities_incomplete_kind': None,
+                'edges_complete': True, 'edges_incomplete_kind': None,
+            },
+        }))
+        assert 'not proof' not in table.lower(), (
+            f'Nothing was partial, so the warning must not fire; got:\n{table}'
+        )
 
 
 # ===========================================================================
@@ -588,16 +943,42 @@ class TestApplyCleanup:
 class TestRun:
     """Async end-to-end tests for run(args, *, memory)."""
 
-    def _make_memory(self, entities=None, edges_by_entity=None):
-        """Build an AsyncMock memory whose graphiti returns fixture data."""
+    def _make_memory(
+        self, entities=None, edges_by_entity=None, *,
+        entities_paged=None, edges_paged=None,
+    ):
+        """Build an AsyncMock memory whose graphiti returns fixture data.
+
+        Both whole-graph reads are the ``enumerate_*`` pair, which returns
+        ``(collection, PagedRead)`` — the script reads them directly for the
+        completeness signal rather than through the ``list_entity_nodes`` /
+        ``get_all_valid_edges`` shims, which discard it (task 4386).  The
+        default here is a PROVEN-complete read, matching what the shims
+        guaranteed by raising: every pre-existing test in this class asserts
+        behaviour over a whole corpus, so that is the honest double for them.
+        Pass ``entities_paged`` / ``edges_paged`` (an ``incomplete_paged_read``)
+        to drive the partial-corpus paths.
+        """
         m = MagicMock()
         m.update_edge = AsyncMock(return_value=None)
         m.add_memory = AsyncMock(return_value=None)
         m.refresh_entity_summary = AsyncMock(return_value=None)
         # graphiti sub-object
         g = MagicMock()
-        g.list_entity_nodes = AsyncMock(return_value=entities or [])
-        g.get_all_valid_edges = AsyncMock(return_value=edges_by_entity or {})
+        entities = entities or []
+        edges_by_entity = edges_by_entity or {}
+        g.enumerate_entity_nodes = AsyncMock(return_value=(
+            entities,
+            entities_paged if entities_paged is not None
+            else complete_paged_read(rows_seen=len(entities)),
+        ))
+        g.enumerate_all_valid_edges = AsyncMock(return_value=(
+            edges_by_entity,
+            edges_paged if edges_paged is not None
+            else complete_paged_read(
+                rows_seen=sum(len(v) for v in edges_by_entity.values()),
+            ),
+        ))
         m.graphiti = g
         return m
 
@@ -633,6 +1014,28 @@ class TestRun:
         matched_uuids = [m['edge_uuid'] for m in report.get('matches', [])]
         assert 'snap-edge' in matched_uuids
 
+        # Per-project read completeness (task 4386). The counts above describe
+        # SOME corpus; without these keys the report never says which one, so a
+        # clean audit over the whole graph is indistinguishable in the JSON from
+        # a clean audit over whatever half of it a truncated read returned.
+        proj = report['projects']['dark_factory']
+        assert proj['entities_complete'] is True, (
+            f'A proven-complete node read must be surfaced as True; got {proj!r}'
+        )
+        assert proj['entities_incomplete_kind'] is None, (
+            f'A complete read has no incompleteness kind; got {proj!r}'
+        )
+        assert proj['edges_complete'] is True, (
+            f'A proven-complete edge read must be surfaced as True; got {proj!r}'
+        )
+        assert proj['edges_incomplete_kind'] is None, (
+            f'A complete read has no incompleteness kind; got {proj!r}'
+        )
+        assert report['totals']['incomplete_enumerations'] == 0, (
+            'Both reads were proven complete, so no project is partial; got '
+            f"totals={report['totals']!r}"
+        )
+
     @pytest.mark.asyncio
     async def test_apply_invokes_writes(self):
         """--apply flag causes update_edge to be awaited."""
@@ -662,7 +1065,7 @@ class TestRun:
         result = await _mod.run(args, memory=memory, known_projects_map=known_map)
 
         memory.update_edge.assert_not_awaited()
-        memory.graphiti.get_all_valid_edges.assert_not_awaited()
+        memory.graphiti.enumerate_all_valid_edges.assert_not_awaited()
         # Result should indicate abort
         assert result.get('aborted') is True
         assert result.get('exceeding_projects') == ['dark_factory']
@@ -693,7 +1096,7 @@ class TestRun:
         assert 'unknown-id' in captured.err
 
         # (iv) enumeration did NOT happen (abort before the entity-fetch loop)
-        memory.graphiti.list_entity_nodes.assert_not_awaited()
+        memory.graphiti.enumerate_entity_nodes.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_limit_cap_abort_emits_abort_output(self, capsys):
@@ -723,3 +1126,358 @@ class TestRun:
         # stderr: non-empty, names the over-cap project
         assert captured.err.strip(), 'stderr should be non-empty on limit-cap abort'
         assert 'dark_factory' in captured.err
+
+
+    # -- partial and refused corpora (task 4386) ----------------------------
+
+    @pytest.mark.asyncio
+    async def test_an_empirically_partial_edge_read_is_reported_and_still_scanned(self):
+        """EMPIRICAL incompleteness warns and proceeds — it does not abort.
+
+        A census disagreeing by a few rows is the expected signature of a
+        graph being written to mid-read, so raising would take a routine audit
+        down for something that self-heals next run.  The scan therefore
+        proceeds over what WAS fetched, and the report says the corpus was
+        partial so the operator can weigh the result accordingly.
+        """
+        entities = [_entity('e1', 'E1')]
+        edges = {'e1': [{'uuid': 'snap-edge', 'fact': '1505 done / 148 cancelled', 'name': ''}]}
+        memory = self._make_memory(
+            entities=entities,
+            edges_by_entity=edges,
+            edges_paged=incomplete_paged_read(
+                INCOMPLETE_SHORT_READ, rows_seen=1, expected_rows=9,
+            ),
+        )
+
+        report = await _mod.run(
+            self._args(apply=False, project_id='dark_factory'),
+            memory=memory,
+            known_projects_map=self._known_map('dark_factory'),
+        )
+
+        proj = report['projects']['dark_factory']
+        assert proj['edges_complete'] is False, (
+            f'A partial edge read must be reported as False; got {proj!r}'
+        )
+        assert proj['edges_incomplete_kind'] == INCOMPLETE_SHORT_READ, (
+            f'The kind is the stable discriminator; got {proj!r}'
+        )
+        assert proj['entities_complete'] is True, (
+            'The two reads are INDEPENDENT — a partial edge read says nothing '
+            f'about the node read, which was whole; got {proj!r}'
+        )
+        assert report['totals']['incomplete_enumerations'] == 1, (
+            f"got totals={report['totals']!r}"
+        )
+        # ...and the scan still ran over what was fetched.
+        assert 'snap-edge' in [m['edge_uuid'] for m in report['matches']], (
+            'An empirical incompleteness must not discard the rows that WERE '
+            f"fetched; got matches={report['matches']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_empirically_partial_node_read_is_reported(self):
+        """The node read carries its own verdict, under its own keys."""
+        memory = self._make_memory(
+            entities=[_entity('e1', 'E1')],
+            edges_by_entity={},
+            entities_paged=incomplete_paged_read(
+                INCOMPLETE_SHORT_READ, rows_seen=1, expected_rows=40,
+            ),
+        )
+
+        report = await _mod.run(
+            self._args(apply=False, project_id='dark_factory'),
+            memory=memory,
+            known_projects_map=self._known_map('dark_factory'),
+        )
+
+        proj = report['projects']['dark_factory']
+        assert proj['entities_complete'] is False, f'got {proj!r}'
+        assert proj['entities_incomplete_kind'] == INCOMPLETE_SHORT_READ, f'got {proj!r}'
+        assert proj['edges_complete'] is True, (
+            f'The edge read was whole and must say so; got {proj!r}'
+        )
+        assert report['totals']['incomplete_enumerations'] == 1, (
+            'One project is partial, however many of its reads were; got '
+            f"totals={report['totals']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_cap_abort_payload_carries_the_node_read_completeness(self):
+        """A real fail-open, not a nicety.
+
+        ``check_limit_cap`` decides the cap on ``len(entities)`` from the NODE
+        read, so a TRUNCATED node read UNDER-counts and an oversized project
+        can slip UNDER the cap — the cap silently stops protecting exactly the
+        projects it exists for.  The abort returns before ``build_audit_report``
+        runs, so the report path cannot carry this and the payload must.
+        """
+        entities = [_entity(f'e{i}', f'E{i}') for i in range(3)]
+        memory = self._make_memory(
+            entities=entities,
+            edges_by_entity={},
+            entities_paged=incomplete_paged_read(
+                INCOMPLETE_SHORT_READ, rows_seen=3, expected_rows=300,
+            ),
+        )
+
+        result = await _mod.run(
+            self._args(apply=True, project_id='dark_factory',
+                       limit_per_project=2, yes_i_am_sure=False),
+            memory=memory,
+            known_projects_map=self._known_map('dark_factory'),
+        )
+
+        assert result.get('aborted') is True
+        assert 'entities_complete' in result, (
+            'The cap was decided on a count from a read that may have been '
+            f'truncated; the payload must say so. got {result!r}'
+        )
+        assert result['entities_complete'] == {'dark_factory': False}, (
+            f'got {result!r}'
+        )
+        assert result['entities_incomplete_kind'] == {
+            'dark_factory': INCOMPLETE_SHORT_READ,
+        }, f'got {result!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_structurally_refused_node_read_aborts_before_any_write(self):
+        """The fail-closed guard survives the move off the raising shim.
+
+        ``enumerate_*`` never raises, so this script re-applies the shared
+        policy itself.  If that call were ever dropped, a page-capped read
+        would be taken for the whole corpus and ``--apply`` would invalidate
+        edges over a fabricated one.  Structural kinds are deterministic and
+        non-transient, so raising on them cannot flap.
+        """
+        memory = self._make_memory(
+            entities=[_entity('e1', 'E1')],
+            edges_by_entity={},
+            entities_paged=incomplete_paged_read(INCOMPLETE_PAGE_CAP, rows_seen=1),
+        )
+
+        with pytest.raises(IncompleteEnumerationError):
+            await _mod.run(
+                self._args(apply=True, project_id='dark_factory'),
+                memory=memory,
+                known_projects_map=self._known_map('dark_factory'),
+            )
+
+        memory.update_edge.assert_not_awaited()
+        memory.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_structurally_refused_edge_read_aborts_before_any_write(self):
+        """Same guard on the second read: the node read succeeding is not a
+        licence to write back over a fabricated edge corpus."""
+        memory = self._make_memory(
+            entities=[_entity('e1', 'E1')],
+            edges_by_entity={},
+            edges_paged=incomplete_paged_read(INCOMPLETE_PAGE_CAP),
+        )
+
+        with pytest.raises(IncompleteEnumerationError):
+            await _mod.run(
+                self._args(apply=True, project_id='dark_factory'),
+                memory=memory,
+                known_projects_map=self._known_map('dark_factory'),
+            )
+
+        memory.update_edge.assert_not_awaited()
+
+
+# ===========================================================================
+# Tests: --apply store-mutation preflight
+# ===========================================================================
+
+class TestRunApplyStoreMutationPreflight:
+    """``--apply`` refuses to START when this process cannot write mem0's store.
+
+    Ported from ``test_sweep_toolcall_xml_leak.TestRunApplyStoreMutationPreflight``
+    (task 3686), which is the in-repo precedent for this contract.
+
+    ``apply_cleanup`` invalidates edges, writes an audit memory per edge and
+    refreshes entity summaries, each in a sequential loop with its OWN
+    best-effort ``except Exception``. ``StoreMutationUnavailable`` subclasses
+    ``RuntimeError``, so a probe inside any of those loops would be absorbed
+    into ``failed_invalidations`` / ``failed_refreshes`` rows -- and
+    ``update_edge`` invalidates the edge BEFORE its audit memory is written, so
+    each of those "failures" would be an already-invalidated edge with no
+    rollback record. Only a run-wide probe ahead of the scan bounds that.
+    """
+
+    def _make_memory(self):
+        """Mirror of ``TestRun._make_memory``, wired for a snapshot edge that
+        would drive all three mutations."""
+        m = MagicMock()
+        m.update_edge = AsyncMock(return_value=None)
+        m.add_memory = AsyncMock(return_value=None)
+        m.refresh_entity_summary = AsyncMock(return_value=None)
+        g = MagicMock()
+        g.enumerate_entity_nodes = AsyncMock(return_value=(
+            [_entity('e1', 'E1')],
+            complete_paged_read(rows_seen=1),
+        ))
+        g.enumerate_all_valid_edges = AsyncMock(return_value=(
+            {'e1': [{'uuid': 'snap-edge', 'fact': '1505 done / 148 cancelled', 'name': ''}]},
+            complete_paged_read(rows_seen=1),
+        ))
+        m.graphiti = g
+        return m
+
+    def _args(self, apply=True, project_id='dark_factory'):
+        """Mirror of ``TestRun._args``."""
+        import argparse
+        return argparse.Namespace(
+            apply=apply,
+            project_id=project_id,
+            limit_per_project=1000,
+            yes_i_am_sure=False,
+        )
+
+    def _known_map(self, pid='dark_factory'):
+        return {pid: '/some/path'}
+
+    @pytest.mark.asyncio
+    async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
+        self, monkeypatch
+    ):
+        """The whole point: refuse to start rather than half-complete.
+
+        ALL THREE mutation entry points are asserted un-awaited, not just one:
+        each sits behind its own swallowing ``except Exception``, so a
+        zero-mutation claim covering only one of them would be vacuous.
+        """
+        deny(_mod, monkeypatch)
+        memory = self._make_memory()
+
+        with pytest.raises(
+            _mod.StoreMutationUnavailable, match=SENTINEL
+        ):
+            await _mod.run(
+                self._args(apply=True),
+                memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        memory.update_edge.assert_not_awaited()
+        memory.add_memory.assert_not_awaited()
+        memory.refresh_entity_summary.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_guard_sits_before_every_backend_read(self, monkeypatch):
+        """It aborts without a single round-trip: neither the first-pass entity
+        enumeration nor the second-pass edge scan is paid for by a run that was
+        never going to be allowed to mutate."""
+        deny(_mod, monkeypatch)
+        memory = self._make_memory()
+
+        with pytest.raises(_mod.StoreMutationUnavailable):
+            await _mod.run(
+                self._args(apply=True),
+                memory=memory,
+                known_projects_map=self._known_map(),
+            )
+
+        memory.graphiti.enumerate_entity_nodes.assert_not_awaited()
+        memory.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
+        """A read-only run mutates nothing, so it must not require the ability
+        to mutate -- the audit report stays obtainable from anywhere, with the
+        deny still installed."""
+        deny(_mod, monkeypatch)
+        memory = self._make_memory()
+
+        report = await _mod.run(
+            self._args(apply=False),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report['dry_run'] is True
+        assert not report.get('aborted')
+        memory.graphiti.enumerate_entity_nodes.assert_awaited()
+        memory.graphiti.enumerate_all_valid_edges.assert_awaited()
+        memory.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_apply_is_unchanged_when_the_preflight_passes(self, monkeypatch):
+        """Happy path: a writable environment cleans up exactly as before."""
+        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+        memory = self._make_memory()
+
+        report = await _mod.run(
+            self._args(apply=True),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert report['dry_run'] is False
+        assert memory.update_edge.await_count == 1
+        assert memory.add_memory.await_count == 1
+        assert memory.refresh_entity_summary.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_the_probe_names_the_operation_being_gated(self, monkeypatch):
+        """The refusal has to be attributable in a log, so the operation string
+        identifies this script and its mutating mode -- and it is probed once
+        for the RUN, not once per project or per edge."""
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            _mod, 'assert_store_mutation_allowed', lambda **kw: calls.append(kw)
+        )
+        memory = self._make_memory()
+
+        await _mod.run(
+            self._args(apply=True),
+            memory=memory,
+            known_projects_map=self._known_map(),
+        )
+
+        assert len(calls) == 1, 'probed ONCE per run, not once per edge'
+        assert 'cleanup_count_snapshots' in calls[0]['operation']
+        assert '--apply' in calls[0]['operation']
+
+    def test_the_refusal_is_loud_when_driven_through_main(self, monkeypatch, caplog):
+        """End-to-end surfacing through the real CLI entry point.
+
+        ``main`` has NO blanket ``except Exception``, so the refusal escapes
+        ``asyncio.run`` uncaught -- which is exactly why the guard site's own
+        ``logger.error`` must carry the fail-closed diagnosis before the raise.
+        Both halves are asserted: the refusal propagates out of ``main`` rather
+        than being converted into a 0 exit code, AND the journal an operator
+        reads carries the diagnosis.
+        """
+        deny(_mod, monkeypatch)
+        memory = self._make_memory()
+        monkeypatch.setattr(sys, 'argv', ['cleanup_count_snapshots.py', '--apply'])
+        real_asyncio_run = asyncio.run
+
+        def _drive(coro, *_a, **_kw):
+            coro.close()  # never construct the live MemoryService
+            return real_asyncio_run(
+                _mod.run(
+                    self._args(apply=True),
+                    memory=memory,
+                    known_projects_map=self._known_map(),
+                )
+            )
+
+        monkeypatch.setattr(_mod.asyncio, 'run', _drive)
+
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(_mod.StoreMutationUnavailable),
+        ):
+            _mod.main()
+
+        assert fail_closed_records(caplog, 'cleanup_count_snapshots'), (
+            "main has no handler, so the traceback is all an operator gets "
+            'unless the guard site logs the fail-closed diagnosis itself; '
+            f'got: {[rec.getMessage() for rec in caplog.records]}'
+        )
+        memory.update_edge.assert_not_awaited()

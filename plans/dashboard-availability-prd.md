@@ -206,6 +206,41 @@ which is why it was wrong and stayed wrong.
 - I5 — The watchdog never restarts a unit it did not observe failing
   (no action on a probe it never ran — e.g. its own startup error).
 
+> **Note on the shipped dedup horizon and I4's episode-end condition (amended 2026-08-12, task
+> 4088, from the shipped `scripts/dashboard-watchdog.py`).**
+> Two §Contract claims above are corrected here rather than rewritten in place, following the
+> convention of the α note below: the original wording is what the γ task was dispatched against,
+> and erasing it would erase the record that the code deliberately diverged, along with the
+> reasoning that justifies the divergence.
+>
+> **1. "Escalation dedup | at most one open L2 per ceiling episode"** ships as *at most one L2 per
+> rolling `RATE_WINDOW_SECS`*, keyed on the persisted `last_escalation_epoch` — deliberately the
+> SAME window the ceiling itself is measured over, so "the ceiling is saturated" and "an L2 about
+> that saturation is already on file" cannot disagree. An earlier version did key the dedup on the
+> `ceiling_open` episode flag; `file_ceiling_escalation` records why it was abandoned. A single
+> successful probe ends an episode, while the restart window it is measured against is deliberately
+> preserved across that recovery — so a flapping dashboard (one healthy tick, then `FAIL_STREAK`
+> failing ones: four ticks, ~120s at the timer's 30s cadence) closed the episode, immediately
+> re-tripped the still-saturated ceiling, and filed a fresh paging-severity L2 roughly every two
+> minutes. The escape has to bound the escalation rate over the same horizon as the restart rate,
+> or it just trades a restart storm for an escalation storm.
+>
+> **2. I4's "no further restarts until an operator intervenes"** ships as *no further restarts until
+> the episode ends*, where any successful probe ends it. `tick` still probes while `ceiling_open`
+> precisely so the episode CAN end: taken literally, "until an operator intervenes" means a state
+> file someone deletes by hand, leaving a dashboard that recovered on its own at 3am unsupervised
+> behind a stale flag nobody knows exists. A successful probe is unambiguous evidence the episode is
+> over — the service is answering, there is nothing left to restart — and normal supervision still
+> requires `FAIL_STREAK` fresh consecutive misses before it acts. The restart epochs are deliberately
+> NOT cleared on episode close, so a crash → recover → crash cycle cannot earn a fresh
+> `MAX_RESTARTS` allowance every cycle.
+>
+> Both corrections are narrow. The **"exactly one L2"** and **"then stop restarting"** halves of I4
+> and of the "On ceiling" row are UNCHANGED: only the dedup HORIZON (rolling window, not episode)
+> and the episode-END CONDITION (a successful probe, not a human) are corrected. The storm escape is
+> not weakened — a dashboard that stays down stays cleanly down, with its L2 on file, for as long as
+> the fault lasts.
+
 ## Boundary-test sketch (B + H)
 
 Facing both sides of the seam. Task γ names this table as its signal.

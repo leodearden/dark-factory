@@ -363,7 +363,9 @@ def _open_escalation(
     """A pending escalation row as ``get_by_task(tid, status='pending')`` yields.
 
     ``filing_claimant_run_id`` is left at its default ``None`` (the shape every
-    legacy row and most current producers carry) — irrelevant for L1/L2, and
+    legacy row carries, and every producer that still does not stamp it — task
+    3550 added stamping to TaskWorkflow, Harness and the agent filing tools)
+    — irrelevant for L1/L2, and
     for L0 the gate passes ``live_claimant=False``, which classifies
     ``dead_l0`` identity-independently.
     """
@@ -623,6 +625,11 @@ def _wired_marker_harness(
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
     h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
+    # Explicit (task 4499): the filer's auto-dismiss guard reads a TERMINAL
+    # record on this citation, so "nothing was previously adjudicated" must be
+    # STATED, not inherited from MagicMock's truthy auto-child — which would
+    # silently suppress every filing these tests assert on.
+    h._escalation_queue.find_terminal_by_citation = MagicMock(return_value=None)
     return h
 
 
@@ -708,7 +715,13 @@ class TestAlreadyLandedDispatchGateMarkerPath:
         # the ONLY has_open_l1 caller left — but assert on the most recent
         # call rather than an exact count, so a future dedup site added
         # elsewhere in the path doesn't turn this into a brittle failure.
-        cast(MagicMock, h._escalation_queue).has_open_l1.assert_called_with('42')
+        # Since task 3116 that dedup is deliberately CATEGORY-SCOPED: passing a
+        # bare task_id matched any open L1, so an unrelated escalation silently
+        # suppressed a provenance_unattributed filing (the task-4105 two-way
+        # blindfold). The kwarg here is the point of that change, not drift.
+        cast(MagicMock, h._escalation_queue).has_open_l1.assert_called_with(
+            '42', category='provenance_unattributed',
+        )
         cast(MagicMock, h._escalation_queue).submit.assert_called_once()
         esc = cast(MagicMock, h._escalation_queue).submit.call_args[0][0]
         assert esc.category == 'provenance_unattributed'
@@ -793,6 +806,11 @@ def _wired_content_harness(
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
     h._escalation_queue.get_by_task = MagicMock(return_value=[])
     h._escalation_queue.make_id = MagicMock(return_value='esc-42-1')
+    # Explicit (task 4499): the filer's auto-dismiss guard reads a TERMINAL
+    # record on this citation, so "nothing was previously adjudicated" must be
+    # STATED, not inherited from MagicMock's truthy auto-child — which would
+    # silently suppress every filing these tests assert on.
+    h._escalation_queue.find_terminal_by_citation = MagicMock(return_value=None)
     return h
 
 

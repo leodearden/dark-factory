@@ -10,6 +10,7 @@ DeterministicRunner and harness delegate to it.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -98,6 +99,175 @@ class TestInspectSystemdUnit:
 
         assert result['MainPID'] == 0
         assert isinstance(result['MainPID'], int)
+
+    @pytest.mark.asyncio
+    async def test_spawn_filenotfound_returns_mainpid_zero_sentinel(self, caplog) -> None:
+        """Task 4157: a MISSING ``systemctl`` binary must degrade to the SAME
+        MainPID=0 sentinel the timeout branch returns, not raise.
+
+        ``asyncio.create_subprocess_exec`` sits OUTSIDE the ``try`` that
+        guards ``communicate()``, so today a spawn failure escapes raw — past
+        ``DeterministicRunner.run()``'s documented "always returns BLOCKED,
+        never a raw exception" contract, and past the crash-window /
+        baseline-gate escalations the operator is supposed to see.
+        """
+        with (
+            patch(
+                'asyncio.create_subprocess_exec',
+                AsyncMock(side_effect=FileNotFoundError(
+                    2, 'No such file or directory', 'systemctl',
+                )),
+            ),
+            caplog.at_level(logging.WARNING, logger='orchestrator.systemd_inspect'),
+        ):
+            result = await inspect_systemd_unit(
+                'orchestrator-reify.service', timeout_secs=5.0,
+            )
+
+        assert result == {
+            'MainPID': 0,
+            'ActiveState': '',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        assert 'orchestrator-reify.service' in caplog.text
+        assert 'MainPID=0 sentinel' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_spawn_emfile_returns_mainpid_zero_sentinel(self, caplog) -> None:
+        """Task 4157: the second spawn-failure mode — a fork failure under
+        resource pressure (fd exhaustion) — must degrade identically.
+
+        EMFILE is the pointed case because it fails the spawn from a
+        system-wide root cause that has nothing to do with the unit being
+        inspected, so raising here would convert a transient host condition
+        into a raw exception escaping an async workflow slot.
+        """
+        with (
+            patch(
+                'asyncio.create_subprocess_exec',
+                AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files')),
+            ),
+            caplog.at_level(logging.WARNING, logger='orchestrator.systemd_inspect'),
+        ):
+            result = await inspect_systemd_unit(
+                'fused-memory.service', timeout_secs=5.0,
+            )
+
+        assert result == {
+            'MainPID': 0,
+            'ActiveState': '',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        assert 'fused-memory.service' in caplog.text
+        assert 'MainPID=0 sentinel' in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_degradation_sink_names_the_spawn_cause(self) -> None:
+        """Reviewer amendment: the sentinel is byte-identical for every
+        degradation mode, so the CAUSE must travel out of band.
+
+        EMFILE (fix the host), a missing ``systemctl`` (fix the install) and a
+        hung systemd (fix the unit) all render as the same four-key dict.
+        Leaving the difference in the journal only would make the escalation an
+        operator actually reads unable to distinguish them — the log-scraping
+        INV-2 ``structured-facts-at-failure`` forbids. The optional
+        ``degradation_sink`` out-dict carries it without touching a single
+        classification field.
+        """
+        sink: dict = {}
+        with patch(
+            'asyncio.create_subprocess_exec',
+            AsyncMock(side_effect=OSError(errno.EMFILE, 'Too many open files')),
+        ):
+            result = await inspect_systemd_unit(
+                'fused-memory.service', timeout_secs=5.0, degradation_sink=sink,
+            )
+
+        # The sentinel itself is untouched — classifiers must still be unable
+        # to tell the two degradation modes apart.
+        assert result == {
+            'MainPID': 0,
+            'ActiveState': '',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        assert 'Too many open files' in sink['cause']
+        assert 'fused-memory.service' in sink['cause']
+
+    @pytest.mark.asyncio
+    async def test_degradation_sink_names_the_timeout_cause(self) -> None:
+        """The OTHER degradation mode must be distinguishable from the first.
+
+        A hung systemd and a failed spawn are the two causes that produce an
+        identical sentinel; the sink is only useful if it separates them.
+        """
+        proc = MagicMock()
+        proc.communicate = AsyncMock(side_effect=TimeoutError())
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock(return_value=0)
+
+        sink: dict = {}
+        with patch('asyncio.create_subprocess_exec', AsyncMock(return_value=proc)):
+            result = await inspect_systemd_unit(
+                'orchestrator-reify.service', timeout_secs=0.01,
+                reap_grace_secs=0.01, degradation_sink=sink,
+            )
+
+        assert result == {
+            'MainPID': 0,
+            'ActiveState': '',
+            'ActiveEnterTimestamp': '',
+            'ActiveEnterTimestampMonotonic': 0,
+        }
+        assert 'timed out' in sink['cause']
+        assert 'orchestrator-reify.service' in sink['cause']
+        assert 'could not be spawned' not in sink['cause'], (
+            f'the two degradation modes must be distinguishable: {sink["cause"]!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_degradation_sink_untouched_on_a_good_reading(self) -> None:
+        """A trustworthy reading must leave the sink empty — callers key on
+        ``sink.get('cause') is None`` to decide whether to append a ``Cause:``
+        line, so a stale/eager write would misreport a healthy inspect."""
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(
+            b'MainPID=42\nActiveState=active\nActiveEnterTimestamp=Mon\n'
+            b'ActiveEnterTimestampMonotonic=99\n', b'',
+        ))
+        sink: dict = {}
+        with patch('asyncio.create_subprocess_exec', AsyncMock(return_value=proc)):
+            result = await inspect_systemd_unit(
+                'orchestrator-reify.service', timeout_secs=5.0, degradation_sink=sink,
+            )
+
+        assert result['MainPID'] == 42
+        assert sink == {}
+
+    @pytest.mark.asyncio
+    async def test_non_oserror_spawn_failure_still_propagates(self) -> None:
+        """Pins the NARROWNESS of the spawn guard: ``except OSError`` only.
+
+        Widening to a bare ``except Exception`` — a very natural refactor for
+        a function documented as sentinel-safe — would swallow programmer
+        errors and ``NotImplementedError`` (an event loop with no subprocess
+        support), returning a sentinel that LIES about the unit's state
+        instead of failing loudly. Mirrors the established
+        ``_raise_emfile_spawn`` / ``_raise_runtime_error`` pairing in
+        ``tests/test_remove_merge_worktree_guarded.py``.
+        """
+        with (
+            patch(
+                'asyncio.create_subprocess_exec',
+                AsyncMock(side_effect=RuntimeError('not an OSError — must stay loud')),
+            ),
+            pytest.raises(RuntimeError, match='must stay loud'),
+        ):
+            await inspect_systemd_unit(
+                'orchestrator-reify.service', timeout_secs=5.0,
+            )
 
 
 class TestEmptyBaselineFresh:

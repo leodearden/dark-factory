@@ -37,12 +37,6 @@ the autouse ``_neutralize_verify_admission`` conftest fixture
 other test in the suite (task 2390 pre-1) — this gate must exercise the REAL
 seam.
 
-Helpers are kept MODULE-LOCAL (never conftest.py) — a conftest.py edit trips
-``verify.py``'s ``has_conftest`` heuristic and forces merge-time scoped
-verify to fall back to running the full owning-package suite instead of a
-scoped subset (mirrors ``test_verify_admission_wiring.py``'s stated
-rationale).
-
 TEST-ONLY integration gate: every scenario drives already-shipped T1/T2/T3
 seams (patch ``orchestrator.verify._run_cmd``, instrument
 ``orchestrator.verify.acquire_task_slot``, inject
@@ -70,52 +64,10 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from _orch_helpers import ADMISSION_TEST_CMD, admission_leg_for_cmd, admission_module_config
 
-from orchestrator.config import ModuleConfig, OrchestratorConfig
+from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import run_full_verification, run_verification
-
-# ---------------------------------------------------------------------------
-# Shared sentinels + labelling (adapted from test_verify_admission_wiring.py)
-# ---------------------------------------------------------------------------
-
-# module_config commands are chosen to be uniquely identifiable by substring,
-# so a spy `_run_cmd` can label which leg is running without needing `label`
-# (which is a `_run_or_skip_timed`-local closure variable, never passed down
-# to `_run_cmd`).
-_TEST_CMD = 'pytest tests/'
-_LINT_CMD = 'ruff'
-_TYPE_CMD = 'pyright'
-
-
-def _leg_for_cmd(cmd: str) -> str:
-    """Label which leg *cmd* belongs to by substring, not exact match — an
-    active admission gate nice-wraps the test leg (``<nice argv> /bin/bash -c
-    <shlex.quote(cmd)>``), so its captured cmd still CONTAINS ``_TEST_CMD``
-    but is no longer equal to it. lint/type are never wrapped either way.
-    """
-    if _TEST_CMD in cmd:
-        return 'test'
-    if _LINT_CMD in cmd:
-        return 'lint'
-    if _TYPE_CMD in cmd:
-        return 'type'
-    return cmd
-
-
-def _module_config(**overrides: Any) -> ModuleConfig:
-    kwargs: dict[str, Any] = dict(
-        prefix='pkg',
-        test_command=_TEST_CMD,
-        lint_command=_LINT_CMD,
-        type_check_command=_TYPE_CMD,
-        # Sequential so the three legs run strictly test -> lint -> type,
-        # making ordering/labelling assertions deterministic (no gather
-        # interleaving between legs themselves).
-        concurrent_verify=False,
-    )
-    kwargs.update(overrides)
-    return ModuleConfig(**kwargs)
-
 
 # ---------------------------------------------------------------------------
 # Configurable spy for orchestrator.verify._run_cmd
@@ -166,7 +118,7 @@ class _RunCmdSpy:
         log_path: Path | None = None,
         **kwargs: Any,
     ) -> tuple[int, str, bool]:
-        leg = _leg_for_cmd(cmd)
+        leg = admission_leg_for_cmd(cmd)
         occurrence = self._leg_seen.get(leg, 0)
         self._leg_seen[leg] = occurrence + 1
         self.calls.append({'cmd': cmd, 'cwd': cwd, 'timeout': timeout, 'leg': leg})
@@ -318,6 +270,7 @@ def _wait_for_marker(marker_path: Path, timeout: float = 5.0) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestGlobalCap:
     """PRD Boundary-test sketch scenario 1: dispatching M concurrent
     task-role verifies against a single N=1 slot never lets more than one
@@ -355,7 +308,7 @@ class TestGlobalCap:
                 run_verification(
                     worktree=worktree,
                     config=config,
-                    module_config=_module_config(),
+                    module_config=admission_module_config(),
                     role='task',
                     attempt_id=None,
                 )
@@ -415,7 +368,7 @@ class TestMergeNeverBlocks:
                 run_verification(
                     worktree=holder_worktree,
                     config=config,
-                    module_config=_module_config(),
+                    module_config=admission_module_config(),
                     role='task',
                     attempt_id=None,
                 )
@@ -432,7 +385,7 @@ class TestMergeNeverBlocks:
                 merge_result = await run_verification(
                     worktree=merge_worktree,
                     config=config,
-                    module_config=_module_config(),
+                    module_config=admission_module_config(),
                     role='merge',
                     attempt_id=None,
                 )
@@ -451,7 +404,7 @@ class TestMergeNeverBlocks:
                 expected_cmd = (
                     shlex.join(['nice', '-n', '5'])
                     + ' /bin/bash -c '
-                    + shlex.quote(_TEST_CMD)
+                    + shlex.quote(ADMISSION_TEST_CMD)
                 )
                 assert merge_call['cmd'] == expected_cmd, (
                     f'expected the merge test leg wrapped with the nice -n 5 '
@@ -469,6 +422,7 @@ class TestMergeNeverBlocks:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestSweepYieldsAndInterleaves:
     """PRD Boundary-test sketch scenario 3: a background-role sweep
     (``run_full_verification`` fanning out over ``config._module_configs``)
@@ -506,8 +460,8 @@ class TestSweepYieldsAndInterleaves:
         # resolved — so passing the same `project_root` object to both
         # satisfies the reuse guard.
         config._module_configs = {
-            'a': _module_config(prefix='a'),
-            'b': _module_config(prefix='b'),
+            'a': admission_module_config(prefix='a'),
+            'b': admission_module_config(prefix='b'),
         }
 
         acq = _DeterministicAcquire()
@@ -539,7 +493,7 @@ class TestSweepYieldsAndInterleaves:
                     run_verification(
                         worktree=task_worktree,
                         config=config,
-                        module_config=_module_config(),
+                        module_config=admission_module_config(),
                         role='task',
                         attempt_id=None,
                     )
@@ -602,7 +556,7 @@ class TestSweepYieldsAndInterleaves:
         expected_background_cmd = (
             shlex.join(['nice', '-n', '19', 'ionice', '-c3'])
             + ' /bin/bash -c '
-            + shlex.quote(_TEST_CMD)
+            + shlex.quote(ADMISSION_TEST_CMD)
         )
         assert all(c['cmd'] == expected_background_cmd for c in background_test_calls), (
             f'expected both sweep subproject test legs wrapped with the '
@@ -618,6 +572,7 @@ class TestSweepYieldsAndInterleaves:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestUntimedWaitNoRequeue:
     """PRD Boundary-test sketch scenario 4: slot-wait time is excluded from
     ``verify_command_timeout_secs`` by construction — ``_run_or_skip_timed``
@@ -645,7 +600,7 @@ class TestUntimedWaitNoRequeue:
             baseline_result = await run_verification(
                 worktree=baseline_worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
@@ -669,7 +624,7 @@ class TestUntimedWaitNoRequeue:
                 run_verification(
                     worktree=holder_worktree,
                     config=config,
-                    module_config=_module_config(),
+                    module_config=admission_module_config(),
                     role='task',
                     attempt_id=None,
                 )
@@ -687,7 +642,7 @@ class TestUntimedWaitNoRequeue:
                     run_verification(
                         worktree=waiter_worktree,
                         config=config,
-                        module_config=_module_config(),
+                        module_config=admission_module_config(),
                         role='task',
                         attempt_id=None,
                     )
@@ -735,6 +690,7 @@ class TestUntimedWaitNoRequeue:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestSelfHeal:
     """PRD Boundary-test sketch scenario 5: a SIGKILLed slot holder's flock
     is freed immediately by the kernel on process death — no canary/daemon
@@ -773,7 +729,7 @@ class TestSelfHeal:
                     run_verification(
                         worktree=worktree,
                         config=config,
-                        module_config=_module_config(),
+                        module_config=admission_module_config(),
                         role='task',
                         attempt_id=None,
                     )
@@ -848,7 +804,7 @@ class TestFailOpen:
             result = await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
@@ -864,7 +820,7 @@ class TestFailOpen:
         )
         test_calls = [c for c in spy.calls if c['leg'] == 'test']
         assert len(test_calls) == 1
-        assert test_calls[0]['cmd'] == _TEST_CMD, (
+        assert test_calls[0]['cmd'] == ADMISSION_TEST_CMD, (
             f'expected the byte-identical, unwrapped (ungated) test-leg cmd; '
             f'got {test_calls[0]["cmd"]!r}'
         )
@@ -872,6 +828,7 @@ class TestFailOpen:
 
     @pytest.mark.real_verify_admission
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("code_default_config")
     async def test_unmkdirable_slots_dir_fails_open_and_verify_still_passes(self, tmp_path):
         # slots_dir's PARENT path component is a regular file, not a missing
         # directory — `slots_dir.mkdir(parents=True, exist_ok=True)` inside
@@ -896,7 +853,7 @@ class TestFailOpen:
             result = await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
@@ -911,7 +868,7 @@ class TestFailOpen:
         expected_cmd = (
             shlex.join(['nice', '-n', '15', 'ionice', '-c2', '-n7'])
             + ' /bin/bash -c '
-            + shlex.quote(_TEST_CMD)
+            + shlex.quote(ADMISSION_TEST_CMD)
         )
         assert test_calls[0]['cmd'] == expected_cmd, (
             f'expected the task nice-tier wrap to still apply even though '

@@ -1,8 +1,23 @@
 #!/usr/bin/env bash
-# Pre-commit hook: universal guards + optional project-specific checks.
+# Pre-commit hook: universal guards + project-specific checks.
 #
 # Universal guards (especially .task/ stripping) run on EVERY branch.
-# Project-specific checks (ruff, pyright, etc.) run only on main.
+# Project-specific checks are REACHED on every branch too, and the
+# project decides which of them apply to which branch -- hooks/project-checks
+# receives the branch as $2 and applies its own per-check policy (today:
+# the merge-lane ratchet audit universal, ruff/pyright main-only).
+#
+# WHY THE BRANCH IS PASSED DOWN RATHER THAN DECIDED HERE.  This hook used
+# to `exit 0` on every branch that is not main, so a project check could
+# only ever fire on a commit made while main was checked out.  That is the
+# wrong shape for any guard about content REACHING main: a task branch's
+# contamination arrives by merge, and a CLEAN merge runs pre-merge-commit
+# rather than this hook (a conflicted one finished with `git commit` -- the
+# merge resolver's path -- does run this hook), while the merge worker
+# advances main with `git update-ref`, which runs no hooks at all.  The
+# .task/ guard below already had to be universal for exactly that reason.
+# Which checks are cheap enough to be universal is a PROJECT question, so
+# the project answers it.
 #
 # IF YOU ARE AN AI AGENT: do NOT use --no-verify to bypass this hook.
 # The .task/ directory must NEVER be committed on ANY branch.
@@ -82,14 +97,10 @@ if [ "$branch" = "main" ]; then
     fi
 fi
 
-# ── Project-specific checks (main only) ──────────────────────────────
-
-if [ "$branch" != "main" ]; then
-    exit 0
-fi
+# ── Project-specific checks (EVERY branch; the project decides) ──────
 
 if [ -x "$ROOT/hooks/project-checks" ]; then
-    exec "$ROOT/hooks/project-checks" "$ROOT"
+    exec "$ROOT/hooks/project-checks" "$ROOT" "$branch"
 fi
 
 echo "pre-commit: all checks passed."

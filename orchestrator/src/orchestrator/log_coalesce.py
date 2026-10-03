@@ -54,7 +54,8 @@ the one caller least likely to notice.
 
 PRECEDENT.  This generalises the ``_reprobe_last_info`` /
 ``REPROBE_STILL_DOWN_INFO_SWEEPS`` rate-limiter already in
-``orchestrator/merge_queue.py`` (see the emitter at merge_queue.py:10448),
+``orchestrator/merge_lane/worker.py`` (see its emitter in
+``SpeculativeMergeWorker._reprobe_quarantined_hosts``),
 whose three shape decisions are adopted verbatim: log immediately on any
 CHANGE and throttle only the unchanged repeat; emit suppressed polls at DEBUG
 rather than dropping them, so nothing is ever actually lost; and select the
@@ -63,9 +64,8 @@ level with a single ``logger.log(level, fmt, ...)`` call.
 ADOPTION CANDIDATES, DELIBERATELY OUT OF SCOPE FOR TASK 3203.  Two merge-queue
 sweeps outside the heartbeat path have the same unbounded-repetition shape and
 could adopt this by construction rather than by rewrite:
-``_reprobe_quarantined_hosts`` (merge_queue.py:10334/10368/10409/10419/10492,
-120s cadence) and ``reap_orphaned_merge_worktrees``
-(merge_queue.py:12120/12145, 300s cadence — whose reclaim behaviour task 3203's
+``_reprobe_quarantined_hosts`` (120s cadence) and ``reap_orphaned_merge_worktrees``
+(300s cadence — whose reclaim behaviour task 3203's
 scope note bars touching).  Extracting the schedule here is what makes that
 adoption cheap; doing it is a separate task.
 """

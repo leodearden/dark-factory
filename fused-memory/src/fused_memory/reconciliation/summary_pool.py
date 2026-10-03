@@ -38,17 +38,23 @@ from fused_memory.reconciliation.recon_pool_map import (
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE as _CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE,
 )
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_TTL_DAYS as _CYCLE_SUMMARY_TTL_DAYS,
+)
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
 
-# Retention window for authoritative cycle_summary ledger rows (task 2229).
-# The ledger is a control-plane store, not a permanent audit log, and Stage 3
-# only ever consumes recent summaries — so rows are given a bounded TTL and
-# reaped by the existing ReconLedgerStore.gc() expires_at pass (already run
-# each cycle by _gc_recon_markers) rather than kept forever or given bespoke
-# cleanup code.
-CYCLE_SUMMARY_TTL_DAYS: int = 30
+# Retention window for authoritative cycle_summary ledger rows (task 2229),
+# stamped as expires_at by write_cycle_summary below and reaped by the existing
+# ReconLedgerStore.gc() expires_at pass (already run each cycle by
+# _gc_recon_markers). Single-sourced in the leaf recon_pool_map since task 3731
+# and re-exported here under its historical name, for the same lockstep reason
+# as the record_types below: the presence READER in
+# services/memory_service.py now needs the same window to tell a reaped row
+# from one that was never written, and cannot import this module without
+# closing a service <-> reconciliation import cycle.
+CYCLE_SUMMARY_TTL_DAYS: int = _CYCLE_SUMMARY_TTL_DAYS
 
 # record_type vocabulary for cycle_summary Mem0 writes (task 2468). There are
 # two distinct writers of kind='cycle_summary': this module's deterministic,
@@ -133,12 +139,13 @@ async def _warn_on_untrimmable_pool_residue(
     reintroduced in a shape nothing reports (reviewer finding robustness,
     task 3041 amendment pass).
 
-    That shape is realistic, not theoretical: cycle_summary metadata is
-    LLM-supplied on the narrative write path, and
-    ``_apply_cycle_summary_metadata_tagging`` backfills ``run_id`` precisely
-    BECAUSE prompt compliance is not guaranteed — a write that lands
-    ``recon_pool`` (or has it auto-stamped from ``metadata.stage``) while
-    dropping ``kind`` produces exactly this residue.
+    New ``add_memory``/``add_system_record`` writes can no longer produce
+    that shape: since task 3239
+    ``services/memory_service.py::_apply_cycle_summary_metadata_tagging``
+    strips ``recon_pool`` from any write whose ``kind`` is not
+    ``cycle_summary``. The residue this backstop reports is what remains —
+    records written before task 3239, and ``update_memory`` patches, which do
+    not run the add-path tagging helper (that gap is tracked as task 6054).
 
     So the narrowed delete filter stays and the pool gets an observability
     backstop instead: one ``count_memories_by_metadata`` on the ``recon_pool``
@@ -270,11 +277,11 @@ async def enforce_summary_pool_cap(
     ``cap``. Reaching it therefore logs a WARNING and still trims, instead of
     silently returning a count that reads as "pool trimmed to cap".
 
-    The ``kind`` filter constraint is load-bearing, not decorative:
-    ``_apply_cycle_summary_metadata_tagging`` is additive-only and never
-    strips a caller-supplied ``recon_pool``, so filtering on ``recon_pool``
-    alone would let a mis-tagged non-summary record join this pool and either
-    be trimmed by it or evict a real mirror.
+    The ``kind`` filter constraint is load-bearing, not decorative: the add
+    path strips a stray ``recon_pool`` since task 3239, but records written
+    before it and ``update_memory`` patches can still carry one, so filtering
+    on ``recon_pool`` alone would let a mis-tagged non-summary record join
+    this pool and either be trimmed by it or evict a real mirror.
 
     **This pool is cap-bounded BY DESIGN, and that is not a bug.** A mirror
     older than the newest *cap* ledger_stamps IS expected to be evicted — the
@@ -306,11 +313,12 @@ async def enforce_summary_pool_cap(
     try:
         members = await memory_service.get_memories_by_metadata(
             project_id=project_id,
-            # kind is load-bearing, not decorative (task 3041):
-            # _apply_cycle_summary_metadata_tagging is ADDITIVE-only and never
-            # strips a caller-supplied recon_pool, so filtering on recon_pool
-            # alone would let a mis-tagged non-summary record join this cap-2
-            # pool — and then either be trimmed by it or evict a real mirror.
+            # kind is load-bearing, not decorative (task 3041): the add path
+            # strips a stray recon_pool since task 3239, but pre-3239 records
+            # and update_memory patches can still carry one, so filtering on
+            # recon_pool alone would let a mis-tagged non-summary record join
+            # this cap-2 pool — and then either be trimmed by it or evict a
+            # real mirror.
             filters={'recon_pool': recon_pool, 'kind': _KIND_CYCLE_SUMMARY},
             limit=SUMMARY_POOL_SCROLL_LIMIT,
         )
@@ -507,14 +515,18 @@ async def write_cycle_summary(
     and swallows the failure, so neither a missing ledger nor a Mem0 outage
     can mask (or be masked by) the other's outcome, and neither can ever
     raise out of this function. This matters in practice: Stage 3's
-    cycle-summary presence check (``prompts/stage3.py``) reads only the Mem0
-    mirror, never the ledger (see the "Known gap" comment there) — if the
-    mirror also went dark whenever the ledger was absent (e.g. a
-    deliberately-disabled ``recon_ledger_enabled=False``, a supported
-    non-default config), Stage 3 would false-report "summary missing" every
-    cycle with no fallback signal. (Reviewer finding robustness, task 2229
-    amendment pass.) The return value reflects ONLY the authoritative ledger
-    upsert.
+    cycle-summary presence check (``prompts/stage3.py``) reads the ledger as
+    PRIMARY (since task 2437) but falls back to the Mem0 mirror whenever that
+    read is INCONCLUSIVE — which is exactly what ``ledger_available: false``
+    reports on a deliberately-disabled ``recon_ledger_enabled=False``, a
+    supported non-default config. If the mirror also went dark whenever the
+    ledger was absent, that documented fallback would have nothing to read and
+    Stage 3 would false-report "summary missing" every cycle. (Reviewer
+    finding robustness, task 2229 amendment pass; corrected task 4186 — the
+    prior text claimed Stage 3 "reads only the Mem0 mirror, never the ledger",
+    which has not been true since 2437 and no longer matches the "Known gap"
+    comment it cited, which no longer exists.) The return value reflects ONLY
+    the authoritative ledger upsert.
 
     Args:
         memory_service: Service that may expose a ``recon_ledger``
@@ -626,9 +638,9 @@ async def write_cycle_summary(
                 # record_type discriminates this deterministic code mirror
                 # (LEDGER_STAMP) from the distinct LLM-authored reconstruction
                 # write in prompts/stage2.py (NARRATIVE) — task 2468.
-                # _apply_cycle_summary_metadata_tagging (memory_service.py)
-                # is additive-only and never strips unknown keys, so this
-                # survives through to storage unchanged.
+                # services/memory_service.py::_apply_cycle_summary_metadata_tagging
+                # strips nothing from a kind='cycle_summary' write, so
+                # record_type survives through to storage unchanged.
                 metadata={
                     'kind': 'cycle_summary',
                     'stage': stage,
