@@ -16,7 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, lane_scene_config
+from _merge_lane_fakes import FakeVerifier, fails, lane_scene_config
 from _orch_helpers import make_placeholder_future, pydantic_spec
 
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -424,6 +424,44 @@ class TestReverifyMemberSoloContract:
         assert result.merge_sha == 'cafe1234solo'
         assert verifier.entered_count == 1
         git_ops.advance_main.assert_not_called()
+
+    async def test_persistent_infra_transient_red_earns_one_full_retry(
+        self, tmp_path: Path,
+    ) -> None:
+        """A member whose solo verify stays infra-transient red is re-verified once, then fails.
+
+        The solo path spends the worker's single full-reverify retry, the same budget a
+        worker merge gets, and still tears the solo worktree and branch down.
+        """
+        from orchestrator.merge_queue import reverify_member_solo
+
+        verifier = FakeVerifier(
+            default=fails(category='semaphore_timeout', summary='semaphore timeout'),
+        )
+        git_ops = _make_git_ops_mock()
+        git_ops.delete_solo_branch = AsyncMock()
+        config = lane_scene_config(tmp_path, GitConfig())
+
+        result = await reverify_member_solo(
+            git_ops=git_ops,
+            member_id='b1',
+            solo_wt=tmp_path,
+            solo_branch='_solo-b1',
+            tip_sha='cafe1234solo',
+            config=config,
+            task_files=None,
+            module_configs=[],
+            verifier=verifier,
+        )
+
+        assert result.passed is False
+        assert verifier.entered_count == 2, (
+            'the solo path must spend the worker\'s single full-reverify retry '
+            '(attempt-0 + one retry), not three retries; '
+            f'got {verifier.entered_count} verifies'
+        )
+        git_ops.cleanup_merge_worktree.assert_called_once_with(tmp_path)
+        git_ops.delete_solo_branch.assert_called_once_with('_solo-b1')
 
 
 # ---------------------------------------------------------------------------
