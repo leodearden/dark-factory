@@ -7098,6 +7098,8 @@ class MemoryService:
         # guaranteed-persistence system-write path exists to rule out, so it
         # must not be journaled as an unconditional success.
         _empty_result = not mem0_ids
+        # mem0 is claimed only when it returned an id (task 4045).
+        stores_written: list[SourceStore] = [] if _empty_result else [SourceStore.mem0]
         if _empty_result and not _mem0_error:
             logger.warning(
                 'MemoryService.add_system_record: mem0 add_system_record '
@@ -7123,7 +7125,7 @@ class MemoryService:
                 params={'content': content[:200], 'category': resolved_category.value},
                 result_summary={
                     'memory_ids': mem0_ids,
-                    'stores': [SourceStore.mem0.value],
+                    'stores': [s.value for s in stores_written],
                 },
                 success=not _empty_result,
                 error=(
@@ -7158,13 +7160,13 @@ class MemoryService:
             agent_id=agent_id,
         ))
 
-        msg = f'Memory queued for {[SourceStore.mem0.value]}'
+        msg = f'Memory queued for {[s.value for s in stores_written]}'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
 
         return AddMemoryResponse(
             memory_ids=mem0_ids,
-            stores_written=[SourceStore.mem0],
+            stores_written=stores_written,
             category=resolved_category,
             message=msg,
         )
