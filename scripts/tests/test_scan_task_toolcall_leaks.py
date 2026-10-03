@@ -25,6 +25,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+from _task_db_scan import TaskDbProblem, TaskDbUnreadable
 from cli_subprocess_timeout import cli_timeout_from_env
 from scan_task_toolcall_leaks import (
     LeakMatch,
@@ -548,3 +550,37 @@ def test_cli_one_unreadable_db_beside_a_clean_one_still_exits_0(tmp_path, make_t
     assert "no leaked tool-call fragments found" in result.stdout
     assert str(corrupt_db) in result.stderr
     assert "NOTHING was scanned" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# A stub store is refused with a structured reason (task 5335)
+#
+# Appended below the task 3083 banner for the same reason as the task 3474
+# block above. The EMPTY_STUB remedy itself quotes `no such table: tasks`, so
+# the CLI test rules out sqlite's raw error as the WARNING's reason rather
+# than the phrase anywhere in stderr.
+# ---------------------------------------------------------------------------
+
+
+def test_scan_db_refuses_a_zero_byte_stub_with_a_structured_reason(tmp_path):
+    stub = tmp_path / "tasks.db"
+    stub.write_bytes(b"")
+
+    with pytest.raises(TaskDbUnreadable) as refused:
+        scan_db(str(stub))
+
+    assert refused.value.reason is TaskDbProblem.EMPTY_STUB
+
+
+def test_cli_names_why_it_skipped_a_stub_beside_a_leaky_store(tmp_path, make_tasks_db):
+    stub = tmp_path / "stub.db"
+    stub.write_bytes(b"")
+    leaky_db = make_tasks_db([{"id": 992, "description": GENUINE_DESCRIPTION_LEAK}])
+
+    result = _run_cli("--db", str(stub), "--db", str(leaky_db))
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "992" in result.stdout
+    refusal = TaskDbUnreadable(stub.resolve(), TaskDbProblem.EMPTY_STUB)
+    assert str(refusal) in result.stderr
+    assert f"unreadable database {stub}: no such table" not in result.stderr

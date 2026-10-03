@@ -27,6 +27,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+from _task_db_scan import TaskDbProblem, TaskDbUnreadable
 from scan_provenance_note_log_leaks import (
     NoteLeakMatch,
     detect_log_leak,
@@ -260,6 +262,15 @@ class TestScanDb:
         assert [m.task_id for m in matches] == [3001], matches
         assert matches[0].leak_line.startswith('2026-07-30'), matches[0]
 
+    def test_a_zero_byte_stub_is_refused_with_a_structured_reason(self, tmp_path):
+        stub = tmp_path / 'tasks.db'
+        stub.write_bytes(b'')
+
+        with pytest.raises(TaskDbUnreadable) as refused:
+            scan_db(str(stub))
+
+        assert refused.value.reason is TaskDbProblem.EMPTY_STUB
+
 
 class TestFormatting:
     """The human report truncates; --json carries the full line."""
@@ -384,6 +395,23 @@ class TestCli:
         assert '2902' in result.stdout
         assert 'corrupt.db' in result.stderr
         assert 'incomplete' in result.stderr
+
+    def test_a_skipped_stub_is_named_with_why_beside_a_polluted_store(
+        self, tmp_path, make_tasks_db
+    ):
+        """The EMPTY_STUB remedy itself quotes `no such table: tasks`, so this
+        rules out sqlite's raw error as the WARNING's reason, not the phrase."""
+        stub = tmp_path / 'stub.db'
+        stub.write_bytes(b'')
+        polluted = str(make_tasks_db(_MIXED_ROWS, name='polluted.db'))
+
+        result = _run_cli('--db', str(stub), '--db', polluted)
+
+        assert result.returncode == 1, result.stderr
+        assert '2902' in result.stdout
+        refusal = TaskDbUnreadable(stub.resolve(), TaskDbProblem.EMPTY_STUB)
+        assert str(refusal) in result.stderr
+        assert f'unreadable database {stub}: no such table' not in result.stderr
 
     def test_every_db_unreadable_exits_3_not_0(self, tmp_path):
         """EVERY resolved database failing to open is not a clean sweep.
