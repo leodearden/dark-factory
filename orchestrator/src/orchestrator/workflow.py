@@ -4510,7 +4510,11 @@ class TaskWorkflow:
         so its outcome goes to the exit-write ledger
         (``orchestrator/src/orchestrator/exit_contract.py``, relaxation 2).
         """
-        assert not conflict.applied
+        if conflict.applied:
+            raise ValueError(
+                f'Task {self.task_id}: an applied scope refinement is not a '
+                f'lock conflict and cannot be requeued: {conflict!r}'
+            )
         self._note_exit_status_write('pending', conflict.repend_error)
         additional = sorted(
             set(derive_modules(
@@ -5317,12 +5321,12 @@ class TaskWorkflow:
             plan_files, self.config.lock_depth, task_id=self.task_id,
         )
         if set(plan_modules) != set(self.modules) and not (
-            await self._reconcile_scope_locks(plan_files)
+            scope := await self._reconcile_scope_locks(plan_files)
         ).applied:
             logger.info(
                 'Task %s: revalidation skip declined — blast-radius '
-                'expansion denied',
-                self.task_id,
+                'expansion denied (re-pend error: %r)',
+                self.task_id, scope.repend_error,
             )
             return None
         # self.modules/_module_configs already updated by
