@@ -1292,6 +1292,10 @@ class TestDumpFetchesFlag:
         assert isinstance(doc['provenance']['guard_threshold'], float)
 
 
+# Each test runs the bake-off twice (dump, then replay); this overrides verify's
+# --timeout=300. Sized per plans/pytest-per-test-timeout-measurement-2026-09-17.md:
+# 8x the worst measured wall clock, never below the pyproject default.
+@pytest.mark.timeout(540)
 class TestReplayFetchesFlag:
     """`--replay-fetches` must touch NOTHING. Not fewer calls — none."""
 
