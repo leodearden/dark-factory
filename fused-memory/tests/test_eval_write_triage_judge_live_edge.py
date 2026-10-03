@@ -49,11 +49,9 @@ _BILLED = types.SimpleNamespace(
     output_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
 )
 
-#: The same bill as the eval artifact's per-case ``usage`` row records it.
-_USAGE_ROW = {
-    'prompt_tokens': 321, 'completion_tokens': 7, 'total_tokens': 328,
-    'reasoning_tokens': 0,
-}
+#: The same bill as the eval artifact's per-case ``usage`` row records it:
+#: only the keys a consumer reads, so the reasoning split is not carried.
+_USAGE_ROW = {'prompt_tokens': 321, 'completion_tokens': 7, 'total_tokens': 328}
 
 T_HIGH = 0.9
 T_LOW = 0.5

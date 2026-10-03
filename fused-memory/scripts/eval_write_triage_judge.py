@@ -1621,14 +1621,14 @@ def _elision_flags(
     )
 
 
-def _usage_row(usage: JudgeUsage | None) -> dict[str, int | None] | None:
+def _usage_row(usage: JudgeUsage | None) -> dict[str, int] | None:
     """The verdict's usage under the artifact's ESTABLISHED keys, or ``None``.
 
     The key names are kept because ``_spend`` and
     ``fused-memory/scripts/score_write_triage_pairs.py::JudgedCase.from_row``
-    read them. The mapping is exact: output (``completion_tokens``) already
-    includes reasoning on both OpenAI APIs. ``reasoning_tokens`` stays ``None``
-    when the provider did not report it separately.
+    read them, and the row carries nothing they do not read. The mapping is
+    exact: output (``completion_tokens``) already includes reasoning on both
+    OpenAI APIs.
     """
     if usage is None:
         return None
@@ -1636,7 +1636,6 @@ def _usage_row(usage: JudgeUsage | None) -> dict[str, int | None] | None:
         'prompt_tokens': usage.input_tokens,
         'completion_tokens': usage.output_tokens,
         'total_tokens': usage.input_tokens + usage.output_tokens,
-        'reasoning_tokens': usage.reasoning_tokens,
     }
 
 
