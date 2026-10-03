@@ -29,6 +29,7 @@ from _merge_lane_fakes import (
     hangs_until,
     lane_scene_config,
     main_health_probe_spawned,
+    passes,
 )
 from _orch_helpers import make_placeholder_future, wait_responsive
 
@@ -171,6 +172,22 @@ async def _wait_for_finalizing_head(
         f'{req.request_id} never reached the finalize-head verifying state; '
         f'store contents: {store.load()!r}'
     )
+
+
+def _finalize_head_holdings(
+    worker: SpeculativeMergeWorker, worktree: Path, host: str,
+) -> dict[str, object]:
+    """Project, from the public snapshot, what the finalize head holds: its
+    merge worktree (on disk and in the worker's ownership ledger), its host
+    slot, and the speculation permits owned by the verifier side.
+    """
+    snap = worker.snapshot()
+    return {
+        'worktree_on_disk': worktree.exists(),
+        'worktree_owned': str(worktree) in snap['owned_merge_worktrees'],
+        'host_slot': {h['name']: h['slot_state'] for h in snap['hosts']}[host],
+        'verifier_owned_permits': snap['speculation']['inflight_speculative'],
+    }
 
 
 async def _wait_for_finalizing_head_mid_advance(
@@ -766,6 +783,101 @@ async def test_stop_resolves_finalizing_head_verifying_to_shutdown(
     worker_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await worker_task
+
+
+@pytest.mark.asyncio
+async def test_stop_releases_finalizing_head_worktree_host_slot_and_speculation_permit(
+    git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+) -> None:
+    """After stop() returns, nothing the VERIFYING finalize head held is still
+    held: its merge worktree, its host slot and its speculation permit.
+
+    The head was merged speculatively onto the request ahead of it, so it
+    carries a permit, and it verifies at _inflight[0] (task 5303).
+    """
+    store = MergeQueueStore(tmp_path / 'data' / 'orchestrator' / 'merge_queue.json')
+
+    ahead_wt = await _make_branch_with_file(
+        git_ops, 'fh-release-ahead', 'fh_release_ahead.py', 'a = 1\n',
+    )
+    head_wt = await _make_branch_with_file(
+        git_ops, 'fh-release-head', 'fh_release_head.py', 'h = 1\n',
+    )
+    ahead = _make_request('fh-release-ahead', 'fh-release-ahead', ahead_wt, config)
+    head = _make_request('fh-release-head', 'fh-release-head', head_wt, config)
+
+    gate_ahead = asyncio.Event()
+    block_head = asyncio.Event()
+    verifier = FakeVerifier(scripts={
+        ahead.task_id: dataclasses.replace(passes(), release=gate_ahead),
+        head.task_id: hangs_until(block_head),
+    })
+
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    worker = SpeculativeMergeWorker(git_ops, queue, merge_store=store, verifier=verifier)
+    worker_task = asyncio.create_task(worker.run())
+    await queue.put(ahead)
+    await queue.put(head)
+
+    try:
+        for _ in range(200):
+            snap = worker.snapshot()
+            states = {e['task_id']: e['state'] for e in snap['entries']}
+            if (
+                states.get(head.task_id) == 'awaiting_verify'
+                and snap['speculation']['inflight_speculative'] == 1
+            ):
+                break
+            await asyncio.sleep(0.05)
+        else:
+            pytest.fail(
+                f'the head was never merged speculatively behind the gated '
+                f'request: {worker.snapshot()!r}'
+            )
+
+        gate_ahead.set()
+        outcome = await wait_responsive(
+            ahead.result, timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+            label='the request ahead of the speculative head to land',
+        )
+        assert outcome.status == 'done', f'Expected the ahead request to land; got {outcome!r}'
+
+        await asyncio.wait_for(
+            verifier.await_entry(2), timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+        )
+        await _wait_for_finalizing_head(worker, store, head)
+
+        snap = worker.snapshot()
+        head_merge_wt = Path(snap['entries'][0]['worktree']).resolve()
+        host = snap['entries'][0]['host']
+
+        assert _finalize_head_holdings(worker, head_merge_wt, host) == {
+            'worktree_on_disk': True,
+            'worktree_owned': True,
+            'host_slot': 'busy',
+            'verifier_owned_permits': 1,
+        }, 'the verifying finalize head must hold every resource before stop()'
+
+        await worker.stop()
+
+        assert head.result.result() == MergeOutcome(
+            'blocked', reason=MERGE_WORKER_SHUTDOWN_REASON,
+        )
+        assert _finalize_head_holdings(worker, head_merge_wt, host) == {
+            'worktree_on_disk': False,
+            'worktree_owned': False,
+            'host_slot': 'free',
+            'verifier_owned_permits': 0,
+        }, (
+            "stop() must release the finalize head's merge worktree, host "
+            'lease and speculation permit'
+        )
+    finally:
+        block_head.set()
+        gate_ahead.set()
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
 
 
 @pytest.mark.asyncio
