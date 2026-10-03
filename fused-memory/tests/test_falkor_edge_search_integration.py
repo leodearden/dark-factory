@@ -14,6 +14,7 @@ the default ``-m 'not integration'`` addopts.  Graphs and backends come only fro
 
 from __future__ import annotations
 
+import copy
 import math
 import time
 from collections.abc import Awaitable, Callable, Iterable
@@ -24,6 +25,7 @@ import pytest
 import pytest_asyncio
 from _falkor_index_live import injected_driver, live_backends, scratch_graphs
 from _fm_helpers import await_index_operational, falkor_skipif
+from _query_recorder import IssuedQuery, recording_driver
 from falkordb.asyncio.graph import AsyncGraph
 from falkordb.execution_plan import ExecutionPlan
 from graphiti_core.driver.driver import GraphDriver
@@ -184,12 +186,6 @@ async def seed_ring(scratch, live_backend_factory) -> Callable[[int], Awaitable[
 # --- Plan shape ---------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class IssuedQuery:
-    cypher: str
-    params: dict[str, Any]
-
-
 SearchLeg = Callable[[GraphDriver], Awaitable[list[EntityEdge]]]
 
 
@@ -215,17 +211,17 @@ async def issued_by_hardened_driver(seeded: SeededGraph, leg: SearchLeg) -> Issu
 
 async def issued_by_stock_graphiti(leg: SearchLeg) -> IssuedQuery:
     """The Cypher stock graphiti emits: a bare FalkorDriver has no search_interface."""
-    stock = object.__new__(FalkorDriver)
-    issued: list[IssuedQuery] = []
-
-    async def record(cypher: str, **params: Any):
-        issued.append(IssuedQuery(cypher, params))
-        return [], [], None
-
-    stock.execute_query = record  # pyright: ignore[reportAttributeAccessIssue]
+    stock, issued = recording_driver(FalkorDriver)
     await leg(stock)
     (query,) = issued
     return query
+
+
+def without_search_interface(driver: GraphDriver) -> GraphDriver:
+    """*driver* on the same connection, taking graphiti's built-in search Cypher."""
+    builtin = copy.copy(driver)
+    builtin.search_interface = None
+    return builtin
 
 
 async def explain(graph: AsyncGraph, query: IssuedQuery) -> ExecutionPlan:
@@ -287,19 +283,23 @@ class TestEdgeFulltextLeg:
         assert elapsed < BM25_BUDGET_SECONDS
 
     @pytest.mark.asyncio
-    async def test_excludes_edges_between_non_entity_nodes(self, seed_ring):
-        """Parity with stock's ``(n:Entity)-[e]->(m:Entity)``.
+    async def test_returns_the_edge_set_of_graphiti_builtin_cypher(self, seed_ring):
+        """Parity with stock's ``(n:Entity)-[e]->(m:Entity)``, which excludes the off-label twin.
 
-        A small ring, so stock graphiti finishes too and this test pins parity
-        with it rather than only the rewrite's own behaviour.
+        A small ring, so the built-in per-row scan finishes inside the server TIMEOUT.
         """
         seeded = await seed_ring(50)
+        leg = bm25_leg(seeded.name, 1000)
+        builtin_driver = without_search_interface(seeded.driver)
+        issued_by_builtin = spy_on_queries(builtin_driver)
 
-        edges = await bm25_leg(seeded.name, 1000)(seeded.driver)
+        rewritten = {edge.uuid for edge in await leg(seeded.driver)}
+        builtin = {edge.uuid for edge in await leg(builtin_driver)}
 
-        returned = {edge.uuid for edge in edges}
-        assert seeded.off_label_edge.uuid not in returned
-        assert returned == set(seeded.entity_edges)
+        (oracle_query,) = issued_by_builtin
+        assert 'MATCH' in oracle_query.cypher, 'the oracle must run the built-in Cypher'
+        assert rewritten == builtin == set(seeded.entity_edges)
+        assert seeded.off_label_edge.uuid not in rewritten
 
 
 # --- Cosine leg ---------------------------------------------------------------

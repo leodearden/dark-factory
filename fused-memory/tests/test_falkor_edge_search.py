@@ -5,21 +5,20 @@ legs as a full Entity label scan driving a per-row index scan.  FalkorEdgeSearch
 replaces those legs; every other leg graphiti dispatches to it unconditionally is
 handed back to graphiti's built-in Cypher.
 
-No connection is opened here.  The recording driver is
-``object.__new__(_MultiTenantFalkorDriver)`` with an instance ``execute_query``,
-so query assembly and dispatch are graphiti's real code.  Plan shape and rows
-against a live FalkorDB are pinned in ``test_falkor_edge_search_integration.py``.
+No connection is opened here: every driver is an unconnected
+``_MultiTenantFalkorDriver`` from ``_query_recorder``, so query assembly and
+dispatch are graphiti's real code.  Plan shape and rows against a live FalkorDB
+are pinned in ``test_falkor_edge_search_integration.py``.
 """
 
 from __future__ import annotations
 
-import copy
 import inspect
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
+from _query_recorder import IssuedQuery, recording_driver
 from graphiti_core.driver.search_interface.search_interface import SearchInterface
 from graphiti_core.search import search_utils
 from graphiti_core.search.search_filters import SearchFilters
@@ -31,25 +30,21 @@ if TYPE_CHECKING:
     from falkordb.asyncio import FalkorDB
 
 
-@dataclass(frozen=True)
-class IssuedQuery:
-    cypher: str
-    params: dict[str, Any]
-
-
-def recording_driver(
+def hardened_driver(
     records: Sequence[dict[str, Any]] = (),
 ) -> tuple[_MultiTenantFalkorDriver, list[IssuedQuery]]:
-    """A hardened driver whose ``execute_query`` records the call and returns *records*."""
-    driver = object.__new__(_MultiTenantFalkorDriver)
-    issued: list[IssuedQuery] = []
+    return recording_driver(_MultiTenantFalkorDriver, records)
 
-    async def record(cypher: str, **params: Any):
-        issued.append(IssuedQuery(cypher, params))
-        return copy.deepcopy(list(records)), [], None
 
-    driver.execute_query = record  # pyright: ignore[reportAttributeAccessIssue]
-    return driver, issued
+def declared_legs(interface: type[SearchInterface]) -> list[str]:
+    """The search legs *interface* itself defines; graphiti awaits every one."""
+    return sorted(
+        name for name, member in vars(interface).items() if inspect.iscoroutinefunction(member)
+    )
+
+
+OVERRIDDEN_LEGS = declared_legs(FalkorEdgeSearch)
+INHERITED_LEGS = sorted(set(declared_legs(SearchInterface)) - set(OVERRIDDEN_LEGS))
 
 
 class TestDriverWiring:
@@ -70,7 +65,7 @@ class TestDriverWiring:
         assert isinstance(cloned.search_interface, FalkorEdgeSearch)
 
 
-SearchLeg = Callable[[_MultiTenantFalkorDriver], Awaitable[list[Any]]]
+SearchLeg = Callable[[_MultiTenantFalkorDriver], Awaitable[object]]
 
 # The legs graphiti-core hands to ``search_interface`` with NO NotImplementedError
 # fallback, which FalkorEdgeSearch returns to graphiti's built-in Cypher.
@@ -86,13 +81,39 @@ DELEGATED_LEGS: dict[str, SearchLeg] = {
     ),
 }
 
+# Every leg FalkorEdgeSearch inherits, driven through its graphiti-core caller.
+# Each caller catches the inherited NotImplementedError and runs its built-in Cypher.
+FALLBACK_LEGS: dict[str, SearchLeg] = {
+    'community_fulltext_search': lambda driver: search_utils.community_fulltext_search(
+        driver, 'alpha beta', ['g']
+    ),
+    'community_similarity_search': lambda driver: search_utils.community_similarity_search(
+        driver, [0.1, 0.2, 0.3], ['g']
+    ),
+    'edge_bfs_search': lambda driver: search_utils.edge_bfs_search(
+        driver, ['origin'], 2, SearchFilters(), ['g']
+    ),
+    'episode_mentions_reranker': lambda driver: search_utils.episode_mentions_reranker(
+        driver, [['a', 'b']]
+    ),
+    'get_embeddings_for_communities': lambda driver: search_utils.get_embeddings_for_communities(
+        driver, []
+    ),
+    'node_bfs_search': lambda driver: search_utils.node_bfs_search(
+        driver, ['origin'], SearchFilters(), 2, ['g']
+    ),
+    'node_distance_reranker': lambda driver: search_utils.node_distance_reranker(
+        driver, ['a', 'b'], 'center'
+    ),
+}
+
 
 class TestDelegatedLegsReachBuiltinCypher:
     @pytest.mark.asyncio
     @pytest.mark.parametrize('leg', sorted(DELEGATED_LEGS))
     async def test_delegated_leg_issues_one_builtin_query(self, leg: str) -> None:
         """No NotImplementedError, no recursion back into the seam, one query issued."""
-        driver, issued = recording_driver()
+        driver, issued = hardened_driver()
         assert isinstance(driver.search_interface, FalkorEdgeSearch)
 
         result = await DELEGATED_LEGS[leg](driver)
@@ -103,21 +124,22 @@ class TestDelegatedLegsReachBuiltinCypher:
     @pytest.mark.asyncio
     async def test_delegated_node_fulltext_keeps_the_hardened_query_builder(self) -> None:
         """Delegation must still route through the task-3334 ``build_fulltext_query``."""
-        driver, issued = recording_driver()
+        driver, issued = hardened_driver()
 
         await DELEGATED_LEGS['node_fulltext_search'](driver)
 
         assert issued[0].params['query'] == '(@group_id:"g") (alpha | beta)'
 
     @pytest.mark.asyncio
-    async def test_unoverridden_leg_falls_back_to_builtin_cypher(self) -> None:
-        """Legs FalkorEdgeSearch leaves alone reach graphiti's NotImplementedError fallback."""
-        driver, issued = recording_driver()
+    @pytest.mark.parametrize('leg', INHERITED_LEGS)
+    async def test_inherited_leg_falls_back_to_builtin_cypher(self, leg: str) -> None:
+        """An upstream caller that stops catching NotImplementedError fails here, not in production."""
+        assert leg in FALLBACK_LEGS, f'graphiti-core added {leg}: drive it through its caller here'
+        driver, issued = hardened_driver()
 
-        result = await search_utils.community_fulltext_search(driver, 'alpha beta', ['g'])
+        await FALLBACK_LEGS[leg](driver)
 
-        assert result == []
-        assert len(issued) == 1
+        assert issued != []
 
 
 # One row shaped like graphiti's FalkorDB edge projection (get_entity_edge_return_query).
@@ -142,7 +164,7 @@ class TestEdgeFulltextSearch:
     async def _search(
         search_filter: SearchFilters | None = None, query: str = 'alpha beta'
     ) -> tuple[list[Any], list[IssuedQuery]]:
-        driver, issued = recording_driver([CANNED_EDGE_RECORD])
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
         edges = await search_utils.edge_fulltext_search(
             driver, query, search_filter or SearchFilters(), ['g'], 20
         )
@@ -199,7 +221,7 @@ class TestEdgeSimilaritySearch:
         source_node_uuid: str | None = None,
         target_node_uuid: str | None = None,
     ) -> tuple[list[Any], list[IssuedQuery]]:
-        driver, issued = recording_driver([CANNED_EDGE_RECORD])
+        driver, issued = hardened_driver([CANNED_EDGE_RECORD])
         edges = await search_utils.edge_similarity_search(
             driver,
             [0.1, 0.2, 0.3],
@@ -258,16 +280,7 @@ class TestEdgeSimilaritySearch:
         )
 
 
-OVERRIDDEN_METHODS = (
-    'edge_fulltext_search',
-    'edge_similarity_search',
-    'node_fulltext_search',
-    'node_similarity_search',
-    'episode_fulltext_search',
-)
-
-
-@pytest.mark.parametrize('method', OVERRIDDEN_METHODS)
+@pytest.mark.parametrize('method', OVERRIDDEN_LEGS)
 def test_override_signature_matches_search_interface(method: str) -> None:
     """graphiti calls these positionally; an upstream reorder must fail here, not bind silently."""
     assert inspect.signature(getattr(FalkorEdgeSearch, method)) == inspect.signature(
