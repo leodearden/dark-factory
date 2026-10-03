@@ -1645,6 +1645,36 @@
           "current": 31682
         }
       ]
+    },
+    {
+      "task_id": "4094",
+      "reason": "Net-additive bug fix: reverify_member_solo gains a keyword-only verifier injection seam (forwarded to _run_post_merge_verify) so a regression test can drive the real retry loop without patching a private name, and its retry budget changes from a literal 3 to SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES; the docstring documents the budget and the seam, and the non-narrowed-retry comment conditions its byte-identity claim on max_enospc == 1. No refactor was attempted, so none failed.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21674,
+          "current": 21686
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12387,
+          "current": 12397
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56584,
+          "current": 56596
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31680,
+          "current": 31690
+        }
+      ]
     }
   ]
 }
