@@ -20,9 +20,9 @@ Four classes, in the order a value travels:
 ## Sentinel-literal hazard — every specimen is BUILT, never written verbatim
 
 A raw envelope literal here would corrupt the tool call that edits this file,
-so every specimen is assembled from ``_markup_helpers``' builders and that
-module's ``assert_no_raw_sentinels`` enforces it on this file's own bytes at
-import. The plan document, the artifacts fixture and the refusal-memo isolation
+so every specimen is assembled from ``_markup_helpers``' builders and
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
+enforces it on this file's source, repo-wide. The plan document, the artifacts fixture and the refusal-memo isolation
 come from ``_plan_markup_fixtures``, shared with the suite this split from —
 the memo especially, since both suites report refusals on the same locator.
 """
@@ -35,7 +35,6 @@ import json
 from _markup_helpers import (
     INVOKE_CLOSER,
     LT,
-    assert_no_raw_sentinels,
     closer,
     param_opener,
 )
@@ -48,9 +47,6 @@ from _plan_markup_fixtures import (
 from shared.toolcall_markup import detect
 
 from orchestrator.mcp import plan_tools
-
-assert_no_raw_sentinels(__file__)
-
 
 # ---------------------------------------------------------------------------
 # Task 4696 — the SELF-NAME closer, invisible to the read-repair prefilter.
