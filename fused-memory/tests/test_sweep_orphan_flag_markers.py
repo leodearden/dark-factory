@@ -24,6 +24,8 @@ from _store_mutation_preflight_contract import (
     neutralise_fixture,
 )
 
+from fused_memory.reconciliation.mem0_tombstone import PROTECTED_AUDIT_KINDS
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_orphan_flag_markers.py'
 
 
@@ -129,6 +131,23 @@ def _ledger_stamp(id: str) -> dict:
     member = _member(id, kind='stage1_flag_marker')
     member['metadata']['record_type'] = 'ledger_stamp'
     return member
+
+
+def _audit(id: str, task_id: str = '452') -> dict:
+    """Member that is a deliberately-permanent AUDIT record (task 4375).
+
+    The motivating shape: 40 ``kind='cadence_check'`` records, every one
+    citing deferred task 452, were destroyed by a pure age-GC. Its kind comes
+    from ``PROTECTED_AUDIT_KINDS`` itself, so this fixture tracks the single
+    source of truth rather than a hand-typed copy of it.
+    """
+    return _member(id, kind=sorted(PROTECTED_AUDIT_KINDS)[0], task_id=task_id)
+
+
+def _foreign(id: str) -> dict:
+    """Member declaring a kind from some OTHER pool that nobody registered —
+    an audit kind its author never added to ``PROTECTED_AUDIT_KINDS``."""
+    return _member(id, kind='quarterly_audit_log')
 
 
 def _svc_with_ledger() -> tuple[AsyncMock, AsyncMock]:
@@ -729,6 +748,84 @@ class TestFindProtectedMarkers:
         """A member with no 'metadata' key at all is handled, not raised on."""
         member = {'id': 'nometa', 'created_at': None}
         assert _mod.find_protected_markers([member]) == []
+
+    def test_audit_and_foreign_kind_records_are_returned(self):
+        """The audit and foreign-kind arms join the protected set (task 5286),
+        in input order and by object identity, beside the legacy shapes the
+        sweep still owns."""
+        audit = _audit('a1')
+        foreign = _foreign('f1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        members = [_orphan('o1'), audit, _member('keep'), foreign]
+        result = _mod.find_protected_markers(members)
+        assert result == [audit, foreign], f'Expected [a1, f1], got: {result!r}'
+        assert result[0] is members[1], 'Expected same object identity'
+        assert result[1] is members[3], 'Expected same object identity'
+
+
+class TestProtectionReason:
+    """protection_reason(metadata): WHICH guard withholds a record, if any.
+
+    The arms are checked in order mirror -> audit -> foreign-kind, and that
+    order IS the attribution: a record matching an earlier, specific arm is
+    never reported under a later, generic one.
+    """
+
+    @pytest.mark.parametrize('builder', [_mirror, _ledger_stamp])
+    def test_mirror_shapes_are_cycle_summary_mirror(self, builder):
+        member = builder('m1')
+        assert (
+            _mod.protection_reason(member['metadata'])
+            is _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR
+        )
+
+    def test_audit_kind_is_attributed_to_the_audit_arm_not_foreign(self):
+        member = _audit('a1')
+        assert member['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        reason = _mod.protection_reason(member['metadata'])
+        assert reason is _mod.ProtectionReason.PROTECTED_AUDIT_KIND
+        assert reason is not _mod.ProtectionReason.FOREIGN_KIND
+
+    @pytest.mark.parametrize('builder', [_foreign, _wrong_kind])
+    def test_unregistered_kind_is_foreign_kind(self, builder):
+        member = builder('f1')
+        assert (
+            _mod.protection_reason(member['metadata'])
+            is _mod.ProtectionReason.FOREIGN_KIND
+        )
+
+    @staticmethod
+    def _explicit_none_kind(id: str) -> dict:
+        member = _member(id)
+        member['metadata']['kind'] = None
+        return member
+
+    @pytest.mark.parametrize(
+        'builder',
+        [_member, _orphan, _taskless, _explicit_none_kind.__func__],
+        ids=['marker', 'kind_missing', 'taskless', 'kind_none'],
+    )
+    def test_legacy_marker_shapes_are_unprotected(self, builder):
+        """Kind absent or MARKER_KIND is exactly the pool this sweep owns."""
+        member = builder('keep')
+        assert _mod.protection_reason(member['metadata']) is None
+
+    @pytest.mark.parametrize('metadata', [None, ['not', 'a', 'dict'], 'string'])
+    def test_non_dict_metadata_is_unprotected_and_does_not_raise(self, metadata):
+        assert _mod.protection_reason(metadata) is None
+
+    @pytest.mark.parametrize(
+        'kind', [['cadence_check'], {'nested': 'cadence_check'}],
+        ids=['list_kind', 'dict_kind'],
+    )
+    def test_unhashable_kind_is_foreign_and_does_not_raise(self, kind):
+        """The unhashable-kind payload is_protected_audit_record guards
+        against: still withheld, never a TypeError."""
+        metadata = {'source': 'stage1_flag_marker', 'task_id': '1', 'kind': kind}
+        assert (
+            _mod.protection_reason(metadata)
+            is _mod.ProtectionReason.FOREIGN_KIND
+        )
 
 
 # ===========================================================================
@@ -2257,6 +2354,95 @@ class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
 
         assert report['protected_skipped_count'] == 0
         assert report['protected_skipped_ids'] == []
+
+
+class TestProtectedAuditAndForeignKindRecordsAreNeverDeleted:
+    """Audit records and foreign-kind records are withheld in EVERY mode
+    (task 5286).
+
+    The motivating loss was an age-only collector taking 40 audit records
+    that all cited deferred task 452. Here every arm that could nominate such
+    a record is switched on at once: the age predicate (``now`` is months
+    past ``created_at``), the kind-orphan predicate (their kind is not
+    MARKER_KIND), and, under --terminal-drain, the terminal predicate (452 is
+    in the terminal set). None of them may get one deleted.
+    """
+
+    _AGED_NOW = datetime(2026, 9, 1, tzinfo=UTC)
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+    _service = staticmethod(TestRunExcludesProtectedMirrorsFromTheDeleteSet._service)
+
+    @staticmethod
+    def _args(apply: bool, delete_ids: list[str] | None = None):
+        return types.SimpleNamespace(
+            apply=apply, project_id='dark_factory', max_age_days=14,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _deleted_ids(memory_service: AsyncMock) -> set[str]:
+        return {
+            c.kwargs['memory_id']
+            for c in memory_service.delete_memory.call_args_list
+        }
+
+    @pytest.mark.asyncio
+    async def test_choke_point_refuses_audit_and_foreign_kind_records(self):
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        audit = _audit('a1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), audit, _foreign('f1')],
+        )
+
+        assert self._deleted_ids(memory_service) == {'o1'}
+        assert memory_service.delete_memory.await_count == 1
+        assert result['protected_skipped'] == ['a1', 'f1']
+        assert result['deleted'] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'terminal_task_ids', [None, {'452'}], ids=['ordinary', 'terminal_drain'],
+    )
+    @pytest.mark.parametrize('apply', [False, True], ids=['dry_run', 'apply'])
+    async def test_run_withholds_them_in_every_mode(self, terminal_task_ids, apply):
+        audit = _audit('a1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        members = [_orphan('o1'), audit, _foreign('f1')]
+        memory_service = self._service(members, apply=apply)
+
+        report = await _mod.run(
+            self._args(apply=apply), memory_service,
+            now=self._AGED_NOW, terminal_task_ids=terminal_task_ids,
+        )
+
+        assert 'a1' not in report['orphan_ids']
+        assert 'f1' not in report['orphan_ids']
+        assert report['protected_skipped_ids'] == ['a1', 'f1']
+        undrainable = report['structural_floor']['undrainable_ids']
+        assert 'a1' in undrainable and 'f1' in undrainable, undrainable
+        if apply:
+            deleted = self._deleted_ids(memory_service)
+            assert 'a1' not in deleted and 'f1' not in deleted, deleted
+            assert report['enforced_protected_skipped'] == []
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_cannot_override_them(self):
+        audit = _audit('a1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        members = [_orphan('o1'), audit, _foreign('f1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True, delete_ids=['a1', 'f1']), memory_service,
+            now=self._NEUTRAL_NOW,
+        )
+
+        deleted = self._deleted_ids(memory_service)
+        assert 'a1' not in deleted and 'f1' not in deleted, deleted
+        assert set(report['targeted_correction_ids']) == {'a1', 'f1'}
 
 
 # ===========================================================================
