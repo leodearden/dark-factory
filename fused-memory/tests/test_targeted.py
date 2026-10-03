@@ -3,7 +3,7 @@
 import json
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -1735,6 +1735,32 @@ def _backlog_rejection() -> dict:
     }
 
 
+async def _run_rows(journal) -> list[dict]:
+    """Every real journal row of the single ``test-project`` run.
+
+    ``limit`` is deliberately above 1 so the cardinality assertion below
+    can actually fail: under ``limit=1`` it could only ever catch zero
+    runs, silently narrowing every per-row count to whichever run came
+    back.  One reconcile_task call is one run.
+    """
+    runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    return await journal.get_run_actions(runs[0].id)
+
+
+async def _journal_rows(journal, action_type: str, target: str, operation: str) -> list[dict]:
+    """Real journal rows for one (action_type, target, operation) triple."""
+    return [
+        r for r in await _run_rows(journal)
+        if r['action_type'] == action_type and r['target'] == target
+        and r['operation'] == operation
+    ]
+
+
+async def _taskmaster_rows(journal, action_type: str, operation: str) -> list[dict]:
+    return await _journal_rows(journal, action_type, 'taskmaster', operation)
+
+
 class TestSweepCancelledDescendants:
     """Auto-sweep dep-tree on task cancellation."""
 
@@ -2383,34 +2409,6 @@ class TestSweepCancelledDescendants:
             if a.get('type') == action_type and a.get('task_id') == 'B'
         ]
 
-    @staticmethod
-    async def _run_rows(journal) -> list[dict]:
-        """Every real journal row of the single run.
-
-        ``limit`` is deliberately above 1 so the cardinality assertion below
-        can actually fail: under ``limit=1`` it could only ever catch zero
-        runs, silently narrowing every per-row count to whichever run came
-        back.  One reconcile_task call is one run.
-        """
-        runs = await journal.get_recent_runs('test-project', limit=5)
-        assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
-        return await journal.get_run_actions(runs[0].id)
-
-    @classmethod
-    async def _journal_rows(
-        cls, journal, action_type: str, target: str, operation: str,
-    ) -> list[dict]:
-        """Real journal rows for one (action_type, target, operation) triple."""
-        return [
-            r for r in await cls._run_rows(journal)
-            if r['action_type'] == action_type and r['target'] == target
-            and r['operation'] == operation
-        ]
-
-    @classmethod
-    async def _taskmaster_rows(cls, journal, action_type: str, operation: str) -> list[dict]:
-        return await cls._journal_rows(journal, action_type, 'taskmaster', operation)
-
     @pytest.mark.asyncio
     @pytest.mark.parametrize('make_response,expected_error', [
         pytest.param(_backlog_rejection, 'ReconciliationBacklogExceeded', id='backlog-verdict'),
@@ -2452,7 +2450,7 @@ class TestSweepCancelledDescendants:
         ]
         assert warns, 'Expected a WARNING logged for the rejected metadata stamp'
 
-        skips = await self._taskmaster_rows(journal, 'skip', 'update_task')
+        skips = await _taskmaster_rows(journal, 'skip', 'update_task')
         assert len(skips) == 1, f'Expected exactly one skip/update_task row, got: {skips}'
         detail = skips[0]['detail']
         assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
@@ -2499,7 +2497,7 @@ class TestSweepCancelledDescendants:
         ]
         assert warns, 'Expected a WARNING logged for the raising metadata stamp'
 
-        skips = await self._taskmaster_rows(journal, 'skip', 'update_task')
+        skips = await _taskmaster_rows(journal, 'skip', 'update_task')
         assert len(skips) == 1, f'Expected exactly one skip/update_task row, got: {skips}'
         detail = skips[0]['detail']
         assert detail.get('task_id') == 'B', f'Expected task_id="B", got: {detail!r}'
@@ -2542,7 +2540,7 @@ class TestSweepCancelledDescendants:
         ]
         assert warns, 'Expected a WARNING logged for the rejected block'
 
-        status_skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        status_skips = await _taskmaster_rows(journal, 'skip', 'set_task_status')
         assert len(status_skips) == 1, (
             f'Expected exactly one skip/set_task_status row, got: {status_skips}'
         )
@@ -2554,7 +2552,7 @@ class TestSweepCancelledDescendants:
             f'Expected the stable error_type code, got: {detail!r}'
         )
 
-        stamp_skips = await self._taskmaster_rows(journal, 'skip', 'update_task')
+        stamp_skips = await _taskmaster_rows(journal, 'skip', 'update_task')
         assert not stamp_skips, (
             f'The metadata write was never attempted, so it must leave no row; '
             f'got: {stamp_skips}'
@@ -2581,7 +2579,7 @@ class TestSweepCancelledDescendants:
             f'metadata_stamp must be absent when the stamp landed, got: {blocks[0]!r}'
         )
 
-        status_writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        status_writes = await _taskmaster_rows(journal, 'write', 'set_task_status')
         assert len(status_writes) == 1, (
             f'Expected exactly one write/set_task_status row, got: {status_writes}'
         )
@@ -2592,7 +2590,7 @@ class TestSweepCancelledDescendants:
             f'got: {status_writes[0]["detail"]!r}'
         )
 
-        stamp_writes = await self._taskmaster_rows(journal, 'write', 'update_task')
+        stamp_writes = await _taskmaster_rows(journal, 'write', 'update_task')
         assert len(stamp_writes) == 1, (
             f'Expected exactly one write/update_task row, got: {stamp_writes}'
         )
@@ -2601,7 +2599,7 @@ class TestSweepCancelledDescendants:
         )
 
         for operation in ('set_task_status', 'update_task'):
-            skips = await self._taskmaster_rows(journal, 'skip', operation)
+            skips = await _taskmaster_rows(journal, 'skip', operation)
             assert not skips, f'Expected no skip/{operation} rows, got: {skips}'
 
     @pytest.mark.asyncio
@@ -2633,7 +2631,7 @@ class TestSweepCancelledDescendants:
         ]
         assert warns, 'Expected a WARNING logged for the rejected cancel'
 
-        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        skips = await _taskmaster_rows(journal, 'skip', 'set_task_status')
         assert len(skips) == 1, (
             f'Expected exactly one skip/set_task_status row, got: {skips}'
         )
@@ -2658,7 +2656,7 @@ class TestSweepCancelledDescendants:
         cancels = self._descendant_actions(result, 'descendant_cancelled')
         assert len(cancels) == 1, f'Expected exactly one descendant_cancelled, got: {cancels}'
 
-        writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        writes = await _taskmaster_rows(journal, 'write', 'set_task_status')
         assert len(writes) == 1, (
             f'Expected exactly one write/set_task_status row, got: {writes}'
         )
@@ -2666,7 +2664,7 @@ class TestSweepCancelledDescendants:
         assert detail.get('type') == 'descendant_cancelled', f'got: {detail!r}'
         assert detail.get('task_id') == 'B', f'got: {detail!r}'
 
-        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        skips = await _taskmaster_rows(journal, 'skip', 'set_task_status')
         assert not skips, f'Expected no skip/set_task_status rows, got: {skips}'
 
     @pytest.mark.asyncio
@@ -2705,7 +2703,7 @@ class TestSweepCancelledDescendants:
         ]
         assert warns, 'Expected a WARNING logged for the raising status write'
 
-        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        skips = await _taskmaster_rows(journal, 'skip', 'set_task_status')
         assert len(skips) == 1, (
             f'Expected exactly one skip/set_task_status row, got: {skips}'
         )
@@ -2718,7 +2716,7 @@ class TestSweepCancelledDescendants:
             f'Expected the raised message recorded, got: {detail!r}'
         )
 
-        writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        writes = await _taskmaster_rows(journal, 'write', 'set_task_status')
         assert not writes, f'Nothing landed, so expected no write row; got: {writes}'
 
     @pytest.mark.asyncio
@@ -2747,13 +2745,13 @@ class TestSweepCancelledDescendants:
             f'A no-op re-cancel must still report the cancel, got: {result.get("actions")}'
         )
 
-        writes = await self._taskmaster_rows(journal, 'write', 'set_task_status')
+        writes = await _taskmaster_rows(journal, 'write', 'set_task_status')
         assert len(writes) == 1, (
             f'Expected exactly one write/set_task_status row, got: {writes}'
         )
         assert writes[0]['detail'].get('task_id') == 'B', f'got: {writes[0]!r}'
 
-        skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
+        skips = await _taskmaster_rows(journal, 'skip', 'set_task_status')
         assert not skips, f'A no-op is a landed write, not a skip; got: {skips}'
 
     # ── Task 5273: the escalate branch journals its L1 filing ─────────────
@@ -2807,13 +2805,13 @@ class TestSweepCancelledDescendants:
             f'got: {escalated[0]!r}'
         )
 
-        writes = await self._journal_rows(journal, 'write', 'escalation', 'submit')
+        writes = await _journal_rows(journal, 'write', 'escalation', 'submit')
         assert len(writes) == 1, f'Expected exactly one write/escalation/submit row, got: {writes}'
         assert writes[0]['detail'] == {
             'task_id': 'B', 'parent_id': 'A', 'type': 'descendant_escalated',
             'escalation_id': filed_id,
         }, f'Unexpected escalate detail: {writes[0]["detail"]!r}'
-        skips = await self._journal_rows(journal, 'skip', 'escalation', 'submit')
+        skips = await _journal_rows(journal, 'skip', 'escalation', 'submit')
         assert not skips, f'A filed escalation is not a skip; got: {skips}'
 
         mock_interceptor.set_task_status.assert_not_awaited()
@@ -2843,13 +2841,13 @@ class TestSweepCancelledDescendants:
         escalated = self._descendant_actions(result, 'descendant_escalated')
         assert not escalated, f'Nothing was filed, so no escalated action; got: {escalated}'
 
-        skips = await self._journal_rows(journal, 'skip', 'escalation', 'submit')
+        skips = await _journal_rows(journal, 'skip', 'escalation', 'submit')
         assert len(skips) == 1, f'Expected exactly one skip/escalation/submit row, got: {skips}'
         assert skips[0]['detail'] == {
             'task_id': 'B', 'parent_id': 'A', 'type': 'descendant_escalated',
             'error': raised,
         }, f'Unexpected escalate skip detail: {skips[0]["detail"]!r}'
-        writes = await self._journal_rows(journal, 'write', 'escalation', 'submit')
+        writes = await _journal_rows(journal, 'write', 'escalation', 'submit')
         assert not writes, f'Nothing was filed, so expected no write row; got: {writes}'
 
         warns = [
@@ -2862,7 +2860,6 @@ class TestSweepCancelledDescendants:
     @pytest.mark.parametrize('target,replacement', [
         pytest.param('fused_memory.reconciliation.targeted.EscalationQueue', None, id='queue_class'),
         pytest.param('fused_memory.reconciliation.targeted.Escalation', None, id='model_class'),
-        pytest.param('fused_memory.reconciliation.targeted._HAS_ESCALATION', False, id='flag'),
     ])
     async def test_escalate_without_escalation_package_is_journal_silent(
         self, wired_reconciler, mock_taskmaster, journal, monkeypatch, tmp_path,
@@ -2883,7 +2880,7 @@ class TestSweepCancelledDescendants:
         assert not escalated, f'Nothing was filed, so no escalated action; got: {escalated}'
         for action_type in ('write', 'skip'):
             rows = [
-                r for r in await self._run_rows(journal)
+                r for r in await _run_rows(journal)
                 if r['action_type'] == action_type and r['target'] == 'escalation'
             ]
             assert not rows, f'Expected no {action_type}/escalation rows, got: {rows}'
@@ -2914,7 +2911,7 @@ class TestSweepCancelledDescendants:
         await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
 
         rows = [
-            r for r in await self._run_rows(journal)
+            r for r in await _run_rows(journal)
             if (r.get('detail') or {}).get('type') == action_type
         ]
         assert len(rows) == 1, f'Expected exactly one {action_type} row, got: {rows}'
@@ -6502,10 +6499,10 @@ async def test_unblock_metadata_stamp_non_dict_response_is_rejected(
 
 # ── task-5273: clear the stale claimant before the blocked->pending flip ────
 #
-# A re-pended dependent must not keep a claimant that no longer owns it, or
-# the scheduler's live-claimant dispatch gate holds it until the heartbeat
-# TTL lapses. The clear rides the flip and nothing else: after the live
-# re-read, before the status write, and never a veto on the flip.
+# A re-pended dependent must not keep a stale claimant that no longer owns
+# it. The clear rides the flip and nothing else: after the live re-read,
+# before the status write, never a veto on the flip, and never against a
+# claimant that is still live.
 
 
 def _blocked_dependent(**overrides) -> dict:
@@ -6516,6 +6513,18 @@ def _blocked_dependent(**overrides) -> dict:
     }
 
 
+def _claimant(*, heartbeat_age: timedelta) -> dict:
+    """Claimant columns whose heartbeat is *heartbeat_age* old."""
+    return {
+        'claimant_run_id': 'run-abc/sess-1/pid=4242',
+        'heartbeat_at': (datetime.now(UTC) - heartbeat_age).isoformat(),
+    }
+
+
+def _stale_claimant() -> dict:
+    return _claimant(heartbeat_age=timedelta(hours=2))
+
+
 async def _complete_dependency(reconciler, tmp_path) -> dict:
     """Drive task '1''s ``done`` transition through the public entry point."""
     return await reconciler.reconcile_task(
@@ -6523,23 +6532,6 @@ async def _complete_dependency(reconciler, tmp_path) -> dict:
         project_root=str(tmp_path),
         task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
     )
-
-
-async def _taskmaster_journal_rows(journal, action_type: str, operation: str) -> list[dict]:
-    """Real journal rows for one (action_type, operation) pair on the
-    ``taskmaster`` target.
-
-    ``limit`` sits above 1 so the single-run assertion can actually fail:
-    one ``reconcile_task`` call is one run.
-    """
-    runs = await journal.get_recent_runs('test-project', limit=5)
-    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
-    rows = await journal.get_run_actions(runs[0].id)
-    return [
-        r for r in rows
-        if r['action_type'] == action_type and r['target'] == 'taskmaster'
-        and r['operation'] == operation
-    ]
 
 
 @pytest.mark.asyncio
@@ -6564,7 +6556,9 @@ async def test_unblock_dependent_clears_claimant_before_pending_flip(
 
     interceptor.set_task_claimant = AsyncMock(side_effect=_clear_claimant)
     interceptor.set_task_status = AsyncMock(side_effect=_set_status)
-    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(_blocked_dependent()))
+    mock_taskmaster.get_tasks = AsyncMock(
+        return_value=_dep_tasks(_blocked_dependent(**_stale_claimant())),
+    )
 
     result = await _complete_dependency(wired_reconciler, tmp_path)
 
@@ -6580,11 +6574,11 @@ async def test_unblock_dependent_clears_claimant_before_pending_flip(
     assert actions[0]['type'] == 'dependent_unblock_applied', (
         f'Expected dependent_unblock_applied, got: {actions[0]!r}'
     )
-    assert 'claimant_clear' not in actions[0], (
-        f'claimant_clear must be absent when the clear landed, got: {actions[0]!r}'
+    assert actions[0].get('claimant_clear') == 'cleared', (
+        f'Expected claimant_clear="cleared", got: {actions[0]!r}'
     )
 
-    clear_writes = await _taskmaster_journal_rows(journal, 'write', 'set_task_claimant')
+    clear_writes = await _taskmaster_rows(journal, 'write', 'set_task_claimant')
     assert len(clear_writes) == 1, (
         f'Expected exactly one write/set_task_claimant row, got: {clear_writes}'
     )
@@ -6592,11 +6586,77 @@ async def test_unblock_dependent_clears_claimant_before_pending_flip(
         'task_id': '2', 'satisfied_by': '1', 'type': 'unblock_claimant_clear',
     }, f'Unexpected claimant-clear detail: {clear_writes[0]["detail"]!r}'
 
-    status_writes = await _taskmaster_journal_rows(journal, 'write', 'set_task_status')
+    status_writes = await _taskmaster_rows(journal, 'write', 'set_task_status')
     assert len(status_writes) == 1, (
         f'The claimant clear must not change the set_task_status row count, '
         f'got: {status_writes}'
     )
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_leaves_live_claimant_in_place(
+    wired_reconciler, mock_taskmaster, journal, tmp_path,
+):
+    """A claimant whose heartbeat is still fresh belongs to a live workflow.
+    Clearing it would switch off the scheduler's live-claimant dispatch gate
+    and let a second workflow start beside the first, so it stays: the flip
+    still lands, and the skipped clear is recorded, not silent.
+    """
+    interceptor = wired_reconciler.task_interceptor
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(
+        _blocked_dependent(**_claimant(heartbeat_age=timedelta(seconds=30))),
+    ))
+
+    result = await _complete_dependency(wired_reconciler, tmp_path)
+
+    interceptor.set_task_claimant.assert_not_awaited()
+    interceptor.set_task_status.assert_awaited_once()
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'A live claimant must not veto the flip, got: {actions[0]!r}'
+    )
+    assert actions[0].get('claimant_clear') == 'claimant_live', (
+        f'Expected claimant_clear="claimant_live", got: {actions[0]!r}'
+    )
+
+    clear_skips = await _taskmaster_rows(journal, 'skip', 'set_task_claimant')
+    assert [r['detail'] for r in clear_skips] == [{
+        'task_id': '2', 'satisfied_by': '1', 'type': 'unblock_claimant_clear',
+        'reason': 'claimant_live',
+    }], f'Expected one claimant_live skip row, got: {clear_skips}'
+    clear_writes = await _taskmaster_rows(journal, 'write', 'set_task_claimant')
+    assert clear_writes == [], f'No clear was made, so no write row; got: {clear_writes}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('claimant_columns', [
+    pytest.param({}, id='columns-absent'),
+    pytest.param({'claimant_run_id': None, 'heartbeat_at': None}, id='columns-null'),
+])
+async def test_unblock_dependent_without_claimant_writes_nothing(
+    wired_reconciler, mock_taskmaster, journal, tmp_path, claimant_columns,
+):
+    """Slot release usually NULLs the claimant already, so the common case
+    has nothing to clear: no backend write and no journal row."""
+    interceptor = wired_reconciler.task_interceptor
+    mock_taskmaster.get_tasks = AsyncMock(
+        return_value=_dep_tasks(_blocked_dependent(**claimant_columns)),
+    )
+
+    result = await _complete_dependency(wired_reconciler, tmp_path)
+
+    interceptor.set_task_claimant.assert_not_awaited()
+    interceptor.set_task_status.assert_awaited_once()
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert (actions[0]['type'], actions[0].get('claimant_clear')) == (
+        'dependent_unblock_applied', 'not_needed',
+    ), f'Expected an applied unblock with nothing to clear, got: {actions[0]!r}'
+    for action_type in ('write', 'skip'):
+        rows = await _taskmaster_rows(journal, action_type, 'set_task_claimant')
+        assert rows == [], f'Expected no {action_type}/set_task_claimant row, got: {rows}'
 
 
 @pytest.mark.asyncio
@@ -6628,7 +6688,9 @@ async def test_unblock_claimant_clear_failure_does_not_veto_flip(
     """
     interceptor = wired_reconciler.task_interceptor
     interceptor.set_task_claimant = make_claimant_mock()
-    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(_blocked_dependent()))
+    mock_taskmaster.get_tasks = AsyncMock(
+        return_value=_dep_tasks(_blocked_dependent(**_stale_claimant())),
+    )
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'):
         result = await _complete_dependency(wired_reconciler, tmp_path)
@@ -6648,7 +6710,7 @@ async def test_unblock_claimant_clear_failure_does_not_veto_flip(
         f'Expected claimant_clear={expected_marker!r}, got: {actions[0]!r}'
     )
 
-    clear_skips = await _taskmaster_journal_rows(journal, 'skip', 'set_task_claimant')
+    clear_skips = await _taskmaster_rows(journal, 'skip', 'set_task_claimant')
     assert len(clear_skips) == 1, (
         f'Expected exactly one skip/set_task_claimant row, got: {clear_skips}'
     )
@@ -6656,11 +6718,11 @@ async def test_unblock_claimant_clear_failure_does_not_veto_flip(
         'task_id': '2', 'satisfied_by': '1', 'type': 'unblock_claimant_clear',
         'error': expected_error,
     }, f'Unexpected claimant-clear skip detail: {clear_skips[0]["detail"]!r}'
-    clear_writes = await _taskmaster_journal_rows(journal, 'write', 'set_task_claimant')
+    clear_writes = await _taskmaster_rows(journal, 'write', 'set_task_claimant')
     assert clear_writes == [], (
         f'A clear that did not land must not leave a write row, got: {clear_writes}'
     )
-    status_writes = await _taskmaster_journal_rows(journal, 'write', 'set_task_status')
+    status_writes = await _taskmaster_rows(journal, 'write', 'set_task_status')
     assert len(status_writes) == 1, (
         f'Expected exactly one write/set_task_status row, got: {status_writes}'
     )
@@ -6673,18 +6735,52 @@ async def test_unblock_claimant_clear_failure_does_not_veto_flip(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('make_status_mock', [
+    pytest.param(lambda: AsyncMock(return_value=_backlog_rejection()), id='flip-rejected'),
+    pytest.param(lambda: AsyncMock(side_effect=RuntimeError('db locked')), id='flip-raises'),
+])
+async def test_unblock_failed_flip_reports_the_landed_claimant_clear(
+    wired_reconciler, mock_taskmaster, journal, tmp_path, make_status_mock,
+):
+    """The clear lands before the flip, so a flip that then fails leaves the
+    task blocked with no claimant. The failed action says so, rather than
+    leaving that change visible only in a separate journal row."""
+    interceptor = wired_reconciler.task_interceptor
+    interceptor.set_task_status = make_status_mock()
+    mock_taskmaster.get_tasks = AsyncMock(
+        return_value=_dep_tasks(_blocked_dependent(**_stale_claimant())),
+    )
+
+    result = await _complete_dependency(wired_reconciler, tmp_path)
+
+    interceptor.set_task_claimant.assert_awaited_once()
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert (actions[0]['type'], actions[0].get('claimant_clear')) == (
+        'dependent_unblock_failed', 'cleared',
+    ), f'Expected a failed unblock reporting the landed clear, got: {actions[0]!r}'
+
+    clear_writes = await _taskmaster_rows(journal, 'write', 'set_task_claimant')
+    assert len(clear_writes) == 1, (
+        f'Expected exactly one write/set_task_claimant row, got: {clear_writes}'
+    )
+    status_writes = await _taskmaster_rows(journal, 'write', 'set_task_status')
+    assert status_writes == [], f'The flip did not land; got: {status_writes}'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('make_get_tasks, expected_type, expected_reason', [
     pytest.param(
         lambda: AsyncMock(side_effect=[
-            _dep_tasks(_blocked_dependent()),
-            _dep_tasks(_blocked_dependent(status='in-progress')),
+            _dep_tasks(_blocked_dependent(**_stale_claimant())),
+            _dep_tasks(_blocked_dependent(status='in-progress', **_stale_claimant())),
         ]),
         'dependent_unblock_skipped', 'status_changed',
         id='live-status-in-progress',
     ),
     pytest.param(
         lambda: AsyncMock(side_effect=[
-            _dep_tasks(_blocked_dependent()),
+            _dep_tasks(_blocked_dependent(**_stale_claimant())),
             RuntimeError('taskmaster unavailable'),
         ]),
         'dependent_unblock_skipped', 'live_status_unavailable',
@@ -6692,7 +6788,7 @@ async def test_unblock_claimant_clear_failure_does_not_veto_flip(
     ),
     pytest.param(
         lambda: AsyncMock(return_value=_dep_tasks(
-            _blocked_dependent(metadata={'parent_cancelled': '7'}),
+            _blocked_dependent(metadata={'parent_cancelled': '7'}, **_stale_claimant()),
         )),
         'dependent_unblock_vetoed', 'parent_cancelled',
         id='parent-cancelled-veto',
@@ -6704,7 +6800,8 @@ async def test_unblock_dependent_no_claimant_clear_when_not_flipping(
 ):
     """The clear can never touch a task the sweep decided not to move -- above
     all one that went in-progress after the snapshot, whose claimant is live:
-    clearing it would be the incident-2588 un-claim class.
+    clearing it would be the incident-2588 un-claim class. Every case carries
+    a stale claimant, so only the no-flip decision can keep the clear away.
     """
     mock_taskmaster.get_tasks = make_get_tasks()
 
@@ -6715,9 +6812,12 @@ async def test_unblock_dependent_no_claimant_clear_when_not_flipping(
     assert (actions[0]['type'], actions[0].get('reason')) == (expected_type, expected_reason), (
         f'Expected the {expected_reason!r} no-flip arm, got: {actions[0]!r}'
     )
+    assert 'claimant_clear' not in actions[0], (
+        f'The clear was never reached, so no claimant_clear; got: {actions[0]!r}'
+    )
     wired_reconciler.task_interceptor.set_task_claimant.assert_not_awaited()
     for action_type in ('write', 'skip'):
-        rows = await _taskmaster_journal_rows(journal, action_type, 'set_task_claimant')
+        rows = await _taskmaster_rows(journal, action_type, 'set_task_claimant')
         assert rows == [], (
             f'Expected no {action_type}/set_task_claimant row on a no-flip arm, got: {rows}'
         )
