@@ -1003,6 +1003,12 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
     {
         'source',
+        # retired 2026-08 — historical carrier, no live writer; rejected on new submissions.
+        # Kept blessed forever: un-blessing would manufacture unknown_key census
+        # noise from immutable terminal carriers (the origin_finding_id
+        # precedent). The rejection lives in
+        # fused_memory.middleware.retired_key_modules_guard::retired_key_modules_error;
+        # see plans/metadata-modules-retirement-prd.md decision 2.
         'modules',
         'spawn_context',
         'complexity',
