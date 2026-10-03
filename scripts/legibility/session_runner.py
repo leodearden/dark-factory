@@ -247,7 +247,9 @@ class SessionRunner:
                 max_budget_usd=stage.max_budget_usd,
                 **stage.tools.invoke_kwargs(),
             ))
-        except (AllAccountsCappedException, PoolFrozen) as exc:
+        except PoolFrozen as exc:
+            raise _exhaustion_error(self._gate, label, frozen=exc) from exc
+        except AllAccountsCappedException as exc:
             raise _exhaustion_error(self._gate, label) from exc
         except OSError as exc:
             # The process never started: a missing claude on the child's PATH,
@@ -285,19 +287,20 @@ def _failure_error(label: str, stage: StageSpec, model: str, result: AgentResult
     )
 
 
-def _exhaustion_error(gate, label: str) -> InvocationFailed:
+def _exhaustion_error(gate, label: str, *, frozen: PoolFrozen | None = None) -> InvocationFailed:
     """The exception for a pool with no account left — typed as well as
     worded, because each exhaustion needs a different operator response.
 
-    ===============================  ====================  ======================
-    gate state (public predicates)   raised                clears on its own?
-    ===============================  ====================  ======================
-    ``account_count == 0``           NoHeadroom            no — config fault
-    ``active_account_name`` set      NoHeadroom            no — not a cap at all
-    every account auth-failed        InvocationFailed      no — operator action
-    some auth-failed, rest capped    NoHeadroom            only the capped ones
-    all capped                       NoHeadroom            yes — weekly reset
-    ===============================  ====================  ======================
+    ====================================  ================  =======================
+    pool state                            raised            clears on its own?
+    ====================================  ================  =======================
+    no accounts resolved                  NoHeadroom        no — config fault
+    a model scope exhausted everywhere    NoHeadroom        yes — the scope's reset
+    retries spent, an account still live  NoHeadroom        no — not a cap at all
+    every account auth-failed             InvocationFailed  no — operator action
+    some auth-failed, rest capped         NoHeadroom        only the capped ones
+    all capped                            NoHeadroom        yes — weekly reset
+    ====================================  ================  =======================
 
     The all-auth-failed pool must NOT be a ``NoHeadroom``:
     ``coder.is_cap_deferral`` would turn a majority of those into an exit-0
@@ -305,7 +308,10 @@ def _exhaustion_error(gate, label: str) -> InvocationFailed:
     (task 4503). As a plain failure it trips the storm, so the night exits 1
     with an ERROR escalation (task 5947).
 
-    Read only off the gate's PUBLIC predicates.
+    A *frozen* pool is read off the ``PoolFrozen`` alone, which snapshots the
+    gate at the moment it refused to park. Only the cases with no such
+    snapshot — an empty pool, and ``AllAccountsCappedException`` after one
+    pass of cap retries — read the gate's PUBLIC predicates.
     """
     count = gate.account_count
     if not count:
@@ -314,6 +320,12 @@ def _exhaustion_error(gate, label: str) -> InvocationFailed:
             "no pool accounts resolved — check that the unit's EnvironmentFile "
             "supplies the CLAUDE_OAUTH_TOKEN_* vars named in "
             "config/usage-accounts.yaml",
+        )
+    if frozen is not None:
+        if frozen.scope is not None:
+            return _scope_exhausted_error(label, frozen)
+        return _unavailable_pool_error(
+            label, frozen.account_count, frozen.auth_failed_account_names,
         )
     live = gate.active_account_name
     if live is not None:
@@ -325,7 +337,13 @@ def _exhaustion_error(gate, label: str) -> InvocationFailed:
             f"reset; the run's per-digest failures say what each account "
             f"reported",
         )
-    auth_failed = gate.auth_failed_account_names
+    return _unavailable_pool_error(label, count, gate.auth_failed_account_names)
+
+
+def _unavailable_pool_error(
+    label: str, count: int, auth_failed: tuple[str, ...],
+) -> InvocationFailed:
+    """Every account is capped or auth-failed: which, decides the type."""
     if len(auth_failed) == count:
         return InvocationFailed(
             f"{label}: every one of the {count} pool accounts had its "
@@ -338,10 +356,27 @@ def _exhaustion_error(gate, label: str) -> InvocationFailed:
             label,
             f"all {count} pool accounts unavailable — {count - len(auth_failed)} "
             f"capped, which clears at the weekly reset, and "
-            f"{', '.join(auth_failed)} with credentials rejected (HTTP 401/403), "
-            f"which will not clear without operator action",
+            f"{_rejected_credentials(auth_failed)}",
         )
     return _pool_exhausted(label, f"all {count} pool accounts capped")
+
+
+def _scope_exhausted_error(label: str, frozen: PoolFrozen) -> NoHeadroom:
+    reason = (
+        f"model scope {frozen.scope!r} is exhausted on every admissible one of "
+        f"the {frozen.account_count} pool accounts — that clears at the "
+        f"scope's reset, and the fleet stays open for other models"
+    )
+    if frozen.auth_failed_account_names:
+        reason += f"; {_rejected_credentials(frozen.auth_failed_account_names)}"
+    return _pool_exhausted(label, reason)
+
+
+def _rejected_credentials(auth_failed: tuple[str, ...]) -> str:
+    return (
+        f"{', '.join(auth_failed)} with credentials rejected (HTTP 401/403), "
+        f"which will not clear without operator action"
+    )
 
 
 def _pool_exhausted(label: str, reason: str) -> NoHeadroom:

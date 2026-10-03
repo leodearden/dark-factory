@@ -1919,7 +1919,7 @@ legibility-trickle@<project>`). The runner's own lines carry its label:
   `shared.invocation_outcome.classify_invocation`. No wording table is
   involved, so a new rejection text fails over like any other.
 
-When no account is left, every remaining digest fails with one of five typed
+When no account is left, every remaining digest fails with one of six typed
 exhaustions, each prefixed with the label:
 
 - `legibility trickle coder DEFERRED: N/M digests found no pool account with
@@ -1952,6 +1952,13 @@ exhaustions, each prefixed with the label:
   401/403), which will not clear without operator action`. This is a mixed
   exhaustion. The night is DEFERRED as for an all-capped pool, but the reason
   names the auth-failed accounts that will not come back with the rest.
+- `<label>: model scope 'claude-fable-5' is exhausted on every admissible one
+  of the 7 pool accounts — that clears at the scope's reset, and the fleet
+  stays open for other models`. Only a model the gate caps in its own scope
+  (`UsageCapConfig.scoped_cap_models`, default `claude-fable-5`) can produce
+  it, and only when a stage passes that full id; the shipped stages pass
+  aliases such as `fable`. It is weather, and the night is DEFERRED. Any
+  auth-failed accounts are named as in the mixed case.
 
 One failure is not an exhaustion. `<label>: claude CLI could not be started
 (model='haiku', cwd=...): [Errno 2] ...` means `claude` is missing from the

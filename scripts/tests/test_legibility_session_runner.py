@@ -28,6 +28,7 @@ from legibility.session_runner import (
     StageSpec,
 )
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_NEAR_CAP_MESSAGES
+from shared.config_models import UsageCapConfig
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -156,9 +157,13 @@ _JSON_STAGE = dataclasses.replace(_CLASSIFIER_STAGE, is_usable_reply=_is_json_ob
 _P, _Q = 'max-p', 'max-q'
 
 
-def _run(fake_claude_cli, pool_roster, by_token, *names, stage=_CLASSIFIER_STAGE, calls=1):
-    """Script the fake per account, run *calls* invocations on one runner and
-    return ``(outcomes, gate)`` — each outcome a reply or the raised exception."""
+def _run(
+    fake_claude_cli, pool_roster, by_token, *names,
+    stage=_CLASSIFIER_STAGE, calls=1, model='haiku',
+):
+    """Script the fake per account, run *calls* invocations of *model* on one
+    runner and return ``(outcomes, gate)`` — each outcome a reply or the
+    raised exception."""
     accounts_file, env_file = pool_roster(*names)
     fake_claude_cli.plan(
         {pool_roster.token(name): response for name, response in by_token.items()},
@@ -170,7 +175,7 @@ def _run(fake_claude_cli, pool_roster, by_token, *names, stage=_CLASSIFIER_STAGE
         invoke = runner.invoker(stage)
         for i in range(calls):
             try:
-                outcomes.append(invoke(f'prompt {i}', 'haiku'))
+                outcomes.append(invoke(f'prompt {i}', model))
             except session_runner.InvocationFailed as exc:
                 outcomes.append(exc)
     return outcomes, gate
@@ -233,6 +238,28 @@ def test_a_partly_auth_failed_pool_defers_without_claiming_every_account_is_capp
     assert 'will not clear' in message, (
         f'the auth-failed account must not be promised back at the reset; got {message!r}'
     )
+
+
+def test_a_model_scope_exhausted_everywhere_defers_until_the_scope_resets(
+    fake_claude_cli, pool_roster, sentinel_login,
+):
+    """A scoped model capped on every account still admissible, while the
+    fleet stays open for every other model. That clears at the scope's reset,
+    so the reason must not call it "not a capacity limit" just because the
+    gate still reports a live account."""
+    [scoped_model, *_] = UsageCapConfig().scoped_cap_models
+    [exc], gate = _run(
+        fake_claude_cli, pool_roster, {_P: _AUTH_401, _Q: _CAPPED}, _P, _Q,
+        model=scoped_model,
+    )
+
+    assert gate.active_account_name == _Q, 'the premise: the fleet is still open'
+    assert isinstance(exc, session_runner.NoHeadroom), exc
+    message = str(exc)
+    assert scoped_model in message, message
+    assert "scope's reset" in message, message
+    assert 'not a capacity limit' not in message, message
+    assert _P in message and 'credentials rejected' in message, message
 
 
 def test_a_near_cap_pool_never_claims_a_cap_that_did_not_happen(
