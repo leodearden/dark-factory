@@ -2445,6 +2445,78 @@ class TestProtectedAuditAndForeignKindRecordsAreNeverDeleted:
         assert set(report['targeted_correction_ids']) == {'a1', 'f1'}
 
 
+class TestProtectedSkipsAreAttributedToTheirGuard:
+    """Each withheld record names the guard that withheld it (task 5286).
+
+    Mirrors the in-cycle collector's rule that a mirror skip must not be
+    logged as an audit skip, or vice versa. Asserted on the structured
+    ``ProtectionReason`` values, never on surrounding prose.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+    _service = staticmethod(TestRunExcludesProtectedMirrorsFromTheDeleteSet._service)
+    _EXPECTED = {
+        'mirror-id': _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR.value,
+        'audit-id': _mod.ProtectionReason.PROTECTED_AUDIT_KIND.value,
+        'foreign-id': _mod.ProtectionReason.FOREIGN_KIND.value,
+    }
+
+    @staticmethod
+    def _members() -> list[dict]:
+        return [
+            _mirror('mirror-id'), _audit('audit-id'),
+            _foreign('foreign-id'), _orphan('orphan-id'),
+        ]
+
+    @staticmethod
+    def _warnings(caplog) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+
+    @pytest.mark.asyncio
+    async def test_choke_point_names_each_records_own_reason(self, caplog):
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.delete_orphan_markers(
+                memory_service, 'dark_factory', self._members(),
+            )
+
+        warnings = self._warnings(caplog)
+        for memory_id, reason in self._EXPECTED.items():
+            naming = [m for m in warnings if memory_id in m]
+            assert len(naming) == 1, (memory_id, warnings)
+            assert reason in naming[0], (memory_id, naming[0])
+        audit_line = next(m for m in warnings if 'audit-id' in m)
+        assert (
+            _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR.value not in audit_line
+        ), audit_line
+
+    @pytest.mark.asyncio
+    async def test_run_aggregate_names_every_reason(self, caplog):
+        memory_service = self._service(self._members(), apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.run(
+                types.SimpleNamespace(
+                    apply=False, project_id='dark_factory', max_age_days=14,
+                    delete_ids=None,
+                ),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        naming_all = [
+            m for m in self._warnings(caplog)
+            if all(memory_id in m for memory_id in self._EXPECTED)
+        ]
+        assert len(naming_all) == 1, self._warnings(caplog)
+        for reason in self._EXPECTED.values():
+            assert reason in naming_all[0], (reason, naming_all[0])
+
+
 # ===========================================================================
 # Tests: run() emits the structural_floor block (task 4436)
 # ===========================================================================
