@@ -22,6 +22,7 @@ SIBLING_EVAL_WORKTREE = (
 )
 LEGACY_EVAL_WORKTREE = '/home/leo/src/dark-factory/.eval-worktrees/df_task_2339/run-ac3ab562'
 TASK_WORKTREE = '/home/leo/src/dark-factory/.worktrees/3096'
+MARKER_NAMED_PROJECT = '/home/leo/src/eval-worktree-tools'
 
 
 class TestIsEvalFixtureTaskId:
@@ -103,12 +104,29 @@ class TestIsEvalFixtureTaskId:
 
 
 class TestIsEvalWorktreePath:
-    @pytest.mark.parametrize('path', [SIBLING_EVAL_WORKTREE, LEGACY_EVAL_WORKTREE])
+    @pytest.mark.parametrize(
+        'path',
+        [
+            SIBLING_EVAL_WORKTREE,
+            LEGACY_EVAL_WORKTREE,
+            '/home/leo/src/eval-worktree-tools-eval-worktrees/kl_task_543/run-1',
+        ],
+    )
     @pytest.mark.parametrize('as_type', [str, Path])
     def test_eval_worktree_layouts_are_recognised(self, path: str, as_type: type) -> None:
         assert is_eval_worktree_path(as_type(path)) is True
 
-    @pytest.mark.parametrize('path', ['/home/leo/src/dark-factory', TASK_WORKTREE])
+    @pytest.mark.parametrize(
+        'path',
+        [
+            '/home/leo/src/dark-factory',
+            TASK_WORKTREE,
+            MARKER_NAMED_PROJECT,
+            f'{MARKER_NAMED_PROJECT}/.worktrees/12',
+            '/home/leo/src/my-eval-worktree/.worktrees/5',
+            '/home/leo/src/eval-worktrees-archive/.worktrees/5',
+        ],
+    )
     @pytest.mark.parametrize('as_type', [str, Path])
     def test_production_paths_are_not_recognised(self, path: str, as_type: type) -> None:
         assert is_eval_worktree_path(as_type(path)) is False

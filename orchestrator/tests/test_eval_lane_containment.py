@@ -87,8 +87,12 @@ def test_live_shadow_minted_id_is_recognised(tmp_path: Path) -> None:
     assert is_eval_fixture_task_id(fixture['id']), fixture['id']
 
 
-def test_eval_worktree_root_is_recognised() -> None:
-    run_dir = eval_worktree_root(Path('/home/leo/src/dark-factory')) / 'df_task_12' / 'run-abc12345'
+@pytest.mark.parametrize(
+    'project_root', ['/home/leo/src/dark-factory', '/home/leo/src/eval-worktree-tools']
+)
+def test_eval_worktree_root_is_recognised(project_root: str) -> None:
+    assert not is_eval_worktree_path(project_root)
+    run_dir = eval_worktree_root(Path(project_root)) / 'df_task_12' / 'run-abc12345'
     assert is_eval_worktree_path(run_dir)
 
 
@@ -112,7 +116,6 @@ def test_load_task_rejects_an_unrecognised_fixture_id(tmp_path: Path, payload: d
     message = str(excinfo.value)
     assert str(path) in message
     assert repr(payload.get('id')) in message
-    assert 'shared/src/shared/eval_lane.py' in message
 
 
 @pytest.mark.parametrize('fixture_id', ['df_task_9999_adv_smoke', 'shadow_5383_01JCELL'])

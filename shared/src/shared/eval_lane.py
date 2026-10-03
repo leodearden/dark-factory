@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+from pathlib import PurePath
 
 #: ``<repo>_task_<n>[_<suffix>]`` — minted by
 #: ``orchestrator/src/orchestrator/evals/task_sampler.py::build_fixture_record``,
@@ -31,10 +32,13 @@ CORPUS_FIXTURE_ID_RE = re.compile(r'^[a-z0-9]+_task_\d+(?:_[a-z0-9_]+)?$')
 #: ``orchestrator/src/orchestrator/evals/live_fixture.py::build_live_fixture``.
 SHADOW_FIXTURE_ID_RE = re.compile(r'^shadow_\S+_[0-9A-Za-z]+$')
 
-#: The substring ``orchestrator/src/orchestrator/evals/snapshots.py::eval_worktree_root``
-#: deliberately keeps in every eval worktree path, current sibling layout
-#: (``<repo>-eval-worktrees/``) and legacy in-repo layout (``.eval-worktrees/``) alike.
-EVAL_WORKTREE_MARKER = 'eval-worktree'
+#: Eval worktree root directory names, matched against whole path components:
+#: the sibling ``<repo>-eval-worktrees/`` minted by
+#: ``orchestrator/src/orchestrator/evals/snapshots.py::eval_worktree_root`` and the
+#: legacy in-repo ``.eval-worktrees/``. A component that merely contains
+#: ``eval-worktree`` (a project named ``eval-worktree-tools``) is production.
+EVAL_WORKTREE_ROOT_SUFFIX = '-eval-worktrees'
+LEGACY_EVAL_WORKTREE_ROOT = '.eval-worktrees'
 
 
 def is_eval_fixture_task_id(task_id: str | None) -> bool:
@@ -52,7 +56,10 @@ def is_eval_worktree_path(path: str | os.PathLike[str] | None) -> bool:
     """True when *path* lies under an eval worktree root."""
     if not path:
         return False
-    return EVAL_WORKTREE_MARKER in os.fspath(path)
+    return any(
+        part == LEGACY_EVAL_WORKTREE_ROOT or part.endswith(EVAL_WORKTREE_ROOT_SUFFIX)
+        for part in PurePath(path).parts
+    )
 
 
 def eval_lane_provenance(
