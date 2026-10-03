@@ -18,7 +18,6 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 from _fm_helpers import load_script_module
-from orchestrator.verify import VerifyResult
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -718,6 +717,18 @@ class TestHooksIntegration:
 # Assign/AnnAssign-only) is unchanged; every test above this banner pins it.
 # ===========================================================================
 
+@pytest.fixture
+def verify_result_field_names() -> frozenset[str]:
+    """VerifyResult's real field names, read at runtime from orchestrator.verify.
+
+    Imported here, not at module top, so an import-time break in orchestrator.verify
+    fails only the drift tests that read it rather than collection of this whole suite.
+    """
+    from orchestrator.verify import VerifyResult
+
+    return frozenset(f.name for f in dataclasses.fields(VerifyResult))
+
+
 class TestDataclassShapeRegistry:
     """The `_DATACLASS_SHAPES` registry that drives Rule B's anchor+overlap match."""
 
@@ -737,20 +748,19 @@ class TestDataclassShapeRegistry:
             'Adding a shape is a deliberate widening — update this test with it.'
         )
 
-    def test_verify_result_fields_match_the_real_dataclass(self):
-        """The registry's field literal equals VerifyResult's real fields, read at runtime.
+    def test_registry_names_no_stale_verify_result_field(self, verify_result_field_names):
+        """Every registered field is one VerifyResult really has, read at runtime.
 
-        The script must stay stdlib-only, so it carries a literal copy; this test is
-        the drift guard that compares that copy against the dataclass itself.
+        The script must stay stdlib-only, so it carries a literal copy.  This test owns
+        the STALE direction; the MISSING direction is owned by
+        test_every_real_field_counts_toward_the_overlap_floor, so one drift fails once.
         """
         shape = _checker._DATACLASS_SHAPES[0]
-        real = frozenset(f.name for f in dataclasses.fields(VerifyResult))
-        assert shape.fields == real, (
-            'add/remove these names in `_DATACLASS_SHAPES[0].fields` in '
-            'fused-memory/scripts/check_bare_magicmock_config.py so the registry matches '
-            'orchestrator/src/orchestrator/verify.py::VerifyResult:\n'
-            f'  missing from registry: {sorted(real - shape.fields)}\n'
-            f'  extra in registry:     {sorted(shape.fields - real)}'
+        stale = sorted(shape.fields - verify_result_field_names)
+        assert stale == [], (
+            'remove these names from `_DATACLASS_SHAPES[0].fields` in '
+            'fused-memory/scripts/check_bare_magicmock_config.py; '
+            f'orchestrator/src/orchestrator/verify.py::VerifyResult has no such field: {stale}'
         )
         assert isinstance(shape.fields, frozenset), (
             f'fields must be a frozenset for cheap set algebra; got {type(shape.fields)}'
@@ -763,7 +773,7 @@ class TestDataclassShapeRegistry:
             f"VerifyResult's anchor must be exactly {{'passed'}}; got {set(shape.anchors)}"
         )
 
-    def test_every_real_field_counts_toward_the_overlap_floor(self):
+    def test_every_real_field_counts_toward_the_overlap_floor(self, verify_result_field_names):
         """Each real non-anchor field, paired with ``passed``, flags exactly one double.
 
         The behavioural consequence of the registry: a field VerifyResult has but the
@@ -772,7 +782,7 @@ class TestDataclassShapeRegistry:
         field landing unregistered turns this red too.
         """
         unflagged = []
-        for name in sorted(f.name for f in dataclasses.fields(VerifyResult)):
+        for name in sorted(verify_result_field_names):
             if name == 'passed':
                 continue
             source = f'm = MagicMock(passed=True, {name}=None)\n'

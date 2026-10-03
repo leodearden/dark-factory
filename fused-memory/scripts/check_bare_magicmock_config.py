@@ -221,8 +221,8 @@ hooks/project-checks can invoke it via plain python3 without uv env-resolution o
 Adding a third-party dependency here would break that fast path.  This is why
 ``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
 describes: ``import orchestrator.verify`` would need pydantic and break every caller.
-The hardcoded copy's drift guard lives in the test, which CAN import it:
-fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry::test_verify_result_fields_match_the_real_dataclass.
+The hardcoded copy's drift guards live in the test, which CAN import it:
+fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry.
 """
 
 from __future__ import annotations
@@ -282,9 +282,10 @@ class _DataclassShape(NamedTuple):
 # VerifyResult's field list is a stdlib-only copy of
 # orchestrator/src/orchestrator/verify.py::VerifyResult, kept EXHAUSTIVE: a field
 # missing here does not count toward the overlap floor, so a double built from it
-# slips through.  Its drift guard is
-# fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry::test_verify_result_fields_match_the_real_dataclass,
-# which compares this literal against ``dataclasses.fields(VerifyResult)`` at runtime.
+# slips through.  Its drift guards are in
+# fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry,
+# which compare this literal against ``dataclasses.fields(VerifyResult)`` at runtime,
+# one test per drift direction.
 _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
     _DataclassShape(
         name='VerifyResult',
