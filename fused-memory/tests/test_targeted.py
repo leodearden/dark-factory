@@ -2384,8 +2384,8 @@ class TestSweepCancelledDescendants:
         ]
 
     @staticmethod
-    async def _taskmaster_rows(journal, action_type: str, operation: str) -> list[dict]:
-        """Real journal rows for one (action_type, operation) pair.
+    async def _run_rows(journal) -> list[dict]:
+        """Every real journal row of the single run.
 
         ``limit`` is deliberately above 1 so the cardinality assertion below
         can actually fail: under ``limit=1`` it could only ever catch zero
@@ -2394,12 +2394,22 @@ class TestSweepCancelledDescendants:
         """
         runs = await journal.get_recent_runs('test-project', limit=5)
         assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
-        rows = await journal.get_run_actions(runs[0].id)
+        return await journal.get_run_actions(runs[0].id)
+
+    @classmethod
+    async def _journal_rows(
+        cls, journal, action_type: str, target: str, operation: str,
+    ) -> list[dict]:
+        """Real journal rows for one (action_type, target, operation) triple."""
         return [
-            r for r in rows
-            if r['action_type'] == action_type and r['target'] == 'taskmaster'
+            r for r in await cls._run_rows(journal)
+            if r['action_type'] == action_type and r['target'] == target
             and r['operation'] == operation
         ]
+
+    @classmethod
+    async def _taskmaster_rows(cls, journal, action_type: str, operation: str) -> list[dict]:
+        return await cls._journal_rows(journal, action_type, 'taskmaster', operation)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('make_response,expected_error', [
@@ -2745,6 +2755,172 @@ class TestSweepCancelledDescendants:
 
         skips = await self._taskmaster_rows(journal, 'skip', 'set_task_status')
         assert not skips, f'A no-op is a landed write, not a skip; got: {skips}'
+
+    # ── Task 5273: the escalate branch journals its L1 filing ─────────────
+    # The cancel and block branches leave write/skip rows; the escalate
+    # branch filed its L1 journal-silently, so ``get_run_actions`` could not
+    # show it.  Its rows name the store written and the call made:
+    # ``escalation``/``submit``.
+
+    @staticmethod
+    def _orchestrator_live(monkeypatch, live: bool = True) -> None:
+        """Override the class autouse fixture's orchestrator-dead default."""
+        from fused_memory.reconciliation import targeted
+        monkeypatch.setattr(targeted, 'is_orchestrator_live_for', lambda _pr: live)
+
+    @staticmethod
+    def _broken_queue_class(stage: str):
+        """An ``EscalationQueue`` stand-in that raises at *stage*:
+        ``'init'`` (construction) or ``'submit'``."""
+        class _BrokenQueue:
+            def __init__(self, queue_dir):
+                if stage == 'init':
+                    raise OSError('read-only fs')
+                self.queue_dir = queue_dir
+
+            def make_id(self, task_id):
+                return f'esc-{task_id}-1'
+
+            def submit(self, escalation):
+                raise RuntimeError('disk full')
+
+        return _BrokenQueue
+
+    @pytest.mark.asyncio
+    async def test_escalate_success_writes_journal_row(
+        self, wired_reconciler, mock_taskmaster, mock_interceptor, journal,
+        monkeypatch, tmp_path,
+    ):
+        """A filed L1 leaves one 'write' row naming the escalation it filed."""
+        self._orchestrator_live(monkeypatch)
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+
+        result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        escalated = self._descendant_actions(result, 'descendant_escalated')
+        assert len(escalated) == 1, f'Expected exactly one descendant_escalated, got: {escalated}'
+        files = list((tmp_path / 'data' / 'escalations').glob('esc-*.json'))
+        assert len(files) == 1, f'Expected one escalation file, got: {files}'
+        filed_id = files[0].stem
+        assert escalated[0].get('escalation_id') == filed_id, (
+            f'Expected the action to name the filed escalation {filed_id!r}, '
+            f'got: {escalated[0]!r}'
+        )
+
+        writes = await self._journal_rows(journal, 'write', 'escalation', 'submit')
+        assert len(writes) == 1, f'Expected exactly one write/escalation/submit row, got: {writes}'
+        assert writes[0]['detail'] == {
+            'task_id': 'B', 'parent_id': 'A', 'type': 'descendant_escalated',
+            'escalation_id': filed_id,
+        }, f'Unexpected escalate detail: {writes[0]["detail"]!r}'
+        skips = await self._journal_rows(journal, 'skip', 'escalation', 'submit')
+        assert not skips, f'A filed escalation is not a skip; got: {skips}'
+
+        mock_interceptor.set_task_status.assert_not_awaited()
+        mock_interceptor.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('stage,raised', [
+        pytest.param('init', 'read-only fs', id='init'),
+        pytest.param('submit', 'disk full', id='submit'),
+    ])
+    async def test_escalate_failure_writes_skip_row(
+        self, wired_reconciler, mock_taskmaster, journal, monkeypatch, tmp_path,
+        caplog, stage, raised,
+    ):
+        """A filing that raised leaves the symmetric 'skip' row, so
+        ``WHERE action_type='skip'`` counts failed escalations too."""
+        self._orchestrator_live(monkeypatch)
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+
+        with caplog.at_level(logging.WARNING, logger=self._TARGETED_LOGGER), patch(
+            'fused_memory.reconciliation.targeted.EscalationQueue',
+            self._broken_queue_class(stage),
+        ):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+        escalated = self._descendant_actions(result, 'descendant_escalated')
+        assert not escalated, f'Nothing was filed, so no escalated action; got: {escalated}'
+
+        skips = await self._journal_rows(journal, 'skip', 'escalation', 'submit')
+        assert len(skips) == 1, f'Expected exactly one skip/escalation/submit row, got: {skips}'
+        assert skips[0]['detail'] == {
+            'task_id': 'B', 'parent_id': 'A', 'type': 'descendant_escalated',
+            'error': raised,
+        }, f'Unexpected escalate skip detail: {skips[0]["detail"]!r}'
+        writes = await self._journal_rows(journal, 'write', 'escalation', 'submit')
+        assert not writes, f'Nothing was filed, so expected no write row; got: {writes}'
+
+        warns = [
+            r for r in caplog.records
+            if r.name == self._TARGETED_LOGGER and r.levelno >= logging.WARNING
+        ]
+        assert warns, 'Expected a WARNING logged for the failed escalation'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('target,replacement', [
+        pytest.param('fused_memory.reconciliation.targeted.EscalationQueue', None, id='queue_class'),
+        pytest.param('fused_memory.reconciliation.targeted.Escalation', None, id='model_class'),
+        pytest.param('fused_memory.reconciliation.targeted._HAS_ESCALATION', False, id='flag'),
+    ])
+    async def test_escalate_without_escalation_package_is_journal_silent(
+        self, wired_reconciler, mock_taskmaster, journal, monkeypatch, tmp_path,
+        caplog, target, replacement,
+    ):
+        """An absent optional package is a degraded environment, not a failed
+        filing: no skip row per routed descendant, and no WARNING -- the
+        stance TestContradictedEscalationWithoutTheEscalationPackage pins for
+        the contradicted-verdict escalation."""
+        self._orchestrator_live(monkeypatch)
+        mock_taskmaster.get_tasks = AsyncMock(return_value=self._block_branch_tasks())
+
+        with caplog.at_level(logging.WARNING), patch(target, replacement):
+            result = await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        assert 'error' not in result, f'Expected reconcile_task to fail open, got: {result}'
+        escalated = self._descendant_actions(result, 'descendant_escalated')
+        assert not escalated, f'Nothing was filed, so no escalated action; got: {escalated}'
+        for action_type in ('write', 'skip'):
+            rows = [
+                r for r in await self._run_rows(journal)
+                if r['action_type'] == action_type and r['target'] == 'escalation'
+            ]
+            assert not rows, f'Expected no {action_type}/escalation rows, got: {rows}'
+        msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not any('escalat' in m.lower() for m in msgs), (
+            f'An absent optional package must not log a WARNING, got {msgs}'
+        )
+        assert not (tmp_path / 'data' / 'escalations').exists(), (
+            'Without the escalation package the queue dir must not be created'
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('tasks_key,orchestrator_live,action_type', [
+        pytest.param('_cancel_branch_tasks', False, 'descendant_cancelled', id='cancel'),
+        pytest.param('_block_branch_tasks', False, 'descendant_blocked', id='block'),
+        pytest.param('_block_branch_tasks', True, 'descendant_escalated', id='escalate'),
+    ])
+    async def test_dispatch_triad_is_symmetric_under_get_run_actions(
+        self, wired_reconciler, mock_taskmaster, journal, monkeypatch, tmp_path,
+        tasks_key, orchestrator_live, action_type,
+    ):
+        """Each branch's landed outcome is one 'write' row whose detail.type is
+        the action it returned. Deliberately agnostic of target/operation,
+        which legitimately differ per branch."""
+        self._orchestrator_live(monkeypatch, orchestrator_live)
+        mock_taskmaster.get_tasks = AsyncMock(return_value=getattr(self, tasks_key)())
+
+        await self._sweep_cancelled_parent(wired_reconciler, tmp_path)
+
+        rows = [
+            r for r in await self._run_rows(journal)
+            if (r.get('detail') or {}).get('type') == action_type
+        ]
+        assert len(rows) == 1, f'Expected exactly one {action_type} row, got: {rows}'
+        assert rows[0]['action_type'] == 'write', f'got: {rows[0]!r}'
+        assert rows[0]['detail'].get('task_id') == 'B', f'got: {rows[0]!r}'
+        assert rows[0]['detail'].get('parent_id') == 'A', f'got: {rows[0]!r}'
 
 
 # ── Regression: cycle 8df8bdcd title↔task_id contract (task 1379) ──────────
