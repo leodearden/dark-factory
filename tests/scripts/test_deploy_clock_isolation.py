@@ -29,6 +29,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +63,7 @@ from df_pytest_isolation import (  # noqa: E402
     deploy_clock_snapshot,
     deploy_clock_violation_reason,
     fixture_marker,
+    run_session_token,
 )
 
 # NOT `from df_pytest_isolation import _df_deploy_clocks_unwritten`. Importing a
@@ -594,6 +596,10 @@ _THIS_SESSION = 'aa11bb22cc33dd44ee55ff6677889900'
 _OTHER_SESSION = '00998877ff66ee55dd44cc33bb22aa11'
 _FLEET_SOURCE = 'restart-all-orchestrators.sh'
 _WATCHDOG_SOURCE = 'orchestrator-watchdog.py'
+# The two falsified headlines' signatures (task 5282): the foreign-token one
+# names a concurrent session; every other one accuses this run.
+_CONCURRENT_MARK = 'CONCURRENT pytest session'
+_THIS_RUN_MARK = 'this test run falsified'
 
 
 def _stamp(*, token: str, source: str = _FLEET_SOURCE, ts: int = 1787849070) -> bytes:
@@ -664,6 +670,8 @@ class TestDeployClockChangeReport:
         assert 'falsified a REAL deploy clock' in message, message
         assert _FLEET_SOURCE in message, 'the writer must be named for triage'
         assert 'this run' in message, message
+        assert _THIS_RUN_MARK in message, message
+        assert _CONCURRENT_MARK not in message, message
 
     def test_an_external_stamp_is_a_redeploy_not_a_falsification(
         self, tmp_path: Path,
@@ -690,14 +698,12 @@ class TestDeployClockChangeReport:
         assert 'not at fault' in message.lower(), message
         assert _FLEET_SOURCE in message, 'the writer must be named for triage'
 
-    def test_a_foreign_session_token_still_fails(self, tmp_path: Path) -> None:
-        """Deliberately conservative: this guard never absolves another session.
-
-        A token that is neither empty nor ours means some OTHER pytest session
-        wrote the shared main-checkout clock. That session's own guard sees its
-        own token and fails, so the signal is never lost — and this run must not
-        become the arbiter of another run's bug on the strength of a token it
-        cannot verify.
+    def test_a_foreign_token_fails_and_names_a_concurrent_session(
+        self, tmp_path: Path,
+    ) -> None:
+        """Keep-and-clarify (task 5282): a foreign token still FAILS the run, but
+        its headline names a concurrent session instead of accusing this run.
+        ``deploy_clock_change_report`` owns the ruling and its reasons.
         """
         before = deploy_clock_snapshot(tmp_path)
         _write(tmp_path, _FLEET_RELPATH, _stamp(token=_OTHER_SESSION))
@@ -709,7 +715,12 @@ class TestDeployClockChangeReport:
         assert report is not None
         verdict, message = report
         assert verdict is ClockVerdict.FALSIFIED
-        assert 'another pytest session' in message.lower(), message
+        assert 'falsified a REAL deploy clock' in message, message
+        assert _CONCURRENT_MARK in message, message
+        assert _THIS_RUN_MARK not in message, message
+        assert _OTHER_SESSION in message, (
+            'the token is what a reader greps the other run\'s log for'
+        )
 
     def test_a_legacy_provenance_free_stamp_still_fails(self, tmp_path: Path) -> None:
         """Today's behaviour, preserved: no provenance means no exemption."""
@@ -721,7 +732,10 @@ class TestDeployClockChangeReport:
         )
 
         assert report is not None
-        assert report[0] is ClockVerdict.FALSIFIED
+        verdict, message = report
+        assert verdict is ClockVerdict.FALSIFIED
+        assert _THIS_RUN_MARK in message, message
+        assert _CONCURRENT_MARK not in message, message
 
     def test_a_created_external_stamp_is_a_redeploy(self, tmp_path: Path) -> None:
         """CREATED-from-absent is the 3797 SHAPE but not necessarily its cause:
@@ -811,7 +825,10 @@ class TestDeployClockChangeReport:
         )
 
         assert report is not None
-        assert report[0] is ClockVerdict.FALSIFIED
+        verdict, message = report
+        assert verdict is ClockVerdict.FALSIFIED
+        assert _THIS_RUN_MARK in message, message
+        assert _CONCURRENT_MARK not in message, message
 
     @pytest.mark.parametrize('token,expected', [
         ('', ClockVerdict.EXTERNAL_REDEPLOY),
@@ -1146,6 +1163,36 @@ class TestViolationReasonIsTheFalsifiedHalfOfTheReport:
         assert 'this run' in reason, reason
 
 
+_FRESH_TOKEN = re.compile(r'[0-9a-f]{32}')
+
+
+class TestRunSessionToken:
+    """One deploy-clock token per pytest RUN, shared by its xdist workers.
+
+    Per-worker tokens made a sibling worker's stamp read as another session's
+    (task 5282). The token must never be falsy: an empty ambient token would
+    make every test-spawned writer stamp '' and read as a real redeploy.
+    """
+
+    def test_an_xdist_worker_adopts_the_run_wide_testrunuid(self) -> None:
+        assert run_session_token({'testrunuid': 'abc123'}) == 'abc123'
+
+    def test_a_plain_or_nested_session_mints_its_own(self) -> None:
+        first, second = run_session_token(None), run_session_token(None)
+
+        assert _FRESH_TOKEN.fullmatch(first), first
+        assert _FRESH_TOKEN.fullmatch(second), second
+        assert first != second
+
+    @pytest.mark.parametrize('workerinput', [
+        {'testrunuid': ''}, {}, {'testrunuid': 123},
+    ])
+    def test_an_unusable_testrunuid_falls_back_to_a_fresh_token(
+        self, workerinput: dict[str, object],
+    ) -> None:
+        assert _FRESH_TOKEN.fullmatch(run_session_token(workerinput))
+
+
 class TestGuardIsLiveInThisRun:
     """The fixture is WIRED, not merely defined.
 
@@ -1263,6 +1310,7 @@ _NESTED_STAMP_BODY = '{"ts": 1786033966, "iso": "2026-08-06T16:32:46+00:00"}'
 # warning). A boolean cannot express the last two at once.
 _NESTED_SCENARIOS = (
     'clean', 'violating', 'external', 'own_token', 'external_plus_own_token',
+    'foreign_token',
 )
 
 
@@ -1291,7 +1339,24 @@ def _nested_test_source(*, scenario: str) -> str:
             "    _stamp(RELPATH, _provenance(''))\n"
             "    _stamp(FM_RELPATH, _provenance(os.environ[TOKEN_ENV]))\n"
         ),
+        # A stamp carrying a token that is neither empty nor this run's: what a
+        # concurrent run's forgetful spawner leaves on the shared clock.
+        'foreign_token': f"    _stamp(RELPATH, _provenance({_OTHER_SESSION!r}))\n",
     }[scenario]
+    return (
+        _nested_preamble()
+        + 'def test_a_forgetful_spawner():\n'
+        '    """PASSES. The damage is to the checkout, not to this result."""\n'
+        + write
+    )
+
+
+def _nested_preamble() -> str:
+    """The nested module's imports, constants and clock-stamping helpers.
+
+    ``_stamp(relpath, body)`` writes under the nested root; ``_provenance(session)``
+    builds a provenance-bearing body from this module's imported key constants.
+    """
     return (
         'import json\n'
         'import os\n'
@@ -1317,9 +1382,37 @@ def _nested_test_source(*, scenario: str) -> str:
         '    })\n'
         '\n'
         '\n'
-        'def test_a_forgetful_spawner():\n'
-        '    """PASSES. The damage is to the checkout, not to this result."""\n'
-        + write
+    )
+
+
+# Two xdist workers, each stamping with its own ambient token, with BOTH writes
+# landing after BOTH guards snapshotted and before EITHER tears down. File
+# barriers make that overlap deterministic rather than timing luck.
+_XDIST_WORKERS = ('gw0', 'gw1')
+
+
+def _xdist_test_source() -> str:
+    """Source for the nested module run under ``-n 2 --dist each``."""
+    return (
+        _nested_preamble()
+        + 'import time\n'
+        '\n'
+        f'WORKERS = {_XDIST_WORKERS!r}\n'
+        '\n'
+        '\n'
+        'def _barrier(name):\n'
+        '    root = Path(__file__).resolve().parent\n'
+        "    (root / f'{name}-{os.environ[\"PYTEST_XDIST_WORKER\"]}').touch()\n"
+        '    deadline = time.monotonic() + 60\n'
+        "    while not all((root / f'{name}-{w}').exists() for w in WORKERS):\n"
+        '        assert time.monotonic() < deadline, f"barrier {name} timed out"\n'
+        '        time.sleep(0.05)\n'
+        '\n'
+        '\n'
+        'def test_every_worker_stamps_with_its_ambient_token():\n'
+        "    _barrier('snapshotted')\n"
+        '    _stamp(RELPATH, _provenance(os.environ[TOKEN_ENV]))\n'
+        "    _barrier('stamped')\n"
     )
 
 
@@ -1479,6 +1572,51 @@ class TestTheGuardAttributesTheStampEndToEnd:
         # The BASENAME, for the same wrapping reason as the sibling assertions
         # above: the failure must name the clock that was actually falsified.
         assert Path(_FM_RELPATH).name in combined, combined
+
+    def test_a_foreign_token_still_fails_the_run_and_names_a_concurrent_session(
+        self, tmp_path: Path,
+    ) -> None:
+        """The task 5282 ruling, driven through the real FIXTURE: a foreign
+        token is clarified, never downgraded, so the run still exits non-zero.
+        """
+        result = _nested_run(tmp_path, scenario='foreign_token')
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, (
+            'a stamp carrying another run\'s token left this run green — the '
+            f'foreign-token case was downgraded. output={combined!r}'
+        )
+        assert '1 passed' in combined, combined
+        assert 'falsified a REAL deploy clock' in combined, combined
+        assert _CONCURRENT_MARK in combined, combined
+
+    def test_every_xdist_worker_attributes_a_sibling_workers_stamp_to_this_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A sibling worker of the SAME run is this run, never a concurrent one.
+
+        ``--dist each`` sends the one test to both workers; the harness passes
+        no ``env=``, so the child inherits PYTEST_ADDOPTS. Measured on the
+        per-worker-token fixture (2026-10-03): one worker reported its own
+        token and the other a foreign one.
+        """
+        monkeypatch.setenv('PYTEST_ADDOPTS', '-n 2 --dist each')
+        result = run_nested_pytest(tmp_path / 'xdist', {
+            'conftest.py': binding_conftest(_GUARD_NAME),
+            'test_xdist_stamp.py': _xdist_test_source(),
+        })
+        combined = result.stdout + result.stderr
+
+        assert result.returncode != 0, combined
+        assert '2 passed' in combined, combined
+        assert '2 errors' in combined, (
+            f'both workers\' guards must fire. output={combined!r}'
+        )
+        assert 'falsified a REAL deploy clock' in combined, combined
+        assert _CONCURRENT_MARK not in combined, (
+            'a sibling xdist worker\'s stamp was reported as a concurrent '
+            f'session\'s. output={combined!r}'
+        )
 
 
 # The sibling that used to reach into THIS module for the marker helper. Named
