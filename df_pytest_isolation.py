@@ -297,7 +297,7 @@ import subprocess
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -673,6 +673,23 @@ CLOCK_PROVENANCE_SOURCE_KEY = 'source'
 CLOCK_PROVENANCE_SESSION_KEY = 'pytest_session'
 
 
+def run_session_token(workerinput: Mapping[str, object] | None) -> str:
+    """The deploy-clock token for this pytest RUN; never falsy.
+
+    xdist hands every worker of one run the same ``workerinput['testrunuid']``
+    (pytest-xdist ``workermanage``/``remote``), so the workers adopt it: with
+    per-worker tokens a sibling worker's stamp read as another session's (task
+    5282).  A plain or nested session has no *workerinput* and mints its own
+    ``uuid4().hex``, as does a worker whose uid is empty or not a ``str`` — an
+    empty token would make every test-spawned writer stamp ``''`` and read as a
+    real redeploy.
+    """
+    testrunuid = (workerinput or {}).get('testrunuid')
+    if isinstance(testrunuid, str) and testrunuid:
+        return testrunuid
+    return uuid.uuid4().hex
+
+
 class DeployClockRedeployWarning(UserWarning):
     """A REAL deploy stamped a protected clock while a test run was in flight.
 
@@ -890,7 +907,9 @@ def deploy_clock_change_report(
     ``$DF_PYTEST_SESSION_TOKEN`` to sentinels themselves, so both stamp one
     from INSIDE this run.  (3) Since task 5299's suite-wide redirect a foreign
     stamp needs a genuine spawner bug in some branch, so the innocent run's
-    cost is rare and a rerun clears it.  A cross-run token registry was
+    cost is rare and a rerun clears it.  Because every xdist worker of one run
+    shares one token (:func:`run_session_token`), "foreign" means a writer
+    outside this pytest invocation.  A cross-run token registry was
     rejected: it could tell a sibling run from a descendant, but it cannot
     guarantee the other run reaches teardown, which is what a downgrade needs.
 
@@ -1156,7 +1175,9 @@ def deploy_clock_violation_reason(
 
 
 @pytest.fixture(scope='session', autouse=True)
-def _df_deploy_clocks_unwritten(tmp_path_factory: pytest.TempPathFactory):
+def _df_deploy_clocks_unwritten(
+    tmp_path_factory: pytest.TempPathFactory, pytestconfig: pytest.Config,
+):
     """Fail the run if it falsified a REAL deploy clock in any guarded checkout.
 
     The roots come from :func:`deploy_clock_guard_roots`, seeded with
@@ -1169,7 +1190,8 @@ def _df_deploy_clocks_unwritten(tmp_path_factory: pytest.TempPathFactory):
     spawned it.  So the guard watches exactly the files a forgetful spawner would
     hit, in every checkout it could hit them in.
 
-    ATTRIBUTES rather than accuses: it stamps a fresh per-session token into
+    ATTRIBUTES rather than accuses: it stamps one token per pytest run, shared
+    by its xdist workers (:func:`run_session_token`), into
     :data:`PYTEST_SESSION_TOKEN_ENV` and hands it to
     :func:`deploy_clock_change_report` at teardown, which decides what a moved
     clock means — fail, or warn with :class:`DeployClockRedeployWarning` and
@@ -1238,7 +1260,7 @@ def _df_deploy_clocks_unwritten(tmp_path_factory: pytest.TempPathFactory):
     ``_df_git_ceiling_at_basetemp`` restores absence by deletion: an empty
     value is not "unset" to the shell scripts' ``${VAR:-…}`` defaults.
     """
-    token = uuid.uuid4().hex
+    token = run_session_token(getattr(pytestconfig, 'workerinput', None))
     prior = os.environ.get(PYTEST_SESSION_TOKEN_ENV)
     os.environ[PYTEST_SESSION_TOKEN_ENV] = token
     roots = deploy_clock_guard_roots(Path(__file__).resolve().parent)
