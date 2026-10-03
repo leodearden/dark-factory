@@ -1574,6 +1574,19 @@ class TestEvalLaneResolutionIsInert:
 
         assert not event.is_set()
 
+    @_EVAL_LANE_RECORDS
+    async def test_merge_halt_owner_is_still_unhalted(
+        self, harness: Harness, task_id: str, worktree: str | None,
+    ):
+        esc = _make_esc(task_id=task_id, worktree=worktree, status='resolved')
+        merge_worker = MagicMock()
+        merge_worker.is_halt_owner = MagicMock(side_effect=lambda esc_id: esc_id == esc.id)
+        harness._merge_worker = merge_worker
+
+        harness._on_escalation_resolved(esc)
+
+        merge_worker.unhalt_wip.assert_called_once_with()
+
     async def test_same_id_from_production_worktree_still_wakes(self, harness: Harness):
         event = asyncio.Event()
         harness._escalation_events['5383'] = event

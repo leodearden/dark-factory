@@ -15888,9 +15888,11 @@ class Harness:
     def _on_escalation_resolved(self, escalation) -> None:
         """Callback when an escalation is resolved — wake the waiting workflow.
 
-        An eval-lane record (``shared/src/shared/eval_lane.py``) wakes nothing
-        and changes no task status, because a numeric id filed from an eval
-        worktree names a production task it must not touch.
+        An eval-lane record (``shared/src/shared/eval_lane.py``) wakes no
+        workflow and dispatches no action, because a numeric id filed from an
+        eval worktree names a production task it must not touch.  The merge-halt
+        and scheduler-pause handlers key on the record's own identity, not its
+        task, so they still run.
         """
         # Increment for any status transition (resolved or dismissed) — both are
         # escalation events, and resolutions feed the digest GATE so that a
@@ -15903,15 +15905,8 @@ class Harness:
         # above; _maybe_write_digest snapshots it at entry to avoid double-skip drift.
         self._escalation_event_count += 1  # task 1327 AFK hardening
         eval_lane_reason = eval_lane_provenance(escalation.task_id, escalation.worktree)
-        if eval_lane_reason is not None:
-            logger.info(
-                'escalation %s is an eval-lane artifact (%s): no workflow wake and no '
-                'status effect on task %s',
-                escalation.id, eval_lane_reason, escalation.task_id,
-            )
-            return
         event = self._escalation_events.get(escalation.task_id)
-        if event:
+        if event and eval_lane_reason is None:
             event.set()
 
         # Un-halt the merge queue only when the escalation that OWNS the
@@ -15981,6 +15976,14 @@ class Harness:
         # The _SCHEDULER_PAUSE_SENTINEL is a synthetic task-id that has its own
         # dedicated auto-resume handling above and is not a real task; skip it.
         if escalation.task_id == self._SCHEDULER_PAUSE_SENTINEL:
+            return
+
+        if eval_lane_reason is not None:
+            logger.info(
+                'escalation %s is an eval-lane artifact (%s): no workflow wake and no '
+                'action dispatch on task %s',
+                escalation.id, eval_lane_reason, escalation.task_id,
+            )
             return
 
         action = self._resolve_escalation_action(escalation)
