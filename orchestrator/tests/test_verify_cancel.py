@@ -442,6 +442,148 @@ class TestCancelRequestReportsWhatItKilled:
 
 
 # ---------------------------------------------------------------------------
+# Task 5301: kill_process_tree — the snapshot -> walk -> SIGKILL -> killpg
+# algorithm shared by cancel_request and the boundary suite's kill_holder_tree
+# (orchestrator/tests/test_laptop_warm_verify_boundary.py::kill_holder_tree).
+# Every seam appends to ONE ordered event log, so ordering is asserted, not
+# merely membership.
+# ---------------------------------------------------------------------------
+
+
+class TestKillProcessTree:
+    """kill_process_tree contract with injected ppid_map_provider, kill, killpg spies."""
+
+    TREE = {200: 100, 201: 100, 300: 200, 999: 1}
+
+    def _run(self, root, ppid_map, *, backstop_pgid, kill_raises=None, killpg_raises=None):
+        """Run kill_process_tree with every seam logging to one ordered event list.
+
+        Events are ``('snapshot',)``, ``('kill', pid, sig)`` and
+        ``('killpg', pgid, sig)``.  *kill_raises* maps pid -> exception.
+        """
+        from orchestrator.verify_cancel import kill_process_tree
+
+        events: list[tuple] = []
+        kill_raises = kill_raises or {}
+
+        def provider():
+            events.append(('snapshot',))
+            return ppid_map
+
+        def kill(pid, sig):
+            events.append(('kill', pid, sig))
+            if pid in kill_raises:
+                raise kill_raises[pid]
+
+        def killpg(pgid, sig):
+            events.append(('killpg', pgid, sig))
+            if killpg_raises is not None:
+                raise killpg_raises
+
+        refused = kill_process_tree(
+            root,
+            backstop_pgid=backstop_pgid,
+            ppid_map_provider=provider,
+            kill=kill,
+            killpg=killpg,
+        )
+        return refused, events
+
+    @staticmethod
+    def _killed(events):
+        return [event[1] for event in events if event[0] == 'kill']
+
+    def test_snapshot_precedes_every_signal(self):
+        """(a) The /proc snapshot is the first event, taken exactly once."""
+        _, events = self._run(100, self.TREE, backstop_pgid=100)
+
+        assert events[0] == ('snapshot',), (
+            f'a signal preceded the ppid snapshot: {events} -- killing the '
+            f'root first reparents survivors and severs the /proc chain'
+        )
+        assert events.count(('snapshot',)) == 1
+
+    def test_sigkills_root_and_transitive_descendants_then_backstops_once(self):
+        """(b) Exactly the tree is SIGKILLed; the killpg backstop fires once, last."""
+        import signal
+
+        refused, events = self._run(100, self.TREE, backstop_pgid=100)
+
+        assert refused == frozenset()
+        killed = self._killed(events)
+        assert sorted(killed) == [100, 200, 201, 300], (
+            'every transitive descendant plus the root, each once, and never '
+            'the unrelated pid 999'
+        )
+        assert all(event[2] == signal.SIGKILL for event in events if event[0] == 'kill')
+        killpg_positions = [i for i, event in enumerate(events) if event[0] == 'killpg']
+        assert [events[i] for i in killpg_positions] == [('killpg', 100, signal.SIGKILL)]
+        last_kill = max(i for i, event in enumerate(events) if event[0] == 'kill')
+        assert killpg_positions[0] > last_kill, (
+            f'the killpg backstop must follow the per-pid sweep: {events}'
+        )
+
+    def test_no_backstop_pgid_skips_killpg_but_still_sweeps(self):
+        """(c) ``backstop_pgid=None`` never calls killpg; the per-pid sweep still runs."""
+        refused, events = self._run(100, self.TREE, backstop_pgid=None)
+
+        assert refused == frozenset()
+        assert [event for event in events if event[0] == 'killpg'] == []
+        assert sorted(self._killed(events)) == [100, 200, 201, 300]
+
+    def test_permission_refusals_are_returned_and_do_not_stop_the_sweep(self):
+        """(d) ProcessLookupError is success; PermissionError pids come back as a frozenset."""
+        refused, events = self._run(
+            100,
+            self.TREE,
+            backstop_pgid=100,
+            kill_raises={200: ProcessLookupError(), 201: PermissionError()},
+        )
+
+        assert isinstance(refused, frozenset)
+        assert refused == frozenset({201}), (
+            'only the live-but-unkillable pid is a refusal; an already-dead '
+            'pid counts as success'
+        )
+        assert sorted(self._killed(events)) == [100, 200, 201, 300], (
+            'a refusal must not abort the sweep -- every remaining target is '
+            'still signalled'
+        )
+
+    @pytest.mark.parametrize(
+        'killpg_exc', [OSError('group gone'), ProcessLookupError()], ids=['OSError', 'ProcessLookupError'],
+    )
+    def test_killpg_errors_are_suppressed_without_touching_the_result(self, killpg_exc):
+        """(e) A raising killpg backstop is suppressed; the refused set is unaffected."""
+        refused, events = self._run(
+            100,
+            self.TREE,
+            backstop_pgid=100,
+            kill_raises={201: PermissionError()},
+            killpg_raises=killpg_exc,
+        )
+
+        assert refused == frozenset({201})
+        assert [event[0] for event in events].count('killpg') == 1
+
+    def test_backstop_pgid_is_a_required_keyword(self):
+        """(f) Every caller must state its group-safety policy -- None included."""
+        import inspect
+
+        from orchestrator.verify_cancel import kill_process_tree
+
+        param = inspect.signature(kill_process_tree).parameters['backstop_pgid']
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is inspect.Parameter.empty
+
+        def declawed(*_args):
+            raise AssertionError('a call missing backstop_pgid must not signal anything')
+
+        with pytest.raises(TypeError):
+            kill_process_tree(100, ppid_map_provider=dict, kill=declawed, killpg=declawed)  # type: ignore[call-arg]
+
+
+# ---------------------------------------------------------------------------
 # Step-7: start_own_process_group — setsid + fallback
 # ---------------------------------------------------------------------------
 
