@@ -22,6 +22,7 @@ from _workflow_helpers import FakeMetadataBackend, wire_metadata_backend
 from orchestrator.artifacts import PLAN_SCHEMA_VERSION, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.scheduler import BlastRadiusResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
@@ -121,7 +122,9 @@ def _make(
     config.revalidation_skip_enabled = revalidation_skip_enabled
     config.max_revalidation_age_hours = max_revalidation_age_hours
 
-    handle_blast_radius_expansion = AsyncMock(return_value=blast_radius_grants)
+    handle_blast_radius_expansion = AsyncMock(
+        return_value=BlastRadiusResult(applied=blast_radius_grants),
+    )
     update_task = AsyncMock(return_value=True)
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock()

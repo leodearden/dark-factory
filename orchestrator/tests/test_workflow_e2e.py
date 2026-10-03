@@ -46,7 +46,7 @@ from orchestrator.config import (
 )
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import AdvanceOutcome, GitOps, _run
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.scheduler import BlastRadiusResult, TaskAssignment
 from orchestrator.verify import VerifyResult
 from orchestrator.workflow import (
     StewardBudgetExhausted,
@@ -1145,7 +1145,7 @@ class TestBlastRadiusExpansion:
                 # Can't acquire locks: re-pend like the real acquire-failure
                 # branch of scheduler.py::Scheduler.handle_blast_radius_expansion.
                 await self.set_task_status(task_id, 'pending')
-                return False
+                return BlastRadiusResult(applied=False)
 
         stub = ExpandingArchitectStub()
         deny_scheduler = DenyingScheduler()

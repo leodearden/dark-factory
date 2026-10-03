@@ -44,6 +44,7 @@ from orchestrator.mcp.verdict_tools import (
 from orchestrator.merge_lane import MergeLane
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import (
+    BlastRadiusResult,
     TaskAssignment,
     _reject_contradictory_metadata_mode,
 )
@@ -79,11 +80,10 @@ class FakeScheduler:
         self.heartbeats: dict[str, str | None] = {}
         # Scope-reconciliation choke point (task 2505): every call's
         # (current, needed, persist_files) is recorded here so tests can
-        # assert on what was persisted, and blast_radius_result configures
-        # the return value (default True == lock acquired successfully;
-        # tests force False to simulate a sibling lock conflict).
+        # assert on what was persisted, and blast_radius_result is the
+        # BlastRadiusResult every call reports (default: applied).
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
-        self.blast_radius_result: bool = True
+        self.blast_radius_result = BlastRadiusResult(applied=True)
         # Scope-grant direct metadata.files persist seam (task 2505, step-18):
         # every update_task(task_id, metadata) call is recorded here so the
         # same-module scope-grant persist path (which writes metadata.files
@@ -146,9 +146,15 @@ class FakeScheduler:
         /,
         *,
         persist_files: list[str] | None = None,
-    ) -> bool:
+    ) -> BlastRadiusResult:
+        """Report ``blast_radius_result``, writing the row the way
+        scheduler.py::Scheduler.handle_blast_radius_expansion does: a conflict
+        re-pends it, unless the result carries the error that write died of."""
         self.blast_radius_calls.append((current, needed, persist_files))
-        return self.blast_radius_result
+        result = self.blast_radius_result
+        if not result.applied and result.repend_error is None:
+            await self.set_task_status(task_id, 'pending')
+        return result
 
     async def get_status(self, task_id: str) -> str | None:
         history = self.statuses.get(task_id)
@@ -295,7 +301,7 @@ class FakeMetadataBackend:
         self.blob: dict = dict(initial or {})
         self.update_task_calls: list[dict] = []
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
-        self.blast_radius_result: bool = True
+        self.blast_radius_result = BlastRadiusResult(applied=True)
         # Matches the fixtures' config.lock_depth; only used to model
         # handle_blast_radius_expansion's no-op early return.
         self.lock_depth = lock_depth
@@ -355,7 +361,7 @@ class FakeMetadataBackend:
         /,
         *,
         persist_files: list[str] | None = None,
-    ) -> bool:
+    ) -> BlastRadiusResult:
         self.blast_radius_calls.append((current, needed, persist_files))
         depth = self.lock_depth
         if {normalize_lock(m, depth) for m in current} == {
@@ -363,7 +369,7 @@ class FakeMetadataBackend:
         }:
             # No-op early return (scheduler.py:6935): nothing acquired, nothing
             # released, nothing persisted.
-            return True
+            return BlastRadiusResult(applied=True)
         # Production persists metadata.files on BOTH the grant and the
         # lock-conflict/requeue branch — only the RETURN differs.  Gating the
         # persist on blast_radius_result would model the deny path wrongly.
@@ -396,13 +402,13 @@ def wire_metadata_backend(
     *seed* is the dispatch-time ``task['metadata']`` the workflow starts with in
     memory; the backend's blob is seeded from it (any value already on the blob
     wins) so backend and in-memory start consistent, as production does at
-    dispatch time.  *grants* sets ``blast_radius_result``.
+    dispatch time.  *grants* is ``blast_radius_result.applied``.
 
     Returns ``(handle_blast_radius_expansion, update_task)`` so a fixture can
     expose the same AsyncMocks it exposes in the un-wired case.
     """
     backend.blob = {**dict(seed), **backend.blob}
-    backend.blast_radius_result = grants
+    backend.blast_radius_result = BlastRadiusResult(applied=grants)
     handle_blast_radius_expansion = AsyncMock(
         side_effect=backend.handle_blast_radius_expansion,
     )

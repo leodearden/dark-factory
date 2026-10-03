@@ -33,6 +33,7 @@ from shared.task_claimant import compose_claimant_run_id
 import orchestrator.workflow as workflow_module
 from orchestrator.config import OrchestratorConfig
 from orchestrator.git_ops import WorktreeInfo
+from orchestrator.scheduler import BlastRadiusResult
 from orchestrator.task_ground_truth import ClaimantSource
 from orchestrator.workflow import TaskWorkflow
 
@@ -449,7 +450,9 @@ async def _acquire_plan_lock_via_workflow(wf: TaskWorkflow) -> None:
 
     assert wf.artifacts is not None
     wf.artifacts.write_plan({'steps': [{'id': 'step-1', 'type': 'impl'}], 'files': []})
-    wf._reconcile_scope_locks = AsyncMock(return_value=True)
+    wf._reconcile_scope_locks = AsyncMock(
+        return_value=BlastRadiusResult(applied=True),
+    )
     wf._stamp_optimistic_path = AsyncMock()
 
     outcome = await wf._apply_revalidation_skip({'files': []}, 'b' * 40)
