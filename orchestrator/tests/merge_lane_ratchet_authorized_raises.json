@@ -1591,6 +1591,60 @@
           "current": 31675
         }
       ]
+    },
+    {
+      "task_id": "5070",
+      "reason": "task 5070: trains retry a lost CAS through the shared re-verify gate (bounded CAS loop, _advance_train) instead of derailing; net-additive behaviour, not a failed refactor",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2135,
+          "current": 2144
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3489,
+          "current": 3493
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21556,
+          "current": 21674
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 1577,
+          "current": 1581
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12386,
+          "current": 12389
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4758,
+          "current": 4767
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56462,
+          "current": 56584
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31675,
+          "current": 31682
+        }
+      ]
     }
   ]
 }
