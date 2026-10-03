@@ -42,10 +42,13 @@
 # all down.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+case "${BASH_SOURCE[0]}" in */*) _self_dir="${BASH_SOURCE[0]%/*}" ;; *) _self_dir=. ;; esac
+_uv_lib="$_self_dir/lib/resolve_uv.sh"
 # shellcheck source=lib/resolve_uv.sh
-source "$REPO_ROOT/scripts/lib/resolve_uv.sh" || { echo "${0##*/}: ERROR: cannot load the shared uv resolver $REPO_ROOT/scripts/lib/resolve_uv.sh -- refusing to stop the fleet without a uv to rebuild it with." >&2; exit 127; }
+source "$_uv_lib" || { echo "${0##*/}: ERROR: cannot load the shared uv resolver $_uv_lib -- refusing to stop the fleet without a uv to rebuild it with." >&2; exit 127; }
 UV="$(require_uv_bin)" || exit $?
+
+REPO_ROOT="$(cd "$_self_dir/.." && pwd)"
 
 # Every committed scripts/orchestrator-*.service unit EXCEPT orchestrator-watchdog
 # (the probe, whose TIMER is stopped first and started last below). All of them run

@@ -334,7 +334,9 @@ def test_caller_finds_resolver_when_invoked_by_bare_name(tmp_path, relpath):
 
     result = _run_caller([BASH, copied.name], cwd=copied.parent, tmp_path=tmp_path)
 
+    assert result.returncode != 0, _diag(result)
     assert STUB_MARKER in result.stderr, _diag(result)
+    assert _systemctl_calls(tmp_path) == "", _diag(result)
 
 
 @pytest.mark.parametrize("relpath", CALLERS)
