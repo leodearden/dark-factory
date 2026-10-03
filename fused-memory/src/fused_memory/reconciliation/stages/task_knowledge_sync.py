@@ -4801,6 +4801,25 @@ For cross-project routing see "Known Projects" above.
         """
         return await render_live_workflow_section(filtered.active_tasks, self.scope.project_root)
 
+    async def _render_required_sections(self, filtered: FilteredTaskTree) -> str:
+        """Render every inference-bearing payload section for *filtered*, in registry order.
+
+        Every Stage-2 payload builder MUST interpolate this — enforced
+        structurally by
+        ``tests/reconciliation/test_stage2_payload_section_parity.py``. See
+        :attr:`REQUIRED_SECTIONS` for which sections qualify.
+
+        Renderers receive the payload's resolved *filtered* tree, because
+        :meth:`assemble_payload` may self-fetch it rather than use the
+        harness-injected attribute. Each renderer keeps its own
+        conditional-empty contract, so ``''`` is a normal result and no
+        separator is added. The sections render on remediation passes too: the
+        harness sets the tree there as well.
+        """
+        return ''.join(
+            [await getattr(self, section.renderer)(filtered) for section in self.REQUIRED_SECTIONS]
+        )
+
     @staticmethod
     def _warn_if_count_tasks_mismatch(
         count: int,
