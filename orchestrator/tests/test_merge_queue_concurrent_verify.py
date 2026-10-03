@@ -254,7 +254,7 @@ async def _stop_worker(
     second one. It is also why this wait is exempt from the shared
     ``wall-clock-deadline`` rule
     (fused-memory/scripts/check_bare_magicmock_config.py): its target is a
-    bare Name, not a ``.result`` future or a ``gate*.wait()`` barrier, so the
+    bare Name, not a ``.result`` future or a zero-argument ``.wait()`` barrier, so the
     exemption is structural rather than a listed name. It is still a real
     wait, so ``_call_wait_budget`` bills its *join_timeout*.
     """
@@ -7472,7 +7472,7 @@ class TestTimeoutMarkOffenders:
 # ---------------------------------------------------------------------------
 #
 # RELATED, BUT ENFORCED ELSEWHERE (task 4246): the SHAPE of a load-bearing wait
-# — a `MergeRequest.result` future or a `gate*.wait()` barrier reached through a
+# — a `MergeRequest.result` future or a zero-argument `.wait()` barrier reached through a
 # bare `asyncio.wait_for(...)`, or carrying a raw numeric `timeout=` literal —
 # is now checked repo-wide by rule `wall-clock-deadline` in
 # fused-memory/scripts/check_bare_magicmock_config.py, run by the seven package
