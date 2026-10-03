@@ -282,8 +282,21 @@ def extract_batch_plan_task_ids(text: str) -> set[int]:
 # references; audit_duplicate_memories' untasked-snapshot accounting depends on
 # it. The trailing '\b' on the digit group is what stops 'task/339' being read
 # out of 'task/3399'.
+#
+# The bare '#' arm refuses a '#' preceded by a foreign-number cue word ('PR
+# #4521', 'issue #123', 'MR #7') and a '#' attached to a word or path
+# ('PR#4521', 'owner/repo#12', 'dark_factory#2748'), task 4853. A PR, issue or
+# GitHub number is never a task id, and 'project#N' belongs to consumers that
+# know the project registry. Python lookbehinds must be fixed-width, so one
+# pair is generated per cue in _FOREIGN_NUMBER_CUES. Residual: in a coordinated
+# list ('PRs #1 and #2') only the first number is excluded.
+_FOREIGN_NUMBER_CUES: tuple[str, ...] = (
+    'pr', 'prs', 'pull', 'request', 'issue', 'issues', 'gh', 'mr',
+)
 TASK_REF_RE: re.Pattern[str] = re.compile(
-    r'(?:\btask\b|\bdf\b|#)\s*[#/]?\s*(\d+)\b',
+    r'(?:\btask\b|\bdf\b|(?<![\w/])'
+    + ''.join(rf'(?<!\b{cue})(?<!\b{cue}\s)' for cue in _FOREIGN_NUMBER_CUES)
+    + r'#)\s*[#/]?\s*(\d+)\b',
     re.IGNORECASE,
 )
 

@@ -196,11 +196,13 @@ _PROJECT_QUALIFIER_RE: re.Pattern[str] = re.compile(
 )
 
 # The `<project_id>:<task_id>` external-dependency spelling used throughout
-# task metadata. TASK_REF_RE cannot see it (no task/df/# cue), and it is only
-# ever accepted for a REGISTERED project, which is what keeps it from firing on
-# an unrelated "label:1234" or a "host:8080".
+# task metadata, and its GitHub-style `<project_id>#<task_id>` sibling
+# ('dark_factory#2748'). TASK_REF_RE cannot see either (it refuses a
+# word-attached '#'), and both are only ever accepted for a REGISTERED project,
+# which is what keeps them from firing on an unrelated "label:1234", a
+# "host:8080" or an "owner/repo#12".
 _EXTERNAL_TASK_REF_RE: re.Pattern[str] = re.compile(
-    r'\b([A-Za-z][A-Za-z0-9_-]*):(\d+)\b'
+    r'\b([A-Za-z][A-Za-z0-9_-]*)[:#](\d+)\b'
 )
 
 APPLIED_WORK_RE: re.Pattern[str] = re.compile(
