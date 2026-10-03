@@ -8744,7 +8744,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     depth-1 behaviour byte-identically.
     """
 
-    MAX_CAS_RETRIES = 5
+    MAX_CAS_RETRIES: int = 5
     # After this many consecutive post-merge verify TIMEOUTS for the same
     # task, the merge queue stops trying and returns an 'abandoned' blocked
     # outcome.  Kept as a class attribute so tests can monkeypatch it.
