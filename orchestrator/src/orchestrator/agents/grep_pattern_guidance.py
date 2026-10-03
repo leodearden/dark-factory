@@ -9,8 +9,9 @@ A character meant literally can be syntax to the shell (backticks and `$`
 inside double quotes) or to the regex engine (an unescaped paren), and either
 layer fails before anything is searched.
 
-The prose is machine-checked by the `test_roles_*` modules, which scan every
-role prompt.
+`orchestrator/tests/test_roles_grep_pattern_escaping.py` checks the block's
+shape and its splice (carrier roles, count, order after
+`GREP_LOOKAROUND_GUIDANCE`), never its wording.
 """
 
 GREP_PATTERN_ESCAPING_GUIDANCE = """
