@@ -771,15 +771,11 @@ def resolve_judge_reasoning_effort(memory_service: Any) -> str | None:
 #: verdict: a truncated answer is unparseable, i.e. a counted fail-open.
 _JUDGE_MAX_TOKENS = 128
 
-#: The Responses API's ``max_output_tokens``, which bounds reasoning PLUS the
-#: answer, so it is a different dimension from :data:`_JUDGE_MAX_TOKENS`.
-#: Measured 2026-09-30 over 3,669 Responses calls, the largest output was 1,161
-#: tokens (gpt-6-luna at medium effort); gpt-6.1-sol at low peaked at 168 and
-#: every low-effort arm at 476. 2,048 is ~1.8x the largest measured and ~4x any
-#: low-effort arm. Exhaustion is a counted fail-open naming its reason, never a
-#: wrong verdict, and a pathological answer that reaches the cap costs about
-#: USD 0.02 at gpt-6.1-sol list price. See plans/write-triage-flip-readiness-prd.md
-#: §11.
+#: The Responses API's ``max_output_tokens``. It bounds reasoning PLUS the
+#: answer, a different dimension from :data:`_JUDGE_MAX_TOKENS`. Exhausting it
+#: is a counted fail-open naming its reason, never a wrong verdict. The arms it
+#: must fit are the frontier judge arms of
+#: plans/write-triage-flip-readiness-prd.md §11.
 _JUDGE_MAX_OUTPUT_TOKENS = 2_048
 
 
@@ -875,64 +871,27 @@ async def _call_llm(
 ) -> _JudgeReply:
     """One single-turn call to *provider*: the raw response text and its usage.
 
-    Three arms behind one dispatch. NATIVE OPENAI — an endpoint that serves the
-    Responses API, per :class:`_ProviderCredentials` — posts
-    ``responses.create``: the system prompt as ``instructions=``, the user turn
-    as ``input=``, a JSON-object text format so that arm's happy path is the
-    parser's, :data:`_JUDGE_MAX_OUTPUT_TOKENS`, and ``reasoning={'effort': …}``
-    only when ``write_triage.judge_reasoning_effort`` is set, in place of
-    ``temperature=0.0`` (reasoning models reject a temperature).
+    Dispatches on what the endpoint declares it serves
+    (:class:`_ProviderCredentials`), never on the model name. Two
+    configurations RAISE instead of falling back, before any client is built:
+    an unrecognised *provider* (picking an arm would bill an account the
+    operator never chose), and a set *reasoning_effort* on an arm that cannot
+    send it (dropping it would let the operator believe the selected
+    configuration runs, INV-11). Unlike :func:`resolve_judge_provider`, which
+    runs where C1 forbids raising, these raises land inside ``triage_write``'s
+    fail-open arm, so each is counted and logged.
 
-    An OPENAI-COMPATIBLE endpoint (``llm.client_class: openai_generic`` —
-    llama.cpp, vLLM, LM Studio) serves chat.completions only, so it keeps the
-    chat request unchanged: ``temperature=0.0``, :data:`_JUDGE_MAX_TOKENS` and
-    ``response_format`` json_object (task 5277 C owns its compat 400s). Which
-    OpenAI arm runs is decided by that capability flag, never by the model
-    name. The ANTHROPIC arm is unchanged too: ``temperature=0.0``, because
-    Anthropic's default is 1.0 and sampling a closed-vocabulary classifier
-    buys nothing but parse failures, and the system prompt via ``system=``,
-    because Anthropic has no system ROLE.
+    Each arm builds and closes its client PER CALL. A cached client would pin
+    a stale ``api_key``/``api_url`` past a hot reload, turning a green-tier
+    knob into a restart-only one. ``async with`` around ``asyncio.wait_for``
+    closes the connection pool even when a timeout cancels the request, which
+    matters because neither SDK client defines ``__del__``. The lost
+    connection reuse is a deliberate trade.
 
-    A set *reasoning_effort* on an arm that cannot send it RAISES before any
-    client is built. Silently dropping it would let the operator believe the
-    selected configuration is running when it is not (INV-11). Like the
-    unknown-provider raise, it lands in ``triage_write``'s fail-open arm, so it
-    is counted and logged naming the leaf to fix.
-
-    The client is constructed PER CALL and deliberately not cached on a module
-    global. ``add_memory`` is served by one long-lived server process, and a
-    cached client keyed to a config that hot-reloads would pin a stale
-    ``model``/``api_url`` past a reload that the operator was told had
-    applied — silently converting a green-tier knob into a restart-only one.
-    Constructing here means a hot-reloaded ``api_key``/``api_url`` takes
-    effect on the very next call.
-
-    It is also CLOSED per call, via ``async with``. Neither SDK client
-    defines ``__del__`` (measured: openai 2.31.0, anthropic 0.92.0), so an
-    unclosed one abandons an ``httpx`` connection pool to the garbage
-    collector on every triaged write. The ``asyncio.wait_for`` sits INSIDE
-    the context deliberately: a timeout cancels the in-flight request, and a
-    close written after the awaited call would never run — leaking precisely
-    when the provider is slow and writes are piling up.
-
-    The remaining cost is the lost connection reuse: ~100–300ms of TCP+TLS
-    handshake per call, on the synchronous write path. That is a deliberate
-    trade — correctness of the hot-reload contract over latency — and is
-    recorded as a follow-up rather than resolved with a cache here.
-
-    ``async with`` is NOT an exception handler and must not become one: it
-    swallows nothing, so the no-``try``/``except`` property below still
-    holds exactly.
-
-    NO ``try``/``except`` ANYWHERE. Every failure propagates to
-    ``triage_write``'s ``except`` arm (write_triage.py:835), which logs with
-    ``exc_info``, counts exactly one fail-open, and returns ``stored``.
-
-    An unrecognised *provider* RAISES rather than falling back to a default.
-    That is the opposite of :func:`resolve_judge_provider`'s behaviour, and
-    deliberately so: the resolver runs on the write path where C1 forbids
-    raising, whereas this raise lands INSIDE the fail-open arm. Silently
-    picking an arm here would bill an account the operator never chose.
+    NO ``try``/``except`` anywhere, and ``async with`` swallows nothing: every
+    failure propagates to ``write_triage.py::triage_write``'s ``except`` arm,
+    which logs with ``exc_info``, counts exactly one fail-open and returns
+    ``stored``.
     """
     if provider not in _KNOWN_PROVIDERS:
         raise ValueError(
@@ -1017,7 +976,11 @@ async def _call_openai_responses(
 async def _call_openai_chat(
     creds: _ProviderCredentials, *, model: str, prompt: str, timeout: float,
 ) -> _JudgeReply:
-    """An OpenAI-compatible endpoint that serves chat.completions only."""
+    """An OpenAI-compatible endpoint that serves chat.completions only.
+
+    ``llm.client_class: openai_generic`` (llama.cpp, vLLM, LM Studio). Its
+    compat 400s are task 5277 C's.
+    """
     import openai  # noqa: PLC0415 — per-call import, matching judge.py
 
     async with openai.AsyncOpenAI(**creds.client_kwargs) as client:
@@ -1048,7 +1011,11 @@ async def _call_openai_chat(
 async def _call_anthropic(
     creds: _ProviderCredentials, *, model: str, prompt: str, timeout: float,
 ) -> _JudgeReply:
-    """The anthropic Messages API."""
+    """The anthropic Messages API.
+
+    ``temperature=0.0`` because Anthropic's default is 1.0, and the system
+    prompt via ``system=`` because Anthropic has no system role.
+    """
     import anthropic  # noqa: PLC0415 — per-call import, matching judge.py
 
     async with anthropic.AsyncAnthropic(**creds.client_kwargs) as client:
