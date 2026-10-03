@@ -5442,6 +5442,7 @@ class _TrainMergeHost(Protocol):
     MAX_POST_MERGE_VERIFY_TIMEOUTS: int
     MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES: int
     MAX_POST_MERGE_VERIFY_NARROWED_RETRIES: int
+    MAX_CAS_RETRIES: int
 
     # ── WIP halt / abandon helpers ────────────────────────────────────────
     def halt_for_wip(self, reason: str) -> None: ...
@@ -6632,6 +6633,163 @@ async def reconcile_landed_outbox(
     return report
 
 
+def _derail_on_train_verify_failure(
+    event_store: EventStore | None,
+    req: GroupMergeRequest,
+    verify_outcome: MergeOutcome,
+    *,
+    started_monotonic: float,
+    emit_kwargs: dict,
+) -> MergeOutcome:
+    """Derail the train on a red verify of its tree, the first verify or a re-verify alike.
+
+    A structured red (non-empty ``failure_category``) that is not a red bare
+    main (``MAIN_HEALTH_RED_REASON_PREFIX``) may be a cross-member
+    interaction rather than one broken member, so its reason is tagged with
+    ``TRAIN_VERIFY_FAILED_REASON_PREFIX`` for δ attribution.  Rebase-conflict,
+    disk-guard, transient-infra and unscoped-pyright reds carry no
+    ``failure_category`` and stay untagged.
+    """
+    reason = verify_outcome.reason
+    if (
+        verify_outcome.failure_category != ''
+        and not reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX)
+    ):
+        logger.info(
+            'Train %s: verify gate interaction-candidate — tagging reason for δ attribution',
+            req.train_id,
+        )
+        reason = f'{TRAIN_VERIFY_FAILED_REASON_PREFIX}: {reason}'
+        verify_outcome = MergeOutcome(
+            verify_outcome.status,
+            reason=reason,
+            failure_category=verify_outcome.failure_category,
+            failure_cause_hint=verify_outcome.failure_cause_hint,
+        )
+    logger.info('Train %s: verify gate blocked: %s', req.train_id, reason)
+    _emit_train_event(
+        event_store, EventType.train_derailed,
+        task_id=req.task_id, train_id=req.train_id,
+        member_task_ids=req.member_task_ids,
+        data={'derail_reason': reason},
+    )
+    _emit_merge_attempt(
+        event_store, req.task_id, OutcomeKind.verify_failed,
+        duration_ms=_elapsed_ms(started_monotonic), **emit_kwargs,
+    )
+    return verify_outcome
+
+
+@dataclasses.dataclass(frozen=True)
+class _TrainAdvance:
+    """How a train's CAS loop (:func:`_advance_train`) ended."""
+
+    advance: AdvanceOutcome
+    """The outcome ``_do_train_merge``'s landing / failure mapping consumes."""
+    landing_base: str
+    """The main the candidate tree sits on: the expected main of the final
+    advance, or the main a gate-cleared rebase was rebased onto."""
+    reverify_failure: MergeOutcome | None = None
+    """The red re-verify of a rebased tip, which ends the loop without landing."""
+
+    def __post_init__(self) -> None:
+        if self.reverify_failure is not None and self.advance.result != 'rebased_pending_reverify':
+            raise ValueError(
+                f'a re-verify failure only follows a rebased_pending_reverify '
+                f'advance, not {self.advance.result!r}'
+            )
+
+
+def _rebased_tip(adv: AdvanceOutcome, task_id: str) -> tuple[str, str]:
+    """``(rebased sha, main it was rebased onto)`` of a ``'rebased_pending_reverify'`` advance."""
+    if adv.advanced_sha is None or adv.rebased_onto is None:
+        raise AssertionError(
+            f'advance_main returned rebased_pending_reverify '
+            f'without SHA fields (task {task_id})'
+        )
+    return adv.advanced_sha, adv.rebased_onto
+
+
+async def _advance_train(
+    worker: _TrainMergeHost,
+    req: GroupMergeRequest,
+    *,
+    merge_commit: str,
+    merge_wt: Path,
+    main_sha: str,
+    branch_tip_sha: str | None,
+    train_verify: Callable[..., Awaitable[MergeOutcome | None]],
+    started_monotonic: float,
+    emit_kwargs: dict,
+) -> _TrainAdvance:
+    """CAS-advance main to the train's verified tree, re-verifying it whenever main moved.
+
+    Every pass journals the candidate write-ahead (so the LandedRow always
+    names the sha about to land) and advances with ``reverify_on_rebase=True``,
+    so ``advance_main`` never lands a tree it rebased itself: it parks the
+    rebase in *merge_wt* and returns ``'rebased_pending_reverify'``.  The
+    rebased tip then goes through :func:`gates._reverify_rebased_tree`, the
+    gate the single-branch CAS loop uses, against the main delta since
+    ``candidate_base`` — the oldest main the candidate's verification is
+    anchored to.  A cleared gate makes the rebased tip the next candidate,
+    sitting on the main it was rebased onto; a red re-verify ends the loop.
+    After ``worker.MAX_CAS_RETRIES`` retries the loop gives up as
+    ``'cas_failed'``.
+    """
+    git_ops = worker._git_ops
+    candidate = merge_commit
+    candidate_base = expected_main = main_sha
+    retries = 0
+    while True:
+        adv = await _journal_landed_then_advance(
+            getattr(worker, '_landed_outbox', None), git_ops,
+            task_id=req.task_id,
+            branch_tip_sha=branch_tip_sha,
+            advanced_sha=candidate,
+            merge_wt=merge_wt,
+            branch=req.branch.full_name,
+            max_attempts=req.config.max_advance_attempts,
+            expected_main=expected_main,
+            reverify_on_rebase=True,
+        )
+        if adv.result != 'rebased_pending_reverify':
+            return _TrainAdvance(adv, landing_base=expected_main)
+        if retries >= worker.MAX_CAS_RETRIES:
+            _emit_merge_attempt(
+                worker._event_store, req.task_id, OutcomeKind.cas_exhausted,
+                attempt=retries + 1, duration_ms=_elapsed_ms(started_monotonic),
+                **emit_kwargs,
+            )
+            return _TrainAdvance(AdvanceOutcome('cas_failed'), landing_base=expected_main)
+        retries += 1
+        rebased_sha, rebased_onto = _rebased_tip(adv, req.task_id)
+        gate = await _reverify_rebased_tree(
+            git_ops, req, merge_wt,
+            rebased_from=candidate_base,
+            rebased_onto=rebased_onto,
+            timeouts=worker._post_merge_verify_timeouts,
+            enospc_retries=worker._post_merge_verify_enospc_retries,
+            max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+            max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
+            merge_sha=rebased_sha,
+            run_post_merge_verify=train_verify,
+        )
+        if gate is not None:
+            return _TrainAdvance(adv, landing_base=candidate_base, reverify_failure=gate)
+        candidate = rebased_sha
+        candidate_base = expected_main = rebased_onto
+        logger.info(
+            'Train %s: rebased tip %s cleared the re-verify gate; advancing '
+            '(retry %d/%d)',
+            req.train_id, rebased_sha[:8], retries, worker.MAX_CAS_RETRIES,
+        )
+        _emit_merge_attempt(
+            worker._event_store, req.task_id, OutcomeKind.gate_retry,
+            attempt=retries, duration_ms=_elapsed_ms(started_monotonic),
+            **emit_kwargs,
+        )
+
+
 async def _do_train_merge(
     worker: _TrainMergeHost,
     req: GroupMergeRequest,
@@ -6888,8 +7046,8 @@ async def _do_train_merge(
     # builds for role='merge': merge_verify_breadth=='full' fans out to
     # every REGISTERED module's full suite per-module; =='scoped' (the
     # shipped default) stays the pre-λ opaque global workspace command.
-    verify_outcome = await _run_post_merge_verify(
-        git_ops, req, merge_wt,
+    train_verify = functools.partial(
+        _run_post_merge_verify,
         timeouts=worker._post_merge_verify_timeouts,
         enospc_retries=worker._post_merge_verify_enospc_retries,
         max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
@@ -6897,50 +7055,17 @@ async def _do_train_merge(
         max_narrowed=worker.MAX_POST_MERGE_VERIFY_NARROWED_RETRIES,
         narrowed_retries=worker._post_merge_verify_narrowed_retries,
         event_store=event_store,
-        merge_sha=merge_commit,
         escalation_queue=getattr(worker, '_escalation_queue', None),
         task_client=getattr(worker, '_flake_task_client', None),
     )
+    verify_outcome = await train_verify(git_ops, req, merge_wt, merge_sha=merge_commit)
     if verify_outcome is not None:
-        reason = verify_outcome.reason
-        # Tag the reason with TRAIN_VERIFY_FAILED_REASON_PREFIX when this is an
-        # "interaction candidate" — a structured verify-red that could be caused
-        # by a cross-member interaction rather than a single broken member.
-        # Conditions: failure_category is non-empty (structured failure) AND the
-        # reason does NOT already start with MAIN_HEALTH_RED_REASON_PREFIX (which
-        # indicates a pre-existing break on bare main, not an interaction).
-        # Rebase-conflict, disk-guard, transient-infra, and unscoped-pyright
-        # failures all leave failure_category='' and therefore are NOT tagged.
-        _is_interaction_candidate = (
-            verify_outcome.failure_category != ''
-            and not reason.startswith(MAIN_HEALTH_RED_REASON_PREFIX)
+        return _derail_on_train_verify_failure(
+            event_store, req, verify_outcome,
+            started_monotonic=t0, emit_kwargs=_train_emit_kwargs,
         )
-        if _is_interaction_candidate:
-            tagged_reason = f'{TRAIN_VERIFY_FAILED_REASON_PREFIX}: {reason}'
-            logger.info(
-                'Train %s: verify gate interaction-candidate — tagging reason for δ attribution',
-                req.train_id,
-            )
-            verify_outcome = MergeOutcome(
-                verify_outcome.status,
-                reason=tagged_reason,
-                failure_category=verify_outcome.failure_category,
-                failure_cause_hint=verify_outcome.failure_cause_hint,
-            )
-            reason = tagged_reason
-        logger.info('Train %s: verify gate blocked: %s', req.train_id, reason)
-        _emit_train_event(
-            event_store, EventType.train_derailed,
-            task_id=req.task_id, train_id=req.train_id,
-            member_task_ids=req.member_task_ids,
-            data={'derail_reason': reason},
-        )
-        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.verify_failed, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
-        return verify_outcome
 
     # (f) CAS-advance main.
-    # Write-ahead (PRD WA-1): record a LandedRow into the durable outbox
-    # BEFORE advancing main — single-sourced via the shared helper (task β).
     # branch_tip_sha is best-effort (resolve_branch_sha returns str | None;
     # _do_train_merge has no MergedOk.branch_tip like the single-branch path).
     # Performance (amendment, task 2154): this costs one extra git subprocess
@@ -6951,45 +7076,23 @@ async def _do_train_merge(
     # result; see git_ops.py:368). The resolve is therefore an accepted,
     # intentional best-effort cost rather than a deferred TODO.
     _train_branch_tip = await git_ops.resolve_branch_sha(req.branch.full_name)
-    adv_outcome = await _journal_landed_then_advance(
-        getattr(worker, '_landed_outbox', None), git_ops,
-        task_id=req.task_id,
-        branch_tip_sha=_train_branch_tip,
-        advanced_sha=merge_commit,
+    train_advance = await _advance_train(
+        worker, req,
+        merge_commit=merge_commit,
         merge_wt=merge_wt,
-        branch=req.branch.full_name,
-        max_attempts=req.config.max_advance_attempts,
-        expected_main=main_sha,
+        main_sha=main_sha,
+        branch_tip_sha=_train_branch_tip,
+        train_verify=train_verify,
+        started_monotonic=t0,
+        emit_kwargs=_train_emit_kwargs,
     )
+    if train_advance.reverify_failure is not None:
+        return _derail_on_train_verify_failure(
+            event_store, req, train_advance.reverify_failure,
+            started_monotonic=t0, emit_kwargs=_train_emit_kwargs,
+        )
+    adv_outcome = train_advance.advance
     adv = adv_outcome.result
-
-    # Correctness (amendment, task 2154): the train call does not pass
-    # reverify_on_rebase=True (unlike the single-branch site), so
-    # advance_main's OWN internal CAS-retry loop can transparently rebase
-    # merge_commit onto a moved main and land the REBASED sha directly,
-    # returning 'advanced' with advanced_sha != the pre-advance merge_commit
-    # journaled above. There is no caller-level rebased_pending_reverify
-    # branch here to re-record from (that only exists in _finalize_inflight's
-    # while-loop), so re-record now whenever the landed sha differs from what
-    # was journaled write-ahead — the row's advanced_sha must always match
-    # what actually landed on main. LandedOutbox is keyed by task_id ALONE
-    # (last-write-wins — see landed_outbox.py's class docstring), so this
-    # re-record OVERWRITES the write-ahead row in place rather than adding a
-    # second (task_id, advanced_sha) entry; any consumer reading the row
-    # after this point sees the landed sha.
-    if (
-        adv == 'advanced'
-        and adv_outcome.advanced_sha is not None
-        and adv_outcome.advanced_sha != merge_commit
-    ):
-        _train_outbox = getattr(worker, '_landed_outbox', None)
-        if _train_outbox is not None:
-            _train_outbox.record(LandedRow(
-                task_id=req.task_id,
-                branch_tip_sha=_train_branch_tip or '',
-                advanced_sha=adv_outcome.advanced_sha,
-                landed_at=time.time(),
-            ))
 
     await git_ops.cleanup_merge_worktree(merge_wt)
 
@@ -7048,7 +7151,7 @@ async def _do_train_merge(
     outcome = await _finalize_advanced_merge(
         git_ops, req, event_store,
         merge_commit_fallback=merge_commit,
-        base_sha=main_sha,
+        base_sha=train_advance.landing_base,
         started_monotonic=t0,
         cas_retries=worker._cas_retries,
         timeouts=worker._post_merge_verify_timeouts,
@@ -7080,7 +7183,7 @@ async def _do_train_merge(
         event_store, EventType.train_merged,
         task_id=req.task_id, train_id=req.train_id,
         member_task_ids=req.member_task_ids,
-        data={'merge_commit_sha': advanced_sha, 'base_sha': main_sha},
+        data={'merge_commit_sha': advanced_sha, 'base_sha': train_advance.landing_base},
     )
 
     # (g) Flip all members done — ONLY after advance + finalize succeed.

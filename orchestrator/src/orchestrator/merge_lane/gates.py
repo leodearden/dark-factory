@@ -3319,8 +3319,12 @@ async def _reverify_rebased_tree(
 ) -> MergeOutcome | None:
     """Shared gate for the disjoint-delta re-verify check.
 
-    Called by the SpeculativeMergeWorker CAS loop after
-    ``advance_main`` returns ``'rebased_pending_reverify'``.
+    Called by both CAS loops after ``advance_main`` returns
+    ``'rebased_pending_reverify'``: ``SpeculativeMergeWorker._finalize_inflight``
+    and ``worker.py::_advance_train``.  For a train's ``GroupMergeRequest``,
+    ``req.worktree`` is the TIP's worktree, whose stacked history carries
+    every member's commits, so the branch-touched set is the train's union
+    footprint, not the tip member's own diff.
 
     Algorithm
     ---------
