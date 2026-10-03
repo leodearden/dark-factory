@@ -29,7 +29,6 @@ from _merge_lane_fakes import (
     hangs_until,
     lane_scene_config,
     main_health_probe_spawned,
-    passes,
 )
 from _orch_helpers import make_placeholder_future, wait_responsive
 
@@ -171,6 +170,32 @@ async def _wait_for_finalizing_head(
     pytest.fail(
         f'{req.request_id} never reached the finalize-head verifying state; '
         f'store contents: {store.load()!r}'
+    )
+
+
+async def _wait_for_speculative_head(
+    worker: SpeculativeMergeWorker, req: MergeRequest,
+) -> None:
+    """Poll until *req* is merged speculatively and parked awaiting verify,
+    holding the verifier side's one speculation permit.
+
+    Bounded by REAL_GIT_MERGE_RESULT_TIMEOUT: reaching this state takes two
+    real-git merges (the request ahead, then *req* on top of it).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + REAL_GIT_MERGE_RESULT_TIMEOUT
+    while loop.time() < deadline:
+        snap = worker.snapshot()
+        states = {e['task_id']: e['state'] for e in snap['entries']}
+        if (
+            states.get(req.task_id) == 'awaiting_verify'
+            and snap['speculation']['inflight_speculative'] == 1
+        ):
+            return
+        await asyncio.sleep(0.05)
+    pytest.fail(
+        f'{req.task_id} was never merged speculatively behind the request '
+        f'ahead of it: {worker.snapshot()!r}'
     )
 
 
@@ -809,7 +834,7 @@ async def test_stop_releases_finalizing_head_worktree_host_slot_and_speculation_
     gate_ahead = asyncio.Event()
     block_head = asyncio.Event()
     verifier = FakeVerifier(scripts={
-        ahead.task_id: dataclasses.replace(passes(), release=gate_ahead),
+        ahead.task_id: hangs_until(gate_ahead),
         head.task_id: hangs_until(block_head),
     })
 
@@ -820,20 +845,7 @@ async def test_stop_releases_finalizing_head_worktree_host_slot_and_speculation_
     await queue.put(head)
 
     try:
-        for _ in range(200):
-            snap = worker.snapshot()
-            states = {e['task_id']: e['state'] for e in snap['entries']}
-            if (
-                states.get(head.task_id) == 'awaiting_verify'
-                and snap['speculation']['inflight_speculative'] == 1
-            ):
-                break
-            await asyncio.sleep(0.05)
-        else:
-            pytest.fail(
-                f'the head was never merged speculatively behind the gated '
-                f'request: {worker.snapshot()!r}'
-            )
+        await _wait_for_speculative_head(worker, head)
 
         gate_ahead.set()
         outcome = await wait_responsive(
@@ -847,9 +859,15 @@ async def test_stop_releases_finalizing_head_worktree_host_slot_and_speculation_
         )
         await _wait_for_finalizing_head(worker, store, head)
 
-        snap = worker.snapshot()
-        head_merge_wt = Path(snap['entries'][0]['worktree']).resolve()
-        host = snap['entries'][0]['host']
+        head_entry = next(
+            (e for e in worker.snapshot()['entries'] if e['task_id'] == head.task_id),
+            None,
+        )
+        assert head_entry is not None and head_entry['host'] is not None, (
+            f'the verifying finalize head must be listed with a host: {head_entry!r}'
+        )
+        head_merge_wt = Path(head_entry['worktree']).resolve()
+        host = head_entry['host']
 
         assert _finalize_head_holdings(worker, head_merge_wt, host) == {
             'worktree_on_disk': True,
