@@ -25,6 +25,15 @@ within days:
      done", and why it is nonetheless a site: it shows a human the same
      verdict the other five act on.
 
+Task 4704 routed ``orchestrator/src/orchestrator/workflow.py``'s four
+``found_on_main`` writers through the family as well: the three recovery
+guards (``TaskWorkflow._recover_if_already_merged``,
+``TaskWorkflow._recover_before_execute`` and
+``TaskWorkflow._recover_before_merge``) call :func:`validate_landing_evidence`
+in DISCOVERY mode, and the architect ``already_done`` writer
+(``TaskWorkflow._handle_already_done_report``) calls
+:func:`validate_reported_landing`, the family's third mode.
+
 Prior to task 2678 each site inlined its own subset of two primitives landed
 by task 2675 (dep δ): ``git_ops.find_task_citation_commit`` (FIX 2,
 subject-anchored citation discovery) and ``git_ops.commit_effect_present_in_main``
@@ -38,7 +47,8 @@ provenance when discovery came up empty.
 
 This module is the single, INV-5 extraction point: ONE async function,
 :func:`validate_landing_evidence`, that ``harness.py`` (×4 call sites),
-``merge_queue.py`` (×1) and ``escalation/server.py`` (×2) all delegate to.
+``merge_queue.py`` (×1), ``escalation/server.py`` (×2) and ``workflow.py``
+(×3) all delegate to.
 
 Task 4647 added a SECOND producer beside it — :func:`branch_work_landed`, the
 PRD "landed-not-done-recovery" Contract's NON-DECAYING patch-id policy — plus
@@ -115,6 +125,11 @@ citation + effect-present policy) — and they share every observable:
 family rather than as a separate helper: its two arms set
 :attr:`LandingMethod.merge_marker` and :attr:`LandingMethod.citation`, and
 everything else about its public surface is unchanged.
+:func:`validate_reported_landing` (task 4704) is a third mode,
+:attr:`LandingMethod.reported_claim`, for a commit an agent REPORTS as the
+task's work: it corroborates the report against the task's declared files or
+checks, then shares CANDIDATE mode's effect-present step rather than copying
+it.
 
 **Two modes**, selected by whether ``candidate_sha`` is given:
 
@@ -205,7 +220,7 @@ from orchestrator.config import RecoveryEmissionConfig
 from orchestrator.git_ops import _run
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from escalation.queue import EscalationQueue
 
@@ -259,6 +274,7 @@ __all__ = [
     'format_unattributed_landing_detail',
     'is_valid_sha_40',
     'validate_landing_evidence',
+    'validate_reported_landing',
 ]
 
 
@@ -278,8 +294,10 @@ class LandingReason(enum.StrEnum):
     would build an identical runtime vocabulary and silently fail the gate.
 
     ONE vocabulary, not two.  The first six members are the PRD Contract's
-    closed set, emitted by :func:`branch_work_landed`.  The last three are the
-    PRE-CONTRACT spelling :func:`validate_landing_evidence` still emits, kept
+    closed set, emitted by :func:`branch_work_landed` (and ``no_attribution``
+    / ``git_error`` also by :func:`validate_reported_landing`).  The last three
+    are the PRE-CONTRACT spelling :func:`validate_landing_evidence` still
+    emits, kept
     here rather than in a separate legacy enum because a second vocabulary
     would be two authorities that must be kept in step forever, and because a
     legacy code reaching a formatter that cannot explain it renders
@@ -294,9 +312,10 @@ class LandingReason(enum.StrEnum):
     no_op_landing = 'no_op_landing'
     #: Rejected — the branch's work is genuinely absent from main.
     not_landed = 'not_landed'
-    #: Rejected — the work IS on main but no main-reachable commit could be
-    #: attributed to this task, so there is nothing to anchor provenance on.
-    #: The Contract's rename of the legacy ``no_citation``.
+    #: Rejected — no main-reachable commit could be attributed to this task,
+    #: so there is nothing to anchor provenance on.  The Contract's rename of
+    #: the legacy ``no_citation``; also the reported-claim mode's reject when
+    #: nothing the task declares corroborates the reported commit.
     no_attribution = 'no_attribution'
     #: Rejected — a provisioning-only branch whose tip never advanced past its
     #: recorded ``branch_base_sha`` (#1226).  Patch-id-contained in main by
@@ -323,7 +342,7 @@ class LandingMethod(enum.StrEnum):
 
     This is the explicit mode/policy discriminator the PRD's epsilon bullet
     demands in place of two separate functions: it maps one-to-one onto the
-    three production attribution paths, so any consumer can read which policy
+    four production attribution paths, so any consumer can read which policy
     decided a verdict — in particular whether it came from the NON-DECAYING
     patch-id contract or from the legacy effect-present policy epsilon is
     retiring at the landing-detection sites.
@@ -338,6 +357,9 @@ class LandingMethod(enum.StrEnum):
     #: :func:`validate_landing_evidence` DISCOVERY mode — attribution by
     #: ``find_task_citation_commit`` subject-anchored citation discovery.
     citation = 'citation'
+    #: :func:`validate_reported_landing` — an agent-REPORTED commit
+    #: corroborated against the task's own declared files or checks.
+    reported_claim = 'reported_claim'
     #: No attribution path ran: the verdict was hand-constructed rather than
     #: produced by this module (the shape several gate-wiring test files
     #: build).  The default, so existing four-keyword constructions are
@@ -1156,7 +1178,7 @@ def _new_probe(
     method: LandingMethod,
     **extra: Any,
 ) -> dict[str, Any]:
-    """Seed the structured-facts probe both producers carry.
+    """Seed the structured-facts probe every producer mode carries.
 
     ``method`` is seeded UP FRONT rather than stamped on the accept: WHICH
     policy answered is a property of the CALL, not of the outcome, and a
@@ -1166,7 +1188,8 @@ def _new_probe(
 
     *extra* carries each producer's own seeds — ``upstream_ref`` for
     :func:`branch_work_landed`, ``effect_check_sha`` and
-    ``delivered_checks_state`` for :func:`validate_landing_evidence`.  They
+    ``delivered_checks_state`` for :func:`validate_landing_evidence` (plus
+    ``declared_files`` for :func:`validate_reported_landing`).  They
     stay per-producer rather than being unioned here: a key seeded for a
     producer that never writes it would read as "measured, and absent" when
     the truth is "never asked".
@@ -1575,6 +1598,55 @@ async def branch_work_landed(
         return _reject(LandingReason.git_error)
 
 
+def _delivered_checks_state(
+    delivered_checks: list[dict[str, Any]] | None,
+) -> str:
+    """The supply state of *delivered_checks*, recorded in every probe.
+
+    Wiring is a property of the CALL SITE, not of the outcome, so an accepted
+    verdict must show it too — otherwise the only way to learn a site is
+    unwired is to wait for it to reject.  ``None`` (not supplied) and ``[]``
+    (supplied, nothing declared) are deliberately distinct states.
+    """
+    if delivered_checks is None:
+        return 'unwired'
+    return 'evaluated' if delivered_checks else 'none_declared'
+
+
+async def _candidate_effect_verdict(
+    git_ops: GitOps,
+    candidate_sha: str,
+    delivered_checks: list[dict[str, Any]] | None,
+    probe: dict[str, Any],
+    *,
+    method: LandingMethod,
+) -> LandingVerdict:
+    """The FIX 1' effect-present guard on an ALREADY-ATTRIBUTED sha.
+
+    The one copy of the step every attributed-candidate mode ends in —
+    :func:`validate_landing_evidence` CANDIDATE mode and
+    :func:`validate_reported_landing` — so the two cannot drift.  Accepts
+    under the legacy ``ok`` spelling on survival; on a survival reject it
+    records the divergence diagnostics and tries the delivered-checks
+    differential, which lives INSIDE the reject branch on purpose: it can only
+    ever rescue a rejection, never produce one (task 3116).
+    """
+    probe['citation'] = candidate_sha
+    probe['effect_check_sha'] = candidate_sha
+    if await git_ops.commit_effect_present_in_main(candidate_sha):
+        return _accept_verdict(
+            candidate_sha, reason=LandingReason.ok, probe=probe, method=method,
+        )
+    await _record_effect_divergence(git_ops, candidate_sha, probe)
+    if delivered_checks and await _delivered_checks_differential(
+        git_ops, candidate_sha, delivered_checks, probe,
+    ):
+        return _accept_verdict(
+            candidate_sha, reason=LandingReason.ok, probe=probe, method=method,
+        )
+    return _reject_verdict(LandingReason.effect_absent, probe=probe, method=method)
+
+
 async def validate_landing_evidence(
     git_ops: GitOps,
     task_id: str,
@@ -1663,6 +1735,9 @@ async def validate_landing_evidence(
                          keyword-only once all seven are wired, so no future
                          caller can inherit the default silently
 
+            ``workflow.py``'s three recovery guards (task 4704) were wired
+            from the start and already pass the task's declared checks.
+
             If ``delivered_checks_state == 'unwired'`` is still appearing in
             escalations after 4500 has landed, that is the bug: one of the
             seven sites regressed to the default.
@@ -1682,15 +1757,7 @@ async def validate_landing_evidence(
         task_id=task_id, branch=branch, branch_tip_sha=branch_tip_sha,
         method=method,
         effect_check_sha=None,
-        # Supply state, recorded unconditionally — wiring is a property of the
-        # CALL SITE, not of the outcome, so an accepted verdict must show it
-        # too.  Otherwise the only way to learn a site is unwired is to wait
-        # for it to reject.
-        delivered_checks_state=(
-            'unwired' if delivered_checks is None
-            else 'evaluated' if delivered_checks
-            else 'none_declared'
-        ),
+        delivered_checks_state=_delivered_checks_state(delivered_checks),
     )
 
     def _reject(reason: LandingReason) -> LandingVerdict:
@@ -1709,19 +1776,9 @@ async def validate_landing_evidence(
         # (a merge-marker subject match, or a stranded-sweep ground-truth
         # report) — skip discovery and the FIX 2 lineage guard entirely and
         # apply ONLY the FIX 1' effect-present guard to candidate_sha.
-        probe['citation'] = candidate_sha
-        probe['effect_check_sha'] = candidate_sha
-        if not await git_ops.commit_effect_present_in_main(candidate_sha):
-            await _record_effect_divergence(git_ops, candidate_sha, probe)
-            # SECOND ACCEPT PATH, and it lives INSIDE the reject branch on
-            # purpose: a differential can only ever rescue a rejection, never
-            # produce one (task 3116).
-            if delivered_checks and await _delivered_checks_differential(
-                git_ops, candidate_sha, delivered_checks, probe,
-            ):
-                return _accept(candidate_sha)
-            return _reject(LandingReason.effect_absent)
-        return _accept(candidate_sha)
+        return await _candidate_effect_verdict(
+            git_ops, candidate_sha, delivered_checks, probe, method=method,
+        )
 
     citation = await git_ops.find_task_citation_commit(
         task_id, pattern_template=pattern_template,
@@ -1789,6 +1846,97 @@ async def validate_landing_evidence(
     return _accept(citation)
 
 
+async def _attribute_reported_commit(
+    git_ops: GitOps,
+    reported_sha: str,
+    declared_files: Sequence[str],
+    delivered_checks: list[dict[str, Any]],
+    probe: dict[str, Any],
+) -> LandingReason | None:
+    """Corroborate *reported_sha* against the task's OWN declarations.
+
+    Returns ``None`` when attributed, else the reject reason, and records the
+    rule that decided in ``probe['attribution_basis']``:
+
+    - ``declared_files`` / ``declared_files_untouched`` — the task declares
+      ``metadata.files``, so the commit's own diff (``sha^1..sha``) must touch
+      one of them.  Untouched is COUNTER-evidence and rejects even when checks
+      are also declared: a check passing at main proves the capability exists
+      somewhere, not that THIS commit delivered it.
+    - ``delivered_checks`` — no files, but checks declared; the caller's
+      mark-done delivered-check gate is what verifies them.
+    - ``nothing_declared`` — nothing to verify the claim against.
+    - ``undetermined`` — git could not produce the diff (``git_error``,
+      never a negative).
+    """
+    if declared_files:
+        commit_files, err = await git_ops.get_merge_commit_diff_files(reported_sha)
+        if err is not None:
+            probe['attribution_basis'] = 'undetermined'
+            probe['git_error_stage'] = 'reported_commit_diff'
+            probe['exception'] = repr(err)
+            return LandingReason.git_error
+        touched = sorted(set(declared_files) & set(commit_files))
+        probe['reported_commit_files'] = list(commit_files)
+        probe['declared_files_touched'] = touched
+        if not touched:
+            probe['attribution_basis'] = 'declared_files_untouched'
+            return LandingReason.no_attribution
+        probe['attribution_basis'] = 'declared_files'
+        return None
+    if delivered_checks:
+        probe['attribution_basis'] = 'delivered_checks'
+        return None
+    probe['attribution_basis'] = 'nothing_declared'
+    return LandingReason.no_attribution
+
+
+async def validate_reported_landing(
+    git_ops: GitOps,
+    task_id: str,
+    branch: str,
+    *,
+    reported_sha: str,
+    declared_files: Sequence[str],
+    delivered_checks: list[dict[str, Any]],
+) -> LandingVerdict:
+    """Validate an agent-REPORTED landing of *task_id* at *reported_sha*.
+
+    The third mode of the producer family (:attr:`LandingMethod.reported_claim`),
+    for a commit an agent names as the task's work — the architect's
+    ``already_done`` report.  Neither existing mode fits: DISCOVERY searches
+    for a citation rather than judging a named sha, and CANDIDATE assumes the
+    caller already attributed it.  Here the report's prose is never
+    attribution; the task's own declarations are (see
+    :func:`_attribute_reported_commit`).  Once attributed, the commit gets
+    exactly the CANDIDATE effect-present guard, through the one shared copy.
+
+    The caller must already have established that *reported_sha* exists and
+    is reachable from main.  ``probe['citation']`` is the reported sha on
+    every verdict, so a filed L1 carries it as ``citation_sha`` and an
+    identical refile is recognisable (task 4499).
+
+    Both declaration lists are REQUIRED: a caller that silently passed
+    nothing would turn every report into a ``nothing_declared`` refusal.
+    """
+    method = LandingMethod.reported_claim
+    probe = _new_probe(
+        task_id=task_id, branch=branch, branch_tip_sha=None, method=method,
+        effect_check_sha=None,
+        delivered_checks_state=_delivered_checks_state(delivered_checks),
+        declared_files=sorted(declared_files),
+    )
+    probe['citation'] = reported_sha
+    reject_reason = await _attribute_reported_commit(
+        git_ops, reported_sha, declared_files, delivered_checks, probe,
+    )
+    if reject_reason is not None:
+        return _reject_verdict(reject_reason, probe=probe, method=method)
+    return await _candidate_effect_verdict(
+        git_ops, reported_sha, delivered_checks, probe, method=method,
+    )
+
+
 #: Operator-facing prose for every :class:`LandingReason` member.
 #:
 #: COMPLETE by contract, machine-checked in
@@ -1815,12 +1963,17 @@ _REASON_EXPLANATIONS: dict[str, str] = {
         'the task has not landed and should be dispatched normally.'
     ),
     'no_attribution': (
-        'The work IS on main, but no main-reachable commit could be '
-        'attributed to THIS task — no commit cites it and no equivalent '
-        'commit resolved. There is no sha to anchor provenance on, and this '
-        'producer refuses to guess: anchoring on the branch tip (not on '
-        'main) or on main\'s current tip would fabricate provenance, which '
-        'is the defect the citation guard exists to prevent. The Contract\'s '
+        'No main-reachable commit could be attributed to THIS task. For a '
+        'branch check (method patch_id) the work IS on main, but no commit '
+        'cites the task and no equivalent commit resolved. For an '
+        'agent-reported commit (method reported_claim) nothing the task '
+        'declares corroborates the report — it declares neither '
+        'metadata.files nor delivered_checks, or the commit touches none of '
+        'its declared files; see probe.attribution_basis. Either way there '
+        'is no sha to anchor provenance on, and this module refuses to '
+        'guess: anchoring on the branch tip, on main\'s current tip or on an '
+        'uncorroborated report would fabricate provenance, which is the '
+        'defect the citation guard exists to prevent. The Contract\'s '
         'rename of the legacy "no_citation".'
     ),
     'degenerate_branch': (
@@ -1894,6 +2047,15 @@ _METHOD_EXPLANATIONS: dict[str, str] = {
         'history (find_task_citation_commit) — validate_landing_evidence '
         'DISCOVERY mode. Depends on a commit on main naming the task, so a '
         'rebase landing that dropped the citation is invisible to it.'
+    ),
+    'reported_claim': (
+        "An agent REPORTED this commit as the task's work (e.g. the "
+        "architect's already_done claim) — validate_reported_landing. The "
+        "report's prose is never attribution: the commit was corroborated "
+        "against the task's own declarations (its diff must touch a declared "
+        'metadata.files entry; with no files declared, the declared '
+        'delivered_checks are the basis), then given the same '
+        'effect-present guard as CANDIDATE mode.'
     ),
     'unspecified': (
         'No attribution path ran: this verdict was hand-constructed rather '
@@ -2507,7 +2669,8 @@ def file_landing_git_error_storm_escalation(
             '\n'
             'WHERE TO LOOK: the failing stage is named per verdict in '
             "probe['git_error_stage'] — resolve_branch_sha, no_op_baseline, "
-            'net_diff_is_empty, patch_id_containment or unexpected_exception '
+            'net_diff_is_empty, patch_id_containment, reported_commit_diff '
+            'or unexpected_exception '
             "(the last also carries probe['exception']).  Grep the "
             "orchestrator log for 'landing tally' to see the per-reason "
             'counts over time.\n'
