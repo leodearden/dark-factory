@@ -9,6 +9,7 @@ See task 1372 (lint guard) and task 1339/1313/1064 (migration).
 from __future__ import annotations
 
 import ast
+import dataclasses
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 from _fm_helpers import load_script_module
+from orchestrator.verify import VerifyResult
 
 # Load the checker script via importlib to avoid sys.path pollution.
 # fused-memory/scripts/ is not on PYTHONPATH per pyproject.toml (pythonpath=['src']).
@@ -674,29 +676,6 @@ class TestHooksIntegration:
 # Assign/AnnAssign-only) is unchanged; every test above this banner pins it.
 # ===========================================================================
 
-# The 16 real fields of orchestrator/src/orchestrator/verify.py::VerifyResult.
-# Duplicated here deliberately: this test is the thing that would notice if the
-# script's registry copy silently drifted from the real dataclass.
-_VERIFY_RESULT_FIELDS = frozenset({
-    'passed',
-    'test_output',
-    'lint_output',
-    'type_output',
-    'summary',
-    'timed_out',
-    'cause_hint',
-    'category',
-    'worktree_log_paths',
-    'archive_log_paths',
-    'contention',
-    'plan',
-    'failing_test_ids',
-    'failing_leg_categories',
-    'trivial',
-    'duration_secs',
-})
-
-
 class TestDataclassShapeRegistry:
     """The `_DATACLASS_SHAPES` registry that drives Rule B's anchor+overlap match."""
 
@@ -717,12 +696,19 @@ class TestDataclassShapeRegistry:
         )
 
     def test_verify_result_fields_match_the_real_dataclass(self):
-        """The registry's field literal equals VerifyResult's 16 real field names."""
+        """The registry's field literal equals VerifyResult's real fields, read at runtime.
+
+        The script must stay stdlib-only, so it carries a literal copy; this test is
+        the drift guard that compares that copy against the dataclass itself.
+        """
         shape = _checker._DATACLASS_SHAPES[0]
-        assert shape.fields == _VERIFY_RESULT_FIELDS, (
-            'Registry field set drifted from orchestrator/src/orchestrator/verify.py::VerifyResult.\n'
-            f'  missing from registry: {sorted(_VERIFY_RESULT_FIELDS - shape.fields)}\n'
-            f'  extra in registry:     {sorted(shape.fields - _VERIFY_RESULT_FIELDS)}'
+        real = frozenset(f.name for f in dataclasses.fields(VerifyResult))
+        assert shape.fields == real, (
+            'add/remove these names in `_DATACLASS_SHAPES[0].fields` in '
+            'fused-memory/scripts/check_bare_magicmock_config.py so the registry matches '
+            'orchestrator/src/orchestrator/verify.py::VerifyResult:\n'
+            f'  missing from registry: {sorted(real - shape.fields)}\n'
+            f'  extra in registry:     {sorted(shape.fields - real)}'
         )
         assert isinstance(shape.fields, frozenset), (
             f'fields must be a frozenset for cheap set algebra; got {type(shape.fields)}'
@@ -733,6 +719,28 @@ class TestDataclassShapeRegistry:
         shape = _checker._DATACLASS_SHAPES[0]
         assert shape.anchors == frozenset({'passed'}), (
             f"VerifyResult's anchor must be exactly {{'passed'}}; got {set(shape.anchors)}"
+        )
+
+    def test_every_real_field_counts_toward_the_overlap_floor(self):
+        """Each real non-anchor field, paired with ``passed``, flags exactly one double.
+
+        The behavioural consequence of the registry: a field VerifyResult has but the
+        registry lacks would not count toward ``min_field_matches``, so a double built
+        from it would slip through.  The field list is read at runtime, so a future
+        field landing unregistered turns this red too.
+        """
+        unflagged = []
+        for name in sorted(f.name for f in dataclasses.fields(VerifyResult)):
+            if name == 'passed':
+                continue
+            source = f'm = MagicMock(passed=True, {name}=None)\n'
+            violations = find_violations(source, _NON_DEBT_FILE)
+            if len(violations) != 1 or 'bare-dataclass-double' not in violations[0].message:
+                unflagged.append(name)
+        assert unflagged == [], (
+            'these VerifyResult fields do not count toward Rule B\'s overlap floor; add '
+            'them to `_DATACLASS_SHAPES[0].fields` in '
+            f'fused-memory/scripts/check_bare_magicmock_config.py: {unflagged}'
         )
 
     def test_verify_result_min_field_matches_is_two(self):
