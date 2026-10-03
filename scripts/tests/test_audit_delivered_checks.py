@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _task_db_scan import TaskDbProblem, TaskDbUnreadable
 from audit_delivered_checks import (
     _TASK_IN_SUBJECT_RE,
     DISPOSITION_BROKEN,
@@ -48,6 +49,7 @@ from audit_delivered_checks import (
     classify_descriptor,
     evaluate_row,
     format_report,
+    load_open_dependents,
     load_task_index,
 )
 from shared.delivered_check_polarity import CheckOutcome
@@ -295,6 +297,24 @@ class TestLoadTaskIndex:
                 conn.execute("UPDATE tasks SET status = 'cancelled'")
         finally:
             conn.close()
+
+
+class TestTaskStoreLoadersRefuseAStub:
+    # load_open_dependents swallows `no such table` for a store that lacks
+    # only its dependencies table; a 0-byte stub has no tables at all, and
+    # must be refused rather than read as "nobody is blocked".
+    @pytest.mark.parametrize(
+        'loader', [load_task_index, load_open_dependents],
+        ids=['load_task_index', 'load_open_dependents'],
+    )
+    def test_a_zero_byte_stub_is_refused_with_a_structured_reason(self, tmp_path, loader):
+        stub = tmp_path / 'tasks.db'
+        stub.write_bytes(b'')
+
+        with pytest.raises(TaskDbUnreadable) as refused:
+            loader(str(stub))
+
+        assert refused.value.reason is TaskDbProblem.EMPTY_STUB
 
 
 # ---------------------------------------------------------------------------

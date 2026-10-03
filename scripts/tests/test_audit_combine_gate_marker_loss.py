@@ -31,11 +31,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from _task_db_scan import (
     AUDIT_EXIT_FINDINGS,
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    TaskDbProblem,
+    TaskDbUnreadable,
 )
 from audit_combine_gate_marker_loss import (
     _COVERAGE_CAVEAT,
@@ -141,6 +144,16 @@ def test_load_combine_targets_metadata_keys_are_a_tuple(make_tasks_db):
 
     assert isinstance(target.metadata_keys, tuple)
     assert "task_kind" in target.metadata_keys
+
+
+def test_load_combine_targets_refuses_a_zero_byte_stub_with_a_structured_reason(tmp_path):
+    stub = tmp_path / "tasks.db"
+    stub.write_bytes(b"")
+
+    with pytest.raises(TaskDbUnreadable) as refused:
+        load_combine_targets(str(stub))
+
+    assert refused.value.reason is TaskDbProblem.EMPTY_STUB
 
 
 # ---------------------------------------------------------------------------
