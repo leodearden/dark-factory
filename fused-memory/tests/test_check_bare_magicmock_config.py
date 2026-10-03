@@ -1869,19 +1869,59 @@ class TestExemptionSeparatorVariants:
         )
 
 
-# The Rule C census (task 4246, base 1d75322218): 618 violations across 20 files,
-# every one under orchestrator/tests/.  Counted as VIOLATIONS, not sites — one call
+# The Rule C census, re-measured by task 5269 after it widened detection: 650
+# violations across 47 files in four packages (task 4246 shipped 618 across 20,
+# every one under orchestrator/tests/).  Counted as VIOLATIONS, not sites — one call
 # can produce two.  test_merge_speculation.py measures ZERO (task 3980 migrated it)
 # and is deliberately ABSENT.
 _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue.py',
     'orchestrator/tests/test_merge_queue_concurrent_verify.py',
     'orchestrator/tests/test_concurrent_verify_boundary.py',
-    'orchestrator/tests/test_merge_queue_permit_conservation.py',
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
+    'orchestrator/tests/test_merge_queue_permit_conservation.py',
     'orchestrator/tests/test_merge_queue_resolve_release.py',
     'orchestrator/tests/test_coalesce_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_request_liveness.py',
+    'orchestrator/tests/test_offline_lane.py',
+    'orchestrator/tests/test_live_merge_worker.py',
+    'orchestrator/tests/test_background_service.py',
+    'orchestrator/tests/test_merge_queue_deep_dispatch.py',
+    'orchestrator/tests/test_merge_queue_deep_landing.py',
+    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
+    'orchestrator/tests/test_harness.py',
+    'orchestrator/tests/test_invoke.py',
     'orchestrator/tests/test_merge_queue_coalesce.py',
+    'orchestrator/tests/test_merge_queue_deep_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py',
+    'orchestrator/tests/test_merge_skew_tripwire.py',
+    'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py',
+    'orchestrator/tests/test_offline_lane_infra_integration.py',
+    'orchestrator/tests/test_offline_lane_integration.py',
+    'orchestrator/tests/test_workflow_cancellation.py',
+    'orchestrator/tests/test_verify.py',
+    'dashboard/tests/test_db.py',
+    'dashboard/tests/test_mcp_fanout.py',
+    'dashboard/tests/test_durability.py',
+    'dashboard/tests/test_metrics_curator.py',
+    'dashboard/tests/_dashboard_helpers.py',
+    'dashboard/tests/test_api_curator.py',
+    'dashboard/tests/test_merge_queue_data.py',
+    'fused-memory/tests/test_drain_signal_handler.py',
+    'fused-memory/tests/test_harness.py',
+    'fused-memory/tests/test_memory_service.py',
+    'fused-memory/tests/test_operator_signal_handler.py',
+    'fused-memory/tests/test_periodic_rebuild_summaries.py',
+    'fused-memory/tests/test_task_interceptor.py',
+    'fused-memory/tests/server/test_grouped_read.py',
+    'fused-memory/tests/test_dependency_direction_check.py',
+    'fused-memory/tests/test_e2e_durable_queue.py',
+    'fused-memory/tests/test_journaling_integration.py',
+    'fused-memory/tests/test_recon_claim_verification_wiring.py',
+    'fused-memory/tests/test_ticket_worker.py',
+    'shared/tests/test_uuid_prefix_guard.py',
+    'shared/tests/test_async_sqlite_base.py',
+    'shared/tests/test_cli_invoke.py',
 })
 
 # A SYNTHETIC debt mapping for the path-matching tests, which drive the pure
@@ -1930,10 +1970,12 @@ def _against_a_budget_of_1(copies: int) -> list:
 class TestWallClockDeadlineDebtBaseline:
     """The shrink-only per-file debt baseline that lets Rule C ship default-ON.
 
-    618 pre-existing violations across 20 files mean a hot default-on rule would
-    turn orchestrator/tests' lint_command red immediately and stall the merge lane
-    repo-wide — the identical situation Rule B faced at 95 sites/11 files, solved
-    the identical way and since retired, its debt fully migrated (task 4354).
+    Pre-existing violations — 618 across 20 files when task 4246 shipped the rule,
+    650 across 47 files in four packages once task 5269 widened its detection —
+    mean a hot default-on rule would turn those packages' lint_commands red
+    immediately and stall the merge lane repo-wide — the identical situation Rule B
+    faced at 95 sites/11 files, solved the identical way and since retired, its debt
+    fully migrated (task 4354).
 
     Opt-OUT rather than opt-in, deliberately: an opt-in list would exempt precisely
     the brand-new file this rule exists to catch, and "which files are covered"

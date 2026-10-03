@@ -585,25 +585,37 @@ def _dataclass_double_violation(
 # Rule C debt baseline — SHRINK-ONLY, and CHECKED.
 #
 # path → the number of pre-existing wall-clock-deadline VIOLATIONS that file
-# carried when Rule C landed (AST census over all seven scanned tests/ directories,
-# task 4246; 618 violations across 20 files, every one under orchestrator/tests/).
+# carries, measured by AST census over all seven scanned tests/ directories.
+#
+# Provenance.  Task 4246 shipped Rule C with 618 violations across 20 files, every
+# one under orchestrator/tests/ (333 bare-wait_for + 285 raw-literal); migrations
+# had shrunk that to 8 files by task 5269.  Task 5269 then RE-MEASURED the census
+# after WIDENING DETECTION — the barrier leg became a structural zero-argument
+# ``.wait()`` on any receiver, the raw-literal leg learned ``max_wall_s=`` and
+# wait_for's positional timeout, and directory discovery gained ``_*.py`` helper
+# modules — and recorded 650 violations across 47 files in four packages.  That is
+# the one sanctioned rise: every added violation was already in the tree, newly
+# SEEN, not new debt.  The non-orchestrator entries can shrink only by a per-site
+# ``# noqa: wall-clock-deadline`` until follow-up ticket
+# tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes ``wait_responsive`` importable outside
+# orchestrator/tests.
 #
 # The number counts VIOLATIONS, not SITES.
 # One call can produce two: `asyncio.wait_for(req.result, timeout=25.0)` is
 # simultaneously the wrong routing (bare-wait_for) and a written number
-# (raw-literal).  The day-one split was 333 bare-wait_for + 285 raw-literal.
+# (raw-literal).
 #
-# Shipping the rule hot with no transition would have turned orchestrator/tests'
-# lint_command red on day one and stalled the merge lane repo-wide — the identical
-# situation Rule B faced at 95 sites/11 files, so these are grandfathered.  Rule C
-# ONLY: Rules A and B still apply in full to every file here.
+# Shipping the rule hot with no transition would have turned the lint_command of
+# every package listed here red on day one and stalled the merge lane repo-wide —
+# the identical situation Rule B faced at 95 sites/11 files, so these are
+# grandfathered.  Rule C ONLY: Rules A and B still apply in full to every file here.
 #
 # The count is a BUDGET, not a comment.  A debt file is silent while it carries at
 # most its recorded number and reports the overrun the moment it carries more, so
 # "shrink-only" is enforced on the same hot path the rule itself runs on rather than
-# trusted.  This matters most for orchestrator/tests/test_merge_queue.py: 317
-# violations in an actively-developed hub, where a wholesale grandfather would have
-# made a brand-new wall-clock wait added tomorrow invisible to the gate.
+# trusted.  This matters most for orchestrator/tests/test_merge_queue.py, an
+# actively-developed hub, where a wholesale grandfather would have made a brand-new
+# wall-clock wait added tomorrow invisible to the gate.
 #
 # DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files are
 # migrated onto wait_responsive(...) with bounds derived from MERGE_RESULT_TIMEOUT.
@@ -618,15 +630,61 @@ def _dataclass_double_violation(
 # be a blanket suppression letting a regression land there silently — which is what
 # 3980 spent a task removing, and what makes it safe for task 4246 to delete that
 # module's file-local copy of this guard.
+#
+# Two entries share the trailing ``tests/test_harness.py``; ``_debt_budget`` matches
+# on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
-    'orchestrator/tests/test_merge_queue.py': 239,
-    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 81,
+    # orchestrator/tests
+    'orchestrator/tests/test_merge_queue.py': 267,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 85,
     'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 30,
     'orchestrator/tests/test_merge_queue_permit_conservation.py': 27,
-    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 26,
     'orchestrator/tests/test_merge_queue_resolve_release.py': 25,
-    'orchestrator/tests/test_coalesce_integration_gate.py': 4,
+    'orchestrator/tests/test_coalesce_integration_gate.py': 12,
+    'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
+    'orchestrator/tests/test_offline_lane.py': 10,
+    'orchestrator/tests/test_live_merge_worker.py': 6,
+    'orchestrator/tests/test_background_service.py': 4,
+    'orchestrator/tests/test_merge_queue_deep_dispatch.py': 4,
+    'orchestrator/tests/test_merge_queue_deep_landing.py': 3,
+    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 3,
+    'orchestrator/tests/test_harness.py': 2,
+    'orchestrator/tests/test_invoke.py': 2,
     'orchestrator/tests/test_merge_queue_coalesce.py': 2,
+    'orchestrator/tests/test_merge_queue_deep_integration_gate.py': 2,
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 2,
+    'orchestrator/tests/test_merge_skew_tripwire.py': 2,
+    'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py': 2,
+    'orchestrator/tests/test_offline_lane_infra_integration.py': 2,
+    'orchestrator/tests/test_offline_lane_integration.py': 2,
+    'orchestrator/tests/test_workflow_cancellation.py': 2,
+    'orchestrator/tests/test_verify.py': 1,
+    # dashboard/tests
+    'dashboard/tests/test_db.py': 26,
+    'dashboard/tests/test_mcp_fanout.py': 18,
+    'dashboard/tests/test_durability.py': 4,
+    'dashboard/tests/test_metrics_curator.py': 4,
+    'dashboard/tests/_dashboard_helpers.py': 3,
+    'dashboard/tests/test_api_curator.py': 2,
+    'dashboard/tests/test_merge_queue_data.py': 2,
+    # fused-memory/tests
+    'fused-memory/tests/test_drain_signal_handler.py': 4,
+    'fused-memory/tests/test_harness.py': 4,
+    'fused-memory/tests/test_memory_service.py': 4,
+    'fused-memory/tests/test_operator_signal_handler.py': 4,
+    'fused-memory/tests/test_periodic_rebuild_summaries.py': 4,
+    'fused-memory/tests/test_task_interceptor.py': 4,
+    'fused-memory/tests/server/test_grouped_read.py': 2,
+    'fused-memory/tests/test_dependency_direction_check.py': 2,
+    'fused-memory/tests/test_e2e_durable_queue.py': 2,
+    'fused-memory/tests/test_journaling_integration.py': 2,
+    'fused-memory/tests/test_recon_claim_verification_wiring.py': 2,
+    'fused-memory/tests/test_ticket_worker.py': 2,
+    # shared/tests
+    'shared/tests/test_uuid_prefix_guard.py': 2,
+    'shared/tests/test_async_sqlite_base.py': 1,
+    'shared/tests/test_cli_invoke.py': 1,
 }
 
 
