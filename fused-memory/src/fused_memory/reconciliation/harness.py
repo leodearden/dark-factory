@@ -4362,33 +4362,16 @@ class ReconciliationHarness:
     async def _persist_stage_reports_then_gc_config_dir(
         self, run: ReconciliationRun,
     ) -> None:
-        """Persist *run*'s stage_reports, then GC its per-run CLI config dir.
+        """Persist *run*'s stage_reports under ``asyncio.shield``, then GC its
+        per-run CLI config dir: the shared ``finally`` tail of
+        :meth:`run_full_cycle` and :meth:`_run_remediation_pass`, called after
+        :meth:`_flush_cycle_summaries` so the persisted copy carries its markers.
 
-        The shared tail of both S1→S2→S3 drivers' ``finally`` blocks
-        (:meth:`run_full_cycle` and :meth:`_run_remediation_pass`), called
-        right after :meth:`_flush_cycle_summaries` so the persisted copy
-        captures whatever markers that flush stamped.
-
-        The write is materialized as its own Task, with
-        :meth:`_log_stage_reports_write_failure` attached as a done-callback,
-        so a failure still leaves a log line once a second cancellation has
-        detached it (task 4431). It is awaited under ``asyncio.shield`` because
-        on the already-being-cancelled path these ``finally`` blocks exist to
-        serve, an unshielded await would abort the write before it reached the
-        DB. The shield protects the WRITE, not this awaiting frame: a second
-        cancellation still raises ``CancelledError`` at that await.
-
-        So the GC sits in a ``finally`` rather than after the await, and never
-        under ``except BaseException``: it is reached on a second cancellation,
-        and the ``CancelledError`` still propagates, keeping the coroutine
-        cancellable on its success path too
-        (``tests/test_harness.py::test_shielded_stage_report_persistence_still_propagates_cancellation``).
-        ``gc_run_config_dir`` is synchronous, so that ``finally`` cannot itself
-        be re-interrupted.
-
-        An interrupted run keeps its dir: its transcript must survive for the
-        startup ``--resume`` pass (task σ / 2744). A GC failure is logged and
-        swallowed so it can never mask the run's real terminal outcome.
+        The GC runs even when a second cancellation lands mid-write, and that
+        cancellation still propagates
+        (``tests/test_harness.py::test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation``).
+        An interrupted run keeps its dir for the startup ``--resume`` pass
+        (task σ). A GC failure is logged, never raised.
         """
         stage_reports_write = asyncio.ensure_future(
             self.journal.update_run_stage_reports(run.id, run.stage_reports)
