@@ -152,7 +152,9 @@ _GATE_MARKER_KEYS = ('execution_class', 'operational_mode', 'task_kind', 'always
 # ``TaskInterceptor._extract_deliverable_signals_from_meta`` unions them.
 # ``TaskInterceptor._pure_consolidation_gate_topic`` reads the same keys for
 # mere presence, so the two cannot disagree about what counts as a declaration.
-_DELIVERABLE_SIGNAL_KEYS = ('files', 'files_to_modify', 'modules')
+# The retired ``metadata.modules`` is deliberately absent
+# (plans/metadata-modules-retirement-prd.md decision 6).
+_DELIVERABLE_SIGNAL_KEYS = ('files', 'files_to_modify')
 
 
 def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
@@ -1944,10 +1946,9 @@ class TaskInterceptor:
     def _extract_deliverable_signals_from_meta(meta: dict) -> list[str]:
         """Extract the UNION of declared deliverable signals from *meta*.
 
-        Reads ``files``, ``files_to_modify`` and ``modules`` in that order,
-        coercing a scalar string to a one-element list, ``str()``-coercing
-        each entry, dropping falsy ones, and deduplicating while preserving
-        first-occurrence order.
+        Reads ``files`` then ``files_to_modify``, coercing a scalar string to
+        a one-element list, ``str()``-coercing each entry, dropping falsy
+        ones, and deduplicating while preserving first-occurrence order.
 
         SEPARATE HELPER, NOT A WIDENING of
         :meth:`_extract_meta_files_from_meta` — deliberately (task 3106).
@@ -1955,15 +1956,15 @@ class TaskInterceptor:
         (:func:`check_files_for_scope`) and the cross-repo tagger
         (:func:`all_files_foreign_owner`), where its ``files``-over-
         ``files_to_modify`` PRECEDENCE is correct because those callers need
-        ONE authoritative declared file list, and where admitting ``modules``
-        would mean a foreign lock-key entry starts hard-REJECTING
-        submissions — a behaviour change well outside this task.
+        ONE authoritative declared file list.
 
         Attribution wants the widest view of what the filer declared, and
         this list feeds ONLY :meth:`_local_attesting_signals`, so it can
         never weaken a rejection.  :func:`local_attesting_signals` documents
-        how the extra keys are treated in BOTH directions — they can attest,
-        and a foreign one vetoes.
+        how the extra entries are treated in BOTH directions — they can
+        attest, and a foreign one vetoes.  The retired ``metadata.modules``
+        contributes nothing in either direction: it neither attests nor
+        vetoes.
         """
         out: list[str] = []
         seen: set[str] = set()
@@ -1972,15 +1973,15 @@ class TaskInterceptor:
             if isinstance(values, str):
                 values = [values]
             if not isinstance(values, (list, tuple, set)):
-                # Malformed caller metadata (``modules: 5``, ``modules:
-                # {...}``).  ``metadata`` is still unvalidated kwargs at this
-                # seam and :func:`_parse_metadata` deliberately
-                # warns-and-continues rather than raising, so degrade the
-                # same way: an unusable value contributes NO signal (falling
-                # back to the unchanged advisory) instead of raising
-                # ``TypeError`` out of ``submit_task`` as an unstructured
-                # crash.  A dict is the quiet variant — iterating it would
-                # walk its KEYS and could silently attest.
+                # Malformed caller metadata (``files_to_modify: 5``,
+                # ``files_to_modify: {...}``).  ``metadata`` is still
+                # unvalidated kwargs at this seam and :func:`_parse_metadata`
+                # deliberately warns-and-continues rather than raising, so
+                # degrade the same way: an unusable value contributes NO
+                # signal (falling back to the unchanged advisory) instead of
+                # raising ``TypeError`` out of ``submit_task`` as an
+                # unstructured crash.  A dict is the quiet variant —
+                # iterating it would walk its KEYS and could silently attest.
                 logger.warning(
                     'task_metadata.schema_warning source=%s error=%s '
                     '(type=%s); deliverable-signal key discarded',
@@ -2105,8 +2106,8 @@ class TaskInterceptor:
         Reads the parsed metadata rather than ``candidate.files_to_modify``:
         the candidate's list has already been narrowed by
         :meth:`_extract_meta_files_from_meta`'s ``files``-over-
-        ``files_to_modify`` precedence and carries no ``modules`` at all, so
-        it is the wrong signal for attribution, which wants the UNION (see
+        ``files_to_modify`` precedence, so it is the wrong signal for
+        attribution, which wants the UNION (see
         :meth:`_extract_deliverable_signals_from_meta`).
 
         Returns ``[]`` when no :attr:`_prefix_registry` is configured — with
@@ -2133,9 +2134,11 @@ class TaskInterceptor:
         outcome (3) of :mod:`fused_memory.middleware.path_scope_guard`.
 
         "Declares" means the key carries a value at all, malformed or not:
-        :meth:`_extract_deliverable_signals_from_meta` discards a ``modules: 5``
-        as unusable, but the filer still claimed a deliverable, so that gate
-        is not pure and keeps the advisory.
+        :meth:`_extract_deliverable_signals_from_meta` discards a
+        ``files_to_modify: 5`` as unusable, but the filer still claimed a
+        deliverable, so that gate is not pure and keeps the advisory.  The
+        retired ``metadata.modules`` is not a declaration, so a gate carrying
+        it stays pure.
         """
         if any(meta.get(key) for key in _DELIVERABLE_SIGNAL_KEYS):
             return None
