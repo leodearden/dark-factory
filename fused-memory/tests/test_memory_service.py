@@ -696,6 +696,60 @@ class TestAddSystemRecord:
         assert call_kwargs['success'] is True
         assert call_kwargs['error'] is None
 
+    # -- Task 4045: stores_written must reflect the Mem0 outcome --
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('backend_mock_kwargs', 'expected_stores', 'expect_error'),
+        [
+            pytest.param(
+                {'return_value': {'results': [{'id': 'sys-1'}]}},
+                [SourceStore.mem0],
+                False,
+                id='landed',
+            ),
+            pytest.param(
+                {'side_effect': RuntimeError('qdrant down')},
+                [],
+                True,
+                id='raised',
+            ),
+            pytest.param(
+                {'return_value': {'results': []}},
+                [],
+                False,
+                id='zero_ids',
+            ),
+        ],
+    )
+    async def test_stores_written_and_journal_stores_reflect_mem0_outcome(
+        self, service, backend_mock_kwargs, expected_stores, expect_error,
+    ):
+        """On the guaranteed-persistence system-write path, the response's
+        stores_written and the journal's stores say mem0 only when Mem0
+        actually returned an id (task 4045)."""
+        service.mem0.add_system_record = AsyncMock(**backend_mock_kwargs)
+        mock_journal = MagicMock()
+        mock_journal.log_write_op = AsyncMock()
+        mock_journal.log_backend_op = AsyncMock()
+        service._write_journal = mock_journal
+
+        result = await service.add_system_record(
+            content='cycle summary',
+            project_id='dark_factory',
+            agent_id='recon-stage-task_knowledge_sync',
+            category='observations_and_summaries',
+            metadata={'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', 'run_id': 'r1'},
+            causation_id='c1',
+        )
+
+        expected_store_values = [s.value for s in expected_stores]
+        assert result.stores_written == expected_stores
+        journal_kwargs = mock_journal.log_write_op.call_args[1]
+        assert journal_kwargs['result_summary']['stores'] == expected_store_values
+        assert result.message.startswith(f'Memory queued for {expected_store_values}')
+        assert ('mem0_error' in result.message) is expect_error
+
     # -- Amendment (task 2620 review): same task_id normalization as add_memory --
 
     @pytest.mark.asyncio
