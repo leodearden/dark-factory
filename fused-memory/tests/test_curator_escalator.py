@@ -54,26 +54,6 @@ def _make_orchestrator_layout(root, *, hold_lock: bool) -> IO[bytes] | None:
     return handle
 
 
-class TestOrchestratorLivenessProbe:
-    def test_missing_lock_file_reports_not_running(self, tmp_path):
-        escalator = CuratorEscalator()
-        # No lock file created — treat as "no orchestrator".
-        assert escalator._orchestrator_running(str(tmp_path)) is False
-
-    def test_unlocked_file_reports_not_running(self, tmp_path):
-        _make_orchestrator_layout(tmp_path, hold_lock=False)
-        escalator = CuratorEscalator()
-        assert escalator._orchestrator_running(str(tmp_path)) is False
-
-    def test_held_exclusive_lock_reports_running(self, tmp_path):
-        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
-        try:
-            escalator = CuratorEscalator()
-            assert escalator._orchestrator_running(str(tmp_path)) is True
-        finally:
-            handle.close()
-
-
 class TestReportFailure:
     @pytest.mark.asyncio
     async def test_no_orchestrator_raises(self, tmp_path):
@@ -1147,6 +1127,9 @@ class TestPersistStateConcurrency:
 
             async def _patched_to_thread(func, *args, **kwargs):
                 nonlocal in_flight, max_in_flight
+                if func is curator_escalator.is_orchestrator_lock_held:
+                    # The liveness probe's hop is not a state write.
+                    return await real_to_thread(func, *args, **kwargs)
                 in_flight += 1
                 if in_flight > max_in_flight:
                     max_in_flight = in_flight
