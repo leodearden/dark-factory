@@ -1,12 +1,20 @@
 """Detect whether an orchestrator instance is live for a given project root.
 
-At startup the orchestrator takes ``LOCK_EX`` on
+At startup the orchestrator takes ``LOCK_EX | LOCK_NB`` on
 ``<project_root>/data/orchestrator/orchestrator.lock`` and writes
 ``PID <N> started <timestamp>`` as its first line. This module reads two
-liveness signals from that one file:
+liveness signals from that one file. Pick one by what a wrong answer costs:
 
-* the PID in the file answers signal 0 (:func:`is_orchestrator_live_for`);
-* some process holds a flock on the file (:func:`is_orchestrator_lock_held`).
+* :func:`is_orchestrator_lock_held` asks the kernel whether some process
+  holds a flock on the file, so it cannot go stale. Use it to decide whether
+  to file work that only a running orchestrator drains, where a false "live"
+  loses the work silently. Its momentary shared lock refuses an orchestrator
+  start that lands in the same instant, and
+  ``orchestrator/src/orchestrator/harness.py::_acquire_project_lock`` exits
+  rather than retrying.
+* :func:`is_orchestrator_live_for` sends signal 0 to the PID in the file. It
+  never touches the lock, but a PID that outlived its orchestrator (a crash,
+  then PID reuse) reads as live.
 """
 
 from __future__ import annotations
@@ -21,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def is_orchestrator_live_for(project_root: str | Path) -> bool:
-    """Return True iff a running orchestrator process holds the project's lock."""
+    """Return True iff the PID recorded in the project's orchestrator.lock answers signal 0."""
     lock_path = _lock_path(project_root)
     try:
         text = lock_path.read_text(encoding='utf-8')
@@ -41,11 +49,8 @@ def is_orchestrator_lock_held(project_root: str | Path) -> bool:
     """Return True iff some process holds a flock on the project's orchestrator.lock.
 
     Probes with ``LOCK_SH | LOCK_NB`` on its own handle, so it never waits;
-    closing that handle releases the probe's lock. Unlike
-    :func:`is_orchestrator_live_for`, this cannot go stale: the kernel drops
-    the lock when its holder dies, whereas a PID in the file can outlive its
-    process. A missing or unopenable lock file reads as not held; any other
-    flock error propagates.
+    closing that handle releases the probe's lock. A missing or unopenable
+    lock file reads as not held; any other flock error propagates.
 
     This is synchronous file I/O, so a coroutine calls it through
     ``asyncio.to_thread``.
