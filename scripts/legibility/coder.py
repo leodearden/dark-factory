@@ -328,9 +328,10 @@ A successful reply that does not parse is put to the gate's STRICT cap
 detector, so a banner delivered at exit 0 caps that account and the same
 digest is retried on the next (task 5637), while a parsed verdict quoting a
 banner is never offered. Every real banner fails to parse
-(``test_the_trickle_stage_offers_every_real_banner_to_the_pool``). Known
-residual, accepted since task 5637: a verdict TRUNCATED mid-JSON after a
-cap-quoting ``evidence_quote`` is unparseable AND strictly a cap, so it caps
+(``scripts/tests/test_legibility_coder.py::test_the_trickle_stage_offers_every_real_banner_to_the_pool``).
+
+Known residual, accepted since task 5637: a verdict TRUNCATED mid-JSON after
+a cap-quoting ``evidence_quote`` is unparseable AND strictly a cap, so it caps
 a healthy account for the night."""
 
 
