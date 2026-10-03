@@ -115,12 +115,16 @@ echo "pre-commit: linting (main branch)..."
 
 # All first-party packages (for ruff)
 ALL_PACKAGES=(shared escalation fused-memory orchestrator dashboard)
-# Packages with [tool.pyright] config (pyright runs per-package from its directory)
-PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard)
-# Shared dependency packages imported by every PYRIGHT_PACKAGES package. These
-# aren't pyright-configured themselves, so a staged change here can't be
-# caught by the per-package prefix filter below — it must instead force a
-# full pyright sweep across all PYRIGHT_PACKAGES. See task 2551.
+# Every package the merge gate type-checks, in the order of
+# dark-factory-orchestrator.yaml::type_check_command (all carry [tool.pyright];
+# pyright runs per-package from its directory). That chain is the source of
+# truth: tests/scripts/test_hook_pyright_packages_drift.py fails when this list
+# and the chain disagree, so widen both together.
+PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard shared escalation sampler cockpit)
+# Dependency packages that the other PYRIGHT_PACKAGES import. They are
+# pyright-checked like any other member, but a staged change here can break a
+# consumer without touching the consumer's files, so it forces a sweep across
+# all PYRIGHT_PACKAGES instead of just its own. See task 2551.
 DEP_PACKAGES=(shared escalation)
 
 DIRS=()
@@ -196,12 +200,11 @@ fi
 
 # pyright (must run from each package directory to pick up [tool.pyright] config)
 # Path-filtered: only run for packages with staged .py changes, so docs/plans-only
-# commits (and commits scoped to a single package) don't pay for an unconditional
-# 3x pyright run. A staged change under a DEP_PACKAGES dependency (shared,
-# escalation) forces a full sweep across all PYRIGHT_PACKAGES instead: those
-# packages aren't in PYRIGHT_PACKAGES themselves, so the per-package prefix
-# filter would otherwise match nothing and skip pyright everywhere, even
-# though fused-memory/orchestrator/dashboard all import from them. See task 2551.
+# commits (and commits scoped to a single package) don't pay for an
+# unconditional all-package pyright run. A staged change under a DEP_PACKAGES
+# dependency (shared, escalation) forces a full sweep across all
+# PYRIGHT_PACKAGES instead, because consumers import from them and can go red
+# without any of their own files being staged. See task 2551.
 # -c core.quotepath=false stops git from quoting/escaping non-ASCII path
 # bytes (its default quoting only covers bytes >= 0x80; control characters and
 # literal quote/backslash bytes are always escaped regardless of this
