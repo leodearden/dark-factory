@@ -54,7 +54,7 @@ from fused_memory.reconciliation.prompts import (
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
-from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
@@ -13157,14 +13157,23 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             max_task_id=max((t.get('id', 0) for t in tasks), default=0),
         )
 
-    @pytest.mark.asyncio
-    async def test_live_workflow_signals_section_present_for_live_task(
-        self, mock_deps, watermark, monkeypatch
-    ):
-        """When an active task is LIVE, '### Live-Workflow Signals' appears in payload
-        and includes the live task's id.
+    @staticmethod
+    def _live_workflow_section(payload: str) -> str:
+        """The '### Live-Workflow Signals' section of *payload*, up to the next markdown header."""
+        section_start = payload.find('### Live-Workflow Signals')
+        section_end = payload.find('\n#', section_start + 1)
+        return payload[section_start:section_end if section_end != -1 else None]
 
-        RED until step-10 implements render_live_workflow_section.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('remediation_mode', [False, True], ids=['full', 'remediation'])
+    async def test_live_workflow_signals_section_present_for_live_task(
+        self, mock_deps, watermark, monkeypatch, remediation_mode
+    ):
+        """When an active task is LIVE, '### Live-Workflow Signals' lists it — on both passes.
+
+        The remediation case is a characterization pin (task 5113): Stage 1's
+        remediation payload once dropped this section (task 3839), and
+        prompts/stage2.py reads its absence as "no task is live".
         """
         import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
@@ -13201,73 +13210,22 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             mock_deps, project_id='dark_factory', project_root='/project'
         )
         stage.filtered_task_tree = self._make_filtered_tree_with_tasks([live_task, other_task])
+        stage.remediation_mode = remediation_mode
 
         payload = await stage.assemble_payload([], watermark, [])
 
         assert '### Live-Workflow Signals' in payload, (
             f"Expected '### Live-Workflow Signals' section in payload; got snippet:\n{payload[-500:]!r}"
         )
-        assert live_task_id in payload, (
-            f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals; "
-            f"got snippet:\n{payload[-500:]!r}"
+        # Sliced, because both task ids also appear in the Active Task Tree.
+        section_body = self._live_workflow_section(payload)
+        assert f'task/{live_task_id}' in section_body, (
+            f"Expected live task {live_task_id} listed under Live-Workflow Signals; "
+            f"got section:\n{section_body!r}"
         )
-
-    @pytest.mark.asyncio
-    async def test_live_workflow_signals_section_present_in_remediation_mode(
-        self, mock_deps, watermark, monkeypatch
-    ):
-        """The REMEDIATION pass carries '### Live-Workflow Signals' too (task 5113).
-
-        A characterization pin: Stage 1's remediation payload once dropped this
-        section (task 3839), and prompts/stage2.py reads its absence as "no task
-        is live". This keeps re-routing assemble_payload through
-        _render_required_sections from silently dropping it on the remediation pass.
-        """
-        import fused_memory.reconciliation.live_workflow_section as lws_module
-        from fused_memory.services.live_workflow_detector import WorkflowLiveness
-
-        live_task_id = '4321'
-        not_live_task_id = '100'
-
-        live_task = {'id': int(live_task_id), 'title': 'Live task', 'status': 'in-progress'}
-        other_task = {'id': int(not_live_task_id), 'title': 'Other task', 'status': 'pending'}
-
-        async def _fake_detect(task_id, project_root, **kwargs):
-            if str(task_id) == live_task_id:
-                return WorkflowLiveness(
-                    is_live=True,
-                    worktree_registered=True,
-                    recent_commit=False,
-                    orchestrator_live=False,
-                    branch=f'task/{live_task_id}',
-                    last_commit_at=None,
-                )
-            return WorkflowLiveness(
-                is_live=False,
-                worktree_registered=False,
-                recent_commit=False,
-                orchestrator_live=False,
-                branch=f'task/{task_id}',
-                last_commit_at=None,
-            )
-
-        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
-
-        stage = make_configured_task_knowledge_sync_stage(
-            mock_deps, project_id='dark_factory', project_root='/project'
-        )
-        stage.filtered_task_tree = self._make_filtered_tree_with_tasks([live_task, other_task])
-        stage.remediation_mode = True
-
-        payload = await stage.assemble_payload([], watermark, [])
-
-        assert '### Live-Workflow Signals' in payload, (
-            "Expected '### Live-Workflow Signals' in the REMEDIATION-mode payload; "
-            f"got snippet:\n{payload[-500:]!r}"
-        )
-        assert live_task_id in payload, (
-            f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals "
-            f"in the remediation-mode payload; got snippet:\n{payload[-500:]!r}"
+        assert f'task/{not_live_task_id}' not in section_body, (
+            f"Expected not-live task {not_live_task_id} NOT listed under Live-Workflow "
+            f"Signals; got section:\n{section_body!r}"
         )
 
     @pytest.mark.asyncio
@@ -13350,9 +13308,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' section; got:\n{payload[-500:]!r}"
         )
         # The firing signals ('worktree' and/or 'recent-commit') should appear
-        section_start = payload.find('### Live-Workflow Signals')
-        section_end = payload.find('\n#', section_start + 1)
-        section_body = payload[section_start:section_end if section_end != -1 else None]
+        section_body = self._live_workflow_section(payload)
         assert 'worktree' in section_body.lower(), (
             f"Expected 'worktree' signal name in section; got section:\n{section_body!r}"
         )
@@ -13414,9 +13370,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' section (pending task is live via "
             f"the orchestrator signal); got snippet:\n{payload[-500:]!r}"
         )
-        section_start = payload.find('### Live-Workflow Signals')
-        section_end = payload.find('\n#', section_start + 1)
-        section_body = payload[section_start:section_end if section_end != -1 else None]
+        section_body = self._live_workflow_section(payload)
 
         assert f'task/{pending_task_id}' in section_body, (
             f"Expected pending task 100 (status still eligible for the orchestrator "
@@ -13599,9 +13553,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' section (the with-worktree task "
             f"is live); got snippet:\n{payload[-500:]!r}"
         )
-        section_start = payload.find('### Live-Workflow Signals')
-        section_end = payload.find('\n#', section_start + 1)
-        section_body = payload[section_start:section_end if section_end != -1 else None]
+        section_body = self._live_workflow_section(payload)
 
         assert f'task/{with_worktree_id}' in section_body, (
             f"Expected blocked normal task {with_worktree_id} WITH a registered "
@@ -13618,6 +13570,98 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"(orchestrator-only) NOT listed — task_kind=None is treated the same as "
             f"'normal'; got section:\n{section_body!r}"
         )
+
+
+class TestAssemblePayloadRequiredSections:
+    """assemble_payload() carries every REQUIRED_SECTIONS renderer's output (task 5113).
+
+    Driven through a TWO-member STAND-IN registry of stub renderers: against
+    the real single-member registry, registry order and the absence of a
+    separator are not falsifiable. That the real registry's sections reach the
+    payload is pinned by TestAssemblePayloadLiveWorkflowSignalsSection.
+    """
+
+    STUB_REGISTRY = (
+        RequiredSection('### Alpha', 'stub_alpha'),
+        RequiredSection('### Beta', 'stub_beta'),
+    )
+    EXPECTED_SECTIONS = '\n### Alpha\nfirst\n\n### Beta\nsecond\n'
+
+    @pytest.fixture
+    def mock_deps(self):
+        return _mock_stage_deps()
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='dark_factory')
+
+    def _install_stub_registry(self, stage, monkeypatch) -> dict[str, FilteredTaskTree]:
+        """Swap in STUB_REGISTRY; return the tree each stub renderer received, by stub."""
+        received: dict[str, FilteredTaskTree] = {}
+
+        async def stub_alpha(filtered: FilteredTaskTree) -> str:
+            received['alpha'] = filtered
+            return '\n### Alpha\nfirst\n'
+
+        async def stub_beta(filtered: FilteredTaskTree) -> str:
+            received['beta'] = filtered
+            return '\n### Beta\nsecond\n'
+
+        monkeypatch.setattr(stage, 'stub_alpha', stub_alpha, raising=False)
+        monkeypatch.setattr(stage, 'stub_beta', stub_beta, raising=False)
+        monkeypatch.setattr(TaskKnowledgeSync, 'REQUIRED_SECTIONS', self.STUB_REGISTRY)
+        return received
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('remediation_mode', [False, True], ids=['full', 'remediation'])
+    async def test_payload_carries_registry_renderers_in_order_without_separator(
+        self, mock_deps, watermark, monkeypatch, remediation_mode
+    ):
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        stage.filtered_task_tree = filter_task_tree(
+            {'tasks': [{'id': 7, 'title': 'Any task', 'status': 'pending'}]}
+        )
+        stage.remediation_mode = remediation_mode
+        received = self._install_stub_registry(stage, monkeypatch)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self.EXPECTED_SECTIONS in payload, (
+            "The Stage-2 payload must carry its registry renderers' output "
+            'concatenated in REGISTRY ORDER, with no separator and no '
+            f'post-processing; expected {self.EXPECTED_SECTIONS!r} in:\n{payload!r}'
+        )
+        assert received.get('alpha') is stage.filtered_task_tree
+        assert received.get('beta') is stage.filtered_task_tree
+
+    @pytest.mark.asyncio
+    async def test_self_fetched_tree_reaches_every_registry_renderer(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """With no harness-injected tree, renderers get the tree assemble_payload fetched.
+
+        Pins Stage 2's contract over Stage 1's zero-arg aggregator: a renderer
+        reading self.filtered_task_tree would see None on this path.
+        """
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]
+        }
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        received = self._install_stub_registry(stage, monkeypatch)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self.EXPECTED_SECTIONS in payload
+        assert stage.filtered_task_tree is None
+        assert received['alpha'] is received['beta'], (
+            'Every Stage-2 registry renderer must receive the SAME resolved '
+            f'FilteredTaskTree; received {received!r}'
+        )
+        assert [task['id'] for task in received['alpha'].active_tasks] == [7]
 
 
 class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
