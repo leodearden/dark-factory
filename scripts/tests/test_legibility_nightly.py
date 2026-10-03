@@ -25,6 +25,7 @@ from typing import Any
 
 import pytest
 from legibility import (
+    account_pool,
     census_trigger,
     codebook,
     digest,
@@ -2012,6 +2013,30 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
         assert [record['closed'] for record in opened] == [1]
         _one_recorded(recorded)
+
+    def test_a_runner_teardown_failure_never_turns_a_good_night_into_a_crash(
+        self, tmp_path, night, monkeypatch,
+    ):
+        fake, _roster, _home, opened = night
+        fake.plan(default={'result': _EMPTY_VERDICT})
+        real_build_pool = account_pool.build_pool
+
+        def _build_pool_whose_shutdown_fails(**kwargs):
+            gate = real_build_pool(**kwargs)
+
+            async def _shutdown():
+                raise RuntimeError('gate shutdown blew up')
+
+            monkeypatch.setattr(gate, 'shutdown', _shutdown)
+            return gate
+
+        monkeypatch.setattr(account_pool, 'build_pool', _build_pool_whose_shutdown_fails)
+
+        result, _escalations = _run_one_digest_night(tmp_path)
+
+        assert result.exit_code == 0
+        assert result.coder_status == 'ok'
+        assert [record['closed'] for record in opened] == [1]
 
     def test_an_injected_invoke_opens_no_runner(self, tmp_path, monkeypatch, install_fake_httpx):
         """Every other run_nightly test here injects an invoke stub and

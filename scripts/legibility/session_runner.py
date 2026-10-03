@@ -264,11 +264,25 @@ class SessionRunner:
         return result.output
 
     def close(self) -> None:
+        """Shut the gate down, then close the loop, then remove the config dir.
+
+        Best-effort: every step runs whatever the one before it did, and a
+        failure is logged at WARNING rather than raised, so teardown never
+        replaces the outcome of the work that ran before it (a completed
+        night must not exit as a crash).
+        """
+        self._teardown_step("gate shutdown", lambda: self._loop.run(self._gate.shutdown()))
+        self._teardown_step("event loop close", self._loop.close)
+        self._teardown_step("config dir cleanup", self._config_dir.cleanup)
+
+    def _teardown_step(self, what: str, step: Callable[[], object]) -> None:
         try:
-            self._loop.run(self._gate.shutdown())
-        finally:
-            self._loop.close()
-            self._config_dir.cleanup()
+            step()
+        except Exception:
+            logger.warning(
+                "%s: %s failed during teardown; continuing", self._label, what,
+                exc_info=True,
+            )
 
 
 def _failure_error(label: str, stage: StageSpec, model: str, result: AgentResult) -> InvocationFailed:

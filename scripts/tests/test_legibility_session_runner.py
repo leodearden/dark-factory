@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -406,3 +407,31 @@ def test_a_call_that_outlives_its_stage_timeout_fails_naming_the_timeout(
     assert isinstance(exc, session_runner.InvocationFailed), exc
     assert not isinstance(exc, session_runner.NoHeadroom), exc
     assert 'timed out' in str(exc), exc
+
+
+def test_a_teardown_failure_is_logged_never_raised_and_the_rest_still_runs(
+    fake_claude_cli, pool_roster, sentinel_login, monkeypatch, caplog,
+):
+    """Teardown never decides the outcome of the work before it: a gate that
+    fails to shut down is a WARNING, and the config dir is still removed."""
+    accounts_file, env_file = pool_roster(_P)
+    gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
+
+    async def _shutdown():
+        raise RuntimeError('gate shutdown blew up')
+
+    monkeypatch.setattr(gate, 'shutdown', _shutdown)
+    runner = SessionRunner(gate, label='t')
+    runner.invoker(_CLASSIFIER_STAGE)('the prompt', 'haiku')
+    [call] = fake_claude_cli.calls()
+    config_dir = Path(call['env']['CLAUDE_CONFIG_DIR'])
+    assert config_dir.exists(), 'the premise: the call ran under the runner\'s dir'
+
+    with caplog.at_level(logging.WARNING, logger='legibility.session_runner'):
+        runner.close()
+
+    assert not config_dir.exists()
+    [warning] = [r for r in caplog.records if r.name == 'legibility.session_runner']
+    assert warning.levelno == logging.WARNING
+    assert warning.exc_info is not None
+    assert 'gate shutdown blew up' in str(warning.exc_info[1])
