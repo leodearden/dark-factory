@@ -103,6 +103,11 @@ from orchestrator.git_ops import (
 )
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.merge_lane.landing_evidence import (
+    LandingVerdict,
+    file_unattributed_landing_escalation,
+    validate_reported_landing,
+)
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.routing import (
@@ -581,6 +586,16 @@ def _normalize_cause_hint(hint: str | None) -> str:
     this wrapper preserves every existing importer's behaviour byte-for-byte.
     """
     return RetryLedger.normalize_cause_hint(hint)
+
+
+def _declared_metadata_list(metadata: Mapping[str, Any], key: str) -> list[Any]:
+    """``metadata[key]`` when it IS a list, else ``[]``.
+
+    For the task's declared ``files`` / ``delivered_checks``: a malformed
+    scalar must read as "nothing declared", never iterate character-wise.
+    """
+    value = metadata.get(key)
+    return value if isinstance(value, list) else []
 
 
 def _compute_merge_outcome_signature(
@@ -6819,16 +6834,19 @@ class TaskWorkflow:
 
         Caller has already verified the artifact exists.
 
-        Validation, in two halves. **Reachability**: ``commit`` must be
+        Validation, in three parts. **Reachability**: ``commit`` must be
         non-empty and reachable from main — ``git merge-base --is-ancestor``
         returns false for both unknown SHAs and SHAs not on main, so that
-        single check covers both. **Capability** (task 3057, seam 5 of
-        eleven): reachability proves only that the cited commit EXISTS on
-        main, never that THIS task's declared capability is present in it, so
-        when the task declares ``metadata.delivered_checks`` those are
-        re-checked against the SAME main SHA the reachability test used
-        (forwarded as ``main_sha=``, so no second ``get_main_sha`` call and no
-        risk of accepting a claim against one main while rejecting it against
+        single check covers both. **Attribution** (task 4704): reachability
+        proves only that the commit EXISTS on main, so the report is
+        corroborated against the task's own declared ``metadata.files`` /
+        ``delivered_checks`` and the commit's effect must survive at main
+        (``validate_reported_landing``); the report's prose is never
+        attribution. **Capability** (task 3057, seam 5 of eleven): when the
+        task declares ``metadata.delivered_checks`` those are re-checked
+        against the SAME main SHA the reachability test used (forwarded as
+        ``main_sha=``, so no second ``get_main_sha`` call and no risk of
+        accepting a claim against one main while rejecting it against
         another).
 
         That second half matters here more than anywhere else in the eleven
@@ -6839,7 +6857,10 @@ class TaskWorkflow:
 
         On success: set task status to ``done`` with provenance pointing
         at the architect-named commit, return ``DONE``.
-        On validation failure of EITHER half: clear the artifact, route to
+        On an attribution failure: hold the task blocked behind one
+        ``provenance_unattributed`` L1 (:meth:`_hold_unattributed_already_done`)
+        — whether the commit is this task's work is a human's call.
+        On a reachability or capability failure: clear the artifact, route to
         ``_mark_blocked`` without escalating to a human — this is an architect
         mistake (wrong/missing commit, or a claim main does not support), not
         an unworkable task, so a steward retry can resolve it. A capability
@@ -6875,8 +6896,21 @@ class TaskWorkflow:
                 )[:2000],
             )
 
+        metadata = self.task.get('metadata') or {}
+        branch = f'{self.config.git.branch_prefix}{self.task_id}'
+        verdict = await validate_reported_landing(
+            self.git_ops, self.task_id, branch,
+            reported_sha=commit,
+            declared_files=_declared_metadata_list(metadata, 'files'),
+            delivered_checks=_declared_metadata_list(metadata, 'delivered_checks'),
+        )
+        if not verdict.accepted or verdict.evidence_sha is None:
+            return await self._hold_unattributed_already_done(
+                branch, verdict, commit, evidence,
+            )
+
         block = await self._delivered_checks_block(
-            self.task_id, (self.task.get('metadata') or {}),
+            self.task_id, metadata,
             site='architect-already-done-report', main_sha=main_sha,
         )
         if block is not None:
@@ -6902,7 +6936,7 @@ class TaskWorkflow:
             await self.scheduler.mark_done(
                 self.task_id,
                 kind='found_on_main',
-                sha=commit,
+                sha=verdict.evidence_sha,
                 note=(
                     f'architect-reported task already on main; '
                     f'evidence: {evidence[:400]}'
@@ -6921,6 +6955,36 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
         return WorkflowOutcome.DONE
+
+    async def _hold_unattributed_already_done(
+        self, branch: str, verdict: LandingVerdict, commit: str, evidence: str,
+    ) -> WorkflowOutcome:
+        """Hold an uncorroborated already_done report BLOCKED behind one L1.
+
+        The ``provenance_unattributed`` L1 is the human signal, so
+        ``_mark_blocked`` files nothing more (``skip_escalation``).  When no
+        such L1 is open — no queue, a suppressed identical refile, a contained
+        filing error — its ordinary non-escalating block runs instead, so the
+        hold is never silent.
+        """
+        file_unattributed_landing_escalation(
+            self.escalation_queue, self.task_id, branch, verdict,
+            agent_role='orchestrator-workflow',
+            filing_claimant_run_id=self._filing_claimant_run_id,
+        )
+        held = self.escalation_queue is not None and self.escalation_queue.has_open_l1(
+            self.task_id, category='provenance_unattributed',
+        )
+        return await self._mark_blocked(
+            f'Architect reported task already done at {commit[:12]} but the '
+            f'claim could not be attributed to this task ({verdict.reason})',
+            detail=(
+                f'commit: {commit}\nreason: {verdict.reason}\n'
+                f'attribution_basis: {verdict.probe.get("attribution_basis")}\n'
+                f'evidence: {evidence}'
+            )[:2000],
+            skip_escalation=held,
+        )
 
     async def _handle_ready_to_merge_report(self) -> WorkflowOutcome:
         """Process a ``.task/ready_to_merge.json`` report from the architect.

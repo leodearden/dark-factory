@@ -2094,6 +2094,26 @@ _HELD_BLOCKED_DISPOSITION = (
 )
 
 
+class _Disposition(NamedTuple):
+    """Which producer a rejected verdict came from, and what became of its task."""
+
+    producer: str
+    closing: str
+
+
+_BRANCH_LANDING_DISPOSITION = _Disposition(
+    'validate_landing_evidence', _REDISPATCH_DISPOSITION,
+)
+
+#: Keyed on the structured :attr:`LandingVerdict.method`; every method not
+#: listed renders :data:`_BRANCH_LANDING_DISPOSITION`.
+_DISPOSITION_BY_METHOD: dict[LandingMethod, _Disposition] = {
+    LandingMethod.reported_claim: _Disposition(
+        'validate_reported_landing', _HELD_BLOCKED_DISPOSITION,
+    ),
+}
+
+
 def format_unattributed_landing_detail(
     task_id: str, branch: str, verdict: LandingVerdict,
 ) -> tuple[str, str]:
@@ -2121,9 +2141,9 @@ def format_unattributed_landing_detail(
         safe string suitable for ``Escalation.summary``; ``detail`` is a
         multi-line block for ``Escalation.detail``.
     """
-    reported = verdict.method is LandingMethod.reported_claim
-    producer = 'validate_reported_landing' if reported else 'validate_landing_evidence'
-    disposition = _HELD_BLOCKED_DISPOSITION if reported else _REDISPATCH_DISPOSITION
+    disposition = _DISPOSITION_BY_METHOD.get(
+        verdict.method, _BRANCH_LANDING_DISPOSITION,
+    )
     explanation = _REASON_EXPLANATIONS.get(
         verdict.reason, f'Unrecognized reason code: {verdict.reason}',
     )
@@ -2134,14 +2154,14 @@ def format_unattributed_landing_detail(
         f'be attributed ({verdict.reason}){summary_fragment}'
     )[:200]
     detail = (
-        f'{producer} rejected the landing evidence for task '
+        f'{disposition.producer} rejected the landing evidence for task '
         f'{task_id} on branch {branch!r}.\n\n'
         f'reason: {verdict.reason}\n'
         f'{explanation}\n\n'
         f'{divergence_block}'
         f'{differential_block}'
         f'probe: {verdict.probe}\n\n'
-        f'{disposition}'
+        f'{disposition.closing}'
     )
     return summary, detail
 
