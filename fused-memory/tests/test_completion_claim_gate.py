@@ -362,6 +362,52 @@ class TestForeignNumberRefs:
         ]
 
 
+class TestDenialAndCompoundForms:
+    """'<verb> nothing' denies the completion, and a hyphenated compound
+    ('merge-landed', 'auto-filed') is an adjective, not a completion verb."""
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(
+                'task 5623 has landed nothing (still pending)', id='sweep-class-b-1554dafd',
+            ),
+            pytest.param('task 5623 merged nothing', id='merged-nothing'),
+            pytest.param("task 5422's fix has applied nothing", id='extension-vocabulary'),
+            pytest.param(
+                'Why task 6118 needed a manual fused-memory restart (2026-10-01): the '
+                'merge-landed restart coordinator (service_restart',
+                id='esc-unverified-claim-6118-3',
+            ),
+            pytest.param(
+                'Task 5850 owns rewording the auto-filed de-flake task text, which '
+                'wrongly tells the implementer to resolve its own debt row',
+                id='esc-unverified-claim-5850-1',
+            ),
+            pytest.param(
+                'the flake ledger opened debt owned by auto-filed task 6169',
+                id='esc-unverified-claim-6169-3',
+            ),
+            pytest.param('task 77 is a pre-merged stub', id='pre-merged'),
+        ],
+    )
+    def test_denial_or_compound_yields_nothing(self, text):
+        assert _extract(text) == []
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(
+                'task 5422 was re-filed as ticket tkt_0RRRC5AASJ9Z630VP4PCN9H376',
+                id='hyphen-inside-re-filed',
+            ),
+            pytest.param('task 5422 landed', id='bare-landed'),
+        ],
+    )
+    def test_controls_still_extract_one_claim(self, text):
+        assert len(_extract(text)) == 1, _extract(text)
+
+
 def _verify(claims, *, task=None, ticket=None, commit=None):
     """Run verify_claims with probes that fail loudly if an unexpected one is
     consulted — the short-circuit contract is part of what is under test."""

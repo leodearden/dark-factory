@@ -3844,6 +3844,15 @@ class TestConflictingTaskStatusFraming:
             f'\ntext={text!r}'
         )
 
+    def test_landed_nothing_is_a_denial_not_a_terminal_outcome(self):
+        from fused_memory.reconciliation.task_filter import find_conflicting_task_status_ids
+
+        text = 'task 5623 has landed nothing (still pending)'
+        assert find_conflicting_task_status_ids(text) == set(), (
+            f"Expected set() — 'has landed nothing' says the task is NOT terminal, "
+            f'which agrees with "still pending".\ntext={text!r}'
+        )
+
 
 class TestLiveTaskStatusFraming:
     """Tests for frames_live_task_status_as_current_fact() in task_filter.py.
@@ -4481,6 +4490,23 @@ class TestFindPresentTenseCompletionClaimTaskIds:
         text = 'Merged PR #4521 into main'
         assert find_present_tense_completion_claim_task_ids(text) == set(), (
             f'Expected set() — PR #4521 is not task 4521.\ntext={text!r}'
+        )
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            'task 5623 has landed nothing (still pending)',
+            'task 6118 is a merge-landed fix',
+        ],
+    )
+    def test_denial_and_hyphenated_compound_are_not_completions(self, text):
+        from fused_memory.reconciliation.task_filter import (
+            find_present_tense_completion_claim_task_ids,
+        )
+
+        assert find_present_tense_completion_claim_task_ids(text) == set(), (
+            f"Expected set() — 'landed nothing' is a denial and 'merge-landed' "
+            f'an adjective.\ntext={text!r}'
         )
 
 
