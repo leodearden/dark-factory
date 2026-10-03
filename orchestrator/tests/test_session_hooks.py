@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest  # pyright: ignore[reportMissingImports]
+import pytest
 
 from orchestrator import session_hooks as sh
 from orchestrator import session_registry as sr
