@@ -76,11 +76,13 @@ class _FakeGraph:
                 for uuid, content in self.episodes.items()
                 if content.startswith(params['p'])
             ]
-        elif 'count(r)' in cypher:
+        elif 'count(' in cypher:
             rows = [[self.reported_total]]
-        else:
+        elif 'SKIP' in cypher:
             rows = list(self.edges) if self._edge_pages_served == 0 else []
             self._edge_pages_served += 1
+        else:
+            raise AssertionError(f'_FakeGraph does not recognise this query shape: {cypher!r}')
         return types.SimpleNamespace(result_set=rows)
 
 
@@ -272,6 +274,28 @@ class TestRunApplyStoreMutationPreflight:
         )
 
     @staticmethod
+    def _record_backend_reads(monkeypatch, graph: _FakeGraph) -> list[str]:
+        """Route ``run``'s two backend opens through recorders.
+
+        ``graph`` is served by the recorded ``connect_graph``, so a caller that
+        omits ``run``'s ``graph`` keyword observes the connect, the
+        scheduler_overrides.db read, and every graph query.
+        """
+        reads: list[str] = []
+
+        def _connect(_args: argparse.Namespace) -> _FakeGraph:
+            reads.append('connect_graph')
+            return graph
+
+        def _read_live(_project_root: str) -> dict[str, dict]:
+            reads.append('read_live_overrides')
+            return {}
+
+        monkeypatch.setattr(_mod, 'connect_graph', _connect)
+        monkeypatch.setattr(_mod, 'read_live_overrides', _read_live)
+        return reads
+
+    @staticmethod
     def _assert_no_mutation(memory: MagicMock) -> None:
         memory.update_edge.assert_not_awaited()
         memory.add_memory.assert_not_awaited()
@@ -296,10 +320,12 @@ class TestRunApplyStoreMutationPreflight:
     async def test_the_guard_sits_before_every_backend_read(self, monkeypatch, tmp_path):
         deny(_mod, monkeypatch)
         graph = self._graph()
+        reads = self._record_backend_reads(monkeypatch, graph)
 
         with pytest.raises(_mod.StoreMutationUnavailable):
-            await _mod.run(self._args(tmp_path, apply=True), memory=self._memory(), graph=graph)
+            await _mod.run(self._args(tmp_path, apply=True), memory=self._memory())
 
+        assert reads == []
         assert graph.queries == []
 
     @pytest.mark.asyncio
@@ -321,14 +347,18 @@ class TestRunApplyStoreMutationPreflight:
 
     @pytest.mark.asyncio
     async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch, tmp_path):
+        """Also the non-vacuity check for the guard-ordering test: the same
+        recorders observe every backend read once the guard is not in the way."""
         deny(_mod, monkeypatch)
         memory = self._memory()
         graph = self._graph()
+        reads = self._record_backend_reads(monkeypatch, graph)
 
-        report = await _mod.run(self._args(tmp_path, apply=False), memory=memory, graph=graph)
+        report = await _mod.run(self._args(tmp_path, apply=False), memory=memory)
 
         assert report['dry_run'] is True
         assert report['target_count'] == 1
+        assert reads == ['connect_graph', 'read_live_overrides']
         assert graph.queries
         self._assert_no_mutation(memory)
 

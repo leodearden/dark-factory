@@ -78,6 +78,8 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
 
 _calibrate = _load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
+# Pyright cannot follow the by-path loader, so it alone resolves `_arms` through
+# the scripts/ extraPath; at runtime the module is always the by-path load.
 if TYPE_CHECKING:
     import eval_write_triage_reranker_arms as _arms
 else:
