@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,6 +31,7 @@ from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
 from graphiti_core.search import search_utils
 from graphiti_core.search.search_filters import SearchFilters
+from graphiti_core.search.search_utils import calculate_cosine_similarity
 
 pytestmark = [
     falkor_skipif(),
@@ -299,3 +300,76 @@ class TestEdgeFulltextLeg:
         returned = {edge.uuid for edge in edges}
         assert seeded.off_label_edge.uuid not in returned
         assert returned == set(seeded.entity_edges)
+
+
+# --- Cosine leg ---------------------------------------------------------------
+
+# Outside the ring's octant, so neighbouring ring edges score >= 3e-4 apart, well
+# clear of float32 rounding in vec.cosineDistance.
+SIMILARITY_QUERY_VECTOR = (math.cos(-math.pi / 4), math.sin(-math.pi / 4), 0.0)
+SIMILARITY_MIN_SCORE = 0.84
+
+
+def similarity_score(embedding: tuple[float, float, float]) -> float:
+    """``vec.cosineDistance`` is ``1 - cos``; graphiti scores ``(2 - distance) / 2``."""
+    cosine = calculate_cosine_similarity(list(SIMILARITY_QUERY_VECTOR), list(embedding))
+    return (1 + cosine) / 2
+
+
+def similarity_ranking(edges: Iterable[SeededEdge]) -> list[str]:
+    """Uuids scoring above SIMILARITY_MIN_SCORE, best first."""
+    scored = sorted(((similarity_score(edge.fact_embedding), edge.uuid) for edge in edges), reverse=True)
+    return [uuid for score, uuid in scored if score > SIMILARITY_MIN_SCORE]
+
+
+def similarity_leg(group_id: str, limit: int) -> SearchLeg:
+    return lambda driver: search_utils.edge_similarity_search(
+        driver,
+        list(SIMILARITY_QUERY_VECTOR),
+        None,
+        None,
+        SearchFilters(),
+        [group_id],
+        limit,
+        SIMILARITY_MIN_SCORE,
+    )
+
+
+class TestEdgeSimilarityLeg:
+    @pytest.mark.asyncio
+    async def test_issued_cypher_plans_without_a_per_row_scan(self, seed_ring):
+        """The discriminating gate for this leg; no wall-clock budget is asserted.
+
+        Stock's per-row scan costs one index scan per Entity node, which stays
+        fast at test scale (4.7 ms on 300 edges) and overruns the server TIMEOUT
+        only at production size.  The plan shape differs at any size.
+        """
+        seeded = await seed_ring(EDGE_COUNT)
+
+        query = await issued_by_hardened_driver(seeded, similarity_leg(seeded.name, 20))
+        plan = await explain(seeded.graph, query)
+
+        assert non_leaf_scans(plan) == [], str(plan)
+
+    @pytest.mark.asyncio
+    async def test_stock_cypher_plans_a_per_row_scan(self, seed_ring):
+        """Negative control: without it the plan assertion above could pass vacuously."""
+        seeded = await seed_ring(EDGE_COUNT)
+
+        query = await issued_by_stock_graphiti(similarity_leg(seeded.name, 20))
+        plan = await explain(seeded.graph, query)
+
+        assert non_leaf_scans(plan) != [], str(plan)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('limit', [20, 100], ids=['cut-by-limit', 'cut-by-min-score'])
+    async def test_returns_the_top_scoring_entity_edges(self, seed_ring, limit):
+        seeded = await seed_ring(EDGE_COUNT)
+        ranking = similarity_ranking(seeded.entity_edges.values())
+        assert 20 < len(ranking) < 100, 'each case id must name the cut that applies'
+
+        edges = await similarity_leg(seeded.name, limit)(seeded.driver)
+
+        assert [edge.uuid for edge in edges] == ranking[:limit]
+        assert returned_endpoints(edges) == seeded.seeded_endpoints(edges)
+        assert seeded.off_label_edge.uuid not in {edge.uuid for edge in edges}

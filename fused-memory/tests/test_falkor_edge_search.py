@@ -192,6 +192,72 @@ class TestEdgeFulltextSearch:
         assert issued == []
 
 
+class TestEdgeSimilaritySearch:
+    @staticmethod
+    async def _search(
+        group_ids: list[str] | None,
+        source_node_uuid: str | None = None,
+        target_node_uuid: str | None = None,
+    ) -> tuple[list[Any], list[IssuedQuery]]:
+        driver, issued = recording_driver([CANNED_EDGE_RECORD])
+        edges = await search_utils.edge_similarity_search(
+            driver,
+            [0.1, 0.2, 0.3],
+            source_node_uuid,
+            target_node_uuid,
+            SearchFilters(),
+            group_ids,
+            20,
+            0.6,
+        )
+        return edges, issued
+
+    @pytest.mark.asyncio
+    async def test_match_pattern_has_no_labeled_endpoint_node(self) -> None:
+        """A labeled endpoint drives a label scan with a per-row edge index scan beneath it."""
+        _, issued = await self._search(['g'])
+
+        (query,) = issued
+        assert '(n:Entity)' not in query.cypher
+        assert '(m:Entity)' not in query.cypher
+
+    @pytest.mark.asyncio
+    async def test_forwards_graphiti_params(self) -> None:
+        _, issued = await self._search(['g'])
+
+        params = issued[0].params
+        assert params['search_vector'] == [0.1, 0.2, 0.3]
+        assert params['min_score'] == 0.6
+        assert params['limit'] == 20
+        assert params['group_ids'] == ['g']
+
+    @pytest.mark.asyncio
+    async def test_endpoint_filters_apply_with_group_ids(self) -> None:
+        _, issued = await self._search(['g'], 's', 't')
+
+        assert issued[0].params['source_uuid'] == 's'
+        assert issued[0].params['target_uuid'] == 't'
+
+    @pytest.mark.asyncio
+    async def test_endpoint_filters_are_dropped_without_group_ids(self) -> None:
+        """Upstream parity: graphiti applies them only inside its ``group_ids`` branch."""
+        _, issued = await self._search(None, 's', 't')
+
+        assert 'source_uuid' not in issued[0].params
+        assert 'target_uuid' not in issued[0].params
+
+    @pytest.mark.asyncio
+    async def test_parses_records_into_entity_edges(self) -> None:
+        edges, _ = await self._search(['g'])
+
+        (edge,) = edges
+        assert (edge.uuid, edge.source_node_uuid, edge.target_node_uuid) == (
+            'edge-uuid',
+            'source-uuid',
+            'target-uuid',
+        )
+
+
 OVERRIDDEN_METHODS = (
     'edge_fulltext_search',
     'edge_similarity_search',
