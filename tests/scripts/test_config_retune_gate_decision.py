@@ -111,6 +111,26 @@ Unmutated at the same base: ``3 passed in 1.48s``.
       (1 != 4, and resolved 1 == declared 1), so the two lock_depth arms are
       independently falsifiable rather than one masking the other.
 
+  M5  option (2) itself — in ``orchestrator/tests/conftest.py``'s
+      ``_isolate_orch_config``, ``str(REPO_ROOT / "dark-factory-orchestrator.yaml")``
+      -> ``str(tmp_path / "no-such-config.yaml")``, verbatim the
+      ``code_default_config`` body promoted to autouse. Taken at base main
+      ``03585022af`` on branch ``task/3886`` at ``79578bf0a4``, same command;
+      unmutated there: ``4 passed in 6.37s``.
+      -> ``1 failed, 3 passed in 4.90s``, FAILED
+      ``test_orchestrator_unit_tests_are_bound_to_the_operational_config_file``
+      on the path-equality assertion:
+        E   AssertionError: fixture bound ORCH_CONFIG_PATH at
+            '/tmp/pytest-of-leo/pytest-48467/test_orchestrator_unit_tests_a0/no-such-config.yaml',
+            not the operational
+            /home/leo/src/dark-factory/.worktrees/3886/dark-factory-orchestrator.yaml.
+      THE FIRST ENTRY TO MUTATE A FILE OTHER THAN THE OPERATIONAL YAML, and
+      that is the gap it closes. Under the same mutation, with that test
+      deselected, the three tests M1-M4 cover still report
+      ``3 passed, 1 deselected in 3.11s``: none of them reads the fixture, so
+      before M5's test existed this file was GREEN under the one option its
+      decision rejected.
+
 Each mutation reddened a DIFFERENT assertion, and no mutation reddened more
 than one test. That is the property worth having: a future edit that breaks one
 premise of the decision reports which premise, rather than collapsing the whole
@@ -126,7 +146,10 @@ DECIDED block.
 """
 from __future__ import annotations
 
+import importlib.util
+import os
 import pathlib
+import sys
 
 import pytest
 import yaml
@@ -148,6 +171,10 @@ REPO_ROOT = pathlib.Path(__file__).parents[2]
 # fallback for unmigrated projects, not a choice this repo has.
 DF_CONFIG_NAME = 'dark-factory-orchestrator.yaml'
 ROOT_CONFIG_PATH = REPO_ROOT / DF_CONFIG_NAME
+
+# The conftest carrying the autouse ``_isolate_orch_config`` binding that
+# option (2) would have narrowed — the contract this decision PRESERVES.
+ORCH_CONFTEST = REPO_ROOT / 'orchestrator' / 'tests' / 'conftest.py'
 
 
 def _root_config(monkeypatch: pytest.MonkeyPatch) -> OrchestratorConfig:
@@ -362,6 +389,114 @@ def test_unit_tests_read_the_operational_lock_depth_not_the_package_default(
         'has lapsed: tests are now exercising a depth the factory does not run '
         'at, silently — precisely the failure mode option (2) would have '
         'institutionalised and which task 3886 rejected'
+    )
+
+
+def _exec_orchestrator_conftest(monkeypatch: pytest.MonkeyPatch):
+    """Execute ``ORCH_CONFTEST`` as a module, its import-time side effects contained to this test.
+
+    Loaded under the UNIQUE name ``_orch_conftest_under_test`` and never as
+    ``conftest``: that file's own docstring records that sibling subprojects'
+    conftests collide under ``sys.modules['conftest']``, and ``tests/scripts``
+    already owns that name in this session.
+
+    Executing it is not inert. At import it inserts five entries into
+    ``sys.path`` (``orchestrator/tests`` among them, at the front) and
+    ``setdefault``s ``ORCH_DEBUG_ASSERTS`` in the environment. Both are handed
+    to ``monkeypatch`` first so they are undone at teardown rather than
+    leaking into every ``tests/scripts`` test collected after this one.
+
+    No skip on failure: an unloadable conftest FAILS this guard (the
+    MUST-NOT-SKIP contract above).
+    """
+    assert ORCH_CONFTEST.is_file(), (
+        f'{ORCH_CONFTEST} does not exist. That file carries the autouse '
+        '_isolate_orch_config binding which task 3886 decided to PRESERVE '
+        '(option (2) rejected), so the binding has MOVED: re-anchor this guard '
+        'at its new home rather than deleting it'
+    )
+    monkeypatch.setattr(sys, 'path', [*sys.path])
+    monkeypatch.setenv('ORCH_DEBUG_ASSERTS', os.environ.get('ORCH_DEBUG_ASSERTS', '1'))
+    spec = importlib.util.spec_from_file_location('_orch_conftest_under_test', ORCH_CONFTEST)
+    assert spec is not None and spec.loader is not None, (
+        f'importlib could not build a module spec for {ORCH_CONFTEST}'
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_orchestrator_unit_tests_are_bound_to_the_operational_config_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """The binding arm: option (2) is REJECTED, and this is what says so.
+
+    Option (2) was to narrow ``orchestrator/tests/conftest.py``'s autouse
+    ``_isolate_orch_config`` so unit tests read the package-bundled DECLARED
+    defaults instead of this project's OPERATIONAL config. That is declined.
+    The heal commit for the incident (``c54d7cf81c``) argues against it in its
+    own body: the binding is deliberate "precisely so tests see real
+    operational values", and the three tests that broke failed LOUDLY via
+    self-validating preconditions — "the precondition worked as designed; the
+    fixture data was stale". Under option (2) those same tests would have
+    PASSED at a declared depth the factory does not run at, trading a loud
+    failure for a silent wrong-test. That is against INV-2
+    ``structured-facts-at-failure`` and the repo's loud-over-silent norm, and
+    ``conftest.py`` already ships the sanctioned escape hatch
+    (``code_default_config``, re-pointing ``ORCH_CONFIG_PATH`` at a
+    guaranteed-absent file) for the minority of tests that genuinely want
+    package defaults.
+
+    This asserts the FIXTURE'S RUNTIME EFFECT — the ``ORCH_CONFIG_PATH`` the
+    production fixture actually sets when invoked — so it is falsifiable by
+    option (2) itself (ledger entry M5). It names a PATH, not a knob value, so
+    no retune of any knob can disturb it.
+
+    Three details are load-bearing:
+
+      * ``ORCH_CONFIG_PATH`` is deleted BEFORE the call, so an ambient value
+        cannot satisfy the assertion without the fixture doing anything.
+      * Both sides are ``.resolve()``d: the conftest derives its ``REPO_ROOT``
+        resolved, this module's is not, and a symlinked checkout would
+        otherwise compare unequal while bound correctly.
+      * ``.is_file()`` on the bound path is what separates the operational
+        binding from option (2)'s shape — ``code_default_config``'s
+        guaranteed-ABSENT path promoted to autouse.
+
+    A returned generator is driven to its first yield, so converting the
+    fixture to a yield-fixture cannot silently no-op this guard.
+    """
+    conftest = _exec_orchestrator_conftest(monkeypatch)
+    fixture = conftest._isolate_orch_config
+    isolate_orch_config = getattr(fixture, '__wrapped__', fixture)
+
+    monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+    result = isolate_orch_config(monkeypatch, tmp_path)
+    if hasattr(result, '__next__'):
+        next(result)
+
+    bound = os.environ.get('ORCH_CONFIG_PATH')
+    operational = ROOT_CONFIG_PATH.resolve()
+    assert bound is not None, (
+        f'{ORCH_CONFTEST}::_isolate_orch_config no longer sets ORCH_CONFIG_PATH '
+        'at all, so every orchestrator unit test falls back to a CWD-relative '
+        f'config.yaml or the package DEFAULTS instead of {DF_CONFIG_NAME}. Task '
+        '3886 rejected narrowing that binding (option (2)); re-take the decision '
+        f'in the DECIDED block in {DF_CONFIG_NAME} rather than editing this assertion'
+    )
+    assert pathlib.Path(bound).resolve() == operational, (
+        f'fixture bound ORCH_CONFIG_PATH at {bound!r}, not the operational '
+        f'{operational}. Orchestrator unit tests would then read values the '
+        'factory does not run at — option (2), which task 3886 rejected. Re-take '
+        f'the decision in the DECIDED block in {DF_CONFIG_NAME} rather than '
+        'editing this assertion'
+    )
+    assert pathlib.Path(bound).is_file(), (
+        f'fixture bound ORCH_CONFIG_PATH at {bound!r}, which does not exist. '
+        'YamlSettingsSource skips a missing file without raising, so every '
+        'orchestrator unit test would silently load the package DEFAULTS — the '
+        'code_default_config escape hatch promoted to autouse, i.e. option (2)'
     )
 
 
