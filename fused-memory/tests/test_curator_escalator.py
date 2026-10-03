@@ -19,8 +19,10 @@ import json
 from typing import IO, Any, Literal, overload
 
 import pytest
+from _fm_helpers import LoopFreedomProbe
 from escalation.queue import EscalationQueue
 
+from fused_memory.middleware import curator_escalator
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DUPLICATE_METADATA_KEY,
@@ -804,6 +806,50 @@ def _pending_records(root) -> list[dict[str, Any]]:
 def _only_escalation_detail(root) -> str:
     [path] = sorted((root / 'data' / 'escalations').glob('esc-*.json'))
     return json.loads(path.read_text())['detail']
+
+
+class TestOrchestratorProbeRunsOffTheEventLoop:
+    """Every orchestrator-liveness probe runs off the event loop's thread.
+
+    The stub stands in for the lock file: it blocks on a LoopFreedomProbe
+    and returns True, and the filed record proves that verdict was honoured.
+    """
+
+    @pytest.mark.asyncio
+    async def test_report_failure_probes_off_the_event_loop(self, tmp_path, monkeypatch):
+        probe = LoopFreedomProbe()
+        seen: list[str] = []
+
+        def _blocking_lock_probe(project_root):
+            seen.append(project_root)
+            probe.block()
+            return True
+
+        monkeypatch.setattr(curator_escalator, 'is_orchestrator_lock_held', _blocking_lock_probe)
+
+        await CuratorEscalator().report_failure(
+            project_root=str(tmp_path), project_id='proj-x',
+            justification='boom', candidate_title='T',
+        )
+
+        probe.assert_loop_stayed_free()
+        assert seen == [str(tmp_path)]
+        assert [r['category'] for r in _pending_records(tmp_path)] == ['curator_failure']
+
+    @pytest.mark.asyncio
+    async def test_report_zot_duplicate_probes_off_the_event_loop(self, tmp_path, monkeypatch):
+        probe = LoopFreedomProbe()
+
+        def _blocking_lock_probe(project_root):
+            probe.block()
+            return True
+
+        monkeypatch.setattr(curator_escalator, 'is_orchestrator_lock_held', _blocking_lock_probe)
+
+        await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+
+        probe.assert_loop_stayed_free()
+        assert [r['category'] for r in _pending_records(tmp_path)] == ['curator_zot_duplicate']
 
 
 class TestTranscriptEvidenceInDetail:
