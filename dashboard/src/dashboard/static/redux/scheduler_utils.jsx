@@ -4,7 +4,7 @@
    consumers can destructure from the global.
 
    Exports: window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo,
-             disambiguateLabels, labelFor, lockChipState }
+             disambiguateLabels, labelFor, lockChipState, lockChipStateFor }
    (Canonical list: the window.DF_SCHED_UTILS assignment at the bottom of this file.)
 */
 
@@ -117,6 +117,7 @@ function labelFor(paths) {
 // all three.
 // Returns { cls, hint, ownerLabel } where ownerLabel is null when the chip has
 // no owner to display (lock-free or lock-mine without a counterpart label).
+// Callers holding a SCHEDULER.modules entry go through lockChipStateFor.
 function lockChipState({ holder, isMine, parkedBy, parkedOwnerLive }) {
   if (holder) {
     if (isMine) return { cls: 'lock-mine', hint: 'held by this task', ownerLabel: null };
@@ -129,4 +130,17 @@ function lockChipState({ holder, isMine, parkedBy, parkedOwnerLive }) {
   return { cls: 'lock-free', hint: 'available', ownerLabel: null };
 }
 
-window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor, lockChipState };
+// lockChipState for one task's view of one SCHEDULER.modules entry (or none):
+// the one place a lock is decided to be "mine" — held by this task id in this
+// project, an entry with no holder_project read as the task's own project.
+function lockChipStateFor(module, taskId, project) {
+  const m = module || {};
+  return lockChipState({
+    holder: m.holder,
+    isMine: Boolean(m.holder) && m.holder === taskId && (m.holder_project || project) === project,
+    parkedBy: m.parked_by,
+    parkedOwnerLive: m.parked_owner_live,
+  });
+}
+
+window.DF_SCHED_UTILS = { fmtAge, totalEvents, avgWaitSeconds, buildSchedLockInfo, disambiguateLabels, labelFor, lockChipState, lockChipStateFor };

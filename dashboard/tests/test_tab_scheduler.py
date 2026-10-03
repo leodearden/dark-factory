@@ -14,7 +14,8 @@ from __future__ import annotations
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments, walk_balanced
+from _dashboard_helpers import extract_function_body, strip_js_comments
+from _lock_chip_matrix import chip_classes_over_the_matrix
 
 
 @pytest.fixture(scope='module')
@@ -533,22 +534,17 @@ def test_cell_state_delegates_membership_to_the_shared_predicate(scheduler_heatm
 
 @pytest.mark.parametrize('token', ['parked_by', 'park_state', 'held-by-other', 'parked-by'])
 def test_cell_state_classifies_through_the_one_lock_classifier(scheduler_heatmap_jsx_body, token):
-    """cellStateFor asks lockChipState and keeps no precedence of its own.
+    """cellStateFor asks lockChipStateFor and keeps no precedence of its own.
 
     The heatmap once ranked parked-by-me above held-by-other while the task-row
     chip ranks the holder first, so one lock read differently in two views.
     test_lock_chip_state.py executes both and pins that they agree; this pins
-    that no private precedence survives beside the call. The call's own
-    argument list is excluded: handing module.parked_by to lockChipState is the
-    one legitimate read of it.
+    that no private precedence, and no reading of the park fields, survives
+    beside the call — the module entry is handed over whole.
     """
     body = strip_js_comments(extract_function_body(scheduler_heatmap_jsx_body, 'cellStateFor'))
-    call = re.search(r'lockChipState\s*\(', body)
-    assert call, 'cellStateFor does not call lockChipState'
-    arguments = walk_balanced(body, call.end() - 1, '(', ')')
-    assert arguments, 'the lockChipState call is never closed'
-    outside_the_call = body.replace(arguments, '')
-    assert token not in outside_the_call, f'cellStateFor still reads or returns `{token}`'
+    assert re.search(r'lockChipStateFor\s*\(', body), 'cellStateFor does not call lockChipStateFor'
+    assert token not in body, f'cellStateFor still reads or returns `{token}`'
 
 
 def test_scheduler_heatmap_derives_no_park_map(scheduler_heatmap_jsx_body):
@@ -562,14 +558,12 @@ def test_scheduler_heatmap_derives_no_park_map(scheduler_heatmap_jsx_body):
 class TestHeatmapCellClassesAreStyled:
     """Every class a heatmap cell can carry has a `.sched-cell.<cls>` rule.
 
-    test_lock_chip_state.py pins what lockChipState returns; what a node
+    test_lock_chip_state.py pins what lockChipStateFor returns; what a node
     process cannot see is whether styles.css colours it. An unstyled class
     renders as a bare cell, and a taken lock would read like a free one.
     """
 
     def test_every_cell_class_has_a_rule(self, styles_css_body):
-        from test_lock_chip_state import chip_classes_over_the_matrix
-
         classes = chip_classes_over_the_matrix() | {'not-in-set'}
         unstyled = sorted(c for c in classes if not _extract_css_rule_block(styles_css_body, f'.sched-cell.{c}'))
         assert unstyled == [], f'styles.css has no `.sched-cell.<cls>` rule for {unstyled}'

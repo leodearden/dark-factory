@@ -25,16 +25,11 @@ const { boundHeatmapAxes, rowTouchesModule } = window.DF_SCHED_HEATMAP_BOUNDS;
 // Returns lockChipState's { cls, hint, ownerLabel }. Membership is
 // rowTouchesModule's — the same predicate the axis filter reaches, so the
 // filter cannot drop a row whose cells this would colour. The lock's state is
-// lockChipState's, the one lock classifier the task-row chips also read, so a
-// lock reads the same in the heatmap as on its chip.
+// lockChipStateFor's, the one lock classifier the task-row chips also read, so
+// a lock reads the same in the heatmap as on its chip.
 function cellStateFor(row, module) {
   if (!rowTouchesModule(row, module)) return { cls: 'not-in-set', hint: 'not in lock set', ownerLabel: null };
-  return window.DF_SCHED_UTILS.lockChipState({
-    holder: module.holder,
-    isMine: module.holder === row.task_id,
-    parkedBy: module.parked_by,
-    parkedOwnerLive: module.parked_owner_live,
-  });
+  return window.DF_SCHED_UTILS.lockChipStateFor(module, row.task_id, row.project);
 }
 
 // ── Single heatmap cell ── `state` is cellStateFor's answer.

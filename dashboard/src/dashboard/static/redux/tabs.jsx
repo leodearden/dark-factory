@@ -176,9 +176,8 @@ function DepChip({ dep }) {
   );
 }
 
-function LockChip({ path, label, holder, holderProject, currentTaskId, currentProject, parkedBy, parkedOwnerLive }) {
-  const isOwn = holder && holder === currentTaskId && (holderProject || currentProject) === currentProject;
-  const { cls, hint, ownerLabel } = window.DF_SCHED_UTILS.lockChipState({ holder, isMine: isOwn, parkedBy, parkedOwnerLive });
+function LockChip({ path, label, module, currentTaskId, currentProject }) {
+  const { cls, hint, ownerLabel } = window.DF_SCHED_UTILS.lockChipStateFor(module, currentTaskId, currentProject);
   return (
     <span className={`chip ${cls}`} title={`${path} · ${hint}`}>
       {label != null ? label : path.split('/').pop()}
@@ -250,7 +249,7 @@ function LocksCell({ task, datum }) {
   const labelMap = disambiguateLabels ? disambiguateLabels(sorted) : null;
   return <ChipList items={sorted} renderChip={(modPath) => {
     const m = moduleByPath.get(modPath);
-    return <LockChip key={modPath} path={modPath} label={labelMap ? labelMap.get(modPath) : modPath.split('/').pop()} holder={m && m.holder} holderProject={m && m.holder_project} currentTaskId={rawTaskId} currentProject={task.project} parkedBy={m && m.parked_by} parkedOwnerLive={m && m.parked_owner_live} />;
+    return <LockChip key={modPath} path={modPath} label={labelMap ? labelMap.get(modPath) : modPath.split('/').pop()} module={m} currentTaskId={rawTaskId} currentProject={task.project} />;
   }} maxInline={2} persistKey={`df.locks.${task.id}`} expandLayout="column" alwaysToggle={true} />;
 }
 
