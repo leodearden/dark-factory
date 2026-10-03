@@ -145,11 +145,11 @@ result = mcp__escalation__promote_to_l2(
 )
 # result: {'id': <l2_id>, 'status': 'created'|'updated', 'members': [...],
 #          'severity': <what was actually filed>}
-#   or, for an eval-lane task_id, the refusal
+#   or, for an eval-lane task_id or any eval-lane member, the refusal
 #          {'error': ..., 'code': 'eval_lane_contained'}  (nothing minted)
 ```
 
-An `eval_lane_contained` refusal is final: close the members instead, per [Eval-lane records](#eval-lane-records-any-category--close-never-promote).
+An `eval_lane_contained` refusal is final for the eval-lane records it names: close them instead, per [Eval-lane records](#eval-lane-records-any-category--close-never-promote), and re-promote any production members without them.
 
 ### Severity of a promoted L2
 
@@ -470,13 +470,13 @@ The class describes the **escalation's usefulness**, not your effort — a `resu
 
 **Class discriminator.** A pending record is eval-lane when **either** holds:
 - its `task_id` matches the eval fixture grammar — `<repo>_task_<n>[_<suffix>]` (e.g. `df_task_2430_adv_plan`, `reify_task_5221`, `kl_task_543`) or `shadow_<task_id>_<cell_id>` (e.g. `shadow_5383_01JCELL`);
-- its `worktree` contains `eval-worktree` (e.g. `/home/leo/src/dark-factory-eval-worktrees/df_task_2339/run-ac3ab562`), even when its `task_id` is a real numeric task.
+- its `worktree` has a path component ending in `-eval-worktrees` or named `.eval-worktrees` (e.g. `/home/leo/src/dark-factory-eval-worktrees/df_task_2339/run-ac3ab562`), even when its `task_id` is a real numeric task. A directory that merely contains `eval-worktree` in its name (a project called `eval-worktree-tools`) is production.
 
 The single source of both signals is `shared/src/shared/eval_lane.py::eval_lane_provenance`; match it, do not approximate it. Other non-numeric ids are **not** eval-lane: `task-path-guard`, `__recovery_veto_streak__*`, `main-sweep-*`, `__scheduler__` and their kin are production harness sentinels whose L2s must still reach a human. A reaper-minted L1 carries `worktree=None`, so on an L1 the `task_id` is usually the only signal.
 
 **Why they exist.** Adversarial eval fixtures seed a deliberately wrong plan step, and the implementer's refuse-and-escalate IS the measured behaviour. It is scored from the eval cell's result artifacts (`orchestrator/src/orchestrator/evals/scoring.py`), never from the escalation queue, so these records carry no production signal. The orphan reaper also used to flag throwaway fixture worktrees as orphans.
 
-**What the system does with them.** The escalation server files eval-lane escalations already-resolved (`resolved_by='escalation-eval-lane-containment'`); the orphan reaper dismisses an eval-lane L0 instead of promoting it; `promote_to_l2` refuses an eval-lane `task_id` with `code: 'eval_lane_contained'` and mints nothing. A rotation should rarely meet one.
+**What the system does with them.** The escalation server files eval-lane escalations already-resolved (`resolved_by='escalation-eval-lane-containment'`); the orphan reaper dismisses an eval-lane L0 instead of promoting it; `promote_to_l2` refuses an eval-lane `task_id`, or any eval-lane member under whatever `task_id`, with `code: 'eval_lane_contained'` and mints nothing. A rotation should rarely meet one.
 
 **Disposition for any that still reach a rotation** (records filed before containment shipped, or written by a path that bypasses the server). Never `promote_to_l2`. Never `resolve_issue(action='resume')`. Close each member L1:
 

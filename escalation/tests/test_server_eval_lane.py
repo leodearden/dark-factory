@@ -237,11 +237,9 @@ def _queue_files(queue: EscalationQueue) -> set[str]:
     return {p.name for p in queue.queue_dir.rglob('*.json')}
 
 
-def _assert_refused(result: dict[str, Any], task_id: str) -> None:
+def _assert_refused(result: dict[str, Any]) -> None:
     assert result.get('code') == 'eval_lane_contained', result
     assert 'id' not in result
-    assert f'fixture-task-id:{task_id}' in result['error']
-    assert "resolve_issue(action='close_only', resolution_class='benign')" in result['error']
 
 
 class TestPromoteToL2RefusesEvalLane:
@@ -262,7 +260,7 @@ class TestPromoteToL2RefusesEvalLane:
             ),
         )
 
-        _assert_refused(result, task_id)
+        _assert_refused(result)
         assert _queue_files(queue) == files_before
         assert [r for r in queue.get_by_task(task_id) if r.level == 2] == []
         assert queue.get(member.id).to_dict() == member_before
@@ -282,7 +280,50 @@ class TestPromoteToL2RefusesEvalLane:
             server, **_promote_args(ADV_FIXTURE_ID, [eval_member.id], 'shared-root-cause')
         )
 
-        _assert_refused(result, ADV_FIXTURE_ID)
+        _assert_refused(result)
+        prod_l2_after = queue.get(created['id'])
+        assert prod_l2_after.members == prod_l2_before.members
+        assert prod_l2_after.amendments == prod_l2_before.amendments
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'eval_member_fields',
+        [{'task_id': ADV_FIXTURE_ID}, {'task_id': '2339', 'worktree': EVAL_WORKTREE}],
+        ids=['fixture-id-member', 'eval-worktree-member'],
+    )
+    async def test_production_promote_with_an_eval_lane_member_mints_nothing(
+        self, queue, eval_member_fields
+    ):
+        server = create_server(queue, startup_sweep=False)
+        prod_member = seed_escalation(queue, level=1, task_id='3096')
+        eval_member = seed_escalation(queue, level=1, **eval_member_fields)
+        files_before = _queue_files(queue)
+
+        result = await _promote(
+            server,
+            **_promote_args('3096', [prod_member.id, eval_member.id], 'mixed-cluster'),
+        )
+
+        _assert_refused(result)
+        assert _queue_files(queue) == files_before
+        assert [r for r in queue.get_by_task('3096') if r.level == 2] == []
+
+    @pytest.mark.asyncio
+    async def test_eval_lane_member_never_folds_into_a_production_l2(self, queue):
+        server = create_server(queue, startup_sweep=False)
+        prod_member = seed_escalation(queue, level=1, task_id='3096')
+        created = await _promote(
+            server, **_promote_args('3096', [prod_member.id], 'shared-root-cause')
+        )
+        assert created['status'] == 'created', created
+        prod_l2_before = queue.get(created['id'])
+        eval_member = seed_escalation(queue, level=1, task_id=ADV_FIXTURE_ID)
+
+        result = await _promote(
+            server, **_promote_args('3096', [eval_member.id], 'shared-root-cause')
+        )
+
+        _assert_refused(result)
         prod_l2_after = queue.get(created['id'])
         assert prod_l2_after.members == prod_l2_before.members
         assert prod_l2_after.amendments == prod_l2_before.amendments

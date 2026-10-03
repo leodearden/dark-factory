@@ -106,8 +106,8 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
 def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Escalation | None]:
     """Read each DISTINCT member id once — ``None`` for an id that does not resolve.
 
-    The one member read ``promote_to_l2`` makes; :func:`_derive_l2_severity`
-    and :func:`_sentinel_bound_task_ids` both consume it.  Through
+    The one member read ``promote_to_l2`` makes; :func:`_derive_l2_severity`,
+    :func:`_sentinel_bound_task_ids` and :func:`_eval_lane_members` all consume it.  Through
     ``queue.get()`` rather than the queue root directly, so a member already
     resolved and archived between the watcher's drain and its promote still
     contributes (``get`` falls back to the archive), and repeated lookups of a
@@ -222,6 +222,37 @@ def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset
             return frozenset()
         bound_task_ids.add(member.task_id)
     return frozenset(bound_task_ids)
+
+
+def _eval_lane_members(members: dict[str, Escalation | None]) -> dict[str, str]:
+    """Map each resolvable member that carries eval-lane provenance to its reason.
+
+    Judged from the member's OWN record (task id and worktree), so a cluster
+    promoted under a production task id still cannot carry an eval-lane record
+    into a human L2.  *members* is :func:`_read_members`' answer.
+    """
+    flagged: dict[str, str] = {}
+    for member_id, member in members.items():
+        if member is None:
+            continue
+        reason = eval_lane_provenance(member.task_id, member.worktree)
+        if reason is not None:
+            flagged[member_id] = reason
+    return flagged
+
+
+def _eval_lane_refusal(subject: str) -> dict[str, str]:
+    """The ``promote_to_l2`` refusal for an eval-lane *subject*; nothing is minted."""
+    return {
+        'error': (
+            f'{subject}; eval-lane escalations are contained to the eval harness '
+            'and never promoted to the human L2 queue. Close the eval-lane L1(s) '
+            "with resolve_issue(action='close_only', resolution_class='benign') "
+            'and re-promote only the production members, if any, under a '
+            'production task_id.'
+        ),
+        'code': 'eval_lane_contained',
+    }
 
 
 # The role the steward's own filings carry (orchestrator.steward
@@ -1511,7 +1542,7 @@ def create_server(
         """
         eval_lane_reason = eval_lane_provenance(esc.task_id, esc.worktree)
         if eval_lane_reason is not None:
-            logger.warning(
+            logger.info(
                 'Eval-lane containment: filing %s as resolved (%s); task_id=%r '
                 'agent_role=%r severity=%r level=%r',
                 esc.id, eval_lane_reason, esc.task_id, esc.agent_role,
@@ -2958,9 +2989,11 @@ def create_server(
         **Eval-lane refusal** (task 3096): a *task_id* with eval-lane
         provenance (``shared/src/shared/eval_lane.py``) is refused with
         ``code: 'eval_lane_contained'`` right after the identity gate, before
-        any read, so it applies to the create AND the fold path — an eval
-        cluster can never fold into a production L2.  Close its member L1s
-        with ``close_only`` instead.
+        any read; a member whose own record carries eval-lane provenance is
+        refused the same way right after the member read, whatever the
+        *task_id*.  Both precede the create AND the fold path, so an eval-lane
+        record can never be minted into, or folded into, a production L2.
+        Close the eval-lane member L1s with ``close_only`` instead.
 
         **Sentinel-bound members** (task 4541): when at least one member
         resolves and EVERY resolved member was filed under a role in
@@ -3107,8 +3140,8 @@ def create_server(
                 'code': 'level_forbidden',
             }
 
-        # Only task_id can carry the signal here: the tool takes no worktree,
-        # and reaper-minted member L1s carry worktree=None.
+        # The caller's task_id is judged here, before any read; each member's
+        # own record is judged right after the member read below.
         eval_lane_reason = eval_lane_provenance(task_id)
         if eval_lane_reason is not None:
             logger.warning(
@@ -3116,17 +3149,9 @@ def create_server(
                 'root_cause=%r',
                 task_id, eval_lane_reason, member_ids, root_cause,
             )
-            return {
-                'error': (
-                    f'task_id {task_id!r} is an eval-lane artifact '
-                    f'({eval_lane_reason}); eval-lane escalations are contained '
-                    'to the eval harness and never promoted to the human L2 '
-                    'queue. Close the member L1(s) with '
-                    "resolve_issue(action='close_only', resolution_class='benign') "
-                    'instead.'
-                ),
-                'code': 'eval_lane_contained',
-            }
+            return _eval_lane_refusal(
+                f'task_id {task_id!r} is an eval-lane artifact ({eval_lane_reason})'
+            )
 
         # Validate required non-empty fields
         if not member_ids:
@@ -3195,11 +3220,24 @@ def create_server(
                     derived,
                     queue.find_pending_l2_by_root_cause(root_cause),
                     _sentinel_bound_task_ids(members),
+                    _eval_lane_members(members),
                 )
 
-            derived, existing_id, required_task_ids = await asyncio.to_thread(
-                _read_for_promote,
-            )
+            (
+                derived, existing_id, required_task_ids, eval_lane_members,
+            ) = await asyncio.to_thread(_read_for_promote)
+
+            if eval_lane_members:
+                logger.warning(
+                    'promote_to_l2 refused: eval-lane members %s under task_id=%r '
+                    'root_cause=%r',
+                    eval_lane_members, task_id, root_cause,
+                )
+                named = ', '.join(
+                    f'{member_id} ({reason})'
+                    for member_id, reason in eval_lane_members.items()
+                )
+                return _eval_lane_refusal(f'member(s) {named} are eval-lane artifacts')
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.
