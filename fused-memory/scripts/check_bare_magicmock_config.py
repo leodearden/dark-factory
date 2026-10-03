@@ -28,10 +28,11 @@ separate message vocabularies and separate ``# noqa`` codes.  Every statement in
       NOT a mock-spec rule.  Position-blind over any ``ast.Call``: a load-bearing
       synchronisation point (a ``MergeRequest.result`` future or a ``gate*.wait()``
       barrier) awaited through a bare ``asyncio.wait_for`` instead of
-      ``wait_responsive``, or carrying a raw numeric ``timeout=`` literal on either
-      call shape.  Remedies are wait-specific (``wait_responsive(...)`` with a
-      ``label=``, bound derived from ``MERGE_RESULT_TIMEOUT``).  Carries its own
-      shrink-only per-file debt BUDGET (``_WALL_CLOCK_DEADLINE_DEBT``).
+      ``wait_responsive``, or carrying a raw numeric literal bound (``timeout=``,
+      ``max_wall_s=`` or wait_for's positional timeout).  Remedies are wait-specific
+      (``wait_responsive(...)`` with a ``label=``, bound derived from
+      ``MERGE_RESULT_TIMEOUT``).  Carries its own shrink-only per-file debt BUDGET
+      (``_WALL_CLOCK_DEADLINE_DEBT``).
 
 WIDEN-NOT-SIBLING RULING (task 4016): Rule B was added here rather than as a sibling
 script.  A sibling would have cost nine wiring edits (seven package ``orchestrator.yaml``
@@ -153,9 +154,11 @@ TWO violations:
 
   1. the target is awaited through a bare ``asyncio.wait_for(...)`` rather than
      ``wait_responsive(...)``, so its deadline is charged in WALL CLOCK; and
-  2. the call carries a RAW numeric ``timeout=`` literal — on EITHER call shape.
-     ``wait_responsive`` takes a ``timeout`` keyword too, so a migrated site can
-     have moved the accounting while keeping a hand-written number.
+  2. the call carries a RAW numeric literal bound — a ``timeout=`` or
+     ``max_wall_s=`` keyword on EITHER call shape, or ``asyncio.wait_for``'s
+     positional timeout.  ``wait_responsive`` takes both keywords too, so a
+     migrated site can have moved the accounting while keeping a hand-written
+     number.  Several literal bounds on one call are still ONE violation.
 
 Suppressed by ``# noqa: wall-clock-deadline — <reason>`` on the preceding non-blank
 line, or by the file's ``_WALL_CLOCK_DEADLINE_DEBT`` budget.
@@ -722,8 +725,11 @@ _WALL_CLOCK_SUPPRESS = (
 )
 
 
-def _wall_clock_violation_msg(kind: str, target: str) -> str:
+def _wall_clock_violation_msg(kind: str, target: str, *, parameter: str | None = None) -> str:
     """Build Rule C's rejection message for one offence *kind* on *target*.
+
+    *parameter* names the bound that carries the raw literal (``timeout`` or
+    ``max_wall_s``); it is consulted only for the raw-literal kind.
 
     Deliberately shares NO vocabulary with ``_VIOLATION_MSG`` or
     ``_dataclass_violation_msg``: Rule A's remedies read pydantic ``model_fields``
@@ -745,13 +751,49 @@ def _wall_clock_violation_msg(kind: str, target: str) -> str:
             + _WALL_CLOCK_SUPPRESS
         )
     return (
-        f'load-bearing wait on {target} carries a RAW wall-clock literal timeout=.'
+        f'load-bearing wait on {target} carries a RAW wall-clock literal as its'
+        f' {parameter} bound.'
         + _WALL_CLOCK_CONSEQUENCE
         + ' Derive the bound from MERGE_RESULT_TIMEOUT instead of writing a number:'
         ' a written literal is a threshold, and task 2376 measured that a policy'
         ' expressed as "literals up to N" cannot catch the one just above N.'
         + _WALL_CLOCK_SUPPRESS
     )
+
+
+# The keywords that carry a wall-clock bound on a wait call: ``timeout`` on both call
+# shapes, and ``max_wall_s``, wait_responsive's wall-clock cap
+# (orchestrator/tests/_orch_helpers.py::wait_responsive).
+_WALL_CLOCK_BOUND_KEYWORDS: tuple[str, ...] = ('timeout', 'max_wall_s')
+
+
+def _is_numeric_literal(node: ast.expr) -> bool:
+    """Return True if *node* is a written int or float.
+
+    ``bool`` is excluded explicitly because it is an int SUBCLASS — without the
+    guard, ``timeout=True`` would be reported as a wall-clock number.
+    """
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    )
+
+
+def _raw_wall_clock_literal(call: ast.Call, *, is_bare_wait_for: bool) -> str | None:
+    """Return the name of the first wall-clock bound on *call* written as a number.
+
+    Checks the ``_WALL_CLOCK_BOUND_KEYWORDS`` keywords on either call shape, and
+    ``asyncio.wait_for``'s positional timeout (``args[1]``) only when
+    *is_bare_wait_for*: wait_responsive's ``timeout`` is keyword-only, so a
+    positional second argument there is a TypeError, not a lintable site.
+    """
+    for kw in call.keywords:
+        if kw.arg in _WALL_CLOCK_BOUND_KEYWORDS and _is_numeric_literal(kw.value):
+            return kw.arg
+    if is_bare_wait_for and len(call.args) >= 2 and _is_numeric_literal(call.args[1]):
+        return 'timeout'
+    return None
 
 
 def _wall_clock_deadline_violations(
@@ -761,7 +803,9 @@ def _wall_clock_deadline_violations(
 
     Returns a LIST, not an Optional, because the two offence kinds are independent
     and a single call can trip both — ``asyncio.wait_for(req.result, timeout=25.0)``
-    is simultaneously the wrong routing and a written number.
+    is simultaneously the wrong routing and a written number.  The written number is
+    a raw numeric literal on ``timeout=`` or ``max_wall_s=``, or wait_for's
+    positional timeout (``_raw_wall_clock_literal``).
 
     Gating order is cheapest-first, and deliberately so:
       1. the call has at least one positional argument (no ``args[0]`` to inspect
@@ -814,33 +858,29 @@ def _wall_clock_deadline_violations(
     if _is_exempted(lines, call.lineno, _RULE_C_CODE):
         return []
 
-    kinds: list[str] = []
+    messages: list[str] = []
     if is_bare_wait_for:
-        kinds.append(_WALL_CLOCK_BARE_WAIT_FOR)
+        messages.append(_wall_clock_violation_msg(_WALL_CLOCK_BARE_WAIT_FOR, target))
 
     # A raw numeric literal is an offence on EITHER call shape: wait_responsive
-    # also takes a ``timeout`` keyword, so a migrated site can have moved the
-    # accounting into loop-responsive time while keeping a hand-written number.
-    #
-    # ``bool`` is excluded explicitly because it is an int SUBCLASS — without the
-    # guard, ``timeout=True`` would be reported as a wall-clock number.
-    timeout_kw = next((kw for kw in call.keywords if kw.arg == 'timeout'), None)
-    if (
-        timeout_kw is not None
-        and isinstance(timeout_kw.value, ast.Constant)
-        and isinstance(timeout_kw.value.value, (int, float))
-        and not isinstance(timeout_kw.value.value, bool)
-    ):
-        kinds.append(_WALL_CLOCK_RAW_LITERAL)
+    # also takes ``timeout`` and ``max_wall_s`` keywords, so a migrated site can
+    # have moved the accounting into loop-responsive time while keeping a
+    # hand-written number.  At most ONE raw-literal violation per call, however
+    # many bounds carry a number: it is one offence with one remedy.
+    parameter = _raw_wall_clock_literal(call, is_bare_wait_for=is_bare_wait_for)
+    if parameter is not None:
+        messages.append(
+            _wall_clock_violation_msg(_WALL_CLOCK_RAW_LITERAL, target, parameter=parameter)
+        )
 
     return [
         Violation(
             filename=filename,
             lineno=call.lineno,
             col_offset=call.col_offset,
-            message=_wall_clock_violation_msg(kind, target),
+            message=message,
         )
-        for kind in kinds
+        for message in messages
     ]
 
 def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
@@ -889,8 +929,9 @@ def find_violations(source: str, filename: str) -> list[Violation]:
 
     Rule C — ``wall-clock-deadline``: each load-bearing wait (a
     ``MergeRequest.result`` future or a ``gate*.wait()`` barrier) routed through a
-    bare ``asyncio.wait_for``, and/or carrying a raw numeric ``timeout=`` literal.
-    One call can produce TWO violations — the kinds are independent.
+    bare ``asyncio.wait_for``, and/or carrying a raw numeric literal bound
+    (``timeout=``, ``max_wall_s=`` or wait_for's positional timeout).  One call can
+    produce TWO violations — the kinds are independent.
 
     Rule C additionally honours its own SHRINK-ONLY per-file debt budget
     (``_WALL_CLOCK_DEADLINE_DEBT``), applied to the collected COUNT after the walk.
