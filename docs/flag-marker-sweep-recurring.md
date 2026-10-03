@@ -118,7 +118,8 @@ is this script's job; deleting them is not.
 
 Every record the sweep withholds is classified by
 `fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason`, in
-this order, and each skip's WARNING names its reason:
+this order. Each skip's WARNING names its reason, and the JSON report's
+`protected_skipped_reasons` maps each skipped id to it:
 
 1. `cycle_summary_mirror` — `mem0_tombstone.is_protected_mirror_record`
    (tasks 3041/4435).

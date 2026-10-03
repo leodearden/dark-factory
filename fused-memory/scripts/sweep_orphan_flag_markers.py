@@ -270,6 +270,11 @@ logger = logging.getLogger('sweep_orphan_flag_markers')
 def find_orphan_markers(members: list[dict]) -> list[dict]:
     """Return members whose metadata lacks ``kind == MARKER_KIND``.
 
+    Only the KIND-ABSENT nominations are ever deletable. A nomination that
+    declares some other ``kind`` is always withheld by the foreign-kind arm
+    of :func:`protection_reason`; it is nominated so that ``run()`` reports
+    it under ``protected_skipped_ids``, not so that it is deleted.
+
     Args:
         members: List of scroll-shaped dicts ``{'id', 'created_at', 'metadata'}``,
             as returned by ``MemoryService.get_memories_by_metadata``.
@@ -616,9 +621,10 @@ def find_protected_markers(members: list[dict]) -> list[dict]:
     :func:`delete_orphan_markers`, ``run()``'s enumeration-scoped subtraction
     and report, and the absolute arm of :func:`find_undrainable_markers` — so
     each arm widens every one of them at once. Attribution survives the
-    union: :func:`protection_reason` returns which arm matched, and the log
-    lines render it. ``find_orphan_markers`` still nominates foreign-kind
-    records; they are subtracted here, exactly as mirrors always were.
+    union: :func:`find_protected_markers_with_reasons` pairs each member with
+    the arm that matched, and the log lines and the report render it.
+    ``find_orphan_markers`` still nominates foreign-kind records; they are
+    subtracted here, exactly as mirrors always were.
 
     Restores parity with the in-cycle collector
     ``stages/task_knowledge_sync.py::_sweep_stale_mem0_pool`` on its two
@@ -646,7 +652,27 @@ def find_protected_markers(members: list[dict]) -> list[dict]:
         Subset of *members* :func:`protection_reason` withholds. Order and
         object identity are preserved. An unprotected input returns ``[]``.
     """
-    return [m for m in members if protection_reason(m.get('metadata')) is not None]
+    return [member for member, _ in find_protected_markers_with_reasons(members)]
+
+
+def find_protected_markers_with_reasons(
+    members: list[dict],
+) -> list[tuple[dict, ProtectionReason]]:
+    """:func:`find_protected_markers`, with each member paired with its arm.
+
+    The single place :func:`protection_reason` is applied to a member list,
+    so every consumer that renders the reason reads the one computed here.
+
+    Returns:
+        ``(member, reason)`` for each member :func:`protection_reason`
+        withholds, in input order, with object identity preserved.
+    """
+    pairs: list[tuple[dict, ProtectionReason]] = []
+    for member in members:
+        reason = protection_reason(member.get('metadata'))
+        if reason is not None:
+            pairs.append((member, reason))
+    return pairs
 
 
 def find_undrainable_markers(
@@ -762,12 +788,12 @@ async def delete_orphan_markers(
     # degrades to a loud skip rather than collateral loss. One WARNING per
     # member, naming the guard that withheld it, so a mirror skip is never
     # logged as an audit skip, or vice versa.
-    protected = find_protected_markers(orphans)
+    protected_pairs = find_protected_markers_with_reasons(orphans)
+    protected = [member for member, _ in protected_pairs]
     if protected:
         protected_ids = {id(m) for m in protected}  # builtin id(), see NOTE below
-        for member in protected:
+        for member, reason in protected_pairs:
             metadata = _member_metadata(member)
-            reason = protection_reason(member.get('metadata'))
             logger.warning(
                 'sweep_orphan_flag_markers: SKIPPING a protected record '
                 '(reason=%s) memory_id=%s (kind=%s record_type=%s) — this '
@@ -775,14 +801,14 @@ async def delete_orphan_markers(
                 "guard means this run's delete set was over-broad and the "
                 'predicate or --delete-ids that produced it should be '
                 'tightened (task 3041/4435/5286).',
-                reason.value if reason else None,
+                reason.value,
                 member.get('id'), metadata.get('kind'), metadata.get('record_type'),
                 extra={'project_id': project_id, 'memory_id': member.get('id')},
             )
         orphans = [m for m in orphans if id(m) not in protected_ids]
     # NOTE ``id(m)`` above is the BUILTIN object identity, not the member's
-    # ``'id'`` payload key. find_protected_markers returns the very objects it
-    # was handed, so object identity is the exact complement of the protected
+    # ``'id'`` payload key. find_protected_markers_with_reasons returns the very
+    # objects it was handed, so object identity is the exact complement of the protected
     # subset and needs no assumption that memory uuids are unique within one
     # delete set (they are, but that is the caller's invariant, not this
     # function's).
@@ -973,6 +999,12 @@ async def run(
               its reason, so the event is greppable in the journal
               too — the report key and the log line are complements here,
               exactly as they are for ``undated_kept_count``.
+            - protected_skipped_reasons (dict[str, str]): each
+              ``protected_skipped_ids`` id mapped to the
+              :class:`ProtectionReason` value that withheld it, in the same
+              order, so a consumer tells a foreign-kind skip from a mirror
+              or audit skip without parsing the journal. Present
+              unconditionally (``{}`` when nothing was protected).
             - cross_check (dict): adjacent-population census (task 3897) —
               ``{'source_total', 'flag_for_stage2_total', 'blind_spot',
               'probe_failed'}``. Diagnostic only, NEVER part of the delete
@@ -1245,7 +1277,8 @@ async def run(
     # including ones that never consult this predicate. Called from here the
     # choke-point guard therefore never fires; it stays as defence in depth
     # and is pinned directly by its own tests.
-    protected = find_protected_markers(members)
+    protected_pairs = find_protected_markers_with_reasons(members)
+    protected = [member for member, _ in protected_pairs]
     if protected:
         # The subtraction is never SILENT. Because it happens here, the
         # choke-point guard's own per-member WARNING can no longer fire on
@@ -1262,11 +1295,10 @@ async def run(
         # says the same class of thing — a permanent floor under
         # ``--check --max-backlog`` that draining cannot reach below.
         rendered: list[str] = []
-        for member in protected:
+        for member, reason in protected_pairs:
             metadata = _member_metadata(member)
-            reason = protection_reason(member.get('metadata'))
             rendered.append(
-                f"{member.get('id')}(reason={reason.value if reason else None} "
+                f"{member.get('id')}(reason={reason.value} "
                 f"kind={metadata.get('kind')!r} "
                 f"record_type={metadata.get('record_type')!r})"
             )
@@ -1409,6 +1441,9 @@ async def run(
         'targeted_correction_ids': targeted_correction_ids,
         'protected_skipped_count': len(protected),
         'protected_skipped_ids': [m['id'] for m in protected],
+        'protected_skipped_reasons': {
+            member['id']: reason.value for member, reason in protected_pairs
+        },
         'cross_check': cross_check,
         'structural_floor': {
             'undated_kept_count': len(undated_kept),

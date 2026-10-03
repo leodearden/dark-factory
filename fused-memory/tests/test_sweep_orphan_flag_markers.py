@@ -762,6 +762,21 @@ class TestFindProtectedMarkers:
         assert result[0] is members[1], 'Expected same object identity'
         assert result[1] is members[3], 'Expected same object identity'
 
+    def test_with_reasons_pairs_each_protected_member_with_its_arm(self):
+        """The attribution-preserving form returns the same members, each
+        paired with the arm protection_reason names for it."""
+        members = [_orphan('o1'), _mirror('m1'), _audit('a1'), _foreign('f1')]
+        pairs = _mod.find_protected_markers_with_reasons(members)
+        assert [member for member, _ in pairs] == _mod.find_protected_markers(members)
+        assert all(
+            paired is original for (paired, _), original in zip(pairs, members[1:], strict=True)
+        ), 'Expected same object identity'
+        assert [reason for _, reason in pairs] == [
+            _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR,
+            _mod.ProtectionReason.PROTECTED_AUDIT_KIND,
+            _mod.ProtectionReason.FOREIGN_KIND,
+        ]
+
 
 class TestProtectionReason:
     """protection_reason(metadata): WHICH guard withholds a record, if any.
@@ -784,7 +799,6 @@ class TestProtectionReason:
         assert member['metadata']['kind'] in PROTECTED_AUDIT_KINDS
         reason = _mod.protection_reason(member['metadata'])
         assert reason is _mod.ProtectionReason.PROTECTED_AUDIT_KIND
-        assert reason is not _mod.ProtectionReason.FOREIGN_KIND
 
     @pytest.mark.parametrize('builder', [_foreign, _wrong_kind])
     def test_unregistered_kind_is_foreign_kind(self, builder):
@@ -2354,6 +2368,7 @@ class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
 
         assert report['protected_skipped_count'] == 0
         assert report['protected_skipped_ids'] == []
+        assert report['protected_skipped_reasons'] == {}
 
 
 class TestProtectedAuditAndForeignKindRecordsAreNeverDeleted:
@@ -2515,6 +2530,25 @@ class TestProtectedSkipsAreAttributedToTheirGuard:
         assert len(naming_all) == 1, self._warnings(caplog)
         for reason in self._EXPECTED.values():
             assert reason in naming_all[0], (reason, naming_all[0])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('apply', [False, True], ids=['dry_run', 'apply'])
+    async def test_report_maps_each_skipped_id_to_its_reason(self, apply):
+        """The attribution reaches the JSON report as structured data, so a
+        consumer never greps the journal to tell the arms apart."""
+        memory_service = self._service(self._members(), apply=apply)
+
+        report = await _mod.run(
+            types.SimpleNamespace(
+                apply=apply, project_id='dark_factory', max_age_days=14,
+                delete_ids=None,
+            ),
+            memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['protected_skipped_reasons'] == self._EXPECTED
+        assert list(report['protected_skipped_reasons']) == report['protected_skipped_ids']
+        assert json.dumps(report)
 
 
 # ===========================================================================
