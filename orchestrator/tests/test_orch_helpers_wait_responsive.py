@@ -134,8 +134,8 @@ class TestWaitResponsiveDefaultCapScalesWithNominal:
     ``timeout=MERGE_GATE_BARRIER_TIMEOUT`` (15s) could consume 90s of wall
     clock while ``_call_wait_budget`` in test_merge_queue_concurrent_verify.py
     billed it ``min(15 * RESPONSIVE_WAIT_STRETCH, 90)`` = 30s.  That made the
-    AST auditor an UNDER-count rather than an upper bound, and the true worst
-    case for TestLateArrivalCleanCAS 365s against a 300s
+    AST auditor an UNDER-count rather than an upper bound, and let the true
+    worst case for TestLateArrivalCleanCAS overrun its
     ``@pytest.mark.timeout`` -- an ``os._exit()`` of the xdist worker.
 
     Of the three, exactly ONE is discriminating against the old flat default:

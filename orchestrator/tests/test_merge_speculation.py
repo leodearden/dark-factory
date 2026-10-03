@@ -1406,7 +1406,7 @@ def _make_late_arrival_lane(
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 215s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalAttaches:
     """Step-1 RED — late arrival B attaches to in-flight predecessor A's merge commit.
 
@@ -1621,7 +1621,7 @@ class TestLateArrivalAttaches:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 245s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalCleanCAS:
     """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
 
@@ -1800,7 +1800,7 @@ class TestLateArrivalCleanCAS:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 245s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalFailCascade:
     """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
 
@@ -2038,7 +2038,7 @@ class TestLateArrivalFailCascade:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 215s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalGuards:
     """Step-7 guards — fallback + permit accounting + depth-K + skip_verify + K=1 sanity.
 
@@ -2562,7 +2562,7 @@ class TestLateArrivalGuards:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 245s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalSubmissionOrderCAS:
     """Step-8 guard — main advances in strict submission order on the late-arrival path.
 
@@ -2931,12 +2931,8 @@ class TestTimeoutMarkCoverage:
         must be cleared by the timeout it actually runs under (its own mark
         if it has one, else the ambient budget).
 
-        Recomputes from source; no figure written anywhere in this file is
-        load-bearing for the assertion.  (For orientation only, current at the
-        time of writing: 215/245/245/215/245 for the five late-arrival classes
-        against their 300s marks.  The per-class ``@pytest.mark.timeout``
-        comments carry the same numbers -- if they disagree with this guard,
-        the guard is right.)
+        Recomputes every class's budget from source on each run -- the
+        single source of those figures, so none is restated beside a mark.
         """
         source = Path(__file__).read_text()
         budgets = _worst_per_method_wait_budget(source)

@@ -263,29 +263,18 @@ async def _stop_worker(
         await asyncio.wait_for(worker_task, timeout=join_timeout)
 
 
-# task 3477 amend: both cascade classes below perform the SAME five sequential
-# real-time waits (2 gates + 2 _await_outcome + 1 worker_task teardown) at
-# MERGE_RESULT_TIMEOUT (45s) each -- a 225s worst case -- plus git-fixture setup
-# and an unbounded worker.stop(). 180 was too tight: it would itself os._exit()
-# the xdist worker (pyproject timeout_method = "thread", --max-worker-restart=0)
-# before the loud _await_outcome failure this task added could ever report. The
-# class mark MUST clear the full 225s budget, not just the pyproject 60s default.
-# Derived, not literal, so the two marks cannot drift apart the way they just did.
-# task 3492: generalized CASCADE_TEST_TIMEOUT -> HEAVY_BARRIER_TEST_TIMEOUT --
-# this same derived ceiling also covers the non-cascade heavy-barrier classes
-# audited by 3492, whose worst per-method budget is 255s
-# (TestCascadeErrorContainment, after task 4846's loud-wait migration), still
-# under the 300s value below.
+# The shared per-test ceiling for every class whose waits outgrow the ambient
+# budget. Derived, not literal, so the marks that share it cannot drift apart:
+# task 3477 found two that had, one so tight it would itself os._exit() the
+# xdist worker (timeout_method = "thread", --max-worker-restart=0) before the
+# loud _await_outcome failure could report. Generalized from
+# CASCADE_TEST_TIMEOUT by task 3492.
+#
+# No class's budget is written here or beside its mark: TestTimeoutMarkCoverage
+# recomputes each one from source on every run (_worst_per_method_wait_budget)
+# and checks it against the class's mark, or against the ambient budget for an
+# unmarked class -- so leaving a class unmarked is a checked decision too.
 HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
-
-
-# task 3492: two classes are deliberately left WITHOUT a HEAVY_BARRIER_TEST_TIMEOUT
-# mark, so the omission reads as a decision, not an oversight:
-#   - TestRunInflightVerifyAbortPoll: four test_* methods at 45s each -- 45s
-#     worst-METHOD, under the 60s pyproject ceiling (why per-method, not a
-#     class-wide sum: see _worst_per_method_wait_budget's docstring below).
-#   - TestAwaitOutcomeHelper: 45s nominal (_await_outcome's default), but the
-#     future under test is pre-resolved, so real elapsed time is ~0.
 
 
 # task 3492: known-name table for _worst_per_method_wait_budget below. These
@@ -309,11 +298,6 @@ _KNOWN_WAIT_CONSTANTS: dict[str, float] = {
 # own per-call default cap from the very same constant, so the RATIO cannot
 # drift and the bill `_wait_responsive_budget` computes is an EXACT upper bound
 # on every site, whatever it passes.
-#
-# Fixing the ratio at 2 is what lets a reviewer check the paired-mark
-# arithmetic instead of trusting a number: the worst per-method budget this
-# scan computes for test_merge_speculation.py is 245s, clearing
-# HEAVY_BARRIER_TEST_TIMEOUT (300s).
 _RESPONSIVE_WAIT_STRETCH = RESPONSIVE_WAIT_STRETCH
 
 
@@ -2513,7 +2497,7 @@ class TestFinalizeInflightNonPass:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 60s worst case (30+30) -- exactly AT the 60s pyproject ceiling with zero headroom, plus unbounded worker.stop()/worker_task teardown
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestSingleHostSerialByteIdentical:
     """SINGLE-HOST serial byte-identical via the restructured _verifier_loop.
 
@@ -2669,7 +2653,7 @@ class TestSingleHostSerialByteIdentical:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 160s worst case per the automated scan (a control-flow-aware hand count over the mutually-exclusive try/except paths in test_both_verifies_enter_before_either_released would land at 135s; the scan sums both branches -- see _method_wait_budget's branch-summing note)
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestOverlapSignal:
     """Two-host overlap: both verifies enter before either is released.
 
@@ -2943,7 +2927,7 @@ class TestLastItemOfBurstFinalizes:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 200s worst case (task 2350 widened this region to 45.0)
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestChainInvalidationUnderOverlap:
     """N's verify fails while N+1 is in-flight: N+1 aborted, re-merged, re-verifies done.
 
@@ -3304,7 +3288,7 @@ class TestChainInvalidationUnderOverlap:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 4846: 125s worst case
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestHaltAndUnavailable:
     """step-21 RED tests: halt aborts all in-flight; RUNNER_UNAVAILABLE quarantine.
 
@@ -4226,7 +4210,7 @@ class TestRunnerUnavailableHeadCascade:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 90s worst case
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestRunInflightVerifyRemoteCancelOnAbort:
     """_run_inflight_verify abort paths fire remote cancel before cancelling verify.
 
@@ -4597,7 +4581,7 @@ class TestStopDrainFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3477 amend: see HEAVY_BARRIER_TEST_TIMEOUT -- derived so this cannot drift from TestRunnerUnavailableHeadCascade's identical wait profile (was a bare 180, too tight for the 225s worst case below)
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3477 amend: see HEAVY_BARRIER_TEST_TIMEOUT -- derived so this cannot drift from TestRunnerUnavailableHeadCascade's identical wait profile
 class TestCascadeFiresRemoteCancel:
     """_verifier_loop head-failure cascade fires remote cancel BEFORE task.cancel().
 
@@ -4742,7 +4726,7 @@ class TestCascadeFiresRemoteCancel:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 4846: 255s worst case (task 2350 widened this region to 45.0)
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
 class TestCascadeErrorContainment:
     """Per-entry exception in the head-failure cascade MUST NOT kill _verifier_loop.
 
@@ -5691,7 +5675,7 @@ class _DriftCheckTakesRemoteAllocator(HostAllocator):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: 65s worst case, includes a loop.time() + 15.0 deadline-bounded poll loop (~4670-4672) invisible to the automated scan -- a deliberate over-mark the guard alone would not have demanded
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3492: a deliberate over-mark -- a loop.time()-deadline poll loop here is invisible to _worst_per_method_wait_budget
 class TestRedispatchSpeculativeConservation:
     """Signal/e2e regression lock (task 2063): a genuinely speculative item
     parked on ``_redispatch`` must stay counted by
@@ -6285,9 +6269,9 @@ class TestTwoSequentialWaits:
         `_method_wait_budget` walks the whole method body via `ast.walk`
         with no awareness of branches, so mutually exclusive arms over-count
         relative to any real execution path (see `_method_wait_budget`'s
-        docstring). It is what makes `TestOverlapSignal`'s computed 160.0s
-        exceed a control-flow-aware hand count of 135.0s for the same
-        method's try/except paths.
+        docstring). It is why `TestOverlapSignal`'s computed budget exceeds
+        a control-flow-aware hand count over the same method's try/except
+        paths.
         """
         source = '''
 class TestBranchesSummed:
@@ -7542,8 +7526,7 @@ class TestTimeoutMarkCoverage:
         TestRunInflightVerifyRemoteCancelOnAbort, TestCascadeErrorContainment.
         Marks were added for those six (plus TestRedispatchSpeculativeConservation,
         over-marked on the strength of a wait shape this scan cannot see) in
-        the same change; the two task-3477 cascade classes already passed
-        (HEAVY_BARRIER_TEST_TIMEOUT=300 clears their 225s budget).
+        the same change; the two task-3477 cascade classes already passed.
         """
         source = Path(__file__).read_text()
         budgets = _worst_per_method_wait_budget(source)
