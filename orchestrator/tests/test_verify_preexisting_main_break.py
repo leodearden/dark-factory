@@ -1056,7 +1056,7 @@ PROBE_NODE_ID = 'tests/test_concurrent_verify_boundary.py::test_concurrent_verif
 
 LOAD_FLAKE_MAIN_RESULT = VerifyResult(
     passed=False,
-    test_output=f'FAILED {PROBE_NODE_ID}\n1 failed, 21082 passed in 1500.00s\n',
+    test_output=f'FAILED {PROBE_NODE_ID}\n[gw14] node down: Not properly terminated\n',
     lint_output='',
     type_output='',
     summary='test_failure',
@@ -1629,8 +1629,8 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
 
     def test_load_flake_signature_match_downgrades_to_false(self, tmp_path: Path) -> None:
         """(step-5) Branch and main-probe share a load-flake signature
-        (category='test_failure', a FAILED line from a session that ran to
-        completion) that would reproduce -> (True, MAIN_SHA) pre-3597. The
+        (category='test_failure', a '[gwN] node down' crash naming the same
+        node-id) that would reproduce -> (True, MAIN_SHA) pre-3597. The
         confirm gate re-runs the named node-id in isolation on the probe
         worktree; it passes -> downgrade to (False, ''), not cached, with a
         loud WARNING and a durable _suppressed_flake_records entry.

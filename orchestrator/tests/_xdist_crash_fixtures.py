@@ -9,7 +9,8 @@ as a plain string so a consumer's marker profile stays readable at its
 assertion site. Consumers: test_verify_env_transient.py (the
 ``_is_bare_xdist_worker_crash`` routing tests), test_verify.py (the cause
 hint, leg summary, aggregation and failure report), test_flake_discriminator.py
-(the isolated-rerun discriminator's truncated-session refusal) and
+(the merge gate's truncated-session refusal, and the main probe still
+re-running a crash-co-occurring failure) and
 test_verify_merge_flake_suppression.py (the merge-gate hook and ledger row for
 that refusal).
 """
