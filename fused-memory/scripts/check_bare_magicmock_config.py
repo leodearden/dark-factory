@@ -26,8 +26,8 @@ separate message vocabularies and separate ``# noqa`` codes.  Every statement in
 
   Rule C — ``wall-clock-deadline`` (task 4246)
       NOT a mock-spec rule.  Position-blind over any ``ast.Call``: a load-bearing
-      synchronisation point (a ``MergeRequest.result`` future or a ``gate*.wait()``
-      barrier) awaited through a bare ``asyncio.wait_for`` instead of
+      synchronisation point (a ``MergeRequest.result`` future or a zero-argument
+      ``.wait()`` barrier) awaited through a bare ``asyncio.wait_for`` instead of
       ``wait_responsive``, or carrying a raw numeric literal bound (``timeout=``,
       ``max_wall_s=`` or wait_for's positional timeout).  Remedies are wait-specific
       (``wait_responsive(...)`` with a ``label=``, bound derived from
@@ -148,8 +148,8 @@ Rule C — ``wall-clock-deadline``
 ---------------------------------------------------------------------------
 
 Rule: a LOAD-BEARING synchronisation point — a ``MergeRequest.result`` future
-(``req.result``) or an ``asyncio.Event`` gate barrier (``gate*.wait()``) — awaited
-with a wall-clock deadline.  Two independent offence kinds, so ONE call can produce
+(``req.result``) or a zero-argument ``.wait()`` barrier (``done.wait()``,
+``self._entered.wait()``) — awaited with a wall-clock deadline.  Two independent offence kinds, so ONE call can produce
 TWO violations:
 
   1. the target is awaited through a bare ``asyncio.wait_for(...)`` rather than
@@ -174,33 +174,29 @@ outside it.  Task 3980's own amendment pass then deleted a hand-maintained five-
 frozenset for the same reason.  So no class list and no budget threshold decides which
 sites are scanned.
 
-The two legs are NOT equally shape-selected, and the difference is a real coverage
-boundary rather than a detail (recorded by task 4246's amendment pass, which found the
-flat claim "selection is by call shape alone" overstated):
+Both legs are pure SHAPE, on any receiver (a Name, an Attribute, a Subscript or a
+Call), in any scope of any file.  No receiver name is consulted (task 5269 dropped the
+``gate`` prefix the barrier leg once required, which hid 113 barrier sites):
 
-  * The ``req.result`` leg IS pure shape — ``ast.Attribute`` with ``attr == 'result'``,
-    any receiver, any scope, any file.
-  * The ``gate*.wait()`` leg additionally requires the receiver to be a bare ``Name``
-    whose id starts with ``gate``.  That IS name-based selection.  It stands in for
-    "this is an ``asyncio.Event`` barrier", which the AST cannot distinguish from any
-    other ``.wait()`` (``proc.wait()``, ``threading.Event.wait()``, a ``Condition``);
-    the convention is universal in the module the file-local guard was ported from.
+  * the ``req.result`` leg is an ``ast.Attribute`` with ``attr == 'result'``;
+  * the barrier leg is a ``.wait()`` method call taking NO arguments.  The
+    zero-argument requirement is the structural discriminator: an ``asyncio.Event``
+    ``.wait()`` takes none, while ``asyncio.wait(aws)`` and
+    ``threading.Event.wait(timeout)`` take arguments and so stay out.
 
-MEASURED false-negative surface of that prefix, over the seven scanned tests/ dirs:
-102 ``asyncio.wait_for(<expr>.wait(), ...)`` sites across 36 files whose receiver is
-not a gate-prefixed Name — 60 under orchestrator/tests (``done.wait()``,
-``verify_started.wait()``, ``drive.first_dispatched.wait()``), 24 under
-dashboard/tests, 18 under fused-memory/tests.  Rule C sees none of them.
+The accepted false-positive surface is an asyncio subprocess ``Process.wait()`` and a
+``Condition``/``Barrier`` ``.wait()``.  The latter two are genuine synchronisation
+points, so flagging them is correct.  ``Process.wait()`` measured ZERO sites in the
+seven scanned dirs at task 5269; ``# noqa: wall-clock-deadline — <reason>`` is the
+escape for one that appears.
 
-Dropping the prefix was considered and DECLINED on a measurement, not a preference:
-the remedy this rule names — ``wait_responsive`` — is defined in
-``orchestrator/tests/_orch_helpers.py`` and exists nowhere else, so flagging the 42
-dashboard/fused-memory sites would emit a rejection naming a helper those packages
-cannot import, and grandfather them into a shrink-only baseline they have no way to
-shrink.  Scoping the wider leg to orchestrator/tests would reintroduce exactly the
-a-list-decides-coverage failure mode the paragraph above rejects.  So the gap is
-documented here rather than asserted away; closing it needs ``wait_responsive`` (or an
-equivalent) reachable from every scanned package first.
+Remedy reachability: ``wait_responsive`` is defined in
+``orchestrator/tests/_orch_helpers.py`` and is importable only under orchestrator/tests,
+so the bare-wait_for message says that elsewhere the per-site ``# noqa`` is the remedy,
+and non-orchestrator debt entries can shrink only that way until follow-up ticket
+tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes it reachable from every scanned package.  Scoping
+the leg to orchestrator/tests instead would reintroduce exactly the
+a-list-decides-coverage failure mode the paragraph above rejects.
 
 What is deliberately NOT load-bearing: a wait on a bare ``ast.Name`` target, i.e. the
 ``asyncio.wait_for(worker_task, ...)`` teardown join in ``_stop_worker``.  It sits
@@ -668,16 +664,12 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
       * ``req_a.result`` — a ``MergeRequest.result`` future.  Its resolution IS
         the event the test is waiting for; a deadline here fails a test whose
         merge pipeline completed correctly.
-      * ``gate_a_entered.wait()`` — an ``asyncio.Event`` barrier.  Already
-        event-driven; only its deadline is wall-clock.  NOTE the asymmetry: this
-        leg is NOT pure shape.  The ``gate`` name prefix is a naming convention
-        standing in for "this is an Event", because the AST cannot tell an
-        ``Event.wait()`` from a ``proc.wait()``.  It therefore has a real,
-        measured false-negative surface — 102 ``asyncio.wait_for(<expr>.wait())``
-        sites across 36 files in the scanned dirs are invisible to it.  See the
-        Rule C section of the module docstring for the census and for why
-        dropping the prefix was declined (``wait_responsive``, the remedy this
-        rule names, exists only under orchestrator/tests).
+      * ``done.wait()`` — a zero-argument ``.wait()`` barrier, on ANY receiver
+        (``self._entered.wait()``, ``verifier.entered[0].wait()``).  Already
+        event-driven; only its deadline is wall-clock.  Requiring zero arguments
+        is what excludes ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)``;
+        see the Rule C section of the module docstring for the accepted
+        false-positive surface.
 
     Deliberately NOT load-bearing, and therefore excluded: the
     ``await asyncio.wait_for(worker_task, timeout=join_timeout)`` join in
@@ -687,11 +679,7 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
     stretching it would only slow teardown down.  The Name-vs-Attribute/Call
     distinction is what makes THAT exclusion structural rather than a
     hand-maintained name list, which is what lets this rule scan every scope of
-    every file the nine call sites reach.  (It is an exclusion, not a selector:
-    the only name-based *selection* here is the ``gate`` prefix above.)
-
-    Ported unchanged in behaviour from the file-local guard this rule replaced
-    (task 3980, orchestrator/tests/test_merge_speculation.py).
+    every file the nine call sites reach.  Neither leg selects by name.
     """
     if isinstance(node, ast.Attribute) and node.attr == 'result':
         return f'{ast.unparse(node)} (MergeRequest.result future)'
@@ -699,10 +687,10 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == 'wait'
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id.startswith('gate')
+        and not node.args
+        and not node.keywords
     ):
-        return f'{ast.unparse(node)} (asyncio.Event gate barrier)'
+        return f'{ast.unparse(node)} (.wait() barrier)'
     return None
 
 # Rule C's two offence kinds.  They are INDEPENDENT — one call can trip both
@@ -748,6 +736,8 @@ def _wall_clock_violation_msg(kind: str, target: str, *, parameter: str | None =
             + ' Route it through wait_responsive(...) with a descriptive label='
             ' (orchestrator/tests/_orch_helpers.py::wait_responsive), which charges its'
             ' budget in loop-responsive time and still reports a genuine hang red.'
+            ' wait_responsive is importable only under orchestrator/tests, so in'
+            ' another package the # noqa escape below is the remedy.'
             + _WALL_CLOCK_SUPPRESS
         )
     return (
@@ -928,7 +918,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     position whose literal kwargs match a registered ``_DATACLASS_SHAPES`` entry.
 
     Rule C — ``wall-clock-deadline``: each load-bearing wait (a
-    ``MergeRequest.result`` future or a ``gate*.wait()`` barrier) routed through a
+    ``MergeRequest.result`` future or a zero-argument ``.wait()`` barrier) routed through a
     bare ``asyncio.wait_for``, and/or carrying a raw numeric literal bound
     (``timeout=``, ``max_wall_s=`` or wait_for's positional timeout).  One call can
     produce TWO violations — the kinds are independent.
