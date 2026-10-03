@@ -406,9 +406,8 @@ directly, not just interactive agents.
   `orchestrator/src/orchestrator/merge_lane/gates.py::_disjoint_skip_blockers`
   refuses the disjoint skip here on two counts — this project's
   `merge_verify_breadth: "full"` (a whole-tree gate), and drift the queue did
-  not itself land green (commit `fa95988c8e`). Under a coalesce train it is
-  worse: the train's CAS fails and the whole train verify is discarded (task
-  5070). Commit when
+  not itself land green (commit `fa95988c8e`). Under a train the price is the
+  same: the train re-verifies its rebased tip, then lands (task 5070). Commit when
   `get_merge_queue` shows `verify_in_progress` null and
   `occupancy.inflight_total` 0. It does not show a train's verify (task
   5245), so also check `data/orchestrator/runs.db` for a `train_started` in the
