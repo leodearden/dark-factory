@@ -37,7 +37,7 @@ from collections.abc import (
 from datetime import timedelta
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 
 from escalation.dedupe import DedupeConfig, content_fingerprint_key, submit_or_dedupe
 from escalation.models import Escalation
@@ -6633,13 +6633,28 @@ async def reconcile_landed_outbox(
     return report
 
 
+def _emit_train_attempt(
+    event_store: EventStore | None,
+    req: GroupMergeRequest,
+    outcome: OutcomeKind,
+    *,
+    started_monotonic: float,
+    attempt: int | None = None,
+) -> None:
+    """Emit a ``merge_attempt`` for *req*'s train, tagged with its train id and members."""
+    _emit_merge_attempt(
+        event_store, req.task_id, outcome,
+        attempt=attempt, duration_ms=_elapsed_ms(started_monotonic),
+        train_id=req.train_id, member_task_ids=req.member_task_ids,
+    )
+
+
 def _derail_on_train_verify_failure(
     event_store: EventStore | None,
     req: GroupMergeRequest,
     verify_outcome: MergeOutcome,
     *,
     started_monotonic: float,
-    emit_kwargs: dict,
 ) -> MergeOutcome:
     """Derail the train on a red verify of its tree, the first verify or a re-verify alike.
 
@@ -6673,9 +6688,8 @@ def _derail_on_train_verify_failure(
         member_task_ids=req.member_task_ids,
         data={'derail_reason': reason},
     )
-    _emit_merge_attempt(
-        event_store, req.task_id, OutcomeKind.verify_failed,
-        duration_ms=_elapsed_ms(started_monotonic), **emit_kwargs,
+    _emit_train_attempt(
+        event_store, req, OutcomeKind.verify_failed, started_monotonic=started_monotonic,
     )
     return verify_outcome
 
@@ -6700,14 +6714,24 @@ class _TrainAdvance:
             )
 
 
-def _rebased_tip(adv: AdvanceOutcome, task_id: str) -> tuple[str, str]:
-    """``(rebased sha, main it was rebased onto)`` of a ``'rebased_pending_reverify'`` advance."""
-    if adv.advanced_sha is None or adv.rebased_onto is None:
+class _RebasedTip(NamedTuple):
+    """The SHA fields of a ``'rebased_pending_reverify'`` advance, narrowed to ``str``."""
+
+    rebased_sha: str
+    rebased_from: str
+    """The ``expected_main`` that advance was handed, not necessarily the
+    base the tree was verified on (see :func:`_advance_train`)."""
+    rebased_onto: str
+
+
+def _rebased_tip(adv: AdvanceOutcome, task_id: str) -> _RebasedTip:
+    """Narrow the SHA fields ``advance_main`` always sets on a rebased_pending_reverify."""
+    if adv.advanced_sha is None or adv.rebased_from is None or adv.rebased_onto is None:
         raise AssertionError(
             f'advance_main returned rebased_pending_reverify '
             f'without SHA fields (task {task_id})'
         )
-    return adv.advanced_sha, adv.rebased_onto
+    return _RebasedTip(adv.advanced_sha, adv.rebased_from, adv.rebased_onto)
 
 
 async def _advance_train(
@@ -6720,7 +6744,6 @@ async def _advance_train(
     branch_tip_sha: str | None,
     train_verify: Callable[..., Awaitable[MergeOutcome | None]],
     started_monotonic: float,
-    emit_kwargs: dict,
 ) -> _TrainAdvance:
     """CAS-advance main to the train's verified tree, re-verifying it whenever main moved.
 
@@ -6757,10 +6780,9 @@ async def _advance_train(
         if adv.result not in ('rebased_pending_reverify', 'cas_failed'):
             return _TrainAdvance(adv, landing_base=expected_main)
         if retries >= worker.MAX_CAS_RETRIES:
-            _emit_merge_attempt(
-                worker._event_store, req.task_id, OutcomeKind.cas_exhausted,
-                attempt=retries + 1, duration_ms=_elapsed_ms(started_monotonic),
-                **emit_kwargs,
+            _emit_train_attempt(
+                worker._event_store, req, OutcomeKind.cas_exhausted,
+                attempt=retries + 1, started_monotonic=started_monotonic,
             )
             return _TrainAdvance(AdvanceOutcome('cas_failed'), landing_base=expected_main)
         retries += 1
@@ -6775,37 +6797,35 @@ async def _advance_train(
                 '(retry %d/%d)',
                 req.train_id, expected_main[:8], retries, worker.MAX_CAS_RETRIES,
             )
-            _emit_merge_attempt(
-                worker._event_store, req.task_id, OutcomeKind.cas_retry,
-                attempt=retries, duration_ms=_elapsed_ms(started_monotonic),
-                **emit_kwargs,
+            _emit_train_attempt(
+                worker._event_store, req, OutcomeKind.cas_retry,
+                attempt=retries, started_monotonic=started_monotonic,
             )
             continue
-        rebased_sha, rebased_onto = _rebased_tip(adv, req.task_id)
+        tip = _rebased_tip(adv, req.task_id)
         gate = await _reverify_rebased_tree(
             git_ops, req, merge_wt,
             rebased_from=candidate_base,
-            rebased_onto=rebased_onto,
+            rebased_onto=tip.rebased_onto,
             timeouts=worker._post_merge_verify_timeouts,
             enospc_retries=worker._post_merge_verify_enospc_retries,
             max_timeouts=worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
             max_enospc=worker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
-            merge_sha=rebased_sha,
+            merge_sha=tip.rebased_sha,
             run_post_merge_verify=train_verify,
         )
         if gate is not None:
             return _TrainAdvance(adv, landing_base=candidate_base, reverify_failure=gate)
-        candidate = rebased_sha
-        candidate_base = expected_main = rebased_onto
+        candidate = tip.rebased_sha
+        candidate_base = expected_main = tip.rebased_onto
         logger.info(
             'Train %s: rebased tip %s cleared the re-verify gate; advancing '
             '(retry %d/%d)',
-            req.train_id, rebased_sha[:8], retries, worker.MAX_CAS_RETRIES,
+            req.train_id, candidate[:8], retries, worker.MAX_CAS_RETRIES,
         )
-        _emit_merge_attempt(
-            worker._event_store, req.task_id, OutcomeKind.gate_retry,
-            attempt=retries, duration_ms=_elapsed_ms(started_monotonic),
-            **emit_kwargs,
+        _emit_train_attempt(
+            worker._event_store, req, OutcomeKind.gate_retry,
+            attempt=retries, started_monotonic=started_monotonic,
         )
 
 
@@ -6830,8 +6850,9 @@ async def _do_train_merge(
     despite being present in ``SpeculativeMergeWorker``'s own single-branch
     advance path:
 
-    1. Its own CAS loop (:func:`_advance_train`), sharing only the gate and
-       the write-ahead advance with the single-branch one.  The train passes
+    1. Its own CAS loop (:func:`_advance_train`), sharing the gate, the
+       write-ahead advance and :func:`_rebased_tip` with the single-branch
+       one, whose weaker post-CAS-loss gate anchor is task 6232.  The train passes
        ``reverify_on_rebase=True``: a main that moved under the train verify
        rebases the train's merge worktree, and the rebased tip goes through
        ``gates.py::_reverify_rebased_tree``, whose footprint is the tip
@@ -6923,11 +6944,6 @@ async def _do_train_merge(
         req.train_id, len(req.member_task_ids), req.branch.bare_id,
     )
 
-    _train_emit_kwargs: dict = {
-        'train_id': req.train_id,
-        'member_task_ids': req.member_task_ids,
-    }
-
     # Telemetry: emit train_started once per *attempt*.  Because the workflow
     # re-parks an incomplete train (MERGE_DEFERRED) for retry, the same
     # train_id can fire train_started on each scheduler iteration until all
@@ -6967,10 +6983,9 @@ async def _do_train_merge(
             req.train_id, prior_timeouts,
             worker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
         )
-        _emit_merge_attempt(
-            event_store, req.task_id, OutcomeKind.abandoned_verify_timeouts,
-            attempt=prior_timeouts, duration_ms=_elapsed_ms(t0),
-            **_train_emit_kwargs,
+        _emit_train_attempt(
+            event_store, req, OutcomeKind.abandoned_verify_timeouts,
+            attempt=prior_timeouts, started_monotonic=t0,
         )
         return worker._abandon_outcome(req.task_id, prior_timeouts)
 
@@ -7001,7 +7016,7 @@ async def _do_train_merge(
             f'{first_status!r} (expected merge-deferred)'
         )
         logger.info('Train %s: %s', req.train_id, reason)
-        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.train_incomplete, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_train_attempt(event_store, req, OutcomeKind.train_incomplete, started_monotonic=t0)
         return MergeOutcome('blocked', reason=reason)
 
     # (b) Rebase tip onto current main so the --no-ff merge is clean.
@@ -7019,7 +7034,7 @@ async def _do_train_merge(
             member_task_ids=req.member_task_ids,
             data={'derail_reason': reason},
         )
-        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.train_rebase_conflict, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_train_attempt(event_store, req, OutcomeKind.train_rebase_conflict, started_monotonic=t0)
         return MergeOutcome('blocked', reason=reason)
 
     # (c) Read current main HEAD AFTER rebase (so CAS expected_main is fresh).
@@ -7038,7 +7053,7 @@ async def _do_train_merge(
             member_task_ids=req.member_task_ids,
             data={'derail_reason': reason},
         )
-        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.conflict if merge_result.conflicts else OutcomeKind.merge_failed, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_train_attempt(event_store, req, OutcomeKind.conflict if merge_result.conflicts else OutcomeKind.merge_failed, started_monotonic=t0)
         return MergeOutcome('blocked', reason=reason)
 
     # Enforce invariants explicitly — plain assert is stripped under python -O,
@@ -7086,8 +7101,7 @@ async def _do_train_merge(
     verify_outcome = await train_verify(git_ops, req, merge_wt, merge_sha=merge_commit)
     if verify_outcome is not None:
         return _derail_on_train_verify_failure(
-            event_store, req, verify_outcome,
-            started_monotonic=t0, emit_kwargs=_train_emit_kwargs,
+            event_store, req, verify_outcome, started_monotonic=t0,
         )
 
     # (f) CAS-advance main.
@@ -7109,12 +7123,10 @@ async def _do_train_merge(
         branch_tip_sha=_train_branch_tip,
         train_verify=train_verify,
         started_monotonic=t0,
-        emit_kwargs=_train_emit_kwargs,
     )
     if train_advance.reverify_failure is not None:
         return _derail_on_train_verify_failure(
-            event_store, req, train_advance.reverify_failure,
-            started_monotonic=t0, emit_kwargs=_train_emit_kwargs,
+            event_store, req, train_advance.reverify_failure, started_monotonic=t0,
         )
     adv_outcome = train_advance.advance
     adv = adv_outcome.result
@@ -7123,7 +7135,7 @@ async def _do_train_merge(
 
     if adv != 'advanced':
         logger.info('Train %s: advance_main returned %r', req.train_id, adv)
-        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.advance_failed, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_train_attempt(event_store, req, OutcomeKind.advance_failed, started_monotonic=t0)
         if adv == 'cas_failed':
             # _advance_train exhausted MAX_CAS_RETRIES.  Return a simple
             # blocked rather than routing through _map_advance_failure (which
@@ -7242,7 +7254,7 @@ async def _do_train_merge(
             + '; '.join(detail_items)
         )
         logger.warning('Train %s: %s', req.train_id, reason)
-        _emit_merge_attempt(event_store, req.task_id, OutcomeKind.train_partial_flip, duration_ms=_elapsed_ms(t0), **_train_emit_kwargs)
+        _emit_train_attempt(event_store, req, OutcomeKind.train_partial_flip, started_monotonic=t0)
         return MergeOutcome('done', merge_sha=advanced_sha, reason=reason)
 
     # _finalize_advanced_merge already emitted merge_attempt 'done'; return its
@@ -20632,19 +20644,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # rebased_pending_reverify are included in retries_per_landing (see
                     # _note_merge_retry docstring for the rationale).
                     self._note_merge_retry()
-                    # advance_main always populates all three fields when it
-                    # constructs AdvanceOutcome('rebased_pending_reverify', ...),
-                    # but they're typed str | None on the dataclass; narrow
-                    # explicitly for pyright (task 1996 explicit-guard style)
-                    # rather than re-adding a verbose per-field diagnostic.
-                    rebased_sha = adv_outcome.advanced_sha
-                    rebased_from = adv_outcome.rebased_from
-                    rebased_onto = adv_outcome.rebased_onto
-                    if rebased_sha is None or rebased_from is None or rebased_onto is None:
-                        raise AssertionError(
-                            f'advance_main returned rebased_pending_reverify '
-                            f'without SHA fields (task {req.task_id})'
-                        )
+                    rebased_sha, rebased_from, rebased_onto = _rebased_tip(adv_outcome, req.task_id)
 
                     self._note_transition(
                         req.request_id, ItemLifecycleState.FINALIZING,
