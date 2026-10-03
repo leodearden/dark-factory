@@ -679,7 +679,7 @@ def test_refusals_are_returned_not_raised(sweep_root):
     """Refusals are structured VALUES carrying (path, lane, reason).
 
     Never raised-and-swallowed: `scripts` is inside
-    shared/tests/silent_fallthrough_scan.py's _SCOPE_ROOTS, so a broad
+    shared/tests/silent_fallthrough_scan.py's SCOPE_ROOTS, so a broad
     `except Exception` funnelling into a default would trip the ratchet — and
     would also lose the reason a human needs to adjudicate the refusal.
     """

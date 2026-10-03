@@ -99,9 +99,9 @@ def _scan(records: Sequence[ParsedFile]) -> tuple[list[_SiteKey], list[_SiteKey]
     ``first_party_tree`` fixture hands out — the whole first-party tree, read
     and ``ast.parse``d exactly once per session and shared with every other
     gate. ``silent_fallthrough_scan.parse_first_party_tree`` still enumerates
-    via ``iter_first_party_files``, so the scope roots in ``_SCOPE_ROOTS``, the
+    via ``iter_first_party_files``, so the scope roots in ``SCOPE_ROOTS``, the
     ``tests``/``mem0``/``graphiti``/``conftest.py`` exclusions, and the
-    sentinel-dir validation that RAISES rather than yielding a vacuously-empty
+    scope-root validation that RAISES rather than yielding a vacuously-empty
     scan all keep their meaning. The trees are walked READ-ONLY: they belong to
     the session, not to this gate.
 

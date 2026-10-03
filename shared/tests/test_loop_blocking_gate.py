@@ -1189,17 +1189,17 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # Task 4484's charter is "re-run the enumeration caller-side across
 # fused-memory", so the finding set is scoped to that package. The shared
 # first-party tree spans every scope root in silent_fallthrough_scan's
-# _SCOPE_ROOTS; orchestrator/src is also heavily async and would balloon the
+# SCOPE_ROOTS; orchestrator/src is also heavily async and would balloon the
 # baseline past anything a reviewer can read, turning the ratchet into a merge
 # blocker for unrelated work. Widening is a deliberate follow-on decision with
 # merge-lane consequences, not a side effect of this audit.
 #
 # The scope is applied by FILTERING the shared first-party tree, never by
-# handing the provider a narrower root: it validates repo_root against
-# sentinel dirs ('shared/src', 'orchestrator/src') and RAISES rather than
-# yielding a vacuously empty scan. Passing 'fused-memory/src' as the root
-# would trip that sentinel, and relaxing the sentinel to accommodate us would
-# delete the loud-failure property its existing consumers rely on.
+# handing the provider a narrower root: the provider requires every
+# SCOPE_ROOTS entry under the root it is handed and RAISES rather than
+# yielding a vacuously empty or narrower scan, so passing 'fused-memory/src'
+# as the root would raise. Relaxing that check to accommodate us would delete
+# the loud-failure property its existing consumers rely on.
 _SCOPE_PREFIX = 'fused-memory/src/'
 
 # How many out-of-scope first-party files the scope-filter test may scan before
