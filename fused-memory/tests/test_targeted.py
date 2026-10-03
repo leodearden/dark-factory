@@ -6324,6 +6324,229 @@ async def test_unblock_metadata_stamp_non_dict_response_is_rejected(
     )
 
 
+# ── task-5273: clear the stale claimant before the blocked->pending flip ────
+#
+# A re-pended dependent must not keep a claimant that no longer owns it, or
+# the scheduler's live-claimant dispatch gate holds it until the heartbeat
+# TTL lapses. The clear rides the flip and nothing else: after the live
+# re-read, before the status write, and never a veto on the flip.
+
+
+def _blocked_dependent(**overrides) -> dict:
+    """Task '2', blocked on the just-done task '1'; *overrides* replace keys."""
+    return {
+        'id': '2', 'title': 'Downstream', 'status': 'blocked', 'dependencies': ['1'],
+        **overrides,
+    }
+
+
+async def _complete_dependency(reconciler, tmp_path) -> dict:
+    """Drive task '1''s ``done`` transition through the public entry point."""
+    return await reconciler.reconcile_task(
+        task_id='1', transition='done', project_id='test-project',
+        project_root=str(tmp_path),
+        task_before={'id': '1', 'title': 'Dep task', 'status': 'in-progress'},
+    )
+
+
+async def _taskmaster_journal_rows(journal, action_type: str, operation: str) -> list[dict]:
+    """Real journal rows for one (action_type, operation) pair on the
+    ``taskmaster`` target.
+
+    ``limit`` sits above 1 so the single-run assertion can actually fail:
+    one ``reconcile_task`` call is one run.
+    """
+    runs = await journal.get_recent_runs('test-project', limit=5)
+    assert len(runs) == 1, f'Expected exactly one run, got: {runs}'
+    rows = await journal.get_run_actions(runs[0].id)
+    return [
+        r for r in rows
+        if r['action_type'] == action_type and r['target'] == 'taskmaster'
+        and r['operation'] == operation
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unblock_dependent_clears_claimant_before_pending_flip(
+    wired_reconciler, mock_taskmaster, journal, tmp_path,
+):
+    """Both claimant columns are cleared -- explicitly None, not omitted --
+    strictly BEFORE the status flip: once the task is pending a dispatch may
+    stamp a fresh claimant, which a late-landing clear would clobber. Same
+    ordering as scheduler.py::Scheduler._phase_redispatch_stranded_blocked.
+    """
+    interceptor = wired_reconciler.task_interceptor
+    calls: list[tuple[str, dict]] = []
+
+    async def _clear_claimant(**kwargs):
+        calls.append(('claimant', kwargs))
+        return {'id': '2', 'message': 'Updated claimant fields for task 2'}
+
+    async def _set_status(**kwargs):
+        calls.append(('status', kwargs))
+        return {'message': 'status updated', 'tasks': [{'taskId': '2', 'newStatus': 'pending'}]}
+
+    interceptor.set_task_claimant = AsyncMock(side_effect=_clear_claimant)
+    interceptor.set_task_status = AsyncMock(side_effect=_set_status)
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(_blocked_dependent()))
+
+    result = await _complete_dependency(wired_reconciler, tmp_path)
+
+    interceptor.set_task_claimant.assert_awaited_once_with(
+        task_id='2', project_root=str(tmp_path), claimant_run_id=None, heartbeat_at=None,
+    )
+    assert [name for name, _ in calls] == ['claimant', 'status'], (
+        f'Expected the claimant clear strictly before the status flip, got: {calls!r}'
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'Expected dependent_unblock_applied, got: {actions[0]!r}'
+    )
+    assert 'claimant_clear' not in actions[0], (
+        f'claimant_clear must be absent when the clear landed, got: {actions[0]!r}'
+    )
+
+    clear_writes = await _taskmaster_journal_rows(journal, 'write', 'set_task_claimant')
+    assert len(clear_writes) == 1, (
+        f'Expected exactly one write/set_task_claimant row, got: {clear_writes}'
+    )
+    assert clear_writes[0]['detail'] == {
+        'task_id': '2', 'satisfied_by': '1', 'type': 'unblock_claimant_clear',
+    }, f'Unexpected claimant-clear detail: {clear_writes[0]["detail"]!r}'
+
+    status_writes = await _taskmaster_journal_rows(journal, 'write', 'set_task_status')
+    assert len(status_writes) == 1, (
+        f'The claimant clear must not change the set_task_status row count, '
+        f'got: {status_writes}'
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('make_claimant_mock, expected_marker, expected_error', [
+    pytest.param(
+        lambda: AsyncMock(side_effect=RuntimeError('db locked')), 'failed', 'db locked',
+        id='raises',
+    ),
+    pytest.param(
+        lambda: AsyncMock(return_value=_backlog_rejection()),
+        'rejected', 'ReconciliationBacklogExceeded',
+        id='gate-rejection',
+    ),
+    pytest.param(
+        lambda: AsyncMock(return_value=None), 'rejected', 'unknown',
+        id='non-dict',
+    ),
+])
+async def test_unblock_claimant_clear_failure_does_not_veto_flip(
+    wired_reconciler, mock_taskmaster, journal, tmp_path, caplog,
+    make_claimant_mock, expected_marker, expected_error,
+):
+    """A clear that raises or is refused is recorded, never a veto: the flip
+    still lands and stays ``dependent_unblock_applied``, carrying
+    ``claimant_clear`` ('failed' for a raise, 'rejected' for a classified
+    refusal) and a durable skip row. A failed clear degrades to the
+    pre-task-5273 behaviour -- pending, dispatchable once the stale
+    heartbeat ages out.
+    """
+    interceptor = wired_reconciler.task_interceptor
+    interceptor.set_task_claimant = make_claimant_mock()
+    mock_taskmaster.get_tasks = AsyncMock(return_value=_dep_tasks(_blocked_dependent()))
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.reconciliation.targeted'):
+        result = await _complete_dependency(wired_reconciler, tmp_path)
+
+    interceptor.set_task_status.assert_awaited_once()
+    assert interceptor.set_task_status.await_args.kwargs.get('status') == 'pending', (
+        f'Expected the flip to pending regardless of the clear, '
+        f'got: {interceptor.set_task_status.await_args!r}'
+    )
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert actions[0]['type'] == 'dependent_unblock_applied', (
+        f'A claimant-clear failure must not downgrade a landed flip, got: {actions[0]!r}'
+    )
+    assert actions[0].get('claimant_clear') == expected_marker, (
+        f'Expected claimant_clear={expected_marker!r}, got: {actions[0]!r}'
+    )
+
+    clear_skips = await _taskmaster_journal_rows(journal, 'skip', 'set_task_claimant')
+    assert len(clear_skips) == 1, (
+        f'Expected exactly one skip/set_task_claimant row, got: {clear_skips}'
+    )
+    assert clear_skips[0]['detail'] == {
+        'task_id': '2', 'satisfied_by': '1', 'type': 'unblock_claimant_clear',
+        'error': expected_error,
+    }, f'Unexpected claimant-clear skip detail: {clear_skips[0]["detail"]!r}'
+    clear_writes = await _taskmaster_journal_rows(journal, 'write', 'set_task_claimant')
+    assert clear_writes == [], (
+        f'A clear that did not land must not leave a write row, got: {clear_writes}'
+    )
+    status_writes = await _taskmaster_journal_rows(journal, 'write', 'set_task_status')
+    assert len(status_writes) == 1, (
+        f'Expected exactly one write/set_task_status row, got: {status_writes}'
+    )
+
+    warns = [
+        r for r in caplog.records
+        if r.name == 'fused_memory.reconciliation.targeted' and r.levelno >= logging.WARNING
+    ]
+    assert warns, 'Expected a warning logged for the claimant clear that did not land'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('make_get_tasks, expected_type, expected_reason', [
+    pytest.param(
+        lambda: AsyncMock(side_effect=[
+            _dep_tasks(_blocked_dependent()),
+            _dep_tasks(_blocked_dependent(status='in-progress')),
+        ]),
+        'dependent_unblock_skipped', 'status_changed',
+        id='live-status-in-progress',
+    ),
+    pytest.param(
+        lambda: AsyncMock(side_effect=[
+            _dep_tasks(_blocked_dependent()),
+            RuntimeError('taskmaster unavailable'),
+        ]),
+        'dependent_unblock_skipped', 'live_status_unavailable',
+        id='live-reread-unavailable',
+    ),
+    pytest.param(
+        lambda: AsyncMock(return_value=_dep_tasks(
+            _blocked_dependent(metadata={'parent_cancelled': '7'}),
+        )),
+        'dependent_unblock_vetoed', 'parent_cancelled',
+        id='parent-cancelled-veto',
+    ),
+])
+async def test_unblock_dependent_no_claimant_clear_when_not_flipping(
+    wired_reconciler, mock_taskmaster, journal, tmp_path,
+    make_get_tasks, expected_type, expected_reason,
+):
+    """The clear can never touch a task the sweep decided not to move -- above
+    all one that went in-progress after the snapshot, whose claimant is live:
+    clearing it would be the incident-2588 un-claim class.
+    """
+    mock_taskmaster.get_tasks = make_get_tasks()
+
+    result = await _complete_dependency(wired_reconciler, tmp_path)
+
+    actions = _dep_actions_for(result, '2')
+    assert len(actions) == 1, f'Expected exactly one action for task 2, got: {actions}'
+    assert (actions[0]['type'], actions[0].get('reason')) == (expected_type, expected_reason), (
+        f'Expected the {expected_reason!r} no-flip arm, got: {actions[0]!r}'
+    )
+    wired_reconciler.task_interceptor.set_task_claimant.assert_not_awaited()
+    for action_type in ('write', 'skip'):
+        rows = await _taskmaster_journal_rows(journal, action_type, 'set_task_claimant')
+        assert rows == [], (
+            f'Expected no {action_type}/set_task_claimant row on a no-flip arm, got: {rows}'
+        )
+
+
 # ── Task 4723 / PRD D7: verdict-specific verification memory templates ──
 #
 # The defect: `confirmed` and `contradicted` shared ONE completion-framed
