@@ -803,8 +803,10 @@ def _shows_xdist_worker_death(output: str) -> bool:
     ``--max-worker-restart=0`` every worker death aborts the session, and the
     ``-q`` witness reads only the FINAL progress line, which
     ``_aggregate_results``'s per-module join can hand to a later, completed
-    module. The accepted cost: a crash xdist recovered from (cap > 0) is
-    refused too, and the merge stays red, the safe direction. Pinned in
+    module. The accepted costs, both keeping the merge red (the safe
+    direction): a crash xdist recovered from (cap > 0) is refused, and so is
+    a session whose assertion diff or captured output merely quotes a marker,
+    since the search spans all of *output*. The first is pinned in
     test_flake_discriminator.py::TestTruncatedSessionIsUnconfirmable.
     """
     if not output:
