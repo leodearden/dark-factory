@@ -912,7 +912,7 @@ def test_memory_tab_reads_writes_axis_labels_whole_counts_only(
 ) -> None:
     """MemoryTab's reads-vs-writes axis is a COUNT axis and must read as one.
 
-    `write_journal.get_memory_timeseries` is a SQL ``COUNT(*)`` bucketed per
+    `write_journal.get_memory_ops` is a SQL ``COUNT(*)`` bucketed per
     hour, so a "3.5" gridline label is not a rounding nicety — it is a count
     that cannot exist.
     """
