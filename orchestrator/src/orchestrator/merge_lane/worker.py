@@ -6733,8 +6733,10 @@ async def _advance_train(
     ``candidate_base`` — the oldest main the candidate's verification is
     anchored to.  A cleared gate makes the rebased tip the next candidate,
     sitting on the main it was rebased onto; a red re-verify ends the loop.
-    After ``worker.MAX_CAS_RETRIES`` retries the loop gives up as
-    ``'cas_failed'``.
+    A lost CAS (``'cas_failed'``) re-reads main and retries the same
+    candidate.  That retry is sound only because ``reverify_on_rebase=True``
+    keeps every rebase behind the gate.  After ``worker.MAX_CAS_RETRIES``
+    retries the loop gives up as ``'cas_failed'``.
     """
     git_ops = worker._git_ops
     candidate = merge_commit
@@ -6752,7 +6754,7 @@ async def _advance_train(
             expected_main=expected_main,
             reverify_on_rebase=True,
         )
-        if adv.result != 'rebased_pending_reverify':
+        if adv.result not in ('rebased_pending_reverify', 'cas_failed'):
             return _TrainAdvance(adv, landing_base=expected_main)
         if retries >= worker.MAX_CAS_RETRIES:
             _emit_merge_attempt(
@@ -6762,6 +6764,23 @@ async def _advance_train(
             )
             return _TrainAdvance(AdvanceOutcome('cas_failed'), landing_base=expected_main)
         retries += 1
+        if adv.result == 'cas_failed':
+            # candidate and candidate_base stay put: a candidate that descends
+            # from the re-read main lands as verified, and one that main moved
+            # past is rebased by the next advance and gated against the delta
+            # since candidate_base, never since the re-read main (task 5070).
+            expected_main = await git_ops.get_main_sha()
+            logger.info(
+                'Train %s: CAS lost to a moved main; retrying against %s '
+                '(retry %d/%d)',
+                req.train_id, expected_main[:8], retries, worker.MAX_CAS_RETRIES,
+            )
+            _emit_merge_attempt(
+                worker._event_store, req.task_id, OutcomeKind.cas_retry,
+                attempt=retries, duration_ms=_elapsed_ms(started_monotonic),
+                **emit_kwargs,
+            )
+            continue
         rebased_sha, rebased_onto = _rebased_tip(adv, req.task_id)
         gate = await _reverify_rebased_tree(
             git_ops, req, merge_wt,
