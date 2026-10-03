@@ -13,6 +13,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from qdrant_client.http.exceptions import UnexpectedResponse
+from shared.config_dir import TaskConfigDir
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -25,6 +26,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -5676,6 +5678,107 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
         'the _error breadcrumb the except asyncio.CancelledError handler '
         "stamped must survive the second cancellation through the finally's "
         'shielded update_run_stage_reports'
+    )
+
+
+def _slow_stage_creating_its_config_dir(journal, stage, stage_entered, created_dirs):
+    """Fake for `stage.run` that creates the run's per-run CLI config dir the
+    way `stages/base.py::BaseStage.run` does, records its path in
+    `created_dirs`, sets `stage_entered`, then blocks until cancelled — so a
+    test can assert the driver's `finally` GC'd (or kept) the real dir."""
+
+    async def slow_stage_run(events, watermark, prior_reports, run_id, model=None):
+        config_dir = TaskConfigDir(
+            task_id=run_id, base_dir=recon_config_base_dir(journal.data_dir),
+        )
+        created_dirs.append(config_dir.path)
+        stage_entered.set()
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=stage.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    return slow_stage_run
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 5128: a second cancellation landing while run_full_cycle's
+    finally awaits its shielded stage_reports write must not make the
+    per-run config-dir GC unreachable — and must still propagate."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = False
+
+    stage_entered = asyncio.Event()
+    created_dirs: list = []
+    harness.stages[0].run = _slow_stage_creating_its_config_dir(
+        journal, harness.stages[0], stage_entered, created_dirs,
+    )
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — no second cancellation was '
+        'delivered, so this test would pass vacuously'
+    )
+    assert len(created_dirs) == 1
+    assert outer_task.cancelled(), (
+        'the second cancellation must still propagate out of run_full_cycle'
+    )
+    assert not created_dirs[0].exists(), (
+        'gc_run_config_dir must still run when a second cancellation raises '
+        "at the finally's shielded stage_reports await"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_keeps_interrupted_runs_config_dir_under_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Passes before and after task 5128 by design: guards the interrupted
+    gate against a fix that hoists the GC out of it (task σ — an interrupted
+    run's transcript must survive for the startup --resume pass)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = True
+
+    stage_entered = asyncio.Event()
+    created_dirs: list = []
+    harness.stages[0].run = _slow_stage_creating_its_config_dir(
+        journal, harness.stages[0], stage_entered, created_dirs,
+    )
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — no second cancellation was '
+        'delivered, so this test would pass vacuously'
+    )
+    assert len(created_dirs) == 1
+    assert outer_task.cancelled()
+    assert created_dirs[0].exists(), (
+        "an interrupted run's config dir must survive for the --resume pass"
     )
 
 
