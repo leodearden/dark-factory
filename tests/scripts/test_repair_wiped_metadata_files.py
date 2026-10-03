@@ -41,9 +41,10 @@ from pathlib import Path
 # falsified it. Same correction in
 # tests/scripts/test_migrate_metadata_modules_to_files.py.
 #
-# _task_db_scan is imported by the TEST only, never by
-# repair_wiped_metadata_files.py itself — see the lockstep guard at the bottom of
-# this file for why that asymmetry is deliberate.
+# The AUDIT_EXIT_* ladder is imported by the TEST only, never by
+# repair_wiped_metadata_files.py itself (whose one _task_db_scan import is
+# UNREADABLE_STORE_ERRORS) — see the lockstep guard at the bottom of this file
+# for why that asymmetry is deliberate.
 from _task_db_scan import (
     AUDIT_EXIT_FINDINGS,
     AUDIT_EXIT_NO_ROOT,

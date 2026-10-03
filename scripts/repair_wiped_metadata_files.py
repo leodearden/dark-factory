@@ -62,6 +62,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol
 
+from _task_db_scan import UNREADABLE_STORE_ERRORS
 from audit_wiped_metadata_files import (
     CONTRADICTED_REAL_MERGE_SHA,
     FIDELITY_FILE_LEVEL,
@@ -1166,8 +1167,10 @@ async def main_async(args: argparse.Namespace) -> int:
     """Repair every resolved root, and never let one bad root eat the run.
 
     ONE UNREADABLE ROOT IS NOT A FAILED RUN. Mirroring the audit's main()
-    (audit_wiped_metadata_files.py:899-933), a ``sqlite3.Error`` from root N is
-    warned to stderr, recorded, and skipped so the remaining roots still run.
+    (audit_wiped_metadata_files.py:899-933), an unreadable store at root N —
+    one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS``, exactly what the
+    audit's own sweep tier skips — is warned to stderr, recorded, and skipped
+    so the remaining roots still run.
     On ``--apply`` that resilience is not a nicety: without it, an unreadable
     root aborts before the summary prints, and the record of the writes already
     applied to roots 1..N-1 is LOST — the reporting-honesty failure this
@@ -1195,7 +1198,7 @@ async def main_async(args: argparse.Namespace) -> int:
             results.append(
                 await repair_project(client, root, apply=args.apply, now_iso=now_iso)
             )
-        except sqlite3.Error as exc:
+        except UNREADABLE_STORE_ERRORS as exc:
             # Same wording as the audit's warning, deliberately: one phrasing
             # for one condition, so the two tools cannot describe the same
             # unreadable database differently.

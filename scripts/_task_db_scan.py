@@ -68,11 +68,12 @@ for why the audit spelling does not port to Tier 2 and vice versa.
 THE THIRD COPY OF THE TIER-3 SKELETON, AND WHY IT STAYS OUT (task 3817).
 ``repair_wiped_metadata_files.py`` — the WRITE counterpart to
 ``audit_wiped_metadata_files.py`` — keeps its own ``EXIT_*`` ladder and its own
-per-root ``sqlite3.Error`` loop inside ``main_async`` instead of adopting
+per-root skip loop inside ``main_async`` instead of adopting
 :func:`run_audit_cli`. That is a decision, not an oversight. It reaches Tier 1
 discovery only second-hand, through the ``discover_project_roots`` re-export in
-``audit_wiped_metadata_files.py``, and holds NO direct import of this module at
-all. Four things Tier 3 cannot express, each measured in the source:
+``audit_wiped_metadata_files.py``. Its ONE direct import from this module is
+:data:`UNREADABLE_STORE_ERRORS`, so its per-root loop skips exactly what this
+tier skips. Four things Tier 3 cannot express, each measured in the source:
 
 1. ``main_async`` is ``async`` and awaits ``repair_project`` (itself
    ``async def``), while :func:`run_audit_cli` and :func:`sweep_project_roots`
