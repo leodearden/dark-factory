@@ -8,6 +8,7 @@ from shared.prompt_artifact import PromptSpec
 
 from orchestrator.agents.chained_command_guidance import CHAINED_COMMAND_STATUS_GUIDANCE
 from orchestrator.agents.code_quality import guidance
+from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
 
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
@@ -1273,6 +1274,7 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + GREP_LOOKAROUND_GUIDANCE
     + PKILL_SELF_MATCH_GUIDANCE
     + CHAINED_COMMAND_STATUS_GUIDANCE
+    + GREP_PATTERN_ESCAPING_GUIDANCE
 )
 
 
