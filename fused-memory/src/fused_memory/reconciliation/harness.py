@@ -6396,48 +6396,12 @@ class ReconciliationHarness:
             # NO remediation exclusion: Stage 2's in-stage write is unconditional
             # by explicit design, so a lost row here is a genuine gap. Anchored
             # at run.started_at (this driver has no separate cycle_start_time
-            # local), and placed strictly before update_run_stage_reports so the
-            # persisted copy captures whatever markers either arm stamped —
-            # and that call is itself shielded against a second cancellation
-            # arriving mid-write, the identical mirror-site fix applied to
-            # run_full_cycle's finally: asyncio.shield only protects work
-            # once its coroutine exists as its own Task, so this driver needs
-            # the same guard for the same reason (task 4431).
+            # local), and placed strictly before the stage_reports persist so
+            # the persisted copy captures whatever markers either arm stamped.
             await self._flush_cycle_summaries(
                 run, run_id, project_id, current_stage_name, run.started_at,
             )
-            # Materialized explicitly (rather than handed to asyncio.shield
-            # as a bare coroutine) so a done-callback can log a failure that
-            # survives a second cancellation instead of vanishing silently
-            # (task 4431).
-            stage_reports_write = asyncio.ensure_future(
-                self.journal.update_run_stage_reports(run_id, run.stage_reports)
-            )
-            stage_reports_write.add_done_callback(
-                lambda t: self._log_stage_reports_write_failure(run_id, t)
-            )
-            await asyncio.shield(stage_reports_write)
-            # Known residual (task 4431): asyncio.shield protects the WRITE,
-            # not this awaiting frame — a second cancellation still raises
-            # CancelledError HERE, so the gc_run_config_dir block below
-            # remains unreachable on that path, exactly as before this fix
-            # (not a regression). A try/finally around this await (finally:
-            # run the gc block) would make it reachable WITHOUT swallowing
-            # the CancelledError — gc_run_config_dir is synchronous
-            # filesystem work with no awaits, so it cannot itself be
-            # re-interrupted. Left unaddressed here by scope, not necessity:
-            # this task's remit is the shield alone (design decision 3), so
-            # the reachability fix is deferred to a follow-up task rather
-            # than folded in here.
-            # Task 2744: GC this remediation run's per-run recon CLI config dir on
-            # every exit path. Defensive — never mask the run's terminal outcome.
-            try:
-                gc_run_config_dir(self.journal.data_dir, run_id)
-            except Exception as gc_err:  # noqa: BLE001
-                logger.warning(
-                    'gc_run_config_dir failed for remediation run %s: %r',
-                    run_id, gc_err,
-                )
+            await self._persist_stage_reports_then_gc_config_dir(run)
 
 
 # ── Backlog iteration ──────────────────────────────────────────────────
