@@ -69,6 +69,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     'APPLIED_WORK_RE',
     'COMMIT_REF_RE',
+    'DISPOSITION_RE',
     'FILING_DISPATCH_RE',
     'TICKET_REF_RE',
     'UNRESOLVABLE',
@@ -82,7 +83,7 @@ __all__ = [
     'verify_claims',
 ]
 
-ClaimKind = Literal['applied_work', 'filing_dispatch']
+ClaimKind = Literal['applied_work', 'filing_dispatch', 'disposition']
 ClaimSubject = Literal['task', 'commit', 'ticket']
 VerdictStatus = Literal['verified', 'mismatch', 'unverifiable']
 
@@ -134,8 +135,9 @@ UNRESOLVABLE: _Unresolvable = _Unresolvable()
 # verb reopens exactly the negation hole those strippers exist to close ("the
 # fix has not been applied" would extract as a completion claim). The two
 # supplementary strippers below cover precisely that delta. INVARIANT: every
-# verb added to _APPLIED_PARTICIPLES must also be reachable from
-# _APPLIED_ANY_FORM, which is the strippers' (deliberately broader) vocabulary.
+# marker verb in the three families (APPLIED_WORK_RE, FILING_DISPATCH_RE,
+# DISPOSITION_RE) that task_filter's vocabulary lacks must also be reachable
+# from _EXTENSION_ANY_FORM, the strippers' (deliberately broader) vocabulary.
 _APPLIED_PARTICIPLES: str = r'applied|patched|deployed'
 _APPLIED_ANY_FORM: str = (
     r'appl(?:y|ied|ies|ying)|patch(?:ed|es|ing)?|deploy(?:ed|s|ing)?'
@@ -160,8 +162,16 @@ _FILING_ANY_FORM: str = (
 )
 
 FILING_DISPATCH_RE: re.Pattern[str] = re.compile(
+    r'\b(?:re[-\s]?filed|filed|submitted|queued|dispatched)\b',
+    re.IGNORECASE,
+)
+
+# A terminal DISPOSITION ("cancelled", "closed as duplicate") asserts more than
+# existence: it is true only of a terminal task, so it is its own kind rather
+# than a filing claim (task 4853).
+DISPOSITION_RE: re.Pattern[str] = re.compile(
     r'\b(?:'
-    r're[-\s]?filed|filed|submitted|queued|dispatched|cancell?ed|'
+    r'cancell?ed|'
     # "closed as <state>" only — a bare "closed" describes non-task things far
     # too often (task_filter drops it from TERMINAL_OUTCOME_RE for exactly this
     # reason), and the "as" is what marks a dispatch outcome.
@@ -313,9 +323,12 @@ class CompletionClaim:
     """One extracted claim that some concrete, named thing is complete.
 
     Attributes:
-        kind: ``'applied_work'`` (the work itself landed) or
-            ``'filing_dispatch'`` (the work was filed/queued/cancelled
-            somewhere) — the esc-3085-1 scope extension.
+        kind: What the claim asserts, which fixes its truth standard.
+            ``'applied_work'``: the work itself landed (true of a terminal
+            task). ``'filing_dispatch'``: the work was filed, submitted, queued
+            or dispatched somewhere, the esc-3085-1 scope extension (true of
+            any task that exists). ``'disposition'``: the work was cancelled
+            or closed as something (true of a terminal task).
         subject: Which authority adjudicates it — ``'task'``, ``'commit'`` or
             ``'ticket'``.
         ref: The named reference, as written: a task id, a commit sha, or a
@@ -369,6 +382,8 @@ def extract_completion_claims(
         de_exempted = _strip_exemptions(clause)
         if APPLIED_WORK_RE.search(de_exempted):
             kind: ClaimKind = 'applied_work'
+        elif DISPOSITION_RE.search(de_exempted):
+            kind = 'disposition'
         elif FILING_DISPATCH_RE.search(de_exempted):
             kind = 'filing_dispatch'
         else:
@@ -521,8 +536,10 @@ def verify_claims(
     * ``task_status_probe(ref, project_id) -> str | None``: the task's live
       status, or ``None`` when it cannot be resolved. The literal ``'unknown'``
       sentinel a NULL/absent DB status maps to counts as unresolvable too.
-      Terminal status (done/cancelled) verifies; any other real status is a
-      mismatch.
+      For ``applied_work`` and ``disposition`` claims a terminal status
+      (done/cancelled) verifies and any other real status is a mismatch; for
+      a ``filing_dispatch`` claim, which asserts only that the task exists,
+      any real status verifies.
     * ``ticket_probe(ref) -> dict | None | UNRESOLVABLE``: the registry row,
       ``None`` when the registry says NO SUCH TICKET (a mismatch — this is
       esc-3085-1 instance (2)), or :data:`UNRESOLVABLE` when the registry could
@@ -561,6 +578,12 @@ def verify_claims(
     return verdicts
 
 
+#: The kinds whose claim is true of any task that EXISTS, whatever its status.
+#: Filing is a historical event, so a later cancellation does not falsify it.
+#: Every other kind needs a terminal status.
+_EXISTENCE_STANDARD_KINDS: frozenset[ClaimKind] = frozenset({'filing_dispatch'})
+
+
 def _verify_task(
     claim: CompletionClaim,
     probe: Callable[[str, str | None], str | None],
@@ -572,8 +595,6 @@ def _verify_task(
             f'live status for task {claim.ref} could not be resolved '
             f'(project={claim.project_id!r})',
         )
-    if status in TERMINAL_TASK_STATUSES:
-        return ClaimVerdict(claim, 'verified', status)
     if status == 'unknown':
         # get_statuses' documented sentinel for a NULL/absent status. It is NOT
         # a live status, so it cannot contradict the claim — but it cannot
@@ -583,6 +604,8 @@ def _verify_task(
             f'task {claim.ref} reports status "unknown" '
             f'(project={claim.project_id!r})',
         )
+    if claim.kind in _EXISTENCE_STANDARD_KINDS or status in TERMINAL_TASK_STATUSES:
+        return ClaimVerdict(claim, 'verified', status)
     return ClaimVerdict(claim, 'mismatch', status)
 
 
