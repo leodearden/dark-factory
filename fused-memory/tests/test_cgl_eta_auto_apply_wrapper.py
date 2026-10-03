@@ -41,8 +41,6 @@ import pytest
 
 _FM = Path(__file__).resolve().parents[1]
 WRAPPER = _FM / "scripts" / "cgl_eta_auto_apply.sh"
-CHECK_WRAPPER = _FM.parent / "scripts" / "fused-memory-flag-marker-check.sh"
-SWEEP_WRAPPER = _FM.parent / "scripts" / "fused-memory-flag-marker-sweep.sh"
 
 # Resolved in the PARENT: the tests below hand the child an empty PATH, and
 # subprocess looks argv[0] up in the CHILD's env, so a bare "bash" would be
@@ -273,13 +271,13 @@ def test_wrapper_fails_loud_when_uv_bin_is_set_but_not_executable(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Structural: the resolve-after-source ordering, shared with the sibling
+# Structural: the resolve-after-source ordering
 # ---------------------------------------------------------------------------
 
 def _code_line_of(src, needle, label, path):
     """Line number of the first NON-COMMENT line containing `needle`.
 
-    Comments are skipped deliberately. Both wrapper headers now DISCUSS this
+    Comments are skipped deliberately. The wrapper header DISCUSSES this
     ordering in prose, quoting `source "$REPO/.env"` verbatim, so a naive
     `src.find(needle)` matches the documentation rather than the code -- which
     makes the assertion below silently vacuous. MEASURED, which is why this
@@ -296,31 +294,33 @@ def _code_line_of(src, needle, label, path):
     )
 
 
-def test_every_wrapper_resolves_uv_after_sourcing_dotenv():
+def test_wrapper_resolves_uv_after_sourcing_dotenv():
     """Task 4591 amendment (review suggestion 4). Pins the ORDER, which is
-    load-bearing: each wrapper's require_uv_bin CALL must come AFTER
+    load-bearing: the wrapper's require_uv_bin CALL must come AFTER
     `set -a; source "$REPO/.env"`.
 
     Resolving first would ignore a PATH or UV_BIN set in .env -- which is
     precisely the remedy an operator reaches for after a minimal-boot-PATH
-    127 -- so one wrapper would fail where its siblings succeed. The line
+    127 -- so this wrapper would fail where its siblings succeed. The line
     that sources scripts/lib/resolve_uv.sh may sit anywhere: it only defines
     functions, so the invocation point is the invariant. Asserted
     structurally because this wrapper hardcodes REPO and so cannot be pointed
-    at a fake .env at runtime.
+    at a fake .env at runtime. The siblings, whose REPO is overridable, pin
+    the same invariant behaviourally next to their own code:
+    scripts/tests/test_flag_marker_check_wrapper.py::test_wrapper_resolves_uv_after_sourcing_dotenv_so_env_can_supply_uv_bin
+    and its namesake in scripts/tests/test_flag_marker_sweep_wrapper.py.
     """
-    for path in (WRAPPER, CHECK_WRAPPER, SWEEP_WRAPPER):
-        src = path.read_text()
-        source_line = _code_line_of(
-            src, 'source "$REPO/.env"', "`source .env`", path,
-        )
-        resolve_line = _code_line_of(
-            src, "require_uv_bin", "require_uv_bin call", path,
-        )
-        assert source_line < resolve_line, (
-            f"{path.name} calls require_uv_bin BEFORE sourcing $REPO/.env. That "
-            f"makes a PATH or UV_BIN set in .env invisible to the resolution -- "
-            f"the exact operator remedy for the boot-PATH 127 this ladder exists "
-            f"for -- and desynchronises it from its sibling wrappers. Move the "
-            f"require_uv_bin call below the `set +a` block."
-        )
+    src = WRAPPER.read_text()
+    source_line = _code_line_of(
+        src, 'source "$REPO/.env"', "`source .env`", WRAPPER,
+    )
+    resolve_line = _code_line_of(
+        src, "require_uv_bin", "require_uv_bin call", WRAPPER,
+    )
+    assert source_line < resolve_line, (
+        f"{WRAPPER.name} calls require_uv_bin BEFORE sourcing $REPO/.env. That "
+        f"makes a PATH or UV_BIN set in .env invisible to the resolution -- "
+        f"the exact operator remedy for the boot-PATH 127 this ladder exists "
+        f"for -- and desynchronises it from its sibling wrappers. Move the "
+        f"require_uv_bin call below the `set +a` block."
+    )

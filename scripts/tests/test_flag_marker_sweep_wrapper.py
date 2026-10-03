@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 WRAPPER = Path(__file__).parent.parent / "fused-memory-flag-marker-sweep.sh"
+
+# Resolved in the PARENT: a row below hands the child an empty PATH, under
+# which a bare "bash" argv[0] would itself be unfindable.
+BASH = shutil.which("bash") or "/bin/bash"
 
 
 # ---------------------------------------------------------------------------
@@ -224,8 +230,7 @@ def test_wrapper_sources_dotenv_and_propagates_to_sweep(tmp_path):
 # Fake `uv` shim (pins the default FLAG_MARKER_SWEEP_CMD prefix)
 # ---------------------------------------------------------------------------
 
-_FAKE_UV_SRC = '''#!/usr/bin/env python3
-"""Fake `uv` shim for pinning fused-memory-flag-marker-sweep.sh's default
+_FAKE_UV_SRC = '''"""Fake `uv` shim for pinning fused-memory-flag-marker-sweep.sh's default
 FLAG_MARKER_SWEEP_CMD prefix (`uv run --frozen --project "$FM" python`).
 Records argv[1:] into a JSON state file at $FAKE_SWEEP_STATE and exits 0.
 Never invokes real uv / fused_memory / live stores.
@@ -247,11 +252,16 @@ sys.exit(0)
 
 def _fake_uv(tmp_path):
     """Write an executable fake `uv` into <tmp_path>/uv-bin/ and its backing
-    JSON state file. Returns (bin_dir, state_path)."""
+    JSON state file. Returns (bin_dir, state_path).
+
+    The shebang is the ABSOLUTE parent interpreter, not `/usr/bin/env
+    python3`: the wrapper execs this shim with its own PATH, which some rows
+    below scrub to an empty dir, where `env` cannot find python3 and the shim
+    would fail 127 -- indistinguishable from the bug under test."""
     bin_dir = tmp_path / "uv-bin"
     bin_dir.mkdir(exist_ok=True)
     fake = bin_dir / "uv"
-    fake.write_text(_FAKE_UV_SRC)
+    fake.write_text(f"#!{sys.executable}\n" + _FAKE_UV_SRC)
     fake.chmod(0o755)
 
     state_path = tmp_path / "uv_state.json"
@@ -444,6 +454,64 @@ def test_wrapper_fails_loud_when_uv_bin_is_set_but_not_executable(tmp_path):
     assert _recorded_calls(state_path) == [], (
         f"Expected NO uv invocation: falling through to the uv on PATH runs a "
         f"different uv than the one pinned. calls={_recorded_calls(state_path)!r}"
+    )
+
+
+def test_wrapper_resolves_uv_after_sourcing_dotenv_so_env_can_supply_uv_bin(tmp_path):
+    """BEHAVIOURAL pin on the ordering of the require_uv_bin call relative to
+    `set -a; source "$REPO/.env"`, mirroring the check wrapper's row of the
+    same name.
+
+    The call must run AFTER the source, so a UV_BIN (or PATH) set in .env is
+    visible to it -- the remedy an operator reaches for after a boot-PATH 127.
+
+    UV_BIN is supplied ONLY by the .env file, under a PATH scrubbed to an
+    empty dir and a HOME with no .local/bin/uv. Were the call hoisted above
+    the source, UV_BIN would still be unset at that moment, nothing else
+    would resolve, and the wrapper would exit 127 with its ERROR: line.
+    Reaching the fake uv at all is the proof. An empty PATH suffices because
+    with FLAG_MARKER_SWEEP_PROJECT_IDS pinned, everything the wrapper runs
+    before exec'ing uv is a bash builtin.
+    """
+    if os.path.exists("/usr/local/bin/uv"):
+        pytest.skip(
+            "/usr/local/bin/uv exists on this host, so the ladder resolves "
+            "without .env's UV_BIN and the ordering cannot be discriminated"
+        )
+
+    uv_bin_dir, state_path = _fake_uv(tmp_path)
+
+    empty_path = tmp_path / "empty-path"
+    empty_path.mkdir(exist_ok=True)
+    fake_home = tmp_path / "fake-home"
+    fake_home.mkdir(exist_ok=True)
+
+    fake_repo = tmp_path / "fake-repo"
+    fake_repo.mkdir(exist_ok=True)
+    (fake_repo / ".env").write_text(f"UV_BIN={uv_bin_dir / 'uv'}\n")
+
+    env = dict(os.environ)
+    env["PATH"] = str(empty_path)
+    env["HOME"] = str(fake_home)
+    env["FAKE_SWEEP_STATE"] = str(state_path)
+    env["REPO"] = str(fake_repo)
+    env["FLAG_MARKER_SWEEP_PROJECT_IDS"] = "dark_factory"
+    env.pop("UV_BIN", None)          # supplied by .env alone -- that is the point
+    env.pop("FLAG_MARKER_SWEEP_CMD", None)
+
+    result = subprocess.run(
+        [BASH, str(WRAPPER)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+    assert result.returncode == 0, (
+        f"Expected UV_BIN set in $REPO/.env to be visible to the uv "
+        f"resolution (a 127 + ERROR: here means require_uv_bin ran BEFORE the "
+        f"source); stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert len(_recorded_calls(state_path)) == 1, (
+        f"Expected exactly one sweep through the .env-pinned uv; "
+        f"calls={_recorded_calls(state_path)!r} stderr={result.stderr!r}"
     )
 
 
