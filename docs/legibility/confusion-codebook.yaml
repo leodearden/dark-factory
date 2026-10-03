@@ -116,6 +116,18 @@ entries:
     origin_phase: verify
     manifested_phase: verify
     note: Interactive session attempts to call read_file and grep_search tool shims (turns 11, 13, 15) during task-completion verification. Same tools and confusion as documented entry, but manifesting in interactive session context rather than just one-shot agents. User submitted a claim-verification request; agent subsequently failed to locate the described tool shims in runtime.
+  - date: '2026-09-26'
+    project: dark_factory
+    session: 1b01d9a5-8438-4075-a9e3-b90efa438d75
+    origin_phase: verify
+    manifested_phase: verify
+    note: Claim-verification session ('## Verification Request') invoked grep_search/glob_search, shim tools the claude_cli runtime does not provide; 3 consecutive 'No such tool available' errors.
+  - date: '2026-10-01'
+    project: dark_factory
+    session: 88a58609-6f09-48a2-baaa-bd1861a33ffd
+    origin_phase: implement
+    manifested_phase: verify
+    note: A claim-verification sub-agent was given a prompt contract describing a JSON tool shim (grep_search, git_log), but those tools do not exist in its runtime. It got four 'No such tool available' errors on grep_search and git_log.
 - id: watcher-capability-envelope
   title: Autonomous watcher rotations never told their capability envelope — level-{0,1} cap, disabled Write/Edit, and git-write denials rediscovered by failure every rotation
   severity: high
@@ -7602,6 +7614,12 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: 'ModuleNotFoundError in turn 176; consistent with venv/import-resolution asymmetry when agent operates in .worktrees/<id> context, per CLAUDE.md §Locating installed code: first-party editable installs resolve to worktree''s OWN checkout, not main checkout'
+  - date: '2026-10-01'
+    project: dark_factory
+    session: 52b053e0-b1e6-49ee-b9f1-6b3bce908492
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The only evidence is a single not_found hit, 'modulenotfounderror', at turn 162 of an orchestrated-task session in the .worktrees/5174 worktree. That fits the known ModuleNotFoundError-in-task-worktree pattern, probably the worktree resolving the wrong or an un-synced .venv. The digest has no transcript detail. It does not show whether this was the architect explore phase, so both phases stay 'unknown'.
 - id: entry-cand-20260720-10
   title: Architect overrides explicit in-task dependency-coordination branching instructions instead of following them
   severity: medium
@@ -9638,6 +9656,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Multiple watcher re-arm tasks failed with exit 124 (designed bounded-wait timeout ceiling), but signal_counts.tool_error=3 vs. 12+ visible exit-124 failures indicates digest signal-scorer is miscounting these by-design timeouts as tool errors
+  - date: '2026-09-25'
+    project: dark_factory
+    session: 42e449d4-db52-498b-be12-1df0595b548c
+    origin_phase: ops
+    manifested_phase: ops
+    note: 'Designed outcome: Bash exit 124 with [bounded-wait-ceiling] marker from a status-polling loop (get_statuses on 5811); a designed bounded wait, not a real error.'
 - id: entry-cand-20260730-25
   title: Digest generator mislabels an ordinary task-dispatch '# Context' briefing block as a 'User Correction'
   severity: medium
@@ -10257,6 +10281,12 @@ entries:
     origin_phase: ops
     manifested_phase: recon
     note: 'Digest ''User Corrections'' bucket captured pasted escalation/risk report content (non-corrective task briefing: gate-fire measurements, CPU-bound hypothesis, reload_config mechanics) mislabeled as user feedback.'
+  - date: '2026-09-28'
+    project: dark_factory
+    session: afde08c9-7c9d-493a-a112-b8f6dc60f973
+    origin_phase: unknown
+    manifested_phase: ops
+    note: The 'User Corrections' bucket holds mostly non-corrective content. This includes /team and /spawn command-message wrappers, a long investigation brief and a /reflect invocation. Only turns 418, 476 and 707 are real user feedback.
 - id: entry-cand-20260728-1
   title: Digest pipeline mislabels an ordinary task's injected '# Context' project-briefing block as a 'User Correction'
   severity: medium
@@ -10426,6 +10456,12 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Autonomous escalation-watcher rotation's supervisor-injected operational context (DARK_FACTORY_ROOT, ROTATION_ESCALATIONS, ROTATION_HOURS settings, watcher-rearm.sh invocation instructions) incorrectly filed under 'User Corrections' section in digest; matches pattern of system-injected briefing/instruction blocks being mislabeled as user feedback
+  - date: '2026-09-25'
+    project: dark_factory
+    session: 42e449d4-db52-498b-be12-1df0595b548c
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The 'User Corrections' bucket holds the injected /unblock command-args prompt block (turn 7) as a correction, not an actual user correction. It is the same digest mislabeling as this entry's pattern for injected briefing blocks.
 - id: entry-cand-20260731-1
   title: Digest 'User Corrections' bucket captures a raw reconciliation run-review JSON dump as if it were corrective user feedback
   severity: medium
@@ -11890,6 +11926,12 @@ entries:
     origin_phase: ops
     manifested_phase: review
     note: Agent invoked Grep with relative path 'dashboard' from cwd /home/leo/src/dark-factory/dashboard, resulting in 'Path does not exist'. Same root cause as git commit --only relative-path failures (cwd persistence) but affecting Grep tool in code-review context.
+  - date: '2026-09-25'
+    project: dark_factory
+    session: 42e449d4-db52-498b-be12-1df0595b548c
+    origin_phase: ops
+    manifested_phase: ops
+    note: Several 'no such file or directory' not_found signals in a long interactive session whose Bash cwd persisted across turns. This is plausible but not confirmed by the digest, which has no neighborhood for those turns.
 - id: entry-cand-20260730-31
   title: Digest 'User Corrections' extraction mislabels an orchestrated-task session's injected memory-search context block as a correction
   severity: medium
@@ -13479,6 +13521,12 @@ entries:
     origin_phase: implement
     manifested_phase: verify
     note: Digest 'User Corrections' section captured the injected task escalation report (esc-3542-5, turn 49) as if it were user feedback. Session has n_user_turns=1 but shows turns 41 and 49 in the digest. The escalation is orchestration-context injection, not a user turn.
+  - date: '2026-09-28'
+    project: dark_factory
+    session: fb458f58-08fb-41aa-9621-987bb7ba8ac6
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: The digest's 'User Corrections' bucket captured the injected /team and /deb dispatch prompt, with its appended result-file instructions, as a user correction. It is the injected task prompt, not a correction, and the signal counts are mostly zero.
 - id: entry-cand-20260728-3
   title: Orchestrated worktree task fires repeated 'no such file or directory' with no other diagnostic signal
   severity: medium
@@ -16218,6 +16266,12 @@ entries:
     manifested_phase: verify
     invariant_violated: worktree environment coherence / file access scope
     note: Orchestrated worktree task (6147, .worktrees/6147) fires repeated 'no such file or directory' errors (turns 23, 39) with no tool_error signal trapped. Test hangs in wait_responsive loop; file-not-found errors in subprocess/test execution context suggest missing ephemeral paths or sandboxing scope breach.
+  - date: '2026-09-30'
+    project: dark_factory
+    session: 13060744-2e95-4801-bacc-0a30b6c906a3
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Orchestrated worktree task (.worktrees/5221) with a single 'no such file or directory' not_found signal at turn 81 and no other diagnostic detail; matches the existing sparse-evidence worktree-task entry.
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -16657,6 +16711,12 @@ entries:
     origin_phase: unknown
     manifested_phase: implement
     note: 'Verified finding: Edit''s multi-match error (''set replace_all to true'') prompted agent to invoke nonexistent bare tool replace_all({}) instead of re-issuing Edit with replace_all:true parameter; wasted turn before fallback to manual disambiguation. Corroborated sighting from session 7dae04c6-f0a5-400d-b199-8932d65a8790.'
+  - date: '2026-09-26'
+    project: dark_factory
+    session: 1b01d9a5-8438-4075-a9e3-b90efa438d75
+    origin_phase: unknown
+    manifested_phase: verify
+    note: 'Same family: agent calls tool names that don''t exist in its harness (grep_search, glob_search) instead of the real Grep/Glob tools. Verifier prompt apparently describes a tool shim, mirroring the one-shot-subagent-contract entry.'
 - id: entry-cand-20260831-16
   title: 'RETRACTED: the verify-artifact discovery failure was cwd drift, not an artifact-naming defect. Superseded by entry-cand-20260729-4.'
   severity: medium
@@ -17179,6 +17239,19 @@ entries:
     origin_phase: ops
     manifested_phase: ops
     note: Pattern of repeated watcher re-arm exit-124 timeouts (turns 647, 714, 737, 763, 776, 793, 897, 928, 973, 990, 1004, 1038, 1136) followed by deliberate 'Wait until just after 00:00 UTC' synchronization (turn 1083) reveals undocumented no-heartbeat lease and time-boundary requirements; the bounded-wait design is rediscovered by failure each rotation, not pre-communicated to the watcher
+- id: entry-cand-20260925-21
+  title: Task branch rebased onto a sibling task's branch instead of main silently carries foreign commits into its own diff
+  severity: medium
+  status: open
+  origin_phase: implement
+  manifested_phase: review
+  sightings:
+  - date: '2026-09-25'
+    project: dark_factory
+    session: 2c2152de-db4e-4b21-bd7f-403fb1ef649c
+    origin_phase: implement
+    manifested_phase: review
+    evidence_quote: Branch task/4880 carries 18 commits from another task (task 3169 ..., and task 5800 steps 1-12 plus two amend passes, ending at 26a7a94207). That is about 4,900 of this diff's ~5,050 changed lines... task/4880 was rebased onto task/5800 and not onto main
 candidates:
 - id: cand-20260715-1
   title: Recon remediation cycles timeout on fused-memory I/O
@@ -32073,3 +32146,49 @@ candidates:
     origin_phase: unknown
     manifested_phase: unknown
     evidence_quote: agent_class=orchestrated-task, cwd=.worktrees/5209, size_bytes=416, n_user_turns=0, truncated_items=0, score=0.0, all signal_counts=0
+- id: cand-20260925-20
+  title: restart-orchestrator.sh reports rc=0 and 'canceled' job while the service never restarted
+  cause: scripts/restart-orchestrator.sh output was piped through `tail`, so `rc=$?` captured tail's exit status (0) instead of the script's (3). The systemd job was canceled and the MainPID and start time were unchanged, with the unit left 'deactivating'. The invocation hid the real failure and the unit state was ambiguous, so the agent had to check MainPID before and after to find out the restart had not happened.
+  area: ops
+  first_seen: '2026-09-25'
+  disposition: rejected
+  sightings:
+  - date: '2026-09-25'
+    project: dark_factory
+    session: 42e449d4-db52-498b-be12-1df0595b548c
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: 'Job for orchestrator-dark-factory.service canceled.
+
+      rc=0
+
+      new MainPID=1325430 start=Mon Sep 21 04:44:48 2026
+
+      deactivating'
+- id: cand-20260925-21
+  title: Task branch rebased onto a sibling task's branch instead of main silently carries foreign commits into its own diff
+  cause: 'Branch task/4880 was rebased onto task/5800 (reflog: ''rebase (start): checkout task/5800'') and each later rebase onto main carried 18 foreign commits along. Nothing in the implementer/rebase workflow checks that the branch diff against main touches only the files in the task''s plan.json. The foreign work was stale and was only caught at review, where about 4,900 of the ~5,050 changed lines belonged to another task.'
+  area: orchestrator git workflow / branch hygiene
+  first_seen: '2026-09-25'
+  disposition: promoted
+  sightings:
+  - date: '2026-09-25'
+    project: dark_factory
+    session: 2c2152de-db4e-4b21-bd7f-403fb1ef649c
+    origin_phase: implement
+    manifested_phase: review
+    evidence_quote: Branch task/4880 carries 18 commits from another task (task 3169 ..., and task 5800 steps 1-12 plus two amend passes, ending at 26a7a94207). That is about 4,900 of this diff's ~5,050 changed lines... task/4880 was rebased onto task/5800 and not onto main
+  promoted_to: entry-cand-20260925-21
+- id: cand-20260928-1
+  title: A nested slash-command line (/spawn /team X) is split into repeated invocations, one per skill, each receiving the whole message
+  cause: Claude Code appears to turn a series of leading skill invocations into one repeat of the message per skill. '/spawn /team rebase, review, and merge 3659 and 3500' arrived as a separate /spawn and a separate /team, each with the same args. This risks the inner command running twice, or running in the wrong session. The user suspects a Claude Code bug. Quoting the inner command is the workaround.
+  area: interactive skill invocation / harness
+  first_seen: '2026-09-28'
+  disposition: rejected
+  sightings:
+  - date: '2026-09-28'
+    project: dark_factory
+    session: afde08c9-7c9d-493a-a112-b8f6dc60f973
+    origin_phase: ops
+    manifested_phase: ops
+    evidence_quote: I actually typed "/spawn /team rebase, review, and merge 3659 and 3500". I think there's a bug in claude code that transforms a series of skill invocations at the start of a message into a series of repeats of the message, one for each skill
