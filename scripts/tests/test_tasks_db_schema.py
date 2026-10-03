@@ -438,6 +438,57 @@ def test_main_with_no_path_arguments_resolves_from_the_cwd(
     assert "tasks" in capsys.readouterr().out
 
 
+def _no_args_from_a_worktree(tmp_path, make_tasks_db):
+    main_checkout = _main_checkout(tmp_path)
+    worktree = _linked_worktree(main_checkout)
+    return _seed_store(main_checkout, make_tasks_db), worktree, []
+
+
+def _relative_project_root(tmp_path, make_tasks_db):
+    return _seed_store(tmp_path / "proj", make_tasks_db), tmp_path, ["--project-root", "proj"]
+
+
+def _relative_db(tmp_path, make_tasks_db):
+    seeded = _seed_store(tmp_path / "proj", make_tasks_db)
+    cwd = seeded.parent.parent
+    return seeded, cwd, ["--db", str(seeded.relative_to(cwd))]
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [_no_args_from_a_worktree, _relative_project_root, _relative_db],
+    ids=lambda spelling: spelling.__name__.lstrip("_"),
+)
+def test_main_first_line_is_the_absolute_path_of_the_store_it_read(
+    spelling, tmp_path, make_tasks_db, monkeypatch, capsys
+):
+    """The hotspot overlay tells a miner to open the path printed on line 1, so
+    a relative echo would reproduce the cwd-relative connect string task 5334
+    deleted."""
+    seeded, cwd, argv = spelling(tmp_path, make_tasks_db)
+    monkeypatch.chdir(cwd)
+
+    exit_code = main(argv)
+
+    out = capsys.readouterr().out
+    assert exit_code == EXIT_OK
+    first = out.splitlines()[0]
+    assert Path(first).is_absolute()
+    assert Path(first) == seeded.resolve()
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    conn = sqlite3.connect(f"file:{first}?mode=ro", uri=True)
+    try:
+        tables = {
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        conn.close()
+    assert "tasks" in tables
+
+
 def test_main_diagnoses_a_git_that_wedges_past_the_timeout(tmp_path, monkeypatch, capsys):
     """`subprocess.TimeoutExpired` is a SubprocessError, NOT an OSError.
 
