@@ -25,6 +25,7 @@ from escalation.action_effects import ACTION_EFFECTS, ANY, WORKFLOW_NONE, TaskEf
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
+from fastmcp.tools.function_tool import FunctionTool
 
 from orchestrator.harness import Harness
 
@@ -1604,6 +1605,7 @@ class TestEvalLaneResolutionIsInert:
         harness._escalation_events['5383'] = event
 
         tool = await server.get_tool('escalate_blocker')
+        assert isinstance(tool, FunctionTool)
         result = await tool.fn(
             task_id='5383',
             worktree=_EVAL_WORKTREE,
