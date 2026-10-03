@@ -1463,6 +1463,22 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
         assert captured['judge_candidate_count'] == expected
         assert isinstance(captured['judge_candidate_count'], int)
 
+    def test_provenance_records_the_effective_field_width(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        captured = self._captured(tmp_path, monkeypatch)
+        expected = write_triage_judge.resolve_judge_field_chars(self._service())
+        assert captured['field_chars'] == expected
+        assert isinstance(captured['field_chars'], int)
+
+    def test_a_requested_width_is_recorded(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        captured = self._captured(tmp_path, monkeypatch, field_chars=40)
+        assert captured['field_chars'] == 40
+
     def test_provenance_records_whether_the_judge_arm_was_live(
         self, tmp_path: Path, monkeypatch,
     ) -> None:
@@ -2920,42 +2936,44 @@ class TestAJudgeBandCaseIsNeverShownAnEmptySlate:
         assert [c['candidates'] for c in plan.cases] == [[]]
 
 
-class TestFieldCharsOverride:
-    """The per-field prompt budget, and its restoration."""
+class TestApplyFieldChars:
+    """`--field-chars` moves the run's own in-memory `write_triage.judge_field_chars`."""
 
     @staticmethod
-    def _judge():
-        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+    def _resolved(config) -> int:
+        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+            resolve_judge_field_chars,
+        )
 
-        return write_triage_judge
+        return resolve_judge_field_chars(types.SimpleNamespace(config=config))
 
-    def test_it_sets_the_width_in_force(self) -> None:
-        with _mod().field_chars_override(40) as in_force:
-            assert in_force == 40
-            assert self._judge()._FIELD_CHARS == 40
+    @staticmethod
+    def _config():
+        from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+
+        return FusedMemoryConfig()
+
+    def test_a_requested_width_is_written_to_the_leaf(self) -> None:
+        config = self._config()
+        assert _mod().apply_field_chars(config, 40) == 40
+        assert self._resolved(config) == 40
 
     def test_zero_means_no_elision_rather_than_everything_elided(self) -> None:
+        config = self._config()
         text = 'x' * 20_000
-        with _mod().field_chars_override(0):
-            assert self._judge()._elide(text) == text
+        slate = [types.SimpleNamespace(id='a', content=text)]
+        assert _mod().apply_field_chars(config, 0) == 0
+        width = self._resolved(config)
+        assert width >= len(text)
+        assert _mod()._elision_flags(text, slate, width) == (False, {'a': False})
 
-    def test_none_overrides_nothing_and_reports_the_shipped_width(self) -> None:
-        shipped = self._judge()._FIELD_CHARS
-        with _mod().field_chars_override(None) as in_force:
-            in_effect = self._judge()._FIELD_CHARS
-        assert (in_force, in_effect) == (shipped, shipped)
-
-    def test_the_shipped_width_is_restored_even_on_a_failure(self) -> None:
-        shipped = self._judge()._FIELD_CHARS
-        with pytest.raises(RuntimeError), _mod().field_chars_override(40):
-            raise RuntimeError('mid-run')
-        restored = self._judge()._FIELD_CHARS
-        assert restored == shipped
+    def test_none_changes_nothing_and_reports_the_configs_own_width(self) -> None:
+        config = self._config()
+        before = config.write_triage.judge_field_chars
+        assert _mod().apply_field_chars(config, None) == self._resolved(config) == 4_000
+        assert config.write_triage.judge_field_chars == before
 
     def test_the_elision_flags_follow_the_width(self) -> None:
         long_text = 'y' * 5_000
         slate = [types.SimpleNamespace(id='a', content=long_text)]
-        with _mod().field_chars_override(1_200):
-            assert _mod()._elision_flags(long_text, slate) == (True, {'a': True})
-        with _mod().field_chars_override(0):
-            assert _mod()._elision_flags(long_text, slate) == (False, {'a': False})
+        assert _mod()._elision_flags(long_text, slate, 1_200) == (True, {'a': True})

@@ -63,7 +63,6 @@ from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
     _DEFAULT_MODEL_BY_PROVIDER,
     _ELIDED_MARKER,
-    _FIELD_CHARS,
     _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
     CANDIDATE_ID_KEY,
@@ -365,9 +364,9 @@ class TestJudgeExemplars:
         id under-measures every candidate line, so the length is asserted
         rather than assumed.
 
-        THE FIELDS ARE OVER ``_FIELD_CHARS``, NOT AT IT. ``_elide`` returns a
-        field of exactly ``_FIELD_CHARS`` untouched and cuts a longer one to
-        ``_FIELD_CHARS`` PLUS ``_ELIDED_MARKER`` — so the input that elides
+        THE FIELDS ARE OVER THE DEFAULT FIELD CAP, NOT AT IT. ``_elide``
+        returns a field of exactly the cap untouched and cuts a longer one to
+        the cap PLUS ``_ELIDED_MARKER`` — so the input that elides
         renders 9 chars wider per field, 54 across a full slate, than the
         input that merely fills. A worst case built at the cap is therefore
         not the worst case; it is the widest input that never trips the
@@ -378,7 +377,7 @@ class TestJudgeExemplars:
         made next to the C1 rationale, rather than a number quietly relaxed in
         a test.
         """
-        maximal = 'x' * (_FIELD_CHARS + 1)
+        maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + 1)
         candidates = [
             _result(str(uuid.uuid4()), 0.9, content=maximal)
             for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
@@ -387,7 +386,9 @@ class TestJudgeExemplars:
             'the slate must carry the 36-char uuids production carries — a '
             'shorter stand-in id under-measures every candidate line'
         )
-        rendered = build_judge_prompt(maximal, candidates)
+        rendered = build_judge_prompt(
+            maximal, candidates, field_chars=_DEFAULT_JUDGE_FIELD_CHARS,
+        )
         assert _ELIDED_MARKER in rendered, (
             'the worst case must be an ELIDED render — otherwise it misses '
             'the marker _elide appends, and under-measures the real ceiling'
@@ -802,7 +803,7 @@ class TestBuildJudgePrompt:
         assert JUDGE_REPLY_SHAPE in build_judge_prompt('new', [_result('m1', 0.9)])
 
     def test_a_long_candidate_is_truncated_and_marked(self) -> None:
-        """The fixture contains a ~9k-char canonical; the budget is ~2.5k tokens.
+        """The fixture contains a ~9k-char canonical; the default cap is 4,000 chars.
 
         Truncating silently would be worse than not truncating: a model told
         nothing would treat a severed sentence as the whole record. The elided
@@ -857,6 +858,16 @@ class TestBuildJudgePrompt:
     def test_an_empty_candidate_list_still_renders(self) -> None:
         """Pure and total: rendering never raises, whatever it is handed."""
         assert isinstance(build_judge_prompt('new', []), str)
+
+    def test_the_width_is_a_parameter(self) -> None:
+        """A field at the width renders whole; one char over is cut there and marked."""
+        prompt = build_judge_prompt(
+            'e' * 10, [_result('m1', 0.9, content='c' * 11)], field_chars=10,
+        )
+        assert 'e' * 10 + '\n' in prompt
+        assert 'e' * 10 + _ELIDED_MARKER not in prompt
+        assert 'c' * 10 + _ELIDED_MARKER in prompt
+        assert 'c' * 11 not in prompt
 
 
 class TestAttachTargetGateProbe:
@@ -1922,6 +1933,62 @@ class TestJudgeWriteOpenAIArm:
             )
         rendered = client.responses.create.call_args.kwargs['input']
         assert sum(1 for c in candidates if f'id: {c.id}\n' in rendered) == 3
+
+    @pytest.mark.asyncio
+    async def test_with_the_leaf_unset_fields_render_up_to_the_default_width(self) -> None:
+        """The user-observable change: a 4,000-char field now reaches the model whole."""
+        client = _openai_client(_payload('distinct'))
+        candidate_text = 'a' * _DEFAULT_JUDGE_FIELD_CHARS
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='b' * (_DEFAULT_JUDGE_FIELD_CHARS + 1),
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80, content=candidate_text)],
+            )
+        rendered = client.responses.create.call_args.kwargs['input']
+        assert candidate_text in rendered
+        assert candidate_text + _ELIDED_MARKER not in rendered
+        assert 'b' * _DEFAULT_JUDGE_FIELD_CHARS + _ELIDED_MARKER in rendered
+        assert 'b' * (_DEFAULT_JUDGE_FIELD_CHARS + 1) not in rendered
+
+    @pytest.mark.asyncio
+    async def test_fields_are_cut_at_the_configured_width(self) -> None:
+        client = _openai_client(_payload('distinct'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(judge_field_chars=50),
+                content='x' * 60,
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80, content='x' * 60)],
+            )
+        rendered = client.responses.create.call_args.kwargs['input']
+        assert 'x' * 50 + _ELIDED_MARKER in rendered
+        assert 'x' * 51 not in rendered
+
+    @pytest.mark.asyncio
+    async def test_a_reloaded_width_changes_the_next_call(self) -> None:
+        """The in-place mutation apply_reload performs, observed with no rebuild."""
+        service = _judge_svc(judge_field_chars=50)
+        rendered = []
+        for width in (50, 55):
+            service.config.write_triage.judge_field_chars = width
+            client = _openai_client(_payload('distinct'))
+            with patch('openai.AsyncOpenAI', return_value=client):
+                await judge_write(
+                    memory_service=service,
+                    content='x' * 60,
+                    project_id='p',
+                    decision=_decision('m1'),
+                    candidates=[_result('m1', 0.80, content='x' * 60)],
+                )
+            rendered.append(client.responses.create.call_args.kwargs['input'])
+        assert 'x' * 50 + _ELIDED_MARKER in rendered[0]
+        assert 'x' * 51 not in rendered[0]
+        assert 'x' * 55 + _ELIDED_MARKER in rendered[1]
+        assert 'x' * 56 not in rendered[1]
 
 
 class TestTheChatArmServesCompatEndpoints:
