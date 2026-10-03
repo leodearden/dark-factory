@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import sqlite3
 import sys
 import types
@@ -56,9 +57,14 @@ def _load_module() -> types.ModuleType:
 
 mod = _load_module()
 
-# Imported only once _load_module() has put scripts/ on sys.path, so these are
-# the same class objects the script raises.
-from _task_db_scan import TaskDbProblem, TaskDbUnreadable  # noqa: E402
+# Looked up only once _load_module() has put scripts/ on sys.path, so these are
+# the same class objects the script raises — and dynamically, like the script
+# itself: a static import of a scripts/-only module would need fused-memory's
+# pyright extraPaths to reach scripts/ (tests/scripts/test_fallback_verify_config.py
+# ::TestMembersImportingScriptsResolveScriptsOnTheirPyrightPath).
+_task_db_scan = importlib.import_module('_task_db_scan')
+TaskDbProblem = _task_db_scan.TaskDbProblem
+TaskDbUnreadable = _task_db_scan.TaskDbUnreadable
 
 _TOPIC = 'cli-demo-topic'
 _PROJECT_ID = 'dark_factory'
