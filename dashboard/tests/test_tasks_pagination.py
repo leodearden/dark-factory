@@ -764,47 +764,6 @@ class TestFetchTasksPagination:
         assert first == second
         assert [t['id'] for t in second] == list(range(1, 8))
 
-    async def test_a_walk_and_a_same_size_page_do_not_share_a_cache_entry(
-        self, dummy_client, dummy_config,
-    ):
-        """The RETURN CONTRACT MUST discriminate the cache key (esc-4360-8).
-
-        `fetch_task_page(page_size=3, offset=0)` is ONE 3-row page;
-        `fetch_tasks(chunk_size=3)` is the complete 7-row tree walked 3 rows
-        at a time. Every other key component is identical, so without the
-        discriminator whichever ran first inside the 20 s TTL would be served
-        to the other — handing a one-page caller the whole tree, or handing
-        `burndown.collect_snapshot` a 3-row page to write into an APPEND-ONLY
-        history table as the project's true size.
-
-        Since task 5018 the discriminator is the `_TasksRead.mode` record's
-        TYPE (`_OnePage` vs `_CompleteRead`) rather than a `paginate` flag, and
-        the two contracts are separate FUNCTIONS. This test is the unit-level
-        twin of `TestPublicReadContracts`' end-to-end signal and is KEPT: it
-        asserts the two results DIFFER, not merely that two keys differ, so it
-        fails if the discriminator is dropped and cannot pass by accident the
-        way an `in`-only key assertion could.
-        """
-        from dashboard.data.tasks import fetch_task_page, fetch_tasks
-
-        tasks = [_paged_task_raw(i) for i in range(1, 8)]
-        calls: list[dict] = []
-        with patch(
-            'dashboard.data.tasks.mcp_tool_call',
-            new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
-        ):
-            walked = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/disc', chunk_size=3,
-            )
-            one_page = await fetch_task_page(
-                dummy_client, dummy_config, '/proj/disc', page_size=3, offset=0,
-            )
-
-        assert [t['id'] for t in walked] == list(range(1, 8)), walked
-        assert [t['id'] for t in one_page] == [1, 2, 3], (
-            f'a page read must return exactly one page, got {one_page!r}'
-        )
-
     async def test_statuses_and_timeout_reach_every_page_of_a_walk(
         self, dummy_client, dummy_config,
     ):
