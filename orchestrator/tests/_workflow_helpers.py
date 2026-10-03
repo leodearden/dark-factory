@@ -44,6 +44,7 @@ from orchestrator.mcp.verdict_tools import (
 from orchestrator.merge_lane import MergeLane
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import (
+    BlastRadiusResult,
     TaskAssignment,
     _reject_contradictory_metadata_mode,
 )
@@ -80,8 +81,9 @@ class FakeScheduler:
         # Scope-reconciliation choke point (task 2505): every call's
         # (current, needed, persist_files) is recorded here so tests can
         # assert on what was persisted, and blast_radius_result configures
-        # the return value (default True == lock acquired successfully;
-        # tests force False to simulate a sibling lock conflict).
+        # the returned BlastRadiusResult.applied (default True == lock
+        # acquired successfully; tests force False to simulate a sibling
+        # lock conflict).
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
         self.blast_radius_result: bool = True
         # Scope-grant direct metadata.files persist seam (task 2505, step-18):
@@ -146,9 +148,9 @@ class FakeScheduler:
         /,
         *,
         persist_files: list[str] | None = None,
-    ) -> bool:
+    ) -> BlastRadiusResult:
         self.blast_radius_calls.append((current, needed, persist_files))
-        return self.blast_radius_result
+        return BlastRadiusResult(applied=self.blast_radius_result)
 
     async def get_status(self, task_id: str) -> str | None:
         history = self.statuses.get(task_id)
@@ -355,7 +357,7 @@ class FakeMetadataBackend:
         /,
         *,
         persist_files: list[str] | None = None,
-    ) -> bool:
+    ) -> BlastRadiusResult:
         self.blast_radius_calls.append((current, needed, persist_files))
         depth = self.lock_depth
         if {normalize_lock(m, depth) for m in current} == {
@@ -363,7 +365,7 @@ class FakeMetadataBackend:
         }:
             # No-op early return (scheduler.py:6935): nothing acquired, nothing
             # released, nothing persisted.
-            return True
+            return BlastRadiusResult(applied=True)
         # Production persists metadata.files on BOTH the grant and the
         # lock-conflict/requeue branch — only the RETURN differs.  Gating the
         # persist on blast_radius_result would model the deny path wrongly.
@@ -372,7 +374,7 @@ class FakeMetadataBackend:
                 **self.blob,
                 'files': sanitize_files_for_persist(persist_files),
             }
-        return self.blast_radius_result
+        return BlastRadiusResult(applied=self.blast_radius_result)
 
     async def get_task(self, task_id: str) -> dict:
         return {'id': task_id, 'metadata': dict(self.blob)}

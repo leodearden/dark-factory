@@ -4800,7 +4800,7 @@ class TestBlastRadiusRefinement:
                 'crates/reify-compiler/tests/trait_conformance_tests.rs',
             ],
         )
-        assert ok is True
+        assert ok.applied is True
         held = lt._held['936']
         assert held == {
             'crates/reify-compiler/src/conformance.rs',
@@ -4827,7 +4827,7 @@ class TestBlastRadiusRefinement:
             current=['a/lib.rs'],
             needed=['a/lib.rs', 'a/other.rs'],
         )
-        assert ok is True
+        assert ok.applied is True
         assert lt._held['T'] == {'a/lib.rs', 'a/other.rs'}
         event_store = scheduler.event_store
         assert event_store is not None
@@ -4847,7 +4847,7 @@ class TestBlastRadiusRefinement:
             current=['a/lib.rs', 'a/other.rs'],
             needed=['a/other.rs', 'a/lib.rs'],  # order differs, set equal
         )
-        assert ok is True
+        assert ok.applied is True
         assert lt._held['T'] == {'a/lib.rs', 'a/other.rs'}
         event_store = scheduler.event_store
         assert event_store is not None
@@ -4873,7 +4873,7 @@ class TestBlastRadiusRefinement:
             current=['crates/reify-compiler/src/lib.rs'],
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
-        assert ok is False
+        assert ok.applied is False
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
 
@@ -4906,7 +4906,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is False
+        assert ok.applied is False
         assert update_task.await_args is not None
         persisted = update_task.await_args.args[1]
         assert persisted == {
@@ -4942,7 +4942,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         assert update_task.await_args is not None, (
             'update_task must be called to make the narrowed set durable'
         )
@@ -4985,7 +4985,7 @@ class TestBlastRadiusRefinement:
             needed=['a/lib.rs', 'a/other.rs'],  # pure widen: additional=[other], stale=[]
         )
 
-        assert ok is True
+        assert ok.applied is True
         assert update_task.await_args is not None, (
             'a pure widen must persist metadata.files so plan.files does not '
             'become a durable strict-superset of metadata.files'
@@ -5028,7 +5028,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         event_store = scheduler.event_store
         assert event_store is not None
         set_to_plan_events = [
@@ -5068,7 +5068,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         # In-memory narrowing applied: lib.rs released, conformance.rs held
         assert lt.try_acquire('2035', ['crates/reify-compiler/src/lib.rs'])
         assert not lt.try_acquire('9999', ['crates/reify-compiler/src/conformance.rs'])
@@ -5108,7 +5108,7 @@ class TestBlastRadiusRefinement:
             needed=['a/lib.rs', 'a/other.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         event_store = scheduler.event_store
         assert event_store is not None
         set_to_plan_events = [
@@ -5169,7 +5169,7 @@ class TestBlastRadiusRefinement:
             persist_files=[deep],  # NEW parameter: supply file-level paths
         )
 
-        assert ok is True
+        assert ok.applied is True
         assert update_task.await_args is not None, (
             'update_task must be called for the narrowing persist'
         )
@@ -5328,7 +5328,7 @@ class TestBlastRadiusRequeueEmitsRelease:
         expected = [normalize_lock(self.HELD, depth)]
 
         ok = await self._requeue(scheduler)
-        assert ok is False
+        assert ok.applied is False
 
         # The teardown release the workflow runs when the slot exits.
         scheduler.release('936')
@@ -5433,7 +5433,7 @@ class TestBlastRadiusRequeueEmitsRelease:
 
         ok = await self._requeue(scheduler)
 
-        assert ok is False
+        assert ok.applied is False
         assert 'status' in order, f'set_task_status was never awaited; got {order}'
         assert 'release' in order, (
             f'no lock_released was emitted during the requeue; got {order}'
@@ -5466,7 +5466,7 @@ class TestBlastRadiusRequeueEmitsRelease:
 
         ok = await self._requeue(scheduler)
 
-        assert ok is False
+        assert ok.applied is False
         assert '936' not in scheduler._dispatched, (
             'the requeue must clear the dispatch guard, else _eligible_for_'
             'dispatch refuses the task forever'
@@ -5544,7 +5544,7 @@ class TestBlastRadiusModuleCacheSeam:
             needed=needed,
         )
 
-        assert ok is False
+        assert ok.applied is False
         assert calls == [('936', expected)], (
             f'Expected exactly one _write_module_cache(936, {expected}) call; '
             f'got {calls}'
@@ -5578,7 +5578,7 @@ class TestBlastRadiusModuleCacheSeam:
             persist_files=['pkg/dir', 'pkg/mod/real.py'],
         )
 
-        assert ok is False
+        assert ok.applied is False
         assert update_task.await_args is not None
         persisted = update_task.await_args.args[1]
         assert persisted == {'files': ['pkg/mod/real.py']}, (
@@ -5627,7 +5627,7 @@ class TestBlastRadiusModuleCacheSeam:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         expected = ['crates/reify-compiler/src/conformance.rs']
         assert ('936', expected) in calls, (
             f'Expected _write_module_cache(936, {expected}) call on the '

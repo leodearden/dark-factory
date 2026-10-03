@@ -864,7 +864,7 @@ class SchedulerFacade(Protocol):
         /,
         *,
         persist_files: list[str] | None = ...,
-    ) -> bool: ...
+    ) -> BlastRadiusResult: ...
     async def get_status(self, task_id: str, /) -> str | None: ...
     async def get_task(self, task_id: str, /) -> dict | None: ...
     async def update_task(
@@ -890,6 +890,30 @@ class TaskAssignment:
     task_id: str
     task: dict
     modules: list[str]
+
+
+@dataclass(frozen=True)
+class BlastRadiusResult:
+    """Outcome of ``Scheduler.handle_blast_radius_expansion``.
+
+    Three legal shapes:
+
+    - ``applied``: the locks now cover the refined scope;
+    - not ``applied``, no ``repend_error``: metadata.files persisted, the row
+      re-pended, and the locks released;
+    - not ``applied``, with ``repend_error``: the pending write died, and the
+      locks are deliberately still held.
+    """
+
+    applied: bool
+    repend_error: Exception | None = None
+
+    def __post_init__(self) -> None:
+        if self.applied and self.repend_error is not None:
+            raise ValueError(
+                'an applied refinement writes no pending row, so it cannot '
+                f'carry a re-pend error: {self.repend_error!r}'
+            )
 
 
 @dataclass
@@ -8175,14 +8199,16 @@ class Scheduler:
         needed: list[str],
         *,
         persist_files: list[str] | None = None,
-    ) -> bool:
+    ) -> BlastRadiusResult:
         """Handle plan refining blast radius (widening, narrowing, or shift).
 
         1. Try acquire any additional locks (needed − current)
         2. On success, release any stale locks (current − needed) so other
            tasks can acquire modules the refined plan no longer touches
         3. On acquire failure: update task with new modules, reset to pending,
-           release current locks
+           release current locks.  Returns ``BlastRadiusResult(applied=False)``,
+           carrying ``repend_error`` when the pending write died (locks then
+           stay held); steps 1-2 and the no-op return ``applied=True``.
 
         ``persist_files`` — optional list of raw file-level paths to store in
         ``metadata.files`` when the persist branch fires.  If supplied, these
@@ -8204,7 +8230,7 @@ class Scheduler:
         additional = sorted(needed_set - current_set)
         stale = sorted(current_set - needed_set)
         if not additional and not stale:
-            return True
+            return BlastRadiusResult(applied=True)
 
         # Determine what to write to metadata.files.  When the caller supplies
         # raw file-level paths via persist_files, use those; otherwise fall back
@@ -8299,7 +8325,7 @@ class Scheduler:
             # diverge.
             self._write_module_cache(task_id, sorted(needed_set))
             logger.info(f'Task {task_id} expanded to modules: {needed}')
-            return True
+            return BlastRadiusResult(applied=True)
 
         # Can't acquire — reset task
         logger.warning(
@@ -8323,12 +8349,15 @@ class Scheduler:
             # sweep or startup) will revert the in-progress status when the
             # backend recovers.  Releasing locks here would let another task
             # claim the modules while this one is still nominally in-progress.
+            # The error is returned so the workflow's run()-exit contract
+            # records the exit as store-unavailable
+            # (orchestrator/src/orchestrator/exit_contract.py).
             logger.warning(
                 'Task %s: set_task_status(pending) failed during '
                 'blast-radius requeue (%s) — keeping locks held for '
                 'reconcile to recover.', task_id, e,
             )
-            return False
+            return BlastRadiusResult(applied=False, repend_error=e)
         # Route through Scheduler.release (requeued=True — status was just set
         # to 'pending'): the single writer that emits lock_released, clears the
         # dispatch guard and arms the anti-hot-loop cooldown.  Stays AFTER that
@@ -8336,7 +8365,7 @@ class Scheduler:
         # stuck-lock hazard: contract C5 / task 3818, written up in
         # orchestrator/tests/test_lock_release_single_writer_guard.py.
         self.release(task_id, requeued=True)
-        return False
+        return BlastRadiusResult(applied=False)
 
     def _arm_requeue_cooldown(self, task_id: str, armed_n: int | None) -> None:
         """Write *task_id*'s re-dispatch cooldown deadline and snapshot meta.

@@ -756,7 +756,7 @@ class TestSetTaskScope:
 
         result = await workflow._set_task_scope(['lib.py', 'new.py'])
 
-        assert result is True
+        assert result.applied is True
         on_disk = artifacts.read_plan()
         assert on_disk['files'] == ['lib.py', 'new.py']
         assert artifacts.validate_plan_owner(workflow.session_id) is True
@@ -782,7 +782,7 @@ class TestSetTaskScope:
 
         result = await workflow._set_task_scope(['lib.py', 'new.py'])
 
-        assert result is False
+        assert result.applied is False
         assert workflow.modules == original_modules, (
             'self.modules must stay unchanged on a lock conflict — the '
             'scheduler already requeued the task holding the ORIGINAL lock.'
@@ -838,7 +838,7 @@ class TestSetTaskScope:
 
         result = await workflow._set_task_scope([f1, f2])
 
-        assert result is True
+        assert result.applied is True
         assert workflow.modules == modules_before, (
             'self.modules must be UNCHANGED on a same-module widen'
         )

@@ -27,6 +27,7 @@ from _orch_helpers import pydantic_spec
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+from orchestrator.scheduler import BlastRadiusResult
 from orchestrator.workflow import TaskWorkflow
 
 
@@ -60,7 +61,7 @@ class _Scheduler:
     async def handle_blast_radius_expansion(
         self, task_id, current, needed, /, *, persist_files=None
     ):
-        return False
+        return BlastRadiusResult(applied=False)
 
     async def dispatch_tool(self, name, arguments, *, timeout=30.0):
         return {}
