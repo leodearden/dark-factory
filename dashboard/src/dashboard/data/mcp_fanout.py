@@ -753,8 +753,9 @@ class TTLCache(Generic[V, K]):
     ``ttl_seconds`` accepts a plain float OR a zero-arg callable, resolved
     at *each* freshness check rather than captured once at construction —
     this is what lets a caller monkeypatch a module-level TTL constant at
-    runtime (as ``test_tasks.py`` does for ``_FETCH_TASKS_TTL_SECONDS``) and
-    have it take effect immediately.
+    runtime (as ``tests/test_tasks_cached_fanout.py::TestFetchTasksCache``
+    does for ``_FETCH_TASKS_TTL_SECONDS``) and have it take effect
+    immediately.
 
     ``cache_ok`` (per-call, default always-true) gates whether a given
     refresh result is stored — e.g. an offline/error marker should not pin
