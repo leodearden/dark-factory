@@ -840,10 +840,9 @@ Choose one of these based on the analysis:
 at session end.** Trigger (already computed, costs nothing): the block cause was a pending
 escalation — any category — that you read in Step 1b, and the session chose an option (with or
 without human ratification) rather than deferring the question. Immediately append the ruling to
-the escalation record: the chosen option, the ruling commit sha, and what remains (e.g. "closure
-deferred pending merge gate"). Use `amend_escalation` once it lands; until then, fold via
-`promote_to_l2` re-passing the record's exact `root_cause` and its existing member ids — the member
-union is a no-op and the fold appends an amendment. The amendment bumps `updated_at`, which is
+the escalation record with `amend_escalation(escalation_id=..., summary=..., detail=...)`: the
+chosen option, the ruling commit sha, and what remains (e.g. "closure deferred pending merge
+gate"). The amendment bumps `updated_at`, which is
 exactly what re-arms the watcher's re-verify on a parked record. This is an annotation, not a
 closure — L2 close rules are unchanged. Do NOT defer the record-write behind a merge gate or any
 tail plan: a deferred write is precisely what dies when a session ends early (esc-6107-7 sat
@@ -851,7 +850,8 @@ answered-but-unrecorded for 183h because its close was sequenced behind a merge 
 session stopped first). While you're there, check `get_pending_escalations(task_id="<TASK_ID>")`
 for OTHER pending records on the same task and disposition them in the same sitting — a ruling
 recorded on one twin while another record survives is the same failure class (esc-3875-12 kept a
-Leo-released task pinned 6.8 further days).
+Leo-released task pinned 6.8 further days). When you later resolve the record, the `resolve_issue`
+response's `related_pending` lists the twins still pending after that resolve; dispose of those too.
 
 ### 4.4: Execute the plan
 
