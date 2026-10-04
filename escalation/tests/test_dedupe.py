@@ -2,7 +2,36 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
+
 import pytest
+
+
+@contextlib.contextmanager
+def _collect_log(name: str, level: int = logging.INFO):
+    """Yield a growing list of ``(levelno, message)`` emitted on the logger *name*.
+
+    A handler attached to the named logger rather than pytest's ``caplog``:
+    the suite runs under xdist and asserts on exactly one logger, so the
+    capture stays independent of global log-level state.
+    """
+    records: list[tuple[int, str]] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append((record.levelno, record.getMessage()))
+
+    handler = _Collect(level=level)
+    log = logging.getLogger(name)
+    previous = log.level
+    log.addHandler(handler)
+    log.setLevel(level)
+    try:
+        yield records
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(previous)
 
 
 class TestSummaryDedupeKey:
@@ -1813,6 +1842,121 @@ class TestDedupeHalves:
                 f'submit_or_dedupe diverged from its halves on {summary!r}: '
                 f'{via_whole} != {via_halves}'
             )
+
+
+class TestFileOrFoldL1:
+    """file_or_fold_l1 — the shared L1 file-or-fold filer, driven against a REAL queue.
+
+    A MagicMock cannot witness a fold or a dedupe_count, and those are the
+    contract on every cycle after the first.
+    """
+
+    _LOGGER = 'test_dedupe.file_or_fold_l1'
+
+    @pytest.fixture
+    def queue(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        return EscalationQueue(tmp_path / 'escalations')
+
+    def _file(self, queue, **overrides):
+        from escalation.dedupe import file_or_fold_l1
+
+        kwargs = {
+            'project_id': 'p',
+            'subject': '3105',
+            'category': 'cat_x',
+            'finding_category': 'fc_a',
+            'agent_role': 'role-x',
+            'summary': 'S1',
+            'detail': 'D1',
+            'log': logging.getLogger(self._LOGGER),
+            'log_label': 'label-x',
+        }
+        kwargs.update(overrides)
+        return file_or_fold_l1(queue, **kwargs)
+
+    @staticmethod
+    def _pending(queue, subject='3105'):
+        return queue.get_by_task(subject, status='pending', level=1)
+
+    def test_first_filing_mints_one_l1_record(self, queue):
+        from escalation.dedupe import compute_content_fingerprint
+
+        assert self._file(queue) is True
+
+        pending = self._pending(queue)
+        assert len(pending) == 1
+        esc = pending[0]
+        assert esc.level == 1
+        assert esc.severity == 'blocking'
+        assert esc.category == 'cat_x'
+        assert esc.agent_role == 'role-x'
+        assert esc.task_id == '3105'
+        assert esc.summary == 'S1'
+        assert esc.detail == 'D1'
+        # The identity formula live parents on disk were stamped with.
+        assert esc.dedupe_fingerprint == compute_content_fingerprint(
+            'cat_x', 'fc_a', ['p:3105'],
+        )
+
+    def test_recurrence_folds_and_logs_info_on_the_callers_logger(self, queue):
+        assert self._file(queue) is True
+        parent_id = self._pending(queue)[0].id
+
+        with _collect_log(self._LOGGER) as records:
+            assert self._file(queue, summary='S2', detail='D2') is False
+
+        pending = self._pending(queue)
+        assert len(pending) == 1
+        assert pending[0].dedupe_count == 1
+        assert pending[0].summary == 'S1'
+        infos = [message for level, message in records if level == logging.INFO]
+        assert len(infos) == 1
+        assert 'label-x' in infos[0]
+        assert '3105' in infos[0]
+        assert parent_id in infos[0]
+
+    def test_distinct_finding_category_is_its_own_record(self, queue):
+        assert self._file(queue) is True
+        assert self._file(queue, finding_category='fc_b') is True
+
+        pending = self._pending(queue)
+        assert len(pending) == 2
+        assert pending[0].dedupe_fingerprint != pending[1].dedupe_fingerprint
+
+    def test_distinct_subject_is_its_own_record(self, queue):
+        assert self._file(queue) is True
+        assert self._file(queue, subject='4102') is True
+
+        assert len(self._pending(queue)) == 1
+        assert len(self._pending(queue, '4102')) == 1
+
+    def test_project_is_part_of_the_fold_key(self, queue):
+        assert self._file(queue) is True
+        assert self._file(queue, project_id='other') is True
+
+        assert len(self._pending(queue)) == 2
+
+    def test_submit_failure_is_logged_on_the_callers_logger_and_not_raised(self, tmp_path):
+        from escalation.queue import EscalationQueue
+
+        class _BrokenQueue(EscalationQueue):
+            def submit(self, escalation):
+                raise RuntimeError('boom')
+
+        queue = _BrokenQueue(tmp_path / 'escalations')
+        with (
+            _collect_log(self._LOGGER) as records,
+            _collect_log('escalation.dedupe') as module_records,
+        ):
+            assert self._file(queue) is False
+
+        warnings = [message for level, message in records if level == logging.WARNING]
+        assert len(warnings) == 1
+        assert 'label-x' in warnings[0]
+        assert '3105' in warnings[0]
+        assert module_records == []
 
 
 class TestEscalationDedupeFingerprint:
