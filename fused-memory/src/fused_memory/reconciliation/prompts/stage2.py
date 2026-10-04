@@ -1,5 +1,6 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
+from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
@@ -340,6 +341,8 @@ re-capturing the outcome inverts the record and fabricates a "finding" that was 
 new information.
 
 {REFERENT_DECLARATION_GUIDANCE}
+
+{render_metadata_vocabulary_guidance()}
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \

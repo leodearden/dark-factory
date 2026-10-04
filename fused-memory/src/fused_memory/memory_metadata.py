@@ -18,6 +18,8 @@ Contents
   that module's docstring for the measured ``ImportError`` behind the
   split.
 * ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
+* ``render_metadata_vocabulary_guidance`` — the writer-facing statement of
+  this vocabulary that the writing reconciliation stage prompts interpolate.
 
 ``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
@@ -82,9 +84,11 @@ from fused_memory.utils.validation import is_full_uuid
 
 __all__ = [
     'BLESSED_METADATA_KEYS',
+    'CHILD_KINDS',
     'KIND_REGISTRY',
     'MEM0_MANAGED_METADATA_KEYS',
     'CanonicalUniquenessViolation',
+    'EXPERIMENTAL_KEY_PREFIX',
     'MemoryMetadataValidationError',
     'MetadataViolation',
     'PARENT_ID_DEAD_CODE',
@@ -99,6 +103,7 @@ __all__ = [
     'is_valid_topic_slug',
     'normalize_supersedes',
     'parent_liveness_violation',
+    'render_metadata_vocabulary_guidance',
     'validate_memory_metadata',
 ]
 
@@ -153,6 +158,13 @@ def normalize_supersedes(value: Any) -> list[Any]:
     # Any other scalar (int, dict, ...) is wrapped rather than rejected —
     # the shape validator owns rejection, this function owns shape only.
     return [value]
+
+
+#: The ``kind`` values a child entry carries when its ``parent_id`` attaches it
+#: to a parent: the V1 child kinds, triage attach outcomes only.  Both were
+#: confirmed ABSENT from the live corpus, so :data:`KIND_REGISTRY` unions them
+#: in explicitly (its BLOCK 3) rather than inheriting them from the census.
+CHILD_KINDS: frozenset[str] = frozenset({'amendment', 'sighting'})
 
 
 #: The normative closed registry of Mem0 ``metadata.kind`` values
@@ -549,15 +561,9 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     'entity_standing_decision',
     'stage1_flag_marker',
     # ---------------------------------------------------------------
-    # BLOCK 3 — NEW IN THIS PRD (2 values)
-    #
-    # V1 child kinds, triage attach outcomes only.  Both confirmed
-    # ABSENT from the live corpus, so they are added explicitly rather
-    # than inherited from the census.
+    # BLOCK 3 — NEW IN THIS PRD: CHILD_KINDS, unioned in below.
     # ---------------------------------------------------------------
-    'amendment',
-    'sighting',
-})
+}) | CHILD_KINDS
 
 
 # ---------------------------------------------------------------------------
@@ -1273,3 +1279,51 @@ def check_canonical_routing(
         'Mem0 twin, or drop the canonical marker',
         fatal=True,
     )]
+
+
+# ---------------------------------------------------------------------------
+# Writer guidance
+# ---------------------------------------------------------------------------
+
+def render_metadata_vocabulary_guidance() -> str:
+    """Teach a writing reconciliation stage this vocabulary, from the registry values.
+
+    Plain, brace-free text the stage prompts interpolate. Its hand-written
+    orchestrator twin is
+    ``orchestrator/src/orchestrator/agents/roles.py::METADATA_VOCABULARY_INSTRUCTIONS``;
+    ``fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py`` holds both
+    to this registry.
+    """
+    child_kinds = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
+    public_blessed_keys = ', '.join(
+        f'`{key}`' for key in sorted(BLESSED_METADATA_KEYS) if not key.startswith('_')
+    )
+    return (
+        '## Memory Metadata Vocabulary\n'
+        '`add_memory` and `update_memory` validate their `metadata` dict on write, '
+        "and `consolidate_memories`' `topic` argument is the same slug namespace. "
+        'Five keys are RESERVED:\n'
+        f'- `topic` — a kebab-case slug matching `{TOPIC_SLUG_RE.pattern}`, at most '
+        f'{TOPIC_SLUG_MAX_LEN} characters: `memory-write-path` is valid, '
+        '`memory_write_path` and `Memory Write Path` are not. A legacy snake_case '
+        'topic seen in the corpus is not a spelling to copy; `consolidate_memories` '
+        'refuses it.\n'
+        '- `canonical` — a bool marking the one authoritative entry for a topic; '
+        'requires `topic`, at most one entry per project and topic may claim it, and '
+        'it is only meaningful on a write that reaches Mem0.\n'
+        '- `kind` — the record type, drawn from a closed registry; distinct from '
+        '`source`, which records writer provenance rather than record type.\n'
+        '- `parent_id` — a full 36-character UUID of a live entry this one attaches '
+        f'to; triage attach outcomes only, with `kind` {child_kinds}.\n'
+        '- `supersedes` — a LIST of full 36-character UUIDs this entry replaces; '
+        'never a bare string, even for a single UUID.\n'
+        f'The blessed conventional keys {public_blessed_keys} do not warn; use those '
+        'exact spellings. Any other key still writes but warns to a census line; if such '
+        f'an annotation is deliberate, prefix it `{EXPERIMENTAL_KEY_PREFIX}` and it '
+        'passes silently.\n'
+        'A malformed reserved key is censused while `memory_metadata.enforce` is off '
+        'and rejected while it is on; the rejection names the violated rule and '
+        f'`{MemoryMetadataValidationError.REGISTRY_LOCATION}`. The registry module '
+        '`fused-memory/src/fused_memory/memory_metadata.py` is the single normative '
+        'source for all of this; consult it rather than guessing.'
+    )
