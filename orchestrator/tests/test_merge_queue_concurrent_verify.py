@@ -64,6 +64,7 @@ from _orch_helpers import (
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.merge_lane.worker import MERGE_WORKER_SHUTDOWN_REASON
 from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
@@ -5700,7 +5701,9 @@ class TestShutdownDrainTeardownIsDefensive:
     CancelledError escaping ``_abort_remote_verify`` aborts the drain loop and
     leaves the remaining ``_inflight`` entries un-drained — the task-1757
     orphaned-remote-verify class. The helper's two arms are pinned separately
-    by :class:`TestVerifyTeardownHelper`; sync-only for the same reason as
+    by :class:`TestVerifyTeardownHelper`, and the drain behaviour end to end by
+    :class:`TestStopDrainSurvivesARaisingRemoteAbort`; this scan is the cheap
+    signal that names the offending site. Sync-only for the same reason as
     :class:`TestVerifyTeardownChokepoint`.
     """
 
@@ -5816,6 +5819,100 @@ class TestShutdownDrainTeardownIsDefensive:
             'orphaning their remote verify-merge processes (task 1757). Pass '
             f'`{_MQ_SHUTDOWN_DEFENSIVE_KWARG}=True` literally. '
             f'Offenders: {offenders!r}'
+        )
+
+
+def _remote_whose_abort_raises(
+    name: str, *, entered: asyncio.Event, reaped: asyncio.Event,
+) -> MagicMock:
+    """A fake remote whose verify hangs until cancelled and whose
+    ``cancel_verify`` raises ``CancelledError``, as when a SIGTERM lands
+    mid-shutdown. *entered* is set when its verify starts, *reaped* when that
+    verify exits by any route.
+    """
+
+    async def _verify_until_cancelled(*args: Any, **kwargs: Any) -> VerifyResult:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+            return _mock_verify_result(True)
+        finally:
+            reaped.set()
+
+    runner = _make_fake_remote(name)
+    runner.run_merge_verify = AsyncMock(side_effect=_verify_until_cancelled)
+    runner.cancel_verify = AsyncMock(side_effect=asyncio.CancelledError)
+    return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
+class TestStopDrainSurvivesARaisingRemoteAbort:
+    """BEHAVIOUR behind :class:`TestShutdownDrainTeardownIsDefensive` (task
+    4164 amend): when every remote abort raises ``CancelledError``, stop()
+    still drains EVERY in-flight verify. Driven through the worker's public
+    surface: two remote hosts under ``prefer_remote`` put both in-flight
+    entries on remote leases, so both stop() drain sites, the finalizing head
+    and then the ``_inflight`` loop, meet a raising abort.
+    """
+
+    async def test_stop_drains_every_inflight_verify_when_remote_aborts_raise(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+    ) -> None:
+        entered_a, reaped_a = asyncio.Event(), asyncio.Event()
+        entered_b, reaped_b = asyncio.Event(), asyncio.Event()
+        remote_a = _remote_whose_abort_raises('remote-a', entered=entered_a, reaped=reaped_a)
+        remote_b = _remote_whose_abort_raises('remote-b', entered=entered_b, reaped=reaped_b)
+
+        class _AlsoManagesRemoteB(HostAllocator):
+            def __init__(self, remote_runners: list, *, quarantine: set[str] | None = None) -> None:
+                super().__init__([*remote_runners, remote_b], quarantine=quarantine)
+
+        config = lane_scene_config(git_repo, git_config, verify_host_policy='prefer_remote')
+        wt_a = await _make_branch_with_file(git_ops, 'task/drain-a', 'drain_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/drain-b', 'drain_b.py', 'b = 2\n')
+        req_a = _make_request('drain-a', 'task/drain-a', wt_a, config)
+        req_b = _make_request('drain-b', 'task/drain-b', wt_b, config)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, remote_a, allocator_cls=_AlsoManagesRemoteB)
+        worker_task = asyncio.create_task(worker.run())
+
+        try:
+            await q.put(req_a)
+            await q.put(req_b)
+            await wait_responsive(
+                entered_a.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='drain-a: remote verify entered',
+            )
+            await wait_responsive(
+                entered_b.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='drain-b: remote verify entered',
+            )
+        finally:
+            await _stop_worker(worker, worker_task)
+
+        remote_a.cancel_verify.assert_awaited()
+        remote_b.cancel_verify.assert_awaited()
+        shutdown = MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
+        outcomes = {
+            req.task_id: req.result.result() if req.result.done() else 'PENDING'
+            for req in (req_a, req_b)
+        }
+        assert outcomes == {'drain-a': shutdown, 'drain-b': shutdown}, (
+            f'stop() must resolve every in-flight request with the shutdown '
+            f'outcome even when the remote abort raises; got {outcomes!r}'
+        )
+        assert reaped_a.is_set() and reaped_b.is_set(), (
+            f'stop() must cancel every in-flight remote verify even when the '
+            f'remote abort raises; reaped: a={reaped_a.is_set()}, '
+            f'b={reaped_b.is_set()}'
         )
 
 
