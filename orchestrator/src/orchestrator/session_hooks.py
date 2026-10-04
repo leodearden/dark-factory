@@ -685,6 +685,20 @@ def hook_session_slug(
     return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint).slug
 
 
+def _own_identity_env(
+    env: Mapping[str, str],
+    resolution: _HookSlugResolution,
+) -> Mapping[str, str]:
+    """The env this event's OWN session identity (record body, OSC retitle) resolves from.
+
+    The raw hook env, or -- when the inherited env slug was rejected -- that
+    env with the spawner's identity keys stripped (see
+    ``_non_spawner_identity_env``). The slug itself is deliberately NOT
+    derived from this (see ``_resolve_hook_slug``).
+    """
+    return env if resolution.rejected_env_slug is None else _non_spawner_identity_env(env)
+
+
 def _bind_claude_session_id(
     record: session_registry.SessionRecord,
     hook_input: Mapping[str, Any],
@@ -1369,7 +1383,7 @@ def run_session_start(
         resolution.rejected_env_slug,
         resolution.may_bind,
     )
-    identity_env = env if forked_from is None else _non_spawner_identity_env(env)
+    identity_env = _own_identity_env(env, resolution)
     identity = resolve_hook_identity(hook_input, identity_env)
     # THE event's only read of the slug it writes: on the adopt path the
     # ownership probe already read this very record, so its snapshot is
@@ -1651,16 +1665,6 @@ def _run_status_refresh_and_retitle(
     watcher -- is linked by its next Notification/Stop, not its next restart.
     """
     probes = _EventProbes(env)
-    # RAW env, deliberately, on the fork path too (task 4663): this identity
-    # feeds ONLY the OSC retitle returned at the bottom, never the record
-    # body, and the tab that escape paints is the terminal the nested
-    # ``claude`` is running INSIDE -- its SPAWNER's. Stripping the spawn
-    # title here would have a forked session rename its spawner's tab,
-    # flapping the text between the two sessions' titles as each one's hooks
-    # fire; the forked session's own identity lands on its own RECORD
-    # instead (``run_session_start``). See `resolve_hook_identity` for the
-    # scope of that strip.
-    identity = resolve_hook_identity(hook_input, env)
     resolution = _resolve_hook_slug(hook_input, env, root, probes=probes)
     slug, may_bind = resolution.slug, resolution.may_bind
     # THE event's only read of the slug it writes: the ownership probe
@@ -1713,7 +1717,8 @@ def _run_status_refresh_and_retitle(
     # -- it is the whole point of withholding rather than skipping.
     session_registry.write_record(record, root=root)
     _stamp_session_pointer(record, probes, root)
-    title = hook_display_title(identity, env, record)
+    own_env = _own_identity_env(env, resolution)
+    title = hook_display_title(resolve_hook_identity(hook_input, own_env), own_env, record)
     return osc_retitle_sequence(status, title)
 
 
