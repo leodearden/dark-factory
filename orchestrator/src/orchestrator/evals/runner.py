@@ -60,6 +60,7 @@ from .metrics import (
     resolve_terminal_kind,
 )
 from .profile import apply_eval_profile
+from .replay_frame import REPLAY_FRAME_ID, build_replay_frame_block
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
@@ -839,7 +840,8 @@ async def run_architect_eval(
     (implementer/debugger/reviewer/verify) is FROZEN (decision 8: noise
     isolation + token savings). The architect runs with THIS candidate's
     model/backend/effort/env_overrides, not the hardcoded opus-high the
-    implementer path pins.
+    implementer path pins. Its prompt ends with the replay frame, and the cell
+    is stamped ``replay_frame`` (docs/eval-replay-frame.md).
 
     The produced plan is scored two ways: :func:`judge_plan_quality` (the LLM
     judge, against the REAL landed reference diff
@@ -1101,6 +1103,7 @@ async def run_architect_eval(
         #    candidate's model/backend/effort/env_overrides.
         briefing = BriefingAssembler(orch_config)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
+        prompt += build_replay_frame_block(pre)  # docs/eval-replay-frame.md
         # Wire plan-tools MCP via the SAME production seam real dispatch uses
         # (workflow._invoke): relocated meta_root + direct-interpreter launch.
         # strict_mcp_config stays default False so the ambient .mcp.json
@@ -1591,6 +1594,7 @@ async def run_architect_eval(
         # correct refusal, reported ALONGSIDE plan_steps rather than folded into
         # it, so both facts survive on a plan-then-decline cell.
         terminal_kind=terminal_kind,
+        replay_frame=REPLAY_FRAME_ID,
         # NO test signal exists for a plan-only cell (task 3099): this path
         # freezes implementer/debugger/reviewer/verify, so verification never
         # runs. ``None`` is the documented "unknown" sentinel; the dataclass

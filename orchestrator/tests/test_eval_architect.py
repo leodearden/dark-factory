@@ -1601,6 +1601,13 @@ def _arch_task_no_reference() -> dict:
     return task
 
 
+def _architect_prompt_sent() -> str:
+    """What the hermetic architect receives: the stubbed briefing plus the replay frame."""
+    from orchestrator.evals.replay_frame import build_replay_frame_block
+
+    return 'ARCH PROMPT' + build_replay_frame_block(_arch_task()['pre_task_commit'])
+
+
 async def _run_architect_eval_hermetic(
     cfg,
     *,
@@ -4352,7 +4359,7 @@ class TestArchitectEvalCapFailover:
         assert kw['model'] == 'sonnet'
         assert kw['backend'] == 'claude'
         assert kw['effort'] == 'high'
-        assert kw['prompt'] == 'ARCH PROMPT'
+        assert kw['prompt'] == _architect_prompt_sent()
         assert kw['cwd'] == Path('/fake/wt')
         assert kw['max_turns'] == 50
         assert kw['system_prompt']
@@ -5300,7 +5307,7 @@ class TestArchitectEvalCapResume:
         first, second = mocks['invoke'].call_args_list
 
         # (a) Attempt 1 is a normal fresh dispatch carrying the real prompt.
-        assert first.kwargs['prompt'] == 'ARCH PROMPT'
+        assert first.kwargs['prompt'] == _architect_prompt_sent()
         assert first.kwargs.get('resume_session_id') is None
 
         # (b) Attempt 2 RESUMES that session on the OTHER account, rather than
@@ -5348,7 +5355,7 @@ class TestArchitectEvalCapResume:
 
         _first, second = mocks['invoke'].call_args_list
         assert second.kwargs.get('resume_session_id') is None
-        assert second.kwargs['prompt'] == 'ARCH PROMPT'
+        assert second.kwargs['prompt'] == _architect_prompt_sent()
 
 
 def _decline_artifact(reported_at: str = '2026-07-19T12:00:00+00:00') -> dict:
