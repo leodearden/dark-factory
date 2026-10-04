@@ -702,15 +702,17 @@ async def scan_prose_citations(
     tombstone_wiring_gap = _tombstone_wiring_gap(memory_service)
     wiring_gap_logged = False
 
-    # Per-call memo of the tombstone probe, alongside the resolver's own memo,
-    # so a missing id named by N findings costs ONE tombstone read as well as
-    # ONE point read. Keeping BOTH memoised is what makes the per-finding
-    # counters and warnings independent of lookup count.
+    # Per-call memo of the tombstone probe, alongside the resolver's own memo
+    # and keyed by the same ``_memo_key``, so a missing id named by N findings
+    # costs ONE tombstone read as well as ONE point read. Keeping BOTH memoised
+    # is what makes the per-finding counters and warnings independent of
+    # lookup count.
     # Values: ('tombstoned', None) | ('absent', None) | ('inconclusive', <ExcTypeName>).
     tombstone_cache: dict[Any, tuple[str, str | None]] = {}
 
     async def _probe_tombstone(memory_id: Any) -> tuple[str, str | None]:
-        cached = tombstone_cache.get(memory_id)
+        key = _memo_key(memory_id)
+        cached = tombstone_cache.get(key)
         if cached is not None:
             return cached
         try:
@@ -721,7 +723,7 @@ async def scan_prose_citations(
             outcome: tuple[str, str | None] = ('inconclusive', type(exc).__name__)
         else:
             outcome = ('tombstoned', None) if tombstone else ('absent', None)
-        tombstone_cache[memory_id] = outcome
+        tombstone_cache[key] = outcome
         return outcome
 
     for finding in findings:

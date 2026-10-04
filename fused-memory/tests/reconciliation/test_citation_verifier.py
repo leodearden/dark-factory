@@ -2308,9 +2308,9 @@ class TestSharedResolverAndProseCeiling:
 
     @pytest.mark.asyncio
     async def test_memo_keys_non_canonical_ids_verbatim(self):
-        """The casing equivalence is established only for the canonical
-        dashed shape. Qdrant resolves ``urn:uuid:<id>`` but rejects
-        ``URN:UUID:<id>``, so merging their verdicts would be wrong."""
+        """The casing equivalence the memo relies on is established only for
+        the canonical dashed shape, so every other spelling and every non-str
+        value keeps a verdict of its own."""
         service = _prose_service(record=None, tombstone=None)
         resolve = make_memory_resolver(service, 'test_project')
 
@@ -2322,7 +2322,10 @@ class TestSharedResolverAndProseCeiling:
         await resolve('URN:UUID:' + _SPECIMEN_REAL)
         assert service.get_memory_by_id.await_count == 4
 
-        assert isinstance(await resolve(7), tuple)
+        assert await resolve(7) == ('missing', None)
+        assert service.get_memory_by_id.await_count == 5
+        assert await resolve(7) == ('missing', None)
+        assert service.get_memory_by_id.await_count == 5
 
     @pytest.mark.asyncio
     async def test_mixed_case_structured_citation_and_prose_mention_cost_one_read(self):
