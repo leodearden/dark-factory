@@ -100,18 +100,18 @@ function App() {
     window.__DF_PAUSE = !!tw.pauseLive;
   }, [tw.pauseLive]);
 
-  // Re-validate the window on every tab switch, whichever path switched it: a
-  // chip tab that does not offer the current window resets it.
+  // On every tab switch, whichever path switched it: re-validate the window (a
+  // chip tab that does not offer the current one resets it), then tell the
+  // poll loop which tab is open AND at which window, so it polls this tab's
+  // endpoints plus the always-on chrome (data.js::pollSetFor) and fetches
+  // anything newly needed at once, already at the window the tab will show.
+  // One effect, so the announcement cannot run ahead of the reset. Declared
+  // before the chip effect below, so the mount-time DF_REFRESH(win) already
+  // runs against the scoped set.
   uE(() => {
-    setWin(w => windowForTab(tab, w));
-  }, [tab]);
-
-  // Tell the poll loop which tab is open, so it polls this tab's endpoints plus
-  // the always-on chrome (data.js::pollSetFor) and fetches anything newly
-  // needed at once. Declared before the chip effect below, so the mount-time
-  // DF_REFRESH(win) already runs against the scoped set.
-  uE(() => {
-    scopePollingToTab(tab);
+    const tabWin = windowForTab(tab, win);
+    setWin(tabWin);
+    scopePollingToTab(tab, tabWin);
   }, [tab]);
 
   // Re-fetch with the new window when the chip changes. Unwindowed endpoints

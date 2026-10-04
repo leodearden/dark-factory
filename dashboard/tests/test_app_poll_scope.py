@@ -102,22 +102,42 @@ def test_app_announces_the_tab_in_a_tab_effect_before_the_chip_refresh(
     app_jsx_body: str,
 ) -> None:
     effects = _effects(_app_body(app_jsx_body))
-    scoping = [
-        (at, call) for at, call in effects
-        if re.search(r'\bscopePollingToTab\(\s*tab\s*\)', call)
-    ]
+    scoping = [(at, call) for at, call in effects if re.search(r'\bscopePollingToTab\(', call)]
     assert len(scoping) == 1, (
-        f'App must call scopePollingToTab(tab) in exactly one effect; found {len(scoping)}'
+        f'App must call scopePollingToTab in exactly one effect; found {len(scoping)}'
     )
     scope_at, scope_call = scoping[0]
     assert re.search(r',\s*\[\s*tab\s*\]\s*\)$', scope_call), (
         f'the scope effect must depend on exactly [tab]: {scope_call}'
     )
+    _assert_the_tab_is_announced_at_its_resolved_window(scope_call)
     refreshing = [at for at, call in effects if 'DF_REFRESH(win)' in call]
     assert len(refreshing) == 1, 'App must keep exactly one DF_REFRESH(win) effect'
     assert scope_at < refreshing[0], (
         'the scope effect must be declared BEFORE the DF_REFRESH(win) effect, so '
         'the mount-time chip refresh already runs against the scoped set'
+    )
+
+
+def _assert_the_tab_is_announced_at_its_resolved_window(scope_call: str) -> None:
+    """The scope effect resolves the tab's window, sets it, and announces both.
+
+    A separate setWin effect only SCHEDULES the reset, so an announcement made
+    beside it would still see the previous tab's window in data.js, and fetch a
+    newly-needed windowed endpoint at a window the new tab does not offer.
+    """
+    resolved = re.search(r'\bconst\s+(\w+)\s*=\s*windowForTab\(\s*tab\s*,\s*win\s*\)', scope_call)
+    assert resolved, (
+        'the scope effect must resolve the window the tab will show, '
+        f'const <name> = windowForTab(tab, win): {scope_call}'
+    )
+    tab_win = resolved.group(1)
+    assert re.search(rf'\bsetWin\(\s*{tab_win}\s*\)', scope_call), (
+        f'the scope effect must set the window it resolved, setWin({tab_win}): {scope_call}'
+    )
+    assert re.search(rf'\bscopePollingToTab\(\s*tab\s*,\s*{tab_win}\s*\)', scope_call), (
+        f'the scope effect must announce the tab AT that window, '
+        f'scopePollingToTab(tab, {tab_win}): {scope_call}'
     )
 
 

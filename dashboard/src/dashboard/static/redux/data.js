@@ -802,6 +802,11 @@ async function refreshDFData(win, opts) {
 // Announce the open tab, and fetch at once whatever it needs that the previous
 // tab's poll set did not fetch — so a tab switch never waits a whole interval.
 //
+// `win`, when given, is the window the new tab will show (App resolves it with
+// window_chip.js::windowForTab). It is adopted BEFORE the fetch, so a tab that
+// resets the window asks for its newly-needed windowed endpoints at that
+// window, not at the one the previous tab left behind.
+//
 // NEWLY NEEDED means a pollKey the old set did not fetch at all, or fetched
 // only narrowed while the new set needs it in full. A full -> narrowed
 // downgrade fetches nothing: the full payload already holds the census, and
@@ -810,15 +815,18 @@ async function refreshDFData(win, opts) {
 // endpoint. It does not check __DF_PAUSE: a user action fetches even while
 // paused, as a chip change does, and only pollTick is paused.
 //
-// An unchanged tab fetches and dispatches nothing.
-async function scopePollingToTab(tab, opts) {
+// An unchanged tab, or one that needs nothing newly, fetches and dispatches
+// nothing.
+async function scopePollingToTab(tab, win, opts) {
   if (tab === currentTab) return;
+  if (typeof win === 'string' && win) currentWin = win;
   const before = pollSetFor(currentTab, currentWin);
   currentTab = tab;
   const after = pollSetFor(currentTab, currentWin);
   const needed = Object.fromEntries(
     Object.entries(after).filter(([url]) => isNewlyNeeded(url, before)),
   );
+  if (Object.keys(needed).length === 0) return;
   await refreshPollSet(needed, opts, () => false);
 }
 

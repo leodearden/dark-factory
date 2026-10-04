@@ -2882,8 +2882,8 @@ function scopedLoad(respond = () => ({ ok: true, json: async () => ({}) })) {
     await drain();
     t += SCOPE_TICK_MS;
   }
-  async function scope(tab) {
-    await loaded.api.scopePollingToTab(tab, opts);
+  async function scope(tab, win) {
+    await loaded.api.scopePollingToTab(tab, win, opts);
   }
   return { ...loaded, opts, requested, tick, scope, clear: () => { requested.length = 0; } };
 }
@@ -2977,9 +2977,11 @@ test('scope change: leaving a rows tab fetches nothing — the full payload alre
   await load.scope('tasks');
   await load.tick();
   load.clear();
+  const before = load.events.length;
 
   await load.scope('scheduler');
   assert.deepEqual(load.requested, []);
+  assert.equal(load.events.length, before, 'nothing fetched, so no df-data-refresh and no re-render');
 
   await load.tick();
   assert.ok(load.requested.includes(CENSUS_TASKS_URL), load.requested.join(', '));
@@ -2991,10 +2993,59 @@ test('scope change: re-announcing the current tab fetches nothing', async () => 
   await load.scope('scheduler');
   await load.tick();
   load.clear();
+  const before = load.events.length;
 
   await load.scope('scheduler');
 
   assert.deepEqual(load.requested, []);
+  assert.equal(load.events.length, before);
+});
+
+test('scope change: the first announcement after the whole-set script-load poll dispatches nothing', async () => {
+  const load = scopedLoad();
+  await load.tick();
+  load.clear();
+  const before = load.events.length;
+
+  await load.scope('overview');
+
+  assert.deepEqual(load.requested, []);
+  assert.equal(load.events.length, before, 'every endpoint is already watched before the first announcement');
+});
+
+test('scope change: a tab switch that resets the window fetches the new tab at the window it will show', async () => {
+  // Perf offers 'all', Burndown does not: App resolves windowForTab('burn',
+  // 'all') to '24h' and announces both together, so the newly-needed burndown
+  // is asked for at 24h rather than at the window the previous tab left.
+  const burndown = `${DASH}/burndown`;
+  const load = scopedLoad();
+  await load.scope('perf', 'all');
+  await load.api.refreshDFData('all', load.opts);
+  await load.tick();
+  load.clear();
+
+  await load.scope('burn', '24h');
+  assert.deepEqual(load.requested, [`${burndown}?window=24h`]);
+
+  await load.api.refreshDFData('24h', load.opts);
+  await load.tick();
+  const windowed = load.requested.filter(url => url.includes('?window='));
+  assert.ok(windowed.length > 0, load.requested.join(', '));
+  assert.ok(windowed.every(url => url.endsWith('?window=24h')),
+    `no request may carry the previous tab's window: ${windowed.join(', ')}`);
+});
+
+test('scope change: re-announcing the current tab with a window changes nothing', async () => {
+  const load = scopedLoad();
+  await load.scope('cost', '24h');
+  await load.tick();
+  load.clear();
+
+  await load.scope('cost', '7d');
+  await load.tick();
+
+  assert.ok(load.requested.every(url => !url.includes('?window=7d')),
+    `only a chip change (DF_REFRESH) may move the window of an open tab: ${load.requested.join(', ')}`);
 });
 
 test('scope change: a newly-needed endpoint inside its backoff window is not fetched, and its failures stand', async () => {
