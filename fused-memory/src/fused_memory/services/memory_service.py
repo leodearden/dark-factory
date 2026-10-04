@@ -24,6 +24,7 @@ from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     GraphitiBackend,
 )
+from fused_memory.backends.llm_token_usage import LlmTokenUsage, TokenMeasurement
 from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     Mem0Backend,
@@ -2247,6 +2248,30 @@ def _elapsed_ms_since(started: float) -> float:
     return round((time.perf_counter() - started) * 1000, 3)
 
 
+def _measured_tokens(measurement: TokenMeasurement | None) -> dict[str, int] | None:
+    """The journal form of a window's token usage, or None if nothing was measured.
+
+    Only a real ``LlmTokenUsage`` passes: anything else (a test double's
+    auto-attribute included) would reach ``json.dumps`` inside the never-raise
+    ``log_backend_op``, which silently drops the whole row.
+    """
+    usage = getattr(measurement, 'usage', None)
+    return usage.as_journal_dict() if isinstance(usage, LlmTokenUsage) else None
+
+
+def _success_result_summary(
+    result: Any, measurement: TokenMeasurement | None
+) -> dict[str, Any] | str | None:
+    text = str(result)[:500] if result else None
+    tokens = _measured_tokens(measurement)
+    return text if tokens is None else {'result': text, 'tokens': tokens}
+
+
+def _failure_result_summary(measurement: TokenMeasurement | None) -> dict[str, Any] | None:
+    tokens = _measured_tokens(measurement)
+    return None if tokens is None else {'tokens': tokens}
+
+
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
@@ -2617,18 +2642,25 @@ class MemoryService:
         operation: str,
         payload: dict[str, Any],
         coro: Any,
+        *,
+        token_probe: Callable[[], contextlib.AbstractAsyncContextManager[TokenMeasurement]]
+        | None = None,
     ) -> Any:
         """Execute a backend call and log to write journal.
 
         Every backend inherits ``duration_ms`` (the awaited call's wall time,
         on success and failure alike) from this choke point, with no
-        per-call-site opt-in.
+        per-call-site opt-in. A ``token_probe`` window wraps only the awaited
+        call, and the LLM tokens it measured ride in ``result_summary``.
         """
+        probe = token_probe() if token_probe is not None else contextlib.nullcontext()
+        measurement: TokenMeasurement | None = None
         result = None
         duration_ms: float | None = None
         started = time.perf_counter()
         try:
-            result = await coro
+            async with probe as measurement:
+                result = await coro
             duration_ms = _elapsed_ms_since(started)
             if self._write_journal:
                 await self._write_journal.log_backend_op(
@@ -2637,7 +2669,7 @@ class MemoryService:
                     backend=backend,
                     operation=operation,
                     payload=payload,
-                    result_summary=str(result)[:500] if result else None,
+                    result_summary=_success_result_summary(result, measurement),
                     success=True,
                     duration_ms=duration_ms,
                 )
@@ -2652,6 +2684,7 @@ class MemoryService:
                     backend=backend,
                     operation=operation,
                     payload=payload,
+                    result_summary=_failure_result_summary(measurement),
                     success=False,
                     error=f'{type(e).__name__}: {e}',
                     duration_ms=duration_ms,
@@ -5963,6 +5996,10 @@ class MemoryService:
                     reference_time=reference_time,
                     unverified_claim=unverified_claim,
                 ),
+                # The only LLM-bearing graphiti path. Deletes and edge updates
+                # spend no LLM, so they stay unprobed rather than journaling a
+                # zero that reads like a measurement.
+                token_probe=self.graphiti.token_probe,
             )
             reconcile_stats = await self._reconcile_episode_identity(
                 result, group_id=payload['group_id'], referents=referents,
