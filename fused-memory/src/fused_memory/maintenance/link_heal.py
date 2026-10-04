@@ -458,6 +458,81 @@ class PlannedAction:
         return change_for(self.action, self.pre_image)
 
 
+COMPLETION_ACTIONS = frozenset({
+    HealAction.COMPLETE_AMENDMENT,
+    HealAction.COMPLETE_AMENDMENT_FLAG,
+    HealAction.COMPLETE_SIGHTING,
+})
+
+
+class StaleField(StrEnum):
+    """What a live re-read found no longer as a heal expected it."""
+
+    CHILD = 'child'
+    PARENT_ID = PARENT_ID_KEY
+    KIND = KIND_KEY
+    CONTESTED = CONTESTED_METADATA_KEY
+    CHILD_SHA256 = 'child_sha256'
+    PARENT = 'parent'
+    PARENT_SHA256 = 'parent_sha256'
+    CHILDREN = 'children'
+
+
+def verification_mismatch(image: LinkImage, record: LiveRecord | None) -> StaleField | None:
+    """The first link key on which *record* does not show *image*, or ``None``."""
+    if record is None:
+        return StaleField.CHILD
+    return _image_mismatch(image, record)
+
+
+def _image_mismatch(image: LinkImage, record: LiveRecord) -> StaleField | None:
+    shown, expected = LinkImage.from_metadata(record.metadata).as_dict(), image.as_dict()
+    for key in LINK_KEYS:
+        if shown.get(key) != expected.get(key):
+            return StaleField(key)
+    return None
+
+
+def corroboration_mismatch(
+    planned: PlannedAction,
+    child: LiveRecord | None,
+    parent: LiveRecord | None,
+    child_count: int | None,
+) -> StaleField | None:
+    """The first way the live link differs from what *planned* was planned against.
+
+    *parent* is the read of the pre-image's parent in the child's project;
+    *child_count* is needed only for a completion.
+    """
+    if child is None:
+        return StaleField.CHILD
+    return (
+        _image_mismatch(planned.pre_image, child)
+        or _child_hash_mismatch(planned, child)
+        or _parent_mismatch(planned, parent)
+        or _children_mismatch(planned, child_count)
+    )
+
+
+def _child_hash_mismatch(planned: PlannedAction, child: LiveRecord) -> StaleField | None:
+    return None if child.text_sha256 == planned.child_sha256 else StaleField.CHILD_SHA256
+
+
+def _parent_mismatch(planned: PlannedAction, parent: LiveRecord | None) -> StaleField | None:
+    """A deterministic detach needs its parent still gone; any other heal, unchanged."""
+    if planned.basis_source is BasisSource.DETERMINISTIC:
+        return None if parent is None else StaleField.PARENT
+    if parent is None:
+        return StaleField.PARENT
+    return None if parent.text_sha256 == planned.parent_sha256 else StaleField.PARENT_SHA256
+
+
+def _children_mismatch(planned: PlannedAction, child_count: int | None) -> StaleField | None:
+    if planned.action in COMPLETION_ACTIONS and child_count != 0:
+        return StaleField.CHILDREN
+    return None
+
+
 @dataclass(frozen=True)
 class RunCounts:
     """The one H1 disclosure record, shared by plan, apply, undo and status.
