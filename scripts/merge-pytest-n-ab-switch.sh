@@ -14,14 +14,13 @@
 #   [escalation_port] default 8102 (dark-factory's escalation MCP)
 #   --dry-run         edit a temp copy, print the diff, no commit, no reload
 #
-# Shares scripts/merge-deep-set-cap.sh's `git commit --only` shape, and that
-# alone: the escalation MCP is STATEFUL, so a single-shot `tools/call` POST is
-# rejected at the TRANSPORT layer — `Bad Request: Missing session ID`, HTTP 400,
-# measured live on 2026-09-12 — before any tool runs, and `curl` without -f
-# exits 0 on it. The reload therefore goes through
-# legibility.census_trigger.post_mcp_tool_call, which handshakes.
-# (merge-deep-set-cap.sh still carries that single-shot defect; copying from it
-# again would reintroduce this bug.)
+# Shares scripts/merge-deep-set-cap.sh's `git commit --only` shape and its
+# reload transport: the escalation MCP is STATEFUL, so a single-shot
+# `tools/call` POST is rejected at the TRANSPORT layer — `Bad Request: Missing
+# session ID`, HTTP 400, measured live on 2026-09-12 — before any tool runs,
+# and `curl` without -f exits 0 on it. Both scripts therefore reach
+# reload_config through legibility.census_trigger.post_mcp_tool_call, which
+# handshakes.
 #
 # Exit 0 on either of the two ways the value can be live: the reload
 # hot-applied it ('applied'), or the running config already carried it and the
