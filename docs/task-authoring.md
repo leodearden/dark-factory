@@ -1296,7 +1296,8 @@ source_finding_id, stage1_finding_id, origin_finding_id,
 related_memory_ids, related_tasks, spawned_from, program, program_stream,
 stream, cross_repo, cross_repo_project, human_curator_gate,
 human_curator_adjudicated_at, last_blocked_at, recurrence,
-execution_class, merge_lane, pending_since, pending_since_backfilled
+execution_class, merge_lane, pending_since, pending_since_backfilled,
+claimant_exception
 ```
 <!-- /tier-a-blessed-keys-mirror -->
 
@@ -1317,6 +1318,15 @@ moved or made lazy, and it is what makes
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py` refuse to
 `x_`-namespace it, which for a submodel-backed key with live readers is the
 correct refusal. Every other key in this list is unregistered.
+
+`claimant_exception` is the machine ledger entry
+`{claimant_run_id, target_status, agent_id, tag, stamped_at}`. The
+fused-memory interceptor writes it, atomically with the status, on a `done`
+or `cancelled` write that explicitly supplies a non-NULL claimant: the one
+case where a terminal row may legitimately keep a claimant. The metadata
+merge is shallow, so it is latest-wins. The alarm tier is a terminal row
+with a claimant and no matching `claimant_exception`
+(`docs/prds/claimant-invariant-detection.md` D-5, E-2).
 
 The finding-provenance family — the id trio (`source_finding_id`,
 `stage1_finding_id`, `origin_finding_id`) plus `related_memory_ids` — is the

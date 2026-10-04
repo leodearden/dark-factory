@@ -274,6 +274,26 @@ def _status_write_claimant_kwargs(
     return _maybe_kwargs(_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at)
 
 
+def _claimant_exception_entry(
+    status: str, claimant_run_id: object, *, agent_id: str | None, tag: str | None,
+) -> dict[str, Any] | None:
+    """Ledger entry for a terminal write that honours an explicit non-NULL claimant.
+
+    docs/prds/claimant-invariant-detection.md D-5/E-2: the sanctioned C4-E2
+    exception leaves its name in ``metadata.claimant_exception``. Every other
+    write (non-terminal, unsupplied or explicit-NULL claimant) gets None.
+    """
+    if status not in TERMINAL_STATUSES or claimant_run_id is _UNSET or claimant_run_id is None:
+        return None
+    return {
+        'claimant_run_id': claimant_run_id,
+        'target_status': status,
+        'agent_id': agent_id,
+        'tag': tag,
+        'stamped_at': datetime.now(UTC).isoformat(),
+    }
+
+
 def _is_ticket_id(value: object) -> bool:
     """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
     return isinstance(value, str) and value.startswith('tkt_')
@@ -1622,6 +1642,11 @@ class TaskInterceptor:
             claimant_kwargs: dict[str, Any] = _status_write_claimant_kwargs(
                 status, claimant_run_id, heartbeat_at,
             )
+            claimant_exception = _claimant_exception_entry(
+                status, claimant_run_id, agent_id=agent_id, tag=tag,
+            )
+            if claimant_exception is not None:
+                audit_fields['claimant_exception'] = claimant_exception
             # Same tri-state forwarding shape, one more kwarg: omitted unless
             # a batch clock was supplied, so the single-id call stays
             # byte-identical to a pre-3816 one (task 3816).
@@ -1692,6 +1717,18 @@ class TaskInterceptor:
         # this check is a no-op.
         if result.get('success') is False and result.get('error') == 'status_write_not_persisted':
             return result
+
+        if (persisted_exception := audit_fields.get('claimant_exception')) is not None:
+            logger.warning(
+                'claimant_exception: terminal write honoured an explicit claimant — '
+                'task_id=%s target_status=%s claimant_run_id=%s agent_id=%s tag=%s stamped_at=%s',
+                task_id,
+                persisted_exception['target_status'],
+                persisted_exception['claimant_run_id'],
+                persisted_exception['agent_id'],
+                persisted_exception['tag'],
+                persisted_exception['stamped_at'],
+            )
 
         # 5. Emit event
         payload: dict[str, Any] = {

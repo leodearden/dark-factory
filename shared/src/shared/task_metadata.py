@@ -1315,6 +1315,14 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # stays countable instead of invisible.
         'pending_since',
         'pending_since_backfilled',
+        # Ledger entry for a terminal write that honoured an explicit
+        # claimant (task 4866). Writer `fused-memory/src/fused_memory/
+        # middleware/task_interceptor.py::_claimant_exception_entry` via
+        # `_apply_status_transition`; consumer the detection gauge's ledger
+        # classification (docs/prds/claimant-invariant-detection.md D-5, E-2).
+        # A permanent machine stamp: unblessed, every carrier would emit
+        # unknown_key census noise.
+        'claimant_exception',
     }
 )
 
