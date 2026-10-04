@@ -1,9 +1,11 @@
 """pytest configuration — ensure local src takes precedence over installed package."""
 import importlib
 import sys
+import tempfile
 from functools import partial
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 # Insert this worktree's src directory at the front of sys.path so that
 # `import shared` loads the local (possibly modified) code rather than
@@ -24,9 +26,6 @@ if str(_TESTS_DIR) not in sys.path:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
-
-import tempfile  # noqa: E402
-from typing import Any  # noqa: E402
 
 import pytest  # noqa: E402
 from _cross_account_evidence import PAIR_OVERRIDE_VAR  # noqa: E402
@@ -163,21 +162,22 @@ def real_probe_dir_sweep() -> bool:
 def _confine_usage_gate_sweep(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
-    usage_gate_sweep_root: Path,
 ) -> None:
     """Re-base, not stub, the probe-dir sweep of every UsageGate built in this package.
 
     ``UsageGate.__init__`` sweeps dead-PID probe dirs under the system tempdir.
     Confining that sweep for every test means safety no longer rests on which
     test first set the once-per-process mark. ``real_probe_dir_sweep`` is the
-    escape hatch.
+    escape hatch. ``usage_gate_sweep_root`` is resolved on the first sweep, so a
+    test that builds no gate and does not request it creates no directory.
     """
     if 'real_probe_dir_sweep' in request.fixturenames:
         return
     real_sweep = usage_gate.sweep_stale_pid_dirs
 
     def _confined_sweep(prefix: str, **kwargs: Any) -> int:
-        kwargs.setdefault('base_dir', usage_gate_sweep_root)
+        if 'base_dir' not in kwargs:
+            kwargs['base_dir'] = request.getfixturevalue('usage_gate_sweep_root')
         return real_sweep(prefix, **kwargs)
 
     monkeypatch.setattr(usage_gate, 'sweep_stale_pid_dirs', _confined_sweep)
