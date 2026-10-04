@@ -1755,11 +1755,12 @@ class TaskInterceptor:
         await self._journal(event)
 
         # 5b. A recurrence carrier completed done mints its successor inline,
-        # so the caller's next read sees it (task 4866 r2).
+        # so the caller's next read sees it (task 4866 r2). The mint takes the
+        # project write lock itself, so it stays outside the transition's
+        # (non-reentrant) lock.
         if mints_successor(status, before):
             await self._mint_recurrence_successor(
                 task_id=task_id,
-                before=before,
                 project_root=project_root,
                 tag=tag,
                 project_id=project_id,
@@ -1790,31 +1791,36 @@ class TaskInterceptor:
         return result
 
     async def _mint_recurrence_successor(
-        self,
-        *,
-        task_id: str,
-        before: dict,
-        project_root: str,
-        tag: str | None,
-        project_id: str,
+        self, *, task_id: str, project_root: str, tag: str | None, project_id: str,
     ) -> None:
-        """Mint a completed carrier's successor link and journal its creation.
+        """Mint a completed carrier's successor link, surviving the request's cancellation.
 
-        Re-acquires the per-project write lock AFTER the transition released
-        it (the lock is not reentrant), so the mint's existing-link scan and
-        insert are atomic with respect to other interceptor writers.
+        The status write has already committed, so the mint runs as a tracked
+        background task behind ``asyncio.shield``: a cancelled request leaves
+        it running to completion, and ``drain()`` awaits it at close, instead
+        of silently leaving the link done with no successor.
         """
+        mint = asyncio.create_task(
+            self._mint_and_journal(
+                task_id=task_id, project_root=project_root, tag=tag, project_id=project_id,
+            ),
+            name=f'recurrence-mint-{task_id}',
+        )
+        self._background_tasks.add(mint)
+        mint.add_done_callback(self._background_tasks.discard)
+        await asyncio.shield(mint)
+
+    async def _mint_and_journal(
+        self, *, task_id: str, project_root: str, tag: str | None, project_id: str,
+    ) -> None:
         tm = await self._ensure_taskmaster()
-        terminal_time = datetime.now(UTC)
-        async with self._write_lock(project_id):
-            outcome = await mint_successor(
-                tm,
-                predecessor=before,
-                predecessor_id=task_id,
-                project_root=project_root,
-                tag=tag,
-                terminal_time=terminal_time,
-            )
+        outcome = await mint_successor(
+            tm,
+            write_lock=self._write_lock(project_id),
+            predecessor_id=task_id,
+            project_root=project_root,
+            tag=tag,
+        )
         if outcome.kind is MintOutcomeKind.MINTED:
             event = self._make_event(
                 EventType.task_created,

@@ -3,8 +3,8 @@
 docs/prds/recurring-deterministic-tasks.md R-D2/R-D3: completing a carrier
 link ``done`` mints exactly one pending successor (C-3), never while another
 non-terminal link of the same chain exists (C-2), firing ``interval_secs``
-after the predecessor's terminal time (C-6). A mint failure is logged and
-never fails the status write that triggered it.
+after the predecessor's persisted terminal time (C-6). A mint failure is
+logged and never fails the status write that triggered it.
 """
 
 from __future__ import annotations
@@ -93,11 +93,10 @@ def _successor_title(pred_title: str, pred_at: object, at: str) -> str:
     return base + _run_label(at)
 
 
-def _build_successor(
-    predecessor: Mapping[str, Any], predecessor_id: str, terminal_time: datetime,
-) -> _SuccessorSpec:
+def _build_successor(predecessor: Mapping[str, Any], predecessor_id: str) -> _SuccessorSpec:
     pred_metadata = _metadata_of(predecessor)
     recurrence = Recurrence.model_validate(pred_metadata['recurrence'])
+    terminal_time = datetime.fromisoformat(predecessor['updatedAt'])
     at = (terminal_time + timedelta(seconds=recurrence.interval_secs)).isoformat(timespec='seconds')
     metadata: dict[str, Any] = {
         'task_kind': pred_metadata.get('task_kind'),
@@ -133,10 +132,12 @@ async def _existing_link_id(
     return None
 
 
-def _failed(predecessor_id: str, key: object, reason: str, *, exc_info: bool = False) -> MintOutcome:
+def _failed(
+    predecessor_id: str, predecessor: Mapping[str, Any], reason: str, *, exc_info: bool = False,
+) -> MintOutcome:
     logger.error(
         'recurrence_mint_failed: predecessor=%s key=%s reason=%s',
-        predecessor_id, key, reason, exc_info=exc_info,
+        predecessor_id, _recurrence_of(predecessor).get('key'), reason, exc_info=exc_info,
     )
     return MintOutcome(MintOutcomeKind.FAILED, detail=reason)
 
@@ -148,9 +149,8 @@ async def _mint(
     predecessor_id: str,
     project_root: str,
     tag: str | None,
-    terminal_time: datetime,
 ) -> MintOutcome:
-    spec = _build_successor(predecessor, predecessor_id, terminal_time)
+    spec = _build_successor(predecessor, predecessor_id)
     key = spec.metadata['recurrence']['key']
     # The carrier contract is checked at submit time only (task 3093), so the
     # link being renewed is re-verified rather than trusted. The check stats
@@ -159,7 +159,7 @@ async def _mint(
         deterministic_task_error, spec.metadata['task_kind'], spec.metadata, project_root,
     )
     if carrier_error is not None:
-        return _failed(predecessor_id, key, str(carrier_error.get('error')))
+        return _failed(predecessor_id, predecessor, str(carrier_error.get('error')))
     existing_id = await _existing_link_id(tm, project_root, tag, key)
     if existing_id is not None:
         logger.info(
@@ -183,27 +183,33 @@ async def _mint(
 async def mint_successor(
     tm: TaskBackendProtocol,
     *,
-    predecessor: Mapping[str, Any],
+    write_lock: asyncio.Lock,
     predecessor_id: str,
     project_root: str,
     tag: str | None,
-    terminal_time: datetime,
 ) -> MintOutcome:
-    """Mint *predecessor*'s successor link; never raises (cancellation aside).
+    """Mint the completed link *predecessor_id*'s successor; never fails the caller.
 
-    The caller holds the project's write lock, so the C-2 scan and the insert
-    are atomic with respect to other interceptor writers. Any failure is
-    returned as ``FAILED`` after one ``recurrence_mint_failed:`` ERROR line.
+    Under *write_lock* (the project's interceptor write lock), the completed
+    link is read back, so its persisted ``updatedAt`` anchors the successor's
+    cadence and the C-2 scan plus the insert are atomic with respect to other
+    interceptor writers. Any failure is returned as ``FAILED`` after one
+    ``recurrence_mint_failed:`` ERROR line; cancellation logs that same line
+    and is re-raised.
     """
+    predecessor: Mapping[str, Any] = {}
     try:
-        return await _mint(
-            tm,
-            predecessor=predecessor,
-            predecessor_id=predecessor_id,
-            project_root=project_root,
-            tag=tag,
-            terminal_time=terminal_time,
-        )
+        async with write_lock:
+            predecessor = await tm.get_task(predecessor_id, project_root, tag)
+            return await _mint(
+                tm,
+                predecessor=predecessor,
+                predecessor_id=predecessor_id,
+                project_root=project_root,
+                tag=tag,
+            )
+    except asyncio.CancelledError:
+        _failed(predecessor_id, predecessor, 'cancelled')
+        raise
     except Exception as exc:
-        key = _recurrence_of(predecessor).get('key')
-        return _failed(predecessor_id, key, f'{type(exc).__name__}: {exc}', exc_info=True)
+        return _failed(predecessor_id, predecessor, f'{type(exc).__name__}: {exc}', exc_info=True)

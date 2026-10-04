@@ -19,9 +19,11 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
+from fused_memory.backends import sqlite_task_backend
 from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 from fused_memory.backends.task_backend_types import AddTaskResult
 from fused_memory.config.schema import TaskmasterConfig
+from fused_memory.middleware.recurrence_mint import RECURRENCE_MINT_SOURCE, mint_successor
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.models.reconciliation import EventType
 from fused_memory.models.scope import resolve_project_id
@@ -30,7 +32,14 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 KEY = 'nightly-check'
 INTERVAL_SECS = 86400
 BEFORE_DONE = {'kind': 'predicate', 'script': 'scripts/check.sh', 'timeout_secs': 60}
+FILES = ['scripts/check.sh']
+FEATURE_TAG = 'feature'
 MINT_LOGGER = 'fused_memory.middleware.recurrence_mint'
+STORE_CLOCK_START = datetime(2026, 9, 1, 12, 0, 0, 250000, tzinfo=UTC)
+
+
+def _is_mint_insert(metadata: str | None) -> bool:
+    return metadata is not None and RECURRENCE_MINT_SOURCE in metadata
 
 
 class _AddTaskFails(SqliteTaskBackend):
@@ -49,12 +58,55 @@ class _AddTaskFails(SqliteTaskBackend):
         tag: str | None = None,
         status: str = 'pending',
     ) -> AddTaskResult:
-        if metadata is not None and 'recurrence-mint' in metadata:
+        if _is_mint_insert(metadata):
             raise RuntimeError('boom')
         return await super().add_task(
             project_root, prompt, title, description, details, dependencies,
             priority, metadata, tag, status,
         )
+
+
+class _GatedMintInsert(SqliteTaskBackend):
+    """Backend whose insert of a minted successor waits until the test releases it."""
+
+    def __init__(self, config: TaskmasterConfig) -> None:
+        super().__init__(config)
+        self.mint_entered = asyncio.Event()
+        self.mint_released = asyncio.Event()
+
+    async def add_task(
+        self,
+        project_root: str,
+        prompt: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        details: str | None = None,
+        dependencies: str | None = None,
+        priority: str | None = None,
+        metadata: str | None = None,
+        tag: str | None = None,
+        status: str = 'pending',
+    ) -> AddTaskResult:
+        if _is_mint_insert(metadata):
+            self.mint_entered.set()
+            await self.mint_released.wait()
+        return await super().add_task(
+            project_root, prompt, title, description, details, dependencies,
+            priority, metadata, tag, status,
+        )
+
+
+class _StoreClock:
+    """Stands in for the task store's clock, in its ``updatedAt`` string shape."""
+
+    def __init__(self) -> None:
+        self.now = STORE_CLOCK_START
+
+    def advance(self, delta: timedelta) -> None:
+        self.now += delta
+
+    def __call__(self) -> str:
+        return self.now.strftime('%Y-%m-%dT%H:%M:%S.') + f'{self.now.microsecond // 1000:03d}Z'
 
 
 @pytest_asyncio.fixture
@@ -78,9 +130,24 @@ def interceptor(backend, event_buffer):
     return TaskInterceptor(backend, None, event_buffer)
 
 
+@pytest_asyncio.fixture
+async def gated_backend(tmp_path):
+    b = _GatedMintInsert(TaskmasterConfig(project_root=str(tmp_path)))
+    await b.start()
+    yield b
+    await b.close()
+
+
 @pytest.fixture
 def root(tmp_path) -> str:
     return str(tmp_path)
+
+
+@pytest.fixture
+def store_clock(monkeypatch) -> _StoreClock:
+    clock = _StoreClock()
+    monkeypatch.setattr(sqlite_task_backend, 'task_timestamp_now', clock)
+    return clock
 
 
 def _write_check_script(project_root: str) -> Path:
@@ -100,15 +167,18 @@ async def _seed_carrier(
     interval_secs: int = INTERVAL_SECS,
     title: str = 'Nightly check',
     status: str = 'in-progress',
+    tag: str | None = None,
+    files: list[str] | None = FILES,
 ) -> str:
     _write_check_script(project_root)
-    metadata = {
+    metadata: dict[str, Any] = {
         'task_kind': 'deterministic',
         'before_done': BEFORE_DONE,
         'milestone': {'mode': 'dated', 'at': '2026-09-01T00:00:00+00:00'},
         'recurrence': {'key': key, 'interval_secs': interval_secs},
-        'files': ['scripts/check.sh'],
     }
+    if files is not None:
+        metadata['files'] = files
     added = await backend.add_task(
         project_root=project_root,
         title=title,
@@ -116,45 +186,41 @@ async def _seed_carrier(
         details='details text',
         priority='high',
         metadata=json.dumps(metadata),
+        tag=tag,
     )
     task_id = str(added['id'])
     if status != 'pending':
-        result = await interceptor.set_task_status(task_id, status, project_root)
+        result = await interceptor.set_task_status(task_id, status, project_root, tag=tag)
         assert 'error' not in result, result
     return task_id
 
 
-async def _all_tasks(backend: SqliteTaskBackend, project_root: str) -> list[dict[str, Any]]:
-    return list((await backend.get_tasks(project_root))['tasks'])
+async def _all_tasks(
+    backend: SqliteTaskBackend, project_root: str, tag: str | None = None,
+) -> list[dict[str, Any]]:
+    return list((await backend.get_tasks(project_root, tag))['tasks'])
 
 
 async def _chain_links(
-    backend: SqliteTaskBackend, project_root: str, *, excluding: str, key: str = KEY,
+    backend: SqliteTaskBackend,
+    project_root: str,
+    *,
+    excluding: str,
+    key: str = KEY,
+    tag: str | None = None,
 ) -> list[dict[str, Any]]:
     return [
-        t for t in await _all_tasks(backend, project_root)
+        t for t in await _all_tasks(backend, project_root, tag)
         if (t.get('metadata') or {}).get('recurrence', {}).get('key') == key
         and str(t['id']) != excluding
     ]
 
 
-async def _next_wall_clock_second() -> None:
-    """Sleep past the current wall-clock second.
-
-    Successive links' milestone.at values are whole seconds, so two links of
-    one chain completed inside the same second would mint identical titles.
-    """
-    now = datetime.now(UTC)
-    await asyncio.sleep(1.01 - now.microsecond / 1_000_000)
-
-
 @pytest.mark.asyncio
-async def test_done_mints_exactly_one_successor_per_c3(interceptor, backend, root):
+async def test_done_mints_exactly_one_successor_per_c3(interceptor, backend, root, store_clock):
     pid = await _seed_carrier(interceptor, backend, root)
 
-    t0 = datetime.now(UTC)
     result = await interceptor.set_task_status(pid, 'done', root)
-    t1 = datetime.now(UTC)
 
     assert 'error' not in result, result
     successors = await _chain_links(backend, root, excluding=pid)
@@ -170,23 +236,25 @@ async def test_done_mints_exactly_one_successor_per_c3(interceptor, backend, roo
     assert md['files'] == ['scripts/check.sh']
     assert md['recurrence'] == {'key': KEY, 'interval_secs': INTERVAL_SECS, 'minted_from': pid}
     assert md['source'] == 'recurrence-mint'
-    assert md['milestone']['mode'] == 'dated'
-    at = datetime.fromisoformat(md['milestone']['at'])
-    interval = timedelta(seconds=INTERVAL_SECS)
-    assert t0.replace(microsecond=0) + interval <= at <= t1 + interval
-    assert successor['title'] == f"Nightly check [due {md['milestone']['at']}]"
+    assert md['milestone'] == {'mode': 'dated', 'at': '2026-09-02T12:00:00+00:00'}
+    assert successor['title'] == 'Nightly check [due 2026-09-02T12:00:00+00:00]'
     predecessor = await backend.get_task(pid, project_root=root)
     assert predecessor['status'] == 'done'
+    terminal_time = datetime.fromisoformat(predecessor['updatedAt'])
+    assert datetime.fromisoformat(md['milestone']['at']) == (
+        terminal_time + timedelta(seconds=INTERVAL_SECS)
+    ).replace(microsecond=0)
 
 
 @pytest.mark.asyncio
-async def test_chain_titles_do_not_accumulate_run_labels(interceptor, backend, root):
+async def test_chain_titles_do_not_accumulate_run_labels(interceptor, backend, root, store_clock):
     pid = await _seed_carrier(interceptor, backend, root)
     assert 'error' not in await interceptor.set_task_status(pid, 'done', root)
     [link2] = await _chain_links(backend, root, excluding=pid)
     link2_id = str(link2['id'])
+    assert link2['title'] == 'Nightly check [due 2026-09-02T12:00:00+00:00]'
 
-    await _next_wall_clock_second()
+    store_clock.advance(timedelta(days=1))
     assert 'error' not in await interceptor.set_task_status(link2_id, 'in-progress', root)
     assert 'error' not in await interceptor.set_task_status(link2_id, 'done', root)
 
@@ -195,9 +263,25 @@ async def test_chain_titles_do_not_accumulate_run_labels(interceptor, backend, r
         if t['metadata']['recurrence'].get('minted_from') == link2_id
     ]
     assert len(link3s) == 1, link3s
-    link3 = link3s[0]
-    assert link3['title'] == f"Nightly check [due {link3['metadata']['milestone']['at']}]"
+    assert link3s[0]['title'] == 'Nightly check [due 2026-09-03T12:00:00+00:00]'
     assert (await backend.get_task(link2_id, project_root=root))['status'] == 'done'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('files', [None, FILES])
+async def test_successor_lands_in_the_carriers_tag_copying_files_only_when_present(
+    files, interceptor, backend, root,
+):
+    pid = await _seed_carrier(interceptor, backend, root, tag=FEATURE_TAG, files=files)
+
+    assert 'error' not in await interceptor.set_task_status(pid, 'done', root, tag=FEATURE_TAG)
+
+    [successor] = await _chain_links(backend, root, excluding=pid, tag=FEATURE_TAG)
+    assert successor['status'] == 'pending'
+    assert successor['metadata']['recurrence']['minted_from'] == pid
+    copied_files = {k: v for k, v in successor['metadata'].items() if k == 'files'}
+    assert copied_files == ({} if files is None else {'files': files})
+    assert await _chain_links(backend, root, excluding=pid) == []
 
 
 @pytest.mark.asyncio
@@ -234,27 +318,28 @@ async def test_non_carrier_done_mints_nothing(interceptor, backend, root):
 
 
 @pytest.mark.asyncio
-async def test_existing_non_terminal_link_suppresses_mint(interceptor, backend, root, caplog):
-    pid = await _seed_carrier(interceptor, backend, root)
+@pytest.mark.parametrize('tag', [None, FEATURE_TAG])
+async def test_existing_non_terminal_link_suppresses_mint(tag, interceptor, backend, root, caplog):
+    pid = await _seed_carrier(interceptor, backend, root, tag=tag)
     existing_id = await _seed_carrier(
-        interceptor, backend, root, title='Nightly check (manual)', status='pending',
+        interceptor, backend, root, title='Nightly check (manual)', status='pending', tag=tag,
     )
-    count_before = len(await _all_tasks(backend, root))
+    count_before = len(await _all_tasks(backend, root, tag))
 
     with caplog.at_level(logging.INFO, logger=MINT_LOGGER):
-        assert 'error' not in await interceptor.set_task_status(pid, 'done', root)
+        assert 'error' not in await interceptor.set_task_status(pid, 'done', root, tag=tag)
 
-    links = await _chain_links(backend, root, excluding=pid)
+    links = await _chain_links(backend, root, excluding=pid, tag=tag)
     assert [str(t['id']) for t in links] == [existing_id]
-    assert len(await _all_tasks(backend, root)) == count_before
+    assert len(await _all_tasks(backend, root, tag)) == count_before
     assert any('recurrence_mint_skipped' in r.getMessage() for r in caplog.records), [
         r.getMessage() for r in caplog.records
     ]
 
-    replay = await interceptor.set_task_status(pid, 'done', root)
+    replay = await interceptor.set_task_status(pid, 'done', root, tag=tag)
 
     assert replay.get('no_op') is True, replay
-    assert len(await _all_tasks(backend, root)) == count_before
+    assert len(await _all_tasks(backend, root, tag)) == count_before
 
 
 def _mint_failures(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -301,6 +386,70 @@ async def test_backend_add_failure_fails_soft(tmp_path, event_buffer, caplog):
         await failing_backend.close()
     failures = _mint_failures(caplog)
     assert len(failures) == 1, failures
+
+
+@pytest.mark.asyncio
+async def test_link_completed_in_its_predecessors_second_fails_soft(
+    interceptor, backend, root, store_clock, caplog,
+):
+    pid = await _seed_carrier(interceptor, backend, root)
+    assert 'error' not in await interceptor.set_task_status(pid, 'done', root)
+    [link2] = await _chain_links(backend, root, excluding=pid)
+    link2_id = str(link2['id'])
+    assert 'error' not in await interceptor.set_task_status(link2_id, 'in-progress', root)
+
+    with caplog.at_level(logging.ERROR, logger=MINT_LOGGER):
+        result = await interceptor.set_task_status(link2_id, 'done', root)
+
+    assert 'error' not in result, result
+    assert (await backend.get_task(link2_id, project_root=root))['status'] == 'done'
+    assert [str(t['id']) for t in await _chain_links(backend, root, excluding=pid)] == [link2_id]
+    failures = _mint_failures(caplog)
+    assert len(failures) == 1, failures
+    assert f'predecessor={link2_id}' in failures[0]
+    assert 'DuplicateCandidateKeyError' in failures[0]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_still_mints_the_successor(gated_backend, event_buffer, root):
+    interceptor = TaskInterceptor(gated_backend, None, event_buffer)
+    pid = await _seed_carrier(interceptor, gated_backend, root)
+    request = asyncio.create_task(interceptor.set_task_status(pid, 'done', root))
+    await asyncio.wait_for(gated_backend.mint_entered.wait(), timeout=5)
+
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    gated_backend.mint_released.set()
+    await interceptor.drain()
+
+    assert (await gated_backend.get_task(pid, project_root=root))['status'] == 'done'
+    assert len(await _chain_links(gated_backend, root, excluding=pid)) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_mint_logs_the_failure_and_reraises(
+    gated_backend, event_buffer, root, caplog,
+):
+    interceptor = TaskInterceptor(gated_backend, None, event_buffer)
+    pid = await _seed_carrier(interceptor, gated_backend, root)
+    await gated_backend.set_task_status(pid, 'done', root)
+    mint = asyncio.create_task(mint_successor(
+        gated_backend, write_lock=asyncio.Lock(), predecessor_id=pid, project_root=root, tag=None,
+    ))
+    await asyncio.wait_for(gated_backend.mint_entered.wait(), timeout=5)
+
+    with caplog.at_level(logging.ERROR, logger=MINT_LOGGER):
+        mint.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await mint
+
+    failures = _mint_failures(caplog)
+    assert len(failures) == 1, failures
+    assert f'predecessor={pid}' in failures[0]
+    assert KEY in failures[0]
+    assert 'reason=cancelled' in failures[0]
+    assert await _chain_links(gated_backend, root, excluding=pid) == []
 
 
 @pytest.mark.asyncio

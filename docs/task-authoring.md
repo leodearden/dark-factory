@@ -1188,17 +1188,19 @@ exactly one `pending` successor at the fused-memory interceptor. It copies
 `description`, `details`, `priority`, `task_kind`, `before_done`, `files` and
 `recurrence.{key, interval_secs}`; it gets `recurrence.minted_from` = the
 predecessor's id, `metadata.source='recurrence-mint'`, and `milestone.at` =
-the predecessor's terminal time plus `interval_secs` (whole seconds, no
-catch-up). The title is the chain's base title plus a ` [due <at>]` run
-label, not a verbatim copy: the store's `candidate_key` UNIQUE index counts
-`done` rows, so a same-title, same-files successor would be refused as a
-duplicate of its own predecessor
+the predecessor's persisted terminal time (the `updatedAt` its `done` write
+stored) plus `interval_secs` (whole seconds, no catch-up). The title is the
+chain's base title plus a ` [due <at>]` run label, not a verbatim copy: the
+store's `candidate_key` UNIQUE index counts `done` rows, so a same-title,
+same-files successor would be refused as a duplicate of its own predecessor
 (`fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title`).
 `cancelled` ends the chain, and an existing non-terminal link with the same
 `key` suppresses the mint. A mint failure never fails the status write: it
 logs `recurrence_mint_failed:` and leaves the link `done` with no successor,
 the *broken* state the chain-state gauge (a separate PRD task, not yet live)
-will surface. A link completed inside the same wall-clock second as its
+will surface. A request cancelled after its `done` write committed does not
+abandon the mint, which runs on to completion; a mint that is itself cancelled
+logs that same line. A link completed inside the same wall-clock second as its
 predecessor would give its successor its own run label, so that mint fails
 the same way.
 
