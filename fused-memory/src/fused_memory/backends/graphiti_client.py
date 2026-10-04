@@ -31,7 +31,6 @@ from graphiti_core.helpers import validate_group_ids
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
-from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
 from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
@@ -50,8 +49,15 @@ from fused_memory.backends.falkor_indices import (
     vector_drop_statement,
     vector_index_properties,
 )
-from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
-from fused_memory.backends.llm_token_usage import TokenMeasurement, measure_llm_tokens
+from fused_memory.backends.llm_clients import (
+    ForceJsonObjectOpenAIGenericClient,
+    TokenRecordingOpenAIGenericClient,
+)
+from fused_memory.backends.llm_token_usage import (
+    AttributingTokenUsageTracker,
+    TokenMeasurement,
+    measure_llm_tokens,
+)
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
@@ -166,7 +172,18 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
 
     ``cfg.llm.client_class`` selects among the OpenAI-shaped clients only; the
     anthropic branch is unaffected by it.
+
+    Every returned client carries an ``AttributingTokenUsageTracker``, installed
+    here once rather than per arm, so ``measure_llm_tokens`` can attribute its
+    spend on whichever arm is configured.
     """
+    llm_client = _construct_llm_client(cfg)
+    if llm_client is not None:
+        llm_client.token_tracker = AttributingTokenUsageTracker()
+    return llm_client
+
+
+def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
     # LLMConfig's validator already rejects this combination at construction,
     # but pydantic does not re-validate on attribute assignment, so a config
     # mutated after loading — how tests and per-arm harnesses build variants —
@@ -236,10 +253,10 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 # shared construction call. Keeping a single call site is
                 # deliberate: two copies of the argument list are how one arm
                 # silently drifts from the other when a kwarg is added.
-                generic_cls: type[OpenAIGenericClient] = (
+                generic_cls: type[TokenRecordingOpenAIGenericClient] = (
                     ForceJsonObjectOpenAIGenericClient
                     if cfg.llm.structured_output_mode == 'json_object'
-                    else OpenAIGenericClient
+                    else TokenRecordingOpenAIGenericClient
                 )
                 llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
             else:
