@@ -30,6 +30,8 @@ from _briefing_helpers import (
     _search_arguments,
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
+    recorded_search_envelope,
+    recorded_search_text,
 )
 from shared.briefing_queries import TASK_SEMANTIC, BriefingScope, queries_for
 
@@ -379,6 +381,27 @@ class TestDistilledRendering:
 
         assert '- [uncategorized · undated · mem0] Native canonical.' in context
         assert '  - [sighting · undated · mem0] NATIVE SIGHTING BODY' in context
+
+    async def test_the_briefing_shows_the_contesting_child_in_full(
+        self, briefing: BriefingAssembler,
+    ):
+        """A correction recalled with the claim it contests reaches the agent
+        whole and marked as contesting it, not as a cut digest under it."""
+        results = json.loads(recorded_search_text('child-also-matched'))['results']
+        parent = next(entry for entry in results if 'grouped' in entry)
+        contesting_id = next(
+            child['id'] for child in parent['grouped']['amendments'] if child.get('contested')
+        )
+        full_body = next(entry['content'] for entry in results if entry['id'] == contesting_id)
+
+        context = await _recall(
+            briefing, _answering(recorded_search_envelope('child-also-matched')),
+        )
+
+        assert any(
+            line.startswith('  - [contests its parent · ') and line.endswith(f'] {full_body}')
+            for line in context.splitlines()
+        ), context
 
     async def test_the_section_headings_come_from_the_specs(
         self, briefing: BriefingAssembler,

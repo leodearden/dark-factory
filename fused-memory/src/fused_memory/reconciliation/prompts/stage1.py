@@ -19,6 +19,7 @@ from fused_memory.reconciliation.prompts import (
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    FLAG_FOR_STAGE2_MARKER_KIND,
     REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
@@ -930,7 +931,9 @@ both; the `flagged_items` entry should carry the same `task_id`, `flag_type`, an
 `description` as the Mem0 memory.
 
 Every `flag_for_stage2=true` Mem0 write MUST also include `metadata.run_id=<current_run_id>` \
-(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt).
+(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt) \
+and `metadata.kind='{FLAG_FOR_STAGE2_MARKER_KIND}'`, which keeps the marker a standalone \
+record rather than one filed under a memory it resembles.
 
 Post-write confirmation (LLM-side variant of the findability discipline enforced in code by flag_dedup.confirm_marker_persisted — task-1400, post-task-1413): \
 `add_memory` returns a `memory_ids` list, but Mem0 may store the content under a DIFFERENT \
