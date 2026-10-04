@@ -164,23 +164,27 @@ PROSE_CITATION_FIELDS: tuple[str, ...] = ('description', 'suggested_action')
 # would extract a 36-char window out of the middle of a 40-hex-digit blob.
 # ``(?<![0-9a-fA-F])`` / ``(?![0-9a-fA-F])`` reject exactly that, while still
 # admitting an id preceded by a dash (``run-<uuid>``) or followed by a period.
-# Ceiling on how many DISTINCT prose ids one run will resolve (reviewer
-# finding, task 4818 amendment pass). The structured pass's fan-out is bounded
-# by the model-emitted ``cited_memories`` list; the prose pass's is not — it is
-# driven by arbitrary LLM free text, so a description naming 200 distinct
-# uuid-shaped substrings would cost 200 serial point reads (plus up to 200
-# tombstone reads) on report assembly's critical path, for a WARN-ONLY
-# diagnostic. Ids past the ceiling are counted INCONCLUSIVE rather than
-# silently dropped — "we did not establish anything about this id" is exactly
-# what that counter already means — and the ceiling is logged ONCE per run, so
-# a pathological report is visible rather than merely slow.
-MAX_PROSE_IDS_PER_RUN: int = 200
-
 _PROSE_UUID_RE = re.compile(
     r'(?<![0-9a-fA-F])'
     r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
     r'(?![0-9a-fA-F])'
 )
+
+# Ceiling on how many DISTINCT prose ids ONE call of ``scan_prose_citations``
+# will resolve (reviewer finding, task 4818 amendment pass). The structured
+# pass's fan-out is bounded by the model-emitted ``cited_memories`` list; the
+# prose pass's is not — it is driven by arbitrary LLM free text, so a
+# description naming 200 distinct uuid-shaped substrings would cost 200 serial
+# point reads (plus up to 200 tombstone reads) on report assembly's critical
+# path, for a WARN-ONLY diagnostic. The budget is per SCAN, not per run:
+# ``stages/base.py::BaseStage.run`` makes one scan per stage, so a three-stage
+# reconciliation run can resolve up to three times this many. That is intended,
+# because what a pathological description stalls is ONE report's assembly. Ids
+# past the ceiling are counted INCONCLUSIVE rather than silently dropped — "we
+# did not establish anything about this id" is exactly what that counter
+# already means — and the ceiling is logged ONCE per scan, so a pathological
+# report is visible rather than merely slow.
+MAX_PROSE_IDS_PER_SCAN: int = 200
 
 
 def find_prose_uuids(finding: Any) -> dict[str, list[str]]:
@@ -302,6 +306,41 @@ def _known_non_mem0_ids(finding: Any, run_id: str | None = None) -> set[str]:
     return excluded
 
 
+def _tombstone_wiring_gap(memory_service: Any) -> str | None:
+    """Why *memory_service* cannot answer the tombstone probe, or ``None``.
+
+    Returns ``'reader_unavailable'`` when it has no
+    ``get_mem0_deletion_tombstone`` at all, ``'ledger_unavailable'`` when the
+    reader exists but no ``recon_ledger`` is wired, and ``None`` when the probe
+    is usable. Both gaps are WIRING conditions rather than data conditions, so
+    they hold for every id a scan meets, and neither may collapse the four-way
+    split into a two-way one — see the asymmetry comment on
+    :func:`scan_prose_citations`' miss branch.
+
+    It checks USABILITY, not merely PRESENCE (reviewer finding, task 4818
+    amendment pass). ``MemoryService.get_mem0_deletion_tombstone`` is
+    documented and implemented as "fail-safe throughout": it returns ``None``
+    — never raises — on a raising ledger read, an undecodable payload, AND
+    when no ledger is wired at all. So on a ``recon_ledger_enabled=False``
+    deployment (a SUPPORTED production config, not a misconfiguration) the
+    reader would answer ``None`` for every id on earth, INDISTINGUISHABLE by
+    return value from "no tombstone exists", and a presence-only check would
+    manufacture a phantom out of every miss. Mirroring the reader's OWN guard
+    — ``getattr(self, 'recon_ledger', None)`` — is what makes the degradation
+    land on the inconclusive counter instead.
+    """
+    if getattr(memory_service, 'get_mem0_deletion_tombstone', None) is None:
+        return 'reader_unavailable'
+    if getattr(memory_service, 'recon_ledger', None) is None:
+        return 'ledger_unavailable'
+    return None
+
+
+def _memo_key(memory_id: Any) -> Any:
+    """Lowercase for an ``is_full_uuid`` id, *memory_id* verbatim otherwise."""
+    return memory_id.lower() if is_full_uuid(memory_id) else memory_id
+
+
 def make_memory_resolver(
     memory_service: Any,
     project_id: str,
@@ -339,6 +378,16 @@ def make_memory_resolver(
     and task 2979 put the structured pass on ALL THREE stages, so the
     repeat-citation case is three times as common as it was.
 
+    The memo is keyed on the lowercase rendering of an ``is_full_uuid`` id, so
+    a mixed-case id cited structurally and named in prose (which
+    :func:`find_prose_uuids` lowercases) is read once and cannot get two
+    verdicts. That is sound because Qdrant resolves a canonical UUID point id
+    case-insensitively, pinned live by
+    ``tests/test_mem0_qdrant_integration.py::TestUuidPointIdCasing``. Every
+    other value is keyed verbatim, because that equivalence is established only
+    for the canonical shape. The backend always receives the caller's own
+    spelling.
+
     The memo is scoped to the RUN, never module-level: a longer-lived cache
     would reintroduce exactly the stale-read TOCTOU these passes exist to
     close. Caching the ``'error'`` outcome too is deliberate — a backend that
@@ -349,7 +398,8 @@ def make_memory_resolver(
     resolution_cache: dict[Any, tuple[str, str | None]] = {}
 
     async def _resolve(memory_id: Any) -> tuple[str, str | None]:
-        cached = resolution_cache.get(memory_id)
+        key = _memo_key(memory_id)
+        cached = resolution_cache.get(key)
         if cached is not None:
             return cached
         try:
@@ -358,7 +408,7 @@ def make_memory_resolver(
             outcome: tuple[str, str | None] = ('error', type(exc).__name__)
         else:
             outcome = ('found', None) if record else ('missing', None)
-        resolution_cache[memory_id] = outcome
+        resolution_cache[key] = outcome
         return outcome
 
     return _resolve
@@ -549,6 +599,10 @@ async def scan_prose_citations(
     NEVER raises — it returns ``None`` on a locked/corrupt ledger, on an
     undecodable payload and on no ledger at all — so a presence-only check
     would read those ``None``s as "no tombstone" and collapse the split anyway.
+    The two wiring conditions (a missing reader, an unwired ledger) are
+    per-scan facts warned ONCE per scan, and a raising reader is a per-read
+    fault warned per id; either way every affected pair still lands on
+    ``_prose_citation_verification_errors``.
 
     Two blind spots remain, and NEITHER is closable from here, because both are
     a readable ledger truthfully reporting no row:
@@ -600,13 +654,13 @@ async def scan_prose_citations(
     verdicts. It defaults to ``None`` (build a private one), so a standalone
     caller needs nothing new.
 
-    At most :data:`MAX_PROSE_IDS_PER_RUN` DISTINCT ids are resolved per call.
+    At most :data:`MAX_PROSE_IDS_PER_SCAN` DISTINCT ids are resolved per call.
     Unlike the structured pass — whose fan-out is bounded by the model-emitted
     citation list — this one is driven by arbitrary free text, so the ceiling
     is what stops a pathological description stalling report assembly for a
     warn-only diagnostic. Ids past it land on the inconclusive counter (we
     declined to look, which establishes nothing) and the ceiling is logged
-    ONCE per run.
+    ONCE per scan.
 
     All FOUR keys are ALWAYS present, on every path, so a caller merging them
     into ``report.stats`` never needs a ``.get(..., 0)`` fallback (the
@@ -638,60 +692,38 @@ async def scan_prose_citations(
 
     _resolve = resolve or make_memory_resolver(memory_service, project_id)
 
-    # Ceiling state for MAX_PROSE_IDS_PER_RUN — see the constant for why the
+    # Ceiling state for MAX_PROSE_IDS_PER_SCAN — see the constant for why the
     # prose pass needs one and the structured pass does not. Distinct ids, not
     # pairs: the memo means a repeat costs nothing, so the ceiling belongs on
     # the thing that actually issues reads.
     scanned_ids: set[str] = set()
     cap_logged = False
 
-    # Establish the tombstone reader's USABILITY once — not merely its
-    # PRESENCE (reviewer finding, task 4818 amendment pass). Both are wiring
-    # conditions rather than data conditions, and neither may collapse the
-    # four-way split into a two-way one — see the asymmetry comment on the miss
-    # branch below.
-    #
-    # Presence alone is not enough because
-    # ``MemoryService.get_mem0_deletion_tombstone`` is documented and
-    # implemented as "fail-safe throughout": it returns ``None`` — never raises
-    # — on a raising ledger read, an undecodable payload, AND when no ledger is
-    # wired at all. So on a ``recon_ledger_enabled=False`` deployment (a
-    # SUPPORTED production config, not a misconfiguration) the reader would
-    # answer ``None`` for every id on earth, and a probe-present check alone
-    # would read each of those ``None``s as "no tombstone" and manufacture a
-    # phantom out of every miss. Mirroring the reader's OWN guard —
-    # ``getattr(self, 'recon_ledger', None)`` — is what makes the degradation
-    # land on the inconclusive counter instead.
-    tombstone_reader = getattr(memory_service, 'get_mem0_deletion_tombstone', None)
-    ledger_wired = getattr(memory_service, 'recon_ledger', None) is not None
+    tombstone_wiring_gap = _tombstone_wiring_gap(memory_service)
+    wiring_gap_logged = False
 
-    # Per-call memo of the tombstone probe, alongside the resolver's own memo,
-    # so a missing id named by N findings costs ONE tombstone read as well as
-    # ONE point read. Keeping BOTH memoised is what makes the per-finding
-    # counters and warnings independent of lookup count.
-    # Values: ('tombstoned', None) | ('absent', None) | ('inconclusive', <reason>).
+    # Per-call memo of the tombstone probe, alongside the resolver's own memo
+    # and keyed by the same ``_memo_key``, so a missing id named by N findings
+    # costs ONE tombstone read as well as ONE point read. Keeping BOTH memoised
+    # is what makes the per-finding counters and warnings independent of
+    # lookup count.
+    # Values: ('tombstoned', None) | ('absent', None) | ('inconclusive', <ExcTypeName>).
     tombstone_cache: dict[Any, tuple[str, str | None]] = {}
 
     async def _probe_tombstone(memory_id: Any) -> tuple[str, str | None]:
-        cached = tombstone_cache.get(memory_id)
+        key = _memo_key(memory_id)
+        cached = tombstone_cache.get(key)
         if cached is not None:
             return cached
-        if tombstone_reader is None:
-            outcome: tuple[str, str | None] = ('inconclusive', 'reader_unavailable')
-        elif not ledger_wired:
-            # The reader exists but has nothing to read: it would short-circuit
-            # to ``None`` on its own ``recon_ledger is None`` guard, which is
-            # INDISTINGUISHABLE from "no tombstone exists" by return value
-            # alone. Refuse to draw the distinction rather than invent it.
-            outcome = ('inconclusive', 'ledger_unavailable')
+        try:
+            tombstone = await memory_service.get_mem0_deletion_tombstone(
+                project_id, memory_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            outcome: tuple[str, str | None] = ('inconclusive', type(exc).__name__)
         else:
-            try:
-                tombstone = await tombstone_reader(project_id, memory_id)
-            except Exception as exc:  # noqa: BLE001
-                outcome = ('inconclusive', type(exc).__name__)
-            else:
-                outcome = ('tombstoned', None) if tombstone else ('absent', None)
-        tombstone_cache[memory_id] = outcome
+            outcome = ('tombstoned', None) if tombstone else ('absent', None)
+        tombstone_cache[key] = outcome
         return outcome
 
     for finding in findings:
@@ -713,24 +745,26 @@ async def scan_prose_citations(
                 # contradiction about the same id on the same finding.
                 continue
             if memory_id not in scanned_ids:
-                if len(scanned_ids) >= MAX_PROSE_IDS_PER_RUN:
+                if len(scanned_ids) >= MAX_PROSE_IDS_PER_SCAN:
                     # Over the ceiling. Counted INCONCLUSIVE, never phantom: we
                     # declined to look, which establishes nothing either way.
                     stats[errors_key] += 1
                     if not cap_logged:
                         cap_logged = True
                         log.warning(
-                            'reconciliation.prose_citation_scan_capped: run_id=%s '
-                            'named more than %d distinct uuid-shaped substrings in '
-                            'finding prose; the remainder are counted INCONCLUSIVE '
-                            'and NOT resolved (first over-cap id=%s in finding=%s)',
-                            run_id, MAX_PROSE_IDS_PER_RUN, memory_id, _finding_id,
+                            'reconciliation.prose_citation_scan_capped: the %s prose '
+                            'scan of run_id=%s met more than %d distinct uuid-shaped '
+                            'substrings in finding prose; the remainder are counted '
+                            'INCONCLUSIVE and NOT resolved (first over-cap id=%s in '
+                            'finding=%s)',
+                            stat_prefix, run_id, MAX_PROSE_IDS_PER_SCAN, memory_id,
+                            _finding_id,
                             extra={
                                 'run_id': run_id,
                                 'stat_prefix': stat_prefix,
                                 'finding_id': _finding_id,
                                 'memory_id': memory_id,
-                                'cap': MAX_PROSE_IDS_PER_RUN,
+                                'cap': MAX_PROSE_IDS_PER_SCAN,
                             },
                         )
                     continue
@@ -776,6 +810,29 @@ async def scan_prose_citations(
             # the probe runs ONLY here — guarded to the miss branch exactly as
             # ``server/tools.py::get_memory_by_id`` guards it, where it "never
             # runs on the hit branch".
+            if tombstone_wiring_gap is not None:
+                stats[errors_key] += 1
+                # Warned lazily on the first affected miss, not before the
+                # loop: a scan that never misses has no gap worth reporting.
+                if not wiring_gap_logged:
+                    wiring_gap_logged = True
+                    log.warning(
+                        'reconciliation.prose_citation_tombstone_unwired: the %s '
+                        'prose scan of run_id=%s cannot read deletion tombstones '
+                        '(reason=%s); every prose miss in this scan is counted '
+                        'INCONCLUSIVE, NOT reported as fabricated (first affected '
+                        'memory_id=%s in finding=%s)',
+                        stat_prefix, run_id, tombstone_wiring_gap, memory_id,
+                        _finding_id,
+                        extra={
+                            'run_id': run_id,
+                            'stat_prefix': stat_prefix,
+                            'reason': tombstone_wiring_gap,
+                            'finding_id': _finding_id,
+                            'memory_id': memory_id,
+                        },
+                    )
+                continue
             probe, probe_reason = await _probe_tombstone(memory_id)
             if probe == 'tombstoned':
                 stats[tombstoned_key] += 1
@@ -826,7 +883,6 @@ async def scan_prose_citations(
                 },
             )
     return stats
-
 
 
 # --------------------------------------------------------------------------- #
