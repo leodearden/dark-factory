@@ -82,6 +82,7 @@ PURE_STDLIB_LEAVES = (
     'task_transitions',
     'testing_reify_layout',
     'testing_streams',
+    'testing_virtual_clock',
     'timestamps',
     'transcript_archive',
     'verify_admission',

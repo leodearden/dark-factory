@@ -1,4 +1,4 @@
-"""Contract of tests/_virtual_clock_helpers.py::run_on_virtual_clock.
+"""Contract of shared/src/shared/testing_virtual_clock.py::run_on_virtual_clock.
 
 The loop clock advances only while the loop is idle, and by exactly the
 timeout it would have slept — so blocking the host thread never moves it.
@@ -10,7 +10,7 @@ import asyncio
 import time
 
 import pytest
-from _virtual_clock_helpers import run_on_virtual_clock
+from shared.testing_virtual_clock import run_on_virtual_clock
 
 
 def test_an_idle_loop_jumps_straight_to_its_next_timer():
