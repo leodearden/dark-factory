@@ -11,8 +11,10 @@ of its matcher, then acceptance tests over a scan set that fails loudly — is
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # The finder
@@ -43,16 +45,76 @@ class AccessGrant:
     names: frozenset[str]
     reason: str
 
+    def excuses(self, module: str, use: AccessUse) -> bool:
+        return (
+            module == self.module
+            and use.name in self.names
+            and (self.scope is None or use.qualname == self.scope)
+        )
+
+
+class _UseFinder(ast.NodeVisitor):
+    """Collects every Load of a guarded read, under the qualname of its def."""
+
+    def __init__(self, aliases: Mapping[str, str]) -> None:
+        self._aliases = aliases
+        self._scope: list[str] = []
+        self.uses: list[AccessUse] = []
+
+    def _record(self, node: ast.expr, name: str) -> None:
+        qualname = '.'.join(self._scope) or '<module>'
+        self.uses.append(AccessUse(node.lineno, qualname, name))
+
+    def _visit_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
+        self._scope.append(node.name)
+        self.generic_visit(node)
+        self._scope.pop()
+
+    visit_FunctionDef = _visit_scope
+    visit_AsyncFunctionDef = _visit_scope
+    visit_ClassDef = _visit_scope
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and node.id in self._aliases:
+            self._record(node, self._aliases[node.id])
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if isinstance(node.ctx, ast.Load) and node.attr in GUARDED:
+            self._record(node, node.attr)
+        self.generic_visit(node)
+
 
 def find_access_path_uses(source: str) -> list[AccessUse]:
-    raise NotImplementedError
+    """Every Load of a guarded read in *source*: a call, a reference or an alias.
+
+    A def's name and an import are not Loads, so a module that only defines
+    or imports a read reports nothing; docstrings and comments never reach
+    the AST as names at all.
+    """
+    tree = ast.parse(source)
+    aliases = {name: name for name in GUARDED}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in GUARDED:
+                    aliases[alias.asname or alias.name] = alias.name
+    finder = _UseFinder(aliases)
+    finder.visit(tree)
+    return finder.uses
 
 
 def violations(
     uses_by_module: Mapping[str, Sequence[AccessUse]],
     grants: Iterable[AccessGrant],
 ) -> list[tuple[str, AccessUse]]:
-    raise NotImplementedError
+    """Every ``(module, use)`` no grant excuses."""
+    granted = tuple(grants)
+    return [
+        (module, use)
+        for module, uses in uses_by_module.items()
+        for use in uses
+        if not any(grant.excuses(module, use) for grant in granted)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -190,3 +252,119 @@ def test_a_grant_for_one_module_does_not_cover_another():
     grant = AccessGrant('data/snap.py', None, frozenset({'fetch_statuses'}), 'test')
 
     assert violations({'data/other.py': [use]}, [grant]) == [('data/other.py', use)]
+
+
+# ---------------------------------------------------------------------------
+# Acceptance tests: the real tree (the whole dashboard package)
+# ---------------------------------------------------------------------------
+
+_PACKAGE_DIR = Path(__file__).resolve().parent.parent / 'src' / 'dashboard'
+
+# 49 modules when this guard was written. A rename or a moved tree must fail
+# loudly here rather than silently shrinking the scan.
+_MIN_SCANNED_MODULES = 40
+
+_GRANTS: tuple[AccessGrant, ...] = (
+    AccessGrant(
+        'data/task_snapshot.py', None,
+        frozenset({'fetch_tasks', 'fetch_statuses', 'fetch_task_page'}),
+        'the snapshot unit and its on-demand terminal window ARE the census '
+        'and row access implementation',
+    ),
+    AccessGrant(
+        'data/task_lookup.py', None, frozenset({'fetch_task'}),
+        'the per-id miss path for a task the snapshot does not hold (PRD '
+        'decision 12)',
+    ),
+    AccessGrant(
+        'app.py', '_fanout_probe_completion', frozenset({'fetch_tasks'}),
+        'the /healthz MCP fan-out liveness probe reads raw and uncached by '
+        'design: a stored value would mask the wedge it detects (PRD '
+        'decision 17). The ONE named exemption.',
+    ),
+)
+
+
+def _scanned_modules() -> dict[str, Path]:
+    """Every module of the dashboard package, keyed by its path under ``src/dashboard``.
+
+    Raises rather than returning a shorter map when the glob comes up empty or
+    short, or a granted module is missing, because a check that quietly stops
+    checking is indistinguishable from a passing one.
+    """
+    modules = {
+        path.relative_to(_PACKAGE_DIR).as_posix(): path
+        for path in sorted(_PACKAGE_DIR.rglob('*.py'))
+    }
+    assert len(modules) >= _MIN_SCANNED_MODULES, (
+        f'only {len(modules)} modules found under {_PACKAGE_DIR} — fewer than '
+        f'the {_MIN_SCANNED_MODULES} this guard was written against'
+    )
+    missing = sorted({grant.module for grant in _GRANTS} - set(modules))
+    assert not missing, f'granted module(s) missing from the scan: {missing}'
+    return modules
+
+
+def _real_uses() -> dict[str, list[AccessUse]]:
+    return {
+        module: find_access_path_uses(path.read_text())
+        for module, path in _scanned_modules().items()
+    }
+
+
+def test_the_scan_covers_the_defining_module_and_every_granted_one():
+    scanned = _scanned_modules()
+
+    assert 'data/tasks.py' in scanned, (
+        'the module that DEFINES the reads is scanned like any other; it needs '
+        'no grant only because it defines them and never uses them'
+    )
+    assert {grant.module for grant in _GRANTS} <= set(scanned)
+
+
+def test_every_task_read_has_one_access_path():
+    found = violations(_real_uses(), _GRANTS)
+
+    assert not found, (
+        'A task read is used outside its access path. Each line below is a new '
+        'route to a task datum, and PRD decision 17 exists to keep there being '
+        'one. Before granting it, ask whether this caller should read through '
+        'task_snapshot (the census and the rows, one cached unit) or '
+        'task_lookup (one task by id). Only if neither can serve it is a '
+        'grant the answer, and then it is a design decision to record in the '
+        'PRD:\n'
+        + '\n'.join(
+            f'  {module}:{use.line} {use.qualname} {use.name} — would need '
+            f'AccessGrant({module!r}, {use.qualname!r}, '
+            f'frozenset({{{use.name!r}}}), reason=...)'
+            for module, use in found
+        )
+    )
+
+
+def test_every_grant_is_exercised():
+    uses = _real_uses()
+    stale = [
+        f'{grant.module}::{grant.scope or "<whole module>"} {name}'
+        for grant in _GRANTS
+        for name in sorted(grant.names)
+        if not any(
+            use.name == name and grant.excuses(module, use)
+            for module, module_uses in uses.items()
+            for use in module_uses
+        )
+    ]
+
+    assert not stale, (
+        'grant(s) that excuse no real use — a stale grant silently widens the '
+        'allowlist for whatever arrives next, so narrow or delete it:\n  '
+        + '\n  '.join(stale)
+    )
+
+
+def test_the_healthz_probe_is_the_only_exemption():
+    scoped = [grant for grant in _GRANTS if grant.scope is not None]
+
+    assert [(grant.module, grant.scope) for grant in scoped] == [
+        ('app.py', '_fanout_probe_completion'),
+    ]
