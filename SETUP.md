@@ -282,8 +282,8 @@ completes one of them fully:
 2. **`~/.claude/skills/<name>/` symlinks** — the newer, self-contained Skill
    directory mechanism (a `SKILL.md` plus `references/`/`scripts/` living
    together in one folder, matched as a directory rather than a single
-   file). `setup-host.sh` wires exactly three this way: `factory-init`,
-   `prd`, `hotspot-survey`.
+   file). `setup-host.sh` wires exactly four this way: `factory-init`,
+   `prd`, `hotspot-survey`, `review-all`.
 
 Both are idempotent `ln -sfn` symlinks back into this repo's `skills/`
 directory, so a `git pull` here is picked up immediately — no re-run needed
@@ -298,7 +298,7 @@ Confirm the wiring landed:
 
 ```bash
 ls -la ~/.claude/commands/ | grep -E 'orchestrate|review|unblock|reflect|merge-queue'
-ls -la ~/.claude/skills/ | grep -E 'factory-init|prd|hotspot-survey'
+ls -la ~/.claude/skills/ | grep -E 'factory-init|prd|hotspot-survey|review-all'
 ```
 
 ## 9. Onboard your first project — `/factory-init`

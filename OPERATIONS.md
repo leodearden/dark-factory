@@ -88,6 +88,7 @@ each does, and when to reach for it.
 | `/study` | Quality | Before a hard discussion or design decision | Loads a deep, discussion-ready understanding of a specific piece of code |
 | `/hotspot-survey` | Quality | Deciding what to refactor based on bug history | Multi-agent survey (~25-30 agents, 60-90 min) mining git/task/postmortem history for bug-cluster root causes, feeding `/prd` |
 | `/census` | Quality | Sweeping for confusion sightings against the legibility codebook | Saturation-mines confusion sightings, updates the codebook, files remediation |
+| `/review-all` | Quality | Deep, infrequent, human-attended review of a whole project against `docs/code-quality.md`; launched from the `Run /review-all on <project>` human-gate task, never unattended | Pins one tree, snapshots whole-repo metrics (report, not gate), refreshes stale instruments in delta mode and consumes the census, runs one seat per area plus cross-area seats against all fourteen heuristics with blinded skeptics, then synthesis, a critic, deliberation → program doc → `/prd` per stream (~40 seats, 5–8M tokens, 4–5 h machine on dark-factory) |
 | `/do` | Other | You've just agreed on a direction and want it executed autonomously | Distills the conversation into a self-contained plan plus the fixed worktree → `/merge-queue` → `/reflect` execution recipe, run in a fresh context |
 | `/warm` | Other | Ad-hoc interactive work that wants a pre-seeded worktree | Claims a copy-on-write warm worktree; falls back to a cold worktree if none is available |
 
@@ -102,8 +103,8 @@ not as things an operator runs directly.
 
 **Wiring:** `scripts/setup-host.sh` installs the skills via two mechanisms
 — flat `~/.claude/commands/*.md` symlinks for most, and whole-directory
-`~/.claude/skills/<name>` symlinks for the three that carry their own
-`references/`/`scripts/` (`factory-init`, `prd`, `hotspot-survey`). If a
+`~/.claude/skills/<name>` symlinks for the four that carry their own
+`references/`/`scripts/` (`factory-init`, `prd`, `hotspot-survey`, `review-all`). If a
 slash command turns out to be missing (e.g. a skill added after your last
 bootstrap), re-run the installer or symlink it by hand — see
 [SETUP.md](SETUP.md) §"Skill wiring".
