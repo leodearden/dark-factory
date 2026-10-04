@@ -15,6 +15,7 @@ import ast
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 # ---------------------------------------------------------------------------
 # The finder
@@ -368,3 +369,100 @@ def test_the_healthz_probe_is_the_only_exemption():
     assert [(grant.module, grant.scope) for grant in scoped] == [
         ('app.py', '_fanout_probe_completion'),
     ]
+
+
+# ---------------------------------------------------------------------------
+# The old-path census (sketch #14, second half): the census kinds and checkers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RetiredPythonName:
+    """No module of the dashboard package binds *name*."""
+
+    name: str
+    retired_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetiredServedAsset:
+    """GET *path* 404s, and no script tag of the parsed index.html loads it."""
+
+    path: str
+    retired_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetiredClientBinding:
+    """No served script binds *name* at top level, or exports it as ``window.<name>``."""
+
+    name: str
+    retired_by: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetiredWireKey:
+    """No entry of *endpoint*'s payload carries *key*."""
+
+    endpoint: str
+    key: str
+    retired_by: str
+
+
+def modules_binding(name: str, modules: Iterable[ModuleType]) -> list[str]:
+    """The ``__name__`` of every module in *modules* whose namespace binds *name*."""
+    raise NotImplementedError
+
+
+def local_script_paths(index_html: str) -> list[str]:
+    """The URL path of every ``<script src>`` this app serves, in document order."""
+    raise NotImplementedError
+
+
+def client_bindings(sources: Mapping[str, str]) -> dict[str, list[str]]:
+    """Each script's top-level bindings and ``window.<name>`` exports, by filename."""
+    raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# Census checker unit tests (fixtures, not the real tree)
+# ---------------------------------------------------------------------------
+
+
+def test_client_bindings_reports_only_top_level_names():
+    source = (
+        'function TopFn() {\n'
+        '  const inner = 1;\n'
+        '  window.DF_INNER = inner;\n'
+        '  return <div>{inner}</div>;\n'
+        '}\n'
+        "const TopConst = 'stringOnly';\n"
+        'const { a, b: c } = window.DF_X;\n'
+        'class TopClass {}\n'
+        'window.DF_Y = { TopFn, TopClass };\n'
+    )
+
+    assert client_bindings({'fixture.jsx': source}) == {
+        'fixture.jsx': ['TopFn', 'TopConst', 'a', 'c', 'TopClass', 'DF_Y'],
+    }
+
+
+def test_local_script_paths_reads_classic_and_babel_tags_but_not_comments():
+    index_html = (
+        '<!doctype html><html><head>\n'
+        '<script src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>\n'
+        '<script src="/static/redux/data.js?v=7"></script>\n'
+        '<!-- <script src="/static/redux/retired.js?v=6"></script> -->\n'
+        '<script type="text/babel" src="/static/redux/app.jsx?v=7"></script>\n'
+        '</head><body></body></html>\n'
+    )
+
+    assert local_script_paths(index_html) == ['/static/redux/data.js', '/static/redux/app.jsx']
+
+
+def test_modules_binding_flags_a_module_that_carries_the_name():
+    clean = ModuleType('fixture_clean')
+    rehomed = ModuleType('fixture_rehomed')
+    rehomed.collect_done_counts = lambda: None  # type: ignore[attr-defined]
+
+    assert modules_binding('collect_done_counts', [clean, rehomed]) == ['fixture_rehomed']
