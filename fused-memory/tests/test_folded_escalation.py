@@ -795,6 +795,12 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     the property that makes a colliding RENAME fail this test: a copy of the
     values in this file would keep passing while production went silent.
     """
+    from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+        BACKLOG_ANCHOR as LINK_HEAL_BACKLOG_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
+        WRITE_FAILURE_ANCHOR as LINK_HEAL_WRITE_FAILURE_ANCHOR,
+    )
     from fused_memory.middleware.candidate_key_escalation import (  # noqa: PLC0415
         _ANCHOR_TASK_ID as CANDIDATE_KEY_ANCHOR,
     )
@@ -857,6 +863,9 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,
         'markup_guard residue': GUARD_RESIDUE_ANCHOR,
+        # -- the link-heal executor's two run escapes (task 6181) -----------
+        'link_heal backlog': LINK_HEAL_BACKLOG_ANCHOR,
+        'link_heal write-failure': LINK_HEAL_WRITE_FAILURE_ANCHOR,
         # -- the non-member neighbours. They dedupe on content fingerprints
         #    via `submit_or_dedupe`, not on a pending anchor, so they are NOT
         #    migrating — but they write to the SAME queue, so they can still
@@ -945,12 +954,14 @@ class TestNoTwoFilersShareAnAnchor:
             'mem0_update_storm_escalator',
             'entity_mint_storm_escalator',
             'scope_violation_escalator',
+            'link_heal backlog',
+            'link_heal write-failure',
         ):
             assert required in anchors, (
                 f'{required!r} files into the same queue but is absent from '
                 'the anchor sweep'
             )
-        assert len(anchors) >= 15, (
+        assert len(anchors) >= 17, (
             f'the sweep shrank to {len(anchors)} entries; a filer was dropped '
             'rather than renamed'
         )

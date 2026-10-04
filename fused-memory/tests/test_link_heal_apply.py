@@ -5,6 +5,9 @@ Each case plans, then applies, against the in-process server in
 server: the record's payload, grouped search and ``get_memory_by_id``, the
 write journal and the ledger. Every heal re-reads the record live before its
 one write, and re-reads it again after.
+
+The second section covers what bounds a run: the per-run cap, the backlog and
+write-failure escapes, and an operator-approved plan.
 """
 
 from __future__ import annotations
@@ -32,13 +35,26 @@ from _link_heal_harness import (
 from orchestrator.agents.memory_recall import render_memory_results
 
 from fused_memory.maintenance.link_heal import LINK_KEYS, BasisSource, LinkBasis
-from fused_memory.maintenance.link_heal_executor import Escape, RunLimits, RunReport, run_apply
+from fused_memory.maintenance.link_heal_executor import (
+    BACKLOG_ANCHOR,
+    WRITE_FAILURE_ANCHOR,
+    ApprovalMismatch,
+    Escape,
+    EscapeFiler,
+    FoldedEscapeFiler,
+    RunLimits,
+    RunReport,
+    plan_sha256,
+    render_plan_document,
+    run_apply,
+)
 from fused_memory.maintenance.link_heal_ledger import (
     ActionRow,
     ActionState,
     LinkHealLedger,
     RunSource,
 )
+from fused_memory.middleware import _folded_escalation
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CONTESTED_METADATA_KEY,
@@ -97,6 +113,24 @@ class RecordingFiler:
         return f'esc-recorded-{len(self.escapes)}'
 
 
+async def apply_pending(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    *,
+    limits: RunLimits = DEFAULT_LIMITS,
+    filer: EscapeFiler | None = None,
+    approved_plan_sha256: str | None = None,
+) -> RunReport:
+    return await run_apply(
+        store=harness.store(),
+        ledger=ledger,
+        limits=limits,
+        filer=filer or RecordingFiler(),
+        source=RunSource.CORPUS,
+        approved_plan_sha256=approved_plan_sha256,
+    )
+
+
 async def plan_then_apply(
     harness: LinkHealHarness,
     ledger: LinkHealLedger,
@@ -104,28 +138,28 @@ async def plan_then_apply(
     *bases: LinkBasis,
     between: Callable[[], None] | None = None,
     limits: RunLimits = DEFAULT_LIMITS,
+    filer: EscapeFiler | None = None,
 ) -> RunReport:
     """Plan *bases*, run *between* (the world moving on), then apply."""
     await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases, limits)
     if between is not None:
         between()
-    return await run_apply(
-        store=harness.store(),
-        ledger=ledger,
-        limits=limits,
-        filer=RecordingFiler(),
-        source=RunSource.CORPUS,
-    )
+    return await apply_pending(harness, ledger, limits=limits, filer=filer)
 
 
-def only_outcome(ledger: LinkHealLedger, report: RunReport) -> ActionRow:
-    """The one heal *report*'s run executed, whatever became of it."""
-    (row,) = [
+def executed_rows(ledger: LinkHealLedger, report: RunReport) -> list[ActionRow]:
+    """Every heal *report*'s run executed, whatever became of it, oldest first."""
+    rows = [
         row
         for run in ledger.recent_runs(10)
         for row in ledger.run_actions(run.run_id)
         if row.executed_run_id == report.run_id
     ]
+    return sorted(rows, key=lambda row: row.action_id)
+
+
+def only_outcome(ledger: LinkHealLedger, report: RunReport) -> ActionRow:
+    (row,) = executed_rows(ledger, report)
     return row
 
 
@@ -362,3 +396,231 @@ class TestFailures:
         assert unadmitted.mem0.payload(DF, CHILD)['kind'] == SIGHTING_KIND
         assert unadmitted.journal_rows() == []
         assert report.counts.failed == 1
+
+
+# ---------------------------------------------------------------------------
+# Caps, escapes and approval.
+# ---------------------------------------------------------------------------
+
+
+def _sighting_ids(index: int) -> tuple[str, str]:
+    return (f'{index:08x}-c0c0-4c0c-8c0c-{index:012x}', f'{index:08x}-a0a0-4a0a-8a0a-{index:012x}')
+
+
+def seed_sightings(harness: LinkHealHarness, count: int) -> tuple[LinkBasis, ...]:
+    """*count* EXTENDS-rated sightings, each under its own parent: *count* relabels."""
+    bases = []
+    for index in range(count):
+        child, parent = _sighting_ids(index)
+        child_text, parent_text = f'sighting {index}', f'parent {index}'
+        harness.seed_link(
+            kind=SIGHTING_KIND, child=child, parent=parent,
+            child_text=child_text, parent_text=parent_text,
+        )
+        bases.append(corpus_basis(
+            'EXTENDS', child=child, parent=parent,
+            child_text=child_text, parent_text=parent_text, key=f'H{index:03d}',
+        ))
+    return tuple(bases)
+
+
+def _ids(rows: list[ActionRow]) -> list[int]:
+    return [row.action_id for row in rows]
+
+
+class TestTheCapDrainsOldestFirst:
+    @pytest.mark.asyncio
+    async def test_a_capped_run_applies_the_oldest_and_leaves_the_rest_pending(
+        self, harness, ledger, tmp_path,
+    ):
+        await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', seed_sightings(harness, 40))
+        planned = _ids(ledger.pending_actions(RunSource.CORPUS))
+
+        report = await apply_pending(harness, ledger)
+
+        assert _ids(ledger.applied_actions(report.run_id)) == planned[:25]
+        rest = ledger.pending_actions(RunSource.CORPUS)
+        assert _ids(rest) == planned[25:]
+        assert {row.state for row in rest} == {ActionState.SKIPPED_CAP}
+        assert (report.counts.applied, report.counts.skipped_cap) == (25, 15)
+        assert report.counts.caps_bit == ('max_actions_per_run',)
+        assert report.counts.complete is False
+
+    @pytest.mark.asyncio
+    async def test_the_next_run_drains_exactly_the_cap_skipped_rest(
+        self, harness, ledger, tmp_path,
+    ):
+        await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', seed_sightings(harness, 40))
+        planned = _ids(ledger.pending_actions(RunSource.CORPUS))
+        await apply_pending(harness, ledger)
+
+        report = await apply_pending(harness, ledger)
+
+        assert _ids(ledger.applied_actions(report.run_id)) == planned[25:]
+        assert report.counts.skipped_cap == 0
+        assert report.counts.caps_bit == ()
+        assert report.counts.complete is True
+
+
+BACKLOG_LIMITS = RunLimits(max_actions_per_run=25, backlog_multiplier=1, write_failure_streak=3)
+
+
+class TestTheBacklogEscape:
+    @pytest.mark.asyncio
+    async def test_a_backlog_files_one_escape_and_the_run_keeps_draining(
+        self, harness, ledger, tmp_path,
+    ):
+        filer = RecordingFiler()
+
+        report = await plan_then_apply(
+            harness, ledger, tmp_path, *seed_sightings(harness, 40),
+            limits=BACKLOG_LIMITS, filer=filer,
+        )
+
+        (escape,) = filer.escapes
+        assert escape.anchor == BACKLOG_ANCHOR
+        assert report.counts.applied == 25
+        assert report.counts.escaped == (
+            {'anchor': BACKLOG_ANCHOR, 'escalation_id': 'esc-recorded-1'},
+        )
+
+    @pytest.mark.skipif(
+        not _folded_escalation.HAS_ESCALATION,
+        reason='escalation package unavailable (minimal env)',
+    )
+    @pytest.mark.asyncio
+    async def test_the_real_filer_files_once_and_a_second_capped_run_folds_in(
+        self, harness, ledger, tmp_path,
+    ):
+        from escalation.queue import EscalationQueue
+
+        filer = FoldedEscapeFiler(project_root=str(tmp_path))
+        bases = seed_sightings(harness, 60)
+
+        first = await plan_then_apply(
+            harness, ledger, tmp_path, *bases, limits=BACKLOG_LIMITS, filer=filer,
+        )
+        second = await apply_pending(harness, ledger, limits=BACKLOG_LIMITS, filer=filer)
+
+        queue = EscalationQueue(tmp_path / 'data' / 'escalations')
+        (record,) = queue.get_by_task(BACKLOG_ANCHOR, status='pending')
+        assert 'dark_factory' in record.detail
+        assert 'reify' in record.detail
+        assert 'pending: 60' in record.detail
+        assert first.counts.escaped == ({'anchor': BACKLOG_ANCHOR, 'escalation_id': record.id},)
+        assert second.counts.escaped == ({'anchor': BACKLOG_ANCHOR, 'escalation_id': record.id},)
+
+
+STREAK_LIMITS = RunLimits(max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3)
+
+
+class TestTheWriteFailureStreak:
+    @pytest.mark.asyncio
+    async def test_an_unadmitted_prefix_stops_the_run_after_the_streak(
+        self, unadmitted, ledger, tmp_path,
+    ):
+        filer = RecordingFiler()
+
+        report = await plan_then_apply(
+            unadmitted, ledger, tmp_path, *seed_sightings(unadmitted, 5),
+            limits=STREAK_LIMITS, filer=filer,
+        )
+
+        counts = report.counts
+        assert counts.stopped_by == 'write_failure_streak'
+        assert (counts.failed, counts.not_attempted) == (3, 2)
+        assert counts.complete is False
+        rest = ledger.pending_actions(RunSource.CORPUS)
+        assert len(rest) == 2
+        assert {row.state for row in rest} == {ActionState.PLANNED}
+        (escape,) = filer.escapes
+        assert escape.anchor == WRITE_FAILURE_ANCHOR
+        assert counts.escaped == (
+            {'anchor': WRITE_FAILURE_ANCHOR, 'escalation_id': 'esc-recorded-1'},
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_first_failure_names_the_refusal(self, unadmitted, ledger, tmp_path):
+        report = await plan_then_apply(
+            unadmitted, ledger, tmp_path, *seed_sightings(unadmitted, 5), limits=STREAK_LIMITS,
+        )
+
+        first = executed_rows(ledger, report)[0]
+        assert first.state is ActionState.FAILED
+        assert first.detail is not None
+        assert first.detail['error_type'] == 'Mem0UpdateNotAuthorized'
+
+    def _sabotage(self, harness: LinkHealHarness, pattern: str) -> Callable[[], None]:
+        """Per sighting, in plan order: f fails its parent read, s goes stale, o is left ok."""
+
+        def between() -> None:
+            for index, mark in enumerate(pattern):
+                child, parent = _sighting_ids(index)
+                if mark == 'f':
+                    harness.mem0.read_failures.add(parent)
+                elif mark == 's':
+                    harness.mem0.payload(DF, child)['data'] = f'sighting {index}, edited'
+
+        return between
+
+    async def _run(self, harness, ledger, tmp_path, pattern: str) -> RunReport:
+        return await plan_then_apply(
+            harness, ledger, tmp_path, *seed_sightings(harness, len(pattern)),
+            between=self._sabotage(harness, pattern),
+            limits=RunLimits(max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=2),
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_stale_skip_does_not_break_the_streak(self, harness, ledger, tmp_path):
+        counts = (await self._run(harness, ledger, tmp_path, 'fsfo')).counts
+
+        assert counts.stopped_by == 'write_failure_streak'
+        assert (counts.failed, counts.skipped_stale, counts.not_attempted) == (2, 1, 1)
+
+    @pytest.mark.asyncio
+    async def test_a_stale_skip_does_not_extend_the_streak(self, harness, ledger, tmp_path):
+        counts = (await self._run(harness, ledger, tmp_path, 'fso')).counts
+
+        assert counts.stopped_by is None
+        assert (counts.failed, counts.skipped_stale, counts.applied) == (1, 1, 1)
+
+    @pytest.mark.asyncio
+    async def test_an_applied_heal_resets_the_streak(self, harness, ledger, tmp_path):
+        counts = (await self._run(harness, ledger, tmp_path, 'fofo')).counts
+
+        assert counts.stopped_by is None
+        assert (counts.failed, counts.applied, counts.not_attempted) == (2, 2, 0)
+
+
+class TestAnApprovedPlan:
+    @pytest.mark.asyncio
+    async def test_an_approved_plan_lifts_the_cap_and_skips_the_backlog_escape(
+        self, harness, ledger, tmp_path,
+    ):
+        await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', seed_sightings(harness, 40))
+        sha = plan_sha256(render_plan_document(ledger.pending_actions(RunSource.CORPUS)))
+        filer = RecordingFiler()
+
+        report = await apply_pending(
+            harness, ledger, limits=BACKLOG_LIMITS, filer=filer, approved_plan_sha256=sha,
+        )
+
+        assert report.counts.applied == 40
+        assert report.counts.skipped_cap == 0
+        assert report.counts.approved_plan_sha256 == sha
+        assert filer.escapes == []
+        assert report.counts.escaped == ()
+
+    @pytest.mark.asyncio
+    async def test_a_wrong_sha_is_refused_before_any_run_row(self, harness, ledger, tmp_path):
+        await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', seed_sightings(harness, 3))
+        sha = plan_sha256(render_plan_document(ledger.pending_actions(RunSource.CORPUS)))
+        runs_before = ledger.recent_runs(10)
+
+        with pytest.raises(ApprovalMismatch) as excinfo:
+            await apply_pending(harness, ledger, approved_plan_sha256='0' * 64)
+
+        assert '0' * 64 in str(excinfo.value)
+        assert sha in str(excinfo.value)
+        assert ledger.recent_runs(10) == runs_before
+        assert harness.mem0.write_count == 0
