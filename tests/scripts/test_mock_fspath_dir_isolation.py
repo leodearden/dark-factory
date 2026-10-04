@@ -9,6 +9,7 @@ generalised guard in ``df_pytest_isolation``, shaped like the other
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -134,6 +135,57 @@ class TestTheGuardFixtureIsArmed:
 
         assert marker.scope == 'function', f'{_GUARD_NAME} scope is {marker.scope!r}'
         assert marker.autouse is True, f'{_GUARD_NAME} must be autouse — nothing requests it'
+
+
+def _is_ignored(relpath: str) -> subprocess.CompletedProcess[str]:
+    """Ask git whether *relpath* is ignored; it answers for paths that need not exist.
+
+    Exit 0 is ignored and 1 is not, so the code is read rather than checked.
+    """
+    return subprocess.run(
+        ['git', 'check-ignore', '-q', '--', relpath],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+class TestEveryMockDerivedShapeIsGitIgnored:
+    """``.gitignore`` follows ``MOCK_FSPATH_ROOT_NAMES``; a name it lags on goes red here.
+
+    The subproject prefixes matter because verify runs ``cd <subproject> &&
+    pytest``, so a leaked tree lands under the subproject, not the repo root.
+    """
+
+    @pytest.mark.parametrize('prefix', ['', 'fused-memory/', 'orchestrator/'])
+    @pytest.mark.parametrize('name', MOCK_FSPATH_ROOT_NAMES)
+    def test_both_shapes_are_ignored(self, name: str, prefix: str) -> None:
+        shapes = {
+            'fspath DIRECTORY': f'{prefix}{name}/mock.data_dir/1/probe',
+            'str()/repr FILE': f"{prefix}<{name} name='mock.x' id='1'>",
+        }
+        uncovered = {
+            shape: (relpath, probed.returncode, probed.stderr)
+            for shape, relpath in shapes.items()
+            if (probed := _is_ignored(relpath)).returncode != 0
+        }
+
+        assert not uncovered, (
+            f'mock-derived paths a `git add -- .` would stage: {uncovered!r} '
+            '(shape: (path, git check-ignore exit code, stderr)). Add '
+            f'`{name}/` and `<{name}*` to the .gitignore block "Test SQLite '
+            'artifacts — MagicMock path side-effects".'
+        )
+
+    def test_the_probe_can_say_no(self) -> None:
+        """Non-vacuity control: a tracked, unignored file is reported as not ignored."""
+        probed = _is_ignored('df_pytest_isolation.py')
+
+        assert probed.returncode == 1, (
+            f'git check-ignore exited {probed.returncode} for a tracked file, so '
+            f'the probe proves nothing. stderr={probed.stderr!r}'
+        )
 
 
 def _nested_run(root: Path, body: str, *, imports: str = ''):
