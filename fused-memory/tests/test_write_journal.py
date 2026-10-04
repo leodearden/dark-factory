@@ -71,6 +71,46 @@ async def test_log_backend_op_roundtrip(journal):
     assert ops[0]['write_op_id'] == write_op_id
 
 
+async def _backend_ops_columns(db_path) -> set[str]:
+    import aiosqlite
+
+    async with aiosqlite.connect(str(db_path)) as db, db.execute(
+        'PRAGMA table_info(backend_ops)'
+    ) as cursor:
+        return {row[1] for row in await cursor.fetchall()}
+
+
+@pytest.mark.asyncio
+async def test_fresh_journal_backend_ops_has_duration_ms_column(journal):
+    columns = await _backend_ops_columns(journal.data_dir / 'write_journal.db')
+    assert 'duration_ms' in columns
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_duration_ms_roundtrips_as_real(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='graphiti',
+        operation='add_episode',
+        duration_ms=1234.567,
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert row['duration_ms'] == pytest.approx(1234.567)
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_without_duration_ms_stores_null(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='mem0',
+        operation='add',
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert row['duration_ms'] is None
+
+
 @pytest.mark.asyncio
 async def test_causation_id_queries_both_layers(journal):
     causation = str(uuid.uuid4())
