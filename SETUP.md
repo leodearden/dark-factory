@@ -201,6 +201,9 @@ docker compose up -d falkordb qdrant
 
 - **FalkorDB** (Redis-protocol graph database — not Neo4j; it's the only
   backend Graphiti is configured for here) on `6379`.
+  - It persists to `fused-memory/data/falkordb` with both RDB snapshots and
+    an append-only file (`appendfsync everysec`), enabled by `REDIS_ARGS` in
+    the compose file.
 - **Qdrant** (vector store for Mem0) on `6333` (HTTP) / `6334` (gRPC).
 
 A third compose service, `fused-mcp`, builds and runs fused-memory itself
@@ -212,6 +215,7 @@ Verify:
 
 ```bash
 docker compose exec falkordb redis-cli ping   # → PONG
+docker compose exec falkordb redis-cli CONFIG GET appendonly   # → appendonly / yes
 curl -sf http://localhost:6333/readyz && echo ok
 ```
 
