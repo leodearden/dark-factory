@@ -7,10 +7,7 @@ that already oversized file does not grow further.
 
 A plain literal decodes the backslash sequences in pasted code: an incomplete
 one rejects the whole script at compile time, and a complete one is silently
-turned into the character it stands for. Task 5964 refiles reify
-legibility-census candidate #7910. The hazard needs no host hook, since it
-reproduces with the script's bytes delivered intact, so it is unlike the
-skim-hook flattening block retired with that hook (commit c735478936).
+turned into the character it stands for.
 
 `orchestrator/tests/test_roles_pasted_text_python_literal.py` checks the
 block's shape and its splice (carrier roles, count, order after

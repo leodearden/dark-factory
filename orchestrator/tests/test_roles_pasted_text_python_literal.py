@@ -1,10 +1,9 @@
 """Anchor/contract test for `PASTED_TEXT_PYTHON_LITERAL_GUIDANCE` (task 5964).
 
-A cross-repo refile of reify legibility-census candidate #7910, and a sibling of
-`test_roles_grep_pattern_escaping.py`. Every assertion here is an existence,
-containment, count or index check against a NAMED constant — never a prose pin,
-never a regex over wording, never a byte-size figure. The mechanical half of
-that shape lives in `_role_splice_contract.py`.
+A sibling of `test_roles_grep_pattern_escaping.py`. Every assertion here is an
+existence, containment, count or index check against a NAMED constant — never a
+prose pin, never a regex over wording, never a byte-size figure. The mechanical
+half of that shape lives in `_role_splice_contract.py`.
 """
 
 from __future__ import annotations
@@ -133,8 +132,10 @@ def test_guidance_lands_after_the_grep_block():
     (a) The order protects the preamble's append-only-at-the-tail convention,
     which keeps the adjacency pins of the blocks ahead of it intact.
 
-    (b) Adjacency is deliberately NOT pinned (esc-5966-3): sibling census blocks
-    append to the same tail of `_BASH_CAPABLE_ROLE_PREAMBLE` in any merge order.
+    (b) Adjacency is deliberately NOT pinned: sibling census blocks append to
+    the same tail in any merge order. The APPEND-ONLY comment above
+    `orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
+    holds that rationale.
     """
     _CONTRACT.assert_lands_after(
         follows=GREP_LOOKAROUND_GUIDANCE,
