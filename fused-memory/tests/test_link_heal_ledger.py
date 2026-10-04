@@ -323,6 +323,7 @@ class TestRunLock:
                 pass
 
         held = excinfo.value
+        assert held.holder is not None
         assert held.holder.pid == holder['pid']
         assert held.holder.started_at == holder['started_at']
         assert str(holder['pid']) in str(held)
