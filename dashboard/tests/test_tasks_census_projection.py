@@ -192,7 +192,9 @@ class TestCollectCensusSnapshots:
             assert unit.census.as_of == NOW
             assert unit.rows.state is DatumState.UNKNOWN, (label, unit.rows)
             assert 'projection=census' in (unit.rows.reason or ''), unit.rows.reason
-            assert unit.to_wire()['rows']['value'] is None
+            rows_wire = unit.to_wire()['rows']
+            assert isinstance(rows_wire, dict), rows_wire
+            assert rows_wire['value'] is None
 
         assert {call['tool'] for call in canned.calls} == {'get_statuses', 'get_tasks'}, (
             [call['tool'] for call in canned.calls]
