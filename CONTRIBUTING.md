@@ -370,7 +370,8 @@ branch, before any merge submission:
    should trigger a broader run).
 2. `uv run ruff check <touched packages>`.
 3. `uv run pyright` in each touched, pyright-configured package
-   (`fused-memory`, `orchestrator`, `dashboard`).
+   (`fused-memory`, `orchestrator`, `dashboard`, `shared`, `escalation`,
+   `sampler`, `cockpit`).
 
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than
