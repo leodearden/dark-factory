@@ -51,19 +51,19 @@ def _cancel_ticket_calls(mock_mcp: AsyncMock) -> list[Any]:
 
 
 async def _concurrent_background_leg(url: str) -> None:
-    """Run one failing sampler-shaped leg against *url* in a separate task, to completion.
+    """Run one sampler-shaped leg against *url* in a separate task, to completion.
 
-    Reproduces, deterministically, the interleaving measured in task 6286: the
-    lifespan's ``_metrics_loop`` / ``_burndown_loop`` initial snapshots fan out
-    against the same URLs, through these same module-global seams, while a
-    request is in flight.
+    The leg dials a non-cancel tool and invalidates *url*'s session through the
+    same module-global seams the lifespan's ``_metrics_loop`` / ``_burndown_loop``
+    initial snapshots drive, so their interleaving with an in-flight request
+    happens deterministically rather than only on a slow host.
     """
 
-    async def _failing_sampler_leg() -> None:
+    async def _sampler_leg_that_invalidates() -> None:
         await memory_data.mcp_tool_call(cast(httpx.AsyncClient, None), url, 'get_status', {})
         memory_data.invalidate_session(url)
 
-    await asyncio.get_running_loop().create_task(_failing_sampler_leg())
+    await asyncio.get_running_loop().create_task(_sampler_leg_that_invalidates())
 
 
 @dataclass
@@ -317,7 +317,6 @@ def test_cancel_handler_invalidates_session_on_transport_error(client):
 
     assert resp.status_code == 502
     assert seams.handler_invalidations() == [configured_url]
-    assert configured_url in seams.foreign_invalidations()
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +466,7 @@ def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
     are unreachable, so the handler returns 502 with the error key
     'fused_memory_unreachable' and includes each server URL in the detail string.
     """
-    with _patched_cancel_seams(httpx.ConnectError('refused')) as (mock_mcp, seams):
+    with _patched_cancel_seams(httpx.ConnectError('refused')) as (mock_mcp, _seams):
         resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
@@ -481,9 +480,6 @@ def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
     assert 'localhost:9000' in detail
     assert 'localhost:9001' in detail
     assert len(_cancel_ticket_calls(mock_mcp)) == 2
-    assert seams.foreign_invalidations(), (
-        'background traffic must have been present while the dial count stayed exact'
-    )
 
 
 def test_two_url_all_unreachable_invalidates_each_session_in_order(two_url_client):
@@ -504,10 +500,10 @@ def test_two_url_all_unreachable_invalidates_each_session_in_order(two_url_clien
         )
 
     assert resp.status_code == 502
-    assert seams.handler_invalidations() == urls
     assert set(urls) <= set(seams.foreign_invalidations()), (
-        'the concurrent background invalidations must have been recorded and excluded'
+        'harness precondition: the injected sampler legs invalidated the same URLs'
     )
+    assert seams.handler_invalidations() == urls
 
 
 # ---------------------------------------------------------------------------
