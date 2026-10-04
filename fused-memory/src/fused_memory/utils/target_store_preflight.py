@@ -145,11 +145,13 @@ Pure stdlib. No probe write, no mem0 import, no network, no backend import.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
 
 __all__ = [
     'TargetStoreMissing',
-    'assert_queue_dir_exists',
+    'assert_queue_dir_populated',
     'assert_target_store_exists',
     'assert_task_store_exists',
     'task_store_path',
@@ -175,6 +177,52 @@ class TargetStoreMissing(RuntimeError):
     that actually exists — an absolute ``--queue-dir``, or the main checkout as
     ``--project-root`` — or create the store deliberately first.
     """
+
+
+class _StoreState(Enum):
+    MISSING = 'missing'
+    EMPTY = 'empty'
+    POPULATED = 'populated'
+    UNDETERMINED = 'undetermined'
+
+
+def _refuse_unless_populated(
+    path: Path | str,
+    classify: Callable[[Path], _StoreState],
+    *,
+    operation: str,
+    what: str,
+    remedy: str,
+) -> None:
+    resolved = Path(path).expanduser().resolve()
+    state = classify(resolved)
+    if state in (_StoreState.POPULATED, _StoreState.UNDETERMINED):
+        return
+    if state is _StoreState.MISSING:
+        raise TargetStoreMissing(
+            f'Refusing to begin {operation!r}: {what} does not exist at '
+            f'{str(resolved)!r}. Proceeding would CREATE it empty and report a '
+            f'clean run — both the escalation queue and tasks.db auto-create '
+            f'silently, so a wrong target is indistinguishable from a quiet one. '
+            f'Remedy: {remedy}'
+        )
+    raise TargetStoreMissing(
+        f'Refusing to begin {operation!r}: {what} at {str(resolved)!r} exists '
+        f'but holds nothing. That is exactly what the store a run aimed at the '
+        f'wrong location auto-creates looks like, so a scan could only report '
+        f'a clean run it cannot vouch for; if it is leftover from such a run, '
+        f'remove it. Remedy: {remedy}'
+    )
+
+
+def _classify_queue_dir(queue_dir: Path) -> _StoreState:
+    if not queue_dir.exists():
+        return _StoreState.MISSING
+    try:
+        first = next(queue_dir.iterdir(), None)
+    except OSError:
+        return _StoreState.UNDETERMINED
+    return _StoreState.EMPTY if first is None else _StoreState.POPULATED
 
 
 def task_store_path(project_root: Path | str) -> Path:
@@ -298,16 +346,17 @@ def assert_task_store_exists(project_root: Path | str, *, operation: str) -> Non
     )
 
 
-def assert_queue_dir_exists(queue_dir: Path | str, *, operation: str) -> None:
-    """Refuse *operation* unless the escalation queue directory already exists.
+def assert_queue_dir_populated(queue_dir: Path | str, *, operation: str) -> None:
+    """Refuse *operation* unless the escalation queue directory holds an entry.
 
     The queue-side twin of :func:`assert_task_store_exists`, and the entry
-    point both escalation scripts call. See that docstring for why the
+    point the escalation scripts call. See that docstring for why the
     family-constant text and the absence of logging live here rather than at
     each call site.
     """
-    assert_target_store_exists(
-        Path(queue_dir),
+    _refuse_unless_populated(
+        queue_dir,
+        _classify_queue_dir,
         operation=operation,
         what=_QUEUE_DIR_WHAT,
         remedy=_QUEUE_DIR_REMEDY,
