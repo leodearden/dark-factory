@@ -279,9 +279,9 @@ async def mcp_tool_call(
     *cold* session performs three posts (``initialize``,
     ``notifications/initialized``, then ``tools/call``), so the worst case is
     roughly ``3 * timeout`` plus the server's own think time. Callers needing
-    a hard whole-operation bound must still wrap this in
-    ``asyncio.wait_for`` — every existing probe caller does, deliberately, and
-    the two layers are complementary rather than redundant.
+    a hard whole-operation bound must still wrap this in ``asyncio.wait_for``
+    at ``enclosing_deadline(timeout)``, never at *timeout* itself — the two
+    layers are complementary rather than redundant.
 
     **A session that hangs is self-evicting** (task 4958). When that enclosing
     ``wait_for`` fires — or the caller is cancelled for any other reason — the
@@ -307,6 +307,23 @@ async def mcp_tool_call(
     except (asyncio.CancelledError, TimeoutError):
         invalidate_session(base_url)
         raise
+
+
+_ENCLOSING_DEADLINE_HEADROOM_SECONDS = 1.0
+
+
+def enclosing_deadline(per_request_timeout: float) -> float:
+    """The ``asyncio.wait_for`` bound to pair with :func:`mcp_tool_call`'s *timeout*.
+
+    Strictly greater, because an equal bound is armed first and fires at the
+    same deadline, pre-empting the transport's own exception —
+    ``httpx.PoolTimeout`` above all. With the exchange shielded by ``_post``,
+    that exception is then absorbed unseen by ``_settle`` and the caller sees
+    only a bare ``TimeoutError``. A saturated pool fails the FIRST post's
+    acquisition, so one budget plus headroom is enough for that failure to
+    reach ``mcp_fanout.py::first_success`` and be named by ``describe_exc``.
+    """
+    return per_request_timeout + _ENCLOSING_DEADLINE_HEADROOM_SECONDS
 
 
 async def _first_success(
@@ -525,7 +542,7 @@ async def get_curator_state(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: the failover walks up to N URLs, each of which may
     perform a three-post cold-session handshake. ``api_curator`` wraps it in
-    ``asyncio.wait_for`` for the whole-operation bound.
+    ``asyncio.wait_for`` at ``enclosing_deadline(timeout)``.
     """
     return await _first_success(
         client, config, 'get_curator_state', {}, 'get_curator_state',
