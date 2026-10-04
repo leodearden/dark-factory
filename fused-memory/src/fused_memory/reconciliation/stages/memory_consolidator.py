@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -105,6 +105,7 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     strip_snapshot_lines,
 )
+from fused_memory.server.grouped_read import PARENT_ID_KEY
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
@@ -1991,6 +1992,14 @@ def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
     return '\n'.join(lines), total_stripped
 
 
+def _parent_link(meta: Mapping[str, Any]) -> str:
+    """Render a memory's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
+    parent_id = meta.get(PARENT_ID_KEY)
+    if not parent_id:
+        return ''
+    return f' {PARENT_ID_KEY}={parent_id} kind={meta.get("kind", "?")}'
+
+
 def _format_memories(memories: list[dict]) -> tuple[str, int]:
     if not memories:
         return 'No memories.', 0
@@ -2003,7 +2012,7 @@ def _format_memories(memories: list[dict]) -> tuple[str, int]:
         content = cleaned[:500]
         meta = m.get('metadata', {}) or {}
         cat = meta.get('category', '?')
-        lines.append(f'- [{m.get("id", "?")}] ({cat}): {content}')
+        lines.append(f'- [{m.get("id", "?")}]{_parent_link(meta)} ({cat}): {content}')
     return '\n'.join(lines), total_stripped
 
 
