@@ -2266,6 +2266,58 @@ class TestRunArchitectEval:
         ]
 
 
+@pytest.mark.asyncio
+class TestArchitectCellCarriesReplayFrame:
+    """The architect is briefed in the replay frame and the cell says so (4844)."""
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_architect_prompt_is_production_briefing_plus_replay_frame(self):
+        from orchestrator.evals.replay_frame import build_replay_frame_block
+
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        assert mocks['invoke'].call_args.kwargs['prompt'] == (
+            'ARCH PROMPT' + build_replay_frame_block(_arch_task()['pre_task_commit'])
+        )
+
+    async def test_cell_is_stamped_with_the_replay_frame(self):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['replay_frame'] == REPLAY_FRAME_ID
+
+    @pytest.mark.parametrize('unmeasurable_cell', [
+        pytest.param(
+            lambda: {'produced_plan': _well_formed_plan(),
+                     'invoke_side_effect': RuntimeError('boom')},
+            id='harness-error',
+        ),
+        pytest.param(
+            lambda: {'produced_plan': {}, 'arch_result': _cap_agent_result()},
+            id='cap-tainted',
+        ),
+    ])
+    async def test_stamp_survives_unmeasurable_cells(self, unmeasurable_cell):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), **unmeasurable_cell(),
+        )
+
+        assert result.metrics['replay_frame'] == REPLAY_FRAME_ID
+
+
 # ---------------------------------------------------------------------------
 # Architect cell records the plan judge's spend (step-5/6, eval-revival υ)
 #
