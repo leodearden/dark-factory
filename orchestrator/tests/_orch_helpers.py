@@ -945,9 +945,10 @@ MERGE_GATE_BARRIER_TIMEOUT = MERGE_RESULT_TIMEOUT // 3  # 15s
 # for this exact shape (task 2350's `wait_for(<event>.wait(), timeout=45.0)`
 # in test_merge_queue_concurrent_verify.py, and MERGE_RESULT_TIMEOUT above).
 # Never-narrow: only replaces literals <=15 in test_workflow_cancellation.py.
-# Any class using it MUST also carry @pytest.mark.timeout(180) — two of
-# these barriers exceed the 60s pyproject default, which pytest-timeout's
-# thread method answers by os._exit()ing the xdist worker.
+# Any class using it MUST also carry
+# @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT): two of these barriers sum
+# to 2 x 45s, and pytest-timeout's thread method answers a breach by
+# os._exit()ing the xdist worker.
 CANCEL_SCOPE_BARRIER_TIMEOUT = 45
 
 # task 3307 (reviewer follow-up): small ceiling for the two PURE in-memory
@@ -956,8 +957,8 @@ CANCEL_SCOPE_BARRIER_TIMEOUT = 45
 # artifact writes, no agent round-trip.  Pairing those with the much larger
 # CANCEL_SCOPE_BARRIER_TIMEOUT above bought no green-path benefit (they
 # resolve in microseconds) while making a genuine CancellationScope
-# regression there take 45s — or up to 180s under a paired
-# @pytest.mark.timeout — to report red instead of pytest's 60s default.
+# regression there take 45s — or up to VERIFY_CLI_PER_TEST_TIMEOUT under a
+# paired marker — to report red.
 # Kept above the retired 5.0s literal (never-narrow) for headroom against
 # scheduler jitter under host oversubscription, without borrowing the
 # I/O-sized budget above.  Do NOT use this for a test that drives a real

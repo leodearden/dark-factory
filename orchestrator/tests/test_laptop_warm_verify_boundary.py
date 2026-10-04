@@ -78,6 +78,7 @@ from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from click.testing import CliRunner
 from df_pytest_isolation import load_scaled_grace
 from escalation.queue import EscalationQueue
@@ -4243,7 +4244,7 @@ def test_parse_watchdog_gate_fire_delays_recovers_both_abutted_marker_records():
 FLOCK_WAIT_CEILING_SECS = 5.0
 
 
-@pytest.mark.timeout(180)  # task 3369: one subprocess again (the baseline probe is gone)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 3369: one subprocess again (the baseline probe is gone)
 def test_flock_wait_env_override_speeds_up_contention_result(tmp_path):
     """ORCH_MERGE_VERIFY_FLOCK_WAIT_SECS overrides the flock bounded wait.
 
@@ -4382,7 +4383,7 @@ WATCHDOG_HEARTBEAT_OVERRIDE_SECS = 0.5
 WATCHDOG_KILL_GRACE_OVERRIDE_SECS = 0.2
 
 
-@pytest.mark.timeout(180)  # task 4474: one subprocess, wedge-detector wait widened
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 4474: one subprocess, wedge-detector wait widened
 def test_watchdog_timeout_env_override_fires_fast_without_heartbeat(tmp_path):
     """ORCH_WATCHDOG_HEARTBEAT_TIMEOUT_SECS/_KILL_GRACE_SECS override the watchdog window.
 
