@@ -113,8 +113,12 @@ fi
 
 echo "pre-commit: linting (main branch)..."
 
-# All first-party packages (for ruff)
-ALL_PACKAGES=(shared escalation fused-memory orchestrator dashboard)
+# Every path the merge gate lints, in the order of the `ruff check` leg of
+# dark-factory-orchestrator.yaml::lint_command -- a wider set than
+# PYRIGHT_PACKAGES, since it also names non-member paths. That leg is the
+# source of truth: tests/scripts/test_hook_ruff_targets_drift.py fails when
+# this list and the leg disagree, so widen both together.
+RUFF_TARGETS=(shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills)
 # Every package the merge gate type-checks, in the order of
 # dark-factory-orchestrator.yaml::type_check_command (all carry [tool.pyright];
 # pyright runs per-package from its directory). That chain is the source of
@@ -127,13 +131,13 @@ PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard shared escalation sampler 
 # all PYRIGHT_PACKAGES instead of just its own. See task 2551.
 DEP_PACKAGES=(shared escalation)
 
-DIRS=()
-for pkg in "${ALL_PACKAGES[@]}"; do
-    [ -d "$ROOT/$pkg" ] && DIRS+=("$ROOT/$pkg")
+RUFF_PATHS=()
+for target in "${RUFF_TARGETS[@]}"; do
+    [ -e "$ROOT/$target" ] && RUFF_PATHS+=("$ROOT/$target")
 done
 
-# ruff check (runs from repo root, all packages at once)
-if ! uv run ruff check --quiet "${DIRS[@]}"; then
+# ruff check (runs from repo root, every target at once)
+if ! uv run ruff check --quiet "${RUFF_PATHS[@]}"; then
     echo "pre-commit: ruff check failed. Fix lint errors before committing to main."
     exit 1
 fi
