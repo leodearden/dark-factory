@@ -13,10 +13,12 @@ in the queue, is left exactly as it was.
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 from _pending_tool_fixtures import _file
 
 from escalation.models import Amendment, Escalation
@@ -25,8 +27,10 @@ from escalation.queue import (
     _MAX_AMENDMENT_LINE_CHARS,
     _MAX_AMENDMENT_OPTIONS,
     _MAX_AMENDMENTS,
+    AmendResult,
     EscalationQueue,
 )
+from escalation.server import create_server
 
 # The only keys an amend may change on the record it amends.
 _AMEND_WRITES = frozenset({'amendments', 'updated_at', 'amendments_chars_elided'})
@@ -290,3 +294,143 @@ class TestQueueAmend:
         assert len(entry['options']) == _MAX_AMENDMENT_OPTIONS
         assert stored.amendments_chars_elided > 3 * over
         assert _others(_json_files(queue), l2.id) == others_before
+
+
+async def _amend(server, **kw: Any) -> dict[str, Any]:
+    """``amend_escalation`` is an ASYNC tool: it awaits the storm reporter."""
+    tool = await server.get_tool('amend_escalation')
+    return await tool.fn(**kw)
+
+
+async def _sync_tool(server, name: str, **kw: Any) -> dict[str, Any]:
+    tool = await server.get_tool(name)
+    return tool.fn(**kw)
+
+
+class _AmendThreadProbeQueue(EscalationQueue):
+    """A REAL queue recording which thread ``amend`` ran on, then delegating.
+
+    The ``test_write_path_scans_off_loop.py::_ThreadProbeQueue`` shape: not a
+    mock, so the probed call still does the real flock, read and rewrite.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.amend_threads: list[int] = []
+
+    def amend(self, escalation_id: str, **kw: Any) -> AmendResult:
+        self.amend_threads.append(threading.get_ident())
+        return super().amend(escalation_id, **kw)
+
+
+@pytest.mark.asyncio
+class TestAmendEscalationTool:
+    async def test_amend_is_visible_and_changes_no_state_field(self, tmp_path):
+        """PRD alpha acceptance: the ruling lands on the record, nothing else moves."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = _framed_l2(queue)
+        server = create_server(queue, startup_sweep=False)
+        triaged = await _sync_tool(
+            server, 'stamp_triage', escalation_id=l2.id, triage_note='probe',
+        )
+        assert 'error' not in triaged
+        before = await _sync_tool(server, 'get_escalation', escalation_id=l2.id)
+
+        response = await _amend(
+            server, escalation_id=l2.id,
+            summary='ruled: proceed', detail='ruling evidence',
+            options=['A: proceed'], root_cause='ruled elsewhere',
+            agent_role='interactive',
+        )
+
+        assert response['amendment_recorded'] is True
+        assert 'no_op_reason' not in response
+        after = await _sync_tool(server, 'get_escalation', escalation_id=l2.id)
+        assert {k: v for k, v in response.items() if k != 'amendment_recorded'} == after, (
+            'the success response is the full amended record'
+        )
+        [entry] = after['amendments']
+        assert entry['summary'] == 'ruled: proceed'
+        assert entry['detail'] == 'ruling evidence'
+        assert entry['agent_role'] == 'interactive'
+        assert datetime.fromisoformat(entry['timestamp'])
+        assert (
+            datetime.fromisoformat(after['updated_at'])
+            > datetime.fromisoformat(after['triaged_at'])
+        )
+        for key in ('status', 'severity', 'level', 'members'):
+            assert after[key] == before[key], f'amend_escalation must not move {key!r}'
+
+    async def test_unknown_id_is_not_found(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue, startup_sweep=False)
+
+        response = await _amend(
+            server, escalation_id='esc-nope-1', summary='x', agent_role='interactive',
+        )
+
+        assert response['code'] == 'not_found'
+        assert response['error']
+
+    async def test_archived_record_is_not_pending_and_untouched(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = _framed_l2(queue, members=[])
+        assert queue.resolve(l2.id, 'decided') is not None
+        server = create_server(queue, startup_sweep=False)
+        snapshot = _json_files(queue)
+
+        response = await _amend(
+            server, escalation_id=l2.id, summary='too late', agent_role='interactive',
+        )
+
+        assert response['code'] == 'not_pending'
+        assert response['status'] == 'resolved'
+        assert response['error']
+        assert _json_files(queue) == snapshot, 'the archived file is byte-identical'
+        assert not _record_path(queue, l2.id).exists(), 'nothing re-created in the root'
+
+    async def test_empty_amendment_is_refused(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = _framed_l2(queue)
+        server = create_server(queue, startup_sweep=False)
+        snapshot = _json_files(queue)
+
+        response = await _amend(
+            server, escalation_id=l2.id, summary='', detail='', options=[],
+            root_cause='', agent_role='interactive',
+        )
+
+        assert response['code'] == 'empty_amendment'
+        assert response['error']
+        assert _json_files(queue) == snapshot
+
+    async def test_repeat_framing_is_a_success_that_records_nothing(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = _framed_l2(queue)
+        server = create_server(queue, startup_sweep=False)
+        ruling = {'escalation_id': l2.id, 'summary': 'ruled', 'agent_role': 'interactive'}
+        first = await _amend(server, **ruling)
+        assert first['amendment_recorded'] is True
+
+        response = await _amend(server, **ruling)
+
+        assert 'error' not in response
+        assert response['amendment_recorded'] is False
+        assert response['no_op_reason'] == 'repeat_framing'
+        assert response['updated_at'] == first['updated_at']
+        assert len(response['amendments']) == 1
+
+    async def test_queue_write_runs_off_the_event_loop(self, tmp_path):
+        queue = _AmendThreadProbeQueue(tmp_path / 'esc')
+        l2 = _framed_l2(queue)
+        server = create_server(queue, startup_sweep=False)
+
+        response = await _amend(
+            server, escalation_id=l2.id, summary='ruled', agent_role='interactive',
+        )
+
+        assert response['amendment_recorded'] is True
+        assert queue.amend_threads, 'the amend probe recorded no call at all'
+        assert threading.get_ident() not in queue.amend_threads, (
+            'queue.amend ran ON the event-loop thread'
+        )
