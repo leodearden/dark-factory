@@ -1753,6 +1753,84 @@
           "current": 56694
         }
       ]
+    },
+    {
+      "task_id": "4582",
+      "reason": "Net-additive defect fix: requeue/drop from inside _run_inflight_verify now vacates its InflightEntry (lease handed back at the requeue, corpse hidden from snapshot()/frozen prefix), the corpse's late finalize no longer bounces a re-dispatched incarnation, and snapshot() dedups entries by request_id. The test private_reads rise is the new lifecycle-registry scene, which drives the verify exit through the worker's own dispatch seams (_register_item, _inflight_append, _run_inflight_verify, _finalize_inflight) while asserting through snapshot()/frozen_prefix().",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2140,
+          "current": 2150
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_finalize_inflight",
+          "baseline": 98,
+          "current": 99
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::snapshot",
+          "baseline": 58,
+          "current": 59
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1699,
+          "current": 1709
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21686,
+          "current": 21797
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_lifecycle_registry.py",
+          "baseline": 158,
+          "current": 179
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 910,
+          "current": 916
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12397,
+          "current": 12459
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4772,
+          "current": 4782
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56828,
+          "current": 56949
+        },
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6632,
+          "current": 6653
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31773,
+          "current": 31841
+        }
+      ]
     }
   ]
 }

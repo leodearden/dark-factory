@@ -3352,24 +3352,17 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
             f'the followers left their submission order: {queued!r}'
         )
 
-        # The head trailing them TWICE is the FIXTURE, not the code, so it is
+        # The head trailing them is the FIXTURE, not the code, so it is
         # asserted on its own rather than folded into the expected list above:
         # each red round requeues its dispatching request onto the outer queue,
         # and `_pair` re-dispatches the same object on round 2 by design (its
         # docstring says why) instead of consuming round 1's requeue, so the
-        # one request is queued twice over.  Split, a `_pair` cleanup that
-        # consumed the requeue reddens only this claim, and a genuine leak
-        # producing a THIRD requeue is distinguishable from the fixture's own
-        # noise instead of reading as the same failure as a reorder.
+        # one request is queued twice over.  snapshot() renders each
+        # request_id once (task 4582), so it trails exactly once.
         tail = queued[len(followers):]
-        assert tail.count('101') == 2, (
-            f'the dispatching head must trail the followers exactly twice — '
-            f'once per red round, `_pair` re-dispatching the same object; '
-            f'got {tail!r}'
-        )
-        assert set(tail) == {'101'}, (
-            f'nothing but the requeued head may sit behind the followers; '
-            f'got {tail!r}'
+        assert tail == ['101'], (
+            f'only the requeued head may sit behind the followers, rendered '
+            f'once; got {tail!r}'
         )
         assert queued_in_lane(worker, 'high') == [], (
             f'nothing was ever enqueued high; got '
