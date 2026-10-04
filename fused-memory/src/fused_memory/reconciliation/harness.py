@@ -56,10 +56,10 @@ from fused_memory.reconciliation.escalation_archive import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
-    FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
     is_routable_task_id,
     resolve_finding_task_target,
+    routed_record_covers_finding,
 )
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
@@ -2962,9 +2962,10 @@ class ReconciliationHarness:
         - the project is not registered in ``_known_projects``;
         - no orchestrator is live for that root, so nothing would drain the
           record;
-        - a pending record of this same CATEGORY is already on the task, at
-          ANY level -- level-blind so the fold survives the orphan reaper
-          promoting an earlier record from L0 to L1.
+        - a pending record already covers this finding: a level-0 record with
+          the same finding fingerprint, or a routed record a human already
+          holds at a higher level
+          (:func:`~fused_memory.reconciliation.finding_task_escalation.routed_record_covers_finding`).
 
         LEVEL 0, deliberately: `EscalationQueue.has_open_l1` is level-1-only
         and is what a spread of orchestrator guards read as "a human is already
@@ -3047,57 +3048,18 @@ class ReconciliationHarness:
                 Path(project_root) / _ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME
             )
             fingerprint = _recon_finding_fingerprint('recon_integrity_issue', finding)
-            # Cross-cycle dedupe.  The `_sweep_escalate_l1` template omits this
-            # and can refile on every sweep — fine for a one-shot cancellation
-            # event, wrong for a filer that re-evaluates each reconciliation
-            # cycle.
-            #
-            # NOT `has_open_l1`: that helper is LEVEL-1-ONLY, and these records
-            # are written at level 0 precisely so they stay off the
-            # orchestrator's L1 guard surface, so it would see nothing and the
-            # filer would refile every cycle.  This is the pending-scan idiom
-            # transcribed from
-            # `orchestrator/harness.py::_file_warm_base_hard_down_notice`.
-            #
-            # The scan filters on `category` ONLY, and is deliberately
-            # LEVEL-BLIND even though the write side is pinned to
-            # FINDING_TASK_ESCALATION_LEVEL.  The asymmetry is load-bearing in
-            # both directions:
-            #
-            #   - `category` is the task-2757 property: it lets a NEW root cause
-            #     escape being silently suppressed by an UNRELATED open record.
-            #     Without it a lingering starvation INFO on the task would
-            #     swallow every recon finding for it forever, and an
-            #     uncategorized `has_open_l1`-style read would do the same via
-            #     the level axis.
-            #   - Level-blindness makes the fold survive PROMOTION.
-            #     `orchestrator/harness.py::_reap_orphan_l0_escalations`
-            #     promotes an aged pending L0 to L1 with no category filter, and
-            #     this filer fires only when NO workflow is live for the task —
-            #     the very condition that makes a record an orphan candidate. So
-            #     a record filed here is born eligible for promotion. A
-            #     `level == 0` scan stopped matching the moment that happened,
-            #     the next cycle filed a fresh L0, and the reaper dismissed it as
-            #     a duplicate of the open L1 — one born-and-dismissed record per
-            #     reconciliation cycle, forever, while the finding persists.
-            #     Matching at ANY level folds onto the promoted record instead,
-            #     which is the right answer: the L1 IS this finding, escalated.
-            #
-            # `FINDING_TASK_ESCALATION_CATEGORY` is IMPORTED, never re-spelled,
-            # so the scan and the builder cannot drift on the one axis they
-            # BOTH read.  The level is set by the builder alone
-            # (`FINDING_TASK_ESCALATION_LEVEL`, public and exported for exactly
-            # that contract) and deliberately not imported here — this scan does
-            # not read it, and an import that only appeared in a comment would
-            # imply a coupling that no longer exists.
-            #
-            # `status='pending'` skips the archive by construction, so a finding
-            # that recurs after a human adjudicated the last record reaches the
-            # ladder again.
-            if [
-                e for e in queue.get_by_task(task_id, status='pending')
-                if e.category == FINDING_TASK_ESCALATION_CATEGORY
-            ]:
+            # Cross-cycle dedupe: the fold policy is
+            # `finding_task_escalation.py::routed_record_covers_finding`. The
+            # scan reads PENDING records only, so a finding re-files once its
+            # record is adjudicated.
+            covering = next(
+                (
+                    e for e in queue.get_by_task(task_id, status='pending')
+                    if routed_record_covers_finding(e, fingerprint)
+                ),
+                None,
+            )
+            if covering is not None:
                 logger.info(
                     'reconciliation.finding_task_escalation_deduped',
                     extra={
@@ -3105,6 +3067,8 @@ class ReconciliationHarness:
                         'run_id': run_id,
                         'task_id': task_id,
                         'finding_category': finding.get('category', ''),
+                        'covering_escalation_id': covering.id,
+                        'covering_level': covering.level,
                     },
                 )
                 return None
@@ -6270,23 +6234,10 @@ class ReconciliationHarness:
                                     },
                                 )
                             else:
-                                # VOLUME PARITY: at most one orchestrator-queue
-                                # record per finding that already files one recon
-                                # escalation today, folded across later cycles by
-                                # the filer's own pending scan on
-                                # FINDING_TASK_ESCALATION_CATEGORY.
-                                #
-                                # That scan is deliberately level-BLIND (see the
-                                # dedupe comment in
-                                # `_file_finding_task_escalation`) so the fold
-                                # survives `orchestrator/harness.py::
-                                # _reap_orphan_l0_escalations` promoting the
-                                # record from L0 to L1.  Without that, promotion
-                                # broke the fold and the next cycle filed a fresh
-                                # L0 that the reaper then dismissed as a
-                                # duplicate — one born-and-dismissed record per
-                                # reconciliation cycle, forever, on a task
-                                # already represented by an open L1.
+                                # VOLUME PARITY: at most one open routed record
+                                # per DISTINCT persistent finding per task, and
+                                # none filed behind an open routed L1 — see
+                                # `finding_task_escalation.py::routed_record_covers_finding`.
                                 self._file_finding_task_escalation(
                                     project_id, run_id, finding, persistence,
                                     task_id=routed_task_id,
