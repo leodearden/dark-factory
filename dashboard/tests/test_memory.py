@@ -496,6 +496,19 @@ class TestMcpToolCallTimeoutBudget:
         )
 
 
+def test_enclosing_deadline_strictly_exceeds_the_per_request_budget():
+    """An enclosing wait_for must outlast the per-request budget it wraps.
+
+    The headroom must dwarf event-loop scheduling jitter, not merely be
+    positive, or the outer timer can still win the race.
+    """
+    from dashboard.data.memory import enclosing_deadline
+
+    for per_request in (0.05, 2.0, 5.0):
+        assert enclosing_deadline(per_request) > per_request
+    assert enclosing_deadline(5.0) - 5.0 >= 0.5
+
+
 class TestAggregateTimeoutBudget:
     """The two multi-URL aggregates must thread a budget to every post.
 
