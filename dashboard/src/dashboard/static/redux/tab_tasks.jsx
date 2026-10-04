@@ -45,14 +45,12 @@ function tasksPersistedState(key, def) {
 function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhood }) {
   const [paths, setPaths] = uS_T([]);
 
-  // Stable signature: edges flicker because the parent's `tasks` is a new array
-  // every render (each data poll and each interaction). Only re-run when the
-  // *content* changes — task ids, statuses, dep edges, selection.
-  // neighborhood is derived from selectedId+tasks so it is already covered.
-  const signature = uM_T(() => {
-    const parts = tasks.map(t => `${t.id}:${t.status}:${(t.deps||[]).map(d=>d.id+(d.done?'1':'0')).join(',')}`);
-    return parts.join('|') + '|sel=' + (selectedId || '');
-  }, [tasks, selectedId]);
+  // Edges flicker if redrawn on the `tasks` reference, a new array every render
+  // (each data poll and each interaction), so the effect below is keyed on
+  // content: the layout's key, each dep's done bit (it picks the stroke), and
+  // the selection. neighborhood derives from selectedId+tasks, so it is covered.
+  const layoutKey = layoutSignature(tasks);
+  const doneKey = JSON.stringify(tasks.map(t => (t.deps || []).map(d => !!d.done)));
 
   // Capture latest tasks/selection in a ref so recompute() always reads fresh
   // values without us having to put them in the effect deps array.
@@ -133,7 +131,7 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
       ro.disconnect();
       window.removeEventListener('resize', recompute);
     };
-  }, [signature]);
+  }, [layoutKey, doneKey, selectedId]);
 
   return (
     <svg className="edges">
@@ -285,8 +283,8 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selecte
   // something it actually reads changes. `graphTasks`/`allProjectTasks` are
   // fresh array instances on every TasksTab render — each data poll and each
   // interaction — which would defeat a plain reference-keyed useMemo on every
-  // one (same reasoning as TaskGraphEdges' `signature` and TaskGraph's
-  // `layoutKey` above). Unlike those, this signature must cover every field
+  // one (same reasoning as the `layoutKey` of TaskGraphEdges and TaskGraph
+  // above). Unlike those, this signature must cover every field
   // TaskGraph/renderNode displays for a grouped task (not just id/status/
   // deps), since a stale cache here would freeze those fields' displayed
   // values across polls — keep it in sync with renderNode if it starts

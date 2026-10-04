@@ -4,8 +4,8 @@ TaskGraph's callers hand it a fresh ``tasks`` array on every render, so memos
 keyed on that reference recomputed the whole Sugiyama layout every time. The
 pure functions it now relies on (``layoutSignature``, ``taskGraphLayout``) are
 covered executably by dashboard/tests/js/graph_layout.test.mjs. This module
-asserts only that TaskGraph wires them: no JSX render harness exists, so the
-wiring is reachable only as source structure.
+asserts only that TaskGraph and its edge overlay, TaskGraphEdges, wire them: no
+JSX render harness exists, so the wiring is reachable only as source structure.
 """
 
 from __future__ import annotations
@@ -30,23 +30,35 @@ def task_graph_code(tab_tasks_jsx_body):
 
 
 @pytest.fixture(scope='module')
+def task_graph_edges_code(tab_tasks_jsx_body):
+    """TaskGraphEdges' body with comments blanked."""
+    return strip_js_comments(extract_function_body(tab_tasks_jsx_body, 'TaskGraphEdges'))
+
+
+@pytest.fixture(scope='module')
 def layout_key(task_graph_code):
     """The name TaskGraph binds ``layoutSignature(tasks)`` to."""
-    match = re.search(r'const\s+(\w+)\s*=\s*layoutSignature\(\s*tasks\s*\)', task_graph_code)
+    return _layout_key(task_graph_code, 'TaskGraph')
+
+
+def _layout_key(code: str, component: str) -> str:
+    """The name *component* binds ``layoutSignature(tasks)`` to."""
+    match = re.search(r'const\s+(\w+)\s*=\s*layoutSignature\(\s*tasks\s*\)', code)
     assert match is not None, (
-        'TaskGraph does not assign `const <key> = layoutSignature(tasks)` — '
-        'without a content key its memos can only be keyed on the `tasks` '
-        'reference, which is new on every render.'
+        f'{component} does not assign `const <key> = layoutSignature(tasks)` — '
+        'without that content key its hooks can only be keyed on the `tasks` '
+        'reference, which is new on every render, or on a second hand-rolled '
+        'encoding of the same id/status/deps content.'
     )
     return match.group(1)
 
 
-def _memo_calls(code: str) -> list[str]:
-    """Every full ``uM_T(...)`` call in *code*, parens balanced."""
+def _hook_calls(code: str, hook: str) -> list[str]:
+    """Every full ``<hook>(...)`` call in *code*, parens balanced."""
     calls = []
-    for match in re.finditer(r'\buM_T\(', code):
+    for match in re.finditer(rf'\b{hook}\(', code):
         call = walk_balanced(code, match.end() - 1, '(', ')')
-        assert call, f'Unbalanced uM_T( call at offset {match.start()} in TaskGraph.'
+        assert call, f'Unbalanced {hook}( call at offset {match.start()}.'
         calls.append(call)
     return calls
 
@@ -110,7 +122,7 @@ class TestTaskGraphLayoutMemo:
         )
 
     def test_no_memo_is_keyed_on_the_tasks_reference(self, task_graph_code):
-        calls = _memo_calls(task_graph_code)
+        calls = _hook_calls(task_graph_code, 'uM_T')
         assert calls, 'TaskGraph contains no uM_T( call — this test would pass vacuously.'
         keyed_on_tasks = [call for call in calls if re.search(r'\btasks\b', _dep_array(call))]
         assert not keyed_on_tasks, (
@@ -137,4 +149,30 @@ class TestTaskGraphLayoutMemo:
         assert re.search(r'renderNode\(\s*\w+\.get\(', task_graph_code), (
             'TaskGraph never calls renderNode on a by-id lookup — the layout ids '
             'must be resolved against the current `tasks` to render.'
+        )
+
+
+class TestTaskGraphEdgesKey:
+    def test_edge_effect_is_keyed_on_the_layout_signature_and_selection(
+        self, task_graph_edges_code
+    ):
+        key = _layout_key(task_graph_edges_code, 'TaskGraphEdges')
+        effects = _hook_calls(task_graph_edges_code, 'uLE_T')
+        assert len(effects) == 1, f'TaskGraphEdges should hold one uLE_T( effect, found {len(effects)}.'
+        deps = _dep_names(effects[0])
+        missing = {key, 'selectedId'} - deps
+        assert not missing, (
+            f'The edge effect depends on {sorted(deps)} but not {sorted(missing)} — '
+            'edges must redraw when the layout content or the selection changes.'
+        )
+
+    def test_no_edge_hook_is_keyed_on_the_tasks_reference(self, task_graph_edges_code):
+        calls = _hook_calls(task_graph_edges_code, 'uM_T') + _hook_calls(
+            task_graph_edges_code, 'uLE_T'
+        )
+        assert calls, 'TaskGraphEdges contains no uM_T(/uLE_T( call — this test would pass vacuously.'
+        keyed_on_tasks = [call for call in calls if re.search(r'\btasks\b', _dep_array(call))]
+        assert not keyed_on_tasks, (
+            'TaskGraphEdges keys a hook on the `tasks` reference, which callers '
+            f'rebuild on every render, so it reruns every time: {keyed_on_tasks}'
         )
