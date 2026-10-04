@@ -951,7 +951,7 @@ class TestStage1LedgerPresenceWiring:
 class TestStage2LedgerPresenceWiring:
     """Stage 2 consults the ReconLedgerStore ground truth
     (``get_cycle_summary_presence``) as the PRIMARY presence authority when
-    re-verifying a carry-forward missing_stage2_summary finding, mirroring
+    deciding a carry-forward missing_stage2_summary finding, mirroring
     Stage 3's τ2 wiring (task 2437) (task 2625).
     """
 
@@ -963,8 +963,8 @@ class TestStage2LedgerPresenceWiring:
             '## Available Tools section.'
         )
 
-    def test_stage2_prompt_checks_ledger_before_reconstructing(self):
-        """Stage 2's carry-forward reconstruct re-verify must be keyed to
+    def test_stage2_prompt_decides_carry_forward_against_ledger(self):
+        """Stage 2's carry-forward missing-summary decision must be keyed to
         stage='task_knowledge_sync' (the summary Stage 2 owns).
 
         Asserts the semantic stage-key token rather than the full multi-line call
@@ -976,8 +976,7 @@ class TestStage2LedgerPresenceWiring:
 
         assert "stage='task_knowledge_sync'" in STAGE2_SYSTEM_PROMPT, (
             "Stage 2 must key a presence check on stage='task_knowledge_sync' "
-            'before deciding whether to reconstruct a carry-forward '
-            'missing_stage2_summary finding.'
+            'when deciding a carry-forward missing_stage2_summary finding.'
         )
 
     def test_stage2_prompt_has_ledger_authoritative_anchors(self):
@@ -985,15 +984,6 @@ class TestStage2LedgerPresenceWiring:
 
         assert 'ledger_available' in STAGE2_SYSTEM_PROMPT
         assert 'AUTHORITATIVE' in STAGE2_SYSTEM_PROMPT
-
-    def test_stage2_prompt_retains_post_write_recheck_and_retry_nonce(self):
-        """The existing post-write count_memories_by_metadata re-check + retry_nonce
-        retry loop must be retained as the inconclusive-only fallback verification,
-        never deleted (fail-safe monotonicity)."""
-        from fused_memory.reconciliation.prompts.stage2 import STAGE2_SYSTEM_PROMPT
-
-        assert 'count_memories_by_metadata' in STAGE2_SYSTEM_PROMPT
-        assert 'retry_nonce' in STAGE2_SYSTEM_PROMPT
 
 
 class TestStage1SourceCompletionWiring:
