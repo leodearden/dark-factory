@@ -14195,6 +14195,7 @@ class TestRunDelegatesToSharedGitAsync:
         spawned: list[str] = []
 
         class _Blocking:
+            pid = -1
             returncode = 0
 
             def __init__(self, tag: str) -> None:

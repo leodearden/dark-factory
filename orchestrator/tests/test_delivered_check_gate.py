@@ -18,12 +18,17 @@ decisions for the point-by-point mirror rationale.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
+import signal
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _recording_event_store import _RecordingEventStore
+from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid
 from pydantic import ValidationError
 from shared.delivered_check_polarity import (
     CheckOutcome,
@@ -31,6 +36,7 @@ from shared.delivered_check_polarity import (
     build_path_argv,
     interpret_grep_rc,
 )
+from shared.proc_group import read_stat_fields
 
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
@@ -393,6 +399,53 @@ class TestRunnerScriptKind:
 
         assert called, 'the injected runner must actually be invoked'
         assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_the_scripts_helpers_too(self, tmp_path, monkeypatch):
+        """A real script run through the DEFAULT runner (task 4155): on timeout,
+        a helper the script backgrounded dies with it.
+
+        The helper is judged while the check is still in flight and only then
+        awaited: a surviving helper holds the script's pipes open, so awaiting
+        first would hang rather than fail.
+        """
+        leaker = tmp_path / 'leaker.sh'
+        leaker.write_text('#!/bin/sh\n' + PIPE_CLOSING_LEAKER_SRC)
+        leaker.chmod(0o755)
+        pidfile = tmp_path / 'leaked.pid'
+        monkeypatch.setenv('LEAK_PIDFILE', str(pidfile))
+        check = {'name': 'cap', 'kind': 'script', 'script': 'leaker.sh', 'timeout_secs': 1}
+
+        task = asyncio.ensure_future(run_delivered_check(check, project_root=tmp_path))
+        leaked_pid = None
+        try:
+            leaked_pid = await asyncio.to_thread(read_leaked_pid, pidfile)
+
+            assert await _wait_pid_exited(leaked_pid, timeout=check['timeout_secs'] + 5.0), (
+                f'pid {leaked_pid}, a helper the script backgrounded, survived its timeout'
+            )
+            assert await task is DeliveredCheckResult.ERRORED
+        finally:
+            task.cancel()
+            if leaked_pid is not None:
+                with contextlib.suppress(OSError):
+                    os.kill(leaked_pid, signal.SIGKILL)
+
+
+async def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
+    """Poll until *pid* is gone or a zombie; False if still running at *timeout*.
+
+    A zombie counts as exited: an orphaned grandchild of a killed group awaits
+    systemd --user's reap, which is not the runner's to perform (task 6029).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        fields = read_stat_fields(Path('/proc') / str(pid))
+        if fields is None or fields.state in ('Z', 'X'):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
