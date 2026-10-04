@@ -2845,6 +2845,15 @@ class ReconciliationHarness:
             self._escalation_task = None
             logger.info('Reconciliation escalation server stopped')
 
+    async def _shutdown_usage_gate(self) -> None:
+        """Tear down the usage gate built in ``__init__``, best-effort."""
+        if self.usage_gate is None:
+            return
+        try:
+            await self.usage_gate.shutdown()
+        except Exception as e:
+            logger.warning(f'usage_gate.shutdown() at harness shutdown failed: {e}')
+
     def _escalate(
         self,
         category: str,
@@ -3282,6 +3291,8 @@ class ReconciliationHarness:
             # is silently dropped by the shutdown.
             await self._drain_judge_tasks()
             await self._stop_escalation_server()
+            # Last: the project loops and the judge invoke through this gate.
+            await self._shutdown_usage_gate()
 
     def auto_resume_pending(self, project_id: str) -> bool:
         """True iff a currently-halted ``project_id`` will auto-resume on the
