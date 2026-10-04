@@ -119,8 +119,9 @@ _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
 # ``.json`` record, so it would otherwise look permanently orphaned).
 SEQ_COUNTER_SUFFIX = '.seq'
 
-# Hard cap on the NUMBER of Escalation.amendments entries (see add_members_to_l2,
-# the SOLE writer and sole trimmer).  Worst case is repeated folds of one cluster
+# Hard cap on the NUMBER of Escalation.amendments entries (see
+# _append_amendment_capped, the single home of the append-and-trim policy for
+# every writer of that list).  Worst case is repeated folds of one cluster
 # inside a single AFK window, and amendments are deliberately NOT in the server's
 # compact projection, so they never inflate a watcher's drain no matter how deep
 # the list gets.  Past the cap the OLDEST are shed — the ORIGINAL framing is never
@@ -550,6 +551,68 @@ def _is_repeat_framing(esc: Escalation, candidate: Amendment) -> bool:
             options=esc.options, agent_role='', timestamp='',
         )
     return _framing_view(baseline) == _framing_view(candidate)
+
+
+def _append_amendment_capped(
+    esc: Escalation, *, root_cause: str, summary: str, evidence: str,
+    options: list[str] | None, agent_role: str, caller: str,
+) -> tuple[bool, int]:
+    """Append one framing :class:`~escalation.models.Amendment` to *esc*, capped.
+
+    THE single home of the ``amendments`` append-and-trim policy, whichever
+    queue method carries the framing in: build the entry through
+    :func:`_build_amendment` (per-field elision), suppress it when
+    :func:`_is_repeat_framing`, count elided characters in
+    ``amendments_chars_elided``, and shed the OLDEST entries past
+    ``_MAX_AMENDMENTS`` into ``amendments_truncated``.  Every loss is a durable
+    structured fact on the record and a WARNING, never log-only.
+
+    No framing at all — all four arguments falsy — records nothing: an empty
+    amendment carries no information and would still burn a cap slot.
+
+    Mutates *esc* in memory only.  The caller holds ``escalation_id_lock``, owns
+    the single ``_rewrite``, and decides whether to bump ``updated_at``, so the
+    append stays atomic with whatever else that caller writes.  The timestamp is
+    stamped HERE, so the write chokepoint owns the clock and no caller can
+    backdate an entry.  *caller* only prefixes the WARNING lines.
+
+    Returns ``(recorded, dropped)``: whether an entry was appended, and how many
+    oldest entries the cap shed.
+    """
+    if not (root_cause or evidence or options or summary):
+        return False, 0
+    candidate, chars_elided = _build_amendment(
+        root_cause=root_cause, summary=summary, evidence=evidence,
+        options=options, agent_role=agent_role,
+        timestamp=datetime.now(UTC).isoformat(),
+    )
+    # Built BEFORE the repeat check, and the check reads the built entry: the
+    # stored form is what a later amendment will be compared against, so
+    # comparing anything else would let two entries the record cannot tell
+    # apart both be recorded.
+    if _is_repeat_framing(esc, candidate):
+        return False, 0
+    esc.amendments.append(candidate)
+    if chars_elided:
+        esc.amendments_chars_elided += chars_elided
+        logger.warning(
+            '%s: %s elided %d char(s) of incoming framing at the per-field '
+            "amendment caps (running total elided=%d); the record's own "
+            'framing is unaffected',
+            caller, esc.id, chars_elided, esc.amendments_chars_elided,
+        )
+    dropped = 0
+    if len(esc.amendments) > _MAX_AMENDMENTS:
+        dropped = len(esc.amendments) - _MAX_AMENDMENTS
+        del esc.amendments[:dropped]
+        esc.amendments_truncated += dropped
+        logger.warning(
+            '%s: %s shed %d oldest amendment(s) at the _MAX_AMENDMENTS=%d cap '
+            "(running total truncated=%d); the record's own original framing "
+            'is unaffected',
+            caller, esc.id, dropped, _MAX_AMENDMENTS, esc.amendments_truncated,
+        )
+    return True, dropped
 
 
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
@@ -2043,10 +2106,11 @@ class EscalationQueue:
         text.  Characters dropped are added to ``amendments_chars_elided``,
         the byte-side counterpart of ``amendments_truncated``.
 
-        **The list is capped at** :data:`_MAX_AMENDMENTS`.  THIS METHOD is the
-        trimmer, at write time, in the same critical section and the same single
-        ``_rewrite`` as the append — so cap enforcement is atomic with it and no
-        over-cap list is ever durable.  It sheds the OLDEST entries, which is
+        **The list is capped at** :data:`_MAX_AMENDMENTS`.  The trim happens at
+        write time (:func:`_append_amendment_capped`), in the same critical
+        section and the same single ``_rewrite`` as the append — so cap
+        enforcement is atomic with it and no over-cap list is ever durable.  It
+        sheds the OLDEST entries, which is
         safe because the ORIGINAL framing is never in this list at all: it lives
         permanently in the record's own immutable ``root_cause``/``detail``/
         ``options``/``summary``.  The oldest amendment is therefore the
@@ -2131,13 +2195,6 @@ class EscalationQueue:
             )
             severity_changed = new_severity != esc.severity
 
-            # Preserve the incoming framing rather than discarding it.  Built
-            # inside the SAME escalation_id_lock critical section as the member
-            # append, so it lands in the same single _rewrite below — no second
-            # write path, no new durability story.
-            amendment_recorded = False
-            dropped_entries = 0
-
             # Track the DISTINCT pre-canonical root_cause spellings this cluster
             # has been addressed by (task 3998).  Canonicalising the match makes
             # more promotes fold BY DESIGN, so the failure it introduces is
@@ -2187,48 +2244,14 @@ class EscalationQueue:
                             + esc.root_cause_variants_truncated,
                         )
 
-            if incoming_framing:
-                candidate, chars_elided = _build_amendment(
-                    root_cause=root_cause, summary=summary, evidence=evidence,
-                    options=options, agent_role=agent_role,
-                    timestamp=datetime.now(UTC).isoformat(),
-                )
-                # Built BEFORE the repeat check, and the check reads the built
-                # entry: the stored form is what a later fold will be compared
-                # against, so comparing anything else would let two entries the
-                # record cannot tell apart both be recorded.
-                if not _is_repeat_framing(esc, candidate):
-                    esc.amendments.append(candidate)
-                    amendment_recorded = True
-                    # Count what the per-field caps dropped on the record, for
-                    # the same reason shed ENTRIES are counted below: a reader
-                    # must be able to tell a whole framing from the head of one
-                    # without scraping logs (INV-8).
-                    if chars_elided:
-                        esc.amendments_chars_elided += chars_elided
-                        logger.warning(
-                            'add_members_to_l2: %s elided %d char(s) of incoming '
-                            'framing at the per-field amendment caps (running '
-                            "total elided=%d); the record's own framing is "
-                            'unaffected',
-                            escalation_id, chars_elided,
-                            esc.amendments_chars_elided,
-                        )
-                    # Enforce the cap in the SAME critical section, so the trim
-                    # lands in the same single _rewrite as the append and there
-                    # is no durable window in which an over-cap list exists.
-                    if len(esc.amendments) > _MAX_AMENDMENTS:
-                        dropped_entries = len(esc.amendments) - _MAX_AMENDMENTS
-                        del esc.amendments[:dropped_entries]
-                        esc.amendments_truncated += dropped_entries
-                        logger.warning(
-                            'add_members_to_l2: %s shed %d oldest amendment(s) at '
-                            'the _MAX_AMENDMENTS=%d cap (running total '
-                            "truncated=%d); the record's own original framing is "
-                            'unaffected',
-                            escalation_id, dropped_entries, _MAX_AMENDMENTS,
-                            esc.amendments_truncated,
-                        )
+            # Preserve the incoming framing rather than discarding it, inside
+            # the SAME critical section as the member append, so it lands in
+            # the same single _rewrite below.
+            amendment_recorded, dropped_entries = _append_amendment_capped(
+                esc, root_cause=root_cause, summary=summary, evidence=evidence,
+                options=options, agent_role=agent_role,
+                caller='add_members_to_l2',
+            )
 
             # A new variant is a real content change, so it joins the existing
             # write condition rather than getting a write of its own — a fold

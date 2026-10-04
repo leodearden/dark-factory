@@ -37,7 +37,8 @@ Incoming-framing amendments (default-empty; task 3997):
               entry count alone bounds nothing when one field is unbounded free
               text, so the two counters together are what make the list's size
               envelope assertable from the record.
-  SOLE WRITER: `queue.add_members_to_l2`.
+  APPEND-AND-TRIM POLICY: `queue._append_amendment_capped`, the single home
+  every writer of these three fields goes through.
 
 Over-fold evidence (default-empty; task 3998):
   root_cause_variants:
@@ -553,9 +554,10 @@ class Escalation:
     # Preserved incoming framing (task 3997).  APPEND-ONLY: an amendment NEVER
     # overwrites this record's own root_cause / detail / options / summary — the
     # original human-facing framing is immutable and every incoming reframing is
-    # kept alongside it.  `queue.add_members_to_l2` is the SOLE writer and also
-    # the sole trimmer (it sheds the OLDEST past `queue._MAX_AMENDMENTS`,
-    # counting each drop in amendments_truncated).  Zero migration, same pattern
+    # kept alongside it.  Every writer appends through
+    # `queue._append_amendment_capped`, the single home of the append-and-trim
+    # policy (it sheds the OLDEST past `queue._MAX_AMENDMENTS`, counting each
+    # drop in amendments_truncated).  Zero migration, same pattern
     # as members / evidence / train_state / the triage quad / granted_files /
     # filing_claimant_run_id above: legacy JSON without these keys deserialises
     # to the defaults via the from_dict __dataclass_fields__ filter below,
