@@ -1025,3 +1025,118 @@ class TestCachedFanoutCore:
         )
 
         assert labels == ['fetch_tasks', 'fetch_task_page']
+
+
+# ---------------------------------------------------------------------------
+# TestEveryReadIsLive — PRD decision 20: one cache per datum, owned by the
+# snapshot unit, so nothing beneath it holds a task read
+# ---------------------------------------------------------------------------
+
+
+class TestEveryReadIsLive:
+    """Every task read reaches the substrate on every call.
+
+    The snapshot unit (``task_snapshot.SNAPSHOT_TTL_SECONDS``) is the one cache
+    a task datum has. A TTL under it would let a read answer with rows older
+    than the ``as_of`` the unit stamps on them, and a retry-suppression window
+    under it would hide a recovery the unit is about to ask for.
+
+    Each case uses its own project root, so no other test's reads can answer
+    for these.
+    """
+
+    async def test_two_identical_whole_tree_reads_both_reach_the_substrate(
+        self, dummy_client, dummy_config
+    ):
+        mock_mcp = AsyncMock(side_effect=lambda *_a, **_k: canned_get_tasks_result())
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            first = await tasks_mod.fetch_tasks(dummy_client, dummy_config, '/proj/live-tree')
+            second = await tasks_mod.fetch_tasks(dummy_client, dummy_config, '/proj/live-tree')
+
+        assert mock_mcp.call_count == 2, (
+            f'two identical fetch_tasks calls made {mock_mcp.call_count} '
+            'substrate call(s); a stored answer served the repeat'
+        )
+        assert isinstance(first, list) and isinstance(second, list)
+        assert first == second
+
+    async def test_two_identical_page_reads_both_reach_the_substrate(
+        self, dummy_client, dummy_config
+    ):
+        mock_mcp = AsyncMock(side_effect=lambda *_a, **_k: canned_get_tasks_result())
+        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
+            for _ in range(2):
+                page = await tasks_mod.fetch_task_page(
+                    dummy_client, dummy_config, '/proj/live-page',
+                    page_size=2, offset=0,
+                )
+                assert isinstance(page, list)
+
+        assert mock_mcp.call_count == 2, (
+            f'two identical fetch_task_page calls made {mock_mcp.call_count} '
+            'substrate call(s); a stored answer served the repeat'
+        )
+
+    async def test_a_failed_read_is_retried_on_the_very_next_call(
+        self, dummy_client, dummy_config
+    ):
+        reachable = False
+        calls: list[bool] = []
+
+        async def _mcp(*_args, **_kwargs):
+            calls.append(reachable)
+            if not reachable:
+                raise httpx.ReadTimeout('canned get_tasks read timeout')
+            return canned_get_tasks_result()
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
+            failed = await tasks_mod.fetch_tasks(dummy_client, dummy_config, '/proj/live-retry')
+            reachable = True
+            recovered = await tasks_mod.fetch_tasks(dummy_client, dummy_config, '/proj/live-retry')
+
+        assert isinstance(failed, dict) and failed.get('offline') is True, failed
+        assert True in calls, (
+            'the read after a failure never reached the substrate: the failure '
+            'suppressed its own retry, so a recovered root stays reported '
+            f'offline (substrate calls, by reachability: {calls})'
+        )
+        assert isinstance(recovered, list) and len(recovered) == 2, recovered
+
+    def test_the_terminal_window_is_read_fresh_per_request(
+        self, client, tmp_path, monkeypatch
+    ):
+        """Its ``as_of`` is the request instant, so the rows must be that instant's.
+
+        The window is asked for on a user action, not polled, so a read per
+        request is the whole cost of making the stamp true.
+        """
+        from _canned_mcp import CannedMCP, _raw_row
+
+        from dashboard.config import DashboardConfig
+
+        root = tmp_path / 'live-window'
+        root.mkdir()
+        client.app.state.config = DashboardConfig(project_root=root)
+        monkeypatch.setattr(
+            'dashboard.data.active_tasks.fetch_task_runtime', AsyncMock(return_value={}),
+        )
+        pairs = [(1, 'in-progress'), (2, 'done'), (3, 'done'), (4, 'cancelled')]
+        canned = CannedMCP(
+            rows=[_raw_row(task_id, status) for task_id, status in pairs],
+            status_map=dict(pairs),
+        )
+
+        with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
+            for _ in range(2):
+                resp = client.get('/api/v2/dashboard/tasks?terminal=live-window')
+                assert resp.status_code == 200, resp.text
+                assert resp.json()['TASKS_TERMINAL:live-window']['value'], resp.json()
+
+        window_reads = [
+            call for call in canned.calls_to('get_tasks')
+            if 'page_size' in call['args']
+        ]
+        assert len(window_reads) == 2, (
+            f'two ?terminal= requests issued {len(window_reads)} terminal page '
+            'read(s); a stored page answered a request whose as_of claims now'
+        )
