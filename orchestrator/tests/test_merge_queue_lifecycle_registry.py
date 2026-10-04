@@ -2962,10 +2962,11 @@ async def _verify_exit_scene(
     worker._host_allocator = allocator
 
     worker._register_item(head_item, initial=ItemLifecycleState.DISPATCHING)
+    head_verify = asyncio.ensure_future(asyncio.Event().wait())
     head_entry = InflightEntry(
         item=head_item,
         lease=HostLease(name='head-host', runner=MagicMock(), is_local=False),
-        verify_task=cast(Any, asyncio.ensure_future(asyncio.Event().wait())),
+        verify_task=cast(Any, head_verify),
         merge_wt=head_item.merge_wt,
         was_speculative=False,
     )
@@ -3001,7 +3002,7 @@ async def _verify_exit_scene(
             req=req, item=item, lease=lease, entry=entry, vr=vr,
         )
     finally:
-        for task in (head_entry.verify_task, verify_task):
+        for task in (head_verify, verify_task):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -3282,10 +3283,11 @@ class TestVacatedCorpseFinalizeLeavesReincarnationAlone:
                 rid, ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING,
                 live_obj=n_item,
             )
+            n_verify = asyncio.ensure_future(asyncio.Event().wait())
             n_entry = InflightEntry(
                 item=n_item,
                 lease=HostLease(name='n-host', runner=MagicMock(), is_local=False),
-                verify_task=cast(Any, asyncio.ensure_future(asyncio.Event().wait())),
+                verify_task=cast(Any, n_verify),
                 merge_wt=n_item.merge_wt,
                 was_speculative=False,
             )
@@ -3313,9 +3315,9 @@ class TestVacatedCorpseFinalizeLeavesReincarnationAlone:
                 assert mine[0]['host'] == 'n-host', f'{mine[0]!r}'
                 assert worker.frozen_prefix().count(rid) == 1, f'{worker.frozen_prefix()!r}'
             finally:
-                n_entry.verify_task.cancel()
+                n_verify.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await n_entry.verify_task
+                    await n_verify
 
 
 @pytest.mark.asyncio
@@ -3341,10 +3343,11 @@ class TestSnapshotRendersEachRequestIdOnce:
         )
         b_req = _make_request('df4582-dedup-b', 'df4582-dedup-b', tmp_path, config)
         worker._register_item(a_item, initial=ItemLifecycleState.DISPATCHING)
+        a_verify = asyncio.ensure_future(asyncio.Event().wait())
         a_entry = InflightEntry(
             item=a_item,
             lease=HostLease(name='a-host', runner=MagicMock(), is_local=False),
-            verify_task=cast(Any, asyncio.ensure_future(asyncio.Event().wait())),
+            verify_task=cast(Any, a_verify),
             merge_wt=a_item.merge_wt,
             was_speculative=False,
         )
@@ -3376,6 +3379,6 @@ class TestSnapshotRendersEachRequestIdOnce:
                 f'{[r.getMessage() for r in caplog.records]!r}'
             )
         finally:
-            a_entry.verify_task.cancel()
+            a_verify.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await a_entry.verify_task
+                await a_verify
