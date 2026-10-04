@@ -117,22 +117,19 @@ def resolve_hook_identity(
     stdin carries no title to parse. *cwd* comes from the hook's stdin JSON, falling back
     to ``os.getcwd()`` when absent.
 
-    SCOPE of the fork-path strip, stated once (task 4663): the strip is
-    RECORD-BODY-scoped. ``run_session_start`` -- the one caller whose
-    resolved identity is PERSISTED as a record's role/project/task_id/
-    escalation_id/title -- must pass an *env* already stripped of the
-    SPAWNER-describing identity keys via ``_non_spawner_identity_env``
-    whenever the inherited env slug was rejected (see
-    ``_HookSlugResolution.rejected_env_slug``), so a forked row describes
-    itself rather than its spawner.
+    SCOPE of the fork-path strip, stated once (tasks 4663, 5421): the strip
+    covers every caller that DESCRIBES the event's own session. Those are
+    ``run_session_start`` (the persisted record body) and
+    ``_run_status_refresh_and_retitle`` (the OSC retitle, which goes to the
+    hook process's own controlling terminal and so describes the session
+    whose hook fired). Both obtain their *env* from ``_own_identity_env``,
+    which strips the SPAWNER-describing identity keys whenever the inherited
+    env slug was rejected (see ``_HookSlugResolution.rejected_env_slug``),
+    so a forked session describes itself rather than its spawner.
 
-    The other two fork-path callers deliberately keep the RAW env, each for
-    a reason of its own, both commented at their call sites: the slug
-    derivation in ``_resolve_hook_slug`` (the slug is an opaque key whose
-    segments nothing parses back, and raw-env derivation is what keeps all
-    three hook events resolving the SAME one) and the OSC retitle in
-    ``_run_status_refresh_and_retitle`` (the tab it paints belongs to the
-    terminal the nested ``claude`` runs INSIDE -- its spawner's).
+    The ONE raw-env caller is the slug derivation in ``_resolve_hook_slug``:
+    an opaque key whose spawner-derived segments nothing parses back, and
+    which must be identical across all three hook events.
     """
     cwd = str(hook_input.get('cwd') or os.getcwd())
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
@@ -187,6 +184,9 @@ def _non_spawner_identity_env(env: Mapping[str, str]) -> Mapping[str, str]:
     enclosing checkout -- see ``session_registry.py::parse_spawn_identity``,
     ``task_id=None``, ``escalation_id=None``) instead of parroting the
     spawner's identity.
+
+    Reached only through ``_own_identity_env``, the one place that decides
+    WHEN to strip.
     """
     return {k: v for k, v in env.items() if k not in _SPAWNER_IDENTITY_ENV_KEYS}
 
@@ -609,8 +609,8 @@ def _resolve_hook_slug(
     # re-derive this slug independently, so whatever identity it is built
     # from must be identical across all three or one forked session splits
     # across two records. The forked session's OWN identity is carried by its
-    # record body instead -- see `resolve_hook_identity` for that strip's
-    # scope.
+    # record body AND its retitle instead -- see `resolve_hook_identity` for
+    # that strip's scope.
     identity = resolve_hook_identity(hook_input, env)
     session_id = _hook_session_id(hook_input) or 'unknown'
     # session_id (str) deliberately fills the launcher_pid slot as the
@@ -1368,10 +1368,9 @@ def run_session_start(
     ``resolve_hook_identity``/``hook_display_title`` still reading
     role/task_id/escalation_id/title straight out of the inherited env, so a
     forked record got the SPAWNER's role, task_id, escalation_id and display
-    title -- two cockpit rows identical except for slug. ``identity_env`` is
-    the raw hook env on every other path, and ``_non_spawner_identity_env``
-    (role/project/task_id/escalation_id/title/prompt stripped) on the fork
-    path, so identity resolution falls through to this session's own
+    title -- two cockpit rows identical except for slug. ``identity_env``
+    comes from ``_own_identity_env`` (stripped on the fork path, raw on
+    every other), so identity resolution falls through to this session's own
     defaults instead of the spawner's.
     """
     probes = _EventProbes(env)
