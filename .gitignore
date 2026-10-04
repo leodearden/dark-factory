@@ -113,8 +113,10 @@ orchestrator/data/
 dashboard/data/
 # recon-escalation-watcher run manifests (mcp.json + run.sh stay tracked):
 recon-watch/close-manifest*.json
-# /review skill phase outputs (review/briefing.yaml stays tracked):
-review/reports/
+# /review run reports (review/reports/<run_id>.*) are tracked. Only the
+# pre-contract phase files, which carry no as_of_sha, stay ignored:
+review/reports/phase[12]-*.json
+review/reports/summary-*.md
 # Editor/tool temp-backup files (e.g. foo.py.tmp.<pid>.<hash>) — one was
 # accidentally committed as test_merge_queue_concurrent_verify.py.tmp.* (task 1990):
 *.tmp.*

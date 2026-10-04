@@ -59,6 +59,16 @@ Review, refactor and PRD work cite those heuristics by name from that file.
 Do not restate them elsewhere (INV-9). The `CONTRIBUTING.md` §4 gates are
 the floor, not the bar.
 
+`docs/quality-findings-contract.md` is the single normative contract for
+the instruments that produce quality findings (`/review`,
+`/hotspot-survey`, `/census`, `/review-all`): finding key, area and
+severity vocabularies, what a report pins, the dedup protocol before
+filing, where a disposition lives (the task store, never a new ledger), and
+the task-completion trigger chain that schedules the next run. Skills point
+at it and do not restate it. `/review-all` (`skills/review-all/SKILL.md`) is
+the whole-project instrument built on it, human-attended and launched by
+the contract §11 human-gate task.
+
 ## Prerequisites
 
 ```bash

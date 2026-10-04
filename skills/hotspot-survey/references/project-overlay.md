@@ -2,20 +2,22 @@
 
 Same pattern as the /prd overlay: the generic skill (this directory, symlinked into `~/.claude/skills/`) reads the overlay at Step 0 and treats it as authoritative extensions/overrides. **Do not** create a competing `SKILL.md` under the project's `.claude/skills/hotspot-survey/` — a directory without `SKILL.md` is correctly ignored by skill discovery, so the overlay loads cleanly.
 
-The overlay is free-form markdown covering these slots (omit any that match the generic defaults):
+The overlay is free-form markdown covering these slots (omit any that match the generic defaults). It points at the project's sources of truth rather than copying them: a column list, a task count or a file size copied here goes stale.
 
 | Slot | What it supplies | Generic default |
 |---|---|---|
 | **Memory identity** | fused-memory `project_id`, `agent_id` convention | elicit from user / CLAUDE.md |
-| **Task tracker source** | where fix-task history lives + how to probe its shape: a command that prints it, e.g. dark-factory's `python3 scripts/tasks_db_schema.py`, preferred over a hand-written column list, which drifts — and whether to mine the store directly or via MCP | probe in Phase 0; skip lane if absent |
-| **Output directory** | where survey artifacts land (`plans/` vs `docs/notes/`) and whether they are committed | `plans/`, committed |
-| **Subsystem vocabulary seed** | known subsystem → files mapping to seed Phase 0's cluster list | derive from repo layout + churn |
-| **Fix-commit vocabulary** | project-specific commit markers beyond fix/bug/regression (e.g. dark-factory's `amend:` post-merge patch-ups and `red-main` commits) | the generic grep set |
-| **History window** | default `--since` (project epoch, or when autonomous commits began) | ~6 months |
-| **Deterministic audit fold-in** | a project detector CLI (e.g. reify's `/audit` — phantom-done/orphan detectors) to run inline in Phase 0 and hand to reviewers as known context | none |
+| **Task store** | where fix-task history lives + how to probe its shape: a command that prints it (e.g. dark-factory's `python3 scripts/tasks_db_schema.py`), preferred over a hand-written column list, which drifts — and whether to mine the store directly or via MCP | probe in Phase 0; skip lane if absent |
+| **Output directory** | where survey artefacts land and whether they are committed | `plans/`, committed |
+| **Cluster seeds** | known subsystem → files mapping; each cluster key is a `sub_area`, mapped to its plain `review/briefing.yaml` area (contract §3) | derive from repo layout + churn |
+| **Fix signal** | additions to the subject-prefix definition (e.g. a broke-main marker), path exclusions for bookkeeping commits, and fix-origin task metadata values | `fix`/`bugfix`/`hotfix` subject prefixes |
+| **History window** | full-mode `--since` (project epoch, or when autonomous commits began) | ~6 months |
+| **Refresh baseline** | for a prior report that predates the contract: the commit standing in for its `as_of_sha`, its `run_id`, and the `--clusters key=area,...` list (in that JSON's cluster order) for `scripts/findings_artefact.py legacy` | none: such a report forces `--full` |
+| **Metrics snapshot** | a committed complexity snapshot for the success measure's complexity pair | none: open-finding counts only |
+| **Deterministic audit fold-in** | a project detector CLI (e.g. reify's `/audit`) to run inline in Phase 0 and hand to reviewers as known context | none |
 | **Doc corpora** | postmortem/PRD locations for the mine:plans lane | `plans/`, `docs/`, CHANGELOG.md, DESIGN.md |
-| **Hand-off conventions** | the project's /prd path conventions, program-doc location, release-gate mechanism (e.g. dark-factory deterministic pure-gate tasks vs reify escalate-on-dispatch milestones) | generic /prd |
-| **Known-context sources** | extra memory queries or standing incident docs to seed cluster `context` paragraphs | fused-memory search only |
+| **Hand-off conventions** | /prd path conventions, program-doc location, anything project-specific about the trigger chain | generic /prd; chain per `skills/_shared/filing-the-trigger-chain.md` |
+| **Known-context sources** | extra memory queries or standing incident docs to seed cluster `context` | fused-memory search only |
 | **Anti-triggers** | project skills that must not be shadowed (e.g. "invariant detector sweeps → /audit, not this") | none |
 
 Example overlay skeleton:
@@ -24,10 +26,11 @@ Example overlay skeleton:
 # hotspot-survey overlay — <project>
 
 - project_id: `<id>`; agent_id: `claude-interactive`.
-- Task tracker: `<path>` — shape: run `<command>`. Mine directly with python3, not via MCP round-trips.
+- Task store: `<path>`; shape: run `<schema probe command>`. Mine directly with python3, not via MCP round-trips.
 - Output: `docs/notes/bug-hotspot-survey-<date>.md` (+ `-full-findings.json`), committed.
-- Fix vocabulary: add `--grep='<project marker>'`.
-- Subsystem seeds: <key> (<files>), ...
+- Fix signal: also count subjects starting `<marker>`; exclude `<bookkeeping dir>`; fix-origin tasks: `metadata.source in (<values>)`.
+- Cluster seeds: <cluster> (the sub_area) → area `<subproject>` (<files>), ...
+- Metrics snapshot: `<path>`, regenerated by `<command>`.
 - Audit fold-in: run `<cli> --pattern P1,P2,P5 --since <window>` in Phase 0; give findings to the matching clusters as known context.
-- Hand-off: PRDs under `docs/prds/`; gate deferred batches with escalate-on-dispatch milestones (see task 5117 precedent).
+- Hand-off: PRDs under `docs/prds/`.
 ```
