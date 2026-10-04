@@ -27,9 +27,8 @@ from orchestrator.agents.roles import (
     ROLES,
 )
 
-#: Every role with a literal system_prompt. Each holds `Read`, `Grep` and
-#: `Glob`, so each can hit a not-found and run the recovery. DERIVED rather
-#: than hand-maintained: two sibling modules already keep this set by hand.
+#: Every role with a literal system_prompt. DERIVED rather than
+#: hand-maintained: two sibling modules already keep this set by hand.
 _UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)
 
 #: The carriers of `_BASH_CAPABLE_ROLE_PREAMBLE`, whose tail this block joins.
@@ -45,8 +44,8 @@ _CONTRACT = SpliceContract(
     constant=PATH_NOT_FOUND_GUIDANCE,
     roles=_UNPINNED_ROLES,
     role_set_name='_UNPINNED_ROLES',
-    capability=lambda role: role.prompt_spec is None,
-    capability_description='a literal (non-PromptSpec) system_prompt',
+    capability=lambda role: role.prompt_spec is None and 'Glob' in role.allowed_tools,
+    capability_description='a literal (non-PromptSpec) system_prompt and `Glob`',
 )
 
 
@@ -96,6 +95,22 @@ def test_derived_role_sets_are_nonempty():
         'No literal-prompt role holds unqualified `Bash`, so the preamble-order '
         "test passes over an empty set. Check the `'Bash' in allowed_tools` "
         'derivation.'
+    )
+
+
+def test_every_carrier_can_run_the_recovery():
+    """Every derived carrier holds `Glob`, the one tool the recovery names.
+
+    Not a tautology: `_UNPINNED_ROLES` is derived from the literal prompt
+    alone, while the capability also requires the `Glob` grant.
+    """
+    _CONTRACT.assert_role_set_matches_capability(
+        remedy=(
+            '_UNPINNED_ROLES is derived, not hand-maintained, so a `lost=` role '
+            'is a literal-prompt role without `Glob`: it would be told to run a '
+            'search it cannot run. Grant it `Glob`, or exclude it from the '
+            'derivation and from the splice together.'
+        ),
     )
 
 
