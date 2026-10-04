@@ -3,13 +3,13 @@
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
 
 from fused_memory.services.memory_service import ReferentFinding
-from fused_memory.services.write_journal import WriteJournal
+from fused_memory.services.write_journal import OPERATOR_TELEMETRY_QUERY, WriteJournal
 from fused_memory.utils.canonical_labels import Referent
 
 
@@ -109,6 +109,112 @@ async def test_log_backend_op_without_duration_ms_stores_null(journal):
     )
     [row] = await journal.get_backend_ops_for_write_op(write_op_id)
     assert row['duration_ms'] is None
+
+
+async def _seed_backend_op(
+    journal: WriteJournal,
+    *,
+    write_operation: str,
+    backend: str,
+    backend_operation: str,
+    duration_ms: float | None,
+    result_summary: dict | str | None,
+) -> None:
+    write_op_id = str(uuid.uuid4())
+    await journal.log_write_op(
+        write_op_id=write_op_id, operation=write_operation, project_id='telemetry'
+    )
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend=backend,
+        operation=backend_operation,
+        result_summary=result_summary,
+        duration_ms=duration_ms,
+    )
+
+
+async def _run_operator_telemetry_query(journal: WriteJournal, since: str, limit: int):
+    import aiosqlite
+
+    async with aiosqlite.connect(str(journal.data_dir / 'write_journal.db')) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(OPERATOR_TELEMETRY_QUERY, (since, limit)) as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+@pytest.mark.asyncio
+async def test_operator_telemetry_query_reports_duration_and_tokens_per_write(journal):
+    await _seed_backend_op(
+        journal,
+        write_operation='add_episode',
+        backend='graphiti',
+        backend_operation='add_episode',
+        duration_ms=1.0,
+        result_summary=None,
+    )
+    since = datetime.now(UTC).isoformat()
+    await _seed_backend_op(
+        journal,
+        write_operation='delete_memory',
+        backend='mem0',
+        backend_operation='delete',
+        duration_ms=None,
+        result_summary=None,
+    )
+    await _seed_backend_op(
+        journal,
+        write_operation='add_memory',
+        backend='mem0',
+        backend_operation='add',
+        duration_ms=3.25,
+        result_summary=str({'results': [{'id': 'm1'}]}),
+    )
+    await _seed_backend_op(
+        journal,
+        write_operation='add_episode',
+        backend='graphiti',
+        backend_operation='add_episode',
+        duration_ms=812.5,
+        result_summary={
+            'result': 'x',
+            'tokens': {
+                'input_tokens': 120,
+                'output_tokens': 45,
+                'total_tokens': 165,
+                'llm_calls': 1,
+            },
+        },
+    )
+
+    rows = await _run_operator_telemetry_query(journal, since, 100)
+
+    assert [(r['operation'], r['backend']) for r in rows] == [
+        ('add_episode', 'graphiti'),
+        ('add_memory', 'mem0'),
+        ('delete_memory', 'mem0'),
+    ]
+    graphiti, mem0, unmeasured = rows
+    assert graphiti['project_id'] == 'telemetry'
+    assert graphiti['success'] == 1
+    assert graphiti['duration_ms'] == 812.5
+    assert (
+        graphiti['input_tokens'],
+        graphiti['output_tokens'],
+        graphiti['total_tokens'],
+        graphiti['llm_calls'],
+    ) == (120, 45, 165, 1)
+    assert mem0['duration_ms'] == 3.25
+    assert (
+        mem0['input_tokens'],
+        mem0['output_tokens'],
+        mem0['total_tokens'],
+        mem0['llm_calls'],
+    ) == (None, None, None, None)
+    assert unmeasured['duration_ms'] is None
+    assert unmeasured['total_tokens'] is None
+
+    [most_recent] = await _run_operator_telemetry_query(journal, since, 1)
+    assert most_recent['duration_ms'] == 812.5
 
 
 @pytest.mark.asyncio
