@@ -10,7 +10,7 @@
 # and asserts the reload's `applied` disposition carries the merge_deep.chain_cap
 # knob (proving it hot-applied on the green tier, not silently deferred to a
 # restart).  The escalation MCP is stateful, so the reload goes through the
-# shared session-handshaking transport, never a single-shot POST.
+# shared reload step (scripts/_config_reload_gate.py), never a single-shot POST.
 # Forward-transition deploy (0->6->32); it is NOT idempotent at a fixed value
 # -- re-running at the current value has nothing to commit and dies there.
 #
@@ -36,9 +36,9 @@ CAP="$1"; CONFIG="$2"; PORT="$3"
 [[ "$PORT" =~ ^[0-9]+$ ]] || die "port must be an integer, got: $PORT"
 [ -f "$CONFIG" ]          || die "config not found: $CONFIG"
 
-# The reload transport is not stdlib (httpx, pydantic), so step 3 runs under
-# the SCRIPT's checkout venv and imports from the SCRIPT's checkout -- never
-# from $REPO, the config's checkout.  Step 1 is stdlib-only plain python3.
+# Step 3's reload runs under the SCRIPT's checkout venv and imports from the
+# SCRIPT's checkout -- never from $REPO, the config's checkout (the contract is
+# scripts/_config_reload_gate.py's).  Step 1 is stdlib-only plain python3.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$SCRIPT_DIR/../.venv/bin/python3"
 [ -x "$PY" ] || PY=python3
@@ -88,50 +88,25 @@ git -C "$REPO" commit --only "$CONFIG_BASE" \
 
 SHA="$(git -C "$REPO" rev-parse --short HEAD)"
 
-# 3. Hot-reload the running orchestrator via its escalation MCP and assert the
-#    knob is live.  The MCP is stateful: a single-shot POST is a transport-level
-#    400 before any tool runs, so this goes through the shared transport
-#    (scripts/legibility/census_trigger.py::post_mcp_envelope), which also
-#    unwraps the tool result.  Every input reaches python by ARGV, never by a
-#    pipe: `python3 -` reads its PROGRAM from stdin and the heredoc IS stdin, so
-#    a pipe into it is silently discarded (task 5398).
+# 3. Hot-reload the running orchestrator and assert the knob is live.  The
+#    transport, its failure diagnostics and the argv-only heredoc contract are
+#    scripts/_config_reload_gate.py's; this checks only the knob's disposition.
 "$PY" - "$SCRIPT_DIR" "$KNOB_KEY" "$CAP" "$PORT" "$SHA" <<'RELOAD_PY'
 import sys
 script_dir, knob, cap, port, sha = sys.argv[1:6]
-
-
-def fail(message):
-    print(f"merge-deep-set-cap: {message}", file=sys.stderr)
-    sys.exit(1)
-
-
 sys.path.insert(0, script_dir)
-try:
-    from legibility import census_trigger
-except ImportError as exc:
-    fail(f"the MCP reload transport is not importable under {sys.executable}: {exc}\n"
-         f"  sys.path entry added: {script_dir}\n"
-         f"  remedy: sync this checkout so {script_dir}/../.venv exists, or re-run\n"
-         f"  this script under `uv run --project shared`")
+from _config_reload_gate import die, reload_or_exit
 
-try:
-    tool = census_trigger.post_mcp_tool_call(f"http://127.0.0.1:{port}/mcp", "reload_config", {})
-except Exception as exc:
-    # Broad on purpose: a malformed/error envelope, a failed handshake and a
-    # dead socket all leave the live cap UNKNOWN, which a deploy gate must fail.
-    fail(f"reload_config never reached the tool at 127.0.0.1:{port}: {type(exc).__name__}: {exc} "
-         f"(committed as {sha}; the cap lands at the next restart)")
-
-if tool.get("error"):
-    fail(f"reload_config error: {tool['error']}")
-applied = tool.get("applied") or {}
+PROG = "merge-deep-set-cap"
+report = reload_or_exit(port, prog=PROG, committed_as=sha)
+applied = report.get("applied") or {}
 entry = applied.get(knob)
 if not isinstance(entry, dict):
-    fail(f"applied disposition missing {knob}: applied_keys={sorted(applied)} "
-         f"restart_required_keys={sorted(tool.get('restart_required') or {})}")
+    die(PROG, f"applied disposition missing {knob}: applied_keys={sorted(applied)} "
+              f"restart_required_keys={sorted(report.get('restart_required') or {})}")
 if str(entry.get("new")) != cap:
-    fail(f"applied {knob} does not carry {cap}: entry={entry}")
-print(f"merge-deep-set-cap: {knob} applied old={entry.get('old')} new={entry.get('new')}")
+    die(PROG, f"applied {knob} does not carry {cap}: entry={entry}")
+print(f"{PROG}: {knob} applied old={entry.get('old')} new={entry.get('new')}")
 RELOAD_PY
 
 echo "merge-deep-set-cap: done cap=${CAP} config=${CONFIG} port=${PORT}"

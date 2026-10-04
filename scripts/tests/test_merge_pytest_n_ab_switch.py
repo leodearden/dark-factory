@@ -19,7 +19,6 @@ one the test itself owns, bound to an ephemeral port.
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -35,6 +34,7 @@ from config_reload_script_fakes import (
     path_python3_shimmed_to,
     reload_report,
     system_python_without_the_transport,
+    venvless_checkout_copy,
 )
 
 SCRIPT = Path(__file__).parent.parent / "merge-pytest-n-ab-switch.sh"
@@ -526,8 +526,8 @@ def test_the_reload_ignores_a_path_python3_that_cannot_import_the_transport(tmp_
 def test_an_interpreter_without_the_transport_fails_loud_with_a_remedy(tmp_path):
     """No venv to fall back on: fail naming the interpreter and the remedy.
 
-    The script is copied into a checkout carrying the real `scripts/legibility`
-    but NO `.venv`, so the bare-`python3` fallback leg is taken and the
+    The script is copied into a checkout carrying its real reload step but NO
+    `.venv`, so the bare-`python3` fallback leg is taken and the
     interpreter is the only thing that differs from the passing case above. A
     raw ImportError traceback would leave an operator with no next step.
     """
@@ -535,10 +535,7 @@ def test_an_interpreter_without_the_transport_fails_loud_with_a_remedy(tmp_path)
     if system_python is None:
         pytest.skip(why)
 
-    scripts_dir = tmp_path / "checkout" / "scripts"
-    scripts_dir.mkdir(parents=True)
-    shutil.copy2(SCRIPT, scripts_dir / SCRIPT.name)
-    (scripts_dir / "legibility").symlink_to(SCRIPT.parent / "legibility")
+    script = venvless_checkout_copy(tmp_path, SCRIPT)
 
     config = _make_repo(tmp_path, "8", marker=True)
     env = path_python3_shimmed_to(tmp_path, system_python)
@@ -549,7 +546,7 @@ def test_an_interpreter_without_the_transport_fails_loud_with_a_remedy(tmp_path)
 
     with FakeEscalationMcp(reload_report(config_path=str(config))) as server:
         proc = _run(server, config, "8",
-                    script=scripts_dir / SCRIPT.name, env=env)
+                    script=script, env=env)
 
     assert proc.returncode != 0, f"stdout={proc.stdout}"
     assert not _converged_verdict_lines(proc)

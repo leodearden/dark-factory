@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import threading
@@ -271,6 +272,20 @@ def system_python_without_the_transport():
     if probe.returncode == 0:
         return None, f"{SYSTEM_PYTHON} can import the transport, so it proves nothing"
     return SYSTEM_PYTHON, ""
+
+
+def venvless_checkout_copy(tmp_path, script):
+    """*script* copied into a fresh checkout at <tmp_path>/checkout that holds
+    everything its reload step imports -- the real scripts/legibility and
+    scripts/_config_reload_gate.py, symlinked -- but NO .venv, so the script's
+    bare-`python3` interpreter fallback is the leg taken. Returns the copy."""
+    scripts_dir = tmp_path / "checkout" / "scripts"
+    scripts_dir.mkdir(parents=True)
+    copy = scripts_dir / script.name
+    shutil.copy2(script, copy)
+    for imported in ("legibility", "_config_reload_gate.py"):
+        (scripts_dir / imported).symlink_to(script.parent / imported)
+    return copy
 
 
 def path_python3_shimmed_to(tmp_path, interpreter):

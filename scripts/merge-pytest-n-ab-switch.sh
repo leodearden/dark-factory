@@ -18,9 +18,8 @@
 # reload transport: the escalation MCP is STATEFUL, so a single-shot
 # `tools/call` POST is rejected at the TRANSPORT layer — `Bad Request: Missing
 # session ID`, HTTP 400, measured live on 2026-09-12 — before any tool runs,
-# and `curl` without -f exits 0 on it. Both scripts therefore reach
-# reload_config through legibility.census_trigger.post_mcp_tool_call, which
-# handshakes.
+# and `curl` without -f exits 0 on it. Both scripts therefore reload through
+# scripts/_config_reload_gate.py, which handshakes.
 #
 # Exit 0 on either of the two ways the value can be live: the reload
 # hot-applied it ('applied'), or the running config already carried it and the
@@ -114,16 +113,9 @@ else
     SHA="$(git -C "$REPO" rev-parse --short HEAD)"
 fi
 
-# 3. Hot-reload via the escalation MCP, and assert the value is live.
-#    `legibility.census_trigger.post_mcp_tool_call` is the single transport
-#    definition every consumer of this server goes through (task 3644). It
-#    supplies the four things one POST cannot: the session-less `initialize`
-#    handshake the stateful server demands, SSE decoding of the reply, raising
-#    on both an envelope-level JSON-RPC `error` and `result.isError`, and the
-#    session-terminating DELETE without which every run leaks a live anyio task
-#    in the long-lived escalation process. None of it is re-implemented here:
-#    three legibility posters each hand-rolled this transport and all three
-#    silently dropped every escalation they ever filed.
+# 3. Hot-reload via the escalation MCP, and assert the value is live. The
+#    transport, its failure diagnostics and the argv-only heredoc contract are
+#    scripts/_config_reload_gate.py's; this checks only verify_env.
 #
 #    The value is live in either of two shapes. `applied` carrying verify_env
 #    with the new value is the flip. ABSENCE of verify_env from `applied` is
@@ -137,73 +129,40 @@ fi
 import json, os, sys
 script_dir, key, value, sha, config_path, port = sys.argv[1:7]
 sys.path.insert(0, script_dir)
-try:
-    from legibility import census_trigger
-except ImportError as exc:
-    # Not stdlib: httpx, and pydantic via census_trigger's legibility.config
-    # import. Name the interpreter and the remedy rather than emitting a
-    # traceback — an operator hitting this from a login shell has no other clue
-    # that the interpreter, not the code, is what is wrong.
-    print(f'the MCP reload transport is not importable under {sys.executable}: {exc}\n'
-          f'  sys.path entry added: {script_dir}\n'
-          f'  remedy: sync this checkout so {script_dir}/../.venv exists, or re-run\n'
-          f'  this script under `uv run --project shared`',
-          file=sys.stderr)
-    sys.exit(1)
+from _config_reload_gate import die, reload_or_exit
 
-try:
-    tool = census_trigger.post_mcp_tool_call(
-        f'http://127.0.0.1:{port}/mcp', 'reload_config', {})
-except Exception as exc:
-    # Broad on purpose, and the breadth is the point: census_trigger raises
-    # StatusFetchUnavailable for a malformed or error envelope, RuntimeError
-    # for a failed handshake, and httpx's own exceptions for a dead socket —
-    # all three mean the live config is UNKNOWN, and a deploy gate must not
-    # pass on an unknown. Naming the TRANSPORT keeps this distinct from the
-    # rolled-back-reload diagnostic below, which is about a reload that ran.
-    print(f'reload_config never reached the tool: {type(exc).__name__}: {exc} '
-          f'(committed as {sha}; the value lands at the next restart)', file=sys.stderr)
-    sys.exit(1)
-
-# reload_config's OWN error field: a config that failed to parse, reported by a
-# perfectly successful tools/call. `_raise_on_mcp_error` inspects the JSON-RPC
-# envelope and never sees this one.
-if tool.get('error'):
-    print(f'reload_config error: {tool["error"]}', file=sys.stderr); sys.exit(1)
+PROG = 'merge-pytest-n-ab-switch'
+tool = reload_or_exit(port, prog=PROG, committed_as=sha)
 entry = (tool.get('applied') or {}).get('verify_env')
 if entry is None:
     reloaded = tool.get('reloaded')
     reported = tool.get('config_path')
     if not reloaded:
-        print(f'reload reported no verify_env change, but did not commit it: reloaded={reloaded!r} '
-              f'(a failed reload rolls every leaf back, so the live config is untouched)', file=sys.stderr)
-        sys.exit(1)
+        die(PROG, f'reload reported no verify_env change, but did not commit it: reloaded={reloaded!r} '
+                  f'(a failed reload rolls every leaf back, so the live config is untouched)')
     # `reported` is the ORCHESTRATOR's own ORCH_CONFIG_PATH, so a RELATIVE one
     # is resolved by the SERVER's cwd — realpath here would resolve it against
     # OURS, and a different unit whose ORCH_CONFIG_PATH is the bare
     # `dark-factory-orchestrator.yaml` would then match us whenever this runs
     # from our project root. Uncomparable is not a match.
     if not reported or not os.path.isabs(reported) or os.path.realpath(reported) != config_path:
-        print(f'reload reported no verify_env change, but re-read a different file: '
-              f'config_path={reported!r} expected={config_path!r}', file=sys.stderr)
-        sys.exit(1)
+        die(PROG, f'reload reported no verify_env change, but re-read a different file: '
+                  f'config_path={reported!r} expected={config_path!r}')
     # verify_env is in RELOADABLE_FIELDS today, so a change to it is never
     # bucketed as restart-required (config.py::diff_config) and this never
     # fires. One allowlist edit away it would: a genuine flip then produces
     # this branch's exact shape — reloaded, our file, nothing under `applied`
     # — while the arm is committed and NOT live.
     if 'verify_env' in (tool.get('restart_required') or {}):
-        print(f'verify_env changed but is restart-required, not hot-applied: '
-              f'restart_required_keys={sorted(tool.get("restart_required") or {})} '
-              f'(committed as {sha}; the value lands at the next restart)', file=sys.stderr)
-        sys.exit(1)
+        die(PROG, f'verify_env changed but is restart-required, not hot-applied: '
+                  f'restart_required_keys={sorted(tool.get("restart_required") or {})} '
+                  f'(committed as {sha}; the value lands at the next restart)')
     outcome = 'already_converged'
 else:
     new = (entry or {}).get('new') or {}
     if str(new.get(key)) != value:
-        print(f'applied.verify_env does not carry {key}={value}: applied_keys={sorted(tool.get("applied") or {})} '
-              f'restart_required_keys={sorted(tool.get("restart_required") or {})} entry={entry}', file=sys.stderr)
-        sys.exit(1)
+        die(PROG, f'applied.verify_env does not carry {key}={value}: applied_keys={sorted(tool.get("applied") or {})} '
+                  f'restart_required_keys={sorted(tool.get("restart_required") or {})} entry={entry}')
     outcome = 'applied'
 print(json.dumps({'switched_to': value, 'commit': sha, 'outcome': outcome}))
 RELOAD_PY
