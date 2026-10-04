@@ -330,12 +330,9 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
     no tag, so an unpinned query would let an unrelated same-id row from another
     tag masquerade as the producer.
 
-    Opens the database through ``_task_db_scan.py::connect_ro``, a read-only
-    URI (``mode=ro``), so the load is structurally incapable of mutating live
-    task records even while fused-memory holds the same file open in WAL mode;
-    a file that is not a task store is refused with a structured reason. Closed
-    in a ``try/finally`` and never a ``with`` block — a sqlite3 ``with`` is a
-    TRANSACTION, not a close.
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). Closed in a ``try/finally`` and never a ``with`` block — a
+    sqlite3 ``with`` is a TRANSACTION, not a close.
     """
     row_ids: set[int] = set()
     delivered_checks: dict[int, dict[str, dict]] = {}

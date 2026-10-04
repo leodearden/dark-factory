@@ -123,13 +123,9 @@ class NoteLeakMatch(NamedTuple):
 def scan_db(db_path: str) -> list[NoteLeakMatch]:
     """Scan *db_path* read-only for leaked log lines in done_provenance notes.
 
-    Opens the database through ``_task_db_scan.py::connect_ro``, a read-only
-    SQLite URI (``mode=ro``), so the scan is structurally incapable of
-    mutating live task data — even while the fused-memory server holds the
-    same file open in WAL mode for concurrent writers. A file that is not a
-    task store is refused with a structured reason, which the sweep tier turns
-    into a warn-and-skip. This matters concretely here: task 2902's note is a preserved
-    forensic specimen, and this tool must be unable to touch it.
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). The read-only open matters concretely here: task 2902's note
+    is a preserved forensic specimen, and this tool must be unable to touch it.
 
     Every row shape is tolerated: metadata that is NULL, undecodable, or a
     JSON scalar/array rather than an object, and a ``done_provenance`` that is

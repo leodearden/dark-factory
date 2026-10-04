@@ -766,14 +766,13 @@ def census_project(project_root: str) -> ProjectCensus:
     NO_MERGE_EVENT, and ``coverage.event_log_read`` goes False so a consumer
     can see the axes were unknown rather than measured clean.
 
-    A tasks.db error PROPAGATES: a ``sqlite3.Error``, or ``connect_ro``'s
-    ``TaskDbUnreadable`` refusal — together
+    A tasks.db error PROPAGATES — any of
     ``_task_db_scan.py::UNREADABLE_STORE_ERRORS``, exactly what
     ``_task_db_scan.py::sweep_project_roots`` skips. That is the contract it
     documents — exactly one result per root, or raise — and its exit-3 gate
     rests on the resulting ``len(audits) + len(unreadable) == len(roots)``
-    equality. Returning a
-    partial census here would silently re-open the false green exit 3 closes.
+    equality. Returning a partial census here would silently re-open the false
+    green exit 3 closes.
     """
     project_id = project_id_for(project_root)
     tasks_db = tasks_db_path(project_root)

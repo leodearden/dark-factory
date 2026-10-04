@@ -487,11 +487,8 @@ def load_task_records(tasks_db_path: str) -> dict[tuple[str, int], TaskRecord]:
     ``master`` tag, but the schema permits the same numeric id under two tags
     and collapsing them would silently merge two distinct tasks.
 
-    Opens the database through ``_task_db_scan.py::connect_ro``, a read-only
-    URI (``mode=ro``), so the load is structurally incapable of mutating live
-    task records even while fused-memory holds the same file open in WAL mode.
-    A file that is not a task store is refused with
-    ``_task_db_scan.py::TaskDbUnreadable``, carrying a structured reason.
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals).
     """
     records: dict[tuple[str, int], TaskRecord] = {}
     conn = connect_ro(tasks_db_path)

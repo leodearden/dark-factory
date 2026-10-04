@@ -141,12 +141,9 @@ def load_combine_targets(tasks_db_path: str) -> dict[tuple[str, int], CombineTar
     ``master`` tag, but the schema permits the same numeric id under two tags
     and collapsing them would silently merge two distinct tasks.
 
-    Opens the database through ``_task_db_scan.py::connect_ro``, a read-only
-    URI (``mode=ro``), so the load is structurally incapable of mutating live
-    task records even while fused-memory holds the same file open in WAL mode;
-    a file that is not a task store is refused with a structured reason.
-    Closed in a ``try/finally`` and never a ``with`` block — a sqlite3
-    ``with`` is a TRANSACTION, not a close.
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). Closed in a ``try/finally`` and never a ``with`` block — a
+    sqlite3 ``with`` is a TRANSACTION, not a close.
     """
     targets: dict[tuple[str, int], CombineTarget] = {}
     conn = connect_ro(tasks_db_path)

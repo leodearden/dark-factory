@@ -149,12 +149,8 @@ class LeakMatch(NamedTuple):
 def scan_db(db_path: str) -> list[LeakMatch]:
     """Scan *db_path* read-only for leaked tool-call fragments.
 
-    Opens the database through ``_task_db_scan.py::connect_ro``, a read-only
-    SQLite URI (``mode=ro``), so the scan is structurally incapable of
-    mutating live task text — even while the fused-memory server holds the
-    same file open in WAL mode for concurrent writers. A file that is not a
-    task store is refused with a structured reason, which the sweep tier turns
-    into a warn-and-skip. Applies :func:`detect_leak` to each of ``SCANNED_COLUMNS`` per
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). Applies :func:`detect_leak` to each of ``SCANNED_COLUMNS`` per
     row; ``metadata`` is deliberately never read (see module docstring).
     """
     matches: list[LeakMatch] = []

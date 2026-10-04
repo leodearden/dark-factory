@@ -403,11 +403,9 @@ class TaskIndex(NamedTuple):
 def load_task_index(db_path: str) -> TaskIndex:
     """Statuses, ``updated_at`` stamps and stamped checks of *db_path*.
 
-    Opened through ``_task_db_scan.py::connect_ro``, a read-only URI — the
-    guarantee is structural, not a convention — which refuses a file that is
-    not a task store with a structured reason. Malformed metadata is SKIPPED
-    rather than raised: a single undecodable row must not
-    abort a whole-project sweep, and ``extract_delivered_checks`` already
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). Malformed metadata is SKIPPED rather than raised: a single
+    undecodable row must not abort a whole-project sweep, and ``extract_delivered_checks`` already
     implements exactly that benign-absent contract (the same one
     ``lock_charter_guard.extract_files`` uses at the wire boundary).
     """
