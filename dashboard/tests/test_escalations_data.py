@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from shared.testing_virtual_clock import run_on_virtual_clock
+from shared.testing_virtual_clock import virtual_clock_test
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1337,28 +1337,26 @@ class TestFetchPinsRecovery:
         assert 'proj8102' in result
         assert result['proj8102'] is None
 
-    def test_timeout_maps_to_none(self):
+    @virtual_clock_test
+    async def test_timeout_maps_to_none(self):
         """A project that does not answer inside per_call_timeout is UNKNOWN,
         while a sibling that did answer keeps its read.
 
         The answering project must beat the same deadline the slow one misses;
         on the host clock a stalled worker made it miss that deadline too, so
-        the scenario runs on shared.testing_virtual_clock's loop clock.
+        this is a shared.testing_virtual_clock.virtual_clock_test.
         """
         from dashboard.data.escalations import fetch_pins_recovery
 
-        async def scenario():
-            handler = _PinsHandler(
-                {8100: [_rec('esc-a', pins_recovery=['3543'])], 8105: []},
-                slow_ports={8105: 0.5},
+        handler = _PinsHandler(
+            {8100: [_rec('esc-a', pins_recovery=['3543'])], 8105: []},
+            slow_ports={8105: 0.5},
+        )
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            result = await fetch_pins_recovery(
+                client, _pins_urls(8100, 8105), per_call_timeout=0.05,
             )
-            transport = httpx.MockTransport(handler)
-            async with httpx.AsyncClient(transport=transport) as client:
-                return await fetch_pins_recovery(
-                    client, _pins_urls(8100, 8105), per_call_timeout=0.05,
-                )
-
-        result = run_on_virtual_clock(scenario())
 
         assert result['proj8100'] == {'esc-a': ['3543']}
         assert result['proj8105'] is None
