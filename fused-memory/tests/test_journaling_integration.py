@@ -3,11 +3,16 @@
 import asyncio
 import json
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
 
+from fused_memory.backends.llm_token_usage import (
+    AttributingTokenUsageTracker,
+    measure_llm_tokens,
+)
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.write_journal import WriteJournal
 
@@ -609,3 +614,114 @@ async def test_failed_backend_call_still_persists_measured_duration_ms(
     assert backend_row['success'] == 0
     assert isinstance(backend_row['duration_ms'], float)
     assert backend_row['duration_ms'] >= _MIN_MEASURED_MS
+
+
+_EPISODE_RESULT = 'episode-result-sentinel'
+
+
+def _graphiti_write_payload(cid: str, wid: str) -> dict:
+    return {
+        'name': 'test',
+        'content': 'test content',
+        'source': 'text',
+        'group_id': 'test',
+        'source_description': '',
+        '_causation_id': cid,
+        '_write_op_id': wid,
+    }
+
+
+@pytest.fixture
+def llm_tracked_client(service) -> SimpleNamespace:
+    """The graphiti mock's token probe measures this client's tracker."""
+    client = SimpleNamespace(token_tracker=AttributingTokenUsageTracker())
+    service.graphiti.token_probe = lambda: measure_llm_tokens(client)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_graphiti_write_persists_its_llm_tokens_and_duration(
+    service, write_journal, llm_tracked_client
+):
+    async def _add_episode(**_kwargs):
+        llm_tracked_client.token_tracker.record('extract_nodes', 120, 45)
+        return _EPISODE_RESULT
+
+    service.graphiti.add_episode = _add_episode
+    wid = str(uuid.uuid4())
+
+    await service._execute_graphiti_write(
+        'add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid)
+    )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert isinstance(row['duration_ms'], float)
+    assert row['duration_ms'] > 0
+    summary = json.loads(row['result_summary'])
+    assert summary['tokens'] == {
+        'input_tokens': 120,
+        'output_tokens': 45,
+        'total_tokens': 165,
+        'llm_calls': 1,
+    }
+    assert summary['result'] == _EPISODE_RESULT
+
+
+@pytest.mark.asyncio
+async def test_failed_graphiti_write_still_persists_the_tokens_it_burned(
+    service, write_journal, llm_tracked_client
+):
+    async def _add_episode(**_kwargs):
+        llm_tracked_client.token_tracker.record('extract_nodes', 10, 2)
+        raise RuntimeError('extraction failed after an LLM call')
+
+    service.graphiti.add_episode = _add_episode
+    wid = str(uuid.uuid4())
+
+    with pytest.raises(RuntimeError, match='extraction failed'):
+        await service._execute_graphiti_write(
+            'add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid)
+        )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 0
+    assert json.loads(row['result_summary'])['tokens']['total_tokens'] == 12
+
+
+@pytest.mark.asyncio
+async def test_mem0_backend_row_keeps_its_plain_string_result_summary(
+    service, write_journal, llm_tracked_client
+):
+    cid = str(uuid.uuid4())
+
+    await service.add_memory(
+        content='a fact with no graphiti LLM spend',
+        category='preferences_and_norms',
+        project_id='test',
+        causation_id=cid,
+    )
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    [mem0_add] = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert mem0_add['result_summary'] == str({'results': [{'id': 'mem0-1'}]})
+    assert 'tokens' not in mem0_add['result_summary']
+
+
+@pytest.mark.asyncio
+async def test_graphiti_row_is_still_persisted_when_the_probe_is_a_bare_mock(
+    service, write_journal
+):
+    """The fixture's MagicMock graphiti auto-creates ``token_probe``; its usage
+    is not a measurement and must never reach the journal's ``json.dumps``."""
+    wid = str(uuid.uuid4())
+
+    await service._execute_graphiti_write(
+        'add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid)
+    )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 1
+    assert row['result_summary'] is None
