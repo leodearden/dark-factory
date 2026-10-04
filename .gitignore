@@ -55,20 +55,25 @@ htmlcov/
 coverage.xml
 
 # ── Test SQLite artifacts — MagicMock path side-effects ──────────────
-# OverrideStore creates an SQLite DB at config.overrides_db_path; when
-# tests pass an unpatched MagicMock as config the stringified mock name
-# becomes the path, producing files like "<MagicMock name='...' id='...'>".
-# That is the str(mock)/repr shape, which always carries a leading "<".
-# A MagicMock is ALSO a valid os.PathLike[str]: os.fspath(mock) returns a
-# repr-derived string whose first component is a plain "MagicMock", with
-# no angle bracket, so code that coerces one with Path() and then calls
-# mkdir() materialises a real directory tree named MagicMock/ under the
-# CWD.  The pattern below cannot match that second shape, so it needs its
-# own entry.  Both are containment only — the real fix is to give the
-# test a genuine path (see orchestrator/tests/conftest.py's autouse
-# stray-artifact guard, which fails loudly on the directory shape).
+# A mock passed where code wants a path leaves one of two shapes: the
+# str(mock)/repr FILE "<ClassName name=... id=...>" (e.g. OverrideStore's
+# SQLite DB) or, via os.fspath(), the DIRECTORY tree "<ClassName>/...".
+# Both lead with the mock's OWN CLASS NAME, not always "MagicMock": every
+# MagicMixin-based stdlib mock does this. AsyncMock is not a MagicMock
+# subclass but shares MagicMixin; it reached a commit in task 4592 because
+# only MagicMock was listed. The names below must cover
+# df_pytest_isolation.py::MOCK_FSPATH_ROOT_NAMES, and
+# tests/scripts/test_mock_fspath_dir_isolation.py fails if they do not.
+# Both are containment only: the real fence is the autouse guard
+# df_pytest_isolation.py::_df_no_mock_derived_stray_dirs.
 <MagicMock*
+<AsyncMock*
+<NonCallableMagicMock*
+<ThreadingMock*
 MagicMock/
+AsyncMock/
+NonCallableMagicMock/
+ThreadingMock/
 
 # ── pytest scratch debris — `--basetemp` inside a checkout ───────────
 # An agent passing `pytest --basetemp=.pytest-tmp` (legal and expected —
