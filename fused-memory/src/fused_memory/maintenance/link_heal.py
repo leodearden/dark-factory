@@ -15,14 +15,21 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from fused_memory.maintenance.link_heal_store import LiveRecord, MetadataChange
+from fused_memory.maintenance.link_heal_store import (
+    LinkCensus,
+    LinkHealStore,
+    LiveRecord,
+    MetadataChange,
+    StoreReadFailed,
+)
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     CHILD_KINDS,
@@ -449,3 +456,215 @@ class PlannedAction:
     @property
     def change(self) -> MetadataChange:
         return change_for(self.action, self.pre_image)
+
+
+@dataclass(frozen=True)
+class RunCounts:
+    """The one H1 disclosure record, shared by plan, apply, undo and status.
+
+    ``examined`` counts the live links that were read and decided.
+    ``adjudicated`` counts the examined links whose basis still judges the texts they show.
+    ``unexamined`` counts the examined links that reached the verdict rows with no basis.
+    """
+
+    links_total: int = 0
+    examined: int = 0
+    adjudicated: int = 0
+    unexamined: int = 0
+    planned: int = 0
+    planned_by_action: Mapping[str, int] = field(default_factory=dict)
+    already_pending: int = 0
+    undo_suppressed: int = 0
+    bases_unlinked: int = 0
+    read_failed: int = 0
+    applied: int = 0
+    skipped_stale: int = 0
+    skipped_cap: int = 0
+    failed: int = 0
+    not_attempted: int = 0
+    stale_rating: int = 0
+    contested_reported: int = 0
+    chain_reported: int = 0
+    peer_reported: int = 0
+    has_children: int = 0
+    cross_project_reported: int = 0
+    unclear: int = 0
+    no_action: int = 0
+    would_escape: tuple[str, ...] = ()
+    escaped: tuple[Mapping[str, Any], ...] = ()
+    caps_bit: tuple[str, ...] = ()
+    stopped_by: str | None = None
+    approved_plan_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, 'planned_by_action', MappingProxyType(dict(self.planned_by_action)),
+        )
+        object.__setattr__(self, 'would_escape', tuple(self.would_escape))
+        object.__setattr__(
+            self, 'escaped', tuple(MappingProxyType(dict(entry)) for entry in self.escaped),
+        )
+        object.__setattr__(self, 'caps_bit', tuple(self.caps_bit))
+
+    @property
+    def complete(self) -> bool:
+        partial = (self.read_failed, self.failed, self.skipped_cap, self.not_attempted)
+        return not any(partial) and self.stopped_by is None
+
+    def as_json(self) -> dict[str, Any]:
+        document: dict[str, Any] = {item.name: getattr(self, item.name) for item in fields(self)}
+        document['planned_by_action'] = dict(self.planned_by_action)
+        document['would_escape'] = list(self.would_escape)
+        document['escaped'] = [dict(entry) for entry in self.escaped]
+        document['caps_bit'] = list(self.caps_bit)
+        document['complete'] = self.complete
+        return document
+
+
+@dataclass(frozen=True)
+class Plan:
+    actions: tuple[PlannedAction, ...]
+    counts: RunCounts
+
+
+async def read_link_state(
+    store: LinkHealStore, project_id: str, child_id: str, projects: Sequence[str],
+) -> LinkState | None:
+    """The link as it reads now, or ``None`` once the record is no longer a link.
+
+    A failed read raises :class:`StoreReadFailed`: unknown is never absent.
+    """
+    child = await store.read(project_id, child_id)
+    parent_id = None if child is None else link_parent_id(child.metadata)
+    if child is None or parent_id is None:
+        return None
+    parent = await store.read(project_id, parent_id)
+    presence = (
+        ParentPresence.FOUND
+        if parent is not None
+        else await _presence_elsewhere(store, parent_id, project_id, projects)
+    )
+    children = await store.count_children(project_id, child_id)
+    return LinkState(
+        project_id=project_id,
+        child=child,
+        parent_presence=presence,
+        parent=parent,
+        has_children=children > 0,
+    )
+
+
+async def _presence_elsewhere(
+    store: LinkHealStore, memory_id: str, home: str, projects: Sequence[str],
+) -> ParentPresence:
+    for project_id in projects:
+        if project_id != home and await store.read(project_id, memory_id) is not None:
+            return ParentPresence.OTHER_PROJECT
+    return ParentPresence.ABSENT
+
+
+async def build_plan(
+    bases: Iterable[LinkBasis],
+    *,
+    store: LinkHealStore,
+    census: LinkCensus,
+    projects: Sequence[str],
+) -> Plan:
+    """Decide every live link of *projects* against *bases*. Writes nothing."""
+    tally = _PlanTally(bases)
+    for project_id in projects:
+        for child_id in await census.linked_ids(project_id):
+            try:
+                state = await read_link_state(store, project_id, child_id, projects)
+            except StoreReadFailed:
+                tally.record_read_failure(project_id, child_id)
+                continue
+            if state is not None:
+                tally.record(state)
+    return tally.plan()
+
+
+def _link_key(project_id: str, child_id: str, parent_id: str | None) -> tuple[str, str, str | None]:
+    return (project_id, child_id, parent_id)
+
+
+class _PlanTally:
+    """What :func:`build_plan` has seen so far. Each :class:`Report` is
+    disclosed by the :class:`RunCounts` counter its value names."""
+
+    def __init__(self, bases: Iterable[LinkBasis]) -> None:
+        self._bases = {
+            _link_key(basis.project_id, basis.child_id, basis.parent_id): basis
+            for basis in bases
+        }
+        self._matched: set[tuple[str, str, str | None]] = set()
+        self._unread: set[tuple[str, str]] = set()
+        self._reports: Counter[Report] = Counter()
+        self._actions: list[PlannedAction] = []
+        self._examined = 0
+        self._adjudicated = 0
+
+    def record_read_failure(self, project_id: str, child_id: str) -> None:
+        self._unread.add((project_id, child_id))
+
+    def record(self, state: LinkState) -> None:
+        self._examined += 1
+        key = _link_key(state.project_id, state.child.memory_id, state.link.parent_id)
+        basis = self._bases.get(key)
+        if basis is not None:
+            self._matched.add(key)
+            if not is_stale(state, basis):
+                self._adjudicated += 1
+        decision = decide(state, basis)
+        if isinstance(decision.outcome, HealAction):
+            self._actions.append(_planned_action(state, decision.outcome, decision.basis_source, basis))
+        else:
+            self._reports[decision.outcome] += 1
+
+    def _bases_unlinked(self) -> int:
+        return sum(
+            1
+            for key in self._bases
+            if key not in self._matched and (key[0], key[1]) not in self._unread
+        )
+
+    def plan(self) -> Plan:
+        reported: dict[str, Any] = {report.value: self._reports[report] for report in Report}
+        counts = RunCounts(
+            links_total=self._examined + len(self._unread),
+            examined=self._examined,
+            adjudicated=self._adjudicated,
+            planned=len(self._actions),
+            planned_by_action=Counter(action.action.value for action in self._actions),
+            bases_unlinked=self._bases_unlinked(),
+            read_failed=len(self._unread),
+            **reported,
+        )
+        return Plan(actions=tuple(self._actions), counts=counts)
+
+
+def _planned_action(
+    state: LinkState,
+    action: HealAction,
+    basis_source: BasisSource | None,
+    basis: LinkBasis | None,
+) -> PlannedAction:
+    """A deterministic detach rests on the live child; every other heal on its basis."""
+    if basis_source is BasisSource.DETERMINISTIC:
+        source, key = BasisSource.DETERMINISTIC, None
+        child_sha256, parent_sha256 = state.child.text_sha256, None
+    elif basis is not None:
+        source, key = basis.source, basis.key
+        child_sha256, parent_sha256 = basis.child_sha256, basis.parent_sha256
+    else:
+        raise ValueError(f'{action} for {state.child.memory_id} rests on no basis')
+    return PlannedAction.planned(
+        project_id=state.project_id,
+        child_id=state.child.memory_id,
+        action=action,
+        pre_image=state.link,
+        basis_source=source,
+        basis_key=key,
+        child_sha256=child_sha256,
+        parent_sha256=parent_sha256,
+    )

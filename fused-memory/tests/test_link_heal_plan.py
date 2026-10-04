@@ -86,13 +86,15 @@ def seed_link(
     child_text: str = CHILD_TEXT,
     parent_text: str | None = PARENT_TEXT,
     project: str = DF,
-    **child_meta,
+    contested: bool = False,
 ) -> None:
     if parent_text is not None:
         harness.seed(project, parent, parent_text)
-    meta = {PARENT_ID_KEY: parent, **child_meta}
+    meta: dict[str, object] = {PARENT_ID_KEY: parent}
     if kind is not None:
         meta['kind'] = kind
+    if contested:
+        meta[CONTESTED_METADATA_KEY] = True
     harness.seed(project, child, child_text, **meta)
 
 
@@ -169,7 +171,7 @@ class TestReportedLinks:
 
     @pytest.mark.asyncio
     async def test_a_contested_child_rated_related_is_reported_not_detached(self, harness):
-        seed_link(harness, **{CONTESTED_METADATA_KEY: True})
+        seed_link(harness, contested=True)
 
         result = await plan(harness, corpus_basis('RELATED'))
 
