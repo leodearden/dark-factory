@@ -12,6 +12,7 @@ import pytest
 from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
+    is_routable_task_id,
     resolve_finding_task_target,
 )
 
@@ -208,6 +209,51 @@ class TestResolveFindingTaskTargetPrecedence:
         finding = {
             'task_id': '   ',
             'cited_tasks': [_citation('dark_factory', '4458')],
+        }
+        assert resolve_finding_task_target(finding, 'dark_factory') == '4458'
+
+
+class TestRoutableTaskIdShape:
+    """Only an id that is safe as a queue key is routed.
+
+    The target id becomes part of a filename (`EscalationQueue.make_id` and
+    `submit`), so a separator, a cross-project ref, whitespace or a control
+    character must never reach the filer.
+    """
+
+    @pytest.mark.parametrize('task_id', ['4458', '4458.2', '1-2', 'abc_12', 'A9'])
+    def test_conservative_id_shapes_are_routable(self, task_id):
+        assert is_routable_task_id(task_id) is True
+
+    @pytest.mark.parametrize(
+        'task_id',
+        [
+            '', '../x', '../../4458', 'a/b', 'proj/4458', '..\\x', 'a\\b',
+            '.', '..', '-4458',
+            'reify:4458',
+            '44 58', '4458\n', '44\x0058',
+        ],
+    )
+    def test_unsafe_id_shapes_are_not_routable(self, task_id):
+        assert is_routable_task_id(task_id) is False
+
+    @pytest.mark.parametrize('task_id', ['../x', '../../4458', 'a/b', 'proj/4458', 'reify:4458'])
+    def test_bare_task_id_with_an_unsafe_shape_is_not_routed(self, task_id):
+        assert resolve_finding_task_target({'task_id': task_id}, 'dark_factory') is None
+
+    def test_unsafe_bare_id_falls_through_to_citations(self):
+        finding = {
+            'task_id': '../x',
+            'cited_tasks': [_citation('dark_factory', '4458')],
+        }
+        assert resolve_finding_task_target(finding, 'dark_factory') == '4458'
+
+    def test_unsafe_citation_does_not_block_a_later_good_one(self):
+        finding = {
+            'cited_tasks': [
+                _citation('dark_factory', 'a/b'),
+                _citation('dark_factory', '4458'),
+            ],
         }
         assert resolve_finding_task_target(finding, 'dark_factory') == '4458'
 
