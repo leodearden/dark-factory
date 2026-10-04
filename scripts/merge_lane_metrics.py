@@ -790,6 +790,57 @@ def _lane_module_aliases(tree: ast.AST) -> set[str]:
     return aliases
 
 
+@dataclasses.dataclass(frozen=True)
+class PatchCall:
+    """One patch-shaped call: ``target`` for ``patch('a.b._c')``, or
+    ``receiver`` + ``attribute`` for ``patch.object(mod, '_c')``."""
+
+    target: str | None
+    receiver: ast.expr | None
+    attribute: str | None
+
+
+def _str_constant(expr: ast.expr) -> str | None:
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return expr.value
+    return None
+
+
+def _patch_call(node: ast.Call) -> PatchCall | None:
+    func = node.func
+    is_setattr = isinstance(func, ast.Attribute) and func.attr == 'setattr'
+    is_dotted_patch = isinstance(func, ast.Attribute) and func.attr == 'patch'
+    is_bare_patch = isinstance(func, ast.Name) and func.id == 'patch'
+    is_patch_object = (
+        isinstance(func, ast.Attribute)
+        and func.attr == 'object'
+        and (
+            (isinstance(func.value, ast.Name) and func.value.id == 'patch')
+            or (isinstance(func.value, ast.Attribute) and func.value.attr == 'patch')
+        )
+    )
+    target = _str_constant(node.args[0])
+    if target is not None:
+        if is_setattr or is_dotted_patch or is_bare_patch:
+            return PatchCall(target=target, receiver=None, attribute=None)
+        return None
+    if (is_setattr or is_patch_object) and len(node.args) >= 2:
+        attribute = _str_constant(node.args[1])
+        if attribute is not None:
+            return PatchCall(target=None, receiver=node.args[0], attribute=attribute)
+    return None
+
+
+def patch_calls_in_tree(node: ast.AST) -> tuple[PatchCall, ...]:
+    """Every patch-shaped call under *node*, in ``ast.walk`` order, duplicates kept."""
+    calls = (
+        _patch_call(call)
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call) and call.args
+    )
+    return tuple(call for call in calls if call is not None)
+
+
 def patch_targets(source: str, *, path: str = '<source>') -> set[str]:
     """Distinct leaf names patched through a lane module path in *source*.
 
@@ -821,49 +872,23 @@ def patch_targets_in_tree(tree: ast.Module) -> set[str]:
             and expr.value.id == 'orchestrator'
         )
 
-    targets: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        func = node.func
-        is_setattr = isinstance(func, ast.Attribute) and func.attr == 'setattr'
-        is_dotted_patch = isinstance(func, ast.Attribute) and func.attr == 'patch'
-        is_bare_patch = isinstance(func, ast.Name) and func.id == 'patch'
-        is_patch_object = (
-            isinstance(func, ast.Attribute)
-            and func.attr == 'object'
-            and (
-                (isinstance(func.value, ast.Name) and func.value.id == 'patch')
-                or (isinstance(func.value, ast.Attribute) and func.value.attr == 'patch')
+    def _lane_leaf(call: PatchCall) -> str | None:
+        if call.target is not None:
+            return next(
+                (
+                    call.target[len(module) + 1:]
+                    for module in LANE_PATCH_MODULES
+                    if call.target.startswith(module + '.')
+                ),
+                None,
             )
-        )
+        if call.receiver is not None and _is_lane_ref(call.receiver):
+            return call.attribute
+        return None
 
-        leaf: str | None = None
-
-        # String-path form: the dotted path IS the first positional argument.
-        if is_setattr or is_dotted_patch or is_bare_patch:
-            first = node.args[0]
-            if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                for module in LANE_PATCH_MODULES:
-                    prefix = module + '.'
-                    if first.value.startswith(prefix):
-                        leaf = first.value[len(prefix):]
-                        break
-
-        # Object-path form: first arg is a lane module reference, second is the
-        # leaf name string.
-        if leaf is None and (is_setattr or is_patch_object) and len(node.args) >= 2:
-            target, name_arg = node.args[0], node.args[1]
-            if (
-                _is_lane_ref(target)
-                and isinstance(name_arg, ast.Constant)
-                and isinstance(name_arg.value, str)
-            ):
-                leaf = name_arg.value
-
-        if leaf:
-            targets.add(leaf)
-    return targets
+    return {
+        leaf for call in patch_calls_in_tree(tree) if (leaf := _lane_leaf(call))
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1133,8 +1158,8 @@ def _git_output(root: Path, *args: str) -> str:
     return completed.stdout
 
 
-def tracked_python_files(root: Path) -> tuple[str, ...]:
-    """Every ``.py`` file git tracks under *root*, repo-relative and sorted.
+def tracked_files(root: Path, *pathspecs: str) -> tuple[str, ...]:
+    """Every file git tracks under *root* matching *pathspecs*, repo-relative and sorted.
 
     *root* must be the top of its work tree. Listing from a directory that is
     not a repository but sits inside one yields only that directory's tracked
@@ -1148,8 +1173,13 @@ def tracked_python_files(root: Path) -> tuple[str, ...]:
             'to it), so its tracked files cannot be listed as the repo; pass the '
             'repo root as --root'
         )
-    listing = _git_output(root, 'ls-files', '-z', '--', '*.py')
+    listing = _git_output(root, 'ls-files', '-z', '--', *pathspecs)
     return tuple(sorted(path for path in listing.split('\0') if path))
+
+
+def tracked_python_files(root: Path) -> tuple[str, ...]:
+    """Every ``.py`` file git tracks under *root*; see ``tracked_files``."""
+    return tracked_files(root, '*.py')
 
 
 def is_external_importer_source(relpath: str) -> bool:
