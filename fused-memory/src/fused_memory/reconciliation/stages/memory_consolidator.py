@@ -105,7 +105,7 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     strip_snapshot_lines,
 )
-from fused_memory.server.grouped_read import PARENT_ID_KEY
+from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
@@ -1993,11 +1993,11 @@ def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
 
 
 def _parent_link(meta: Mapping[str, Any]) -> str:
-    """Render a memory's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
-    parent_id = meta.get(PARENT_ID_KEY)
-    if not parent_id:
+    """Render a child's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
+    parent_id = _parent_id_in_meta(meta)
+    if parent_id is None:
         return ''
-    return f' {PARENT_ID_KEY}={parent_id} kind={meta.get("kind", "?")}'
+    return f' {PARENT_ID_KEY}={parent_id} kind={meta["kind"]}'
 
 
 def _format_memories(memories: list[dict]) -> tuple[str, int]:

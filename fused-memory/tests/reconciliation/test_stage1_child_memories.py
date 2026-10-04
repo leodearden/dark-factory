@@ -40,9 +40,10 @@ def _fixture_memories() -> list[dict]:
     return [parent, *children]
 
 
-async def _render_payload() -> str:
+async def _render_payload(memories: list[dict] | None = None) -> str:
     stage = make_consolidator()
-    stage.memory.mem0.get_all = AsyncMock(return_value={'results': _fixture_memories()})
+    results = _fixture_memories() if memories is None else memories
+    stage.memory.mem0.get_all = AsyncMock(return_value={'results': results})
     return await stage.assemble_payload(
         events=[], watermark=Watermark(project_id='test_project'), prior_reports=[]
     )
@@ -77,6 +78,46 @@ class TestStage1PayloadRendersChildLinks:
         assert line == f'- [{_PARENT_ID}] (procedural_knowledge): {_PARENT_BODY}', (
             f'A memory without {PARENT_ID_KEY} must keep the pre-existing line format; '
             f'payload:\n{payload}'
+        )
+
+
+_NOT_A_CHILD_ID = 'cccccccc-dddd-4eee-8fff-000000000000'
+_NON_CHILD_KIND = 'cycle_summary'
+
+
+class TestStage1PayloadRendersNoLinkForNonChildren:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('metadata', 'rendered_category'),
+        [
+            pytest.param(
+                {'category': 'procedural_knowledge', PARENT_ID_KEY: _PARENT_ID,
+                 'kind': _NON_CHILD_KIND},
+                'procedural_knowledge',
+                id='parent-id-with-non-child-kind',
+            ),
+            pytest.param(
+                {'category': 'procedural_knowledge', PARENT_ID_KEY: _PARENT_ID},
+                'procedural_knowledge',
+                id='parent-id-without-kind',
+            ),
+            pytest.param(
+                {'category': 'procedural_knowledge', PARENT_ID_KEY: 42,
+                 'kind': min(CHILD_KINDS)},
+                'procedural_knowledge',
+                id='child-kind-with-non-string-parent-id',
+            ),
+            pytest.param(None, '?', id='no-metadata'),
+        ],
+    )
+    async def test_line_keeps_plain_format(self, metadata, rendered_category: str):
+        assert _NON_CHILD_KIND not in CHILD_KINDS
+        memory = {'id': _NOT_A_CHILD_ID, 'memory': _PARENT_BODY, 'metadata': metadata}
+        payload = await _render_payload([memory])
+        line = _line_for(payload, _NOT_A_CHILD_ID)
+        assert line == f'- [{_NOT_A_CHILD_ID}] ({rendered_category}): {_PARENT_BODY}', (
+            'Only a grouped_read child (child kind + string parent id) gets a parent '
+            f'link; line={line!r}; payload:\n{payload}'
         )
 
 
