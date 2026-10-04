@@ -96,18 +96,39 @@ SHA="$(git -C "$REPO" rev-parse --short HEAD)"
 "$PY" - "$SCRIPT_DIR" "$KNOB_KEY" "$CAP" "$PORT" "$SHA" <<'RELOAD_PY'
 import sys
 script_dir, knob, cap, port, sha = sys.argv[1:6]
-sys.path.insert(0, script_dir)
-from legibility import census_trigger
 
-tool = census_trigger.post_mcp_tool_call(f"http://127.0.0.1:{port}/mcp", "reload_config", {})
+
+def fail(message):
+    print(f"merge-deep-set-cap: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+sys.path.insert(0, script_dir)
+try:
+    from legibility import census_trigger
+except ImportError as exc:
+    fail(f"the MCP reload transport is not importable under {sys.executable}: {exc}\n"
+         f"  sys.path entry added: {script_dir}\n"
+         f"  remedy: sync this checkout so {script_dir}/../.venv exists, or re-run\n"
+         f"  this script under `uv run --project shared`")
+
+try:
+    tool = census_trigger.post_mcp_tool_call(f"http://127.0.0.1:{port}/mcp", "reload_config", {})
+except Exception as exc:
+    # Broad on purpose: a malformed/error envelope, a failed handshake and a
+    # dead socket all leave the live cap UNKNOWN, which a deploy gate must fail.
+    fail(f"reload_config never reached the tool at 127.0.0.1:{port}: {type(exc).__name__}: {exc} "
+         f"(committed as {sha}; the cap lands at the next restart)")
+
 if tool.get("error"):
-    print(f"reload_config error: {tool['error']}", file=sys.stderr); sys.exit(1)
+    fail(f"reload_config error: {tool['error']}")
 applied = tool.get("applied") or {}
 entry = applied.get(knob)
 if not isinstance(entry, dict):
-    print(f"applied disposition missing {knob}: applied_keys={sorted(applied)} "
-          f"restart_required_keys={sorted(tool.get('restart_required') or {})}", file=sys.stderr)
-    sys.exit(1)
+    fail(f"applied disposition missing {knob}: applied_keys={sorted(applied)} "
+         f"restart_required_keys={sorted(tool.get('restart_required') or {})}")
+if str(entry.get("new")) != cap:
+    fail(f"applied {knob} does not carry {cap}: entry={entry}")
 print(f"merge-deep-set-cap: {knob} applied old={entry.get('old')} new={entry.get('new')}")
 RELOAD_PY
 
