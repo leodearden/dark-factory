@@ -11,6 +11,7 @@ from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
 from orchestrator.agents.python_literal_guidance import PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
+from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
 # it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
@@ -1277,6 +1278,7 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + CHAINED_COMMAND_STATUS_GUIDANCE
     + GREP_PATTERN_ESCAPING_GUIDANCE
     + PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
+    + SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 )
 
 
