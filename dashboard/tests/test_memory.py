@@ -17,6 +17,7 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
+from shared.testing_virtual_clock import virtual_clock_test
 
 from dashboard.data.datum import Datum, DatumState, unknown_datum, validate_datum
 from dashboard.data.memory import get_curator_state
@@ -1023,9 +1024,11 @@ class TestHandRolledLoopsBoundEachUrl:
     ``call_with_deadline`` bound, after which the hung url is logged,
     invalidated and skipped.
 
-    The outer ``asyncio.wait_for(..., 5)`` is mandatory: without it a
-    regression is SIGALRM-killed at the suite's 60s pytest-timeout with no
-    traceback instead of failing fast.
+    Both run on shared/src/shared/testing_virtual_clock.py::virtual_clock_test,
+    so the healthy url's ``HOST_STALL_SECONDS`` stall cannot expire its deadline
+    while the hung url still times out at exactly ``DEADLINE_SECONDS``. The outer
+    ``asyncio.wait_for(..., 5)`` stays mandatory: without it a regression parks
+    until pytest-timeout kills the worker with no traceback.
     """
 
     DEADLINE_SECONDS = 0.05
@@ -1039,6 +1042,7 @@ class TestHandRolledLoopsBoundEachUrl:
             mcp_fanout, '_DEFAULT_PER_URL_DEADLINE_SECONDS', self.DEADLINE_SECONDS,
         )
 
+    @virtual_clock_test
     async def test_get_queue_stats_skips_the_hung_url_and_aggregates_the_rest(
         self, two_url_config,
     ):
@@ -1065,6 +1069,7 @@ class TestHandRolledLoopsBoundEachUrl:
         assert 9001 in handler.ports_seen, 'the loop must reach the second url'
         assert hung not in _sessions, "the hung url's session must be evicted"
 
+    @virtual_clock_test
     async def test_get_wal_status_skips_the_hung_url_and_reports_the_rest(
         self, two_url_config,
     ):
