@@ -10149,6 +10149,10 @@ def _group_node_ids_by_subproject(
     order and logs a WARNING naming every candidate prefix and *log_label* —
     a low-likelihood, non-fatal ambiguity, not a fail-safe path.
 
+    A ModuleConfig keyed on an empty prefix is never probed (it would match
+    every node-id and yield a leading-slash qualified id); it is skipped with
+    a WARNING, so node-ids it alone could own map to nothing (``None``).
+
     Args:
         worktree: Tree the existence probes run against.
         module_configs: Prefix -> ModuleConfig, freshly discovered on
@@ -10157,11 +10161,18 @@ def _group_node_ids_by_subproject(
         log_label: Caller name, embedded in every log line so an operator can
             attribute the message to the right call site.
     """
+    probe_prefixes = [prefix for prefix in module_configs if prefix]
+    if len(probe_prefixes) != len(module_configs):
+        logger.warning(
+            '%s: ignoring ModuleConfig with an empty prefix — an empty prefix '
+            'would match every node-id and qualify it as %r',
+            log_label, '/<node_id>',
+        )
     groups: dict[str, list[str]] = {}
     for node_id in node_ids:
         file_part = node_id.split('::', 1)[0]
         candidates: list[tuple[str, str]] = []
-        for prefix, _mc in module_configs.items():
+        for prefix in probe_prefixes:
             if (worktree / prefix / file_part).exists():
                 candidates.append((prefix, f'{prefix}/{node_id}'))
             elif file_part.startswith(f'{prefix}/') and (worktree / file_part).exists():

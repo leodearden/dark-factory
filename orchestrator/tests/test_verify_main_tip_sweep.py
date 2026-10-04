@@ -1836,6 +1836,36 @@ class TestGroupNodeIdsBySubproject:
 
         assert groups == {}, f'Expected {{}} for an empty node-id list, got {groups!r}'
 
+    def test_empty_prefix_config_is_not_a_universal_matcher(
+        self, tmp_path: Path
+    ) -> None:
+        """(g) A ModuleConfig keyed on prefix='' must not match every node-id
+        (pathlib drops the empty component) nor yield a '/'-leading qualified
+        id: it is skipped with a WARNING, real prefixes still map unambiguously,
+        and an id only the empty prefix could own is unmapped (None)."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, _GROUP_PROJECT_LAYOUT_TWO)
+        mcs = self._discover(tmp_path)
+        with_empty = {'': mcs['alpha'], **mcs}
+
+        with patch.object(verify_module, 'logger') as mock_logger:
+            groups = verify_module._group_node_ids_by_subproject(
+                tmp_path, with_empty, ['tests/test_a.py::test_a'], log_label='unit',
+            )
+            only_empty = verify_module._group_node_ids_by_subproject(
+                tmp_path, {'': mcs['alpha']}, ['tests/test_a.py::test_a'],
+                log_label='unit',
+            )
+
+        assert groups == {'alpha': ['alpha/tests/test_a.py::test_a']}, groups
+        assert only_empty is None, only_empty
+        assert mock_logger.warning.call_count == 2, mock_logger.warning.call_args_list
+        assert all(
+            'empty prefix' in call.args[0]
+            for call in mock_logger.warning.call_args_list
+        ), mock_logger.warning.call_args_list
+
 
 # ---------------------------------------------------------------------------
 # task-3095 step-3: verify._sweep_failure_reproduces_in_isolation
