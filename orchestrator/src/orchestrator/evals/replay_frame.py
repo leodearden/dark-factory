@@ -8,6 +8,11 @@ evidence is in frame. Decision, rationale and known gaps: docs/eval-replay-frame
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.config import OrchestratorConfig
+
 # Bump whenever the block text changes materially, so one id means one briefing.
 REPLAY_FRAME_ID = 'honest-frame-v1'
 
@@ -50,3 +55,29 @@ out-of-frame evidence.
 
 Otherwise, plan the task as if `main` were at `{sha}`.
 """
+
+
+class ReplayFramedBriefingAssembler(BriefingAssembler):
+    """An eval-only BriefingAssembler whose architect prompt ends with the replay frame.
+
+    Production never constructs it; see docs/eval-replay-frame.md.
+    """
+
+    def __init__(self, config: OrchestratorConfig, *, base_commit: str):
+        super().__init__(config)
+        self._base_commit = _require_base_commit(base_commit)
+
+    async def build_architect_prompt(
+        self,
+        task: dict,
+        worktree: Path | None = None,
+        context: str | None = None,
+        *,
+        include_prior_proposals: bool = False,
+        committed_work: list[dict] | None = None,
+    ) -> str:
+        return await super().build_architect_prompt(
+            task, worktree, context,
+            include_prior_proposals=include_prior_proposals,
+            committed_work=committed_work,
+        ) + build_replay_frame_block(self._base_commit)

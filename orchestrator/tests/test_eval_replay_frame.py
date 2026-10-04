@@ -117,8 +117,8 @@ class TestPlanOnlyCliAppendsReplayFrame:
         ])
 
         assert r.exit_code == 0, r.output
-        invoke_agent.assert_awaited_once()
-        assert invoke_agent.await_args.kwargs['prompt'] == (
+        (architect_call,) = invoke_agent.await_args_list
+        assert architect_call.kwargs['prompt'] == (
             'ARCH PROMPT' + build_replay_frame_block('feedface1234')
         )
 
