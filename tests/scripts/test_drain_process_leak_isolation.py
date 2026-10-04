@@ -488,22 +488,10 @@ class TestWaitProofGraceSecs:
     explains why.
     """
 
-    # Representative wait-proving spawn timeouts in scripts/tests/
-    # test_restart_all_orchestrators.py. NOT flat literals everywhere:
-    # - test_defer_withholds_restart_while_busy and
-    #   test_unknown_grace_withholds_restart_while_absent resolve
-    #   ``load_scaled_grace(3, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)``, so
-    #   3 is a BASE and the value is anywhere in [3, CAP] depending on host
-    #   loadavg. Do not "restore" a flat 3: that reinstates the flake/vacuity
-    #   load scaling fixed.
-    # - test_busy_stale_busy_oscillation_does_not_reset_the_force_fire_anchor
-    #   pins exactly WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS.
-    # - test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await
-    #   uses a flat 20.
-    # wait_proof_grace_secs is monotone, so the endpoints (3 and the cap) bound
-    # every reachable value; the cap is also pinned maximal by
-    # test_the_spawn_timeout_cap_is_the_largest_the_ceiling_permits.
-    REAL_SPAWN_TIMEOUTS = (3, 20, WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
+    # Endpoints of the reachable wait-proving spawn timeouts: the smallest
+    # load-scaled base and WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS.
+    # wait_proof_grace_secs is monotone, so these bound every site.
+    REAL_SPAWN_TIMEOUTS = (3, WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
     def test_the_grace_comfortably_exceeds_the_spawn_timeout_that_kills_it(self) -> None:
         """Too SMALL and the wait-proving tests stop proving anything.
