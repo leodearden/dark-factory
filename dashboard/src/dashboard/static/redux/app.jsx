@@ -6,7 +6,7 @@ const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, Esca
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
-const { staleNoticesForTab, loadingNoticesForTab } = window.DF_ENDPOINT_STALENESS;
+const { staleNoticesForTab, loadingNoticeForTab } = window.DF_ENDPOINT_STALENESS;
 const { scopePollingToTab } = window.DF_DATA_LOADER;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
@@ -47,7 +47,7 @@ function LiveClock({ live }) {
   return <>{now.toLocaleTimeString('en-GB', { hour12: false })}</>;
 }
 
-// The per-endpoint notices' shared look; only the left edge says which kind.
+// The staleness and loading notices' shared look; only the left edge says which kind.
 function noticeBannerStyle(edgeColor) {
   return {
     padding: '8px 12px',
@@ -184,9 +184,9 @@ function App() {
   //
   // TAB_ENDPOINTS plus CHROME_ENDPOINTS now also decide what is POLLED, so a
   // tab opened for the first time may show its pre-fetch seed until its
-  // endpoints answer: the loading notices name each path with no receipt yet.
+  // endpoints answer: the one loading notice names every path with no receipt yet.
   const staleNotices = staleNoticesForTab({ tab, stale: DD.__stale || {}, now: Date.now() });
-  const loadingNotices = loadingNoticesForTab({ tab, receipt: DD.__receipt || {}, stale: DD.__stale || {} });
+  const loadingNotice = loadingNoticeForTab({ tab, receipt: DD.__receipt || {}, stale: DD.__stale || {} });
 
   function renderTab() {
     switch (tab) {
@@ -277,13 +277,13 @@ function App() {
               {notice.text}
             </div>
           ))}
-          {loadingNotices.map(notice => (
-            <div key={notice.path} className="col-span-12"
+          {loadingNotice && (
+            <div className="col-span-12"
                  data-testid="endpoint-loading-banner"
                  style={noticeBannerStyle('var(--fg-3)')}>
-              {notice.text}
+              {loadingNotice.text}
             </div>
-          ))}
+          )}
           {renderTab()}
         </div>
       </div>

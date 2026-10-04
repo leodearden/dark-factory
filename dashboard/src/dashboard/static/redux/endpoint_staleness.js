@@ -218,38 +218,44 @@ function staleNoticesForTab(input) {
 }
 
 /**
- * Which "still loading" notices the given tab should render.
+ * The one "still loading" notice the given tab should render, or null.
  *
- * Returns `[{kind: 'loading', path, text}]`, one per endpoint of that tab that
- * has not delivered a response since this page loaded — read off `receipt`,
- * data.js's success-only `DF_DATA.__receipt` map. A tab opened for the first
- * time asks for its endpoints at once, and until they answer its body is the
- * pre-fetch seed, which looks exactly like a measured empty payload.
+ * Returns `{kind: 'loading', paths, text}` naming every endpoint of that tab
+ * that has not delivered a response since this page loaded — read off
+ * `receipt`, data.js's success-only `DF_DATA.__receipt` map. A tab opened for
+ * the first time asks for its endpoints at once, and until they answer its
+ * body is the pre-fetch seed, which looks exactly like a measured empty
+ * payload.
  *
- * Suppressed for an endpoint already failing STALE_FAILURE_THRESHOLD times:
+ * ONE NOTICE PER TAB, NOT PER ENDPOINT. Every path is pending at page load, so
+ * a per-endpoint banner would stack up to one per path (eight on Overview)
+ * for a single transient fact. A stale notice stays per-endpoint: there each
+ * endpoint's age and failure count is its own fact.
+ *
+ * A path already failing STALE_FAILURE_THRESHOLD times is left out:
  * staleNoticesForTab names that one, and two banners for one fact is noise.
  *
  * ADDITIVE, like the stale notices, and every input optional: a missing
  * `receipt` produces no notice rather than a claim about every path.
  */
-function loadingNoticesForTab(input) {
+function loadingNoticeForTab(input) {
   const s = input || {}
   const paths = TAB_ENDPOINTS[s.tab]
-  if (!Array.isArray(paths)) return []
-  if (!s.receipt || typeof s.receipt !== 'object') return []
+  if (!Array.isArray(paths)) return null
+  if (!s.receipt || typeof s.receipt !== 'object') return null
 
-  const notices = []
-  for (const path of paths) {
-    if (s.receipt[path]) continue
+  const pending = paths.filter(path => {
+    if (s.receipt[path]) return false
     const entry = staleEntryFor(s.stale, path)
-    if (entry && Number(entry.failures) >= STALE_FAILURE_THRESHOLD) continue
-    notices.push({
-      kind: 'loading',
-      path,
-      text: path + ' has not delivered data yet — loading',
-    })
+    return !(entry && Number(entry.failures) >= STALE_FAILURE_THRESHOLD)
+  })
+  if (pending.length === 0) return null
+  return {
+    kind: 'loading',
+    paths: pending,
+    text: pending.join(', ') + (pending.length === 1 ? ' has' : ' have') +
+      ' not delivered data yet — loading',
   }
-  return notices
 }
 
 const ENDPOINT_STALENESS_API = {
@@ -259,7 +265,7 @@ const ENDPOINT_STALENESS_API = {
   staleEntryFor,
   formatAge,
   staleNoticesForTab,
-  loadingNoticesForTab,
+  loadingNoticeForTab,
 }
 
 if (typeof module !== 'undefined' && module.exports) {

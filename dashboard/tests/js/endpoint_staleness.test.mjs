@@ -39,7 +39,7 @@ const {
   staleEntryFor,
   formatAge,
   staleNoticesForTab,
-  loadingNoticesForTab,
+  loadingNoticeForTab,
 } = staleness;
 
 const REDUX_DIR = path.resolve(
@@ -478,52 +478,61 @@ test('the Overview tab watches /merge-queue — its LiveFeed reads MERGE_QUEUE',
   assert.equal(notices[0].path, MERGE_PATH);
 });
 
-// ── loadingNoticesForTab: a tab path that has never delivered since page load ─
+// ── loadingNoticeForTab: the tab paths that have never delivered since page load ─
 
-test('loadingNoticesForTab names every tab path with no receipt yet', () => {
-  const notices = loadingNoticesForTab({ tab: 'tasks', receipt: {}, stale: {} });
-  assert.deepEqual(notices.map(n => n.path), TAB_ENDPOINTS.tasks);
-  for (const notice of notices) {
-    assert.deepEqual(Object.keys(notice).sort(), ['kind', 'path', 'text']);
-    assert.equal(notice.kind, 'loading');
-    assert.ok(notice.text.includes(notice.path),
-      `the loading notice must name its endpoint, got: ${notice.text}`);
+test('loadingNoticeForTab is ONE notice naming every tab path with no receipt yet', () => {
+  const notice = loadingNoticeForTab({ tab: 'tasks', receipt: {}, stale: {} });
+  assert.deepEqual(Object.keys(notice).sort(), ['kind', 'paths', 'text']);
+  assert.equal(notice.kind, 'loading');
+  assert.deepEqual(notice.paths, TAB_ENDPOINTS.tasks);
+  for (const path of TAB_ENDPOINTS.tasks) {
+    assert.ok(notice.text.includes(path),
+      `the loading notice must name ${path}, got: ${notice.text}`);
   }
 });
 
-test('loadingNoticesForTab is silent for a path that has delivered', () => {
+test('loadingNoticeForTab names only the paths that have not delivered', () => {
   const receipt = { [TASKS_PATH]: { servedAt: null, receivedAt: NOW, window: null } };
-  const notices = loadingNoticesForTab({ tab: 'tasks', receipt, stale: {} });
-  assert.deepEqual(
-    notices.map(n => n.path),
-    TAB_ENDPOINTS.tasks.filter(p => p !== TASKS_PATH),
-  );
+  const notice = loadingNoticeForTab({ tab: 'tasks', receipt, stale: {} });
+  const pending = TAB_ENDPOINTS.tasks.filter(p => p !== TASKS_PATH);
+  assert.deepEqual(notice.paths, pending);
+  assert.ok(!notice.text.includes(TASKS_PATH), `a delivered path is not loading: ${notice.text}`);
 });
 
-test('loadingNoticesForTab defers to the stale notice once an endpoint is stale', () => {
+test('loadingNoticeForTab is null once every tab path has delivered', () => {
+  const receipt = Object.fromEntries(TAB_ENDPOINTS.tasks.map(p => [p, { receivedAt: NOW }]));
+  assert.equal(loadingNoticeForTab({ tab: 'tasks', receipt, stale: {} }), null);
+});
+
+test('loadingNoticeForTab defers to the stale notice once an endpoint is stale', () => {
   // A path that has failed STALE_FAILURE_THRESHOLD times is already named by
   // staleNoticesForTab ("has never delivered data"); a second banner for the
   // same fact would only be noise.
   const stale = staleMap({ [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: 0 } });
-  assert.deepEqual(loadingNoticesForTab({ tab: 'merge', receipt: {}, stale }), []);
+  assert.equal(loadingNoticeForTab({ tab: 'merge', receipt: {}, stale }), null);
   const below = staleMap({ [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD - 1, lastSuccessAt: 0 } });
-  assert.equal(loadingNoticesForTab({ tab: 'merge', receipt: {}, stale: below }).length, 1);
+  assert.deepEqual(loadingNoticeForTab({ tab: 'merge', receipt: {}, stale: below }).paths, [MERGE_PATH]);
 });
 
-test('loadingNoticesForTab tolerates every missing input', () => {
-  assert.deepEqual(loadingNoticesForTab({ tab: 'not-a-tab', receipt: {}, stale: {} }), []);
-  assert.deepEqual(loadingNoticesForTab(), []);
-  assert.deepEqual(loadingNoticesForTab({}), []);
-  assert.deepEqual(loadingNoticesForTab({ tab: 'merge' }), []);
-  assert.deepEqual(loadingNoticesForTab({ receipt: {}, stale: {} }), []);
+test('loadingNoticeForTab reads one pending path in the singular', () => {
+  const notice = loadingNoticeForTab({ tab: 'merge', receipt: {}, stale: {} });
+  assert.equal(notice.text, `${MERGE_PATH} has not delivered data yet — loading`);
 });
 
-// ── loadingNoticesForTab over the real data.js ─────────────────────────────
+test('loadingNoticeForTab tolerates every missing input', () => {
+  assert.equal(loadingNoticeForTab({ tab: 'not-a-tab', receipt: {}, stale: {} }), null);
+  assert.equal(loadingNoticeForTab(), null);
+  assert.equal(loadingNoticeForTab({}), null);
+  assert.equal(loadingNoticeForTab({ tab: 'merge' }), null);
+  assert.equal(loadingNoticeForTab({ receipt: {}, stale: {} }), null);
+});
+
+// ── loadingNoticeForTab over the real data.js ──────────────────────────────
 
 function liveLoadingNotices(win) {
   return Object.fromEntries(Object.keys(TAB_ENDPOINTS).map(tab => [
     tab,
-    loadingNoticesForTab({ tab, receipt: win.DF_DATA.__receipt, stale: win.DF_DATA.__stale }),
+    loadingNoticeForTab({ tab, receipt: win.DF_DATA.__receipt, stale: win.DF_DATA.__stale }),
   ]));
 }
 
@@ -540,8 +549,8 @@ function quietDeps(fetchImpl) {
 
 test('over the real data.js: every tab is loading before the first refresh, none after it', async () => {
   const api = loadDataJs();
-  for (const [tab, notices] of Object.entries(liveLoadingNotices(globalThis.window))) {
-    assert.equal(notices.length, TAB_ENDPOINTS[tab].length, `${tab}: ${JSON.stringify(notices)}`);
+  for (const [tab, notice] of Object.entries(liveLoadingNotices(globalThis.window))) {
+    assert.deepEqual(notice?.paths, TAB_ENDPOINTS[tab], `${tab}: ${JSON.stringify(notice)}`);
   }
 
   const ok = () => Promise.resolve({ ok: true, json: async () => ({}) });
@@ -549,8 +558,8 @@ test('over the real data.js: every tab is loading before the first refresh, none
     state: api.createPollState(), jitterMaxMs: 0, deps: quietDeps(ok),
   });
 
-  for (const [tab, notices] of Object.entries(liveLoadingNotices(globalThis.window))) {
-    assert.deepEqual(notices, [], `${tab} still claims to be loading after a full refresh`);
+  for (const [tab, notice] of Object.entries(liveLoadingNotices(globalThis.window))) {
+    assert.equal(notice, null, `${tab} still claims to be loading after a full refresh`);
   }
 });
 
@@ -567,7 +576,7 @@ test('over the real data.js: an endpoint that failed its first poll leaves only 
   });
 
   const loading = Object.entries(liveLoadingNotices(globalThis.window))
-    .filter(([, notices]) => notices.length > 0);
+    .filter(([, notice]) => notice !== null);
   assert.deepEqual(loading.map(([tab]) => tab), ['curator']);
-  assert.deepEqual(loading[0][1].map(n => n.path), [curator]);
+  assert.deepEqual(loading[0][1].paths, [curator]);
 });
