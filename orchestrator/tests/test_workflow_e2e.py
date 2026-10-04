@@ -5301,7 +5301,7 @@ class TestFileStructureInvariants:
 #
 # CI gate — how enforcement actually reaches this file:
 #   • hooks/project-checks (invoked by hooks/pre-commit on main-branch commits)
-#     iterates over PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard) and
+#     iterates over PYRIGHT_PACKAGES (which includes orchestrator) and
 #     runs `uv run pyright` from each package directory, failing the commit on
 #     any error.
 #   • [tool.pyright] include = ["src", "tests"] in orchestrator/pyproject.toml

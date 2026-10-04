@@ -3,13 +3,12 @@
 hooks/project-checks path-filters its pyright loop to the packages whose own
 staged .py files changed (task 2551, commit 144a781e29) so docs/plans-only
 commits skip pyright entirely instead of paying for an unconditional 3x
-pyright run. That filter is too narrow on its own: ``shared`` and
-``escalation`` are dependency packages imported by all three
-pyright-configured packages (fused-memory, orchestrator, dashboard) but are
-not themselves in PYRIGHT_PACKAGES, so a commit that stages only
-shared/*.py or escalation/*.py matches none of the per-package prefixes and
-skips pyright everywhere — silently dropping transitive type coverage on
-main.
+pyright run. ``shared`` and ``escalation`` are dependency packages imported
+by the other pyright-configured packages, so a commit that stages only
+shared/*.py or escalation/*.py must still type-check the consumers, not just
+the package it touched. Every package in the merge gate's type_check_command
+(task 5338) is a PYRIGHT_PACKAGES member, including shared and escalation
+themselves.
 
 These tests run the real hook end-to-end against a throwaway git repo, with
 a PATH-stubbed ``uv`` that records the working directory of every
@@ -18,13 +17,12 @@ including ``uv run ruff check``), so they observe exactly which packages the
 hook type-checks for a given staged change:
 
 - a docs/plans-only change: pyright is skipped entirely (preserved fast path).
-- a change scoped to a single PYRIGHT_PACKAGES package: pyright runs there
-  only (preserved per-package filter).
-- a change under ``shared`` or ``escalation``: pyright must run in ALL of
-  fused-memory, orchestrator, and dashboard (the fix under test — RED against
-  the current hook, which skips all three).
+- a change scoped to a single consumer package: pyright runs there only
+  (preserved per-package filter); the same holds for a leaf like ``sampler``.
+- a change under ``shared`` or ``escalation``: pyright must run in EVERY
+  package, the touched one included.
 
-See task 2551.
+See task 2551 and task 5338.
 """
 
 from __future__ import annotations
@@ -33,10 +31,21 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 _REPO_ROOT = Path(__file__).parents[2]
 _HOOK_SOURCE = _REPO_ROOT / "hooks" / "project-checks"
 
-_PACKAGE_DIRS = ("shared", "escalation", "fused-memory", "orchestrator", "dashboard")
+_PACKAGE_DIRS = (
+    "shared",
+    "escalation",
+    "fused-memory",
+    "orchestrator",
+    "dashboard",
+    "sampler",
+    "cockpit",
+)
+_ALL_PYRIGHT_PACKAGES = set(_PACKAGE_DIRS)
 
 # Test stub for `uv`: records the CWD of every `uv run pyright` invocation to
 # $UV_STUB_LOG, and exits 0 unconditionally (including for `uv run ruff check`,
@@ -127,8 +136,8 @@ def test_docs_only_commit_skips_pyright_entirely(tmp_path: Path) -> None:
 
 
 def test_single_package_commit_runs_pyright_there_only(tmp_path: Path) -> None:
-    """Staging a .py file under a single PYRIGHT_PACKAGES package must run
-    pyright in that package only, not the other two.
+    """Staging a .py file under a single consumer package must run pyright in
+    that package only, not the others.
     """
     repo = _make_repo(tmp_path)
     stub_bin, log_file = _make_stub_uv(tmp_path)
@@ -140,10 +149,9 @@ def test_single_package_commit_runs_pyright_there_only(tmp_path: Path) -> None:
     assert _logged_pyright_packages(log_file) == {"fused-memory"}
 
 
-def test_shared_only_commit_runs_pyright_in_all_dependents(tmp_path: Path) -> None:
-    """`shared` is imported by all three PYRIGHT_PACKAGES packages, so a commit
-    that stages only shared/*.py must run pyright in all three — not skip
-    pyright everywhere just because no PYRIGHT_PACKAGES prefix matched.
+def test_shared_only_commit_runs_pyright_in_every_package(tmp_path: Path) -> None:
+    """`shared` is imported by the other packages, so a commit that stages only
+    shared/*.py must run pyright everywhere, shared itself included.
     """
     repo = _make_repo(tmp_path)
     stub_bin, log_file = _make_stub_uv(tmp_path)
@@ -152,10 +160,10 @@ def test_shared_only_commit_runs_pyright_in_all_dependents(tmp_path: Path) -> No
     result = _run_hook(repo, stub_bin, log_file)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _logged_pyright_packages(log_file) == {"fused-memory", "orchestrator", "dashboard"}
+    assert _logged_pyright_packages(log_file) == _ALL_PYRIGHT_PACKAGES
 
 
-def test_escalation_only_commit_runs_pyright_in_all_dependents(tmp_path: Path) -> None:
+def test_escalation_only_commit_runs_pyright_in_every_package(tmp_path: Path) -> None:
     """Same as above for `escalation`, the other shared dependency package."""
     repo = _make_repo(tmp_path)
     stub_bin, log_file = _make_stub_uv(tmp_path)
@@ -164,4 +172,19 @@ def test_escalation_only_commit_runs_pyright_in_all_dependents(tmp_path: Path) -
     result = _run_hook(repo, stub_bin, log_file)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _logged_pyright_packages(log_file) == {"fused-memory", "orchestrator", "dashboard"}
+    assert _logged_pyright_packages(log_file) == _ALL_PYRIGHT_PACKAGES
+
+
+@pytest.mark.parametrize("pkg", ["sampler", "cockpit"])
+def test_leaf_package_commit_runs_pyright_there_only(tmp_path: Path, pkg: str) -> None:
+    """`sampler` and `cockpit` are in the merge gate's type_check_command, so a
+    commit staging only their files must type-check them (and nothing else).
+    """
+    repo = _make_repo(tmp_path)
+    stub_bin, log_file = _make_stub_uv(tmp_path)
+    _stage_file(repo, f"{pkg}/src/foo.py")
+
+    result = _run_hook(repo, stub_bin, log_file)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _logged_pyright_packages(log_file) == {pkg}

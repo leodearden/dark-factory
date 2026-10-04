@@ -380,9 +380,9 @@ catching it locally.
 (installed via `hooks/setup.sh`, which points `core.hooksPath` at `hooks/`):
 it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
-**pyright up to 3×** (once per touched package under `PYRIGHT_PACKAGES`, or
-across all three if the change touches a shared dependency like `shared` or
-`escalation`). That stage is path-filtered since task 2551: a commit
+**pyright up to 7×** (once per touched package under `PYRIGHT_PACKAGES` —
+the same seven members the merge gate type-checks — or across all of them if
+the change touches a shared dependency like `shared` or `escalation`). That stage is path-filtered since task 2551: a commit
 staging no `.py` files skips pyright entirely and finishes in seconds
 (`pre-commit: pyright skipped (no Python changes)`), and a staged `.py`
 outside every one of those prefixes (e.g. `scripts/`, a root-level
