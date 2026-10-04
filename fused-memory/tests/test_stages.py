@@ -15111,12 +15111,9 @@ class TestTaskKnowledgeSyncDeterministicCycleSummaryWrite:
         nonce'd per-cycle summary — the directive block (and its
         payload-section pointer) is fully deleted, not merely made optional.
 
-        Scoped to the exact bolded heading (rather than a blanket
-        'summary_nonce'/'retry_nonce' substring search across the whole
-        prompt) because the unrelated '## Re-Verify Reconstruction Writes
-        Before Carry-Forward' section — a distinct LLM-driven mechanism for
-        carry-forward findings about OTHER runs' summaries, out of this
-        task's scope — still mentions those words in prose.
+        Scoped to the exact bolded heading. The blanket retry_nonce negative
+        for the Stage 2 system prompt lives in
+        tests/test_stage2_narrative_reconstruction_retired.py.
         """
         from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 

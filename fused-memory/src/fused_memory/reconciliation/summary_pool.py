@@ -56,12 +56,11 @@ logger = logging.getLogger(__name__)
 # closing a service <-> reconciliation import cycle.
 CYCLE_SUMMARY_TTL_DAYS: int = _CYCLE_SUMMARY_TTL_DAYS
 
-# record_type vocabulary for cycle_summary Mem0 writes (task 2468). There are
-# two distinct writers of kind='cycle_summary': this module's deterministic,
-# terse, auto-generated Mem0 mirror of the authoritative ledger row
-# (LEDGER_STAMP, written unconditionally below), and the LLM-authored
-# reconstruction/self-heal cycle_summary write in
-# ``reconciliation.prompts.stage2`` (NARRATIVE).
+# record_type vocabulary for cycle_summary Mem0 writes (task 2468). The one
+# live writer of kind='cycle_summary' is this module's deterministic, terse,
+# auto-generated Mem0 mirror of the authoritative ledger row (LEDGER_STAMP,
+# written unconditionally below). NARRATIVE is the value of the LLM-authored
+# reconstruction write that task 3734 retired.
 #
 # record_type was write-only as of task 2468: no reader (dedup/near-duplicate
 # tooling, Path-2 verification, pool-cap trim) filtered on it — the fix that
@@ -79,9 +78,8 @@ CYCLE_SUMMARY_TTL_DAYS: int = _CYCLE_SUMMARY_TTL_DAYS
 # pinning the copies equal, so an edit to one side would silently disable half
 # the protected-mirror guard).
 #
-# NARRATIVE still has no Python consumer; keeping the prompt-side literal
-# (prompts/stage2.py, recon_self_model.py) in sync remains a reviewed
-# invariant rather than an enforced one.
+# There is no longer a prompt-side NARRATIVE literal; the value survives for
+# historical payloads and the eviction order (see recon_pool_map).
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = _CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = _CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
 
@@ -636,8 +634,8 @@ async def write_cycle_summary(
                 agent_id=f'recon-stage-{stage}',
                 category='observations_and_summaries',
                 # record_type discriminates this deterministic code mirror
-                # (LEDGER_STAMP) from the distinct LLM-authored reconstruction
-                # write in prompts/stage2.py (NARRATIVE) — task 2468.
+                # (LEDGER_STAMP) from the LLM-authored reconstruction write
+                # (NARRATIVE, task 2468) that task 3734 retired.
                 # services/memory_service.py::_apply_cycle_summary_metadata_tagging
                 # strips nothing from a kind='cycle_summary' write, so
                 # record_type survives through to storage unchanged.
