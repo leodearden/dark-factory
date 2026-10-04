@@ -27,8 +27,9 @@ Harness notes (see plan pre-1):
   * That same config turns "marked with @pytest.mark.asyncio but not an async
     function" into an ERROR — never put a sync ``test_*`` inside a marked class.
     Sync tests live in their OWN unmarked class.
-  * Default per-test ``timeout = 60``; any class doing real-git worktree/merge
-    work carries ``@pytest.mark.timeout(180)``.
+  * Any class doing real-git worktree/merge work carries
+    ``@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`` because a merge chain
+    plus worktree creation is slow.
   * ``orchestrator/tests/`` has no ``__init__.py``, so flat helpers are imported
     by bare module name.
 """
@@ -41,6 +42,7 @@ from typing import Literal
 
 import pytest
 from _merge_lane_census import queued_in_lane, queued_request_ids
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 from orchestrator import merge_liveness, merge_queue
 from orchestrator.config import GitConfig, MergeDeepConfig, OrchestratorConfig
@@ -873,7 +875,7 @@ def _lane_states(git_ops: GitOps) -> list:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestDeepChainPlacementBuild:
     """The gate's build: exact call contract, the deadline, and the leak-free exits."""
 
@@ -1459,7 +1461,7 @@ def _fail_verify_result():
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestRunInflightVerifyChainRedirect:
     """`_run_inflight_verify(..., chain=...)` verifies the TIP, in the LANE."""
 
@@ -2051,7 +2053,7 @@ class TestRunInflightVerifyChainRedirect:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestDeepTipVerifyNeverAdopts:
     """The two arms that STAY non-adopting under δ: tip fail, and tip error.
 
@@ -2513,7 +2515,7 @@ def _canary_says_deep(data: dict) -> bool:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestDeepDispatchRoundsIntegration:
     """γ end to end: successive rounds, a scripted oracle, real git."""
 
