@@ -23,30 +23,30 @@ from _link_heal_harness import (
     CHILD_TEXT,
     DEFAULT_LIMITS,
     DF,
-    FORBIDDEN_ROUTES,
     PARENT,
     PARENT_TEXT,
     WITHOUT_LINK_HEAL_PREFIX,
     LinkHealHarness,
+    RecordingFiler,
+    assert_store_invariants,
     build_harness,
     corpus_basis,
+    run_corpus_apply,
     run_corpus_plan,
 )
 from orchestrator.agents.memory_recall import render_memory_results
 
-from fused_memory.maintenance.link_heal import LINK_KEYS, BasisSource, LinkBasis
+from fused_memory.maintenance.link_heal import BasisSource, LinkBasis
 from fused_memory.maintenance.link_heal_executor import (
     BACKLOG_ANCHOR,
     WRITE_FAILURE_ANCHOR,
     ApprovalMismatch,
-    Escape,
     EscapeFiler,
     FoldedEscapeFiler,
     RunLimits,
     RunReport,
     plan_sha256,
     render_plan_document,
-    run_apply,
 )
 from fused_memory.maintenance.link_heal_ledger import (
     ActionRow,
@@ -64,15 +64,6 @@ from fused_memory.server.grouped_read import (
 
 OTHER_PARENT = '33333333-3333-4333-8333-333333333333'
 GRANDCHILD = '55555555-5555-4555-8555-555555555555'
-
-
-def assert_store_invariants(harness: LinkHealHarness) -> None:
-    """No heal combines a patch and a delete, sends content, or stores a null link key."""
-    for route in FORBIDDEN_ROUTES:
-        assert harness.mem0.writes[route] == 0, route
-    for (project_id, memory_id), payload in harness.mem0.points.items():
-        for key in LINK_KEYS:
-            assert key not in payload or payload[key] is not None, (project_id, memory_id, key)
 
 
 async def _harness(mock_config, tmp_path: Path, prefixes: list[str]):
@@ -102,35 +93,6 @@ def ledger(tmp_path):
     opened.close()
 
 
-class RecordingFiler:
-    """An ``EscapeFiler`` that files nowhere and remembers every escape."""
-
-    def __init__(self) -> None:
-        self.escapes: list[Escape] = []
-
-    def __call__(self, escape: Escape) -> str | None:
-        self.escapes.append(escape)
-        return f'esc-recorded-{len(self.escapes)}'
-
-
-async def apply_pending(
-    harness: LinkHealHarness,
-    ledger: LinkHealLedger,
-    *,
-    limits: RunLimits = DEFAULT_LIMITS,
-    filer: EscapeFiler | None = None,
-    approved_plan_sha256: str | None = None,
-) -> RunReport:
-    return await run_apply(
-        store=harness.store(),
-        ledger=ledger,
-        limits=limits,
-        filer=filer or RecordingFiler(),
-        source=RunSource.CORPUS,
-        approved_plan_sha256=approved_plan_sha256,
-    )
-
-
 async def plan_then_apply(
     harness: LinkHealHarness,
     ledger: LinkHealLedger,
@@ -144,7 +106,7 @@ async def plan_then_apply(
     await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases, limits)
     if between is not None:
         between()
-    return await apply_pending(harness, ledger, limits=limits, filer=filer)
+    return await run_corpus_apply(harness, ledger, limits=limits, filer=filer)
 
 
 def executed_rows(ledger: LinkHealLedger, report: RunReport) -> list[ActionRow]:
@@ -436,7 +398,7 @@ class TestTheCapDrainsOldestFirst:
         await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', seed_sightings(harness, 40))
         planned = _ids(ledger.pending_actions(RunSource.CORPUS))
 
-        report = await apply_pending(harness, ledger)
+        report = await run_corpus_apply(harness, ledger)
 
         assert _ids(ledger.applied_actions(report.run_id)) == planned[:25]
         rest = ledger.pending_actions(RunSource.CORPUS)
@@ -452,9 +414,9 @@ class TestTheCapDrainsOldestFirst:
     ):
         await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', seed_sightings(harness, 40))
         planned = _ids(ledger.pending_actions(RunSource.CORPUS))
-        await apply_pending(harness, ledger)
+        await run_corpus_apply(harness, ledger)
 
-        report = await apply_pending(harness, ledger)
+        report = await run_corpus_apply(harness, ledger)
 
         assert _ids(ledger.applied_actions(report.run_id)) == planned[25:]
         assert report.counts.skipped_cap == 0
@@ -500,7 +462,7 @@ class TestTheBacklogEscape:
         first = await plan_then_apply(
             harness, ledger, tmp_path, *bases, limits=BACKLOG_LIMITS, filer=filer,
         )
-        second = await apply_pending(harness, ledger, limits=BACKLOG_LIMITS, filer=filer)
+        second = await run_corpus_apply(harness, ledger, limits=BACKLOG_LIMITS, filer=filer)
 
         queue = EscalationQueue(tmp_path / 'data' / 'escalations')
         (record,) = queue.get_by_task(BACKLOG_ANCHOR, status='pending')
@@ -600,7 +562,7 @@ class TestAnApprovedPlan:
         sha = plan_sha256(render_plan_document(ledger.pending_actions(RunSource.CORPUS)))
         filer = RecordingFiler()
 
-        report = await apply_pending(
+        report = await run_corpus_apply(
             harness, ledger, limits=BACKLOG_LIMITS, filer=filer, approved_plan_sha256=sha,
         )
 
@@ -617,7 +579,7 @@ class TestAnApprovedPlan:
         runs_before = ledger.recent_runs(10)
 
         with pytest.raises(ApprovalMismatch) as excinfo:
-            await apply_pending(harness, ledger, approved_plan_sha256='0' * 64)
+            await run_corpus_apply(harness, ledger, approved_plan_sha256='0' * 64)
 
         assert '0' * 64 in str(excinfo.value)
         assert sha in str(excinfo.value)

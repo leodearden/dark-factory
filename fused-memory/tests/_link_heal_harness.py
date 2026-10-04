@@ -27,8 +27,15 @@ from _fm_helpers import install_identity_mocks
 
 from fused_memory.backends.mem0_client import split_managed_metadata
 from fused_memory.config.schema import Mem0UpdateConfig
-from fused_memory.maintenance.link_heal import BasisSource, LinkBasis, Verdict
-from fused_memory.maintenance.link_heal_executor import RunLimits, RunReport, run_plan
+from fused_memory.maintenance.link_heal import LINK_KEYS, BasisSource, LinkBasis, Verdict
+from fused_memory.maintenance.link_heal_executor import (
+    Escape,
+    EscapeFiler,
+    RunLimits,
+    RunReport,
+    run_apply,
+    run_plan,
+)
 from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_store import LinkHealStore, ToolCaller, text_sha256
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -313,3 +320,42 @@ async def run_corpus_plan(
         source=RunSource.CORPUS,
         plan_path=plan_path,
     )
+
+
+class RecordingFiler:
+    """An ``EscapeFiler`` that files nowhere and remembers every escape."""
+
+    def __init__(self) -> None:
+        self.escapes: list[Escape] = []
+
+    def __call__(self, escape: Escape) -> str | None:
+        self.escapes.append(escape)
+        return f'esc-recorded-{len(self.escapes)}'
+
+
+async def run_corpus_apply(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    *,
+    limits: RunLimits = DEFAULT_LIMITS,
+    filer: EscapeFiler | None = None,
+    approved_plan_sha256: str | None = None,
+) -> RunReport:
+    """``run_apply`` of the corpus-planned heals over the harness's store."""
+    return await run_apply(
+        store=harness.store(),
+        ledger=ledger,
+        limits=limits,
+        filer=filer or RecordingFiler(),
+        source=RunSource.CORPUS,
+        approved_plan_sha256=approved_plan_sha256,
+    )
+
+
+def assert_store_invariants(harness: LinkHealHarness) -> None:
+    """No heal combines a patch and a delete, sends content, or stores a null link key."""
+    for route in FORBIDDEN_ROUTES:
+        assert harness.mem0.writes[route] == 0, route
+    for (project_id, memory_id), payload in harness.mem0.points.items():
+        for key in LINK_KEYS:
+            assert key not in payload or payload[key] is not None, (project_id, memory_id, key)
