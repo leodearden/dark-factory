@@ -7,15 +7,33 @@ greps with one executed check: ``fetch_tasks``, ``fetch_task_page``,
 ``app.py::_fanout_probe_completion``. The apparatus — a finder, fixture tests
 of its matcher, then acceptance tests over a scan set that fails loudly — is
 ``test_clock_discipline.py``'s.
+
+The old-path census (sketch #14) follows in the same shape: :data:`_RETIRED`
+is one typed table of the paths PRD decisions 9, 12 and 16 deleted, each kind
+checked by executing something — importing the package, requesting the
+asset, parsing every served script, or calling the route.
 """
 
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterable, Mapping, Sequence
+import importlib
+import json
+import pkgutil
+import subprocess
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import Any, TypeVar
+from unittest.mock import AsyncMock, patch
+from urllib.parse import urlsplit
+
+from _dashboard_helpers import ScriptTagCollector
+from _lock_chip_matrix import node_path
+
+import dashboard
 
 # ---------------------------------------------------------------------------
 # The finder
@@ -411,17 +429,48 @@ class RetiredWireKey:
 
 def modules_binding(name: str, modules: Iterable[ModuleType]) -> list[str]:
     """The ``__name__`` of every module in *modules* whose namespace binds *name*."""
-    raise NotImplementedError
+    return [module.__name__ for module in modules if name in vars(module)]
 
 
 def local_script_paths(index_html: str) -> list[str]:
     """The URL path of every ``<script src>`` this app serves, in document order."""
-    raise NotImplementedError
+    collector = ScriptTagCollector()
+    collector.feed(index_html)
+    srcs = [urlsplit(src) for attrs in collector.script_attrs if (src := attrs.get('src'))]
+    return [src.path for src in srcs if not src.netloc]
+
+
+_SERVED_BUNDLE = Path(__file__).resolve().parent / 'js' / '_served_bundle.mjs'
+
+_CLIENT_BINDINGS_DRIVER = (
+    "import fs from 'node:fs';\n"
+    f'import {{ topLevelBindings }} from {json.dumps(_SERVED_BUNDLE.as_uri())};\n'
+    "const sources = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+    'const out = Object.fromEntries(\n'
+    '  Object.entries(sources).map(([name, src]) => [name, topLevelBindings(src, name)]),\n'
+    ');\n'
+    'process.stdout.write(JSON.stringify(out));\n'
+)
 
 
 def client_bindings(sources: Mapping[str, str]) -> dict[str, list[str]]:
-    """Each script's top-level bindings and ``window.<name>`` exports, by filename."""
-    raise NotImplementedError
+    """Each script's top-level bindings and ``window.<name>`` exports, by filename.
+
+    Parsed in node by ``js/_served_bundle.mjs::topLevelBindings`` with the
+    Babel build index.html pins, so a ``.jsx`` is read as the browser reads it.
+    """
+    result = subprocess.run(
+        [node_path(), '--input-type=module', '-e', _CLIENT_BINDINGS_DRIVER],
+        input=json.dumps(dict(sources)),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f'the top-level-binding reader exited {result.returncode}:\n{result.stderr}'
+    )
+    return json.loads(result.stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -466,3 +515,166 @@ def test_modules_binding_flags_a_module_that_carries_the_name():
     rehomed.collect_done_counts = lambda: None  # type: ignore[attr-defined]
 
     assert modules_binding('collect_done_counts', [clean, rehomed]) == ['fixture_rehomed']
+
+
+# ---------------------------------------------------------------------------
+# Acceptance tests: the real census
+# ---------------------------------------------------------------------------
+
+_RETIRED: tuple[RetiredPythonName | RetiredServedAsset | RetiredClientBinding | RetiredWireKey, ...] = (
+    RetiredPythonName(
+        'collect_done_counts',
+        "PRD decision 16: active_tasks.py's second done counter; the census counts",
+    ),
+    RetiredPythonName(
+        '_STATUS_MAP',
+        'PRD decision 9: the burndown bands read the generated status vocabulary',
+    ),
+    RetiredPythonName(
+        'load_task_titles',
+        'PRD decision 12: a request-path whole-tree fetch; task_lookup serves titles',
+    ),
+    RetiredPythonName(
+        '_load_task_cards',
+        'PRD decision 12: a request-path whole-tree fetch; task_lookup serves cards',
+    ),
+    RetiredServedAsset(
+        '/static/redux/task_status_counts.js',
+        'PRD decision 16: the client bucketer; the Tasks header reads the served census',
+    ),
+    RetiredClientBinding(
+        'dailyDeltas',
+        "PRD decision 9, task 5592: shell.jsx's client-side forecast",
+    ),
+    RetiredClientBinding(
+        'DF_TASK_STATUS_COUNTS',
+        "PRD decision 16: task_status_counts.js's export",
+    ),
+    RetiredWireKey(
+        '/api/v2/dashboard/orchestrators', 'summary',
+        'PRD decision 16: discovery measures no task count, so it claims none',
+    ),
+)
+
+
+_Row = TypeVar('_Row')
+
+
+def _retired(kind: type[_Row]) -> list[_Row]:
+    rows = [row for row in _RETIRED if isinstance(row, kind)]
+    assert rows, f'the census lists no {kind.__name__}; its check would pass vacuously'
+    return rows
+
+
+def _raise(name: str) -> None:
+    raise ImportError(f'could not import package {name}')
+
+
+def _package_modules() -> list[ModuleType]:
+    """Every module of the dashboard package, imported.
+
+    ``dashboard.__main__`` is skipped because importing it starts the server.
+    """
+    names = [
+        info.name
+        for info in pkgutil.walk_packages(dashboard.__path__, 'dashboard.', onerror=_raise)
+        if info.name != 'dashboard.__main__'
+    ]
+    assert len(names) >= _MIN_SCANNED_MODULES, (
+        f'only {len(names)} modules found in the dashboard package — fewer than '
+        f'the {_MIN_SCANNED_MODULES} this census was written against'
+    )
+    return [dashboard, *(importlib.import_module(name) for name in names)]
+
+
+def test_no_package_module_binds_a_retired_python_name():
+    modules = _package_modules()
+    found = [
+        f'  {row.name} in {holder} — retired by {row.retired_by}'
+        for row in _retired(RetiredPythonName)
+        for holder in modules_binding(row.name, modules)
+    ]
+
+    assert not found, 'a retired Python name is bound again:\n' + '\n'.join(found)
+
+
+def test_no_retired_asset_is_served_or_loaded(client):
+    loaded = local_script_paths(client.get('/static/redux/index.html').text)
+    assert loaded, 'index.html loads no local script, so the absence below proves nothing'
+    found = [
+        f'  {row.path}: GET {status}, loaded by index.html: {row.path in loaded} '
+        f'— retired by {row.retired_by}'
+        for row in _retired(RetiredServedAsset)
+        if (status := client.get(row.path).status_code) != 404 or row.path in loaded
+    ]
+
+    assert not found, 'a retired asset is still served or loaded:\n' + '\n'.join(found)
+
+
+def test_no_served_script_binds_a_retired_client_name(client):
+    served = {}
+    for path in local_script_paths(client.get('/static/redux/index.html').text):
+        resp = client.get(path)
+        assert resp.status_code == 200, f'index.html loads {path}, which is not served'
+        served[path] = resp.text
+    bindings = client_bindings(served)
+    unread = sorted(path for path in served if not bindings.get(path))
+    assert served and not unread, (
+        f'the binding reader saw no top-level name in {unread or "any script"}; '
+        'every served script exports at least one, so the reader has gone blind'
+    )
+    found = [
+        f'  {row.name} in {path} — retired by {row.retired_by}'
+        for row in _retired(RetiredClientBinding)
+        for path, names in bindings.items()
+        if row.name in names
+    ]
+
+    assert not found, 'a served script binds a retired name again:\n' + '\n'.join(found)
+
+
+@dataclass(frozen=True, slots=True)
+class _WireSubstrate:
+    """How to make *endpoint* serve at least one entry, and where its entries sit."""
+
+    serving: Callable[[], AbstractContextManager[Any]]
+    entries_at: str
+
+
+_ONE_DISCOVERED_ORCHESTRATOR = {
+    'pids': [4321],
+    'prd': '/proj/dark-factory/prd.md',
+    'label': '/proj/dark-factory/prd.md',
+    'project_root': '/proj/dark-factory',
+    'running': True,
+    'started': 'Mar18',
+}
+
+_WIRE_SUBSTRATES: dict[str, _WireSubstrate] = {
+    '/api/v2/dashboard/orchestrators': _WireSubstrate(
+        lambda: patch(
+            'dashboard.api.orchestrators.discover_orchestrators',
+            new=AsyncMock(return_value=[_ONE_DISCOVERED_ORCHESTRATOR]),
+        ),
+        'ORCHESTRATORS',
+    ),
+}
+
+
+def test_no_route_entry_carries_a_retired_wire_key(client):
+    found = []
+    for row in _retired(RetiredWireKey):
+        substrate = _WIRE_SUBSTRATES[row.endpoint]
+        with substrate.serving():
+            resp = client.get(row.endpoint)
+        assert resp.status_code == 200, f'{row.endpoint} answered {resp.status_code}'
+        entries = resp.json()[substrate.entries_at]
+        assert entries, f'{row.endpoint} served no {substrate.entries_at}, so the check is vacuous'
+        found += [
+            f'  {row.endpoint} {substrate.entries_at}[{index}] carries {row.key!r} '
+            f'— retired by {row.retired_by}'
+            for index, entry in enumerate(entries)
+            if row.key in entry
+        ]
+
+    assert not found, 'a route entry carries a retired key again:\n' + '\n'.join(found)

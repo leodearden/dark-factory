@@ -34,17 +34,17 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
-import crypto from 'node:crypto';
-import { createRequire } from 'node:module';
-import { fileURLToPath } from 'node:url';
 
-// Mirrors the relative-path idiom in esc_flow_layout.test.mjs /
-// runtime_format.test.mjs: resolve the served asset directory from this test
-// file's own location rather than from process.cwd().
-const TESTS_JS_DIR = path.dirname(fileURLToPath(import.meta.url));
-const REDUX_DIR = path.resolve(TESTS_JS_DIR, '../../src/dashboard/static/redux');
-
-const INDEX_HTML = path.join(REDUX_DIR, 'index.html');
+import {
+  INDEX_HTML,
+  REDUX_DIR,
+  SCRIPT_TAG_BABEL_OPTIONS,
+  VENDORED_BABEL,
+  babelScriptSrcs,
+  classicScriptSrcs,
+  loadVendoredBabel,
+  readIndexHtml,
+} from './_served_bundle.mjs';
 
 // Each classic script's browser global, keyed by filename. Asserting these are
 // defined after the shared load is strictly stronger than "did not throw": it
@@ -73,21 +73,6 @@ const EXPECTED_WINDOW_GLOBALS = {
   'escalation_views.js': 'DF_ESCALATION_VIEWS',
   'memory_readings.js': 'DF_MEMORY_READINGS',
 };
-
-function readIndexHtml() {
-  return fs.readFileSync(INDEX_HTML, 'utf8');
-}
-
-// Matches ONLY the local classic tags — `<script src="/static/redux/<name>.js?v=NN"></script>`.
-// Excluded by construction:
-//   - the `https://unpkg.com/...` CDN tags (path does not start with /static/redux/);
-//   - the `type="text/babel"` .jsx tags (an attribute sits between `<script`
-//     and `src`, and the path ends `.jsx`, not `.js`).
-const CLASSIC_SCRIPT_RE = /<script\s+src="\/static\/redux\/([A-Za-z0-9_.-]+\.js)(?:\?[^"]*)?"\s*><\/script>/g;
-
-function classicScriptSrcs(html) {
-  return [...html.matchAll(CLASSIC_SCRIPT_RE)].map(m => m[1]);
-}
 
 // NOTE — no `document` shim, and that omission is load-bearing rather than an
 // oversight. data.js:330 gates its polling auto-start on
@@ -274,59 +259,6 @@ test('the harness actually detects a duplicate top-level const (negative control
 });
 
 // ── The text/babel .jsx tags ──────────────────────────────────────────────
-
-// A vendored copy of the exact Babel build index.html loads, so this suite
-// needs no npm install. Versionless on purpose: index.html's tag is the one
-// pin, and loadVendoredBabel holds this copy to it.
-const VENDORED_BABEL = path.join(TESTS_JS_DIR, 'vendor', 'babel.min.js');
-
-const BABEL_TAG_RE =
-  /<script\s+src="(https:\/\/unpkg\.com\/@babel\/standalone@[^"]+\/babel\.min\.js)"\s+integrity="(sha384-[^"]+)"/;
-
-function pinnedBabelTag() {
-  const match = readIndexHtml().match(BABEL_TAG_RE);
-  assert.ok(match, `found no @babel/standalone <script> tag with an integrity attribute in ${INDEX_HTML}`);
-  return { url: match[1], integrity: match[2] };
-}
-
-function vendoredBabelDigest() {
-  if (!fs.existsSync(VENDORED_BABEL)) return 'missing';
-  return `sha384-${crypto.createHash('sha384').update(fs.readFileSync(VENDORED_BABEL)).digest('base64')}`;
-}
-
-// Loads the vendored Babel only once its sha384 matches index.html's pin, so a
-// stale, truncated or missing copy fails with the refresh command rather than
-// a parse error. require's own cache makes repeat calls cheap.
-function loadVendoredBabel() {
-  const { url, integrity } = pinnedBabelTag();
-  assert.equal(
-    vendoredBabelDigest(),
-    integrity,
-    `${VENDORED_BABEL} is not the build index.html loads (${url}), so the text/babel ` +
-      'scope test would compile the .jsx files with a different Babel than the browser. ' +
-      `Refresh it: curl -sSfL -o ${VENDORED_BABEL} ${url}`,
-  );
-  return createRequire(import.meta.url)(VENDORED_BABEL);
-}
-
-// The options Babel-standalone builds for a text/babel tag with no
-// `type="module"`, no data-presets/data-plugins and no data-targets. The
-// bundle's script-tag loader keeps these literals through minification; the
-// test below pins them to it.
-const SCRIPT_TAG_BABEL_OPTIONS = {
-  presets: ['react', 'env'],
-  plugins: ['transform-class-properties', 'transform-object-rest-spread', 'transform-flow-strip-types'],
-  targets: { browsers: undefined },
-};
-
-// Matches `<script type="text/babel" src="/static/redux/<name>.jsx?v=NN"></script>`,
-// and the `text/jsx` spelling, which Babel-standalone executes too.
-const BABEL_SCRIPT_RE =
-  /<script\s+type="text\/(?:babel|jsx)"\s+src="\/static\/redux\/([A-Za-z0-9_.-]+\.jsx)(?:\?[^"]*)?"\s*><\/script>/g;
-
-function babelScriptSrcs(html) {
-  return [...html.matchAll(BABEL_SCRIPT_RE)].map(m => m[1]);
-}
 
 function compileAsScriptTag(source, filename) {
   return loadVendoredBabel().transform(source, { ...SCRIPT_TAG_BABEL_OPTIONS, filename, sourceFileName: filename }).code;
