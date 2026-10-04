@@ -12,6 +12,12 @@ write attempts and escalates a backlog beyond its multiple; an operator who
 approves the exact pending plan by sha lifts both. Any run stops, and
 escalates, after ``write_failure_streak`` consecutive failed heals.
 
+An undo run takes every heal one apply run applied back to its pre-image,
+newest first. Each step is corroborated against the image it expects and
+verified after its one write; the heal's row is marked undone by the undo run
+only once every step applied, and that row keeps a re-plan from proposing the
+heal again at the same texts.
+
 The escape anchors below belong to these filers alone; no other filer may
 share them.
 """
@@ -35,12 +41,15 @@ from fused_memory.maintenance.link_heal import (
     PlannedAction,
     RunCounts,
     StaleField,
+    apply_change,
     build_plan,
     corroboration_mismatch,
     journal_reason,
+    undo_changes,
     verification_mismatch,
 )
 from fused_memory.maintenance.link_heal_ledger import (
+    UNDO_ACTION,
     ActionRow,
     ActionState,
     LinkHealLedger,
@@ -433,6 +442,10 @@ class _Drain:
         elif outcome.state is ActionState.APPLIED:
             self.streak = 0
 
+    def stop(self, *, not_attempted: int) -> None:
+        self.stopped_by = STREAK_STOP
+        self.not_attempted = not_attempted
+
 
 async def _drain(
     pending: Sequence[ActionRow],
@@ -453,8 +466,7 @@ async def _drain(
         ledger.set_outcome(row.action_id, outcome.state, run_id, outcome.detail)
         drain.record(outcome)
         if drain.streak >= streak_limit:
-            drain.stopped_by = STREAK_STOP
-            drain.not_attempted = len(pending) - index - 1
+            drain.stop(not_attempted=len(pending) - index - 1)
             break
     return drain
 
@@ -496,21 +508,25 @@ async def run_apply(
             run_id, streak=drain.streak, not_attempted=drain.not_attempted,
             last_failure=drain.last_failure, projects=projects,
         ))
-    counts = _apply_counts(pending, drain, escaped, approved_plan_sha256)
+    counts = _drain_counts(
+        pending, drain, escaped=escaped, approved_plan_sha256=approved_plan_sha256,
+    )
     ledger.finish_run(run_id, counts=counts.as_json())
     return RunReport(run_id=run_id, counts=counts)
 
 
-def _apply_counts(
-    pending: Sequence[ActionRow],
+def _drain_counts(
+    heals: Sequence[ActionRow],
     drain: _Drain,
-    escaped: tuple[Mapping[str, Any], ...],
-    approved_plan_sha256: str | None,
+    *,
+    escaped: tuple[Mapping[str, Any], ...] = (),
+    approved_plan_sha256: str | None = None,
 ) -> RunCounts:
+    """A writing run's disclosure: the heals it took on, and what became of them."""
     skipped_cap = drain.outcomes[ActionState.SKIPPED_CAP]
     return RunCounts(
-        planned=len(pending),
-        planned_by_action=Counter(row.planned.action.value for row in pending),
+        planned=len(heals),
+        planned_by_action=Counter(row.planned.action.value for row in heals),
         applied=drain.outcomes[ActionState.APPLIED],
         skipped_stale=drain.outcomes[ActionState.SKIPPED_STALE],
         skipped_cap=skipped_cap,
@@ -521,3 +537,67 @@ def _apply_counts(
         stopped_by=drain.stopped_by,
         approved_plan_sha256=approved_plan_sha256,
     )
+
+
+async def _undo_step(
+    heal: PlannedAction,
+    change: MetadataChange,
+    before: LinkImage,
+    after: LinkImage,
+    *,
+    store: LinkHealStore,
+    run_id: str,
+) -> _Outcome:
+    """Corroborate that the record shows *before*, write *change*, verify *after*."""
+    try:
+        stale = await _verify(store, heal.project_id, heal.child_id, before)
+    except StoreReadFailed as failure:
+        return _Outcome(ActionState.FAILED, _read_failure('read', failure))
+    if stale is not None:
+        return _Outcome(ActionState.SKIPPED_STALE, {'stale_field': stale.value})
+    return await _write_and_verify(
+        store, heal.project_id, heal.child_id, change, after,
+        run_id=run_id,
+        reason=journal_reason(run_id[:8], UNDO_ACTION, before),
+    )
+
+
+async def _undo_heal(
+    row: ActionRow, *, store: LinkHealStore, ledger: LinkHealLedger, run_id: str, drain: _Drain,
+) -> None:
+    """Take one heal back step by step; it is undone only once every step applied."""
+    heal = row.planned
+    before = heal.post_image
+    for change in undo_changes(heal.post_image, heal.pre_image):
+        after = apply_change(before, change)
+        outcome = await _undo_step(heal, change, before, after, store=store, run_id=run_id)
+        ledger.add_undo_step(
+            run_id, row, before=before, after=after, state=outcome.state, detail=outcome.detail,
+        )
+        drain.record(outcome)
+        if outcome.state is not ActionState.APPLIED:
+            return
+        before = after
+    ledger.mark_undone(row.action_id, run_id)
+
+
+async def run_undo(
+    target_run_id: str, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
+) -> RunReport:
+    """A writing run taking back every heal *target_run_id* applied, newest first.
+
+    *target_run_id* may be a run id or a unique prefix of one. An unknown or
+    ambiguous one raises before any run row.
+    """
+    target = ledger.resolve_run(target_run_id)
+    heals = ledger.applied_actions(target.run_id)[::-1]
+    run_id = ledger.start_run(RunSource.UNDO, writes=True)
+    drain = _Drain()
+    for index, row in enumerate(heals):
+        await _undo_heal(row, store=store, ledger=ledger, run_id=run_id, drain=drain)
+        if drain.streak >= limits.write_failure_streak:
+            drain.stop(not_attempted=len(heals) - index - 1)
+            break
+    counts = _drain_counts(heals, drain)
+    ledger.finish_run(run_id, counts=counts.as_json())
+    return RunReport(run_id=run_id, counts=counts)
