@@ -60,11 +60,7 @@ from .metrics import (
     resolve_terminal_kind,
 )
 from .profile import apply_eval_profile
-from .replay_frame import (
-    REPLAY_FRAME_ID,
-    ReplayFramedBriefingAssembler,
-    build_replay_frame_block,
-)
+from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
@@ -955,7 +951,6 @@ async def run_architect_eval(
     its ambiguity direction. The artifacts are read in the ``finally`` block
     below, which is the last moment they exist.
     """
-    from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
     from orchestrator.agents.roles import ARCHITECT
     from orchestrator.artifacts import TaskArtifacts
@@ -1105,9 +1100,8 @@ async def run_architect_eval(
 
         # 4. Build the architect prompt and invoke the architect LIVE with THIS
         #    candidate's model/backend/effort/env_overrides.
-        briefing = BriefingAssembler(orch_config)
+        briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=pre)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
-        prompt += build_replay_frame_block(pre)  # docs/eval-replay-frame.md
         # Wire plan-tools MCP via the SAME production seam real dispatch uses
         # (workflow._invoke): relocated meta_root + direct-interpreter launch.
         # strict_mcp_config stays default False so the ambient .mcp.json

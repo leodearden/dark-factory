@@ -1945,13 +1945,13 @@ def _run_plan_only(task_path: Path | None, base_config):
         sys.exit(1)
 
     async def _run():
-        from orchestrator.agents.briefing import BriefingAssembler
         from orchestrator.agents.invoke import invoke_agent
         from orchestrator.agents.roles import ARCHITECT
         from orchestrator.artifacts import TaskArtifacts
-        from orchestrator.evals.replay_frame import build_replay_frame_block
-
-        briefing = BriefingAssembler(base_config)
+        from orchestrator.evals.replay_frame import (
+            REPLAY_FRAME_ID,
+            ReplayFramedBriefingAssembler,
+        )
 
         for tp in task_paths:
             task = load_task(tp)
@@ -1982,9 +1982,10 @@ def _run_plan_only(task_path: Path | None, base_config):
 
                 # Build architect prompt
                 task_def = task.get('task_definition', {})
+                briefing = ReplayFramedBriefingAssembler(
+                    base_config, base_commit=task['pre_task_commit'],
+                )
                 prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
-                # Per-fixture base commit; see docs/eval-replay-frame.md.
-                prompt += build_replay_frame_block(task['pre_task_commit'])
 
                 # Invoke architect (opus-high, always Claude)
                 result = await invoke_agent(
@@ -2012,6 +2013,7 @@ def _run_plan_only(task_path: Path | None, base_config):
 
                 # Save plan into task JSON
                 task['plan'] = plan
+                task['plan_replay_frame'] = REPLAY_FRAME_ID
                 with open(tp, 'w') as f:
                     json.dump(task, f, indent=2)
                     f.write('\n')

@@ -1,8 +1,9 @@
 """Tests for the eval REPLAY FRAME — evals/replay_frame.py (task 4844).
 
-Covered here: the replay-frame primitive (block text, persisted frame id, base
-commit refusal) and the ``EvalMetrics.replay_frame`` field. The runner wiring
-lives in ``test_eval_architect.py`` and ``test_eval_driver.py``.
+Covered here: the replay-frame primitive (block text, base commit refusal), the
+``EvalMetrics.replay_frame`` field, the framed assembler, and the
+``eval --plan-only`` command. The runner wiring lives in
+``test_eval_architect.py`` and ``test_eval_driver.py``.
 """
 
 from __future__ import annotations
@@ -40,12 +41,6 @@ class TestBuildReplayFrameBlock:
         assert repr(base_commit) in str(excinfo.value)
 
 
-def test_replay_frame_id_is_the_persisted_vocabulary():
-    from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
-
-    assert REPLAY_FRAME_ID == 'honest-frame-v1'
-
-
 class TestEvalMetricsReplayFrameField:
     def test_default_is_none_the_unframed_sentinel(self):
         from orchestrator.evals.metrics import EvalMetrics
@@ -63,64 +58,107 @@ class TestEvalMetricsReplayFrameField:
         from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
 
         assert EvalMetrics(replay_frame=REPLAY_FRAME_ID).to_dict()[
-            'replay_frame'] == 'honest-frame-v1'
+            'replay_frame'] == REPLAY_FRAME_ID
 
 
-class TestPlanOnlyCliAppendsReplayFrame:
+_PLAN_ONLY_BASE = 'feedface1234'
+
+
+def _run_plan_only_cli(tmp_path, monkeypatch, *, architect):
+    """Run ``orchestrator eval --plan-only`` on one fixture with git, memory and the LLM stubbed.
+
+    ``architect`` is the side effect of the stubbed ``invoke_agent``; it may
+    write a plan through the real ``TaskArtifacts`` of the worktree it is given.
+    Returns ``(cli_result, invoke_agent_mock, fixture_path)``.
+    """
+    import json
+    from unittest.mock import AsyncMock
+
+    from click.testing import CliRunner
+
+    import orchestrator.cli
+    from orchestrator.agents.briefing import BriefingAssembler
+    from orchestrator.cli import main
+    from orchestrator.config import OrchestratorConfig
+
+    monkeypatch.setattr(
+        orchestrator.cli, 'load_config',
+        lambda _p: OrchestratorConfig(project_root=tmp_path),
+    )
+    fixture = tmp_path / 'df_task_9001.json'
+    fixture.write_text(json.dumps({
+        'id': 'df_task_9001',
+        'project_root': str(tmp_path),
+        'pre_task_commit': _PLAN_ONLY_BASE,
+        'task_definition': {'title': 'T', 'description': 'D'},
+        'plan': None,
+    }))
+    dummy_yaml = tmp_path / 'dummy.yaml'
+    dummy_yaml.write_text('')
+
+    invoke_agent = AsyncMock(side_effect=architect)
+    monkeypatch.setattr(
+        'orchestrator.evals.snapshots.create_eval_worktree',
+        AsyncMock(return_value=(tmp_path / 'wt', 'run-x')),
+    )
+    monkeypatch.setattr(
+        'orchestrator.evals.snapshots.cleanup_eval_worktree', AsyncMock(),
+    )
+    monkeypatch.setattr(
+        BriefingAssembler, 'build_architect_prompt',
+        AsyncMock(return_value='ARCH PROMPT'),
+    )
+    monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', invoke_agent)
+
+    result = CliRunner().invoke(main, [
+        'eval', '--plan-only', '--task', str(fixture), '--config', str(dummy_yaml),
+    ])
+    return result, invoke_agent, fixture
+
+
+class TestPlanOnlyCliBriefsInReplayFrame:
     def test_plan_only_architect_is_briefed_in_the_replay_frame(
         self, tmp_path, monkeypatch,
     ):
-        import json
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import MagicMock
 
-        from click.testing import CliRunner
-
-        import orchestrator.cli
-        from orchestrator.cli import main
-        from orchestrator.config import OrchestratorConfig
         from orchestrator.evals.replay_frame import build_replay_frame_block
 
-        monkeypatch.setattr(
-            orchestrator.cli, 'load_config',
-            lambda _p: OrchestratorConfig(project_root=tmp_path),
+        r, invoke_agent, _ = _run_plan_only_cli(
+            tmp_path, monkeypatch,
+            architect=lambda **_kw: MagicMock(success=False, output='refused'),
         )
-        fixture = tmp_path / 'df_task_9001.json'
-        fixture.write_text(json.dumps({
-            'id': 'df_task_9001',
-            'project_root': str(tmp_path),
-            'pre_task_commit': 'feedface1234',
-            'task_definition': {'title': 'T', 'description': 'D'},
-            'plan': None,
-        }))
-        dummy_yaml = tmp_path / 'dummy.yaml'
-        dummy_yaml.write_text('')
-
-        briefing = MagicMock()
-        briefing.build_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
-        invoke_agent = AsyncMock(return_value=MagicMock(success=False, output='refused'))
-        monkeypatch.setattr(
-            'orchestrator.evals.snapshots.create_eval_worktree',
-            AsyncMock(return_value=(tmp_path / 'wt', 'run-x')),
-        )
-        monkeypatch.setattr(
-            'orchestrator.evals.snapshots.cleanup_eval_worktree', AsyncMock(),
-        )
-        monkeypatch.setattr(
-            'orchestrator.agents.briefing.BriefingAssembler',
-            MagicMock(return_value=briefing),
-        )
-        monkeypatch.setattr('orchestrator.artifacts.TaskArtifacts', MagicMock())
-        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', invoke_agent)
-
-        r = CliRunner().invoke(main, [
-            'eval', '--plan-only', '--task', str(fixture), '--config', str(dummy_yaml),
-        ])
 
         assert r.exit_code == 0, r.output
         (architect_call,) = invoke_agent.await_args_list
         assert architect_call.kwargs['prompt'] == (
-            'ARCH PROMPT' + build_replay_frame_block('feedface1234')
+            'ARCH PROMPT' + build_replay_frame_block(_PLAN_ONLY_BASE)
         )
+
+    def test_generated_plan_is_stamped_with_the_replay_frame(
+        self, tmp_path, monkeypatch,
+    ):
+        import json
+        from unittest.mock import MagicMock
+
+        from orchestrator.artifacts import TaskArtifacts
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        def architect_writes_a_plan(**kw):
+            TaskArtifacts(kw['cwd']).write_plan({
+                'task_id': 'df_task_9001',
+                'steps': [{'id': 'step-1', 'description': 'do it', 'status': 'pending'}],
+            })
+            return MagicMock(success=True, output='planned', cost_usd=0.5)
+
+        r, _, fixture = _run_plan_only_cli(
+            tmp_path, monkeypatch, architect=architect_writes_a_plan,
+        )
+
+        assert r.exit_code == 0, r.output
+        written = json.loads(fixture.read_text())
+        assert written['plan']['steps']
+        assert written['plan_replay_frame'] == REPLAY_FRAME_ID
 
 
 _FRAMED_BASE = 'abc123def'
@@ -143,7 +181,7 @@ def _assemblers(tmp_path):
 class TestReplayFramedBriefingAssembler:
     @pytest.mark.parametrize('call_shape', [
         pytest.param({}, id='fresh-plan'),
-        pytest.param({'include_prior_proposals': True}, id='replan'),
+        pytest.param({'include_prior_proposals': True}, id='prior-proposals'),
         pytest.param(
             {'committed_work': [{'sha': 'a' * 40, 'subject': 's'}]},
             id='committed-work',

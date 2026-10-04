@@ -1602,7 +1602,7 @@ def _arch_task_no_reference() -> dict:
 
 
 def _architect_prompt_sent() -> str:
-    """What the hermetic architect receives: the stubbed briefing plus the replay frame."""
+    """What the hermetic architect receives: the stubbed production briefing plus the replay frame."""
     from orchestrator.evals.replay_frame import build_replay_frame_block
 
     return 'ARCH PROMPT' + build_replay_frame_block(_arch_task()['pre_task_commit'])
@@ -1741,6 +1741,7 @@ async def _run_architect_eval_hermetic(
     """
     from shared.config_models import UsageCapConfig
 
+    from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
 
@@ -1779,8 +1780,9 @@ async def _run_architect_eval_hermetic(
         assert _kind in _DECLINE_READERS, f'unknown decline kind {_kind!r}'
         getattr(artifacts_instance, _DECLINE_READERS[_kind]).side_effect = _exc
 
-    briefing_instance = MagicMock()
-    briefing_instance.build_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
+    # Stubs the PRODUCTION briefing only; the replay-frame subclass the runner
+    # builds still appends its block for real (task 4844).
+    production_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
 
     mock_judge = AsyncMock(return_value=judge_return, side_effect=judge_side_effect)
     mock_verify = AsyncMock()
@@ -1834,8 +1836,8 @@ async def _run_architect_eval_hermetic(
         p(patch('orchestrator.agents.invoke.invoke_agent', mock_invoke))
         p(patch('orchestrator.artifacts.TaskArtifacts',
                 MagicMock(return_value=artifacts_instance)))
-        p(patch('orchestrator.agents.briefing.BriefingAssembler',
-                MagicMock(return_value=briefing_instance)))
+        p(patch.object(BriefingAssembler, 'build_architect_prompt',
+                       production_architect_prompt))
         p(patch('orchestrator.evals.runner.build_eval_orch_config',
                 MagicMock(
                     return_value=orch_stub,
@@ -2285,15 +2287,11 @@ class TestArchitectCellCarriesReplayFrame:
         )
 
     async def test_architect_prompt_is_production_briefing_plus_replay_frame(self):
-        from orchestrator.evals.replay_frame import build_replay_frame_block
-
         _, mocks = await _run_architect_eval_hermetic(
             self._cfg(), produced_plan=_well_formed_plan(),
         )
 
-        assert mocks['invoke'].call_args.kwargs['prompt'] == (
-            'ARCH PROMPT' + build_replay_frame_block(_arch_task()['pre_task_commit'])
-        )
+        assert mocks['invoke'].call_args.kwargs['prompt'] == _architect_prompt_sent()
 
     async def test_cell_is_stamped_with_the_replay_frame(self):
         from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
