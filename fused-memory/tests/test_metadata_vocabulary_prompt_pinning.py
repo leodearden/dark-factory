@@ -4,7 +4,9 @@ registry that defines the vocabulary (task 3202, PRD
 normative copy, everything else a pointer).
 
 ``fused_memory.memory_metadata`` (leaf β / task 3195) is that normative copy.
-Two prompt surfaces quote it, and both are pinned here:
+Two kinds of prompt surface quote it, the writer instructions and the kind
+examples, and both are pinned here, together with where the recon copy of the
+writer instructions must appear:
 
 ARM 1 — the writer instructions, on both writer surfaces.
 ``orchestrator/src/orchestrator/agents/roles.py::METADATA_VOCABULARY_INSTRUCTIONS``
@@ -28,6 +30,10 @@ ARM 2 is deliberately NOT exhaustive over every possible spelling: it pins the
 surfaces and syntaxes that were measured to carry kinds, and a novel spelling
 introduced later would be invisible to it. Extend the regex and
 ``_PROMPT_SOURCES`` when one appears rather than assuming the coverage is total.
+
+ARM 3 — the rendered vocabulary guidance reaches every reconciliation prompt
+that can write memory, verbatim, and no prompt that cannot (task 4912). Which
+prompts can write is decided by ``fused-memory/tests/_recon_prompt_write_scope.py``.
 
 WHY THIS FILE LIVES IN fused-memory/tests: this suite's pytest config already
 declares ``pythonpath = ["src", "../orchestrator/src"]``, so BOTH
@@ -59,6 +65,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _recon_prompt_write_scope import WRITE_TOOL, recon_system_prompts, split_by_write_grant
 from orchestrator.agents.roles import _MEMORY_INSTRUCTIONS, METADATA_VOCABULARY_INSTRUCTIONS, ROLES
 
 from fused_memory.memory_metadata import (
@@ -330,3 +337,37 @@ class TestReconPromptKindLiteralsPinned:
         """The constant<->registry edge itself: the shared kind constant the
         writers use must be a member of the closed registry."""
         assert CYCLE_SUMMARY_KIND in KIND_REGISTRY
+
+
+_RECON_PROMPTS = recon_system_prompts()
+_WRITING_PROMPTS, _NON_WRITING_PROMPTS = split_by_write_grant(_RECON_PROMPTS)
+
+
+class TestVocabularyReachesTheWritingReconStages:
+    """ARM 3: a recon stage that can write is taught the vocabulary it is
+    validated against, and a stage that cannot write is never taught it.
+
+    Byte-identical containment of the rendered guidance, so a re-typed or
+    reworded copy fails while rewording the renderer never does.
+    """
+
+    def test_scope_split_is_not_vacuous(self) -> None:
+        assert _WRITING_PROMPTS, f'no discovered prompt lists {WRITE_TOOL}: {sorted(_RECON_PROMPTS)}'
+        assert _NON_WRITING_PROMPTS, (
+            f'every discovered prompt lists {WRITE_TOOL}: {sorted(_RECON_PROMPTS)}'
+        )
+
+    @pytest.mark.parametrize('name', _WRITING_PROMPTS)
+    def test_every_writing_prompt_carries_the_guidance(self, name: str) -> None:
+        assert render_metadata_vocabulary_guidance() in _RECON_PROMPTS[name], (
+            f'{name} lists {WRITE_TOOL} but does not carry the rendered metadata '
+            'vocabulary guidance verbatim. Interpolate '
+            'render_metadata_vocabulary_guidance(); do not restate it.'
+        )
+
+    @pytest.mark.parametrize('name', _NON_WRITING_PROMPTS)
+    def test_no_non_writing_prompt_carries_the_guidance(self, name: str) -> None:
+        assert render_metadata_vocabulary_guidance() not in _RECON_PROMPTS[name], (
+            f'{name} cannot write memory but is taught the write-time metadata '
+            'vocabulary.'
+        )
