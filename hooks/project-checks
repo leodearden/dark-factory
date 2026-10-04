@@ -133,8 +133,8 @@ DEP_PACKAGES=(shared escalation)
 
 # Every tests/ directory the merge gate's check_bare_magicmock_config.py tail leg
 # scans, in the order of dark-factory-orchestrator.yaml::lint_command. That leg is
-# the source of truth: tests/scripts/test_hook_ruff_targets_drift.py fails when
-# this list and the leg disagree, so widen both together.
+# the source of truth: tests/scripts/test_hook_magicmock_test_dirs_drift.py fails
+# when this list and the leg disagree, so widen both together.
 MAGICMOCK_TEST_DIRS=(shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests)
 
 RUFF_PATHS=()

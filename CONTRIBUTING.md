@@ -369,9 +369,8 @@ branch, before any merge submission:
    and `escalation` are imported by most of the others, so a change there
    should trigger a broader run).
 2. `uv run ruff check <touched packages>`.
-3. `uv run pyright` in each touched, pyright-configured package
-   (`fused-memory`, `orchestrator`, `dashboard`, `shared`, `escalation`,
-   `sampler`, `cockpit`).
+3. `uv run pyright` in each touched, pyright-configured package — any of the
+   seven workspace members the §3 **Type-check** command walks.
 
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than
