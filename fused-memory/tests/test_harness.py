@@ -21683,6 +21683,36 @@ def test_unregistered_project_files_nothing(
     assert not _orch_queue_dir(tmp_path).exists()
 
 
+@pytest.mark.parametrize(
+    ('finding', 'supplied_task_id'),
+    [
+        (_orch_finding(), '../escape'),
+        (_orch_finding(task_id='../../4458', affected_ids=['4458']), None),
+    ],
+    ids=['pre-resolved-target', 'resolver-target'],
+)
+def test_unroutable_target_files_nothing_and_touches_no_queue_directory(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+    finding, supplied_task_id,
+):
+    """An id unsafe as a queue key is refused BEFORE any I/O.
+
+    The production call site passes a PRE-RESOLVED target, which skips the
+    resolver's shape check, so the filer must enforce
+    `finding_task_escalation.py::is_routable_task_id` again at the point of use.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    result = harness._file_finding_task_escalation(
+        'test-project', 'run-1', finding, 4, task_id=supplied_task_id,
+    )
+
+    assert result is None
+    assert not _orch_queue_dir(tmp_path).exists()
+    assert list(tmp_path.rglob('esc-*')) == []
+
+
 def test_queue_submit_failure_is_swallowed_and_warned(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
 ):
