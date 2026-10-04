@@ -10042,7 +10042,9 @@ def _unmeasured_session_reason(failing_result: VerifyResult) -> str | None:
 
     Reads EVERY failing leg's category: the aggregated list carries no leg
     identity, and a stopped lint leg that printed nothing leaves
-    ``lint_output`` empty.
+    ``lint_output`` empty. An unrecorded list (``None`` or ``[]``) is never a
+    licence (the contract on ``VerifyResult.failing_leg_categories``), and
+    ranks last because it is an absence of evidence.
     """
     recorded = failing_result.failing_leg_categories
     stopped = next((c for c in recorded or () if c in _STOPPED_LEG_CATEGORIES), None)
@@ -10050,6 +10052,8 @@ def _unmeasured_session_reason(failing_result: VerifyResult) -> str | None:
         return f'leg_without_verdict:{stopped}'
     if _shows_xdist_worker_death(failing_result.test_output):
         return 'session_truncated'
+    if not recorded:
+        return 'leg_categories_unrecorded'
     return None
 
 
@@ -10495,8 +10499,9 @@ async def confirm_merge_verify_flake_suppressible(
     failure; a node-id mapping to no given subproject; an infra-sentinel re-run
     category, which is never trusted as confirmation; a session an xdist worker
     death truncated, ``session_truncated``; a session with a failing leg
-    stopped before its own verdict, ``leg_without_verdict:<category>``) are
-    different facts, and
+    stopped before its own verdict, ``leg_without_verdict:<category>``; a
+    failing result whose per-leg categories were never recorded,
+    ``leg_categories_unrecorded``) are different facts, and
     θ's class-1 health check is an unconfirmable RATE that cannot be computed
     from a ``None``. The caller — ``apply_merge_flake_suppression`` — still
     suppresses on ``passes_in_isolation`` alone, so the GATE's behaviour is
