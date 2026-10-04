@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from _virtual_clock_helpers import run_on_virtual_clock
+from shared.testing_virtual_clock import run_on_virtual_clock
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1343,7 +1343,7 @@ class TestFetchPinsRecovery:
 
         The answering project must beat the same deadline the slow one misses;
         on the host clock a stalled worker made it miss that deadline too, so
-        the scenario runs on tests/_virtual_clock_helpers.py's loop clock.
+        the scenario runs on shared.testing_virtual_clock's loop clock.
         """
         from dashboard.data.escalations import fetch_pins_recovery
 

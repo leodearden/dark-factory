@@ -8,6 +8,13 @@ loop-time order.
 Scope: scenarios whose every wait is in-loop (httpx.MockTransport handlers,
 asyncio primitives). Real sockets and threads race the jump; executor work
 (run_in_executor, asyncio.to_thread, getaddrinfo) is rejected with RuntimeError.
+
+The dashboard and orchestrator suites both run scenarios on this clock, and
+neither can import the other's test tree, so it lives HERE, in the shipped
+``shared`` package — the same convention as :mod:`shared.testing_stdin` and
+:mod:`shared.testing_streams` — rather than being copied into each suite (INV-5).
+
+Pure stdlib, and registered as such in ``shared/tests/test_pure_stdlib_leaves.py``.
 """
 
 from __future__ import annotations
@@ -16,6 +23,8 @@ import asyncio
 import selectors
 from collections.abc import Coroutine
 from typing import Any, NoReturn, TypeVar
+
+__all__ = ['run_on_virtual_clock']
 
 T = TypeVar('T')
 

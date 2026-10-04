@@ -13,7 +13,7 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
-from _virtual_clock_helpers import run_on_virtual_clock
+from shared.testing_virtual_clock import run_on_virtual_clock
 
 
 class _PerPortHandler:
@@ -110,8 +110,8 @@ class TestGetMergeHaltStatus:
         """A project that does not answer inside per_call_timeout is offline,
         while a sibling that did answer stays online.
 
-        Runs on tests/_virtual_clock_helpers.py::run_on_virtual_clock so host
-        stalls cannot expire the deadline.
+        Runs on shared/src/shared/testing_virtual_clock.py::run_on_virtual_clock
+        so host stalls cannot expire the deadline.
         """
         from dashboard.data.merge_halt import get_merge_halt_status
 
