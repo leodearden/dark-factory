@@ -915,6 +915,38 @@ class TestDropPlanFile:
         assert result['message']
         self._assert_record_untouched(artifacts, ['mod_a/only.py'])
 
+    def test_stringified_files_are_normalized_not_iterated_by_character(
+        self, artifacts
+    ):
+        """A stored non-list ``files`` must be coerced, not treated as a
+        string whose substrings and characters are the "entries"."""
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = '["mod_a/foo.py","mod_a/bar.py"]'
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/foo.py', reason='Needed no edit'
+        )
+
+        assert result['status'] == 'ok'
+        assert artifacts.read_plan()['files'] == ['mod_a/bar.py']
+
+    def test_stringified_files_single_entry_still_refuses_last_drop(
+        self, artifacts
+    ):
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = '["mod_a/only.py"]'
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/only.py', reason='Turned out unnecessary'
+        )
+
+        assert result['status'] == 'error'
+        assert artifacts.read_plan().get('dropped_files', []) == []
+
 
 class TestRemovePlanStep:
     def test_removes_pending_step(self, artifacts):

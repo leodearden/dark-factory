@@ -1245,7 +1245,7 @@ def _drop_plan_file(
             markup_facts,
         )
 
-    current = plan.get('files', [])
+    current = _coerce_files(plan.get('files'))
     if path not in current:
         return _with_markup_repairs(
             {
