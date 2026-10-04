@@ -916,8 +916,8 @@ test('layoutSignature: empty input returns a string without throwing', () => {
 // cache the result on layoutSignature without freezing displayed task fields.
 // ---------------------------------------------------------------------------
 
-// A tangled 3-tier component interleaved with a chain component and
-// singletons, so components and singletons are not contiguous in the input.
+// Three components — a P1 diamond, an A→B chain, a P2 chain — interleaved
+// with two singletons, so neither is contiguous in the input.
 function layoutFixture() {
   return [
     displayTask('P1'),
@@ -934,13 +934,14 @@ function layoutFixture() {
   ];
 }
 
-test('taskGraphLayout: equals the composition of computeTiers, partitionComponents and orderRows, as ids', () => {
-  const tasks = layoutFixture();
-  const tiers = computeTiers(tasks);
-  const { components, singletons } = partitionComponents(tasks);
-  assert.deepEqual(taskGraphLayout(tasks), {
-    blocks: components.map(c => orderRows(c, tiers).map(row => row.map(t => t.id))),
-    singletons: singletons.map(t => t.id),
+test('taskGraphLayout: one block per component in first-member order, one row per tier, singletons apart', () => {
+  assert.deepEqual(taskGraphLayout(layoutFixture()), {
+    blocks: [
+      [['P1'], ['M2', 'M3'], ['C1']],
+      [['A'], ['B']],
+      [['P2'], ['M1'], ['C2']],
+    ],
+    singletons: ['S1', 'S2'],
   });
 });
 
