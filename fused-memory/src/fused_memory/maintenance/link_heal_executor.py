@@ -24,6 +24,7 @@ share them.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -302,7 +303,7 @@ async def run_plan(
     ledger.add_planned(run_id, staged.new)
     pending = ledger.pending_actions(source)
     document = render_plan_document(pending)
-    plan_path.write_bytes(document)
+    await asyncio.to_thread(plan_path.write_bytes, document)
     sha = plan_sha256(document)
     escape = backlog_escape(len(pending), limits, projects=projects)
     counts = replace(
