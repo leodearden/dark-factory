@@ -8,16 +8,27 @@ loop-time order.
 Scope: scenarios whose every wait is in-loop (httpx.MockTransport handlers,
 asyncio primitives). Real sockets and threads race the jump; executor work
 (run_in_executor, asyncio.to_thread, getaddrinfo) is rejected with RuntimeError.
+
+The dashboard and orchestrator suites both run scenarios on this clock, and
+neither can import the other's test tree, so it lives HERE, in the shipped
+``shared`` package — the same convention as :mod:`shared.testing_stdin` and
+:mod:`shared.testing_streams` — rather than being copied into each suite (INV-5).
+
+Pure stdlib, and registered as such in ``shared/tests/test_pure_stdlib_leaves.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import selectors
-from collections.abc import Coroutine
-from typing import Any, NoReturn, TypeVar
+from collections.abc import Callable, Coroutine
+from typing import Any, NoReturn, ParamSpec, TypeVar
+
+__all__ = ['run_on_virtual_clock', 'virtual_clock_test']
 
 T = TypeVar('T')
+P = ParamSpec('P')
 
 
 class _VirtualClock:
@@ -60,3 +71,18 @@ def run_on_virtual_clock(scenario: Coroutine[Any, Any, T]) -> T:
     """
     with asyncio.Runner(loop_factory=_VirtualClockLoop) as runner:
         return runner.run(scenario)
+
+
+def virtual_clock_test(test: Callable[P, Coroutine[Any, Any, None]]) -> Callable[P, None]:
+    """Turn an ``async def`` test into a sync test whose body runs on :func:`run_on_virtual_clock`.
+
+    pytest still resolves fixtures from the test's own signature, and
+    pytest-asyncio sees no coroutine function to claim, so the test needs no
+    ``@pytest.mark.asyncio``.
+    """
+
+    @functools.wraps(test)
+    def run_test(*args: P.args, **kwargs: P.kwargs) -> None:
+        run_on_virtual_clock(test(*args, **kwargs))
+
+    return run_test

@@ -1,16 +1,19 @@
-"""Contract of tests/_virtual_clock_helpers.py::run_on_virtual_clock.
+"""Contract of shared/src/shared/testing_virtual_clock.py.
 
 The loop clock advances only while the loop is idle, and by exactly the
 timeout it would have slept — so blocking the host thread never moves it.
+``virtual_clock_test`` is pinned by decorated tests that pytest itself runs.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
 import pytest
-from _virtual_clock_helpers import run_on_virtual_clock
+
+from shared.testing_virtual_clock import run_on_virtual_clock, virtual_clock_test
 
 
 def test_an_idle_loop_jumps_straight_to_its_next_timer():
@@ -87,3 +90,28 @@ def test_name_resolution_is_rejected_loudly():
 
     with pytest.raises(RuntimeError, match='executor'):
         run_on_virtual_clock(scenario())
+
+
+def _assert_a_host_stall_leaves_the_running_loop_clock_still() -> None:
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    time.sleep(0.02)
+    assert loop.time() - t0 == 0.0
+
+
+@virtual_clock_test
+async def test_a_decorated_test_runs_on_the_virtual_clock_with_its_fixtures(
+    tmp_path: Path,
+) -> None:
+    _assert_a_host_stall_leaves_the_running_loop_clock_still()
+    assert tmp_path.is_dir()
+
+
+class TestADecoratedMethod:
+    @virtual_clock_test
+    async def test_runs_on_the_virtual_clock_with_self_and_its_fixtures(
+        self, tmp_path: Path,
+    ) -> None:
+        _assert_a_host_stall_leaves_the_running_loop_clock_still()
+        assert isinstance(self, TestADecoratedMethod)
+        assert tmp_path.is_dir()
