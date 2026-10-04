@@ -11,11 +11,23 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from _link_heal_harness import ALL_LINK_HEAL_PREFIXES, LinkHealHarness, build_harness
+from _link_heal_harness import (
+    ALL_LINK_HEAL_PREFIXES,
+    CHILD,
+    CHILD_TEXT,
+    DF,
+    PARENT,
+    PARENT_TEXT,
+    PROJECTS,
+    REIFY,
+    LinkHealHarness,
+    build_harness,
+    corpus_basis,
+    run_corpus_plan,
+)
 
 from fused_memory.maintenance.link_heal import (
     BasisSource,
@@ -24,7 +36,6 @@ from fused_memory.maintenance.link_heal import (
     LinkImage,
     Plan,
     RunCounts,
-    Verdict,
     build_plan,
 )
 from fused_memory.maintenance.link_heal_executor import (
@@ -33,30 +44,19 @@ from fused_memory.maintenance.link_heal_executor import (
     RunLimits,
     RunReport,
     render_plan_document,
-    run_plan,
 )
 from fused_memory.maintenance.link_heal_ledger import ActionState, LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_store import text_sha256
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
-    CONTESTED_METADATA_KEY,
     PARENT_ID_KEY,
     SIGHTING_KIND,
 )
 
-DF = 'dark_factory'
-REIFY = 'reify'
-PROJECTS = (DF, REIFY)
-
-CHILD = '11111111-1111-4111-8111-111111111111'
-PARENT = '22222222-2222-4222-8222-222222222222'
 OTHER_PARENT = '33333333-3333-4333-8333-333333333333'
 GRANDPARENT = '44444444-4444-4444-8444-444444444444'
 GRANDCHILD = '55555555-5555-4555-8555-555555555555'
 SECOND_CHILD = '66666666-6666-4666-8666-666666666666'
-
-CHILD_TEXT = 'the child note about link healing'
-PARENT_TEXT = 'the parent note about link healing'
 
 
 @pytest_asyncio.fixture
@@ -68,49 +68,6 @@ async def harness(mock_config, tmp_path):
     await built.journal.close()
 
 
-def corpus_basis(
-    verdict: str,
-    *,
-    child: str = CHILD,
-    parent: str = PARENT,
-    child_text: str = CHILD_TEXT,
-    parent_text: str = PARENT_TEXT,
-    key: str = 'H001',
-    project: str = DF,
-) -> LinkBasis:
-    return LinkBasis(
-        project_id=project,
-        child_id=child,
-        parent_id=parent,
-        verdict=Verdict(verdict),
-        child_sha256=text_sha256(child_text),
-        parent_sha256=text_sha256(parent_text),
-        source=BasisSource.CORPUS,
-        key=key,
-    )
-
-
-def seed_link(
-    harness: LinkHealHarness,
-    *,
-    kind: str | None = AMENDMENT_KIND,
-    child: str = CHILD,
-    parent: str = PARENT,
-    child_text: str = CHILD_TEXT,
-    parent_text: str | None = PARENT_TEXT,
-    project: str = DF,
-    contested: bool = False,
-) -> None:
-    if parent_text is not None:
-        harness.seed(project, parent, parent_text)
-    meta: dict[str, object] = {PARENT_ID_KEY: parent}
-    if kind is not None:
-        meta['kind'] = kind
-    if contested:
-        meta[CONTESTED_METADATA_KEY] = True
-    harness.seed(project, child, child_text, **meta)
-
-
 async def plan(harness: LinkHealHarness, *bases: LinkBasis) -> Plan:
     return await build_plan(
         bases, store=harness.store(), census=harness.mem0, projects=PROJECTS,
@@ -120,7 +77,7 @@ async def plan(harness: LinkHealHarness, *bases: LinkBasis) -> Plan:
 class TestPlannedHeals:
     @pytest.mark.asyncio
     async def test_a_corpus_rated_misfiled_amendment_plans_one_detach(self, harness):
-        seed_link(harness)
+        harness.seed_link()
         basis = corpus_basis('RELATED')
 
         result = await plan(harness, basis)
@@ -142,7 +99,7 @@ class TestPlannedHeals:
 
     @pytest.mark.asyncio
     async def test_an_unrated_link_to_a_deleted_parent_is_a_deterministic_detach(self, harness):
-        seed_link(harness, parent_text=None)
+        harness.seed_link(parent_text=None)
 
         result = await plan(harness)
 
@@ -159,7 +116,7 @@ class TestPlannedHeals:
 class TestReportedLinks:
     @pytest.mark.asyncio
     async def test_a_parent_present_only_in_another_run_project_is_reported(self, harness):
-        seed_link(harness, parent_text=None)
+        harness.seed_link(parent_text=None)
         harness.seed(REIFY, PARENT, PARENT_TEXT)
 
         result = await plan(harness, corpus_basis('RELATED'))
@@ -171,7 +128,7 @@ class TestReportedLinks:
     @pytest.mark.asyncio
     async def test_a_parent_that_is_itself_a_link_is_a_chain(self, harness):
         harness.seed(DF, GRANDPARENT, 'the grandparent note')
-        seed_link(harness, parent_text=None)
+        harness.seed_link(parent_text=None)
         harness.seed(
             DF, PARENT, PARENT_TEXT, **{PARENT_ID_KEY: GRANDPARENT, 'kind': AMENDMENT_KIND},
         )
@@ -184,7 +141,7 @@ class TestReportedLinks:
 
     @pytest.mark.asyncio
     async def test_a_contested_child_rated_related_is_reported_not_detached(self, harness):
-        seed_link(harness, contested=True)
+        harness.seed_link(contested=True)
 
         result = await plan(harness, corpus_basis('RELATED'))
 
@@ -193,7 +150,7 @@ class TestReportedLinks:
 
     @pytest.mark.asyncio
     async def test_a_child_edited_since_export_is_a_stale_rating(self, harness):
-        seed_link(harness, child_text='the child note, edited after export')
+        harness.seed_link(child_text='the child note, edited after export')
 
         result = await plan(harness, corpus_basis('RELATED'))
 
@@ -204,7 +161,7 @@ class TestReportedLinks:
     @pytest.mark.asyncio
     async def test_a_corpus_row_whose_child_moved_parent_is_unlinked(self, harness):
         harness.seed(DF, PARENT, PARENT_TEXT)
-        seed_link(harness, parent=OTHER_PARENT, parent_text='another parent note')
+        harness.seed_link(parent=OTHER_PARENT, parent_text='another parent note')
 
         result = await plan(harness, corpus_basis('RELATED'))
 
@@ -215,7 +172,7 @@ class TestReportedLinks:
 
     @pytest.mark.asyncio
     async def test_an_unrated_live_link_is_unexamined(self, harness):
-        seed_link(harness)
+        harness.seed_link()
 
         result = await plan(harness)
 
@@ -225,7 +182,7 @@ class TestReportedLinks:
 
     @pytest.mark.asyncio
     async def test_a_half_link_with_a_child_rated_extends_has_children(self, harness):
-        seed_link(harness, kind=None)
+        harness.seed_link(kind=None)
         harness.seed(
             DF, GRANDCHILD, 'a note filed under the child',
             **{PARENT_ID_KEY: CHILD, 'kind': SIGHTING_KIND},
@@ -241,7 +198,7 @@ class TestReportedLinks:
 class TestReadFailures:
     @pytest.mark.asyncio
     async def test_a_parent_read_timeout_is_read_failed_and_plans_nothing(self, harness):
-        seed_link(harness)
+        harness.seed_link()
         harness.mem0.read_failures.add(PARENT)
 
         result = await plan(harness, corpus_basis('RELATED'))
@@ -261,9 +218,8 @@ REPORT_COUNTERS = (
 
 class TestDisclosureIdentities:
     async def _mixed_store(self, harness: LinkHealHarness) -> Plan:
-        seed_link(harness)
-        seed_link(
-            harness, child=SECOND_CHILD, parent=OTHER_PARENT, kind=SIGHTING_KIND,
+        harness.seed_link()
+        harness.seed_link(child=SECOND_CHILD, parent=OTHER_PARENT, kind=SIGHTING_KIND,
             child_text='a second child', parent_text='a second parent',
         )
         harness.seed(
@@ -368,7 +324,6 @@ class TestRunCounts:
         assert document['stopped_by'] is None
 
 
-DEFAULT_LIMITS = RunLimits(max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3)
 DANGLING_CHILD = '99999999-9999-4999-8999-999999999999'
 DELETED_PARENT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 SECOND_TEXT, SECOND_PARENT_TEXT = 'a second child', 'a second parent'
@@ -383,13 +338,11 @@ def ledger(tmp_path):
 
 def seed_three_heals(harness: LinkHealHarness) -> tuple[LinkBasis, ...]:
     """A misfiled amendment, an EXTENDS sighting and a dangling link: three heals."""
-    seed_link(harness)
-    seed_link(
-        harness, child=SECOND_CHILD, parent=OTHER_PARENT, kind=SIGHTING_KIND,
+    harness.seed_link()
+    harness.seed_link(child=SECOND_CHILD, parent=OTHER_PARENT, kind=SIGHTING_KIND,
         child_text=SECOND_TEXT, parent_text=SECOND_PARENT_TEXT,
     )
-    seed_link(
-        harness, child=DANGLING_CHILD, parent=DELETED_PARENT, parent_text=None,
+    harness.seed_link(child=DANGLING_CHILD, parent=DELETED_PARENT, parent_text=None,
         child_text='a note whose parent was deleted',
     )
     return (
@@ -398,25 +351,6 @@ def seed_three_heals(harness: LinkHealHarness) -> tuple[LinkBasis, ...]:
             'EXTENDS', child=SECOND_CHILD, parent=OTHER_PARENT, key='H002',
             child_text=SECOND_TEXT, parent_text=SECOND_PARENT_TEXT,
         ),
-    )
-
-
-async def run_corpus_plan(
-    harness: LinkHealHarness,
-    ledger: LinkHealLedger,
-    plan_path: Path,
-    bases: tuple[LinkBasis, ...],
-    limits: RunLimits = DEFAULT_LIMITS,
-) -> RunReport:
-    return await run_plan(
-        bases,
-        store=harness.store(),
-        census=harness.mem0,
-        ledger=ledger,
-        limits=limits,
-        projects=PROJECTS,
-        source=RunSource.CORPUS,
-        plan_path=plan_path,
     )
 
 
@@ -512,7 +446,7 @@ class TestRePlanning:
     async def test_an_undone_heal_at_the_same_hashes_is_not_re_planned(
         self, harness, ledger, tmp_path,
     ):
-        seed_link(harness)
+        harness.seed_link()
         bases = (corpus_basis('RELATED'),)
         self._undo(ledger, await run_corpus_plan(harness, ledger, tmp_path / 'a.json', bases))
 
@@ -526,7 +460,7 @@ class TestRePlanning:
     async def test_editing_the_child_re_opens_a_corpus_heal_as_a_stale_rating(
         self, harness, ledger, tmp_path,
     ):
-        seed_link(harness)
+        harness.seed_link()
         bases = (corpus_basis('RELATED'),)
         self._undo(ledger, await run_corpus_plan(harness, ledger, tmp_path / 'a.json', bases))
         harness.mem0.payload(DF, CHILD)['data'] = 'the child note, edited after the undo'
@@ -540,7 +474,7 @@ class TestRePlanning:
     async def test_editing_the_child_re_opens_a_deterministic_detach(
         self, harness, ledger, tmp_path,
     ):
-        seed_link(harness, parent_text=None)
+        harness.seed_link(parent_text=None)
         self._undo(ledger, await run_corpus_plan(harness, ledger, tmp_path / 'a.json', ()))
         harness.mem0.payload(DF, CHILD)['data'] = 'the child note, edited after the undo'
 

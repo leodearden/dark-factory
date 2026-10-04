@@ -9,6 +9,8 @@ ever touched.
 
 ``FakeMem0.overwrite_payload`` and ``FakeMem0.update`` raise, which pins at the
 store that a patch and a delete are never combined and content is never sent.
+The server turns that raise into an error reply, so each also counts its calls
+in ``FakeMem0.writes`` under its own name, where a test can see it.
 """
 
 from __future__ import annotations
@@ -25,11 +27,18 @@ from _fm_helpers import install_identity_mocks
 
 from fused_memory.backends.mem0_client import split_managed_metadata
 from fused_memory.config.schema import Mem0UpdateConfig
-from fused_memory.maintenance.link_heal_store import LinkHealStore, ToolCaller
+from fused_memory.maintenance.link_heal import BasisSource, LinkBasis, Verdict
+from fused_memory.maintenance.link_heal_executor import RunLimits, RunReport, run_plan
+from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
+from fused_memory.maintenance.link_heal_store import LinkHealStore, ToolCaller, text_sha256
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.scope import Scope
-from fused_memory.server.grouped_read import PARENT_ID_KEY
+from fused_memory.server.grouped_read import (
+    AMENDMENT_KIND,
+    CONTESTED_METADATA_KEY,
+    PARENT_ID_KEY,
+)
 from fused_memory.server.tools import create_mcp_server
 from fused_memory.services.memory_service import MemoryService, SearchResults
 from fused_memory.services.write_journal import WriteJournal
@@ -38,6 +47,41 @@ ALL_LINK_HEAL_PREFIXES = ['recon-stage-', 'curator-', 'link-heal-']
 WITHOUT_LINK_HEAL_PREFIX = ['recon-stage-', 'curator-']
 
 WRITE_ROUTES = ('set_payload', 'delete_payload')
+FORBIDDEN_ROUTES = ('overwrite_payload', 'update')
+
+DF = 'dark_factory'
+REIFY = 'reify'
+PROJECTS = (DF, REIFY)
+
+CHILD = '11111111-1111-4111-8111-111111111111'
+PARENT = '22222222-2222-4222-8222-222222222222'
+CHILD_TEXT = 'the child note about link healing'
+PARENT_TEXT = 'the parent note about link healing'
+
+DEFAULT_LIMITS = RunLimits(max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3)
+
+
+def corpus_basis(
+    verdict: str,
+    *,
+    child: str = CHILD,
+    parent: str = PARENT,
+    child_text: str = CHILD_TEXT,
+    parent_text: str = PARENT_TEXT,
+    key: str = 'H001',
+    project: str = DF,
+) -> LinkBasis:
+    """A hand-link corpus verdict on (child, parent) at these texts' hashes."""
+    return LinkBasis(
+        project_id=project,
+        child_id=child,
+        parent_id=parent,
+        verdict=Verdict(verdict),
+        child_sha256=text_sha256(child_text),
+        parent_sha256=text_sha256(parent_text),
+        source=BasisSource.CORPUS,
+        key=key,
+    )
 
 
 def _matches(payload: dict[str, Any], filters: dict[str, Any]) -> bool:
@@ -76,9 +120,11 @@ class FakeMem0:
             point.pop(key, None)
 
     async def overwrite_payload(self, *args: Any, **kwargs: Any) -> None:
+        self.writes['overwrite_payload'] += 1
         raise AssertionError('link-heal combined a patch and a delete (overwrite_payload)')
 
     async def update(self, *args: Any, **kwargs: Any) -> None:
+        self.writes['update'] += 1
         raise AssertionError('link-heal sent content (mem0.update)')
 
     def _rows(self, scope: Scope, filters: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
@@ -178,6 +224,27 @@ class LinkHealHarness:
             **meta,
         }
 
+    def seed_link(
+        self,
+        *,
+        kind: str | None = AMENDMENT_KIND,
+        child: str = CHILD,
+        parent: str = PARENT,
+        child_text: str = CHILD_TEXT,
+        parent_text: str | None = PARENT_TEXT,
+        project: str = DF,
+        contested: bool = False,
+    ) -> None:
+        """A child linked to a parent; ``parent_text=None`` seeds no parent."""
+        if parent_text is not None:
+            self.seed(project, parent, parent_text)
+        meta: dict[str, object] = {PARENT_ID_KEY: parent}
+        if kind is not None:
+            meta['kind'] = kind
+        if contested:
+            meta[CONTESTED_METADATA_KEY] = True
+        self.seed(project, child, child_text, **meta)
+
     def journal_rows(self, kind: str = 'write') -> list[dict[str, Any]]:
         """The journal's ``write_ops`` rows of *kind*, oldest first, params decoded."""
         with sqlite3.connect(self.journal_dir / 'write_journal.db') as conn:
@@ -225,4 +292,24 @@ async def build_harness(
         journal=journal,
         server=create_mcp_server(service),
         journal_dir=journal_dir,
+    )
+
+
+async def run_corpus_plan(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    plan_path: Path,
+    bases: tuple[LinkBasis, ...],
+    limits: RunLimits = DEFAULT_LIMITS,
+) -> RunReport:
+    """``run_plan`` over the harness's store and census, for both projects."""
+    return await run_plan(
+        bases,
+        store=harness.store(),
+        census=harness.mem0,
+        ledger=ledger,
+        limits=limits,
+        projects=PROJECTS,
+        source=RunSource.CORPUS,
+        plan_path=plan_path,
     )
