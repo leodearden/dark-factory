@@ -14088,44 +14088,38 @@ class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
 
 
 class TestStage2PromptCycleSummaryPoolTag:
-    """Stage 2 prompt must instruct the agent to tag per-cycle summaries with
-    recon_pool='stage2_cycle_summary' so the deterministic Python trim can
-    enumerate the pool by metadata key.
+    """Stage 2 prompt still names the recon_pool='stage2_cycle_summary' tag
+    that Python's cycle_summary mirror carries, so the agent can recognise
+    the pool's members.
 
     Task 1657 step-11: minimal key-presence assertions only (no prose-wording
-    pins).  Mirrors TestStage2PromptNonceMechanism.
+    pins).
 
-    These tests are the producer-contract guard: the Python trim
-    (_enforce_stage2_summary_pool_cap) identifies pool members by the filter
-    {'recon_pool': 'stage2_cycle_summary'}.  If the prompt omits the tag
-    instruction the producer never sets the key and the consumer (trim) finds
-    an empty pool — silently leaving the pool uncapped.
+    No LLM producer of the tag remains: task 2229 moved the normal-flow write
+    to summary_pool.write_cycle_summary and task 3734 retired the
+    reconstruction write, so the producer contract the trim
+    (_enforce_stage2_summary_pool_cap) relies on is Python's, not the prompt's.
     """
 
     def test_stage2_prompt_contains_recon_pool_key(self):
         """build_stage2_system_prompt('dark_factory') must include 'recon_pool'.
 
-        The Stage 2 agent must be instructed to pass recon_pool in the
-        add_memory metadata for the per-cycle summary.  Without this key the
-        Python trim (which filters by {'recon_pool': ...}) finds no members.
+        The Python trim identifies pool members by the recon_pool key, so the
+        prompt names it alongside the mirror's other metadata.
         """
         from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 
         prompt = build_stage2_system_prompt('dark_factory')
         assert 'recon_pool' in prompt, (
             "build_stage2_system_prompt('dark_factory') must include 'recon_pool' "
-            "in the per-cycle summary metadata guidance so the Stage 2 agent "
-            "tags writes with the pool key (task 1657 — producer contract for "
-            "_enforce_stage2_summary_pool_cap)."
+            "in the per-cycle summary metadata guidance (task 1657)."
         )
 
     def test_stage2_prompt_contains_stage2_cycle_summary_value(self):
         """build_stage2_system_prompt('dark_factory') must include 'stage2_cycle_summary'.
 
         This is the pool key value that Python's _enforce_stage2_summary_pool_cap
-        uses as the filter.  Both the key name ('recon_pool') and value
-        ('stage2_cycle_summary') must appear in the prompt so the agent writes
-        the exact tag the consumer expects.
+        uses as the filter.
         """
         from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 
@@ -14133,33 +14127,7 @@ class TestStage2PromptCycleSummaryPoolTag:
         assert 'stage2_cycle_summary' in prompt, (
             "build_stage2_system_prompt('dark_factory') must include "
             "'stage2_cycle_summary' — the recon_pool value the Python trim "
-            "filters on (task 1657 — without this, _enforce_stage2_summary_pool_cap "
-            "silently finds an empty pool and never trims)."
-        )
-
-    def test_stage2_prompt_contains_literal_recon_pool_metadata_fragment(self):
-        """The prompt must contain the literal key=value metadata fragment 'recon_pool': 'stage2_cycle_summary'.
-
-        Stronger than bare token checks: verifies the key and value co-occur as
-        the exact add_memory metadata fragment the producer must emit, not just
-        anywhere in unrelated prose.  If the producer instruction is removed or
-        the value changes, this test catches it immediately.
-
-        The consumer (_enforce_stage2_summary_pool_cap) filters by exactly
-        {'recon_pool': 'stage2_cycle_summary'} — so the prompt must instruct
-        the agent to write that exact key-value pair in the metadata dict.
-        """
-        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
-
-        prompt = build_stage2_system_prompt('dark_factory')
-        # The literal metadata fragment the producer must emit.  This ties the
-        # test to the actual contract rather than token presence anywhere.
-        fragment = "recon_pool': 'stage2_cycle_summary'"
-        assert fragment in prompt, (
-            f"build_stage2_system_prompt('dark_factory') must contain the literal "
-            f"metadata fragment {fragment!r} so the Stage 2 agent writes the exact "
-            f"key-value pair that _enforce_stage2_summary_pool_cap filters on "
-            f"(task 1657 — producer/consumer contract)."
+            "filters on (task 1657)."
         )
 
 
