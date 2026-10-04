@@ -1,0 +1,158 @@
+"""The sideways census a resolve reports: ``related_pending`` (task 4886).
+
+PRD ``docs/prds/truth-propagation-record-mechanics.md`` leaf beta.  Resolving
+one record says nothing about its twins: another pending record on the same
+task, or a pending L2 clustering a shared member, can carry the same
+now-answered question.  The census LISTS them for the resolver to dispose of;
+it never closes anything, because a pin is indistinguishable from an answered
+question on member evidence alone.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from escalation.models import Escalation
+from escalation.related_pending import related_pending
+
+_ENTRY_KEYS = {'id', 'category', 'severity', 'level', 'same_task', 'shared_member'}
+
+
+def _esc(
+    id: str,  # noqa: A002 — mirrors the Escalation attribute name
+    *,
+    task_id: str = 'T1',
+    level: int = 1,
+    members: list[str] | None = None,
+    status: str = 'pending',
+    **kw: Any,
+) -> Escalation:
+    """A real ``escalation.models.Escalation``."""
+    return Escalation(
+        id=id,
+        task_id=task_id,
+        agent_role='implementer',
+        severity=kw.pop('severity', 'blocking'),
+        category=kw.pop('category', 'design_concern'),
+        summary='s',
+        level=level,
+        members=list(members or []),
+        status=status,
+        **kw,
+    )
+
+
+def _by_id(entries: list[Any]) -> dict[str, Any]:
+    return {e['id']: e for e in entries}
+
+
+class TestRelatedPending:
+    def test_same_task_record_at_any_level_is_listed(self):
+        resolved = _esc('esc-T1-1', level=2, members=['m1'])
+        twin_l1 = _esc('esc-T1-2', level=1)
+        twin_l0 = _esc('esc-T1-3', level=0)
+
+        census = _by_id(related_pending([twin_l1, twin_l0], resolved=resolved))
+
+        assert set(census) == {'esc-T1-2', 'esc-T1-3'}
+        for entry in census.values():
+            assert entry['same_task'] is True
+            assert entry['shared_member'] is None
+
+    def test_other_task_l2_sharing_a_member_names_the_smallest_match(self):
+        resolved = _esc('esc-T1-1', level=2, members=['m3', 'm2', 'm1'])
+        sibling = _esc('esc-T2-1', task_id='T2', level=2, members=['m9', 'm3', 'm2'])
+
+        [entry] = related_pending([sibling], resolved=resolved)
+
+        assert entry['id'] == 'esc-T2-1'
+        assert entry['same_task'] is False
+        assert entry['shared_member'] == 'm2'
+
+    def test_l2_clustering_the_resolved_record_itself_is_listed(self):
+        resolved = _esc('esc-T1-5', level=1)
+        clusterer = _esc('esc-T9-1', task_id='T9', level=2, members=['esc-T1-5', 'mx'])
+
+        [entry] = related_pending([clusterer], resolved=resolved)
+
+        assert entry['id'] == 'esc-T9-1'
+        assert entry['same_task'] is False
+        assert entry['shared_member'] == 'esc-T1-5'
+
+    def test_same_task_and_member_sharing_appears_once_with_both_markers(self):
+        resolved = _esc('esc-T1-1', level=2, members=['m1'])
+        both = _esc('esc-T1-9', level=2, members=['m1'])
+
+        census = related_pending([both, both], resolved=resolved)
+
+        assert census == [{
+            'id': 'esc-T1-9', 'category': 'design_concern', 'severity': 'blocking',
+            'level': 2, 'same_task': True, 'shared_member': 'm1',
+        }]
+
+    def test_the_resolved_record_itself_is_never_listed(self):
+        resolved = _esc('esc-T1-1', level=2, members=['m1'])
+
+        assert related_pending([resolved], resolved=resolved) == []
+
+    def test_non_qualifying_records_are_not_listed(self):
+        resolved = _esc('esc-T1-1', level=2, members=['m1'])
+        closed_twin = _esc('esc-T1-2', status='resolved')
+        other_task_l1 = _esc('esc-T2-1', task_id='T2', level=1, members=['m1'])
+        unrelated = _esc('esc-T3-1', task_id='T3', level=2, members=['m7'])
+
+        census = related_pending(
+            [closed_twin, other_task_l1, unrelated], resolved=resolved,
+        )
+
+        assert census == []
+
+    def test_entry_keys_are_exactly_the_documented_shape(self):
+        resolved = _esc('esc-T1-1', level=2, members=['m1'])
+        pending = [
+            _esc('esc-T1-2'),
+            _esc('esc-T2-1', task_id='T2', level=2, members=['m1']),
+        ]
+
+        census = related_pending(pending, resolved=resolved)
+
+        assert len(census) == 2
+        for entry in census:
+            assert set(entry) == _ENTRY_KEYS
+
+    def test_output_is_sorted_by_id(self):
+        resolved = _esc('esc-T1-1', level=2, members=['m1'])
+        pending = [
+            _esc('esc-T1-9'),
+            _esc('esc-T2-1', task_id='T2', level=2, members=['m1']),
+            _esc('esc-T1-3'),
+        ]
+
+        census = related_pending(pending, resolved=resolved)
+
+        assert [e['id'] for e in census] == ['esc-T1-3', 'esc-T1-9', 'esc-T2-1']
+
+    def test_no_twins_is_empty(self):
+        resolved = _esc('esc-T1-1', level=2, members=['m1'])
+
+        assert related_pending([], resolved=resolved) == []
+        assert related_pending(
+            [_esc('esc-T5-1', task_id='T5')], resolved=resolved,
+        ) == []
+
+    def test_inputs_are_not_mutated(self):
+        resolved = _esc('esc-T1-1', level=2, members=['m2', 'm1'])
+        pending = [
+            _esc('esc-T1-2'),
+            _esc('esc-T2-1', task_id='T2', level=2, members=['m1', 'm2']),
+            resolved,
+        ]
+        before = [e.to_dict() for e in pending]
+        resolved_before = resolved.to_dict()
+        order_before = [e.id for e in pending]
+
+        related_pending(pending, resolved=resolved)
+
+        assert [e.id for e in pending] == order_before
+        assert [e.to_dict() for e in pending] == before
+        assert resolved.to_dict() == resolved_before
