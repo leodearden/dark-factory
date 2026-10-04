@@ -20,9 +20,22 @@ from typing import Any
 
 import _boundary_payloads
 import pytest
-from _boundary_payloads import T0
+from _boundary_payloads import (
+    RAGGED,
+    RAGGED_CAP,
+    RAGGED_DAYS,
+    RAGGED_T1,
+    RAGGED_T2,
+    T0,
+    ragged_a,
+    ragged_b,
+    ragged_day,
+)
 from _lock_chip_matrix import node_path
 from shared.task_statuses import TaskStatus
+
+from dashboard.data.burndown import aggregate_forecast_confidence
+from dashboard.data.census import SERIES_KEYS
 
 _JS_DIR = Path(__file__).parent / 'js'
 
@@ -35,8 +48,13 @@ _PASSING_ROW_RE = re.compile(r'^ok \d+ - sketch \\#(\d+):', re.MULTILINE)
 
 
 @pytest.fixture(scope='module')
-def served_bodies(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
-    return _boundary_payloads.build_all(tmp_path_factory.mktemp('substrates'))
+def substrates(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    return tmp_path_factory.mktemp('substrates')
+
+
+@pytest.fixture(scope='module')
+def served_bodies(substrates: Path) -> dict[str, Any]:
+    return _boundary_payloads.build_all(substrates)
 
 
 def test_the_boundary_suite_covers_every_sketch_row(served_bodies, tmp_path):
@@ -144,3 +162,63 @@ def test_sketch_13_a_transient_failure_ages_the_census_then_recovers(served_bodi
     assert aged['as_of'] == measured['as_of'], 'the stale census is the measured one, at its instant'
     assert recovered['state'] == 'fresh', recovered
     assert datetime.fromisoformat(recovered['as_of']) == _served_at(after)
+
+
+def test_sketch_6_the_sampler_persists_the_census_the_route_serves(served_bodies):
+    census = _census(served_bodies['census_at_t'], 'dark-factory')
+    burndown = served_bodies['burndown_at_t']
+    assert census['state'] == 'fresh', census
+
+    for block in (burndown['BURNDOWN'], burndown['BURNDOWN_BY_PROJECT']['dark-factory']):
+        assert datetime.fromisoformat(block['labels'][-1]) == datetime.fromisoformat(census['as_of'])
+        for member, column in SERIES_KEYS.items():
+            assert block[column][-1] == census['value']['counts'][member.value], (
+                f'{column}: one datum, two homes, at one instant'
+            )
+
+    after = _census(served_bodies['census_after_t'], 'dark-factory')
+    assert after['value']['counts']['in-progress'] != census['value']['counts']['in-progress'], (
+        'the later census must move, or the client half cannot tell the tile from its spark'
+    )
+
+
+def _measured(tree, days: range) -> dict[str, list[Any]]:
+    """The series one project's MEASURED samples make, built from the fixture alone."""
+    return {
+        'labels': [ragged_day(index).isoformat() for index in days],
+        'done': [tree(index).get(TaskStatus.DONE, 0) for index in days],
+        'pending': [tree(index).get(TaskStatus.PENDING, 0) for index in days],
+    }
+
+
+def test_sketch_7_a_gap_carries_the_last_measurement_and_is_judged_once(served_bodies, substrates):
+    body = served_bodies[RAGGED]
+    aggregate, b = body['BURNDOWN'], body['BURNDOWN_BY_PROJECT']['B']
+    at_t2 = aggregate['labels'].index(RAGGED_T2.isoformat())
+    a_at_t2, b_at_t1 = ragged_a(RAGGED_DAYS - 1), ragged_b(RAGGED_DAYS - 2)
+
+    for member, column in SERIES_KEYS.items():
+        assert aggregate[column][at_t2] == a_at_t2.get(member, 0) + b_at_t1.get(member, 0), column
+
+    assert b['latest']['state'] == 'stale', b['latest']
+    assert datetime.fromisoformat(b['latest']['as_of']) == RAGGED_T1
+    assert _served_at(body) - datetime.fromisoformat(b['latest']['as_of']) == RAGGED_T2 - RAGGED_T1
+
+    rows_at_t2 = {
+        row['project']: row for row in _boundary_payloads.ragged_store_rows(substrates)
+        if datetime.fromisoformat(row['ts']) == RAGGED_T2
+    }
+    assert rows_at_t2['A']['state'] == 'value', rows_at_t2['A']
+    assert rows_at_t2['B']['state'] == 'gap', rows_at_t2['B']
+    assert 'ReadTimeout' in rows_at_t2['B']['reason'], rows_at_t2['B']['reason']
+
+    measured = [(ragged_a, range(RAGGED_DAYS)), (ragged_b, range(RAGGED_DAYS - 1))]
+    breaches = sum(tree(index)[TaskStatus.IN_PROGRESS] > RAGGED_CAP for tree, days in measured for index in days)
+    assert breaches == 1, 'the fixture breaches once, at B(t1), so a re-judged carry would show'
+    assert aggregate['parity_breach_count'] == breaches
+    assert aggregate['parity_projects'] == ['B']
+    assert (aggregate['parity_peak'], aggregate['parity_cap']) == (30, RAGGED_CAP)
+
+    forecast = aggregate_forecast_confidence([_measured(tree, days) for tree, days in measured])
+    assert forecast['forecast_low'] is not None, 'eight days of history: the forecast is measured'
+    assert aggregate['forecast']['value'] == forecast
