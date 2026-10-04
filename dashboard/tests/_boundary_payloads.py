@@ -8,12 +8,13 @@ them, so the client half never applies a hand-built payload.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, patch
 
 import aiosqlite
@@ -34,6 +35,8 @@ T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 
 TASKS = '/api/v2/dashboard/tasks'
 BURNDOWN = '/api/v2/dashboard/burndown'
+COSTS = '/api/v2/dashboard/costs'
+MERGE_QUEUE = '/api/v2/dashboard/merge-queue'
 
 # in_flight 43 (running 25), backlog 1310, terminal 4106: total 5459.
 DARK_FACTORY_COUNTS: Mapping[TaskStatus, int] = {
@@ -72,6 +75,42 @@ RAGGED_T1 = RAGGED_T2 - timedelta(days=1)
 RAGGED_DAYS = 8
 RAGGED_CAP = 24
 """Both ragged projects' ``max_concurrent_tasks``."""
+
+
+class MergeAttempt(NamedTuple):
+    """One merge_attempt event, *age* before T0; a NULL or zero duration is untimed."""
+
+    age: timedelta
+    outcome: str
+    duration_ms: int | None
+
+
+MERGE_ATTEMPTS: tuple[MergeAttempt, ...] = (
+    MergeAttempt(timedelta(hours=2), 'done', 1200),
+    MergeAttempt(timedelta(hours=5), 'conflict', None),
+    MergeAttempt(timedelta(hours=20), 'done', 900),
+    MergeAttempt(timedelta(hours=30), 'done', None),
+    MergeAttempt(timedelta(hours=50), 'blocked', 0),
+    MergeAttempt(timedelta(hours=70), 'done', 3000),
+)
+"""One project's merges over three days: three inside 24h, all six inside 7d."""
+
+# The orchestrator's runs.db events table, as orchestrator/src/orchestrator/
+# event_store.py::_SCHEMA creates it; the dashboard does not depend on that package.
+_EVENTS_DDL = """\
+CREATE TABLE events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL,
+    run_id      TEXT    NOT NULL,
+    task_id     TEXT,
+    event_type  TEXT    NOT NULL,
+    phase       TEXT,
+    role        TEXT,
+    data        TEXT    DEFAULT '{}',
+    cost_usd    REAL,
+    duration_ms INTEGER
+);
+"""
 
 
 def ragged_day(index: int) -> datetime:
@@ -142,15 +181,22 @@ class _ByRoot:
         return await substrate(client, url, tool, args, **kwargs)
 
 
+def _get(client: TestClient, path: str, **params: str) -> dict[str, Any]:
+    resp = client.get(path, params=params)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
 @contextmanager
-def _tasks_route(
+def _canned_roots(
     client: TestClient, workdir: Path, substrates: Mapping[str, CannedMCP],
 ) -> Iterator[Callable[[datetime], dict[str, Any]]]:
-    """GET /tasks over one tmp root per substrate, served at the instant the caller names.
+    """Configure the app over one tmp root per substrate; yield GET /tasks at a named instant.
 
-    The unit TTL is zero, so every acquisition, a render or a sampler tick,
-    reads the substrate and a failure lands on the very next one; the last
-    good store is what survives.
+    Every task read under it, by any route or by the sampler, is answered by
+    the substrate its root is labelled with. The unit TTL is zero, so every
+    acquisition reads the substrate and a failure lands on the very next one;
+    the last good store is what survives.
     """
     roots = [workdir / label for label in substrates]
     for root in roots:
@@ -161,9 +207,7 @@ def _tasks_route(
 
     def render(at: datetime) -> dict[str, Any]:
         with patch('dashboard.api.tasks.resolve_now', new=lambda _now: at):
-            resp = client.get(TASKS)
-        assert resp.status_code == 200, resp.text
-        return resp.json()
+            return _get(client, TASKS)
 
     try:
         with (
@@ -181,25 +225,25 @@ def _census_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     bodies: dict[str, Any] = {}
 
     two_projects = {'dark-factory': _substrate(DARK_FACTORY_COUNTS), 'reify': _substrate(REIFY_COUNTS)}
-    with _tasks_route(client, workdir / 'census_fresh', two_projects) as render:
+    with _canned_roots(client, workdir / 'census_fresh', two_projects) as render:
         bodies['census_fresh'] = render(T0)
 
-    with _tasks_route(client, workdir / 'census_nine', {'dark-factory': _substrate(NINE_MEMBERS)}) as render:
+    with _canned_roots(client, workdir / 'census_nine', {'dark-factory': _substrate(NINE_MEMBERS)}) as render:
         bodies['census_nine'] = render(T0)
 
     cold = {'dark-factory': _substrate(DARK_FACTORY_COUNTS), 'reify': _substrate(REIFY_COUNTS)}
     _fail_status_map(cold['dark-factory'])
-    with _tasks_route(client, workdir / 'census_unknown', cold) as render:
+    with _canned_roots(client, workdir / 'census_unknown', cold) as render:
         bodies['census_unknown'] = render(T0)
 
     aging = _substrate(DARK_FACTORY_COUNTS)
-    with _tasks_route(client, workdir / 'census_stale_3h', {'dark-factory': aging}) as render:
+    with _canned_roots(client, workdir / 'census_stale_3h', {'dark-factory': aging}) as render:
         render(T0)
         _fail_status_map(aging)
         bodies['census_stale_3h'] = render(T0 + timedelta(hours=3))
 
     transient = _substrate(DARK_FACTORY_COUNTS)
-    with _tasks_route(client, workdir / 'census_transient', {'dark-factory': transient}) as render:
+    with _canned_roots(client, workdir / 'census_transient', {'dark-factory': transient}) as render:
         bodies['census_transient_before'] = render(T0)
         _fail_status_map(transient)
         bodies['census_transient_during'] = render(T0 + timedelta(seconds=20))
@@ -235,9 +279,7 @@ async def _collect_into_store(config: DashboardConfig, http_client: httpx.AsyncC
 def _render_burndown(client: TestClient, at: datetime, window: str) -> dict[str, Any]:
     """GET /burndown?window=*window* on the real route, its single clock capture at *at*."""
     with patch('dashboard.api.burndown.datetime', make_fixed_datetime_cls(at)):
-        resp = client.get(BURNDOWN, params={'window': window})
-    assert resp.status_code == 200, resp.text
-    return resp.json()
+        return _get(client, BURNDOWN, window=window)
 
 
 def _cap_every_root(cap: int) -> None:
@@ -252,7 +294,7 @@ def _burndown_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     bodies: dict[str, Any] = {}
 
     tree = _substrate(DARK_FACTORY_COUNTS)
-    with _tasks_route(client, workdir / 'census_at_t', {'dark-factory': tree}) as render:
+    with _canned_roots(client, workdir / 'census_at_t', {'dark-factory': tree}) as render:
         _sample(client, T0)
         bodies['census_at_t'] = render(T0)
         bodies['burndown_at_t'] = _render_burndown(client, T0, '24h')
@@ -260,7 +302,7 @@ def _burndown_family(client: TestClient, workdir: Path) -> dict[str, Any]:
         bodies['census_after_t'] = render(T0 + timedelta(minutes=10))
 
     a, b = CannedMCP(status_page_size=2000), CannedMCP(status_page_size=2000)
-    with _tasks_route(client, workdir / RAGGED, {'A': a, 'B': b}):
+    with _canned_roots(client, workdir / RAGGED, {'A': a, 'B': b}):
         _cap_every_root(RAGGED_CAP)
         for index in range(RAGGED_DAYS):
             at = ragged_day(index)
@@ -271,6 +313,40 @@ def _burndown_family(client: TestClient, workdir: Path) -> dict[str, Any]:
                 _stock(b, ragged_b(index), live_at=at)
             _sample(client, at)
         bodies[RAGGED] = _render_burndown(client, RAGGED_T2, '30d')
+
+    return bodies
+
+
+def _write_merge_attempts(root: Path) -> None:
+    """*root*'s runs.db, holding :data:`MERGE_ATTEMPTS` as task ids 1, 2, ..."""
+    store = root / 'data' / 'orchestrator' / 'runs.db'
+    store.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(store)) as conn:
+        conn.executescript(_EVENTS_DDL)
+        conn.executemany(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase, data, duration_ms) '
+            "VALUES (?, ?, ?, 'merge_attempt', 'merge', ?, ?)",
+            [
+                ((T0 - attempt.age).isoformat(), f'run-{task_id}', str(task_id),
+                 json.dumps({'outcome': attempt.outcome}), attempt.duration_ms)
+                for task_id, attempt in enumerate(MERGE_ATTEMPTS, start=1)
+            ],
+        )
+        conn.commit()
+
+
+def _window_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Sketch #8 and #9: windowed routes, and the window each says it served."""
+    bodies: dict[str, Any] = {}
+
+    with _canned_roots(client, workdir / 'costs_90d', {'dark-factory': _substrate(REIFY_COUNTS)}):
+        bodies['costs_90d'] = _get(client, COSTS, window='90d')
+
+    with _canned_roots(client, workdir / 'merge', {'dark-factory': _substrate(REIFY_COUNTS)}):
+        _write_merge_attempts(app.state.config.project_root)
+        for window in ('7d', '24h'):
+            with patch('dashboard.api.merge_queue.resolve_now', new=lambda _now: T0):
+                bodies[f'merge_{window}'] = _get(client, MERGE_QUEUE, window=window)
 
     return bodies
 
@@ -293,4 +369,8 @@ def build_all(workdir: Path) -> dict[str, Any]:
     *workdir* is an empty directory the scenarios root their substrates in.
     """
     with TestClient(app) as client:
-        return {**_census_family(client, workdir), **_burndown_family(client, workdir)}
+        return {
+            **_census_family(client, workdir),
+            **_burndown_family(client, workdir),
+            **_window_family(client, workdir),
+        }

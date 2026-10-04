@@ -21,6 +21,7 @@ from typing import Any
 import _boundary_payloads
 import pytest
 from _boundary_payloads import (
+    MERGE_ATTEMPTS,
     RAGGED,
     RAGGED_CAP,
     RAGGED_DAYS,
@@ -222,3 +223,31 @@ def test_sketch_7_a_gap_carries_the_last_measurement_and_is_judged_once(served_b
     forecast = aggregate_forecast_confidence([_measured(tree, days) for tree, days in measured])
     assert forecast['forecast_low'] is not None, 'eight days of history: the forecast is measured'
     assert aggregate['forecast']['value'] == forecast
+
+
+def test_sketch_8_a_declined_window_is_echoed_as_the_one_served(served_bodies):
+    body = served_bodies['costs_90d']
+
+    assert body['WINDOW'] == {'requested': '90d', 'served': '30d', 'days': 30}
+    assert 'COSTS' in body
+
+
+@pytest.mark.parametrize('window, span', [('7d', timedelta(days=7)), ('24h', timedelta(hours=24))])
+def test_sketch_9_a_window_counts_its_own_merges_and_each_attempt_once(served_bodies, window, span):
+    body = served_bodies[f'merge_{window}']
+    block = body['MERGE_QUEUE']['dark-factory']
+    in_window = [attempt for attempt in MERGE_ATTEMPTS if attempt.age <= span]
+
+    assert body['WINDOW']['served'] == window
+    assert block['recent_total'] == len(block['recent']) == len(in_window)
+    latency = block['latency']
+    assert sum(block['outcomes']['values']) == latency['with_duration'] + latency['without_duration']
+    assert latency['with_duration'] == sum(1 for attempt in in_window if attempt.duration_ms)
+    assert latency['without_duration'] == sum(1 for attempt in in_window if not attempt.duration_ms)
+
+
+def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
+    week, day = (served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory'] for window in ('7d', '24h'))
+
+    assert week['recent_total'] != day['recent_total']
+    assert len(week['recent']) != len(day['recent'])
