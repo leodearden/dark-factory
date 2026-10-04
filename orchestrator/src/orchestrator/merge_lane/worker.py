@@ -20034,10 +20034,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         read LANE_BUFFERED/MERGING/AWAITING_VERIFY by the time we resume. Both
         would route an illegal edge into :meth:`_note_transition` and re-fire
         the very ``merge_lifecycle_transition_rejected`` escalation this fix
-        retires. Defence in depth for a future requeue site that forgets the
-        call — NOT a substitute for per-branch symmetry, which every requeue
-        site still owns and which is pinned by the on_requeued/_note_requeue
-        pairing tests in test_merge_queue_lifecycle_registry.py.
+        retires. The repair is defence in depth ONLY for a NON-vacated entry,
+        i.e. a requeue site that bypassed :meth:`_requeue_from_verify` and
+        forgot the call — NOT a substitute for per-branch symmetry, which every
+        requeue site still owns and which is pinned by the
+        on_requeued/_note_requeue pairing tests in
+        test_merge_queue_lifecycle_registry.py. A vacated entry's requeue site
+        already ran the full recipe, so its request_id's registry state belongs
+        to whatever incarnation re-entered since, and a VERIFYING read there is
+        the RE-DISPATCHED verify: bouncing it would strand a live verify as
+        'queued' (task 4582).
           PASS          — vr.outcome is None (or verify_task=None for compat shim):
                           CAS advance_main loop.
 
@@ -20154,8 +20160,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # See this method's docstring, SENTINEL DISPOSITION (task 3082):
             # deliberately ABOVE the VERIFYING -> FINALIZING hop below, because
             # a dropped/requeued item is not finalizing; DROPPED -> retire,
-            # REQUEUED -> idempotent bounce to QUEUED, guarded on VERIFYING so a
-            # merger-loop-raced requeue already past QUEUED is left alone.
+            # REQUEUED -> idempotent bounce to QUEUED, guarded on a non-vacated
+            # entry and on VERIFYING so a merger-loop-raced requeue already past
+            # QUEUED, or a re-dispatched incarnation, is left alone.
             if vr is not None and vr.status in (InflightStatus.DROPPED, InflightStatus.REQUEUED):
                 _cancel_release = True
                 # abandon / operator-halt / deep-tip non-adoption → chain stale.
@@ -20199,7 +20206,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 _n_failed_val = True
                 if vr.status == InflightStatus.DROPPED:
                     self._retire_item(req.request_id)
-                elif self._lifecycle.current(req.request_id) == ItemLifecycleState.VERIFYING:
+                elif (
+                    not entry.vacated
+                    and self._lifecycle.current(req.request_id) == ItemLifecycleState.VERIFYING
+                ):
                     self._note_requeue(req.request_id, live_obj=req)
                 return False
 
