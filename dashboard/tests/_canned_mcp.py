@@ -4,7 +4,9 @@ Shared by every test that patches ``dashboard.data.tasks.mcp_tool_call`` so
 the real ``fetch_tasks`` / ``fetch_statuses`` / cache / fan-out path runs
 underneath — one faithful emulation rather than a hand-rolled fake per test
 module. Its own fidelity tests live in
-``tests/test_task_snapshot.py::TestCannedMCP``.
+``tests/test_task_snapshot.py::TestCannedMCP``. :func:`canned_get_tasks_result`
+builds the canned two-row ``get_tasks`` answer the cache, narrowing and
+contract tests stub with.
 """
 
 from __future__ import annotations
@@ -168,3 +170,30 @@ def _raw_row(task_id, status, **overrides) -> dict:
     }
     row.update(overrides)
     return row
+
+
+def canned_get_tasks_result() -> dict:
+    """A fresh two-row ``get_tasks`` answer, so no caller can mutate another's."""
+    return {
+        'tasks': [
+            {
+                'id': '7',
+                'title': 'A done task',
+                'status': 'done',
+                'updatedAt': '2026-05-29T10:00:00+00:00',
+                'description': 'finished',
+                'details': '',
+                'dependencies': [],
+                'metadata': {},
+            },
+            {
+                'id': '8',
+                'title': 'A pending task',
+                'status': 'pending',
+                'description': '',
+                'details': '',
+                'dependencies': [],
+                'metadata': {},
+            },
+        ],
+    }

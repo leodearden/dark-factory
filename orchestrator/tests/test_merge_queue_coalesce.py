@@ -2860,9 +2860,9 @@ class TestCoalesceAfterHealthyMerge:
             merged = await _poll_events('train_merged', timeout=180)
             assert merged, (
                 'train_coalesced but never train_merged: the train derailed. '
-                'A train cannot recover from a lost CAS — check that it parked '
-                'behind the unadvanced predecessor '
-                '(_await_unadvanced_predecessor)'
+                'Read its train_derailed derail_reason — a predecessor that '
+                'moved main under the train costs a re-verify of the rebased '
+                'tip (_advance_train), not a derail'
             )
 
             # The train landed: every member's file is on main under one shared SHA.
@@ -2892,8 +2892,8 @@ class TestCoalesceAfterHealthyMerge:
                 f'the fix removes, so a train forming here would prove nothing'
             )
             assert not _events_of_type(db_path, 'train_derailed'), (
-                'the train derailed — most likely it lost the CAS to a predecessor '
-                'that advanced main under it; see _await_unadvanced_predecessor'
+                'the train derailed — read its train_derailed derail_reason; a '
+                'predecessor advancing main under it is re-verified, not derailed'
             )
             # And the pipeline really was speculating while all this happened —
             # i.e. the coalescer ran against a live, healthy merge chain rather

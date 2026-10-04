@@ -19,6 +19,7 @@ from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
 )
+from shared.eval_lane import is_eval_fixture_task_id
 from shared.usage_gate import UsageGate
 
 from orchestrator.agents.briefing import BriefingAssembler
@@ -372,9 +373,21 @@ def load_task(task_path: Path) -> dict:
     machines.  If the path in the JSON starts with ``$REPO_ROOT`` it is
     expanded; if the hardcoded absolute path does not exist the discovered
     repository root is used instead.
+
+    Raises ``ValueError`` when the fixture's ``id`` is not an eval fixture id.
     """
     with open(task_path) as f:
         task = json.load(f)
+
+    task_id = task.get('id')
+    if not is_eval_fixture_task_id(task_id):
+        raise ValueError(
+            f'eval fixture {task_path}: id {task_id!r} is not an eval fixture id '
+            '(<repo>_task_<n>[_<suffix>] or shadow_<task_id>_<cell_id>). Eval-lane '
+            'escalation containment (shared/src/shared/eval_lane.py) recognises '
+            'eval provenance by this grammar; an off-grammar id would let this '
+            "fixture's escalations reach the production human L2 queue."
+        )
 
     repo_root = _find_repo_root(task_path)
     raw_root = task.get('project_root', '')

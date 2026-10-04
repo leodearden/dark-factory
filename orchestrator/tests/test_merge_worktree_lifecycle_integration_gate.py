@@ -310,7 +310,7 @@ from _merge_lane_fakes import (
     hangs_until,
     make_lane,
 )
-from _orch_helpers import make_placeholder_future, wait_responsive
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, make_placeholder_future, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -1000,7 +1000,7 @@ class _TreeLivenessVerifier(FakeVerifier):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # heavy class: real git + real merge worker end-to-end
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # heavy class: real git + real merge worker end-to-end
 class TestFiveThreeTwoSixReplayGate:
     """The headline done-gate: replays the 2026-07-22 task/5326 restart
     incident end-to-end, driving the ACTUAL startup substrate (real

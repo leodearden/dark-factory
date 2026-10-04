@@ -3792,6 +3792,24 @@ class TestWriteTriageConfig:
             "the retired guard's limit=5 (measured recall 26.1% @5 vs 69.4% @20)"
         )
 
+    def test_judge_field_chars_defaults_to_4000(self):
+        """The judge's per-field cap ships at 4,000 chars, not the old 1,200.
+
+        Why: task 6076's decision record,
+        calibration/write_triage_judge_field_chars_report.md.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig().judge_field_chars == 4000
+
+    @pytest.mark.parametrize('value', [0, -1])
+    def test_judge_field_chars_rejects_a_cap_that_would_empty_every_field(self, value):
+        """A non-positive cap is refused at load and reload, never at write time."""
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(judge_field_chars=value)
+
 
 
 class TestMemoryMetadataConfig:

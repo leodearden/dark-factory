@@ -26,6 +26,7 @@ from fused_memory.reconciliation.prompts import (
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     REFERENT_DECLARATION_GUIDANCE,
+    STAGE2_SUPPRESS_GUARD_KIND,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_entity_standing_decision_write_section,
@@ -212,7 +213,8 @@ systematically under-covers done tasks). For EACH task in the audit section, run
 {{'task_id': str(task_id), 'stage2_suppress': True}})`; if `count > 0`, skip that task \
 entirely; otherwise search for related memories and, if completion knowledge is genuinely \
 missing, write a completion note tagged `metadata={{'stage2_suppress': True, 'task_id': \
-str(task_id)}}` (see the Completion-Note Suppression Pre-Check below). If the section \
+str(task_id), 'kind': '{STAGE2_SUPPRESS_GUARD_KIND}'}}` (see the Completion-Note \
+Suppression Pre-Check below). If the section \
 carries an overflow `_NOTE:` that coverage was clipped this cycle, the omitted (oldest) \
 tasks will resurface in a later cycle — do NOT treat the clipped render as full coverage.
 - Use search to understand the knowledge landscape around each task.
@@ -305,7 +307,8 @@ above only fires if a prior write actually stored the `stage2_suppress` key. The
 whenever the pre-check returns `count == 0` AND you proceed to write a protective \
 completion-note / "task marked done, no knowledge captured" guard memory for an \
 already-done task, you MUST tag that `add_memory` call with \
-`metadata={{'stage2_suppress': True, 'task_id': str(task_id)}}` (merge these keys into \
+`metadata={{'stage2_suppress': True, 'task_id': str(task_id), \
+'kind': '{STAGE2_SUPPRESS_GUARD_KIND}'}}` (merge these keys into \
 whatever other metadata the write already carries). This prompt instruction is one writer \
 of the `stage2_suppress` key — TargetedReconciliation's own fast-path completion echo \
 (code, not a prompt instruction) now also stamps it on every `done` transition, so a task \

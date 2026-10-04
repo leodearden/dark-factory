@@ -59,7 +59,7 @@ from _merge_lane_fakes import (
     passes,
     raises,
 )
-from _orch_helpers import wait_responsive
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -3779,12 +3779,10 @@ class _HangThenPassVerify(FakeVerifier):
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 3927: real (unmocked) worker.run() loop with
-# real git subprocesses: per drive cycle a wait_for(20) entry deadline, a
-# wait_responsive outcome wait (billed 90s), then a 10s stop and a 10s join,
-# 130s in all -- widened from the 60s default to tolerate host
-# oversubscription, same convention as test_crash_recovery.py (task 2376)
-# and test_merge_queue_restart_hook.py (task 3927).
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 3927: real (unmocked) worker.run()
+# loop with real git subprocesses: per drive cycle a wait_for(20) entry
+# deadline, a wait_responsive outcome wait (billed 90s), then a 10s stop and a
+# 10s join, 130s in all.
 class TestDeadVerifyAbortSelfHealsEndToEnd:
     """A dead-verify no-progress abort must SELF-HEAL through the live queue,
     leaving every user-observable surface truthful (task 3082 step-9).

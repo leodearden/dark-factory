@@ -1575,40 +1575,38 @@ def guard_committed_report(
     return report_path
 
 
-@contextlib.contextmanager
-def field_chars_override(field_chars: int | None) -> Iterator[int]:
-    """Run with the judge's per-field prompt budget set to *field_chars*.
+def apply_field_chars(config: Any, requested: int | None) -> int:
+    """Set this run's ``write_triage.judge_field_chars``; return the width to record.
 
-    A MODULE-LEVEL override, restored on exit, because the seam admits nothing
-    finer: ``_FIELD_CHARS`` is read inside ``_elide``, which ``build_judge_prompt``
-    calls with no width parameter, which ``judge_write`` in turn calls with
-    none either. Threading one would mean widening three production signatures
-    for a knob only this eval turns.
+    Written on the run's own in-memory config, exactly as
+    ``--judge-candidate-count`` is: config.yaml is never written and nothing
+    module-global changes, and the shipped judge reads the leaf live per call.
 
-    ``0`` means NO elision and is spelled as an effective cap of ``sys.maxsize``
-    rather than 0, which would elide every field to nothing. ``None`` overrides
-    nothing and yields the shipped value, so the caller records what was in
-    force either way.
+    ``0`` means NO elision. The leaf is a positive cap, so it is spelled there
+    as ``sys.maxsize``, while the returned provenance keeps ``0``. ``None``
+    writes nothing and returns the width the config already resolves to.
+
+    A negative width is refused: the resolver would silently read the default
+    instead, so the provenance would record a width the judge never used.
     """
     import sys  # noqa: PLC0415
 
-    from fused_memory.server import write_triage_judge  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        resolve_judge_field_chars,
+    )
 
-    shipped = write_triage_judge._FIELD_CHARS
-    if field_chars is None:
-        yield shipped
-        return
-    write_triage_judge._FIELD_CHARS = sys.maxsize if field_chars == 0 else field_chars
-    try:
-        yield field_chars
-    finally:
-        write_triage_judge._FIELD_CHARS = shipped
+    if requested is None:
+        return resolve_judge_field_chars(types.SimpleNamespace(config=config))
+    if requested < 0:
+        raise ValueError(f'--field-chars must be 0 (no elision) or positive, got {requested}')
+    config.write_triage.judge_field_chars = sys.maxsize if requested == 0 else requested
+    return requested
 
 
 def _elision_flags(
-    content: str, slate: Sequence[Any],
+    content: str, slate: Sequence[Any], field_chars: int,
 ) -> tuple[bool, dict[str, bool]]:
-    """Which rendered fields the judge's own ``_elide`` cut, at the width in force.
+    """Which rendered fields the judge's own ``_elide`` cut at *field_chars*.
 
     Asked of the shipped function rather than re-derived from a length
     comparison here, so the flags cannot disagree with the prompt.
@@ -1616,8 +1614,8 @@ def _elision_flags(
     from fused_memory.server.write_triage_judge import _elide  # noqa: PLC0415
 
     return (
-        _elide(content) != content,
-        {c.id: _elide(c.content) != c.content for c in slate},
+        _elide(content, field_chars) != content,
+        {c.id: _elide(c.content, field_chars) != c.content for c in slate},
     )
 
 
@@ -1661,12 +1659,17 @@ def _ask_judge(
     import asyncio  # noqa: PLC0415
 
     from fused_memory.server.write_triage import BandDecision  # noqa: PLC0415
-    from fused_memory.server.write_triage_judge import judge_write  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        judge_write,
+        resolve_judge_field_chars,
+    )
 
     if outcome != OUTCOME_JUDGE:
         return JudgeAnswer(outcome=outcome)
 
-    entry_elided, candidates_elided = _elision_flags(content, slate)
+    entry_elided, candidates_elided = _elision_flags(
+        content, slate, resolve_judge_field_chars(service),
+    )
     verdict = asyncio.run(judge_write(
         memory_service=service,
         content=content,
@@ -1922,6 +1925,7 @@ def _run(args: Any) -> int:
     # `judge_write` applies to it.
     if args.judge_candidate_count is not None:
         config.write_triage.judge_candidate_count = args.judge_candidate_count
+    field_chars = apply_field_chars(config, args.field_chars)
     service = types.SimpleNamespace(config=config)
     provider = resolve_judge_provider(service)
     model = resolve_judge_model(service)
@@ -1948,46 +1952,45 @@ def _run(args: Any) -> int:
     else:
         plan = seeded_plan(records, distractors=args.distractors, aliases=aliases)
 
-    with field_chars_override(args.field_chars) as field_chars:
-        if args.dry_run:
-            judge_fn = _dry_run_judge_fn()
-            provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
-            logger.info('--dry-run: no provider call will be made')
-        else:
-            # Logged BEFORE the first call, so a mis-resolved model is visible
-            # while the run is still free to abort.
-            logger.info('Judge resolves to provider=%s model=%s', provider, model)
-            judge_fn = (
-                build_retrieved_judge_fn(config)
-                if args.slate_mode == SLATE_RETRIEVED
-                else build_judge_fn(config)
-            )
-
-        report = run_judge_eval(
-            plan=plan,
-            judge_fn=judge_fn,
-            report_path=report_path,
-            cases_path=args.cases_path,
-            provenance={
-                'fixture_path': package_relative(args.fixture),
-                'judge_provider': provider,
-                'judge_model': model,
-                # Present on EVERY run, `None` on a full one. An absent key
-                # would be indistinguishable from an artifact predating the
-                # field, and this is the one field that says a committed
-                # report is a partial smoke rather than the corpus-wide
-                # measurement the task-3169 flip gate reads it as.
-                'limit': args.limit,
-                'canonical_aliases_path': (
-                    package_relative(args.canonical_aliases) if args.canonical_aliases else None
-                ),
-                'canonical_aliases_count': len(aliases),
-                'cases_path': package_relative(args.cases_path) if args.cases_path else None,
-                'field_chars': field_chars,
-                'judge_candidate_count': judge_candidate_count,
-                'judge_enabled': judge_enabled,
-            },
+    if args.dry_run:
+        judge_fn = _dry_run_judge_fn()
+        provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
+        logger.info('--dry-run: no provider call will be made')
+    else:
+        # Logged BEFORE the first call, so a mis-resolved model is visible
+        # while the run is still free to abort.
+        logger.info('Judge resolves to provider=%s model=%s', provider, model)
+        judge_fn = (
+            build_retrieved_judge_fn(config)
+            if args.slate_mode == SLATE_RETRIEVED
+            else build_judge_fn(config)
         )
+
+    report = run_judge_eval(
+        plan=plan,
+        judge_fn=judge_fn,
+        report_path=report_path,
+        cases_path=args.cases_path,
+        provenance={
+            'fixture_path': package_relative(args.fixture),
+            'judge_provider': provider,
+            'judge_model': model,
+            # Present on EVERY run, `None` on a full one. An absent key
+            # would be indistinguishable from an artifact predating the
+            # field, and this is the one field that says a committed
+            # report is a partial smoke rather than the corpus-wide
+            # measurement the task-3169 flip gate reads it as.
+            'limit': args.limit,
+            'canonical_aliases_path': (
+                package_relative(args.canonical_aliases) if args.canonical_aliases else None
+            ),
+            'canonical_aliases_count': len(aliases),
+            'cases_path': package_relative(args.cases_path) if args.cases_path else None,
+            'field_chars': field_chars,
+            'judge_candidate_count': judge_candidate_count,
+            'judge_enabled': judge_enabled,
+        },
+    )
     print(json.dumps(report, indent=2))
     return 0
 
@@ -2026,8 +2029,9 @@ def main() -> int:
     parser.add_argument('--field-chars', dest='field_chars', type=int, default=None,
                         help="override the judge's per-field prompt budget for "
                              'this run; 0 renders every field UN-elided. '
-                             'Recorded as provenance.field_chars (default: the '
-                             'shipped _FIELD_CHARS)')
+                             'Recorded as provenance.field_chars (default: '
+                             'write_triage.judge_field_chars as the config '
+                             'resolves it)')
     parser.add_argument('--judge-candidate-count', dest='judge_candidate_count',
                         type=int, default=None,
                         help='override write_triage.judge_candidate_count for '

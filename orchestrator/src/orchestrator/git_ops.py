@@ -2606,10 +2606,10 @@ async def _run(
     A thin adapter over :func:`shared.git_async.run_git` (task 3778), which
     owns the spawn mechanism and its rationale: the ``LC_ALL=C`` locale pin
     :func:`_git_clean_failure_is_benign` depends on, stdin feeding, and the
-    task-2608 cancellation kill+reap.  What stays here is orchestrator-
-    specific: the :class:`WorktreeMissing` taxonomy and the 3-tuple return.
-    ``run_git`` is imported by bare name so ``git_ops.run_git`` is the single
-    patchable spawn seam.
+    process-group kill+reap on cancellation (tasks 2608/4155).  What stays
+    here is orchestrator-specific: the :class:`WorktreeMissing` taxonomy and
+    the 3-tuple return.  ``run_git`` is imported by bare name so
+    ``git_ops.run_git`` is the single patchable spawn seam.
 
     ``input_text``, when given, is piped to the child's stdin, e.g. a diff
     into ``git patch-id`` (see :meth:`GitOps.find_equivalent_commit`).
@@ -4490,16 +4490,19 @@ class GitOps:
         out-of-band to the orchestrator/operator (see
         docs/shared-repo-git-maintenance.md).
 
-        Idempotent: ``git config`` overwrites the value in place, so calling this
-        repeatedly (harness startup + every create_worktree) leaves the same
-        result.  Best-effort/loud: a non-zero git rc is logged at WARNING but
+        Idempotent: ``git config --replace-all`` converges from any prior state
+        (absent, single, or duplicated value) to exactly one value, so calling
+        this repeatedly (harness startup + every create_worktree) leaves the
+        same result.  A plain ``git config`` would be refused (exit 5) on an
+        already-multivalued key.  Best-effort/loud: a non-zero git rc is logged at WARNING but
         never raised — failing to set the key merely leaves auto-gc enabled
         (itself only a benign-but-noisy failure), which must not block
         orchestrator startup or a task dispatch (loud-over-silent-degradation).
         """
         for key, value in (('gc.auto', '0'), ('maintenance.auto', 'false')):
             rc, _, stderr = await _run(
-                ['git', 'config', key, value], cwd=self.project_root,
+                ['git', 'config', '--replace-all', key, value],
+                cwd=self.project_root,
             )
             if rc != 0:
                 logger.warning(
@@ -4576,12 +4579,9 @@ class GitOps:
         # maintenance.auto=false on every worktree-create so background
         # auto-gc never fires under the narrow shared-.git write-set (and
         # any config drift/re-clone is re-covered).  Idempotent & best-effort
-        # (never raises) — safe to run every time.  NOTE it does NOT share the
-        # core.hooksPath block's convergence property: it sets gc.auto /
-        # maintenance.auto with a plain single-value `git config`, which git
-        # refuses (exit 5) on an already-multivalued key.  Don't copy this as
-        # the model for a self-heal; the rc is logged at WARNING and the only
-        # consequence here is that auto-gc stays enabled.
+        # (never raises) — safe to run every time.  Like the core.hooksPath
+        # block above it uses --replace-all, so it converges from a
+        # duplicated key too.
         await self.disable_shared_repo_auto_maintenance()
 
         # ── Resolve start-ref: train-predecessor tip or freshened main ──

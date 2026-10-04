@@ -423,12 +423,13 @@ b5bf73106e; the incident predates the retirement) carried an entry that
 outlived the task that owned it (2733, done 2026-07-18) with no owner
 recorded on the entry itself, and the same test recurred at task 4545's gate
 on 2026-09-06 (esc-4545-6); a missing-id check would not have caught this —
-only a **liveness** check would have. A register still in the tree makes
-that point checkable today:
+only a **liveness** check would have. A register in the tree made that point
+checkable while it stood:
 `orchestrator/tests/test_timeout_marker_inversion_guard.py::_GRANDFATHERED`
-(owner task 5149) asserts every entry still names a live REFERENT — a real
-in-band site — while recording no owner on an entry at all: a dead referent
-fails, a dead owner does not. (A second register of the same shape, the
+(since retired, in task 5149, its owner, which migrated the last entry)
+asserted every entry still named a live REFERENT — a real in-band site — while
+recording no owner on an entry at all: a dead referent failed, a dead owner
+did not. (A second register of the same shape, the
 serial-worker import guard's allowlist, went with that fixture in task 5034.) A census of the repo's named allow-lists found the same gap under
 tasks 4354, 4920 and 5215, each owning a burn-down that nothing connects to
 the entries it retires, so nothing notices when one of those tasks completes

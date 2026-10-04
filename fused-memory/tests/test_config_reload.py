@@ -633,7 +633,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
 
     The expected leaf set is DERIVED from ``WriteTriageConfig.model_fields``
     rather than listed by hand, and that inversion is the whole point: a
-    EIGHTH ``judge_*`` leaf added later without a reload registration fails
+    NINTH ``judge_*`` leaf added later without a reload registration fails
     here instead of silently degrading to restart-only. ``config/reload.py``
     states the rule its own way — "anything absent from this frozenset
     silently degrades to restart-only" — and a kill switch that quietly needs
@@ -655,7 +655,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
 
     def test_the_schema_actually_declares_judge_leaves(self):
         """Guards the derivation itself: an empty set would pass vacuously."""
-        assert len(self.JUDGE_FIELDS) >= 7, self.JUDGE_FIELDS
+        assert len(self.JUDGE_FIELDS) >= 8, self.JUDGE_FIELDS
 
     @pytest.mark.parametrize('field', JUDGE_FIELDS)
     def test_every_judge_leaf_is_allowlisted(self, field):
@@ -676,6 +676,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_candidate_count', 3),
             ('judge_accuracy_report_path', 'calibration/judge_report.json'),
             ('judge_reasoning_effort', 'low'),
+            ('judge_field_chars', 1_200),
         ],
     )
     def test_a_changed_judge_leaf_lands_in_applied_candidates(self, field, new_value):
@@ -701,6 +702,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_timeout_seconds', 'resolve_judge_timeout', 3.5),
             ('judge_candidate_count', 'resolve_judge_candidate_count', 3),
             ('judge_reasoning_effort', 'resolve_judge_reasoning_effort', 'low'),
+            ('judge_field_chars', 'resolve_judge_field_chars', 1_200),
         ],
     )
     def test_an_applied_reload_is_observed_by_the_live_resolver(

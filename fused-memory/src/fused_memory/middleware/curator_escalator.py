@@ -22,9 +22,9 @@ Routing policy (keyed off orchestrator liveness):
   cross-referencing the live zero-output-hang record. Filed only when an
   orchestrator is running; otherwise logged, never raised.
 
-Liveness is probed via ``flock(LOCK_SH | LOCK_NB)`` on
-``{project_root}/data/orchestrator/orchestrator.lock`` (the orchestrator
-holds ``LOCK_EX`` on startup). Treat a missing file as "no orchestrator".
+Liveness is read by
+``fused_memory/services/orchestrator_detector.py::is_orchestrator_lock_held``;
+a missing lock file means no orchestrator.
 
 Per-project burst policy: escalate the first 3 failures within a rolling
 1 h window, then suppress further escalations for the rest of the window.
@@ -36,7 +36,6 @@ note makes the burst visible to operators without flooding the queue.
 from __future__ import annotations
 
 import asyncio
-import fcntl
 import json
 import logging
 import os
@@ -50,6 +49,7 @@ from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DuplicateFinding,
 )
 from fused_memory.middleware.task_curator import CuratorFailureError
+from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
 if TYPE_CHECKING:
     from escalation.models import Escalation  # type: ignore[import-untyped]
@@ -76,7 +76,6 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_COOLDOWN_SECS = 3600.0
-_LOCK_FILENAME = 'data/orchestrator/orchestrator.lock'
 _QUEUE_DIRNAME = 'data/escalations'
 
 # Short in-process dedup window for zero-output-timeout reports. A batch of N
@@ -305,38 +304,6 @@ class CuratorEscalator:
 
             await asyncio.to_thread(_write)
 
-    def _orchestrator_running(self, project_root: str) -> bool:
-        """Return True if the project's orchestrator holds its exclusive lock.
-
-        We probe with a *shared* non-blocking lock so we don't perturb the
-        orchestrator's lock state — a successful acquisition means nobody
-        holds LOCK_EX, so no orchestrator is running; a block/EAGAIN means
-        it is.
-        """
-        lock_path = Path(project_root) / _LOCK_FILENAME
-        if not lock_path.exists():
-            return False
-        try:
-            fd = lock_path.open('rb')
-        except OSError:
-            return False
-        try:
-            try:
-                fcntl.flock(fd.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            except OSError as exc:
-                # EAGAIN / EWOULDBLOCK on some platforms map to OSError
-                import errno
-                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    return True
-                raise
-            # Lock acquired → orchestrator is not running. Release promptly.
-            fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-            return False
-        finally:
-            fd.close()
-
     def _queue_for(self, project_root: str) -> EscalationQueue:
         q = self._queues.get(project_root)
         if q is None:
@@ -399,7 +366,7 @@ class CuratorEscalator:
                 zero_output_timeout=zero_output_timeout,
             )
 
-        if not self._orchestrator_running(project_root):
+        if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
             raise CuratorFailureError(
                 f'TaskCurator LLM failed and no orchestrator is running for '
                 f'project {project_id!r}. No dedupe was applied. '
@@ -540,7 +507,7 @@ class CuratorEscalator:
         raising could only turn a missed notice into noise on a successful write.
         """
         if not HAS_ESCALATION or not await asyncio.to_thread(
-            self._orchestrator_running, project_root,
+            is_orchestrator_lock_held, project_root,
         ):
             logger.warning(
                 'curator_escalator: no orchestrator/escalation queue for project %s; '

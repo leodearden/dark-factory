@@ -269,8 +269,10 @@ Reversing this decision means updating this section, `CLAUDE.md` and
   That bullet mirrors the `ruff check` leg only; `lint_command` chains one
   more leg the merge gate also runs —
   `fused-memory/scripts/check_bare_magicmock_config.py` over each package's
-  `tests/` — so see `lint_command` in `dark-factory-orchestrator.yaml` for
-  the full chain. Despite its legacy filename that script now carries **three
+  `tests/`, where a directory scan covers `test_*.py`, `conftest.py` and
+  `_*.py` helper modules — so see `lint_command` in
+  `dark-factory-orchestrator.yaml` for the full chain. Despite its legacy
+  filename that script now carries **three
   independent test-quality rules** — two about mock-spec discipline and one
   about wait deadlines, which is not a mock rule at all — each with its own
   suppression code (all three take the form
@@ -289,24 +291,23 @@ Reversing this decision means updating this section, `CLAUDE.md` and
     <reason>` pragma above is its only suppression.
   - `wall-clock-deadline` — a **load-bearing** synchronisation point awaited on
     a wall-clock deadline: a `MergeRequest.result` future (`req.result`) or a
-    `gate*.wait()` barrier, reached either through a bare
-    `asyncio.wait_for(...)` or carrying a raw numeric `timeout=` literal.
+    zero-argument `.wait()` barrier on any receiver, reached either through a
+    bare `asyncio.wait_for(...)` or carrying a raw numeric literal bound
+    (`timeout=`, `max_wall_s=`, or `asyncio.wait_for`'s positional timeout).
     Remedy: `wait_responsive(...)` with a descriptive `label=`, and a bound
     derived from `MERGE_RESULT_TIMEOUT` rather than a written number — a
-    deadline expiry on such a wait fails a test whose pipeline completed
-    correctly. No class list and no budget threshold decides which sites are
-    scanned, and the teardown join in `_stop_worker` is exempt structurally (a
-    bare `ast.Name` target), not by name. The two legs differ, though: the
-    `req.result` leg is pure **shape**, while the barrier leg additionally
-    requires a receiver `Name` starting with `gate` — a naming convention
-    standing in for "this is an `asyncio.Event`", with a measured
-    false-negative surface of 102 `asyncio.wait_for(<expr>.wait(), ...)` sites
-    it cannot see. That gap is documented, not closed: `wait_responsive` lives
-    in `orchestrator/tests/_orch_helpers.py` and three of the seven scanned
-    packages cannot import it. See the script's Rule C docstring. Twenty files carry pre-existing debt, grandfathered in the script's
-    `_WALL_CLOCK_DEADLINE_DEBT` baseline — the last surviving baseline, and
-    **shrink-only** and opt-out, so a new offending file fails the gate by
-    default. It is a **budget** rather than a bare list: a listed file is
+    deadline expiry on such a wait fails a test whose awaited event did
+    happen. Both legs are pure **shape**: no receiver name, no class list
+    and no budget threshold decides which sites are scanned, and the teardown
+    join in `_stop_worker` is exempt structurally (a bare `ast.Name` target).
+    `wait_responsive` and `MERGE_RESULT_TIMEOUT` live in
+    `orchestrator/tests/_orch_helpers.py` and are importable only under
+    `orchestrator/tests`, so in any other package the
+    per-site `# noqa: wall-clock-deadline — <reason>` is the remedy. See the
+    script's Rule C docstring. Pre-existing debt, across four packages, is
+    grandfathered in the script's `_WALL_CLOCK_DEADLINE_DEBT` baseline — the
+    last surviving baseline, and **shrink-only** and opt-out, so a new
+    offending file fails the gate by default. It is a **budget** rather than a bare list: a listed file is
     silent at or under its recorded count and reports its overrun above it, so
     a number may only be lowered, never raised.
 - **Formatting**: this repo runs `ruff check` only. **`ruff format` is not part
@@ -379,9 +380,9 @@ catching it locally.
 (installed via `hooks/setup.sh`, which points `core.hooksPath` at `hooks/`):
 it strips any staged `.task/` files (see §8), then on `main` runs `ruff
 check`, the asyncmock/bare-MagicMock style checks on staged test files, and
-**pyright up to 3×** (once per touched package under `PYRIGHT_PACKAGES`, or
-across all three if the change touches a shared dependency like `shared` or
-`escalation`). That stage is path-filtered since task 2551: a commit
+**pyright up to 7×** (once per touched package under `PYRIGHT_PACKAGES` —
+the same seven members the merge gate type-checks — or across all of them if
+the change touches a shared dependency like `shared` or `escalation`). That stage is path-filtered since task 2551: a commit
 staging no `.py` files skips pyright entirely and finishes in seconds
 (`pre-commit: pyright skipped (no Python changes)`), and a staged `.py`
 outside every one of those prefixes (e.g. `scripts/`, a root-level

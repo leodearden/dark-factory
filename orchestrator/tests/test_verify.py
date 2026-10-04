@@ -8488,6 +8488,7 @@ class TestMergeConfigOnlyDiffForcesFullGate:
             git=GitConfig(merge_config_only_full_gate_globs=globs),
         )
 
+    @pytest.mark.usefixtures('code_default_config')
     def test_empty_globs_default_config_returns_false(self):
         """Default OrchestratorConfig (empty globs) → False regardless of files."""
         from orchestrator.verify import _merge_config_only_diff_forces_full_gate

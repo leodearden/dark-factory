@@ -76,36 +76,6 @@ def make_mock_cost_store() -> AsyncMock:
     return store
 
 
-@pytest.fixture
-def real_probe_dir_sweep():
-    """Opt out of the module-wide sweep neutralizer below (task 3086).
-
-    Request this from any test that must exercise the real sweep. Such a test
-    is responsible for redirecting the sweep away from the real /tmp — e.g.
-    ``patch('shared.config_dir.tempfile.gettempdir', return_value=str(tmp_path))``.
-    """
-    return True
-
-
-@pytest.fixture(autouse=True)
-def _keep_gates_off_the_real_tmp(request):
-    """Neutralize the probe-dir sweep for every gate built in this module.
-
-    ``UsageGate.__init__`` sweeps ``tempfile.gettempdir()`` (task 3086), so
-    the first real gate constructed in a pytest process would scandir the
-    developer's actual /tmp and delete real dead-PID probe dirs — a
-    multi-second stall inside a unit test, and a mutation no test asked for.
-    Defaulting it off also removes the ordering coupling that the process-wide
-    one-shot mark in ``shared.config_dir`` would otherwise create between test
-    classes. Tests that want the real thing request ``real_probe_dir_sweep``.
-    """
-    if 'real_probe_dir_sweep' in request.fixturenames:
-        yield
-        return
-    with patch('shared.usage_gate.sweep_stale_pid_dirs', return_value=0):
-        yield
-
-
 # ---------------------------------------------------------------------------
 # step-1: before_invoke race condition — _last_account_name updated before
 #         the failover cost event fires; event uses _fire_cost_event not
@@ -889,7 +859,7 @@ class TestProbeConfigDirLeakSweep:
         instead — whether by a def-time default parameter, which cannot be
         intercepted at all, or by calling that module's global by name, which
         merely moves the single interception point there — then
-        `_keep_gates_off_the_real_tmp` and the ~dozen sibling
+        conftest.py's `_confine_usage_gate_sweep` and the ~dozen sibling
         `patch('shared.usage_gate.sweep_stale_pid_dirs', ...)` sites in this
         class silently stop intercepting, and this suite starts scandir-ing and
         deleting the developer's real /tmp.
@@ -1036,8 +1006,8 @@ class TestProbeConfigDirLeakSweep:
     ):
         """The whole fix, exercised against a real (redirected) tmp dir.
 
-        Requests `real_probe_dir_sweep` to opt out of the module-wide
-        neutralizer. Patching shared.config_dir.tempfile.gettempdir then
+        Requests `real_probe_dir_sweep` to opt out of the suite-wide
+        confinement in conftest.py. Patching shared.config_dir.tempfile.gettempdir then
         redirects BOTH TaskConfigDir and the sweep's default base to tmp_path,
         so this never touches the real /tmp.
         """

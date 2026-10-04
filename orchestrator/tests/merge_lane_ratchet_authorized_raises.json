@@ -1593,6 +1593,90 @@
       ]
     },
     {
+      "task_id": "5070",
+      "reason": "task 5070: trains retry a lost CAS through the shared re-verify gate (bounded CAS loop, _advance_train) instead of derailing; net-additive behaviour, not a failed refactor",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2135,
+          "current": 2144
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 3489,
+          "current": 3493
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21556,
+          "current": 21674
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/gates.py",
+          "baseline": 1577,
+          "current": 1581
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12386,
+          "current": 12389
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4758,
+          "current": 4767
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56462,
+          "current": 56584
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31675,
+          "current": 31682
+        }
+      ]
+    },
+    {
+      "task_id": "4094",
+      "reason": "Net-additive bug fix: reverify_member_solo gains a keyword-only verifier injection seam (forwarded to _run_post_merge_verify) so a regression test can drive the real retry loop without patching a private name, and its retry budget changes from a literal 3 to SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES; the docstring documents the budget and the seam, and the non-narrowed-retry comment conditions its byte-identity claim on max_enospc == 1. No refactor was attempted, so none failed.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21674,
+          "current": 21686
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12387,
+          "current": 12397
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56584,
+          "current": 56596
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31680,
+          "current": 31690
+        }
+      ]
+    },
+    {
       "task_id": "4704",
       "reason": "Task 4704 adds the reported-claim attribution mode (validate_reported_landing) and a method-aware L1 disposition to landing_evidence so workflow.py's architect already_done writer stops stamping uncorroborated commits; net-additive guard, the CANDIDATE effect arm was extracted not copied.",
       "measures": [

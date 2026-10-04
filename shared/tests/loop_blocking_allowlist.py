@@ -329,23 +329,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         _FIXED_STAT_GUARD_WHY,
     ),
 
-    # ---- middleware/curator_escalator.py ----
-    (
-        'fused-memory/src/fused_memory/middleware/curator_escalator.py',
-        'CuratorEscalator.report_failure',
-        '3ba9760c42a6',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): the orchestrator-liveness probe '
-        '(_orchestrator_running in middleware/ticket_janitor.py and '
-        'middleware/curator_escalator.py, plus '
-        'ticket_janitor._surface_probe_defect which reaches it) takes an '
-        'fcntl.flock on the loop thread. A lock wait is bounded only by '
-        'ANOTHER process\'s hold time, which this one does not control -- '
-        'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
-        'never enumerated. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
-    ),
-
     # ---- middleware/task_interceptor.py ----
     (
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
@@ -367,38 +350,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'd7b1b643f3fe',
         'accepted',
         _COMBINE_AUDIT_APPEND_WHY,
-    ),
-
-    # ---- middleware/ticket_janitor.py ----
-    (
-        'fused-memory/src/fused_memory/middleware/ticket_janitor.py',
-        'TicketJanitor.tick',
-        '90eccb740171',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): the orchestrator-liveness probe '
-        '(_orchestrator_running in middleware/ticket_janitor.py and '
-        'middleware/curator_escalator.py, plus '
-        'ticket_janitor._surface_probe_defect which reaches it) takes an '
-        'fcntl.flock on the loop thread. A lock wait is bounded only by '
-        'ANOTHER process\'s hold time, which this one does not control -- '
-        'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
-        'never enumerated. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
-    ),
-    (
-        'fused-memory/src/fused_memory/middleware/ticket_janitor.py',
-        'TicketJanitor.tick',
-        'f0c22189ed58',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): the orchestrator-liveness probe '
-        '(_orchestrator_running in middleware/ticket_janitor.py and '
-        'middleware/curator_escalator.py, plus '
-        'ticket_janitor._surface_probe_defect which reaches it) takes an '
-        'fcntl.flock on the loop thread. A lock wait is bounded only by '
-        'ANOTHER process\'s hold time, which this one does not control -- '
-        'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
-        'never enumerated. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
     ),
 
     # ---- middleware/ticket_store.py ----
@@ -499,7 +450,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._recover_one_run',
         '361d4c634750',
         'to_file',
-        'ROOT CAUSE (one defect, 3 rows): three harness coroutines call the '
+        'ROOT CAUSE (one defect, 2 rows): two harness coroutines call the '
         'sync cli_stage_runner.py::gc_run_config_dir inline, which '
         'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
         'syscall per file, all of them on the loop thread, and a config dir '
@@ -512,26 +463,10 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness.run_full_cycle',
-        '21ec0716d946',
+        'ReconciliationHarness._persist_stage_reports_then_gc_config_dir',
+        '361d4c634750',
         'to_file',
-        'ROOT CAUSE (one defect, 3 rows): three harness coroutines call the '
-        'sync cli_stage_runner.py::gc_run_config_dir inline, which '
-        'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
-        'syscall per file, all of them on the loop thread, and a config dir '
-        'is not one file. Found only once task 4484\'s amendment pass added '
-        'shutil.rmtree to the vocabulary, which is the same gap-B shape the '
-        'guard exists to close: the primitive was never enumerated, so the '
-        'sites were invisible however the census was run. Follow-up filed by '
-        'task 4484 amendment pass.'
-        ' Ticket: tkt_0RT88VW7RRECTHNCVTJXD6M5RJ.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._run_remediation_pass',
-        '21ec0716d946',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): three harness coroutines call the '
+        'ROOT CAUSE (one defect, 2 rows): two harness coroutines call the '
         'sync cli_stage_runner.py::gc_run_config_dir inline, which '
         'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
         'syscall per file, all of them on the loop thread, and a config dir '

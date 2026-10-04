@@ -19,8 +19,10 @@ import json
 from typing import IO, Any, Literal, overload
 
 import pytest
+from _fm_helpers import LoopFreedomProbe
 from escalation.queue import EscalationQueue
 
+from fused_memory.middleware import curator_escalator
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.curator_zot_duplicate_sweep import (
     DUPLICATE_METADATA_KEY,
@@ -50,26 +52,6 @@ def _make_orchestrator_layout(root, *, hold_lock: bool) -> IO[bytes] | None:
     handle = lock_path.open('r+b')
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     return handle
-
-
-class TestOrchestratorLivenessProbe:
-    def test_missing_lock_file_reports_not_running(self, tmp_path):
-        escalator = CuratorEscalator()
-        # No lock file created — treat as "no orchestrator".
-        assert escalator._orchestrator_running(str(tmp_path)) is False
-
-    def test_unlocked_file_reports_not_running(self, tmp_path):
-        _make_orchestrator_layout(tmp_path, hold_lock=False)
-        escalator = CuratorEscalator()
-        assert escalator._orchestrator_running(str(tmp_path)) is False
-
-    def test_held_exclusive_lock_reports_running(self, tmp_path):
-        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
-        try:
-            escalator = CuratorEscalator()
-            assert escalator._orchestrator_running(str(tmp_path)) is True
-        finally:
-            handle.close()
 
 
 class TestReportFailure:
@@ -806,6 +788,50 @@ def _only_escalation_detail(root) -> str:
     return json.loads(path.read_text())['detail']
 
 
+class TestOrchestratorProbeRunsOffTheEventLoop:
+    """Every orchestrator-liveness probe runs off the event loop's thread.
+
+    The stub stands in for the lock file: it blocks on a LoopFreedomProbe
+    and returns True, and the filed record proves that verdict was honoured.
+    """
+
+    @pytest.mark.asyncio
+    async def test_report_failure_probes_off_the_event_loop(self, tmp_path, monkeypatch):
+        probe = LoopFreedomProbe()
+        seen: list[str] = []
+
+        def _blocking_lock_probe(project_root):
+            seen.append(project_root)
+            probe.block()
+            return True
+
+        monkeypatch.setattr(curator_escalator, 'is_orchestrator_lock_held', _blocking_lock_probe)
+
+        await CuratorEscalator().report_failure(
+            project_root=str(tmp_path), project_id='proj-x',
+            justification='boom', candidate_title='T',
+        )
+
+        probe.assert_loop_stayed_free()
+        assert seen == [str(tmp_path)]
+        assert [r['category'] for r in _pending_records(tmp_path)] == ['curator_failure']
+
+    @pytest.mark.asyncio
+    async def test_report_zot_duplicate_probes_off_the_event_loop(self, tmp_path, monkeypatch):
+        probe = LoopFreedomProbe()
+
+        def _blocking_lock_probe(project_root):
+            probe.block()
+            return True
+
+        monkeypatch.setattr(curator_escalator, 'is_orchestrator_lock_held', _blocking_lock_probe)
+
+        await CuratorEscalator().report_zot_duplicate(**_duplicate_report(tmp_path))
+
+        probe.assert_loop_stayed_free()
+        assert [r['category'] for r in _pending_records(tmp_path)] == ['curator_zot_duplicate']
+
+
 class TestTranscriptEvidenceInDetail:
     """The escalation detail says what the failed run did, from its transcript.
 
@@ -1101,6 +1127,9 @@ class TestPersistStateConcurrency:
 
             async def _patched_to_thread(func, *args, **kwargs):
                 nonlocal in_flight, max_in_flight
+                if func is curator_escalator.is_orchestrator_lock_held:
+                    # The liveness probe's hop is not a state write.
+                    return await real_to_thread(func, *args, **kwargs)
                 in_flight += 1
                 if in_flight > max_in_flight:
                     max_in_flight = in_flight

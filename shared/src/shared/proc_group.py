@@ -25,6 +25,9 @@ The pgid MUST be captured by the caller immediately after spawn::
     except TimeoutError:
         await terminate_process_group(proc, pgid, grace_secs=5.0)
 
+``terminate_process_group`` gives the group a graceful SIGTERM grace period;
+``sigkill_process_group`` kills it at once and leaves the reap to the caller.
+
 Why the caller captures pgid instead of the helper calling
 ``os.getpgid(proc.pid)``:
 - Once ``proc`` has been reaped (``proc.returncode is not None``), the kernel
@@ -59,8 +62,8 @@ Limitations
 If a grandchild calls ``setsid()`` on its own it will escape into a new
 session and process group, making it invisible to ``killpg``.  This is
 acceptable for the current codebase because cargo/rustc do not call
-``setsid``.  Git sub-processes spawned by short-lived helpers are out of
-scope (they are bounded and never appear in stuck-process incidents).
+``setsid``.  ``shared.git_async``'s children are group-killed through
+``sigkill_process_group`` when interrupted (task 4155).
 """
 
 from __future__ import annotations
@@ -310,6 +313,43 @@ async def terminate_process_group(
             os.killpg(pgid, signal.SIGKILL)
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(proc.wait(), grace_secs)
+
+
+def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
+    """SIGKILL group *pgid* at once; signal-only, never raises, never reaps.
+
+    *pgid* must be the value frozen at a ``start_new_session=True`` spawn of
+    *proc* — see the module docstring's "Why the caller captures pgid".  The
+    caller owns ``await proc.wait()``.
+
+    Immediate SIGKILL rather than :func:`terminate_process_group`'s SIGTERM
+    stage: that helper stops escalating once the LEADER exits, so a grandchild
+    that ignores SIGTERM would survive.
+
+    An already-reaped *proc* gets no signal (its pid may be recycled).  A
+    refused or failed group kill degrades to a direct ``proc.kill()``, which is
+    safe while the pid is unreaped.
+    """
+    if proc.returncode is not None:
+        return
+
+    reason = unsafe_pgid_reason(pgid, proc.pid)
+    if reason is not None:
+        logger.error(
+            'sigkill_process_group: refusing to killpg — %s. '
+            'Falling back to a direct kill() of pid %s.',
+            reason,
+            proc.pid,
+        )
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
 
 
 # ---------------------------------------------------------------------------

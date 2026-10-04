@@ -89,6 +89,8 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # (`1 failed, 5 passed`). So an edit here can only break the half named above —
 # do not read a green run of that one test as the gate being intact.
 
+# This command also carries test_config_retune_gate_decision.py (docs/config-retune-gate.md).
+
 # KNOWN COST, recorded rather than left invisible (task 3350 amendment;
 # restated by task 3460, which falsified this block's original premise).
 #

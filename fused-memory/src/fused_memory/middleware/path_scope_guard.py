@@ -64,7 +64,7 @@ plus one bypass that PRECEDES all three:
    escalation establishes that a task exists (task 4159).  ITSELF GATED on
    attribution —
    :func:`local_attesting_signals` (task 3106) asks whether the DECLARED
-   deliverables (``metadata.files`` ∪ ``files_to_modify`` ∪ ``modules``)
+   deliverables (``metadata.files`` ∪ ``files_to_modify``)
    attest work in the FILING project, i.e. at least one is owned by it and
    NONE is owned by another; when they do, the interceptor suppresses BOTH
    the stamp and the escalation, logging the decision at INFO instead.  The
@@ -604,8 +604,8 @@ def local_attesting_signals(
     the two cannot drift and every signal is classified exactly once.
 
     *signals* are the submission's DECLARED deliverables — the union of
-    ``metadata.files``, ``metadata.files_to_modify`` and ``metadata.modules``
-    (task 3106).  Attestation requires BOTH:
+    ``metadata.files`` and ``metadata.files_to_modify`` (task 3106).
+    Attestation requires BOTH:
 
     1. at least one signal OWNED by *project_id* (the positive half the
        module docstring describes), and
@@ -613,20 +613,20 @@ def local_attesting_signals(
 
     (2) exists because the caller's upstream ``check_files_for_scope`` sees a
     NARROWER list than this one: only ``files``, or (when ``files`` is
-    absent) ``files_to_modify`` — never ``modules``, and never a
-    ``files_to_modify`` entry shadowed by a present ``files`` key.  A foreign
-    entry in that non-overlapping remainder was therefore never classified by
-    the hard reject, so a MIXED declaration (local ``files`` + foreign
-    ``modules``) must not buy silence here.  It is advisory-only: declining
-    to attest leaves such a submission on the unchanged
-    stamp-plus-advisory path, and never creates a new rejection.
+    absent) ``files_to_modify`` — never a ``files_to_modify`` entry
+    shadowed by a present ``files`` key.  A foreign entry in that
+    non-overlapping remainder was therefore never classified by the hard
+    reject, so a MIXED declaration (local ``files`` + a foreign
+    ``files_to_modify`` shadowed by it) must not buy silence here.  It is
+    advisory-only: declining to attest leaves such a submission on the
+    unchanged stamp-plus-advisory path, and never creates a new rejection.
 
     Signals are classified with the CERTAIN
     :meth:`ProjectPrefixRegistry.project_for_path` lookup, never the
     heuristic regex-over-prose :func:`find_paths`.  That matters: a declared
-    DIRECTORY (``'fused-memory/src'``, a ``modules`` lock key) and an
-    ABSOLUTE spelling both classify correctly here, where the prose
-    scanner's right-boundary assertion (task 3120) deliberately misses them.
+    DIRECTORY (``'fused-memory/src'``) and an ABSOLUTE spelling both
+    classify correctly here, where the prose scanner's right-boundary
+    assertion (task 3120) deliberately misses them.
     It also means attribution inherits ``project_for_path``'s documented
     fail-open residue (``'../other-repo/x.py'``, ``'~user/...'``) in the SAFE
     direction: an unclassifiable signal simply fails to attest, so the

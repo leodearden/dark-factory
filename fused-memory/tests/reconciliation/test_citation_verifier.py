@@ -20,7 +20,7 @@ import pytest
 
 from fused_memory.models.reconciliation import StageId
 from fused_memory.reconciliation.citation_verifier import (
-    MAX_PROSE_IDS_PER_RUN,
+    MAX_PROSE_IDS_PER_SCAN,
     PROSE_CITATION_FIELDS,
     STAGE_STAT_PREFIX,
     X_CITATION_TOMBSTONE_KEY,
@@ -1592,6 +1592,15 @@ def _prose_service(*, record=None, tombstone=None, get_raises=None) -> AsyncMock
     return service
 
 
+class _NoTombstoneService:
+    """A memory_service with NO ``get_mem0_deletion_tombstone`` attribute at
+    all. A bare ``AsyncMock`` auto-creates the attribute, so it cannot model
+    this wiring gap."""
+
+    async def get_memory_by_id(self, project_id, memory_id):
+        return None
+
+
 class TestScanProseCitationsBranches:
     """``scan_prose_citations`` splits every prose id FOUR ways and warns on
     exactly one of them (task 4818).
@@ -1810,11 +1819,6 @@ class TestScanProseCitationsSafety:
 
         ``spec=`` is required: a bare ``AsyncMock`` auto-creates the attribute
         and would silently pass a two-way implementation."""
-
-        class _NoTombstoneService:
-            async def get_memory_by_id(self, project_id, memory_id):
-                return None
-
         service = _NoTombstoneService()
         finding = {'finding_id': 'f1', 'description': f'see {_SPECIMEN_FABRICATED}'}
 
@@ -1898,6 +1902,77 @@ class TestScanProseCitationsSafety:
         assert stats['stage1_prose_phantom_citations'] == 1
         assert stats['stage1_prose_citation_verification_errors'] == 0
         assert 'phantom' in caplog.records[0].getMessage().lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'reason', ['ledger_unavailable', 'reader_unavailable'],
+    )
+    async def test_wiring_gap_warns_once_per_scan_not_per_id(self, caplog, reason):
+        """A missing reader or an unwired ledger is a fact about how THIS scan
+        is wired, not about any id, so it warns once per scan. On a
+        ``recon_ledger_enabled=False`` deployment a per-id warning would be one
+        identical line per prose miss. The counters still count every pair."""
+        if reason == 'ledger_unavailable':
+            service: Any = _prose_service(record=None, tombstone=None)
+            service.recon_ledger = None
+        else:
+            service = _NoTombstoneService()
+        third = '0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d'
+        findings = [
+            {
+                'finding_id': 'f1',
+                'description': f'{_SPECIMEN_FABRICATED} and {_SPECIMEN_REAL}',
+            },
+            {'finding_id': 'f2', 'description': f'{_SPECIMEN_FABRICATED} and {third}'},
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations(
+                findings, service, 'test_project', run_id='run-unwired',
+            )
+
+            assert stats['stage1_prose_citation_verification_errors'] == 4
+            assert stats['stage1_prose_phantom_citations'] == 0
+            assert len(caplog.records) == 1
+            msg = caplog.records[0].getMessage()
+            assert 'tombstone' in msg.lower()
+            assert reason in msg
+            assert 'run-unwired' in msg
+            assert 'stage1' in msg
+            assert 'phantom' not in msg.lower()
+
+            # Once per SCAN, not once per process: a later run on the same
+            # deployment must still surface the gap.
+            await scan_prose_citations(
+                findings, service, 'test_project', run_id='run-unwired',
+            )
+            assert len(caplog.records) == 2
+
+    @pytest.mark.asyncio
+    async def test_raising_reader_still_warns_per_id(self, caplog):
+        """A raising read is a per-READ fault carrying its own exception type,
+        not a wiring fact, so it must not collapse into the once-per-scan
+        wiring warning."""
+        service = _prose_service(record=None)
+        service.get_mem0_deletion_tombstone = AsyncMock(
+            side_effect=RuntimeError('ledger locked'),
+        )
+        finding = {
+            'finding_id': 'f1',
+            'description': f'{_SPECIMEN_FABRICATED} and {_SPECIMEN_REAL}',
+        }
+
+        with caplog.at_level(logging.WARNING):
+            stats = await scan_prose_citations([finding], service, 'test_project')
+
+        assert stats['stage1_prose_citation_verification_errors'] == 2
+        assert stats['stage1_prose_phantom_citations'] == 0
+        assert len(caplog.records) == 2
+        named = [
+            [m for m in (_SPECIMEN_FABRICATED, _SPECIMEN_REAL) if m in r.getMessage()]
+            for r in caplog.records
+        ]
+        assert sorted(named) == sorted([[_SPECIMEN_FABRICATED], [_SPECIMEN_REAL]])
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2215,6 +2290,71 @@ class TestSharedResolverAndProseCeiling:
         )
 
     @pytest.mark.asyncio
+    async def test_memo_merges_casings_of_a_canonical_uuid(self):
+        """Casing cannot name a different Qdrant point (pinned live by
+        ``tests/test_mem0_qdrant_integration.py::TestUuidPointIdCasing``), so
+        two casings of one canonical uuid share one read and one verdict. The
+        backend still receives the caller's own spelling."""
+        service = _prose_service(record=None, tombstone=None)
+        resolve = make_memory_resolver(service, 'test_project')
+
+        first = await resolve(_SPECIMEN_FABRICATED.upper())
+        second = await resolve(_SPECIMEN_FABRICATED)
+
+        assert first == second == ('missing', None)
+        service.get_memory_by_id.assert_awaited_once_with(
+            'test_project', _SPECIMEN_FABRICATED.upper(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_memo_keys_non_canonical_ids_verbatim(self):
+        """The casing equivalence the memo relies on is established only for
+        the canonical dashed shape, so every other spelling and every non-str
+        value keeps a verdict of its own."""
+        service = _prose_service(record=None, tombstone=None)
+        resolve = make_memory_resolver(service, 'test_project')
+
+        await resolve('A')
+        await resolve('a')
+        assert service.get_memory_by_id.await_count == 2
+
+        await resolve('urn:uuid:' + _SPECIMEN_REAL)
+        await resolve('URN:UUID:' + _SPECIMEN_REAL)
+        assert service.get_memory_by_id.await_count == 4
+
+        assert await resolve(7) == ('missing', None)
+        assert service.get_memory_by_id.await_count == 5
+        assert await resolve(7) == ('missing', None)
+        assert service.get_memory_by_id.await_count == 5
+
+    @pytest.mark.asyncio
+    async def test_mixed_case_structured_citation_and_prose_mention_cost_one_read(self):
+        """``find_prose_uuids`` lowercases what it finds, while a structured
+        citation keeps the model's casing. One shared resolver must still read
+        the id once, so the two passes cannot reach two verdicts for it."""
+        upper = _SPECIMEN_FABRICATED.upper()
+        service = _prose_service(record=None, tombstone=None)
+        shared_resolve = make_memory_resolver(service, 'test_project')
+        findings = [
+            {
+                'finding_id': 'f1',
+                'description': f'Memory {upper} is stale.',
+                'cited_memories': [{'memory_id': upper, 'store': 'mem0'}],
+            },
+        ]
+
+        s1 = await verify_cited_memories(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+        s2 = await scan_prose_citations(
+            findings, service, 'test_project', resolve=shared_resolve,
+        )
+
+        assert s1['stage1_phantom_citations_dropped'] == 1
+        assert s2['stage1_prose_phantom_citations'] == 1
+        assert service.get_memory_by_id.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_default_resolve_none_still_builds_a_private_resolver(self):
         """Omitting ``resolve`` keeps every standalone caller on the original
         behaviour — the parameter is an optimisation, not a new requirement."""
@@ -2227,13 +2367,13 @@ class TestSharedResolverAndProseCeiling:
         service.get_memory_by_id.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_distinct_prose_ids_are_capped_per_run(self, caplog):
+    async def test_distinct_prose_ids_are_capped_per_scan(self, caplog):
         """A description naming more distinct uuids than the ceiling must not
         stall report assembly with unbounded serial point reads for a WARN-ONLY
         diagnostic. Unlike the structured pass, whose fan-out is bounded by the
         model-emitted citation list, this one is driven by arbitrary free
         text."""
-        over = MAX_PROSE_IDS_PER_RUN + 3
+        over = MAX_PROSE_IDS_PER_SCAN + 3
         ids = [self._uuid(n) for n in range(over)]
         finding = {'finding_id': 'f-flood', 'description': ' '.join(ids)}
         service = _prose_service(record=None, tombstone=None)
@@ -2245,15 +2385,18 @@ class TestSharedResolverAndProseCeiling:
 
         # Exactly the ceiling is resolved; the remainder is INCONCLUSIVE, never
         # phantom — declining to look establishes nothing either way.
-        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_RUN
-        assert stats['stage1_prose_phantom_citations'] == MAX_PROSE_IDS_PER_RUN
+        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_SCAN
+        assert stats['stage1_prose_phantom_citations'] == MAX_PROSE_IDS_PER_SCAN
         assert stats['stage1_prose_citation_verification_errors'] == 3
         # ...and the four counters still account for every distinct pair.
         assert sum(stats.values()) == over
 
         capped = [r for r in caplog.records if 'scan_capped' in r.getMessage()]
-        assert len(capped) == 1, 'the ceiling must be logged ONCE per run, not per id'
+        assert len(capped) == 1, 'the ceiling must be logged ONCE per scan, not per id'
         assert 'run-flood' in capped[0].getMessage()
+        # One run carries one scan per stage, so the line must say WHICH
+        # stage's scan met the ceiling.
+        assert 'stage1' in capped[0].getMessage()
 
     @pytest.mark.asyncio
     async def test_a_report_under_the_ceiling_is_untouched(self):
@@ -2272,7 +2415,7 @@ class TestSharedResolverAndProseCeiling:
         """A repeat of an ALREADY-resolved id is free (the memo answers it), so
         it must not consume ceiling budget — the ceiling bounds reads, and the
         counters keep counting per-finding CLAIMS."""
-        ids = [self._uuid(n) for n in range(MAX_PROSE_IDS_PER_RUN)]
+        ids = [self._uuid(n) for n in range(MAX_PROSE_IDS_PER_SCAN)]
         blob = ' '.join(ids)
         findings = [
             {'finding_id': 'f-a', 'description': blob},
@@ -2282,6 +2425,31 @@ class TestSharedResolverAndProseCeiling:
 
         stats = await scan_prose_citations(findings, service, 'test_project')
 
-        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_RUN
-        assert stats['stage1_prose_phantom_citations'] == 2 * MAX_PROSE_IDS_PER_RUN
+        assert service.get_memory_by_id.await_count == MAX_PROSE_IDS_PER_SCAN
+        assert stats['stage1_prose_phantom_citations'] == 2 * MAX_PROSE_IDS_PER_SCAN
         assert stats['stage1_prose_citation_verification_errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_ceiling_is_per_scan_not_per_run(self):
+        """The budget belongs to one ``scan_prose_citations`` call, even when
+        the resolver is shared: ``BaseStage.run()`` hands each stage its own
+        scan over one run-scoped resolver, and each scan gets a full fresh
+        ceiling. Making the budget run-wide would need a rename, not a silent
+        change."""
+        service = _prose_service(record=None, tombstone=None)
+        shared_resolve = make_memory_resolver(service, 'test_project')
+        first = [self._uuid(n) for n in range(MAX_PROSE_IDS_PER_SCAN)]
+        second = [
+            self._uuid(n)
+            for n in range(MAX_PROSE_IDS_PER_SCAN, 2 * MAX_PROSE_IDS_PER_SCAN)
+        ]
+
+        for ids in (first, second):
+            stats = await scan_prose_citations(
+                [{'finding_id': 'f-scan', 'description': ' '.join(ids)}],
+                service, 'test_project', resolve=shared_resolve,
+            )
+            assert stats['stage1_prose_citation_verification_errors'] == 0
+            assert stats['stage1_prose_phantom_citations'] == MAX_PROSE_IDS_PER_SCAN
+
+        assert service.get_memory_by_id.await_count == 2 * MAX_PROSE_IDS_PER_SCAN

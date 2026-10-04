@@ -16,7 +16,14 @@ import logging
 from pathlib import Path
 
 import pytest
-from _briefing_helpers import _edge, _grouped_block, _grouped_parent, _node, _result
+from _briefing_helpers import (
+    _edge,
+    _grouped_block,
+    _grouped_parent,
+    _node,
+    _result,
+    recorded_search_text,
+)
 
 from orchestrator.agents.memory_recall import (
     FOREIGN_PROJECT_TAG_KEYS,
@@ -654,6 +661,154 @@ class TestRenderMemoryResults:
 
         assert render_memory_results(()) == ''
         assert render_memory_results(('stray', silent)) == ''
+
+
+def _recorded_results(name: str) -> tuple:
+    reply = parse_search_reply(recorded_search_text(name))
+    assert isinstance(reply, SearchReply), reply
+    return reply.results
+
+
+def _grouped_parent_of(results: tuple) -> dict:
+    return next(entry for entry in results if 'grouped' in entry)
+
+
+def _amendment(parent: dict, *, contested: bool) -> dict:
+    return next(
+        child for child in parent['grouped']['amendments']
+        if (child.get('contested') is True) is contested
+    )
+
+
+def _top_level(results: tuple, entry_id: str) -> dict:
+    return next(entry for entry in results if entry['id'] == entry_id)
+
+
+_CONTESTING_BULLET = '  - [contests its parent · '
+
+
+def _line_index(lines: list[str], predicate) -> int:
+    index = next((index for index, line in enumerate(lines) if predicate(line)), None)
+    assert index is not None, lines
+    return index
+
+
+class TestContestingChildRender:
+    """A child that contests its parent renders in full, first, and once.
+
+    Every input is a reply recorded from the real fused-memory ``search``
+    tool (``fixtures/grouped_search_contesting_child/PROVENANCE.md``), so the
+    render is tested against the shape the producer actually emits.
+    """
+
+    def test_a_contesting_child_renders_in_full_marked_as_contesting(self):
+        results = _recorded_results('child-also-matched')
+        parent = _grouped_parent_of(results)
+        contesting = _amendment(parent, contested=True)
+        full_body = _top_level(results, contesting['id'])['content']
+        assert contesting['digest'].endswith('…')
+
+        rendered = render_memory_results(results)
+
+        contests = [
+            line for line in rendered.splitlines()
+            if line.startswith(_CONTESTING_BULLET)
+        ]
+        assert len(contests) == 1, rendered
+        assert contests[0].endswith(f'] {full_body}')
+        assert contesting['digest'] not in rendered
+
+    def test_it_renders_ahead_of_the_parents_other_digests(self):
+        results = _recorded_results('child-also-matched')
+        parent = _grouped_parent_of(results)
+        amendments = parent['grouped']['amendments']
+        plain = _amendment(parent, contested=False)
+        assert amendments.index(plain) < amendments.index(_amendment(parent, contested=True))
+
+        lines = render_memory_results(results).splitlines()
+
+        parent_at = _line_index(lines, lambda line: line.endswith(f'] {parent["content"]}'))
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
+        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
+        assert parent_at < contests_at < plain_at, lines
+
+    def test_the_contesting_child_is_rendered_once(self):
+        results = _recorded_results('child-also-matched')
+        contesting = _amendment(_grouped_parent_of(results), contested=True)
+        full_body = _top_level(results, contesting['id'])['content']
+
+        assert render_memory_results(results).count(full_body) == 1
+
+    def test_a_digest_only_contesting_child_is_still_marked_and_first(self):
+        results = _recorded_results('only-parent-matched')
+        parent = _grouped_parent_of(results)
+        contesting = _amendment(parent, contested=True)
+        plain = _amendment(parent, contested=False)
+
+        lines = render_memory_results(results).splitlines()
+
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
+        plain_at = _line_index(lines, lambda line: line.endswith(f'] {plain["digest"]}'))
+        assert contests_at < plain_at, lines
+        assert lines[contests_at].endswith(f'] {contesting["digest"]}')
+
+    @pytest.mark.parametrize('name', ['child-also-matched', 'only-parent-matched'])
+    def test_an_uncontested_digest_renders_unchanged(self, name):
+        lines = render_memory_results(_recorded_results(name)).splitlines()
+
+        assert (
+            '  - [amendment · 2026-08-10 · mem0] Applies to coalesce-train verifies as well.'
+        ) in lines
+
+    def test_contested_is_read_from_the_grouped_marker_only(self):
+        results = _recorded_results('child-also-matched')
+        contesting = _amendment(_grouped_parent_of(results), contested=True)
+        child_hit = _top_level(results, contesting['id'])
+
+        rendered = render_memory_results((child_hit,))
+
+        assert rendered.startswith('- [')
+        assert rendered.endswith(f'] {child_hit["content"]}')
+        assert 'contests' not in rendered
+
+    def test_a_contesting_child_under_an_unrenderable_parent_is_not_lost(self):
+        results = _recorded_results('child-also-matched')
+        parent = _grouped_parent_of(results)
+        contesting = _amendment(parent, contested=True)
+        full_body = _top_level(results, contesting['id'])['content']
+        blanked = tuple({**entry, 'content': ''} if entry is parent else entry for entry in results)
+
+        lines = render_memory_results(blanked).splitlines()
+
+        assert any(
+            line.startswith('- [') and line.endswith(f'] {full_body}') for line in lines
+        ), lines
+
+    def test_a_contesting_hit_renders_under_its_own_store(self):
+        results = _recorded_results('child-also-matched')
+        contesting = _amendment(_grouped_parent_of(results), contested=True)
+        moved = tuple(
+            {**entry, 'source_store': 'graphiti'} if entry['id'] == contesting['id'] else entry
+            for entry in results
+        )
+
+        lines = render_memory_results(moved).splitlines()
+
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
+        assert ' · graphiti] ' in lines[contests_at], lines
+
+    def test_a_digest_only_contesting_child_renders_under_its_parents_store(self):
+        results = _recorded_results('only-parent-matched')
+        parent = _grouped_parent_of(results)
+        moved = tuple(
+            {**entry, 'source_store': 'graphiti'} if entry is parent else entry
+            for entry in results
+        )
+
+        lines = render_memory_results(moved).splitlines()
+
+        contests_at = _line_index(lines, lambda line: line.startswith(_CONTESTING_BULLET))
+        assert ' · graphiti] ' in lines[contests_at], lines
 
 
 class TestRenderEntityBlock:

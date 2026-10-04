@@ -34,6 +34,7 @@ from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
 from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
+from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.backends.falkor_indices import (
     IndexCatalogUnsettledError,
@@ -1160,7 +1161,14 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     path, which is exactly where 9950 originated.  If ``clone()`` ever returns a
     plain ``FalkorDriver`` again, the hardening silently stops applying
     everywhere that matters while the unit tests still pass.
+
+    ``search_interface`` is set (task 6238) so graphiti's edge search runs
+    Cypher FalkorDB can plan over the provisioned indices; see
+    :mod:`fused_memory.backends.falkor_edge_search`.  It is a class attribute, so
+    every ``clone()`` carries it on both the read and the write path.
     """
+
+    search_interface = FalkorEdgeSearch()
 
     async def build_indices_and_constraints(self, delete_existing=False):
         pass

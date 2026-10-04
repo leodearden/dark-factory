@@ -408,9 +408,12 @@ A **declared deliverable** can, so it is what the advisory is attributed on.
 The annotation is suppressed when your declared deliverables attest local
 work — meaning **both** of:
 
-- at least one entry across `metadata.files`, `metadata.files_to_modify` or
-  `metadata.modules` is owned by the project you are filing into, **and**
-- **no** entry across those three keys is owned by a *different* project.
+- at least one entry across `metadata.files` or `metadata.files_to_modify`
+  is owned by the project you are filing into, **and**
+- **no** entry across those two keys is owned by a *different* project.
+
+`metadata.modules` is retired: it is not read here, and a new submission
+carrying it is rejected (see §8 Tier-A).
 
 When both hold, the prose citation is treated as incidental and neither the
 annotation nor the escalation fires. **Supplying accurate deliverable
@@ -451,8 +454,8 @@ None of this relaxes the rule above. A submission whose **`metadata.files`**
 mix local and foreign entries is still a hard reject — attribution is
 consulted only after that check has already passed, so a locally-owned entry
 can never buy a mixed `files` list past it. A foreign entry that the reject
-never classified (one in `metadata.modules`, or in `metadata.files_to_modify`
-when `metadata.files` is also present and takes precedence) does not reject,
+never classified (one in `metadata.files_to_modify` when `metadata.files` is
+also present and takes precedence) does not reject,
 but it *does* fail the second condition above, so such a submission keeps the
 annotation and the escalation rather than being silently suppressed.
 
@@ -1299,6 +1302,31 @@ recon **Stage 1/2 prompts now name both canonical keys literally**
 (`fused-memory/src/fused_memory/reconciliation/prompts/`), so the prompt is
 the writer. Grepping for a *code* writer and finding none is therefore not
 evidence that these entries are dead.
+
+`modules` is **retired 2026-08 — historical carrier, no live writer; rejected
+on new submissions.** It stays blessed so the immutable terminal and deferred
+carriers do not emit `unknown_key`: the same corpus-dominance reasoning that
+blessed the writer-less finding-provenance family (`origin_finding_id` et al.,
+`esc-3796-1`, described just above), applied in reverse — un-blessing a
+dominant key manufactures the census noise the scan exists to surface.
+
+- A **new** `submit_task` carrying top-level `metadata.modules`, on either
+  creation path, is rejected with `error_type: "RetiredMetadataKey"`
+  (`retired_key: "modules"`, `replacement_key: "files"`). Declare scope in
+  `metadata.files` with FILE paths, or `[]` to defer to the architect.
+- `update_task` and `commit_planning` stay tolerant, so existing carriers can
+  be re-written whole.
+- Lock derivation and the §3.2.1 attestation read `files` /
+  `files_to_modify` only.
+- Quoting the key in prose, or nesting it under an `x_` key, never trips the
+  guard, which is why there is no bypass flag.
+- Retained readers: the `orchestrator/src/orchestrator/cli.py` task listing
+  (historical display), and `scripts/mint_hard_v2_fixtures.py` (historical
+  eval corpus, where `files` on a done task is the merge diff, i.e. the
+  answer).
+
+See `plans/metadata-modules-retirement-prd.md`; run evidence is in
+`plans/metadata-modules-migration-run.md`.
 
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
 (§3.2.1): auto-set by the fused-memory submit path when a task's

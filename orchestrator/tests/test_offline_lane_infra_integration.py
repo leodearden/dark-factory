@@ -81,6 +81,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import (
     MEASURED_SPAWN_LATENCY_SECS,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
     pydantic_spec,
     required_timeout_secs,
 )
@@ -994,18 +995,17 @@ def test_lane_bounds_clear_the_measured_floor_and_the_global_ceiling(pytestconfi
     )
 
 
-@pytest.mark.timeout(120)  # task 4203 review remediation: this module's copy of the
-# sibling's marker for the test of the same name, derived independently from THIS
-# module's own constants. The only marker-carrying test here composing NO _run_lane
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 4203 review remediation: this
+# module's twin of the sibling's test of the same name, its requirement derived independently
+# from THIS module's own constants. The only marker-carrying test here composing NO _run_lane
 # pass -- its whole bounded term is _assert_infra_never_a_gate's
 # _NOTE_OFFLINE_LANE_BOUND_SECS + _NOTE_MERGE_ALL_BOUND_SECS = 15.5s. Out-of-bound term
 # = 21 spawns: 2 x _SPAWNS_PER_REPO_FIXTURE (the repo fixture AND the fresh _setup_repo
 # measured against below -- the only doubled fixture term in either module), plus
 # _SPAWNS_PER_DRIVE_ADVANCE (4) and _SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE (7); 21 x
-# MEASURED_SPAWN_LATENCY_SECS = 98.91s, required = 114.41s. 120 is the next multiple of
-# the 60s pyproject grid at or above that -- the same rule that derived the sibling's
-# b7 360. Unlike a hand-maintained comment this value is ENFORCED: this test now has its
-# own row in test_every_composing_caller_carries_a_timeout_override.
+# MEASURED_SPAWN_LATENCY_SECS = 98.91s, required = 114.41s. The verify budget clears that
+# requirement, and the value is ENFORCED by this test's row in
+# test_every_composing_caller_carries_a_timeout_override.
 @pytest.mark.asyncio
 async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     harness: Harness, git_ops: GitOps, repo: Path, tmp_path: Path,
@@ -1060,7 +1060,7 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     ``AsyncMock(return_value=([], None))``, so `_note_merge_all`'s `git
     diff` leg contributes zero spawns here too.
 
-    CARRIES `@pytest.mark.timeout(120)` — it is NOT marker-less. An earlier
+    CARRIES `@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)` — it is NOT marker-less. An earlier
     revision of this paragraph claimed this test had "zero bounded waits" and
     the same real-git shape the marker-less ib1/ib3/ib5 carry unmarked. The
     reviewer amendment that added the `_assert_infra_never_a_gate`
@@ -1072,12 +1072,10 @@ async def test_out_of_bound_spawn_counts_are_measured_not_asserted(
     (`_NOTE_OFFLINE_LANE_BOUND_SECS` + `_NOTE_MERGE_ALL_BOUND_SECS`) and 21
     out-of-bound spawns, ~2.3x the real-git work of an ib1/ib3/ib5 test (9
     each: the `repo` fixture plus one `_drive_advance`), for a
-    `required_timeout_secs` of 114.41s. The 120s marker sits below the
-    ambient per-test budget, so it tightens rather than widens it; the site
-    is listed in `test_timeout_marker_inversion_guard.py::_GRANDFATHERED`.
-    See the marker comment above for the derivation; the value is enforced
-    by `test_every_composing_caller_carries_a_timeout_override`'s row for
-    this test, not by this prose.
+    `required_timeout_secs` of 114.41s. See the marker comment above for the
+    derivation; the value is enforced by
+    `test_every_composing_caller_carries_a_timeout_override`'s row for this
+    test, not by this prose.
     """
     import orchestrator.git_ops as git_ops_mod
 
@@ -1340,15 +1338,15 @@ async def _assert_infra_never_a_gate(
     assert cast(EscalationQueue, worker.escalation_queue).get_pending() == []
 
 
-@pytest.mark.timeout(150)  # task 4030: NOT a _drive_infra_reds chainer, which is why the
-# task-3832 review's marker sweep missed it -- but it composes anyway: a 30s _run_lane bound
-# raced concurrently by wait_entered (max, not sum), then _assert_infra_never_a_gate's 0.5 +
-# 15.0 SEQUENTIALLY after it = 45.5s bounded, on top of unbounded real-git spawns: repo init
-# (_SPAWNS_PER_REPO_FIXTURE=5), one _drive_advance (4), and _assert_infra_never_a_gate's own
-# get_main_sha + two _advance_main rounds (_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE=7, task 4203
-# reviewer amendment -- MEASURED, supersedes an earlier "two _drive_advance/_advance_main
-# rounds" approximation) = 16 spawns x 4.71s = 75.36s, required = 120.86s, comfortably under
-# this marker. Grandfathered in test_timeout_marker_inversion_guard.py::_GRANDFATHERED.
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 4030: NOT a _drive_infra_reds
+# chainer, which is why the task-3832 review's marker sweep missed it -- but it composes
+# anyway: a 30s _run_lane bound raced concurrently by wait_entered (max, not sum), then
+# _assert_infra_never_a_gate's 0.5 + 15.0 SEQUENTIALLY after it = 45.5s bounded, on top of
+# unbounded real-git spawns: repo init (_SPAWNS_PER_REPO_FIXTURE=5), one _drive_advance (4),
+# and _assert_infra_never_a_gate's own get_main_sha + two _advance_main rounds
+# (_SPAWNS_PER_ASSERT_INFRA_NEVER_A_GATE=7, task 4203 reviewer amendment -- MEASURED,
+# supersedes an earlier "two _drive_advance/_advance_main rounds" approximation) = 16 spawns
+# x 4.71s = 75.36s, required = 120.86s, comfortably under this marker.
 @pytest.mark.asyncio
 async def test_ib2_infra_run_in_flight_never_gates_merge(harness, git_ops, repo, tmp_path):
     """IB2 (C7/§6, load-bearing) — a merge-landed notification while the
@@ -1438,10 +1436,9 @@ async def test_ib3_confirmed_infra_red_files_normal_fix_task_and_info_escalation
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.timeout(150)  # task 3832 review: _drive_infra_reds(n=2) chains 2
-# 30s-bounded _run_one_lane_pass calls (60s alone) plus real-git _drive_advance
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 3832 review: _drive_infra_reds(n=2)
+# chains 2 30s-bounded _run_one_lane_pass calls (60s alone) plus real-git _drive_advance
 # overhead (5 + 2 x 4 = 13 spawns x 4.71s = 61.23s, required = 121.23s).
-# Grandfathered in test_timeout_marker_inversion_guard.py::_GRANDFATHERED.
 @pytest.mark.asyncio
 async def test_ib4_same_infra_set_recurrence_updates_not_duplicates(
     harness,
