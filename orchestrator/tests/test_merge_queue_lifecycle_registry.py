@@ -3316,3 +3316,66 @@ class TestVacatedCorpseFinalizeLeavesReincarnationAlone:
                 n_entry.verify_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await n_entry.verify_task
+
+
+@pytest.mark.asyncio
+class TestSnapshotRendersEachRequestIdOnce:
+    """Belt and braces: whatever container holds a stale reference to a
+    request already rendered at a deeper pipeline stage, ``snapshot()`` keeps
+    only the first, head-of-line copy, renumbers positions, counts distinct
+    requests in ``depth`` and logs a WARNING naming the dropped request_id
+    (task 4582 step-7 RED / step-8 GREEN).
+    """
+
+    async def test_duplicate_request_id_keeps_the_head_of_line_copy(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState
+        from orchestrator.verify_runner import HostLease
+
+        queue: asyncio.Queue = asyncio.Queue()
+        worker = make_lane(git_ops, queue)
+        a_req, a_item = await _make_merged_item(
+            git_ops, config, 'df4582-dedup-a', 'df4582_a.py', 'a = 1\n',
+        )
+        b_req = _make_request('df4582-dedup-b', 'df4582-dedup-b', tmp_path, config)
+        worker._register_item(a_item, initial=ItemLifecycleState.DISPATCHING)
+        a_entry = InflightEntry(
+            item=a_item,
+            lease=HostLease(name='a-host', runner=MagicMock(), is_local=False),
+            verify_task=cast(Any, asyncio.ensure_future(asyncio.Event().wait())),
+            merge_wt=a_item.merge_wt,
+            was_speculative=False,
+        )
+        worker._inflight_append(a_entry)
+        # A stale reference: A is ALSO on the input queue, ahead of B, so the
+        # dropped duplicate sits mid-list.
+        queue.put_nowait(a_req)
+        queue.put_nowait(b_req)
+        try:
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                snap = worker.snapshot()
+
+            assert _rendered_ids(snap) == [a_req.request_id, b_req.request_id], (
+                f'the head-of-line copy of A must be kept and its queued '
+                f'duplicate dropped: {snap["entries"]!r}'
+            )
+            assert snap['entries'][0]['state'] == 'verifying', f'{snap["entries"][0]!r}'
+            assert snap['depth'] == 2, f'depth must count distinct requests: {snap["depth"]}'
+            assert [e['position'] for e in snap['entries']] == [0, 1], (
+                f'positions must be renumbered contiguously: {snap["entries"]!r}'
+            )
+            assert snap['head_of_line'] == a_req.task_id, f'{snap["head_of_line"]!r}'
+            named = [
+                r for r in caplog.records
+                if r.levelno == logging.WARNING and a_req.request_id in r.getMessage()
+            ]
+            assert len(named) == 1, (
+                f'exactly one WARNING must name the dropped duplicate: '
+                f'{[r.getMessage() for r in caplog.records]!r}'
+            )
+        finally:
+            a_entry.verify_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await a_entry.verify_task
