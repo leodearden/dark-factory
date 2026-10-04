@@ -66,6 +66,30 @@ reviewer):
 | terminal window (400 done/cancelled rows) | — | — | 2.25 s / 9.4 MB |
 | whole tree (`orchestrator.py`, `burndown.py`, `app.py::_load_task_cards`, `merge_queue.py::load_task_titles`) | 3.4 s / 29 MB | 3.65 s / 30 MB | — |
 | `GET /api/v2/dashboard/tasks` today | | | 6.8 s / 16.4 MB |
+| `GET /api/v2/dashboard/tasks` after ι (task 5598, 2026-10-04) | | | 3.65–4.17 s / 3.08 MB |
+
+**After ι (task 5598, 2026-10-04, 22:43–22:45 UTC).** Method: the real
+`api/tasks.py::api_tasks` handler was called with a duck-typed `Request` over
+`DashboardConfig.from_env()` (the service's nine roots, live fused-memory at
+`localhost:8002`) and a new `httpx.AsyncClient`. Each run was a fresh process, so
+MCP sessions and every cache started cold, and timing was `perf_counter` from an
+uncommitted ad-hoc probe.
+
+- **Cold render, 3 runs:** 4.17 s, 3.65 s and 4.11 s, each serving 3.08 MB.
+- **Per-root health:** in every run all nine roots classified OK, census and rows
+  both `fresh`. `TASKS_OFFLINE` was false, so no root trailed in any run.
+- **Warm:** a second call in the same process took 1.54 s, 3.77 s and 0.99 s. The
+  15 s snapshot unit answers both reads, so what remains is the per-request tail:
+  the runtime probe, row shaping and the external-dep read.
+- **Terminal window:** in a further fresh process, `?terminal=dark-factory` took
+  4.25 s and 3.38 MB in all. The window alone took 0.77 s for 400 rows (0.32 MB),
+  served `lower_bound` as the newest 400 of 4682 terminal rows.
+- **Against the 2026-09-18 baseline (6.8 s / 16.4 MB):** the cold render is
+  39–46 % faster and its payload 81 % smaller. The baseline acquisition was
+  0.38 s + 2.49 s + 2.25 s and included terminal rows. The default render no
+  longer reads terminal rows; one root's window, read on request, now costs
+  0.77 s, where the nine-root window cost 2.25 s / 9.4 MB.
+- **Next lever for task 4795:** field projection on `get_tasks` (task 4390).
 
 The whole-tree fetches are the heavy calls and this PRD removes all four from the
 request path. The compact map is cheap **but not immune**: the dashboard journal for
