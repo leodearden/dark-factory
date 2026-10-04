@@ -196,8 +196,11 @@ class Amendment(TypedDict):
     When `promote_to_l2` folds a new promote into an existing pending L2, the
     incoming root_cause/evidence/options/summary used to be dropped on the floor
     (measured: 336,875 characters lost).  Each such fold now appends one of these
-    to `Escalation.amendments`.  The record's OWN framing is never overwritten —
-    both the original and every incoming reframing survive, which is the point.
+    to `Escalation.amendments`.  An explicit `queue.EscalationQueue.amend`
+    (task 4886) appends one too, with no fold behind it; the two sources are
+    distinguishable by `agent_role`.  The record's OWN framing is never
+    overwritten — both the original and every incoming reframing survive, which
+    is the point.
 
     `detail` holds `promote_to_l2`'s ``evidence`` ARGUMENT — the same argument the
     create path writes into the record's own `detail` — so a reader can diff an

@@ -13,7 +13,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from shared.timestamps import parse_timestamp_or_warn
 
@@ -276,6 +276,25 @@ class AmendmentOutcome(TypedDict):
     # plateauing exactly when a runaway makes it matter.  This is what the
     # server's over-fold threshold crossing is tested against.
     variants: int
+
+
+AmendStatus = Literal['amended', 'repeat_framing', 'no_framing', 'not_found', 'not_pending']
+
+
+class AmendResult(TypedDict):
+    """What ONE :meth:`EscalationQueue.amend` call did.
+
+    A RETURN value rather than an out-param, unlike :class:`AmendmentOutcome`:
+    ``amend`` has no pre-existing call sites to keep reading a bare
+    ``Escalation``.  Computed inside ``escalation_id_lock`` for the same TOCTOU
+    reason ``AmendmentOutcome`` states, and every key is populated on every
+    return path.
+    """
+
+    status: AmendStatus
+    escalation: Escalation | None  # the record as amended; None when not found
+    recorded: bool                 # THIS call appended an amendment
+    dropped: int                   # entries THIS call shed at the _MAX_AMENDMENTS cap
 
 
 class ResolveOutcome(TypedDict):
@@ -2317,9 +2336,10 @@ class EscalationQueue:
         previously-recorded predicate/probe. Does NOT touch ``updated_at``:
         an annotation must not masquerade as a content change.  The mutations
         that DO bump ``updated_at`` — and therefore DO re-trigger the watcher's
-        "changed since I triaged it" re-assess rule — are
+        "changed since I triaged it" re-assess rule — are, exhaustively:
         ``add_members_to_l2`` (a real member append, severity promotion or
-        recorded amendment; guarded, since a true no-op must not bump) and
+        recorded amendment; guarded, since a true no-op must not bump),
+        ``amend`` (a recorded explicit amendment; guarded the same way) and
         ``attach_dedupe_child`` (a dedupe fold; unconditional, since every
         successful call appends a child and increments ``dedupe_count``).
 
@@ -2348,6 +2368,78 @@ class EscalationQueue:
             self._rewrite(escalation_id, esc)
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
             return esc
+
+    def amend(
+        self, escalation_id: str, *, root_cause: str = '', summary: str = '',
+        detail: str = '', options: list[str] | None = None, agent_role: str = '',
+    ) -> AmendResult:
+        """Append one framing :class:`~escalation.models.Amendment` to a pending record.
+
+        The explicit counterpart of the framing a ``promote_to_l2`` fold carries
+        in: a ruling made elsewhere can be written onto the record it rules on
+        WITHOUT a fold's side effects.  APPEND-ONLY through
+        :func:`_append_amendment_capped`, so the per-field elision, repeat
+        suppression and ``_MAX_AMENDMENTS`` oldest-shed policy are exactly the
+        fold's.  *detail* lands under the amendment's ``detail`` key.
+
+        It NEVER writes ``status``, ``severity``, ``level``, ``members``,
+        ``resolution`` / ``resolved_at`` / ``resolved_by`` /
+        ``resolution_action``, the triage quad, the record's own framing, or
+        ``root_cause_variants`` (an explicit amend is not a fold, so it must
+        not feed the over-fold signal).  There is NO severity floor, and it is
+        category-agnostic.
+
+        PENDING-ONLY, parked records included.  Loads from the queue root ONLY
+        (never ``self.get()``), so an archived record is ``not_found`` and is
+        never resurrected — the ``stamp_triage`` guard.
+
+        An ``updated_at`` writer (see ``stamp_triage``'s enumeration), guarded:
+        only a RECORDED amendment bumps it and rewrites the file.  A repeat of
+        what the record already says and an all-empty framing write nothing.
+
+        Serialized per-id by ``escalation_id_lock``; the result is computed
+        inside it.  See :class:`AmendResult`.
+        """
+        result: AmendResult = {
+            'status': 'no_framing', 'escalation': None, 'recorded': False, 'dropped': 0,
+        }
+        if not (root_cause or summary or detail or options):
+            return result
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self.queue_dir / f'{escalation_id}.json'
+            if not path.exists():
+                result['status'] = 'not_found'
+                return result
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                result['status'] = 'not_found'
+                return result
+
+            result['escalation'] = esc
+            if esc.status != 'pending':
+                result['status'] = 'not_pending'
+                return result
+
+            recorded, dropped = _append_amendment_capped(
+                esc, root_cause=root_cause, summary=summary, evidence=detail,
+                options=options, agent_role=agent_role, caller='amend',
+            )
+            if not recorded:
+                result['status'] = 'repeat_framing'
+                return result
+
+            esc.updated_at = datetime.now(UTC).isoformat()
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'amend: %s recorded an amendment by %r (amendments=%d, shed=%d)',
+                escalation_id, agent_role, len(esc.amendments), dropped,
+            )
+            result['status'] = 'amended'
+            result['recorded'] = True
+            result['dropped'] = dropped
+            return result
 
     def declare_pin(
         self, escalation_id: str, *, declared_by: list[str], reason: str = '',
@@ -2394,11 +2486,11 @@ class EscalationQueue:
         archived record into the pending pile — the Defect-2 class of bug that
         motivated task 1498's ``add_members_to_l2`` guard.
 
-        Does NOT touch ``status``, ``level``, ``triaged_at`` or ``updated_at``.
-        ``add_members_to_l2`` remains the SOLE ``updated_at`` writer, so that
-        signal keeps meaning exactly one thing ("real member append"); the
-        protection here is the loud refusal at resolve time, not a freshness
-        bump (see the task's design decision).
+        Does NOT touch ``status``, ``level``, ``triaged_at`` or ``updated_at``
+        — it is not among the ``updated_at`` writers ``stamp_triage``'s
+        docstring enumerates, so that signal keeps meaning "the record's
+        content changed"; the protection here is the loud refusal at resolve
+        time, not a freshness bump (see the task's design decision).
 
         Returns the updated ``Escalation``, or ``None`` when *escalation_id* is
         not found in the queue root, fails to parse, is not pending, or when
