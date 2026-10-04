@@ -153,7 +153,7 @@ Named separately from the handful of ``CLAUDE_SPAWN_*`` keys
 (``CLAUDE_SPAWN_PARENT_ID``, ``CLAUDE_SPAWN_LAUNCHER_PID``,
 ``CLAUDE_SPAWN_WM_TITLE``) because those are consulted directly by name at
 their own call sites, not funneled through identity resolution -- this set
-exists purely to drive ``_non_spawner_identity_env``.
+exists purely to drive ``_own_identity_env``.
 
 ``CLAUDE_SPAWN_PROMPT`` is the one member no assertion can pin: it is
 forwarded to ``parse_spawn_identity`` but documented there as taking no part
@@ -162,33 +162,6 @@ funnel stays complete if that ever changes. Every OTHER member is
 load-bearing and mutation-detectable -- see
 ``test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title``.
 """
-
-
-def _non_spawner_identity_env(env: Mapping[str, str]) -> Mapping[str, str]:
-    """*env* with the inherited role/project/task/escalation/title/prompt stripped.
-
-    Forked-inheritor fix (task 4663, review of task 4193): once
-    ``_resolve_hook_slug`` REJECTS an inherited ``CLAUDE_SPAWN_SESSION_ID``
-    (this event belongs to a nested ``claude`` that merely inherited the
-    variable, not the session that minted it), every remaining
-    ``CLAUDE_SPAWN_*`` identity value still in scope describes the SPAWNER,
-    not this forked session -- the same principle ``run_session_start``
-    already applies to ``parent_session_id``/display/``launcher_pid`` (see
-    its docstring). Without this, ``resolve_hook_identity`` and
-    ``hook_display_title`` would read the spawner's role/task_id/
-    escalation_id/title straight through, and the forked session's cockpit
-    row would be indistinguishable from its spawner's except by slug.
-
-    Stripping these keys makes both functions fall through to their own
-    non-spawn defaults (``role='session'``, ``project`` derived from the
-    enclosing checkout -- see ``session_registry.py::parse_spawn_identity``,
-    ``task_id=None``, ``escalation_id=None``) instead of parroting the
-    spawner's identity.
-
-    Reached only through ``_own_identity_env``, the one place that decides
-    WHEN to strip.
-    """
-    return {k: v for k, v in env.items() if k not in _SPAWNER_IDENTITY_ENV_KEYS}
 
 
 def _hook_session_id(hook_input: Mapping[str, Any]) -> str:
@@ -691,12 +664,24 @@ def _own_identity_env(
 ) -> Mapping[str, str]:
     """The env this event's OWN session identity (record body, OSC retitle) resolves from.
 
-    The raw hook env, or -- when the inherited env slug was rejected -- that
-    env with the spawner's identity keys stripped (see
-    ``_non_spawner_identity_env``). The slug itself is deliberately NOT
-    derived from this (see ``_resolve_hook_slug``).
+    The raw hook env, unless ``_resolve_hook_slug`` REJECTED an inherited
+    ``CLAUDE_SPAWN_SESSION_ID`` (tasks 4663, 4193 review): this event then
+    belongs to a nested ``claude`` that merely inherited the variable, so
+    every remaining ``CLAUDE_SPAWN_*`` identity value in scope describes the
+    SPAWNER -- the same principle ``run_session_start`` already applies to
+    ``parent_session_id``/display/``launcher_pid``. Those
+    ``_SPAWNER_IDENTITY_ENV_KEYS`` are stripped, so ``resolve_hook_identity``
+    and ``hook_display_title`` fall through to their own non-spawn defaults
+    (``role='session'``, ``project`` from the enclosing checkout -- see
+    ``session_registry.py::parse_spawn_identity`` -- ``task_id=None``,
+    ``escalation_id=None``) instead of parroting the spawner's identity.
+
+    The slug itself is deliberately NOT derived from this (see
+    ``_resolve_hook_slug``).
     """
-    return env if resolution.rejected_env_slug is None else _non_spawner_identity_env(env)
+    if resolution.rejected_env_slug is None:
+        return env
+    return {k: v for k, v in env.items() if k not in _SPAWNER_IDENTITY_ENV_KEYS}
 
 
 def _bind_claude_session_id(
