@@ -710,6 +710,29 @@ class TestPlannedEpisodePromotion:
         reconciler_with_registry.planned_episode_registry.promote.assert_called_with(ep_uuid)
 
     @pytest.mark.asyncio
+    async def test_planned_search_opts_out_of_topic_anchoring(
+        self, reconciler_with_registry, mock_memory_service
+    ):
+        """REGRESSION GUARD (task 4656): the include_planned window is post-filtered
+        on metadata['planned'], which a pinned canonical never carries, so the pin
+        could only evict genuine planned hits. The opt-out must be explicit; the
+        service-side default is True."""
+        mock_memory_service.search = AsyncMock(return_value=[])
+
+        await reconciler_with_registry.reconcile_task(
+            task_id='1', transition='done', project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': '1', 'title': 'CostStore', 'status': 'in-progress'},
+        )
+
+        planned_calls = [
+            c for c in mock_memory_service.search.call_args_list
+            if c.kwargs.get('include_planned') is True
+        ]
+        assert len(planned_calls) == 1
+        assert planned_calls[0].kwargs.get('anchor_topics') is False
+
+    @pytest.mark.asyncio
     async def test_promotion_not_called_when_no_planned_edges(
         self, reconciler_with_registry, mock_memory_service
     ):

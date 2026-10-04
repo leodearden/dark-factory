@@ -697,6 +697,13 @@ class TargetedReconciler:
         #      event happens to match it — there is no periodic/fallback sweep that
         #      re-evaluates lingering withheld episodes independent of search
         #      recall. Acceptable for this task's scope; flagged as a follow-up.
+        #
+        #      `anchor_topics=False` (task 4656): the window is post-filtered on
+        #      metadata['planned'] below, and topic-anchored canonicals never carry
+        #      it, so a pin would spend up to _MAX_ANCHOR_TOPICS of the 10 slots on
+        #      records discarded by that filter and evict genuine planned hits —
+        #      worsening the recall limitation above. Same bounded-window +
+        #      post-filter shape as reconciliation/mem0_dedup.py::find_prior_memory.
         if self.planned_episode_registry is not None:
             try:
                 planned_related = await self.memory.search(
@@ -705,6 +712,7 @@ class TargetedReconciler:
                     limit=10,
                     causation_id=run_id,
                     include_planned=True,
+                    anchor_topics=False,
                 )
                 ep_uuids = {
                     ep
