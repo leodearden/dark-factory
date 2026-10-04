@@ -29,13 +29,17 @@ wherever pytest was invoked.
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 from fused_memory.utils.target_store_preflight import (
     TargetStoreMissing,
-    assert_queue_dir_exists,
+    assert_queue_dir_populated,
     assert_target_store_exists,
     assert_task_store_exists,
     task_store_path,
@@ -46,6 +50,90 @@ _KWARGS = {
     'what': 'the durable escalation queue directory',
     'remedy': 'pass an absolute --queue-dir, or run from the project root',
 }
+
+
+def _seed_one_escalation(queue_dir: Path) -> tuple[EscalationQueue, Escalation]:
+    """Submit one pending record through the REAL queue, never hand-rolled JSON."""
+    queue = EscalationQueue(queue_dir)
+    escalation = Escalation(
+        id=f'esc-1-{uuid.uuid4().hex[:8]}',
+        task_id='1',
+        agent_role='reconciler',
+        severity='info',
+        category='recon_integrity_issue',
+        summary='Non-actionable integrity finding: test.',
+        timestamp=datetime.now(UTC).isoformat(),
+    )
+    queue.submit(escalation)
+    return queue, escalation
+
+
+class TestQueueDirArm:
+    """The queue arm refuses unless the directory HOLDS at least one entry.
+
+    Existence alone cannot separate "wrong location" from "genuinely quiet":
+    ``EscalationQueue.__init__`` mkdirs its target and ``get_pending()`` writes
+    nothing, so the residue a mis-targeted run leaves is an EMPTY directory.
+    Every shape here is built by the real queue, not approximated by hand.
+    """
+
+    def test_an_existing_empty_directory_is_refused_and_left_empty(self, tmp_path: Path):
+        queue_dir = tmp_path / 'escalations'
+        queue_dir.mkdir()
+
+        with pytest.raises(TargetStoreMissing):
+            assert_queue_dir_populated(queue_dir, operation='dismiss_recon_integrity_noise')
+
+        assert queue_dir.is_dir()
+        assert list(queue_dir.iterdir()) == []
+
+    def test_the_residue_a_mis_targeted_run_leaves_is_refused(self, tmp_path: Path):
+        """The measured shape: a real queue constructed and read on a fresh path."""
+        queue_dir = tmp_path / 'data' / 'reconciliation' / 'escalations'
+        assert EscalationQueue(queue_dir).get_pending() == []
+
+        with pytest.raises(TargetStoreMissing):
+            assert_queue_dir_populated(queue_dir, operation='backfill_recon_escalations')
+
+    def test_a_queue_holding_a_pending_escalation_passes(self, tmp_path: Path):
+        _seed_one_escalation(tmp_path)
+
+        assert assert_queue_dir_populated(tmp_path, operation='op') is None
+
+    def test_a_queue_whose_only_record_was_resolved_still_passes(self, tmp_path: Path):
+        """A queue that has minted once is never empty again.
+
+        Which entries survive the resolve is the queue's business, so it is
+        deliberately not asserted; only that a genuinely quiet live queue is
+        not mistaken for the residue of a mis-targeted run.
+        """
+        queue, escalation = _seed_one_escalation(tmp_path)
+        queue.resolve(escalation.id, 'note', resolved_by='test')
+        assert queue.get_pending() == []
+
+        assert assert_queue_dir_populated(tmp_path, operation='op') is None
+
+    def test_a_regular_file_at_the_queue_path_fails_open(self, tmp_path: Path):
+        """An unreadable target is not refused: the queue's own mkdir fails loudly."""
+        not_a_dir = tmp_path / 'escalations'
+        not_a_dir.write_text('not a queue')
+
+        assert assert_queue_dir_populated(not_a_dir, operation='op') is None
+
+    def test_the_empty_refusal_names_operation_resolved_path_and_flag(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.chdir(tmp_path)
+        relative = Path('escalations')
+        relative.mkdir()
+
+        with pytest.raises(TargetStoreMissing) as excinfo:
+            assert_queue_dir_populated(relative, operation='derive_orphaned_recon_escalations')
+
+        message = str(excinfo.value)
+        assert 'derive_orphaned_recon_escalations' in message
+        assert str(tmp_path / relative) in message
+        assert '--queue-dir' in message
 
 
 class TestPassesForAnExistingTarget:
@@ -159,7 +247,7 @@ class TestExceptionType:
 class TestFamilyWrappers:
     """The two entry points the six scripts actually call.
 
-    ``assert_task_store_exists`` / ``assert_queue_dir_exists`` exist so that
+    ``assert_task_store_exists`` / ``assert_queue_dir_populated`` exist so that
     only ``operation`` varies between call sites: the target derivation and the
     family-constant ``what``/``remedy`` prose live in one place instead of six
     (task 4319 amendment pass).  What is pinned here is that they are genuinely
@@ -186,17 +274,19 @@ class TestFamilyWrappers:
         assert '--project-root' in message
         assert not (tmp_path / '.taskmaster').exists()
 
-    def test_queue_dir_wrapper_passes_when_the_directory_exists(self, tmp_path: Path):
+    def test_queue_dir_wrapper_passes_when_the_queue_holds_a_record(self, tmp_path: Path):
         queue_dir = tmp_path / 'escalations'
-        queue_dir.mkdir()
+        _seed_one_escalation(queue_dir)
 
-        assert assert_queue_dir_exists(queue_dir, operation='backfill_recon_escalations') is None
+        assert assert_queue_dir_populated(
+            queue_dir, operation='backfill_recon_escalations',
+        ) is None
 
     def test_queue_dir_wrapper_refuses_and_creates_nothing(self, tmp_path: Path):
         queue_dir = tmp_path / 'data' / 'reconciliation' / 'escalations'
 
         with pytest.raises(TargetStoreMissing) as excinfo:
-            assert_queue_dir_exists(queue_dir, operation='backfill_recon_escalations')
+            assert_queue_dir_populated(queue_dir, operation='backfill_recon_escalations')
 
         message = str(excinfo.value)
         assert 'backfill_recon_escalations' in message
@@ -214,7 +304,7 @@ class TestFamilyWrappers:
         with pytest.raises(TargetStoreMissing) as task_exc:
             assert_task_store_exists(tmp_path, operation='op')
         with pytest.raises(TargetStoreMissing) as queue_exc:
-            assert_queue_dir_exists(tmp_path / 'absent', operation='op')
+            assert_queue_dir_populated(tmp_path / 'absent', operation='op')
 
         assert '--queue-dir' not in str(task_exc.value)
         assert '--project-root' not in str(queue_exc.value)
