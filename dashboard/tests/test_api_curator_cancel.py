@@ -273,10 +273,7 @@ def test_all_servers_unreachable_returns_502(client, exc):
     refactor that drops one of these types will fail this parametrized test,
     surfacing the contract break immediately.
     """
-    with patch(
-        _PATCH_TARGET,
-        new=AsyncMock(side_effect=exc),
-    ) as mock_mcp:
+    with _patched_cancel_seams(exc) as (mock_mcp, _seams):
         resp = client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
@@ -421,9 +418,12 @@ def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
     transport error (rather than short-circuiting and returning 502 too early).
     """
     mcp_result = {'status': 'cancelled', 'ticket_id': 'tkt_abc'}
-    side_effects = [httpx.ConnectError('refused'), mcp_result]
+    outcomes = _PerUrl({
+        'http://localhost:9000': httpx.ConnectError('refused'),
+        'http://localhost:9001': mcp_result,
+    })
 
-    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=side_effects)) as mock_mcp:
+    with _patched_cancel_seams(outcomes) as (mock_mcp, _seams):
         resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_abc'},
@@ -446,7 +446,7 @@ def test_two_url_not_found_short_circuits_loop(two_url_client):
     """
     mcp_result = {'error': 'not_found', 'ticket_id': 'tkt_missing'}
 
-    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+    with _patched_cancel_seams(mcp_result) as (mock_mcp, _seams):
         resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_missing'},
@@ -466,10 +466,7 @@ def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
     are unreachable, so the handler returns 502 with the error key
     'fused_memory_unreachable' and includes each server URL in the detail string.
     """
-    with patch(
-        _PATCH_TARGET,
-        new=AsyncMock(side_effect=httpx.ConnectError('refused')),
-    ) as mock_mcp:
+    with _patched_cancel_seams(httpx.ConnectError('refused')) as (mock_mcp, _seams):
         resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
@@ -528,7 +525,7 @@ def test_cancel_handler_not_found_does_not_fan_out(two_url_client):
     """
     mcp_result = {'error': 'not_found', 'ticket_id': 'tkt_missing'}
 
-    with patch(_PATCH_TARGET, new=AsyncMock(return_value=mcp_result)) as mock_mcp:
+    with _patched_cancel_seams(mcp_result) as (mock_mcp, _seams):
         resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_missing'},
