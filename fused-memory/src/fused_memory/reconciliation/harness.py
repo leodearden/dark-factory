@@ -58,6 +58,7 @@ from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
     FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
+    is_routable_task_id,
     resolve_finding_task_target,
 )
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
@@ -2947,6 +2948,7 @@ class ReconciliationHarness:
           supplied as None and
           :func:`~fused_memory.reconciliation.finding_task_escalation.resolve_finding_task_target`
           also returned None;
+        - the target is not a routable queue key (``is_routable_task_id``);
         - the project is not registered in ``_known_projects``;
         - no orchestrator is live for that root, so nothing would drain the
           record;
@@ -2996,6 +2998,13 @@ class ReconciliationHarness:
                     'run_id': run_id,
                     'finding_category': finding.get('category', ''),
                 },
+            )
+            return None
+        # A supplied target skipped the resolver's shape check; re-check before any I/O.
+        if not is_routable_task_id(task_id):
+            logger.warning(
+                'reconciliation.finding_task_escalation_unroutable_target',
+                extra={'project_id': project_id, 'run_id': run_id, 'task_id': task_id},
             )
             return None
 
