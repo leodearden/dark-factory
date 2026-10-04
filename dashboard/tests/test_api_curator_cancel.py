@@ -45,6 +45,11 @@ def _tool_name(c):
     return c.kwargs.get('tool_name')
 
 
+def _cancel_ticket_calls(mock_mcp: AsyncMock) -> list[Any]:
+    """The handler's own ``mcp_tool_call`` dials: no background sampler dials cancel_ticket."""
+    return [c for c in mock_mcp.call_args_list if _tool_name(c) == 'cancel_ticket']
+
+
 async def _concurrent_background_leg(url: str) -> None:
     """Run one failing sampler-shaped leg against *url* in a separate task, to completion.
 
@@ -207,12 +212,8 @@ def test_successful_proxy_forwards_verbatim(client, mcp_result):
     assert resp.json() == mcp_result
 
     # The cancel handler must call cancel_ticket exactly once with the correct
-    # args.  Background tasks (metrics loop) may also call mcp_tool_call for
-    # get_status / get_queue_stats probes during the test window; filter those
-    # out so the assertion targets only the handler's own MCP call.
-    # _tool_name() filters the call list by tool name; the positional
-    # destructure below still assumes positional invocation.
-    cancel_calls = [c for c in mock_mcp.call_args_list if _tool_name(c) == 'cancel_ticket']
+    # args.  The positional destructure below assumes positional invocation.
+    cancel_calls = _cancel_ticket_calls(mock_mcp)
     assert len(cancel_calls) == 1, (
         f'Expected exactly 1 cancel_ticket call, got {len(cancel_calls)}: {cancel_calls}'
     )
@@ -284,8 +285,8 @@ def test_all_servers_unreachable_returns_502(client, exc):
     assert data.get('error') == 'fused_memory_unreachable'
     assert 'detail' in data
     assert isinstance(data['detail'], str)
-    # Default config has exactly one URL → exactly one MCP attempt
-    assert mock_mcp.call_count == 1
+    # Default config has exactly one URL → exactly one cancel_ticket dial
+    assert len(_cancel_ticket_calls(mock_mcp)) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -431,10 +432,11 @@ def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
 
     assert resp.status_code == 200
     assert resp.json() == mcp_result
-    # Both URLs must have been tried
-    assert mock_mcp.call_count == 2
-    urls_called = [c.args[1] for c in mock_mcp.call_args_list]
-    assert urls_called == ['http://localhost:9000', 'http://localhost:9001']
+    # Both URLs must have been tried, in order
+    assert [c.args[1] for c in _cancel_ticket_calls(mock_mcp)] == [
+        'http://localhost:9000',
+        'http://localhost:9001',
+    ]
 
 
 def test_two_url_not_found_short_circuits_loop(two_url_client):
@@ -455,8 +457,7 @@ def test_two_url_not_found_short_circuits_loop(two_url_client):
     assert resp.status_code == 404
     assert resp.json() == mcp_result
     # Only URL[0] must have been called; URL[1] must be skipped
-    assert mock_mcp.call_count == 1
-    assert mock_mcp.call_args.args[1] == 'http://localhost:9000'
+    assert [c.args[1] for c in _cancel_ticket_calls(mock_mcp)] == ['http://localhost:9000']
 
 
 def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
@@ -466,7 +467,7 @@ def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
     are unreachable, so the handler returns 502 with the error key
     'fused_memory_unreachable' and includes each server URL in the detail string.
     """
-    with _patched_cancel_seams(httpx.ConnectError('refused')) as (mock_mcp, _seams):
+    with _patched_cancel_seams(httpx.ConnectError('refused')) as (mock_mcp, seams):
         resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
@@ -479,7 +480,10 @@ def test_two_url_all_unreachable_returns_502_with_both_urls(two_url_client):
     # Both server URLs must appear in the error detail
     assert 'localhost:9000' in detail
     assert 'localhost:9001' in detail
-    assert mock_mcp.call_count == 2
+    assert len(_cancel_ticket_calls(mock_mcp)) == 2
+    assert seams.foreign_invalidations(), (
+        'background traffic must have been present while the dial count stayed exact'
+    )
 
 
 def test_two_url_all_unreachable_invalidates_each_session_in_order(two_url_client):
@@ -520,7 +524,7 @@ def test_cancel_handler_not_found_does_not_fan_out(two_url_client):
     ``mcp_fanout.first_success``: first_success stops at the first ``_call``
     that does not raise, so a not_found JSONResponse must short-circuit the
     fan-out exactly like the original for-loop's early
-    ``return JSONResponse(result, 404)`` — mcp_tool_call must be invoked
+    ``return JSONResponse(result, 404)`` — cancel_ticket must be dialed
     exactly once (never falling through to url[1]).
     """
     mcp_result = {'error': 'not_found', 'ticket_id': 'tkt_missing'}
@@ -533,8 +537,7 @@ def test_cancel_handler_not_found_does_not_fan_out(two_url_client):
 
     assert resp.status_code == 404
     assert resp.json() == mcp_result
-    assert mock_mcp.call_count == 1
-    assert mock_mcp.call_args.args[1] == 'http://localhost:9000'
+    assert [c.args[1] for c in _cancel_ticket_calls(mock_mcp)] == ['http://localhost:9000']
 
 
 # ---------------------------------------------------------------------------
