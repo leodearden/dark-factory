@@ -373,7 +373,7 @@ def _is_held(path: Path) -> bool | None:
     The probe is ``LOCK_SH``, not ``LOCK_EX``: two sweepers running at once
     must not exclude each other and mistake a peer's probe for a live run.
     Shape copied from
-    ``fused_memory/middleware/ticket_janitor.py::_orchestrator_running``;
+    ``fused_memory/services/orchestrator_detector.py::is_orchestrator_lock_held``;
     copied rather than imported because cron runs this file under the system
     ``python3``, where ``fused_memory`` is not importable.
     """

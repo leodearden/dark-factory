@@ -329,23 +329,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         _FIXED_STAT_GUARD_WHY,
     ),
 
-    # ---- middleware/curator_escalator.py ----
-    (
-        'fused-memory/src/fused_memory/middleware/curator_escalator.py',
-        'CuratorEscalator.report_failure',
-        '3ba9760c42a6',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): the orchestrator-liveness probe '
-        '(_orchestrator_running in middleware/ticket_janitor.py and '
-        'middleware/curator_escalator.py, plus '
-        'ticket_janitor._surface_probe_defect which reaches it) takes an '
-        'fcntl.flock on the loop thread. A lock wait is bounded only by '
-        'ANOTHER process\'s hold time, which this one does not control -- '
-        'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
-        'never enumerated. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
-    ),
-
     # ---- middleware/task_interceptor.py ----
     (
         'fused-memory/src/fused_memory/middleware/task_interceptor.py',
@@ -367,38 +350,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'd7b1b643f3fe',
         'accepted',
         _COMBINE_AUDIT_APPEND_WHY,
-    ),
-
-    # ---- middleware/ticket_janitor.py ----
-    (
-        'fused-memory/src/fused_memory/middleware/ticket_janitor.py',
-        'TicketJanitor.tick',
-        '90eccb740171',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): the orchestrator-liveness probe '
-        '(_orchestrator_running in middleware/ticket_janitor.py and '
-        'middleware/curator_escalator.py, plus '
-        'ticket_janitor._surface_probe_defect which reaches it) takes an '
-        'fcntl.flock on the loop thread. A lock wait is bounded only by '
-        'ANOTHER process\'s hold time, which this one does not control -- '
-        'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
-        'never enumerated. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
-    ),
-    (
-        'fused-memory/src/fused_memory/middleware/ticket_janitor.py',
-        'TicketJanitor.tick',
-        'f0c22189ed58',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): the orchestrator-liveness probe '
-        '(_orchestrator_running in middleware/ticket_janitor.py and '
-        'middleware/curator_escalator.py, plus '
-        'ticket_janitor._surface_probe_defect which reaches it) takes an '
-        'fcntl.flock on the loop thread. A lock wait is bounded only by '
-        'ANOTHER process\'s hold time, which this one does not control -- '
-        'the lock limb of INV-8 that task 3778\'s subprocess-only vocabulary '
-        'never enumerated. Follow-up filed by task 4484 step-9.'
-        ' Ticket: tkt_0RT7QZ4R9MQHJP4MKS78DXQ2Z9.',
     ),
 
     # ---- middleware/ticket_store.py ----
