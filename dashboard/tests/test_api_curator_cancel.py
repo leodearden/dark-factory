@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
-from typing import cast
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from collections.abc import Awaitable, Callable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, cast
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -27,6 +28,7 @@ from dashboard.data import memory as memory_data
 # ---------------------------------------------------------------------------
 
 _PATCH_TARGET = 'dashboard.data.memory.mcp_tool_call'
+_INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
 
 
 def _tool_name(c):
@@ -59,6 +61,39 @@ async def _concurrent_background_leg(url: str) -> None:
     await asyncio.get_running_loop().create_task(_failing_sampler_leg())
 
 
+@dataclass
+class _CancelSeams:
+    """What the cancel request did through the two patched seams, by asyncio task.
+
+    The lifespan's samplers drive these same module-global seams concurrently
+    with the request, so only calls made by the task that dialed cancel_ticket
+    are the handler's.  ``call_with_deadline`` bounds a dial with
+    ``asyncio.timeout``, not a new task, so the handler's ``mcp_tool_call``
+    dials and ``first_success``'s ``invalidate_session`` calls share that task.
+    """
+
+    request_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+    invalidations: list[tuple[asyncio.Task[Any] | None, str]] = field(default_factory=list)
+
+    def record_cancel_dial(self) -> None:
+        task = asyncio.current_task()
+        assert task is not None, 'cancel_ticket is only ever dialed from a coroutine'
+        self.request_tasks.add(task)
+
+    def record_invalidation(self, url: str) -> None:
+        try:
+            task = asyncio.current_task()
+        except RuntimeError:
+            task = None
+        self.invalidations.append((task, url))
+
+    def handler_invalidations(self) -> list[str]:
+        return [url for task, url in self.invalidations if task in self.request_tasks]
+
+    def foreign_invalidations(self) -> list[str]:
+        return [url for task, url in self.invalidations if task not in self.request_tasks]
+
+
 @dataclass(frozen=True)
 class _PerUrl:
     """Scripted cancel_ticket outcomes keyed by URL, for fan-out tests."""
@@ -66,13 +101,13 @@ class _PerUrl:
     outcomes: Mapping[str, object]
 
 
-def _cancel_script(outcome: object) -> Callable[..., Awaitable[object]]:
+def _cancel_script(outcome: object, seams: _CancelSeams) -> Callable[..., Awaitable[object]]:
     """Script ``mcp_tool_call``: *outcome* answers cancel_ticket; any other tool gets ``{}``.
 
     *outcome* applies to every URL, or is a :class:`_PerUrl`.  A BaseException
-    outcome is raised, anything else returned.  Every cancel_ticket dial first
-    awaits :func:`_concurrent_background_leg`, so each test runs under the
-    worst-case sampler interleaving on every host.
+    outcome is raised, anything else returned.  Every cancel_ticket dial is
+    recorded in *seams*, then awaits :func:`_concurrent_background_leg`, so each
+    test runs under the worst-case sampler interleaving on every host.
     """
 
     async def _scripted_mcp_tool_call(
@@ -80,6 +115,7 @@ def _cancel_script(outcome: object) -> Callable[..., Awaitable[object]]:
     ) -> object:
         if tool_name != 'cancel_ticket':
             return {}
+        seams.record_cancel_dial()
         await _concurrent_background_leg(url)
         result = outcome.outcomes[url] if isinstance(outcome, _PerUrl) else outcome
         if isinstance(result, BaseException):
@@ -87,6 +123,18 @@ def _cancel_script(outcome: object) -> Callable[..., Awaitable[object]]:
         return result
 
     return _scripted_mcp_tool_call
+
+
+@contextmanager
+def _patched_cancel_seams(outcome: object) -> Iterator[tuple[AsyncMock, _CancelSeams]]:
+    """Script ``mcp_tool_call`` with :func:`_cancel_script` and record ``invalidate_session``."""
+    seams = _CancelSeams()
+    mock_mcp = AsyncMock(side_effect=_cancel_script(outcome, seams))
+    with (
+        patch(_PATCH_TARGET, new=mock_mcp),
+        patch(_INVALIDATE_TARGET, new=seams.record_invalidation),
+    ):
+        yield mock_mcp, seams
 
 
 # ---------------------------------------------------------------------------
@@ -259,25 +307,19 @@ def test_cancel_handler_invalidates_session_on_transport_error(client):
     Verifies that the cancel handler routes through invalidate_session (the
     public helper) rather than reaching into memory_data._sessions directly,
     ensuring the module-boundary contract introduced in task-1285/step-4.
+    The assertion is scoped to the request's own task; see :class:`_CancelSeams`.
     """
-    _INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
     configured_url = client.app.state.config.fused_memory_urls[0]
 
-    with (
-        patch(
-            _PATCH_TARGET,
-            new=AsyncMock(side_effect=_cancel_script(httpx.ConnectError('refused'))),
-        ),
-        patch(_INVALIDATE_TARGET, new=MagicMock()) as mock_invalidate,
-    ):
+    with _patched_cancel_seams(httpx.ConnectError('refused')) as (_mock_mcp, seams):
         resp = client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
         )
 
     assert resp.status_code == 502
-    # invalidate_session must have been called exactly once with the failing URL
-    assert mock_invalidate.call_args_list == [call(configured_url)]
+    assert seams.handler_invalidations() == [configured_url]
+    assert configured_url in seams.foreign_invalidations()
 
 
 # ---------------------------------------------------------------------------
@@ -450,25 +492,21 @@ def test_two_url_all_unreachable_invalidates_each_session_in_order(two_url_clien
     memory_data.invalidate_session(url) exactly once before moving to the
     next server.  Any future refactor that batches these calls (e.g. moves
     invalidation to after the loop), removes them, or skips them for certain
-    error types will fail this assertion immediately.
+    error types will fail this assertion immediately.  Only the request's own
+    calls count; see :class:`_CancelSeams`.
     """
-    _INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
-    with (
-        patch(
-            _PATCH_TARGET,
-            new=AsyncMock(side_effect=_cancel_script(httpx.ConnectError('refused'))),
-        ),
-        patch(_INVALIDATE_TARGET, new=MagicMock()) as mock_invalidate,
-    ):
-        two_url_client.post(
+    urls = ['http://localhost:9000', 'http://localhost:9001']
+    with _patched_cancel_seams(httpx.ConnectError('refused')) as (_mock_mcp, seams):
+        resp = two_url_client.post(
             '/api/v2/dashboard/curator/cancel',
             json={'ticket_id': 'tkt_xyz'},
         )
 
-    assert mock_invalidate.call_args_list == [
-        call('http://localhost:9000'),
-        call('http://localhost:9001'),
-    ]
+    assert resp.status_code == 502
+    assert seams.handler_invalidations() == urls
+    assert set(urls) <= set(seams.foreign_invalidations()), (
+        'the concurrent background invalidations must have been recorded and excluded'
+    )
 
 
 # ---------------------------------------------------------------------------
