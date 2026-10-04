@@ -2546,29 +2546,16 @@ _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     {
     # test_cli.py -- 1 site at 120s
     ('test_cli.py', 'test_verify_merge_cancel_end_to_end'),
-    # test_crash_recovery.py -- 6 sites at 180s
-    ('test_crash_recovery.py', 'TestRecoverCrashedTasksWarmLane'),
-    ('test_crash_recovery.py', 'TestRecoverCrashedTasksWarmLaneEdgeCases'),
-    ('test_crash_recovery.py', 'TestRecoverCrashedTasksPoolStorageAbsentGuard'),
-    ('test_crash_recovery.py', 'TestRecoverCrashedTasksNoPoolConfiguredNoOp'),
-    ('test_crash_recovery.py', 'TestRecordDrivenRecovery'),
-    ('test_crash_recovery.py', 'TestRecordDrivenRecoveryCompatAndRelocation'),
     # test_laptop_warm_verify_boundary.py -- 2 sites at 180s
     ('test_laptop_warm_verify_boundary.py', 'test_flock_wait_env_override_speeds_up_contention_result'),
     ('test_laptop_warm_verify_boundary.py', 'test_watchdog_timeout_env_override_fires_fast_without_heartbeat'),
     # test_marker_registration_drift.py -- 2 sites at 120s
     ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_every_marker_applied_under_tests_is_registered'),
     ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_the_sweep_is_not_vacuous'),
-    # test_merge_queue_request_liveness.py -- 1 site at 180s
-    ('test_merge_queue_request_liveness.py', 'TestDeadVerifyAbortSelfHealsEndToEnd'),
-    # test_merge_queue_restart_hook.py -- 1 site at 180s
-    ('test_merge_queue_restart_hook.py', 'test_stop_does_not_preempt_finalizing_head_mid_advance'),
     # test_merge_verify_survivor_barrier.py -- 3 sites at 90s/120s
     ('test_merge_verify_survivor_barrier.py', 'TestReapMergeVerifySurvivors::test_knob_on_reaps_real_survivor_and_excludes_own_group'),
     ('test_merge_verify_survivor_barrier.py', 'TestReapMergeVerifySurvivors::test_residual_survivor_returns_false_and_logs_error'),
     ('test_merge_verify_survivor_barrier.py', 'TestReapMergeVerifySurvivors::test_integration_reap_then_reset_succeeds_on_clear_tree'),
-    # test_merge_worktree_lifecycle_integration_gate.py -- 1 site at 180s
-    ('test_merge_worktree_lifecycle_integration_gate.py', 'TestFiveThreeTwoSixReplayGate'),
     # test_offline_lane_infra_integration.py -- 3 sites at 120s/150s
     ('test_offline_lane_infra_integration.py', 'test_out_of_bound_spawn_counts_are_measured_not_asserted'),
     ('test_offline_lane_infra_integration.py', 'test_ib2_infra_run_in_flight_never_gates_merge'),
@@ -2583,10 +2570,6 @@ _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     ('test_shutdown.py', 'test_sigterm_exits_within_deadline'),
     # test_warm_lane_bash_bucket_placement.py -- 1 site at 120s
     ('test_warm_lane_bash_bucket_placement.py', 'test_the_configured_lane_command_actually_collects_the_bucket'),
-    # test_workflow_cancellation.py -- 3 sites at 180s
-    ('test_workflow_cancellation.py', 'TestRunSingleCatchHardCancel'),
-    ('test_workflow_cancellation.py', 'TestSoftCancelCoversNewAwait'),
-    ('test_workflow_cancellation.py', 'TestHarnessSyntheticCancelRetirement'),
     }
 )
 
