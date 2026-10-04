@@ -48,8 +48,10 @@ const STALE_FAILURE_THRESHOLD = 3
 // one-line edit here. endpoint_staleness.test.mjs machine-checks BOTH
 // directions — every path is a real endpointsFor() key, and every app.jsx tab
 // id has an entry — because a map that silently stops matching a renamed
-// endpoint is a check that has quietly stopped checking. `toolbarConfig` in
-// app.jsx is the sibling per-tab map; keep the two tab-id lists in step.
+// endpoint is a check that has quietly stopped checking. test_app_poll_scope.py
+// walks each tab's components and fails when a path the tab reads is missing
+// from its entry. `toolbarConfig` in app.jsx is the sibling per-tab map; keep
+// the two tab-id lists in step.
 //
 // LIST /tasks FOR A TAB ONLY IF IT RENDERS TASK ROWS. Listing it polls the full
 // multi-MB render on that tab; the census every tab's chrome reads is already
