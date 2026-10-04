@@ -541,3 +541,71 @@ async def test_causation_search_row_carries_the_widened_shape(service, write_jou
         'The query bound is disclosed on this row too — one contract, three '
         f'producers. got {params!r}.'
     )
+
+
+# ── task 3716: per-call backend telemetry on the persisted Layer-2 row ──
+#
+# The 10 ms sleep is the floor; 9.0 ms leaves ~1 ms for asyncio firing a timer
+# up to one clock resolution early (perf_counter and the loop clock are both
+# CLOCK_MONOTONIC on Linux).
+
+_SLEEP_SECONDS = 0.01
+_MIN_MEASURED_MS = 9.0
+
+
+@pytest.mark.asyncio
+async def test_successful_backend_call_persists_measured_duration_ms(
+    service, write_journal
+):
+    cid = str(uuid.uuid4())
+
+    async def _slow_add(*_args, **_kwargs):
+        await asyncio.sleep(_SLEEP_SECONDS)
+        return {'results': [{'id': 'mem0-1'}]}
+
+    service.mem0.add = _slow_add
+
+    await service.add_memory(
+        content='a fact that takes a while to land',
+        category='preferences_and_norms',
+        project_id='test',
+        causation_id=cid,
+    )
+
+    ops = await write_journal.get_ops_by_causation(cid)
+    [mem0_add] = [
+        o for o in ops
+        if o['layer'] == 'backend_op' and o['backend'] == 'mem0' and o['operation'] == 'add'
+    ]
+    assert isinstance(mem0_add['duration_ms'], float)
+    assert mem0_add['duration_ms'] >= _MIN_MEASURED_MS
+
+
+@pytest.mark.asyncio
+async def test_failed_backend_call_still_persists_measured_duration_ms(
+    service, write_journal
+):
+    cid = str(uuid.uuid4())
+    op_id = str(uuid.uuid4())
+
+    async def _slow_failing_add(*_args, **_kwargs):
+        await asyncio.sleep(_SLEEP_SECONDS)
+        raise RuntimeError('mem0 exploded after burning time')
+
+    service.mem0.add = _slow_failing_add
+
+    with pytest.raises(RuntimeError):
+        await service._execute_mem0_write(
+            {
+                'content': 'a fact that never lands',
+                'project_id': 'test',
+                '_causation_id': cid,
+                '_write_op_id': op_id,
+                'metadata': {'category': 'preferences_and_norms'},
+            }
+        )
+
+    [backend_row] = await write_journal.get_backend_ops_for_write_op(op_id)
+    assert backend_row['success'] == 0
+    assert isinstance(backend_row['duration_ms'], float)
+    assert backend_row['duration_ms'] >= _MIN_MEASURED_MS
