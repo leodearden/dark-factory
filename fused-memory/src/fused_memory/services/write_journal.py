@@ -1,4 +1,11 @@
-"""SQLite-backed write journal for durable auditing of all memory writes."""
+"""SQLite-backed write journal for durable auditing of all memory writes.
+
+``OPERATOR_TELEMETRY_QUERY`` is the read-only per-write telemetry query, and
+OPERATIONS.md §11 carries the operator copy. In it, a NULL
+``backend_ops.duration_ms`` means the row predates the column; a value is the
+measured backend-call time, excluding identity-lock and queue wait. Its token
+columns are populated only on graphiti LLM-bearing writes.
+"""
 
 from __future__ import annotations
 
@@ -270,6 +277,30 @@ CREATE TABLE IF NOT EXISTS referent_findings (
 -- watchdog grace; this table starts EMPTY so that build is free today, and must
 -- not be multiplied later without taking that measurement again.
 CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, created_at);
+"""
+
+#: Parameters: ``(since_iso_timestamp, limit)``.
+OPERATOR_TELEMETRY_QUERY = """
+SELECT
+    bo.created_at AS created_at,
+    wo.operation AS operation,
+    wo.project_id AS project_id,
+    bo.backend AS backend,
+    bo.success AS success,
+    bo.duration_ms AS duration_ms,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.input_tokens') END AS input_tokens,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.output_tokens') END AS output_tokens,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.total_tokens') END AS total_tokens,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.llm_calls') END AS llm_calls
+FROM backend_ops AS bo
+LEFT JOIN write_ops AS wo ON wo.id = bo.write_op_id
+WHERE bo.created_at >= ?
+ORDER BY bo.created_at DESC
+LIMIT ?
 """
 
 
