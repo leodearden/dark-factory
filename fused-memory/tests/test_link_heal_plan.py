@@ -2,16 +2,28 @@
 
 Every case runs ``build_plan`` against the in-process server in
 ``_link_heal_harness``: the census enumerates the linked ids, and every value
-the table reads comes back through the server's own tools.
+the table reads comes back through the server's own tools. The last section
+runs ``run_plan``, the non-writing run that ledgers the plan and writes its
+document.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
 from _link_heal_harness import ALL_LINK_HEAL_PREFIXES, LinkHealHarness, build_harness
+from fused_memory.maintenance.link_heal_executor import (
+    BACKLOG_ANCHOR,
+    WRITE_FAILURE_ANCHOR,
+    RunLimits,
+    RunReport,
+    render_plan_document,
+    run_plan,
+)
 
 from fused_memory.maintenance.link_heal import (
     BasisSource,
@@ -23,6 +35,7 @@ from fused_memory.maintenance.link_heal import (
     Verdict,
     build_plan,
 )
+from fused_memory.maintenance.link_heal_ledger import ActionState, LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_store import text_sha256
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
@@ -353,3 +366,227 @@ class TestRunCounts:
         assert document['caps_bit'] == ['max_actions_per_run']
         assert document['complete'] is False
         assert document['stopped_by'] is None
+
+
+DEFAULT_LIMITS = RunLimits(max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3)
+DANGLING_CHILD = '99999999-9999-4999-8999-999999999999'
+DELETED_PARENT = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+SECOND_TEXT, SECOND_PARENT_TEXT = 'a second child', 'a second parent'
+
+
+@pytest.fixture
+def ledger(tmp_path):
+    opened = LinkHealLedger(tmp_path / 'link_heal.db')
+    yield opened
+    opened.close()
+
+
+def seed_three_heals(harness: LinkHealHarness) -> tuple[LinkBasis, ...]:
+    """A misfiled amendment, an EXTENDS sighting and a dangling link: three heals."""
+    seed_link(harness)
+    seed_link(
+        harness, child=SECOND_CHILD, parent=OTHER_PARENT, kind=SIGHTING_KIND,
+        child_text=SECOND_TEXT, parent_text=SECOND_PARENT_TEXT,
+    )
+    seed_link(
+        harness, child=DANGLING_CHILD, parent=DELETED_PARENT, parent_text=None,
+        child_text='a note whose parent was deleted',
+    )
+    return (
+        corpus_basis('RELATED'),
+        corpus_basis(
+            'EXTENDS', child=SECOND_CHILD, parent=OTHER_PARENT, key='H002',
+            child_text=SECOND_TEXT, parent_text=SECOND_PARENT_TEXT,
+        ),
+    )
+
+
+async def run_corpus_plan(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    plan_path: Path,
+    bases: tuple[LinkBasis, ...],
+    limits: RunLimits = DEFAULT_LIMITS,
+) -> RunReport:
+    return await run_plan(
+        bases,
+        store=harness.store(),
+        census=harness.mem0,
+        ledger=ledger,
+        limits=limits,
+        projects=PROJECTS,
+        source=RunSource.CORPUS,
+        plan_path=plan_path,
+    )
+
+
+class TestRunPlanLedgersANonWritingRun:
+    @pytest.mark.asyncio
+    async def test_records_exactly_one_finished_non_writing_run(self, harness, ledger, tmp_path):
+        report = await run_corpus_plan(
+            harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness),
+        )
+
+        (run,) = ledger.recent_runs(10)
+        assert run.run_id == report.run_id
+        assert run.source is RunSource.CORPUS
+        assert run.writes is False
+        assert run.finished_at is not None
+        assert run.counts == report.counts.as_json()
+        assert run.plan_sha256 == report.plan_sha256
+
+    @pytest.mark.asyncio
+    async def test_every_planned_action_is_an_actions_row_in_state_planned(
+        self, harness, ledger, tmp_path,
+    ):
+        bases = seed_three_heals(harness)
+        expected = await plan(harness, *bases)
+
+        report = await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases)
+
+        rows = ledger.run_actions(report.run_id)
+        assert {row.state for row in rows} == {ActionState.PLANNED}
+        assert [row.planned for row in rows] == list(expected.actions)
+        assert report.counts.planned == 3
+
+    @pytest.mark.asyncio
+    async def test_the_plan_document_is_written_and_its_sha_ledgered(
+        self, harness, ledger, tmp_path,
+    ):
+        plan_path = tmp_path / 'plan.json'
+
+        report = await run_corpus_plan(harness, ledger, plan_path, seed_three_heals(harness))
+
+        assert report.plan_path == plan_path
+        written = plan_path.read_bytes()
+        assert hashlib.sha256(written).hexdigest() == report.plan_sha256
+        assert ledger.resolve_run(report.run_id).plan_sha256 == report.plan_sha256
+
+    @pytest.mark.asyncio
+    async def test_the_plan_document_is_the_rendering_of_the_pending_rows(
+        self, harness, ledger, tmp_path,
+    ):
+        plan_path = tmp_path / 'plan.json'
+        await run_corpus_plan(harness, ledger, plan_path, seed_three_heals(harness))
+
+        rendered = render_plan_document(ledger.pending_actions(RunSource.CORPUS))
+
+        assert rendered == plan_path.read_bytes()
+        document = json.loads(rendered)
+        assert document['format'] == 'link-heal-plan/1'
+        assert len(document['actions']) == 3
+        assert rendered.endswith(b'\n')
+
+    @pytest.mark.asyncio
+    async def test_a_plan_run_writes_nothing_to_the_store(self, harness, ledger, tmp_path):
+        await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness))
+
+        assert harness.mem0.write_count == 0
+        assert harness.journal_rows() == []
+
+
+class TestRePlanning:
+    @pytest.mark.asyncio
+    async def test_re_planning_an_unchanged_store_inserts_no_new_rows(
+        self, harness, ledger, tmp_path,
+    ):
+        bases = seed_three_heals(harness)
+        first = await run_corpus_plan(harness, ledger, tmp_path / 'first.json', bases)
+
+        second = await run_corpus_plan(harness, ledger, tmp_path / 'second.json', bases)
+
+        assert len(ledger.pending_actions(RunSource.CORPUS)) == 3
+        assert ledger.run_actions(second.run_id) == []
+        assert second.counts.already_pending == 3
+        assert second.plan_sha256 == first.plan_sha256
+
+    def _undo(self, ledger: LinkHealLedger, report: RunReport) -> None:
+        """Mark every heal *report* planned as applied, then undone."""
+        writer = ledger.start_run(RunSource.CORPUS, writes=True)
+        undoer = ledger.start_run(RunSource.UNDO, writes=True)
+        for row in ledger.run_actions(report.run_id):
+            ledger.set_outcome(row.action_id, ActionState.APPLIED, writer, None)
+            ledger.mark_undone(row.action_id, undoer)
+
+    @pytest.mark.asyncio
+    async def test_an_undone_heal_at_the_same_hashes_is_not_re_planned(
+        self, harness, ledger, tmp_path,
+    ):
+        seed_link(harness)
+        bases = (corpus_basis('RELATED'),)
+        self._undo(ledger, await run_corpus_plan(harness, ledger, tmp_path / 'a.json', bases))
+
+        again = await run_corpus_plan(harness, ledger, tmp_path / 'b.json', bases)
+
+        assert again.counts.undo_suppressed == 1
+        assert again.counts.planned == 0
+        assert ledger.pending_actions(RunSource.CORPUS) == []
+
+    @pytest.mark.asyncio
+    async def test_editing_the_child_re_opens_a_corpus_heal_as_a_stale_rating(
+        self, harness, ledger, tmp_path,
+    ):
+        seed_link(harness)
+        bases = (corpus_basis('RELATED'),)
+        self._undo(ledger, await run_corpus_plan(harness, ledger, tmp_path / 'a.json', bases))
+        harness.mem0.payload(DF, CHILD)['data'] = 'the child note, edited after the undo'
+
+        again = await run_corpus_plan(harness, ledger, tmp_path / 'b.json', bases)
+
+        assert again.counts.undo_suppressed == 0
+        assert again.counts.stale_rating == 1
+
+    @pytest.mark.asyncio
+    async def test_editing_the_child_re_opens_a_deterministic_detach(
+        self, harness, ledger, tmp_path,
+    ):
+        seed_link(harness, parent_text=None)
+        self._undo(ledger, await run_corpus_plan(harness, ledger, tmp_path / 'a.json', ()))
+        harness.mem0.payload(DF, CHILD)['data'] = 'the child note, edited after the undo'
+
+        again = await run_corpus_plan(harness, ledger, tmp_path / 'b.json', ())
+
+        assert again.counts.undo_suppressed == 0
+        (row,) = ledger.pending_actions(RunSource.CORPUS)
+        assert row.planned.basis_source is BasisSource.DETERMINISTIC
+        assert row.planned.child_sha256 == text_sha256('the child note, edited after the undo')
+
+
+class TestReportModeEscapes:
+    @pytest.mark.asyncio
+    async def test_a_backlog_over_cap_times_multiplier_would_escape_and_files_nothing(
+        self, harness, ledger, tmp_path,
+    ):
+        limits = RunLimits(max_actions_per_run=2, backlog_multiplier=1, write_failure_streak=3)
+
+        report = await run_corpus_plan(
+            harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness), limits,
+        )
+
+        assert report.counts.would_escape == (BACKLOG_ANCHOR,)
+        assert report.counts.escaped == ()
+
+    @pytest.mark.asyncio
+    async def test_a_backlog_at_cap_times_multiplier_would_not_escape(
+        self, harness, ledger, tmp_path,
+    ):
+        limits = RunLimits(max_actions_per_run=3, backlog_multiplier=1, write_failure_streak=3)
+
+        report = await run_corpus_plan(
+            harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness), limits,
+        )
+
+        assert report.counts.would_escape == ()
+
+    @pytest.mark.asyncio
+    async def test_a_non_writing_run_never_would_escape_a_write_failure(
+        self, harness, ledger, tmp_path,
+    ):
+        limits = RunLimits(max_actions_per_run=0, backlog_multiplier=1, write_failure_streak=1)
+
+        report = await run_corpus_plan(
+            harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness), limits,
+        )
+
+        assert WRITE_FAILURE_ANCHOR not in report.counts.would_escape
+        assert report.counts.would_escape == (BACKLOG_ANCHOR,)
