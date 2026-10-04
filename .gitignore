@@ -54,6 +54,15 @@ __pycache__/
 htmlcov/
 coverage.xml
 
+# ── Mutation-testing artifacts — mutmut run products ─────────────────
+# `mutmut run` (configured under [tool.mutmut] in orchestrator/pyproject.toml,
+# task 5035) copies the source tree plus every mutant into mutants/ in its
+# working directory: hundreds of MB, never to be committed. The two symlinks
+# are the run's harness (plans/merge-lane-quality-prd.mutation-baseline.md).
+mutants/
+/orchestrator/dark-factory-orchestrator.yaml
+/orchestrator/df_pytest_isolation.py
+
 # ── Test SQLite artifacts — MagicMock path side-effects ──────────────
 # OverrideStore creates an SQLite DB at config.overrides_db_path; when
 # tests pass an unpatched MagicMock as config the stringified mock name
