@@ -9753,13 +9753,13 @@ class _RerunPolicy:
     """Per-call-site knobs for the ONE discriminator.
 
     INV-5 (no-lockstep-duplication) is about one IMPLEMENTATION of "passes in
-    isolation", NOT one set of tuning constants. The two gates differ in six
+    isolation", NOT one set of tuning constants. The two gates differ in five
     genuine, deliberately-calibrated ways — re-run engine, timeout constant,
-    log label, success log level, the other-leg precondition, and the
-    partially-measured-session refusal — and every one of those is pinned by
-    an existing assertion. Capturing them as a ``call_site -> policy`` table
-    gives exactly ONE body to drift from while keeping each site's calibration
-    independent and visible in one place.
+    log label, success log level, and the partially-measured-session refusal
+    — and every one of those is pinned by an existing assertion. Capturing
+    them as a ``call_site -> policy`` table gives exactly ONE body to drift
+    from while keeping each site's calibration independent and visible in one
+    place.
 
     Shape note (operator ruling 2026-08-12, task-3786 suggestion): the
     verbatim-log-preservation fields are deliberate while only two call
@@ -9775,10 +9775,6 @@ class _RerunPolicy:
     #: Per-test timeout injected into the isolated re-run command. SEPARATE
     #: per site by design — the two are retuned on different signals.
     timeout_secs: int
-    #: Whether a non-clean lint/type leg on the failing result bails the whole
-    #: gate before any work (main_probe only — see the discriminator's
-    #: docstring for why it must NOT apply to the merge gate).
-    requires_clean_other_legs: bool
     #: Whether a failing session that left tests unmeasured is
     #: ``unconfirmable`` before any re-run: a failing leg stopped before its
     #: own verdict (task 6247), or an xdist worker death (task 5492). See
@@ -10243,24 +10239,20 @@ async def confirm_isolated_rerun_verdict(
         )
 
     try:
-        # PRECONDITION, main_probe only: bail before ANY work when another leg
-        # is known non-clean. ``run_verification``'s
-        # ``_summarize_checks``/``_worst_category`` picks ONE category across up
-        # to three legs, so a matched (category, cause_hint) signature does NOT
-        # prove the lint/type legs were clean — a genuine, co-occurring
-        # lint/type break can lose the "worst" contest to the test leg's
-        # category and still be real. Re-running just the named TEST node-ids
-        # would then wrongly downgrade a genuinely red main.
+        # PRECONDITION, both gates: bail before ANY work when another leg is
+        # known non-clean, because re-running the named TEST node-ids is no
+        # evidence about it. At the main probe, ``_summarize_checks``/
+        # ``_worst_category`` picks ONE category across the legs, so a
+        # co-occurring lint/type break can hide behind the test leg's category
+        # and a pass would wrongly downgrade a genuinely red main. At the merge
+        # gate a pass replaces the WHOLE result and lands the tree, and the
+        # post-suppression unscoped gate re-checks types but not lint. See
+        # test_flake_discriminator.py::TestFailingLintOrTypeLegIsUnconfirmableAtBothGates.
         # ``lint_output``/``type_output`` are populated ONLY when that leg's
         # return code was non-zero, so a non-empty value is a precise, free
-        # signal. Promoting today's bare ``return None`` to
-        # ``unconfirmable('other_leg_failed')`` is INV-2 applied to a third
-        # dropped fact. Deliberately NOT applied to the merge gate: it has no
-        # such bail today, PRD §3 does not ask for one, and adding it would
-        # newly refuse to suppress merges carrying any lint output.
-        if policy.requires_clean_other_legs and (
-            failing_result.lint_output or failing_result.type_output
-        ):
+        # signal; a leg that failed while printing nothing is caught only if
+        # it was stopped (see ``_STOPPED_LEG_CATEGORIES``).
+        if failing_result.lint_output or failing_result.type_output:
             return _observe(
                 FlakeVerdict.unconfirmable, (),
                 call_site=coerced_site, runner=runner,
@@ -10430,7 +10422,6 @@ _CALL_SITE_POLICY: dict[FlakeCallSite, _RerunPolicy] = {
     FlakeCallSite.merge_gate: _RerunPolicy(
         log_label='confirm_merge_verify_flake_suppressible',
         timeout_secs=_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS,
-        requires_clean_other_legs=False,
         refuses_partially_measured_sessions=True,
         unmapped_log_tail='not suppressing',
         error_log_tail='failing closed to red',
@@ -10441,9 +10432,6 @@ _CALL_SITE_POLICY: dict[FlakeCallSite, _RerunPolicy] = {
     FlakeCallSite.main_probe: _RerunPolicy(
         log_label='verify_failure_is_preexisting_on_main confirm gate',
         timeout_secs=_MAIN_PROBE_CONFIRM_TIMEOUT_SECS,
-        # See the precondition block in confirm_isolated_rerun_verdict for why
-        # this is main_probe's alone.
-        requires_clean_other_legs=True,
         # See the partially-measured-session precondition block for why this
         # is False here.
         refuses_partially_measured_sessions=False,
@@ -10495,7 +10483,8 @@ async def confirm_merge_verify_flake_suppressible(
     verdict onto a shared ``None``, which made the extraction provably
     behaviour-preserving but discarded the observation at exactly the point it
     became knowable: ``fails_in_isolation`` (a REAL red) and ``unconfirmable``
-    (we could not tell — no recoverable node-id from an opaque/lint/type
+    (we could not tell — a co-occurring lint/type failure,
+    ``other_leg_failed``; no recoverable node-id from an opaque
     failure; a node-id mapping to no given subproject; an infra-sentinel re-run
     category, which is never trusted as confirmation; a session an xdist worker
     death truncated, ``session_truncated``; a session with a failing leg
@@ -10571,9 +10560,9 @@ async def _main_probe_failure_is_isolated_flake(
     contract. The main_probe entry in ``_CALL_SITE_POLICY`` carries this site's
     calibration — the bounded ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` re-run engine,
     ``_MAIN_PROBE_CONFIRM_TIMEOUT_SECS`` (a constant SEPARATE from the merge
-    gate's by design; the two are retuned on different signals), and the
-    "another leg is not clean on main" precondition that is deliberately this
-    site's alone. That precondition's rationale, the node-id -> subproject
+    gate's by design; the two are retuned on different signals), and no
+    partially-measured-session refusal. The "another leg is not clean"
+    precondition's rationale, the node-id -> subproject
     mapping rules, and the *module_configs* provenance are all documented on
     the discriminator so they are stated ONCE (PRD §8.1, INV-5) — the merge
     gate and this gate can no longer drift into different notions of "passes
