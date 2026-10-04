@@ -64,3 +64,60 @@ class TestEvalMetricsReplayFrameField:
 
         assert EvalMetrics(replay_frame=REPLAY_FRAME_ID).to_dict()[
             'replay_frame'] == 'honest-frame-v1'
+
+
+class TestPlanOnlyCliAppendsReplayFrame:
+    def test_plan_only_architect_is_briefed_in_the_replay_frame(
+        self, tmp_path, monkeypatch,
+    ):
+        import json
+        from unittest.mock import AsyncMock, MagicMock
+
+        from click.testing import CliRunner
+
+        import orchestrator.cli
+        from orchestrator.cli import main
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.replay_frame import build_replay_frame_block
+
+        monkeypatch.setattr(
+            orchestrator.cli, 'load_config',
+            lambda _p: OrchestratorConfig(project_root=tmp_path),
+        )
+        fixture = tmp_path / 'df_task_9001.json'
+        fixture.write_text(json.dumps({
+            'id': 'df_task_9001',
+            'project_root': str(tmp_path),
+            'pre_task_commit': 'feedface1234',
+            'task_definition': {'title': 'T', 'description': 'D'},
+            'plan': None,
+        }))
+        dummy_yaml = tmp_path / 'dummy.yaml'
+        dummy_yaml.write_text('')
+
+        briefing = MagicMock()
+        briefing.build_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
+        invoke_agent = AsyncMock(return_value=MagicMock(success=False, output='refused'))
+        monkeypatch.setattr(
+            'orchestrator.evals.snapshots.create_eval_worktree',
+            AsyncMock(return_value=(tmp_path / 'wt', 'run-x')),
+        )
+        monkeypatch.setattr(
+            'orchestrator.evals.snapshots.cleanup_eval_worktree', AsyncMock(),
+        )
+        monkeypatch.setattr(
+            'orchestrator.agents.briefing.BriefingAssembler',
+            MagicMock(return_value=briefing),
+        )
+        monkeypatch.setattr('orchestrator.artifacts.TaskArtifacts', MagicMock())
+        monkeypatch.setattr('orchestrator.agents.invoke.invoke_agent', invoke_agent)
+
+        r = CliRunner().invoke(main, [
+            'eval', '--plan-only', '--task', str(fixture), '--config', str(dummy_yaml),
+        ])
+
+        assert r.exit_code == 0, r.output
+        invoke_agent.assert_awaited_once()
+        assert invoke_agent.await_args.kwargs['prompt'] == (
+            'ARCH PROMPT' + build_replay_frame_block('feedface1234')
+        )
