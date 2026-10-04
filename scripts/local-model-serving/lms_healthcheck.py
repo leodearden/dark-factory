@@ -53,7 +53,7 @@ from typing import Any, Literal, Protocol
 import lms_ctl
 import lms_vram
 from lms_manifest import ArmEntry, ArmManifestError, load_arms
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 #: Per-request ceiling for the readiness/identity GET.  A plain float, never an
 #: `httpx.Timeout` object: the shared test fake (scripts/tests/conftest.py)
@@ -240,7 +240,7 @@ class ProbeExtraction(BaseModel):
 
 #: The report's latency resolution, in decimal places of a millisecond.
 LATENCY_DECIMALS = 1
-#: The smallest latency a TIMED result may report; 0.0 is reserved for "never timed".
+#: One unit of that resolution; see `ProbeResult.latency_ms` for its role.
 MIN_MEASURED_LATENCY_MS = 10 ** -LATENCY_DECIMALS
 
 
@@ -267,10 +267,17 @@ class ProbeResult(BaseModel):
     #: this code cannot read.  See `_cached_prompt_tokens`.
     cached_prompt_tokens: int | None = None
 
+    @field_validator('latency_ms')
+    @classmethod
+    def _timed_or_never_timed(cls, value: float) -> float:
+        if not (value == 0.0 or value >= MIN_MEASURED_LATENCY_MS):
+            raise ValueError(
+                f'latency_ms={value!r} is neither 0.0 ("never timed") nor a timed '
+                f'result of at least MIN_MEASURED_LATENCY_MS={MIN_MEASURED_LATENCY_MS}'
+            )
+        return value
+
     def with_latency(self, latency_ms: float) -> ProbeResult:
-        """Rounding to the report resolution may not erase the fact that a
-        measurement was taken: 0.0 means "never timed", as read by
-        `scripts/tests/test_lms_verification_artifact.py::test_passing_rows_carry_a_real_measured_latency`."""
         reported = max(round(latency_ms, LATENCY_DECIMALS), MIN_MEASURED_LATENCY_MS)
         return self.model_copy(update={'latency_ms': reported})
 
@@ -1837,11 +1844,19 @@ def _ms_cell(row: ArmRow) -> str:
     for.  The spread is shown BESIDE the headline number, never instead of it:
     only the first sample is prefix-cold, so the range is context, not a
     better estimate."""
-    head = f'{row.latency_ms:.0f}'
+    head = _ms_text(row.latency_ms)
     spread = row.repeat_latencies_ms
     if not spread:
         return head
-    return f'{head} [{min(spread):.0f}-{max(spread):.0f}]'
+    return f'{head} [{_ms_text(min(spread))}-{_ms_text(max(spread))}]'
+
+
+def _ms_text(latency_ms: float) -> str:
+    """Whole milliseconds, except that a timed sub-millisecond reading keeps its
+    decimal so it cannot be read as the 0 of "never timed"."""
+    if 0.0 < latency_ms < 1.0:
+        return f'{latency_ms:.{LATENCY_DECIMALS}f}'
+    return f'{latency_ms:.0f}'
 
 
 def render_table(report: HealthReport) -> str:
@@ -1867,7 +1882,7 @@ def render_table(report: HealthReport) -> str:
             row.endpoint,
             row.verdict,
             str(row.reason),
-            f'{row.first_probe_ms:.0f}',
+            _ms_text(row.first_probe_ms),
             _ms_cell(row),
         )
         for row in report.arms
