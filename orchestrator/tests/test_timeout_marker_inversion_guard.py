@@ -12,13 +12,10 @@ costs a whole truncated session rather than one red test -- has ONE home: the
 ``VERIFY_CLI_PER_TEST_TIMEOUT`` comment block in _orch_helpers.py.  Read it
 there.  This module points at it rather than restating it, so a pytest-timeout
 upgrade that moves that precedence invalidates one copy and not five.  The sole
-deliberate exception is :func:`test_no_new_inverting_timeout_marker`'s failure
-message, where the reader is looking at a traceback and not at the source.
+deliberate exception is :func:`test_no_timeout_marker_sits_in_the_inversion_band`'s
+failure message, where the reader is looking at a traceback and not at the source.
 
-A RATCHET, NOT A SWEEP.  52 pre-existing in-band sites are grandfathered in
-:data:`_GRANDFATHERED`; see its comment for why they were not migrated here and
-:func:`test_grandfather_allowlist_has_no_stale_entries` for what forces that
-list to shrink.
+A SWEEP WITH NO ALLOWLIST: every in-band marker under this directory fails.
 
 SCOPE IS ``orchestrator/tests`` ONLY, and the sibling packages are KNOWINGLY
 UNGUARDED -- do not read this module as tree-wide coverage.  The defect is a
@@ -123,8 +120,8 @@ _MIN_DEEP_GATE_MARKER_SITES = 8
 #: The module task 5582 sizes and ratchets: nine real-git classes that all
 #: carried an identical bare ``180`` -- inside the inversion band, so under
 #: verify's CLI budget they ran TIGHTER than the run gating the merge.  They
-#: were the largest single block in :data:`_GRANDFATHERED` until that task
-#: migrated them.
+#: were the largest block on the task-5147 allowlist until that task migrated
+#: them.
 _DEEP_LANDING_MODULE = 'test_merge_queue_deep_landing.py'
 
 #: How many timeout marker sites that module must carry -- an EQUALITY, argued
@@ -163,7 +160,7 @@ _TIMEOUT_FLAG_RE = re.compile(r'--timeout[=\s](\d+)')
 #: mirror that reads too HIGH fails SILENTLY, which is the dangerous
 #: direction: retune ``MERGE_RESULT_TIMEOUT`` to 30 and every
 #: ``timeout(HEAVY_BARRIER_TEST_TIMEOUT)`` site really pins 225s -- squarely
-#: inside the band -- while this map still answers 300 and the ratchet stays
+#: inside the band -- while this map still answers 300 and the sweep stays
 #: green.  Matching on the TRAILING name only widens that hole: a new
 #: file-local ``PYTEST_TIMEOUT = 120`` would be waved through at 960.
 #:
@@ -819,7 +816,7 @@ class TestSanctionedNameMirrors:
     Without it the map is an unchecked claim about four constants defined
     elsewhere, and a wrong entry that reads too HIGH is silent: it resolves a
     marker to a safe number while the real constant sits inside the band, so
-    the ratchet stays green over a live inversion.
+    the sweep stays green over a live inversion.
 
     THE MEASURED CASE this closes:
     ``HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75``
@@ -869,10 +866,9 @@ class TestSanctionedNameMirrors:
     def test_every_mirrored_name_is_really_defined(self) -> None:
         """The map may not outlive the constants it mirrors.
 
-        Same hygiene as
-        :func:`test_grandfather_allowlist_has_no_stale_entries`: an entry for a
-        deleted constant is dead weight that silently re-sanctions the name if
-        someone later reintroduces it at an arbitrary value.  It is also the
+        An entry for a deleted constant is dead weight that silently
+        re-sanctions the name if someone later reintroduces it at an arbitrary
+        value.  It is also the
         anti-vacuity floor for the twin above, which passes trivially over an
         empty binding list.
         """
@@ -1060,7 +1056,7 @@ class TestDeepGateSceneBudget:
     ``VERIFY_CLI_PER_TEST_TIMEOUT``'s own comment makes, plus a mechanical
     one: :func:`_resolve_seconds` resolves only bare or dotted NAMES present
     in :data:`_SANCTIONED_TIMEOUT_NAMES`, so a marker spelled as arithmetic
-    yields None -- "no opinion" -- and the ratchet would stop having a view of
+    yields None -- "no opinion" -- and the sweep would stop having a view of
     this marker at all.
     """
 
@@ -1881,45 +1877,13 @@ class TestDeepLandingModuleMarkers:
         """Every ``timeout`` marker site in the deep-landing module."""
         return [site for module, site in _tree_scan().sites if module == _DEEP_LANDING_MODULE]
 
-    def test_the_module_has_no_in_band_marker_sites(self) -> None:
-        """Not one marker here may sit in the inversion band.
-
-        Asserted at the MODULE rather than left to the tree-wide ratchet
-        because these nine sites were the largest grandfathered block in it:
-        the ratchet would keep passing over an entry someone re-added under an
-        allowlisted name, and this pin would not.
-        """
-        in_band = sorted(
-            (site for site in self._sites() if _inverts(site.seconds)),
-            key=lambda site: site.lineno,
-        )
-
-        assert not in_band, (
-            f'{len(in_band)} timeout marker(s) in {_DEEP_LANDING_MODULE} sit '
-            f'in the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING} < N < '
-            f'{VERIFY_CLI_PER_TEST_TIMEOUT}), so they run TIGHTER under '
-            "verify's CLI budget than the ambient run that gates the merge -- "
-            'and a breach there is not a red test but an os._exit()d xdist '
-            'worker.\n\n'
-            'Spell them as DEEP_LANDING_SCENE_TEST_TIMEOUT, imported from '
-            '_orch_helpers, which is derived from this module\'s MEASURED '
-            'spawn counts and bounded waits. Do not pick a new number by '
-            'hand, and do not re-add them to _GRANDFATHERED -- that census '
-            'may only ever shrink.\n'
-            + '\n'.join(
-                f'  {_DEEP_LANDING_MODULE}:{site.lineno} {site.qualname} '
-                f'({site.kind}) pins {site.seconds:g}s'
-                for site in in_band
-            )
-        )
-
     def test_every_marker_site_is_spelled_as_the_named_constant(self) -> None:
         """Both halves matter, and neither implies the other.
 
         The ``seconds`` half is what proves the name is registered in
         :data:`_SANCTIONED_TIMEOUT_NAMES`: an unregistered name resolves to
         None -- "no opinion" -- which would quietly take these nine sites out
-        of the ratchet's view entirely rather than fail anything.
+        of the sweep's view entirely rather than fail anything.
 
         The ``spelling`` half is what stops a bare ``1080`` literal, which
         resolves identically and would leave the constant and the markers as
@@ -1945,7 +1909,7 @@ class TestDeepLandingModuleMarkers:
             'second copy of the number that a re-derivation cannot move. A '
             'wrong VALUE means _SANCTIONED_TIMEOUT_NAMES has no entry for the '
             'name, or drifted from it -- an unresolved name reads as "no '
-            'opinion", so the ratchet would stop having any view of these '
+            'opinion", so the sweep would stop having any view of these '
             'sites at all while staying green. Import the constant from '
             '_orch_helpers, and register it in _SANCTIONED_TIMEOUT_NAMES.\n'
             + '\n'.join(
@@ -2496,7 +2460,7 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The tree-wide RATCHET.
+# The tree-wide sweep.
 # ---------------------------------------------------------------------------
 
 #: Anti-vacuity FLOORS, not equalities -- 563 files and 148 marker sites
@@ -2510,46 +2474,6 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_MARKER_SITES = 100
 
-#: The pre-existing in-band sites: 61 across 18 modules at 90/120/150/180s
-#: when MEASURED at authorship time; 52 across 17 since task 5582 migrated
-#: test_merge_queue_deep_landing.py's nine off a grandfathered 180s onto a
-#: measured DEEP_LANDING_SCENE_TEST_TIMEOUT; 50 since task 5034 deleted two
-#: serial-worker tests.  Entries may only ever be
-#: REMOVED, never added -- a new marker in the band is what this module exists
-#: to reject, and `test_no_new_inverting_timeout_marker`'s failure message
-#: says so outright.
-#:
-#: Not mechanically migrated in task 5147, deliberately: these are the hottest
-#: files in the repo (test_merge_queue.py and its deep_* siblings,
-#: test_crash_recovery.py), so rewriting ~20 of them at once would have taken
-#: concurrency locks on nearly every file in-flight fleet tasks were editing
-#: and would itself have risked destabilising the very verify path the task
-#: existed to de-flake.  Stopping the bleeding is what prevents a fourth task
-#: being blamed; the migration is ordinary follow-up work, filed as
-#: agent-followup ticket tkt_0RTCC80EM92A7WD08D6RF6ZZPY -- PARTIALLY
-#: DISCHARGED by task 5582, which took the nine deep-landing sites.
-#:
-#: Keyed on ``(module, qualname)`` -- *module* being the path RELATIVE to this
-#: directory (``test_cli.py``, and ``fixtures/x.py`` for anything nested), NOT
-#: the basename.  The sweep rglob()s subdirectories, so a basename key would
-#: silently hand a future ``tests/<subdir>/test_cli.py`` the top-level
-#: test_cli.py's exemption -- exactly the collapse that per-SITE keying exists
-#: to avoid.  Every entry below is top-level, so the two spellings agree today.
-#: Keyed on a name rather than a line number so an entry
-#: survives ordinary edits above it, and per-SITE rather than a per-file COUNT
-#: because a count nets to zero when one marker is added and another removed in
-#: the same file -- a hole in a guard whose entire purpose is catching
-#: accidental additions.  Verbosity is cheap; a hole in the ratchet is not.
-#: :func:`test_grandfather_allowlist_has_no_stale_entries` is what stops this
-#: list rotting into a permanent blanket exemption.
-_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
-    {
-    # test_marker_registration_drift.py -- 2 sites at 120s
-    ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_every_marker_applied_under_tests_is_registered'),
-    ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_the_sweep_is_not_vacuous'),
-    }
-)
-
 
 class _TreeScan(NamedTuple):
     """One pass over every ``*.py`` under :data:`_TESTS_DIR`, with sweep-health counters.
@@ -2559,11 +2483,10 @@ class _TreeScan(NamedTuple):
     tree.
 
     ``sites`` pairs each timeout marker site with its module -- the path
-    relative to :data:`_TESTS_DIR`, which is the first half of the
-    ``(module, qualname)`` key :data:`_GRANDFATHERED` is written in.
-    ``bindings`` is every assignment of a :data:`_SANCTIONED_TIMEOUT_NAMES`
-    name, for :class:`TestSanctionedNameMirrors`.  Files skipped as
-    ``unreadable`` are NOT counted as ``examined`` (they were not).
+    relative to :data:`_TESTS_DIR`.  ``bindings`` is every assignment of a
+    :data:`_SANCTIONED_TIMEOUT_NAMES` name, for
+    :class:`TestSanctionedNameMirrors`.  Files skipped as ``unreadable`` are
+    NOT counted as ``examined`` (they were not).
     """
 
     sites: tuple[tuple[str, _Site], ...]
@@ -2620,71 +2543,37 @@ def _in_band_sites() -> tuple[tuple[str, _Site], ...]:
     return tuple(pair for pair in _tree_scan().sites if _inverts(pair[1].seconds))
 
 
-def _sweep_is_healthy(scan: _TreeScan) -> str:
-    """'' when *scan* cleared :data:`_MIN_EXPECTED_TEST_FILES`, else why not.
+def test_no_timeout_marker_sits_in_the_inversion_band() -> None:
+    """No marker anywhere under this directory may sit in the inversion band.
 
-    SPOT for the anti-vacuity floor both ratchet tests need: a broken sweep
-    reports zero offenders AND reads every allowlist entry as stale, and the
-    two failures want the same measurement stated the same way.
+    A marker at ``DELIBERATE_TIGHT_BOUND_CEILING < N <
+    VERIFY_CLI_PER_TEST_TIMEOUT`` is too large to read as a deliberate tight
+    bound, so it was written to give a slow test room -- and it silently
+    becomes a TIGHTENING under verify's CLI budget.  Under
+    ``timeout_method = "thread"`` a breach is not a red test: pytest-timeout
+    ``os._exit()``s the xdist worker, ``--max-worker-restart=0`` declines to
+    replace it, and the session is truncated with the blame landing on
+    whatever innocent test shared the dead worker.  Three tasks (4176, 4384,
+    4405) were failed that way by ONE such marker.
     """
-    if scan.examined >= _MIN_EXPECTED_TEST_FILES:
-        return ''
-    return (
+    scan = _tree_scan()
+    assert scan.examined >= _MIN_EXPECTED_TEST_FILES, (
         f'only {scan.examined} .py files examined under {_TESTS_DIR} (expected '
         f'at least {_MIN_EXPECTED_TEST_FILES}; {len(scan.unreadable)} skipped '
         f'as unreadable: {sorted(scan.unreadable)}) -- the sweep itself is '
-        'broken'
+        'broken, so this guard would pass vacuously rather than because the '
+        'tree is clean.'
     )
 
-
-def test_no_new_inverting_timeout_marker() -> None:
-    """No marker in the inversion band, except the grandfathered census.
-
-    THE RATCHET.  A marker at ``DELIBERATE_TIGHT_BOUND_CEILING < N <
-    VERIFY_CLI_PER_TEST_TIMEOUT`` is too large to read as a deliberate tight
-    bound, so it was written to give a slow test room -- and it silently
-    becomes a TIGHTENING under verify's CLI budget.  Under ``timeout_method = "thread"`` a breach is not a red
-    test: pytest-timeout ``os._exit()``s the xdist worker,
-    ``--max-worker-restart=0`` declines to replace it, and the session is
-    truncated with the blame landing on whatever innocent test shared the dead
-    worker.  Three tasks (4176, 4384, 4405) were failed that way by ONE such
-    marker.
-
-    A RATCHET AND NOT A SWEEP, deliberately.  The 52 surviving in-band sites
-    span 17 modules, most of them the hottest files in the repo
-    (test_merge_queue.py, test_merge_queue_build_chain.py,
-    test_crash_recovery.py).  Rewriting them
-    here would take a concurrency lock on nearly every file in-flight fleet
-    tasks are editing, and would risk destabilising the very verify path this
-    guard exists to de-flake.  Blocking NEW instances at commit time is what
-    actually stops a fourth task being blamed; migrating the existing ones is
-    ordinary follow-up work, and the stale-entry twin below is what forces the
-    list to shrink as that happens.
-
-    The SITES are grandfathered, not the FILES.  A per-file count would net to
-    zero when one marker is added and another removed in the same file,
-    leaving a hole in a guard whose entire purpose is catching accidental
-    additions.  Verbosity is cheap; a hole in the ratchet is not.
-    """
-    broken = _sweep_is_healthy(_tree_scan())
-    assert not broken, (
-        f'{broken}, so this guard would pass vacuously rather than because '
-        'the tree is clean.'
-    )
-
-    new_offenders = [
-        (module, site)
-        for module, site in _in_band_sites()
-        if (module, site.qualname) not in _GRANDFATHERED
-    ]
-    if new_offenders:
+    offenders = _in_band_sites()
+    if offenders:
         offender_list = '\n  '.join(
             f'{module}::{site.qualname} ({site.kind}, line {site.lineno}) pins '
             f'{site.seconds:g}s'
-            for module, site in sorted(new_offenders, key=lambda pair: (pair[0], pair[1].qualname))
+            for module, site in sorted(offenders, key=lambda pair: (pair[0], pair[1].qualname))
         )
         raise AssertionError(
-            f'{len(new_offenders)} NEW timeout marker(s) in the inversion band '
+            f'{len(offenders)} timeout marker(s) in the inversion band '
             f'({DELIBERATE_TIGHT_BOUND_CEILING} < N < {VERIFY_CLI_PER_TEST_TIMEOUT}).\n\n'
             'A marker there is a TWO-WAY override, not a floor: it REPLACES '
             'the ambient budget in both directions, so a number big enough to '
@@ -2705,34 +2594,9 @@ def test_no_new_inverting_timeout_marker() -> None:
             'enough to read as that deliberate bound, which is why it is '
             'allowed. Anything in between '
             'inverts. Full rationale: the VERIFY_CLI_PER_TEST_TIMEOUT comment '
-            'block in _orch_helpers.py.\n\n'
-            '_GRANDFATHERED is a shrinking census of pre-existing sites and may '
-            'only ever have entries REMOVED -- do not add yours to it.'
+            'block in _orch_helpers.py.'
             f'\n\nOffending sites:\n  {offender_list}'
         )
-
-
-def test_grandfather_allowlist_has_no_stale_entries() -> None:
-    """Every ``_GRANDFATHERED`` entry must still name a real in-band site.
-
-    The ratchet self-tightens: as the follow-up migration raises these markers,
-    their entries stop matching and must be deleted, so the list can never rot
-    into a permanent blanket exemption that silently re-admits a site someone
-    later re-adds under the same name.
-    """
-    broken = _sweep_is_healthy(_tree_scan())
-    assert not broken, f'{broken}, so EVERY allowlist entry would read as stale.'
-
-    live = {(module, site.qualname) for module, site in _in_band_sites()}
-    stale = sorted(_GRANDFATHERED - live)
-
-    assert not stale, (
-        f'{len(stale)} _GRANDFATHERED entr(y/ies) no longer correspond to an '
-        'in-band timeout marker -- delete them, the ratchet is supposed to '
-        'shrink. (The marker was raised, removed, or its test renamed; in the '
-        'rename case re-add nothing, the new name must stand on its own.)\n  '
-        + '\n  '.join(f'{module}::{qualname}' for module, qualname in stale)
-    )
 
 
 def test_the_marker_census_is_not_vacuous() -> None:
@@ -2749,7 +2613,7 @@ def test_the_marker_census_is_not_vacuous() -> None:
         f'only {len(scan.sites)} timeout marker site(s) found across '
         f'{scan.examined} files (expected at least '
         f'{_MIN_EXPECTED_MARKER_SITES}) -- '
-        '_timeout_marker_sites has probably stopped matching, so the ratchet '
+        '_timeout_marker_sites has probably stopped matching, so the sweep '
         'would pass vacuously. Check it against the inline fixtures above.'
     )
 
