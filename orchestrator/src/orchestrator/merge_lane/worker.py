@@ -10035,9 +10035,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         pre-dispatch operator halt in :meth:`_dispatch_item`, and — task 3185,
         PRD γ, narrowed by task 3186, PRD δ — the deep-tip verify's two
         NON-ADOPTING exits in :meth:`_run_inflight_verify`: the tip-FAIL exit
-        and (review fix 3) the chain-arm ``except Exception`` exit. Those last
-        two are the odd ones out in WHY they defer: the other five are all
-        "something went wrong, come back later", while these defer because the
+        and (review fix 3) the chain-arm ``except Exception`` exit. The five
+        that live in :meth:`_run_inflight_verify` reach it through
+        :meth:`_requeue_from_verify` (task 4582), which vacates the entry
+        first. The deep-tip pair are the odd ones out in WHY they defer: the
+        other five are all "something went wrong, come back later", while
+        these defer because the
         verdict is about the WRONG TREE. A tip verdict proves the cumulative
         tree, never any individual member's own subset tree — so a red tip
         names no culprit to blame (the fail arm) and an infra error is not a
@@ -10101,6 +10104,53 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._queue.put_nowait(req)
         self._request_ledger.on_requeued(req.request_id)
         self._note_requeue(req.request_id, live_obj=req)
+
+    async def _vacate_inflight_entry(
+        self, item: RealMergeItem, status: InflightStatus,
+    ) -> None:
+        """Hand back *item*'s host lease and stamp *status* on its InflightEntry
+        (task 4582), so a verify that drops or requeues its request leaves no
+        corpse occupying a host, the frozen prefix or ``snapshot()``.
+
+        The entry is found through the registry's live object because the
+        verify task is created BEFORE its entry (see
+        :class:`VerifyWorktreeHandle`), and nothing inside
+        :meth:`_run_inflight_verify` touches the registry before its exits, so
+        ``_live_items[rid]`` is this dispatch's entry right up to here. The
+        ``entry.item is item`` guard keeps an older incarnation of the same
+        request_id from matching.
+
+        The lease is nulled only AFTER the release returns: once the slot is
+        free it can be re-leased, and a later cascade, ``stop()`` drain or
+        finalize acting on the stale lease would cancel a DIFFERENT verify on
+        that host; if the release raises, the lease stays for the canceller.
+
+        No matching entry (a direct-call unit test with nothing registered) is
+        a deliberate no-op: the lease is then released at finalize, as before.
+        """
+        entry = self._live_items.get(item.request.request_id)
+        if not (isinstance(entry, InflightEntry) and entry.item is item):
+            return
+        if entry.lease is not None:
+            await self._cancel_and_release_tracked(entry.lease)
+            entry.lease = None
+        entry.status = status
+
+    async def _requeue_from_verify(self, item: RealMergeItem) -> None:
+        """Vacate *item*'s entry as REQUEUED, then :meth:`_requeue_request`.
+
+        No await separates the two, so a cancel landing during the lease
+        release skips the requeue: the cancelling caller owns the request, the
+        same convention every requeue arm of :meth:`_run_inflight_verify`
+        already keeps.
+        """
+        await self._vacate_inflight_entry(item, InflightStatus.REQUEUED)
+        self._requeue_request(item.request)
+
+    async def _drop_from_verify(self, item: RealMergeItem) -> None:
+        """Vacate *item*'s entry as DROPPED, then retire its request_id."""
+        await self._vacate_inflight_entry(item, InflightStatus.DROPPED)
+        self._retire_item(item.request.request_id)
 
     # ── task 3204 sweep: two neighbouring candidates, deliberately REJECTED ──
     # Recorded here because this is where a future author would be tempted.
@@ -17406,11 +17456,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         """THE cancel-release chokepoint: release the lease, RECORD a strand.
 
         Sole caller of ``HostAllocator.cancel_and_release`` — enforced by
-        :class:`TestCancelAndReleaseChokepoint`'s AST ratchet.  Its five call
+        :class:`TestCancelAndReleaseChokepoint`'s AST ratchet.  Its six call
         sites are the two ``stop()`` drains (finalizing head and ``_inflight``),
         the head-failure cascade's in-body release,
-        :meth:`_resolve_and_release` with ``cancel_lease=True``, and
-        :meth:`_finalize_inflight`'s ``_cancel_release`` path.
+        :meth:`_resolve_and_release` with ``cancel_lease=True``,
+        :meth:`_finalize_inflight`'s ``_cancel_release`` path, and
+        :meth:`_vacate_inflight_entry` (task 4582).
 
         MECHANISM (task 3043, reify 2026-07-25).  Against an unreachable host
         ``cancel_verify()`` returns rc != 0 and all ``max_attempts``
@@ -18350,10 +18401,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # leaving it to `_finalize_inflight`'s sentinel chokepoint
                     # alone would make that chokepoint the SOLE owner, so any
                     # future path consuming this result without finalizing would
-                    # silently strand a phantom finalize head. `_retire_item` is
-                    # idempotent, so the chokepoint call stays valid as defence
-                    # in depth (symmetric with the REQUEUED branches below).
-                    self._retire_item(req.request_id)
+                    # silently strand a phantom finalize head. `_drop_from_verify`
+                    # hands the lease back and stamps the entry DROPPED before it
+                    # retires (task 4582); `_retire_item` is idempotent, so the
+                    # chokepoint call stays valid as defence in depth.
+                    await self._drop_from_verify(item)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -18370,7 +18422,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     )
                     await self._teardown_verify_task(lease, verify_task, req.task_id)
                     await _dispose_verify_worktree()
-                    self._requeue_request(req)
+                    await self._requeue_from_verify(item)
                     # task 3003 amend (robustness): an operator-halt requeue is
                     # NOT a contended-lane defer — a verify was running, so the
                     # lane lock had been acquired.  Close any open streak so its
@@ -18529,7 +18581,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # the REGISTRY. The recipe — and why each of its three
                     # effects is load-bearing — now lives in
                     # `_requeue_request`'s docstring.
-                    self._requeue_request(req)
+                    await self._requeue_from_verify(item)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -18809,9 +18861,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             #
             # Accepted trade-off: _run_inflight_verify runs as a background
             # asyncio.ensure_future task, so this sleep does NOT stall the
-            # merger's dequeue loop — but the HostLease is only released by
-            # _finalize_inflight once this coroutine returns, so the backoff
-            # holds the verify slot for ≤ the min period.  That is bounded,
+            # merger's dequeue loop — but the HostLease is only released at the
+            # requeue right after it (task 4582), so the backoff holds the
+            # verify slot for ≤ the min period.  That is bounded,
             # orders of magnitude shorter than the real verify the slot normally
             # runs, and moot on the warm path anyway (any other local verify
             # would contend on the same lane lock).
@@ -18844,7 +18896,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _backoff = max(0.0, self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS - _waited)
             if _backoff:
                 await self._clock.sleep(_backoff)
-            self._requeue_request(req)
+            await self._requeue_from_verify(item)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=None,
@@ -18935,7 +18987,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'will verify its own subset tree un-chained',
                     req.task_id, merge_commit[:8], exc,
                 )
-                self._requeue_request(req)
+                await self._requeue_from_verify(item)
                 return InflightVerifyResult(
                     outcome=None,
                     merge_wt=None,
@@ -19232,7 +19284,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # THE chokepoint, not a bare put_nowait: all three of its effects
             # are load-bearing here exactly as they are at the operator-halt
             # and dead-verify defers it already serves (see its docstring).
-            self._requeue_request(req)
+            await self._requeue_from_verify(item)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=None,
@@ -19973,7 +20025,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                           CAS advance_main loop.
 
         Lease release and speculation-slot release happen in the single finally:
-          · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED)
+          · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED; a
+                                    vacated entry arrives with lease None and
+                                    the ``entry.lease is not None`` guard skips it)
           · _cancel_release=False → release              (FAIL/PASS)
           · _skip_release=True    → no allocator call    (PASSTHROUGH: lease is None)
         _n_failed is carried in _n_failed_val (None → defer to 'not advanced').
