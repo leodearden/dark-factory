@@ -82,6 +82,23 @@ def test_curator_state_leg_names_pool_timeout(saturated_app, caplog, monkeypatch
     )
 
 
+def test_curator_fan_out_leg_names_pool_timeout(saturated_app, caplog, monkeypatch):
+    monkeypatch.setattr('dashboard.app._CURATOR_ENDPOINT_TIMEOUT_SECONDS', 0.05)
+
+    with caplog.at_level(logging.WARNING):
+        resp = saturated_app.get('/api/v2/dashboard/curator')
+
+    assert resp.status_code == 200
+    list_tickets = [m for m in _warnings(caplog, _FANOUT_LOGGER) if 'list_tickets' in m]
+    assert list_tickets, 'no fan-out WARNING was logged for list_tickets'
+    assert all('PoolTimeout' in m for m in list_tickets), (
+        f'pool saturation must be named, not reported as a timeout; got {list_tickets}'
+    )
+    assert not [m for m in list_tickets if 'timed out' in m], (
+        f'pool saturation was mislabelled as an endpoint timeout; got {list_tickets}'
+    )
+
+
 def test_memory_route_names_pool_timeout(saturated_app, caplog, monkeypatch):
     monkeypatch.setattr('dashboard.api.memory._MEMORY_ENDPOINT_TIMEOUT_SECONDS', 0.05)
 
