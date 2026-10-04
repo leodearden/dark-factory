@@ -29,6 +29,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import inspect
 import logging
 import math
 import traceback
@@ -5629,6 +5630,136 @@ class TestVerifyTeardownHelper:
         verify_task.cancel()
         with contextlib.suppress(BaseException):
             await verify_task
+
+
+# ---------------------------------------------------------------------------
+# task 4164: stop()'s shutdown-drain teardowns must pass shutdown_defensive=True
+# ---------------------------------------------------------------------------
+
+
+class TestShutdownDrainTeardownIsDefensive:
+    """Every ``_teardown_verify_task`` call inside ``SpeculativeMergeWorker.stop``
+    passes ``shutdown_defensive=True`` (task 4164). Without it a SIGTERM-driven
+    CancelledError escaping ``_abort_remote_verify`` aborts the drain loop and
+    leaves the remaining ``_inflight`` entries un-drained — the task-1757
+    orphaned-remote-verify class. The helper's two arms are pinned separately
+    by :class:`TestVerifyTeardownHelper`; sync-only for the same reason as
+    :class:`TestVerifyTeardownChokepoint`.
+    """
+
+    # ── scanner self-tests: the ratchet must never pass vacuously ──────────
+
+    def test_scanner_accepts_drain_sites_that_pass_the_flag(self) -> None:
+        """POSITIVE control: both drain sites pass the flag -> no offenders,
+        and both calls were actually seen.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def stop(self):\n'
+            '        if self.head is not None:\n'
+            '            await self._teardown_verify_task(a, b, c, shutdown_defensive=True)\n'
+            '        for entry in self.inflight:\n'
+            '            await self._teardown_verify_task(a, b, c, shutdown_defensive=True)\n'
+        )
+        assert _undefended_shutdown_teardown_offenders(src) == []
+        assert len(_shutdown_drain_teardown_calls(ast.parse(src))) == 2
+
+    def test_scanner_flags_a_drain_site_that_omits_the_flag(self) -> None:
+        """SYNTHETIC BYPASS: the flagless second call (line 6) is the one flagged."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def stop(self):\n'
+            '        if self.head is not None:\n'
+            '            await self._teardown_verify_task(a, b, c, shutdown_defensive=True)\n'
+            '        for entry in self.inflight:\n'
+            '            await self._teardown_verify_task(a, b, c)\n'
+        )
+        offenders = _undefended_shutdown_teardown_offenders(src)
+        assert len(offenders) == 1, offenders
+        assert offenders[0].startswith('stop:6 '), offenders
+
+    def test_scanner_flags_anything_but_a_literal_true(self) -> None:
+        """LITERAL-ONLY: ``False``, a variable, or a ``**kwargs`` splat cannot be
+        proven True from source text, so each is an offender.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def stop(self, defensive, kwargs):\n'
+            '        await self._teardown_verify_task(a, b, c, shutdown_defensive=False)\n'
+            '        await self._teardown_verify_task(a, b, c, shutdown_defensive=defensive)\n'
+            '        await self._teardown_verify_task(a, b, c, **kwargs)\n'
+        )
+        offenders = _undefended_shutdown_teardown_offenders(src)
+        assert len(offenders) == 3, offenders
+
+    def test_scanner_sees_a_teardown_nested_in_a_wrapper_call(self) -> None:
+        """NESTING: a teardown wrapped in shield/wait_for is still a drain site."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def stop(self):\n'
+            '        await asyncio.wait_for('
+            'asyncio.shield(self._teardown_verify_task(a, b, c)), timeout=1)\n'
+        )
+        offenders = _undefended_shutdown_teardown_offenders(src)
+        assert len(offenders) == 1, offenders
+
+    def test_scanner_ignores_teardown_calls_outside_the_drain_path(self) -> None:
+        """SCOPE: the cascade and abort triggers deliberately propagate by
+        default (see ``test_default_lets_a_raising_abort_propagate``).
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _verifier_loop(self):\n'
+            '        await self._teardown_verify_task(a, b, c)\n'
+            '\n'
+            '    async def _run_inflight_verify(self):\n'
+            '        await self._teardown_verify_task(a, b, c)\n'
+        )
+        assert _undefended_shutdown_teardown_offenders(src) == []
+
+    def test_scanner_ignores_a_stop_on_another_class(self) -> None:
+        """CLASS-QUALIFICATION: only ``SpeculativeMergeWorker.stop`` is scanned."""
+        src = (
+            'class SomethingElse:\n'
+            '    async def stop(self):\n'
+            '        await self._teardown_verify_task(a, b, c)\n'
+        )
+        assert _undefended_shutdown_teardown_offenders(src) == []
+        assert _shutdown_drain_teardown_calls(ast.parse(src)) == []
+
+    def test_scanner_returns_empty_on_unparseable_source(self) -> None:
+        """SYNTAX ERROR: return [] rather than raising."""
+        assert _undefended_shutdown_teardown_offenders('async def broken(:\n') == []
+
+    # ── the ratchet ────────────────────────────────────────────────────────
+
+    def test_stop_drain_teardowns_all_pass_shutdown_defensive(self) -> None:
+        """STRUCTURAL: deleting the flag at either stop() drain site must fail
+        here, not pass silently.
+        """
+        source_file = inspect.getsourcefile(SpeculativeMergeWorker)
+        assert source_file is not None
+        src = Path(source_file).read_text()
+
+        drain_calls = _shutdown_drain_teardown_calls(ast.parse(src))
+        assert len(drain_calls) >= _MQ_SHUTDOWN_DRAIN_SITE_FLOOR, (
+            f'expected at least {_MQ_SHUTDOWN_DRAIN_SITE_FLOOR} '
+            f'`{_MQ_TEARDOWN_CHOKEPOINT}` calls inside {_MQ_SHUTDOWN_DRAIN_METHODS!r} '
+            f'on `{_MQ_CHOKEPOINT_CLASS}`, found {len(drain_calls)}. If a drain '
+            'site moved out of stop(), add its method to '
+            '`_MQ_SHUTDOWN_DRAIN_METHODS`, or this ratchet goes vacuous.'
+        )
+
+        offenders = _undefended_shutdown_teardown_offenders(src)
+        assert offenders == [], (
+            f'every `{_MQ_TEARDOWN_CHOKEPOINT}` call on the shutdown drain path '
+            f'must pass `{_MQ_SHUTDOWN_DEFENSIVE_KWARG}=True`: otherwise a '
+            'SIGTERM-driven CancelledError escaping the remote abort aborts the '
+            'drain loop and leaves the remaining in-flight verifies un-drained, '
+            'orphaning their remote verify-merge processes (task 1757). Pass '
+            f'`{_MQ_SHUTDOWN_DEFENSIVE_KWARG}=True` literally. '
+            f'Offenders: {offenders!r}'
+        )
 
 
 # ---------------------------------------------------------------------------
