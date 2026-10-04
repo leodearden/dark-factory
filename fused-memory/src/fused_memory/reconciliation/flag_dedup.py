@@ -865,6 +865,19 @@ def extract_flag_uuids(flag: dict[str, Any]) -> set[str]:
     return _extract_uuids(_flag_text_blob(flag))
 
 
+def contains_any_casefolded(text: Any, family: tuple[str, ...]) -> bool:
+    """Return True iff *text* is a non-empty ``str`` containing a *family* member.
+
+    Both sides are casefolded and a member matches as a SUBSTRING.  Total over
+    malformed input: a non-``str`` or empty *text* is ``False``, never an
+    exception.  Pure, sync, no I/O.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    folded = text.casefold()
+    return any(member.casefold() in folded for member in family)
+
+
 def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
     """Return True iff *flag_type* belongs to *grounds*' bound token family.
 
@@ -891,11 +904,7 @@ def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
     """
     if not isinstance(flag_type, str) or not flag_type:
         return False
-    family = GROUNDS_TOKEN_FAMILIES.get(grounds)
-    if not family:
-        return False
-    folded = flag_type.casefold()
-    return any(stem.casefold() in folded for stem in family)
+    return contains_any_casefolded(flag_type, GROUNDS_TOKEN_FAMILIES.get(grounds) or ())
 
 
 @dataclass(frozen=True)

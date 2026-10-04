@@ -55,10 +55,12 @@ through the one shared splitter, ``flag_task_ids.task_id_components``.
 LEAF CONTRACT.  This module imports only from
 ``standing_decision_constants`` (for the one genuinely shared fact, the
 ``investigation_outcome`` mem0 kind), ``flag_task_ids`` (the shared flag
-task-id splitter) and ``services.memory_service`` (for the canonical
-raw-payload content extractor).  It reaches nothing in ``stages/``,
-``middleware/`` or ``prompts/``; the consolidator calls in.  It performs
-detection only — it drops flags, never writes tasks or memories.
+task-id splitter), ``flag_dedup`` (its public ``contains_any_casefolded``
+matcher), ``services.memory_service`` (for the canonical raw-payload content
+extractor) and, optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
+nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator
+calls in.  It performs detection only — it drops flags, never writes tasks or
+memories.
 
 WHAT "DISTINCTIVE" MEANS HERE, AND WHY IT IS CHECKED.  Both token families are
 matched as casefolded SUBSTRINGS, so their safety rests entirely on holding
@@ -81,6 +83,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from fused_memory.reconciliation.flag_dedup import contains_any_casefolded
 from fused_memory.reconciliation.flag_task_ids import task_id_components
 from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,
@@ -259,23 +262,6 @@ _LOG_LABEL: str = 'maybe_escalate_preservation_suppression_storm'
 # ── Pure helpers ─────────────────────────────────────────────────────────────
 
 
-def _contains_any(text: Any, family: tuple[str, ...]) -> bool:
-    """Return True iff *text* is a non-empty ``str`` containing a *family* member.
-
-    Casefolded substring test, the spelling
-    ``flag_dedup._flag_type_in_grounds_family`` uses.  Total over malformed
-    input: a non-``str`` (``None``, ``int``, ``bytes``, ``list``) is ``False``,
-    never an exception — every value reaching this helper comes out of a
-    free-form LLM-authored dict or a raw Qdrant payload.
-
-    Pure, sync, no I/O.
-    """
-    if not isinstance(text, str) or not text:
-        return False
-    folded = text.casefold()
-    return any(member in folded for member in family)
-
-
 def cites_preservation(text: Any) -> bool:
     """Return True iff *text* states that a task is a deliberately preserved specimen.
 
@@ -289,7 +275,7 @@ def cites_preservation(text: Any) -> bool:
 
     Pure, sync, no I/O.
     """
-    return _contains_any(text, PRESERVATION_TOKEN_FAMILY)
+    return contains_any_casefolded(text, PRESERVATION_TOKEN_FAMILY)
 
 
 def flag_asserts_stranded(flag: Any) -> bool:
@@ -323,11 +309,11 @@ def flag_asserts_stranded(flag: Any) -> bool:
     """
     if not isinstance(flag, dict):
         return False
-    if _contains_any(flag.get('flag_type'), STRANDED_FLAG_TOKEN_FAMILY):
+    if contains_any_casefolded(flag.get('flag_type'), STRANDED_FLAG_TOKEN_FAMILY):
         return True
     return any(
-        _contains_any(flag.get(field), STRANDED_ACTION_VERB_FAMILY)
-        and _contains_any(flag.get(field), STRANDED_ACTION_TARGET_FAMILY)
+        contains_any_casefolded(flag.get(field), STRANDED_ACTION_VERB_FAMILY)
+        and contains_any_casefolded(flag.get(field), STRANDED_ACTION_TARGET_FAMILY)
         for field in _STRANDED_ACTION_FIELDS
     )
 
