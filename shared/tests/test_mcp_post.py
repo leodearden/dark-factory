@@ -10,6 +10,8 @@ TDD pair 1: ``mcp_endpoint_url`` canonicalization (GREEN on impl step-2).
 TDD pair 2: ``check_mcp_post_response`` loud-and-never-raising (GREEN on step-4).
 Pair 2b + 3: the SSE decode path and the composed ``post_mcp_tool_call`` /
 ``open_mcp_client`` primitives (amendment pass, reviewer suggestions 3 and 4).
+Pair 4: ``decode_mcp_response_body``, the public decoder ``McpSession``
+consumes (task 4819).
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import pytest
 from shared.mcp_post import (
     MCP_POST_HEADERS,
     check_mcp_post_response,
+    decode_mcp_response_body,
     mcp_endpoint_url,
     mcp_tool_call_payload,
     open_mcp_client,
@@ -256,7 +259,7 @@ def test_a_null_jsonrpc_error_member_is_not_treated_as_an_error(caplog):
 # WHY THIS BRANCH IS NOT OPTIONAL COVERAGE.  The fix adds
 # ``Accept: application/json, text/event-stream`` to all five POSTs — that
 # header is what INVITES FastMCP to answer in SSE at all.  So the change made
-# ``_decode_body``'s ``text/event-stream`` branch newly reachable in
+# ``decode_mcp_response_body``'s ``text/event-stream`` branch newly reachable in
 # production while nothing exercised it.  If ``_parse_sse`` were wrong, every
 # SUCCESSFUL write would emit a "could not be inspected" WARNING: the exact
 # inverse of this module's loud-only-on-real-failure contract, and
@@ -383,7 +386,7 @@ def test_sse_labelled_body_with_no_data_line_warns_instead_of_raising(caplog):
 def test_an_unlabelled_sse_body_is_still_decoded(caplog):
     """A body that IS SSE but is not labelled falls back to the SSE spelling.
 
-    ``_decode_body`` tries ``resp.json()`` first and only then ``_parse_sse``.
+    ``decode_mcp_response_body`` tries ``resp.json()`` first and only then ``_parse_sse``.
     Pins that fallback so a server sending SSE under ``application/json`` (or
     no content-type at all) does not warn on a delivered write.
     """
@@ -575,3 +578,62 @@ def test_open_mcp_client_forwards_extra_kwargs(monkeypatch):
     open_mcp_client(timeout=5, follow_redirects=False)
 
     assert built == [{'timeout': 5, 'follow_redirects': False}]
+
+
+# ---------------------------------------------------------------------------
+# Pair 4 — decode_mcp_response_body, the public decoder McpSession consumes (task 4819)
+# ---------------------------------------------------------------------------
+
+_RESULT = {'jsonrpc': '2.0', 'id': 1, 'result': {'content': []}}
+
+
+def test_decode_returns_a_json_labelled_json_body():
+    """A JSON body labelled application/json decodes to that object."""
+    assert decode_mcp_response_body(_response(200, json_body=_RESULT)) == _RESULT
+
+
+@pytest.mark.parametrize('prefix', ['data: ', 'data:'], ids=['spaced', 'tight'])
+def test_decode_parses_an_sse_body_with_either_data_prefix(prefix):
+    """An SSE body decodes to its data frame, with or without the optional space."""
+    resp = _response(200, text=_sse_body(_RESULT, prefix=prefix), headers=SSE_HEADERS)
+
+    assert decode_mcp_response_body(resp) == _RESULT
+
+
+def test_decode_takes_the_last_sse_data_frame():
+    """Of several SSE frames, the last data frame is the answer."""
+    final = {'jsonrpc': '2.0', 'id': 1, 'result': {'final': True}}
+    resp = _response(
+        200,
+        text=_sse_body({'jsonrpc': '2.0', 'id': 1, 'result': {'partial': True}})
+        + _sse_body(final),
+        headers=SSE_HEADERS,
+    )
+
+    assert decode_mcp_response_body(resp) == final
+
+
+@pytest.mark.parametrize(
+    'headers',
+    [None, {'content-type': 'application/json'}],
+    ids=['unlabelled', 'mislabelled-as-json'],
+)
+def test_decode_falls_back_to_sse_for_an_unlabelled_or_mislabelled_body(headers):
+    """An SSE body without the SSE label still decodes via the SSE fallback."""
+    resp = _response(200, text=_sse_body(_RESULT), headers=headers)
+
+    assert decode_mcp_response_body(resp) == _RESULT
+
+
+@pytest.mark.parametrize(
+    ('text', 'headers'),
+    [
+        ('event: ping\nretry: 3000\n\n', SSE_HEADERS),
+        ('not json and not sse', None),
+    ],
+    ids=['sse-without-data', 'neither-json-nor-sse'],
+)
+def test_decode_raises_value_error_when_no_data_line(text, headers):
+    """The decoder RAISES on an undecodable body; only the checker swallows it."""
+    with pytest.raises(ValueError):
+        decode_mcp_response_body(_response(200, text=text, headers=headers))

@@ -903,3 +903,82 @@ class TestQueueItemSessionSlug:
         by_kind = {item.kind: item for item in items}
         assert by_kind['session'].session_slug == 'awaiting-1'
         assert by_kind['decision'].session_slug is None
+
+
+class TestResolveTargetLinksThroughRecordSlug:
+    """A decision focuses the session its filer's record_slug names (task 4237).
+
+    session_id is the filer's provenance label -- in production a watcher's
+    lease token, never a registry key -- so it resolves only as a fallback.
+    """
+
+    _WATCHER_SLUG = 'session-dark-factory-sess-watcher'
+    _LEASE_TOKEN = 'watcher-df-1348600'
+
+    def _sessions(self, *sessions: sr.SessionRecord) -> dict[str, sr.SessionRecord]:
+        return {session.session_slug: session for session in sessions}
+
+    def _watcher(self, **overrides) -> sr.SessionRecord:
+        display = sr.Display(kind='wm', wm_title='escalation-watcher df')
+        return _make_session(
+            **{'session_slug': self._WATCHER_SLUG, 'display': display, **overrides}
+        )
+
+    def test_record_slug_resolves_to_that_sessions_display(self):
+        from cockpit.backends import DisplayTarget
+        from cockpit.panes.decision_queue import resolve_target
+
+        decision = _make_decision(session_id=self._LEASE_TOKEN, record_slug=self._WATCHER_SLUG)
+
+        target = resolve_target(decision, self._sessions(self._watcher()))
+
+        assert target == DisplayTarget(kind='wm', wm_title='escalation-watcher df')
+
+    def test_record_slug_wins_over_a_session_id_naming_another_known_session(self):
+        from cockpit.backends import DisplayTarget
+        from cockpit.panes.decision_queue import resolve_target
+
+        other = _make_session(
+            session_slug='other-session',
+            display=sr.Display(kind='tmux', tmux_target='fleet-df:9'),
+        )
+        decision = _make_decision(session_id='other-session', record_slug=self._WATCHER_SLUG)
+
+        target = resolve_target(decision, self._sessions(self._watcher(), other))
+
+        assert target == DisplayTarget(kind='wm', wm_title='escalation-watcher df')
+
+    def test_a_lease_token_session_id_without_record_slug_stays_unresolved(self):
+        from cockpit.panes.decision_queue import resolve_target
+
+        decision = _make_decision(session_id=self._LEASE_TOKEN, record_slug='')
+
+        assert resolve_target(decision, self._sessions(self._watcher())) is None
+
+    def test_both_blank_is_unresolved(self):
+        from cockpit.panes.decision_queue import resolve_target
+
+        decision = _make_decision(session_id=None, record_slug='')
+
+        assert resolve_target(decision, self._sessions(self._watcher())) is None
+
+    def test_a_linked_session_without_a_display_is_unresolved(self):
+        from cockpit.panes.decision_queue import resolve_target
+
+        decision = _make_decision(record_slug=self._WATCHER_SLUG)
+
+        assert resolve_target(decision, self._sessions(self._watcher(display=None))) is None
+
+    def test_order_queue_gives_a_record_slug_decision_a_focus_target(self):
+        from cockpit.panes.decision_queue import order_queue
+        from cockpit.priority import Priorities
+
+        decision = _make_decision(
+            session_id=self._LEASE_TOKEN,
+            record_slug=self._WATCHER_SLUG,
+            state=sr.DecisionState.OPEN,
+        )
+
+        [item] = order_queue([decision], [self._watcher()], Priorities.default(), _NOW)
+
+        assert item.target is not None

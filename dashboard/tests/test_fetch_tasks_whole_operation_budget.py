@@ -24,7 +24,12 @@ assertions that checked them, went with it. That is the STRONGEST available
 resolution of its share of the incident — a call that does not exist cannot
 hang — and not a relaxation. The endpoint is still swept by
 ``test_dashboard_endpoints_survive_hung_mcp.py``, which asserts it answers
-200 while the seam hangs. The browser-abort ceiling this file used to read out
+200 while the seam hangs. ``merge_queue.load_task_titles`` went the same way
+(task 5595): /merge-queue no longer fetches a task tree, it reads the few
+titles it names through ``task_lookup.lookup_tasks``, whose
+``LOOKUP_BUDGET_SECONDS`` takes its place in assertion (b). ``_load_task_cards``
+followed (task 5596): /escalations reads its task cards through the same
+``lookup_tasks``, so its ``_TASK_CARDS_BUDGET`` row in (b) went with it. The browser-abort ceiling this file used to read out
 of ``data.js`` went with (d); ``test_tasks_budget.py`` assertion (c) still
 enforces it for the one whole-handler deadline that remains.
 
@@ -35,8 +40,7 @@ default walks into (e). That mutual constraint is the point.
 
 from __future__ import annotations
 
-from dashboard.api import escalations
-from dashboard.data import merge_queue, tasks
+from dashboard.data import task_lookup, tasks
 
 
 def test_fetch_tasks_whole_operation_budget_is_structurally_deliverable():
@@ -94,8 +98,7 @@ def test_fetch_tasks_whole_operation_budget_is_structurally_deliverable():
 
     # (b) a call-site constant may only ever tighten the shared default.
     for label, site_budget in (
-        ('merge_queue._TASK_TITLES_BUDGET', merge_queue._TASK_TITLES_BUDGET),
-        ('escalations._TASK_CARDS_BUDGET', escalations._TASK_CARDS_BUDGET),
+        ('task_lookup.LOOKUP_BUDGET_SECONDS', task_lookup.LOOKUP_BUDGET_SECONDS),
     ):
         assert site_budget <= whole, (
             f'{label} ({site_budget}s) exceeds the shared '

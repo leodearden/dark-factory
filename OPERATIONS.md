@@ -88,6 +88,7 @@ each does, and when to reach for it.
 | `/study` | Quality | Before a hard discussion or design decision | Loads a deep, discussion-ready understanding of a specific piece of code |
 | `/hotspot-survey` | Quality | Deciding what to refactor based on bug history | Multi-agent survey (~25-30 agents, 60-90 min) mining git/task/postmortem history for bug-cluster root causes, feeding `/prd` |
 | `/census` | Quality | Sweeping for confusion sightings against the legibility codebook | Saturation-mines confusion sightings, updates the codebook, files remediation |
+| `/review-all` | Quality | Deep, infrequent, human-attended review of a whole project against `docs/code-quality.md`; launched from the `Run /review-all on <project>` human-gate task, never unattended | Pins one tree, snapshots whole-repo metrics (report, not gate), refreshes stale instruments in delta mode and consumes the census, runs one seat per area plus cross-area seats against all fourteen heuristics with blinded skeptics, then synthesis, a critic, deliberation → program doc → `/prd` per stream (~40 seats, 5–8M tokens, 4–5 h machine on dark-factory) |
 | `/do` | Other | You've just agreed on a direction and want it executed autonomously | Distills the conversation into a self-contained plan plus the fixed worktree → `/merge-queue` → `/reflect` execution recipe, run in a fresh context |
 | `/warm` | Other | Ad-hoc interactive work that wants a pre-seeded worktree | Claims a copy-on-write warm worktree; falls back to a cold worktree if none is available |
 
@@ -102,8 +103,8 @@ not as things an operator runs directly.
 
 **Wiring:** `scripts/setup-host.sh` installs the skills via two mechanisms
 — flat `~/.claude/commands/*.md` symlinks for most, and whole-directory
-`~/.claude/skills/<name>` symlinks for the three that carry their own
-`references/`/`scripts/` (`factory-init`, `prd`, `hotspot-survey`). If a
+`~/.claude/skills/<name>` symlinks for the four that carry their own
+`references/`/`scripts/` (`factory-init`, `prd`, `hotspot-survey`, `review-all`). If a
 slash command turns out to be missing (e.g. a skill added after your last
 bootstrap), re-run the installer or symlink it by hand — see
 [SETUP.md](SETUP.md) §"Skill wiring".
@@ -396,7 +397,8 @@ python3 orchestrator/src/orchestrator/session_registry.py lease-show --name watc
 ```
 
 It prints `key=value` lines — `state`, `holder_slug`, `holder_pid`,
-`holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable` —
+`holder_pid_alive`, `heartbeat_ts`, `heartbeat_age_secs`, `reclaimable`,
+`holder_record`, and `holder_record_slug` when the body carries one —
 computed by the same reader `lease-claim` decides with, and never touches the
 lease. A lease is stale only when the holder pid is dead **and** the heartbeat
 is past `LEASE_HEARTBEAT_TTL` (2h); a live holder is never reclaimable however
@@ -407,7 +409,12 @@ only** — `orphaned` means the pid recorded in the lease body is not running,
 nothing more; `none` means the claim was acquired and there is no contending
 holder at all. Treat `orphaned` as one diagnostic, never as grounds to
 force-release on its own: a quiet-but-live holder that reads as dead is the
-duplicate-spawn incident.
+duplicate-spawn incident. `holder_record=<unlinked|absent|unreadable|active|exited>`
+(printed by both `lease-claim` and `lease-show`) is the second, independent
+axis: the state of the holder's session-registry record, found through the
+`record_slug` the lease body carries. `exited`/`absent` corroborate an
+`orphaned` pid, and `unlinked` (a lease claimed before that field existed) is no
+evidence either way.
 
 A holder whose lease body says `holder_pid=0` claimed it on the **degraded**
 pid path (`$CLAUDE_PID` unset — the CLI records 0, a never-alive sentinel, and
@@ -477,8 +484,11 @@ findings.
 ### Dashboard
 
 The dashboard (typically `http://127.0.0.1:8080`, a shared process for the
-whole fleet) polls every registered project every few seconds and presents
-these tabs: **Overview**, **Orchestrators**, **Tasks**, **Scheduler**,
+whole fleet) covers every registered project. Every few seconds the browser
+polls only the endpoints the open tab renders, plus an always-on set behind
+the rail badges, the topbar and the filters, whose task counts come from
+`/api/v2/dashboard/tasks?projection=census`. Switching tabs fetches the
+newly-needed data at once. It presents these tabs: **Overview**, **Orchestrators**, **Tasks**, **Scheduler**,
 **Curator**, **Performance**, **Memory**, **Reconciliation**, **Merge
 Queue**, **Costs**, **Burndown**, **Escalations**, and **Analytics**
 (escalation analytics). It's read-only situational awareness across the
@@ -804,6 +814,11 @@ takes no arguments: it always re-reads that process's own
 - `session_resume.*` (whole submodel, including the `restore_from_archive`
   rehydration kill switch — see [§14](#14-transcript-preservation--the-archival-guard))
 - `verify_env`
+- `verify_cgroup_cpu_weight_merge` / `_task` / `_background` (the per-role
+  cgroup `CPUWeight` a verify scope is spawned with when
+  `verify_use_cgroup_scope` is on; read at each scope spawn, so a reload
+  applies from the next verify leg — a scope already running keeps the weight
+  it started with)
 - `git.merge_park_lock_grace_seconds` (the `advance_main` index-lock
   stand-off budget — re-read per advance, see
   [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state))
@@ -814,7 +829,7 @@ takes no arguments: it always re-reads that process's own
 - `merge_disjoint_skip_requires_verified_drift` (the soundness gate on the
   merge queue's disjoint-delta fast path — see
   [§"Merge-halt semantics"](#merge-halt-semantics-wip_conflict--unmerged_state)'s
-  neighbourhood and `merge_gates._disjoint_skip_blockers`). When `true`
+  neighbourhood and `merge_lane/gates.py::_disjoint_skip_blockers`). When `true`
   (the default) a rebase whose footprint is disjoint from the intervening
   main delta is re-verified anyway unless that delta is a main tip **this
   queue landed green**; drift from any other writer — an unattended nightly
@@ -1673,11 +1688,13 @@ directly, not just interactive sessions. Treat it accordingly:
     bumped timeout: reach for a plain gated `git commit --only <paths>`
     first.
   - **Staged `.py` under `shared/` or `escalation/`** — every dependent
-    package imports them, so the hook runs a full sweep across all three
-    `PYRIGHT_PACKAGES` (`fused-memory`, `orchestrator`, `dashboard`).
-    This is the 3x worst case and can comfortably exceed two minutes.
-  - **Staged `.py` under exactly one of `fused-memory`, `orchestrator`,
-    or `dashboard`** — pyright runs once, for that package only.
+    package imports them, so the hook runs a full sweep across all seven
+    `PYRIGHT_PACKAGES` (`fused-memory`, `orchestrator`, `dashboard`,
+    `shared`, `escalation`, `sampler`, `cockpit` — the members of
+    `type_check_command`). This is the 7x worst case and can comfortably
+    exceed two minutes.
+  - **Staged `.py` under exactly one of the other `PYRIGHT_PACKAGES`
+    (`fused-memory`, `orchestrator`, `dashboard`, `sampler`, `cockpit`)** — pyright runs once, for that package only.
   - **Staged `.py` outside every prefix above** (e.g. `scripts/`, a
     root-level `conftest.py`) — pyright is skipped for the whole commit,
     and unlike the no-Python case the hook prints *nothing*, so there is
@@ -1818,46 +1835,67 @@ they carry a different unit name, and a re-armed sweep would merely fail
 
 ### Legibility trickle accounts (03:00)
 
-**Which accounts it uses.** Every invocation of the night — each digest the
-coder codes, and the census subprocess when the trigger fires — is drawn from
-the shared account pool in `config/usage-accounts.yaml` (`max-b`..`max-h`),
-through the same `shared.usage_gate.UsageGate` the orchestrator uses. The
-trickle drains the roster from the **end** (h→b) while the orchestrator takes
-first-available (b→h), so the two only contend when the pool is nearly
-exhausted anyway. Before task 5488 the trickle had no pool at all: it rode
+**Which accounts it uses, and how it calls them.** Every model call of the
+night goes through the orchestrator's own session runner,
+`shared.cli_invoke.invoke_with_cap_retry`, over the shared seven-account pool in
+`config/usage-accounts.yaml` and the same `shared.usage_gate.UsageGate` the
+orchestrator uses (task 6042). That covers each digest the coder codes, and,
+when the trigger fires, every census stage and its headroom probe.
+`scripts/legibility/session_runner.py` is the one boundary that does it. Each
+call runs `claude` in JSON mode under a per-process `CLAUDE_CONFIG_DIR`, into
+which the runner writes the leased account's token, so no call reads the
+operator's own `~/.claude` login. The pool never falls back to that login
+either: an empty pool defers. Nothing waits for a reset. When no account is
+admissible the call fails at once with a typed exhaustion (below), so a capped
+night still ends inside the 03:00 run.
+
+Accounts are taken first-available in roster order, the same order the
+orchestrator uses; the trickle's old drain-from-the-end order is retired. Since
+2026-09-29 the roster lists its org-disabled accounts last, so the trickle
+reaches them only once the live ones are capped. Each then costs one rejected
+call before the gate marks it AUTH_FAILED for the rest of the process (task
+5947). The trickle builds one pool for its digests. The census is a separate
+process and builds its own, so the census starts with no memory of the
+trickle's caps. Before task 5488 the trickle had no pool at all: it rode
 whatever login `~/.claude` happened to hold, so one capped account deferred a
 whole night while six live ones sat idle.
 
 **What the unit must supply, and the API-key policy.** This paragraph is the
 one statement of that policy; the unit file, `account_pool.build_pool` and the
 unit-template test cite it rather than re-argue it.
-`legibility-trickle@.service` pins **no** account — choosing one is the gate's
-job, per invocation — and carries two directives:
+`legibility-trickle@.service` pins **no** account (choosing one is the gate's
+job, per call) and carries three directives:
 
-- `EnvironmentFile=/home/leo/src/dark-factory/.env` — belt and braces, not the
-  pool's lifeline: `build_pool` `load_dotenv`s that same file itself and
-  resolves all seven accounts even with no `CLAUDE_OAUTH_TOKEN_*` in the
-  environment (measured), so deleting the directive does not strand the gate.
-  It is there so the unit states the dependency it runs on instead of burying
-  it in Python.
-- `UnsetEnvironment=ANTHROPIC_API_KEY` — load-bearing. The CLI prefers an API
-  key over the OAuth token, so a key inherited from the `systemd --user`
-  manager would authenticate every invocation as that one identity while the
-  pool's failover still *looked* like it worked.
+- `Environment=PATH=...`, an absolute list with `/home/leo/.local/bin` ahead of
+  `/usr/bin`. The runner spawns the bare name `claude`, resolved against this
+  PATH, and the census grandchild inherits it. It replaces the old
+  `LEGIBILITY_CLAUDE_BIN` pin, which nothing reads any more. The reason it is
+  pinned is unchanged: on 2026-08-18 the `systemd --user` manager started at
+  boot without `~/.local/bin` on its PATH, and the catch-up run failed every
+  digest with ENOENT.
+- `EnvironmentFile=-/home/leo/src/dark-factory/.env`. This is belt and braces,
+  not the pool's lifeline, and the leading `-` makes it optional (task 5635).
+  `build_pool` `load_dotenv`s that same file itself and resolves all seven
+  accounts even with no `CLAUDE_OAUTH_TOKEN_*` in the environment (measured).
+  A missing file must therefore not stop the unit starting: an empty pool
+  becomes a recorded deferral. The directive is there so the unit states the
+  dependency it runs on instead of burying it in Python.
+- `UnsetEnvironment=ANTHROPIC_API_KEY`. This one is load-bearing. The CLI
+  prefers an API key over the OAuth token, so a key inherited from the
+  `systemd --user` manager would authenticate every call as that one identity.
+  The pool's failover would still *look* like it worked.
 
-That `.env` *also* defines `ANTHROPIC_API_KEY`, so the strip happens at three
-points, none of which covers another's scope:
+That `.env` *also* defines `ANTHROPIC_API_KEY`, so the key is stripped at three
+points, and none of them covers another's scope:
 
-1. systemd's `UnsetEnvironment=`, for the unit's own process (it is applied
-   after `EnvironmentFile=`, so it removes the `.env`'s copy too);
+1. systemd's `UnsetEnvironment=`, for the unit's own process. It is applied
+   after `EnvironmentFile=`, so it removes the `.env`'s copy too.
 2. `account_pool.build_pool`, in-process, immediately after its own
-   `load_dotenv` of that same file — which would otherwise put the key
-   straight back for every child that *inherits* this environment rather than
-   being handed one. That child is the census launcher whenever the pool has
-   nothing to lease (`subprocess_env` returns `None`): the census and every
-   `claude` it spawns would then bill the key's identity, and its headroom
-   preflight would pass instead of fail-safe deferring, so nothing would show;
-3. `coder.child_env`, for each child handed an explicit env.
+   `load_dotenv` of that same file. Without it, the load would put the key
+   straight back into this process's environment, and from there into the
+   census grandchild that inherits it.
+3. `shared/src/shared/cli_invoke.py::_invoke_claude`, for every `claude` the
+   runner spawns.
 
 **The 2026-09-14 max-h pin is retired.** `legibility-trickle@.service.d/
 10-account-pin.conf` reset `ExecStart` and re-spelled it with one account's
@@ -1869,35 +1907,76 @@ the unit. A drop-in's `ExecStart=` reset REPLACES the unit's own, so one left
 behind keeps the trickle pinned and makes the pool inert.
 
 **Reading a night in the journal** (`journalctl --user -u
-legibility-trickle@<project>`):
+legibility-trickle@<project>`). The runner's own lines carry its label:
+`legibility-trickle[<project>][trickle-coder]` for a digest, and
+`legibility-census[<project>][census-mining]` (or `census-verify`,
+`census-synthesis`) for the census.
 
-- `legibility account pool: 7 accounts — max-b, ...` at startup. Names only,
-  never tokens.
-- `account max-h did not complete this digest and the gate recorded a cap
-  signal against it — retrying this digest on the next account in the pool`:
-  ordinary weather. The digest is retried on the next account, not lost. The
-  line deliberately does not say *capped*, because only the gate knows which
-  transition it took — a cap hit caps the account (look for its own `Account
-  max-h CAPPED: <banner>` alongside), while a near-cap warning only annotates
-  one that stays perfectly usable.
-- `legibility trickle coder DEFERRED: all accounts capped, N/M digests
-  returned a usage-limit banner instead of a model turn` — **exit 0**, a
-  deferral rather than an incident (task 4736), with a WARNING-level
-  escalation. The per-digest reason reads `legibility trickle: all N pool
-  accounts capped`. This one self-clears at the weekly reset; nothing to do.
-- `legibility trickle: no pool accounts resolved — check that the unit's
-  EnvironmentFile supplies the CLAUDE_OAUTH_TOKEN_* vars named in
-  config/usage-accounts.yaml` — the SECOND exhaustion, and a config fault that
-  will never clear on its own. Paired with a loud `legibility account pool
-  resolved NO usable accounts` warning naming the roster it failed to resolve.
-- `legibility trickle: no account in the pool completed this digest (7 of 7
-  tried) and the gate still considers max-c usable — so this is not a capacity
-  limit ...` — the THIRD, and the only one that is neither weather nor a
-  missing token: every account was tried and every one refused, while the gate
-  says the pool is fine. Nothing will clear at the weekly reset because
-  nothing is capped. Read the run's per-digest failures for what each account
-  actually reported — a fleet-wide near-cap warning and a backend fault both
-  land here.
+- `legibility account pool: 7 of 7 configured accounts resolved (configured:
+  max-b, ...)` at startup. Names only, never tokens.
+- `<label>: dispatching on account 'max-b'`, once per call.
+- `Account max-b CAPPED: <banner>`, then `<label>: cap hit (1 consecutive),
+  ...` and a dispatch on the next account. This is ordinary weather: the same
+  digest is retried on the next account, not lost.
+- `<label>: account max-h auth-failed (HTTP 403) — failing over`, alongside
+  the gate's own `Account max-h AUTH-FAILED: ...`. The account's credentials
+  were rejected (for example `Your organization has disabled Claude
+  subscription access ...`). The digest is retried on the next account, and
+  the gate skips the rejected one for the rest of the process: unlike the
+  orchestrator's gate, the legibility pool never re-probes it, because a
+  re-probe reloads `.env` into the process. This is **not**
+  weather: the account needs an operator or billing decision, and retiring it
+  means editing `config/usage-accounts.yaml` (cf. task 5944). An auth
+  rejection is recognised from the CLI's JSON `api_error_status` (401 or 403)
+  by the same classifier the orchestrator uses,
+  `shared.invocation_outcome.classify_invocation`. No wording table is
+  involved, so a new rejection text fails over like any other.
+
+When no account is left, every remaining digest fails with one of six typed
+exhaustions, each prefixed with the label:
+
+- `legibility trickle coder DEFERRED: N/M digests found no pool account with
+  headroom`, where each per-digest reason reads `<label>: all 7 pool accounts
+  capped`. The run exits **0**: a deferral rather than an incident (task
+  4736), with a WARNING-level escalation. It self-clears at the weekly reset,
+  so there is nothing to do.
+- `<label>: no pool accounts resolved — check that the unit's EnvironmentFile
+  supplies the CLAUDE_OAUTH_TOKEN_* vars named in config/usage-accounts.yaml`.
+  This is a config fault and will never clear on its own. It is paired with a
+  loud `legibility account pool resolved NO usable accounts` warning naming the
+  roster, or with `legibility account pool could not load its roster` when the
+  file is unreadable or malformed. The night is still recorded as DEFERRED
+  rather than crashing (task 5635).
+- `<label>: no account completed this invocation in one pass over the
+  7-account pool and the gate still considers max-c usable — so this is not a
+  capacity limit ...`. This is neither weather nor a missing token: every
+  account was tried and every one refused, while the gate says the pool is
+  fine. Nothing will clear at the weekly reset, because nothing is capped. Read
+  the run's per-digest failures for what each account actually reported.
+- `<label>: every one of the 7 pool accounts had its credentials rejected
+  (HTTP 401/403): max-d, ... — this is not a capacity limit and will not clear
+  at the weekly reset; those accounts' access or tokens need operator action`.
+  Every digest fails with this, so the night is a `legibility trickle coder
+  storm: N/N digests failed` that exits **1** with an ERROR escalation. That
+  is deliberate. It is never a DEFERRED night, because nothing here clears at
+  the weekly reset.
+- `<label>: all 7 pool accounts unavailable — 4 capped, which clears at the
+  weekly reset, and max-b, max-c, max-h with credentials rejected (HTTP
+  401/403), which will not clear without operator action`. This is a mixed
+  exhaustion. The night is DEFERRED as for an all-capped pool, but the reason
+  names the auth-failed accounts that will not come back with the rest.
+- `<label>: model scope 'claude-fable-5' is exhausted on every admissible one
+  of the 7 pool accounts — that clears at the scope's reset, and the fleet
+  stays open for other models`. Only a model the gate caps in its own scope
+  (`UsageCapConfig.scoped_cap_models`, default `claude-fable-5`) can produce
+  it, and only when a stage passes that full id; the shipped stages pass
+  aliases such as `fable`. It is weather, and the night is DEFERRED. Any
+  auth-failed accounts are named as in the mixed case.
+
+One failure is not an exhaustion. `<label>: claude CLI could not be started
+(model='haiku', cwd=...): [Errno 2] ...` means `claude` is missing from the
+unit's PATH. Every digest fails with it, so the night is a storm that exits
+1. Check the unit's `Environment=PATH=` pin.
 
 ### Legibility trickle health probe (04:30)
 

@@ -75,7 +75,8 @@ __all__ = [
 #:
 #: A topic is a duplicate CLUSTER, so a conforming one is single digits and
 #: this bound is never reached; it exists so a topic that has become a
-#: dumping ground cannot return an unbounded payload. Reaching it is itself
+#: dumping ground cannot return an unbounded payload (each row's size is
+#: bounded separately, by the envelope's projection). Reaching it is itself
 #: a finding, which is why the envelope discloses ``topic_members_truncated``
 #: rather than letting a capped listing read as the whole closure.
 TOPIC_MEMBER_LIMIT = 200
@@ -88,6 +89,10 @@ class TopicClosure:
     ``available`` is the third answer an empty ``members`` cannot give on
     its own: a scroll that could not be READ is not a topic with no
     members, and conflating them is the overclaim this op exists to end.
+
+    ``members`` are the RAW scroll rows, because the tool's topic-guard seed
+    (step 7c) reads their ``content``; the envelope projects them, in
+    ``server/consolidation.py::build_consolidation_result``.
     """
 
     members: list[Any]

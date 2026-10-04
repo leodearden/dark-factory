@@ -112,8 +112,9 @@ def resolve_hook_identity(
 
     Delegates to ``session_registry.parse_spawn_identity``: ``CLAUDE_SPAWN_*``
     env wins when present; otherwise falls back to its documented defaults
-    (``role='session'``, ``project=basename(cwd)``) since hook stdin carries
-    no title to parse. *cwd* comes from the hook's stdin JSON, falling back
+    (``role='session'``, ``project`` derived from the enclosing checkout of
+    *cwd* -- see ``session_registry.py::parse_spawn_identity``) since hook
+    stdin carries no title to parse. *cwd* comes from the hook's stdin JSON, falling back
     to ``os.getcwd()`` when absent.
 
     SCOPE of the fork-path strip, stated once (task 4663): the strip is
@@ -182,7 +183,8 @@ def _non_spawner_identity_env(env: Mapping[str, str]) -> Mapping[str, str]:
     row would be indistinguishable from its spawner's except by slug.
 
     Stripping these keys makes both functions fall through to their own
-    non-spawn defaults (``role='session'``, ``project=basename(cwd)``,
+    non-spawn defaults (``role='session'``, ``project`` derived from the
+    enclosing checkout -- see ``session_registry.py::parse_spawn_identity``,
     ``task_id=None``, ``escalation_id=None``) instead of parroting the
     spawner's identity.
     """
@@ -727,6 +729,26 @@ def _bind_claude_session_id(
     # read back as "cannot prove ownership".
     record.claude_owner_pid = (probes or _EventProbes({})).owning_claude_pid()
     return True
+
+
+def _stamp_session_pointer(
+    record: session_registry.SessionRecord,
+    probes: _EventProbes,
+    root: Path | str | None,
+) -> None:
+    """Point this event's claude pid at *record*, iff the record names it as owner.
+
+    The pointer asserts exactly what the written record already proves --
+    ``claude_owner_pid`` is this event's owning claude pid -- so one rule
+    covers every lane (adopt, fork, a withheld launch window, an unproven
+    adopt, a blank session_id) without branching on them. The pid comes from
+    the event's probe memo, the same observation the binding was made from.
+    Fail-soft: ``write_session_pointer`` never raises.
+    """
+    pid = probes.owning_claude_pid()
+    if pid is None or record.claude_owner_pid != pid:
+        return
+    session_registry.write_session_pointer(pid, record.session_slug, root=root)
 
 
 # ---------------------------------------------------------------------------
@@ -1417,6 +1439,7 @@ def run_session_start(
             probes=probes,
         )
     session_registry.write_record(record, root=root)
+    _stamp_session_pointer(record, probes, root)
     return record
 
 
@@ -1622,6 +1645,10 @@ def _run_status_refresh_and_retitle(
     alternative of forking every pre-SessionStart event onto a new slug,
     which would misroute the OWNER's session whenever its SessionStart is
     merely slow -- trading a rare stale status for a routine wrong one.
+
+    The refresh path stamps the pid pointer too (``_stamp_session_pointer``),
+    so a session already running when the pointer shipped -- a long-lived
+    watcher -- is linked by its next Notification/Stop, not its next restart.
     """
     probes = _EventProbes(env)
     # RAW env, deliberately, on the fork path too (task 4663): this identity
@@ -1685,6 +1712,7 @@ def _run_status_refresh_and_retitle(
     # itself, and that bump is owed on EVERY event, a withheld one included
     # -- it is the whole point of withholding rather than skipping.
     session_registry.write_record(record, root=root)
+    _stamp_session_pointer(record, probes, root)
     title = hook_display_title(identity, env, record)
     return osc_retitle_sequence(status, title)
 

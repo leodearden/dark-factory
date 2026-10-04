@@ -55,6 +55,7 @@ from fused_memory.reconciliation.graphiti_degradation_probe import (
     NEGATIVE_SET_VERDICT,
 )
 from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_KIND,
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
     STAGE1_CYCLE_SUMMARY_RECON_POOL,
     STAGE2_CYCLE_SUMMARY_RECON_POOL,
@@ -565,7 +566,10 @@ def render_cycle_summary_section() -> str:
         'this runs unconditionally every cycle. Do NOT author your own per-cycle '
         'summary `add_memory` write on the normal flow: doing so creates a second '
         "cycle_summary record for the same run_id. Python's mirror is tagged with "
-        "metadata={'kind': 'cycle_summary', 'stage': <stage_name>, "
+        # Task 3202 / INV-5: the kind literal is rendered from the shared
+        # CYCLE_SUMMARY_KIND constant, never re-typed, so a rename in
+        # recon_pool_map reaches this prompt instead of stranding it.
+        f"metadata={{'kind': '{CYCLE_SUMMARY_KIND}', 'stage': <stage_name>, "
         "'run_id': <run_id>, 'recon_pool': <recon_pool>, 'record_type': 'ledger_stamp'}. "
         '<run_id> is the exact run_id from the payload context (the same run_id '
         'embedded in the summary content). <recon_pool> is looked up from the '
@@ -616,7 +620,7 @@ def render_cycle_summary_section() -> str:
         'author and is unrelated to the normal-flow write this section '
         'describes.\n\n'
         'The summary is deterministically findable by a metadata-keyed lookup — '
-        "count_memories_by_metadata(project_id, {'kind': 'cycle_summary', "
+        f"count_memories_by_metadata(project_id, {{'kind': '{CYCLE_SUMMARY_KIND}', "
         "'run_id': <run_id>, 'stage': <stage_name>}) — which downstream stages "
         'use as a second verification path instead of relying on semantic search '
         'alone. The stage key in this lookup is REQUIRED: both Stage 1 and '

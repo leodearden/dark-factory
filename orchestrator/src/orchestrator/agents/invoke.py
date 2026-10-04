@@ -262,7 +262,7 @@ async def _invoke_claude_with_sandbox(
             # Build command via the shared single source of truth (task 2465
             # dedup) so this sandboxed path stays in lockstep with the
             # non-sandbox path in shared.cli_invoke._invoke_claude — including
-            # the CLI-2.1.168 StructuredOutput deny-list expansion.
+            # the schema + '*' deny → `--tools ''` registry-filter substitution.
             cmd, temp_files = build_claude_argv(
                 model=model,
                 max_budget_usd=max_budget_usd,

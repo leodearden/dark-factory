@@ -23,9 +23,11 @@ a fixed date; `--window <iso>..<iso>` is the mechanism for that. The GATE that
 holds a budget up lives in tests/scripts/test_module_verify_budgets.py; do not
 read this report as that gate.
 
-THREE FACTS COME ONLY FROM THE PATH. A summary.json carries no task id, no
-module prefix and no role, so `parse_record_path` recovers them from where the
-file sits. The two corpora spell the filename differently and the difference is
+TWO FACTS COME ONLY FROM THE PATH. A summary.json carries no task id and no
+module prefix, so `parse_record_path` recovers them from where the file sits.
+The role comes from the record itself (stamped since task 5671); only a record
+written before that falls back to the role its path implies (`Record.role`).
+The two corpora spell the filename differently and the difference is
 easy to get wrong: the worktree side ends `.summary.json`, while the ARCHIVE
 side carries its stamp AFTER that word — `.summary-20260914T123016_283575Z.json`
 — so a `*.summary.json` glob selects zero archive records. D17's own text globs
@@ -111,12 +113,14 @@ class RecordPath:
     attempt one. Selection sanitises the REQUESTED prefix through the same rule
     and compares forward, which is unambiguous; see ``sanitise_prefix``.
 
-    ``role`` is ``None`` when it is not knowable, which is every archive record
-    (the archive carries both task-path and merge-path legs, and the path does
-    not say which) and any unrecognised worktree lane name. ``None`` is the
-    honest reading: defaulting it to ``'task'`` would fold merge legs, which
-    run a different breadth on a different budget, into a task distribution and
-    call the result measured.
+    ``role`` is the role the path implies, which is only the FALLBACK for a
+    record written before task 5671 stamped the role into the summary itself;
+    read ``Record.role``, not this. It is ``None`` when it is not knowable,
+    which is every archive record (the archive carries both task-path and
+    merge-path legs, and the path does not say which) and any unrecognised
+    worktree lane name. ``None`` is the honest reading: defaulting it to
+    ``'task'`` would fold merge legs, which run a different breadth on a
+    different budget, into a task distribution and call the result measured.
     """
 
     path: Path
@@ -207,6 +211,17 @@ class Record:
 
     where: RecordPath
     payload: dict
+
+    @property
+    def role(self) -> str | None:
+        """The verify role that wrote this record: its own stamp, else its path's.
+
+        The ONE place role is resolved. A non-string stamp is treated as no
+        stamp, so a malformed record keeps the path inference rather than
+        inventing a role.
+        """
+        stamped = self.payload.get('role')
+        return stamped if isinstance(stamped, str) else self.where.role
 
 
 @dataclass(frozen=True)
@@ -476,9 +491,10 @@ def select_full_suite_legs(
     report renders ``<none declared>`` beside it, so a reader can tell "nothing
     to compare against" from "compared and found nothing".
 
-    ``role=None`` means "do not filter by role", which is the only usable
-    default for the archive corpus, where the role is not knowable from the
-    path at all (see ``RecordPath.role``).
+    ``role=None`` means "do not filter by role". A role filter compares
+    ``Record.role``, so it selects archive records stamped since task 5671 and
+    rejects the unstamped ones, whose role is not knowable from the path at all
+    (see ``RecordPath.role``).
 
     Every entry read is either selected or counted under a reason, and every
     record not read is counted under one — in ``Selection``'s two separate
@@ -494,7 +510,7 @@ def select_full_suite_legs(
         if record.where.module_prefix != wanted_infix:
             rejected_records['prefix_mismatch'] += 1
             continue
-        if role is not None and record.where.role != role:
+        if role is not None and record.role != role:
             rejected_records['role_mismatch'] += 1
             continue
         entries = record.payload.get('commands')

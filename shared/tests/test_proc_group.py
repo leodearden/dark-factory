@@ -24,6 +24,7 @@ from shared.proc_group import (
     process_group_terminated,
     reap_process_groups,
     scan_process_groups_under_path,
+    sigkill_process_group,
     snapshot_process_group,
     terminate_process_group,
 )
@@ -869,6 +870,106 @@ class TestTerminateProcessGroup:
         assert calls == []
 
 
+class _KillRecordingProc:
+    """A fake live proc handle whose ``kill()`` records that it was called."""
+
+    returncode = None
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.killed = False
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+class TestSigkillProcessGroup:
+    """sigkill_process_group: an immediate, signal-only SIGKILL of a frozen pgid."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(60)
+    async def test_sigkills_the_whole_group_including_grandchildren(self):
+        proc = await asyncio.create_subprocess_shell(
+            'sleep 60 & sleep 60 & echo ready; wait',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+
+        try:
+            # Same anti-vacuity arrange as
+            # test_terminate_process_group_reaps_grandchildren: the grandchildren
+            # must provably exist before the kill.
+            await _await_shell_ready(proc, what='both background jobs forked')
+            await _await_group_membership(pgid, total=3, comm='sleep', comm_count=2)
+
+            sigkill_process_group(proc, pgid)
+
+            await proc.wait()
+            assert proc.returncode == -signal.SIGKILL, (
+                f'expected an immediate SIGKILL (-9), got {proc.returncode}'
+            )
+        finally:
+            if proc.returncode is None:
+                _kill_group(pgid)
+            with contextlib.suppress(Exception):
+                await proc.wait()
+
+        await _await_group_terminated(pgid)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
+    async def test_dispatches_nothing_once_the_leader_is_reaped(self, monkeypatch):
+        """A reaped leader's pid may be recycled: refusing a stranger beats reaping an orphan."""
+        proc = await asyncio.create_subprocess_shell(
+            'true',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        pgid = proc.pid
+        await proc.wait()
+
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            'shared.proc_group.os.killpg', lambda pgid, sig: calls.append((pgid, sig))
+        )
+
+        sigkill_process_group(proc, pgid)
+
+        assert calls == [], f'killpg must not fire on a reaped leader; got {calls}'
+
+    @pytest.mark.timeout(5)
+    def test_unsafe_pgid_is_refused_and_degrades_to_a_direct_kill(self, monkeypatch, caplog):
+        calls: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            'shared.proc_group.os.killpg', lambda pgid, sig: calls.append((pgid, sig))
+        )
+        fake = _KillRecordingProc(pid=999_999)
+
+        with caplog.at_level(logging.ERROR, logger='shared.proc_group'):
+            sigkill_process_group(fake, 999_998)  # type: ignore[arg-type]
+
+        assert calls == [], f'killpg should be refused; got {calls}'
+        assert fake.killed, 'a refused group kill must still kill the direct child'
+        assert any(
+            'refusing to killpg' in rec.message.lower() for rec in caplog.records
+        ), f'expected a refusal log record, got {[r.message for r in caplog.records]}'
+
+    @pytest.mark.timeout(5)
+    def test_killpg_failure_degrades_to_a_direct_kill(self, monkeypatch):
+        def failing_killpg(pgid: int, sig: int) -> None:
+            raise ProcessLookupError(errno.ESRCH, 'no such process group')
+
+        monkeypatch.setattr('shared.proc_group.os.killpg', failing_killpg)
+        fake = _KillRecordingProc(pid=999_999)
+
+        sigkill_process_group(fake, 999_999)  # type: ignore[arg-type]
+
+        assert fake.killed, 'a failed group kill must still kill the direct child'
+
+
 class TestSnapshotProcessGroup:
     """Tests for snapshot_process_group(pgid) — /proc-based process-group snapshot.
 
@@ -1706,9 +1807,9 @@ class TestReapProcessGroups:
 
         monkeypatch.setattr('shared.proc_group.os.killpg', killpg)
         stat_reads: list[str] = []
-        real_read = proc_group_module._read_stat_fields
+        real_read = proc_group_module.read_stat_fields
         monkeypatch.setattr(
-            'shared.proc_group._read_stat_fields',
+            'shared.proc_group.read_stat_fields',
             lambda entry: stat_reads.append(entry.name) or real_read(entry),
         )
 

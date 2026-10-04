@@ -1003,6 +1003,7 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
     {
         'source',
+        # retired 2026-08; stays blessed for historical carriers (docs/task-authoring.md §8).
         'modules',
         'spawn_context',
         'complexity',

@@ -290,10 +290,11 @@ def _write_heartbeat(fleet_dir, unit, **overrides):
 def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=20):
     """Run restart-all-orchestrators.sh with the fake systemctl on PATH.
 
-    ORCH_FLEET_DEPLOY_CLOCK is NOT set here: conftest.py's session-scoped
-    autouse `_df_fleet_deploy_clock_redirect` already points it at a tmp file
-    for every spawner in this directory (task 3797). A per-test override still
-    wins via `env=`, which is applied after the os.environ copy below.
+    ORCH_FLEET_DEPLOY_CLOCK is NOT set here:
+    df_pytest_isolation.py::_df_deploy_clocks_unwritten, autoused by every
+    conftest, already points it at a tmp file suite-wide (task 3797). A
+    per-test override still wins via `env=`, which is applied after the
+    os.environ copy below.
 
     The spawn is SESSION-ISOLATED via run_in_new_session (task 3798), not a
     plain subprocess.run: subprocess.run's timeout kill()s the direct child
@@ -712,7 +713,7 @@ def test_suite_never_stamps_the_repo_fleet_deploy_clock(
         f"{reason}\nThe write came from THIS test spawning "
         "restart-all-orchestrators.sh against a fake systemctl: point "
         "ORCH_FLEET_DEPLOY_CLOCK at a tmp file "
-        "(scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect)."
+        "(df_pytest_isolation.py::_df_deploy_clocks_unwritten, autoused suite-wide)."
     )
 
     stamped_after = (

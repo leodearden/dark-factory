@@ -791,9 +791,11 @@ class TestEnforceSummaryPoolCapPrecision:
     designed cap-2 bound alone:
 
     (a) the enumeration filtered ONLY on recon_pool, with no kind constraint —
-        and _apply_cycle_summary_metadata_tagging is additive-only, never
+        and _apply_cycle_summary_metadata_tagging was then additive-only, never
         stripping a caller-supplied recon_pool, so a mis-tagged non-summary
-        record could join the pool and be trimmed (or evict a real mirror);
+        record could join the pool and be trimmed (or evict a real mirror).
+        The add path has stripped such a tag since task 3239; the kind
+        constraint still guards pre-3239 and update_memory-patched records;
     (b) the sort was record_type-blind, so an LLM-authored 'narrative' copy
         could evict the deterministic 'ledger_stamp' mirror that
         get_cycle_summary_presence parity and any run-scoped audit depend on.
@@ -1202,12 +1204,11 @@ class TestEnforceSummaryPoolCapResidueBackstop:
     trimmed; after it, it would grow unbounded with zero signal — the exact
     failure mode tasks 1657/1831/2229 built this trim to prevent.
 
-    That shape is realistic: cycle_summary metadata is LLM-supplied on the
-    narrative path (which is why _apply_cycle_summary_metadata_tagging
-    backfills run_id at all), so a write that lands recon_pool while dropping
-    kind is a prompt-compliance failure away. So the narrow delete filter
-    stays and the pool gets a diagnostic count instead (reviewer finding
-    robustness, task 3041 amendment pass).
+    That shape is realistic: records written before task 3239 (which made the
+    add path strip a stray recon_pool) and update_memory patches can still
+    carry recon_pool without kind. So the narrow delete filter stays and the
+    pool gets a diagnostic count instead (reviewer finding robustness, task
+    3041 amendment pass).
     """
 
     @staticmethod
@@ -1412,9 +1413,11 @@ class _StatefulMem0Pool:
             'metadata': dict(metadata),
         }
 
-    def _insert(self, metadata: dict, causation_id, project_id: str) -> str:
+    def _insert(self, metadata: dict, causation_id, project_id: str, agent_id) -> str:
         meta = dict(metadata or {})
-        _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+        _apply_cycle_summary_metadata_tagging(
+            meta, causation_id, project_id=project_id, agent_id=agent_id,
+        )
         self._seq += 1
         memory_id = f'mem-{self._seq:03d}'
         self.records[memory_id] = {
@@ -1424,14 +1427,18 @@ class _StatefulMem0Pool:
         }
         return memory_id
 
-    async def add_system_record(self, *, metadata=None, project_id, causation_id=None, **_):
+    async def add_system_record(
+        self, *, metadata=None, project_id, agent_id=None, causation_id=None, **_,
+    ):
         return SimpleNamespace(
-            memory_ids=[self._insert(metadata or {}, causation_id, project_id)]
+            memory_ids=[self._insert(metadata or {}, causation_id, project_id, agent_id)]
         )
 
-    async def add_memory(self, *, metadata=None, project_id, causation_id=None, **_):
+    async def add_memory(
+        self, *, metadata=None, project_id, agent_id=None, causation_id=None, **_,
+    ):
         return SimpleNamespace(
-            memory_ids=[self._insert(metadata or {}, causation_id, project_id)]
+            memory_ids=[self._insert(metadata or {}, causation_id, project_id, agent_id)]
         )
 
     # -- reads/deletes ---------------------------------------------------
@@ -1505,11 +1512,11 @@ class TestMultiCycleSummaryPoolSoak:
                 'record_type': 'ledger_stamp',
             },
             # Mis-tagged with THIS pool's name but not a cycle_summary.
-            # Reachable because _apply_cycle_summary_metadata_tagging is
-            # additive-only and never strips a caller-supplied recon_pool, so
-            # only the enumeration's `kind` constraint keeps this out of the
-            # cap-2 pool — where it would otherwise be trimmed, or evict a
-            # real mirror.
+            # Reachable as a record written before task 3239 (which made the
+            # add path strip a stray recon_pool) or via an update_memory
+            # patch, so only the enumeration's `kind` constraint keeps this
+            # out of the cap-2 pool — where it would otherwise be trimmed, or
+            # evict a real mirror.
             'decoy-mistagged-pool': {
                 'kind': 'task_count_snapshot',
                 'recon_pool': STAGE1_CYCLE_SUMMARY_RECON_POOL,

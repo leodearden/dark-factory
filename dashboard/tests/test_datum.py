@@ -16,12 +16,14 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 from shared.task_statuses import TaskStatus
 
+from dashboard.data import datum as datum_module
 from dashboard.data.census import build_census
 from dashboard.data.datum import (
     Datum,
     DatumContractError,
     DatumInvariant,
     DatumState,
+    aged_at,
     validate_datum,
 )
 
@@ -301,6 +303,60 @@ def test_validate_accepts_a_non_fresh_datum_older_than_its_bound(state):
     """Being past the bound is what `stale` and `lower_bound` exist to say."""
     as_of = SERVED_AT - timedelta(seconds=BOUND_SECONDS * 100)
     validate_datum(datum_measured_at(as_of, state=state, reason='refresh failed'), SERVED_AT)
+
+
+# ---------------------------------------------------------------------------
+# aged_at — a datum re-read at the instant it is served. A producer stamps a
+# measurement once; a cache and a slow fan-out can carry it past its bound
+# before it is served, and then it is honestly `stale`, not a contract breach.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('age_seconds', [0, BOUND_SECONDS - 1, BOUND_SECONDS])
+def test_aged_at_returns_a_fresh_datum_within_its_bound_unchanged(age_seconds):
+    datum = datum_measured_at(SERVED_AT - timedelta(seconds=age_seconds))
+
+    assert aged_at(datum, SERVED_AT) is datum
+
+
+def test_aged_at_turns_a_fresh_datum_past_its_bound_stale():
+    """Same value and as_of; the reason names the age and the bound."""
+    as_of = SERVED_AT - timedelta(seconds=BOUND_SECONDS + 15)
+
+    aged = aged_at(datum_measured_at(as_of), SERVED_AT)
+
+    assert aged.state is DatumState.STALE
+    assert (aged.value, aged.as_of) == (5, as_of)
+    assert aged.freshness_bound_seconds == BOUND_SECONDS
+    assert aged.reason is not None
+    assert f'{BOUND_SECONDS + 15}s' in aged.reason
+    assert f'{BOUND_SECONDS}s freshness bound' in aged.reason
+
+
+@pytest.mark.parametrize('state', NON_FRESH_STATES)
+def test_aged_at_leaves_a_non_fresh_datum_alone(state):
+    """Its own reason is the producer's; aging must not overwrite it."""
+    datum = datum_in_state(state, 'fused-memory unreachable')
+    if state is not DatumState.UNKNOWN:
+        datum = dataclasses.replace(
+            datum, as_of=SERVED_AT - timedelta(seconds=BOUND_SECONDS * 100),
+        )
+
+    assert aged_at(datum, SERVED_AT) is datum
+
+
+def test_an_aged_datum_passes_validation_at_the_instant_it_was_aged_for():
+    as_of = SERVED_AT - timedelta(seconds=BOUND_SECONDS * 3)
+
+    validate_datum(aged_at(datum_measured_at(as_of), SERVED_AT), SERVED_AT)
+
+
+def test_unknown_datum_builds_the_triad_validate_accepts():
+    built = datum_module.unknown_datum('the probe failed', 45)
+
+    assert (built.value, built.as_of, built.state) == (None, None, DatumState.UNKNOWN)
+    assert (built.reason, built.freshness_bound_seconds) == ('the probe failed', 45)
+    validate_datum(built, SERVED_AT)
 
 
 # ---------------------------------------------------------------------------

@@ -297,7 +297,7 @@ def test_every_shared_component_file_destructures_df_datum(
 #
 # THE PRD'S OWN LIST IS STALE IN BOTH DIRECTIONS, which is why this table was
 # re-measured rather than transcribed.  It names "36 in tabs.jsx/tab_overview.jsx"
-# — correct, 32 + 4 — but omits the seven `<C.StatTile` sites in
+# — correct, 32 + 4 — but omits the eight `<C.StatTile` sites in
 # tab_escalations.jsx and tab_escalation_analytics.jsx, and it names four files
 # (scheduler_drawer.jsx, tab_curator.jsx, tab_memory_evals.jsx, tab_scheduler.jsx)
 # that carry no StatTile site at all — they do not even import the component.
@@ -311,7 +311,7 @@ def test_every_shared_component_file_destructures_df_datum(
 _STAT_TILE_SITES = {
     'tabs.jsx': 30,
     'tab_overview.jsx': 4,
-    'tab_escalations.jsx': 5,
+    'tab_escalations.jsx': 6,
     'tab_escalation_analytics.jsx': 2,
 }
 
@@ -489,7 +489,7 @@ def census_bodies(_client):
 
 
 def test_stat_tile_census_counts_are_exact(census_bodies):
-    """41 tiles, over four files, under three local spellings.
+    """42 tiles, over four files, under three local spellings.
 
     The census is stated as counts rather than as "at least one" so the
     migration assertions below cannot pass by deletion.
@@ -500,11 +500,11 @@ def test_stat_tile_census_counts_are_exact(census_bodies):
     }
     assert measured == _STAT_TILE_SITES, (
         'the StatTile call-site census moved. Expected '
-        f'{_STAT_TILE_SITES} (41 total), measured {measured}. If a tile was '
+        f'{_STAT_TILE_SITES} (42 total), measured {measured}. If a tile was '
         'legitimately added or removed, update _STAT_TILE_SITES in the same '
         'commit — the count is what stops a migration passing by deletion.'
     )
-    assert sum(measured.values()) == 41
+    assert sum(measured.values()) == 42
 
 
 def test_files_the_prd_named_carry_no_stat_tile(census_bodies):
@@ -524,7 +524,7 @@ def test_files_the_prd_named_carry_no_stat_tile(census_bodies):
 
 
 def test_every_stat_tile_site_hands_over_a_datum(census_bodies):
-    """Each of the 41 sites carries ``datum=`` and neither ``value=`` nor ``spark=``.
+    """Each of the 42 sites carries ``datum=`` and neither ``value=`` nor ``spark=``.
 
     Matched within the tag's OWN balanced span, so a neighbouring element
     carrying `datum=` cannot satisfy a site that does not — the failure mode a
@@ -609,6 +609,28 @@ def test_the_locks_cell_site_hands_over_a_datum(census_bodies):
         'tabs.jsx: <LocksCell> is handed no `datum=`, so locksCellState throws '
         'inside the render rather than drawing the unknown arm:\n'
         f'{spans[0]}'
+    )
+
+
+def test_the_locks_datum_is_decided_by_scheduler_locks_datum(census_bodies):
+    """The Locks Datum comes from task_row_cells.js::schedulerLocksDatum, not tabs.jsx.
+
+    The decision used to be a tabs.jsx arrow keyed on the snapshot's any-project
+    ``offline`` flag, so ONE offline project blanked every project's Locks
+    column — and, being JSX, nothing could execute it. task_row_cells.test.mjs
+    now runs the decision; this pins that tabs.jsx reaches it and kept no copy.
+    """
+    body = census_bodies['tabs.jsx']
+    (span,) = _tag_spans(body, _LOCKS_CELL_TAG_RE, 'tabs.jsx')
+    assert re.search(r'(?<![\w$])datum\s*=\s*\{\s*schedulerLocksDatum\(', span), (
+        f'<LocksCell> is not handed schedulerLocksDatum(...):\n{span}'
+    )
+    assert not re.search(r'\bschedLocksDatum\b', body), (
+        'tabs.jsx still defines its own schedLocksDatum beside the executable one.'
+    )
+    assert not re.search(r'SCHEDULER\.offline\b', body), (
+        "tabs.jsx still reads the snapshot's any-project `offline` flag, which "
+        "blanks every project's Locks when one project's scheduler is offline."
     )
 
 

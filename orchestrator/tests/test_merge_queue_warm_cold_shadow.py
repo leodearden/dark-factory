@@ -24,20 +24,23 @@ from escalation.models import BORN_AT_L2_SEVERITIES
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps, _run
-from orchestrator.merge_queue import (  # noqa: E402
+from orchestrator.merge_lane.shadow import (
     _WARM_COLD_SHADOW_SENTINEL,
     _WARM_COLD_SHADOW_UNPARSEABLE_SENTINEL,
     ShadowCompareDiff,
     ShadowCompareState,
-    _alarm_warm_shadow_unparseable,
     _load_shadow_compare_state,
-    _maybe_schedule_shadow_compare,
     _nextest_reported_test_count,
     _run_shadow_compare,
     _save_shadow_compare_state,
     _shadow_compare_due,
     _submit_shadow_divergence_escalation,
     diff_per_test_results,
+)
+from orchestrator.merge_lane.worker import PRODUCTION_VERIFIER
+from orchestrator.merge_queue import (
+    _alarm_warm_shadow_unparseable,
+    _maybe_schedule_shadow_compare,
     parse_per_test_results,
 )
 from orchestrator.verify import VerifyResult
@@ -968,11 +971,12 @@ class TestRunShadowCompare:
         git_ops_stub = MagicMock()
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                git_ops_stub, req, 'sha123abc', warm, q, event_store
+                git_ops_stub, req, 'sha123abc', warm, q, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # Case (c): no divergence → no escalation
@@ -988,11 +992,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store
+                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # Parity-ok event should be emitted
@@ -1012,11 +1017,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'deadbeef1234', warm, q, event_store
+                MagicMock(), req, 'deadbeef1234', warm, q, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         q.submit.assert_called_once()
@@ -1031,11 +1037,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'deadbeef1234', warm, q, MagicMock()
+                MagicMock(), req, 'deadbeef1234', warm, q, MagicMock(),
+                verifier=PRODUCTION_VERIFIER,
             )
 
         esc = q.submit.call_args[0][0]
@@ -1050,11 +1057,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store
+                MagicMock(), req, 'sha', warm, _make_escalation_queue(), event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         event_store.emit.assert_not_called()
@@ -1068,10 +1076,11 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(return_value=cold)
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
             await _run_shadow_compare(
                 MagicMock(), req, 'sha_target_123', warm,
-                _make_escalation_queue(), MagicMock()
+                _make_escalation_queue(), MagicMock(),
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # _run_cold_shadow_verify must have been called with the exact merge_commit
@@ -1104,11 +1113,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'sha123', warm, q, event_store
+                MagicMock(), req, 'sha123', warm, q, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # No alarm — this is inconclusive, not a real warm/cold divergence
@@ -1127,11 +1137,12 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
 
         with patch(
-            'orchestrator.merge_queue._run_cold_shadow_verify',
+            'orchestrator.merge_lane.shadow._run_cold_shadow_verify',
             new=AsyncMock(return_value=cold),
         ):
             await _run_shadow_compare(
-                MagicMock(), req, 'sha', warm, q, event_store
+                MagicMock(), req, 'sha', warm, q, event_store,
+                verifier=PRODUCTION_VERIFIER,
             )
 
         # Both empty: diff has no divergence → parity-ok event (both agree on nothing)
@@ -1157,8 +1168,8 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(side_effect=[cold1, cold2])
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
-            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, MagicMock())
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, MagicMock(), verifier=PRODUCTION_VERIFIER)
 
         # Cold leg must be invoked exactly twice (initial run + re-confirmation)
         assert mock_cold.call_count == 2, (
@@ -1187,8 +1198,8 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(side_effect=[cold1, cold2])
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
-            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store)
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store, verifier=PRODUCTION_VERIFIER)
 
         # Transient flip → no alarm (flaky, not a real divergence)
         q.submit.assert_not_called()
@@ -1212,8 +1223,8 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(return_value=cold)
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
-            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store)
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store, verifier=PRODUCTION_VERIFIER)
 
         # No re-confirmation: cold called exactly once (no alarm-worthy divergence)
         assert mock_cold.call_count == 1, (
@@ -1247,8 +1258,8 @@ class TestRunShadowCompare:
         req = _make_mock_req(tmp_path)
         mock_cold = AsyncMock(side_effect=[cold1, cold2])
 
-        with patch('orchestrator.merge_queue._run_cold_shadow_verify', new=mock_cold):
-            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store)
+        with patch('orchestrator.merge_lane.shadow._run_cold_shadow_verify', new=mock_cold):
+            await _run_shadow_compare(MagicMock(), req, 'sha', warm, q, event_store, verifier=PRODUCTION_VERIFIER)
 
         # Cold must be called twice (first run + re-confirm attempt)
         assert mock_cold.call_count == 2, (
@@ -1344,6 +1355,8 @@ class _ColdLegDouble:
         warm_results: dict[str, str],
         escalation_queue: object,
         event_store: object,
+        *,
+        verifier: object,
     ) -> None:
         self.calls.append(_ColdLegCall(
             git_ops, req, merge_commit, warm_results, escalation_queue, event_store,
@@ -1408,9 +1421,10 @@ async def _schedule_with_cold_leg_doubled(
     merge_commit: str = 'sha',
 ) -> None:
     """Run the scheduler once against a doubled cold leg, then settle."""
-    with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+    with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
         await _maybe_schedule_shadow_compare(
-            worker, MagicMock(), req, merge_commit, warm, None, None
+            worker, MagicMock(), req, merge_commit, warm, None, None,
+            verifier=PRODUCTION_VERIFIER,
         )
         await _settle()
 
@@ -1514,10 +1528,11 @@ class TestMaybeScheduleShadowCompare:
 
         # try/finally, not straight-line — see _ColdLegDouble.drain.
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 # This call must RETURN before the gated leg can complete
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha123', warm, None, None
+                    worker, MagicMock(), req, 'sha123', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await cold_leg.await_start()
                 assert cold_leg.in_flight, (
@@ -1561,10 +1576,11 @@ class TestMaybeScheduleShadowCompare:
 
         # try/finally, not straight-line — see _ColdLegDouble.drain.
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 # First call: spawns the leg, which stays in flight on its gate
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha', warm, None, None
+                    worker, MagicMock(), req, 'sha', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await cold_leg.await_start()
                 assert len(cold_leg.calls) == 1
@@ -1577,7 +1593,8 @@ class TestMaybeScheduleShadowCompare:
                 _save_shadow_compare_state(_shadow_state_path(tmp_path), state2)
 
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha2', warm, None, None
+                    worker, MagicMock(), req, 'sha2', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await _settle()
                 # Still only the one leg
@@ -1610,10 +1627,11 @@ class TestMaybeScheduleShadowCompare:
 
         # try/finally, not straight-line — see _ColdLegDouble.drain.
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 # First call: due → spawns the leg, resets counter to 0
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha', warm, None, None
+                    worker, MagicMock(), req, 'sha', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await cold_leg.await_start()
                 assert len(cold_leg.calls) == 1
@@ -1627,7 +1645,8 @@ class TestMaybeScheduleShadowCompare:
                 # Second call while first is in-flight: skips scheduling but MUST
                 # increment and persist the counter (10 → 11)
                 await _maybe_schedule_shadow_compare(
-                    worker, MagicMock(), req, 'sha2', warm, None, None
+                    worker, MagicMock(), req, 'sha2', warm, None, None,
+                    verifier=PRODUCTION_VERIFIER,
                 )
                 await _settle()
 
@@ -1870,7 +1889,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         # _pytest.outcomes.Failed, a BaseException, so an unguarded stop call
         # would be skipped and leak a live worker into teardown (esc-3980-4).
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 await queue.put(req)
                 outcome = await wait_responsive(
                     req.result, label='task-sched merge outcome'
@@ -1919,7 +1938,7 @@ class TestVerifyAndAdvanceShadowCompareScheduling:
         # wait_responsive give-up is a BaseException. The gated leg is released
         # in the finally too, so a mid-block assert cannot leave it parked.
         try:
-            with patch('orchestrator.merge_queue._run_shadow_compare', new=cold_leg):
+            with patch('orchestrator.merge_lane.shadow._run_shadow_compare', new=cold_leg):
                 await queue.put(req)
                 # The outcome must arrive without the cold leg being released
                 outcome = await wait_responsive(

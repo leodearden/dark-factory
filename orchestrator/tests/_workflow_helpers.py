@@ -41,8 +41,10 @@ from orchestrator.mcp.verdict_tools import (
 from orchestrator.mcp.verdict_tools import (
     _submit_review_verdict,
 )
+from orchestrator.merge_lane import MergeLane
 from orchestrator.module_charter import sanitize_files_for_persist
 from orchestrator.scheduler import (
+    BlastRadiusResult,
     TaskAssignment,
     _reject_contradictory_metadata_mode,
 )
@@ -78,11 +80,10 @@ class FakeScheduler:
         self.heartbeats: dict[str, str | None] = {}
         # Scope-reconciliation choke point (task 2505): every call's
         # (current, needed, persist_files) is recorded here so tests can
-        # assert on what was persisted, and blast_radius_result configures
-        # the return value (default True == lock acquired successfully;
-        # tests force False to simulate a sibling lock conflict).
+        # assert on what was persisted, and blast_radius_result is the
+        # BlastRadiusResult every call reports (default: applied).
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
-        self.blast_radius_result: bool = True
+        self.blast_radius_result = BlastRadiusResult(applied=True)
         # Scope-grant direct metadata.files persist seam (task 2505, step-18):
         # every update_task(task_id, metadata) call is recorded here so the
         # same-module scope-grant persist path (which writes metadata.files
@@ -145,9 +146,15 @@ class FakeScheduler:
         /,
         *,
         persist_files: list[str] | None = None,
-    ) -> bool:
+    ) -> BlastRadiusResult:
+        """Report ``blast_radius_result``, writing the row the way
+        scheduler.py::Scheduler.handle_blast_radius_expansion does: a conflict
+        re-pends it, unless the result carries the error that write died of."""
         self.blast_radius_calls.append((current, needed, persist_files))
-        return self.blast_radius_result
+        result = self.blast_radius_result
+        if not result.applied and result.repend_error is None:
+            await self.set_task_status(task_id, 'pending')
+        return result
 
     async def get_status(self, task_id: str) -> str | None:
         history = self.statuses.get(task_id)
@@ -294,7 +301,7 @@ class FakeMetadataBackend:
         self.blob: dict = dict(initial or {})
         self.update_task_calls: list[dict] = []
         self.blast_radius_calls: list[tuple[list[str], list[str], list[str] | None]] = []
-        self.blast_radius_result: bool = True
+        self.blast_radius_result = BlastRadiusResult(applied=True)
         # Matches the fixtures' config.lock_depth; only used to model
         # handle_blast_radius_expansion's no-op early return.
         self.lock_depth = lock_depth
@@ -354,7 +361,7 @@ class FakeMetadataBackend:
         /,
         *,
         persist_files: list[str] | None = None,
-    ) -> bool:
+    ) -> BlastRadiusResult:
         self.blast_radius_calls.append((current, needed, persist_files))
         depth = self.lock_depth
         if {normalize_lock(m, depth) for m in current} == {
@@ -362,7 +369,7 @@ class FakeMetadataBackend:
         }:
             # No-op early return (scheduler.py:6935): nothing acquired, nothing
             # released, nothing persisted.
-            return True
+            return BlastRadiusResult(applied=True)
         # Production persists metadata.files on BOTH the grant and the
         # lock-conflict/requeue branch — only the RETURN differs.  Gating the
         # persist on blast_radius_result would model the deny path wrongly.
@@ -395,13 +402,13 @@ def wire_metadata_backend(
     *seed* is the dispatch-time ``task['metadata']`` the workflow starts with in
     memory; the backend's blob is seeded from it (any value already on the blob
     wins) so backend and in-memory start consistent, as production does at
-    dispatch time.  *grants* sets ``blast_radius_result``.
+    dispatch time.  *grants* is ``blast_radius_result.applied``.
 
     Returns ``(handle_blast_radius_expansion, update_task)`` so a fixture can
     expose the same AsyncMocks it exposes in the un-wired case.
     """
     backend.blob = {**dict(seed), **backend.blob}
-    backend.blast_radius_result = grants
+    backend.blast_radius_result = BlastRadiusResult(applied=grants)
     handle_blast_radius_expansion = AsyncMock(
         side_effect=backend.handle_blast_radius_expansion,
     )
@@ -596,7 +603,16 @@ def _make(
     task_id: str = '50',
     branch_on_main: bool = True,
     main_sha: str = 'mainsha123',
+    landing_citation: str | None = 'citationsha123',
+    landing_effect_present: bool = True,
 ) -> _Fixture:
+    """A workflow wired to git stubs for the already-merged recovery guards.
+
+    ``landing_citation`` / ``landing_effect_present`` answer the landing
+    evidence a recovery guard's fallback arm validates before stamping
+    (task 4704): the commit on main citing this task, and whether its effect
+    survives.  The defaults describe a genuine, attributable landing.
+    """
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
@@ -611,6 +627,7 @@ def _make(
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
+    config.git.branch_prefix = 'task/'
 
     set_task_status = AsyncMock()
     scheduler = MagicMock()
@@ -635,6 +652,10 @@ def _make(
     git_ops = MagicMock()
     git_ops.is_ancestor = is_ancestor
     git_ops.get_main_sha = get_main_sha
+    git_ops.find_task_citation_commit = AsyncMock(return_value=landing_citation)
+    git_ops.commit_effect_present_in_main = AsyncMock(
+        return_value=landing_effect_present,
+    )
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -1129,11 +1150,9 @@ def _build_workflow(
     agent_stub: AgentStub,
 ) -> tuple[TaskWorkflow, FakeScheduler]:
     """Wire up a TaskWorkflow with all fakes injected."""
-    from _serial_merge_worker import MergeWorker
-
     scheduler = FakeScheduler()
     merge_queue: asyncio.Queue = asyncio.Queue()
-    worker = MergeWorker(git_ops, merge_queue)
+    worker = MergeLane(git_ops, merge_queue)
     # Start merge worker — cleaned up when event loop tears down after test
     asyncio.create_task(worker.run(), name='test-merge-worker')
     workflow = TaskWorkflow(
@@ -1159,19 +1178,17 @@ def _build_workflow_with_escalation(
 ) -> tuple[TaskWorkflow, FakeScheduler, EscalationQueue]:
     """Wire up a TaskWorkflow with an EscalationQueue attached.
 
-    When ``spawn_merge_worker=False``, skips the MergeWorker/asyncio.create_task
+    When ``spawn_merge_worker=False``, skips the MergeLane/asyncio.create_task
     setup — use for tests that exercise _mark_blocked directly and never enqueue
     merge work; omitting create_task avoids the 'Task was destroyed but it is
     pending!' warning in pytest teardown.
     """
-    from _serial_merge_worker import MergeWorker
-
     scheduler = FakeScheduler()
     queue_dir = tmp_path / 'escalation_queue'
     queue = EscalationQueue(queue_dir)
     merge_queue: asyncio.Queue = asyncio.Queue()
     if spawn_merge_worker:
-        worker = MergeWorker(git_ops, merge_queue)
+        worker = MergeLane(git_ops, merge_queue)
         asyncio.create_task(worker.run(), name='test-merge-worker')
     else:
         worker = None

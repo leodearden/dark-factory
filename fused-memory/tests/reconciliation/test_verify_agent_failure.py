@@ -29,6 +29,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _git_root_helper import make_git_root
 from pydantic import ValidationError
+from shared.cli_invoke import AgentResult
 
 from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import VerificationResult, VerificationVerdict
@@ -293,6 +294,43 @@ async def test_verify_failure_token_coerces_malformed_origin(raw_origin, expecte
     assert result.failure_token == expected_token, (
         f'Expected failure_token={expected_token!r} for raw origin '
         f'{raw_origin!r} but got {result.failure_token!r}'
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_api_refusal_is_an_audited_agent_failure(git_root):
+    """Task 6022: an API usage-policy refusal must reach the census as
+    failure_token='api_refusal', not escape verify() as a RuntimeError.
+
+    The escaping exception is what produced the production 'error' rows that
+    could not be told apart from any other crash.  Patched at the CLI seam
+    (not verify.AgentLoop) so the whole chain is exercised: the shared
+    classifier, agent_loop's refusal branch, run()'s warning_origin, and
+    verify()'s preference chain.
+    """
+    refused = AgentResult(
+        success=False,
+        output=(
+            "API Error: Sonnet 5.5's safeguards flagged this message "
+            '(https://www.anthropic.com/legal/aup).'
+        ),
+        subtype='success',
+        stop_reason='refusal',
+        session_id='sess-r',
+    )
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = refused
+        verifier = CodebaseVerifier(_default_config())
+        result = await verifier.verify(claim='Task X completed', codebase_root=git_root)
+
+    assert result.verdict == 'inconclusive'
+    assert result.agent_failed is True
+    assert result.failure_token == 'api_refusal', (
+        f"Expected failure_token='api_refusal' but got {result.failure_token!r}"
     )
 
 

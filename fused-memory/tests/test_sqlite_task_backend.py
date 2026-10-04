@@ -1203,6 +1203,188 @@ async def test_update_task_done_provenance_floor_skips_unparseable_metadata(
     await backend.update_task('1', project_root=project_root, metadata=bad_metadata)
 
 
+_STORED_DONE_PROVENANCE = {'kind': 'merged', 'commit': 'a' * 40}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'passed_through',
+    [
+        {'kind': 'merged', 'commit': 'a' * 40},
+        {'commit': 'a' * 40, 'kind': 'merged'},
+    ],
+    ids=['same-key-order', 'reversed-key-order'],
+)
+async def test_update_task_replace_admits_identical_done_provenance_passthrough(
+    backend, project_root, passed_through,
+):
+    """A whole-blob replace that carries the STORED done_provenance through
+    unchanged is admitted, and it RETIRES every key the payload omits — the
+    one thing merge mode can never do. Identity is on JSON VALUE, not bytes:
+    a get_task -> json.dumps round trip does not preserve inner key order."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'done_provenance': _STORED_DONE_PROVENANCE,
+            'stale_key': 1,
+            'files': ['src'],
+        }),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'done_provenance': passed_through, 'files': ['src']}),
+        metadata_mode='replace',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == _STORED_DONE_PROVENANCE
+    assert 'stale_key' not in task['metadata']
+    assert task['metadata']['files'] == ['src']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('stored', 'payload_done_provenance'),
+    [
+        ({'files': ['src']}, _STORED_DONE_PROVENANCE),
+        (
+            {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
+            {'kind': 'merged', 'commit': 'b' * 40},
+        ),
+        (
+            {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
+            {'kind': 'operational-verified', 'commit': 'a' * 40},
+        ),
+        (
+            {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']},
+            {**_STORED_DONE_PROVENANCE, 'note': 'drift'},
+        ),
+    ],
+    ids=['add', 'change-commit', 'change-kind', 'change-nested-shape'],
+)
+async def test_update_task_replace_still_rejects_added_and_changed_done_provenance(
+    backend, project_root, stored, payload_done_provenance,
+):
+    """Only the identical passthrough is admitted under replace: a payload
+    that ADDS done_provenance to a row without one, or CHANGES the stored
+    value in any way (deep equality, not a subset check), is refused and the
+    transaction rolls back with the stored blob untouched."""
+    await backend.add_task(
+        project_root=project_root, title='x', metadata=json.dumps(stored),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'done_provenance': payload_done_provenance}),
+            metadata_mode='replace',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_rejects_dropping_stored_done_provenance(
+    backend, project_root,
+):
+    """Under a whole-blob replace, omission is deletion: a payload that drops
+    the stored done_provenance is refused rather than silently destroying the
+    audit record of a done task."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({
+            'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src'],
+        }),
+    )
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'files': ['src']}),
+            metadata_mode='replace',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata']['done_provenance'] == _STORED_DONE_PROVENANCE
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_allows_omitting_absent_done_provenance(
+    backend, project_root,
+):
+    """The deletion arm is scoped to rows that HAVE done_provenance: an
+    ordinary replace on a row without one still lands and still retires the
+    keys it omits."""
+    await backend.add_task(
+        project_root=project_root, title='x',
+        metadata=json.dumps({'stale_key': 1, 'files': ['src']}),
+    )
+    await backend.update_task(
+        '1', project_root=project_root,
+        metadata=json.dumps({'files': ['lib']}),
+        metadata_mode='replace',
+    )
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == {'files': ['lib']}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('metadata_mode', [None, 'merge', 'additive'])
+async def test_update_task_non_replace_modes_reject_done_provenance_unconditionally(
+    backend, project_root, metadata_mode,
+):
+    """The carve-out is keyed on metadata_mode='replace' and nothing else:
+    every other mode still refuses the very identical-value payload that
+    replace admits, before touching the row."""
+    stored = {'done_provenance': _STORED_DONE_PROVENANCE, 'files': ['src']}
+    await backend.add_task(
+        project_root=project_root, title='x', metadata=json.dumps(stored),
+    )
+    before = (await backend.get_task('1', project_root=project_root))['metadata']
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE}),
+            metadata_mode=metadata_mode,
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    task = await backend.get_task('1', project_root=project_root)
+    assert task['metadata'] == before
+
+
+@pytest.mark.asyncio
+async def test_update_task_merge_mode_done_provenance_rejection_precedes_existence_check(
+    backend, project_root,
+):
+    """Explicit merge mode keeps the pre-connect ordering: the
+    write-authority rejection beats 'No tasks found'."""
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root,
+            metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE}),
+            metadata_mode='merge',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('999')
+    assert 'No tasks found' not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_done_provenance_on_missing_task_reports_not_found(
+    backend, project_root,
+):
+    """The one deliberate ordering difference, confined to replace mode: the
+    passthrough check needs the stored value, so it runs after the SELECT and
+    a missing row reports 'No tasks found'. Both answers are refusals — there
+    is no stored value to pass through on a row that does not exist."""
+    with pytest.raises(TaskmasterError) as exc:
+        await backend.update_task(
+            '999', project_root=project_root,
+            metadata=json.dumps({'done_provenance': _STORED_DONE_PROVENANCE}),
+            metadata_mode='replace',
+        )
+    assert not isinstance(exc.value, DoneProvenanceWriteAuthorityError)
+    assert 'No tasks found' in exc.value.message
+
+
 @pytest.mark.asyncio
 async def test_update_task_appends_metadata(backend, project_root):
     await backend.add_task(
@@ -6055,6 +6237,44 @@ async def test_update_task_refuses_to_clobber_corrupt_metadata(
 
 
 @pytest.mark.asyncio
+async def test_update_task_replace_on_corrupt_stored_blob_done_provenance_arms(
+    backend, project_root,
+):
+    """On a row whose stored blob does not parse, done_provenance identity
+    cannot be established: (a) a replace payload CARRYING done_provenance is
+    refused, so a corrupted row cannot launder a done_provenance write, while
+    (b) a replace payload OMITTING it is still the sanctioned corrupt-row
+    repair and lands verbatim."""
+    await backend.add_task(project_root=project_root, title='carries')
+    await backend.add_task(project_root=project_root, title='omits')
+    conn = await backend._get_connection(project_root)
+    await conn.execute(
+        'UPDATE tasks SET metadata = ? WHERE id IN (1, 2)', (_CORRUPT_BLOB,),
+    )
+    await conn.commit()
+
+    with pytest.raises(DoneProvenanceWriteAuthorityError) as exc:
+        await backend.update_task(
+            '1', project_root=project_root,
+            metadata=json.dumps({
+                'done_provenance': {'kind': 'merged', 'commit': 'a' * 40},
+            }),
+            metadata_mode='replace',
+        )
+    assert exc.value.to_error_dict() == done_provenance_via_update_task_error('1')
+    cursor = await conn.execute('SELECT metadata FROM tasks WHERE id = 1')
+    assert (await cursor.fetchone())['metadata'] == _CORRUPT_BLOB
+
+    await backend.update_task(
+        '2', project_root=project_root,
+        metadata=json.dumps({'files': ['src']}),
+        metadata_mode='replace',
+    )
+    repaired = await backend.get_task('2', project_root=project_root)
+    assert repaired['metadata'] == {'files': ['src']}
+
+
+@pytest.mark.asyncio
 async def test_stamp_audit_metadata_refuses_to_clobber_corrupt_metadata(
     backend, project_root, caplog,
 ):
@@ -7708,6 +7928,64 @@ async def test_update_task_unknown_key_patch_tolerates_untouched_invalid_done_pr
                     'duplicate_check_required': True,
                 }),
             )
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_update_task_replace_passthrough_tolerates_legacy_invalid_done_provenance(
+    tmp_path, project_root,
+):
+    """Under enforce mode, a whole-blob replace that passes a LEGACY (schema-
+    invalid) done_provenance through verbatim is not blamed for it.
+
+    The replace caller is REQUIRED to send the stored done_provenance back, so
+    the field is not this write's responsibility (task 2401's scoping rule).
+    The tolerance is scoped to that one verified key: a CHANGED invalid value
+    still gets the write-authority answer first, and any other invalid field
+    the payload adds is still a ValidationError.
+    """
+    legacy = {'commit': 'abc123'}
+    cfg = TaskmasterConfig(project_root=str(tmp_path))
+    backend = SqliteTaskBackend(cfg, task_metadata_enforce=True)
+    await backend.start()
+    try:
+        backend._task_metadata_enforce = False
+        dto = await backend.add_task(
+            project_root=project_root, title='t',
+            metadata=json.dumps({
+                'done_provenance': legacy, 'stale_key': 1, 'files': ['src'],
+            }),
+        )
+        backend._task_metadata_enforce = True
+
+        await backend.update_task(
+            dto['id'], project_root=project_root,
+            metadata=json.dumps({'done_provenance': legacy, 'files': ['src']}),
+            metadata_mode='replace',
+        )
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata']['done_provenance'] == legacy
+        assert 'stale_key' not in task['metadata']
+        assert task['metadata']['files'] == ['src']
+
+        with pytest.raises(DoneProvenanceWriteAuthorityError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({'done_provenance': {'commit': 'zzz'}}),
+                metadata_mode='replace',
+            )
+
+        with pytest.raises(ValidationError):
+            await backend.update_task(
+                dto['id'], project_root=project_root,
+                metadata=json.dumps({
+                    'done_provenance': legacy, 'task_kind': 'bogus_kind',
+                }),
+                metadata_mode='replace',
+            )
+        task = await backend.get_task(dto['id'], project_root=project_root)
+        assert task['metadata'] == {'done_provenance': legacy, 'files': ['src']}
     finally:
         await backend.close()
 

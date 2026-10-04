@@ -69,6 +69,9 @@ const EXPECTED_WINDOW_GLOBALS = {
   'task_snapshot.js': 'DF_TASK_SNAPSHOT',
   'scheduler_heatmap_bounds.js': 'DF_SCHED_HEATMAP_BOUNDS',
   'window_chip.js': 'DF_WINDOW_CHIP',
+  'merge_queue.js': 'DF_MERGE_QUEUE',
+  'escalation_views.js': 'DF_ESCALATION_VIEWS',
+  'memory_readings.js': 'DF_MEMORY_READINGS',
 };
 
 function readIndexHtml() {

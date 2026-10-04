@@ -1714,8 +1714,8 @@ class TestDigestCarriesOriginProjectTag:
     inside a KEPT parent entry at ``entry['grouped']['amendments']``, and the
     orchestrator briefing renders that sub-object verbatim into a dispatched
     agent's ``# Context`` block.  The briefing's cross-project safeguard
-    (``orchestrator/src/orchestrator/agents/briefing.py``:
-    ``filter_foreign_project_results``) reads a project tag off each entry's
+    (``orchestrator/src/orchestrator/agents/memory_recall.py::filter_foreign_project_results``)
+    reads a project tag off each entry's
     ``metadata`` — so a digest that carries no ``metadata`` at all cannot be
     classified, and the deliberate keep-untagged policy keeps every one of
     them.  Emitting the tag here is what gives that safeguard a key to read.

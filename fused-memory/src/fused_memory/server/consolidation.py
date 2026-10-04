@@ -26,13 +26,15 @@ therefore checked once, in one place, rather than re-typed per caller.
 calls NONE of this: PRD C2 makes the benign codes the emit boundary's business,
 and the predicate re-derives none of them.
 
-WHY VALIDATION IS A SEPARATE, FIRST STEP
-----------------------------------------
+WHY VALIDATION IS A SEPARATE, PRE-WRITE STEP (2)
+------------------------------------------------
 ``consolidate_memories`` is irreversible by construction: it writes a
 canonical, patches retained peers and DELETES its supersedes.  Argument
-validation is the only stage that can refuse at zero cost, so everything
-decidable from the arguments alone is decided here — before the canonical
-exists, before a single victim is touched.
+validation runs as step (2): immediately after the fail-closed
+authorization gate, which deliberately precedes it, and before anything
+reads or writes the corpus.  It is the last point where everything
+decidable from the arguments alone can be refused for free — before the
+canonical exists, before a single victim is touched.
 
 Two properties follow from that position and are not incidental:
 
@@ -515,6 +517,16 @@ def validate_consolidate_args(
     )
 
 
+def _closure_member_ref(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {'id': None, 'canonical': False}
+    meta = row.get('metadata')
+    return {
+        'id': row.get('id'),
+        'canonical': isinstance(meta, dict) and meta.get('canonical') is True,
+    }
+
+
 def build_consolidation_result(
     *,
     canonical_id: str,
@@ -609,6 +621,14 @@ def build_consolidation_result(
     ``topic_cluster_seed`` (absent means no topic-cluster store is wired, so
     no seed was attempted) and ``hint`` (recovery guidance on a clean run
     would be noise).
+
+    ``topic_members`` rows are projected to ``{'id', 'canonical'}``.  This
+    envelope is the ONLY record of an irreversible multi-delete, and a
+    dumping-ground topic's raw rows could push it past the MCP transport
+    limit, where it is rejected wholesale and ``deleted``, ``survivors`` and
+    ``failed_deletes`` are lost for records that are already gone.  A
+    closure proof needs only the id and the canonical flag, and the
+    projection never raises, for the same reason.
     """
     failed_deletes = list(failed_deletes)
     survivors = list(survivors)
@@ -622,7 +642,7 @@ def build_consolidation_result(
         or survivors
         or survivor_check_failed
     )
-    members = list(topic_members or [])
+    members = [_closure_member_ref(row) for row in (topic_members or [])]
     result: dict[str, Any] = {
         'status': 'partial' if open_business else 'consolidated',
         'canonical_id': canonical_id,

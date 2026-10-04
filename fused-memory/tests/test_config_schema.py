@@ -1748,6 +1748,31 @@ class TestCuratorConfigBudgetRaise:
         )
 
 
+class TestCuratorZotDuplicateSweepConfig:
+    """Task 5491: the post-ZOT duplicate sweep's knobs live on CuratorConfig."""
+
+    def test_defaults(self):
+        cfg = CuratorConfig()
+        assert cfg.zot_duplicate_sweep_enabled is True
+        assert cfg.zot_duplicate_score_threshold == pytest.approx(0.65)
+        assert cfg.zot_duplicate_search_limit == 5
+
+    @pytest.mark.parametrize('threshold', [1.5, -0.1])
+    def test_threshold_is_a_cosine_in_unit_interval(self, threshold):
+        with pytest.raises(ValidationError):
+            CuratorConfig(zot_duplicate_score_threshold=threshold)
+
+    @pytest.mark.parametrize('threshold', [0.0, 1.0])
+    def test_threshold_bounds_are_inclusive(self, threshold):
+        assert CuratorConfig(
+            zot_duplicate_score_threshold=threshold,
+        ).zot_duplicate_score_threshold == threshold
+
+    def test_search_limit_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            CuratorConfig(zot_duplicate_search_limit=0)
+
+
 class TestQueueConfigTransientErrorFields:
     """Task 1936: QueueConfig exposes the error-aware retry budget knobs that
     flow into DurableWriteQueue(transient_max_attempts=..., transient_error_names=...).
@@ -3766,6 +3791,24 @@ class TestWriteTriageConfig:
             'fused-memory/config/config.yaml must ship a candidate_k wider than '
             "the retired guard's limit=5 (measured recall 26.1% @5 vs 69.4% @20)"
         )
+
+    def test_judge_field_chars_defaults_to_4000(self):
+        """The judge's per-field cap ships at 4,000 chars, not the old 1,200.
+
+        Why: task 6076's decision record,
+        calibration/write_triage_judge_field_chars_report.md.
+        """
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        assert WriteTriageConfig().judge_field_chars == 4000
+
+    @pytest.mark.parametrize('value', [0, -1])
+    def test_judge_field_chars_rejects_a_cap_that_would_empty_every_field(self, value):
+        """A non-positive cap is refused at load and reload, never at write time."""
+        from fused_memory.config.schema import WriteTriageConfig  # noqa: PLC0415
+
+        with pytest.raises(ValidationError):
+            WriteTriageConfig(judge_field_chars=value)
 
 
 

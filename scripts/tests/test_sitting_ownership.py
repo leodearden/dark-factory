@@ -202,11 +202,15 @@ class TestTaskRulingProbe:
         assert result.owner_task_status == 'pending'
 
 
+FOLLOWUP_SPELLINGS = pytest.mark.parametrize('key', ['x_origin_escalation', 'origin_escalation'])
+
+
 class TestSpawnedFollowupProbe:
-    def test_live_followup_owns(self, sessions_root, seed_tasks):
+    @FOLLOWUP_SPELLINGS
+    def test_live_followup_owns(self, sessions_root, seed_tasks, key):
         rows = seed_tasks([
             {'id': 6798, 'status': 'blocked'},
-            {'id': 7001, 'status': 'pending', 'title': 'follow-up', 'metadata': {'origin_escalation': 'esc-6798-1'}},
+            {'id': 7001, 'status': 'pending', 'title': 'follow-up', 'metadata': {key: 'esc-6798-1'}},
         ])
 
         result = _probe(_sweep(_item('esc-6798-1', '6798'), sessions_root=sessions_root, task_rows=rows),
@@ -216,9 +220,10 @@ class TestSpawnedFollowupProbe:
         assert result.owner_task_id == '7001'
         assert result.owner_task_status == 'pending'
 
+    @FOLLOWUP_SPELLINGS
     @pytest.mark.parametrize('status', ['done', 'cancelled'])
-    def test_terminal_followup_is_empty(self, sessions_root, seed_tasks, status):
-        rows = seed_tasks([{'id': 7001, 'status': status, 'metadata': {'origin_escalation': 'esc-6798-1'}}])
+    def test_terminal_followup_is_empty(self, sessions_root, seed_tasks, status, key):
+        rows = seed_tasks([{'id': 7001, 'status': status, 'metadata': {key: 'esc-6798-1'}}])
 
         result = _probe(_sweep(_item('esc-6798-1', '6798'), sessions_root=sessions_root, task_rows=rows),
                         'spawned_followup')

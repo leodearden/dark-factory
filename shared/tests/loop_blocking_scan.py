@@ -32,9 +32,13 @@ is the number 3778's methodology could not produce.
 
 Design
 ------
-* Pure stdlib (``ast`` only), no filesystem I/O -- ``find_loop_blocking_sites``
-  takes a ``{relpath: source}`` mapping so the unit tests can feed synthetic
-  modules directly, exactly as ``silent_fallthrough_scan.find_violations`` does.
+* Pure stdlib (``ast`` only), no filesystem I/O.  Two entry points, split
+  exactly as ``silent_fallthrough_scan.find_violations`` /
+  ``find_violations_in_tree`` are: ``find_loop_blocking_sites`` takes a
+  ``{relpath: source}`` mapping so the unit tests can feed synthetic modules
+  directly, and ``find_loop_blocking_sites_in_trees`` takes already-parsed
+  ``{relpath: ast.Module}`` trees, which the whole-tree gate hands it from the
+  session's shared first-party tree.
 * ``SyntaxError`` in one module contributes nothing and never raises, so a
   mid-edit file cannot turn the whole-tree gate red.
 * Callee names resolve through the calling module's ``from X import Y``
@@ -78,6 +82,7 @@ directory.
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 from typing import NamedTuple
 
 from silent_fallthrough_scan import (
@@ -872,8 +877,10 @@ def _reaches_blocking(
 # --------------------------------------------------------------------------- #
 
 
-def find_loop_blocking_sites(sources: dict[str, str]) -> list[LoopBlockingSite]:
+def find_loop_blocking_sites(sources: Mapping[str, str]) -> list[LoopBlockingSite]:
     """Return every coroutine call site that reaches a blocking primitive.
+
+    A parse-then-delegate wrapper over :func:`find_loop_blocking_sites_in_trees`.
 
     Args:
         sources: ``{repo-relative path: source text}``.  Cross-module callee
@@ -886,13 +893,34 @@ def find_loop_blocking_sites(sources: dict[str, str]) -> list[LoopBlockingSite]:
         ``(filename, lineno)``.  A module that fails to parse contributes
         nothing and does not suppress its siblings.
     """
-    modules: dict[str, _ModuleCtx] = {}
-    ordered: list[_ModuleCtx] = []
+    trees: dict[str, ast.Module] = {}
     for relpath, source in sources.items():
         try:
-            tree = ast.parse(source, filename=relpath)
+            trees[relpath] = ast.parse(source, filename=relpath)
         except SyntaxError:
             continue
+    return find_loop_blocking_sites_in_trees(trees)
+
+
+def find_loop_blocking_sites_in_trees(
+    trees: Mapping[str, ast.Module],
+) -> list[LoopBlockingSite]:
+    """Return every coroutine call site that reaches a blocking primitive.
+
+    Args:
+        trees: ``{repo-relative path: parsed module}``.  Walked READ-ONLY: the
+            resolver builds only ``id()``-keyed side maps and never writes to a
+            node, because under the gate these trees are shared with every
+            other gate in the session.  Cross-module resolution sees only the
+            modules in this mapping, as for :func:`find_loop_blocking_sites`.
+
+    Returns:
+        One :class:`LoopBlockingSite` per CALL SITE, ordered by
+        ``(filename, lineno)``.
+    """
+    modules: dict[str, _ModuleCtx] = {}
+    ordered: list[_ModuleCtx] = []
+    for relpath, tree in trees.items():
         ctx = _ModuleCtx(relpath, tree)
         modules[ctx.name] = ctx
         ordered.append(ctx)

@@ -39,7 +39,7 @@ dark-factory-shared = { workspace = true }
 orchestrator = "orchestrator.cli:main"
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]
 # ".." LAST (mirrors tests/conftest.py's sys.path.append): resolves the repo-root
 # df_pytest_isolation module without letting project dirs shadow their own src/.
 #
@@ -58,8 +58,8 @@ include = ["src", "tests"]
 # entry is what keeps the two gates in agreement. DO NOT REMOVE — pinned by
 # tests/test_run_vllm_eval.py::TestPyrightScopeParity and by
 # tests/scripts/test_fallback_verify_config.py's chain-independent
-# generalisation. It only widens IMPORT RESOLUTION: scripts/ is still absent
-# from `include` above, so scripts/ files are not themselves type-checked here.
+# generalisation. It only widens IMPORT RESOLUTION: the REPO-ROOT ../scripts is
+# absent from `include` above, so its files are not themselves type-checked here.
 extraPaths = ["src", "tests", "../scripts", "../shared/src", "../escalation/src", "../fused-memory/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"

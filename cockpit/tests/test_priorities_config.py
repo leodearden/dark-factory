@@ -8,6 +8,7 @@ defaults with a logged warning — load_priorities() must never raise.
 from __future__ import annotations
 
 import logging
+import stat
 
 import yaml
 
@@ -280,6 +281,27 @@ class TestEnsurePrioritiesFile:
         ensure_priorities_file(target)
 
         assert target.read_text() == custom_contents
+
+    def test_written_file_is_owner_only(self, tmp_path):
+        """The saved file is created 0600, not widened to the process umask."""
+        from cockpit.priority import Priorities, save_priorities
+
+        target = tmp_path / 'priorities.yaml'
+
+        save_priorities(Priorities.default(), target)
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+    def test_creates_missing_parent_dirs_and_writes_owner_only(self, tmp_path):
+        """A target whose parent dirs don't exist yet is still written, 0600."""
+        from cockpit.priority import Priorities, load_priorities, save_priorities
+
+        target = tmp_path / 'a' / 'b' / 'priorities.yaml'
+
+        save_priorities(Priorities.default(), target)
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+        assert load_priorities(target) == Priorities.default()
 
     def test_write_failure_is_fail_soft_and_warns(self, tmp_path, caplog):
         """An unwritable target must fail soft: logged WARNING, never an exception.

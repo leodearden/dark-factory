@@ -29,7 +29,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -47,6 +46,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 # docstring exists to prevent.
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
+
+from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
@@ -487,12 +488,10 @@ class TestWaitProofGraceSecs:
     explains why.
     """
 
-    # The two spawn timeouts actually in use, at the three sites step-9 edits:
-    # test_defer_withholds_restart_while_busy (3s),
-    # test_unknown_grace_withholds_restart_while_absent (3s),
-    # scripts/tests/test_restart_all_orchestrators.py::
-    # test_unit_that_drains_during_the_unknown_grace_resumes_after_the_await (20s).
-    REAL_SPAWN_TIMEOUTS = (3, 20)
+    # Endpoints of the reachable wait-proving spawn timeouts: the smallest
+    # load-scaled base and WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS.
+    # wait_proof_grace_secs is monotone, so these bound every site.
+    REAL_SPAWN_TIMEOUTS = (3, WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS)
 
     def test_the_grace_comfortably_exceeds_the_spawn_timeout_that_kills_it(self) -> None:
         """Too SMALL and the wait-proving tests stop proving anything.
@@ -1026,20 +1025,6 @@ class TestGuardIsLiveInThisRun:
 # every test passed", because a fixture cannot fail its own session.
 # ---------------------------------------------------------------------------
 
-# Minimal ini so the nested run's rootdir is the tmp tree and NOT this repo:
-# without it pytest walks up looking for an inifile and would inherit this
-# repo's addopts (`--import-mode=importlib -m 'not smoke ...'`).
-_NESTED_INI = '[pytest]\n'
-
-_NESTED_CONFTEST = '''\
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-from df_pytest_isolation import _df_no_leaked_drain_processes  # noqa: F401
-'''
-
 # NAMED for the marker and nothing else. The guard matches this basename in
 # /proc/<pid>/cmdline, and a test that reached for the REAL script to earn that
 # match would be executing production fleet-restart code — spawning systemctl
@@ -1102,21 +1087,12 @@ def _nested_run(root: Path, *, leaks: bool) -> subprocess.CompletedProcess[str]:
     *root* is passed in rather than derived so the caller knows the pidfile path
     BEFORE the run starts, and can therefore reap a leaker even when this call
     raises.
-
-    The 120s cap is under pytest-timeout's own ``--timeout=300`` per-test axe, so
-    a wedged nested run reports as this test's failure rather than as the whole
-    outer session being killed mid-assertion.
     """
-    root.mkdir(parents=True)
-    shutil.copy2(Path(df_pytest_isolation.__file__), root / 'df_pytest_isolation.py')
-    (root / 'pytest.ini').write_text(_NESTED_INI)
-    (root / 'conftest.py').write_text(_NESTED_CONFTEST)
-    (root / _LEAKER_NAME).write_text(_NESTED_LEAKER)
-    (root / 'test_forgetful.py').write_text(_nested_test_source(leaks=leaks))
-    return subprocess.run(
-        [sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', str(root)],
-        cwd=root, capture_output=True, text=True, timeout=120,
-    )
+    return run_nested_pytest(root, {
+        'conftest.py': binding_conftest(_GUARD_NAME),
+        _LEAKER_NAME: _NESTED_LEAKER,
+        'test_forgetful.py': _nested_test_source(leaks=leaks),
+    })
 
 
 def _read_pid_file(pidfile: Path) -> int | None:

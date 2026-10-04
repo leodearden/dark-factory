@@ -36,10 +36,11 @@ served to the others for up to the TTL window. The record is also the single
 source of the WIRE arguments (:meth:`_TasksRead.wire_arguments`), so the key
 and the request it stands for cannot drift apart. A caller that must not ride
 that TTL passes ``cached=False``.
-``fetch_statuses``, ``fetch_external_statuses`` and ``fetch_task_prose`` are
-uncached and return live data; ``fetch_statuses`` held a 5 s cache until task
-5587, removed because its one consumer now owns a longer TTL over the unit
-above it.
+``fetch_statuses``, ``fetch_external_statuses``, ``fetch_task_prose`` and
+``fetch_task`` are uncached and return live data; ``fetch_statuses`` held a
+5 s cache until task 5587, removed because its one consumer now owns a longer
+TTL over the unit above it. ``fetch_task``'s caller owns its cache
+(``task_lookup``), because only the caller knows which answers may be held.
 """
 
 from __future__ import annotations
@@ -50,7 +51,7 @@ import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from shared.task_claimant import is_stranded
@@ -62,17 +63,14 @@ from dashboard.data.utils import resolve_now
 
 # ---------------------------------------------------------------------------
 # Per-project_root TTL cache for fetch_tasks
-# (mirrors app._load_task_cards / merge_queue.load_task_titles pattern)
+# (mirrors the app._load_task_cards pattern)
 #
 # Code-duplication note: fetch_tasks's own copy of the {TTL constant, store,
 # _clear() hook, store-only-on-success, list()-copy} pattern is now extracted
-# into dashboard.data.mcp_fanout.TTLCache (this task).  app._task_cards_cache
-# and merge_queue._task_titles_cache still implement the pattern inline —
-# extracting a shared helper there would require changes to those modules,
-# which fall outside this task's module lock.  Both caller caches are now
-# primarily redundant for MCP de-duplication (the 20 s inner TTL handles it);
-# they remain for legacy shaping-cost avoidance and are outside this task's
-# scope to remove.
+# into dashboard.data.mcp_fanout.TTLCache.  app._task_cards_cache still
+# implements the pattern inline; it is now primarily redundant for MCP
+# de-duplication (the 20 s inner TTL handles it) and remains for legacy
+# shaping-cost avoidance.
 #
 # Keyed by project_root_str — a small, bounded set in practice — which
 # satisfies TTLCache's documented "bounded key space" assumption (it never
@@ -80,14 +78,13 @@ from dashboard.data.utils import resolve_now
 # ---------------------------------------------------------------------------
 
 # Within the PRD's recommended 15-30 s staleness window.  Slightly longer than
-# the 10 s caller caches (_TASK_CARDS_TTL_SECONDS / _TASK_TITLES_TTL_SECONDS)
-# because fetch_tasks is the dominant full-tree seam — a monitoring view
-# tolerates brief staleness; the inner TTL dominates net MCP cadence.
+# the 10 s caller cache (_TASK_CARDS_TTL_SECONDS) because fetch_tasks is the
+# dominant full-tree seam — a monitoring view tolerates brief staleness; the
+# inner TTL dominates net MCP cadence.
 #
-# Caller-cache stacking: app._load_task_cards (10 s) and
-# merge_queue.load_task_titles (10 s) both cache fetch_tasks output on top of
-# this inner cache.  Worst-case combined staleness ≈ caller TTL + inner TTL
-# ≈ 10 s + 20 s = 30 s — at the PRD's upper bound; intentional for a
+# Caller-cache stacking: app._load_task_cards (10 s) caches fetch_tasks output
+# on top of this inner cache.  Worst-case combined staleness ≈ caller TTL +
+# inner TTL ≈ 10 s + 20 s = 30 s — at the PRD's upper bound; intentional for a
 # monitoring view where brief staleness is preferable to MCP hammering.
 DEFAULT_PER_CALL_TIMEOUT = 2.0
 """Per-HTTP-request budget for every ``fetch_tasks`` MCP call.
@@ -291,8 +288,8 @@ _fetch_tasks_cache: TTLCache[list[dict] | dict, _TasksRead] = TTLCache(
 # cache's per-key lock, and ``TTLCache`` documents that a ``cache_ok``-rejected
 # value stores nothing and lets "the next lock-queued waiter run its own
 # refresh in turn" — so with two concurrent callers for the same key (the
-# routine case: app._load_task_cards, data.orchestrator, data.merge_queue and
-# data.burndown all fetch the same unnarrowed key on the same poll) waiter A's
+# routine case: app._load_task_cards, data.orchestrator and data.burndown all
+# fetch the same unnarrowed key on the same poll) waiter A's
 # failure can write a 5 s marker while waiter B's success writes a 20 s
 # positive entry.  ``fetch_tasks`` therefore prefers a fresh POSITIVE entry
 # over a fresh marker: a demonstrated success outranks a retry-suppression
@@ -1078,9 +1075,8 @@ async def fetch_tasks(
     **Server-side narrowing.**  *statuses* is forwarded to the ``get_tasks``
     MCP tool and is added to the arguments dict only when actually requested,
     so a caller that narrows nothing sends a dict byte-identical to the
-    pre-narrowing shape — the four full-tree callers
-    (``app._load_task_cards``, ``data.orchestrator``, ``data.merge_queue``,
-    ``data.burndown``) are unaffected.  It is a REAL server-side row filter —
+    pre-narrowing shape — the full-tree callers
+    (``app._load_task_cards``, ``data.burndown``) are unaffected.  It is a REAL server-side row filter —
     it becomes ``WHERE tag = ? AND status IN (...)`` in SQL, so narrowing with
     it cuts backend work, not just wire bytes.  ``None`` (the default) means
     "no filter"; an EMPTY LIST is a valid, distinct "return nothing" request
@@ -1103,9 +1099,8 @@ async def fetch_tasks(
     ``asyncio.wait_for``; every route caller now does, and the two layers are
     complementary rather than redundant.
     ``active_tasks.collect_tasks_with_counts`` was first, with its own
-    per-project budget; ``merge_queue.load_task_titles`` and
-    ``app._load_task_cards`` follow it, each binding a named module constant
-    to :data:`DEFAULT_WHOLE_OPERATION_BUDGET`. ``discover_orchestrators`` used
+    per-project budget; ``app._load_task_cards`` follows it, binding a named
+    module constant to :data:`DEFAULT_WHOLE_OPERATION_BUDGET`. ``discover_orchestrators`` used
     to be a fourth and is no longer a caller at all — task 5587 removed its
     task fetch, which is the one resolution a budget cannot beat.
 
@@ -1295,6 +1290,68 @@ class TaskReadOffline:
 
 
 TaskProseRead = TaskProse | TaskNotFound | TaskReadOffline
+TaskRowRead = dict | TaskNotFound | TaskReadOffline
+
+_Projected = TypeVar('_Projected')
+
+
+async def _read_task(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | os.PathLike[str],
+    task_id: int,
+    *,
+    timeout: float,
+    log_name: str,
+    project: Callable[[dict], _Projected],
+) -> _Projected | TaskNotFound | TaskReadOffline:
+    """Read ONE task through fused-memory's ``get_task``, projected by *project*.
+
+    The single place the ``get_task`` wire answer is classified:
+
+    - fused-memory's ``TaskNotFoundError``, matched on its structured
+      ``error_type``, is RETURNED as :class:`TaskNotFound` from the per-URL
+      call, not raised: ``first_success`` would treat a raised ``ValueError``
+      as a soft failure and ask the next URL, reporting an absent task as an
+      outage;
+    - any other tool error, or an empty result, raises ``ValueError`` — a soft
+      failure, so the next URL is asked; *project* may raise it too;
+    - every URL failing is :class:`TaskReadOffline` naming each failure.
+
+    *timeout* is per HTTP request; the caller bounds the whole read.
+    """
+    root = str(project_root)
+
+    async def _call(url: str) -> _Projected | TaskNotFound:
+        result = await mcp_tool_call(
+            client, url, 'get_task', {'id': str(task_id), 'project_root': root},
+            timeout=timeout,
+        )
+        if result.get('error_type') == 'TaskNotFoundError':
+            return TaskNotFound(str(result['error']))
+        if 'error' in result or not result:
+            raise ValueError(str(result.get('error', 'empty result')))
+        return project(result)
+
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label=fanout_label(log_name, root),
+        offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
+    )
+
+
+def _prose_of(result: dict) -> TaskProse:
+    """Missing prose normalises to ``''``, as :func:`_shape_task` does for ``description``."""
+    return TaskProse(result.get('description') or '', result.get('details') or '')
+
+
+def _row_of(result: dict) -> dict:
+    """The :func:`_shape_task` row; an id it cannot parse is a soft failure."""
+    row = _shape_task(result)
+    if row is None:
+        raise ValueError(f'get_task answered with an unparseable id {result.get("id")!r}')
+    return row
 
 
 async def fetch_task_prose(
@@ -1309,36 +1366,34 @@ async def fetch_task_prose(
 
     The ACTIVE_TASKS rows omit both fields; the pane fetches them here for the
     selected task only. Each outcome is its own type because the route answers
-    each with a different status:
-
-    - :class:`TaskProse`: missing prose normalises to ``''``, as
-      :func:`_shape_task` does for ``description``;
-    - :class:`TaskNotFound`: fused-memory's ``TaskNotFoundError``, matched on
-      its structured ``error_type``. It is RETURNED from the per-URL call, not
-      raised: ``first_success`` would treat a raised ``ValueError`` as a soft
-      failure and ask the next URL, reporting an absent task as an outage;
-    - :class:`TaskReadOffline`: every URL failed. Any other tool error, or an
-      empty result, is such a soft failure.
+    each with a different status: :class:`TaskProse`, :class:`TaskNotFound`
+    or :class:`TaskReadOffline`, classified by :func:`_read_task`.
 
     *timeout* is per HTTP request; the caller bounds the whole read.
     Uncached, deliberately: a primary-key lookup fetched only on selection.
     """
-    root = str(project_root)
+    return await _read_task(
+        client, config, project_root, task_id,
+        timeout=timeout, log_name='fetch_task_prose', project=_prose_of,
+    )
 
-    async def _call(url: str) -> TaskProseRead:
-        result = await mcp_tool_call(
-            client, url, 'get_task', {'id': str(task_id), 'project_root': root},
-            timeout=timeout,
-        )
-        if result.get('error_type') == 'TaskNotFoundError':
-            return TaskNotFound(str(result['error']))
-        if 'error' in result or not result:
-            raise ValueError(str(result.get('error', 'empty result')))
-        return TaskProse(result.get('description') or '', result.get('details') or '')
 
-    return await first_success(
-        config.fused_memory_urls,
-        _call,
-        log_label=fanout_label('fetch_task_prose', root),
-        offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
+async def fetch_task(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | os.PathLike[str],
+    task_id: int,
+    *,
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
+) -> TaskRowRead:
+    """Read ONE task's dashboard row — the :func:`_shape_task` row ``fetch_tasks`` serves.
+
+    The per-id read for a caller that needs a few tasks, not the tree:
+    :class:`TaskNotFound` and :class:`TaskReadOffline` are classified by
+    :func:`_read_task`. *timeout* is per HTTP request; the caller bounds the
+    whole read. Uncached here; its caller owns the cache.
+    """
+    return await _read_task(
+        client, config, project_root, task_id,
+        timeout=timeout, log_name='fetch_task', project=_row_of,
     )

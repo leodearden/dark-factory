@@ -13,9 +13,8 @@ scripts/tests/conftest.py) — mirroring test_census_verify_sandbox_cwd.py.
 from __future__ import annotations
 
 import census as mod
-import coder
 import filing_policy
-from legibility import census_trigger
+from legibility import census_trigger, session_runner
 
 import config as config_mod
 
@@ -61,6 +60,20 @@ def _poison(name):
     return _fn
 
 
+class _InertRunner:
+    """The pooled session runner main() opens, for a run whose stages are
+    never invoked (run_census is faked)."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        pass
+
+    def invoker(self, stage):
+        return _poison(f"the {stage.name} invoke")
+
+
 def _setup_main(tmp_path, monkeypatch):
     """A target project with its own legibility.yaml, and every side effect
     main() would really perform stubbed out. Returns (target, fake_run_census)."""
@@ -69,7 +82,9 @@ def _setup_main(tmp_path, monkeypatch):
     _write_legibility_yaml(
         target / "docs" / "legibility" / "legibility.yaml", project_root=target,
     )
-    monkeypatch.setattr(coder, "_invoke_cli", _poison("coder._invoke_cli"))
+    monkeypatch.setattr(
+        session_runner, "open_pooled_runner", lambda *_args, **_kwargs: _InertRunner(),
+    )
     # Every test here passes --force, which must never reach the gate.
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
     fake_run_census = _make_fake_main_run_census()
@@ -109,6 +124,9 @@ def test_main_defaults_the_harness_to_the_census_checkouts_own_config(tmp_path, 
 def test_main_fails_loud_on_an_unloadable_harness_config(tmp_path, monkeypatch, capsys):
     target, _ = _setup_main(tmp_path, monkeypatch)
     monkeypatch.setattr(mod, "run_census", _poison("run_census"))
+    monkeypatch.setattr(
+        session_runner, "open_pooled_runner", _poison("session_runner.open_pooled_runner"),
+    )
     missing = tmp_path / "no-such-harness.yaml"
 
     exit_code = mod.main([

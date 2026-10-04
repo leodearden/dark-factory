@@ -39,8 +39,9 @@ class Slate:
 
     ``candidates`` are the records ``select_judge_candidates`` kept, in the
     order the prompt renders them; ``attach_target_id`` is
-    ``decision.canonical_id`` verbatim, which is what ``triage_write`` files
-    an attach against and is NOT required to be in ``candidates``.
+    ``decision.canonical_id`` verbatim, the band's winner, and is NOT required
+    to be in ``candidates``. A judged attach files against the candidate the
+    judge names (task 5794), which need not be this one.
     """
 
     memory_id: str

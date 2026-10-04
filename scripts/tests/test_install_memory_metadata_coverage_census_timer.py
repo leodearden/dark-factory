@@ -1448,6 +1448,52 @@ def test_wrapper_cannot_commit_into_a_repo_named_only_by_ambient_git_dir(tmp_pat
         f'{sandbox_status!r} stdout={result.stdout!r}')
 
 
+def test_wrapper_commit_runs_no_hook_injected_by_ambient_git_config_parameters(
+        tmp_path):
+    """GIT_CONFIG_PARAMETERS is git's own `-c` channel, read at command-line
+    precedence, so an ambient one can name a core.hooksPath whose pre-commit
+    hook the wrapper's `commit --only` (no --no-verify) would run. Injected via
+    `extra_env`, AFTER the harness scrub, so the wrapper's own `unset` is what
+    is under test."""
+    hooks_dir = tmp_path / 'decoy-hooks'
+    hooks_dir.mkdir()
+    marker = tmp_path / 'hook-ran'
+    hook = hooks_dir / 'pre-commit'
+    hook.write_text(f'#!/bin/sh\ntouch {marker}\nexit 0\n')
+    hook.chmod(0o755)
+    poisoned = f"'core.hooksPath={hooks_dir}'"
+
+    # PREMISE CONTROL: this host's git really runs a hook injected this way,
+    # so the absence asserted below cannot be vacuous.
+    premise = _git_repo_harness(tmp_path / 'premise')
+    probe = subprocess.run(
+        ['git', '-C', str(premise), 'commit', '-q', '--allow-empty', '-m', 'probe'],
+        env={**_scrub_git_env(dict(os.environ)), 'GIT_CONFIG_PARAMETERS': poisoned},
+        capture_output=True, text=True, check=False,
+    )
+    assert marker.exists(), (
+        f'the injected hook did not run in the premise probe: {probe!r}')
+    marker.unlink()
+
+    repo = _git_repo_harness(tmp_path / 'sandbox')
+    result, state = _run_wrapper_in_git_repo(
+        tmp_path, repo, extra_env={'GIT_CONFIG_PARAMETERS': poisoned},
+    )
+
+    assert not marker.exists(), (
+        'the wrapper ran a pre-commit hook injected by an ambient '
+        f'GIT_CONFIG_PARAMETERS; stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    # POSITIVE CONTROL: the commit really happened, so a hook had its chance.
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    assert [c['who'] for c in state] == ['CENSUS', 'STAMP'], state
+    sandbox_status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
+    assert sandbox_status.strip() == '', (
+        f'the sandbox commit did not happen, so the guard proved nothing: '
+        f'{sandbox_status!r} stdout={result.stdout!r}')
+
+
 def test_harness_git_calls_cannot_be_redirected_by_ambient_git_dir(
         tmp_path, monkeypatch):
     """The OTHER half of the incident: the harness's own identity writes.

@@ -3699,6 +3699,15 @@ class OrchestratorConfig(BaseSettings):
     # the existing test suite are unchanged; opt in per project where
     # `systemd-run --user` is available.
     verify_use_cgroup_scope: bool = Field(default=False)
+    # Per-role cgroup v2 cpu.weight each verify scope is spawned with
+    # (`systemd-run -p CPUWeight=`), only when verify_use_cgroup_scope is on.
+    # nice orders threads only INSIDE one cgroup, so without a weight the role
+    # tiers are inert across sibling scopes. task/background are lowered rather than merge raised, so the
+    # merge scope stays at parity (100) with each orchestrator unit and the
+    # operator's terminals under app.slice; 33/10 keep the 3:1 merge:task intent.
+    verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
+    verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
+    verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
 
     # ── Verify admission control (task 2390 T2; PRD
     # plans/verify-oversubscription-control-prd.md) ────────────────────────
@@ -5993,6 +6002,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'verify_admission_nice_task',
         'verify_admission_nice_background',
         'verify_admission_pytest_n',
+        # Per-role verify scope CPUWeight (task 5205): read at each verify scope
+        # spawn (verify.py::_resolve_scope_cpu_weight), so a reload applies from
+        # the next spawn; a scope already running keeps the weight it started with.
+        'verify_cgroup_cpu_weight_merge',
+        'verify_cgroup_cpu_weight_task',
+        'verify_cgroup_cpu_weight_background',
         # Merge-role internal-fanout cap (task 2393, T5) — same knob family:
         # read fresh per run_scoped_verification call, so a live reload
         # lowers the merge fan-out without a restart.

@@ -2167,6 +2167,9 @@ class CuratorConfig(BaseModel):
     # 180s bounds a silent Anthropic-API hang for the curator's best-effort
     # contract while still giving ~20% headroom over the slowest legitimate
     # single-item decision observed in production (~150s); see esc-task-curator-20.
+    # Time to the FIRST assistant record alone has a long tail (p99 117.3s, max
+    # 203.3s over 5,484 curator transcripts, task 3995), so a gated curator sets
+    # startup_grace_secs equal to this timeout rather than the 120s default.
     timeout_seconds: float = Field(default=180.0)
     # Durable flat $2.00 per-call ceiling (task 1980 / esc-task-curator-194).
     # A prior scale-by-batch-size attempt (reify task 2254) was cancelled and
@@ -2323,8 +2326,10 @@ class CuratorConfig(BaseModel):
     janitor: TicketJanitorConfig = Field(default_factory=TicketJanitorConfig)
 
     # Zero-output-timeout (ZOT) circuit-breaker watchdog.
-    # Root cause: transient Anthropic-backend degradation on the curator's
-    # sonnet+json-schema call shape (task 1743). Each hang burns the full
+    # ZOTs are an accepted, recurring transient pre-turn hang on the curator's
+    # sonnet+json-schema call shape (ACCEPT-AND-RETUNE ruling on
+    # esc-task-curator-17); for a gated curator the classification is
+    # transcript-authoritative (0 assistant turns). Each hang burns the full
     # timeout_seconds (180s); the breaker stops every call burning that cost
     # during a sustained outage while preserving the best-effort
     # degrade-to-create contract.
@@ -2339,6 +2344,12 @@ class CuratorConfig(BaseModel):
     # task_curator.py::TaskCurator._reset_zero_output_breaker and
     # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker.
     zero_output_breaker_cooldown_seconds: float = Field(default=600.0, gt=0)
+    # Post-ZOT duplicate sweep (fused_memory/middleware/curator_zot_duplicate_sweep.py).
+    # The threshold is the sweep's own cosine flagging cutoff, not a curator
+    # combine threshold: combine-vs-create is an LLM judgement with no numeric cutoff.
+    zot_duplicate_sweep_enabled: bool = Field(default=True)
+    zot_duplicate_score_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
+    zot_duplicate_search_limit: int = Field(default=5, ge=1)
 
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching
@@ -2468,6 +2479,12 @@ def _default_curator_usage_cap() -> UsageCapConfig:
     )
 
 
+#: The reasoning efforts the write-triage judge may send on the Responses API.
+#: The single home of that vocabulary: the judge's resolver reads it with
+#: ``typing.get_args`` rather than restating the words.
+JudgeReasoningEffort = Literal['none', 'low', 'medium', 'high']
+
+
 class WriteTriageConfig(BaseModel):
     """Server-owned band thresholds for add_memory write triage (task 3130).
 
@@ -2542,7 +2559,7 @@ class WriteTriageConfig(BaseModel):
     #
     # OPERATOR KNOBS like `enabled`/`candidate_k` above, NOT calibrated bands:
     # they ship with real defaults, and None on the two inheriting leaves means
-    # "follow llm.*", never "uncalibrated". All six are green-tier
+    # "follow llm.*", never "uncalibrated". All eight are green-tier
     # hot-reloadable and read LIVE per middle-band write by
     # server/write_triage_judge.py's resolvers — nothing is captured at import
     # or construction, which is what makes the registration in
@@ -2584,7 +2601,7 @@ class WriteTriageConfig(BaseModel):
         description=(
             'The model the judge calls. None INHERITS llm.model. The PRD\'s '
             '"haiku-class" is a cost/size class, not a vendor pin: this is a '
-            'single-turn ~2.5k-token classification with a four-word closed '
+            'single-turn classification with a four-word closed '
             'output, so the smallest capable model is the right one. Whatever '
             'is resolved here is stamped into the accuracy report\'s provenance '
             'block by scripts/eval_write_triage_judge.py, so the operator at '
@@ -2592,7 +2609,7 @@ class WriteTriageConfig(BaseModel):
         ),
     )
     judge_timeout_seconds: float = Field(
-        default=10.0,
+        default=15.0,
         gt=0,
         description=(
             'Per-call wall-clock budget for the judge, enforced with '
@@ -2604,7 +2621,25 @@ class WriteTriageConfig(BaseModel):
             'TimeoutError propagates into triage_write\'s fail-open arm, which '
             'is exactly C1\'s "judge error/timeout => stored + storm counter" '
             '(INV-4). Bounded gt=0 because a zero budget would fail every call '
-            'and read as a total judge outage caused by nothing.'
+            'and read as a total judge outage caused by nothing. 15 s rather '
+            'than 10 s because the frontier judge arms measured p95 4.6-6.4 s '
+            '(plans/write-triage-flip-readiness-prd.md §11.2 D15).'
+        ),
+    )
+    judge_reasoning_effort: JudgeReasoningEffort | None = Field(
+        default=None,
+        description=(
+            'Reasoning effort the judge requests. None OMITS the reasoning '
+            'parameter and sends temperature=0.0 instead, which is what a '
+            'non-reasoning model such as gpt-4o-mini needs; a reasoning model '
+            'rejects a temperature, so it needs a value here. A value is sent '
+            'as reasoning={"effort": value} on the '
+            'Responses API, and only an endpoint that serves that API '
+            "(llm.client_class 'openai') can honour it; a set value on any other "
+            'arm is refused per call and counted as a fail-open rather than '
+            'silently dropped. Set together with judge_model from the judge-arm '
+            "selection at the task-3169 flip. PRD: "
+            "plans/write-triage-flip-readiness-prd.md §11.3 C1''."
         ),
     )
     judge_candidate_count: int = Field(
@@ -2620,6 +2655,21 @@ class WriteTriageConfig(BaseModel):
             'this cap. Bounded ge=1 so a 0 cannot silently empty the slate — '
             'that would answer `stored` on every middle-band write, reducing '
             'triage to its below-t_low behaviour with nothing logged.'
+        ),
+    )
+    judge_field_chars: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            'Per-field character cap applied to the new entry and to every '
+            'candidate before the judge sees them; a cut field is marked '
+            '`…[elided]` so the model knows it is reading a truncation. Why '
+            '4000 replaced 1,200 — the measured recall loss at the old cap and '
+            'the call cost at the new one — is the decision record '
+            'calibration/write_triage_judge_field_chars_report.md. Bounded ge=1 '
+            'because a zero cap would elide every field to nothing and show the '
+            'model empty records. Green-tier hot-reloadable, read live per '
+            'middle-band write.'
         ),
     )
     judge_accuracy_report_path: str | None = Field(

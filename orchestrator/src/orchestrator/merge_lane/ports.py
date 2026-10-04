@@ -26,9 +26,8 @@ from escalation.models import Escalation
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_gates import PostMergePyrightResult
-from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord
-from orchestrator.merge_types import MergeRequest
+from orchestrator.merge_lane.gates import PostMergePyrightResult
+from orchestrator.merge_lane.types import DiskGuardOutcome, EscalationRecord, MergeRequest
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 

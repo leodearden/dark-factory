@@ -3949,7 +3949,8 @@ class TestPersistAttemptLogs:
     def _persist(self, worktree, attempt_id, runs, category='cargo_cli_error', cause_hint='error: bad'):
         from orchestrator.verify import _persist_attempt_logs  # noqa: PLC0415
         return _persist_attempt_logs(
-            worktree, attempt_id, runs, _build_summary_payload(runs, category, cause_hint),
+            worktree, attempt_id, runs,
+            _build_summary_payload(runs, category, cause_hint, role='task'),
         )
 
     def _make_runs(self):
@@ -5229,7 +5230,7 @@ class TestPersistAttemptLogsModulePrefix:
         kwargs = {}
         if module_prefix is not None:
             kwargs['module_prefix'] = module_prefix
-        summary = _build_summary_payload(runs, category, cause_hint)
+        summary = _build_summary_payload(runs, category, cause_hint, role='task')
         return _persist_attempt_logs(worktree, attempt_id, runs, summary, **kwargs)
 
     def _make_runs(self):
@@ -8128,7 +8129,7 @@ class TestBuildSummaryPayload:
 
     def _build(self, runs, category='test_failure', cause_hint=''):
         from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
-        return _build_summary_payload(runs, category, cause_hint)
+        return _build_summary_payload(runs, category, cause_hint, role='task')
 
     def test_top_level_keys_present(self):
         """Returned dict has category, cause_hint, rc, timed_out, cmd, started_at,
@@ -8487,6 +8488,7 @@ class TestMergeConfigOnlyDiffForcesFullGate:
             git=GitConfig(merge_config_only_full_gate_globs=globs),
         )
 
+    @pytest.mark.usefixtures('code_default_config')
     def test_empty_globs_default_config_returns_false(self):
         """Default OrchestratorConfig (empty globs) → False regardless of files."""
         from orchestrator.verify import _merge_config_only_diff_forces_full_gate
@@ -9275,13 +9277,9 @@ class TestRunVerificationGovernRouting:
         scope contains the cpu-governed-exec.sh invocation, which on its
         governed path itself tries to create an inner systemd-run --user --scope.
 
-        In the real environment reify currently sets verify_use_cgroup_scope=False,
-        so this combination does not occur on the live path.  cpu-governed-exec.sh
-        has a runtime probe + fail-open that handles systemd-run absence or
-        failures; the outer scope's cgroup kill still reaps the whole subtree.
-        This test confirms the code paths compose without crashing and that
-        governance wrapping still fires (the nested scope interaction is a
-        runtime-environment concern, not a code-correctness bug).
+        What the nested scope does and does not govern is stated at
+        verify.py::_govern_cpu_str.  This test confirms the two wrappings
+        compose and that governance wrapping still fires.
         """
         import shlex
 
@@ -10616,7 +10614,7 @@ class TestSummaryPayloadNamesTheKilledRun:
         ]
 
     def test_killed_run_outranks_a_passing_run(self):
-        payload = _build_summary_payload(self._runs(), 'infra_kill', '')
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '', role='task')
         assert payload['rc'] == -9
         assert payload['cmd'] == _KILLED_LINT_CMD
         assert payload['duration_secs'] == 0.31
@@ -10625,12 +10623,12 @@ class TestSummaryPayloadNamesTheKilledRun:
     def test_killed_run_outranks_a_genuine_nonzero_failure(self):
         runs = self._runs()
         runs[0]['rc'] = 1
-        payload = _build_summary_payload(runs, 'infra_kill', '')
+        payload = _build_summary_payload(runs, 'infra_kill', '', role='task')
         assert payload['rc'] == -9
         assert payload['cmd'] == _KILLED_LINT_CMD
 
     def test_all_commands_are_still_listed(self):
-        payload = _build_summary_payload(self._runs(), 'infra_kill', '')
+        payload = _build_summary_payload(self._runs(), 'infra_kill', '', role='task')
         assert [c['label'] for c in payload['commands']] == ['test', 'lint']
         assert [c['rc'] for c in payload['commands']] == [0, -9]
 
@@ -10643,7 +10641,7 @@ class TestSummaryPayloadNamesTheKilledRun:
             {'label': 'lint', 'cmd': 'ruff check .', 'rc': 0, 'timed_out': False,
              'started_at': 't1', 'duration_secs': 3.0},
         ]
-        payload = _build_summary_payload(runs, 'test_failure', '')
+        payload = _build_summary_payload(runs, 'test_failure', '', role='task')
         assert payload['rc'] == 1
         assert payload['cmd'] == 'pytest'
         assert payload['duration_secs'] == 12.0
@@ -10655,7 +10653,7 @@ class TestSummaryPayloadNamesTheKilledRun:
             {'label': 'lint', 'cmd': 'ruff check .', 'rc': 1, 'timed_out': False,
              'started_at': 't1', 'duration_secs': 3.0},
         ]
-        payload = _build_summary_payload(runs, 'infra_timeout', '')
+        payload = _build_summary_payload(runs, 'infra_timeout', '', role='task')
         assert payload['cmd'] == 'pytest'
         assert payload['timed_out'] is True
 

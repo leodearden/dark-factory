@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import sys
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -80,7 +81,6 @@ from df_pytest_isolation import (  # noqa: E402
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
-from orchestrator import merge_queue  # noqa: E402
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
     EscalationConfig,
@@ -90,12 +90,14 @@ from orchestrator.config import (  # noqa: E402
     ReviewConfig,
     SandboxConfig,
 )
+from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402
+from orchestrator.merge_lane import worker  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
 # orchestrator.merge_queue was imported (by another conftest/plugin) before
 # the os.environ.setdefault above took effect, which would have frozen its
 # module-level _DEBUG_ASSERTS seed at False.
-merge_queue._DEBUG_ASSERTS = True
+worker._DEBUG_ASSERTS = True
 
 track_async_mock_coroutines()
 
@@ -122,7 +124,7 @@ async def _drain_leaked_tasks():
 
 @pytest_asyncio.fixture(autouse=True)
 async def _reap_leaked_merge_workers(_drain_leaked_tasks):
-    """Gracefully stop any MergeWorker orphaned onto the test event loop (task 1907).
+    """Gracefully stop any merge worker orphaned onto the test event loop (task 1907).
 
     A merge-queue test that raises before its own ``await worker.stop()`` leaks
     the worker's ``run()`` task and its background loops, which do real ``git``
@@ -657,7 +659,7 @@ def forbid_live_mcp(monkeypatch):
     NOT ``orchestrator.scheduler.mcp_call`` — because ``scheduler.py`` binds
     ``mcp_call`` via ``from ... import``, a distinct binding from the
     canonical ``orchestrator.mcp_lifecycle.mcp_call`` (and
-    ``orchestrator.agents.briefing.mcp_call``).  Every alias, however,
+    ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
     ultimately constructs/uses an ``McpSession`` and issues its first
     network I/O through ``McpSession.initialize`` -> ``_raw_call`` (the
     one-shot fallback path inside ``mcp_call``, since the module-global
@@ -788,12 +790,26 @@ def _clear_probe_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolated_merge_provenance(tmp_path_factory):
+    """Start every test with MergeProvenance on a fresh, empty landed outbox.
+
+    MergeProvenance is process-global, and every lane built over a real repo
+    binds its own outbox there (SpeculativeMergeWorker.__init__) with nothing
+    to unbind it, so a row one test's lane recorded would answer a later test's
+    lookup in the same worker (task 5034). The file is never created unless
+    something records through the facade.
+    """
+    basetemp = tmp_path_factory.getbasetemp()
+    MergeProvenance.bind(LandedOutbox(basetemp / f'landed-outbox-{uuid.uuid4().hex}.json'))
+
+
+@pytest.fixture(autouse=True)
 def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
-    MergeWorker hardcodes orchestrator.merge_queue.run_scoped_verification in its
-    internal calls; tests that create a live MergeWorker need this patched or
-    pytest/ruff/pyright (not in PATH in test environments) cause BLOCKED outcomes.
+    A lane on the production verifier (``ports.py::ProductionVerifier``) resolves
+    orchestrator.merge_queue.run_scoped_verification on every call; tests that run
+    one need it patched or pytest/ruff/pyright cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
 
@@ -931,18 +947,18 @@ def make_steward(tmp_path: Path):
       serve exactly one consumer.  That factory instead adopted this one's
       ``project_root`` recipe directly (task 3551), so the sandbox invariant is
       shared even though the construction is not;
-    * a THIRD sanctioned site exists, which the lineage had missed:
-      ``test_verdict_servers_integration_gate.py``'s
-      ``_build_steward_for_triage``, added by task 2488 AFTER the 3514
-      consolidation.  It takes a REAL ``OrchestratorConfig`` and a real on-disk
-      meta-root, which this fixture's ``spec_set`` ``MagicMock`` cannot supply;
-      whether to grow a ``config=`` passthrough for it is filed as a follow-up,
-      not decided here.
+    * ``test_verdict_servers_integration_gate.py``'s ``_build_steward_for_triage``
+      (task 2488, after 3514) was FOLDED onto this fixture by task 4452 with NO
+      ``config=`` passthrough: its real config was only needed for
+      ``config.routing.*``, which ``stamp_stock_routing_config`` supplies, and its
+      meta-root pre-init is test-side seeding (``triage_steward``).  A passthrough
+      is a second mode with no consumer; add one only when a caller needs a real
+      config's VALUES, not just its routing containers.
 
     ENFORCEMENT, so the ruling is checkable rather than merely asserted in prose
     a fourth time: ``test_steward_scaffolding_guards.py`` censuses every steward
     construction in this tree against an allowlist that carries the reason for
-    each.  A fourth idiom cannot appear silently — its author must either use
+    each.  Another idiom cannot appear silently — its author must either use
     this fixture or record why they cannot.  That module also owns the
     recurrence guard for the sandboxed-``project_root`` block; the assertion
     itself is ``_orch_helpers.assert_sandboxed_project_root``, which the
