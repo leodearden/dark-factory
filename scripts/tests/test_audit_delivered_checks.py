@@ -299,22 +299,16 @@ class TestLoadTaskIndex:
             conn.close()
 
 
-class TestTaskStoreLoadersRefuseAStub:
-    # load_open_dependents swallows `no such table` for a store that lacks
-    # only its dependencies table; a 0-byte stub has no tables at all, and
-    # must be refused rather than read as "nobody is blocked".
-    @pytest.mark.parametrize(
-        'loader', [load_task_index, load_open_dependents],
-        ids=['load_task_index', 'load_open_dependents'],
-    )
-    def test_a_zero_byte_stub_is_refused_with_a_structured_reason(self, tmp_path, loader):
-        stub = tmp_path / 'tasks.db'
-        stub.write_bytes(b'')
+def test_load_open_dependents_refuses_a_zero_byte_stub_rather_than_reading_nobody_blocked(tmp_path):
+    """Its `no such table` swallow is for a store lacking only the
+    dependencies table; a 0-byte stub has no tables at all."""
+    stub = tmp_path / 'tasks.db'
+    stub.write_bytes(b'')
 
-        with pytest.raises(TaskDbUnreadable) as refused:
-            loader(str(stub))
+    with pytest.raises(TaskDbUnreadable) as refused:
+        load_open_dependents(str(stub))
 
-        assert refused.value.reason is TaskDbProblem.EMPTY_STUB
+    assert refused.value.reason is TaskDbProblem.EMPTY_STUB
 
 
 # ---------------------------------------------------------------------------

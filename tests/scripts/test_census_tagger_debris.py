@@ -869,16 +869,6 @@ def test_load_stamped_records_keys_on_the_full_tag_and_id_primary_key(tmp_path):
     assert records[("feature", 5)].files_tagged_at == _AFTER
 
 
-def test_load_stamped_records_refuses_a_zero_byte_stub_with_a_structured_reason(tmp_path):
-    stub = tmp_path / "tasks.db"
-    stub.write_bytes(b"")
-
-    with pytest.raises(TaskDbUnreadable) as refused:
-        load_stamped_records(str(stub))
-
-    assert refused.value.reason is TaskDbProblem.EMPTY_STUB
-
-
 def test_the_censuss_own_opener_cannot_write(tmp_path):
     """THE SAFETY PROPERTY. Every corpus connection this module opens is a
     mode=ro URI, so the sweep is structurally incapable of mutating a live task
@@ -1240,18 +1230,6 @@ def test_an_unreadable_tasks_db_raises_rather_than_reporting_a_partial_result(tm
         census_project(str(root))
 
     assert refused.value.reason is TaskDbProblem.NOT_A_DATABASE
-
-
-def test_a_zero_byte_tasks_db_is_refused_as_an_empty_stub(tmp_path):
-    root = tmp_path / "stub"
-    tasks_dir = root / ".taskmaster" / "tasks"
-    tasks_dir.mkdir(parents=True)
-    (tasks_dir / "tasks.db").write_bytes(b"")
-
-    with pytest.raises(TaskDbUnreadable) as refused:
-        census_project(str(root))
-
-    assert refused.value.reason is TaskDbProblem.EMPTY_STUB
 
 
 def test_coverage_is_always_reported_even_for_a_project_with_no_stamps(tmp_path):

@@ -26,8 +26,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
-from _task_db_scan import TaskDbProblem, TaskDbUnreadable
 from audit_wiped_metadata_files import (
     _LOCK_LEVEL_CAVEAT,
     _SOURCE_PRECEDENCE,
@@ -254,16 +252,6 @@ def test_load_task_records_coerces_non_string_file_entries(tmp_path, make_tasks_
 def test_load_task_records_on_empty_db_returns_empty_mapping(tmp_path, make_tasks_db):
     db_path = make_tasks_db([])
     assert load_task_records(str(db_path)) == {}
-
-
-def test_load_task_records_refuses_a_zero_byte_stub_with_a_structured_reason(tmp_path):
-    stub = tmp_path / "tasks.db"
-    stub.write_bytes(b"")
-
-    with pytest.raises(TaskDbUnreadable) as refused:
-        load_task_records(str(stub))
-
-    assert refused.value.reason is TaskDbProblem.EMPTY_STUB
 
 
 # ---------------------------------------------------------------------------

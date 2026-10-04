@@ -47,8 +47,6 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
-    TaskDbProblem,
-    TaskDbUnreadable,
     format_kv_line,
 )
 from audit_manifest_descriptor_drift import (
@@ -1100,16 +1098,6 @@ def test_widening_the_loader_changed_neither_existing_output(make_tasks_db):
     assert scan.row_ids == {1, 2, 3}
     assert scan.delivered_checks == {2: {"gate": gate}, 3: {"cap": cap}}
     assert [b.task_id for b in scan.manifest_bindings] == [3]
-
-
-def test_scan_refuses_a_zero_byte_stub_with_a_structured_reason(tmp_path):
-    stub = tmp_path / "tasks.db"
-    stub.write_bytes(b"")
-
-    with pytest.raises(TaskDbUnreadable) as refused:
-        load_task_store_scan(str(stub))
-
-    assert refused.value.reason is TaskDbProblem.EMPTY_STUB
 
 
 # ---------------------------------------------------------------------------

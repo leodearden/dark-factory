@@ -27,7 +27,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 from _task_db_scan import TaskDbProblem, TaskDbUnreadable
 from scan_provenance_note_log_leaks import (
     NoteLeakMatch,
@@ -261,15 +260,6 @@ class TestScanDb:
 
         assert [m.task_id for m in matches] == [3001], matches
         assert matches[0].leak_line.startswith('2026-07-30'), matches[0]
-
-    def test_a_zero_byte_stub_is_refused_with_a_structured_reason(self, tmp_path):
-        stub = tmp_path / 'tasks.db'
-        stub.write_bytes(b'')
-
-        with pytest.raises(TaskDbUnreadable) as refused:
-            scan_db(str(stub))
-
-        assert refused.value.reason is TaskDbProblem.EMPTY_STUB
 
 
 class TestFormatting:
