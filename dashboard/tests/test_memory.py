@@ -1024,11 +1024,9 @@ class TestHandRolledLoopsBoundEachUrl:
     ``call_with_deadline`` bound, after which the hung url is logged,
     invalidated and skipped.
 
-    Both run on shared/src/shared/testing_virtual_clock.py::virtual_clock_test,
-    so the healthy url's ``HOST_STALL_SECONDS`` stall cannot expire its deadline
-    while the hung url still times out at exactly ``DEADLINE_SECONDS``. The outer
-    ``asyncio.wait_for(..., 5)`` stays mandatory: without it a regression parks
-    until pytest-timeout kills the worker with no traceback.
+    Both run on shared/src/shared/testing_virtual_clock.py::virtual_clock_test.
+    The outer ``asyncio.wait_for(..., 5)`` is mandatory: without it a regression
+    parks until pytest-timeout kills the worker with no traceback.
     """
 
     DEADLINE_SECONDS = 0.05
