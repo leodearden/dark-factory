@@ -415,6 +415,7 @@ async def test_cancelled_request_still_mints_the_successor(gated_backend, event_
     interceptor = TaskInterceptor(gated_backend, None, event_buffer)
     pid = await _seed_carrier(interceptor, gated_backend, root)
     request = asyncio.create_task(interceptor.set_task_status(pid, 'done', root))
+    # noqa: wall-clock-deadline — wait_responsive is importable only under orchestrator/tests
     await asyncio.wait_for(gated_backend.mint_entered.wait(), timeout=5)
 
     request.cancel()
@@ -437,6 +438,7 @@ async def test_cancelled_mint_logs_the_failure_and_reraises(
     mint = asyncio.create_task(mint_successor(
         gated_backend, write_lock=asyncio.Lock(), predecessor_id=pid, project_root=root, tag=None,
     ))
+    # noqa: wall-clock-deadline — wait_responsive is importable only under orchestrator/tests
     await asyncio.wait_for(gated_backend.mint_entered.wait(), timeout=5)
 
     with caplog.at_level(logging.ERROR, logger=MINT_LOGGER):
