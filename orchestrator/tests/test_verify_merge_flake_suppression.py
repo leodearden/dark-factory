@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sibling_leg_fixtures import sibling_without_verdict_session
 from _xdist_crash_fixtures import (
     COMPLETE_SESSION_FAILED_NODEID,
     PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
@@ -1089,31 +1090,27 @@ class TestTruncatedSessionIsNeverSuppressed:
         )
 
 
-#: A killed sibling module's partial -q output: progress dots, no test named.
-_KILLED_MODULE_PARTIAL_OUTPUT = '.' * 40 + '\n'
-
-
-def _stopped_sibling_red(stopped_category: str = 'infra_kill') -> VerifyResult:
-    """The joined scoped red of task 6247: one module stopped before its own
+def _sibling_without_verdict_red(sibling_category: str = 'infra_kill') -> VerifyResult:
+    """The joined scoped red of task 6247: one module's leg reached no test
     verdict beside one that completed with a single load flake."""
+    test_output, legs = sibling_without_verdict_session(sibling_category)
     return VerifyResult(
         passed=False,
-        test_output='\n'.join(
-            (PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT, _KILLED_MODULE_PARTIAL_OUTPUT),
-        ),
+        test_output=test_output,
         lint_output='',
         type_output='',
-        summary=f'1 failed; sibling module leg stopped ({stopped_category})',
-        category=stopped_category,
-        failing_leg_categories=['test_failure', stopped_category],
+        summary=f'1 failed; sibling module leg reached no verdict ({sibling_category})',
+        category=sibling_category,
+        failing_leg_categories=legs,
     )
 
 
-class TestStoppedSiblingLegIsNeverSuppressed:
+class TestSiblingLegWithoutVerdictIsNeverSuppressed:
     """Task 6247, end to end with the DEFAULT gate: a scoped red in which one
-    module's leg was stopped before its verdict must never land as a pass
-    because a sibling module's flake re-runs green. The re-run is patched to
-    PASS throughout, so only the discriminator's own refusal keeps it red.
+    module's leg reached no test verdict (stopped, or failed before any test
+    was judged) must never land as a pass because a sibling module's flake
+    re-runs green. The re-run is patched to PASS throughout, so only the
+    discriminator's own refusal keeps it red.
     """
 
     @staticmethod
@@ -1133,13 +1130,16 @@ class TestStoppedSiblingLegIsNeverSuppressed:
             )
         return result, rerun
 
-    @pytest.mark.parametrize('stopped_category', ['infra_kill', 'infra_timeout'])
-    def test_stopped_sibling_stays_red_and_says_why(
-        self, tmp_path: Path, stopped_category: str,
+    @pytest.mark.parametrize(
+        'sibling_category',
+        ['infra_kill', 'infra_timeout', 'disk_full', 'pytest_internalerror', 'compile_error'],
+    )
+    def test_sibling_without_verdict_stays_red_and_says_why(
+        self, tmp_path: Path, sibling_category: str,
     ) -> None:
         from orchestrator.flake_ledger import FlakeVerdict
 
-        result, rerun = self._apply(_stopped_sibling_red(stopped_category), tmp_path)
+        result, rerun = self._apply(_sibling_without_verdict_red(sibling_category), tmp_path)
 
         assert result.passed is False, result
         assert result.category != 'merge_flake_suppressed', result.category
@@ -1148,7 +1148,7 @@ class TestStoppedSiblingLegIsNeverSuppressed:
             result.flake_suppression
         )
         assert result.flake_suppression.unconfirmable_reason == (
-            f'leg_without_verdict:{stopped_category}'
+            f'leg_without_verdict:{sibling_category}'
         ), result.flake_suppression
         rerun.assert_not_awaited()
 
@@ -1159,7 +1159,7 @@ class TestStoppedSiblingLegIsNeverSuppressed:
 
         _materialize(tmp_path, 'orchestrator/tests/test_config.py')
         runner, _run_scoped, run_unscoped = _make_hook_runner(
-            tmp_path, scoped_result=_stopped_sibling_red(),
+            tmp_path, scoped_result=_sibling_without_verdict_red(),
         )
         rerun = AsyncMock(return_value=_result(True))
 
@@ -1170,14 +1170,14 @@ class TestStoppedSiblingLegIsNeverSuppressed:
         run_unscoped.assert_not_awaited()
         rerun.assert_not_awaited()
 
-    def test_stopped_sibling_lands_an_unconfirmable_ledger_row(
+    def test_sibling_without_verdict_lands_an_unconfirmable_ledger_row(
         self, tmp_path: Path,
     ) -> None:
         from orchestrator import flake_recorder
         from orchestrator.flake_ledger import ledger_db_path, read_occurrences
         from orchestrator.verify_runner import result_from_json, result_to_json
 
-        result, _rerun = self._apply(_stopped_sibling_red(), tmp_path)
+        result, _rerun = self._apply(_sibling_without_verdict_red(), tmp_path)
         wired = result_from_json(result_to_json(result))
         es = _FakeEventStore()
 
@@ -1272,6 +1272,58 @@ class TestFailingLintLegIsNeverSuppressed:
         assert result.flake_suppression.unconfirmable_reason == 'other_leg_failed', (
             result.flake_suppression
         )
+        rerun.assert_not_awaited()
+
+
+class TestMergeNoEvidenceFailIsRecordedAsItself:
+    """The INV-1 loud FAIL for a merge gate that resolved to "nothing to run"
+    (task 2883) reaches the hook like any scoped red. It ran no leg, yet its
+    summary rides in ``type_output``, so the ledger must name it for what it
+    is rather than as a failed type leg (task 6247).
+
+    Driven through LocalRunner with the REAL run_scoped_verification on a
+    command-less config and a docs-only diff, so the result is the one
+    production builds. No command may run, and the re-run is patched to PASS.
+    """
+
+    def test_merge_no_evidence_fail_is_unconfirmable_for_its_own_reason(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'docs/x.md')
+        config = OrchestratorConfig(
+            project_root=tmp_path, test_command='', lint_command='', type_check_command='',
+        )
+        runner = LocalRunner(
+            merge_wt=tmp_path,
+            config=config,
+            module_configs=[],
+            task_files=('docs/x.md',),
+            run_scoped=verify_module.run_scoped_verification,
+            run_unscoped=AsyncMock(return_value=_clean_unscoped_gate()),
+            task_id='6247',
+        )
+        commands = AsyncMock(side_effect=AssertionError('no command may run'))
+        rerun = AsyncMock(return_value=_result(True))
+
+        with (
+            patch.object(verify_module, '_run_cmd', commands),
+            patch.object(verify_module, 'run_verification', rerun),
+        ):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        assert result.passed is False, result
+        assert result.category == 'merge_no_evidence', result.category
+        assert result.flake_suppression is not None, result
+        assert result.flake_suppression.verdict is FlakeVerdict.unconfirmable, (
+            result.flake_suppression
+        )
+        assert result.flake_suppression.unconfirmable_reason == 'merge_no_evidence', (
+            result.flake_suppression
+        )
+        commands.assert_not_awaited()
         rerun.assert_not_awaited()
 
 

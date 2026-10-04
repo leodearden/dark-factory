@@ -9776,8 +9776,8 @@ class _RerunPolicy:
     #: per site by design — the two are retuned on different signals.
     timeout_secs: int
     #: Whether a failing session that left tests unmeasured is
-    #: ``unconfirmable`` before any re-run: a failing leg stopped before its
-    #: own verdict (task 6247), or an xdist worker death (task 5492). See
+    #: ``unconfirmable`` before any re-run: a failing leg that reached no test
+    #: verdict (task 6247), or an xdist worker death (task 5492). See
     #: ``_unmeasured_session_reason``; merge_gate only — the precondition block
     #: in confirm_isolated_rerun_verdict says why it must NOT apply to the
     #: main probe.
@@ -10023,12 +10023,17 @@ def _psi_cpu_some10_or_none() -> float | None:
     return sample.cpu_some10 if sample.read_ok else None
 
 
-#: The categories verify_classify.py::classify_failure assigns from a STOP
-#: signal — our wall clock (guard 2) or an external one (guard 2.5) — before
-#: reading any output, so such a leg never reached its own exit verdict. Why
-#: that refuses suppression: test_flake_discriminator.py::TestStoppedLegIsUnconfirmable.
-_STOPPED_LEG_CATEGORIES: frozenset[FailureCategory] = frozenset({
-    FailureCategory.INFRA_TIMEOUT, FailureCategory.INFRA_KILL,
+#: The only failing-leg categories verify_classify.py::classify_failure
+#: assigns after the leg's tests ran to a verdict: a FAILED line, or the
+#: ladder's fall-through, where an ERROR-only session (a fixture-setup
+#: timeout) lands while still naming its node-ids. Every other category means
+#: the leg was stopped, or failed before any test was judged. Residual: the
+#: fall-through also holds a leg that named no test (pytest rc=5, a lint leg
+#: that printed nothing), which the aggregated list cannot tell apart. Why
+#: anything else refuses suppression:
+#: test_flake_discriminator.py::TestLegWithoutVerdictIsUnconfirmable.
+_VERDICT_BEARING_LEG_CATEGORIES: frozenset[FailureCategory] = frozenset({
+    FailureCategory.TEST_FAILURE, FailureCategory.UNKNOWN_TEST_FAILURE,
 })
 
 
@@ -10043,9 +10048,11 @@ def _unmeasured_session_reason(failing_result: VerifyResult) -> str | None:
     ranks last because it is an absence of evidence.
     """
     recorded = failing_result.failing_leg_categories
-    stopped = next((c for c in recorded or () if c in _STOPPED_LEG_CATEGORIES), None)
-    if stopped is not None:
-        return f'leg_without_verdict:{stopped}'
+    without_verdict = next(
+        (c for c in recorded or () if c not in _VERDICT_BEARING_LEG_CATEGORIES), None,
+    )
+    if without_verdict is not None:
+        return f'leg_without_verdict:{without_verdict}'
     if _shows_xdist_worker_death(failing_result.test_output):
         return 'session_truncated'
     if not recorded:
@@ -10157,7 +10164,7 @@ async def confirm_isolated_rerun_verdict(
 
     At the merge gate (``policy.refuses_partially_measured_sessions``) no
     re-run is attempted when the failing session left tests unmeasured: a
-    failing leg stopped before its own verdict is
+    failing leg that reached no test verdict is
     ``unconfirmable('leg_without_verdict:<category>')`` (task 6247), and an
     xdist worker death is ``unconfirmable('session_truncated')`` (task 5492),
     because no re-run of the named tests can vouch for the ones never judged.
@@ -10239,6 +10246,16 @@ async def confirm_isolated_rerun_verdict(
         )
 
     try:
+        # INV-1 (task 2883): a merge gate that resolved to "nothing to run"
+        # judged nothing. Named for itself, because its summary rides in
+        # type_output and the next check would misreport a failed type leg.
+        if failing_result.category == _MERGE_NO_EVIDENCE_CATEGORY:
+            return _observe(
+                FlakeVerdict.unconfirmable, (),
+                call_site=coerced_site, runner=runner,
+                reason=_MERGE_NO_EVIDENCE_CATEGORY, now=now,
+            )
+
         # PRECONDITION, both gates: bail before ANY work when another leg is
         # known non-clean, because re-running the named TEST node-ids is no
         # evidence about it. At the main probe, ``_summarize_checks``/
@@ -10251,7 +10268,8 @@ async def confirm_isolated_rerun_verdict(
         # ``lint_output``/``type_output`` are populated ONLY when that leg's
         # return code was non-zero, so a non-empty value is a precise, free
         # signal; a leg that failed while printing nothing is caught only if
-        # it was stopped (see ``_STOPPED_LEG_CATEGORIES``).
+        # its category is not verdict-bearing (see
+        # ``_VERDICT_BEARING_LEG_CATEGORIES``).
         if failing_result.lint_output or failing_result.type_output:
             return _observe(
                 FlakeVerdict.unconfirmable, (),
@@ -10260,10 +10278,11 @@ async def confirm_isolated_rerun_verdict(
             )
 
         node_ids = _extract_failing_test_ids(failing_result.test_output)
-        # PRECONDITION, merge_gate only: a stopped leg or a worker death means
-        # the named failures are not the only unmeasured tests. At the merge
-        # gate a passes_in_isolation LANDS the tree, and no re-run of the named
-        # ids can speak for the tests left without a verdict (INV-1). At the
+        # PRECONDITION, merge_gate only: a leg that reached no test verdict, or
+        # a worker death, means the named failures are not the only unmeasured
+        # tests. At the merge gate a passes_in_isolation LANDS the tree, and no
+        # re-run of the named ids can speak for the tests left without a
+        # verdict (INV-1). At the
         # main probe the same verdict only downgrades "main is broken" to
         # "task-own red", so nothing lands; refusing there would declare main
         # broken on no evidence, and task 3597's ground truth (esc-3514-2) is
@@ -10483,12 +10502,13 @@ async def confirm_merge_verify_flake_suppressible(
     verdict onto a shared ``None``, which made the extraction provably
     behaviour-preserving but discarded the observation at exactly the point it
     became knowable: ``fails_in_isolation`` (a REAL red) and ``unconfirmable``
-    (we could not tell — a co-occurring lint/type failure,
+    (we could not tell — a merge gate that ran nothing, ``merge_no_evidence``;
+    a co-occurring lint/type failure,
     ``other_leg_failed``; no recoverable node-id from an opaque
     failure; a node-id mapping to no given subproject; an infra-sentinel re-run
     category, which is never trusted as confirmation; a session an xdist worker
-    death truncated, ``session_truncated``; a session with a failing leg
-    stopped before its own verdict, ``leg_without_verdict:<category>``; a
+    death truncated, ``session_truncated``; a session with a failing leg that
+    reached no test verdict, ``leg_without_verdict:<category>``; a
     failing result whose per-leg categories were never recorded,
     ``leg_categories_unrecorded``) are different facts, and
     θ's class-1 health check is an unconfirmable RATE that cannot be computed

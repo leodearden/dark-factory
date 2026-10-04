@@ -34,6 +34,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _sibling_leg_fixtures import sibling_without_verdict_session
 from _xdist_crash_fixtures import (
     COMPLETE_SESSION_FAILED_NODEID,
     PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
@@ -48,6 +49,7 @@ from _xdist_crash_fixtures import (
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.verify import VerifyResult
+from orchestrator.verify_categories import FailureCategory
 
 
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
@@ -1596,45 +1598,41 @@ class TestMainProbeStillJudgesCrashCoOccurringFailures:
 
 
 # ---------------------------------------------------------------------------
-# Task 6247: a session with a leg that was stopped before its own verdict is
-# never confirmable at the merge gate.
+# Task 6247: a session with a failing leg that reached no test verdict is never
+# confirmable at the merge gate.
 # ---------------------------------------------------------------------------
 
-#: A killed sibling module's partial -q output: progress dots, then nothing.
-#: It names no test, so the stopped leg's only record is its category.
-_KILLED_MODULE_PARTIAL_OUTPUT = '.' * 40 + '\n'
+#: The merge gate's allowlist, stated here independently of verify.py: the leg
+#: categories verify_classify.py::classify_failure assigns once tests ran.
+_VERDICT_BEARING_LEG_CATEGORIES = ('test_failure', 'unknown_test_failure')
 
-_STOPPED_LEG_CATEGORIES = ('infra_kill', 'infra_timeout')
+#: Every other category, derived from the enum so that a category added later
+#: is refused by default.
+_LEG_CATEGORIES_WITHOUT_VERDICT = [
+    pytest.param(c.value, id=c.value or 'none')
+    for c in FailureCategory
+    if c.value not in _VERDICT_BEARING_LEG_CATEGORIES
+]
 
-
-def _joined(*module_outputs: str) -> str:
-    """Join per-module test output the way verify.py::_aggregate_results does."""
-    return '\n'.join(module_outputs)
-
-
-def _stopped_sibling_session(
-    stopped_category: str, *, killed_module_first: bool,
-) -> tuple[str, list[str]]:
-    """A completed module with one flake beside a stopped one, as
-    (joined test_output, failing_leg_categories) in matching module order."""
-    if killed_module_first:
-        return (
-            _joined(_KILLED_MODULE_PARTIAL_OUTPUT, PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT),
-            [stopped_category, 'test_failure'],
-        )
-    return (
-        _joined(PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT, _KILLED_MODULE_PARTIAL_OUTPUT),
-        ['test_failure', stopped_category],
-    )
+#: An ERROR-only -q session: a fixture-setup timeout names its node-id on an
+#: ERROR line and no test FAILED.
+_ERROR_ONLY_SESSION_OUTPUT = (
+    '.' * 72 + ' [ 99%]\n'
+    + 'E.........'.ljust(73) + '[100%]\n'
+    + ' short test summary info '.center(80, '=') + '\n'
+    + f'ERROR {COMPLETE_SESSION_FAILED_NODEID} - Failed: Timeout >60.0s\n'
+    + '21082 passed, 1 error in 1500.00s\n'
+)
 
 
-class TestStoppedLegIsUnconfirmable:
-    """A leg our wall clock or an external signal stopped never reached its
-    own verdict, and its partial output names no test. At the merge gate a
-    ``passes_in_isolation`` replaces the WHOLE joined result with a pass and
-    lands the tree, yet the isolated re-run vouches only for the named flake,
-    so the stopped leg's suite would land with no verdict at all (INV-1). The
-    gate therefore refuses before spending a re-run, naming the stopped
+class TestLegWithoutVerdictIsUnconfirmable:
+    """Re-running the tests a session named vouches only for legs whose tests
+    ran to a verdict. Any other category (a leg our wall clock or an external
+    signal stopped, a full disk, an INTERNALERROR, a compile error) means that
+    leg's suite was never judged, and its partial output names no test. At the
+    merge gate a ``passes_in_isolation`` replaces the WHOLE joined result with
+    a pass and lands the tree, so that suite would land with no verdict at all
+    (INV-1). The gate therefore refuses before spending a re-run, naming the
     category, and still names the flake so the ledger counts it.
 
     The re-run is patched to PASS throughout, so a refusal here can only come
@@ -1642,16 +1640,16 @@ class TestStoppedLegIsUnconfirmable:
     downgrades "main is broken", and nothing lands.
     """
 
-    @pytest.mark.parametrize('killed_module_first', [False, True], ids=['flake_first', 'killed_first'])
-    @pytest.mark.parametrize('stopped_category', _STOPPED_LEG_CATEGORIES)
-    def test_stopped_leg_is_unconfirmable_without_a_rerun(
-        self, tmp_path: Path, stopped_category: str, killed_module_first: bool,
+    @pytest.mark.parametrize('sibling_first', [False, True], ids=['flake_first', 'sibling_first'])
+    @pytest.mark.parametrize('sibling_category', _LEG_CATEGORIES_WITHOUT_VERDICT)
+    def test_a_leg_without_a_verdict_is_unconfirmable_without_a_rerun(
+        self, tmp_path: Path, sibling_category: str, sibling_first: bool,
     ) -> None:
         from orchestrator import verify as verify_module
         from orchestrator.flake_ledger import FlakeCallSite, FlakeVerdict
 
-        test_output, legs = _stopped_sibling_session(
-            stopped_category, killed_module_first=killed_module_first,
+        test_output, legs = sibling_without_verdict_session(
+            sibling_category, sibling_first=sibling_first,
         )
         s, rerun = _confirm_with_passing_rerun(
             verify_module, tmp_path, test_output,
@@ -1659,7 +1657,7 @@ class TestStoppedLegIsUnconfirmable:
         )
 
         assert s.verdict is FlakeVerdict.unconfirmable, s
-        assert s.unconfirmable_reason == f'leg_without_verdict:{stopped_category}', s
+        assert s.unconfirmable_reason == f'leg_without_verdict:{sibling_category}', s
         assert s.test_ids == (COMPLETE_SESSION_FAILED_NODEID,), s.test_ids
         assert s.call_site == FlakeCallSite.merge_gate, s.call_site
         rerun.assert_not_awaited()
@@ -1681,15 +1679,15 @@ class TestStoppedLegIsUnconfirmable:
         assert s.unconfirmable_reason == 'leg_without_verdict:infra_kill', s
         rerun.assert_not_awaited()
 
-    @pytest.mark.parametrize('stopped_category', _STOPPED_LEG_CATEGORIES)
-    def test_main_probe_still_reruns_a_session_with_a_stopped_leg(
-        self, tmp_path: Path, stopped_category: str,
+    @pytest.mark.parametrize('sibling_category', _LEG_CATEGORIES_WITHOUT_VERDICT)
+    def test_main_probe_still_reruns_a_session_with_a_leg_without_a_verdict(
+        self, tmp_path: Path, sibling_category: str,
     ) -> None:
         from orchestrator import verify as verify_module
         from orchestrator.flake_ledger import FlakeVerdict
 
-        test_output, legs = _stopped_sibling_session(
-            stopped_category, killed_module_first=True,
+        test_output, legs = sibling_without_verdict_session(
+            sibling_category, sibling_first=True,
         )
         s, rerun = _confirm_with_passing_rerun(
             verify_module, tmp_path, test_output,
@@ -1700,20 +1698,44 @@ class TestStoppedLegIsUnconfirmable:
         assert s.verdict is FlakeVerdict.passes_in_isolation, s
         assert s.unconfirmable_reason is None, s
 
-    def test_recorded_completed_test_leg_is_still_rerun_and_confirmed(
-        self, tmp_path: Path,
+    @pytest.mark.parametrize(
+        ('test_output', 'legs'),
+        [
+            pytest.param(PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT, ['test_failure'], id='failed_line'),
+            pytest.param(_ERROR_ONLY_SESSION_OUTPUT, ['unknown_test_failure'], id='error_only'),
+            pytest.param(
+                PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
+                list(_VERDICT_BEARING_LEG_CATEGORIES),
+                id='both',
+            ),
+        ],
+    )
+    def test_verdict_bearing_legs_are_still_rerun_and_confirmed(
+        self, tmp_path: Path, test_output: str, legs: list[str],
     ) -> None:
         from orchestrator import verify as verify_module
         from orchestrator.flake_ledger import FlakeVerdict
 
         s, rerun = _confirm_with_passing_rerun(
-            verify_module, tmp_path, PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
-            call_site='merge_gate', failing_leg_categories=['test_failure'],
+            verify_module, tmp_path, test_output,
+            call_site='merge_gate', failing_leg_categories=legs,
         )
 
         rerun.assert_awaited()
         assert s.verdict is FlakeVerdict.passes_in_isolation, s
         assert s.test_ids == (COMPLETE_SESSION_FAILED_NODEID,), s.test_ids
+
+    def test_an_error_only_session_classifies_into_the_allowlist(self) -> None:
+        """Why ``unknown_test_failure`` is admitted: the pytest ladder's
+        fall-through is where an ERROR-only session lands, and it still names
+        its node-ids. If the classifier ever gives such a session its own
+        category, this fails and the allowlist must be revisited."""
+        from orchestrator.verify_classify import classify_failure
+        from orchestrator.verify_cmd import ToolKind
+
+        category = classify_failure(ToolKind.PYTEST, 1, _ERROR_ONLY_SESSION_OUTPUT, False)
+
+        assert category == 'unknown_test_failure', category
 
 
 class TestUnrecordedLegCategoriesAreUnconfirmable:
