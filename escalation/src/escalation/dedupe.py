@@ -3,11 +3,13 @@
 Provides:
 - DedupeConfig  — configuration knobs (defaults: enabled, 600s window,
                   infra_issue category only).  Named constructors for the
-                  non-infra paths: DedupeConfig.for_recon() (recon integrity
-                  findings, key_fn=content_fingerprint_key) and
-                  DedupeConfig.for_gate_backlog() (stale gate backlog,
-                  key_fn=gate_backlog_fingerprint_key — a superset that also
-                  recovers pre-stamp parents); both use an unbounded window.
+                  non-infra paths: DedupeConfig.for_content_fingerprint(category)
+                  (one category, key_fn=content_fingerprint_key),
+                  DedupeConfig.for_recon() (that policy for recon integrity
+                  findings) and DedupeConfig.for_gate_backlog() (stale gate
+                  backlog, key_fn=gate_backlog_fingerprint_key — a superset
+                  that also recovers pre-stamp parents); all use an unbounded
+                  window.
 - summary_dedupe_key() — pure function; normalises a summary string and
                          returns the first ≤3 tokens as a tuple.
 - find_dedupe_parent() — scans the live queue and returns the oldest
@@ -328,28 +330,29 @@ class DedupeConfig:
     key_fn: KeyFn | None = None  # None => _default_summary_key (summary prefix key)
 
     @classmethod
-    def for_recon(cls) -> DedupeConfig:
-        """Return a DedupeConfig configured for recon integrity dedup.
+    def for_content_fingerprint(cls, category: str) -> DedupeConfig:
+        """Return the unbounded content-fingerprint fold policy for one *category*.
 
-        Properties:
-        - ``infra_dedupe_enabled``     : True
-        - ``infra_dedupe_window_secs`` : float('inf') — unbounded window so
-          recurring findings over hours/days always fold into the same parent.
-        - ``infra_dedupe_categories``  : ('recon_integrity_issue',) — only fold
-          recon integrity findings; recon_failure / recon_backlog_overflow /
-          recon_stale_run are intentionally excluded to preserve distinct
-          blocking signals.
-        - ``key_fn``                   : content_fingerprint_key — folds on
-          esc.dedupe_fingerprint rather than the summary prefix.
-
-        The ``infra_dedupe_*`` prefix is historical / general-purpose.
+        Folds on ``esc.dedupe_fingerprint`` with an unbounded window, so a
+        finding that recurs over hours or days keeps folding into one parent.
         """
         return cls(
             infra_dedupe_enabled=True,
             infra_dedupe_window_secs=float('inf'),
-            infra_dedupe_categories=('recon_integrity_issue',),
+            infra_dedupe_categories=(category,),
             key_fn=content_fingerprint_key,
         )
+
+    @classmethod
+    def for_recon(cls) -> DedupeConfig:
+        """Return a DedupeConfig configured for recon integrity dedup.
+
+        ``for_content_fingerprint('recon_integrity_issue')``: only recon
+        integrity findings fold; recon_failure / recon_backlog_overflow /
+        recon_stale_run are intentionally excluded to preserve distinct
+        blocking signals.
+        """
+        return cls.for_content_fingerprint('recon_integrity_issue')
 
     @classmethod
     def for_gate_backlog(cls) -> DedupeConfig:
