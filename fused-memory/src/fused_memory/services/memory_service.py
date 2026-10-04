@@ -2242,6 +2242,11 @@ class DescendantScan(NamedTuple):
     truncated: bool
 
 
+def _elapsed_ms_since(started: float) -> float:
+    """Milliseconds since a ``time.perf_counter()`` reading, to 3 decimals."""
+    return round((time.perf_counter() - started) * 1000, 3)
+
+
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
@@ -2613,10 +2618,18 @@ class MemoryService:
         payload: dict[str, Any],
         coro: Any,
     ) -> Any:
-        """Execute a backend call and log to write journal."""
+        """Execute a backend call and log to write journal.
+
+        Every backend inherits ``duration_ms`` (the awaited call's wall time,
+        on success and failure alike) from this choke point, with no
+        per-call-site opt-in.
+        """
         result = None
+        duration_ms: float | None = None
+        started = time.perf_counter()
         try:
             result = await coro
+            duration_ms = _elapsed_ms_since(started)
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2626,9 +2639,12 @@ class MemoryService:
                     payload=payload,
                     result_summary=str(result)[:500] if result else None,
                     success=True,
+                    duration_ms=duration_ms,
                 )
             return result
         except (Exception, asyncio.CancelledError) as e:
+            if duration_ms is None:
+                duration_ms = _elapsed_ms_since(started)
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2638,6 +2654,7 @@ class MemoryService:
                     payload=payload,
                     success=False,
                     error=f'{type(e).__name__}: {e}',
+                    duration_ms=duration_ms,
                 )
             raise
 
