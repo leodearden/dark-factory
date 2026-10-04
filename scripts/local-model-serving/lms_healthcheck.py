@@ -238,6 +238,12 @@ class ProbeExtraction(BaseModel):
     summary: str
 
 
+#: The report's latency resolution, in decimal places of a millisecond.
+LATENCY_DECIMALS = 1
+#: The smallest latency a TIMED result may report; 0.0 is reserved for "never timed".
+MIN_MEASURED_LATENCY_MS = 10 ** -LATENCY_DECIMALS
+
+
 class ProbeResult(BaseModel):
     """One arm's verdict.  Rendered verbatim into the JSON report."""
 
@@ -246,6 +252,7 @@ class ProbeResult(BaseModel):
     verdict: Verdict
     reason: Reason
     detail: str = ''
+    #: 0.0 means never timed (e.g. a placeholder refusal); any timed result is at least `MIN_MEASURED_LATENCY_MS`.
     latency_ms: float = 0.0
     #: How many known entities were promoted to TOP-LEVEL entities, as opposed
     #: to captured anywhere.  REPORTED, NON-GATING — the gap between this and
@@ -261,7 +268,11 @@ class ProbeResult(BaseModel):
     cached_prompt_tokens: int | None = None
 
     def with_latency(self, latency_ms: float) -> ProbeResult:
-        return self.model_copy(update={'latency_ms': round(latency_ms, 1)})
+        """Rounding to the report resolution may not erase the fact that a
+        measurement was taken: 0.0 means "never timed", as read by
+        `scripts/tests/test_lms_verification_artifact.py::test_passing_rows_carry_a_real_measured_latency`."""
+        reported = max(round(latency_ms, LATENCY_DECIMALS), MIN_MEASURED_LATENCY_MS)
+        return self.model_copy(update={'latency_ms': reported})
 
     def with_top_level(self, count: int) -> ProbeResult:
         return self.model_copy(update={'top_level_entities_named': count})
