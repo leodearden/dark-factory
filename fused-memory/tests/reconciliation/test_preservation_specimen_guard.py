@@ -1600,9 +1600,7 @@ class TestMaybeEscalatePreservationSuppressionStorm:
     @pytest.mark.asyncio
     async def test_escalation_package_unavailable_returns_empty(self, queue, monkeypatch):
         """The reconciliation package must import where escalation is not installed."""
-        monkeypatch.setattr(
-            preservation_specimen_guard, 'Escalation', None, raising=False,
-        )
+        monkeypatch.setattr(preservation_specimen_guard, 'file_or_fold_l1', None)
         escalated = await maybe_escalate_preservation_suppression_storm(
             queue, PROJECT, self._RUN, _suppression_result(),
         )
@@ -1626,6 +1624,67 @@ class TestMaybeEscalatePreservationSuppressionStorm:
 
         assert escalated == []
         assert any('3105' in message for message in records)
+
+    @staticmethod
+    def _seed_legacy_parent(queue, subject, finding_category):
+        """Submit a pending parent built exactly as the pre-5466 filer built it.
+
+        *finding_category* is the persisted LITERAL, never the module's private
+        constant: the string on disk is the fold contract, so renaming the
+        constant must break this test rather than un-fold every live parent.
+        """
+        from escalation.dedupe import compute_content_fingerprint
+        from escalation.models import Escalation
+
+        return queue.submit(Escalation(
+            id=queue.make_id(subject),
+            task_id=subject,
+            agent_role='reconciliation-stage1',
+            severity='blocking',
+            category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
+            summary='legacy parent',
+            detail='legacy parent',
+            level=1,
+            dedupe_fingerprint=compute_content_fingerprint(
+                CATEGORY_PRESERVATION_SPECIMEN_STORM,
+                finding_category,
+                [f'{PROJECT}:{subject}'],
+            ),
+        ))
+
+    @pytest.mark.asyncio
+    async def test_storm_folds_into_a_parent_already_on_disk(self, queue):
+        """A pending storm parent filed before the helper moved still receives the fold."""
+        parent_id = self._seed_legacy_parent(
+            queue, '3105', 'preservation_specimen_suppression_storm',
+        )
+
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(),
+        )
+
+        assert escalated == []
+        parent = queue.get(parent_id)
+        assert parent is not None
+        assert parent.dedupe_count == 1
+
+    @pytest.mark.asyncio
+    async def test_unresolved_folds_into_a_parent_already_on_disk(self, queue):
+        """A pending unresolved-corroboration parent filed before the move still folds."""
+        parent_id = self._seed_legacy_parent(
+            queue,
+            UNRESOLVED_CORROBORATION_SUBJECT,
+            'preservation_specimen_corroboration_unreadable',
+        )
+
+        escalated = await maybe_escalate_preservation_suppression_storm(
+            queue, PROJECT, self._RUN, _suppression_result(1, unresolved=('3105',)),
+        )
+
+        assert escalated == []
+        parent = queue.get(parent_id)
+        assert parent is not None
+        assert parent.dedupe_count == 1
 
 
 class TestCompositeFlagTaskIds:
