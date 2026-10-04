@@ -11,6 +11,7 @@ import os
 import sqlite3
 import subprocess
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
@@ -97,3 +98,78 @@ def flake_db(path: Path, rows: Sequence[tuple[str, str, str]]) -> Path:
         )
     conn.close()
     return path
+
+
+def _set_mtime(path: Path, iso_utc: str) -> None:
+    stamp = datetime.fromisoformat(iso_utc).timestamp()
+    os.utime(path, (stamp, stamp))
+
+
+PYTEST_S1 = "2026-09-30T14:15:43.000000+01:00"
+
+
+def pytest_project(root: Path) -> Path:
+    """A dark-factory-shaped project whose verify artefacts cover every pytest source.
+
+    Modules (dirs holding orchestrator.yaml): orchestrator, fused-memory, tests/scripts.
+    ``tests/test_a.py`` exists under BOTH orchestrator and fused-memory.
+
+    - archived junit, run S1 (orchestrator): TestX::test_p[1]/[2] pass 2.0/3.0,
+      test_q@grp failure 0.5, test_e error 0.2, test_s skipped, and
+      tests.test_gone::test_z pass 1.0 (no such tracked file);
+    - archived junit (tests_scripts): tests.scripts.test_b::test_b1 pass 1.5,
+      classname relative to the repo root;
+    - live junit: w1 repeats run S1 (mtime 2026-10-02T12:00:00Z); w2 is a new run,
+      test_live pass 0.7 (mtime 2026-10-03T12:00:00Z);
+    - pytest log (orchestrator): FAILED TestX::test_p[1], ERROR test_r;
+    - runs.db flake_occurrence: the ambiguous tests/test_a.py::test_q, '<unknown>'
+      and the deleted tests/test_deleted.py::test_x.
+    """
+    git_tree(root, {
+        "orchestrator/orchestrator.yaml": "",
+        "orchestrator/tests/test_a.py": "def test_q():\n    pass\n",
+        "fused-memory/orchestrator.yaml": "",
+        "fused-memory/tests/test_a.py": "def test_q():\n    pass\n",
+        "tests/scripts/orchestrator.yaml": "",
+        "tests/scripts/test_b.py": "def test_b1():\n    pass\n",
+    })
+    s1 = junit_xml(PYTEST_S1, [
+        ("tests.test_a.TestX", "test_p[1]", 2.0, "pass"),
+        ("tests.test_a.TestX", "test_p[2]", 3.0, "pass"),
+        ("tests.test_a", "test_q@grp", 0.5, "failure"),
+        ("tests.test_a", "test_e", 0.2, "error"),
+        ("tests.test_a", "test_s", 0.01, "skipped"),
+        ("tests.test_gone", "test_z", 1.0, "pass"),
+    ])
+    logs = root / "data" / "verify-logs"
+    write_gz(logs / "T1" / "attempt-1.orchestrator.junit-20260930T131543_256921Z.xml.gz", s1)
+    write_gz(
+        logs / "T2" / "attempt-1.tests_scripts.junit-20261001T000000_1Z.xml.gz",
+        junit_xml("2026-10-01T01:00:00+01:00", [("tests.scripts.test_b", "test_b1", 1.5, "pass")]),
+    )
+    live = {
+        "w1": (s1, "2026-10-02T12:00:00+00:00"),
+        "w2": (
+            junit_xml("2026-10-03T13:00:00+01:00", [("tests.test_a", "test_live", 0.7, "pass")]),
+            "2026-10-03T12:00:00+00:00",
+        ),
+    }
+    for worktree, (text, mtime) in live.items():
+        report = root / ".worktrees" / worktree / ".df-verify-junit" / "report.orchestrator.xml"
+        report.parent.mkdir(parents=True)
+        report.write_text(text)
+        _set_mtime(report, mtime)
+    log = logs / "T3" / "attempt-2.orchestrator.test-20260920T101010_5Z.log"
+    log.parent.mkdir(parents=True)
+    log.write_text(
+        "============ short test summary info ============\n"
+        "FAILED tests/test_a.py::TestX::test_p[1] - AssertionError: boom\n"
+        "ERROR tests/test_a.py::test_r\n"
+        "1 failed, 1 error in 3.21s\n"
+    )
+    flake_db(root / "data" / "orchestrator" / "runs.db", [
+        ("2026-09-01T00:00:00+00:00", "tests/test_a.py::test_q", "passes_in_isolation"),
+        ("2026-09-02T00:00:00+00:00", "<unknown>", "unconfirmable"),
+        ("2026-09-03T00:00:00+00:00", "tests/test_deleted.py::test_x", "fails_in_isolation"),
+    ])
+    return root
