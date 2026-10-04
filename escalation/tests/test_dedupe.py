@@ -868,6 +868,80 @@ class TestDedupeConfigForRecon:
         assert result == 'esc-1-1'
 
 
+class TestDedupeConfigForContentFingerprint:
+    """DedupeConfig.for_content_fingerprint(category) — the unbounded content-fingerprint fold policy."""
+
+    _CATEGORY = 'some_category'
+
+    def _make_esc(
+        self,
+        esc_id: str,
+        fingerprint: str | None = 'fp',
+        category: str = _CATEGORY,
+        ts: str | None = None,
+    ):
+        from escalation.models import Escalation
+        esc = Escalation(
+            id=esc_id,
+            task_id='42',
+            agent_role='reconciler',
+            severity='blocking',
+            category=category,
+            summary='Recurring finding on subject 42',
+            level=1,
+        )
+        esc.dedupe_fingerprint = fingerprint
+        if ts is not None:
+            esc.timestamp = ts
+        return esc
+
+    def test_config_shape(self):
+        import math
+
+        from escalation.dedupe import DedupeConfig, content_fingerprint_key
+
+        cfg = DedupeConfig.for_content_fingerprint(self._CATEGORY)
+        assert cfg.infra_dedupe_enabled is True
+        assert math.isinf(cfg.infra_dedupe_window_secs)
+        assert cfg.infra_dedupe_window_secs > 0
+        assert cfg.infra_dedupe_categories == (self._CATEGORY,)
+        assert cfg.key_fn is content_fingerprint_key
+
+    def test_folds_matching_fingerprint_regardless_of_age(self, tmp_path):
+        from datetime import UTC, datetime, timedelta
+
+        from escalation.dedupe import DedupeConfig, find_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        three_days_ago = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+        queue.submit(self._make_esc('esc-42-1', ts=three_days_ago))
+
+        cfg = DedupeConfig.for_content_fingerprint(self._CATEGORY)
+        assert find_dedupe_parent(queue, self._make_esc('esc-42-2'), cfg) == 'esc-42-1'
+        assert find_dedupe_parent(
+            queue, self._make_esc('esc-42-3', fingerprint='other-fp'), cfg,
+        ) is None
+
+    def test_other_category_is_not_folded(self, tmp_path):
+        from escalation.dedupe import DedupeConfig, resolve_dedupe_parent
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(self._make_esc('esc-42-1', category='other_category'))
+
+        candidate = self._make_esc('esc-42-2', category='other_category')
+        cfg = DedupeConfig.for_content_fingerprint(self._CATEGORY)
+        assert resolve_dedupe_parent(queue, candidate, cfg) is None
+
+    def test_for_recon_is_derived_from_it(self):
+        from escalation.dedupe import DedupeConfig
+
+        assert DedupeConfig.for_recon() == DedupeConfig.for_content_fingerprint(
+            'recon_integrity_issue',
+        )
+
+
 class TestDedupeConfigForGateBacklog:
     """DedupeConfig.for_gate_backlog() — sibling constructor for stale-gate dedup.
 
