@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec
 from pydantic import ValidationError
+from shared.testing_virtual_clock import run_on_virtual_clock
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.offline_lane import OfflineLaneWorker, _parse_confirmed_failures
@@ -2009,9 +2010,8 @@ async def test_run_once_infra_leg_exception_does_not_advance_last_run_head(
     )
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_loop_retries_after_red_handling_exception(tmp_path: Path):
+def test_loop_retries_after_red_handling_exception(tmp_path: Path) -> None:
     """run()'s poll backstop retries a red-handling exception (Bug #2, end-to-end).
 
     Because ``_run_once`` (after the step-2 reorder) no longer advances
@@ -2027,42 +2027,52 @@ async def test_loop_retries_after_red_handling_exception(tmp_path: Path):
     the poll backstop believing the head was already handled —
     ``_handle_red_run`` is never retried and this test times out waiting for
     the 2nd call. Must fail before impl.
+
+    The retry is gated on the worker's 0.05s poll timer racing this test's
+    3.0s wedge deadline. On the host clock a stalled xdist worker let the
+    deadline fall due before the retry finished, so the scenario runs on
+    shared.testing_virtual_clock's loop clock, where a host stall cannot move
+    time.
     """
-    calls = {'n': 0}
-    done = asyncio.Event()
 
-    async def _handle_red_run_effect(wt, head):
-        calls['n'] += 1
-        if calls['n'] == 1:
-            raise RuntimeError('red handling boom')
-        done.set()
+    async def scenario() -> None:
+        calls = {'n': 0}
+        done = asyncio.Event()
 
-    git_ops = _make_git_ops(head='HEAD1')
-    config = _make_config(tmp_path, offline_lane_poll_interval_secs=0.05)
-    suite_runner = AsyncMock(return_value=(1, ''))
-    worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=suite_runner)
-    worker._handle_red_run = AsyncMock(side_effect=_handle_red_run_effect)
-    worker._dirty = True
+        async def _handle_red_run_effect(wt, head):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise RuntimeError('red handling boom')
+            done.set()
 
-    real_sleep = asyncio.sleep
+        git_ops = _make_git_ops(head='HEAD1')
+        config = _make_config(tmp_path, offline_lane_poll_interval_secs=0.05)
+        suite_runner = AsyncMock(return_value=(1, ''))
+        worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=suite_runner)
+        worker._handle_red_run = AsyncMock(side_effect=_handle_red_run_effect)
+        worker._dirty = True
 
-    async def _tracking_sleep(delay, *a, **k):
-        return await real_sleep(0)
+        real_sleep = asyncio.sleep
 
-    with patch('orchestrator.offline_lane.asyncio.sleep', side_effect=_tracking_sleep), \
-            patch('orchestrator.offline_lane.logger'):
-        task = asyncio.create_task(worker.run())
-        try:
-            await asyncio.wait_for(done.wait(), timeout=3.0)
-        finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        async def _tracking_sleep(delay, *a, **k):
+            return await real_sleep(0)
 
-    assert worker._handle_red_run.await_count >= 2, (
-        'the poll backstop must re-flag the still-outstanding head and retry '
-        '_handle_red_run after the first pass raised'
-    )
+        with patch('orchestrator.offline_lane.asyncio.sleep', side_effect=_tracking_sleep), \
+                patch('orchestrator.offline_lane.logger'):
+            task = asyncio.create_task(worker.run())
+            try:
+                await asyncio.wait_for(done.wait(), timeout=3.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        assert worker._handle_red_run.await_count >= 2, (
+            'the poll backstop must re-flag the still-outstanding head and retry '
+            '_handle_red_run after the first pass raised'
+        )
+
+    run_on_virtual_clock(scenario())
 
 
 # ---------------------------------------------------------------------------
