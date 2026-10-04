@@ -70,10 +70,11 @@ import sys
 import textwrap
 import threading
 import time
+import uuid
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -98,6 +99,7 @@ from orchestrator.git_ops import GitOps
 from orchestrator.merge_queue import _run_post_merge_verify, _verify_worktree_contention_sentinel
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
     collect_descendants,
+    kill_process_tree,
     lane_lock_path,
     merge_verify_lock_path,
     pgid_file,
@@ -292,6 +294,54 @@ def apply_dispatcher_env(monkeypatch) -> None:
     monkeypatch.delenv('ORCH_PROJECT_ROOT', raising=False)
 
 
+#: Deliberately NOT ``ORCH_``-prefixed: verify.py::_target_subprocess_env
+#: scrubs that namespace from every build it spawns.
+HOLDER_TAG_ENV: str = 'DF_TEST_HOLDER_TAG'
+
+
+class TaggedPopen(subprocess.Popen[bytes]):
+    """A Popen whose whole process tree carries ``HOLDER_TAG_ENV=<self.tag>``.
+
+    Every descendant inherits the tag across fork, setsid and exec --
+    including a start_new_session build whose /proc ppid chain is severed
+    the moment the leader dies -- so :func:`tagged_pids` still names it.
+    """
+
+    def __init__(self, args, *, env: Mapping[str, str] | None = None, **kwargs: Any) -> None:
+        self.tag = uuid.uuid4().hex
+        tagged_env = dict(os.environ if env is None else env)
+        tagged_env[HOLDER_TAG_ENV] = self.tag
+        super().__init__(args, env=tagged_env, **kwargs)
+
+
+def tagged_pids(tag: str) -> set[int]:
+    """Pids whose environment holds exactly ``HOLDER_TAG_ENV=<tag>``, never this process.
+
+    An unreadable entry (vanished, or another user's) is skipped, and a
+    zombie reads an empty environ, so only live processes match.
+    """
+    wanted = f'{HOLDER_TAG_ENV}={tag}'.encode()
+    pids: set[int] = set()
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / 'environ').read_bytes()
+        except OSError:
+            continue
+        if wanted in raw.split(b'\0'):
+            pids.add(int(entry.name))
+    pids.discard(os.getpid())
+    return pids
+
+
+def sweep_tagged(tag: str, *, kill: Callable[[int, int], None] = os.kill) -> None:
+    """SIGKILL every live process carrying ``HOLDER_TAG_ENV=<tag>``; one already gone is fine."""
+    for pid in tagged_pids(tag):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            kill(pid, signal.SIGKILL)
+
+
 def spawn_verify_merge(
     *,
     sha: str,
@@ -301,8 +351,8 @@ def spawn_verify_merge(
     stdin: int | None = subprocess.PIPE,
     extra_env: dict[str, str] | None = None,
     bootstrap: str = STOCK_BOOTSTRAP,
-) -> subprocess.Popen:
-    """Spawn a real ``orchestrator verify-merge`` subprocess.
+) -> TaggedPopen:
+    """Spawn a real ``orchestrator verify-merge`` subprocess, tagged per holder.
 
     ``stdin=subprocess.PIPE`` by default so callers can drive the
     connection-death protocol (heartbeat writer / EOF-on-close); tests that
@@ -311,7 +361,7 @@ def spawn_verify_merge(
     ``bootstrap`` defaults to :data:`STOCK_BOOTSTRAP` (byte-identical to the
     pre-seam argv); see that constant for the only reason to override it.
     """
-    return subprocess.Popen(
+    return TaggedPopen(
         verify_merge_argv(
             sha=sha, spec=spec, cfg_file=cfg_file, request_id=request_id,
             bootstrap=bootstrap,
@@ -797,24 +847,77 @@ def wait_pids_exited(
         time.sleep(interval)
 
 
+def _kill_pinned_holder(
+    proc: TaggedPopen,
+    *,
+    timeout: float,
+    ppid_map_provider: Callable[[], dict[int, int]],
+    kill: Callable[[int, int], None],
+    killpg: Callable[[int, int], None],
+) -> None:
+    """Tree-kill and reap an UN-REAPED *proc*: its pid is pinned until the wait below.
+
+    ``proc.poll()`` is called NOWHERE here: it waitpid-reaps, so a leader
+    that exited since the caller's gate (the Row 5 holder's finally arms the
+    CLI's stdin-watchdog self-kill just before tearing down) would have its
+    pid FREED before the backstop fires, aiming it at a recycled stranger's
+    group.  ``kill_process_tree`` never reaps either, so the backstop always
+    fires while the pid is still pinned (a zombie at worst).
+    """
+    # Read before any signal: a leader already gone, or any other OSError,
+    # degrades to "no group to backstop" rather than raising out of a finally
+    # and masking the caller's real assertion failure.
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    self_led_foreign_group = pgid is not None and pgid == proc.pid and pgid != os.getpgid(0)
+
+    def snapshot_or_empty() -> dict[int, int]:
+        try:
+            return ppid_map_provider()
+        except OSError:
+            return {}
+
+    kill_process_tree(
+        proc.pid,
+        backstop_pgid=pgid if self_led_foreign_group else None,
+        ppid_map_provider=snapshot_or_empty,
+        kill=kill,
+        killpg=killpg,
+    )
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A leader that will not die must not mask the test's own failure by
+        # raising out of a finally -- surface it loudly instead.
+        warnings.warn(
+            f'kill_holder_tree: leader pid={proc.pid} did not exit within '
+            f'{timeout}s of SIGKILL',
+            stacklevel=3,
+        )
+
+
 def kill_holder_tree(
-    proc: subprocess.Popen,
+    proc: TaggedPopen,
     *,
     timeout: float | None = None,
     _ppid_map_provider=read_ppid_map,
     _kill=os.kill,
     _killpg=os.killpg,
 ) -> None:
-    """SIGKILL *proc* and every descendant it forked, including start_new_session escapes.
+    """SIGKILL *proc*'s whole process tree, including start_new_session escapes.
 
-    Mirrors :func:`orchestrator.verify_cancel.cancel_request`'s algorithm --
-    snapshot the ``/proc`` PPID map before sending any signal, collect
-    descendants, SIGKILL them, SIGKILL the leader, fire a GUARDED
-    ``killpg`` backstop for same-group stragglers while the leader is
-    still an unreaped zombie, and only THEN reap it -- but walks
-    descendants from ``proc.pid`` rather than a recorded pgid, and the
-    ``killpg`` backstop only fires when the holder is provably its own
-    group leader.
+    Two phases, then the stdin close:
+
+    1. PINNED-LEADER PHASE, only while ``proc`` is un-reaped
+       (:func:`_kill_pinned_holder`): the snapshot -> walk -> SIGKILL ->
+       killpg algorithm of
+       ``orchestrator/src/orchestrator/verify_cancel.py::kill_process_tree``,
+       rooted at ``proc.pid``, then the reap.
+    2. TAG SWEEP, always: SIGKILL every live process carrying this holder's
+       :class:`TaggedPopen` tag (:func:`tagged_pids`).
 
     Walking from ``proc.pid`` (rather than
     ``os.killpg(os.getpgid(proc.pid), SIGKILL)``, the obvious one-liner) is
@@ -829,188 +932,70 @@ def kill_holder_tree(
     os.getpgid(0)``.  An unconditional ``killpg`` there would SIGKILL the
     pytest worker running this very test -- see
     ``test_kill_holder_tree_never_signals_the_callers_own_process_group``.
-    The descendant walk has no such hazard: the caller is always an
-    ANCESTOR of the holder, never a descendant -- the same argument
+    So the backstop is aimed only at a group the holder provably leads and
+    the caller provably is not in.  The descendant walk has no such hazard:
+    the caller is always an ANCESTOR of the holder, never a descendant --
+    the same argument
     :func:`~orchestrator.verify_cancel.start_own_process_group` makes for
     ``sshd`` never being a descendant of the pgid ``cancel_request`` walks.
+
+    PINNED-LEADER GATE: an already-reaped leader means ``proc.pid`` is a
+    FREE pid, so nothing may be derived from it.  Several call sites reap
+    the leader with ``wait()`` inside their ``try`` block BEFORE their
+    ``finally`` runs this helper
+    (``test_watchdog_timeout_env_override_fires_fast_without_heartbeat``,
+    ``test_cancel_verify_tree_kills_under_live_watchdog``,
+    ``test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive``,
+    ``test_heartbeat_starved_hard_partition_tree_killed_via_timeout``) --
+    on their GREEN path ``proc.pid`` no longer refers to the holder at all.
+    ``os.getpgid(proc.pid)`` and ``collect_descendants(proc.pid, ...)``
+    would then describe whatever process happens to OWN that recycled pid
+    now, and every descendant of that stranger would be SIGKILLed (and
+    killpg'd by the backstop, if it happened to be its own group leader).
+    pid recycling is observed on this fleet, not theoretical (the stale-file
+    NOTE in ``orchestrator/src/orchestrator/verify_cancel.py::cancel_request``:
+    pid_max=4194304, and the laptop's own pid counter demonstrably wrapped
+    on 2026-08-11).  So liveness is read ONCE, at entry, from
+    ``proc.returncode`` -- state this Popen already owns, never a reaping
+    ``poll()`` -- strictly before the pgid read and the ppid-map snapshot.
+
+    WHY BOTH PHASES.  The walk cannot reach the orphan of an already-reaped
+    leader: verify.py's ``_run_cmd`` runs every build with
+    ``start_new_session=True``, so the build is reachable only through the
+    /proc ppid chain, which is severed the instant the leader dies, and it
+    leads its own group, so no killpg reaches it either.  The tag sweep can:
+    the tag is in the build's environ from fork onward, and a stranger
+    cannot match a uuid it never inherited -- short of a pid freed and
+    reused between :func:`tagged_pids`'s environ read and the SIGKILL.
+    Conversely, the sweep would miss a descendant that execs with a
+    scrubbed environment, which the walk still reaches while the leader is
+    pinned.
 
     *timeout* defaults to :data:`ROW5_HOLDER_TEARDOWN_CEILING_SECS`,
     resolved when the call actually runs rather than at import time -- the
     same lazy-default convention :func:`wait_for_pgid_file` and
     :func:`wait_subtree_live` use above, needed here because that constant
     is defined later in this module.  This is the ONLY blocking wait the
-    helper performs (the descendant sweep is pure signalling, no polling
-    loop), so the budget ``_ROW5_WORST_CASE_FIXED_SECS`` derives from stays
-    valid unchanged.
+    helper performs (both sweeps are pure signalling, no polling loop), so
+    the budget ``_ROW5_WORST_CASE_FIXED_SECS`` derives from stays valid
+    unchanged.
 
-    *_ppid_map_provider* / *_kill* / *_killpg* are private injectable seams,
-    mirroring :func:`cancel_request`'s own convention, so tests can pin the
-    session-escape reap deterministically with zero risk of signalling
-    anything unintended.
-
-    ALREADY-REAPED SHORT CIRCUIT: an already-reaped leader means
-    ``proc.pid`` is a FREE pid, so the walk below must never run against
-    it.  Several call sites reap the leader with ``wait()`` inside their
-    ``try`` block BEFORE their ``finally`` runs this helper
-    (``test_watchdog_timeout_env_override_fires_fast_without_heartbeat``,
-    ``test_cancel_verify_tree_kills_under_live_watchdog``,
-    ``test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive``,
-    ``test_heartbeat_starved_hard_partition_tree_killed_via_timeout``) --
-    on their GREEN path ``proc.pid`` no longer refers to the holder at all.  ``os.getpgid(proc.pid)`` and
-    ``collect_descendants(proc.pid, ...)`` would then describe whatever
-    process happens to OWN that recycled pid now, and every descendant of
-    that stranger would be SIGKILLed (and killpg'd by the backstop above,
-    if it happened to be its own group leader) -- precisely what "zero
-    risk of signalling anything unintended" above promises never happens.
-    pid recycling is observed on this fleet, not theoretical
-    (verify_cancel.py:313-315: pid_max=4194304, and the laptop's own pid
-    counter demonstrably wrapped on 2026-08-11).  So liveness is captured
-    ONCE, at entry, strictly before the pgid read and the ppid-map
-    snapshot below: an already-reaped leader's descendants have already
-    been reparented to init (or the nearest subreaper) and are no longer
-    reachable from ``proc.pid`` anyway, so the early return forgoes no
-    reachable kill.
-
-    IT IS NOT FREE, THOUGH -- KNOWN RESIDUE (esc-4092-3, measured
-    2026-08-30).  "No longer reachable" is a statement about this helper's
-    ability to FIND the descendants, NOT a claim that something else kills
-    them.  Nothing does.  A session-escaped grandchild (verify.py's
-    ``_run_cmd`` runs every build via
-    ``create_subprocess_shell(..., start_new_session=True)``, so it holds
-    its OWN pgid/sid) is reachable ONLY via the /proc ppid chain, and that
-    chain is severed the instant the leader dies.  When a caller reaps the
-    leader inside its ``try`` -- as the four rows named above do -- the
-    grandchild is already reparented to init by the time this runs, the
-    descendant walk returns EMPTY, and the killpg backstop cannot reach it
-    either (different group).  It then survives to its full ``sleeper_spec``
-    duration.
-
-    MEASURED, not inferred: over 5 instrumented full-module xdist runs, 3
-    leaked exactly one ``sleep 300.0``, each reparented to pid 1940
-    (``systemd --user``) in its own pgid/sid.  The surviving orphan's
-    ``/proc/<pid>/cwd`` resolved to
-    ``.../test_watchdog_timeout_env_over0/repo/.worktrees/_merge-<uuid>``
-    -- i.e. one of the four already-reaped rows, whose logged teardown
-    state was ``returncode=1, /proc entry gone, descendants=[]``.  The two
-    ``_KNOWN_HOLDER_TEARDOWN_ROWS`` anchors did NOT leak: their leaders were
-    logged alive (``returncode=None``, state ``S``) with a NON-EMPTY
-    descendant set containing the real sleeper, which was swept correctly.
-
-    ACCEPTED for now, deliberately: the residue is bounded by the spec's own
-    sleep duration, has no correctness impact on the assertions, and closing
-    it needs a design change this helper cannot make alone (the descendant
-    set must be captured EARLY, while the leader is provably alive, and
-    carried into teardown -- a spawn-time pgid does not suffice, because the
-    grandchild setsid's into a group of its own).  Tracked as a follow-up;
-    do NOT "fix" it by deleting the short circuit, which would reintroduce
-    the free-pid walk described above.
+    *_ppid_map_provider* / *_kill* / *_killpg* are private injectable seams
+    (*_kill* also serves the tag sweep), so tests can pin the session-escape
+    reap deterministically with zero risk of signalling anything unintended.
     """
     timeout = ROW5_HOLDER_TEARDOWN_CEILING_SECS if timeout is None else timeout
 
-    # An already-reaped leader means proc.pid is a FREE pid -- see the
-    # ALREADY-REAPED SHORT CIRCUIT paragraph above.  Captured once, via
-    # proc.returncode (a pure read of state this Popen already owns, no
-    # waitpid side effect) rather than a fresh proc.poll(), and not
-    # re-read later in this function.  ``proc.poll()`` is deliberately
-    # called NOWHERE in this helper: a poll() after this point would
-    # ``waitpid``-reap a leader that exited in the meantime and FREE
-    # proc.pid, aiming the killpg backstop below at a recycled group --
-    # see the unguarded leader SIGKILL further down for the full argument.
-    if proc.returncode is not None:
-        if proc.stdin is not None:
-            with contextlib.suppress(OSError):
-                proc.stdin.close()
-        return
-
-    # Pre-kill snapshot phase -- BOTH reads must happen before any signal is
-    # sent.  Killing the leader first reparents survivors to init and severs
-    # the /proc parent chain, making a session-escaped descendant unfindable
-    # (the same invariant cancel_request documents at
-    # verify_cancel.py:246-250).  The pgid is read only to gate the killpg
-    # backstop below; a leader already gone by now makes getpgid raise
-    # ProcessLookupError, and a permission mismatch or any other OSError
-    # degrades the same way -- "no group to backstop" -- rather than
-    # propagating out of a finally and masking whatever real assertion
-    # failure the caller was cleaning up after.
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        pgid = None
-    # A /proc read losing a race with process exit degrades to an empty map
-    # rather than propagating -- this helper runs almost exclusively inside
-    # a finally block, where an exception would mask whatever real assertion
-    # failure the caller was cleaning up after.
-    try:
-        ppid_map = _ppid_map_provider()
-    except OSError:
-        ppid_map = {}
-    descendants = collect_descendants(proc.pid, ppid_map)
-
-    # SIGKILL every descendant.  Already-dead and not-ours are both expected
-    # outcomes, not errors.
-    for pid in descendants:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            _kill(pid, signal.SIGKILL)
-
-    # SIGKILL the leader.  UNGUARDED, deliberately: there is no
-    # `if proc.poll() is None:` here, and adding one back would REINTRODUCE
-    # the pid-recycling hazard the backstop below exists to avoid.
-    # ``Popen.poll()`` is not a passive read -- it calls ``_internal_poll()``
-    # -> ``os.waitpid(pid, WNOHANG)``, so if the leader exited at any point
-    # after the entry-time ``proc.returncode is not None`` short circuit
-    # (the Row 5 holder's ``finally`` calls ``stop_heartbeats()`` FIRST,
-    # which arms the CLI's stdin-watchdog self-kill, making exactly that a
-    # DESIGNED behaviour, not an exotic race), a poll() here would REAP it
-    # and FREE proc.pid -- and the backstop below would then evaluate
-    # ``pgid == proc.pid`` against a pgid captured pre-reap and fire
-    # ``killpg`` at a now-free pgid, SIGKILLing a stranger's whole process
-    # group on a shared dev box or CI host.
-    #
-    # Signalling here is safe unguarded and costs nothing: the entry-time
-    # short circuit already established the leader was un-reaped, and this
-    # Popen object is the ONLY thing that can reap it, so with no poll() in
-    # this function the pid stays PINNED (a zombie at worst) until
-    # ``proc.wait()`` below.  SIGKILL to an exited-but-unreaped zombie is a
-    # no-op, and ProcessLookupError/PermissionError are suppressed anyway.
-    # This is what makes the backstop's "still unreaped, pid provably
-    # pinned" premise actually true rather than merely asserted.
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        _kill(proc.pid, signal.SIGKILL)
-
-    # Guarded killpg backstop for same-group stragglers -- fires ONLY when
-    # the holder is PROVABLY its own group leader (setsid ran, i.e. the CLI
-    # was invoked with --request-id) AND that group is PROVABLY not the
-    # caller's own.  Both checks are required, not either alone: cli.py's
-    # os.setsid is gated on --request-id and spawn_verify_merge never passes
-    # start_new_session=, so a holder that never setsid'd (e.g. the
-    # lane-lock site) shares this process's own group -- an unguarded
-    # killpg there would SIGKILL the pytest worker itself (see
-    # test_kill_holder_tree_never_signals_the_callers_own_process_group).
-    #
-    # Fired HERE -- immediately after the leader SIGKILL and BEFORE
-    # proc.wait() reaps it below, not after.  While still unreaped the
-    # leader is a zombie that keeps its pid pinned, so pgid provably still
-    # denotes the holder's own group; group members that outlive it are
-    # killed just as effectively.  Firing this AFTER the reap would let a
-    # pid-recycling race aim killpg at a stranger's group instead -- the
-    # exact hazard the ALREADY-REAPED SHORT CIRCUIT above exists to avoid,
-    # and pid recycling is observed on this fleet, not theoretical
-    # (verify_cancel.py:313-315: pid_max=4194304, and the laptop's own pid
-    # counter demonstrably wrapped on 2026-08-11).
-    if pgid is not None and pgid == proc.pid and pgid != os.getpgid(0):
-        with contextlib.suppress(ProcessLookupError, OSError):
-            _killpg(pgid, signal.SIGKILL)
-
-    try:
-        proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # A leader that will not die must not mask the test's own failure by
-        # raising out of a finally -- surface it loudly instead.
-        warnings.warn(
-            f'kill_holder_tree: leader pid={proc.pid} did not exit within '
-            f'{timeout}s of SIGKILL',
-            stacklevel=2,
+    if proc.returncode is None:
+        _kill_pinned_holder(
+            proc,
+            timeout=timeout,
+            ppid_map_provider=_ppid_map_provider,
+            kill=_kill,
+            killpg=_killpg,
         )
+
+    sweep_tagged(proc.tag, kill=_kill)
 
     if proc.stdin is not None:
         with contextlib.suppress(OSError):
@@ -2939,6 +2924,11 @@ def test_sleeper_spec_build_pgid_file_names_the_blocking_session_leader(tmp_path
 # flake (the module's own task-2819 banner above warns against exactly
 # this).  The two real-CLI call sites remain covered end-to-end by the Row
 # 5 / lane-lock tests below plus their post-run pgrep check.
+#
+# Task 5301: the helper now routes through
+# orchestrator/src/orchestrator/verify_cancel.py::kill_process_tree while the
+# leader is pinned, plus a per-holder tag sweep that also reaches the orphans
+# of an already-reaped leader.
 # ---------------------------------------------------------------------------
 
 
@@ -2964,7 +2954,7 @@ def test_kill_holder_tree_reaps_a_session_escaped_grandchild():
     pin.
     """
     sleep_secs = f'271.{os.getpid() % 1000:03d}'
-    leader = subprocess.Popen([
+    leader = TaggedPopen([
         sys.executable, '-c',
         f'import subprocess, time\n'
         f'subprocess.Popen(["sleep", "{sleep_secs}"], start_new_session=True)\n'
@@ -3037,7 +3027,7 @@ def test_kill_holder_tree_never_signals_the_callers_own_process_group():
     (killpg-aware) helper: it fails the moment a future edit drops either
     condition, or otherwise makes the backstop unconditional.
     """
-    leader = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    leader = TaggedPopen([sys.executable, '-c', 'import time; time.sleep(300)'])
     try:
         assert os.getpgid(leader.pid) == os.getpgid(0), (
             'harness bug: a plain subprocess.Popen with no start_new_session '
@@ -3102,7 +3092,7 @@ def test_kill_holder_tree_killpg_backstop_fires_for_a_setsid_leader():
     condition actually hold before kill_holder_tree runs, so a pass here
     cannot be a vacuous accident of the harness's own process group.
     """
-    leader = subprocess.Popen(
+    leader = TaggedPopen(
         [sys.executable, '-c', 'import time; time.sleep(300)'],
         start_new_session=True,
     )
@@ -3200,7 +3190,7 @@ def test_kill_holder_tree_does_not_reap_a_leader_that_exits_mid_teardown():
     returncode: the pid was freed before the backstop fired, and the test
     goes RED.
     """
-    leader = subprocess.Popen(
+    leader = TaggedPopen(
         [sys.executable, '-c', 'import time; time.sleep(300)'],
         start_new_session=True,
     )
@@ -3279,7 +3269,7 @@ def test_kill_holder_tree_does_not_reap_a_leader_that_exits_mid_teardown():
 
 
 def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
-    """An already-reaped leader means proc.pid is a FREE pid -- signal NOTHING.
+    """An already-reaped leader means proc.pid is a FREE pid -- derive NOTHING from it.
 
     Four converted call sites reap the leader with ``wait()`` inside their
     ``try`` block BEFORE the ``finally`` runs ``kill_holder_tree``
@@ -3303,8 +3293,11 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
         faked, and NONE may fire -- in particular the ppid-map provider
         must never be CALLED AT ALL, which is what proves the short
         circuit lands before the snapshot phase rather than merely seeing
-        a map with no descendants in it.  Also pins that the early-return
-        path still closes stdin, since the lane-lock site
+        a map with no descendants in it.  This leader spawned nothing, so
+        the tag sweep finds nothing to signal either (the sweep itself is
+        pinned by ``test_kill_holder_tree_sweeps_the_session_escaped_orphan_of_an_already_reaped_leader``).
+        Also pins that the already-reaped path still closes stdin, since
+        the lane-lock site
         (``test_live_verify_merge_holds_lane_lock_real_subprocess``)
         delegates its stdin cleanup to this helper.
 
@@ -3324,7 +3317,7 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
         ``except OSError: ppid_map = {}`` branch stays under test.
     """
     # (a) + (b): one already-reaped leader, shared.
-    leader = subprocess.Popen([sys.executable, '-c', 'pass'], stdin=subprocess.PIPE)
+    leader = TaggedPopen([sys.executable, '-c', 'pass'], stdin=subprocess.PIPE)
     leader.wait(timeout=10)
 
     # (a) REAL-PATH: every seam spied; none may fire for an already-reaped
@@ -3421,7 +3414,7 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
     def raising_ppid_map_provider():
         raise OSError('simulated /proc read racing process exit')
 
-    live_leader = subprocess.Popen(
+    live_leader = TaggedPopen(
         [sys.executable, '-c', 'import time; time.sleep(300)'],
     )
     try:
@@ -3439,6 +3432,165 @@ def test_kill_holder_tree_is_safe_when_the_leader_already_exited():
         if live_leader.poll() is None:
             live_leader.kill()
             live_leader.wait(timeout=5)
+
+
+def test_kill_holder_tree_sweeps_the_session_escaped_orphan_of_an_already_reaped_leader():
+    """An already-reaped leader's session-escaped orphan is still killed; other holders are not.
+
+    Models the four rows that ``wait()`` the leader inside their ``try``
+    before the ``finally`` tears down: by then the build is reparented away,
+    leads its own session, and the ppid walk provably cannot reach it.  Only
+    the holder's inherited tag still names it.  The bystander is a different
+    holder's tree, which Row 5's waiter teardown must never reach.
+    """
+    sleep_secs = f'272.{os.getpid() % 1000:03d}'
+    leader = TaggedPopen(
+        [
+            sys.executable, '-c',
+            'import subprocess\n'
+            f'child = subprocess.Popen(["sleep", "{sleep_secs}"], start_new_session=True, '
+            'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+            'print(child.pid, flush=True)\n',
+        ],
+        stdout=subprocess.PIPE,
+    )
+    bystander = TaggedPopen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        assert leader.stdout is not None
+        grandchild = int(leader.stdout.readline())
+        leader.wait(timeout=10)
+
+        assert leader.returncode is not None, (
+            "harness bug: the leader must already be reaped, or kill_holder_tree's "
+            'already-reaped short circuit never fires and this test exercises nothing'
+        )
+        orphan_state = read_proc_state(grandchild)
+        assert orphan_state is not None and not orphan_state.exited, (
+            f'harness bug: orphan pid={grandchild} is not running ({orphan_state}) '
+            f'before teardown, so its exit afterwards would prove nothing'
+        )
+        assert orphan_state.ppid != leader.pid, (
+            f'harness bug: orphan pid={grandchild} still names the reaped leader '
+            f'pid={leader.pid} as its parent -- it was never reparented'
+        )
+        assert grandchild not in collect_descendants(leader.pid, read_ppid_map()), (
+            f'harness bug: the ppid walk from pid={leader.pid} still reaches orphan '
+            f'pid={grandchild}, so this test does not isolate the severed-chain case'
+        )
+
+        kill_holder_tree(leader, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+
+        survivors = wait_pids_exited({grandchild}, timeout=5.0)
+        state_by_pid = {pid: (st.state, st.ppid) for pid, st in sorted(survivors.items())}
+        assert not survivors, (
+            f'kill_holder_tree left the session-escaped orphan of already-reaped '
+            f'leader pid={leader.pid} running, as {{pid: (state, ppid)}}: '
+            f'{state_by_pid} -- the #4962 leak'
+        )
+        assert bystander.poll() is None, (
+            "kill_holder_tree reached a different holder's tree -- the sweep "
+            'must be scoped to this holder alone'
+        )
+    finally:
+        sweep_tagged(leader.tag)
+        bystander.kill()
+        bystander.wait(timeout=5)
+        if leader.stdout is not None:
+            leader.stdout.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 5301 -- per-holder env tag.  A TaggedPopen stamps a uuid into its
+# child's environment; every descendant inherits it across fork, setsid and
+# exec, so tagged_pids() names the holder's whole tree even after the /proc
+# ppid chain to a session-escaped build is severed.  The real-CLI test pins
+# the premise end to end: verify.py::_target_subprocess_env must pass the tag
+# through to the build it spawns.
+# ---------------------------------------------------------------------------
+
+
+def test_tagged_pids_finds_a_session_escaped_grandchild_and_nothing_else():
+    """tagged_pids(tag) names exactly one holder's tree, session escapes included."""
+    sleep_secs = f'273.{os.getpid() % 1000:03d}'
+    leader = TaggedPopen(
+        [
+            sys.executable, '-c',
+            'import subprocess, time\n'
+            f'child = subprocess.Popen(["sleep", "{sleep_secs}"], start_new_session=True, '
+            'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+            'print(child.pid, flush=True)\n'
+            'time.sleep(300)\n',
+        ],
+        stdout=subprocess.PIPE,
+    )
+    bystander = TaggedPopen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    try:
+        assert leader.stdout is not None
+        grandchild = int(leader.stdout.readline())
+        assert os.getsid(grandchild) == grandchild, (
+            f'harness bug: grandchild pid={grandchild} must lead its own '
+            f'session, or this test is not exercising the escape the sweep '
+            f'exists for'
+        )
+
+        assert isinstance(leader.tag, str) and leader.tag
+        assert leader.tag != bystander.tag, 'tags are per holder, never shared'
+
+        found = tagged_pids(leader.tag)
+        assert {leader.pid, grandchild} <= found, (
+            f'tagged_pids missed part of the leader pid={leader.pid} tree '
+            f'(grandchild pid={grandchild}): found {sorted(found)}'
+        )
+        assert bystander.pid not in found, (
+            "another holder's tree must never match this holder's tag"
+        )
+        assert os.getpid() not in found
+    finally:
+        sweep_tagged(leader.tag)
+        sweep_tagged(bystander.tag)
+        leader.wait(timeout=5)
+        bystander.wait(timeout=5)
+        if leader.stdout is not None:
+            leader.stdout.close()
+
+
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)
+def test_spawned_verify_merge_build_carries_the_holder_tag(tmp_path):
+    """The real CLI's session-escaped build inherits its holder's tag.
+
+    Anti-vacuity anchor for kill_holder_tree's tag sweep: it only reaches an
+    orphaned build because verify.py::_target_subprocess_env is a denylist
+    (venv/uv/ORCH_*) that passes the tag through.  An allowlist there would
+    silently disable the sweep; this fails loudly instead.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    cfg_file = tmp_path / 'config.yaml'
+    write_verify_config(cfg_file, repo, persistent_merge_worktree=False)
+    build_pgf = tmp_path / 'build.pgid'
+
+    holder = spawn_verify_merge(
+        sha=head_sha,
+        spec=sleeper_spec(300.0, build_pgid_file=build_pgf),
+        cfg_file=cfg_file,
+    )
+    try:
+        build_pid = wait_for_pgid_file(build_pgf, timeout=row_discovery_ceiling_secs())
+        assert os.getsid(build_pid) == build_pid, (
+            f'harness bug: build pid={build_pid} must lead its own session '
+            f'(verify.py::_run_cmd start_new_session), or this test is not '
+            f'exercising the escape the sweep exists for'
+        )
+        assert build_pid in tagged_pids(holder.tag), (
+            f'the build pid={build_pid} spawned by holder pid={holder.pid} '
+            f'does not carry {HOLDER_TAG_ENV}={holder.tag} -- the target-env '
+            f'scrub dropped it, so kill_holder_tree cannot sweep an orphaned build'
+        )
+    finally:
+        kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+        for pipe in (holder.stdout, holder.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4994,8 +5146,9 @@ def test_flock_contention_full_two_way_seam_blocks_and_escalates(tmp_path):
         # any of the six assertions before this finally failing, previously
         # left the waiter leader -- and its session-escaped descendants --
         # alive.  Tear the waiter down BEFORE the holder: it is the process
-        # contending for the lock the holder owns.  Free on the success
-        # path via kill_holder_tree's already-reaped short circuit.
+        # contending for the lock the holder owns.  Cheap on the success
+        # path: kill_holder_tree's pinned-leader gate skips the walk, leaving
+        # only its tag sweep.
         if waiter is not None:
             kill_holder_tree(waiter, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
         kill_holder_tree(holder, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
