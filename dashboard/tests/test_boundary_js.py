@@ -21,7 +21,14 @@ from typing import Any
 import _boundary_payloads
 import pytest
 from _boundary_payloads import (
+    CORPUS_TTL_GENERATIONS,
+    ESCALATIONS_ARCHIVED,
+    ESCALATIONS_FILED,
+    HELD,
+    LOCKED_MODULE,
+    MEMORY_OPS,
     MERGE_ATTEMPTS,
+    OFFLINE_SCHEDULER,
     RAGGED,
     RAGGED_CAP,
     RAGGED_DAYS,
@@ -32,7 +39,13 @@ from _boundary_payloads import (
     ragged_b,
     ragged_day,
 )
-from _lock_chip_matrix import node_path
+from _lock_chip_matrix import (
+    CELL_MATRIX,
+    heatmap_cell_and_chip,
+    heatmap_module,
+    heatmap_row,
+    node_path,
+)
 from shared.task_statuses import TaskStatus
 
 from dashboard.data.burndown import aggregate_forecast_confidence
@@ -251,3 +264,59 @@ def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
 
     assert week['recent_total'] != day['recent_total']
     assert len(week['recent']) != len(day['recent'])
+
+
+@pytest.mark.parametrize('generation', sorted(CORPUS_TTL_GENERATIONS))
+def test_sketch_10_the_pill_and_the_strip_count_one_walk_whatever_its_ttl(served_bodies, generation):
+    escalations = served_bodies[f'escalations_{generation}']['ESCALATIONS']
+    (project,) = served_bodies[f'analytics_{generation}']['ESCALATION_ANALYTICS']['per_project']
+    queue_pending = escalations['views']['queue_pending']
+    open_in_history = project['views']['open_in_history']
+
+    assert queue_pending['value'] == ESCALATIONS_FILED - ESCALATIONS_ARCHIVED == 2
+    assert open_in_history['value'] == ESCALATIONS_FILED == 5
+    assert queue_pending['state'] == open_in_history['state'] == 'fresh'
+    assert queue_pending['as_of'] == open_in_history['as_of'], 'two walks, where there must be one'
+
+
+def test_sketch_10_each_ttl_generation_is_its_own_walk(served_bodies):
+    as_of = {
+        generation: served_bodies[f'escalations_{generation}']['ESCALATIONS']['views']['queue_pending']['as_of']
+        for generation in CORPUS_TTL_GENERATIONS
+    }
+    assert len(set(as_of.values())) == len(as_of), f'a generation reused another\'s walk: {as_of}'
+
+
+def test_sketch_11_every_journal_row_is_counted_once_in_the_totals(served_bodies):
+    totals = served_bodies['memory_ops']['MEMORY_OPS']['totals']
+    kinds = [kind for _operation, kind in MEMORY_OPS]
+
+    assert totals['reads'] + totals['writes'] + totals['other'] == totals['total'] == len(MEMORY_OPS)
+    assert (totals['reads'], totals['writes']) == (kinds.count('read'), kinds.count('write'))
+    assert totals['other'] == 1, 'the kind outside read and write is counted, as other'
+
+
+def test_sketch_12_an_offline_scheduler_is_named_while_its_tasks_are_still_served(served_bodies):
+    scheduler = served_bodies['scheduler_offline']['SCHEDULER']
+    rows = served_bodies['tasks_with_p']['TASKS_SNAPSHOT'][OFFLINE_SCHEDULER]['rows']
+
+    assert scheduler['offline_projects'] == [OFFLINE_SCHEDULER]
+    assert rows['state'] == 'fresh', rows
+    assert sum(row['status'] == 'in-progress' for row in rows['value']) >= 2
+
+
+def test_sketch_12_a_served_parked_and_held_lock_is_one_class_in_the_cell_and_the_chip(served_bodies):
+    scheduler = served_bodies['scheduler_offline']['SCHEDULER']
+    (module,) = (m for m in scheduler['modules'] if (m['project'], m['path']) == (HELD, LOCKED_MODULE))
+    (row,) = (r for r in scheduler['rows'] if (r['project'], r['task_id']) == (HELD, '2'))
+    assert (module['holder'], module['parked_by'], module['parked_owner_live']) == ('1', '2', True), module
+
+    fixture_module = heatmap_module(**CELL_MATRIX['parked and held'])
+    fixture_row = heatmap_row(fixture_module)
+    assert set(fixture_module) <= set(module), 'the lock matrix must be built in the served module shape'
+    assert set(fixture_row) <= set(row), 'the lock matrix must be built in the served row shape'
+
+    cell, chip = heatmap_cell_and_chip(row, module)
+    _fixture_cell, fixture_chip = heatmap_cell_and_chip(fixture_row, fixture_module)
+    assert cell == chip, f'heatmap cell {cell!r} disagrees with the lock chip {chip!r}'
+    assert chip['cls'] == fixture_chip['cls'] == 'lock-taken'

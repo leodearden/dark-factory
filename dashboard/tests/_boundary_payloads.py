@@ -9,6 +9,7 @@ them, so the client half never applies a hand-built payload.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import closing, contextmanager
@@ -21,14 +22,21 @@ import aiosqlite
 import httpx
 from _canned_mcp import CannedMCP, _raw_row
 from _dt_helpers import make_fixed_datetime_cls
+from escalation.archive import archive_dir_for_date
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from fastapi.testclient import TestClient
+from shared.locking import files_to_modules
 from shared.task_statuses import TaskStatus
 
 import dashboard.data.active_tasks as active_tasks_mod
 import dashboard.data.task_snapshot as snapshot_mod
+from dashboard.api.escalations import _analytics_memo_clear
 from dashboard.app import app
 from dashboard.config import DashboardConfig
+from dashboard.data import escalation_corpus
 from dashboard.data.burndown import BURNDOWN_SCHEMA, collect_snapshot
+from dashboard.data.scheduler import _scheduler_cache_clear
 
 T0 = datetime(2026, 10, 4, 9, 0, 0, tzinfo=UTC)
 """The instant every scenario's first render is served at."""
@@ -37,6 +45,10 @@ TASKS = '/api/v2/dashboard/tasks'
 BURNDOWN = '/api/v2/dashboard/burndown'
 COSTS = '/api/v2/dashboard/costs'
 MERGE_QUEUE = '/api/v2/dashboard/merge-queue'
+ESCALATIONS = '/api/v2/dashboard/escalations'
+ESCALATION_ANALYTICS = '/api/v2/dashboard/escalation-analytics'
+MEMORY_GRAPHS = '/api/v2/dashboard/memory-graphs'
+SCHEDULER = '/api/v2/dashboard/scheduler'
 
 # in_flight 43 (running 25), backlog 1310, terminal 4106: total 5459.
 DARK_FACTORY_COUNTS: Mapping[TaskStatus, int] = {
@@ -111,6 +123,46 @@ CREATE TABLE events (
     duration_ms INTEGER
 );
 """
+
+
+ESCALATIONS_FILED = 5
+ESCALATIONS_ARCHIVED = 3
+"""Pending L1 records filed through the real queue, and how many then sit in its archive."""
+
+CORPUS_TTL_GENERATIONS: Mapping[str, float] = {'a': escalation_corpus.CORPUS_TTL_SECONDS, 'b': 3600.0}
+"""Each corpus generation's TTL; the counts must not depend on it."""
+
+MEMORY_OPS: tuple[tuple[str, str], ...] = (
+    ('search', 'read'),
+    ('search', 'read'),
+    ('get_entity', 'read'),
+    ('add_memory', 'write'),
+    ('delete_memory', 'write'),
+    ('compact', 'maintenance'),
+)
+"""(operation, kind) per journal row in the window: one kind is neither read nor write."""
+
+_WRITE_OPS_DDL = """\
+CREATE TABLE write_ops (
+    id         TEXT PRIMARY KEY,
+    operation  TEXT,
+    project_id TEXT,
+    agent_id   TEXT,
+    kind       TEXT NOT NULL DEFAULT 'write',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_wo_created ON write_ops(created_at);
+"""
+"""The columns and index the ops read touches of fused-memory's write_ops
+(fused-memory/src/fused_memory/services/write_journal.py::SCHEMA_SQL)."""
+
+OFFLINE_SCHEDULER = 'P'
+"""The project whose scheduler fan-out fails; its task reads stay healthy."""
+HELD = 'H'
+"""The healthy project: task 1 holds :data:`LOCKED_MODULE` and live task 2 is parked on it."""
+LOCKED_FILE = 'src/m/x.py'
+LOCK_DEPTH = 2
+LOCKED_MODULE = files_to_modules([LOCKED_FILE], LOCK_DEPTH)[0]
 
 
 def ragged_day(index: int) -> datetime:
@@ -351,6 +403,116 @@ def _window_family(client: TestClient, workdir: Path) -> dict[str, Any]:
     return bodies
 
 
+def _clear_corpus() -> None:
+    """Forget the corpus walk and the analytics derived from it, through their own hooks."""
+    escalation_corpus._corpus_cache_clear()
+    _analytics_memo_clear()
+
+
+def _file_escalations(config: DashboardConfig) -> None:
+    """File :data:`ESCALATIONS_FILED` pending records, then move the last few under the archive.
+
+    A pending record in the archive is how a stranded one sits there: the
+    live queue no longer lists it, the history still holds it open.
+    """
+    queue = EscalationQueue(config.escalations_dir)
+    for n in range(1, ESCALATIONS_FILED + 1):
+        queue.submit(Escalation(
+            id=f'esc-b{n}-1',
+            task_id=f'b{n}',
+            agent_role='boundary-suite',
+            severity='blocking',
+            category='cleanup_needed',
+            summary=f'boundary escalation {n}',
+            timestamp=(T0 - timedelta(hours=n)).isoformat(),
+            status='pending',
+            level=1,
+        ))
+    archived = archive_dir_for_date(queue.queue_dir, T0.isoformat())
+    archived.mkdir(parents=True, exist_ok=True)
+    for n in range(ESCALATIONS_FILED - ESCALATIONS_ARCHIVED + 1, ESCALATIONS_FILED + 1):
+        os.replace(queue.queue_dir / f'esc-b{n}-1.json', archived / f'esc-b{n}-1.json')
+    config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _write_memory_ops(config: DashboardConfig) -> None:
+    """The write journal, holding :data:`MEMORY_OPS` inside the hour before T0."""
+    journal = config.write_journal_db
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(journal)) as conn:
+        conn.executescript(_WRITE_OPS_DDL)
+        conn.executemany(
+            'INSERT INTO write_ops (id, operation, project_id, agent_id, kind, created_at) '
+            "VALUES (?, ?, 'dark_factory', 'boundary-suite', ?, ?)",
+            [
+                (f'op-{n}', operation, kind, (T0 - timedelta(minutes=n)).isoformat())
+                for n, (operation, kind) in enumerate(MEMORY_OPS, start=1)
+            ],
+        )
+        conn.commit()
+
+
+def _held_tree() -> CannedMCP:
+    """H's two in-progress tasks, both footprinting :data:`LOCKED_FILE`."""
+    footprint = {'metadata': {'files': [LOCKED_FILE]}}
+    return CannedMCP(
+        rows=[_raw_row(1, 'in-progress', **footprint), _raw_row(2, 'in-progress', **footprint)],
+        status_map={1: 'in-progress', 2: 'in-progress'},
+        status_page_size=2000,
+    )
+
+
+_HELD_SNAPSHOT: Mapping[str, Any] = {
+    'lock_depth': LOCK_DEPTH,
+    'current_holders': {LOCKED_MODULE: '1'},
+    'park_stacks': {LOCKED_MODULE: [{'owner': '2', 'installed_at': T0.isoformat()}]},
+    'parks': {'2': {'modules': [LOCKED_MODULE], 'installed_at': T0.isoformat()}},
+}
+"""H's scheduler: task 1 holds the module and task 2 is parked on it."""
+
+
+async def _scheduler_mcp(_client, _url, tool, args):
+    """The scheduler fan-out: unreachable for P, the held lock and no events for H."""
+    if Path(args['project_root']).name == OFFLINE_SCHEDULER:
+        raise httpx.ConnectError('canned scheduler unreachable')
+    return dict(_HELD_SNAPSHOT) if tool == 'get_scheduler_state' else []
+
+
+def _corpus_family(client: TestClient, workdir: Path) -> dict[str, Any]:
+    """Sketch #10, #11 and #12: the escalation corpus, memory ops and locks."""
+    bodies: dict[str, Any] = {}
+
+    with _canned_roots(client, workdir / 'escalations', {'dark-factory': _substrate(REIFY_COUNTS)}):
+        _file_escalations(app.state.config)
+        for hours, (generation, ttl) in enumerate(CORPUS_TTL_GENERATIONS.items()):
+            at = T0 + timedelta(hours=hours)
+            _clear_corpus()
+            with (
+                patch.object(escalation_corpus, 'CORPUS_TTL_SECONDS', ttl),
+                patch('dashboard.api.escalations.resolve_now', new=lambda _now, at=at: at),
+            ):
+                bodies[f'escalations_{generation}'] = _get(client, ESCALATIONS)
+                bodies[f'analytics_{generation}'] = _get(client, ESCALATION_ANALYTICS)
+        _clear_corpus()
+
+    with _canned_roots(client, workdir / 'memory', {'dark-factory': _substrate(REIFY_COUNTS)}):
+        _write_memory_ops(app.state.config)
+        with patch('dashboard.data.write_journal.resolve_now', new=lambda now: now or T0):
+            bodies['memory_ops'] = _get(client, MEMORY_GRAPHS)
+
+    offline_tree = _substrate({TaskStatus.IN_PROGRESS: 3, TaskStatus.PENDING: 2})
+    with _canned_roots(client, workdir / 'locks', {HELD: _held_tree(), OFFLINE_SCHEDULER: offline_tree}) as render:
+        _scheduler_cache_clear()
+        try:
+            with patch('dashboard.data.scheduler.mcp_tool_call', new=_scheduler_mcp):
+                bodies['scheduler_offline'] = _get(client, SCHEDULER)
+        finally:
+            _scheduler_cache_clear()
+        bodies['tasks_with_p'] = render(T0)
+
+    return bodies
+
+
 def ragged_store_rows(workdir: Path) -> list[dict[str, Any]]:
     """Every row the real sampler wrote in the ragged scenario, oldest first.
 
@@ -373,4 +535,5 @@ def build_all(workdir: Path) -> dict[str, Any]:
             **_census_family(client, workdir),
             **_burndown_family(client, workdir),
             **_window_family(client, workdir),
+            **_corpus_family(client, workdir),
         }
