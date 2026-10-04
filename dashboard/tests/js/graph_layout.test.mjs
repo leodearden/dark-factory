@@ -908,3 +908,66 @@ test('layoutSignature: encoding is unambiguous — a comma inside a dep id is no
 test('layoutSignature: empty input returns a string without throwing', () => {
   assert.equal(typeof layoutSignature([]), 'string');
 });
+
+// ---------------------------------------------------------------------------
+// taskGraphLayout — TaskGraph's whole layout as ids only: tiers computed once
+// over the full list, weakly-connected components each ordered by orderRows,
+// and the singletons. Holding ids (never task objects) is what lets TaskGraph
+// cache the result on layoutSignature without freezing displayed task fields.
+// ---------------------------------------------------------------------------
+
+// A tangled 3-tier component interleaved with a chain component and
+// singletons, so components and singletons are not contiguous in the input.
+function layoutFixture() {
+  return [
+    displayTask('P1'),
+    displayTask('A'),
+    displayTask('P2'),
+    displayTask('S1', [], 'blocked'),
+    displayTask('M1', ['P2']),
+    displayTask('M2', ['P1'], 'in-progress'),
+    displayTask('B', ['A'], 'done'),
+    displayTask('M3', ['P1']),
+    displayTask('C1', ['M2', 'M3']),
+    displayTask('S2'),
+    displayTask('C2', ['M1']),
+  ];
+}
+
+test('taskGraphLayout: equals the composition of computeTiers, partitionComponents and orderRows, as ids', () => {
+  const tasks = layoutFixture();
+  const tiers = computeTiers(tasks);
+  const { components, singletons } = partitionComponents(tasks);
+  assert.deepEqual(taskGraphLayout(tasks), {
+    blocks: components.map(c => orderRows(c, tiers).map(row => row.map(t => t.id))),
+    singletons: singletons.map(t => t.id),
+  });
+});
+
+test('taskGraphLayout: holds ids only — every leaf is a string, so no task object is reachable', () => {
+  const { blocks, singletons } = taskGraphLayout(layoutFixture());
+  assert.ok(blocks.length > 0, 'fixture should produce at least one component block');
+  for (const block of blocks) {
+    assert.ok(Array.isArray(block), `block should be an array of rows, got ${JSON.stringify(block)}`);
+    for (const row of block) {
+      assert.ok(Array.isArray(row), `row should be an array of ids, got ${JSON.stringify(row)}`);
+      for (const id of row) assert.equal(typeof id, 'string', `row entry should be an id string, got ${JSON.stringify(id)}`);
+    }
+  }
+  assert.ok(singletons.length > 0, 'fixture should produce at least one singleton');
+  for (const id of singletons) assert.equal(typeof id, 'string', `singleton should be an id string, got ${JSON.stringify(id)}`);
+});
+
+test('taskGraphLayout: blind to fields the layout does not read', () => {
+  const tasks = layoutFixture();
+  assert.deepEqual(taskGraphLayout(withDisplayFieldsChanged(tasks)), taskGraphLayout(tasks));
+});
+
+test('taskGraphLayout: empty input yields no blocks and no singletons', () => {
+  assert.deepEqual(taskGraphLayout([]), { blocks: [], singletons: [] });
+});
+
+test('taskGraphLayout: deterministic across fresh deep copies of identical input', () => {
+  const tasks = layoutFixture();
+  assert.deepEqual(taskGraphLayout(structuredClone(tasks)), taskGraphLayout(structuredClone(tasks)));
+});
