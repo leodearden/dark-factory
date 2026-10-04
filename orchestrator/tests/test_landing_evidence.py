@@ -2541,9 +2541,10 @@ class TestValidateReportedLanding:
     attributed its sha, and DISCOVERY mode searches for a citation — neither
     asks whether a REPORTED sha is corroborated.  This mode answers that from
     the task's OWN declarations: ``metadata.files`` the commit's diff must
-    touch, else ``metadata.delivered_checks`` (which the caller's mark-done
-    gate verifies), else nothing to verify the claim against.  Only once
-    attributed does it run the same effect-present guard CANDIDATE mode does.
+    touch, else a ``metadata.delivered_checks`` entry the commit MADE TRUE
+    (the three-leg differential), else nothing to verify the claim against.
+    Only once attributed does it run the same effect-present guard CANDIDATE
+    mode does.
     """
 
     SHA = 'c' * 40
@@ -2560,13 +2561,23 @@ class TestValidateReportedLanding:
 
     async def _validate(
         self, git_ops: MagicMock, *, declared_files, delivered_checks,
+        delivered_checks_enabled: bool = True,
     ) -> LandingVerdict:
         return await validate_reported_landing(
             git_ops, '42', 'task/42',
             reported_sha=self.SHA,
             declared_files=declared_files,
             delivered_checks=delivered_checks,
+            delivered_checks_enabled=delivered_checks_enabled,
         )
+
+    def _made_true_by_the_commit(self):
+        """A check runner that reads FALSE before the commit and TRUE at it and main."""
+        return _check_runner({
+            f'{self.SHA}^1': DeliveredCheckResult.FAILED,
+            self.SHA: DeliveredCheckResult.DELIVERED,
+            'main': DeliveredCheckResult.DELIVERED,
+        })
 
     async def test_nothing_declared_rejects_before_asking_git(self) -> None:
         """THE refusal: a task declaring neither files nor checks gives the
@@ -2653,21 +2664,82 @@ class TestValidateReportedLanding:
         assert verdict.evidence_sha is None
         assert verdict.probe['diverged_paths'] == ['pkg/a.py']
 
-    async def test_declared_checks_alone_attribute_without_a_diff(self) -> None:
-        """No files declared: the declared checks are the basis, and the
-        caller's mark-done gate is what verifies them.
-        """
+    async def test_a_declared_check_the_commit_made_true_attributes(self) -> None:
+        """No files declared: a declared check must flip AT the reported commit."""
         git_ops = self._ops()
+        stub, calls = self._made_true_by_the_commit()
 
-        verdict = await self._validate(
-            git_ops, declared_files=[], delivered_checks=[_grep_check()],
-        )
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await self._validate(
+                git_ops, declared_files=[], delivered_checks=[_grep_check()],
+            )
 
         assert verdict.accepted is True
         assert verdict.evidence_sha == self.SHA
         assert verdict.probe['attribution_basis'] == 'delivered_checks'
+        assert calls == [
+            ('cap-x', f'{self.SHA}^1'), ('cap-x', self.SHA), ('cap-x', 'main'),
+        ]
         git_ops.get_merge_commit_diff_files.assert_not_awaited()
         git_ops.commit_effect_present_in_main.assert_awaited_once_with(self.SHA)
+
+    async def test_a_declared_check_already_true_before_the_commit_rejects(
+        self,
+    ) -> None:
+        """A check passing at main proves the capability exists, not that THIS
+        commit delivered it — so it is no attribution for any surviving commit.
+        """
+        git_ops = self._ops()
+        stub, _calls = _check_runner(lambda _check, _ref: DeliveredCheckResult.DELIVERED)
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await self._validate(
+                git_ops, declared_files=[], delivered_checks=[_grep_check()],
+            )
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.probe['attribution_basis'] == 'delivered_checks_unconfirmed'
+        assert verdict.probe['delivered_checks_outcome'] == 'no_signal'
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
+
+    async def test_disarmed_checks_never_attribute_and_never_run(self) -> None:
+        """``delivered_checks.enabled=False``: the checks-only report is refused,
+        not stamped on effect survival alone, and no declared check executes.
+        """
+        git_ops = self._ops()
+        stub, calls = self._made_true_by_the_commit()
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await self._validate(
+                git_ops, declared_files=[], delivered_checks=[_grep_check()],
+                delivered_checks_enabled=False,
+            )
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.no_attribution
+        assert verdict.probe['attribution_basis'] == 'delivered_checks_unconfirmed'
+        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
+        assert calls == []
+        git_ops.commit_effect_present_in_main.assert_not_awaited()
+
+    async def test_disarmed_checks_never_rescue_a_files_attributed_claim(
+        self,
+    ) -> None:
+        """The switch governs the effect step's rescue too, not only attribution."""
+        git_ops = self._ops(effect_present=False)
+        stub, calls = self._made_true_by_the_commit()
+
+        with patch('orchestrator.delivered_checks.run_delivered_check', stub):
+            verdict = await self._validate(
+                git_ops, declared_files=['pkg/a.py'],
+                delivered_checks=[_grep_check()], delivered_checks_enabled=False,
+            )
+
+        assert verdict.accepted is False
+        assert verdict.reason is LandingReason.effect_absent
+        assert verdict.probe['delivered_checks_outcome'] == 'disabled'
+        assert calls == []
 
     async def test_an_unreadable_diff_is_a_git_error_never_a_negative(self) -> None:
         """git failing to answer says nothing about the task (LandingReason.git_error)."""
@@ -2729,6 +2801,7 @@ class TestReportedClaimEscalation:
             ),
             '42', 'task/42',
             reported_sha=self.SHA, declared_files=[], delivered_checks=[],
+            delivered_checks_enabled=True,
         )
 
     def _queue(self, tmp_path):

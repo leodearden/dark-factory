@@ -25,15 +25,6 @@ within days:
      done", and why it is nonetheless a site: it shows a human the same
      verdict the other five act on.
 
-Task 4704 routed ``orchestrator/src/orchestrator/workflow.py``'s four
-``found_on_main`` writers through the family as well: the three recovery
-guards (``TaskWorkflow._recover_if_already_merged``,
-``TaskWorkflow._recover_before_execute`` and
-``TaskWorkflow._recover_before_merge``) call :func:`validate_landing_evidence`
-in DISCOVERY mode, and the architect ``already_done`` writer
-(``TaskWorkflow._handle_already_done_report``) calls
-:func:`validate_reported_landing`, the family's third mode.
-
 Prior to task 2678 each site inlined its own subset of two primitives landed
 by task 2675 (dep δ): ``git_ops.find_task_citation_commit`` (FIX 2,
 subject-anchored citation discovery) and ``git_ops.commit_effect_present_in_main``
@@ -46,9 +37,8 @@ two more lean on a silent ``x or <fallback-sha>`` expression that fabricated
 provenance when discovery came up empty.
 
 This module is the single, INV-5 extraction point: ONE async function,
-:func:`validate_landing_evidence`, that ``harness.py`` (×4 call sites),
-``merge_queue.py`` (×1), ``escalation/server.py`` (×2) and ``workflow.py``
-(×3) all delegate to.
+:func:`validate_landing_evidence`, that every landing-evidence call site
+delegates to.
 
 Task 4647 added a SECOND producer beside it — :func:`branch_work_landed`, the
 PRD "landed-not-done-recovery" Contract's NON-DECAYING patch-id policy — plus
@@ -839,6 +829,12 @@ async def _differential_parent_ref(
     return fork_point if isinstance(fork_point, str) and fork_point else parent_ref
 
 
+def _differential_disarmed(git_ops: GitOps, enabled: bool) -> bool:
+    """Whether ``delivered_checks.enabled`` is off, from the caller or ``git_ops``."""
+    checks_config = getattr(getattr(git_ops, 'config', None), 'delivered_checks', None)
+    return not (enabled and getattr(checks_config, 'enabled', True))
+
+
 async def _delivered_checks_differential(
     git_ops: GitOps,
     effect_check_sha: str,
@@ -846,6 +842,7 @@ async def _delivered_checks_differential(
     probe: dict[str, Any],
     *,
     anchor_is_branch_tip: bool = False,
+    enabled: bool = True,
 ) -> bool:
     """The SECOND accept path: did *effect_check_sha* MAKE a declared
     capability true? (task 3116 part b.)
@@ -898,7 +895,9 @@ async def _delivered_checks_differential(
     Without it, disabling the delivered-checks feature would still leave this
     consumer of it running task-declared checks (amendment pass, review
     finding).  A stand-in git_ops carrying no config reads as ENABLED, which
-    is the pre-amendment behaviour.
+    is the pre-amendment behaviour.  A real ``GitOps.config`` is the ``git``
+    sub-config and carries no ``delivered_checks`` either, so a caller holding
+    the project config passes the leaf as *enabled*.
 
     LAZY import (``# noqa: PLC0415``), mirroring
     :func:`file_unattributed_landing_escalation`'s ``escalation.models``
@@ -916,8 +915,7 @@ async def _delivered_checks_differential(
     ``delivered_checks_error`` and logged, and declines the upgrade — the
     fail-safe direction for an accept path is to not accept.
     """
-    checks_config = getattr(getattr(git_ops, 'config', None), 'delivered_checks', None)
-    if not getattr(checks_config, 'enabled', True):
+    if _differential_disarmed(git_ops, enabled):
         # Switched off fleet-wide. Recorded, never silent: an operator who
         # disabled the feature must be able to see in the escalation that the
         # second accept path was not merely unlucky.
@@ -1620,6 +1618,7 @@ async def _candidate_effect_verdict(
     probe: dict[str, Any],
     *,
     method: LandingMethod,
+    checks_enabled: bool = True,
 ) -> LandingVerdict:
     """The FIX 1' effect-present guard on an ALREADY-ATTRIBUTED sha.
 
@@ -1639,7 +1638,7 @@ async def _candidate_effect_verdict(
         )
     await _record_effect_divergence(git_ops, candidate_sha, probe)
     if delivered_checks and await _delivered_checks_differential(
-        git_ops, candidate_sha, delivered_checks, probe,
+        git_ops, candidate_sha, delivered_checks, probe, enabled=checks_enabled,
     ):
         return _accept_verdict(
             candidate_sha, reason=LandingReason.ok, probe=probe, method=method,
@@ -1734,9 +1733,6 @@ async def validate_landing_evidence(
               task 4500  CAPSTONE — flips this parameter to REQUIRED and
                          keyword-only once all seven are wired, so no future
                          caller can inherit the default silently
-
-            ``workflow.py``'s three recovery guards (task 4704) were wired
-            from the start and already pass the task's declared checks.
 
             If ``delivered_checks_state == 'unwired'`` is still appearing in
             escalations after 4500 has landed, that is the bug: one of the
@@ -1852,6 +1848,8 @@ async def _attribute_reported_commit(
     declared_files: Sequence[str],
     delivered_checks: list[dict[str, Any]],
     probe: dict[str, Any],
+    *,
+    checks_enabled: bool,
 ) -> LandingReason | None:
     """Corroborate *reported_sha* against the task's OWN declarations.
 
@@ -1863,8 +1861,12 @@ async def _attribute_reported_commit(
       one of them.  Untouched is COUNTER-evidence and rejects even when checks
       are also declared: a check passing at main proves the capability exists
       somewhere, not that THIS commit delivered it.
-    - ``delivered_checks`` — no files, but checks declared; the caller's
-      mark-done delivered-check gate is what verifies them.
+    - ``delivered_checks`` / ``delivered_checks_unconfirmed`` — no files, so
+      a declared check must have been MADE TRUE by this commit: false at its
+      parent, true at it and at main (:func:`_delivered_checks_differential`).
+      A check merely passing at main would accept any surviving commit.
+      Unconfirmed covers both no signal and a disarmed ``checks_enabled``;
+      ``probe['delivered_checks_outcome']`` says which.
     - ``nothing_declared`` — nothing to verify the claim against.
     - ``undetermined`` — git could not produce the diff (``git_error``,
       never a negative).
@@ -1885,8 +1887,13 @@ async def _attribute_reported_commit(
         probe['attribution_basis'] = 'declared_files'
         return None
     if delivered_checks:
-        probe['attribution_basis'] = 'delivered_checks'
-        return None
+        if await _delivered_checks_differential(
+            git_ops, reported_sha, delivered_checks, probe, enabled=checks_enabled,
+        ):
+            probe['attribution_basis'] = 'delivered_checks'
+            return None
+        probe['attribution_basis'] = 'delivered_checks_unconfirmed'
+        return LandingReason.no_attribution
     probe['attribution_basis'] = 'nothing_declared'
     return LandingReason.no_attribution
 
@@ -1899,6 +1906,7 @@ async def validate_reported_landing(
     reported_sha: str,
     declared_files: Sequence[str],
     delivered_checks: list[dict[str, Any]],
+    delivered_checks_enabled: bool,
 ) -> LandingVerdict:
     """Validate an agent-REPORTED landing of *task_id* at *reported_sha*.
 
@@ -1917,7 +1925,9 @@ async def validate_reported_landing(
     identical refile is recognisable (task 4499).
 
     Both declaration lists are REQUIRED: a caller that silently passed
-    nothing would turn every report into a ``nothing_declared`` refusal.
+    nothing would turn every report into a ``nothing_declared`` refusal.  So
+    is *delivered_checks_enabled*, the project's ``delivered_checks.enabled``
+    leaf: disarmed, the declared checks neither attribute nor rescue.
     """
     method = LandingMethod.reported_claim
     probe = _new_probe(
@@ -1929,11 +1939,13 @@ async def validate_reported_landing(
     probe['citation'] = reported_sha
     reject_reason = await _attribute_reported_commit(
         git_ops, reported_sha, declared_files, delivered_checks, probe,
+        checks_enabled=delivered_checks_enabled,
     )
     if reject_reason is not None:
         return _reject_verdict(reject_reason, probe=probe, method=method)
     return await _candidate_effect_verdict(
         git_ops, reported_sha, delivered_checks, probe, method=method,
+        checks_enabled=delivered_checks_enabled,
     )
 
 
@@ -1968,8 +1980,9 @@ _REASON_EXPLANATIONS: dict[str, str] = {
         'cites the task and no equivalent commit resolved. For an '
         'agent-reported commit (method reported_claim) nothing the task '
         'declares corroborates the report — it declares neither '
-        'metadata.files nor delivered_checks, or the commit touches none of '
-        'its declared files; see probe.attribution_basis. Either way there '
+        'metadata.files nor delivered_checks, the commit touches none of its '
+        'declared files, or the commit made none of its declared checks '
+        'true; see probe.attribution_basis. Either way there '
         'is no sha to anchor provenance on, and this module refuses to '
         'guess: anchoring on the branch tip, on main\'s current tip or on an '
         'uncorroborated report would fabricate provenance, which is the '
@@ -2053,8 +2066,8 @@ _METHOD_EXPLANATIONS: dict[str, str] = {
         "architect's already_done claim) — validate_reported_landing. The "
         "report's prose is never attribution: the commit was corroborated "
         "against the task's own declarations (its diff must touch a declared "
-        'metadata.files entry; with no files declared, the declared '
-        'delivered_checks are the basis), then given the same '
+        'metadata.files entry; with no files declared, the commit must '
+        'have made a declared delivered_check true), then given the same '
         'effect-present guard as CANDIDATE mode.'
     ),
     'unspecified': (
@@ -2358,10 +2371,9 @@ def _render_delivered_checks_differential(
     if outcome == 'disabled':
         return (
             'delivered-checks differential: NOT RUN — delivered_checks.enabled '
-            'is false in this project config, so the second accept path is '
-            'switched off (the same kill switch the mark-done delivered-check '
-            'gate honours). This landing was decided by line survival alone.'
-            '\n\n'
+            'is false in this project config, so the task\'s declared checks '
+            'were not run and could not confirm this landing (the same kill '
+            'switch the mark-done delivered-check gate honours).\n\n'
         )
     lines = [f'delivered-checks differential: {outcome}']
     parent_ref = verdict.probe.get('delivered_checks_parent_ref')

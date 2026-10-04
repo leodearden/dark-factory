@@ -104,6 +104,7 @@ from orchestrator.git_ops import (
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
 from orchestrator.merge_lane.landing_evidence import (
+    LandingReason,
     LandingVerdict,
     file_unattributed_landing_escalation,
     validate_landing_evidence,
@@ -589,14 +590,27 @@ def _normalize_cause_hint(hint: str | None) -> str:
     return RetryLedger.normalize_cause_hint(hint)
 
 
-def _declared_metadata_list(metadata: Mapping[str, Any], key: str) -> list[Any]:
+def _declared_entries(metadata: Mapping[str, Any], key: str) -> list[Any]:
     """``metadata[key]`` when it IS a list, else ``[]``.
 
-    For the task's declared ``files`` / ``delivered_checks``: a malformed
-    scalar must read as "nothing declared", never iterate character-wise.
+    A malformed scalar must read as "nothing declared", never iterate
+    character-wise.
     """
     value = metadata.get(key)
     return value if isinstance(value, list) else []
+
+
+def _declared_files(metadata: Mapping[str, Any]) -> list[str]:
+    """The task's declared ``metadata.files``, path strings only."""
+    return [f for f in _declared_entries(metadata, 'files') if isinstance(f, str)]
+
+
+def _declared_checks(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The task's declared ``metadata.delivered_checks``, mapping entries only."""
+    return [
+        c for c in _declared_entries(metadata, 'delivered_checks')
+        if isinstance(c, dict)
+    ]
 
 
 def _compute_merge_outcome_signature(
@@ -6860,7 +6874,8 @@ class TaskWorkflow:
         at the architect-named commit, return ``DONE``.
         On an attribution failure: hold the task blocked behind one
         ``provenance_unattributed`` L1 (:meth:`_hold_unattributed_already_done`)
-        — whether the commit is this task's work is a human's call.
+        — whether the commit is this task's work is a human's call — unless
+        git could not answer, which blocks like a reachability failure.
         On a reachability or capability failure: clear the artifact, route to
         ``_mark_blocked`` without escalating to a human — this is an architect
         mistake (wrong/missing commit, or a claim main does not support), not
@@ -6902,8 +6917,9 @@ class TaskWorkflow:
         verdict = await validate_reported_landing(
             self.git_ops, self.task_id, branch,
             reported_sha=commit,
-            declared_files=_declared_metadata_list(metadata, 'files'),
-            delivered_checks=_declared_metadata_list(metadata, 'delivered_checks'),
+            declared_files=_declared_files(metadata),
+            delivered_checks=_declared_checks(metadata),
+            delivered_checks_enabled=self.config.delivered_checks.enabled,
         )
         if not verdict.accepted or verdict.evidence_sha is None:
             return await self._hold_unattributed_already_done(
@@ -6966,16 +6982,23 @@ class TaskWorkflow:
         ``_mark_blocked`` files nothing more (``skip_escalation``).  When no
         such L1 is open — no queue, a suppressed identical refile, a contained
         filing error — its ordinary non-escalating block runs instead, so the
-        hold is never silent.
+        hold is never silent.  A ``git_error`` verdict is the detector failing,
+        never a negative, so it files no L1 and gets that steward-retryable
+        block directly.
         """
-        file_unattributed_landing_escalation(
-            self.escalation_queue, self.task_id, branch, verdict,
-            agent_role='orchestrator-workflow',
-            filing_claimant_run_id=self._filing_claimant_run_id,
-        )
-        held = self.escalation_queue is not None and self.escalation_queue.has_open_l1(
-            self.task_id, category='provenance_unattributed',
-        )
+        held = False
+        if verdict.reason is not LandingReason.git_error:
+            file_unattributed_landing_escalation(
+                self.escalation_queue, self.task_id, branch, verdict,
+                agent_role='orchestrator-workflow',
+                filing_claimant_run_id=self._filing_claimant_run_id,
+            )
+            held = (
+                self.escalation_queue is not None
+                and self.escalation_queue.has_open_l1(
+                    self.task_id, category='provenance_unattributed',
+                )
+            )
         return await self._mark_blocked(
             f'Architect reported task already done at {commit[:12]} but the '
             f'claim could not be attributed to this task ({verdict.reason})',
@@ -15071,18 +15094,24 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         most recently from ANY task.  This runs ``validate_landing_evidence``
         in DISCOVERY mode — the shape of the harness dispatch gate's ancestry
         arm — and returns the task's own attributable, surviving citation.  A
-        reject is logged and answers None, so the guard proceeds with its
-        phase rather than stamping.
+        reject, or a validation that raises, is logged and answers None, so
+        every guard proceeds with its phase rather than stamping.
         """
-        verdict = await validate_landing_evidence(
-            self.git_ops, self.task_id,
-            f'{self.config.git.branch_prefix}{self.task_id}',
-            branch_tip_sha=branch_tip_sha,
-            pattern_template=self.git_ops.config.commit_citation_pattern,
-            delivered_checks=_declared_metadata_list(
-                self.task.get('metadata') or {}, 'delivered_checks',
-            ),
-        )
+        try:
+            verdict = await validate_landing_evidence(
+                self.git_ops, self.task_id,
+                f'{self.config.git.branch_prefix}{self.task_id}',
+                branch_tip_sha=branch_tip_sha,
+                pattern_template=self.git_ops.config.commit_citation_pattern,
+                delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+            )
+        except Exception:
+            logger.warning(
+                'Task %s: %s recovery landing-evidence check failed — not '
+                'stamping, proceeding',
+                self.task_id, guard, exc_info=True,
+            )
+            return None
         if verdict.accepted and verdict.evidence_sha is not None:
             return verdict.evidence_sha
         logger.warning(
@@ -15210,17 +15239,7 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             return None
 
-        # Same git-layer degradation as the merge-check above: an infra
-        # failure proceeds with the normal workflow rather than aborting it.
-        try:
-            evidence_sha = await self._discovered_landing_sha('pre-PLAN', wt_head)
-        except Exception:
-            logger.warning(
-                'Task %s: landing-evidence check failed, proceeding with '
-                'normal workflow',
-                self.task_id, exc_info=True,
-            )
-            return None
+        evidence_sha = await self._discovered_landing_sha('pre-PLAN', wt_head)
         if evidence_sha is None:
             return None
 

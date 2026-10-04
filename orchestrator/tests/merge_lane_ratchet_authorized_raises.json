@@ -1633,6 +1633,42 @@
           "current": 31763
         }
       ]
+    },
+    {
+      "task_id": "4704",
+      "reason": "Task 4704 review amendment: a checks-only architect already_done claim is attributed only when the delivered-checks differential shows the reported commit made a declared check true, and the caller's delivered_checks.enabled leaf now disarms both that attribution and the effect-step rescue (a real GitOps.config carries no delivered_checks, so the stand-in read alone cannot). Net-additive guard; the differential's own cognitive is unchanged via _differential_disarmed.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+          "baseline": 148,
+          "current": 151
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py::_attribute_reported_commit",
+          "baseline": 6,
+          "current": 8
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/landing_evidence.py",
+          "baseline": 2776,
+          "current": 2788
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4764,
+          "current": 4767
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56682,
+          "current": 56694
+        }
+      ]
     }
   ]
 }

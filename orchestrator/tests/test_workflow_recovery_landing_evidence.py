@@ -19,7 +19,6 @@ its effect survives.  This file imports no merge-lane module on purpose.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -132,17 +131,17 @@ class TestFallbackStampsTheTasksOwnCitation:
         assert outcome is None
         f.mark_done.assert_not_awaited()
 
-    async def test_a_reject_is_logged_with_its_reason(
+    async def test_a_raising_validation_stamps_nothing_and_proceeds(
         self, tmp_path: Path, guard: _Guard, note: str, tip: str,
-        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        f = _fixture(tmp_path, landing_citation=None)
+        """Every guard degrades the same way when the check itself fails."""
+        f = _fixture(tmp_path)
 
-        with caplog.at_level(logging.WARNING, logger='orchestrator.workflow'):
-            await guard(f)
+        with patch(_VALIDATE_TARGET, AsyncMock(side_effect=OSError('git timed out'))):
+            outcome = await guard(f)
 
-        assert 'no_citation' in caplog.text
-        assert tip[:8] in caplog.text
+        assert outcome is None
+        f.mark_done.assert_not_awaited()
 
     async def test_validates_the_tasks_own_branch_tip_checks_and_pattern(
         self, tmp_path: Path, guard: _Guard, note: str, tip: str,

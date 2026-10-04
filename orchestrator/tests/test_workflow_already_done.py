@@ -20,7 +20,7 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import DeliveredChecksConfig, OrchestratorConfig
-from orchestrator.delivered_checks import DeliveredChecksBlock
+from orchestrator.delivered_checks import DeliveredCheckResult, DeliveredChecksBlock
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome, WorkflowState
 
 
@@ -358,6 +358,7 @@ async def test_run_short_circuits_on_plan_escalated(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 _AD_GATE_TARGET = 'orchestrator.workflow.gate_mark_done_on_delivered_checks'
+_RUN_CHECK_TARGET = 'orchestrator.delivered_checks.run_delivered_check'
 _AD_COMMIT = 'abcdef1234567890'
 _AD_MAIN_SHA = 'mainsha123'
 _AD_DC_CHECK = {
@@ -369,13 +370,18 @@ def _arm_already_done_fixture(
     tmp_path: Path, *, metadata: dict | None = None, enabled: bool = True,
     commit_on_main: bool = True,
 ) -> _Fixture:
-    """`_make` plus a live ``delivered_checks`` config and a staged report."""
+    """`_make` plus a live ``delivered_checks`` config and a staged report.
+
+    The default task declares the file its reported commit touches, so the
+    claim is attributed and these tests reach the capability half.
+    """
     f = _make(
         worktree=tmp_path / 'wt', project_root=tmp_path / 'proj',
         commit_on_main=commit_on_main, main_sha=_AD_MAIN_SHA,
     )
     f.wf.task['metadata'] = (
-        {'delivered_checks': [_AD_DC_CHECK]} if metadata is None else metadata
+        {'files': ['helpers/foo.py'], 'delivered_checks': [_AD_DC_CHECK]}
+        if metadata is None else metadata
     )
     f.wf.config.delivered_checks = DeliveredChecksConfig(
         enabled=enabled, check_timeout_secs=7.5,
@@ -719,3 +725,74 @@ class TestHandleAlreadyDoneReportAttribution:
 
         esc = self._assert_held_behind_one_provenance_l1(f, queue, outcome)
         assert 'effect_absent' in esc.summary
+
+    def _checks_only(self, f: _Fixture, *, enabled: bool) -> None:
+        f.wf.task['metadata'] = {'delivered_checks': [_AD_DC_CHECK]}
+        f.wf.config.delivered_checks = DeliveredChecksConfig(enabled=enabled)
+
+    async def test_checks_only_claim_the_commit_made_true_stamps(self, tmp_path: Path):
+        """A check false before the reported commit and true at it and at main
+        attributes the claim; the mark-done gate is stubbed to isolate that."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        self._checks_only(f, enabled=True)
+        queue = _arm_queue(f, tmp_path)
+        self._report(f)
+
+        async def _made_true(check, *, project_root, ref='main', runner=None):
+            return (
+                DeliveredCheckResult.FAILED if ref == f'{_AD_COMMIT}^1'
+                else DeliveredCheckResult.DELIVERED
+            )
+
+        with (
+            patch(_RUN_CHECK_TARGET, _made_true),
+            patch(_AD_GATE_TARGET, AsyncMock(return_value=None)),
+        ):
+            outcome = await f.wf._handle_already_done_report()
+
+        assert outcome == WorkflowOutcome.DONE
+        mark_done = cast(AsyncMock, f.wf.scheduler.mark_done)
+        mark_done.assert_awaited_once()
+        assert mark_done.await_args is not None
+        assert mark_done.await_args.kwargs['sha'] == _AD_COMMIT
+        assert queue.get_by_task('50') == []
+
+    async def test_checks_only_claim_with_the_kill_switch_off_holds(
+        self, tmp_path: Path,
+    ):
+        """``delivered_checks.enabled=False`` leaves a checks-only task nothing
+        to corroborate the report with, so it is held rather than stamped on
+        effect survival alone — and no declared check runs."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        self._checks_only(f, enabled=False)
+        queue = _arm_queue(f, tmp_path)
+        self._report(f)
+        run_check = AsyncMock(return_value=DeliveredCheckResult.DELIVERED)
+
+        with patch(_RUN_CHECK_TARGET, run_check):
+            outcome = await f.wf._handle_already_done_report()
+
+        esc = self._assert_held_behind_one_provenance_l1(f, queue, outcome)
+        assert 'no_attribution' in esc.summary
+        run_check.assert_not_awaited()
+
+    async def test_unreadable_commit_diff_blocks_without_a_provenance_l1(
+        self, tmp_path: Path,
+    ):
+        """git failing to read the reported commit says nothing about the
+        claim: a steward-retryable block, not a human attribution question."""
+        f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
+        f.wf.git_ops.get_merge_commit_diff_files = AsyncMock(
+            return_value=([], RuntimeError('bad object')),
+        )
+        queue = _arm_queue(f, tmp_path)
+        self._report(f)
+
+        outcome = await f.wf._handle_already_done_report()
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        cast(AsyncMock, f.wf.scheduler.mark_done).assert_not_awaited()
+        assert ('50', 'blocked') in _status_writes(f)
+        filed = queue.get_by_task('50')
+        assert {e.category for e in filed} == {'task_failure'}
+        assert any(e.level == 0 for e in filed), 'the steward-facing L0 is the retry route'
