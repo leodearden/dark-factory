@@ -16,14 +16,6 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 from _link_heal_harness import ALL_LINK_HEAL_PREFIXES, LinkHealHarness, build_harness
-from fused_memory.maintenance.link_heal_executor import (
-    BACKLOG_ANCHOR,
-    WRITE_FAILURE_ANCHOR,
-    RunLimits,
-    RunReport,
-    render_plan_document,
-    run_plan,
-)
 
 from fused_memory.maintenance.link_heal import (
     BasisSource,
@@ -34,6 +26,14 @@ from fused_memory.maintenance.link_heal import (
     RunCounts,
     Verdict,
     build_plan,
+)
+from fused_memory.maintenance.link_heal_executor import (
+    BACKLOG_ANCHOR,
+    WRITE_FAILURE_ANCHOR,
+    RunLimits,
+    RunReport,
+    render_plan_document,
+    run_plan,
 )
 from fused_memory.maintenance.link_heal_ledger import ActionState, LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_store import text_sha256
