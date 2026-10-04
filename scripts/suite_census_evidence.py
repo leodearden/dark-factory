@@ -1,14 +1,16 @@
 """Evidence readers for the suite census (task 5414): retained verify artefacts become typed records.
 
 The I/O rim of ``suite_census_outcomes``. Each artefact format -- archived and
-live junit, pytest logs, the runs.db ``flake_occurrence`` table -- is parsed
-once, here, into Observation / Unresolved values. An artefact that cannot be
+live junit, pytest logs, nextest status and run_all lines, the flaky ledger, the
+runs.db ``flake_occurrence`` table -- is parsed once, here, into Observation /
+Unresolved values. An artefact that cannot be
 read or attributed to a tracked test becomes an Unresolved record, so it is
 counted rather than dropped (INV-11).
 """
 from __future__ import annotations
 
 import gzip
+import json
 import re
 import sqlite3
 import xml.etree.ElementTree as ET
@@ -348,4 +350,164 @@ def pytest_evidence(project_root: Path, tree_root: Path) -> Evidence:
         ),
         records=records,
         uncosted_universe=frozenset(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The nextest ecosystem.
+
+FLAKY_LEDGER = 'data/verify-logs/flaky-ledger.jsonl'
+INFRA_DIR = 'tests/infra'
+
+_NEXTEST_STATUS = re.compile(
+    r'^\s+(?P<status>[A-Z][A-Z-]*) \[\s*>?(?P<secs>[\d.]+)s\]\s+(?:\([^)]*\)\s+)?'
+    r'(?P<binary>\S+)\s+(?P<test>\S+)\s*$'
+)
+_RUN_ALL_FAILED = re.compile(r'^FAILED ((?:\S+\.sh\s*)+)$')
+
+# The one home of the nextest status vocabulary. None marks a progress line,
+# which says nothing about an outcome; a status missing here is Unresolved.
+_NEXTEST_OUTCOME: MappingProxyType[str, Outcome | None] = MappingProxyType({
+    'PASS': Outcome.PASSED,
+    'LEAK': Outcome.PASSED,
+    **dict.fromkeys(
+        ('FAIL', 'TIMEOUT', 'LEAK-FAIL', 'SIGSEGV', 'SIGABRT', 'SIGBUS', 'SIGKILL',
+         'SIGTERM', 'ABORT'),
+        Outcome.FAILED,
+    ),
+    **dict.fromkeys(('SLOW', 'TERMINATING', 'START', 'RETRY'), None),
+})
+
+
+@dataclass(frozen=True)
+class _InfraTests:
+    """The tracked ``tests/infra/*.sh`` scripts run_all.sh drives."""
+
+    tracked: frozenset[str]
+
+    @classmethod
+    def of(cls, tree_root: Path) -> _InfraTests:
+        scripts = tracked_files(tree_root, f'{INFRA_DIR}/*.sh')
+        return cls(frozenset(path for path in scripts if path.rpartition('/')[0] == INFRA_DIR))
+
+    def resolve(self, name: str) -> list[TestId]:
+        path = f'{INFRA_DIR}/{name}'
+        return [TestId(package=INFRA_DIR, name=path)] if path in self.tracked else []
+
+    def universe(self) -> frozenset[TestId]:
+        return frozenset(
+            TestId(package=INFRA_DIR, name=path)
+            for path in self.tracked
+            if path.rpartition('/')[2].startswith('test_')
+        )
+
+
+def _status_record(status: re.Match[str], run: str) -> Record | None:
+    if status['status'] not in _NEXTEST_OUTCOME:
+        return Unresolved(source='nextest-logs', raw_id=status.string.strip())
+    outcome = _NEXTEST_OUTCOME[status['status']]
+    if outcome is None:
+        return None
+    binary = status['binary']
+    return Observation(
+        source='nextest-logs', run=run,
+        test=TestId(package=binary.split('::', 1)[0], name=f'{binary} {status["test"]}'),
+        outcome=outcome, seconds=_seconds(status['secs']),
+    )
+
+
+def _nextest_line_records(line: str, run: str, infra: _InfraTests) -> Iterator[Record]:
+    status = _NEXTEST_STATUS.match(line)
+    if status is not None:
+        record = _status_record(status, run)
+        if record is not None:
+            yield record
+        return
+    run_all = _RUN_ALL_FAILED.match(line)
+    for name in run_all[1].split() if run_all else ():
+        yield from _failure_records('nextest-logs', run, name, infra.resolve(name))
+
+
+def _nextest_log_records(artefact: _Artefact, infra: _InfraTests) -> Iterator[Record]:
+    try:
+        lines = artefact.path.read_text(encoding='utf-8', errors='replace').splitlines()
+    except OSError:
+        yield Unresolved(source='nextest-logs', raw_id=artefact.relative)
+        return
+    for line in lines:
+        yield from _nextest_line_records(line, artefact.relative, infra)
+
+
+@dataclass(frozen=True)
+class _LedgerEntry:
+    ts: str
+    test: str
+    run_id: str
+
+
+def _ledger_line(line: str) -> _LedgerEntry | Unresolved:
+    try:
+        entry = json.loads(line)
+    except json.JSONDecodeError:
+        entry = None
+    fields = ('ts', 'test', 'run_id')
+    if not isinstance(entry, dict) or not all(isinstance(entry.get(f), str) for f in fields):
+        return Unresolved(source='flaky-ledger', raw_id=line)
+    return _LedgerEntry(ts=entry['ts'], test=entry['test'], run_id=entry['run_id'])
+
+
+def _ledger(project_root: Path) -> tuple[_LedgerEntry | Unresolved, ...]:
+    path = project_root / FLAKY_LEDGER
+    if not path.is_file():
+        return ()
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return (Unresolved(source='flaky-ledger', raw_id=FLAKY_LEDGER),)
+    return tuple(_ledger_line(line) for line in text.splitlines() if line.strip())
+
+
+def _ledger_window(ledger: Sequence[_LedgerEntry | Unresolved]) -> SourceWindow:
+    stamps = (
+        stamp for line in ledger
+        if isinstance(line, _LedgerEntry) and (stamp := _iso_utc(line.ts)) is not None
+    )
+    return _window('flaky-ledger', FLAKY_LEDGER, len(ledger), stamps)
+
+
+def _ledger_records(
+    ledger: Sequence[_LedgerEntry | Unresolved], infra: _InfraTests,
+) -> Iterator[Record]:
+    by_run: dict[str, list[_LedgerEntry]] = {}
+    for line in ledger:
+        if isinstance(line, Unresolved):
+            yield line
+        else:
+            by_run.setdefault(line.run_id, []).append(line)
+    for run_id, entries in by_run.items():
+        for entry in entries:
+            yield from _failure_records('flaky-ledger', run_id, entry.test, infra.resolve(entry.test))
+
+
+def nextest_evidence(project_root: Path, tree_root: Path) -> Evidence:
+    """Nextest status and run_all lines in the verify logs, the flaky ledger and
+    flake_occurrence under *project_root*; infra scripts resolve against *tree_root*."""
+    infra = _InfraTests.of(tree_root)
+    logs = _archived(project_root, VERIFY_LOGS)
+    ledger = _ledger(project_root)
+
+    def records() -> Iterator[Record]:
+        for artefact in logs:
+            yield from _nextest_log_records(artefact, infra)
+        yield from _ledger_records(ledger, infra)
+        yield from _flake_records(project_root, infra.resolve)
+
+    return Evidence(
+        windows=(
+            _artefact_window('nextest-logs', VERIFY_LOGS, logs),
+            _ledger_window(ledger),
+            _flake_window(project_root),
+        ),
+        records=records,
+        uncosted_universe=infra.universe(),
     )
