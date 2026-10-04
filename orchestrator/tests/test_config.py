@@ -2198,6 +2198,50 @@ class TestParkBackfillConfig:
         )
 
 
+class TestPinReservationConfig:
+    """The three pin reservation knobs (task 6040).
+
+    Flat ``OrchestratorConfig`` leaves beside the ``backfill_*`` block, read
+    from ``self.config`` at tick time, so green-tier membership alone makes
+    them hot-reloadable.
+    """
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_defaults(self):
+        cfg = OrchestratorConfig()
+        assert cfg.pin_reservations_enabled is True
+        assert cfg.pin_reservation_max_active == 1
+        assert cfg.pin_blocked_emit_interval_secs == 3600.0
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_max_active_rejects_below_one(self, bad):
+        """ge=1: the kill switch is the single "off" lever, not max_active=0."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(pin_reservation_max_active=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_emit_interval_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(pin_blocked_emit_interval_secs=bad)
+
+    @pytest.mark.parametrize('leaf', [
+        'pin_reservations_enabled',
+        'pin_reservation_max_active',
+        'pin_blocked_emit_interval_secs',
+    ])
+    def test_pin_reservation_leaves_are_green_tier_reloadable(self, leaf):
+        assert leaf in RELOADABLE_FIELDS
+
+    def test_reloading_the_kill_switch_flips_the_live_config(self):
+        live = OrchestratorConfig()
+        assert live.pin_reservations_enabled is True, 'premise: enabled before the reload'
+
+        report = apply_reload(live, OrchestratorConfig(pin_reservations_enabled=False))
+
+        assert 'pin_reservations_enabled' in report['applied']
+        assert live.pin_reservations_enabled is False
+
+
 class TestTransientRequeueBackoffConfig:
     """The two jittered-backoff knobs (task 3317 / PRD contract C3).
 

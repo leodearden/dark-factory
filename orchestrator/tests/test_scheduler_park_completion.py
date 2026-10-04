@@ -71,6 +71,7 @@ async def test_an_empty_install_emits_no_reservation_installed_and_one_blocked_e
         'attempts': 1,
         'skip_count': 1,
         'priority': 'high',
+        'source': 'fairness',
     }, 'empty install: blocked payload'
     assert 'T' not in scheduler.lock_table.snapshot_parks(), 'empty install: T parks nothing'
 
@@ -107,7 +108,7 @@ async def test_a_partial_install_parks_what_it_can_and_reports_the_rest():
     assert await scheduler.acquire_next() is None, 'partial install: T must not dispatch'
 
     assert event_data_for(store, 'reservation_installed', 'T') == [
-        {'modules': [M1], 'skip_count': 1, 'priority': 'high'},
+        {'modules': [M1], 'skip_count': 1, 'priority': 'high', 'source': 'fairness'},
     ], 'partial install: reservation_installed carries only the parked module'
     blocked = event_data_for(store, 'reservation_install_blocked', 'T')
     assert len(blocked) == 1, 'partial install: one blocked event'

@@ -11,7 +11,65 @@ renders.  That rule lives only in :func:`event_matches`.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, NamedTuple
+
 from _recording_event_store import _RecordingEventStore
+
+from orchestrator.config import OrchestratorConfig
+from orchestrator.overrides import OverrideStore
+from orchestrator.park_eviction_requests import ParkEvictionRequestStore
+from orchestrator.scheduler import Scheduler
+
+
+class ParkWorld(NamedTuple):
+    scheduler: Scheduler
+    store: _RecordingEventStore
+    overrides: OverrideStore
+    root: str
+
+
+def park_world(
+    tmp_path: Path,
+    *,
+    pinned: tuple[str, ...] = (),
+    time_source: Callable[[], float] | None = None,
+    park_eviction_store: ParkEvictionRequestStore | None = None,
+    state_snapshot_path: Path | None = None,
+    **config_overrides: Any,
+) -> ParkWorld:
+    """A started Scheduler whose top parks on its first skip.
+
+    One holder per module, ``lock_depth=2`` and ``project_root=tmp_path``,
+    with *config_overrides* applied on top.  Each id in *pinned* is pinned in
+    the given order, so its pin_order is its 1-based position.  *time_source*
+    is the Scheduler's monotonic clock (the real one when None);
+    *park_eviction_store* and *state_snapshot_path* go to the Scheduler
+    constructor unchanged.
+    """
+    config = OrchestratorConfig(**{
+        'max_per_module': 1,
+        'lock_depth': 2,
+        'project_root': tmp_path,
+        **config_overrides,
+    })
+    config.fairness.skip_threshold = 1
+    root = str(config.project_root)
+    overrides = OverrideStore(tmp_path / 'o.db')
+    for tid in pinned:
+        overrides.set_override(root, tid, pinned=True)
+    store = _RecordingEventStore()
+    scheduler = Scheduler(
+        config,
+        event_store=store,  # type: ignore[arg-type]
+        override_store=overrides,
+        time_source=time_source,
+        park_eviction_store=park_eviction_store,
+        state_snapshot_path=state_snapshot_path,
+    )
+    scheduler.finish_startup()
+    return ParkWorld(scheduler, store, overrides, root)
 
 
 def make_task(tid: str, priority: str, files: list[str], *, status: str = 'pending') -> dict:

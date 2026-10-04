@@ -4457,6 +4457,46 @@ class OrchestratorConfig(BaseSettings):
         ),
     )
 
+    # Pin reservations (task 6040): the head lock-blocked pin(s) hold a
+    # reservation on their modules — see orchestrator/pin_reservation.py.
+    # Flat top-level fields beside backfill_*, read from self.config at tick
+    # time, so green-tier membership is the whole reload story.
+    pin_reservations_enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for pin reservations. When False the pin loop behaves '
+            'as before task 6040: a lock-blocked pinned task is granted no '
+            'reservation and emits no pin_blocked event, and any pin '
+            'reservations left over from before the switch flipped are released '
+            'once, on the next tick (reservation_expired reason '
+            "'pin_reservations_disabled')."
+        ),
+    )
+    pin_reservation_max_active: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            'How many of the lowest-pin_order, eligible, lock-blocked pins may '
+            'hold a pin reservation at once. The default of 1 is the EASY-'
+            'backfill head reservation: one operator-chosen reservation cannot '
+            'gridlock with itself, its idle cost is one footprint, and backfill '
+            'still borrows through it. Raising it moves toward the general '
+            'below-rank-1 park installation that '
+            'plans/scheduler-dispatch-scoring-and-lock-layer-prd.md section 7 '
+            'measured as harmful. ge=1 because pin_reservations_enabled is the '
+            'single off lever.'
+        ),
+    )
+    pin_blocked_emit_interval_secs: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'pin_blocked is emitted when a pinned task becomes blocked, then at '
+            'most once per this many seconds while it stays blocked. A dispatch, '
+            'or the task leaving the pin queue, resets it.'
+        ),
+    )
+
     # Escalation-watcher subprocess supervisor (AFK hardening, task 1326).
     # Keeps a fresh escalation-watcher-auto agent alive across multi-day AFK
     # windows with rotation, exponential backoff, and a crashloop→pause_scheduler
@@ -5839,6 +5879,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'backfill_safety_factor',
         'backfill_min_samples',
         'backfill_max_park_age_secs',
+        # Pin reservations (task 6040).  Explicit literals for the same reason
+        # as the backfill_* group: FLAT top-level fields.  Read from
+        # self.config at tick time, so no reload hook is needed.
+        'pin_reservations_enabled',
+        'pin_reservation_max_active',
+        'pin_blocked_emit_interval_secs',
         # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
         # same reason as the backfill_* group above: these are FLAT top-level
         # fields, not a submodel, so _submodel_leaf_paths does not apply.

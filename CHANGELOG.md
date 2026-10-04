@@ -515,6 +515,66 @@ landed, have since landed under task 3134 (below).
 
 ### Changed
 
+#### Pinned tasks earn a pin reservation; reservation events carry `source`; new `pin_blocked` (task 6040)
+
+**Old behaviour.** A pinned task that failed `try_acquire` was skipped silently. It
+earned no reservation, accrued no skip count and emitted no event. Every module that
+freed up could be taken by whichever task scored next, so a pin on a hot file could
+starve indefinitely. Task 3659 is the replay: pinned, behind a holder on one module and
+a critical fairness park on it, while a medium task took its other module.
+
+**New behaviour.**
+
+- **Pin reservation.** The lowest-`pin_order` pins that are pinned, present, eligible,
+  not landed-outbox gated, not deterministic and lock-blocked are HEADS. At most
+  `pin_reservation_max_active` of them exist. A head reserves its current module set
+  on the ordinary park stacks, at a pin rank band that sits above every priority tier
+  and is ordered by `pin_order`. It installs inline in the pin loop, so a later pin or
+  scored candidate in the same tick cannot take a module the head is waiting for. It
+  shadows any fairness park, critical included, and restores it when used or released.
+  The pin owner's own fairness park on a module stays beneath its pin reservation, so a
+  release by the pin phase leaves that park exactly where it was; an owner whose skip
+  count has reached its tier's threshold also completes, at release, the fairness parks
+  the pin reservation had made redundant. It never preempts a HELD lock. A dispatch
+  consumes it, and EASY-backfill borrows through it as through a fairness park. It is
+  derived state, so the first tick after a restart rebuilds it. A pin still accrues no
+  skip count from the pin loop.
+- **`data.source` on every `reservation_*` event**: `'pin'` or `'fairness'`, derived
+  from the park's rank. `reserve_now` parks read `'fairness'`. This is the only new key
+  on `reservation_used`, `reservation_restored`, `reservation_expired`,
+  `reservation_force_evicted` and `reservation_force_evict_refused`. Pin-sourced
+  `reservation_installed`, `reservation_shadowed` and `reservation_install_blocked`
+  carry `pin_order` IN PLACE OF the tier fields `priority` / `preempted_by_priority`:
+  a pin rank lies above every tier, so the owner's tier would misdescribe it. On
+  `reservation_restored`, `source` is that of the restored entries themselves.
+- **New `reservation_expired` reasons** for releases decided in the pin phase:
+  `unpinned`, `gated`, `ineligible`, `deterministic`, `pin_displaced` (outranked by a
+  lower `pin_order` or past the cap) and `pin_reservations_disabled`. These remove only
+  the owner's pin entries. Terminal, missing and deps-unsatisfied pins are released by
+  park GC with its existing reasons, which remove every park the owner holds.
+- **New `pin_blocked` event**, payload `{task_id, pin_order, head, blockers: [{module,
+  owner, kind: held|parked}]}`. The blockers are read before the head's own
+  reservation installs. It fires when a pin becomes blocked, then at most once per
+  `pin_blocked_emit_interval_secs` while it stays blocked. Dispatching or leaving the
+  pin queue resets it, and a PSI-held tick neither emits nor resets it.
+- **New snapshot key `pin_reservations`**, `{task_id: {modules, installed_at}}`, in
+  `get_state_snapshot()` and `scheduler_state.json` (so `get_scheduler_state` too).
+  `parks` still reports every active top, pin owners included.
+- **Three green-tier knobs**, hot-reloadable and read at tick time:
+  `pin_reservations_enabled` (default `true`), `pin_reservation_max_active` (default
+  `1`, `ge=1`) and `pin_blocked_emit_interval_secs` (default `3600`). The kill switch
+  restores the pre-change pin loop: no reservation, no `pin_blocked`, and leftover pin
+  reservations are released once with reason `pin_reservations_disabled`.
+
+The design rationale is the annotation to
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7 and the module docstring of
+`orchestrator/src/orchestrator/pin_reservation.py`.
+
+**Migration for historical series.** Consumers filtering `reservation_installed` (or any
+`reservation_*` event) should add `json_extract(data, '$.source') = 'fairness'` to keep
+post-change series comparable with pre-change ones. Pre-change rows carry no `source`,
+and all of them are fairness. The change boundary is this task's merge commit.
+
 #### The plan-target drop-guard judges the tip the merge commit merged, not the submitted worktree's HEAD (task 4956)
 
 - **Plan-target drop-guard** — before: the guard took the task's HEAD from the submitted
