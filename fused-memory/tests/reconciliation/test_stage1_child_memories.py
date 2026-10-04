@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from fused_memory.models.reconciliation import Watermark
+from fused_memory.reconciliation.prompts.stage1 import CHILD_MEMORY_AUTHORITY_RULE
 from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
 from reconciliation.consolidator_fixtures import make_consolidator
 
@@ -76,4 +77,20 @@ class TestStage1PayloadRendersChildLinks:
         assert line == f'- [{_PARENT_ID}] (procedural_knowledge): {_PARENT_BODY}', (
             f'A memory without {PARENT_ID_KEY} must keep the pre-existing line format; '
             f'payload:\n{payload}'
+        )
+
+
+class TestStage1PromptChildRule:
+    def test_rendered_prompt_carries_child_rule(self):
+        assert CHILD_MEMORY_AUTHORITY_RULE in make_consolidator().get_system_prompt()
+
+    @pytest.mark.parametrize('kind', sorted(CHILD_KINDS))
+    def test_child_rule_names_every_child_kind(self, kind: str):
+        assert f'`{kind}`' in CHILD_MEMORY_AUTHORITY_RULE, (
+            f'Child rule must name CHILD_KINDS member {kind!r}; rule={CHILD_MEMORY_AUTHORITY_RULE!r}'
+        )
+
+    def test_child_rule_names_the_parent_link_key(self):
+        assert f'`{PARENT_ID_KEY}`' in CHILD_MEMORY_AUTHORITY_RULE, (
+            f'Child rule must name {PARENT_ID_KEY!r}; rule={CHILD_MEMORY_AUTHORITY_RULE!r}'
         )
