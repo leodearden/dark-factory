@@ -189,7 +189,8 @@ CREATE TABLE IF NOT EXISTS backend_ops (
     result_summary TEXT,
     success INTEGER DEFAULT 1,
     error TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    duration_ms REAL  -- backend-call milliseconds; NULL = not measured / predates the column
 );
 CREATE INDEX IF NOT EXISTS idx_bo_write_op ON backend_ops(write_op_id);
 CREATE INDEX IF NOT EXISTS idx_bo_causation ON backend_ops(causation_id);
@@ -462,6 +463,7 @@ class WriteJournal:
         result_summary: dict | str | None = None,
         success: bool = True,
         error: str | None = None,
+        duration_ms: float | None = None,
     ) -> None:
         """Log a Layer 2 backend dispatch. Fire-and-forget — never raises."""
         try:
@@ -469,8 +471,9 @@ class WriteJournal:
                 await db.execute(
                     """INSERT INTO backend_ops
                        (id, write_op_id, causation_id, backend, operation,
-                        payload, result_summary, success, error, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        payload, result_summary, success, error, created_at,
+                        duration_ms)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         str(uuid_mod.uuid4()),
                         write_op_id,
@@ -482,6 +485,7 @@ class WriteJournal:
                         1 if success else 0,
                         error,
                         datetime.now(UTC).isoformat(),
+                        duration_ms,
                     ),
                 )
         except Exception as e:
