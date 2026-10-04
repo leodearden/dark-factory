@@ -1134,6 +1134,7 @@ def campaign(
 
     async def _run() -> int:
         from orchestrator.config import default_price_table, load_config
+        from orchestrator.evals.runner import campaign_usage_gate
 
         from . import campaign as reduce
         from .runner import DIFF_CAP_CHARS, run_trial
@@ -1151,57 +1152,54 @@ def campaign(
         cap = DIFF_CAP_CHARS if diff_cap is None else diff_cap
         prices = default_price_table()
 
-        usage_gate = None
-        if pool:
-            from shared.usage_gate import UsageGate
+        async with campaign_usage_gate(load_config(config_path) if pool else None) as usage_gate:
+            if usage_gate is not None:
+                await usage_gate.check_at_startup()
 
-            usage_gate = UsageGate(load_config(config_path).usage_cap)
-            await usage_gate.check_at_startup()
-
-        click.echo(click.style(
-            f'Campaign: {len(variants)} arms x {len(corpus.diffs)} diffs ({split}) x {trials} trials, '
-            f'diff cap {cap or "lifted"}, pool={"on" if usage_gate else "off"}',
-            bold=True,
-        ))
-        blocking_gt = {d.diff_id: {g.id for g in d.blocking_issues()} for d in corpus.diffs}
-        records: list[dict] = []
-        for trial in range(1, trials + 1):
-            trial_dir = results_dir / f'trial-{trial}'
-            score_dir = trial_dir / 'scores'
-            score_dir.mkdir(parents=True, exist_ok=True)
-            click.echo(f'\n== trial {trial}/{trials}')
-            results = await run_trial(
-                variants, corpus, max_parallel_panels=max_parallel, prices=prices,
-                results_dir=trial_dir, usage_gate=usage_gate, diff_cap_chars=cap,
-            )
-            for result in results:
-                diff = corpus.get_diff(result.diff_id)
-                if diff is None:
-                    continue
-                score_path = score_dir / f'{result.variant_name}__{result.diff_id}.json'
-                if score_path.exists():
-                    rec = json.loads(score_path.read_text())
-                else:
-                    rec = asdict(await score_panel_run(result, diff))
-                    score_path.write_text(json.dumps(rec, indent=2))
-                rec['trial'] = trial
-                records.append(rec)
-                click.echo(
-                    f'  {result.variant_name:22s} x {result.diff_id:<28s} '
-                    f'F1={rec["f1"]:.3f} BR={rec["blocking_recall"]:.3f} ${rec["cost_usd"]:.2f}'
+            click.echo(click.style(
+                f'Campaign: {len(variants)} arms x {len(corpus.diffs)} diffs ({split}) x {trials} trials, '
+                f'diff cap {cap or "lifted"}, pool={"on" if usage_gate else "off"}',
+                bold=True,
+            ))
+            blocking_gt = {d.diff_id: {g.id for g in d.blocking_issues()} for d in corpus.diffs}
+            records: list[dict] = []
+            for trial in range(1, trials + 1):
+                trial_dir = results_dir / f'trial-{trial}'
+                score_dir = trial_dir / 'scores'
+                score_dir.mkdir(parents=True, exist_ok=True)
+                click.echo(f'\n== trial {trial}/{trials}')
+                results = await run_trial(
+                    variants, corpus, max_parallel_panels=max_parallel, prices=prices,
+                    results_dir=trial_dir, usage_gate=usage_gate, diff_cap_chars=cap,
                 )
+                for result in results:
+                    diff = corpus.get_diff(result.diff_id)
+                    if diff is None:
+                        continue
+                    score_path = score_dir / f'{result.variant_name}__{result.diff_id}.json'
+                    if score_path.exists():
+                        rec = json.loads(score_path.read_text())
+                    else:
+                        rec = asdict(await score_panel_run(result, diff))
+                        score_path.write_text(json.dumps(rec, indent=2))
+                    rec['trial'] = trial
+                    records.append(rec)
+                    click.echo(
+                        f'  {result.variant_name:22s} x {result.diff_id:<28s} '
+                        f'F1={rec["f1"]:.3f} BR={rec["blocking_recall"]:.3f} ${rec["cost_usd"]:.2f}'
+                    )
 
-        arms_out, decisions = reduce.summarize_campaign(records, incumbent, blocking_gt)
-        md = reduce.format_markdown(arms_out, decisions)
-        (results_dir / 'campaign_report.md').write_text(md + '\n')
-        (results_dir / 'campaign_report.json').write_text(
-            json.dumps(reduce.to_json(arms_out, decisions), indent=2),
-        )
-        click.echo()
-        click.echo(md)
-        click.echo(f'\nTotal campaign cost (panels + matcher): ${sum(a.total_cost_usd for a in arms_out):.2f}')
-        click.echo(f'Report saved to: {results_dir / "campaign_report.md"}')
-        return 0
+            arms_out, decisions = reduce.summarize_campaign(records, incumbent, blocking_gt)
+            md = reduce.format_markdown(arms_out, decisions)
+            (results_dir / 'campaign_report.md').write_text(md + '\n')
+            (results_dir / 'campaign_report.json').write_text(
+                json.dumps(reduce.to_json(arms_out, decisions), indent=2),
+            )
+            click.echo()
+            click.echo(md)
+            click.echo(f'\nTotal campaign cost (panels + matcher): ${sum(a.total_cost_usd for a in arms_out):.2f}')
+            click.echo(f'Report saved to: {results_dir / "campaign_report.md"}')
+            return 0
 
     try:
         sys.exit(asyncio.run(_run()))
