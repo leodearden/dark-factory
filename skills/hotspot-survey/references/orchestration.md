@@ -139,12 +139,13 @@ if a source is genuinely empty, return an empty themes array and explain in `sum
 Mine the tracker's storage directly (a file read beats N MCP round-trips); the overlay names the source.
 
 ```
-SOURCE: the task database at ${ROOT}/<tracker path> — <shape probed in Phase 0, e.g. "SQLite at
-.taskmaster/tasks/tasks.db. Open it READ-ONLY so you never contend with the live orchestrator:
-sqlite3.connect('file:${ROOT}/.taskmaster/tasks/tasks.db?mode=ro', uri=True). `tasks` columns: tag, id,
-title, description, details, test_strategy, status, priority, metadata, updated_at,
-claimant_run_id, heartbeat_at, candidate_key — `metadata` is a JSON string. There is NO
-`dependencies` column: dependencies are their own table keyed (tag, task_id, depends_on)">.
+SOURCE: the task database at <absolute path of the live store — it lives in the MAIN checkout,
+not a worktree>. If it is SQLite, open it READ-ONLY by that absolute path so you never contend
+with the live orchestrator, percent-encoding the path into the URI:
+sqlite3.connect(pathlib.Path('<absolute path of the live store>').as_uri() + '?mode=ro', uri=True).
+Shape: <the shape you PROBED in Phase 0 step 3 — paste the probe's actual output (the overlay
+names a shape command if the project has one), never a column list remembered or copied from
+this template or an older doc>.
 Method: write a python3 script (run via Bash; temp files under the scratchpad) to extract tasks
 whose title/description/details match fix-flavored patterns (fix, bug, regression, guard, race,
 leak, stale, orphan, crash, wedge, starv, deadlock, retry, fault, FP, false.positive, escalat).

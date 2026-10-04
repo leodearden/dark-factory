@@ -7,7 +7,7 @@ The overlay is free-form markdown covering these slots (omit any that match the 
 | Slot | What it supplies | Generic default |
 |---|---|---|
 | **Memory identity** | fused-memory `project_id`, `agent_id` convention | elicit from user / CLAUDE.md |
-| **Task tracker source** | where fix-task history lives + its shape (e.g. a taskmaster SQLite db at `.taskmaster/tasks/tasks.db` + query recipe — note dependencies sit in their own table, not a column) and whether to mine the store directly or via MCP | probe in Phase 0; skip lane if absent |
+| **Task tracker source** | where fix-task history lives + how to probe its shape: a command that prints it, e.g. dark-factory's `python3 scripts/tasks_db_schema.py`, preferred over a hand-written column list, which drifts — and whether to mine the store directly or via MCP | probe in Phase 0; skip lane if absent |
 | **Output directory** | where survey artifacts land (`plans/` vs `docs/notes/`) and whether they are committed | `plans/`, committed |
 | **Subsystem vocabulary seed** | known subsystem → files mapping to seed Phase 0's cluster list | derive from repo layout + churn |
 | **Fix-commit vocabulary** | project-specific commit markers beyond fix/bug/regression (e.g. dark-factory's `amend:` post-merge patch-ups and `red-main` commits) | the generic grep set |
@@ -24,7 +24,7 @@ Example overlay skeleton:
 # hotspot-survey overlay — <project>
 
 - project_id: `<id>`; agent_id: `claude-interactive`.
-- Task tracker: `<path>` — <shape>. Mine directly with python3, not via MCP round-trips.
+- Task tracker: `<path>` — shape: run `<command>`. Mine directly with python3, not via MCP round-trips.
 - Output: `docs/notes/bug-hotspot-survey-<date>.md` (+ `-full-findings.json`), committed.
 - Fix vocabulary: add `--grep='<project marker>'`.
 - Subsystem seeds: <key> (<files>), ...
