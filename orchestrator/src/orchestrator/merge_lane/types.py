@@ -1534,11 +1534,8 @@ class InflightEntry:
                          them in submission order
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
     status         : optional sentinel.  ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH are
-                     set by _dispatch_item.  DROPPED / REQUEUED are STAMPED ON THE ENTRY by
-                     its verify when it drops the request or gives it back (task 4582):
-                     such an entry is :attr:`vacated` — it has already released its lease
-                     (``lease is None``) and only awaits head-of-line disposal by
-                     _finalize_inflight.
+                     set by _dispatch_item; DROPPED / REQUEUED by the entry's own verify
+                     when it vacates the entry (see :attr:`vacated`, task 4582).
     chain          : the :class:`ChainResult` this dispatch's verify was
                      REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
                      ordinary adjacent-verify path.  Its READER is
@@ -1585,7 +1582,8 @@ class InflightEntry:
 
     @property
     def vacated(self) -> bool:
-        """True once the verify dropped or requeued this entry's request."""
+        """True once the verify dropped or requeued this entry's request and
+        released its lease; only the head-of-line finalize remains."""
         return self.status in (InflightStatus.REQUEUED, InflightStatus.DROPPED)
 
     def __post_init__(self) -> None:
@@ -1601,6 +1599,19 @@ class InflightEntry:
                 f'passthrough_outcome={self.passthrough_outcome!r} on an item of type '
                 f'{type(self.item).__name__}',
             )
+
+
+@dataclass
+class InflightEntrySlot:
+    """The :class:`InflightEntry` wrapping a verify, handed to that verify (task 4582).
+
+    Built empty before the verify task for the reason
+    :class:`VerifyWorktreeHandle` gives, and filled by ``_dispatch_item`` once
+    the entry exists, so a verify that requeues or drops its request vacates
+    its OWN entry.
+    """
+
+    entry: InflightEntry | None = None
 
 
 @dataclass

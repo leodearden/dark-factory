@@ -145,6 +145,7 @@ from orchestrator.merge_lane.types import (
     EscalationRecord,
     GroupMergeRequest,
     InflightEntry,
+    InflightEntrySlot,
     InFlightMergeRegistry,
     InflightStatus,
     InflightVerifyResult,
@@ -4976,6 +4977,30 @@ def _first_copy_per_request(entries: list[dict]) -> tuple[list[dict], list[str]]
     return kept, dropped
 
 
+class _DuplicateRenderLog:
+    """WARNs about a request_id ``snapshot()`` rendered more than once, once
+    per episode: snapshot() runs on every heartbeat and MCP poll, so a
+    duplicate that persists is named when it appears, not on every call
+    (task 4582).
+    """
+
+    def __init__(self) -> None:
+        self._duplicated: frozenset[str] = frozenset()
+
+    def report(self, duplicate_rids: list[str]) -> None:
+        """Record this snapshot's duplicates; WARN about those new since the last."""
+        duplicated = frozenset(duplicate_rids)
+        fresh = sorted(duplicated - self._duplicated)
+        self._duplicated = duplicated
+        if fresh:
+            logger.warning(
+                'snapshot(): request_id(s) %s rendered more than once — a '
+                'pipeline container holds a stale reference to a request '
+                'already rendered at a deeper stage; keeping the head-of-line copy',
+                fresh,
+            )
+
+
 async def coalesce_or_enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,
@@ -9628,6 +9653,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # Default interval ~5 min; override in tests for deterministic rate-limit checks.
         # Mirrors the _shutdown_timeout override precedent.
         self._heartbeat_interval_s: float = 300.0
+        self._duplicate_render_log = _DuplicateRenderLog()
         # Periodic orphaned-_merge-* reap (task 3018 — closes the
         # observe-but-never-reclaim gap: reap_orphaned_merge_worktrees was
         # previously wired only at worker construction/recovery time, so a
@@ -10055,12 +10081,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         pre-dispatch operator halt in :meth:`_dispatch_item`, and — task 3185,
         PRD γ, narrowed by task 3186, PRD δ — the deep-tip verify's two
         NON-ADOPTING exits in :meth:`_run_inflight_verify`: the tip-FAIL exit
-        and (review fix 3) the chain-arm ``except Exception`` exit. The five
-        that live in :meth:`_run_inflight_verify` reach it through
-        :meth:`_requeue_from_verify` (task 4582), which vacates the entry
-        first. The deep-tip pair are the odd ones out in WHY they defer: the
-        other five are all "something went wrong, come back later", while
-        these defer because the
+        and (review fix 3) the chain-arm ``except Exception`` exit. Those last
+        two are the odd ones out in WHY they defer: the other five are all
+        "something went wrong, come back later", while these defer because the
         verdict is about the WRONG TREE. A tip verdict proves the cumulative
         tree, never any individual member's own subset tree — so a red tip
         names no culprit to blame (the fail arm) and an infra error is not a
@@ -10126,50 +10149,54 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._note_requeue(req.request_id, live_obj=req)
 
     async def _vacate_inflight_entry(
-        self, item: RealMergeItem, status: InflightStatus,
+        self, entry_slot: InflightEntrySlot | None, status: InflightStatus,
     ) -> None:
-        """Hand back *item*'s host lease and stamp *status* on its InflightEntry
-        (task 4582), so a verify that drops or requeues its request leaves no
-        corpse occupying a host, the frozen prefix or ``snapshot()``.
+        """Release the host lease of the entry in *entry_slot* and stamp
+        *status* on it (task 4582): a verify that drops or requeues its request
+        leaves no corpse on a host, in the frozen prefix or in ``snapshot()``.
 
-        The entry is found through the registry's live object because the
-        verify task is created BEFORE its entry (see
-        :class:`VerifyWorktreeHandle`), and nothing inside
-        :meth:`_run_inflight_verify` touches the registry before its exits, so
-        ``_live_items[rid]`` is this dispatch's entry right up to here. The
-        ``entry.item is item`` guard keeps an older incarnation of the same
-        request_id from matching.
-
-        The lease is nulled only AFTER the release returns: once the slot is
-        free it can be re-leased, and a later cascade, ``stop()`` drain or
-        finalize acting on the stale lease would cancel a DIFFERENT verify on
-        that host; if the release raises, the lease stays for the canceller.
-
-        No matching entry (a direct-call unit test with nothing registered) is
-        a deliberate no-op: the lease is then released at finalize, as before.
+        A release that raises leaves the entry un-vacated, lease and all, for
+        finalize to release; ``entry_slot is None`` (a direct-call test) leaves
+        it to finalize too.
         """
-        entry = self._live_items.get(item.request.request_id)
-        if not (isinstance(entry, InflightEntry) and entry.item is item):
+        if entry_slot is None:
+            return
+        entry = entry_slot.entry
+        if entry is None:
+            logger.warning(
+                'vacate %s: _dispatch_item never filled the entry slot; the '
+                'lease is left to finalize', status,
+            )
             return
         if entry.lease is not None:
-            await self._cancel_and_release_tracked(entry.lease)
+            try:
+                await self._cancel_and_release_tracked(entry.lease)
+            except Exception:
+                logger.warning(
+                    'vacate %s for %s: lease release failed; the entry stays '
+                    'un-vacated and finalize retries the release',
+                    status, entry.item.request.task_id, exc_info=True,
+                )
+                return
             entry.lease = None
         entry.status = status
 
-    async def _requeue_from_verify(self, item: RealMergeItem) -> None:
-        """Vacate *item*'s entry as REQUEUED, then :meth:`_requeue_request`.
+    async def _requeue_from_verify(
+        self, item: RealMergeItem, entry_slot: InflightEntrySlot | None,
+    ) -> None:
+        """Vacate the entry as REQUEUED, then :meth:`_requeue_request`.
 
-        No await separates the two, so a cancel landing during the lease
-        release skips the requeue: the cancelling caller owns the request, the
-        same convention every requeue arm of :meth:`_run_inflight_verify`
-        already keeps.
+        No await separates the two, so a cancel landing during the release
+        skips the requeue and leaves the request to the canceller.
         """
-        await self._vacate_inflight_entry(item, InflightStatus.REQUEUED)
+        await self._vacate_inflight_entry(entry_slot, InflightStatus.REQUEUED)
         self._requeue_request(item.request)
 
-    async def _drop_from_verify(self, item: RealMergeItem) -> None:
-        """Vacate *item*'s entry as DROPPED, then retire its request_id."""
-        await self._vacate_inflight_entry(item, InflightStatus.DROPPED)
+    async def _drop_from_verify(
+        self, item: RealMergeItem, entry_slot: InflightEntrySlot | None,
+    ) -> None:
+        """Vacate the entry as DROPPED, then retire *item*'s request_id."""
+        await self._vacate_inflight_entry(entry_slot, InflightStatus.DROPPED)
         self._retire_item(item.request.request_id)
 
     # ── task 3204 sweep: two neighbouring candidates, deliberately REJECTED ──
@@ -11594,15 +11621,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # it is deliberately a SEPARATE task, not folded in here.
 
     def _occupying_inflight_entries(self) -> list[InflightEntry]:
-        """The ``_inflight`` entries still occupying the pipeline, in deque
-        order: every entry not :attr:`~InflightEntry.vacated` (task 4582).
-
-        A vacated entry's verify already gave its request back or dropped it
-        and released its lease; the raw deque keeps it only for its
-        head-of-line finalize, which still releases the speculation permit,
-        sets ``_n_failed`` and fires the cascade for successors stacked on its
-        dead merge commit. Rendering and frozen-prefix readers use this;
-        dispatch-control reads keep the raw deque.
+        """The ``_inflight`` entries not :attr:`~InflightEntry.vacated`, in
+        deque order (task 4582) — what rendering and frozen-prefix readers see.
+        Dispatch control keeps the raw deque: a vacated entry's head-of-line
+        finalize still owns its permit, ``_n_failed`` and cascade.
         """
         return [e for e in self._inflight if not e.vacated]
 
@@ -13482,10 +13504,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entries.append(_infl_entry(_fh_entry, 0))
             _excluded_ids.add(_fh_entry.item.request.request_id)
 
-        # 1. In-flight verify entries: iterate the occupying _inflight entries
-        # head-first. They are the sole source of truth for concurrent-verify
-        # state; a vacated entry (task 4582) renders through whichever
-        # container now holds its request instead.
+        # 1. In-flight verify entries: iterate the occupying (non-vacated,
+        # task 4582) _inflight entries head-first; they are the sole source of
+        # truth for concurrent-verify state.
         # The vestigial single-host _verify_item/_verify_phase fields (set but
         # never cleared after γ, causing a stale phantom entry) were deleted by
         # task λ (2173) — that phantom-entry class is now structurally
@@ -13597,13 +13618,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entries.append(_entry(req, 'queued', worktree_path=None, position=len(entries)))
 
         entries, _duplicate_rids = _first_copy_per_request(entries)
-        if _duplicate_rids:
-            logger.warning(
-                'snapshot(): request_id(s) %s rendered more than once — a '
-                'pipeline container holds a stale reference to a request '
-                'already rendered at a deeper stage; keeping the head-of-line copy',
-                _duplicate_rids,
-            )
+        self._duplicate_render_log.report(_duplicate_rids)
 
         # verify_in_progress: non-None only when the deque head is actively
         # verifying or in a post-verify gate phase.  Passthrough entries
@@ -17928,6 +17943,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         chain_items: int = 1,
         chain: ChainResult | None = None,
         verify_wt: VerifyWorktreeHandle | None = None,
+        entry_slot: InflightEntrySlot | None = None,
     ) -> InflightVerifyResult:
         """Run the verify portion for one in-flight item.
 
@@ -18054,6 +18070,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
             ``None`` (default) is every existing caller and is byte-identical
             to pre-γ dispatch.
+        entry_slot: This dispatch's own InflightEntry, which every requeue or
+            drop exit vacates (:meth:`_vacate_inflight_entry`, task 4582).
+            ``None`` (default) leaves the lease to finalize.
         """
         req = item.request
         # ── task 3185 (PRD γ): THE DEEP-CHAIN REDIRECT ──────────────────────
@@ -18448,11 +18467,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # leaving it to `_finalize_inflight`'s sentinel chokepoint
                     # alone would make that chokepoint the SOLE owner, so any
                     # future path consuming this result without finalizing would
-                    # silently strand a phantom finalize head. `_drop_from_verify`
-                    # hands the lease back and stamps the entry DROPPED before it
-                    # retires (task 4582); `_retire_item` is idempotent, so the
-                    # chokepoint call stays valid as defence in depth.
-                    await self._drop_from_verify(item)
+                    # silently strand a phantom finalize head. `_retire_item` is
+                    # idempotent, so the chokepoint call stays valid as defence
+                    # in depth (symmetric with the REQUEUED branches below).
+                    await self._drop_from_verify(item, entry_slot)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -18469,7 +18487,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     )
                     await self._teardown_verify_task(lease, verify_task, req.task_id)
                     await _dispose_verify_worktree()
-                    await self._requeue_from_verify(item)
+                    await self._requeue_from_verify(item, entry_slot)
                     # task 3003 amend (robustness): an operator-halt requeue is
                     # NOT a contended-lane defer — a verify was running, so the
                     # lane lock had been acquired.  Close any open streak so its
@@ -18628,7 +18646,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # the REGISTRY. The recipe — and why each of its three
                     # effects is load-bearing — now lives in
                     # `_requeue_request`'s docstring.
-                    await self._requeue_from_verify(item)
+                    await self._requeue_from_verify(item, entry_slot)
                     return InflightVerifyResult(
                         outcome=None,
                         merge_wt=None,
@@ -18943,7 +18961,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             _backoff = max(0.0, self.CONTENDED_LEASE_DEFER_MIN_PERIOD_SECS - _waited)
             if _backoff:
                 await self._clock.sleep(_backoff)
-            await self._requeue_from_verify(item)
+            await self._requeue_from_verify(item, entry_slot)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=None,
@@ -19034,7 +19052,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     'will verify its own subset tree un-chained',
                     req.task_id, merge_commit[:8], exc,
                 )
-                await self._requeue_from_verify(item)
+                await self._requeue_from_verify(item, entry_slot)
                 return InflightVerifyResult(
                     outcome=None,
                     merge_wt=None,
@@ -19331,7 +19349,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # THE chokepoint, not a bare put_nowait: all three of its effects
             # are load-bearing here exactly as they are at the operator-halt
             # and dead-verify defers it already serves (see its docstring).
-            await self._requeue_from_verify(item)
+            await self._requeue_from_verify(item, entry_slot)
             return InflightVerifyResult(
                 outcome=None,
                 merge_wt=None,
@@ -20064,23 +20082,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         read LANE_BUFFERED/MERGING/AWAITING_VERIFY by the time we resume. Both
         would route an illegal edge into :meth:`_note_transition` and re-fire
         the very ``merge_lifecycle_transition_rejected`` escalation this fix
-        retires. The repair is defence in depth ONLY for a NON-vacated entry,
-        i.e. a requeue site that bypassed :meth:`_requeue_from_verify` and
-        forgot the call — NOT a substitute for per-branch symmetry, which every
-        requeue site still owns and which is pinned by the
-        on_requeued/_note_requeue pairing tests in
-        test_merge_queue_lifecycle_registry.py. A vacated entry's requeue site
-        already ran the full recipe, so its request_id's registry state belongs
-        to whatever incarnation re-entered since, and a VERIFYING read there is
-        the RE-DISPATCHED verify: bouncing it would strand a live verify as
-        'queued' (task 4582).
+        retires. Defence in depth for a future requeue site that forgets the
+        call — NOT a substitute for per-branch symmetry, which every requeue
+        site still owns and which is pinned by the on_requeued/_note_requeue
+        pairing tests in test_merge_queue_lifecycle_registry.py. A vacated
+        entry is skipped: its VERIFYING is a re-dispatch's (task 4582).
           PASS          — vr.outcome is None (or verify_task=None for compat shim):
                           CAS advance_main loop.
 
         Lease release and speculation-slot release happen in the single finally:
-          · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED; a
-                                    vacated entry arrives with lease None and
-                                    the ``entry.lease is not None`` guard skips it)
+          · _cancel_release=True  → cancel_and_release  (DROPPED/REQUEUED,
+                                    unless vacated: lease is None)
           · _cancel_release=False → release              (FAIL/PASS)
           · _skip_release=True    → no allocator call    (PASSTHROUGH: lease is None)
         _n_failed is carried in _n_failed_val (None → defer to 'not advanced').
@@ -21550,14 +21562,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # exist yet (it wraps the task, below).  Seeded with the item's own
         # ephemeral so a round that never warm-swaps still publishes the truth.
         verify_wt = VerifyWorktreeHandle(merge_wt=item.merge_wt, spec_warm=False)
+        entry_slot = InflightEntrySlot()
         verify_task: asyncio.Task = asyncio.ensure_future(  # type: ignore[type-arg]
             self._run_inflight_verify(
                 item, lease, depth=depth, probe_base=probe_base,
                 chain_items=chain_items, chain=chain, verify_wt=verify_wt,
+                entry_slot=entry_slot,
             )
         )
 
-        return InflightEntry(
+        entry = InflightEntry(
             item=item,
             lease=lease,
             verify_task=verify_task,
@@ -21574,6 +21588,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             chain=chain,
             verify_wt=verify_wt,
         )
+        entry_slot.entry = entry
+        return entry
 
 
 # ── MQ-invariants iota (task 1994): resource-audit escalation ───────────────

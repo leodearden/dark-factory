@@ -1831,6 +1831,60 @@
           "current": 31841
         }
       ]
+    },
+    {
+      "task_id": "4582",
+      "reason": "Amendment pass on task 4582's review: the verify now receives its own InflightEntry through a threaded InflightEntrySlot instead of a _live_items lookup (types.py lines), the vacate's lease release is guarded so a failed release still requeues and leaves the lease to finalize, an unfilled slot is logged rather than silently skipped (worker cognitive/lines), and the new failed-release scene finalizes its entry through _finalize_inflight (one test private read).",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2150,
+          "current": 2152
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_vacate_inflight_entry",
+          "baseline": 3,
+          "current": 5
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1709,
+          "current": 1720
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21797,
+          "current": 21813
+        },
+        {
+          "measure": "private_reads",
+          "key": "orchestrator/tests/test_merge_queue_lifecycle_registry.py",
+          "baseline": 179,
+          "current": 180
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 916,
+          "current": 921
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4782,
+          "current": 4784
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56949,
+          "current": 56976
+        }
+      ]
     }
   ]
 }

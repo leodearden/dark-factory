@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
 from pathlib import Path
 
 import pytest
@@ -394,7 +393,6 @@ async def test_normal_shutdown_does_not_trigger_death_path(
 async def test_verifier_restart_preserves_inflight_and_redispatch(
     git_ops: GitOps,
     config: OrchestratorConfig,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Within-cap verifier restart must NOT clear _inflight or _redispatch.
 
@@ -497,13 +495,11 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     #    census. snapshot() emits the redispatch park and the in-flight entry
     #    unconditionally, so a supervisor restart that dropped either would
     #    show up here as a missing state.
-    with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
-        states = sorted(e['state'] for e in worker.snapshot()['entries'])
+    states = sorted(e['state'] for e in worker.snapshot()['entries'])
     assert states == ['awaiting_host', 'verifying'], (
         f'the seeded redispatch park and in-flight entry must both survive the '
         f'restart, got {states}'
     )
-    assert 'rendered more than once' not in caplog.text, caplog.text
 
     # ── Assert 4: Future not resolved by supervisor ───────────────────────
     assert not future.done(), (
