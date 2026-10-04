@@ -504,8 +504,7 @@ class TestTheBacklogEscape:
 
         queue = EscalationQueue(tmp_path / 'data' / 'escalations')
         (record,) = queue.get_by_task(BACKLOG_ANCHOR, status='pending')
-        assert 'dark_factory' in record.detail
-        assert 'reify' in record.detail
+        assert 'projects: ["dark_factory"]' in record.detail
         assert 'pending: 60' in record.detail
         assert first.counts.escaped == ({'anchor': BACKLOG_ANCHOR, 'escalation_id': record.id},)
         assert second.counts.escaped == ({'anchor': BACKLOG_ANCHOR, 'escalation_id': record.id},)
