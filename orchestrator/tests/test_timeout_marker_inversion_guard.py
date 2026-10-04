@@ -2559,19 +2559,6 @@ _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     # test_marker_registration_drift.py -- 2 sites at 120s
     ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_every_marker_applied_under_tests_is_registered'),
     ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_the_sweep_is_not_vacuous'),
-    # test_merge_queue_build_chain.py -- 7 sites at 180s
-    ('test_merge_queue_build_chain.py', 'TestMergeBranchIntoWorktree'),
-    ('test_merge_queue_build_chain.py', 'TestChainBuildLane'),
-    ('test_merge_queue_build_chain.py', 'TestChainSnapshot'),
-    ('test_merge_queue_build_chain.py', 'TestBuildChainDegenerate'),
-    ('test_merge_queue_build_chain.py', 'TestBuildChainClean'),
-    ('test_merge_queue_build_chain.py', 'TestBuildChainTruncation'),
-    ('test_merge_queue_build_chain.py', 'TestMergeBranchIntoWorktreeRevParseGuard'),
-    # test_merge_queue_deep_dispatch.py -- 4 sites at 180s
-    ('test_merge_queue_deep_dispatch.py', 'TestDeepChainPlacementBuild'),
-    ('test_merge_queue_deep_dispatch.py', 'TestRunInflightVerifyChainRedirect'),
-    ('test_merge_queue_deep_dispatch.py', 'TestDeepTipVerifyNeverAdopts'),
-    ('test_merge_queue_deep_dispatch.py', 'TestDeepDispatchRoundsIntegration'),
     # test_merge_queue_request_liveness.py -- 1 site at 180s
     ('test_merge_queue_request_liveness.py', 'TestDeadVerifyAbortSelfHealsEndToEnd'),
     # test_merge_queue_restart_hook.py -- 1 site at 180s
