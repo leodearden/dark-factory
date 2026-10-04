@@ -17,6 +17,8 @@ Provides:
                          or None.
 - compute_content_fingerprint() — deterministic sha256-based fingerprint
                                    keyed on finding identity for recon dedup.
+- file_or_fold_l1() — files one L1 record about a subject, or folds it into
+                      the pending parent with the same content fingerprint.
 - content_fingerprint_key() / gate_backlog_fingerprint_key() — key adapters.
                   The latter additionally recomputes the identity of a
                   gate-backlog record filed before the fingerprint stamp
@@ -51,6 +53,7 @@ __all__ = [
     'attach_or_submit',
     'compute_content_fingerprint',
     'content_fingerprint_key',
+    'file_or_fold_l1',
     'find_dedupe_parent',
     'gate_backlog_fingerprint_key',
     'resolve_dedupe_parent',
@@ -75,6 +78,7 @@ from shared.timestamps import parse_timestamp_or_warn
 # root-cause matching.  Both call sites in this module pin punctuation='strip'
 # (the legacy, deletion-flavoured policy); see _normalize_description.
 from escalation.canonical import canonical_text
+from escalation.models import Escalation
 
 # observed_submit_response lives next to the record it re-reads (queue), not
 # here — this module owns fold logic only.  Re-exported by neither module's
@@ -82,7 +86,6 @@ from escalation.canonical import canonical_text
 from escalation.queue import observed_submit_response
 
 if TYPE_CHECKING:
-    from escalation.models import Escalation
     from escalation.queue import EscalationQueue
 
 # Type alias for injectable key functions.  A key function maps an Escalation
@@ -674,6 +677,86 @@ def submit_or_dedupe(
     *now* is forwarded to ``find_dedupe_parent`` for deterministic testing.
     """
     return attach_or_submit(queue, esc, resolve_dedupe_parent(queue, esc, config, now=now))
+
+
+def file_or_fold_l1(
+    queue: EscalationQueue,
+    *,
+    project_id: str,
+    subject: str,
+    category: str,
+    finding_category: str,
+    agent_role: str,
+    summary: str,
+    detail: str,
+    log: logging.Logger,
+    log_label: str,
+) -> bool:
+    """File one L1 ``blocking`` record about *subject*, or fold it into its pending parent.
+
+    *subject* occupies ``task_id``, which is what ``get_by_task`` reads the
+    record back by.  The fold key is the ``(category, finding_category,
+    project_id:subject)`` content fingerprint, never a count or run_id that
+    drifts per filing, under ``DedupeConfig.for_content_fingerprint(category)``
+    — so a condition recurring for days keeps ONE pending record and raises
+    its ``dedupe_count``.
+
+    Returns True iff a NEW record was minted; a fold returns False.
+
+    Best-effort: any failure (fingerprint, id-gen, construction, submit or
+    fold) is logged WARNING and returns False, never raises.  Every line is
+    logged on the caller's *log* under *log_label*, so it stays attributed to
+    the filer an operator greps.
+    """
+    try:
+        fingerprint = compute_content_fingerprint(
+            category, finding_category, [f'{project_id}:{subject}'],
+        )
+        # Fail closed: find_dedupe_parent short-circuits on a falsy key, so
+        # the record would silently never fold.
+        if not fingerprint:
+            raise ValueError(
+                f'empty dedupe_fingerprint for {finding_category} subject={subject}'
+            )
+        esc = Escalation(
+            id=queue.make_id(subject),
+            task_id=subject,
+            agent_role=agent_role,
+            severity='blocking',
+            category=category,
+            summary=summary,
+            detail=detail,
+            level=1,
+            dedupe_fingerprint=fingerprint,
+        )
+        outcome = submit_or_dedupe(queue, esc, DedupeConfig.for_content_fingerprint(category))
+    except Exception as exc:
+        log.warning(
+            '%s (%s): failed to escalate subject=%s '
+            '(fingerprint, id-gen, construction, submit, or fold): %s',
+            log_label,
+            finding_category,
+            subject,
+            exc,
+            extra={'project_id': project_id},
+        )
+        return False
+
+    if outcome.get('status') == 'dedup_skipped':
+        log.info(
+            '%s (%s): subject=%s folded into parent_id=%s (child_id=%s) '
+            '— the condition is recurring',
+            log_label,
+            finding_category,
+            subject,
+            outcome.get('parent_id'),
+            outcome.get('child_id'),
+            extra={'project_id': project_id},
+        )
+        return False
+    # != rather than == 'queued': observed_submit_response's auto-resolved
+    # branch still minted a record.
+    return True
 
 
 # WHY THE READ HOPS, AND WHY THE WRITE BESIDE IT DOES NOT.  This is the single
