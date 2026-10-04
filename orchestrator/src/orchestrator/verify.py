@@ -9756,10 +9756,10 @@ class _RerunPolicy:
     isolation", NOT one set of tuning constants. The two gates differ in six
     genuine, deliberately-calibrated ways — re-run engine, timeout constant,
     log label, success log level, the other-leg precondition, and the
-    worker-death refusal — and every one of those is pinned by an existing
-    assertion. Capturing them as a ``call_site -> policy`` table gives exactly
-    ONE body to drift from while keeping each site's calibration independent
-    and visible in one place.
+    partially-measured-session refusal — and every one of those is pinned by
+    an existing assertion. Capturing them as a ``call_site -> policy`` table
+    gives exactly ONE body to drift from while keeping each site's calibration
+    independent and visible in one place.
 
     Shape note (operator ruling 2026-08-12, task-3786 suggestion): the
     verbatim-log-preservation fields are deliberate while only two call
@@ -9779,11 +9779,13 @@ class _RerunPolicy:
     #: gate before any work (main_probe only — see the discriminator's
     #: docstring for why it must NOT apply to the merge gate).
     requires_clean_other_legs: bool
-    #: Whether a failing session showing an xdist worker death is
-    #: ``unconfirmable('session_truncated')`` before any re-run (merge_gate
-    #: only — see the precondition block in confirm_isolated_rerun_verdict for
-    #: why it must NOT apply to the main probe).
-    refuses_worker_death_sessions: bool
+    #: Whether a failing session that left tests unmeasured is
+    #: ``unconfirmable`` before any re-run: a failing leg stopped before its
+    #: own verdict (task 6247), or an xdist worker death (task 5492). See
+    #: ``_unmeasured_session_reason``; merge_gate only — the precondition block
+    #: in confirm_isolated_rerun_verdict says why it must NOT apply to the
+    #: main probe.
+    refuses_partially_measured_sessions: bool
     #: Verdict-vocabulary tail of the "mapping yielded nothing usable" line;
     #: the caller's alone (the shared helper only knows 'unconfirmable').
     unmapped_log_tail: str
@@ -10025,6 +10027,32 @@ def _psi_cpu_some10_or_none() -> float | None:
     return sample.cpu_some10 if sample.read_ok else None
 
 
+#: The categories verify_classify.py::classify_failure assigns from a STOP
+#: signal — our wall clock (guard 2) or an external one (guard 2.5) — before
+#: reading any output, so such a leg never reached its own exit verdict. Why
+#: that refuses suppression: test_flake_discriminator.py::TestStoppedLegIsUnconfirmable.
+_STOPPED_LEG_CATEGORIES: frozenset[FailureCategory] = frozenset({
+    FailureCategory.INFRA_TIMEOUT, FailureCategory.INFRA_KILL,
+})
+
+
+def _unmeasured_session_reason(failing_result: VerifyResult) -> str | None:
+    """Why the failing session left tests that no isolated re-run of its named
+    failures can vouch for, or ``None`` when it did not.
+
+    Reads EVERY failing leg's category: the aggregated list carries no leg
+    identity, and a stopped lint leg that printed nothing leaves
+    ``lint_output`` empty.
+    """
+    recorded = failing_result.failing_leg_categories
+    stopped = next((c for c in recorded or () if c in _STOPPED_LEG_CATEGORIES), None)
+    if stopped is not None:
+        return f'leg_without_verdict:{stopped}'
+    if _shows_xdist_worker_death(failing_result.test_output):
+        return 'session_truncated'
+    return None
+
+
 def _unconfirmable_rerun_reason(observation: _RerunObservation) -> str:
     """Name WHY an isolated re-run produced no verdict, for the ledger row.
 
@@ -10127,10 +10155,12 @@ async def confirm_isolated_rerun_verdict(
     ``type_check_command`` nulled, so only the named tests run, serially,
     without pyproject ``addopts`` or its 60s per-test default.
 
-    At the merge gate (``policy.refuses_worker_death_sessions``) no re-run is
-    attempted when the failing session shows an xdist worker death: that is
-    ``unconfirmable('session_truncated')`` (task 5492), because the death
-    abandoned tests no re-run of the named ones can vouch for.
+    At the merge gate (``policy.refuses_partially_measured_sessions``) no
+    re-run is attempted when the failing session left tests unmeasured: a
+    failing leg stopped before its own verdict is
+    ``unconfirmable('leg_without_verdict:<category>')`` (task 6247), and an
+    xdist worker death is ``unconfirmable('session_truncated')`` (task 5492),
+    because no re-run of the named tests can vouch for the ones never judged.
 
     That command is one WE BUILD, which is why pytest REJECTING it
     (``FailureCategory.PYTEST_USAGE_ERROR``) is ``unconfirmable`` rather than
@@ -10234,26 +10264,29 @@ async def confirm_isolated_rerun_verdict(
             )
 
         node_ids = _extract_failing_test_ids(failing_result.test_output)
-        # PRECONDITION, merge_gate only: a worker death means the named
-        # failures are not the only unmeasured tests. At the merge gate a
-        # passes_in_isolation LANDS the tree, and no re-run of the named ids
-        # can speak for the remainder the death abandoned (INV-1). At the main
-        # probe the same verdict only downgrades "main is broken" to "task-own
-        # red", so nothing lands; refusing there would declare main broken on
-        # no evidence, and task 3597's ground truth (esc-3514-2) is an aborted
-        # xdist run. The ids are still named so the ledger counts the victim.
-        if policy.refuses_worker_death_sessions and _shows_xdist_worker_death(
-            failing_result.test_output,
-        ):
+        # PRECONDITION, merge_gate only: a stopped leg or a worker death means
+        # the named failures are not the only unmeasured tests. At the merge
+        # gate a passes_in_isolation LANDS the tree, and no re-run of the named
+        # ids can speak for the tests left without a verdict (INV-1). At the
+        # main probe the same verdict only downgrades "main is broken" to
+        # "task-own red", so nothing lands; refusing there would declare main
+        # broken on no evidence, and task 3597's ground truth (esc-3514-2) is
+        # an aborted xdist run. The ids are still named so the ledger counts
+        # them.
+        unmeasured_reason = (
+            _unmeasured_session_reason(failing_result)
+            if policy.refuses_partially_measured_sessions else None
+        )
+        if unmeasured_reason is not None:
             logger.info(
-                '%s: failing session shows an xdist worker death — '
-                'unconfirmable (session_truncated), not re-running %s',
-                policy.log_label, node_ids[:10],
+                '%s: failing session left tests unmeasured (%s) — '
+                'unconfirmable, not re-running %s',
+                policy.log_label, unmeasured_reason, node_ids[:10],
             )
             return _observe(
                 FlakeVerdict.unconfirmable, node_ids,
                 call_site=coerced_site, runner=runner,
-                reason='session_truncated', now=now,
+                reason=unmeasured_reason, now=now,
             )
         if not node_ids:
             # We examined NOTHING — an opaque/lint/type-only failure names no
@@ -10394,7 +10427,7 @@ _CALL_SITE_POLICY: dict[FlakeCallSite, _RerunPolicy] = {
         log_label='confirm_merge_verify_flake_suppressible',
         timeout_secs=_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS,
         requires_clean_other_legs=False,
-        refuses_worker_death_sessions=True,
+        refuses_partially_measured_sessions=True,
         unmapped_log_tail='not suppressing',
         error_log_tail='failing closed to red',
         engine=_merge_gate_isolated_rerun,
@@ -10407,8 +10440,9 @@ _CALL_SITE_POLICY: dict[FlakeCallSite, _RerunPolicy] = {
         # See the precondition block in confirm_isolated_rerun_verdict for why
         # this is main_probe's alone.
         requires_clean_other_legs=True,
-        # See the worker-death precondition block for why this is False here.
-        refuses_worker_death_sessions=False,
+        # See the partially-measured-session precondition block for why this
+        # is False here.
+        refuses_partially_measured_sessions=False,
         unmapped_log_tail='keeping the preexisting verdict',
         error_log_tail='keeping the preexisting verdict',
         # The BOUNDED _SWEEP_CONFIRM_MAX_ATTEMPTS loop, which passes only
@@ -10460,7 +10494,9 @@ async def confirm_merge_verify_flake_suppressible(
     (we could not tell — no recoverable node-id from an opaque/lint/type
     failure; a node-id mapping to no given subproject; an infra-sentinel re-run
     category, which is never trusted as confirmation; a session an xdist worker
-    death truncated, ``session_truncated``) are different facts, and
+    death truncated, ``session_truncated``; a session with a failing leg
+    stopped before its own verdict, ``leg_without_verdict:<category>``) are
+    different facts, and
     θ's class-1 health check is an unconfirmable RATE that cannot be computed
     from a ``None``. The caller — ``apply_merge_flake_suppression`` — still
     suppresses on ``passes_in_isolation`` alone, so the GATE's behaviour is
