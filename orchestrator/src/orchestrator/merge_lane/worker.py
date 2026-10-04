@@ -2909,7 +2909,11 @@ async def _run_post_merge_verify(
             # enospc_retries/max_enospc budget so an unrelated prior ENOSPC event
             # can never starve it.  A non-narrowed retry (flag off, or a payload
             # that could not be built/corroborated) keeps sharing the legacy
-            # budget, byte-identical to before task 2835.
+            # budget: at most `max_enospc` full re-verifies, which matches the
+            # pre-2835 single retry only at max_enospc == 1.  reverify_member_solo
+            # never sets retry_failed_only, so it always lands here; its budget
+            # is pinned by
+            # orchestrator/tests/test_merge_queue_train_attribution.py::TestReverifyMemberSoloContract::test_persistent_infra_transient_red_earns_one_full_retry
             retries, budget = (
                 (narrowed_retries, max_narrowed) if narrowed else (enospc_retries, max_enospc)
             )
@@ -5460,13 +5464,18 @@ async def reverify_member_solo(
     task_files: list[str] | None,
     module_configs: list[ModuleConfig],
     event_store: EventStore | None = None,
+    verifier: VerifyPort = PRODUCTION_VERIFIER,
 ) -> SoloVerifyResult:
     """Run post-merge verification on a single train member's un-stacked solo branch.
 
     Wraps :func:`_run_post_merge_verify` (which provides disk-guard, ENOSPC
     prune-retry, and timeout loop-breaker semantics) but does NOT advance main.
     Fresh per-call ``timeouts`` / ``enospc_retries`` dicts are used so solo
-    attempts do not count against the tip's existing timeout budgets.
+    attempts do not count against the tip's existing timeout budgets.  The
+    limits are the worker's own (``SpeculativeMergeWorker``'s
+    ``MAX_POST_MERGE_VERIFY_TIMEOUTS`` / ``MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES``),
+    so an infra-transient or ENOSPC red earns a member the same retry budget
+    as a worker merge.
 
     Returns a :class:`SoloVerifyResult`:
       - ``passed=True``  when ``_run_post_merge_verify`` returns ``None``.
@@ -5491,6 +5500,8 @@ async def reverify_member_solo(
         task_files:     Task-scoped files list for scoped verify (may be None).
         module_configs: Module-level configs for multi-module projects.
         event_store:    Optional EventStore for telemetry (may be None).
+        verifier:       Forwarded to :func:`_run_post_merge_verify`; tests
+                        inject a fake through it.
 
     Returns:
         :class:`SoloVerifyResult` with passed/failed verdict and reason.
@@ -5510,10 +5521,11 @@ async def reverify_member_solo(
         git_ops, req, solo_wt,
         timeouts={},
         enospc_retries={},
-        max_timeouts=3,
-        max_enospc=3,
+        max_timeouts=SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
+        max_enospc=SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
         event_store=event_store,
         merge_sha=tip_sha,
+        verifier=verifier,
     )
     if outcome is None:
         # Pass: hand off the live worktree+branch to _attribute_train_failure.
