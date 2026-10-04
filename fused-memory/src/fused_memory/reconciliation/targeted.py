@@ -698,12 +698,10 @@ class TargetedReconciler:
         #      re-evaluates lingering withheld episodes independent of search
         #      recall. Acceptable for this task's scope; flagged as a follow-up.
         #
-        #      `anchor_topics=False` (task 4656): the window is post-filtered on
-        #      metadata['planned'] below, and topic-anchored canonicals never carry
-        #      it, so a pin would spend up to _MAX_ANCHOR_TOPICS of the 10 slots on
-        #      records discarded by that filter and evict genuine planned hits —
-        #      worsening the recall limitation above. Same bounded-window +
-        #      post-filter shape as reconciliation/mem0_dedup.py::find_prior_memory.
+        #      `anchor_topics=False` (task 4656): this window is a post-filtered
+        #      candidate set and a topic pin promotes rather than adds, so it can
+        #      only evict a genuine planned hit — worsening the recall limitation
+        #      above. Policy: services/memory_service.py::MemoryService.search.
         if self.planned_episode_registry is not None:
             try:
                 planned_related = await self.memory.search(

@@ -713,10 +713,10 @@ class TestPlannedEpisodePromotion:
     async def test_planned_search_opts_out_of_topic_anchoring(
         self, reconciler_with_registry, mock_memory_service
     ):
-        """REGRESSION GUARD (task 4656): the include_planned window is post-filtered
-        on metadata['planned'], which a pinned canonical never carries, so the pin
-        could only evict genuine planned hits. The opt-out must be explicit; the
-        service-side default is True."""
+        """REGRESSION GUARD (task 4656): the include_planned window is a
+        post-filtered candidate set and a topic pin promotes rather than adds, so
+        it could only evict genuine planned hits. The opt-out must be explicit;
+        the service-side default is True."""
         mock_memory_service.search = AsyncMock(return_value=[])
 
         await reconciler_with_registry.reconcile_task(
