@@ -371,12 +371,15 @@ async def test_run_once_snapshots_head_at_run_start_and_invokes_seam(tmp_path: P
 
 # ---------------------------------------------------------------------------
 # run() — coalescing loop core (step-7/8)
+#
+# The run() loop tests race the worker's poll/backoff timers against a wedge
+# deadline, so each runs its scenario on shared.testing_virtual_clock's loop
+# clock, where a host stall cannot expire the deadline.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
+def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path) -> None:
     """Multiple dirty-sets during one run collapse into exactly one re-run.
 
     Drives worker.run() as a real background task; the suite_runner
@@ -386,53 +389,57 @@ async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
 
     Step 7 (RED): run() is a NotImplementedError stub — must fail before impl.
     """
-    heads = ['HEAD1', 'HEAD2']
-    head_calls = {'n': 0}
 
-    async def _fake_get_main_sha() -> str:
-        idx = min(head_calls['n'], len(heads) - 1)
-        head_calls['n'] += 1
-        return heads[idx]
+    async def scenario() -> None:
+        heads = ['HEAD1', 'HEAD2']
+        head_calls = {'n': 0}
 
-    git_ops = MagicMock()
-    git_ops.get_main_sha = AsyncMock(side_effect=_fake_get_main_sha)
-    git_ops.reset_persistent_offline_deep_worktree = AsyncMock(
-        return_value=tmp_path / '_offline-deep'
-    )
+        async def _fake_get_main_sha() -> str:
+            idx = min(head_calls['n'], len(heads) - 1)
+            head_calls['n'] += 1
+            return heads[idx]
 
-    run_count = {'n': 0}
-    done = asyncio.Event()
+        git_ops = MagicMock()
+        git_ops.get_main_sha = AsyncMock(side_effect=_fake_get_main_sha)
+        git_ops.reset_persistent_offline_deep_worktree = AsyncMock(
+            return_value=tmp_path / '_offline-deep'
+        )
 
-    async def _suite_runner(wt, head, threads):
-        run_count['n'] += 1
-        if run_count['n'] == 1:
-            # Multiple advances landing mid-run must collapse into exactly
-            # ONE coalesced re-run afterwards, not two.
-            worker._dirty = True
-            worker._wake.set()
-            worker._dirty = True
-            worker._wake.set()
-        else:
-            done.set()
-        return (0, '')
+        run_count = {'n': 0}
+        done = asyncio.Event()
 
-    # Large poll interval so the poll backstop (not yet implemented at this
-    # step) cannot fire and interfere with this test.
-    config = _make_config(tmp_path, offline_lane_poll_interval_secs=120.0)
-    worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=_suite_runner)
-    worker._dirty = True  # initial trigger already queued
+        async def _suite_runner(wt, head, threads):
+            run_count['n'] += 1
+            if run_count['n'] == 1:
+                # Multiple advances landing mid-run must collapse into exactly
+                # ONE coalesced re-run afterwards, not two.
+                worker._dirty = True
+                worker._wake.set()
+                worker._dirty = True
+                worker._wake.set()
+            else:
+                done.set()
+            return (0, '')
 
-    task = asyncio.create_task(worker.run())
-    try:
-        await asyncio.wait_for(done.wait(), timeout=5)
-    finally:
-        task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
+        # Large poll interval so the poll backstop (not yet implemented at this
+        # step) cannot fire and interfere with this test.
+        config = _make_config(tmp_path, offline_lane_poll_interval_secs=120.0)
+        worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=_suite_runner)
+        worker._dirty = True  # initial trigger already queued
 
-    assert run_count['n'] == 2, 'exactly one coalesced re-run — never a third'
-    assert head_calls['n'] == 2
-    git_ops.reset_persistent_offline_deep_worktree.assert_any_call('HEAD2')
+        task = asyncio.create_task(worker.run())
+        try:
+            await asyncio.wait_for(done.wait(), timeout=5)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert run_count['n'] == 2, 'exactly one coalesced re-run — never a third'
+        assert head_calls['n'] == 2
+        git_ops.reset_persistent_offline_deep_worktree.assert_any_call('HEAD2')
+
+    run_on_virtual_clock(scenario())
 
 
 # ---------------------------------------------------------------------------
@@ -440,9 +447,8 @@ async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
+def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path) -> None:
     """A missed trigger is caught by a periodic get_main_sha poll.
 
     With ``_dirty`` False and the wake event never set (on_post_merge was
@@ -457,60 +463,64 @@ async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
     bounded ``wait_for`` below turns that hang into a clean failure rather
     than a slow pytest-timeout kill. Must fail before impl.
     """
-    poll_interval = 0.05
 
-    # -- Scenario A: get_main_sha diverges from _last_run_head -> backstop runs.
-    git_ops_a = _make_git_ops(head='HEAD2')
-    config_a = _make_config(tmp_path, offline_lane_poll_interval_secs=poll_interval)
-    calls_a: list[tuple] = []
-    done = asyncio.Event()
+    async def scenario() -> None:
+        poll_interval = 0.05
 
-    async def _suite_runner_a(wt, head, threads):
-        calls_a.append((wt, head, threads))
-        done.set()
-        return (0, '')
+        # -- Scenario A: get_main_sha diverges from _last_run_head -> backstop runs.
+        git_ops_a = _make_git_ops(head='HEAD2')
+        config_a = _make_config(tmp_path, offline_lane_poll_interval_secs=poll_interval)
+        calls_a: list[tuple] = []
+        done = asyncio.Event()
 
-    worker_a = _make_worker(
-        tmp_path, git_ops=git_ops_a, config=config_a, suite_runner=_suite_runner_a
-    )
-    worker_a._last_run_head = 'HEAD1'
+        async def _suite_runner_a(wt, head, threads):
+            calls_a.append((wt, head, threads))
+            done.set()
+            return (0, '')
 
-    task_a = asyncio.create_task(worker_a.run())
-    try:
-        await asyncio.wait_for(done.wait(), timeout=2.0)
-    finally:
-        task_a.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task_a
+        worker_a = _make_worker(
+            tmp_path, git_ops=git_ops_a, config=config_a, suite_runner=_suite_runner_a
+        )
+        worker_a._last_run_head = 'HEAD1'
 
-    assert len(calls_a) == 1, 'a missed-trigger mismatch must run exactly once'
-    assert calls_a[0][1] == 'HEAD2', 'the backstop run must use the polled (current) head'
-    assert worker_a._last_run_head == 'HEAD2'
+        task_a = asyncio.create_task(worker_a.run())
+        try:
+            await asyncio.wait_for(done.wait(), timeout=2.0)
+        finally:
+            task_a.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task_a
 
-    # -- Scenario B: get_main_sha matches _last_run_head -> no spurious run.
-    git_ops_b = _make_git_ops(head='HEAD1')
-    config_b = _make_config(tmp_path, offline_lane_poll_interval_secs=poll_interval)
-    calls_b: list[tuple] = []
+        assert len(calls_a) == 1, 'a missed-trigger mismatch must run exactly once'
+        assert calls_a[0][1] == 'HEAD2', 'the backstop run must use the polled (current) head'
+        assert worker_a._last_run_head == 'HEAD2'
 
-    async def _suite_runner_b(wt, head, threads):
-        calls_b.append((wt, head, threads))
-        return (0, '')
+        # -- Scenario B: get_main_sha matches _last_run_head -> no spurious run.
+        git_ops_b = _make_git_ops(head='HEAD1')
+        config_b = _make_config(tmp_path, offline_lane_poll_interval_secs=poll_interval)
+        calls_b: list[tuple] = []
 
-    worker_b = _make_worker(
-        tmp_path, git_ops=git_ops_b, config=config_b, suite_runner=_suite_runner_b
-    )
-    worker_b._last_run_head = 'HEAD1'
+        async def _suite_runner_b(wt, head, threads):
+            calls_b.append((wt, head, threads))
+            return (0, '')
 
-    task_b = asyncio.create_task(worker_b.run())
-    try:
-        await asyncio.sleep(poll_interval * 6)
-    finally:
-        task_b.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task_b
+        worker_b = _make_worker(
+            tmp_path, git_ops=git_ops_b, config=config_b, suite_runner=_suite_runner_b
+        )
+        worker_b._last_run_head = 'HEAD1'
 
-    assert calls_b == [], 'no advance since the last run must never trigger a spurious run'
-    assert worker_b._last_run_head == 'HEAD1'
+        task_b = asyncio.create_task(worker_b.run())
+        try:
+            await asyncio.sleep(poll_interval * 6)
+        finally:
+            task_b.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task_b
+
+        assert calls_b == [], 'no advance since the last run must never trigger a spurious run'
+        assert worker_b._last_run_head == 'HEAD1'
+
+    run_on_virtual_clock(scenario())
 
 
 # ---------------------------------------------------------------------------
@@ -518,9 +528,8 @@ async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
+def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path) -> None:
     """A broken lane run can never wedge the process (worker leg of C7).
 
     (a)+(c): a suite_runner that raises on its first call is logged as a
@@ -537,58 +546,61 @@ async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
     suite_runner propagates straight out of run(), killing the loop task, so
     no second run and no backoff sleep ever happen. Must fail before impl.
     """
-    # -- (a)+(c): fail-open with a bounded log + backoff, then survive.
-    calls = {'n': 0}
-    done = asyncio.Event()
 
-    async def _suite_runner(wt, head, threads):
-        calls['n'] += 1
-        if calls['n'] == 1:
-            raise RuntimeError('suite boom')
-        done.set()
-        return (0, '')
+    async def scenario() -> None:
+        # -- (a)+(c): fail-open with a bounded log + backoff, then survive.
+        calls = {'n': 0}
+        done = asyncio.Event()
 
-    git_ops = _make_git_ops(head='HEAD1')
-    config = _make_config(tmp_path, offline_lane_poll_interval_secs=0.05)
-    worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=_suite_runner)
-    worker._dirty = True
+        async def _suite_runner(wt, head, threads):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise RuntimeError('suite boom')
+            done.set()
+            return (0, '')
 
-    sleeps: list[float] = []
-    real_sleep = asyncio.sleep
+        git_ops = _make_git_ops(head='HEAD1')
+        config = _make_config(tmp_path, offline_lane_poll_interval_secs=0.05)
+        worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=_suite_runner)
+        worker._dirty = True
 
-    async def _tracking_sleep(delay, *a, **k):
-        sleeps.append(delay)
-        return await real_sleep(0)
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
 
-    with patch('orchestrator.offline_lane.asyncio.sleep', side_effect=_tracking_sleep), \
-            patch('orchestrator.offline_lane.logger') as mock_logger:
-        task = asyncio.create_task(worker.run())
-        try:
-            await asyncio.wait_for(done.wait(), timeout=3.0)
-        finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        async def _tracking_sleep(delay, *a, **k):
+            sleeps.append(delay)
+            return await real_sleep(0)
 
-    assert calls['n'] == 2, 'the loop must survive the first failure and run again'
-    mock_logger.exception.assert_not_called()
-    assert mock_logger.error.call_count >= 1, 'expected a bounded logger.error summary'
-    assert 60.0 in sleeps, f'expected a backoff sleep after the failure, got {sleeps!r}'
+        with patch('orchestrator.offline_lane.asyncio.sleep', side_effect=_tracking_sleep), \
+                patch('orchestrator.offline_lane.logger') as mock_logger:
+            task = asyncio.create_task(worker.run())
+            try:
+                await asyncio.wait_for(done.wait(), timeout=3.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
-    # -- (b): cancelling run() propagates CancelledError cleanly (never swallowed).
-    worker2 = _make_worker(
-        tmp_path, config=_make_config(tmp_path, offline_lane_poll_interval_secs=120.0)
-    )
-    task2 = asyncio.create_task(worker2.run())
-    await asyncio.sleep(0)
-    task2.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task2
+        assert calls['n'] == 2, 'the loop must survive the first failure and run again'
+        mock_logger.exception.assert_not_called()
+        assert mock_logger.error.call_count >= 1, 'expected a bounded logger.error summary'
+        assert 60.0 in sleeps, f'expected a backoff sleep after the failure, got {sleeps!r}'
+
+        # -- (b): cancelling run() propagates CancelledError cleanly (never swallowed).
+        worker2 = _make_worker(
+            tmp_path, config=_make_config(tmp_path, offline_lane_poll_interval_secs=120.0)
+        )
+        task2 = asyncio.create_task(worker2.run())
+        await asyncio.sleep(0)
+        task2.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task2
+
+    run_on_virtual_clock(scenario())
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
-async def test_loop_backoff_grows_and_caps_on_consecutive_failures(tmp_path: Path):
+def test_loop_backoff_grows_and_caps_on_consecutive_failures(tmp_path: Path) -> None:
     """Consecutive run() failures back off exponentially, capped (task 2016 amendment).
 
     Bug #2's fix means a persistently-raising red-handling/MCP leg now
@@ -598,44 +610,48 @@ async def test_loop_backoff_grows_and_caps_on_consecutive_failures(tmp_path: Pat
     fixed base cadence forever. The backoff must double per consecutive
     failure, capped, and reset once a pass succeeds.
     """
-    calls = {'n': 0}
-    done = asyncio.Event()
-    failures = 5
 
-    async def _suite_runner(wt, head, threads):
-        calls['n'] += 1
-        if calls['n'] <= failures:
-            raise RuntimeError('suite boom')
-        done.set()
-        return (0, '')
+    async def scenario() -> None:
+        calls = {'n': 0}
+        done = asyncio.Event()
+        failures = 5
 
-    git_ops = _make_git_ops(head='HEAD1')
-    config = _make_config(tmp_path, offline_lane_poll_interval_secs=0.05)
-    worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=_suite_runner)
-    worker._dirty = True
+        async def _suite_runner(wt, head, threads):
+            calls['n'] += 1
+            if calls['n'] <= failures:
+                raise RuntimeError('suite boom')
+            done.set()
+            return (0, '')
 
-    sleeps: list[float] = []
-    real_sleep = asyncio.sleep
+        git_ops = _make_git_ops(head='HEAD1')
+        config = _make_config(tmp_path, offline_lane_poll_interval_secs=0.05)
+        worker = _make_worker(tmp_path, git_ops=git_ops, config=config, suite_runner=_suite_runner)
+        worker._dirty = True
 
-    async def _tracking_sleep(delay, *a, **k):
-        sleeps.append(delay)
-        return await real_sleep(0)
+        sleeps: list[float] = []
+        real_sleep = asyncio.sleep
 
-    with patch('orchestrator.offline_lane.asyncio.sleep', side_effect=_tracking_sleep), \
-            patch('orchestrator.offline_lane.logger'):
-        task = asyncio.create_task(worker.run())
-        try:
-            await asyncio.wait_for(done.wait(), timeout=3.0)
-        finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        async def _tracking_sleep(delay, *a, **k):
+            sleeps.append(delay)
+            return await real_sleep(0)
 
-    assert calls['n'] == failures + 1, 'the loop must keep retrying every consecutive failure'
-    assert sleeps[:failures] == [60.0, 120.0, 240.0, 480.0, 900.0], (
-        f'expected exponential backoff doubling from the 60s base and capping '
-        f'at 900.0s, got {sleeps[:failures]!r}'
-    )
+        with patch('orchestrator.offline_lane.asyncio.sleep', side_effect=_tracking_sleep), \
+                patch('orchestrator.offline_lane.logger'):
+            task = asyncio.create_task(worker.run())
+            try:
+                await asyncio.wait_for(done.wait(), timeout=3.0)
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        assert calls['n'] == failures + 1, 'the loop must keep retrying every consecutive failure'
+        assert sleeps[:failures] == [60.0, 120.0, 240.0, 480.0, 900.0], (
+            f'expected exponential backoff doubling from the 60s base and capping '
+            f'at 900.0s, got {sleeps[:failures]!r}'
+        )
+
+    run_on_virtual_clock(scenario())
 
 
 # ---------------------------------------------------------------------------
