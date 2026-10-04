@@ -405,9 +405,10 @@ def load_task_index(db_path: str) -> TaskIndex:
 
     Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
     refusals). Malformed metadata is SKIPPED rather than raised: a single
-    undecodable row must not abort a whole-project sweep, and ``extract_delivered_checks`` already
-    implements exactly that benign-absent contract (the same one
-    ``lock_charter_guard.extract_files`` uses at the wire boundary).
+    undecodable row must not abort a whole-project sweep, and
+    ``extract_delivered_checks`` already implements exactly that benign-absent
+    contract (the same one ``lock_charter_guard.extract_files`` uses at the
+    wire boundary).
     """
     conn = connect_ro(db_path)
     try:

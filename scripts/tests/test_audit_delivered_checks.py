@@ -299,7 +299,7 @@ class TestLoadTaskIndex:
             conn.close()
 
 
-def test_load_open_dependents_refuses_a_zero_byte_stub_rather_than_reading_nobody_blocked(tmp_path):
+def test_load_open_dependents_refuses_a_stub_instead_of_reading_nobody_blocked(tmp_path):
     """Its `no such table` swallow is for a store lacking only the
     dependencies table; a 0-byte stub has no tables at all."""
     stub = tmp_path / 'tasks.db'

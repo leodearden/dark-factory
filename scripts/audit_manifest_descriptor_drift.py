@@ -8,10 +8,10 @@ READ-ONLY / REPORT-ONLY, in both directions: this module and its CLI never
 mutate a task record or a manifest file. Its one database connection, to the
 task store, goes through ``_task_db_scan.py::connect_ro``, a read-only SQLite
 URI (``mode=ro``), so the sweep is structurally incapable of writing to the live
-WAL database the running orchestrator holds open. Manifest YAML on disk is only ever read. There
-is no ``--apply`` flag and no MCP client is ever constructed. RESYNCING A
-DRIFTED SIDECAR, OR FIXING AN UNBOUND LABEL, IS A SEPARATE, REVIEWED EDIT —
-never done from this report by this script.
+WAL database the running orchestrator holds open. Manifest YAML on disk is only
+ever read. There is no ``--apply`` flag and no MCP client is ever constructed.
+RESYNCING A DRIFTED SIDECAR, OR FIXING AN UNBOUND LABEL, IS A SEPARATE,
+REVIEWED EDIT — never done from this report by this script.
 
 THE DRIFT DIRECTION (task 4545). ``metadata.delivered_checks`` is copied
 exactly ONE WAY, sidecar -> task record, at ``commit_planning``
@@ -1287,8 +1287,8 @@ def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
 
     Raises one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS`` for an
     unreadable task store, which :func:`_task_db_scan.sweep_project_roots`
-    turns into a warn-and-skip; every other exception propagates. Returns exactly one audit, per that function's
-    one-audit-per-root contract.
+    turns into a warn-and-skip; every other exception propagates. Returns
+    exactly one audit, per that function's one-audit-per-root contract.
     """
     return audit_project(root, args.manifest_root)
 
