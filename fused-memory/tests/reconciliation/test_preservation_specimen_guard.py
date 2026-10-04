@@ -1901,3 +1901,26 @@ class TestCompositeFlagTaskIds:
 
         assert result.kept_flags == [flag]
         assert result.unresolved_task_ids == ('4102', '4103')
+
+    @pytest.mark.asyncio
+    async def test_a_cited_task_is_not_the_task_the_flag_claims_is_stranded(self):
+        """Only the flag's OWN task_id is corroborated, never its cited_tasks.
+
+        A cited task is evidence the flag mentions; corroborating it would drop
+        a genuine stranded finding about a different task — the over-suppression
+        this guard is biased against.
+        """
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+        flag = _stranded_flag(task_id='4102', cited_tasks=[{'task_id': '3105'}])
+
+        result = await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[flag],
+        )
+
+        assert result.kept_flags == [flag]
+        assert result.suppressed_by_task == {}
+        queried = [
+            call.kwargs['filters']['task_id']
+            for call in memory_service.get_memories_by_metadata.await_args_list
+        ]
+        assert queried == ['4102']

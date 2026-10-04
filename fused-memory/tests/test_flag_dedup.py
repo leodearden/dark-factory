@@ -12490,6 +12490,36 @@ class TestClusterGrowthExtractionHelpers:
         assert _flag_candidate_task_ids(flag) == []
 
 
+class TestFlagOwnTaskIds:
+    """`flag_own_task_ids` — the flag's OWN top-level task_id channel only."""
+
+    def test_splits_and_strips_the_comma_joined_shape(self):
+        assert flag_dedup.flag_own_task_ids({'task_id': '3105, 4223'}) == ['3105', '4223']
+
+    def test_coerces_an_int_task_id(self):
+        assert flag_dedup.flag_own_task_ids({'task_id': 3417}) == ['3417']
+
+    def test_dedupes_keeping_first_position(self):
+        assert flag_dedup.flag_own_task_ids(
+            {'task_id': '3417,3468,3417'},
+        ) == ['3417', '3468']
+
+    def test_separator_only_yields_nothing(self):
+        assert flag_dedup.flag_own_task_ids({'task_id': ','}) == []
+
+    @pytest.mark.parametrize('task_id', [None, True, ['3105'], {'a': 1}])
+    def test_a_non_id_value_yields_nothing(self, task_id):
+        assert flag_dedup.flag_own_task_ids({'task_id': task_id}) == []
+
+    def test_cited_tasks_are_not_the_flags_own_ids(self):
+        flag = {'task_id': '4102', 'cited_tasks': [{'task_id': '3105'}]}
+        assert flag_dedup.flag_own_task_ids(flag) == ['4102']
+
+    def test_components_are_not_screened(self):
+        """Usability screening is a caller's policy, not this primitive's."""
+        assert flag_dedup.flag_own_task_ids({'task_id': '0,-5'}) == ['0', '-5']
+
+
 # ---------------------------------------------------------------------------
 # ---- task 3476 step-5 ----
 # RED: the core drop path — reproduces the run-df364849 false positives.
@@ -13795,6 +13825,26 @@ class TestEntityStandingMatchHelpers:
         assert flag_dedup._flag_type_in_grounds_family(
             'Oversized_Entity', GROUNDS_STRUCTURAL_SIZE_CONFLATION
         ) is True
+
+
+class TestContainsAnyCasefolded:
+    """`contains_any_casefolded` — the casefolded-substring family test."""
+
+    def test_member_found_inside_text(self):
+        assert flag_dedup.contains_any_casefolded('task_STRANDED_x', ('strand',)) is True
+
+    def test_members_are_casefolded_too(self):
+        assert flag_dedup.contains_any_casefolded('stranded', ('STRAND',)) is True
+
+    def test_no_member_found(self):
+        assert flag_dedup.contains_any_casefolded('abc', ('x',)) is False
+
+    @pytest.mark.parametrize('text', [None, '', 5, b'strand', ['strand']])
+    def test_total_over_malformed_text(self, text):
+        assert flag_dedup.contains_any_casefolded(text, ('strand',)) is False
+
+    def test_empty_family_never_matches(self):
+        assert flag_dedup.contains_any_casefolded('anything', ()) is False
 
 
 class TestExtractFlagUuids:
