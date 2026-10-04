@@ -3246,3 +3246,73 @@ class TestVacatedInflightEntryRendersAtMostOnce:
             assert worker.check_frozen_prefix_invariant(scene.head_item.base_sha) == [], (
                 f'{worker.check_frozen_prefix_invariant(scene.head_item.base_sha)!r}'
             )
+
+
+@pytest.mark.asyncio
+class TestVacatedCorpseFinalizeLeavesReincarnationAlone:
+    """A vacated corpse's late head-of-line finalize must not touch the
+    request_id once it has been re-dispatched: the registry's VERIFYING then
+    belongs to the new incarnation (task 4582 step-5 RED / step-6 GREEN).
+
+    This is the reify mr-945466ca shape — a corpse still in ``_inflight`` while
+    the same request_id verifies again behind it.
+    """
+
+    async def test_corpse_finalize_leaves_the_redispatched_verify_verifying(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState
+        from orchestrator.verify_runner import HostLease
+
+        async with _verify_exit_scene(git_ops, config, 'operator_halt') as scene:
+            worker = scene.worker
+            rid = scene.req.request_id
+            worker.unhalt_all_lanes('test: the halt is not needed past the vacate')
+
+            # Walk the request back to VERIFYING through the production
+            # chokepoints and legal edges, as a fresh incarnation N.
+            worker._drain_queue_into_lanes()
+            assert worker._pop_next_pickable() is scene.req
+            n_item = dataclasses.replace(scene.item)
+            worker._note_transition(
+                rid, ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY,
+                live_obj=n_item,
+            )
+            worker._note_transition(
+                rid, ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING,
+                live_obj=n_item,
+            )
+            n_entry = InflightEntry(
+                item=n_item,
+                lease=HostLease(name='n-host', runner=MagicMock(), is_local=False),
+                verify_task=cast(Any, asyncio.ensure_future(asyncio.Event().wait())),
+                merge_wt=n_item.merge_wt,
+                was_speculative=False,
+            )
+            worker._inflight_append(n_entry)
+            assert worker._lifecycle.current(rid) == ItemLifecycleState.VERIFYING
+            try:
+                await worker._finalize_inflight(scene.entry)
+
+                current = worker._lifecycle.current(rid)
+                assert current == ItemLifecycleState.VERIFYING, (
+                    f'the corpse finalize bounced the re-dispatched verify: '
+                    f'registry reads {current!r}'
+                )
+                assert worker._live_items[rid] is n_entry, (
+                    f'_live_items must still hold the new incarnation: '
+                    f'{worker._live_items.get(rid)!r}'
+                )
+                assert _rejected_transition_escalations(scene.fake_eq) == [], (
+                    f'{scene.fake_eq.filed!r}'
+                )
+                snap = worker.snapshot()
+                mine = [e for e in snap['entries'] if e['request_id'] == rid]
+                assert len(mine) == 1, f'{snap["entries"]!r}'
+                assert mine[0]['state'] == 'verifying', f'{mine[0]!r}'
+                assert mine[0]['host'] == 'n-host', f'{mine[0]!r}'
+                assert worker.frozen_prefix().count(rid) == 1, f'{worker.frozen_prefix()!r}'
+            finally:
+                n_entry.verify_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await n_entry.verify_task
