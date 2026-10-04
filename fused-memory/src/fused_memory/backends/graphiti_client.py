@@ -51,6 +51,7 @@ from fused_memory.backends.falkor_indices import (
     vector_index_properties,
 )
 from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+from fused_memory.backends.llm_token_usage import TokenMeasurement, measure_llm_tokens
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
 from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
@@ -1321,6 +1322,15 @@ class GraphitiBackend:
     def registered_graph_ids(self) -> frozenset[str]:
         """The graphs this backend provisions — PRD D5, docs/prds/falkordb-index-provisioning.md."""
         return self._registered_graph_ids
+
+    def token_probe(self) -> contextlib.AbstractAsyncContextManager[TokenMeasurement]:
+        """Measure the LLM tokens the calling asyncio context spends inside the window.
+
+        ``_llm_client`` is shared by ``self.client`` and every ``_client_for``
+        clone, which is why attribution is by context, never by tracker delta
+        or ``reset()``.
+        """
+        return measure_llm_tokens(self._llm_client)
 
     # --- Per-request driver routing ---
 
