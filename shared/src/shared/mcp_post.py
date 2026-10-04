@@ -72,6 +72,7 @@ Public API::
 
     from shared.mcp_post import (
         MCP_POST_HEADERS,
+        call_mcp_tool,
         check_mcp_post_response,
         decode_mcp_response_body,
         mcp_endpoint_url,
@@ -79,6 +80,10 @@ Public API::
         open_mcp_client,
         post_mcp_tool_call,
     )
+
+Use :func:`call_mcp_tool` instead of :func:`post_mcp_tool_call` when the
+caller needs the tool's reply (a read's payload, a refusal's ``error_type``)
+rather than only "it landed"; both share one send.
 
 The module is intentionally NOT re-exported from ``shared/__init__.py``.
 Consumers import via the fully-qualified path (see above), consistent with the
@@ -97,8 +102,11 @@ import json
 import logging
 from typing import Any
 
+from shared.mcp_envelope import parse_tool_result
+
 __all__ = [
     'MCP_POST_HEADERS',
+    'call_mcp_tool',
     'check_mcp_post_response',
     'decode_mcp_response_body',
     'mcp_endpoint_url',
@@ -320,6 +328,68 @@ async def post_mcp_tool_call(
     :param context: identifies the call site in any warning.
     :returns: True only if the call actually landed.
     """
+    resp = await _send_tool_call(
+        client, base_url, tool, arguments,
+        context=context, request_id=request_id, timeout=timeout,
+    )
+    return check_mcp_post_response(resp, context=context)
+
+
+async def call_mcp_tool(
+    client: Any,
+    base_url: str,
+    tool: str,
+    arguments: dict,
+    *,
+    context: str,
+    request_id: Any = 1,
+    timeout: float = 10,
+) -> dict | None:
+    """POST one MCP ``tools/call`` and return the tool's reply dict.
+
+    The same four-part send as :func:`post_mcp_tool_call`, for a caller that
+    needs the reply itself — a read's payload, or the ``error_type`` a tool
+    returns when it refuses — rather than only "it landed".  A reply carrying
+    ``error_type`` is returned unchanged: a tool-level refusal is a delivered
+    call.
+
+    Returns ``None``, always with a warning, when no reply dict arrived: any
+    failure :func:`check_mcp_post_response` reports, a ``result.isError``
+    answer, or a text block that is not a JSON object.  Propagates a transport
+    exception from ``client.post``, as :func:`post_mcp_tool_call` does.
+    """
+    resp = await _send_tool_call(
+        client, base_url, tool, arguments,
+        context=context, request_id=request_id, timeout=timeout,
+    )
+    if not check_mcp_post_response(resp, context=context):
+        return None
+    try:
+        body = decode_mcp_response_body(resp)
+    except ValueError as exc:
+        logger.warning('MCP tool reply could not be decoded [%s]: %s', context, exc)
+        return None
+    result = body.get('result') if isinstance(body, dict) else None
+    if isinstance(result, dict) and result.get('isError'):
+        logger.warning(
+            'MCP tool call returned isError [%s]: %s', context, str(result)[:200],
+        )
+        return None
+    reply, err = parse_tool_result(body, None, dict)
+    return None if err is not None else reply
+
+
+async def _send_tool_call(
+    client: Any,
+    base_url: str,
+    tool: str,
+    arguments: dict,
+    *,
+    context: str,
+    request_id: Any,
+    timeout: float,
+) -> Any:
+    """Parts 1 and 2 of the fix, plus the warning that guards part 3."""
     # ``True`` by default so a duck-typed stub with no such attribute (several
     # existing test doubles) does not produce a spurious warning.
     if not getattr(client, 'follow_redirects', True):
@@ -330,10 +400,9 @@ async def post_mcp_tool_call(
             context,
         )
 
-    resp = await client.post(
+    return await client.post(
         mcp_endpoint_url(base_url),
         headers=MCP_POST_HEADERS,
         json=mcp_tool_call_payload(tool, arguments, request_id=request_id),
         timeout=timeout,
     )
-    return check_mcp_post_response(resp, context=context)
