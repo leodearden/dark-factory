@@ -2556,14 +2556,6 @@ _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     ('test_merge_verify_survivor_barrier.py', 'TestReapMergeVerifySurvivors::test_knob_on_reaps_real_survivor_and_excludes_own_group'),
     ('test_merge_verify_survivor_barrier.py', 'TestReapMergeVerifySurvivors::test_residual_survivor_returns_false_and_logs_error'),
     ('test_merge_verify_survivor_barrier.py', 'TestReapMergeVerifySurvivors::test_integration_reap_then_reset_succeeds_on_clear_tree'),
-    # test_offline_lane_infra_integration.py -- 3 sites at 120s/150s
-    ('test_offline_lane_infra_integration.py', 'test_out_of_bound_spawn_counts_are_measured_not_asserted'),
-    ('test_offline_lane_infra_integration.py', 'test_ib2_infra_run_in_flight_never_gates_merge'),
-    ('test_offline_lane_infra_integration.py', 'test_ib4_same_infra_set_recurrence_updates_not_duplicates'),
-    # test_offline_lane_integration.py -- 3 sites at 120s/150s
-    ('test_offline_lane_integration.py', 'test_out_of_bound_spawn_counts_are_measured_not_asserted'),
-    ('test_offline_lane_integration.py', 'test_b3_never_a_gate'),
-    ('test_offline_lane_integration.py', 'test_b5_same_set_recurrence_updates_not_duplicates'),
     # test_plan_tools_startup_load.py -- 1 site at 120s
     ('test_plan_tools_startup_load.py', 'test_concurrent_startup_no_hang'),
     # test_shutdown.py -- 1 site at 120s
