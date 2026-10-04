@@ -278,6 +278,23 @@ async def test_explicit_null_claimant_on_terminal_write_stamps_nothing(intercept
     task = await backend.get_task(task_id, project_root=root)
     assert 'claimant_exception' not in task['metadata']
     assert task['claimant_run_id'] is None
+    assert task['heartbeat_at'] is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_null_claimant_terminal_write_overrides_supplied_heartbeat(
+    interceptor, backend, root,
+):
+    task_id = await _claimed_in_progress(interceptor, backend, root)
+
+    result = await interceptor.set_task_status(
+        task_id, 'cancelled', root, claimant_run_id=None, heartbeat_at=_now_iso(),
+    )
+
+    assert 'error' not in result, result
+    task = await backend.get_task(task_id, project_root=root)
+    assert task['claimant_run_id'] is None
+    assert task['heartbeat_at'] is None
 
 
 def _exception_log_messages(caplog: pytest.LogCaptureFixture) -> list[str]:

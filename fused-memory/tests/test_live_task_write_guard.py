@@ -818,6 +818,10 @@ class TestInterceptorSetTaskStatusLifecycleGuard:
         await interceptor.set_task_status('1', 'cancelled', '/project', agent_id=RECON_AGENT_ID)
 
         filer.assert_not_awaited()
+        taskmaster.set_task_status.assert_awaited_once()
+        write_kwargs = taskmaster.set_task_status.await_args.kwargs
+        assert write_kwargs['claimant_run_id'] is None
+        assert write_kwargs['heartbeat_at'] is None
 
     @pytest.mark.asyncio
     async def test_non_recon_agent_id_does_not_invoke_filer(self, interceptor, taskmaster, monkeypatch):

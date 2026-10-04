@@ -270,12 +270,12 @@ def _status_write_claimant_kwargs(
     """Claimant kwargs a status write forwards to the backend writer.
 
     docs/prds/claimant-invariant-enforcement.md C4-E2: a terminal target whose
-    caller did not supply ``claimant_run_id`` clears BOTH columns, so a
-    supplied ``heartbeat_at`` without a claimant is overridden to NULL. A
-    supplied claimant (string or None) is honoured verbatim. C4-E3: every
-    non-terminal write keeps the plain tri-state forwarding.
+    caller supplied no claimant (unsupplied or explicit None) clears BOTH
+    columns, so a heartbeat never outlives its claimant on a terminal row. A
+    supplied non-NULL claimant is honoured verbatim. C4-E3: every non-terminal
+    write keeps the plain tri-state forwarding.
     """
-    if status in TERMINAL_STATUSES and claimant_run_id is _UNSET:
+    if status in TERMINAL_STATUSES and (claimant_run_id is _UNSET or claimant_run_id is None):
         return dict(claimant_run_id=None, heartbeat_at=None)
     return _maybe_kwargs(_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at)
 
