@@ -1142,9 +1142,11 @@ that flips `before_done.kind` to `deploy`, deletes `metadata.milestone`, or
 attaches `recurrence` to an existing normal task lands exactly the state
 this contract forbids, with no error raised. That is not specific to
 `recurrence`: it is the root cause task **3093** tracks, which `milestone`
-(§6) and `task_kind` are already symptoms of. Don't do it — and any consumer
-acting on a chain link (the mint above all) should re-verify the carrier
-rather than assume submit-time validation still holds.
+(§6) and `task_kind` are already symptoms of. Don't do it. The mint does
+re-verify the carrier of the link it renews, through
+`deterministic_task_error`, and fails soft when it no longer holds; any other
+consumer acting on a chain link should likewise re-verify rather than assume
+submit-time validation still holds.
 
 **Forbidden until ruled.** `recurrence` on a *deploy*-kind deterministic
 task — or on any non-predicate `before_done`, or on `task_kind='normal'` —
@@ -1180,10 +1182,25 @@ deterministic-recon sweep's Source B auto-closer keys on that category to
 resolve deploy-stranded escalations, so widening the carrier rule to deploys
 would make that population un-auto-closable.
 
-**Not fully live yet.** The mint-on-terminal step and the chain-state gauge
-are separate PRD tasks. Filing a carrier today therefore gets you a
-*validated, time-withheld one-shot link* whose failures are correctly
-categorised — not an auto-renewing chain.
+**Minting.** Completing a carrier link `done`, through any writer (the
+orchestrator, `resolve_issue`, an interactive `set_task_status`), mints
+exactly one `pending` successor at the fused-memory interceptor. It copies
+`description`, `details`, `priority`, `task_kind`, `before_done`, `files` and
+`recurrence.{key, interval_secs}`; it gets `recurrence.minted_from` = the
+predecessor's id, `metadata.source='recurrence-mint'`, and `milestone.at` =
+the predecessor's terminal time plus `interval_secs` (whole seconds, no
+catch-up). The title is the chain's base title plus a ` [due <at>]` run
+label, not a verbatim copy: the store's `candidate_key` UNIQUE index counts
+`done` rows, so a same-title, same-files successor would be refused as a
+duplicate of its own predecessor
+(`fused-memory/src/fused_memory/middleware/recurrence_mint.py::_successor_title`).
+`cancelled` ends the chain, and an existing non-terminal link with the same
+`key` suppresses the mint. A mint failure never fails the status write: it
+logs `recurrence_mint_failed:` and leaves the link `done` with no successor,
+the *broken* state the chain-state gauge (a separate PRD task, not yet live)
+will surface. A link completed inside the same wall-clock second as its
+predecessor would give its successor its own run label, so that mint fails
+the same way.
 
 ---
 

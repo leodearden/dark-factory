@@ -115,7 +115,8 @@ predecessor is terminal, so runs never overlap — no lock, no exclusion guard.
 - `done` → successor minted: same title/description/`before_done`/`recurrence`, `milestone.at`
   advanced to `terminal_time + interval_secs`, `metadata.recurrence.minted_from = <predecessor
   id>`, status `pending` (machine-minted; no planning phase — it is a copy of an
-  already-vetted spec, and its provenance says so).
+  already-vetted spec, and its provenance says so). *(Amended, task 4866: the title carries a
+  run label rather than being copied verbatim — see C-3, esc-4866-5.)*
 - `cancelled` → chain **ends** (cancel is the operator's stop verb; visible in the tree).
 - `blocked` (predicate failed / timed out) → chain **pauses**: no successor until the pending
   escalation is resolved and the link reaches a terminal status. The pending L2 is the standing
@@ -173,6 +174,9 @@ failure logs structured ERROR and leaves the broken state visible per C-4.
 **C-3 (successor shape).** Copies title/description/`before_done`/`recurrence.{key,
 interval_secs}`; `milestone.at = terminal_time + interval_secs`; `recurrence.minted_from =
 predecessor id`; `status='pending'`; carries `metadata.source='recurrence-mint'`.
+*(Amended, task 4866.)* The title is copied with a ` [due <at>]` run label, not verbatim: the
+fm-task-dedup partial UNIQUE index `ux_tasks_candidate_key` covers `done` rows, so a verbatim
+title + `files` copy is refused with `DuplicateCandidateKeyError` (esc-4866-5).
 
 **C-4 (gauge).** The chain-state function of R-D5 is total over every task carrying
 `recurrence.key`: every chain resolves to exactly one of
@@ -285,7 +289,7 @@ path; the gauge computation is per-root, ms-scale, in the dashboard.
 
 1. **Overdue grace window size** (how far past `at` before `overdue`). Suggested: one full
    `interval_secs`, capped at 24h. Decide during r4.
-2. **Whether the minted successor copies `metadata.files`** (lock-set inheritance). Suggested:
-   yes, verbatim — same job, same locks. Decide during r2.
+2. **Whether the minted successor copies `metadata.files`** (lock-set inheritance).
+   **Resolved in r2 (task 4866): yes, verbatim** — same job, same locks.
 3. **Seed cadences for r6's two chains.** Suggested: 24h both, matching their documented timer
    slots. Decide during r6.
