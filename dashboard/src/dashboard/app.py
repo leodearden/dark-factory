@@ -660,7 +660,7 @@ async def _fanout_probe_completion(
     mask a wedge that began in between. The two readings diverge in precisely
     the case this probe exists to catch.
     """
-    await fetch_tasks(client, config, config.project_root, cached=False)
+    await fetch_tasks(client, config, config.project_root)
     return asyncio.get_running_loop().time()
 
 

@@ -61,7 +61,7 @@ V = TypeVar('V')
 # defaulted TypeVar may not precede a non-defaulted one, so V stays first.
 #
 # THE TRADE, since the result reads backwards against every stdlib mapping
-# generic (`TTLCache[dict, _TasksRead]` looks like `Mapping[value, key]`):
+# generic (`TTLCache[dict, _AnalyticsKey]` looks like `Mapping[value, key]`):
 # declaring K FIRST with no default would read conventionally, at the cost of
 # editing all six single-argument `TTLCache[V]` annotations in src plus 32 in
 # test_mcp_fanout.py — churn across five modules, none of which cares what the
@@ -106,32 +106,26 @@ _failure_streaks: dict[tuple[str, str], int] = {}
 # roughly 3 * DEFAULT_PER_CALL_TIMEOUT (~6s) per URL — while converting an
 # UNBOUNDED wedge (19.8h measured) into a bounded one.
 #
-# This bound is UNREACHABLE from active_tasks.collect_tasks_with_counts's
-# per-project path (the Tasks tab), for a STRUCTURAL reason rather than a
-# timing one: that path takes no per-key lock this bound could apply to.
-# Its reads go through task_snapshot.acquire_snapshot, which calls
-# tasks.fetch_statuses (uncached — live paged reads) and
-# tasks.fetch_tasks(cached=False), which awaits its refresh directly instead
-# of going through get_or_refresh. No get_or_refresh means no
-# ``async with lock:``, so this timeout has nothing to bound there. The one
-# get_or_refresh that path can still reach is the offline-MARKER store on
-# tasks._cached_fanout's failure branch, whose refresh returns an
-# already-computed value without awaiting anything and so cannot be the
-# parked holder this bound exists to escape. A wedge on that path surfaces
-# as the snapshot unit's own stale/unknown state instead, which is its
-# documented degradation story — never as a bypass.
+# The task-snapshot path has exactly ONE per-key lock: the unit's own
+# task_snapshot._snapshot_cache. Nothing beneath the unit has a
+# get_or_refresh at all — tasks.fetch_statuses and tasks.fetch_tasks are live
+# reads (task 5598) — so a wedged read can only ever be parked inside that
+# one refresh.
 #
-# (Before task 5587 the reason was a timing one: _shape_one_project fetched
-# for itself, under an enclosing asyncio.wait_for bounded by
-# active_tasks._TASKS_PER_PROJECT_BUDGET, and was cancelled before this bound
-# could fire. It is now pure and issues no MCP call.)
+# Whether this bound is reachable on that lock depends on the caller's
+# enclosing deadline. The Tasks tab and the census projection
+# (active_tasks.collect_tasks_with_counts, collect_census_snapshots) admit
+# each root under active_tasks._TASKS_PER_PROJECT_BUDGET (14.0 s), shorter
+# than this bound, so their callers are cancelled before it can fire and a
+# wedge surfaces as the snapshot unit's stale/unknown state — its documented
+# degradation story — never as a bypass. task_lookup._lookup_cache is
+# likewise unreachable, under task_lookup.LOOKUP_BUDGET_SECONDS (7.0 s).
 #
-# The bound IS reachable from every OTHER live call site, because none of
-# them has an enclosing deadline: app._task_cards_cache (which also reaches
-# _fetch_tasks_cache, but via fetch_tasks called from _load_task_cards — a
-# path with no _TASKS_PER_PROJECT_BUDGET-style wrapper, so the SAME cache
-# can be bound-reachable or not depending on which caller reached it),
-# app._analytics_cache, app._memory_evals_cache and scheduler._scheduler_cache.
+# The bound IS reachable wherever the enclosing deadline is longer or absent:
+# the burndown loop's acquire_snapshot (under
+# burndown._SNAPSHOT_PER_ROOT_BUDGET, 60.0 s), app._memory_evals_cache,
+# scheduler._scheduler_cache, escalation_corpus._corpus_cache and
+# api.escalations._analytics_memo.
 _LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
 
 # A bypass must leave its own journal trace — reusing the SAME
@@ -753,8 +747,8 @@ class TTLCache(Generic[V, K]):
     ``ttl_seconds`` accepts a plain float OR a zero-arg callable, resolved
     at *each* freshness check rather than captured once at construction —
     this is what lets a caller monkeypatch a module-level TTL constant at
-    runtime (as ``tests/test_tasks_cached_fanout.py::TestFetchTasksCache``
-    does for ``_FETCH_TASKS_TTL_SECONDS``) and have it take effect
+    runtime (as ``tests/test_task_snapshot.py`` does for
+    ``task_snapshot.SNAPSHOT_TTL_SECONDS``) and have it take effect
     immediately.
 
     ``cache_ok`` (per-call, default always-true) gates whether a given
@@ -889,10 +883,10 @@ class TTLCache(Generic[V, K]):
         self._store: dict[K, tuple[float, V]] = {}
         self._locks: dict[K, asyncio.Lock] = {}
         # Per-INSTANCE (not module-level) consecutive-bypass streaks, keyed
-        # by cache key. Per-instance because the key space is per-cache:
-        # tasks._fetch_tasks_cache and tasks._fetch_tasks_negative_cache
-        # share keys exactly, and three more live instances key on a
-        # bare project_root — a module-level dict would collapse them.
+        # by cache key. Per-instance because a key means something only
+        # inside the cache that minted it: several live instances key on a
+        # bare string, so a module-level dict would let two caches' streaks
+        # collide.
         self._bypass_streaks: dict[K, int] = {}
         # The in-flight bypass task for a key, if any, stamped with the
         # monotonic time it started. Bounds concurrent bypass refreshes to

@@ -122,15 +122,12 @@ def project_root(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _isolate_caches():
-    """Neither the unit cache nor the fetch_tasks cache may cross a test."""
+    """The unit cache may not cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
-    import dashboard.data.tasks as tasks_mod
 
     snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
     yield
     snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
 
 
 class TestAcquireSnapshotHappyPath:
@@ -386,9 +383,9 @@ class TestAcquireSnapshotHappyPath:
     ):
         """(g) The unit owns the only TTL on this path.
 
-        Inside it, nothing is read at all. Past it, BOTH halves are — including
-        the rows, whose own 20 s cache would otherwise serve a value older than
-        the ``as_of`` this unit is about to stamp on it.
+        Inside it, nothing is read at all. Past it, BOTH halves are re-read
+        live, so neither can be older than the ``as_of`` this unit is about to
+        stamp on it.
         """
         import dashboard.data.task_snapshot as snapshot_mod
 
@@ -404,9 +401,7 @@ class TestAcquireSnapshotHappyPath:
             f'a warm unit issues no MCP call, got {canned.calls[calls_after_first:]}'
         )
 
-        # Past the unit TTL. The fetch_tasks cache is NOT cleared and its 20 s
-        # window is still open in real time, so a cached row read would serve
-        # the first acquisition's rows here.
+        # Past the unit TTL.
         monkeypatch.setattr(snapshot_mod, 'SNAPSHOT_TTL_SECONDS', 0.0)
         later = NOW + timedelta(seconds=16)
         third = await self._acquire(canned, dummy_client, dashboard_config, project_root, now=later)

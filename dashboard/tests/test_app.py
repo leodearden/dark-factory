@@ -336,16 +336,13 @@ def _render_through_the_real_collector(client, canned):
     render production serves every 15 s.
     """
     import dashboard.data.task_snapshot as snapshot_mod
-    import dashboard.data.tasks as tasks_mod
 
     snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             return client.get('/api/v2/dashboard/tasks')
     finally:
         snapshot_mod._snapshot_cache_clear()
-        tasks_mod._fetch_tasks_cache_clear()
 
 
 def test_a_healthy_root_is_fresh_when_the_real_collector_measures_it(client, caplog):
@@ -427,7 +424,6 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
     from test_task_snapshot import CannedMCP, _raw_row
 
     import dashboard.data.task_snapshot as snapshot_mod
-    import dashboard.data.tasks as tasks_mod
     from dashboard.data.utils import resolve_now
 
     config = client.app.state.config
@@ -444,7 +440,6 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
         return next(instants, None) or resolve_now(now)
 
     snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
     try:
         with patch('dashboard.data.tasks.mcp_tool_call', new=canned):
             render_a = client.get('/api/v2/dashboard/tasks')
@@ -461,7 +456,6 @@ def test_a_unit_another_render_refreshed_later_is_not_a_contract_break(client, c
                 resp = client.get('/api/v2/dashboard/tasks')
     finally:
         snapshot_mod._snapshot_cache_clear()
-        tasks_mod._fetch_tasks_cache_clear()
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -946,11 +940,9 @@ def _terminal_render(
     from pathlib import Path
 
     import dashboard.data.task_snapshot as snapshot_mod
-    import dashboard.data.tasks as tasks_mod
 
     if window is not None:
         monkeypatch.setattr(snapshot_mod, '_TERMINAL_FETCH_WINDOW', window)
-    tasks_mod._fetch_tasks_cache_clear()
 
     roots = [Path('/proj') / label for label in labels]
     rendered = {str(root) for root in roots}
@@ -980,17 +972,14 @@ def _terminal_render(
         return {'tasks': rows}
 
     snapshots = _snapshots(labels, count_unknown=count_unknown, done=done)
-    try:
-        with patch(
-            'dashboard.api.tasks.collect_tasks_with_counts',
-            new=AsyncMock(return_value=([], snapshots)),
-        ), patch(
-            'dashboard.api.tasks._all_project_roots',
-            new=lambda config: list(roots),
-        ), patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
-            resp = client.get(f'/api/v2/dashboard/tasks?terminal={terminal}')
-    finally:
-        tasks_mod._fetch_tasks_cache_clear()
+    with patch(
+        'dashboard.api.tasks.collect_tasks_with_counts',
+        new=AsyncMock(return_value=([], snapshots)),
+    ), patch(
+        'dashboard.api.tasks._all_project_roots',
+        new=lambda config: list(roots),
+    ), patch('dashboard.data.tasks.mcp_tool_call', new=_mcp):
+        resp = client.get(f'/api/v2/dashboard/tasks?terminal={terminal}')
     assert resp.status_code == 200, resp.text
     body = resp.json()
     # data.js::ON_DEMAND_KEYS.terminal.key names the body key AND the DF_DATA

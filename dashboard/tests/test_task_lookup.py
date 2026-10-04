@@ -31,13 +31,11 @@ NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
 
 @pytest.fixture(autouse=True)
 def _isolate_caches():
-    """No unit, tree read or per-id answer may cross a test."""
+    """No unit or per-id answer may cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
-    import dashboard.data.tasks as tasks_mod
 
     def _clear():
         snapshot_mod._snapshot_cache_clear()
-        tasks_mod._fetch_tasks_cache_clear()
         task_lookup._lookup_cache_clear()
 
     _clear()
@@ -201,13 +199,11 @@ class TestBudget:
         self, root, dashboard_config, dummy_client, monkeypatch,
     ):
         import dashboard.data.task_snapshot as snapshot_mod
-        import dashboard.data.tasks as tasks_mod
 
         canned = _canned((10, 'in-progress'), (3, 'done'))
         held, unread = TaskRef(root, 3), TaskRef(root, 10)
         await _lookup(canned, dummy_client, dashboard_config, [held])
         snapshot_mod._snapshot_cache_clear()
-        tasks_mod._fetch_tasks_cache_clear()
         monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', 0.2)
 
         async def _hung_snapshot(client, url, tool, args, **kwargs):
