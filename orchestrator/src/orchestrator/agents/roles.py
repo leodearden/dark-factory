@@ -10,6 +10,7 @@ from orchestrator.agents.chained_command_guidance import CHAINED_COMMAND_STATUS_
 from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
 from orchestrator.agents.partial_failure_guidance import MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
+from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
 from orchestrator.agents.python_literal_guidance import PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
 
@@ -1279,6 +1280,7 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + GREP_PATTERN_ESCAPING_GUIDANCE
     + PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
     + MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
+    + PATH_NOT_FOUND_GUIDANCE
 )
 
 
@@ -1870,7 +1872,7 @@ JUDGE = AgentRole(
 You are a completion judge. You decide whether an implementer agent has
 *substantively* completed a task's work, regardless of whether the plan.json
 bookkeeping reflects that.
-""" + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE_READ_ONLY + """
+""" + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE_READ_ONLY + PATH_NOT_FOUND_GUIDANCE + """
 ## Context
 
 You run AFTER each implementer iteration inside the orchestrator's execute
