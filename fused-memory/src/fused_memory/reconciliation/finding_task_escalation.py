@@ -37,6 +37,7 @@ purity contract of the sibling module ``reconciliation/predicate_contradiction.p
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -44,6 +45,7 @@ __all__ = [
     'FINDING_TASK_ESCALATION_CATEGORY',
     'FINDING_TASK_ESCALATION_LEVEL',
     'build_finding_task_escalation_kwargs',
+    'is_routable_task_id',
     'resolve_finding_task_target',
 ]
 
@@ -167,6 +169,19 @@ _ESCALATION_SEVERITY = 'info'
 
 _AGENT_ROLE = 'reconciliation-harness'
 
+_ROUTABLE_TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+
+
+def is_routable_task_id(task_id: str) -> bool:
+    """Whether *task_id* is safe to use as an orchestrator-queue key.
+
+    The id becomes part of a filename (``EscalationQueue.make_id`` builds
+    ``esc-{key}-{seq}`` and ``submit`` writes ``{id}.json``), so only a
+    conservative shape is routed: path separators, ``':'`` (cross-project
+    refs), whitespace and control characters are refused.
+    """
+    return _ROUTABLE_TASK_ID.fullmatch(task_id) is not None
+
 
 def _sole_task_id_part(value: object) -> str | None:
     """Return the single task id inside *value*, or None if it is not exactly one.
@@ -216,6 +231,13 @@ def _sole_task_id_part(value: object) -> str | None:
     return parts.pop()
 
 
+def _routable_task_id(value: object) -> str | None:
+    candidate = _sole_task_id_part(value)
+    if candidate is None or not is_routable_task_id(candidate):
+        return None
+    return candidate
+
+
 def resolve_finding_task_target(
     finding: Mapping,
     project_id: str,
@@ -255,12 +277,13 @@ def resolve_finding_task_target(
     Both branches are LLM-authored input, so every value is passed through
     :func:`_sole_task_id_part` (coerce, strip, and reject a comma-joined
     multi-id value — see that docstring for why routing one verbatim is worse
-    than not routing it), and a malformed ``cited_tasks`` entry is SKIPPED
+    than not routing it) and then :func:`is_routable_task_id` (reject a shape
+    unsafe as a queue key), and a malformed ``cited_tasks`` entry is SKIPPED
     rather than raised — a bad citation must not abort the remediation pass.
     """
     raw = finding.get('task_id')
     if raw is not None:
-        candidate = _sole_task_id_part(raw)
+        candidate = _routable_task_id(raw)
         if candidate:
             return candidate
 
@@ -279,7 +302,7 @@ def resolve_finding_task_target(
         # to write one id per entry, so this is defence in depth rather than a
         # known shape -- but a joined value here would be just as unroutable,
         # and skipping the entry lets a well-formed later citation still win.
-        candidate = _sole_task_id_part(entry_task_id)
+        candidate = _routable_task_id(entry_task_id)
         if candidate:
             return candidate
     return None
