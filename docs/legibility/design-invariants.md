@@ -424,8 +424,9 @@ outlived the task that owned it (2733, done 2026-07-18) with no owner
 recorded on the entry itself, and the same test recurred at task 4545's gate
 on 2026-09-06 (esc-4545-6); a missing-id check would not have caught this —
 only a **liveness** check would have. A register in the tree made that point
-checkable until its owner, task 5149, migrated the last entry and retired it:
+checkable while it stood:
 `orchestrator/tests/test_timeout_marker_inversion_guard.py::_GRANDFATHERED`
+(since retired, in task 5149, its owner, which migrated the last entry)
 asserted every entry still named a live REFERENT — a real in-band site — while
 recording no owner on an entry at all: a dead referent failed, a dead owner
 did not. (A second register of the same shape, the
