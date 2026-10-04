@@ -233,6 +233,28 @@ def test_rerunning_at_the_current_cap_dies_before_the_reload(tmp_path):
     assert received == [], f"the commit gate must precede the reload: {received}"
 
 
+@pytest.mark.parametrize("cap", ["06", "010"])
+def test_a_cap_with_a_leading_zero_is_refused_before_anything_lands(tmp_path, cap):
+    """YAML reads `chain_cap: 06` as 6 and `chain_cap: 010` as octal 8, so a
+    leading zero would commit one spelling and gate on another value -- a
+    failure that only surfaces after the commit has landed. The cap is
+    refused at validation instead, so the yaml, the history and the server
+    are all untouched."""
+    repo = init_repo(tmp_path)
+    config = commit_config(repo, SEEDS["block_present"])
+    before = head(repo)
+
+    with FakeEscalationMcp(reload_report(config_path=str(config))) as server:
+        proc = _run(server, config, cap)
+        received = list(server.received)
+
+    assert proc.returncode != 0, f"stdout={proc.stdout}"
+    assert "leading zero" in proc.stderr, f"stderr={proc.stderr}"
+    assert head(repo) == before
+    assert config.read_text() == SEEDS["block_present"]
+    assert received == [], f"a refused cap reached the server: {received}"
+
+
 # ---------------------------------------------------------------------------
 # Which interpreter runs the reload
 # ---------------------------------------------------------------------------
