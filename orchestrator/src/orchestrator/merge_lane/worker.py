@@ -2910,10 +2910,10 @@ async def _run_post_merge_verify(
             # can never starve it.  A non-narrowed retry (flag off, or a payload
             # that could not be built/corroborated) keeps sharing the legacy
             # budget: at most `max_enospc` full re-verifies, which matches the
-            # pre-2835 single retry only at max_enospc == 1.  Every caller passes
-            # SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES;
+            # pre-2835 single retry only at max_enospc == 1.  reverify_member_solo
+            # never sets retry_failed_only, so it always lands here; its budget
+            # is pinned by
             # orchestrator/tests/test_merge_queue_train_attribution.py::TestReverifyMemberSoloContract::test_persistent_infra_transient_red_earns_one_full_retry
-            # pins the solo caller.
             retries, budget = (
                 (narrowed_retries, max_narrowed) if narrowed else (enospc_retries, max_enospc)
             )
@@ -5472,10 +5472,10 @@ async def reverify_member_solo(
     prune-retry, and timeout loop-breaker semantics) but does NOT advance main.
     Fresh per-call ``timeouts`` / ``enospc_retries`` dicts are used so solo
     attempts do not count against the tip's existing timeout budgets.  The
-    solo verify takes the worker's full-reverify retry budget
-    (``SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES``), so an
-    infra-transient or ENOSPC red costs a member at most one re-verify, the
-    same as a worker merge.
+    limits are the worker's own (``SpeculativeMergeWorker``'s
+    ``MAX_POST_MERGE_VERIFY_TIMEOUTS`` / ``MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES``),
+    so an infra-transient or ENOSPC red earns a member the same retry budget
+    as a worker merge.
 
     Returns a :class:`SoloVerifyResult`:
       - ``passed=True``  when ``_run_post_merge_verify`` returns ``None``.
@@ -5521,7 +5521,7 @@ async def reverify_member_solo(
         git_ops, req, solo_wt,
         timeouts={},
         enospc_retries={},
-        max_timeouts=3,
+        max_timeouts=SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_TIMEOUTS,
         max_enospc=SpeculativeMergeWorker.MAX_POST_MERGE_VERIFY_ENOSPC_RETRIES,
         event_store=event_store,
         merge_sha=tip_sha,
