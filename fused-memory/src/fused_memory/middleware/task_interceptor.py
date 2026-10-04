@@ -83,6 +83,12 @@ from fused_memory.middleware.path_scope_guard import (
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+from fused_memory.middleware.recurrence_mint import (
+    RECURRENCE_MINT_SOURCE,
+    MintOutcomeKind,
+    mint_successor,
+    mints_successor,
+)
 from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
 from fused_memory.middleware.soft_scope_signals import (
     SoftScopeFinding,
@@ -1748,6 +1754,17 @@ class TaskInterceptor:
         )
         await self._journal(event)
 
+        # 5b. A recurrence carrier completed done mints its successor inline,
+        # so the caller's next read sees it (task 4866 r2).
+        if mints_successor(status, before):
+            await self._mint_recurrence_successor(
+                task_id=task_id,
+                before=before,
+                project_root=project_root,
+                tag=tag,
+                project_id=project_id,
+            )
+
         # 6. Targeted reconciliation for trigger statuses (fire-and-forget)
         if status in self.STATUS_TRIGGERS and self.reconciler:
             task = asyncio.create_task(
@@ -1771,6 +1788,45 @@ class TaskInterceptor:
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
         return result
+
+    async def _mint_recurrence_successor(
+        self,
+        *,
+        task_id: str,
+        before: dict,
+        project_root: str,
+        tag: str | None,
+        project_id: str,
+    ) -> None:
+        """Mint a completed carrier's successor link and journal its creation.
+
+        Re-acquires the per-project write lock AFTER the transition released
+        it (the lock is not reentrant), so the mint's existing-link scan and
+        insert are atomic with respect to other interceptor writers.
+        """
+        tm = await self._ensure_taskmaster()
+        terminal_time = datetime.now(UTC)
+        async with self._write_lock(project_id):
+            outcome = await mint_successor(
+                tm,
+                predecessor=before,
+                predecessor_id=task_id,
+                project_root=project_root,
+                tag=tag,
+                terminal_time=terminal_time,
+            )
+        if outcome.kind is MintOutcomeKind.MINTED:
+            event = self._make_event(
+                EventType.task_created,
+                project_root,
+                {
+                    'operation': 'add_task',
+                    'task_id': outcome.successor_id,
+                    'source': RECURRENCE_MINT_SOURCE,
+                    'minted_from': task_id,
+                },
+            )
+            await self._journal(event)
 
     # ── Claimant-only writes (no status-FSM gate) ───────────────────────
 
