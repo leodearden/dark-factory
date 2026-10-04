@@ -1318,24 +1318,26 @@ def create_server(
     async def _report_amendment_truncation_storm(l2_id: str) -> None:
         """File ONE info escalation when amendment truncation BURSTS.
 
-        ``queue.add_members_to_l2`` already counts every dropped amendment on
-        the record itself (``amendments_truncated``) and logs a WARNING.  The
+        Called by both amendment writers' tools — a ``promote_to_l2`` fold and
+        an explicit ``amend_escalation`` — whenever their write shed entries.
+        ``queue._append_amendment_capped`` already counts every dropped
+        amendment on the record itself (``amendments_truncated``) and logs a
+        WARNING.  The
         counter stays the PRIMARY structured fact — the contract is assertable
         from the record, never by log-scrape (INV-8) — but a WARNING has no
         audience.  This is the rate-thresholded NOTIFICATION layered on top,
         which is what INV-4 asks for: a hearer, at a threshold.
 
         Deliberately lives here and not in ``queue.py``.  That module is a pure
-        storage leaf, and a self-file from inside ``add_members_to_l2`` would
+        storage leaf, and a self-file from inside a locked amendment write would
         re-enter ``make_id``/``submit``/``_atomic_write`` while still holding
-        ``escalation_id_lock``.  ``promote_to_l2`` already calls ``queue.submit``
-        on its create path and runs outside that flock.
+        ``escalation_id_lock``.  Both callers await this outside that flock.
 
         PURELY ADDITIVE, NEVER FATAL, mirroring the house analogues
         ``emit_markup_storm_escalation`` and
         ``emit_residual_candidate_key_escalation``: nothing raised in here may
-        fail the promote that triggered it.  A dropped report costs a
-        notification; a raised one would cost the fold.
+        fail the write that triggered it.  A dropped report costs a
+        notification; a raised one would cost the fold or the amend.
 
         Filed under ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``, following the same
         analogues, because the condition is system-scoped rather than a property
@@ -2984,6 +2986,10 @@ def create_server(
             return result, queue.get(escalation_id)
 
         result, esc = await asyncio.to_thread(amend_and_enrich)
+        # An alarm whose census excluded a truncation source would under-report
+        # exactly the cap pressure it exists to detect.
+        if result['dropped'] > 0:
+            await _report_amendment_truncation_storm(escalation_id)
         status = result['status']
         if status == 'amended' and esc is not None:
             return {**esc.to_dict(), 'amendment_recorded': True}
