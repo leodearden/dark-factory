@@ -427,9 +427,20 @@ function focusGroupView(tasks, options) {
   };
 }
 
+// ── Content key for a memo over this module's layout functions ──
+// Covers exactly what they read: input order, id, status and deps[].id. If any
+// of them starts reading another field, add that field here.
+function layoutSignature(tasks) {
+  return JSON.stringify(tasks.map(t => [t.id, t.status, (t.deps || []).map(d => d.id)]));
+}
+
+function taskGraphLayout(tasks) {
+  throw new Error('not implemented');
+}
+
 // Named GRAPH_LAYOUT_API, never a bare `API` — see the module-unique-const
 // convention in this file's header comment.
-const GRAPH_LAYOUT_API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset, focusGroupView };
+const GRAPH_LAYOUT_API = { computeTiers, partitionComponents, orderRows, countCrossings, computeNeighborhood, focusSubset, focusGroupView, layoutSignature, taskGraphLayout };
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = GRAPH_LAYOUT_API;
