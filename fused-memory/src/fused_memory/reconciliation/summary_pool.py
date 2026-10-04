@@ -56,30 +56,8 @@ logger = logging.getLogger(__name__)
 # closing a service <-> reconciliation import cycle.
 CYCLE_SUMMARY_TTL_DAYS: int = _CYCLE_SUMMARY_TTL_DAYS
 
-# record_type vocabulary for cycle_summary Mem0 writes (task 2468). The one
-# live writer of kind='cycle_summary' is this module's deterministic, terse,
-# auto-generated Mem0 mirror of the authoritative ledger row (LEDGER_STAMP,
-# written unconditionally below). NARRATIVE is the value of the LLM-authored
-# reconstruction write that task 3734 retired.
-#
-# record_type was write-only as of task 2468: no reader (dedup/near-duplicate
-# tooling, Path-2 verification, pool-cap trim) filtered on it — the fix that
-# actually stopped the double-write was the removed normal-flow LLM
-# instruction (recon_self_model.py), not this discriminator.
-#
-# Task 3041 gives LEDGER_STAMP its first two real readers: this module's own
-# record_type-aware eviction order in enforce_summary_pool_cap below, and
-# reconciliation.mem0_tombstone.is_protected_mirror_record. Because
-# mem0_tombstone is imported BY this module (for the trim-path tombstone
-# write), it cannot import back — so the literals now live in the leaf
-# recon_pool_map alongside the pool names, single-sourced for both readers,
-# and are re-exported here under their historical names. See that module for
-# why (task 3041 amendment pass: they were previously duplicated with nothing
-# pinning the copies equal, so an edit to one side would silently disable half
-# the protected-mirror guard).
-#
-# There is no longer a prompt-side NARRATIVE literal; the value survives for
-# historical payloads and the eviction order (see recon_pool_map).
+# record_type vocabulary for cycle_summary Mem0 writes, re-exported; see
+# recon_pool_map.py::CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE.
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP: str = _CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE: str = _CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE
 
@@ -633,9 +611,7 @@ async def write_cycle_summary(
                 project_id=project_id,
                 agent_id=f'recon-stage-{stage}',
                 category='observations_and_summaries',
-                # record_type discriminates this deterministic code mirror
-                # (LEDGER_STAMP) from the LLM-authored reconstruction write
-                # (NARRATIVE, task 2468) that task 3734 retired.
+                # record_type: see recon_pool_map.py::CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE.
                 # services/memory_service.py::_apply_cycle_summary_metadata_tagging
                 # strips nothing from a kind='cycle_summary' write, so
                 # record_type survives through to storage unchanged.

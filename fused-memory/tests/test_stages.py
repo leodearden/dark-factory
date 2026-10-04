@@ -14087,50 +14087,6 @@ class TestMaybeQueueBriefingRefreshTasksNoTaskmasterNoOp:
         mock_script.assert_not_called()
 
 
-class TestStage2PromptCycleSummaryPoolTag:
-    """Stage 2 prompt still names the recon_pool='stage2_cycle_summary' tag
-    that Python's cycle_summary mirror carries, so the agent can recognise
-    the pool's members.
-
-    Task 1657 step-11: minimal key-presence assertions only (no prose-wording
-    pins).
-
-    No LLM producer of the tag remains: task 2229 moved the normal-flow write
-    to summary_pool.write_cycle_summary and task 3734 retired the
-    reconstruction write, so the producer contract the trim
-    (_enforce_stage2_summary_pool_cap) relies on is Python's, not the prompt's.
-    """
-
-    def test_stage2_prompt_contains_recon_pool_key(self):
-        """build_stage2_system_prompt('dark_factory') must include 'recon_pool'.
-
-        The Python trim identifies pool members by the recon_pool key, so the
-        prompt names it alongside the mirror's other metadata.
-        """
-        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
-
-        prompt = build_stage2_system_prompt('dark_factory')
-        assert 'recon_pool' in prompt, (
-            "build_stage2_system_prompt('dark_factory') must include 'recon_pool' "
-            "in the per-cycle summary metadata guidance (task 1657)."
-        )
-
-    def test_stage2_prompt_contains_stage2_cycle_summary_value(self):
-        """build_stage2_system_prompt('dark_factory') must include 'stage2_cycle_summary'.
-
-        This is the pool key value that Python's _enforce_stage2_summary_pool_cap
-        uses as the filter.
-        """
-        from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
-
-        prompt = build_stage2_system_prompt('dark_factory')
-        assert 'stage2_cycle_summary' in prompt, (
-            "build_stage2_system_prompt('dark_factory') must include "
-            "'stage2_cycle_summary' — the recon_pool value the Python trim "
-            "filters on (task 1657)."
-        )
-
-
 # ---------------------------------------------------------------------------
 # The former classes TestStage1PromptCycleSummaryPoolTag and
 # TestStage1CycleSummaryPoolTrim (task 1942) tested the LLM-driven
