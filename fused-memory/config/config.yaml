@@ -429,35 +429,56 @@ summary_rebuild:
 
 # In-place Mem0 amendment (task 3088) — the update_memory MCP tool, which
 # rewrites a record's content and/or metadata while PRESERVING its Qdrant point
-# id. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6);
-# every value below is the shipped default, shown so the knobs are discoverable
-# without reading the schema. Uncomment to change one.
-# mem0_update:
-#   # Kill switch. false denies every caller on the very next call, allowlisted
-#   # or not — this is the knob to flip during a runaway-rewrite incident.
-#   enabled: true
-#   # Two independent agent_id-prefix allowlists, one per arm. Widening the
-#   # metadata bar ALONE is the supported way to admit an interactive tagging
-#   # flow without granting content-amend authority: a mistagged record is cheap
-#   # to notice and cheap to correct, a silent content rewrite is neither.
-#   # agent_id is self-reported, so this deters misuse by cooperating callers
-#   # rather than enforcing a security boundary.
-#   #
-#   # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
-#   # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
-#   # all-deployments default): it admits the interactive memory-consolidation
-#   # sitting defined by skills/curate-fused-memories, which cannot work
-#   # without the grant. Both arms deliberately — gate 3200's retain-and-tag
-#   # stamps retained peers via metadata-only patches, so content_amend alone
-#   # would be the destructive half without the preserving half. Full
-#   # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
-#   content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
-#   metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-']
-#   # Content-amend burst alarm: escalates, never blocks (a hard block would
-#   # risk a legitimate large consolidation cycle failing mid-run over its own
-#   # success count). Metadata-only calls do not count toward it.
-#   storm_threshold: 20
-#   storm_window_seconds: 3600.0
+# id. All five leaves are green-tier hot-reloadable (see OPERATIONS.md §6).
+# Only metadata_patch_allowed_agent_prefixes is active; every commented value
+# below is the shipped default, shown so the knobs are discoverable without
+# reading the schema. Uncomment to change one.
+mem0_update:
+  # Kill switch. false denies every caller on the very next call, allowlisted
+  # or not — this is the knob to flip during a runaway-rewrite incident.
+  # enabled: true
+  # Two independent agent_id-prefix allowlists, one per arm. Widening the
+  # metadata bar ALONE is the supported way to admit an interactive tagging
+  # flow without granting content-amend authority: a mistagged record is cheap
+  # to notice and cheap to correct, a silent content rewrite is neither.
+  # agent_id is self-reported, so this deters misuse by cooperating callers
+  # rather than enforcing a security boundary.
+  #
+  # curator- is part of the SCHEMA DEFAULT (ruling 2026-08-12, promoting the
+  # 2026-08-11 esc-3524-1 ruling (b) from a per-machine override here to an
+  # all-deployments default): it admits the interactive memory-consolidation
+  # sitting defined by skills/curate-fused-memories, which cannot work
+  # without the grant. Both arms deliberately — gate 3200's retain-and-tag
+  # stamps retained peers via metadata-only patches, so content_amend alone
+  # would be the destructive half without the preserving half. Full
+  # rationale: the Mem0UpdateConfig field descriptions in config/schema.py.
+  # content_amend_allowed_agent_prefixes: ['recon-stage-', 'curator-']
+  #
+  # link-heal- is owned by plans/write-triage-link-healing-prd.md H1 and task α
+  # (6181): the link-heal executor (fused-memory/scripts/link_heal.py) writes
+  # metadata-only heals as agent_id link-heal-<run8>, so it holds this arm and
+  # never the content-amend arm. This ACTIVE list overrides the schema default
+  # for this arm, so a future change to Mem0UpdateConfig's default
+  # metadata_patch_allowed_agent_prefixes must be mirrored here by hand.
+  metadata_patch_allowed_agent_prefixes: ['recon-stage-', 'curator-', 'link-heal-']
+  # Content-amend burst alarm: escalates, never blocks (a hard block would
+  # risk a legitimate large consolidation cycle failing mid-run over its own
+  # success count). Metadata-only calls do not count toward it.
+  # storm_threshold: 20
+  # storm_window_seconds: 3600.0
+
+# Link-heal executor caps (task 6181, plans/write-triage-link-healing-prd.md
+# H1). Read by fused-memory/scripts/link_heal.py at each run start, so an edit
+# takes effect on the next run with no restart. Every value below is the shipped
+# default, shown so the knobs are discoverable. Uncomment to change one.
+# link_heal:
+#   # Write attempts per unattended run, oldest-planned first; the rest stay
+#   # pending as skipped_cap. 0 applies nothing unattended.
+#   max_actions_per_run: 25
+#   # Escalate once (link-heal-backlog) when pending > max_actions_per_run x this.
+#   backlog_multiplier: 5
+#   # Consecutive failed actions that stop a run (link-heal-write-failure).
+#   write_failure_streak: 3
 
 # Entity-node minting (task 4932) — the ensure_entity_node MCP tool, which
 # CREATES a Graphiti Entity node so a dangling referent has something to point
