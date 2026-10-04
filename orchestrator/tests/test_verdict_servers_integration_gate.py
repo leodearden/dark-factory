@@ -86,11 +86,11 @@ from orchestrator.steward import TaskSteward
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
-# Fixtures — file-local, mirroring test_workflow_e2e.py:147-191. The WORKFLOW
-# half needs a REAL OrchestratorConfig (not _workflow_helpers._make's
-# MagicMock): the real _invoke calls resolve_route(route_inputs, self.config).
-# The steward half takes conftest's make_steward, whose stamped routing.*
-# containers satisfy resolve_and_record_route — see make_steward.__doc__.
+# Fixtures — file-local, mirroring test_workflow_e2e.py::git_repo, ::config,
+# ::git_ops and ::task_assignment. The WORKFLOW half needs a REAL
+# OrchestratorConfig (not _workflow_helpers._make's MagicMock): the real
+# _invoke calls resolve_route(route_inputs, self.config). The steward half
+# uses conftest.py::make_steward.
 # ---------------------------------------------------------------------------
 
 
@@ -359,7 +359,7 @@ def triage_steward(make_steward) -> TaskSteward:
     """
     steward = make_steward()
     _artifacts_for(steward.worktree).init(
-        steward.task_id, 'Verdict boundary task', 'exercise triage boundary',
+        steward.task_id, steward.task['title'], steward.task['description'],
     )
     return steward
 
@@ -749,8 +749,6 @@ class TestTriageBoundary:
     its REAL invoke seam — monkeypatch ``orchestrator.steward.invoke_agent``
     (NOT ``workflow.invoke_agent``; the steward binds its own module-level
     ``invoke_agent`` symbol, steward.py:33/790-793).
-
-    The steward comes from the ``triage_steward`` fixture.
     """
 
     _SUGGESTIONS = [
@@ -772,13 +770,11 @@ class TestTriageBoundary:
         carries the pre-triaged markdown (accepted/skipped counts, proposed
         task groups) — extract_triage_verdict consumed the real artifact.
         """
-        steward = triage_steward
-        worktree = steward.worktree
         escalation = _make_triage_escalation(self._SUGGESTIONS)
         monkeypatch.setattr(
             'orchestrator.steward.invoke_agent',
             _fake_invoke_writes_triage_verdict(
-                worktree=worktree,
+                worktree=triage_steward.worktree,
                 accepted=[{
                     'index': 0, 'suggestion': 'Add test for X', 'reason': 'missing coverage',
                     'files': ['orchestrator/foo.py'], 'proposed_task_title': 'Add coverage for X',
@@ -793,7 +789,7 @@ class TestTriageBoundary:
             ),
         )
 
-        result = await steward._pre_triage_suggestions(escalation)
+        result = await triage_steward._pre_triage_suggestions(escalation)
 
         assert result is not escalation
         assert '## Pre-Triaged Results' in result.detail
@@ -810,10 +806,8 @@ class TestTriageBoundary:
         cleared before this spawn (I-FRESH) — proven here because it does
         NOT leak through as a modified escalation.
         """
-        steward = triage_steward
-        worktree = steward.worktree
         escalation = _make_triage_escalation(self._SUGGESTIONS)
-        _artifacts_for(worktree).write_verdict(
+        _artifacts_for(triage_steward.worktree).write_verdict(
             'triage',
             _envelope('triage', 'stale-sid', {
                 'accepted': [{
@@ -825,10 +819,10 @@ class TestTriageBoundary:
         )
         monkeypatch.setattr(
             'orchestrator.steward.invoke_agent',
-            _fake_invoke_writes_triage_verdict(worktree=worktree, write=False),
+            _fake_invoke_writes_triage_verdict(worktree=triage_steward.worktree, write=False),
         )
 
-        result = await steward._pre_triage_suggestions(escalation)
+        result = await triage_steward._pre_triage_suggestions(escalation)
 
         assert result is escalation
 
