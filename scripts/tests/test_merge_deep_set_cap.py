@@ -25,6 +25,7 @@ from config_reload_script_fakes import (
     ClosedPort,
     FakeEscalationMcp,
     commit_config,
+    git,
     head,
     init_repo,
     path_python3_shimmed_to,
@@ -63,13 +64,6 @@ def _run(server, config, cap, *, script=SCRIPT, env=None):
     )
 
 
-def _git_out(repo, *args):
-    return subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True, capture_output=True, text=True,
-    ).stdout
-
-
 # ---------------------------------------------------------------------------
 # The forward transition, hot-applied
 # ---------------------------------------------------------------------------
@@ -96,9 +90,9 @@ def test_a_cap_change_is_hot_applied_through_the_session_handshake(tmp_path, see
     assert f"{KNOB} applied old=0 new=6" in proc.stdout, proc.stdout
     assert proc.stdout.splitlines()[-1].startswith("merge-deep-set-cap: done cap=6")
 
-    landed = _git_out(repo, "rev-list", f"{before}..HEAD").split()
+    landed = git(repo, "rev-list", f"{before}..HEAD").split()
     assert len(landed) == 1, f"expected exactly one new commit, got {landed}"
-    touched = _git_out(repo, "show", "--name-only", "--format=", "HEAD").split()
+    touched = git(repo, "show", "--name-only", "--format=", "HEAD").split()
     assert touched == ["dark-factory-orchestrator.yaml"]
     text = config.read_text()
     assert "merge_deep:\n  chain_cap: 6\n" in text, text
@@ -128,10 +122,6 @@ def _seeded(tmp_path, seed="block_present"):
     return commit_config(init_repo(tmp_path), SEEDS[seed])
 
 
-def _short_head(repo):
-    return _git_out(repo, "rev-parse", "--short", "HEAD").strip()
-
-
 def _assert_failed_closed_on_the_transport(proc, repo):
     """The one verdict every transport fault must reach: a loud failure naming
     the TRANSPORT, the sha the cap is already committed as, and the restart
@@ -139,7 +129,7 @@ def _assert_failed_closed_on_the_transport(proc, repo):
     request that reached no tool says nothing about."""
     assert proc.returncode != 0, f"a transport fault was read as success: {proc.stdout}"
     assert TRANSPORT_MARKER in proc.stderr, f"stderr={proc.stderr}"
-    assert _short_head(repo) in proc.stderr, f"stderr={proc.stderr}"
+    assert head(repo, short=True) in proc.stderr, f"stderr={proc.stderr}"
     assert "lands at the next restart" in proc.stderr, f"stderr={proc.stderr}"
     assert "applied disposition missing" not in proc.stderr, (
         f"a request that never reached the tool was blamed on the disposition: {proc.stderr}"

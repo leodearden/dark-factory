@@ -290,12 +290,13 @@ def path_python3_shimmed_to(tmp_path, interpreter):
 # ---------------------------------------------------------------------------
 
 def git(repo, *args):
-    """Run a git command against *repo*, raising loudly on failure -- test
-    setup must never silently produce a repo that doesn't match the spec."""
-    subprocess.run(
+    """Run a git command against *repo* and return its stdout, raising loudly
+    on failure -- test setup must never silently produce a repo that doesn't
+    match the spec."""
+    return subprocess.run(
         ["git", "-C", str(repo), *args],
         check=True, capture_output=True, text=True,
-    )
+    ).stdout
 
 
 def init_repo(tmp_path):
@@ -323,9 +324,6 @@ def commit_config(repo, text):
     return config
 
 
-def head(repo):
-    """*repo*'s full HEAD sha."""
-    return subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
+def head(repo, *, short=False):
+    """*repo*'s HEAD sha -- abbreviated as the scripts print it if *short*."""
+    return git(repo, "rev-parse", *(["--short"] if short else []), "HEAD").strip()

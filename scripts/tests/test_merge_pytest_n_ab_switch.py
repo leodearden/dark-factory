@@ -29,6 +29,7 @@ from config_reload_script_fakes import (
     ClosedPort,
     FakeEscalationMcp,
     commit_config,
+    git,
     head,
     init_repo,
     path_python3_shimmed_to,
@@ -128,15 +129,9 @@ def test_flip_reports_outcome_applied_and_commits(tmp_path):
         f"the script never handshook; the server saw {methods}"
     )
 
-    landed = subprocess.run(
-        ["git", "-C", str(repo), "rev-list", f"{before}..HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.split()
+    landed = git(repo, "rev-list", f"{before}..HEAD").split()
     assert len(landed) == 1, f"expected exactly one new commit, got {landed}"
-    touched = subprocess.run(
-        ["git", "-C", str(repo), "show", "--name-only", "--format=", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.split()
+    touched = git(repo, "show", "--name-only", "--format=", "HEAD").split()
     assert touched == ["dark-factory-orchestrator.yaml"]
     assert f'{KEY}: "8"' in config.read_text()
 
@@ -480,10 +475,7 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
         proc = _run(server, config, "8")
 
     _assert_failed_closed_on_the_transport(proc)
-    sha = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
+    sha = head(repo, short=True)
     assert sha in proc.stderr, f"stderr={proc.stderr}"
     assert "lands at the next restart" in proc.stderr, f"stderr={proc.stderr}"
 
