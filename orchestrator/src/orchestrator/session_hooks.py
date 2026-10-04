@@ -1701,8 +1701,9 @@ def _run_status_refresh_and_retitle(
     # -- it is the whole point of withholding rather than skipping.
     session_registry.write_record(record, root=root)
     _stamp_session_pointer(record, probes, root)
-    own_env = _own_identity_env(env, resolution)
-    title = hook_display_title(resolve_hook_identity(hook_input, own_env), own_env, record)
+    identity_env = _own_identity_env(env, resolution)
+    identity = resolve_hook_identity(hook_input, identity_env)
+    title = hook_display_title(identity, identity_env, record)
     return osc_retitle_sequence(status, title)
 
 
