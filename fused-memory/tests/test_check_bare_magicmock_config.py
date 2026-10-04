@@ -9,6 +9,8 @@ See task 1372 (lint guard) and task 1339/1313/1064 (migration).
 from __future__ import annotations
 
 import ast
+import dataclasses
+import re
 import shutil
 import subprocess
 import sys
@@ -421,7 +423,10 @@ class TestCliExitCodes:
 
 
 class TestCliDirectoryScan:
-    """Directory-mode scans test_*.py and conftest.py recursively, ignores other .py files."""
+    """Directory-mode scans test_*.py, conftest.py and _*.py helper modules recursively.
+
+    Every other .py file is ignored.
+    """
 
     def test_cli_recursively_scans_directory_for_test_files_and_conftest(self, tmp_path: Path):
         """Dir scan: test_example.py + conftest.py flagged; other_file.py ignored."""
@@ -444,6 +449,44 @@ class TestCliDirectoryScan:
         assert 'test_example.py' in output
         assert 'conftest.py' in output
         assert 'other_file.py' not in output
+
+
+    def test_cli_scans_underscore_helper_modules(self, tmp_path: Path):
+        """``_*.py`` helpers are scanned, at any depth; other non-test files still are not."""
+        (tmp_path / '_helper.py').write_text(_VIOLATION_SOURCE)
+        subdir = tmp_path / 'sub'
+        subdir.mkdir()
+        (subdir / '_nested_helper.py').write_text(_VIOLATION_SOURCE)
+        (tmp_path / 'other_file.py').write_text(_VIOLATION_SOURCE)
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), str(tmp_path)],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 1
+        output = result.stdout
+        assert '_helper.py' in output
+        assert '_nested_helper.py' in output
+        assert 'other_file.py' not in output
+
+    def test_discover_scan_targets_returns_the_sorted_union_of_the_three_globs(
+        self, tmp_path: Path
+    ):
+        """The one discovery seam the CLI and the baseline-integrity census both use."""
+        subdir = tmp_path / 'sub'
+        subdir.mkdir()
+        expected = [
+            tmp_path / 'test_a.py',
+            tmp_path / 'conftest.py',
+            tmp_path / '_h.py',
+            subdir / '_n.py',
+            subdir / 'test_b.py',
+        ]
+        for path in [*expected, tmp_path / 'plain.py']:
+            path.write_text('')
+
+        assert _checker.discover_scan_targets(tmp_path) == sorted(expected)
 
 
 class TestCliErrorHandling:
@@ -674,27 +717,16 @@ class TestHooksIntegration:
 # Assign/AnnAssign-only) is unchanged; every test above this banner pins it.
 # ===========================================================================
 
-# The 16 real fields of orchestrator/src/orchestrator/verify.py::VerifyResult.
-# Duplicated here deliberately: this test is the thing that would notice if the
-# script's registry copy silently drifted from the real dataclass.
-_VERIFY_RESULT_FIELDS = frozenset({
-    'passed',
-    'test_output',
-    'lint_output',
-    'type_output',
-    'summary',
-    'timed_out',
-    'cause_hint',
-    'category',
-    'worktree_log_paths',
-    'archive_log_paths',
-    'contention',
-    'plan',
-    'failing_test_ids',
-    'failing_leg_categories',
-    'trivial',
-    'duration_secs',
-})
+@pytest.fixture
+def verify_result_field_names() -> frozenset[str]:
+    """VerifyResult's real field names, read at runtime from orchestrator.verify.
+
+    Imported here, not at module top, so an import-time break in orchestrator.verify
+    fails only the drift tests that read it rather than collection of this whole suite.
+    """
+    from orchestrator.verify import VerifyResult
+
+    return frozenset(f.name for f in dataclasses.fields(VerifyResult))
 
 
 class TestDataclassShapeRegistry:
@@ -716,13 +748,19 @@ class TestDataclassShapeRegistry:
             'Adding a shape is a deliberate widening — update this test with it.'
         )
 
-    def test_verify_result_fields_match_the_real_dataclass(self):
-        """The registry's field literal equals VerifyResult's 16 real field names."""
+    def test_registry_names_no_stale_verify_result_field(self, verify_result_field_names):
+        """Every registered field is one VerifyResult really has, read at runtime.
+
+        The script must stay stdlib-only, so it carries a literal copy.  This test owns
+        the STALE direction; the MISSING direction is owned by
+        test_every_real_field_counts_toward_the_overlap_floor, so one drift fails once.
+        """
         shape = _checker._DATACLASS_SHAPES[0]
-        assert shape.fields == _VERIFY_RESULT_FIELDS, (
-            'Registry field set drifted from orchestrator/src/orchestrator/verify.py::VerifyResult.\n'
-            f'  missing from registry: {sorted(_VERIFY_RESULT_FIELDS - shape.fields)}\n'
-            f'  extra in registry:     {sorted(shape.fields - _VERIFY_RESULT_FIELDS)}'
+        stale = sorted(shape.fields - verify_result_field_names)
+        assert stale == [], (
+            'remove these names from `_DATACLASS_SHAPES[0].fields` in '
+            'fused-memory/scripts/check_bare_magicmock_config.py; '
+            f'orchestrator/src/orchestrator/verify.py::VerifyResult has no such field: {stale}'
         )
         assert isinstance(shape.fields, frozenset), (
             f'fields must be a frozenset for cheap set algebra; got {type(shape.fields)}'
@@ -733,6 +771,28 @@ class TestDataclassShapeRegistry:
         shape = _checker._DATACLASS_SHAPES[0]
         assert shape.anchors == frozenset({'passed'}), (
             f"VerifyResult's anchor must be exactly {{'passed'}}; got {set(shape.anchors)}"
+        )
+
+    def test_every_real_field_counts_toward_the_overlap_floor(self, verify_result_field_names):
+        """Each real non-anchor field, paired with ``passed``, flags exactly one double.
+
+        The behavioural consequence of the registry: a field VerifyResult has but the
+        registry lacks would not count toward ``min_field_matches``, so a double built
+        from it would slip through.  The field list is read at runtime, so a future
+        field landing unregistered turns this red too.
+        """
+        unflagged = []
+        for name in sorted(verify_result_field_names):
+            if name == 'passed':
+                continue
+            source = f'm = MagicMock(passed=True, {name}=None)\n'
+            violations = find_violations(source, _NON_DEBT_FILE)
+            if len(violations) != 1 or 'bare-dataclass-double' not in violations[0].message:
+                unflagged.append(name)
+        assert unflagged == [], (
+            'these VerifyResult fields do not count toward Rule B\'s overlap floor; add '
+            'them to `_DATACLASS_SHAPES[0].fields` in '
+            f'fused-memory/scripts/check_bare_magicmock_config.py: {unflagged}'
         )
 
     def test_verify_result_min_field_matches_is_two(self):
@@ -1309,16 +1369,13 @@ class TestWallClockLoadBearingTarget:
 
     Exactly two shapes are load-bearing, and both gate a hard assertion
     downstream: a ``MergeRequest.result`` future (its resolution IS the event
-    the test waits for) and a ``gate*.wait()`` ``asyncio.Event`` barrier
-    (already event-driven; only its deadline is wall-clock).
+    the test waits for) and a zero-argument ``.wait()`` barrier (already
+    event-driven; only its deadline is wall-clock).
 
-    The two legs are NOT symmetric and these tests pin the asymmetry rather than
-    hiding it: ``.result`` is selected by pure shape, while the barrier leg also
-    demands a receiver Name starting with ``gate`` — a naming convention, with a
-    measured false-negative surface (102 ``asyncio.wait_for(<expr>.wait())``
-    sites across the scanned dirs). Task 4246's amendment pass declined to drop
-    the prefix because the remedy the rule names, ``wait_responsive``, exists
-    only under orchestrator/tests; see the script's Rule C docstring.
+    Both legs are pure SHAPE, on any receiver — a Name, an Attribute, a
+    Subscript or a Call.  No receiver name is consulted.  The barrier leg's
+    zero-argument requirement is its structural discriminator: it is what keeps
+    ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)`` out.
 
     The Name negative is the load-bearing one: it is what keeps the
     ``_stop_worker`` teardown join — ``asyncio.wait_for(worker_task, ...)``,
@@ -1340,18 +1397,18 @@ class TestWallClockLoadBearingTarget:
         assert 'follower_reqs[tid].result' in described
         assert 'MergeRequest.result future' in described
 
-    def test_gate_wait_call_is_an_event_barrier(self):
-        """``gate_a_entered.wait()`` → described as an asyncio.Event gate barrier."""
+    def test_gate_wait_call_is_a_barrier(self):
+        """``gate_a_entered.wait()`` → described as a .wait() barrier."""
         described = _checker._load_bearing_wait_target(_expr('gate_a_entered.wait()'))
         assert described is not None
         assert 'gate_a_entered.wait()' in described
-        assert 'asyncio.Event gate barrier' in described
+        assert '.wait() barrier' in described
 
-    def test_bare_gate_prefix_wait_call_is_an_event_barrier(self):
-        """``gate_entered.wait()`` → the prefix is 'gate', not 'gate_<letter>_'."""
+    def test_bare_gate_prefix_wait_call_is_a_barrier(self):
+        """``gate_entered.wait()`` → gate-named barriers stay detected."""
         described = _checker._load_bearing_wait_target(_expr('gate_entered.wait()'))
         assert described is not None
-        assert 'asyncio.Event gate barrier' in described
+        assert '.wait() barrier' in described
 
     def test_bare_name_target_is_not_load_bearing(self):
         """``worker_task`` → None.
@@ -1366,22 +1423,47 @@ class TestWallClockLoadBearingTarget:
         """``obj.results`` → None (the attribute must be exactly 'result')."""
         assert _checker._load_bearing_wait_target(_expr('obj.results')) is None
 
-    def test_non_gate_name_wait_call_is_not_load_bearing(self):
-        """``notagate.wait()`` → None (the receiver Name must start with 'gate').
+    def test_a_non_gate_name_wait_call_is_a_barrier(self):
+        """``done.wait()`` → a barrier: no receiver name prefix is required."""
+        described = _checker._load_bearing_wait_target(_expr('done.wait()'))
+        assert described is not None
+        assert 'done.wait()' in described
+        assert '.wait() barrier' in described
 
-        This pins a KNOWN false negative, not a desired exclusion: a real
-        ``done.wait()`` barrier is invisible for the same reason. It is here so
-        the boundary is measured rather than assumed — see the class docstring.
-        """
-        assert _checker._load_bearing_wait_target(_expr('notagate.wait()')) is None
+    @pytest.mark.parametrize(
+        'barrier',
+        [
+            'self._entered.wait()',
+            'drive.first_dispatched.wait()',
+            "verifier.entered[0].wait()",
+            "started['y'].wait()",
+            'some_call().wait()',
+        ],
+        ids=['attribute', 'nested-attribute', 'subscript', 'string-subscript', 'call'],
+    )
+    def test_a_wait_call_on_any_receiver_shape_is_a_barrier(self, barrier: str):
+        """Attribute, Subscript and Call receivers are barriers exactly like a Name."""
+        described = _checker._load_bearing_wait_target(_expr(barrier))
+        assert described is not None, f'{barrier} must be load-bearing'
+        assert '.wait() barrier' in described
 
     def test_wrong_method_on_a_gate_is_not_load_bearing(self):
         """``gate_a.set()`` → None (only ``.wait()`` blocks)."""
         assert _checker._load_bearing_wait_target(_expr('gate_a.set()')) is None
 
-    def test_wait_on_a_non_name_receiver_is_not_load_bearing(self):
-        """``some_call().wait()`` → None (``func.value`` is a Call, not a Name)."""
-        assert _checker._load_bearing_wait_target(_expr('some_call().wait()')) is None
+    @pytest.mark.parametrize(
+        'not_a_barrier',
+        ['asyncio.wait(pending)', 'ev.wait(5)', 'ev.wait(timeout=1)', 'ev.wait'],
+        ids=['asyncio-wait', 'positional-arg', 'keyword-arg', 'uncalled'],
+    )
+    def test_a_wait_taking_arguments_or_uncalled_is_not_a_barrier(self, not_a_barrier: str):
+        """The zero-argument requirement is the structural discriminator.
+
+        ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)`` take arguments;
+        an ``asyncio.Event``'s ``.wait()`` takes none.  An uncalled ``ev.wait`` is
+        not a wait at all.
+        """
+        assert _checker._load_bearing_wait_target(_expr(not_a_barrier)) is None
 
 
 # A brand-new orchestrator test file: NOT on any debt baseline, so Rule C
@@ -1489,6 +1571,70 @@ class TestWallClockDeadlineDetection:
         )
         assert 'wait_responsive' in violations[0].message
 
+    def test_positional_timeout_literal_flags_both_kinds(self):
+        """``asyncio.wait_for(req.result, 25.0)`` writes its number positionally.
+
+        wait_for's second positional parameter IS its timeout, so a keyword-only
+        literal scan would see the routing offence and miss the written number.
+        """
+        violations = _rule_c('asyncio.wait_for(req.result, 25.0)\n')
+        assert len(violations) == 2, (
+            'a positional timeout literal is the raw-literal offence as surely as '
+            f'timeout=25.0; got {violations!r}'
+        )
+        assert any('MERGE_RESULT_TIMEOUT' in v.message for v in violations), violations
+
+    def test_positional_derived_timeout_flags_the_bare_wait_for_kind_only(self):
+        """A positional bound derived from MERGE_RESULT_TIMEOUT is not a written number."""
+        violations = _rule_c('asyncio.wait_for(req.result, MERGE_RESULT_TIMEOUT)\n')
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' not in violations[0].message
+
+    def test_positional_boolean_timeout_is_not_a_numeric_literal(self):
+        """A positional ``True`` is not a raw number either (bool is an int subclass)."""
+        violations = _rule_c('asyncio.wait_for(req.result, True)\n')
+        assert len(violations) == 1, (
+            f'only the bare-wait_for kind should fire for a positional True; got {violations!r}'
+        )
+        assert 'RAW wall-clock literal' not in violations[0].message
+
+    def test_max_wall_s_literal_on_wait_responsive_flags_the_literal_kind(self):
+        """``max_wall_s=30.0`` is wait_responsive's wall-clock cap, written as a number."""
+        violations = _rule_c("wait_responsive(req.result, label='x', max_wall_s=30.0)\n")
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' in violations[0].message
+        assert 'max_wall_s' in violations[0].message
+
+    def test_several_literals_on_one_call_are_one_raw_literal_violation(self):
+        """Offence kinds are per CALL: two written numbers are one raw-literal violation.
+
+        This keeps the per-file budget arithmetic at 0, 1 or 2 violations per call.
+        """
+        source = "wait_responsive(req.result, timeout=45.0, max_wall_s=90.0, label='x')\n"
+        violations = _rule_c(source)
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' in violations[0].message
+
+    def test_a_non_gate_event_barrier_wait_flags_both_kinds(self):
+        """``asyncio.wait_for(done.wait(), timeout=5)`` → routing AND written number."""
+        violations = _rule_c('asyncio.wait_for(done.wait(), timeout=5)\n')
+        assert len(violations) == 2, violations
+
+    def test_a_non_gate_barrier_through_wait_responsive_flags_only_its_literal(self):
+        """A migrated non-gate barrier that kept its number trips the literal kind only."""
+        violations = _rule_c("wait_responsive(self._entered.wait(), timeout=30.0, label='x')\n")
+        assert len(violations) == 1, violations
+        assert 'RAW wall-clock literal' in violations[0].message
+
+    def test_asyncio_wait_inside_wait_for_is_not_a_barrier(self):
+        """``asyncio.wait(tasks)`` takes arguments, so it is not a ``.wait()`` barrier."""
+        assert _rule_c('asyncio.wait_for(asyncio.wait(tasks), timeout=5)\n') == []
+
+    def test_a_positional_timeout_on_a_non_gate_barrier_flags_both_kinds(self):
+        """``asyncio.wait_for(entered.wait(), 2.0)`` — the shape of the fused-memory sites."""
+        violations = _rule_c('asyncio.wait_for(entered.wait(), 2.0)\n')
+        assert len(violations) == 2, violations
+
     def test_a_call_with_no_positional_args_does_not_crash(self):
         """``asyncio.wait_for()`` has no args[0] to inspect — it must be skipped, not raise."""
         assert _rule_c('asyncio.wait_for()\nwait_responsive()\n') == []
@@ -1508,11 +1654,15 @@ class TestWallClockDeadlineMessage:
     _BOTH_KINDS = 'asyncio.wait_for(req_a.result, timeout=25.0)\n'
 
     def test_the_two_kinds_carry_distinct_remedies(self):
-        """Each kind names its own remedy; conflating them sends the reader down a dead end."""
+        """Each kind names its own remedy; conflating them sends the reader down a dead end.
+
+        Both messages mention both helpers in the shared reachability caveat, so the
+        filters key on the PRESCRIBING clause, not on the helper names.
+        """
         messages = [v.message for v in _rule_c(self._BOTH_KINDS)]
         assert len(messages) == 2, messages
-        bare = [m for m in messages if 'wait_responsive' in m and 'label=' in m]
-        literal = [m for m in messages if 'MERGE_RESULT_TIMEOUT' in m]
+        bare = [m for m in messages if 'through wait_responsive(...) with a descriptive label=' in m]
+        literal = [m for m in messages if 'Derive the bound from MERGE_RESULT_TIMEOUT' in m]
         assert len(bare) == 1, f'exactly one message must prescribe wait_responsive: {messages}'
         assert len(literal) == 1, (
             f'exactly one message must prescribe deriving from MERGE_RESULT_TIMEOUT: {messages}'
@@ -1526,15 +1676,50 @@ class TestWallClockDeadlineMessage:
             assert 'MergeRequest.result future' in v.message
 
     def test_messages_explain_the_consequence(self):
-        """A deadline expiry on a load-bearing sync point fails a test that PASSED."""
+        """A deadline expiry on a load-bearing sync point fails a test that PASSED.
+
+        Stated without merge vocabulary: Rule C scans every package's tests, and an
+        ``Event.wait()`` in fused-memory/tests has no merge pipeline.
+        """
         for v in _rule_c(self._BOTH_KINDS):
             assert 'WALL CLOCK' in v.message or 'wall-clock' in v.message
-            assert 'completed correctly' in v.message, v.message
+            assert 'awaited event did happen' in v.message, v.message
+            assert 'merge pipeline' not in v.message, v.message
+
+    def test_every_rule_c_message_says_where_its_remedy_is_importable(self):
+        """wait_responsive and MERGE_RESULT_TIMEOUT exist only under orchestrator/tests.
+
+        Both offence kinds and the debt overrun prescribe one of them, so each must
+        carry the same caveat naming the per-site noqa as the remedy elsewhere.
+        """
+        entry, budget = _live_rule_c_debt_entry()
+        messages = [v.message for v in _rule_c(self._BOTH_KINDS)]
+        messages += [v.message for v in _rule_c(_RULE_C_ONE_HIT * (budget + 1), entry)]
+        assert len(messages) == 3, messages
+        for message in messages:
+            assert 'importable only under orchestrator/tests' in message, message
 
     def test_messages_name_the_suppression_code(self):
         """Every rule's message tells the reader how to suppress that rule specifically."""
         for v in _rule_c(self._BOTH_KINDS):
             assert '# noqa: wall-clock-deadline' in v.message
+
+    def test_raw_literal_message_names_the_offending_parameter(self):
+        """The raw-literal message says WHICH bound carries the number."""
+        timeout_msgs = [
+            v.message
+            for v in _rule_c("wait_responsive(req.result, timeout=45.0, label='x')\n")
+        ]
+        assert len(timeout_msgs) == 1, timeout_msgs
+        assert 'timeout' in timeout_msgs[0]
+        assert 'max_wall_s' not in timeout_msgs[0]
+
+        cap_msgs = [
+            v.message
+            for v in _rule_c("wait_responsive(req.result, label='x', max_wall_s=30.0)\n")
+        ]
+        assert len(cap_msgs) == 1, cap_msgs
+        assert 'max_wall_s' in cap_msgs[0]
 
     def test_messages_share_no_vocabulary_with_rule_a_or_rule_b(self):
         """Rule A's and Rule B's remedies are unusable here and must not appear.
@@ -1683,19 +1868,92 @@ class TestWallClockDeadlineCrossCodeIsolation:
         assert _checker._RULE_C_CODE == 'wall-clock-deadline'
 
 
-# The Rule C census (task 4246, base 1d75322218): 618 violations across 20 files,
-# every one under orchestrator/tests/.  Counted as VIOLATIONS, not sites — one call
+class TestExemptionSeparatorVariants:
+    """Every rule honours every separator ``_EXEMPT_TEMPLATE`` accepts.
+
+    A uniform cross-rule pin of the exemption contract: em-dash, ASCII hyphen and a
+    repeated hyphen, for all three codes.  A future regex edit cannot then honour a
+    separator for one rule and not for another.
+    """
+
+    @pytest.mark.parametrize(
+        ('code', 'offending'),
+        [
+            ('bare-magicmock', _RULE_A_SOURCE),
+            ('bare-dataclass-double', _RULE_B_SOURCE),
+            ('wall-clock-deadline', _RULE_C_SOURCE),
+        ],
+    )
+    @pytest.mark.parametrize('separator', ['—', '-', '--'])
+    def test_the_pragma_suppresses_its_rule_with_every_separator(
+        self, code: str, offending: str, separator: str
+    ):
+        """``# noqa: <code> <sep> a reason`` on the preceding line suppresses that rule."""
+        def own(violations: list) -> list:
+            return [v for v in violations if f'# noqa: {code}' in v.message]
+
+        assert own(find_violations(offending, _NON_DEBT_FILE)), (
+            f'the offending source must trip {code} unsuppressed, or this pin is vacuous'
+        )
+        source = f'# noqa: {code} {separator} a reason\n' + offending
+        assert own(find_violations(source, _NON_DEBT_FILE)) == [], (
+            f'{code} must honour the {separator!r} separator like every other rule'
+        )
+
+
+# The Rule C census, re-measured by task 5269 after it widened detection: 650
+# violations across 47 files in four packages (task 4246 shipped 618 across 20,
+# every one under orchestrator/tests/).  Counted as VIOLATIONS, not sites — one call
 # can produce two.  test_merge_speculation.py measures ZERO (task 3980 migrated it)
 # and is deliberately ABSENT.
 _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
     'orchestrator/tests/test_merge_queue.py',
     'orchestrator/tests/test_merge_queue_concurrent_verify.py',
     'orchestrator/tests/test_concurrent_verify_boundary.py',
-    'orchestrator/tests/test_merge_queue_permit_conservation.py',
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
+    'orchestrator/tests/test_merge_queue_permit_conservation.py',
     'orchestrator/tests/test_merge_queue_resolve_release.py',
     'orchestrator/tests/test_coalesce_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_request_liveness.py',
+    'orchestrator/tests/test_offline_lane.py',
+    'orchestrator/tests/test_live_merge_worker.py',
+    'orchestrator/tests/test_background_service.py',
+    'orchestrator/tests/test_merge_queue_deep_dispatch.py',
+    'orchestrator/tests/test_merge_queue_deep_landing.py',
+    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py',
+    'orchestrator/tests/test_harness.py',
+    'orchestrator/tests/test_invoke.py',
     'orchestrator/tests/test_merge_queue_coalesce.py',
+    'orchestrator/tests/test_merge_queue_deep_integration_gate.py',
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py',
+    'orchestrator/tests/test_merge_skew_tripwire.py',
+    'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py',
+    'orchestrator/tests/test_offline_lane_infra_integration.py',
+    'orchestrator/tests/test_offline_lane_integration.py',
+    'orchestrator/tests/test_workflow_cancellation.py',
+    'orchestrator/tests/test_verify.py',
+    'dashboard/tests/test_db.py',
+    'dashboard/tests/test_mcp_fanout.py',
+    'dashboard/tests/test_durability.py',
+    'dashboard/tests/test_metrics_curator.py',
+    'dashboard/tests/_dashboard_helpers.py',
+    'dashboard/tests/test_api_curator.py',
+    'dashboard/tests/test_merge_queue_data.py',
+    'fused-memory/tests/test_drain_signal_handler.py',
+    'fused-memory/tests/test_harness.py',
+    'fused-memory/tests/test_memory_service.py',
+    'fused-memory/tests/test_operator_signal_handler.py',
+    'fused-memory/tests/test_periodic_rebuild_summaries.py',
+    'fused-memory/tests/test_task_interceptor.py',
+    'fused-memory/tests/server/test_grouped_read.py',
+    'fused-memory/tests/test_dependency_direction_check.py',
+    'fused-memory/tests/test_e2e_durable_queue.py',
+    'fused-memory/tests/test_journaling_integration.py',
+    'fused-memory/tests/test_recon_claim_verification_wiring.py',
+    'fused-memory/tests/test_ticket_worker.py',
+    'shared/tests/test_uuid_prefix_guard.py',
+    'shared/tests/test_async_sqlite_base.py',
+    'shared/tests/test_cli_invoke.py',
 })
 
 # A SYNTHETIC debt mapping for the path-matching tests, which drive the pure
@@ -1744,10 +2002,12 @@ def _against_a_budget_of_1(copies: int) -> list:
 class TestWallClockDeadlineDebtBaseline:
     """The shrink-only per-file debt baseline that lets Rule C ship default-ON.
 
-    618 pre-existing violations across 20 files mean a hot default-on rule would
-    turn orchestrator/tests' lint_command red immediately and stall the merge lane
-    repo-wide — the identical situation Rule B faced at 95 sites/11 files, solved
-    the identical way and since retired, its debt fully migrated (task 4354).
+    Pre-existing violations — 618 across 20 files when task 4246 shipped the rule,
+    650 across 47 files in four packages once task 5269 widened its detection —
+    mean a hot default-on rule would turn those packages' lint_commands red
+    immediately and stall the merge lane repo-wide — the identical situation Rule B
+    faced at 95 sites/11 files, solved the identical way and since retired, its debt
+    fully migrated (task 4354).
 
     Opt-OUT rather than opt-in, deliberately: an opt-in list would exempt precisely
     the brand-new file this rule exists to catch, and "which files are covered"
@@ -2077,7 +2337,7 @@ class TestWallClockDeadlineBaselineIntegrity:
             root = _REPO_ROOT / scanned
             if not root.is_dir():
                 continue
-            for path in sorted(set(root.rglob('test_*.py')) | set(root.rglob('conftest.py'))):
+            for path in _checker.discover_scan_targets(root):
                 entry = str(path.relative_to(_REPO_ROOT))
                 if entry in listed:
                     continue
@@ -2113,6 +2373,22 @@ def _merge_speculation_source() -> str:
     if not path.is_file():
         pytest.skip(f'{_MERGE_SPECULATION} not present under {_REPO_ROOT}')
     return path.read_text(encoding='utf-8')
+
+
+def _strip_exemption_pragmas(source: str, code: str) -> str:
+    """Return *source* without the lines the checker reads as a *code* exemption.
+
+    Matches with ``_EXEMPT_RES[code]`` on the stripped line, the exact predicate
+    ``_is_exempted`` applies, so this proof and the rule cannot disagree about
+    which separators spell a pragma.  Line endings are kept, so the result equals
+    *source* exactly when no line matched.
+    """
+    exempt_re = _checker._EXEMPT_RES[code]
+    return ''.join(
+        line
+        for line in source.splitlines(keepends=True)
+        if not exempt_re.match(line.strip())
+    )
 
 
 class TestRuleCCoversMergeSpeculation:
@@ -2238,22 +2514,35 @@ class TestRuleBCoversMergeSpeculation:
             'has been grandfathered and its file-local guard must NOT be deleted.'
         )
 
-    def test_stripping_the_pragma_makes_the_deliberate_site_flag(self):
+    @pytest.mark.parametrize('respelled', [False, True], ids=['as-written', 'ascii-hyphen'])
+    def test_stripping_the_pragma_makes_the_deliberate_site_flag(self, respelled: bool):
         """(c) The exemption is the PRAGMA, not an accident of shape matching.
 
         Without this, leg (a) is also satisfied by a deliberate site that Rule B
         simply cannot see — in which case deleting the local guard would silently
         drop coverage rather than transfer it.
+
+        Run once as written and once with the pragma's em-dash respelled as an ASCII
+        hyphen, a separator the checker equally accepts: the proof must hold for
+        every spelling of the pragma the rule honours.
         """
-        source = _merge_speculation_source()
-        stripped = '\n'.join(
-            line
-            for line in source.splitlines()
-            if 'noqa: bare-dataclass-double —' not in line
+        original = _merge_speculation_source()
+        source = original
+        if respelled:
+            source = re.sub(r'(noqa: bare-dataclass-double) —', r'\1 -', original)
+            assert source != original, 'the respelling must actually change the pragma'
+        still_clean = [
+            v
+            for v in find_violations(source, _MERGE_SPECULATION)
+            if '_fake_verify_result' in v.message
+        ]
+        assert still_clean == [], (
+            f'the respelled pragma must still exempt the site; got {still_clean!r}'
         )
+        stripped = _strip_exemption_pragmas(source, _checker._RULE_B_CODE)
         assert stripped != source, (
-            'expected a `# noqa: bare-dataclass-double — <reason>` pragma in the '
-            'module; if it is gone, this proof no longer means anything'
+            "no line matched the checker's own `bare-dataclass-double` exemption "
+            'regex, so there was no pragma to strip and this proof means nothing'
         )
         violations = [
             v
