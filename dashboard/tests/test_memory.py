@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -995,6 +996,20 @@ class TestAggregatingLoopsLogFailuresAtWarning:
         )
 
 
+def _stall_host_before(port, seconds, handler):
+    """Wrap *handler* so a request to *port* first blocks the loop THREAD for *seconds*.
+
+    Models a starved xdist worker: the wall clock moves while the event loop cannot run.
+    """
+
+    async def stalled(request: httpx.Request) -> httpx.Response:
+        if request.url.port == port:
+            time.sleep(seconds)
+        return await handler(request)
+
+    return stalled
+
+
 # ── one hung url must not starve the hand-rolled per-URL loops ──
 
 
@@ -1013,11 +1028,16 @@ class TestHandRolledLoopsBoundEachUrl:
     traceback instead of failing fast.
     """
 
+    DEADLINE_SECONDS = 0.05
+    HOST_STALL_SECONDS = 2 * DEADLINE_SECONDS
+
     @pytest.fixture(autouse=True)
     def _short_deadline(self, monkeypatch):
         from dashboard.data import mcp_fanout
 
-        monkeypatch.setattr(mcp_fanout, '_DEFAULT_PER_URL_DEADLINE_SECONDS', 0.05)
+        monkeypatch.setattr(
+            mcp_fanout, '_DEFAULT_PER_URL_DEADLINE_SECONDS', self.DEADLINE_SECONDS,
+        )
 
     async def test_get_queue_stats_skips_the_hung_url_and_aggregates_the_rest(
         self, two_url_config,
@@ -1027,7 +1047,9 @@ class TestHandRolledLoopsBoundEachUrl:
         hung = 'http://localhost:9000'
         _get_session(hung)
         handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD, hang_port=9000)
-        transport = httpx.MockTransport(handler)
+        transport = httpx.MockTransport(
+            _stall_host_before(9001, self.HOST_STALL_SECONDS, handler),
+        )
 
         async with httpx.AsyncClient(transport=transport) as client:
             result = await asyncio.wait_for(
@@ -1052,7 +1074,9 @@ class TestHandRolledLoopsBoundEachUrl:
         _get_session(hung)
         stores = {'graphiti': {'busy': 0}}
         handler = _SessionAwareHandler({'stores': stores}, hang_port=9000)
-        transport = httpx.MockTransport(handler)
+        transport = httpx.MockTransport(
+            _stall_host_before(9001, self.HOST_STALL_SECONDS, handler),
+        )
 
         async with httpx.AsyncClient(transport=transport) as client:
             result = await asyncio.wait_for(
