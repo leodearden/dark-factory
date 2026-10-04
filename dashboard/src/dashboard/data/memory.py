@@ -364,7 +364,8 @@ async def get_memory_status(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: the failover walks up to N URLs, each of which may
     perform a three-post cold-session handshake. Callers needing a hard bound
-    must still wrap this in ``asyncio.wait_for`` — ``metrics.py`` does.
+    must still wrap this in ``asyncio.wait_for`` at ``enclosing_deadline(timeout)``
+    — ``metrics.py`` does.
     """
     return await _first_success(
         client, config, 'get_status', {}, 'get_status', timeout=timeout,
@@ -383,8 +384,8 @@ async def get_queue_stats(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: unlike a first-success failover this visits ALL N
     configured URLs, so the aggregate cost scales with N. Callers needing a
-    hard bound must still wrap this in ``asyncio.wait_for`` — ``metrics.py``
-    does.
+    hard bound must still wrap this in ``asyncio.wait_for`` at
+    ``enclosing_deadline(timeout)`` — ``metrics.py`` does.
 
     Each URL's attempt additionally carries ``mcp_fanout.call_with_deadline``'s
     default whole-operation deadline (resolved inside that helper at call time,
@@ -490,7 +491,7 @@ async def get_wal_status(
     *timeout* is a per-HTTP-request budget (see :func:`mcp_tool_call`), NOT a
     bound on this call: like ``get_queue_stats`` this visits ALL N configured
     URLs, so the aggregate cost scales with N. Callers needing a hard bound
-    must still wrap this in ``asyncio.wait_for``.
+    must still wrap this in ``asyncio.wait_for`` at ``enclosing_deadline(timeout)``.
 
     Each URL's attempt additionally carries ``mcp_fanout.call_with_deadline``'s
     default whole-operation deadline (resolved inside that helper at call time,

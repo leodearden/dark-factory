@@ -577,7 +577,7 @@ async def collect_metrics_snapshot(
             get_memory_status(
                 http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
             ),
-            timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            timeout=enclosing_deadline(_HTTP_SAMPLER_TIMEOUT_SECONDS),
         )
         pairs, _queue_inline = _split_status(status)
         for pid, payload in pairs:
@@ -602,7 +602,7 @@ async def collect_metrics_snapshot(
             get_queue_stats(
                 http_client, config, timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
             ),
-            timeout=_HTTP_SAMPLER_TIMEOUT_SECONDS,
+            timeout=enclosing_deadline(_HTTP_SAMPLER_TIMEOUT_SECONDS),
         )
         pending, retry, dead = _split_queue_stats(qstats)
         await conn.execute(
