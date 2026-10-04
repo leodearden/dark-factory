@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _xdist_crash_fixtures import (
+    COMPLETE_SESSION_FAILED_NODEID,
     PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
     XDIST_IN_FLIGHT_NODEID,
     XDIST_Q_TRUNCATED_OUTPUT,
@@ -1099,6 +1100,121 @@ class TestTruncatedSessionIsNeverSuppressed:
         assert result.flake_suppression.verdict is FlakeVerdict.passes_in_isolation, (
             result.flake_suppression
         )
+
+
+#: A killed sibling module's partial -q output: progress dots, no test named.
+_KILLED_MODULE_PARTIAL_OUTPUT = '.' * 40 + '\n'
+
+
+def _stopped_sibling_red(stopped_category: str = 'infra_kill') -> VerifyResult:
+    """The joined scoped red of task 6247: one module stopped before its own
+    verdict beside one that completed with a single load flake."""
+    return VerifyResult(
+        passed=False,
+        test_output='\n'.join(
+            (PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT, _KILLED_MODULE_PARTIAL_OUTPUT),
+        ),
+        lint_output='',
+        type_output='',
+        summary=f'1 failed; sibling module leg stopped ({stopped_category})',
+        category=stopped_category,
+        failing_leg_categories=['test_failure', stopped_category],
+    )
+
+
+class TestStoppedSiblingLegIsNeverSuppressed:
+    """Task 6247, end to end with the DEFAULT gate: a scoped red in which one
+    module's leg was stopped before its verdict must never land as a pass
+    because a sibling module's flake re-runs green. The re-run is patched to
+    PASS throughout, so only the discriminator's own refusal keeps it red.
+    """
+
+    @staticmethod
+    def _apply(failing: VerifyResult, tmp_path: Path) -> tuple[VerifyResult, AsyncMock]:
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_config.py')
+        rerun = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rerun):
+            result = asyncio.run(
+                verify_module.apply_merge_flake_suppression(
+                    failing,
+                    worktree=tmp_path,
+                    config=_make_config(tmp_path),
+                    module_configs=[_orch_module_config()],
+                )
+            )
+        return result, rerun
+
+    @pytest.mark.parametrize('stopped_category', ['infra_kill', 'infra_timeout'])
+    def test_stopped_sibling_stays_red_and_says_why(
+        self, tmp_path: Path, stopped_category: str,
+    ) -> None:
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        result, rerun = self._apply(_stopped_sibling_red(stopped_category), tmp_path)
+
+        assert result.passed is False, result
+        assert result.category != 'merge_flake_suppressed', result.category
+        assert result.flake_suppression is not None, result
+        assert result.flake_suppression.verdict is FlakeVerdict.unconfirmable, (
+            result.flake_suppression
+        )
+        assert result.flake_suppression.unconfirmable_reason == (
+            f'leg_without_verdict:{stopped_category}'
+        ), result.flake_suppression
+        rerun.assert_not_awaited()
+
+    def test_merge_never_leaves_the_scoped_phase(self, tmp_path: Path) -> None:
+        """Through LocalRunner.run_merge_verify with the real hook: the merge
+        stays red and the unscoped typecheck gate is never reached."""
+        from orchestrator import verify as verify_module
+
+        _materialize(tmp_path, 'orchestrator/tests/test_config.py')
+        runner, _run_scoped, run_unscoped = _make_hook_runner(
+            tmp_path, scoped_result=_stopped_sibling_red(),
+        )
+        rerun = AsyncMock(return_value=_result(True))
+
+        with patch.object(verify_module, 'run_verification', rerun):
+            result = asyncio.run(runner.run_merge_verify(_MERGE_VERIFY_SHA, _merge_spec()))
+
+        assert result.passed is False, result
+        run_unscoped.assert_not_awaited()
+        rerun.assert_not_awaited()
+
+    def test_stopped_sibling_lands_an_unconfirmable_ledger_row(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import flake_recorder
+        from orchestrator.flake_ledger import ledger_db_path, read_occurrences
+        from orchestrator.verify_runner import result_from_json, result_to_json
+
+        result, _rerun = self._apply(_stopped_sibling_red(), tmp_path)
+        wired = result_from_json(result_to_json(result))
+        es = _FakeEventStore()
+
+        asyncio.run(
+            flake_recorder.record_merge_flake_suppression(
+                wired,
+                project_root=tmp_path,
+                project_id='dark_factory',
+                merge_sha=_MERGE_SHA,
+                task_id='6247',
+                event_store=es,  # type: ignore[arg-type]
+            )
+        )
+
+        rows = read_occurrences(ledger_db_path(tmp_path))
+        assert len(rows) == 1, rows
+        row = rows[0]
+        assert row.verdict == 'unconfirmable', row
+        assert row.call_site == 'merge_gate', row
+        assert row.test_id == COMPLETE_SESSION_FAILED_NODEID, row
+        assert json.loads(row.detail)['unconfirmable_reason'] == (
+            'leg_without_verdict:infra_kill'
+        ), row
+        assert es.emits == [], es.emits
 
 
 # --- LocalRunner.run_merge_verify integration (step-9/10) ---------------------

@@ -29,6 +29,7 @@ exclusively (neither existing file uses pytest ``monkeypatch``).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,6 +39,7 @@ from _xdist_crash_fixtures import (
     PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
     XDIST_CRASH_ATTRIBUTED_FAILED_OUTPUT,
     XDIST_IN_FLIGHT_NODEID,
+    XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT,
     XDIST_Q_RECOVERED_OUTPUT,
     XDIST_Q_TRUNCATED_OUTPUT,
     XDIST_Q_TRUNCATED_THEN_COMPLETED_MODULE_OUTPUT,
@@ -141,8 +143,14 @@ def _failing_result(
     *,
     lint_output: str = '',
     type_output: str = '',
+    failing_leg_categories: Sequence[str] | None = ('test_failure',),
 ) -> VerifyResult:
-    """The failing VerifyResult handed to the discriminator."""
+    """The failing VerifyResult handed to the discriminator.
+
+    Records one category per failing leg by default, as production
+    ``run_verification`` always does; pass ``None`` or ``()`` to model a
+    result whose legs were never recorded.
+    """
     return VerifyResult(
         passed=False,
         test_output=test_output,
@@ -151,6 +159,9 @@ def _failing_result(
         summary='fail',
         category='test_failure',
         cause_hint=f'FAILED {FAILED_ID}',
+        failing_leg_categories=(
+            None if failing_leg_categories is None else list(failing_leg_categories)
+        ),
     )
 
 
@@ -1536,7 +1547,10 @@ _WORKER_DEATH_SPECIMENS = [
 ]
 
 
-def _confirm_with_passing_rerun(verify_module, tmp_path, test_output, *, call_site):
+def _confirm_with_passing_rerun(
+    verify_module, tmp_path, test_output, *, call_site,
+    failing_leg_categories: Sequence[str] | None = ('test_failure',),
+):
     """Run THE discriminator on *test_output* with every isolated re-run
     patched to PASS; return the verdict and the re-run mock."""
     _materialize(tmp_path, 'orchestrator/tests/test_config.py')
@@ -1545,7 +1559,10 @@ def _confirm_with_passing_rerun(verify_module, tmp_path, test_output, *, call_si
         s = asyncio.run(
             verify_module.confirm_isolated_rerun_verdict(
                 tmp_path, _make_config(tmp_path), [_module_config('orchestrator')],
-                _failing_result(test_output), call_site=call_site,
+                _failing_result(
+                    test_output, failing_leg_categories=failing_leg_categories,
+                ),
+                call_site=call_site,
             )
         )
     return s, rerun
@@ -1653,6 +1670,127 @@ class TestMainProbeStillJudgesCrashCoOccurringFailures:
 
         assert downgrade_ids == [XDIST_IN_FLIGHT_NODEID], downgrade_ids
         rerun.assert_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Task 6247: a session with a leg that was stopped before its own verdict is
+# never confirmable at the merge gate.
+# ---------------------------------------------------------------------------
+
+#: A killed sibling module's partial -q output: progress dots, then nothing.
+#: It names no test, so the stopped leg's only record is its category.
+_KILLED_MODULE_PARTIAL_OUTPUT = '.' * 40 + '\n'
+
+_STOPPED_LEG_CATEGORIES = ('infra_kill', 'infra_timeout')
+
+
+def _joined(*module_outputs: str) -> str:
+    """Join per-module test output the way verify.py::_aggregate_results does."""
+    return '\n'.join(module_outputs)
+
+
+def _stopped_sibling_session(
+    stopped_category: str, *, killed_module_first: bool,
+) -> tuple[str, list[str]]:
+    """A completed module with one flake beside a stopped one, as
+    (joined test_output, failing_leg_categories) in matching module order."""
+    if killed_module_first:
+        return (
+            _joined(_KILLED_MODULE_PARTIAL_OUTPUT, PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT),
+            [stopped_category, 'test_failure'],
+        )
+    return (
+        _joined(PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT, _KILLED_MODULE_PARTIAL_OUTPUT),
+        ['test_failure', stopped_category],
+    )
+
+
+class TestStoppedLegIsUnconfirmable:
+    """A leg our wall clock or an external signal stopped never reached its
+    own verdict, and its partial output names no test. At the merge gate a
+    ``passes_in_isolation`` replaces the WHOLE joined result with a pass and
+    lands the tree, yet the isolated re-run vouches only for the named flake,
+    so the stopped leg's suite would land with no verdict at all (INV-1). The
+    gate therefore refuses before spending a re-run, naming the stopped
+    category, and still names the flake so the ledger counts it.
+
+    The re-run is patched to PASS throughout, so a refusal here can only come
+    from the precondition. The main probe keeps re-running: there a pass only
+    downgrades "main is broken", and nothing lands.
+    """
+
+    @pytest.mark.parametrize('killed_module_first', [False, True], ids=['flake_first', 'killed_first'])
+    @pytest.mark.parametrize('stopped_category', _STOPPED_LEG_CATEGORIES)
+    def test_stopped_leg_is_unconfirmable_without_a_rerun(
+        self, tmp_path: Path, stopped_category: str, killed_module_first: bool,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeCallSite, FlakeVerdict
+
+        test_output, legs = _stopped_sibling_session(
+            stopped_category, killed_module_first=killed_module_first,
+        )
+        s, rerun = _confirm_with_passing_rerun(
+            verify_module, tmp_path, test_output,
+            call_site='merge_gate', failing_leg_categories=legs,
+        )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s
+        assert s.unconfirmable_reason == f'leg_without_verdict:{stopped_category}', s
+        assert s.test_ids == (COMPLETE_SESSION_FAILED_NODEID,), s.test_ids
+        assert s.call_site == FlakeCallSite.merge_gate, s.call_site
+        rerun.assert_not_awaited()
+
+    def test_a_stopped_leg_outranks_the_worker_death_it_truncated(
+        self, tmp_path: Path,
+    ) -> None:
+        """A recovered crash and then a kill: the structural stop is the more
+        specific reason than the crash marker the kill cut short."""
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s, rerun = _confirm_with_passing_rerun(
+            verify_module, tmp_path, XDIST_Q_KILLED_AFTER_RECOVERED_CRASH_OUTPUT,
+            call_site='merge_gate', failing_leg_categories=['infra_kill'],
+        )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s
+        assert s.unconfirmable_reason == 'leg_without_verdict:infra_kill', s
+        rerun.assert_not_awaited()
+
+    @pytest.mark.parametrize('stopped_category', _STOPPED_LEG_CATEGORIES)
+    def test_main_probe_still_reruns_a_session_with_a_stopped_leg(
+        self, tmp_path: Path, stopped_category: str,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        test_output, legs = _stopped_sibling_session(
+            stopped_category, killed_module_first=True,
+        )
+        s, rerun = _confirm_with_passing_rerun(
+            verify_module, tmp_path, test_output,
+            call_site='main_probe', failing_leg_categories=legs,
+        )
+
+        rerun.assert_awaited()
+        assert s.verdict is FlakeVerdict.passes_in_isolation, s
+        assert s.unconfirmable_reason is None, s
+
+    def test_recorded_completed_test_leg_is_still_rerun_and_confirmed(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s, rerun = _confirm_with_passing_rerun(
+            verify_module, tmp_path, PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
+            call_site='merge_gate', failing_leg_categories=['test_failure'],
+        )
+
+        rerun.assert_awaited()
+        assert s.verdict is FlakeVerdict.passes_in_isolation, s
+        assert s.test_ids == (COMPLETE_SESSION_FAILED_NODEID,), s.test_ids
 
 
 # ---------------------------------------------------------------------------
