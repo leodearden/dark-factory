@@ -103,6 +103,13 @@ from orchestrator.git_ops import (
 )
 from orchestrator.landed_outbox import LandedRow, MergeProvenance
 from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.merge_lane.landing_evidence import (
+    LandingReason,
+    LandingVerdict,
+    file_unattributed_landing_escalation,
+    validate_landing_evidence,
+    validate_reported_landing,
+)
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.routing import (
@@ -581,6 +588,29 @@ def _normalize_cause_hint(hint: str | None) -> str:
     this wrapper preserves every existing importer's behaviour byte-for-byte.
     """
     return RetryLedger.normalize_cause_hint(hint)
+
+
+def _declared_entries(metadata: Mapping[str, Any], key: str) -> list[Any]:
+    """``metadata[key]`` when it IS a list, else ``[]``.
+
+    A malformed scalar must read as "nothing declared", never iterate
+    character-wise.
+    """
+    value = metadata.get(key)
+    return value if isinstance(value, list) else []
+
+
+def _declared_files(metadata: Mapping[str, Any]) -> list[str]:
+    """The task's declared ``metadata.files``, path strings only."""
+    return [f for f in _declared_entries(metadata, 'files') if isinstance(f, str)]
+
+
+def _declared_checks(metadata: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The task's declared ``metadata.delivered_checks``, mapping entries only."""
+    return [
+        c for c in _declared_entries(metadata, 'delivered_checks')
+        if isinstance(c, dict)
+    ]
 
 
 def _compute_merge_outcome_signature(
@@ -6819,16 +6849,19 @@ class TaskWorkflow:
 
         Caller has already verified the artifact exists.
 
-        Validation, in two halves. **Reachability**: ``commit`` must be
+        Validation, in three parts. **Reachability**: ``commit`` must be
         non-empty and reachable from main — ``git merge-base --is-ancestor``
         returns false for both unknown SHAs and SHAs not on main, so that
-        single check covers both. **Capability** (task 3057, seam 5 of
-        eleven): reachability proves only that the cited commit EXISTS on
-        main, never that THIS task's declared capability is present in it, so
-        when the task declares ``metadata.delivered_checks`` those are
-        re-checked against the SAME main SHA the reachability test used
-        (forwarded as ``main_sha=``, so no second ``get_main_sha`` call and no
-        risk of accepting a claim against one main while rejecting it against
+        single check covers both. **Attribution** (task 4704): reachability
+        proves only that the commit EXISTS on main, so the report is
+        corroborated against the task's own declared ``metadata.files`` /
+        ``delivered_checks`` and the commit's effect must survive at main
+        (``validate_reported_landing``); the report's prose is never
+        attribution. **Capability** (task 3057, seam 5 of eleven): when the
+        task declares ``metadata.delivered_checks`` those are re-checked
+        against the SAME main SHA the reachability test used (forwarded as
+        ``main_sha=``, so no second ``get_main_sha`` call and no risk of
+        accepting a claim against one main while rejecting it against
         another).
 
         That second half matters here more than anywhere else in the eleven
@@ -6839,7 +6872,11 @@ class TaskWorkflow:
 
         On success: set task status to ``done`` with provenance pointing
         at the architect-named commit, return ``DONE``.
-        On validation failure of EITHER half: clear the artifact, route to
+        On an attribution failure: hold the task blocked behind one
+        ``provenance_unattributed`` L1 (:meth:`_hold_unattributed_already_done`)
+        — whether the commit is this task's work is a human's call — unless
+        git could not answer, which blocks like a reachability failure.
+        On a reachability or capability failure: clear the artifact, route to
         ``_mark_blocked`` without escalating to a human — this is an architect
         mistake (wrong/missing commit, or a claim main does not support), not
         an unworkable task, so a steward retry can resolve it. A capability
@@ -6875,8 +6912,22 @@ class TaskWorkflow:
                 )[:2000],
             )
 
+        metadata = self.task.get('metadata') or {}
+        branch = f'{self.config.git.branch_prefix}{self.task_id}'
+        verdict = await validate_reported_landing(
+            self.git_ops, self.task_id, branch,
+            reported_sha=commit,
+            declared_files=_declared_files(metadata),
+            delivered_checks=_declared_checks(metadata),
+            delivered_checks_enabled=self.config.delivered_checks.enabled,
+        )
+        if not verdict.accepted or verdict.evidence_sha is None:
+            return await self._hold_unattributed_already_done(
+                branch, verdict, commit, evidence,
+            )
+
         block = await self._delivered_checks_block(
-            self.task_id, (self.task.get('metadata') or {}),
+            self.task_id, metadata,
             site='architect-already-done-report', main_sha=main_sha,
         )
         if block is not None:
@@ -6902,7 +6953,7 @@ class TaskWorkflow:
             await self.scheduler.mark_done(
                 self.task_id,
                 kind='found_on_main',
-                sha=commit,
+                sha=verdict.evidence_sha,
                 note=(
                     f'architect-reported task already on main; '
                     f'evidence: {evidence[:400]}'
@@ -6921,6 +6972,43 @@ class TaskWorkflow:
                 escalate_to_human=True,
             )
         return WorkflowOutcome.DONE
+
+    async def _hold_unattributed_already_done(
+        self, branch: str, verdict: LandingVerdict, commit: str, evidence: str,
+    ) -> WorkflowOutcome:
+        """Hold an uncorroborated already_done report BLOCKED behind one L1.
+
+        The ``provenance_unattributed`` L1 is the human signal, so
+        ``_mark_blocked`` files nothing more (``skip_escalation``).  When no
+        such L1 is open — no queue, a suppressed identical refile, a contained
+        filing error — its ordinary non-escalating block runs instead, so the
+        hold is never silent.  A ``git_error`` verdict is the detector failing,
+        never a negative, so it files no L1 and gets that steward-retryable
+        block directly.
+        """
+        held = False
+        if verdict.reason is not LandingReason.git_error:
+            file_unattributed_landing_escalation(
+                self.escalation_queue, self.task_id, branch, verdict,
+                agent_role='orchestrator-workflow',
+                filing_claimant_run_id=self._filing_claimant_run_id,
+            )
+            held = (
+                self.escalation_queue is not None
+                and self.escalation_queue.has_open_l1(
+                    self.task_id, category='provenance_unattributed',
+                )
+            )
+        return await self._mark_blocked(
+            f'Architect reported task already done at {commit[:12]} but the '
+            f'claim could not be attributed to this task ({verdict.reason})',
+            detail=(
+                f'commit: {commit}\nreason: {verdict.reason}\n'
+                f'attribution_basis: {verdict.probe.get("attribution_basis")}\n'
+                f'evidence: {evidence}'
+            )[:2000],
+            skip_escalation=held,
+        )
 
     async def _handle_ready_to_merge_report(self) -> WorkflowOutcome:
         """Process a ``.task/ready_to_merge.json`` report from the architect.
@@ -14946,7 +15034,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         capability (``metadata.delivered_checks``) survived to it. The guard
         sits HERE, at the SINGLE chokepoint all six recovery stamps funnel
         through (3x journal ``kind='merged'`` + 3x fallback
-        ``kind='found_on_main'``), rather than at the six call sites,
+        ``kind='found_on_main'``, whose anchor is the task's own citation from
+        :meth:`_discovered_landing_sha`, never main's tip — task 4704),
+        rather than at the six call sites,
         precisely so a future SEVENTH recovery arm cannot be added unguarded —
         the failure mode that re-opened this defect class eight times.
 
@@ -14994,6 +15084,44 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
         return WorkflowOutcome.DONE
 
+    async def _discovered_landing_sha(
+        self, guard: str, branch_tip_sha: str,
+    ) -> str | None:
+        """The sha a recovery guard's fallback arm may stamp, or None (task 4704).
+
+        A fallback arm's has-work heuristic says only that the branch reads as
+        merged; main's tip, which those arms used to stamp, is whatever landed
+        most recently from ANY task.  This runs ``validate_landing_evidence``
+        in DISCOVERY mode — the shape of the harness dispatch gate's ancestry
+        arm — and returns the task's own attributable, surviving citation.  A
+        reject, or a validation that raises, is logged and answers None, so
+        every guard proceeds with its phase rather than stamping.
+        """
+        try:
+            verdict = await validate_landing_evidence(
+                self.git_ops, self.task_id,
+                f'{self.config.git.branch_prefix}{self.task_id}',
+                branch_tip_sha=branch_tip_sha,
+                pattern_template=self.git_ops.config.commit_citation_pattern,
+                delivered_checks=_declared_checks(self.task.get('metadata') or {}),
+            )
+        except Exception:
+            logger.warning(
+                'Task %s: %s recovery landing-evidence check failed — not '
+                'stamping, proceeding',
+                self.task_id, guard, exc_info=True,
+            )
+            return None
+        if verdict.accepted and verdict.evidence_sha is not None:
+            return verdict.evidence_sha
+        logger.warning(
+            'Task %s: %s recovery found branch tip %s on main with prior work '
+            'but no attributable landing evidence (%s) — not stamping, '
+            'proceeding',
+            self.task_id, guard, branch_tip_sha[:8], verdict.reason,
+        )
+        return None
+
     async def _recover_if_already_merged(self) -> WorkflowOutcome | None:
         """Check if the task's branch is already on main and transition to DONE.
 
@@ -15007,8 +15135,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         A miss falls through to the existing git-layer/artifacts-layer checks.
 
         Returns WorkflowOutcome.DONE if the branch is already merged to main AND
-        there is prior implementation work.  Returns None in all other cases
+        there is prior implementation work AND the landing is attributable to
+        this task (:meth:`_discovered_landing_sha`, whose citation is the
+        stamped sha — task 4704).  Returns None in all other cases
         (branch not merged, no prior work, missing worktree/git_ops, exceptions,
+        no attributable landing,
         or — task 3057 — the shared :meth:`_finalise_recovery_done` chokepoint
         withholding the recovery because the task's declared
         ``metadata.delivered_checks`` are not verifiably present on main).
@@ -15108,12 +15239,16 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             return None
 
+        evidence_sha = await self._discovered_landing_sha('pre-PLAN', wt_head)
+        if evidence_sha is None:
+            return None
+
         logger.info(
             'Task %s: branch already on main — completing instead of re-queueing',
             self.task_id,
         )
         return await self._finalise_recovery_done(
-            basis='fallback', sha=main_sha, kind='found_on_main',
+            basis='fallback', sha=evidence_sha, kind='found_on_main',
             note='branch already on main at workflow start (pre-PLAN recovery)',
         )
 
@@ -15166,10 +15301,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Returns ``WorkflowOutcome.DONE`` (via the shared
         :meth:`_finalise_recovery_done` chokepoint, MP-2) when the branch is
-        already merged AND ``base_commit..wt_head`` is a non-empty diff.
+        already merged AND ``base_commit..wt_head`` is a non-empty diff AND
+        the landing is attributable to this task
+        (:meth:`_discovered_landing_sha`, whose citation is the stamped sha —
+        task 4704).
         Returns ``None`` in all other cases (external worktree, not on main,
         on main but a zero-diff branch — a fresh, re-dispatched, or
-        otherwise stale/unadvanced branch point, or — task 3057 — the
+        otherwise stale/unadvanced branch point, no attributable landing, or
+        — task 3057 — the
         chokepoint withholding the recovery because the task's declared
         ``metadata.delivered_checks`` are not verifiably present on main) so
         the caller proceeds with the normal execute/verify/review loop.
@@ -15203,13 +15342,17 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             )
             return None
 
+        evidence_sha = await self._discovered_landing_sha('pre-EXECUTE', wt_head)
+        if evidence_sha is None:
+            return None
+
         logger.info(
             f'Task {self.task_id}: worktree HEAD {wt_head[:8]} '
             f'already on main with {len(branch_files)} changed file(s) '
             f'— skipping to DONE (prior merge survived)'
         )
         return await self._finalise_recovery_done(
-            basis='fallback', sha=main_sha, kind='found_on_main',
+            basis='fallback', sha=evidence_sha, kind='found_on_main',
             note='branch already on main at workflow start (pre-EXECUTE recovery)',
             files=branch_files,
         )
@@ -15237,9 +15380,14 @@ Update the plan to address the blocking issues. You may add new steps to the `st
 
         Returns ``WorkflowOutcome.DONE`` (via the shared
         :meth:`_finalise_recovery_done` chokepoint, MP-2) when the branch is
-        already merged AND there is prior implementation work. Returns
+        already merged AND there is prior implementation work AND the landing
+        is attributable to this task (:meth:`_discovered_landing_sha`, whose
+        citation is the stamped sha — task 4704; an unrelated main tip was
+        stamped here for task 3269). Returns
         ``None`` in all other cases (not an ancestor, a spurious merge
-        signal, or — task 3057 — the chokepoint withholding the recovery
+        signal, no attributable landing — the merge then runs, and its
+        already-merged-without-merge-sha path surfaces an L1 — or — task 3057
+        — the chokepoint withholding the recovery
         because the task's declared ``metadata.delivered_checks`` are not
         verifiably present on main) so the caller proceeds with the
         merge-retry loop, which is already how ``_run_merge_phase`` reads a
@@ -15258,8 +15406,11 @@ Update the plan to address the blocking issues. You may add new steps to the `st
         # iteration-log fallback rather than the SHA-primary signal (see
         # _has_prior_implementation's docstring and task 2504).
         if await self._branch_work_landed_on_main(branch_head, main_sha, wt_head=None):
+            evidence_sha = await self._discovered_landing_sha('pre-MERGE', branch_head)
+            if evidence_sha is None:
+                return None
             return await self._finalise_recovery_done(
-                basis='fallback', sha=main_sha, kind='found_on_main',
+                basis='fallback', sha=evidence_sha, kind='found_on_main',
                 note='branch already on main at merge phase (pre-MERGE recovery)',
             )
 

@@ -603,7 +603,16 @@ def _make(
     task_id: str = '50',
     branch_on_main: bool = True,
     main_sha: str = 'mainsha123',
+    landing_citation: str | None = 'citationsha123',
+    landing_effect_present: bool = True,
 ) -> _Fixture:
+    """A workflow wired to git stubs for the already-merged recovery guards.
+
+    ``landing_citation`` / ``landing_effect_present`` answer the landing
+    evidence a recovery guard's fallback arm validates before stamping
+    (task 4704): the commit on main citing this task, and whether its effect
+    survives.  The defaults describe a genuine, attributable landing.
+    """
     assignment = MagicMock()
     assignment.task_id = task_id
     assignment.task = {'id': task_id, 'title': 'T', 'description': 'd'}
@@ -618,6 +627,7 @@ def _make(
     config.lock_depth = 2
     config.steward_completion_timeout = 300.0
     config.project_root = project_root
+    config.git.branch_prefix = 'task/'
 
     set_task_status = AsyncMock()
     scheduler = MagicMock()
@@ -642,6 +652,10 @@ def _make(
     git_ops = MagicMock()
     git_ops.is_ancestor = is_ancestor
     git_ops.get_main_sha = get_main_sha
+    git_ops.find_task_citation_commit = AsyncMock(return_value=landing_citation)
+    git_ops.commit_effect_present_in_main = AsyncMock(
+        return_value=landing_effect_present,
+    )
 
     wf = TaskWorkflow(
         assignment=assignment,

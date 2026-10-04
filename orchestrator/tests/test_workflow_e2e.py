@@ -4673,7 +4673,7 @@ class TestRecoverIfAlreadyMerged:
         - scheduler.statuses[task_id][-1] == 'done'
         - scheduler.provenance[task_id] == {
               'kind': 'found_on_main',
-              'commit': <main_sha captured before the call>,
+              'commit': <the task's own citing merge commit — task 4704>,
               'note': 'branch already on main at workflow start (pre-PLAN recovery)',
           }
 
@@ -4715,10 +4715,11 @@ class TestRecoverIfAlreadyMerged:
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
-        # Capture main_sha BEFORE calling _recover_if_already_merged — this is
-        # the value the helper reads internally from _check_branch_on_main and
-        # must appear as prov['main_sha'] in the provenance dict.
-        expected_main_sha = await git_ops.get_main_sha()
+        # The merge commit's 'Merge task/<id> into main' subject is the task's
+        # citation; main then moves on, so its tip is NOT this task's work.
+        citing_commit = result.merge_commit
+        main_tip = await _land_unrelated_task_on_main(git_ops)
+        assert main_tip != citing_commit
 
         # 2. Build workflow, wire up worktree and artifacts
         stub = AgentStub()
@@ -4756,9 +4757,28 @@ class TestRecoverIfAlreadyMerged:
         assert prov['note'] == 'branch already on main at workflow start (pre-PLAN recovery)', (
             f"Unexpected provenance note: {prov['note']!r}"
         )
-        assert prov['commit'] == expected_main_sha, (
-            f"Provenance commit {prov['commit']!r} != expected main_sha {expected_main_sha!r}"
+        assert prov['commit'] == citing_commit, (
+            f"Provenance commit {prov['commit']!r} != the task's citation "
+            f"{citing_commit!r} (main's tip is {main_tip!r})"
         )
+
+
+async def _land_unrelated_task_on_main(git_ops: GitOps, task_id: str = '4321') -> str:
+    """Merge another task's commit onto main, so main's tip moves past a landing.
+
+    A recovery stamp must name the task's OWN citation (task 4704); while the
+    task's merge is still main's tip the two are the same sha and the stamp
+    cannot tell them apart.  Returns the new main tip.
+    """
+    info = await git_ops.create_worktree(task_id)
+    (info.path / f'unrelated_{task_id}.py').write_text('X = 1\n')
+    await git_ops.commit(info.path, f'feat({task_id}): unrelated work')
+    result = await git_ops.merge_to_main(info.path, task_id)
+    assert result.success and result.merge_commit is not None
+    await git_ops.advance_main(result.merge_commit)
+    if result.merge_worktree:
+        await git_ops.cleanup_merge_worktree(result.merge_worktree)
+    return await git_ops.get_main_sha()
 
 
 # ---------------------------------------------------------------------------
@@ -4903,8 +4923,9 @@ class TestRecoverBeforeExecuteGhostLoop:
     ):
         """A genuinely-merged branch (real commit, merged + advanced to
         main, no journal binding) must recover to DONE with provenance
-        pointing at the real main SHA — the positive-path complement to the
-        two regression tests above.
+        pointing at the task's own citing merge commit (task 4704), not at
+        main's tip — the positive-path complement to the two regression
+        tests above.
         """
         # 1. Create worktree; capture base_commit BEFORE the implementation
         #    commit — the branch-diff gate reads base_commit from
@@ -4938,7 +4959,10 @@ class TestRecoverBeforeExecuteGhostLoop:
         if result.merge_worktree:
             await git_ops.cleanup_merge_worktree(result.merge_worktree)
 
-        expected_main_sha = await git_ops.get_main_sha()
+        # 'Merge task/<id> into main' is the citation; main then moves on.
+        citing_commit = result.merge_commit
+        main_tip = await _land_unrelated_task_on_main(git_ops)
+        assert main_tip != citing_commit
 
         # 4. Call _recover_before_execute directly.
         outcome = await workflow._recover_before_execute()
@@ -4954,8 +4978,9 @@ class TestRecoverBeforeExecuteGhostLoop:
         assert prov['kind'] == 'found_on_main', (
             f"Unexpected provenance kind: {prov['kind']!r}"
         )
-        assert prov['commit'] == expected_main_sha, (
-            f"Provenance commit {prov['commit']!r} != expected main_sha {expected_main_sha!r}"
+        assert prov['commit'] == citing_commit, (
+            f"Provenance commit {prov['commit']!r} != the task's citation "
+            f"{citing_commit!r} (main's tip is {main_tip!r})"
         )
         # ACTION #2 (Layer C): the pre-computed branch diff must be threaded
         # through override_files into metadata.files — this is what closes
