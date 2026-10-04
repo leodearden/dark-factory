@@ -223,14 +223,15 @@ class TestRenderMarkdown:
         assert _rows_containing(text, 'test_slow') and _rows_containing(text, 'test_mid')
         assert not _rows_containing(text, 'test_fast')
 
-    def test_per_package_row_and_floor_size(self, census):
+    def test_per_package_row_and_floor_members(self, census):
         text = oc.render_markdown(census, top=10)
         assert [row for row in _table_rows(text) if row[0] == 'p']
-        assert any(
-            str(len(census.failed_floor)) in line and 'floor' in line.lower()
-            for line in text.splitlines()
-        )
-        assert 'test_bad' in text and 'test_logged' in text
+        (floor_block,) = [
+            block for block in text.split('<details>') if 'test_bad' in block
+        ]
+        items = [line for line in floor_block.splitlines() if line.startswith('- ')]
+        assert len(items) == len(census.failed_floor) == 2
+        assert any('test_logged' in item for item in items)
 
     def test_rendering_is_deterministic(self, census):
         assert oc.render_markdown(census, top=10) == oc.render_markdown(census, top=10)
