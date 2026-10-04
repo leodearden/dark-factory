@@ -9,6 +9,7 @@ from shared.prompt_artifact import PromptSpec
 from orchestrator.agents.chained_command_guidance import CHAINED_COMMAND_STATUS_GUIDANCE
 from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
+from orchestrator.agents.partial_failure_guidance import MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
 from orchestrator.agents.python_literal_guidance import PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
 
@@ -1277,6 +1278,7 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + CHAINED_COMMAND_STATUS_GUIDANCE
     + GREP_PATTERN_ESCAPING_GUIDANCE
     + PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
+    + MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
 )
 
 
