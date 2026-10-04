@@ -16,7 +16,8 @@ the same vocabulary for the reconciliation stages. There are two copies because
 the orchestrator package has no dependency edge on ``fused_memory``: its copy is
 hand-written, the fused_memory copy interpolates the registry values. Adding a
 key to ``RESERVED_VOCABULARY_KEYS`` without documenting it, renaming one, or
-moving a quoted registry scalar fails here for whichever surface fell behind.
+changing a registry value the copies quote (the topic cap, the ``x_`` prefix,
+the ``parent_id`` child kinds) fails here for whichever surface fell behind.
 
 ARM 2 — the agent-facing surfaces that show a memory kind: the reconciliation
 stage prompts and the ``count_memories_by_metadata`` tool docstring. Every kind
@@ -69,6 +70,7 @@ from _recon_prompt_write_scope import WRITE_TOOL, recon_system_prompts, split_by
 from orchestrator.agents.roles import _MEMORY_INSTRUCTIONS, METADATA_VOCABULARY_INSTRUCTIONS, ROLES
 
 from fused_memory.memory_metadata import (
+    CHILD_KINDS,
     EXPERIMENTAL_KEY_PREFIX,
     KIND_REGISTRY,
     RESERVED_VOCABULARY_KEYS,
@@ -152,12 +154,13 @@ class TestReservedKeysReachTheWriters:
         """A registry SCALAR the writer prose quotes must be the live one.
 
         The orchestrator package cannot import ``fused_memory``, so the cap is
-        hand-written in ``METADATA_VOCABULARY_INSTRUCTIONS``, while the
-        fused_memory renderer interpolates it. The same value-resolution check
-        guards both: raising ``TOPIC_SLUG_MAX_LEN`` without updating a copy
-        would leave its readers quietly told the wrong limit — the exact
-        miscommunication this leaf exists to close (review, task 3202). Not a
-        wording pin: any reflow that keeps the number stays green.
+        hand-written in ``METADATA_VOCABULARY_INSTRUCTIONS``: there this catches
+        a raised ``TOPIC_SLUG_MAX_LEN`` left behind in the prose, which would
+        quietly tell writers the wrong limit — the exact miscommunication this
+        leaf exists to close (review, task 3202). The fused_memory renderer
+        interpolates the cap, so its value cannot drift; there this catches a
+        rewrite that stops stating the cap at all. Not a wording pin: any
+        reflow that keeps the number stays green.
         """
         assert str(TOPIC_SLUG_MAX_LEN) in _WRITER_SURFACES[surface], (
             f'{surface} does not state the live topic-slug cap '
@@ -167,11 +170,25 @@ class TestReservedKeysReachTheWriters:
     @pytest.mark.parametrize('surface', sorted(_WRITER_SURFACES))
     def test_experimental_prefix_resolves_to_the_registry_value(self, surface: str) -> None:
         """The other registry scalar both copies quote: the escape-hatch prefix
-        that lets a deliberate unregistered key pass without a census warning."""
+        that lets a deliberate unregistered key pass without a census warning.
+        Drift on the hand-written copy, omission on the rendered one, as above."""
         assert EXPERIMENTAL_KEY_PREFIX in _WRITER_SURFACES[surface], (
             f'{surface} does not state the live experimental-key prefix '
             f'({EXPERIMENTAL_KEY_PREFIX!r}); writers would prefix keys the census '
             f'still warns on'
+        )
+
+    @pytest.mark.parametrize('surface', sorted(_WRITER_SURFACES))
+    @pytest.mark.parametrize('kind', sorted(CHILD_KINDS))
+    def test_parent_id_child_kinds_resolve_to_the_registry_values(
+        self, kind: str, surface: str
+    ) -> None:
+        """The ``parent_id`` line names the kinds a child entry carries; both
+        copies quote them, so each must be a live ``CHILD_KINDS`` member.
+        Drift on the hand-written copy, omission on the rendered one, as above."""
+        assert kind in _WRITER_SURFACES[surface], (
+            f'{surface} does not name the child kind {kind!r}; writers attaching '
+            f'a child via parent_id would not know which kind to carry'
         )
 
     @pytest.mark.parametrize('role_name', _MEMORY_ROLES)
