@@ -273,6 +273,40 @@ async def test_hung_refresh_is_reported_degraded(
     assert body['checks']['deadline_exceeded'] is True
 
 
+async def test_a_stored_route_read_never_answers_the_probe(
+    config, clean_probe_state, wedge_reported_at_once, monkeypatch,
+):
+    """A task read some OTHER caller completed is not evidence the path is open.
+
+    PRD decision 17: the probe is the one raw, uncached traversal, and a stored
+    value must never answer for a traversal.  So an earlier successful read of
+    the very whole tree the probe reads proves nothing about whether a caller
+    can get through NOW, and /healthz must still go to the network leg.
+    """
+    reads: list[str] = []
+
+    async def _fast_network_leg(*_args, **_kwargs):
+        reads.append('read')
+        return []
+
+    monkeypatch.setattr(tasks_module, 'first_success', _fast_network_leg)
+    assert await tasks_module.fetch_tasks(None, config, config.project_root) == []  # type: ignore[arg-type]
+    assert reads == ['read']
+
+    entered: list[str] = []
+    monkeypatch.setattr(tasks_module, 'first_success', _hanging_network_leg(entered))
+
+    body, status, _elapsed = await _call_healthz(_make_request(config))
+
+    assert entered == ['enter'], (
+        'the probe never reached the network leg: a read another caller '
+        'completed earlier answered for it, so a wedge that began since would '
+        'be reported healthy'
+    )
+    assert body['checks']['mcp_fanout'] == 'timeout', body
+    assert status == 503, body
+
+
 # ---------------------------------------------------------------------------
 # ACCEPTANCE 2 — routine slowness must NOT trip it
 # ---------------------------------------------------------------------------
