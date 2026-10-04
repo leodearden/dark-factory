@@ -324,8 +324,8 @@ def positional_targets(
     ``test_contributing_lint_command_drift.py``,
     ``test_skills_module_config_decision.py``,
     ``test_fallback_verify_config.py``) while only two of those four supply a
-    set; ``test_scripts_module_config.py`` supplies none and asserts no
-    existence. The remaining exposure is therefore root_lint's AND fallback's,
+    set; ``test_scripts_module_config.py``, the fifth, supplies one for its
+    pytest keyword only and asserts no existence. The remaining exposure is therefore root_lint's AND fallback's,
     and each is recorded on that guard's own extractor —
     ``test_root_lint_covers_nonmember_py.py::_ruff_targets`` and
     ``test_fallback_verify_config.py::_lint_leg_targets`` — rather than papered
