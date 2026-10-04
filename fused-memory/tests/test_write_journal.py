@@ -368,6 +368,70 @@ async def test_migration_adds_columns(tmp_path):
     await j.close()
 
 
+@pytest.mark.asyncio
+async def test_migration_adds_backend_ops_duration_ms_without_backfill(tmp_path):
+    import aiosqlite
+
+    db_dir = tmp_path / 'migrate_duration'
+    db_dir.mkdir()
+    db_path = db_dir / 'write_journal.db'
+    legacy_schema = """
+    CREATE TABLE write_ops (
+        id TEXT PRIMARY KEY,
+        causation_id TEXT,
+        source TEXT,
+        provenance TEXT DEFAULT 'original',
+        operation TEXT,
+        project_id TEXT,
+        agent_id TEXT,
+        params TEXT DEFAULT '{}',
+        result_summary TEXT,
+        success INTEGER DEFAULT 1,
+        error TEXT,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE backend_ops (
+        id TEXT PRIMARY KEY,
+        write_op_id TEXT,
+        causation_id TEXT,
+        backend TEXT,
+        operation TEXT,
+        payload TEXT DEFAULT '{}',
+        result_summary TEXT,
+        success INTEGER DEFAULT 1,
+        error TEXT,
+        created_at TEXT NOT NULL
+    );
+    """
+    async with aiosqlite.connect(str(db_path)) as db:
+        await db.executescript(legacy_schema)
+        await db.execute(
+            'INSERT INTO backend_ops (id, write_op_id, backend, operation, created_at)'
+            ' VALUES (?, ?, ?, ?, ?)',
+            ('legacy-bo', 'legacy-wo', 'graphiti', 'add_episode', '2025-01-01T00:00:00'),
+        )
+        await db.commit()
+
+    j = WriteJournal(db_dir)
+    await j.initialize()
+    try:
+        assert 'duration_ms' in await _backend_ops_columns(db_path)
+
+        [legacy_row] = await j.get_backend_ops_for_write_op('legacy-wo')
+        assert legacy_row['duration_ms'] is None
+
+        await j.log_backend_op(
+            write_op_id='fresh-wo',
+            backend='mem0',
+            operation='add',
+            duration_ms=12.5,
+        )
+        [fresh_row] = await j.get_backend_ops_for_write_op('fresh-wo')
+        assert fresh_row['duration_ms'] == 12.5
+    finally:
+        await j.close()
+
+
 # ------------------------------------------------------------------
 # Stats methods
 # ------------------------------------------------------------------
