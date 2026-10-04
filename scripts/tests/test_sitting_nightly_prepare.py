@@ -33,6 +33,7 @@ APPLY_VERBS = (
     'mcp__escalation__stamp_triage',
     'mcp__escalation__promote_to_l2',
     'mcp__escalation__declare_pin',
+    'mcp__escalation__amend_escalation',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
     'mcp__fused-memory__submit_task',

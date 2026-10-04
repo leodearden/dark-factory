@@ -65,7 +65,7 @@ from escalation.models import (
     max_severity,
 )
 from escalation.pins import classify_pins
-from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
+from escalation.queue import AmendmentOutcome, AmendResult, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
 
@@ -2919,6 +2919,99 @@ def create_server(
                 }
             return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
+
+    @mcp.tool()
+    async def amend_escalation(
+        escalation_id: str,
+        summary: str = '',
+        detail: str = '',
+        options: list[str] | None = None,
+        root_cause: str = '',
+        agent_role: str = '',
+    ) -> dict[str, Any]:
+        """Append one framing amendment to a pending escalation (task 4886).
+
+        Writes a ruling made elsewhere onto the record it rules on, without
+        the side effects of the only other amendment writer, a
+        ``promote_to_l2`` fold.  APPEND-ONLY and PENDING-ONLY (parked records
+        included) via ``queue.amend``, which carries the full contract: the
+        amendment caps and repeat suppression are the fold's, but there is NO
+        severity floor, it is category-agnostic, and it never touches
+        ``status`` / ``severity`` / ``level`` / ``members``, the resolution
+        fields, the triage quad, the record's own framing or
+        ``root_cause_variants``.
+
+        Deliberately NOT gated by the connection-capability level check, for
+        ``stamp_triage``'s reason: an annotation is not a state transition, so
+        an L0/L1-capped connection may amend an L2 it cannot resolve.
+
+        *agent_role* attribution: an X-Escalation-Identity header overrides
+        the arg, mirroring ``triaged_by`` / ``resolved_by``.  Attribution only,
+        never a deny path.
+
+        A recorded amendment bumps ``updated_at``, the watcher's re-assess
+        trigger (``updated_at > triaged_at``).
+
+        Returns:
+
+        - the full record dict plus ``amendment_recorded: True``;
+        - the full record dict plus ``amendment_recorded: False`` and
+          ``no_op_reason: 'repeat_framing'`` when the framing repeats what the
+          record already says (a success: nothing new to record);
+        - ``{'error', 'code': 'empty_amendment'}`` when every framing arg is
+          empty;
+        - ``{'error', 'code': 'not_pending', 'status'}`` when the record exists
+          (archive included) but is not pending;
+        - ``{'error', 'code': 'not_found'}`` otherwise.
+
+        Queue I/O hops off the event loop: this server shares the
+        ORCHESTRATOR's loop, and ``queue.amend`` fires no loop-affine callback,
+        so the reason flock'd writes elsewhere stay inline (stated beside
+        ``dedupe.py::submit_or_dedupe_off_loop``) does not apply.
+        """
+        identity = get_http_headers().get(_IDENTITY_HEADER)
+        if identity is not None:
+            agent_role = identity
+
+        def amend_and_enrich() -> tuple[AmendResult, Escalation | None]:
+            result = queue.amend(
+                escalation_id, root_cause=root_cause, summary=summary,
+                detail=detail, options=options, agent_role=agent_role,
+            )
+            if result['status'] != 'not_found':
+                return result, result['escalation']
+            # Archive-inclusive and read-only, so it cannot resurrect anything.
+            return result, queue.get(escalation_id)
+
+        result, esc = await asyncio.to_thread(amend_and_enrich)
+        status = result['status']
+        if status == 'amended' and esc is not None:
+            return {**esc.to_dict(), 'amendment_recorded': True}
+        if status == 'repeat_framing' and esc is not None:
+            return {
+                **esc.to_dict(),
+                'amendment_recorded': False,
+                'no_op_reason': 'repeat_framing',
+            }
+        if status == 'no_framing':
+            return {
+                'error': (
+                    f'amend_escalation on {escalation_id} carries no framing: pass at '
+                    'least one of summary / detail / options / root_cause. Nothing '
+                    'was recorded.'
+                ),
+                'code': 'empty_amendment',
+            }
+        if esc is not None and esc.status != 'pending':
+            return {
+                'error': (
+                    f'Escalation {escalation_id} is {esc.status}, not pending; only a '
+                    'pending record can be amended. Nothing was recorded.'
+                ),
+                'code': 'not_pending',
+                'status': esc.status,
+            }
+        return {'error': f'Escalation {escalation_id} not found', 'code': 'not_found'}
 
     # --- L2 promotion tool ---
 
