@@ -1949,6 +1949,7 @@ def _run_plan_only(task_path: Path | None, base_config):
         from orchestrator.agents.invoke import invoke_agent
         from orchestrator.agents.roles import ARCHITECT
         from orchestrator.artifacts import TaskArtifacts
+        from orchestrator.evals.replay_frame import build_replay_frame_block
 
         briefing = BriefingAssembler(base_config)
 
@@ -1982,6 +1983,8 @@ def _run_plan_only(task_path: Path | None, base_config):
                 # Build architect prompt
                 task_def = task.get('task_definition', {})
                 prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
+                # Per-fixture base commit; see docs/eval-replay-frame.md.
+                prompt += build_replay_frame_block(task['pre_task_commit'])
 
                 # Invoke architect (opus-high, always Claude)
                 result = await invoke_agent(
