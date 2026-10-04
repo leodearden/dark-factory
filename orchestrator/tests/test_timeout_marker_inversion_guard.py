@@ -2559,17 +2559,6 @@ _GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     # test_marker_registration_drift.py -- 2 sites at 120s
     ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_every_marker_applied_under_tests_is_registered'),
     ('test_marker_registration_drift.py', 'TestMarkerRegistrationDrift::test_the_sweep_is_not_vacuous'),
-    # test_merge_queue.py -- 10 sites at 90s/120s
-    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_speculative_chain_invalidation_propagates'),
-    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_speculative_merger_phase_emits_duration_ms'),
-    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_speculative_follower_chain_invalidated_after_pickup_rebase'),
-    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_chain_invalidated_pre_rebased_n2_verify_runs'),
-    ('test_merge_queue.py', 'TestSpeculativeMergeWorker::test_chain_invalidated_pre_rebased_n2_red_tree_blocked'),
-    ('test_merge_queue.py', 'TestBoundaryTableWorkerEntry::test_scenario_11_generation_chain_escalation'),
-    ('test_merge_queue.py', 'TestSpeculationSlotSemaphoreDepth::test_k2_builds_two_speculative_ahead'),
-    ('test_merge_queue.py', 'TestSpeculationPermitLeakOnMergerError::test_worktree_missing_releases_speculation_permit'),
-    ('test_merge_queue.py', 'TestSpeculationPermitLeakOnMergerError::test_merger_exception_releases_speculation_permit'),
-    ('test_merge_queue.py', 'TestSpeculationPermitLeakOnMergerError::test_abandoned_speculative_releases_speculation_permit'),
     # test_merge_queue_build_chain.py -- 7 sites at 180s
     ('test_merge_queue_build_chain.py', 'TestMergeBranchIntoWorktree'),
     ('test_merge_queue_build_chain.py', 'TestChainBuildLane'),
