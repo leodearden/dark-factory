@@ -803,6 +803,23 @@ class TestInterceptorSetTaskStatusLifecycleGuard:
         taskmaster.set_task_status.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_terminal_clear_is_a_requested_claimant_write(self, interceptor, taskmaster, monkeypatch):
+        """The interceptor's own terminal-entry claimant clear (C4-E2) is a requested
+        claimant write, not a lifecycle reset, so it files nothing."""
+        monkeypatch.setattr(
+            recon_write_policy, 'is_workflow_live_for_task', _async_detector(False),
+        )
+        before = _live_claimant_before()
+        after = _flat(status='cancelled', claimant_run_id=None)
+        taskmaster.get_task = AsyncMock(side_effect=[before, after])
+        filer = AsyncMock()
+        interceptor.set_lifecycle_reset_filer(filer)
+
+        await interceptor.set_task_status('1', 'cancelled', '/project', agent_id=RECON_AGENT_ID)
+
+        filer.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_non_recon_agent_id_does_not_invoke_filer(self, interceptor, taskmaster, monkeypatch):
         """(d) a non-recon agent_id does NOT invoke the filer and the write proceeds."""
         monkeypatch.setattr(

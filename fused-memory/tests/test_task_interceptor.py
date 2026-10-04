@@ -3711,6 +3711,53 @@ async def test_reopen_atomic_contract_persists_against_real_backend(
         await backend.close()
 
 
+@pytest.mark.asyncio
+async def test_found_on_main_recovery_done_clears_leaked_claimant(tmp_path, event_buffer):
+    """The orchestrator restart/recovery-DONE shape whose coverage was contested (task 3996):
+    a found_on_main done written with no claimant must clear the still-fresh claimant
+    through the atomic set_status_and_stamp_audit writer.
+    """
+    from datetime import UTC, datetime
+
+    from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
+    from fused_memory.config.schema import TaskmasterConfig
+
+    project_root = str(tmp_path)
+    sha = _init_git_repo(tmp_path)
+    backend = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await backend.start()
+    try:
+        await backend.add_task(project_root=project_root, title='T')
+        interceptor = TaskInterceptor(backend, None, event_buffer)
+        claim = await interceptor.set_task_status(
+            '1', 'in-progress', project_root,
+            claimant_run_id='run-r/sess-1/pid=7',
+            heartbeat_at=datetime.now(UTC).isoformat(),
+        )
+        assert 'error' not in claim, claim
+
+        result = await interceptor.set_task_status(
+            '1', 'done', project_root,
+            done_provenance={
+                'kind': 'found_on_main',
+                'commit': sha,
+                'note': 'recovered after orchestrator restart',
+            },
+        )
+        assert 'error' not in result, result
+    finally:
+        await backend.close()
+
+    fresh = SqliteTaskBackend(TaskmasterConfig(project_root=project_root))
+    await fresh.start()
+    try:
+        task = await fresh.get_task('1', project_root=project_root)
+    finally:
+        await fresh.close()
+    assert task['claimant_run_id'] is None, task
+    assert task['metadata']['done_provenance']['kind'] == 'found_on_main'
+
+
 # ── Tests for the reopen-freshness gate (task 2674, PRD task alpha) ────────
 #
 # Closes Face B (re-derivation clobber, task-1175 shape): a legitimate
