@@ -43,8 +43,8 @@ premise that it exists is what was wrong. Report that as a finding about the
 task; it is not a cue to guess another directory.
 
 Carry the correction forward. Every other path you built from the same assumed
-directory -- sibling files, entries in a plan or file list, paths you mean to
-commit -- rests on the same falsified guess. Re-derive them now rather than
+directory -- sibling files, entries in a plan or file list, paths you plan to
+act on -- rests on the same falsified guess. Re-derive them now rather than
 finding them one not-found at a time.
 
 Catalogued sighting: a test file assumed to live under a `harness_cli/`
