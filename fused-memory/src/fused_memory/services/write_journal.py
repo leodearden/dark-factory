@@ -336,6 +336,8 @@ class WriteJournal:
         db = self._require_db()
         async with db.execute('PRAGMA table_info(write_ops)') as cursor:
             existing = {row[1] for row in await cursor.fetchall()}
+        async with db.execute('PRAGMA table_info(backend_ops)') as cursor:
+            existing_backend_ops = {row[1] for row in await cursor.fetchall()}
 
         async with self._txn() as db:
             if 'session_id' not in existing:
@@ -370,6 +372,12 @@ class WriteJournal:
             if 'terminal_error' not in existing:
                 await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_error TEXT')
                 logger.info('Migration: added terminal_error column to write_ops')
+
+            # Same O(1), no-backfill stance as terminal_* above: a historical
+            # row's duration is unknown, so it stays NULL.
+            if 'duration_ms' not in existing_backend_ops:
+                await db.execute('ALTER TABLE backend_ops ADD COLUMN duration_ms REAL')
+                logger.info('Migration: added duration_ms column to backend_ops')
 
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
