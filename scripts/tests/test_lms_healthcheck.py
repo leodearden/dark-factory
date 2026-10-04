@@ -722,6 +722,45 @@ def test_a_placeholder_arm_is_refused_before_any_request(install_fake_httpx):
 
 
 # ---------------------------------------------------------------------------
+# Latency resolution (task 6291)
+#
+# A latency of 0.0 means "never timed"; a timed result must never report it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'elapsed_ms',
+    [0.0, 0.03, 0.049],
+    ids=['clock-did-not-tick', 'laptop-speed', 'just-under-half-unit'],
+)
+def test_a_sub_resolution_measurement_is_never_reported_as_unmeasured(elapsed_ms):
+    """0.0 is the "never timed" sentinel -- a placeholder refusal, a pre-v5 row,
+    and the gate in
+    `scripts/tests/test_lms_verification_artifact.py::test_passing_rows_carry_a_real_measured_latency`
+    -- so a real measurement must not round onto it."""
+    result = lms_healthcheck.ProbeResult(
+        verdict='PASS', reason=lms_healthcheck.Reason.OK,
+    ).with_latency(elapsed_ms)
+
+    assert result.latency_ms > 0.0
+    assert result.latency_ms == lms_healthcheck.MIN_MEASURED_LATENCY_MS
+
+
+@pytest.mark.parametrize(
+    ('elapsed_ms', 'expected_ms'),
+    [(0.06, 0.1), (38.84, 38.8), (359.06, 359.1), (33794.84, 33794.8)],
+)
+def test_a_measurement_above_the_resolution_keeps_its_rounded_value(
+    elapsed_ms, expected_ms,
+):
+    result = lms_healthcheck.ProbeResult(
+        verdict='PASS', reason=lms_healthcheck.Reason.OK,
+    ).with_latency(elapsed_ms)
+
+    assert result.latency_ms == expected_ms
+
+
+# ---------------------------------------------------------------------------
 # The cached-prompt-token diagnostic (task 3781)
 #
 # This is the only DIRECT evidence in the artifact that the measured probe
