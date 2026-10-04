@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 from _pending_tool_fixtures import _file
 
+from escalation.dedupe import DedupeConfig
 from escalation.models import Amendment, Escalation
 from escalation.queue import (
     _MAX_AMENDMENT_DETAIL_CHARS,
@@ -30,7 +31,11 @@ from escalation.queue import (
     AmendResult,
     EscalationQueue,
 )
-from escalation.server import create_server
+from escalation.server import (
+    _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID,
+    _AMENDMENT_TRUNCATION_STORM_THRESHOLD,
+    create_server,
+)
 
 # The only keys an amend may change on the record it amends.
 _AMEND_WRITES = frozenset({'amendments', 'updated_at', 'amendments_chars_elided'})
@@ -434,3 +439,48 @@ class TestAmendEscalationTool:
         assert threading.get_ident() not in queue.amend_threads, (
             'queue.amend ran ON the event-loop thread'
         )
+
+
+@pytest.mark.asyncio
+class TestAmendTruncationStorm:
+    """Amend-driven truncation feeds the SAME INV-4 escape as a fold's.
+
+    An alarm whose census excluded a truncation source would under-report
+    exactly the cap pressure it exists to detect.  Dedupe is off for the
+    reason ``test_server.py::TestAmendmentTruncationStorm`` states: otherwise
+    a second record would fold and "exactly one" would pass for the wrong
+    reason.
+    """
+
+    async def test_amend_truncations_file_one_info_escalation(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = _framed_l2(queue, amendments=[_amendment(i) for i in range(_MAX_AMENDMENTS)])
+        server = create_server(
+            queue, startup_sweep=False,
+            dedupe_config=DedupeConfig(infra_dedupe_enabled=False),
+        )
+        known = {e.id for e in queue.get_pending()}
+
+        def new_pending() -> set[str]:
+            return {e.id for e in queue.get_pending()} - known
+
+        for i in range(_AMENDMENT_TRUNCATION_STORM_THRESHOLD - 1):
+            below = await _amend(
+                server, escalation_id=l2.id, summary=f'ruling {i}', agent_role='interactive',
+            )
+            assert below['amendment_recorded'] is True
+            assert below['amendments_truncated'] == i + 1
+        assert new_pending() == set(), 'below the threshold nothing may be filed'
+
+        await _amend(
+            server, escalation_id=l2.id, summary='ruling at threshold',
+            agent_role='interactive',
+        )
+
+        [storm_id] = new_pending()
+        storm = queue.get(storm_id)
+        assert storm is not None
+        assert storm.severity == 'info'
+        assert storm.category == 'infra_issue'
+        assert storm.task_id == _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID
+        assert l2.id in storm.summary
