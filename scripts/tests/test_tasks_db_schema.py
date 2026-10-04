@@ -479,7 +479,7 @@ def test_main_first_line_is_the_absolute_path_of_the_store_it_read(
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
-    conn = sqlite3.connect(f"file:{first}?mode=ro", uri=True)
+    conn = sqlite3.connect(Path(first).as_uri() + "?mode=ro", uri=True)
     try:
         tables = {
             row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")

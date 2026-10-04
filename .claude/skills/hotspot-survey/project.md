@@ -13,8 +13,8 @@
   a worktree, refuses the 0-byte decoy, and prints that store's ABSOLUTE path on line 1, then
   every table's columns, declared types and python value types. Paste that output into the
   mine:tasks prompt — never a remembered column list — and open the store read-only (so you never
-  contend with the live orchestrator) by the printed path:
-  `sqlite3.connect(f'file:{path}?mode=ro', uri=True)`.
+  contend with the live orchestrator) by the printed path, percent-encoded into the URI:
+  `sqlite3.connect(pathlib.Path(path).as_uri() + '?mode=ro', uri=True)`.
 - **Output**: `plans/bug-hotspot-survey-<date>.md` + `-full-findings.json`, committed. Use `git commit --only <paths>` — direct-to-main commits race the live merge queue (ref lock → re-add + retry); pre-commit (3× pyright) can exceed the Bash 2-min ceiling → `setsid git commit ... &` + poll.
 - **Fix-commit vocabulary**: generic set plus `--grep='amend:'` (post-merge patch-ups) and `--grep='red-main'` (broke main) — these mark the weakest code.
 - **History window**: `--since=2026-01-01` (the autonomous-factory era; most commits are agent-authored TDD).

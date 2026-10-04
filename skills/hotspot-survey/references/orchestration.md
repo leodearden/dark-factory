@@ -141,7 +141,8 @@ Mine the tracker's storage directly (a file read beats N MCP round-trips); the o
 ```
 SOURCE: the task database at <absolute path of the live store — it lives in the MAIN checkout,
 not a worktree>. If it is SQLite, open it READ-ONLY by that absolute path so you never contend
-with the live orchestrator: sqlite3.connect('file:<absolute path of the live store>?mode=ro', uri=True).
+with the live orchestrator, percent-encoding the path into the URI:
+sqlite3.connect(pathlib.Path('<absolute path of the live store>').as_uri() + '?mode=ro', uri=True).
 Shape: <the shape you PROBED in Phase 0 step 3 — paste the probe's actual output (the overlay
 names a shape command if the project has one), never a column list remembered or copied from
 this template or an older doc>.
