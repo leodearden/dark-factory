@@ -7,7 +7,7 @@ const DF_T = window.DF_DATA;
 // see the SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs.
 const DF_LOADER_T = window.DF_DATA_LOADER;
 const { useState: uS_T, useEffect: uE_T, useRef: uR_T, useLayoutEffect: uLE_T, useMemo: uM_T } = React;
-const { computeTiers, partitionComponents, orderRows, computeNeighborhood, focusGroupView } = window.DF_GRAPH_LAYOUT;
+const { computeTiers, computeNeighborhood, focusGroupView, layoutSignature, taskGraphLayout } = window.DF_GRAPH_LAYOUT;
 const {
   prdTitle, aggregatePrdStatus, summarizePrdMembers, prdIsFinished, prdBarSegments, prdProgress, prdProgressReading,
   groupTasksByPrd, orderPrdGroups,
@@ -166,19 +166,13 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
   const ownNodeRefs = uR_T({});
   const nodeRefs = externalNodeRefs || ownNodeRefs;
 
-  // Partition into weakly-connected components + singletons, then order each
-  // component's tiers via barycenter/transpose (STATUS_ORDER baked in as the
-  // initial permutation/tiebreak — see graph_layout.js). Tiers are computed
-  // once over the full filtered set: a weakly-connected component has no
-  // edges to other components, so per-component tiers equal global tiers.
-  const { blocks, singletons } = uM_T(() => {
-    const tiers = computeTiers(tasks);
-    const { components, singletons: singles } = partitionComponents(tasks);
-    return { blocks: components.map(c => orderRows(c, tiers)), singletons: singles };
-  }, [tasks]);
-
-  // Highlight neighborhood when something is selected
-  const neighborhood = uM_T(() => computeNeighborhood(tasks, selectedId), [selectedId, tasks]);
+  // Keyed on content, not on `tasks`: callers pass a fresh array every render
+  // (each poll, each click). The layout holds ids only (see
+  // graph_layout.js::taskGraphLayout), so nodes render the current task objects.
+  const layoutKey = layoutSignature(tasks);
+  const { blocks, singletons } = uM_T(() => taskGraphLayout(tasks), [layoutKey]);
+  const neighborhood = uM_T(() => computeNeighborhood(tasks, selectedId), [layoutKey, selectedId]);
+  const taskById = new Map(tasks.map(t => [t.id, t]));
 
   // Node card JSX, shared verbatim between component-block tier rows and the
   // singleton strip so TaskGraphEdges (which resolves positions via
@@ -225,7 +219,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
                   tiers 0..maxTier with no gaps (tier = 1 + max(in-component deps' tier)),
                   so a row shouldn't be empty here in practice. Kept in case that
                   invariant is ever violated by a future graph_layout.js change. */}
-              {row.length === 0 ? <div className="empty-tier">—</div> : row.map(renderNode)}
+              {row.length === 0 ? <div className="empty-tier">—</div> : row.map(id => renderNode(taskById.get(id)))}
             </div>
           ))}
         </div>
@@ -234,7 +228,7 @@ function TaskGraph({ tasks, selectedId, onSelect, onEnterFocus, nodeRefs: extern
         <div className="singleton-strip">
           <div className="strip-label">unconnected</div>
           <div className="row">
-            {singletons.map(renderNode)}
+            {singletons.map(id => renderNode(taskById.get(id)))}
           </div>
         </div>
       )}
