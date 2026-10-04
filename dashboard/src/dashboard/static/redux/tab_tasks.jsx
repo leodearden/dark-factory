@@ -46,7 +46,7 @@ function TaskGraphEdges({ containerRef, nodeRefs, tasks, selectedId, neighborhoo
   const [paths, setPaths] = uS_T([]);
 
   // Stable signature: edges flicker because the parent's `tasks` is a new array
-  // every render (overview clock ticks force re-renders). Only re-run when the
+  // every render (each data poll and each interaction). Only re-run when the
   // *content* changes — task ids, statuses, dep edges, selection.
   // neighborhood is derived from selectedId+tasks so it is already covered.
   const signature = uM_T(() => {
@@ -283,14 +283,13 @@ function ProjectPrdGroups({ graphTasks, allProjectTasks, rows, terminal, selecte
   // Content signatures so the pricier work below (bucketing + PRD-level
   // mini-DAG tiering, and the full-member summaries) only reruns when
   // something it actually reads changes. `graphTasks`/`allProjectTasks` are
-  // fresh array instances on every TasksTab render — including the app-wide
-  // 1s clock tick (app.jsx's `setInterval(() => setNow(...), 1000)`, unrelated
-  // to data polling) — which would defeat a plain reference-keyed useMemo
-  // every tick (same reasoning as TaskGraphEdges' own `signature` memo
-  // above). Unlike that one, this signature must cover every field
+  // fresh array instances on every TasksTab render — each data poll and each
+  // interaction — which would defeat a plain reference-keyed useMemo on every
+  // one (same reasoning as TaskGraphEdges' `signature` and TaskGraph's
+  // `layoutKey` above). Unlike those, this signature must cover every field
   // TaskGraph/renderNode displays for a grouped task (not just id/status/
   // deps), since a stale cache here would freeze those fields' displayed
-  // values across ticks — keep it in sync with renderNode if it starts
+  // values across polls — keep it in sync with renderNode if it starts
   // reading more of a task.
   const filteredSig = uM_T(() => graphTasks.map(t =>
     `${t.id}:${t.status}:${t.prd || ''}:${t.title}:${t.started}:${t.completed || ''}:` +
@@ -861,7 +860,7 @@ function TasksTab({ projectFilter, search }) {
             // ProjectPrdGroups). For an OPEN group dropping them costs no
             // measured work: both were reference-keyed on `filtered`, which
             // listed.rows.filter(...) above rebuilds as a fresh array on every
-            // TasksTab render — including the app-wide 1s clock tick — so both
+            // TasksTab render — each data poll and each interaction — so both
             // already recomputed every render. That is the same hazard
             // ProjectPrdGroups documents for its own signature-keyed memos.
             //
