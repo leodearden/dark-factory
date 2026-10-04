@@ -121,4 +121,33 @@ justified it.
 
 ## 6. Demonstration
 
-Pending: filled in by the acceptance demo of task 4844.
+**The live cell was not run to completion.** On 2026-10-04 the task 4844
+implementer tried ONE cell from its sandboxed task worktree, with the code at
+commit `990e6a3a64`: `run_architect_eval` on
+`orchestrator/src/orchestrator/evals/tasks_hard_v2/df_task_2260.json`, config
+`EvalConfig('architect-sonnet-replay-demo', 'claude', 'sonnet', 'high',
+role='architect', max_budget_usd=3.0)`, `timeout_override=30`. It failed
+before the architect was invoked, while creating the eval worktree. No run id
+was persisted, no metrics were produced and no money was spent. The raw error:
+
+```
+RuntimeError: Command git worktree add --detach /home/leo/src/dark-factory-eval-worktrees/df_task_2260/run-19aacddd 20c934ca597c7c9e3e2eb79f572970a8099f9243 failed (rc=128): Preparing worktree (detached HEAD 20c934ca59)
+fatal: could not create directory of '.git/worktrees/run-19aacddd': Permission denied
+```
+
+The task-worktree sandbox forbids writes to the shared `.git` directory, and
+`create_eval_worktree` must register a new worktree there. A live cell has to
+be run from an unsandboxed session.
+
+Until then, the hermetic tests are the deterministic demonstration that the
+architect's briefing carries the frame and that every cell is stamped
+`honest-frame-v1`:
+
+- `orchestrator/tests/test_eval_architect.py::TestArchitectCellCarriesReplayFrame`
+- `orchestrator/tests/test_eval_driver.py::TestEndToEndCarriesReplayFrame`
+- `orchestrator/tests/test_eval_replay_frame.py::TestPlanOnlyCliAppendsReplayFrame`
+
+When a live cell does run, record here its date, commit, run id, and the
+`replay_frame`, `terminal_kind`, `plan_steps`, `plan_quality`, `cost_usd` and
+`invocation_error` values, verbatim. A decline is an acceptable result if it is
+grounded in in-frame evidence.
