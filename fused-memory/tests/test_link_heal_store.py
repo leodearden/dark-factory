@@ -10,7 +10,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from _fm_helpers import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
@@ -25,6 +25,9 @@ from fused_memory.maintenance.link_heal_store import (
     WriteReply,
     text_sha256,
 )
+
+if TYPE_CHECKING:
+    from fused_memory.backends.mem0_client import Mem0Backend
 
 PROJECT = 'dark_factory'
 CHILD = '11111111-1111-1111-1111-111111111111'
@@ -93,6 +96,7 @@ class TestRead:
 
         record = await LinkHealStore(caller).read(PROJECT, CHILD)
 
+        assert record is not None
         assert record == LiveRecord(
             memory_id=CHILD,
             text='child text',
@@ -281,7 +285,7 @@ class TestQdrantLinkCensus:
         as_uuid = uuid.UUID('22222222-2222-2222-2222-222222222222')
         backend = _FakeScrollBackend([_Point(as_uuid), _Point(CHILD)])
 
-        ids = await QdrantLinkCensus(backend, 'fused').linked_ids(PROJECT)
+        ids = await QdrantLinkCensus(cast('Mem0Backend', backend), 'fused').linked_ids(PROJECT)
 
         assert ids == [str(as_uuid), CHILD]
 
@@ -291,7 +295,7 @@ class TestQdrantLinkCensus:
 
         backend = _FakeScrollBackend([])
 
-        await QdrantLinkCensus(backend, 'fused').linked_ids(PROJECT)
+        await QdrantLinkCensus(cast('Mem0Backend', backend), 'fused').linked_ids(PROJECT)
 
         (collection, scroll_filter), = backend.scrolls
         assert collection == 'fused_dark_factory'
