@@ -4956,6 +4956,26 @@ def _snapshot_verify_state(
     return (False, None)
 
 
+def _first_copy_per_request(entries: list[dict]) -> tuple[list[dict], list[str]]:
+    """Keep the first entry dict per ``request_id`` (task 4582).
+
+    ``snapshot()`` emits head-of-line first, so the first copy of a request_id
+    is its deepest pipeline stage. Returns ``(kept, dropped_request_ids)``;
+    each kept dict is a copy whose ``position`` is its index in *kept*.
+    """
+    kept: list[dict] = []
+    dropped: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        rid = entry['request_id']
+        if rid in seen:
+            dropped.append(rid)
+            continue
+        seen.add(rid)
+        kept.append({**entry, 'position': len(kept)})
+    return kept, dropped
+
+
 async def coalesce_or_enqueue_merge_request(
     queue: asyncio.Queue,
     req: MergeRequest,
@@ -13307,7 +13327,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Returns a dict with:
           entries: list of entry dicts, head-of-line first.
-          depth: total number of entries.
+          depth: number of distinct request_ids (entries deduplicated
+            head-of-line-first).
           head_of_line: task_id of the first entry, or None.
           verify_in_progress: {task_id, phase, age_secs, verify_age_secs} when the
             deque head is actively verifying (phase in verifying/gate_reverify/finalizing),
@@ -13574,6 +13595,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             if req is None:
                 continue
             entries.append(_entry(req, 'queued', worktree_path=None, position=len(entries)))
+
+        entries, _duplicate_rids = _first_copy_per_request(entries)
+        if _duplicate_rids:
+            logger.warning(
+                'snapshot(): request_id(s) %s rendered more than once — a '
+                'pipeline container holds a stale reference to a request '
+                'already rendered at a deeper stage; keeping the head-of-line copy',
+                _duplicate_rids,
+            )
 
         # verify_in_progress: non-None only when the deque head is actively
         # verifying or in a post-verify gate phase.  Passthrough entries
