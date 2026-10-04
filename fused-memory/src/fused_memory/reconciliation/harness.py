@@ -395,6 +395,21 @@ def _derive_affected_ids(finding: dict) -> list[str]:
     return ids
 
 
+def _recon_finding_fingerprint(escalation_category: str, finding: dict) -> str:
+    """The identity of a recon *finding* under *escalation_category*.
+
+    One expression for every finding-keyed consumer: ``_escalate``'s dedupe,
+    the persistence count, the open-escalation check and the routed record's
+    ``finding_fingerprint``, so none of them can drift from the others.
+    """
+    return compute_content_fingerprint(  # type: ignore[possibly-undefined]
+        escalation_category,
+        finding.get('category') or '',
+        _derive_affected_ids(finding),
+        finding.get('description') or '',
+    )
+
+
 def _finding_has_reference(finding: dict) -> bool:
     """Return True iff *finding* cites at least one task/entity/edge/memory ID.
 
@@ -2874,12 +2889,7 @@ class ReconciliationHarness:
         try:
             queue = self._escalation_queue
             if finding is not None:
-                fingerprint = compute_content_fingerprint(  # type: ignore[possibly-undefined]
-                    category,
-                    finding.get('category') or '',
-                    _derive_affected_ids(finding),
-                    finding.get('description') or '',
-                )
+                fingerprint = _recon_finding_fingerprint(category, finding)
             else:
                 # No finding in scope: use '' for finding_category (sentinel for
                 # "summary-only, no finding identity") so the description-hash branch
@@ -3036,6 +3046,7 @@ class ReconciliationHarness:
             queue = EscalationQueue(  # type: ignore[possibly-undefined]
                 Path(project_root) / _ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME
             )
+            fingerprint = _recon_finding_fingerprint('recon_integrity_issue', finding)
             # Cross-cycle dedupe.  The `_sweep_escalate_l1` template omits this
             # and can refile on every sweep — fine for a one-shot cancellation
             # event, wrong for a filer that re-evaluates each reconciliation
@@ -3105,6 +3116,7 @@ class ReconciliationHarness:
                     project_id=project_id,
                     run_id=run_id,
                     persistence=persistence,
+                    finding_fingerprint=fingerprint,
                 ),
             )
             esc_id: str = queue.submit(esc)
@@ -4852,12 +4864,7 @@ class ReconciliationHarness:
         if not HAS_ESCALATION:
             return 0
         try:
-            target_fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
-                'recon_integrity_issue',
-                finding.get('category') or '',
-                _derive_affected_ids(finding),
-                finding.get('description') or '',
-            )
+            target_fp = _recon_finding_fingerprint('recon_integrity_issue', finding)
         except Exception as exc:
             logger.warning(
                 'reconciliation.persistence_fingerprint_failed',
@@ -4885,12 +4892,7 @@ class ReconciliationHarness:
                 # Count this run once if any item matches the target fingerprint
                 for item in items:
                     try:
-                        fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
-                            'recon_integrity_issue',
-                            item.get('category') or '',
-                            _derive_affected_ids(item),
-                            item.get('description') or '',
-                        )
+                        fp = _recon_finding_fingerprint('recon_integrity_issue', item)
                     except Exception:
                         any_item_fp_failed = True
                         continue
@@ -5079,12 +5081,7 @@ class ReconciliationHarness:
         if not HAS_ESCALATION or self._escalation_queue is None:
             return False
         try:
-            target_fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
-                'recon_integrity_issue',
-                finding.get('category') or '',
-                _derive_affected_ids(finding),
-                finding.get('description') or '',
-            )
+            target_fp = _recon_finding_fingerprint('recon_integrity_issue', finding)
             if pending_fps is not None:
                 return target_fp in pending_fps
             # Fallback: per-finding scan (no pre-fetched set supplied).

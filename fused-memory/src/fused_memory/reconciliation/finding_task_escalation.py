@@ -15,9 +15,10 @@ choosing Option A, and an implementer then committed the opposite. Reconciliatio
 DID flag the divergence — and the flag went to a queue nobody reading task 4458
 would ever look at.
 
-This module supplies the two PURE halves of the fix: deciding WHICH task a
-finding names, and building the escalation payload. The impure half — queue
-construction, dedupe and submit — lives on the harness as
+This module supplies the three PURE parts of the fix: deciding WHICH task a
+finding names, building the escalation payload, and deciding whether a pending
+record already covers a finding. The impure half — queue construction, the
+pending scan and submit — lives on the harness as
 ``ReconciliationHarness._file_finding_task_escalation``, because it needs the
 harness's ``_known_projects`` registry and its guarded ``HAS_ESCALATION``
 import.
@@ -39,14 +40,16 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Protocol
 
 __all__ = [
     'FINDING_TASK_ESCALATION_CATEGORY',
     'FINDING_TASK_ESCALATION_LEVEL',
+    'RoutedRecordView',
     'build_finding_task_escalation_kwargs',
     'is_routable_task_id',
     'resolve_finding_task_target',
+    'routed_record_covers_finding',
 ]
 
 # Escalation category for a Stage-3 finding routed onto its named task's
@@ -63,9 +66,10 @@ __all__ = [
 # package, whose filer/reader spelling contract is depended on by every
 # categorized detector — so the trigger is recorded rather than discharged.
 # Because nothing rejects a typo'd category at submit time, the name is
-# single-sourced through this constant: the filer and the `has_open_l1` dedupe
-# read the SAME symbol, which is the property the trigger's comment says the
-# dedup correctness of a categorized detector depends on.
+# single-sourced through this constant: the builder and
+# `routed_record_covers_finding` read the SAME symbol, which is the property the
+# trigger's comment says the dedup correctness of a categorized detector
+# depends on.
 FINDING_TASK_ESCALATION_CATEGORY = 'recon_task_finding'
 
 # Fixed routing fields for every record this module builds.
@@ -168,6 +172,8 @@ FINDING_TASK_ESCALATION_LEVEL = 0
 _ESCALATION_SEVERITY = 'info'
 
 _AGENT_ROLE = 'reconciliation-harness'
+
+_FINDING_FINGERPRINT_KEY = 'finding_fingerprint'
 
 _ROUTABLE_TASK_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 
@@ -315,6 +321,7 @@ def build_finding_task_escalation_kwargs(
     project_id: str,
     run_id: str,
     persistence: int,
+    finding_fingerprint: str,
 ) -> dict[str, Any]:
     """Build the ``Escalation(...)`` keyword arguments for *finding*.
 
@@ -337,12 +344,13 @@ def build_finding_task_escalation_kwargs(
       defect ``BacklogPolicy._restore_policy_keys`` exists to work around; ALL
       provenance goes into ``detail`` (a real field) as JSON so we never need
       that workaround.
-    - No ``dedupe_fingerprint``: nothing on the orchestrator queue folds on one
-      for this category — cross-cycle dedupe is the filer's own pending-scan
-      on ``(level, category)``, see ``_file_finding_task_escalation`` — and
-      setting one risks unintended folding should a future ``submit_or_dedupe``
-      config ever name the category.  The recon-side fingerprint is preserved in
-      ``detail`` for correlation instead.
+    - No ``dedupe_fingerprint``: the finding's identity,
+      *finding_fingerprint*, rides in ``detail`` instead, because the orphan
+      reaper's promotion copies ``detail`` and drops ``dedupe_fingerprint``
+      (see :func:`routed_record_covers_finding`).  Setting one would also risk
+      unintended folding should a future ``submit_or_dedupe`` config ever name
+      the category.  The value equals the recon-side twin's
+      ``dedupe_fingerprint``, so ``detail`` correlates the two queues.
     - No ``suggested_action``: it is left at its ``''`` default rather than
       guessed from the ``expand_scope|create_followup_task|abort_task``
       vocabulary, because the correct disposition is exactly what the ladder
@@ -371,6 +379,7 @@ def build_finding_task_escalation_kwargs(
             'run_id': run_id,
             'project_id': project_id,
             'persistence': persistence,
+            _FINDING_FINGERPRINT_KEY: finding_fingerprint,
         },
         default=str,
         indent=2,
@@ -385,3 +394,65 @@ def build_finding_task_escalation_kwargs(
         'detail': detail,
         'level': FINDING_TASK_ESCALATION_LEVEL,
     }
+
+
+class RoutedRecordView(Protocol):
+    """The fields of a pending escalation that the coverage decision reads."""
+
+    @property
+    def category(self) -> str: ...
+
+    @property
+    def level(self) -> int: ...
+
+    @property
+    def detail(self) -> str: ...
+
+
+def _finding_fingerprint_of(detail: str) -> str | None:
+    try:
+        parsed = json.loads(detail)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    value = parsed.get(_FINDING_FINGERPRINT_KEY)
+    return value if isinstance(value, str) and value else None
+
+
+def routed_record_covers_finding(
+    record: RoutedRecordView,
+    finding_fingerprint: str,
+) -> bool:
+    """Whether pending *record* already covers the finding *finding_fingerprint*.
+
+    Only a record of ``FINDING_TASK_ESCALATION_CATEGORY`` can cover: an
+    unrelated open record on the task must not swallow a new root cause (the
+    task-2757 property).  Among those, a level-0 record covers only the SAME
+    finding, so two distinct findings on one task each get a record.  An absent
+    identity on either side never folds.
+
+    The fingerprint is the finding's PERSISTENCE identity (the key the harness
+    counts recurrence under), not its ``finding_id``:
+    ``fused_memory/server/recon_report.py::ReconReportState.add_finding`` mints
+    a fresh uuid4 per call, so the same persistent finding carries a new id
+    every run.
+
+    A record ABOVE ``FINDING_TASK_ESCALATION_LEVEL`` covers EVERY finding.  It
+    is a routed finding a human already holds, and
+    ``orchestrator/harness.py::Harness._reap_orphan_l0_escalations`` dismisses
+    any L0 on a task with an open L1 as covered, so filing one would only start
+    a file-dismiss-refile loop each cycle.  Promotion builds a new record that
+    keeps ``detail`` (with a suffix appended) but not ``dedupe_fingerprint``,
+    which is why the level alone decides here.
+
+    The caller passes PENDING records only, so a finding reaches the ladder
+    again once the covering record is adjudicated.
+    """
+    if record.category != FINDING_TASK_ESCALATION_CATEGORY:
+        return False
+    if record.level > FINDING_TASK_ESCALATION_LEVEL:
+        return True
+    return bool(finding_fingerprint) and (
+        _finding_fingerprint_of(record.detail) == finding_fingerprint
+    )
