@@ -9,6 +9,7 @@ never fails the status write that triggered it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Mapping
@@ -152,8 +153,11 @@ async def _mint(
     spec = _build_successor(predecessor, predecessor_id, terminal_time)
     key = spec.metadata['recurrence']['key']
     # The carrier contract is checked at submit time only (task 3093), so the
-    # link being renewed is re-verified rather than trusted.
-    carrier_error = deterministic_task_error(spec.metadata['task_kind'], spec.metadata, project_root)
+    # link being renewed is re-verified rather than trusted. The check stats
+    # the before_done script, so it runs off the event loop.
+    carrier_error = await asyncio.to_thread(
+        deterministic_task_error, spec.metadata['task_kind'], spec.metadata, project_root,
+    )
     if carrier_error is not None:
         return _failed(predecessor_id, key, str(carrier_error.get('error')))
     existing_id = await _existing_link_id(tm, project_root, tag, key)
