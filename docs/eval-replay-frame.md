@@ -32,8 +32,8 @@ TRUE in the present. The worst case is `df_task_2260`, whose base is the first
 parent of its own landing merge `97059b1dd8`. The architect that investigated
 honestly was required by its role contract to report the task already done. The
 headline planRate was measuring willingness to plan a moot task, not planning.
-The forensic record lives only in the main checkout, untracked:
-`data/eval-campaign/tranche1/investigation/FINDINGS.md`.
+The forensic record is untracked campaign data, not part of this repository;
+the figures above are the part of it this decision rests on.
 
 ## 2. Decision: option B, HONEST FRAME (`honest-frame-v1`)
 
@@ -73,16 +73,17 @@ refusal as a failure and teach the opposite of the role contract.
 
 ## 3. Enforcement
 
-- `runner.py::run_architect_eval` appends `build_replay_frame_block(pre_task_commit)`
-  to the production assembler's prompt.
-- `orchestrator eval --plan-only` (`cli.py::_run_plan_only`) appends it the same
-  way, per fixture, because one assembler is shared across fixtures with
-  different bases.
-- `runner.py::run_end_to_end` (the both-live matrix/confirm path) passes
-  `replay_frame.py::ReplayFramedBriefingAssembler` through `build_workflow`'s
-  `briefing` parameter. TaskWorkflow's PLAN phase calls its
-  `build_architect_prompt`, which returns the production prompt plus the block.
-  It overrides nothing else.
+One mechanism frames every eval architect:
+`replay_frame.py::ReplayFramedBriefingAssembler`, built with the fixture's
+`pre_task_commit`. Its `build_architect_prompt` returns the production prompt
+plus the block, and it overrides nothing else.
+
+- `runner.py::run_architect_eval` builds one per cell.
+- `orchestrator eval --plan-only` (`cli.py::_run_plan_only`) builds one per
+  fixture, since each fixture has its own base.
+- `runner.py::run_end_to_end` (the both-live matrix/confirm path) passes one
+  through `build_workflow`'s `briefing` parameter, so TaskWorkflow's PLAN phase
+  briefs its live architect with it.
 
 Load-bearing constraint: `orchestrator/src/orchestrator/agents/briefing.py` and
 `orchestrator/src/orchestrator/workflow.py` stay byte-identical to production.
@@ -104,50 +105,39 @@ A readout that mixes framed and unframed cells must split on this field. Bump
 `REPLAY_FRAME_ID` whenever the block text changes materially, so one id always
 means one briefing.
 
+`--plan-only` stamps the same id into the fixture JSON as `plan_replay_frame`,
+next to the `plan` it wrote. A fixture plan without that key was generated
+unframed, before task 4844. `run_eval`'s implementer cells consume the frozen
+plan but do not copy this key into their metrics.
+
 ## 5. Deliberately still unfixed
 
 - Live MCP visibility and writes from eval agents: task 4757.
 - TaskWorkflow's follow-up architect prompts are not framed: plan completion,
-  revalidation, repair, replan and plan tightening. They operate on a plan that
-  already exists, and the tranche-1 declines were reached from the PLAN-phase
-  prompt.
+  revalidation, plan tightening, schema repair (`_repair_plan_schema`) and the
+  post-review replan (`_replan`). They operate on a plan that already exists,
+  and the tranche-1 declines were reached from the PLAN-phase prompt. The
+  PLAN phase's own re-plan, which passes `include_prior_proposals=True` to
+  `build_architect_prompt`, IS framed.
 - The simple-task route, and the ARCHITECT system prompt itself (production
   text, still teaching `git log --all`). The frame overrides it in the user
   prompt for the replay only.
-- `--plan-only` writes plans into fixture JSON without a frame stamp.
 
 Moving toward option A must be recorded here, with the measurement that
 justified it.
 
 ## 6. Demonstration
 
-**The live cell was not run to completion.** On 2026-10-04 the task 4844
-implementer tried ONE cell from its sandboxed task worktree, with the code at
-commit `990e6a3a64`: `run_architect_eval` on
-`orchestrator/src/orchestrator/evals/tasks_hard_v2/df_task_2260.json`, config
-`EvalConfig('architect-sonnet-replay-demo', 'claude', 'sonnet', 'high',
-role='architect', max_budget_usd=3.0)`, `timeout_override=30`. It failed
-before the architect was invoked, while creating the eval worktree. No run id
-was persisted, no metrics were produced and no money was spent. The raw error:
-
-```
-RuntimeError: Command git worktree add --detach /home/leo/src/dark-factory-eval-worktrees/df_task_2260/run-19aacddd 20c934ca597c7c9e3e2eb79f572970a8099f9243 failed (rc=128): Preparing worktree (detached HEAD 20c934ca59)
-fatal: could not create directory of '.git/worktrees/run-19aacddd': Permission denied
-```
-
-The task-worktree sandbox forbids writes to the shared `.git` directory, and
-`create_eval_worktree` must register a new worktree there. A live cell has to
-be run from an unsandboxed session.
-
-Until then, the hermetic tests are the deterministic demonstration that the
-architect's briefing carries the frame and that every cell is stamped
-`honest-frame-v1`:
+No live framed cell has been recorded yet. A live cell must run from an
+unsandboxed session, because `create_eval_worktree` registers a worktree in the
+shared `.git` directory. Until one runs, these hermetic tests show that the
+architect's briefing carries the frame and that every cell is stamped:
 
 - `orchestrator/tests/test_eval_architect.py::TestArchitectCellCarriesReplayFrame`
 - `orchestrator/tests/test_eval_driver.py::TestEndToEndCarriesReplayFrame`
-- `orchestrator/tests/test_eval_replay_frame.py::TestPlanOnlyCliAppendsReplayFrame`
+- `orchestrator/tests/test_eval_replay_frame.py::TestPlanOnlyCliBriefsInReplayFrame`
 
-When a live cell does run, record here its date, commit, run id, and the
+When a live cell runs, record here: date, commit, fixture, run id, and the
 `replay_frame`, `terminal_kind`, `plan_steps`, `plan_quality`, `cost_usd` and
 `invocation_error` values, verbatim. A decline is an acceptable result if it is
 grounded in in-frame evidence.
