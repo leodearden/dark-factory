@@ -13,9 +13,9 @@
 //
 // This is the live layout source for TaskGraph: index.html loads this file
 // (classic script, before the Babel JSX tags) so `window.DF_GRAPH_LAYOUT` is
-// defined before tab_tasks.jsx executes its top-level
-// `const { computeTiers, partitionComponents, orderRows } = window.DF_GRAPH_LAYOUT;`
-// destructure. tab_tasks.jsx has no inline copy of any of these functions —
+// defined before tab_tasks.jsx destructures its layout functions from
+// `window.DF_GRAPH_LAYOUT` at top level. tab_tasks.jsx has no inline copy of
+// any of these functions —
 // this module is their sole implementation.
 //
 // MODULE-UNIQUE TOP-LEVEL NAMES. Every classic (non-module) <script> tag on
@@ -434,8 +434,18 @@ function layoutSignature(tasks) {
   return JSON.stringify(tasks.map(t => [t.id, t.status, (t.deps || []).map(d => d.id)]));
 }
 
+// ── TaskGraph's whole layout: ordered component blocks + singletons, as ids ──
+// Tiers are computed once over the full list: a weakly-connected component has
+// no edges to other components, so per-component tiers equal global tiers. The
+// result holds ids only, so a caller may cache it on layoutSignature and
+// resolve the ids against its current task objects.
 function taskGraphLayout(tasks) {
-  throw new Error('not implemented');
+  const tiers = computeTiers(tasks);
+  const { components, singletons } = partitionComponents(tasks);
+  return {
+    blocks: components.map(c => orderRows(c, tiers).map(row => row.map(t => t.id))),
+    singletons: singletons.map(t => t.id),
+  };
 }
 
 // Named GRAPH_LAYOUT_API, never a bare `API` — see the module-unique-const
