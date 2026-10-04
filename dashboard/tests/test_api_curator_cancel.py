@@ -9,13 +9,18 @@ Step-by-step TDD:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from typing import cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
 import pytest
 
 from dashboard.app import _CANCEL_DETAIL_EXC_CHAR_LIMIT
+from dashboard.data import memory as memory_data
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -36,6 +41,52 @@ def _tool_name(c):
     if len(c.args) > 2:
         return c.args[2]
     return c.kwargs.get('tool_name')
+
+
+async def _concurrent_background_leg(url: str) -> None:
+    """Run one failing sampler-shaped leg against *url* in a separate task, to completion.
+
+    Reproduces, deterministically, the interleaving measured in task 6286: the
+    lifespan's ``_metrics_loop`` / ``_burndown_loop`` initial snapshots fan out
+    against the same URLs, through these same module-global seams, while a
+    request is in flight.
+    """
+
+    async def _failing_sampler_leg() -> None:
+        await memory_data.mcp_tool_call(cast(httpx.AsyncClient, None), url, 'get_status', {})
+        memory_data.invalidate_session(url)
+
+    await asyncio.get_running_loop().create_task(_failing_sampler_leg())
+
+
+@dataclass(frozen=True)
+class _PerUrl:
+    """Scripted cancel_ticket outcomes keyed by URL, for fan-out tests."""
+
+    outcomes: Mapping[str, object]
+
+
+def _cancel_script(outcome: object) -> Callable[..., Awaitable[object]]:
+    """Script ``mcp_tool_call``: *outcome* answers cancel_ticket; any other tool gets ``{}``.
+
+    *outcome* applies to every URL, or is a :class:`_PerUrl`.  A BaseException
+    outcome is raised, anything else returned.  Every cancel_ticket dial first
+    awaits :func:`_concurrent_background_leg`, so each test runs under the
+    worst-case sampler interleaving on every host.
+    """
+
+    async def _scripted_mcp_tool_call(
+        client: object, url: str, tool_name: str, arguments: object, **kwargs: object
+    ) -> object:
+        if tool_name != 'cancel_ticket':
+            return {}
+        await _concurrent_background_leg(url)
+        result = outcome.outcomes[url] if isinstance(outcome, _PerUrl) else outcome
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    return _scripted_mcp_tool_call
 
 
 # ---------------------------------------------------------------------------
@@ -212,26 +263,11 @@ def test_cancel_handler_invalidates_session_on_transport_error(client):
     _INVALIDATE_TARGET = 'dashboard.app.memory_data.invalidate_session'
     configured_url = client.app.state.config.fused_memory_urls[0]
 
-    async def _only_cancel_ticket_fails(*args, **kwargs):
-        """Fail the tool under test; let every other tool succeed.
-
-        ``mcp_tool_call`` is a module global shared with the lifespan's
-        metrics sampler, whose ``get_status``/``get_queue_stats`` legs run
-        CONCURRENTLY with this request and route their own transport failures
-        through the same ``invalidate_session``.  A blanket side_effect made
-        those legs fail too, so the call count below was a race against the
-        background loop rather than a statement about the handler — observed
-        as three recorded invalidations instead of one on a loaded host.
-        Narrowing the failure to ``cancel_ticket`` leaves the sampler's legs
-        succeeding, so every recorded invalidation is the handler's.
-        """
-        tool_name = args[2] if len(args) > 2 else kwargs.get('tool_name')
-        if tool_name == 'cancel_ticket':
-            raise httpx.ConnectError('refused')
-        return {}
-
     with (
-        patch(_PATCH_TARGET, new=AsyncMock(side_effect=_only_cancel_ticket_fails)),
+        patch(
+            _PATCH_TARGET,
+            new=AsyncMock(side_effect=_cancel_script(httpx.ConnectError('refused'))),
+        ),
         patch(_INVALIDATE_TARGET, new=MagicMock()) as mock_invalidate,
     ):
         resp = client.post(
@@ -420,7 +456,7 @@ def test_two_url_all_unreachable_invalidates_each_session_in_order(two_url_clien
     with (
         patch(
             _PATCH_TARGET,
-            new=AsyncMock(side_effect=httpx.ConnectError('refused')),
+            new=AsyncMock(side_effect=_cancel_script(httpx.ConnectError('refused'))),
         ),
         patch(_INVALIDATE_TARGET, new=MagicMock()) as mock_invalidate,
     ):
