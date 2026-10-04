@@ -60,7 +60,11 @@ from .metrics import (
     resolve_terminal_kind,
 )
 from .profile import apply_eval_profile
-from .replay_frame import REPLAY_FRAME_ID, build_replay_frame_block
+from .replay_frame import (
+    REPLAY_FRAME_ID,
+    ReplayFramedBriefingAssembler,
+    build_replay_frame_block,
+)
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
@@ -1719,7 +1723,9 @@ async def run_end_to_end(
 
     The result's ``config_name`` encodes the ``(architect, implementer)`` combo
     and its metrics carry ``role_under_test='end_to_end'``. Mirrors run_eval's
-    timeout / exception handling and persists via :func:`save_result`.
+    timeout / exception handling and persists via :func:`save_result`. Its
+    architect is briefed in the replay frame, and the cell is stamped
+    ``replay_frame`` (docs/eval-replay-frame.md).
     """
     task = load_task(task_path)
     task_id = task['id']
@@ -1757,7 +1763,11 @@ async def run_end_to_end(
     # 4. Workflow dependencies (mirrors run_eval).
     git_ops = GitOps(orch_config.git, orch_config.project_root)
     scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
-    briefing = BriefingAssembler(orch_config)
+    # TaskWorkflow's PLAN phase briefs the live architect through this; see
+    # docs/eval-replay-frame.md.
+    briefing = ReplayFramedBriefingAssembler(
+        orch_config, base_commit=task['pre_task_commit'],
+    )
     mcp = _EvalMcpStub(orch_config.fused_memory.url)
 
     # Owned only when the caller supplied nothing — see :data:`InjectedGate`.
@@ -1808,6 +1818,7 @@ async def run_end_to_end(
             logger.warning(f'Metric collection failed: {e}')
             metrics_dict = {}
         metrics_dict['role_under_test'] = 'end_to_end'
+        metrics_dict['replay_frame'] = REPLAY_FRAME_ID
 
         result = EvalResult(
             task_id=task_id,
