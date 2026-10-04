@@ -42,10 +42,12 @@ Measured with `pipefail` on:
   120 when the broken write was its final flush at exit.
 
 It is intermittent, so "it worked when I ran it" proves nothing. It fires
-only when the producer still has output to write after the reader has quit.
-`grep -q` on a present line never returned 141 for 4 KB of input, returned
-it in 15 of 20 runs for 24 KB, and in every run for 1.2 MB. Run alone, the
-same producer exits 0.
+only when the producer still has output to write after the reader has quit,
+and that depends on scheduling as well as size. `grep -q` on a present line
+returned 141 in 15 of 20 runs for 24 KB of input and in every run for
+1.2 MB, and under host load a payload of a few hundred bytes has been
+measured to miss too. Small output is not safe: output size never clears a
+pipeline. Run alone, the same producer exits 0.
 
 RECOGNISE IT. A 141, or a "BrokenPipeError" traceback, from a pipeline that
 ends in `head`, `grep -q` or `grep -m` means the producer was cut off after
@@ -58,10 +60,12 @@ the producer's status.
 
 GUARD IT whenever you write or edit a script that sets `pipefail`:
 
-- For a yes/no membership test, capture first, then test the captured text:
-  `keys=$(producer)`, then `grep -qxF -- "$key" <<<"$keys"`. The capture
-  fails only if the producer really failed, and the test's 0 or 1 is the
-  answer.
+- For a yes/no membership test, capture first, then test the captured text
+  as a condition: `keys=$(producer)`, then
+  `if grep -qxF -- "$key" <<<"$keys"; then ...; fi`. The capture fails only
+  if the producer really failed, and the test's 0 or 1 is the answer. Keep
+  the test in an `if`, `&&` or `||` condition: run bare under `set -e`, its
+  1 for an absent key ends the script.
 - Otherwise, use a reader that consumes all of its input: `sed -n 1p` in
   place of `head -n1`, and `grep -c PATTERN >/dev/null` in place of
   `grep -q PATTERN`, which still exits 1 when nothing matches. Both
