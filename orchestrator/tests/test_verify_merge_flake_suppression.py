@@ -442,8 +442,9 @@ class TestConfirmMergeVerifyFlakeSuppressible:
     # -- fail-closed: no recoverable node-id, no re-run at all -------------
 
     def test_no_node_id_is_unconfirmable_without_rerun(self, tmp_path: Path) -> None:
-        """Opaque/lint/type failure output (no pytest node-id) -> `unconfirmable`
-        WITHOUT calling run_verification (cheap early-out, fail-closed to red).
+        """An opaque test-leg failure that names no pytest node-id ->
+        `unconfirmable` WITHOUT calling run_verification (cheap early-out,
+        fail-closed to red).
 
         NOT `fails_in_isolation`: nothing was re-run, so this is "we could not
         tell", and reporting it as a red would launder a gate-blind case into a
@@ -453,8 +454,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
 
         config = _make_config(tmp_path)
         failing = _failing(
-            '', lint_output='src/foo.py:12:5: F401 unused import',
-            summary='lint_failure', category='lint_failure',
+            'no tests ran in 0.01s\n', category='unknown_test_failure',
             failing_leg_categories=['unknown_test_failure'],
         )
 
@@ -1234,6 +1234,44 @@ class TestUnrecordedLegCategoriesAreNeverSuppressed:
         assert result.flake_suppression.unconfirmable_reason == (
             'leg_categories_unrecorded'
         ), result.flake_suppression
+        rerun.assert_not_awaited()
+
+
+class TestFailingLintLegIsNeverSuppressed:
+    """A completed lint failure beside a test flake must not land with it:
+    the re-run vouches only for the named tests, and the post-suppression
+    unscoped gate re-checks types but not lint (task 6247)."""
+
+    def test_failing_lint_leg_stays_red_and_says_why(self, tmp_path: Path) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        failing = _failing(
+            _B1_TEST_OUTPUT,
+            lint_output='src/foo.py:12:5: F401 unused import\n',
+            failing_leg_categories=['test_failure', 'unknown_test_failure'],
+        )
+        rerun = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rerun):
+            result = asyncio.run(
+                verify_module.apply_merge_flake_suppression(
+                    failing,
+                    worktree=tmp_path,
+                    config=_make_config(tmp_path),
+                    module_configs=[_orch_module_config()],
+                )
+            )
+
+        assert result.passed is False, result
+        assert result.category != 'merge_flake_suppressed', result.category
+        assert result.flake_suppression is not None, result
+        assert result.flake_suppression.verdict is FlakeVerdict.unconfirmable, (
+            result.flake_suppression
+        )
+        assert result.flake_suppression.unconfirmable_reason == 'other_leg_failed', (
+            result.flake_suppression
+        )
         rerun.assert_not_awaited()
 
 
