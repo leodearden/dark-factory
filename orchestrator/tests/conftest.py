@@ -948,16 +948,12 @@ def make_steward(tmp_path: Path):
       ``project_root`` recipe directly (task 3551), so the sandbox invariant is
       shared even though the construction is not;
     * ``test_verdict_servers_integration_gate.py``'s ``_build_steward_for_triage``
-      (task 2488, which postdated the 3514 consolidation) was FOLDED onto this
-      fixture by task 4452, with NO ``config=`` passthrough.  Its real
-      ``OrchestratorConfig`` had only ever been needed for ``config.routing.*``,
-      which ``stamp_stock_routing_config`` below supplies; its pre-initialised
-      meta-root is test-side seeding (that module's ``triage_steward`` fixture),
-      not construction.  A ``config=`` passthrough would have to define what the
-      stamped defaults, the ``project_root`` recipe and ``config_overrides`` mean
-      against a caller-owned real config — a second mode with no consumer.  Do
-      not add one until a caller needs a real config's VALUES, not just its
-      routing containers.
+      (task 2488, after 3514) was FOLDED onto this fixture by task 4452 with NO
+      ``config=`` passthrough: its real config was only needed for
+      ``config.routing.*``, which ``stamp_stock_routing_config`` supplies, and its
+      meta-root pre-init is test-side seeding (``triage_steward``).  A passthrough
+      is a second mode with no consumer; add one only when a caller needs a real
+      config's VALUES, not just its routing containers.
 
     ENFORCEMENT, so the ruling is checkable rather than merely asserted in prose
     a fourth time: ``test_steward_scaffolding_guards.py`` censuses every steward
