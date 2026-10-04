@@ -11573,6 +11573,19 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     # a finalize head whose verify is dead still counts as frozen.  Tightening
     # it is deliberately a SEPARATE task, not folded in here.
 
+    def _occupying_inflight_entries(self) -> list[InflightEntry]:
+        """The ``_inflight`` entries still occupying the pipeline, in deque
+        order: every entry not :attr:`~InflightEntry.vacated` (task 4582).
+
+        A vacated entry's verify already gave its request back or dropped it
+        and released its lease; the raw deque keeps it only for its
+        head-of-line finalize, which still releases the speculation permit,
+        sets ``_n_failed`` and fires the cascade for successors stacked on its
+        dead merge commit. Rendering and frozen-prefix readers use this;
+        dispatch-control reads keep the raw deque.
+        """
+        return [e for e in self._inflight if not e.vacated]
+
     def _frozen_inflight_entries(self) -> list[InflightEntry]:
         """Return ordered list of frozen InflightEntry objects (ε=1890).
 
@@ -11582,7 +11595,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
 
         Definition (§5.3):
           frozen = (self._finalizing_head_entry() if its phase is a verify/finalize phase)
-                   + [e for e in self._inflight if e.verify_task is not None]
+                   + [e for e in self._occupying_inflight_entries()
+                      if e.verify_task is not None]
 
         Passthroughs (verify_task=None: conflict/already_merged/skip) are NOT
         frozen — they carry no merge_commit and are not part of the verify
@@ -11602,7 +11616,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             and self._entry_phase(_fh_entry) in {'verifying', 'gate_reverify', 'finalizing'}
         ):
             entries.append(_fh_entry)
-        for e in self._inflight:
+        for e in self._occupying_inflight_entries():
             if e.verify_task is not None:
                 entries.append(e)
         return entries
@@ -13415,7 +13429,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # and reused below for _finalizing_head_entry() too, rather than
         # letting it re-derive the same set internally (both would
         # otherwise take an O(inflight) pass over the identical deque).
-        _inflight_ids: set[str] = {e.item.request.request_id for e in self._inflight}
+        _occupying = self._occupying_inflight_entries()
+        _inflight_ids: set[str] = {e.item.request.request_id for e in _occupying}
         _container_ids: set[str] = set(_inflight_ids)
         _container_ids |= {_rd.request.request_id for _rd in self._redispatch}
         _container_ids |= {
@@ -13446,15 +13461,17 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             entries.append(_infl_entry(_fh_entry, 0))
             _excluded_ids.add(_fh_entry.item.request.request_id)
 
-        # 1. In-flight verify entries: iterate self._inflight head-first.
-        # self._inflight is the sole source of truth for concurrent-verify state.
+        # 1. In-flight verify entries: iterate the occupying _inflight entries
+        # head-first. They are the sole source of truth for concurrent-verify
+        # state; a vacated entry (task 4582) renders through whichever
+        # container now holds its request instead.
         # The vestigial single-host _verify_item/_verify_phase fields (set but
         # never cleared after γ, causing a stale phantom entry) were deleted by
         # task λ (2173) — that phantom-entry class is now structurally
         # impossible.
         # Each entry carries host (from lease.name), started_at (dispatch time ≈
         # verify start), and phase (per-entry authoritative source under multi-host).
-        for _infl in self._inflight:
+        for _infl in _occupying:
             entries.append(_infl_entry(_infl, len(entries)))
 
         # 1b/3 replacement (task 2435 kappa-b): every remaining non-terminal
@@ -13575,7 +13592,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # genuinely-verifying _inflight[0].
         _vip_head = (
             _fh_entry if _fh_entry is not None and self._entry_phase(_fh_entry) in _verify_phases
-            else (self._inflight[0] if self._inflight else None)
+            else (_occupying[0] if _occupying else None)
         )
         if _vip_head is not None and self._entry_phase(_vip_head) in _verify_phases:
             verify_in_progress = {
@@ -13594,7 +13611,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # occupancy: per-host in-flight breakdown for heartbeat and dashboard consumers.
         _by_host = {
             _infl.lease.name: _infl.item.request.task_id
-            for _infl in self._inflight
+            for _infl in _occupying
             if _infl.lease is not None
         }
         # Include the finalizing head (if any) — it is the submission-order head
@@ -13615,7 +13632,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         _inflight_by_host: dict[str, list[str]] = {}
         if _fh_entry is not None and _fh_entry.lease is not None:
             _inflight_by_host[_fh_entry.lease.name] = [_fh_entry.item.request.task_id]
-        for _infl in self._inflight:
+        for _infl in _occupying:
             if _infl.lease is not None:
                 _inflight_by_host.setdefault(_infl.lease.name, []).append(
                     _infl.item.request.task_id
