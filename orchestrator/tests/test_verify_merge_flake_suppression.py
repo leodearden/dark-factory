@@ -124,6 +124,20 @@ def _result(passed: bool, *, category: str = '') -> VerifyResult:
     )
 
 
+def _failing(test_output: str, **overrides) -> VerifyResult:
+    """A failing scoped result handed to the REAL merge-gate discriminator,
+    recording one category per failing leg as production run_verification
+    always does."""
+    return dataclasses.replace(
+        VerifyResult(
+            passed=False, test_output=test_output, lint_output='',
+            type_output='', summary='fail', category='test_failure',
+            failing_leg_categories=['test_failure'],
+        ),
+        **overrides,
+    )
+
+
 class _FakeEventStore:
     """Records emit() calls without touching sqlite."""
 
@@ -364,10 +378,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
-        failing = VerifyResult(
-            passed=False, test_output=_B1_TEST_OUTPUT, lint_output='',
-            type_output='', summary='fail', category='test_failure',
-        )
+        failing = _failing(_B1_TEST_OUTPUT)
 
         rv = AsyncMock(return_value=_result(True))
         with patch.object(verify_module, 'run_verification', rv):
@@ -401,10 +412,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
-        failing = VerifyResult(
-            passed=False, test_output=_B1_TEST_OUTPUT, lint_output='',
-            type_output='', summary='fail', category='test_failure',
-        )
+        failing = _failing(_B1_TEST_OUTPUT)
 
         rv = AsyncMock(return_value=_result(False))
         with patch.object(verify_module, 'run_verification', rv):
@@ -423,10 +431,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
-        failing = VerifyResult(
-            passed=False, test_output=_B3_TEST_OUTPUT, lint_output='',
-            type_output='', summary='collection error', category='test_failure',
-        )
+        failing = _failing(_B3_TEST_OUTPUT, summary='collection error')
 
         rv = AsyncMock(return_value=_result(False))
         with patch.object(verify_module, 'run_verification', rv):
@@ -447,10 +452,10 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         from orchestrator.flake_ledger import FlakeVerdict
 
         config = _make_config(tmp_path)
-        failing = VerifyResult(
-            passed=False, test_output='',
-            lint_output='src/foo.py:12:5: F401 unused import',
-            type_output='', summary='lint_failure', category='lint_failure',
+        failing = _failing(
+            '', lint_output='src/foo.py:12:5: F401 unused import',
+            summary='lint_failure', category='lint_failure',
+            failing_leg_categories=['unknown_test_failure'],
         )
 
         rv = AsyncMock(return_value=_result(True))
@@ -474,10 +479,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         from orchestrator.flake_ledger import FlakeVerdict
 
         config = _make_config(tmp_path)
-        failing = VerifyResult(
-            passed=False, test_output='FAILED some/other/tests/test_q.py::test_z\n',
-            lint_output='', type_output='', summary='fail', category='test_failure',
-        )
+        failing = _failing('FAILED some/other/tests/test_q.py::test_z\n')
 
         rv = AsyncMock(return_value=_result(True))
         with patch.object(verify_module, 'run_verification', rv):
@@ -501,10 +503,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
 
         _materialize(tmp_path, 'orchestrator/tests/test_x.py')
         config = _make_config(tmp_path)
-        failing = VerifyResult(
-            passed=False, test_output=_B1_TEST_OUTPUT, lint_output='',
-            type_output='', summary='fail', category='test_failure',
-        )
+        failing = _failing(_B1_TEST_OUTPUT)
 
         rv = AsyncMock(return_value=_result(True, category='pytest_internalerror'))
         with patch.object(verify_module, 'run_verification', rv):
@@ -522,10 +521,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
 
     @staticmethod
     def _b1_failing() -> VerifyResult:
-        return VerifyResult(
-            passed=False, test_output=_B1_TEST_OUTPUT, lint_output='',
-            type_output='', summary='fail', category='test_failure',
-        )
+        return _failing(_B1_TEST_OUTPUT)
 
     def test_delegates_node_id_mapping_to_shared_helper(self, tmp_path: Path) -> None:
         """The gate maps node-ids via the SHARED
@@ -674,10 +670,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
 
         _materialize(tmp_path, 'alpha/tests/test_dup.py', 'beta/tests/test_dup.py')
         config = _make_config(tmp_path)
-        failing = VerifyResult(
-            passed=False, test_output='FAILED tests/test_dup.py::test_dup\n',
-            lint_output='', type_output='', summary='fail', category='test_failure',
-        )
+        failing = _failing('FAILED tests/test_dup.py::test_dup\n')
 
         rv = AsyncMock(return_value=_result(True))
         with (
@@ -726,10 +719,7 @@ class TestConfirmMergeVerifyFlakeSuppressible:
         from orchestrator import verify as verify_module
 
         config = _make_config(tmp_path)
-        failing = VerifyResult(
-            passed=False, test_output='FAILED some/other/tests/test_q.py::test_z\n',
-            lint_output='', type_output='', summary='fail', category='test_failure',
-        )
+        failing = _failing('FAILED some/other/tests/test_q.py::test_z\n')
 
         rv = AsyncMock(return_value=_result(True))
         with (
@@ -1020,10 +1010,7 @@ class TestTruncatedSessionIsNeverSuppressed:
         from orchestrator import verify as verify_module
 
         _materialize(tmp_path, 'orchestrator/tests/test_config.py')
-        failing = VerifyResult(
-            passed=False, test_output=test_output, lint_output='',
-            type_output='', summary='fail', category='test_failure',
-        )
+        failing = _failing(test_output)
         rerun = AsyncMock(return_value=_result(True))
         with patch.object(verify_module, 'run_verification', rerun):
             result = asyncio.run(
@@ -1215,6 +1202,39 @@ class TestStoppedSiblingLegIsNeverSuppressed:
             'leg_without_verdict:infra_kill'
         ), row
         assert es.emits == [], es.emits
+
+
+class TestUnrecordedLegCategoriesAreNeverSuppressed:
+    """A failing result whose per-leg categories were never recorded cannot
+    show that no sibling leg was stopped, so the DEFAULT gate keeps it red
+    even when its named failures pass alone (task 6247)."""
+
+    def test_unrecorded_legs_stay_red_and_say_why(self, tmp_path: Path) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        _materialize(tmp_path, 'orchestrator/tests/test_x.py')
+        rerun = AsyncMock(return_value=_result(True))
+        with patch.object(verify_module, 'run_verification', rerun):
+            result = asyncio.run(
+                verify_module.apply_merge_flake_suppression(
+                    _failing(_B1_TEST_OUTPUT, failing_leg_categories=None),
+                    worktree=tmp_path,
+                    config=_make_config(tmp_path),
+                    module_configs=[_orch_module_config()],
+                )
+            )
+
+        assert result.passed is False, result
+        assert result.category != 'merge_flake_suppressed', result.category
+        assert result.flake_suppression is not None, result
+        assert result.flake_suppression.verdict is FlakeVerdict.unconfirmable, (
+            result.flake_suppression
+        )
+        assert result.flake_suppression.unconfirmable_reason == (
+            'leg_categories_unrecorded'
+        ), result.flake_suppression
+        rerun.assert_not_awaited()
 
 
 # --- LocalRunner.run_merge_verify integration (step-9/10) ---------------------

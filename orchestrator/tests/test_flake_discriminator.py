@@ -1793,6 +1793,68 @@ class TestStoppedLegIsUnconfirmable:
         assert s.test_ids == (COMPLETE_SESSION_FAILED_NODEID,), s.test_ids
 
 
+class TestUnrecordedLegCategoriesAreUnconfirmable:
+    """The contract on verify.py::VerifyResult.failing_leg_categories: ``None``
+    means NOT RECORDED and is the fail-closed default no consumer may treat as
+    a licence, and ``[]`` on a failing result is no licence either. Without
+    the record the merge gate cannot tell whether a sibling leg was stopped
+    before its verdict, so it refuses rather than land on missing data. This
+    mirrors the merge_lane/worker.py veto gate's ``legs and all(...)``
+    reading of the same field.
+
+    Absent evidence ranks last: a worker death the output does show is the
+    more specific reason. The main probe keeps re-running, since nothing lands
+    there.
+    """
+
+    @pytest.mark.parametrize('legs', [None, []], ids=['none', 'empty'])
+    def test_unrecorded_legs_are_unconfirmable_without_a_rerun(
+        self, tmp_path: Path, legs: list[str] | None,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s, rerun = _confirm_with_passing_rerun(
+            verify_module, tmp_path, PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
+            call_site='merge_gate', failing_leg_categories=legs,
+        )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s
+        assert s.unconfirmable_reason == 'leg_categories_unrecorded', s
+        assert s.test_ids == (COMPLETE_SESSION_FAILED_NODEID,), s.test_ids
+        rerun.assert_not_awaited()
+
+    @pytest.mark.parametrize('legs', [None, []], ids=['none', 'empty'])
+    def test_main_probe_still_reruns_unrecorded_legs(
+        self, tmp_path: Path, legs: list[str] | None,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s, rerun = _confirm_with_passing_rerun(
+            verify_module, tmp_path, PYTEST_Q_COMPLETE_ONE_FAILED_OUTPUT,
+            call_site='main_probe', failing_leg_categories=legs,
+        )
+
+        rerun.assert_awaited()
+        assert s.verdict is FlakeVerdict.passes_in_isolation, s
+
+    def test_a_shown_worker_death_outranks_unrecorded_legs(
+        self, tmp_path: Path,
+    ) -> None:
+        from orchestrator import verify as verify_module
+        from orchestrator.flake_ledger import FlakeVerdict
+
+        s, rerun = _confirm_with_passing_rerun(
+            verify_module, tmp_path, XDIST_Q_TRUNCATED_OUTPUT,
+            call_site='merge_gate', failing_leg_categories=None,
+        )
+
+        assert s.verdict is FlakeVerdict.unconfirmable, s
+        assert s.unconfirmable_reason == 'session_truncated', s
+        rerun.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # S11: PURITY (INV-5) and SAME-TREE (INV-3), asserted BEHAVIOURALLY — no
 # source-text greps.

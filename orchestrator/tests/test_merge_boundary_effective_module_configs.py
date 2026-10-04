@@ -98,6 +98,7 @@ def _failing_scoped_result(node_id: str) -> VerifyResult:
         summary='Failures: tests failed',
         category='test_failure',
         cause_hint='AssertionError: boom',
+        failing_leg_categories=['test_failure'],
     )
 
 
