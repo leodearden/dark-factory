@@ -5636,6 +5636,63 @@ class TestVerifyTeardownHelper:
 # task 4164: stop()'s shutdown-drain teardowns must pass shutdown_defensive=True
 # ---------------------------------------------------------------------------
 
+_MQ_SHUTDOWN_DRAIN_METHODS: tuple[str, ...] = ('stop',)
+_MQ_SHUTDOWN_DEFENSIVE_KWARG = 'shutdown_defensive'
+_MQ_SHUTDOWN_DRAIN_SITE_FLOOR = 2
+
+
+def _shutdown_drain_teardown_calls(tree: ast.Module) -> list[tuple[str, ast.Call]]:
+    """Every ``<x>._teardown_verify_task(...)`` call lexically inside one of
+    the ``_MQ_SHUTDOWN_DRAIN_METHODS`` defined directly on
+    ``SpeculativeMergeWorker``, paired with that method's name, in source order.
+    """
+    teardown_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == _MQ_TEARDOWN_CHOKEPOINT
+    ]
+    drain_calls = [
+        (method, call)
+        for method in _MQ_SHUTDOWN_DRAIN_METHODS
+        for start, end in _chokepoint_ranges(tree, _MQ_CHOKEPOINT_CLASS, method)
+        for call in teardown_calls
+        if start <= call.lineno <= end
+    ]
+    return sorted(drain_calls, key=lambda pair: pair[1].lineno)
+
+
+def _passes_literal_shutdown_defensive(call: ast.Call) -> bool:
+    """True only for a literal ``shutdown_defensive=True`` keyword — the one
+    spelling whose value is provable from source text alone.
+    """
+    return any(
+        kw.arg == _MQ_SHUTDOWN_DEFENSIVE_KWARG
+        and isinstance(kw.value, ast.Constant)
+        and kw.value.value is True
+        for kw in call.keywords
+    )
+
+
+def _undefended_shutdown_teardown_offenders(source: str) -> list[str]:
+    """Every shutdown-drain teardown call that does not pass a literal
+    ``shutdown_defensive=True``, as ``'<method>:<lineno> <call_src>'``.
+
+    Pure (takes source text, not a path) like
+    :func:`_teardown_chokepoint_offenders`, so the self-tests can drive it on
+    synthetic modules; returns ``[]`` rather than raising on unparseable source.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    return [
+        f'{method}:{call.lineno} {ast.unparse(call)}'
+        for method, call in _shutdown_drain_teardown_calls(tree)
+        if not _passes_literal_shutdown_defensive(call)
+    ]
+
 
 class TestShutdownDrainTeardownIsDefensive:
     """Every ``_teardown_verify_task`` call inside ``SpeculativeMergeWorker.stop``
