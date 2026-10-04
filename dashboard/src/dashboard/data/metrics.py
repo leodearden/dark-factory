@@ -36,6 +36,7 @@ from dashboard.data.mcp_fanout import (
     first_success,
 )
 from dashboard.data.memory import (
+    enclosing_deadline,
     get_curator_state,
     get_memory_status,
     get_queue_stats,
@@ -57,7 +58,8 @@ logger = logging.getLogger(__name__)
 # 5s ceiling on any individual fused-memory HTTP call so a hung MCP cannot
 # extend the 10-minute sampling cycle.  Note: this is per-(root, url) call,
 # not per-loop — worst-case latency for the pending-count accumulation loop
-# scales as N_roots × M_urls × 5s if all URLs hang for every root.
+# scales as N_roots × M_urls × enclosing_deadline(5s) if all URLs hang for
+# every root.
 _HTTP_SAMPLER_TIMEOUT_SECONDS = 5.0
 # Default per-(root, url) page size for list_tickets; saturation triggers a WARNING.
 _LIST_TICKETS_LIMIT = 2000
@@ -98,6 +100,7 @@ async def fan_out_list_tickets(
     # Resolve limit at call time so monkeypatching _LIST_TICKETS_LIMIT in tests
     # takes effect without needing to pass an explicit kwarg.
     effective_limit = limit if limit is not None else _LIST_TICKETS_LIMIT
+    per_url_deadline = enclosing_deadline(timeout)
     all_roots = [str(root) for root in config.all_project_roots]
     labels = config.project_labels
 
@@ -122,12 +125,11 @@ async def fan_out_list_tickets(
                         # Per-HTTP-request budget: bounds connect/read/write AND
                         # pool acquisition on the shared client, which otherwise
                         # ran to mcp_tool_call's 10s default regardless of the
-                        # sampler's own deadline. The enclosing wait_for stays —
-                        # a cold session is three posts, so this layer alone
-                        # would permit roughly 3x timeout.
+                        # sampler's own deadline. The enclosing wait_for stays,
+                        # at a larger bound — see memory.py::enclosing_deadline.
                         timeout=timeout,
                     ),
-                    timeout=timeout,
+                    timeout=per_url_deadline,
                 )
                 count = result.get('count', 0) or 0
                 if count >= effective_limit:
@@ -157,7 +159,7 @@ async def fan_out_list_tickets(
                 # prefix is correct rather than doubled. The two branches
                 # below DO pre-render, hence PreformattedFanoutError there.
                 raise ValueError(
-                    f'timed out after {timeout:.1f}s (project_root={root_str})'
+                    f'timed out after {per_url_deadline:.1f}s (project_root={root_str})'
                 ) from None
             except (httpx.HTTPError, ValueError) as exc:
                 # DEBUG (not WARNING) and exc_info: this is the traceback
