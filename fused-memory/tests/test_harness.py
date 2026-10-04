@@ -13,6 +13,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from qdrant_client.http.exceptions import UnexpectedResponse
+from shared.config_dir import TaskConfigDir
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -25,6 +26,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -5413,7 +5415,7 @@ async def _drive_cancelling_first_stage_report_write(
 ):
     """Drive `make_task()` under a second cancellation injected from inside
     `journal.update_run_stage_reports`'s first call — the shared rig behind
-    the three task-4431 tests below, which differ only in which driver
+    the second-cancellation tests below, which differ in which driver
     `make_task` invokes (`run_full_cycle` vs `_run_remediation_pass`) and in
     their post-hoc assertions. Mirrors
     `TestStage2CycleSummaryHarnessBackstop._drive_degraded_arm_cancelling_first_identity_read`
@@ -5478,6 +5480,44 @@ async def _drive_cancelling_first_stage_report_write(
     return outer_task, not first_call[0]
 
 
+def _slow_stage(stage, stage_entered, *, on_enter=None):
+    """Fake for `stage.run` that calls `on_enter(run_id)` if given, sets
+    `stage_entered`, then blocks until cancelled — the slowed stage the
+    second-cancellation rig above cancels mid-flight."""
+
+    async def slow_stage_run(events, watermark, prior_reports, run_id, model=None):
+        if on_enter is not None:
+            on_enter(run_id)
+        stage_entered.set()
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=stage.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    return slow_stage_run
+
+
+def _config_dir_creator(journal, created_dirs):
+    """`on_enter` for `_slow_stage`: creates the run's per-run CLI config dir
+    the way `stages/base.py::BaseStage.run` does and records its path in
+    `created_dirs`, so a test can assert the driver's `finally` GC'd (or
+    kept) the real dir."""
+
+    def create_config_dir(run_id):
+        config_dir = TaskConfigDir(
+            task_id=run_id, base_dir=recon_config_base_dir(journal.data_dir),
+        )
+        created_dirs.append(config_dir.path)
+
+    return create_config_dir
+
+
 @pytest.mark.asyncio
 async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_cancellation(
     journal, event_buffer, mock_memory_service,
@@ -5516,26 +5556,11 @@ async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_ca
     # matching test_cancellation_cleanup_shielded_from_second_cancel above.
     harness.config.resume_after_restart = False
 
-    # Event set by slow_stage_run when it starts — ensures the first cancel
+    # Event set by the slowed stage when it starts — ensures the first cancel
     # fires inside the try block, not during pre-try setup.
     stage_entered = asyncio.Event()
 
-    async def slow_stage_run(
-        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
-    ):
-        stage_entered.set()
-        await asyncio.sleep(999)
-        return StageReport(
-            stage=_s.stage_id,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    harness.stages[0].run = slow_stage_run
+    harness.stages[0].run = _slow_stage(harness.stages[0], stage_entered)
     _mock_stage_run(harness.stages[1])
     _mock_stage_run(harness.stages[2])
 
@@ -5608,27 +5633,12 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
 
     _mock_stage_run(harness.stages[0])
 
-    # Event set by slow_stage_run when it starts — ensures the first cancel
+    # Event set by the slowed stage when it starts — ensures the first cancel
     # fires inside the stage loop (Stage 2), after Stage 1 has recorded its
     # real report into run.stage_reports.
     stage_entered = asyncio.Event()
 
-    async def slow_stage_run(
-        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[1],
-    ):
-        stage_entered.set()
-        await asyncio.sleep(999)
-        return StageReport(
-            stage=_s.stage_id,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    harness.stages[1].run = slow_stage_run
+    harness.stages[1].run = _slow_stage(harness.stages[1], stage_entered)
     _mock_stage_run(harness.stages[2])
 
     _outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
@@ -5676,6 +5686,128 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
         'the _error breadcrumb the except asyncio.CancelledError handler '
         "stamped must survive the second cancellation through the finally's "
         'shielded update_run_stage_reports'
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 5128: a second cancellation landing while run_full_cycle's
+    finally awaits its shielded stage_reports write must not make the
+    per-run config-dir GC unreachable — and must still propagate."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = False
+
+    stage_entered = asyncio.Event()
+    created_dirs: list = []
+    harness.stages[0].run = _slow_stage(
+        harness.stages[0], stage_entered,
+        on_enter=_config_dir_creator(journal, created_dirs),
+    )
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — no second cancellation was '
+        'delivered, so this test would pass vacuously'
+    )
+    assert len(created_dirs) == 1
+    assert outer_task.cancelled(), (
+        'the second cancellation must still propagate out of run_full_cycle'
+    )
+    assert not created_dirs[0].exists(), (
+        'gc_run_config_dir must still run when a second cancellation raises '
+        "at the finally's shielded stage_reports await"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_keeps_interrupted_runs_config_dir_under_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Passes before and after task 5128 by design: guards the interrupted
+    gate against a fix that hoists the GC out of it (task σ — an interrupted
+    run's transcript must survive for the startup --resume pass)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = True
+
+    stage_entered = asyncio.Event()
+    created_dirs: list = []
+    harness.stages[0].run = _slow_stage(
+        harness.stages[0], stage_entered,
+        on_enter=_config_dir_creator(journal, created_dirs),
+    )
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — no second cancellation was '
+        'delivered, so this test would pass vacuously'
+    )
+    assert len(created_dirs) == 1
+    assert outer_task.cancelled()
+    assert created_dirs[0].exists(), (
+        "an interrupted run's config dir must survive for the --resume pass"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_finally_gcs_config_dir_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 5128: the remediation mirror of
+    test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation —
+    the GC must be reached and the cancellation must still propagate."""
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    stage_entered = asyncio.Event()
+    created_dirs: list = []
+    _mock_stage_run(harness.stages[0])
+    harness.stages[1].run = _slow_stage(
+        harness.stages[1], stage_entered,
+        on_enter=_config_dir_creator(journal, created_dirs),
+    )
+    _mock_stage_run(harness.stages[2])
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        ),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — no second cancellation was '
+        'delivered, so this test would pass vacuously'
+    )
+    assert len(created_dirs) == 1
+    assert outer_task.cancelled(), (
+        'the second cancellation must still propagate out of _run_remediation_pass'
+    )
+    assert not created_dirs[0].exists(), (
+        'gc_run_config_dir must still run when a second cancellation raises '
+        "at the remediation finally's shielded stage_reports await"
     )
 
 
@@ -6162,22 +6294,7 @@ async def test_shielded_stage_report_persistence_still_propagates_cancellation(
 
     stage_entered = asyncio.Event()
 
-    async def slow_stage_run(
-        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
-    ):
-        stage_entered.set()
-        await asyncio.sleep(999)
-        return StageReport(
-            stage=_s.stage_id,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    harness.stages[0].run = slow_stage_run
+    harness.stages[0].run = _slow_stage(harness.stages[0], stage_entered)
     _mock_stage_run(harness.stages[1])
     _mock_stage_run(harness.stages[2])
 

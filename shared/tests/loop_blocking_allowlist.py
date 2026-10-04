@@ -450,7 +450,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'ReconciliationHarness._recover_one_run',
         '361d4c634750',
         'to_file',
-        'ROOT CAUSE (one defect, 3 rows): three harness coroutines call the '
+        'ROOT CAUSE (one defect, 2 rows): two harness coroutines call the '
         'sync cli_stage_runner.py::gc_run_config_dir inline, which '
         'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
         'syscall per file, all of them on the loop thread, and a config dir '
@@ -463,26 +463,10 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness.run_full_cycle',
-        '21ec0716d946',
+        'ReconciliationHarness._persist_stage_reports_then_gc_config_dir',
+        '361d4c634750',
         'to_file',
-        'ROOT CAUSE (one defect, 3 rows): three harness coroutines call the '
-        'sync cli_stage_runner.py::gc_run_config_dir inline, which '
-        'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
-        'syscall per file, all of them on the loop thread, and a config dir '
-        'is not one file. Found only once task 4484\'s amendment pass added '
-        'shutil.rmtree to the vocabulary, which is the same gap-B shape the '
-        'guard exists to close: the primitive was never enumerated, so the '
-        'sites were invisible however the census was run. Follow-up filed by '
-        'task 4484 amendment pass.'
-        ' Ticket: tkt_0RT88VW7RRECTHNCVTJXD6M5RJ.',
-    ),
-    (
-        'fused-memory/src/fused_memory/reconciliation/harness.py',
-        'ReconciliationHarness._run_remediation_pass',
-        '21ec0716d946',
-        'to_file',
-        'ROOT CAUSE (one defect, 3 rows): three harness coroutines call the '
+        'ROOT CAUSE (one defect, 2 rows): two harness coroutines call the '
         'sync cli_stage_runner.py::gc_run_config_dir inline, which '
         'shutil.rmtree()s a run\'s per-run agent config dir -- one unlink '
         'syscall per file, all of them on the loop thread, and a config dir '
