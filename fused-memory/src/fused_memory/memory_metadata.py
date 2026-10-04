@@ -18,6 +18,8 @@ Contents
   that module's docstring for the measured ``ImportError`` behind the
   split.
 * ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
+* ``render_metadata_vocabulary_guidance`` — the writer-facing statement of
+  this vocabulary that the writing reconciliation stage prompts interpolate.
 
 ``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
@@ -85,6 +87,7 @@ __all__ = [
     'KIND_REGISTRY',
     'MEM0_MANAGED_METADATA_KEYS',
     'CanonicalUniquenessViolation',
+    'EXPERIMENTAL_KEY_PREFIX',
     'MemoryMetadataValidationError',
     'MetadataViolation',
     'PARENT_ID_DEAD_CODE',
@@ -99,6 +102,7 @@ __all__ = [
     'is_valid_topic_slug',
     'normalize_supersedes',
     'parent_liveness_violation',
+    'render_metadata_vocabulary_guidance',
     'validate_memory_metadata',
 ]
 
@@ -1273,3 +1277,48 @@ def check_canonical_routing(
         'Mem0 twin, or drop the canonical marker',
         fatal=True,
     )]
+
+
+# ---------------------------------------------------------------------------
+# Writer guidance
+# ---------------------------------------------------------------------------
+
+def render_metadata_vocabulary_guidance() -> str:
+    """Teach a writing reconciliation stage this vocabulary, from the registry values.
+
+    Plain, brace-free text the stage prompts interpolate. Its hand-written
+    orchestrator twin is
+    ``orchestrator/src/orchestrator/agents/roles.py::METADATA_VOCABULARY_INSTRUCTIONS``;
+    ``fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py`` holds both
+    to this registry.
+    """
+    return (
+        '## Memory Metadata Vocabulary\n'
+        '`add_memory` and `update_memory` validate their `metadata` dict on write, '
+        "and `consolidate_memories`' `topic` argument is the same slug namespace. "
+        'Five keys are RESERVED:\n'
+        f'- `topic` — a kebab-case slug matching `{TOPIC_SLUG_RE.pattern}`, at most '
+        f'{TOPIC_SLUG_MAX_LEN} characters: `memory-write-path` is valid, '
+        '`memory_write_path` and `Memory Write Path` are not. A legacy snake_case '
+        'topic seen in the corpus is not a spelling to copy; `consolidate_memories` '
+        'refuses it.\n'
+        '- `canonical` — a bool marking the one authoritative entry for a topic; '
+        'requires `topic`, at most one entry per project and topic may claim it, and '
+        'it is only meaningful on a write that reaches Mem0.\n'
+        '- `kind` — the record type, drawn from a closed registry; distinct from '
+        '`source`, which records writer provenance rather than record type.\n'
+        '- `parent_id` — a full 36-character UUID of a live entry this one attaches '
+        'to; triage attach outcomes only, kinds `amendment` and `sighting`.\n'
+        '- `supersedes` — a LIST of full 36-character UUIDs this entry replaces; '
+        'never a bare string, even for a single UUID.\n'
+        'A small blessed set of conventional keys — `task_id`, `source`, '
+        '`transition`, `stage` and a few more — does not warn; use those exact '
+        'spellings. Any other key still writes but warns to a census line; if such '
+        f'an annotation is deliberate, prefix it `{EXPERIMENTAL_KEY_PREFIX}` and it '
+        'passes silently.\n'
+        'A malformed reserved key is censused while `memory_metadata.enforce` is off '
+        'and rejected while it is on; the rejection names the violated rule and '
+        f'`{MemoryMetadataValidationError.REGISTRY_LOCATION}`. The registry module '
+        '`fused-memory/src/fused_memory/memory_metadata.py` is the single normative '
+        'source for all of this; consult it rather than guessing.'
+    )
