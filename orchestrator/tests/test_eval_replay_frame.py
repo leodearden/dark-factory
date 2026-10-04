@@ -121,3 +121,69 @@ class TestPlanOnlyCliAppendsReplayFrame:
         assert invoke_agent.await_args.kwargs['prompt'] == (
             'ARCH PROMPT' + build_replay_frame_block('feedface1234')
         )
+
+
+_FRAMED_BASE = 'abc123def'
+_TASK = {'id': '9001', 'title': 'T', 'description': 'D'}
+
+
+def _assemblers(tmp_path):
+    from orchestrator.agents.briefing import BriefingAssembler
+    from orchestrator.config import OrchestratorConfig
+    from orchestrator.evals.replay_frame import ReplayFramedBriefingAssembler
+
+    cfg = OrchestratorConfig(project_root=tmp_path)
+    return (
+        BriefingAssembler(cfg),
+        ReplayFramedBriefingAssembler(cfg, base_commit=_FRAMED_BASE),
+    )
+
+
+@pytest.mark.asyncio
+class TestReplayFramedBriefingAssembler:
+    @pytest.mark.parametrize('call_shape', [
+        pytest.param({}, id='fresh-plan'),
+        pytest.param({'include_prior_proposals': True}, id='replan'),
+        pytest.param(
+            {'committed_work': [{'sha': 'a' * 40, 'subject': 's'}]},
+            id='committed-work',
+        ),
+    ])
+    async def test_architect_prompt_is_production_prompt_plus_frame(
+        self, tmp_path, call_shape,
+    ):
+        from orchestrator.evals.replay_frame import build_replay_frame_block
+
+        plain, framed = _assemblers(tmp_path)
+
+        assert await framed.build_architect_prompt(
+            _TASK, None, 'CTX', **call_shape,
+        ) == await plain.build_architect_prompt(
+            _TASK, None, 'CTX', **call_shape,
+        ) + build_replay_frame_block(_FRAMED_BASE)
+
+    async def test_production_assembler_carries_no_frame(self, tmp_path):
+        from orchestrator.evals.replay_frame import build_replay_frame_block
+
+        plain, _ = _assemblers(tmp_path)
+
+        assert build_replay_frame_block(_FRAMED_BASE) not in (
+            await plain.build_architect_prompt(_TASK, context='CTX')
+        )
+
+    async def test_only_the_architect_prompt_is_framed(self, tmp_path):
+        plain, framed = _assemblers(tmp_path)
+        plan = {'task_id': '9001', 'steps': []}
+
+        assert await framed.build_implementer_prompt(plan, context='CTX') == (
+            await plain.build_implementer_prompt(plan, context='CTX')
+        )
+
+    async def test_empty_base_commit_is_refused_at_construction(self, tmp_path):
+        from orchestrator.config import OrchestratorConfig
+        from orchestrator.evals.replay_frame import ReplayFramedBriefingAssembler
+
+        with pytest.raises(ValueError):
+            ReplayFramedBriefingAssembler(
+                OrchestratorConfig(project_root=tmp_path), base_commit='',
+            )
