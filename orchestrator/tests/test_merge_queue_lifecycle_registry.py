@@ -3164,3 +3164,85 @@ class TestRunInflightVerifyRequeuesOnlyThroughVacate:
             'no _requeue_from_verify call found inside _run_inflight_verify — '
             'the scan is mis-wired or the method moved'
         )
+
+
+def _rendered_ids(snap: dict) -> list[str]:
+    """The request_ids of *snap*'s entries, in emission order."""
+    return [e['request_id'] for e in snap['entries']]
+
+
+@pytest.mark.asyncio
+class TestVacatedInflightEntryRendersAtMostOnce:
+    """A vacated entry is invisible to every in-flight reader: the requeued
+    request renders exactly once, as queued, and never sits in the frozen
+    prefix and the unfrozen suffix at once (task 4582 step-3 RED / step-4
+    GREEN). Read through the public seams only: ``snapshot()``,
+    ``frozen_prefix()``, ``unfrozen_suffix()``, ``check_frozen_prefix_invariant()``.
+    """
+
+    @pytest.mark.parametrize('trigger', _REQUEUE_TRIGGERS)
+    async def test_requeued_request_renders_once_before_and_after_the_drain(
+        self, git_ops: GitOps, config: OrchestratorConfig, trigger: str,
+    ) -> None:
+        async with _verify_exit_scene(git_ops, config, trigger) as scene:
+            worker = scene.worker
+            rid = scene.req.request_id
+            head_rid = scene.head_req.request_id
+            head_tid = scene.head_req.task_id
+
+            for where in ('on the input queue', 'in a lane buffer'):
+                if where == 'in a lane buffer':
+                    worker._drain_queue_into_lanes()
+                    assert rid in worker.unfrozen_suffix(), (
+                        f'the drain must have buffered the requeued request: '
+                        f'{worker.unfrozen_suffix()!r}'
+                    )
+                snap = worker.snapshot()
+                rendered = _rendered_ids(snap)
+                assert rendered.count(rid) == 1, (
+                    f'{where}: the requeued request must render exactly once, '
+                    f'not also as its vacated InflightEntry: {snap["entries"]!r}'
+                )
+                assert next(
+                    e['state'] for e in snap['entries'] if e['request_id'] == rid
+                ) == 'queued', f'{where}: {snap["entries"]!r}'
+                assert rid not in worker.frozen_prefix(), (
+                    f'{where}: a vacated entry is not frozen: {worker.frozen_prefix()!r}'
+                )
+                assert worker.check_frozen_prefix_invariant(scene.head_item.base_sha) == [], (
+                    f'{where}: {worker.check_frozen_prefix_invariant(scene.head_item.base_sha)!r}'
+                )
+                assert snap['depth'] == 2 == len(set(rendered)), (
+                    f'{where}: depth must count the two live requests: '
+                    f'depth={snap["depth"]} entries={snap["entries"]!r}'
+                )
+                assert snap['occupancy']['inflight_by_host'] == {'head-host': [head_tid]}, (
+                    f'{where}: {snap["occupancy"]!r}'
+                )
+                assert snap['occupancy']['inflight_total'] == 1, f'{where}: {snap["occupancy"]!r}'
+                assert snap['verify_in_progress'] is not None
+                assert snap['verify_in_progress']['task_id'] == head_tid, (
+                    f'{where}: {snap["verify_in_progress"]!r}'
+                )
+                assert snap['frozen_prefix']['request_ids'] == [head_rid], (
+                    f'{where}: {snap["frozen_prefix"]!r}'
+                )
+
+    async def test_dropped_request_does_not_render(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        async with _verify_exit_scene(git_ops, config, 'abandon') as scene:
+            worker = scene.worker
+            rid = scene.req.request_id
+
+            snap = worker.snapshot()
+
+            assert _rendered_ids(snap).count(rid) == 0, (
+                f'a dropped request must not render as its vacated entry: '
+                f'{snap["entries"]!r}'
+            )
+            assert rid not in worker.frozen_prefix(), f'{worker.frozen_prefix()!r}'
+            assert snap['depth'] == 1, f'{snap["entries"]!r}'
+            assert worker.check_frozen_prefix_invariant(scene.head_item.base_sha) == [], (
+                f'{worker.check_frozen_prefix_invariant(scene.head_item.base_sha)!r}'
+            )
