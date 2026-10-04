@@ -2198,7 +2198,9 @@ class TestMetadataFastPathEquivalence:
         ['topic'],
         ['topic', 'kind'],
         ['not_present_at_all'],
-    ], ids=['one', 'several', 'absent'])
+        ['category'],                               # a fused-memory-owned key
+        ['topic', 'category'],
+    ], ids=['one', 'several', 'absent', 'protected_key', 'mixed_with_protected'])
     def test_delete_payload_agrees_with_the_delta_helper(self, keys):
         """merge + delete-only: Qdrant's server-side delete == the helper's."""
         payload = dict(DEFAULT_POINT_PAYLOAD)
