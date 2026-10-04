@@ -93,27 +93,13 @@ from fused_memory.reconciliation.standing_decision_constants import (
 # one more place for the two to drift (INV-5).
 from fused_memory.services.memory_service import _mem0_content
 
-# Optional escalation dependency, mirroring ``flag_dedup``'s block: the
-# reconciliation package must import cleanly where the escalation package is not
-# installed, and ``maybe_escalate_preservation_suppression_storm`` no-ops when
-# ``Escalation`` is None.  ONE combined block, so all five names bind or fail
-# together and any single identity check suffices at runtime; every name is
-# still listed in that guard because only an identity check on the name itself
-# narrows an optionally-imported symbol for the type checker.
+# Optional escalation dependency: the reconciliation package must import
+# cleanly where the escalation package is not installed, and
+# ``maybe_escalate_preservation_suppression_storm`` no-ops when the name is None.
 try:
-    from escalation.dedupe import (  # type: ignore[import-untyped]
-        DedupeConfig,
-        compute_content_fingerprint,
-        content_fingerprint_key,
-        submit_or_dedupe,
-    )
-    from escalation.models import Escalation  # type: ignore[import-untyped]
+    from escalation.dedupe import file_or_fold_l1  # type: ignore[import-untyped]
 except ImportError:
-    Escalation = None  # type: ignore[assignment,misc]
-    DedupeConfig = None  # type: ignore[assignment,misc]
-    compute_content_fingerprint = None  # type: ignore[assignment]
-    content_fingerprint_key = None  # type: ignore[assignment]
-    submit_or_dedupe = None  # type: ignore[assignment]
+    file_or_fold_l1 = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +251,9 @@ UNRESOLVED_CORROBORATION_SUBJECT: str = 'preservation_specimen_guard'
 #: each other when both fire in one cycle.
 _STORM_FINDING_CATEGORY: str = 'preservation_specimen_suppression_storm'
 _UNRESOLVED_FINDING_CATEGORY: str = 'preservation_specimen_corroboration_unreadable'
+
+_AGENT_ROLE: str = 'reconciliation-stage1'
+_LOG_LABEL: str = 'maybe_escalate_preservation_suppression_storm'
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────
@@ -911,73 +900,6 @@ async def filter_preservation_specimen_flags(
 # ── Storm escape (INV-4) ─────────────────────────────────────────────────────
 
 
-def _file_or_fold(
-    escalation_queue: Any,
-    project_id: str,
-    subject: str,
-    finding_category: str,
-    summary: str,
-    detail: str,
-    config: Any,
-    log: logging.Logger,
-) -> bool:
-    """Submit one L1 record for *subject*; return True iff a NEW one was minted.
-
-    Everything that can fail is inside the try, so a fingerprint, id-gen,
-    constructor, submit or fold failure costs this subject its filing and is
-    logged WARNING — never the rest of the cycle.  A fold logs INFO, so the
-    recurrence is visible in the log stream and not only as a counter on disk.
-    """
-    try:
-        # Unreachable through the caller, which checks the whole import block
-        # first; restated here so this helper enforces its own precondition and
-        # a missing package surfaces as the logged WARNING below rather than an
-        # AttributeError. Inside the try deliberately — loud, not silent.
-        if Escalation is None or compute_content_fingerprint is None or submit_or_dedupe is None:
-            raise RuntimeError('escalation package unavailable')
-        fingerprint = compute_content_fingerprint(
-            CATEGORY_PRESERVATION_SPECIMEN_STORM,
-            finding_category,
-            [f'{project_id}:{subject}'],
-        )
-        # Fail closed rather than file with a falsy key: find_dedupe_parent
-        # short-circuits on one, so the record would silently become a second
-        # visible pending record every cycle instead of folding.
-        if not fingerprint:
-            raise ValueError(f'empty dedupe_fingerprint for subject={subject}')
-        esc = Escalation(
-            id=escalation_queue.make_id(subject),
-            task_id=subject,
-            agent_role='reconciliation-stage1',
-            severity='blocking',
-            category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
-            summary=summary,
-            detail=detail,
-            level=1,
-            dedupe_fingerprint=fingerprint,
-        )
-        outcome = submit_or_dedupe(escalation_queue, esc, config)
-    except Exception as exc:
-        log.warning(
-            'maybe_escalate_preservation_suppression_storm: failed to escalate '
-            'subject=%s (fingerprint, id-gen, construction, submit, or fold): %s',
-            subject, exc, extra={'project_id': project_id},
-        )
-        return False
-
-    if outcome.get('status') == 'dedup_skipped':
-        log.info(
-            'maybe_escalate_preservation_suppression_storm: subject=%s folded into '
-            'parent_id=%s (child_id=%s) — the condition is recurring',
-            subject, outcome.get('parent_id'), outcome.get('child_id'),
-            extra={'project_id': project_id},
-        )
-        return False
-    # Tested with != rather than == 'queued' so observed_submit_response's
-    # auto-resolved/dismissed branch (a record WAS minted) still counts.
-    return True
-
-
 async def maybe_escalate_preservation_suppression_storm(
     escalation_queue: Any,
     project_id: str,
@@ -1002,42 +924,19 @@ async def maybe_escalate_preservation_suppression_storm(
        silence: every stranded recommendation flows on, the suppressed stat
        reads 0, and nothing distinguishes that from a healthy quiet cycle.
 
-    **Filed through** :func:`escalation.dedupe.submit_or_dedupe`, NOT gated on
-    ``has_open_l1`` (task 3522).  Stage 1 re-evaluates every cycle, so a
-    condition that fires once tends to fire every cycle — exactly the recurring-
-    detector shape for which that skip was retired: it suppressed every cycle
-    after the first, pinning ``dedupe_count`` at 0 so an operator saw no
-    difference between one storm and forty.  Folding keeps ONE pending record
-    per subject and increments ``dedupe_count`` on it, which is the steward's
-    recurrence signal.  The fold key is the ``(category, finding_category,
-    project:subject)`` fingerprint — deliberately NOT the count or run_id, which
-    drift every cycle and would mint a fresh record per breach — and the window
-    is UNBOUNDED, so a condition persisting for days still folds into its
-    original parent.  Accepted cost: a folded record keeps the PARENT's summary,
-    so the count named there is the FIRST breach's.
+    Each is filed or folded through ``escalation/dedupe.py::file_or_fold_l1``,
+    NOT gated on ``has_open_l1`` (task 3522): Stage 1 re-evaluates every cycle,
+    so a condition that fires once tends to fire every cycle, and folding keeps
+    ONE pending record per subject whose ``dedupe_count`` carries the
+    recurrence.  A folded record keeps the PARENT's summary, so the count named
+    there is the FIRST breach's.
 
     Best-effort throughout: returns ``[]`` immediately when the ``escalation``
-    package is unavailable, and any per-subject failure is logged and excluded.
-    Returns the subjects that received a NEW record this cycle — folds excluded,
-    with recurrence carried by ``dedupe_count`` and the fold INFO log.
+    package is unavailable, and any per-subject failure is logged on *log* and
+    excluded.  Returns the subjects that received a NEW record this cycle.
     """
-    # Any ONE identity check suffices at runtime (all five names bind or fail
-    # together); each is named so the type checker narrows it below.
-    if (
-        Escalation is None
-        or DedupeConfig is None
-        or compute_content_fingerprint is None
-        or content_fingerprint_key is None
-        or submit_or_dedupe is None
-    ):
+    if file_or_fold_l1 is None:
         return []
-
-    config = DedupeConfig(
-        infra_dedupe_enabled=True,
-        infra_dedupe_window_secs=float('inf'),
-        infra_dedupe_categories=(CATEGORY_PRESERVATION_SPECIMEN_STORM,),
-        key_fn=content_fingerprint_key,
-    )
 
     escalated: list[str] = []
 
@@ -1045,14 +944,18 @@ async def maybe_escalate_preservation_suppression_storm(
         if count <= threshold:
             continue
         citation = result.citations_by_task.get(task_id, 'unknown')
-        filed = _file_or_fold(
+        filed = file_or_fold_l1(
             escalation_queue,
-            project_id,
-            task_id,
-            _STORM_FINDING_CATEGORY,
-            f'Preservation citation for task {task_id} suppressed {count} recon '
-            f'flag(s) in a single cycle (> {threshold})',
-            '\n'.join([
+            project_id=project_id,
+            subject=task_id,
+            category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
+            finding_category=_STORM_FINDING_CATEGORY,
+            agent_role=_AGENT_ROLE,
+            summary=(
+                f'Preservation citation for task {task_id} suppressed {count} recon '
+                f'flag(s) in a single cycle (> {threshold})'
+            ),
+            detail='\n'.join([
                 f'project_id: {project_id}',
                 f'run_id: {run_id}',
                 f'task_id: {task_id}',
@@ -1060,23 +963,27 @@ async def maybe_escalate_preservation_suppression_storm(
                 f'suppressed_this_cycle: {count}',
                 f'threshold: {threshold}',
             ]),
-            config,
-            log,
+            log=log,
+            log_label=_LOG_LABEL,
         )
         if filed:
             escalated.append(task_id)
 
     if result.unresolved_task_ids:
         unresolved = ', '.join(result.unresolved_task_ids)
-        filed = _file_or_fold(
+        filed = file_or_fold_l1(
             escalation_queue,
-            project_id,
-            UNRESOLVED_CORROBORATION_SUBJECT,
-            _UNRESOLVED_FINDING_CATEGORY,
-            f'Preservation corroboration unresolved for '
-            f'{len(result.unresolved_task_ids)} task(s) this cycle — stranded '
-            f'findings are flowing through unfiltered',
-            '\n'.join([
+            project_id=project_id,
+            subject=UNRESOLVED_CORROBORATION_SUBJECT,
+            category=CATEGORY_PRESERVATION_SPECIMEN_STORM,
+            finding_category=_UNRESOLVED_FINDING_CATEGORY,
+            agent_role=_AGENT_ROLE,
+            summary=(
+                f'Preservation corroboration unresolved for '
+                f'{len(result.unresolved_task_ids)} task(s) this cycle — stranded '
+                f'findings are flowing through unfiltered'
+            ),
+            detail='\n'.join([
                 f'project_id: {project_id}',
                 f'run_id: {run_id}',
                 f'unresolved_task_ids: {unresolved}',
@@ -1086,8 +993,8 @@ async def maybe_escalate_preservation_suppression_storm(
                 'WARNING log lines from this module, which name either the '
                 'failing channel or an exhausted per-cycle corroboration budget.',
             ]),
-            config,
-            log,
+            log=log,
+            log_label=_LOG_LABEL,
         )
         if filed:
             escalated.append(UNRESOLVED_CORROBORATION_SUBJECT)
