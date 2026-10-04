@@ -36,6 +36,7 @@ from fused_memory.reconciliation.recon_self_model import (
 from fused_memory.reconciliation.stage1_stall_detector import (
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
 )
+from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
 
 _STAGE1_GATE_STALL_THRESHOLD_HOURS = int(
     STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS // 3600
@@ -60,6 +61,21 @@ EXECUTING_A_CLUSTER_FOLD_HEADING = f'## {EXECUTING_A_CLUSTER_FOLD_TITLE}'
 #: same reason, for ``tests/reconciliation/test_stage1.py``.
 LIVE_STATE_FRESHNESS_TITLE = 'Live-State Freshness Before Re-Flagging'
 LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
+
+_CHILD_KIND_NAMES = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
+
+#: The Authority-Model carve-out for child memories (task 6193), exported so
+#: tests mirror ``server/grouped_read.py::CHILD_KINDS`` against it.
+CHILD_MEMORY_AUTHORITY_RULE = (
+    f'- A Mem0 memory whose metadata carries `{PARENT_ID_KEY}` with a `kind` of '
+    f'{_CHILD_KIND_NAMES} is a CHILD of the memory that `{PARENT_ID_KEY}` names, not a '
+    f"duplicate of it; the payload shows that link beside the memory's id. Never delete a "
+    f'child to dedupe it against its parent or a sibling child — neither via '
+    f"`delete_memory` nor by listing it in `consolidate_memories`' `supersedes`. This "
+    f'overrides the duplicate rule above: a sighting restates its parent by design and is '
+    f"what the parent's sighting count counts, and an amendment holds the only copy of its "
+    f'newer text.'
+)
 
 _DOCUMENTED_SWEEP_DELETERS = ', '.join(f'`{d}`' for d in MEM0_TOMBSTONE_DELETERS)
 
@@ -208,6 +224,7 @@ any other caller's, coming back with `routed` set to `stored`, `restated`, `amen
 ## Authority Model
 - Knowledge contradicts task assumptions → Knowledge wins (more recent). Flag for Stage 2.
 - Duplicate knowledge across stores → Keep most recent / highest confidence. Delete duplicate.
+{CHILD_MEMORY_AUTHORITY_RULE}
 
 ## Guidelines
 - Be surgical: only modify what needs changing. Don't rewrite memories that are fine.
