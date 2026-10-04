@@ -67,6 +67,7 @@ from escalation.models import (
 from escalation.pins import classify_pins
 from escalation.queue import AmendmentOutcome, AmendResult, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
+from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
@@ -1965,6 +1966,28 @@ def create_server(
 
     # --- Handler-side tools ---
 
+    def _attach_related_pending(
+        payload: dict[str, Any], resolved: Escalation,
+    ) -> dict[str, Any]:
+        """Add ``resolve_issue``'s sideways census to *payload*, or leave it ABSENT.
+
+        A census that cannot be computed must never fail the resolve that has
+        already happened, and must never read as ``[]`` ("no pending twins"):
+        on any failure the key stays absent, which is the contract's UNKNOWN —
+        the same seam guard as the ``pins_recovery`` annotation in
+        ``get_pending_escalations``.
+        """
+        try:
+            payload['related_pending'] = related_pending(
+                queue.get_pending(), resolved=resolved,
+            )
+        except Exception:
+            logger.exception(
+                'related_pending census failed after resolving %s; the response '
+                'reports UNKNOWN (key absent)', resolved.id,
+            )
+        return payload
+
     @mcp.tool()
     def resolve_issue(
         escalation_id: str,
@@ -2056,6 +2079,18 @@ def create_server(
         ``_COMPACT_ESCALATION_FIELDS`` is a fixed ALLOWLIST and is deliberately
         NOT widened by any of this — ``late_resolutions`` is forensic detail for
         a full-record read, not triage-facing.
+
+        **Sideways census (``related_pending``)** (task 4886).  Both success
+        returns — ``park`` and resolve/dismiss — carry ``related_pending``: the
+        PENDING records that may carry the same question, one entry per record
+        (shape: ``escalation/related_pending.py::RelatedPendingEntry``) — another
+        record on the same task, or a pending L2 sharing a member with this
+        record or clustering it.  REPORT-ONLY: nothing is closed or changed;
+        disposing of each twin is the caller's call.  PENDING-ONLY, so ``[]``
+        means "no pending twins".  Computed AFTER the mutation, so this record's
+        own cascade-closed members are not listed.  The key is ABSENT when the
+        census could not be computed — absent means UNKNOWN, never "none".
+        Error returns carry no census: they changed nothing.
 
         ``escalate_model`` (task μ, adaptive-routing trigger 3): when True and
         the action leads to a *next dispatch* (``resume`` / ``restart``), the
@@ -2326,7 +2361,7 @@ def create_server(
             )
             if esc is None:
                 return {'error': f'Escalation {escalation_id} not found'}
-            return esc.to_dict()
+            return _attach_related_pending(esc.to_dict(), esc)
 
         # DECLARED-PIN GATE (task 4377) — see the "Declared-pin gate" section of
         # this docstring.  Its POSITION is load-bearing in two ways.  It sits
@@ -2459,7 +2494,7 @@ def create_server(
                     if corrected else '.'
                 )
             )
-        return payload
+        return _attach_related_pending(payload, esc)
 
     @mcp.tool()
     async def get_pending_escalations(
