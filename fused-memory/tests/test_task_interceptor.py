@@ -7006,7 +7006,7 @@ async def test_set_task_status_holds_lock_across_read_and_write(
         await asyncio.sleep(0)
         return {'id': task_id, 'status': state['status'], 'title': 'T'}
 
-    async def set_task_status(task_id, status, project_root, tag=None):
+    async def set_task_status(task_id, status, project_root, tag=None, **_claimant_kwargs):
         call_log.append(f'{task_id}:{state["status"]}->{status}')
         # Yield between the read above and committing the new state so
         # the race window is widened.
