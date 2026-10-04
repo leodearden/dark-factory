@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import suite_census_evidence as ev
 import suite_census_outcomes as oc
-from suite_census_fixtures import pytest_project, write_gz
+from suite_census_fixtures import nextest_project, pytest_project, write_gz
 
 PASSED, FAILED, SKIPPED = oc.Outcome.PASSED, oc.Outcome.FAILED, oc.Outcome.SKIPPED
 
@@ -113,3 +113,78 @@ class TestPytestEvidence:
 
     def test_pytest_has_no_uncosted_universe(self, root):
         assert ev.pytest_evidence(root, root).uncosted_universe == frozenset()
+
+
+ALPHA = oc.TestId('tests/infra', 'tests/infra/test_alpha.sh')
+BETA = oc.TestId('tests/infra', 'tests/infra/test_beta.sh')
+LOG_9 = 'data/verify-logs/9/attempt-1.test-20260920T101010_5Z.log'
+
+
+class TestNextestEvidence:
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        return nextest_project(tmp_path)
+
+    @pytest.fixture
+    def records(self, root: Path) -> list[oc.Record]:
+        return list(ev.nextest_evidence(root, root).records())
+
+    def test_a_debug_and_release_pass_sum_into_one_run_cost(self, root, records):
+        case_one = oc.TestId('reify-compiler', 'reify-compiler::harness_types mod_a::case_one')
+        logs = _observations(records, 'nextest-logs')
+        assert [(o.run, o.outcome, o.seconds) for o in logs if o.test == case_one] == [
+            (LOG_9, PASSED, 1.348), (LOG_9, PASSED, 0.652),
+        ]
+        census = oc.census_outcomes(ev.nextest_evidence(root, root))
+        (cost,) = [cost for cost in census.ranking if cost.test == case_one]
+        assert (cost.runs, cost.total_s) == (1, pytest.approx(2.0))
+
+    def test_status_vocabulary(self, records):
+        logs = _observations(records, 'nextest-logs')
+        assert _outcomes(logs, 'reify-eval mod::leaky') == [(PASSED, 0.1)]
+        assert _outcomes(logs, 'reify-eval::e2e t_fail') == [(FAILED, 2.0)]
+        assert _outcomes(logs, 'reify-eval::solve x') == [(FAILED, 1200.048)]
+        assert [raw for raw in _unresolved(records, 'nextest-logs') if 'WEIRD' in raw]
+
+    def test_run_all_failures_count_once_per_log(self, records):
+        logs = _observations(records, 'nextest-logs')
+        assert [(o.run, o.outcome) for o in logs if o.test == ALPHA] == [(LOG_9, FAILED)]
+        assert _unresolved(records, 'nextest-logs').count('test_gamma.sh') == 1
+
+    def test_ledger_entries_fail_their_run(self, records):
+        ledger = _observations(records, 'flaky-ledger')
+        assert [(o.test, o.run, o.outcome) for o in ledger] == [
+            (BETA, 'run-1', FAILED), (BETA, 'run-2', FAILED),
+        ]
+        assert _unresolved(records, 'flaky-ledger') == ['not json at all']
+
+    def test_an_unknown_flake_row_is_unresolved(self, records):
+        assert _observations(records, 'flake_occurrence') == []
+        assert _unresolved(records, 'flake_occurrence') == ['<unknown>']
+
+    def test_every_run_is_contiguous(self, records):
+        keys = [(o.source, o.run) for o in records if isinstance(o, oc.Observation)]
+        starts = [key for i, key in enumerate(keys) if i == 0 or keys[i - 1] != key]
+        assert len(starts) == len(set(starts))
+
+    def test_windows(self, root):
+        windows = {w.source: w for w in ev.nextest_evidence(root, root).windows}
+        assert list(windows) == ['nextest-logs', 'flaky-ledger', 'flake_occurrence']
+        observed = {
+            source: (w.present, w.artefacts, w.first, w.last) for source, w in windows.items()
+        }
+        assert observed == {
+            'nextest-logs': (True, 2, '2026-09-20T10:10:10Z', '2026-10-01T00:00:00Z'),
+            'flaky-ledger': (True, 3, '2026-09-05T01:02:03Z', '2026-09-06T01:02:03Z'),
+            'flake_occurrence': (True, 1, '2026-09-07T00:00:00Z', '2026-09-07T00:00:00Z'),
+        }
+
+    def test_uncosted_universe_is_the_tracked_infra_tests(self, root):
+        assert ev.nextest_evidence(root, root).uncosted_universe == frozenset({ALPHA, BETA})
+
+    def test_an_absent_ledger_is_a_window_not_an_error(self, root):
+        (root / 'data' / 'verify-logs' / 'flaky-ledger.jsonl').unlink()
+        evidence = ev.nextest_evidence(root, root)
+        (ledger,) = [w for w in evidence.windows if w.source == 'flaky-ledger']
+        assert (ledger.present, ledger.artefacts) == (False, 0)
+        assert _observations(list(evidence.records()), 'flaky-ledger') == []

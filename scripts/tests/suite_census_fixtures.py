@@ -173,3 +173,55 @@ def pytest_project(root: Path) -> Path:
         ("2026-09-03T00:00:00+00:00", "tests/test_deleted.py::test_x", "fails_in_isolation"),
     ])
     return root
+
+
+def nextest_project(root: Path) -> Path:
+    """A reify-shaped project: a cargo workspace, tests/infra scripts and nextest-era artefacts.
+
+    - log 9 (no infix): reify-compiler::harness_types mod_a::case_one PASS 1.348s and
+      0.652s (a debug+release pair), a LEAK, a FAIL, a TIMEOUT plus its SLOW and
+      TERMINATING progress lines, one unknown WEIRD status, the run_all line
+      ``FAILED test_alpha.sh test_gamma.sh`` with its ``=== FAILED:`` banner, and a
+      pytest-style ``PASS:`` line;
+    - log 10 (remote-laptop segment): one PASS;
+    - flaky-ledger.jsonl: two test_beta.sh entries and one malformed line;
+    - runs.db flake_occurrence: one '<unknown>' row.
+    """
+    git_tree(root, {
+        "Cargo.toml": '[workspace]\nmembers = ["crates/*"]\n',
+        "crates/reify-eval/Cargo.toml": '[package]\nname = "reify-eval"\n',
+        "crates/reify-eval/tests/e2e.rs": "#[test]\nfn t_fail() {\n    assert!(true);\n}\n",
+        "tests/infra/test_alpha.sh": "#!/bin/sh\n",
+        "tests/infra/test_beta.sh": "#!/bin/sh\n",
+        "tests/infra/run_all.sh": "#!/bin/sh\n",
+    })
+    logs = root / "data" / "verify-logs"
+    nine = logs / "9" / "attempt-1.test-20260920T101010_5Z.log"
+    nine.parent.mkdir(parents=True)
+    nine.write_text(
+        "        PASS [   1.348s] ( 6259/23688) reify-compiler::harness_types mod_a::case_one\n"
+        "         LEAK [   0.100s] ( 1/2) reify-eval mod::leaky\n"
+        "        FAIL [   2.000s] ( 2/2) reify-eval::e2e t_fail\n"
+        "        SLOW [>120.000s] (───────────) reify-eval::solve x\n"
+        "     TIMEOUT [1200.048s] (22899/22899) reify-eval::solve x\n"
+        "  TERMINATING [ ...\n"
+        "        WEIRD [ 1.0s] a::b c\n"
+        "        PASS [   0.652s] ( 6259/23688) reify-compiler::harness_types mod_a::case_one\n"
+        "PASS: some text\n"
+        "=== FAILED: test_alpha.sh test_gamma.sh ===\n"
+        "FAILED test_alpha.sh test_gamma.sh\n"
+    )
+    ten = logs / "10" / "attempt-1.remote-laptop.test-20261001T000000_1Z.log"
+    ten.parent.mkdir(parents=True)
+    ten.write_text("        PASS [   0.500s] (1/1) reify-eval mod::other\n")
+    (logs / "flaky-ledger.jsonl").write_text(
+        '{"ts":"2026-09-05T01:02:03Z","test":"test_beta.sh","role":"merge",'
+        '"task":"1","branch":"HEAD","run_id":"run-1"}\n'
+        "not json at all\n"
+        '{"ts":"2026-09-06T01:02:03Z","test":"test_beta.sh","role":"merge",'
+        '"task":"2","branch":"HEAD","run_id":"run-2"}\n'
+    )
+    flake_db(root / "data" / "orchestrator" / "runs.db", [
+        ("2026-09-07T00:00:00+00:00", "<unknown>", "unconfirmable"),
+    ])
+    return root
