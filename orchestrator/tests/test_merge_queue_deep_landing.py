@@ -2447,9 +2447,9 @@ async def _adopted_warm_head_scene(
         parked=parked,
         late_head_task_factory=_real_head_verify,
     )
-    head_calls = [c for c in s['verifier'].calls if c['task_id'] == '100']
+    head_calls = [c for c in s['verifier'].verify_calls if c.task_id == '100']
     assert len(head_calls) == 1, 'the head verify must have reached the park'
-    post_verify_wt = head_calls[0]['worktree']
+    post_verify_wt = head_calls[0].worktree
     assert post_verify_wt is not None
     assert post_verify_wt != s['head_item'].merge_wt, (
         'staging check: the warm swap must actually have swapped, or every '
