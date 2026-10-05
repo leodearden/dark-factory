@@ -535,7 +535,7 @@ NOTE_CAP = 400
 
 
 def test_trailing_verdict_fits_the_note_cap(tmp_path, capsys):
-    dropped = ("proposal", "supersedes", "statement")
+    dropped = ("statement", "proposal", "supersedes")
     findings = [finding_lacking(*dropped, key=f"fk-{index:012x}") for index in range(30)]
     write_report(tmp_path / "plans", STEM, findings=findings, sections=["Method"])
     expected = [f"## {title}" for title in SECTIONS if title != "Method"]

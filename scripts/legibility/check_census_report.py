@@ -310,14 +310,26 @@ def gap_line(gap: Gap) -> str:
     return f"  {gap.kind} {gap.name}" + (f": {gap.detail}" if gap.detail else "")
 
 
-def compact_verdict(result: Result) -> str:
-    payload = {
-        "verdict": str(result.verdict),
-        "report": result.report,
-        "missing": names(result.gaps, GapKind.MISSING),
-        "malformed": names(result.gaps, GapKind.MALFORMED),
-    }
+def elided(kept: list[str], dropped: int) -> list[str]:
+    return [*kept, f"...+{dropped} more"] if dropped else kept
+
+
+def serialise_verdict(result: Result, kept: dict[GapKind, list[str]], dropped: dict[GapKind, int]) -> str:
+    payload: dict[str, object] = {"verdict": str(result.verdict), "report": result.report}
+    payload |= {str(kind): elided(kept[kind], dropped[kind]) for kind in GapKind}
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def compact_verdict(result: Result) -> str:
+    kept = {kind: names(result.gaps, kind) for kind in GapKind}
+    dropped = dict.fromkeys(GapKind, 0)
+    text = serialise_verdict(result, kept, dropped)
+    while len(text) > NOTE_CAP and any(kept.values()):
+        longer = max(GapKind, key=lambda kind: len(kept[kind]))
+        kept[longer].pop()
+        dropped[longer] += 1
+        text = serialise_verdict(result, kept, dropped)
+    return text
 
 
 def render(result: Result) -> list[str]:
