@@ -1,0 +1,449 @@
+prd: plans/completion-driven-triggers-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: null
+  title: Factory-rooted predicate scripts (BeforeDone.script_root, resolver lifted to shared)
+  capabilities:
+  - name: shared-repo-paths-module
+    binding: capability→producer — producer:α moves orchestrator/src/orchestrator/repo_paths.py::resolve_dark_factory_root
+      (present on main, stdlib-only imports) into shared so fused-memory, which depends on shared only,
+      can resolve the factory root
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - shared/src/shared/repo_paths.py
+      expect: present
+  - name: no-orchestrator-repo-paths-shim
+    binding: heuristic 13 / INV-5 — the move leaves no re-export shim; importers are harness.py and
+      two orchestrator test modules (grep, 2026-10-05)
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - orchestrator/src/orchestrator/repo_paths.py
+      expect: absent
+  - name: before-done-script-root-field
+    binding: capability→producer — producer:α adds shared/src/shared/task_metadata.py::BeforeDone.script_root
+      (BeforeDone today declares script/args/env/cwd/timeout_secs/target_unit/kind)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: script_root[[:space:]]*:[[:space:]]*Literal
+      paths:
+      - shared/src/shared/task_metadata.py
+      expect: present
+  - name: submit-guard-resolves-factory-root
+    binding: capability→producer (wired) — producer:α; fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done
+      is the submit-boundary resolver (containment, existence, X_OK) and gains the factory-root arm
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: resolve_dark_factory_root
+      paths:
+      - fused-memory/src/fused_memory/middleware/deterministic_task_guard.py
+      expect: present
+  - name: runner-resolves-factory-root
+    binding: capability→producer (wired) — producer:α; orchestrator/src/orchestrator/deterministic_runner.py::DeterministicRunner._default_run_script
+      execs the resolved script with cwd unchanged (project_root)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: script_root
+      paths:
+      - orchestrator/src/orchestrator/deterministic_runner.py
+      expect: present
+  - name: signal-script-exists-in-factory-root
+    binding: G6 branch 3 — the signal's scripts/check_write_triage_enabled.py exists and is mode 0775
+      in the factory root (ls, 2026-10-05)
+    verdict: PASS
+  - name: missing-script-without-script-root-rejected
+    binding: rejection-mechanism — the signal's negative half reuses the existing "does not exist under
+      project_root" refusal in deterministic_task_guard.py::_validate_before_done (observed in source);
+      the deploy+factory refusal is built and observed by α's own fixtures
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is a fixture property of α's guard tests (fixture project_root lacking
+        scripts/), not a grep
+- label: β
+  task_id: null
+  title: Re-arm verdict for predicates (exit 75, recheck_secs, stall cap)
+  capabilities:
+  - name: recheck-secs-field
+    binding: capability→producer — producer:β adds BeforeDone.recheck_secs and the milestone half on
+      shared/src/shared/task_metadata.py::TaskMetadata (write boundary parse_metadata(enforce=True) in
+      fused-memory/src/fused_memory/backends/sqlite_task_backend.py covers update_task)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recheck_secs
+      paths:
+      - shared/src/shared/task_metadata.py
+      expect: present
+  - name: ex-tempfail-arm-in-run-predicate
+    binding: capability→producer (wired) — producer:β; today DeterministicRunner._run_predicate maps
+      every rc != 0 to _file_milestone_check_failed_and_block (read 2026-10-05); D11 makes os.EX_TEMPFAIL
+      the one home of 75
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EX_TEMPFAIL
+      paths:
+      - orchestrator/src/orchestrator/deterministic_runner.py
+      expect: present
+  - name: predicate-verdict-stamp
+    binding: capability→producer — producer:β stamps metadata.predicate_verdict from the parsed trailing-JSON
+      tier of deterministic_runner.py::_extract_predicate_payload (present on main); consumed by ζ (review_due.verdict)
+      and δ's --pending
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: predicate_verdict
+      paths:
+      - orchestrator/src/orchestrator/deterministic_runner.py
+      expect: present
+  - name: predicate-rearmed-event
+    binding: capability→producer — producer:β adds EventType.predicate_rearmed and predicate_recheck_stalled
+      to orchestrator/src/orchestrator/event_store.py::EventType; emitted through scheduler.event_store
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: predicate_rearmed
+      paths:
+      - orchestrator/src/orchestrator/event_store.py
+      expect: present
+  - name: stall-cap-config-green-tier
+    binding: capability→producer — producer:β; no deterministic sub-config exists on OrchestratorConfig
+      today (grep 2026-10-05), so β adds it and registers it in config.py::RELOADABLE_FIELDS via the
+      _submodel_leaf_paths idiom or an explicit dotted path
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _submodel_leaf_paths\(.deterministic.|deterministic\.predicate_recheck_stall_cap
+      paths:
+      - orchestrator/src/orchestrator/config.py
+      expect: present
+  - name: stall-cap-read-per-slot
+    binding: capability→producer (wired) — producer:β; harness.py::Harness._run_deterministic_slot constructs
+      the runner per slot, so the cap is live on reload
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: predicate_recheck_stall_cap
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: stalled-category-deny-listed
+    binding: rejection-mechanism — producer:β adds milestone_check_stalled to escalation/src/escalation/authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES
+      (today design_concern, milestone_gate, milestone_check_failed, curator_adjudication_missing) and
+      to shadow_ruling.py::_MILESTONE_CATEGORIES; vocabulary registration is task 5257 (upstream, pending)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: milestone_check_stalled
+      paths:
+      - escalation/src/escalation/authority.py
+      expect: present
+  - name: requeued-bypasses-retry-cap
+    binding: G6 branch 3 — WorkflowOutcome.REQUEUED exists (workflow_types.py::WorkflowOutcome); the
+      deterministic early return in harness.py::Harness._run_slot never reaches _apply_retry_cap (finally
+      comment "report is None, e.g. the deterministic-gate early return", read 2026-10-05)
+    verdict: PASS
+  - name: stall-l2-refuses-auto-close
+    binding: rejection-mechanism — boundary row 4 observes the stalled L2 refused by the auto-close
+      denylist check in authority.py
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the refusal is observed by β's row-4 test through authority.py, not mechanically greppable
+- label: γ
+  task_id: null
+  title: trigger_chain metadata, one-open-chain guard, capability report and closed before_done keys
+  capabilities:
+  - name: trigger-chain-model
+    binding: capability→producer — producer:γ; shared/src/shared/task_metadata.py::register_metadata_submodel
+      and ::_BLESSED_METADATA_KEYS are the registry (present on main)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class TriggerChain\(
+      paths:
+      - shared/src/shared/task_metadata.py
+      expect: present
+  - name: capabilities-constant
+    binding: capability→producer — producer:γ; TASK_METADATA_CAPABILITIES is the one home (C2)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: TASK_METADATA_CAPABILITIES
+      paths:
+      - shared/src/shared/task_metadata.py
+      expect: present
+  - name: get-status-reports-capabilities
+    binding: capability→producer (wired) — producer:γ; fused-memory/src/fused_memory/server/tools.py::get_status
+      already emits the top-level reconciliation_halt field, the precedent for the new top-level list
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_metadata_capabilities
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: present
+  - name: open-chain-guard-wired-in-submit-task
+    binding: capability→producer (wired) — producer:γ; wired in tools.py::submit_task directly after
+      recurring_gate_guard_error (guard order read 2026-10-05), covering curator and planning_mode
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: trigger_chain_open_error
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: present
+  - name: open-chain-refusal
+    binding: rejection-mechanism — producer:γ; error_type TriggerChainOpen with open_chain rows; row
+      7's guard half observes it
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: TriggerChainOpen
+      paths:
+      - fused-memory/src/fused_memory/middleware/trigger_chain_guard.py
+      expect: present
+  - name: closed-before-done-keys
+    binding: rejection-mechanism — producer:γ; every stored before_done uses only the seven declared
+      keys (66 dark_factory, 5 reify, read-only sqlite 2026-10-05), so closing the set refuses nothing
+      that exists
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: UnsupportedTaskMetadata
+      paths:
+      - fused-memory/src/fused_memory/middleware/deterministic_task_guard.py
+      expect: present
+  - name: carrier-rules-validator
+    binding: capability→producer — producer:γ; deterministic_task_guard.py::_validate_recurrence is
+      the mirrored precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: _validate_trigger_chain
+      paths:
+      - fused-memory/src/fused_memory/middleware/deterministic_task_guard.py
+      expect: present
+  - name: in-process-metadata-lookup
+    binding: producer:task-metadata-lookup L1 upstream — TaskInterceptor.find_tasks_by_metadata (plans/task-metadata-lookup-prd.md
+      L1, same project; γ depends on it; DAG checked, no lookup task depends on this batch); γ passes
+      include_value=True because matched_value is opt-in (lookup decision 4, amended 2026-10-05)
+    verdict: PASS
+  - name: bare-skill-and-version-skew-rejections
+    binding: rejection-mechanism — rows 15 and 16 observe the '/review' refusal with the bare-name hint
+      and the unknown-key refusal with nothing persisted
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: refusal wording and no-persist are fixture properties of γ's guard tests
+- label: δ
+  task_id: null
+  title: scripts/check_run_completion.py — weighted completion measure, predicate CLI and --pending
+    report (ε coalesced)
+  note: ε (--pending report) is coalesced into δ at decompose, as PRD §10 permits when δ has not dispatched;
+    ε is not filed and its capabilities are bound here.
+  capabilities:
+  - name: completion-script-exists
+    binding: capability→producer — producer:δ; the path the census PRD's L8b and the snippet's §2
+      probe name
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - scripts/check_run_completion.py
+      expect: present
+  - name: weighted-completion-importable
+    binding: capability→producer — producer:δ; pure function per contract §11 arithmetic
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def weighted_completion\(
+      paths:
+      - scripts/check_run_completion.py
+      expect: present
+  - name: run-tasks-selection-over-lookup-tool
+    binding: producer:task-metadata-lookup L1 upstream for find_tasks_by_metadata (row shape task_id,
+      status, priority, plus matched_value only with include_value=True; has_more paging with offset
+      += returned under RESULT_BYTE_BUDGET; tasks_with_key — lookup PRD amended 2026-10-05); transport
+      scripts/legibility/census_trigger.py::post_mcp_tool_call present on main
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: find_tasks_by_metadata
+      paths:
+      - scripts/check_run_completion.py
+      expect: present
+  - name: not-yet-exit-code
+    binding: capability→producer — producer:δ imports os.EX_TEMPFAIL (D11), the same home β's runner
+      arm reads
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: EX_TEMPFAIL
+      paths:
+      - scripts/check_run_completion.py
+      expect: present
+  - name: pending-report-mode
+    binding: capability→producer — producer:δ (ε's scope); presence query key=trigger_chain, value=None;
+      discover_project_roots in scripts/_task_db_scan.py present on main
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: "['\"]--pending['\"]"
+      paths:
+      - scripts/check_run_completion.py
+      expect: present
+  - name: verdict-json-within-note-cap
+    binding: floor:400 > 343 — worst case computed 2026-10-05 (run id hotspot-survey-dark_factory-20261004-99,
+      all five tiers at 999999 per bucket, compact separators) = 343 chars against the 400-char
+      _PREDICATE_NOTE_MAX_PAYLOAD_CHARS cap in deterministic_runner.py; headroom assumes a project_id
+      under about 70 chars
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the bound is pinned by δ's worst-case fixture test, not a grep
+  - name: measure-exactness
+    binding: G6 branch 2 — Fraction(landed, landed+pending) >= Fraction(str(threshold)) is exact for
+      rationals; 7/10 against '0.7' compares equal, where 0.7*10 in float is 7.000000000000001
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: exactness is an arithmetic fixture (boundary row 11), not a grep
+  - name: reader-names-absent-producer
+    binding: INV-13 — no task carries x_finding_run (0 rows) or trigger_chain (0 rows) in the dark_factory
+      store (read-only sqlite 2026-10-05); the CLI exits 2 with empty_run and --pending prints "no trigger
+      chain has been filed in <project>", each distinct from a healthy answer
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the distinct-state rendering is observed live and in rows 13 and the empty_run test
+  - name: scripts-tests-can-import-fused-memory
+    binding: G6 branch 3 — the scripts verify leg runs under uv run --project shared; scripts/tests/test_scan_task_toolcall_leaks.py
+      already imports fused_memory there (precedent for binding the real tool function in-process)
+    verdict: PASS
+- label: ζ
+  task_id: null
+  title: review_due escalation — typed payload and one gate-fields builder
+  capabilities:
+  - name: review-due-payload-type
+    binding: capability→producer — producer:ζ; escalation/src/escalation/models.py::TrainState and ::IndexHealthState
+      are the zero-migration optional-field precedent
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: class ReviewDueState\(
+      paths:
+      - escalation/src/escalation/models.py
+      expect: present
+  - name: review-due-deny-listed
+    binding: rejection-mechanism — producer:ζ adds review_due to authority.py::L2_AUTO_CLOSE_DENY_CATEGORIES;
+      shadow_ruling.py derives deterministic_runner_filing for it without an edit; category registration
+      is task 5257 (upstream)
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: review_due
+      paths:
+      - escalation/src/escalation/authority.py
+      expect: present
+  - name: one-gate-fields-builder
+    binding: INV-5 — producer:ζ renames deterministic_runner.py::build_milestone_gate_escalation_fields,
+      today consumed by DeterministicRunner._file_milestone_gate_and_block and harness.py::Harness._recover_stranded_deterministic_gate
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def build_gate_escalation_fields\(
+      paths:
+      - orchestrator/src/orchestrator/deterministic_runner.py
+      expect: present
+  - name: strand-recovery-uses-the-builder
+    binding: capability→producer (wired) — producer:ζ; the harness strand-recovery path calls the
+      same builder
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: build_gate_escalation_fields
+      paths:
+      - orchestrator/src/orchestrator/harness.py
+      expect: present
+  - name: old-builder-name-retired
+    binding: heuristic 13 — no alias left for the old name
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: build_milestone_gate_escalation_fields
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: absent
+  - name: review-due-verdict-populated
+    binding: field-population — β (upstream through γ) writes predicate_verdict as a parsed dict on
+      every verdict-bearing exit; ζ copies it into review_due.verdict; row 2 reads review_due.verdict.share
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: non-sentinel population is observed by row 2 against the real runner
+  - name: pure-gate-resume-completes
+    binding: G6 branch 3 — the runner's pure-gate resume path writes done with note 'pure gate resolved'
+      on 95 tasks, latest 2026-10-04 (read-only sqlite 2026-10-05); task 3638's 2026-08-04 strand premise
+      no longer holds
+    verdict: PASS
+- label: η
+  task_id: null
+  title: Escalation watcher review_due handler (spawn when attended, digest when AFK)
+  capabilities:
+  - name: watcher-review-due-section
+    binding: capability→producer — producer:η; consumes ζ's category and payload (upstream)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: skill text is verified by review against C4/C5 and by first live use; a prose grep would
+        be the guard INV-10 forbids
+  - name: spawn-carve-outs
+    binding: skills/escalation-watcher/SKILL.md "Always ask — keyed on record content" lists deterministic-runner
+      filings (review_due falls there via shadow_ruling) and spend_or_eval_launch; η names review_due
+      as the exception (D10, Leo 2026-10-05) and states the spawn is not a spend launch
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: carve-out correctness is a reviewer judgement against D10 and the standing-policy doc
+- label: θ
+  task_id: null
+  title: docs/task-authoring.md — recheck_secs, script_root, the 75 verdict and the chain keys
+  capabilities:
+  - name: authoring-doc-recheck-secs
+    binding: capability→producer — producer:θ; λ row 14 executes the doc's fenced blocks
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: recheck_secs
+      paths:
+      - docs/task-authoring.md
+      expect: present
+  - name: authoring-doc-trigger-chain
+    binding: capability→producer — producer:θ; §8 Tier-A gains trigger_chain, predicate_recheck, predicate_verdict
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: trigger_chain
+      paths:
+      - docs/task-authoring.md
+      expect: present
+- label: λ
+  task_id: null
+  title: 'Integration gate: trigger chain end to end (boundary rows 1–16)'
+  capabilities:
+  - name: boundary-sketch-green-e2e
+    binding: DAG-direction — every leg is upstream (α resolver, β verdict, γ guards, δ script, ζ payload,
+      θ doc rows, lookup L1 transitively); orchestrator tests already import fused_memory (test_workflow_e2e.py)
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the task is the check suite; its signal is the merge-verify-green boundary matrix
