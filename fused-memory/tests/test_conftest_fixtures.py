@@ -11,6 +11,7 @@ import re
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -21,6 +22,10 @@ from _fm_helpers import (
     load_script_module,
     make_rebuild_detail,
 )
+from _graphiti_fake import FakeGraphitiClient
+
+from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
 
 CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
 
@@ -439,6 +444,61 @@ class TestMakeGraphMockCypherDispatch:
         graph = make_graph_mock()
         assert (await graph.ro_query('MATCH (n) RETURN n')).result_set == []
         assert (await graph.ro_query('MATCH (n) RETURN count(*)')).result_set == [[0]]
+
+
+# ---------------------------------------------------------------------------
+# make_backend_over_fake_graphiti factory fixture (task 5473)
+# ---------------------------------------------------------------------------
+
+
+class TestMakeBackendOverFakeGraphiti:
+    """The contract-faithful sibling of make_backend (task 5473)."""
+
+    @pytest.mark.asyncio
+    async def test_a_write_reaches_the_fake_it_was_given(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        fake = FakeGraphitiClient()
+        backend = make_backend_over_fake_graphiti(mock_config, fake)
+        assert isinstance(backend, GraphitiBackend)
+
+        result = await backend.add_episode(name='n', content='body', group_id='g')
+
+        assert [c['episode_body'] for c in fake.calls] == ['body']
+        assert fake.episodes[result.episode.uuid] is result.episode
+
+    @pytest.mark.asyncio
+    async def test_a_search_reaches_the_fake_it_was_given(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        fake = FakeGraphitiClient()
+        backend = make_backend_over_fake_graphiti(mock_config, fake)
+        edge = SimpleNamespace(episodes=[])
+        fake.next_edges = [edge]
+
+        await backend.add_episode(name='n', content='body', group_id='g')
+
+        assert await backend.search('q', group_ids=['g']) == [edge]
+
+    def test_the_registry_defaults_to_empty_like_make_backend(
+        self, mock_config, make_backend_over_fake_graphiti, make_backend,
+        monkeypatch, tmp_path,
+    ):
+        (tmp_path / 'ambient-proj').mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(tmp_path / 'ambient-proj'))
+
+        over_fake = make_backend_over_fake_graphiti(mock_config, FakeGraphitiClient())
+
+        assert over_fake.registered_graph_ids == frozenset()
+        assert over_fake.registered_graph_ids == make_backend(mock_config).registered_graph_ids
+
+    def test_an_explicit_registry_is_honoured_and_canonicalized(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        backend = make_backend_over_fake_graphiti(
+            mock_config, FakeGraphitiClient(), registered_graph_ids={'Reg-A'},
+        )
+        assert backend.registered_graph_ids == frozenset({'reg_a'})
 
 
 # ---------------------------------------------------------------------------
