@@ -24,6 +24,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import re
 import types
 from pathlib import Path
@@ -775,6 +776,18 @@ def _run(
     )
 
 
+def _inserted_span(longer: str, shorter: str) -> str:
+    """The one contiguous span *longer* inserts into *shorter*.
+
+    Fails unless inserting that span is the ONLY difference, so a caller can
+    check what a clause says without the rest of the prose answering for it.
+    """
+    head = len(os.path.commonprefix([longer, shorter]))
+    tail = len(os.path.commonprefix([longer[head:][::-1], shorter[head:][::-1]]))
+    assert longer[:head] + longer[len(longer) - tail:] == shorter, (longer, shorter)
+    return longer[head:len(longer) - tail]
+
+
 class TestBuildReport:
     """The report is the deliverable — D10 makes it the operator's input."""
 
@@ -902,74 +915,91 @@ class TestBuildReport:
         assert 'judge_system_prompt_sha256' in _mod().PROVENANCE_KEYS
 
     @staticmethod
-    def _pseudo_report(
-        cases: list[dict], pseudo_answers, *, production_shape=None,
+    def _answering(
+        cases: list[dict], label: str, answers, *,
+        production_shape=None, judge_model=None,
     ) -> dict:
-        """*cases* scored with the pseudo_contradiction cases answering in turn
-        from *pseudo_answers* and every other case answering `restated`."""
-        answers = iter(pseudo_answers)
+        """*cases* scored with the *label* cases answering in turn from
+        *answers* and every other case answering `restated`."""
+        answer = iter(answers)
         verdicts = [
-            next(answers)
-            if case['expected_class'] == _mod().LABEL_PSEUDO_CONTRADICTION
-            else OUTCOME_RESTATED
+            next(answer) if case['expected_class'] == label else OUTCOME_RESTATED
             for case in cases
         ]
+        provenance = dict(_PROVENANCE)
+        if judge_model is not None:
+            provenance['judge_model'] = judge_model
         return _mod().build_report(
             scored=_mod().score_cases(cases, verdicts),
-            provenance=dict(_PROVENANCE),
+            provenance=provenance,
             production_shape=production_shape,
         )
 
     @staticmethod
-    def _k_of_n(report: dict) -> str:
-        label = _mod().LABEL_PSEUDO_CONTRADICTION
+    def _caveat_counting(report: dict, label: str) -> str:
+        """The one caveat naming how many *label* cases answered `contested`."""
         k = report['confusion'][label][OUTCOME_CONTESTED]
         n = report['per_class'][label]['n']
-        return f'{k} of {n}'
+        count = f'{k} of {n} {label}'
+        naming = [caveat for caveat in report['caveats'] if count in caveat]
+        assert len(naming) == 1, (count, report['caveats'])
+        return naming[0]
 
-    def test_the_caveats_report_how_the_pseudo_contradictions_read(self) -> None:
+    _COUNTED_LABELS = ('LABEL_PSEUDO_CONTRADICTION', 'LABEL_DUPLICATE')
+
+    @pytest.mark.parametrize('label_name', _COUNTED_LABELS)
+    def test_a_caveat_counts_the_contested_answers_in_the_class(
+        self, label_name: str,
+    ) -> None:
+        label = getattr(_mod(), label_name)
         cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        report = self._pseudo_report(cases, [OUTCOME_CONTESTED] * len(cases))
-        label = _mod().LABEL_PSEUDO_CONTRADICTION
-        assert report['per_class'][label]['n'] > 0, 'the corpus lost its pseudo case'
-        k_of_n = self._k_of_n(report)
-        naming = [caveat for caveat in report['caveats'] if k_of_n in caveat]
-        assert len(naming) == 1, (k_of_n, report['caveats'])
-        assert label in naming[0]
+        report = self._answering(cases, label, [OUTCOME_CONTESTED] * len(cases))
+        assert report['per_class'][label]['n'] > 0, f'the corpus lost its {label} cases'
+        self._caveat_counting(report, label)
 
-    def test_the_pseudo_contradiction_caveat_follows_the_verdicts(self) -> None:
+    @pytest.mark.parametrize('label_name', _COUNTED_LABELS)
+    def test_the_count_follows_the_verdicts(self, label_name: str) -> None:
+        label = getattr(_mod(), label_name)
         cases = _mod().build_judge_cases(_corpus(), distractors=2)
-        contested = self._pseudo_report(cases, [OUTCOME_CONTESTED] * len(cases))
-        amended = self._pseudo_report(cases, [OUTCOME_AMENDED] * len(cases))
-        assert contested['caveats'] != amended['caveats']
-        for report in (contested, amended):
-            k_of_n = self._k_of_n(report)
-            assert any(k_of_n in caveat for caveat in report['caveats']), (
-                k_of_n, report['caveats'],
-            )
+        contested = self._answering(cases, label, [OUTCOME_CONTESTED] * len(cases))
+        amended = self._answering(cases, label, [OUTCOME_AMENDED] * len(cases))
+        assert (
+            self._caveat_counting(contested, label)
+            != self._caveat_counting(amended, label)
+        )
 
-    def test_the_judged_share_is_named_when_the_band_split_is_known(self) -> None:
-        label = _mod().LABEL_PSEUDO_CONTRADICTION
-        cases = _cases(*((f'p{i}', label) for i in range(6)))
+    @pytest.mark.parametrize('label_name', _COUNTED_LABELS)
+    def test_the_judged_share_is_named_when_the_band_split_is_known(
+        self, label_name: str,
+    ) -> None:
+        label = getattr(_mod(), label_name)
+        cases = _cases(*((f'c{i}', label) for i in range(6)))
         answers = [
             OUTCOME_RESTATED, OUTCOME_CONTESTED, OUTCOME_CONTESTED,
             OUTCOME_AMENDED, OUTCOME_AMENDED, OUTCOME_AMENDED,
         ]
+        judged = 5
         shape = {'band_split': {label: {
-            OUTCOME_RESTATED: 1, OUTCOME_JUDGE: 5, OUTCOME_STORED: 0,
+            OUTCOME_RESTATED: 1, OUTCOME_JUDGE: judged, OUTCOME_STORED: 0,
         }}}
 
-        def pseudo_caveat(report: dict) -> str:
-            k_of_n = self._k_of_n(report)
-            [caveat] = [c for c in report['caveats'] if k_of_n in c]
-            return caveat
-
-        with_split = pseudo_caveat(
-            self._pseudo_report(cases, answers, production_shape=shape),
+        with_split = self._caveat_counting(
+            self._answering(cases, label, answers, production_shape=shape), label,
         )
-        without_split = pseudo_caveat(self._pseudo_report(cases, answers))
-        assert re.search(r'\b5\b', with_split), with_split
-        assert not re.search(r'\b5\b', without_split), without_split
+        without_split = self._caveat_counting(
+            self._answering(cases, label, answers), label,
+        )
+        added = _inserted_span(with_split, without_split)
+        assert str(judged) in re.findall(r'\d+', added), added
+
+    def test_the_duplicate_caveat_names_the_judge_it_measured(self) -> None:
+        label = _mod().LABEL_DUPLICATE
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        report = self._answering(
+            cases, label, [OUTCOME_CONTESTED] * len(cases),
+            judge_model='judge-under-test',
+        )
+        assert 'judge-under-test' in self._caveat_counting(report, label)
 
 
 class TestRenderMarkdown:

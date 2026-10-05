@@ -1153,6 +1153,14 @@ def caveats_for(slate_mode: Any) -> list[str]:
     return [*CAVEATS, *MODE_CAVEATS.get(str(slate_mode), MODE_CAVEATS[SLATE_SEEDED])]
 
 
+def _judged_share(label: str, production_shape: Mapping[str, Any] | None) -> str:
+    """How many *label* cases reached the judge, where the run measured a band split."""
+    band_split = (production_shape or {}).get('band_split') or {}
+    if label not in band_split:
+        return ''
+    return f' (of the {band_split[label][OUTCOME_JUDGE]} the judge saw)'
+
+
 def pseudo_contradiction_caveat(
     scored: Mapping[str, Any], production_shape: Mapping[str, Any] | None,
 ) -> str:
@@ -1167,22 +1175,51 @@ def pseudo_contradiction_caveat(
     row = scored['confusion'][label]
     n = scored['per_class'][label]['n']
     breakdown = ', '.join(f'`{outcome}` {row[outcome]}' for outcome in EVAL_OUTCOMES)
-    band_split = (production_shape or {}).get('band_split') or {}
-    judged = (
-        f' (of the {band_split[label][OUTCOME_JUDGE]} the judge saw)'
-        if label in band_split else ''
-    )
     return (
         'Under the shipped `contests` definition — the entry says a candidate '
         "is wrong, outdated or different (Leo's ruling 2026-09-30, "
         "plans/write-triage-flip-readiness-prd.md §11.3 C1'') — the judge "
         f'answered `contested` on {row[OUTCOME_CONTESTED]} of {n} {label} '
-        f'cases{judged}; all outcomes: {breakdown}. These records were '
+        f'cases{_judged_share(label, production_shape)}; all outcomes: '
+        f'{breakdown}. These records were '
         'adjudicated NOT contradictions under the EARLIER definition ("cannot '
         'be true at the same time"), and this report still scores `contested` '
         'on them as wrong and counts it in false_contested. The fixture is '
         'deliberately not relabelled, so this reports how the new definition '
         'reads them without asserting which reading is right.'
+    )
+
+
+def duplicate_contested_caveat(
+    scored: Mapping[str, Any],
+    production_shape: Mapping[str, Any] | None,
+    judge_model: Any,
+) -> str:
+    """How often a duplicate read as `contested`, and on which judge.
+
+    Derived from the scored confusion row like
+    :func:`pseudo_contradiction_caveat`. Every one of these is a write the
+    run's judge would flag for a human, so this is the false-alarm figure the
+    flip operator reads, and it is only as general as the judge that
+    produced it.
+    """
+    label = LABEL_DUPLICATE
+    contested = scored['confusion'][label][OUTCOME_CONTESTED]
+    n = scored['per_class'][label]['n']
+    return (
+        f'The judge, `{judge_model}`, answered `contested` on {contested} of '
+        f'{n} {label} cases{_judged_share(label, production_shape)}. The '
+        'curator labelled each duplicate the same claim as its canonical, so '
+        'this report scores `contested` on one as wrong; with triage enabled, '
+        'each is a write this judge would flag `contested` for a human to '
+        'read. The `contests` definition was settled on a frontier reasoning '
+        'judge: its live boundary test, '
+        'fused-memory/tests/server/test_write_triage_judge.py::TestTheShippedWordingLive, '
+        "pins one, because gpt-4o-mini answers that test's outdated cases "
+        '`contested` under the earlier wording too. Where this judge is not '
+        'the model that test pins, the figure measures the wording on a judge '
+        'it was not settled on: read it beside a run on that model before '
+        'deciding which judge the flip ships.'
     )
 
 
@@ -1246,6 +1283,9 @@ def build_report(
         'caveats': [
             *caveats_for(run_provenance.get('slate_mode')),
             pseudo_contradiction_caveat(scored, production_shape),
+            duplicate_contested_caveat(
+                scored, production_shape, run_provenance['judge_model'],
+            ),
         ],
         'provenance': run_provenance,
     }
