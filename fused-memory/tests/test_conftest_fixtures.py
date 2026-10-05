@@ -17,16 +17,10 @@ import pytest
 from _fm_helpers import (
     extract_cypher,
     extract_params,
+    lease_dir_fixture,  # also activates the autouse lease-dir isolation here
     load_script_module,
     make_rebuild_detail,
 )
-
-# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
-#
-# Defined once in the sibling module so five importers cannot drift apart;
-# its docstring says why redirecting the directory is a hard boundary rather
-# than a convenience.  Autouse applies to every test in THIS module.
-from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: F401
 
 CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
 
@@ -555,7 +549,8 @@ class TestTheIntegrationLaneLeaseFixture:
 
 class TestTheLeaseDirIsolationHasOneDefinition:
     """The fixture keeping tests out of the machine-global lease directory is
-    defined ONCE and imported by the modules that need it.
+    defined ONCE, in ``_fm_helpers.py``, and imported by the modules that
+    need it.
 
     It was five verbatim copies of a ~26-line function before this guard
     (task 4775 pre-1).  The duplication is correctness-relevant rather than
@@ -566,7 +561,7 @@ class TestTheLeaseDirIsolationHasOneDefinition:
     """
 
     TESTS_DIR = Path(__file__).parent
-    HOME = '_fm_lease_dir_fixture.py'
+    HOME = '_fm_helpers.py'
     #: `lease_dir\w*` so a copy under either spelling is caught — the shared
     #: definition is `lease_dir_fixture`, registered under the fixture NAME
     #: `lease_dir`.  Spelled as a regex so this file does not match itself.
@@ -581,8 +576,8 @@ class TestTheLeaseDirIsolationHasOneDefinition:
 
         assert definitions == [self.HOME], (
             f'{definitions} define the fixture themselves; import the one '
-            f'definition instead — `from _fm_lease_dir_fixture import '
-            f'lease_dir  # noqa: F401`'
+            f'definition instead — `from _fm_helpers import '
+            f'lease_dir_fixture  # noqa: F401`'
         )
 
     def test_an_importing_module_really_gets_the_isolation(self, lease_dir):
@@ -593,3 +588,14 @@ class TestTheLeaseDirIsolationHasOneDefinition:
 
         assert reaper.lease_dir() == lease_dir
         assert reaper.lease_dir() != reaper.DEFAULT_LEASE_DIR
+
+    def test_conftest_never_activates_it_for_the_whole_package(self):
+        """Bound into conftest.py, the autouse fixture would redirect every
+        test, the ``-m integration`` lane included, whose lease must land in
+        the real directory the live cron reads.  Opt-in is per module, by
+        import."""
+        conftest = _fused_memory_conftest()
+
+        assert not any(
+            value is lease_dir_fixture for value in vars(conftest).values()
+        )

@@ -25,7 +25,10 @@ not-yet-delivered capability currently fails, so none is a false green. The
 four that legitimately match today are must-survive guards (green-tier
 registration, the sampler unit's `WorkingDirectory`, reify's
 `PartOf=orchestrator-reify.service`, and the `fleet_load_detector` block that
-must NOT be deleted).
+must NOT be deleted). Task 4935 later converted reify's two guards, and ρ3's
+`held_back` check, to `kind: manual`: the polarity lint refuses a present-grep
+that already matches (`vacuous_present`), so none of them could be stamped as a
+gate.
 
 Substrate verified live on dark-factory `main` `b6282847f9` and reify `main`
 `840f87779c` (both 2026-09-08), by symbol. Every anchor below is
@@ -343,7 +346,7 @@ D11.
 | the slice name to place the unit under | producer:`dark_factory:3394` upstream (qualified external dep); name from `fused_memory.project_id` = `reify` | PASS |
 | the parity guard is satisfied, not tripped | producer:ρ2 — see §Corrections (1): both knobs in `verify_env`, **both** `verify.sh` defaults moved to `@own-slice`, and a `KNOB_TABLE` row per knob | PASS |
 | the fallback is value-preserving, not a silent low reading (INV-11) | manual — no `df-*.slice` ancestor ⇒ read `/proc/pressure/cpu` and warn **once** per process; the balancer's existing `None` path is untouched | PASS |
-| the `reify-jobserver.service` `PartOf=` and the canary timer survive | grep — both already present in `install_build_services`; ρ2 changes only `Slice=` and one `Environment=` | PASS |
+| the `reify-jobserver.service` `PartOf=` and the canary timer survive | manual — both already present in `install_build_services`; ρ2 changes only `Slice=` and one `Environment=` | PASS |
 
 ### ρ3 — balancer unit re-deploy (`reify`, new, `task_kind='deterministic'`)
 
@@ -357,7 +360,7 @@ Slice,Environment` reads `df-reify.slice` and the sentinel;
 | the stub can never run for real | producer:ρ2 upstream (edge ρ3→ρ2) | PASS |
 | one rendering site to source (INV-5) | producer:ρ2 upstream — `render_jobserver_unit` | PASS |
 | it corroborates the live unit rather than the render (INV-3) | manual — asserts `systemctl show`'s actual `Slice` / `Environment` after the restart, and exits nonzero on mismatch (INV-SF-2) | PASS |
-| `held_back` is observable | grep — `scripts/jobserver-balancer.py::write_held_back` → `/tmp/reify-jobserver-held-back` | PASS |
+| `held_back` is observable | manual — `scripts/jobserver-balancer.py::write_held_back` → `/tmp/reify-jobserver-held-back` | PASS |
 
 ---
 

@@ -736,3 +736,87 @@ def test_placement_char_budget_applies_in_follows_mode_too() -> None:
         )
         is None
     )
+
+
+def test_lands_after_passes_when_the_splice_abuts_its_predecessor() -> None:
+    """Order holds trivially when the constant starts exactly where `follows` ends."""
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_PREDECESSOR}{_SPLICE}{_SECTION}'), frozenset({'alpha'})
+    )
+
+    assert (
+        contract.assert_lands_after(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+        is None
+    )
+
+
+def test_lands_after_passes_with_another_block_between_it_and_its_predecessor() -> None:
+    """The discriminating case: adjacency fails, order holds.
+
+    A block appended at the tail of a shared chain needs exactly this property,
+    since sibling blocks may merge in between in any order.
+    """
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_PREDECESSOR}{_SECTION}{_SPLICE}'), frozenset({'alpha'})
+    )
+
+    with pytest.raises(AssertionError):
+        contract.assert_placement(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+    assert (
+        contract.assert_lands_after(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+        is None
+    )
+
+
+def test_lands_after_fires_when_the_splice_precedes_its_predecessor() -> None:
+    """A constant ahead of `follows` fires, reporting the earliest allowed offset."""
+    contract = _contract(
+        _roles(alpha=f'{_IDENTITY}{_SPLICE}{_PREDECESSOR}{_SECTION}'), frozenset({'alpha'})
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_lands_after(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+
+    message = str(excinfo.value)
+    assert 'alpha' in message
+    assert 'earliest_allowed' in message
+    assert 'PREDECESSOR' in message
+    assert _REMEDY in message
+
+
+@pytest.mark.parametrize(
+    ('prompt', 'expected_key'),
+    [
+        (f'{_IDENTITY}{_PREDECESSOR}{_SECTION}', 'offset'),
+        (f'{_IDENTITY}{_SPLICE}{_SECTION}', 'follows_offset'),
+    ],
+    ids=['splice-absent', 'predecessor-absent'],
+)
+def test_lands_after_records_a_missing_block_as_an_offender(
+    prompt: str, expected_key: str
+) -> None:
+    """ABSENT is recorded, never skipped, so the check cannot pass vacuously.
+
+    The second case also pins that there is NO up-front fallback:
+    `assert_placement(follows=...)` would accept it, because there the splice
+    owns the first heading.
+    """
+    contract = _contract(_roles(alpha=prompt), frozenset({'alpha'}))
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_lands_after(
+            follows=_PREDECESSOR, follows_name='PREDECESSOR', remedy=_REMEDY
+        )
+
+    # The key/value pair, not a bare 'ABSENT': the rule text names 'ABSENT' too.
+    message = str(excinfo.value)
+    assert 'alpha' in message
+    assert f"'{expected_key}': 'ABSENT'" in message

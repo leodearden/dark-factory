@@ -124,3 +124,17 @@ def test_stat_strip_renders_the_tasks_node(shell_jsx_body: str) -> None:
     assert re.search(r'\{\s*summary\.tasks\s*\}', body), (
         'StatStrip does not render {summary.tasks}, the DatumReading node App builds.'
     )
+
+
+def test_the_topbar_queue_reads_the_write_queue_datum(app_jsx_body: str) -> None:
+    """The topbar queue count is the served write-queue Datum, not a bare number.
+
+    A bare ``queue.counts.pending`` rendered a confident 0 whenever the queue
+    probe failed; through ``writeQueue`` an unmeasured queue is an em-dash
+    with the probe's reason (memory_readings.test.mjs executes the reader).
+    """
+    summary = _const_object(_app_body(app_jsx_body), 'summary')
+    assert re.search(r'\bqueue\s*:\s*<DatumReading\s+datum=\{\s*writeQueue\(\s*DD\s*\)\s*\}', summary), (
+        f'summary.queue is not a <DatumReading> over writeQueue(DD):\n{summary}'
+    )
+    assert 'queue.counts' not in _app_body(app_jsx_body)

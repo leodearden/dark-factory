@@ -279,22 +279,33 @@ class ReviewAggregation:
         return bool(self.reviewer_errors) and not self.reviews
 
     def format_for_replan(self) -> str:
-        """Format blocking issues for the architect to address."""
-        lines = ['# Review Feedback — Blocking Issues\n']
-        for issue in self.blocking_issues:
-            reviewer = issue.get('reviewer', 'unknown')
-            location = issue.get('location', '')
-            category = issue.get('category', '')
-            description = issue.get('description', '')
-            fix = issue.get('suggested_fix', '')
-            lines.append(f'## [{reviewer}] {category}')
-            if location:
-                lines.append(f'**Location:** {location}')
-            lines.append(f'**Issue:** {description}')
-            if fix:
-                lines.append(f'**Suggested fix:** {fix}')
-            lines.append('')
-        return '\n'.join(lines)
+        """Blocking issues only — the architect's input (TaskWorkflow._replan)."""
+        return _format_issue_section('# Review Feedback — Blocking Issues\n', self.blocking_issues)
+
+    def format_for_escalation(self) -> str:
+        """Blocking issues then suggestions — the steward's review_issues detail (TaskWorkflow._escalate_review_issues)."""
+        text = self.format_for_replan()
+        if self.suggestions:
+            text += '\n' + _format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
+        return text
+
+
+def _format_issue_section(heading: str, issues: list[dict]) -> str:
+    lines = [heading]
+    for issue in issues:
+        reviewer = issue.get('reviewer', 'unknown')
+        location = issue.get('location', '')
+        category = issue.get('category', '')
+        description = issue.get('description', '')
+        fix = issue.get('suggested_fix', '')
+        lines.append(f'## [{reviewer}] {category}')
+        if location:
+            lines.append(f'**Location:** {location}')
+        lines.append(f'**Issue:** {description}')
+        if fix:
+            lines.append(f'**Suggested fix:** {fix}')
+        lines.append('')
+    return '\n'.join(lines)
 
 
 class TaskArtifacts:

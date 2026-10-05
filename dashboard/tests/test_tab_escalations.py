@@ -433,7 +433,9 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         level, category, severity, agent_role, workflow_state, worktree, resolution.
     (d) sidebar references linked task card fields: task.title, task.status, task.description.
     (e) renders the resolved project label.
-    (f) task_unresolved fallback branch present.
+    (f) the linked task is the row's served task Datum, read through
+        escalation_views.js::taskCard, and a card with no measurement renders
+        the server's reason rather than a local guess at one.
     """
     body = tab_escalations_jsx_body
 
@@ -479,11 +481,22 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         'add `{row.project}` display in the sidebar.'
     )
 
-    # (f) task_unresolved fallback branch
-    assert 'task_unresolved' in body, (
-        'tab_escalations.jsx sidebar does not have a `task_unresolved` fallback branch — '
-        'add `{row.task_unresolved ? <unresolved note> : <task card>}` to handle '
-        'escalations whose linked task could not be resolved.'
+    # (f) The card is the row's task Datum, read through taskCard, and a hole
+    # renders the reason the server gave for it.
+    sidebar = strip_js_comments(extract_function_body(body, 'EscalationSidebar'))
+    assert re.search(r'\btaskCard\(\s*row\b', sidebar), (
+        'EscalationSidebar does not read its linked task through '
+        '`taskCard(row, ...)` (escalation_views.js) — the card is the row\'s served '
+        'task Datum, and taskCard is its one reader.'
+    )
+    assert 'isHole' in sidebar and re.search(r'\.reason\b', sidebar), (
+        'EscalationSidebar does not branch on the card\'s `isHole` and render its '
+        '`.reason` — a task the server could not read must say why, not show a '
+        'blank card or a locally invented note.'
+    )
+    assert 'task_unresolved' not in strip_js_comments(body), (
+        'tab_escalations.jsx still reads `task_unresolved` — the payload no longer '
+        'carries it: an unknown task card is a Datum with its own reason.'
     )
 
 
@@ -737,8 +750,9 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
     backend aggregator already emits, and render four labeled tiles.
 
     Asserts, scoped to the EscalationStatStrip body:
-    (a) benign-rate — references flow_daily, the 'benign'/'actionable' class
-        literals, and stamped_share (the hint).
+    (a) benign-rate — reads flow_daily through escalation_views.js's
+        windowedClassSplit, whose denominator is every resolution class, and
+        stamped_share (the hint).
     (b) 6h-breach — references open_items and breach_6h.
     (c) esc-per-done — references esc_per_done_daily.
     (d) churn — references churn_daily.
@@ -752,17 +766,22 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
         'must be computed from workflow.flow_daily (the only per-day benign/'
         'actionable series in the payload).'
     )
-    assert "'benign'" in strip_fn, (
-        "EscalationStatStrip does not reference the 'benign' class literal — "
-        "sum flow_daily rows where class == 'benign'."
+    assert re.search(r'\bwindowedClassSplit\(', strip_fn), (
+        'EscalationStatStrip does not compute the benign rate through '
+        '`windowedClassSplit(` (escalation_views.js) — summing only the benign and '
+        'actionable rows divides by a narrower whole than origin\'s class split.'
     )
-    assert "'actionable'" in strip_fn, (
-        "EscalationStatStrip does not reference the 'actionable' class literal — "
-        "sum flow_daily rows where class == 'actionable'."
+    assert "'actionable'" not in strip_js_comments(strip_fn), (
+        "EscalationStatStrip still names the 'actionable' class — the benign "
+        'rate\'s denominator is every class the payload serves, not a fixed pair.'
     )
     assert 'stamped_share' in strip_fn, (
         'EscalationStatStrip does not reference stamped_share — add the all-time '
         'stamped-share hint computed from origin.sources[].'
+    )
+    assert re.search(r'\.classified\b', strip_fn) and not re.search(r'\bs\.(benign|actionable)\b', strip_fn), (
+        'the stamped-share hint must weight each source by its served `classified` '
+        'count — summing `s.benign + s.actionable` drops every other class.'
     )
 
     # (b) 6h-breach substrate
@@ -1116,4 +1135,115 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
         f'{seed_capture.group(0)!r}. A first poll that resolves before this '
         'module is evaluated freezes a real payload as the "seed", and paused '
         'polling or endpoint backoff makes that wedge permanent.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 5596 (PRD leaf eta): the tab reads the escalation corpus' named views
+#
+# "Pending in the live queue" and "open in history" are two named populations
+# of ONE walk, served as Datums; escalation_views.js is their one client
+# reader and dashboard/tests/js/escalation_views.test.mjs executes it. What is
+# pinned here is only the wiring a .jsx body cannot run under node.
+# ---------------------------------------------------------------------------
+
+_VIEWS_DESTRUCTURE_RE = re.compile(
+    r'const\s*\{([^}]*)\}\s*=\s*window\.DF_ESCALATION_VIEWS\s*;'
+)
+
+
+def test_tab_escalations_reads_escalation_views_at_module_scope(
+    tab_escalations_jsx_code: str,
+) -> None:
+    """DF_ESCALATION_VIEWS is destructured at module scope, with no fallback.
+
+    The CANONICAL note in datum.js's header: a missing or mis-ordered
+    dependency must throw at load, not degrade silently inside a render.
+    """
+    m = _VIEWS_DESTRUCTURE_RE.search(tab_escalations_jsx_code)
+    assert m is not None, (
+        'tab_escalations.jsx does not destructure `window.DF_ESCALATION_VIEWS` at '
+        'module scope (`const { … } = window.DF_ESCALATION_VIEWS;`, no `|| {}`).'
+    )
+    names = {n.split(':')[-1].strip() for n in m.group(1).split(',') if n.strip()}
+    for name in ('queuePending', 'subsectionQueuePending', 'openInHistoryOver',
+                 'corpusAgeCaption', 'windowedClassSplit', 'taskCard'):
+        assert name in names, (
+            f'tab_escalations.jsx does not take `{name}` from DF_ESCALATION_VIEWS.'
+        )
+
+
+def test_tab_escalations_pill_reads_the_queue_pending_view(
+    tab_escalations_jsx_code: str,
+) -> None:
+    """The header pill renders the served queue_pending view, labelled as such.
+
+    It used to print `byStatus.pending || 0` — a root-only count, request-fresh,
+    beside a strip counting the archive too at a 60s TTL. Now both are views of
+    one walk and each says which population it is.
+    """
+    tab_fn = extract_function_body(tab_escalations_jsx_code, 'EscalationsTab')
+    m = re.search(r'<DatumReading\s+datum=\{([^}]+)\}\s*/>\s*queue pending', tab_fn)
+    assert m is not None, (
+        'EscalationsTab renders no `<DatumReading datum={…} /> queue pending` pill — '
+        'the header count must be the served queue_pending Datum, labelled with the '
+        'population it counts.'
+    )
+    datum_expr = m.group(1).strip()
+    if datum_expr != 'queuePending(DF)':
+        assert re.search(rf'const\s+{re.escape(datum_expr)}\s*=\s*queuePending\(DF\)', tab_fn), (
+            f'the header pill renders `{datum_expr}`, which is not `queuePending(DF)`.'
+        )
+    assert 'byStatus.pending' not in tab_escalations_jsx_code, (
+        'tab_escalations.jsx still counts `byStatus.pending` itself — the pill reads '
+        'the served view, never a client re-count.'
+    )
+
+
+def test_tab_escalations_subsection_pip_reads_the_queue_pending_view(
+    tab_escalations_jsx_code: str,
+) -> None:
+    """Each subsection's pending pip is that queue's served view."""
+    tab_fn = extract_function_body(tab_escalations_jsx_code, 'EscalationsTab')
+    assert re.search(
+        r'<Pip\s+datum=\{subsectionQueuePending\(sec\b[^}]*\}\s+label="queue pending"', tab_fn,
+    ), (
+        'the per-subsection pip does not render '
+        '`<Pip datum={subsectionQueuePending(sec, …)} label="queue pending" />`.'
+    )
+    assert 'secByStatus.pending' not in tab_fn, (
+        'the subsection pip still reads `secByStatus.pending` — read the served view.'
+    )
+
+
+def test_tab_escalations_strip_renders_open_in_history(tab_escalations_jsx_code: str) -> None:
+    """The strip carries an 'open in history' tile over the project filter.
+
+    lifespan.open_items holds every pending record, root or archive, so the 6h
+    breaches it counts are not "of N pending" in the pill's sense; the hint stops
+    saying 'pending' and the open-in-history tile states that population.
+    """
+    strip_fn = extract_function_body(tab_escalations_jsx_code, 'EscalationStatStrip')
+    tiles = re.split(r'(?=<C\.StatTile\b)', strip_fn)[1:]
+    open_tiles = [t.split('/>')[0] for t in tiles if 'label="open in history"' in t.split('/>')[0]]
+    assert len(open_tiles) == 1, (
+        'EscalationStatStrip renders no `<C.StatTile label="open in history" …/>` tile.'
+    )
+    assert re.search(r'datum=\{openInHistoryOver\(DF,\s*projectFilter\)\}', open_tiles[0]), (
+        'the open-in-history tile does not render `openInHistoryOver(DF, projectFilter)`.'
+    )
+    breach_tiles = [t.split('/>')[0] for t in tiles if 'label="6h breaches"' in t.split('/>')[0]]
+    assert len(breach_tiles) == 1, 'could not locate the "6h breaches" tile'
+    assert 'pending' not in breach_tiles[0], (
+        'the 6h-breaches hint still says "pending" — open_items spans the archive '
+        'too, which is the open-in-history population, not the queue\'s pending one.'
+    )
+
+
+def test_tab_escalations_states_the_corpus_age(tab_escalations_jsx_code: str) -> None:
+    """The tab renders how old the corpus walk it shows is, even when fresh."""
+    tab_fn = extract_function_body(tab_escalations_jsx_code, 'EscalationsTab')
+    assert re.search(r'\{\s*corpusAgeCaption\(', tab_fn), (
+        'EscalationsTab renders no `{corpusAgeCaption(…)}` — a count read from a '
+        'cached walk must say when the walk was.'
     )

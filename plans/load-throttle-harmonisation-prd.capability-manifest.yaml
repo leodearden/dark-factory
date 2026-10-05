@@ -514,11 +514,10 @@ tasks:
       so 3590''s ''delete the self-refuting census entry'' clause does not fire'
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: fleet_load_detector
-      paths:
-      - dark-factory-orchestrator.yaml
-      expect: present
+      kind: manual
+      reason: a preservation fact already present on reify main at authoring, which a
+        present-grep can never gate (polarity lint vacuous_present); verified at
+        review
 - label: ρ2
   task_id: 7335
   title: '@own-slice for reify''s verify gates and jobserver balancer, plus the extracted
@@ -638,11 +637,10 @@ tasks:
       changes only Slice= and one Environment=
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: PartOf=orchestrator-reify\.service
-      paths:
-      - scripts/setup-dev.sh
-      expect: present
+      kind: manual
+      reason: a preservation fact already present on reify main at authoring, which a
+        present-grep can never gate (polarity lint vacuous_present); verified at
+        review
   - name: redeploy-script-is-created-sourcing-the-one-renderer
     binding: 'producer:ρ2 — scripts/redeploy-jobserver-unit.sh does not exist. A loud
       stub was committed at decompose so ρ3''s before_done could validate at submit,
@@ -693,11 +691,10 @@ tasks:
       publishes to REIFY_JOBSERVER_HELD_BACK_FILE, default /tmp/reify-jobserver-held-back
     verdict: PASS
     delivered_check:
-      kind: grep
-      pattern: held-back
-      paths:
-      - scripts/jobserver-balancer.py
-      expect: present
+      kind: manual
+      reason: a precondition fact already present on reify main at authoring, which a
+        present-grep can never gate (polarity lint vacuous_present); verified at
+        review
   note: 'Filed in the reify project (project_root /home/leo/src/reify) against this
     dark_factory-hosted PRD. HAND-STAMPED: commit_planning''s stamper derives the
     sidecar as Path(project_root)/re.sub(r''[.]md$'','''',prd_path)+''.capability-manifest.yaml''

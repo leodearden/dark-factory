@@ -103,6 +103,8 @@ candidates:
     sightings: [...]                         # same shape as above
 ```
 
+**The sighting `note` field is human-readable provenance only — it is not machine-read signal, and no census feedback loop runs through it.** `note` is written by `scripts/legibility/codebook.py::_build_sighting` (and requested from the coder by `scripts/legibility/coder.py::build_prompt`), but no code path reads a sighting's `note` back; its readers are humans and agents skimming the raw YAML (`skills/census/SKILL.md` directs that skim). The coder's matching prompt takes codebook content from one seam alone, `scripts/legibility/coder.py::build_codebook_index`, which emits `{id}: {title} — {one-line cause}` per entry and never includes sightings; the census miner reaches the LLM through that same seam. The claim is about `note` alone, not about sightings: other sighting fields do have automated readers (`scripts/legibility/census.py::_entry_cluster`, for one, copies `evidence_quote` into a filed task's evidence). Consequence: a stale present-tense `note` cannot make a census pass re-derive an already-fixed defect as live — unlike an entry's `cause`, which `build_codebook_index` renders to the matcher. Wiring `note` into matching would be new work to file separately, not something this PRD assumes exists.
+
 Phase enum everywhere: `prd | decompose | architect | implement | verify | review | merge | recon | ops | unknown`.
 
 ### 7.2 Digest (extractor output)

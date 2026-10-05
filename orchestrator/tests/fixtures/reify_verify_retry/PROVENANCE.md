@@ -82,7 +82,7 @@ a filter file yields a file that is **non-empty** (reify's "retry refused: no
 subset" loud fallback therefore never fires) and matches **zero tests** — a
 narrowed retry that runs nothing and reports PASS. That is a latent **FALSE
 GREEN**, strictly worse than the inertness the task names. Filter files must
-carry the **bare test name**; `merge_shadow.nextest_filter_ids` performs that
+carry the **bare test name**; `merge_lane/shadow.py::nextest_filter_ids` performs that
 mapping at the single write boundary.
 
 ---
@@ -123,7 +123,7 @@ Load-bearing facts:
   still refuses to run it), but it inflates every filter file toward reify's
   `REIFY_VERIFY_RETRY_MAX_SUBSET` ceiling — and tripping that ceiling makes
   reify refuse narrowing for the whole profile, so an ignore-heavy workspace
-  would silently lose the capability. `merge_shadow._nextest_case_is_planned`
+  would silently lose the capability. `merge_lane/shadow.py::_nextest_case_is_planned`
   drops them.
 * **Unrecognised shapes are treated as PLANNED.** The superset bias is
   deliberate and matches the module's `None`-is-never-an-empty-plan rule: a

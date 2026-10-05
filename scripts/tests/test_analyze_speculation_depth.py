@@ -24,6 +24,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import analyze_speculation_depth as mod
+import pytest
 
 
 def _mv(task_id, passed, *, attempt=0, depth=None):
@@ -303,3 +304,23 @@ class TestMainCLI:
         captured = capsys.readouterr()
         assert ret == 0
         assert '0.5' in captured.out  # F2 per-attempt pass rate == 3/6 == 0.5
+
+    def test_main_opens_db_read_only(self, tmp_path, monkeypatch):
+        """main's handle is opened with a mode=ro URI, so a write on it raises."""
+        db_path = tmp_path / 'runs.db'
+        _seed_events_db(
+            str(db_path),
+            merge_verify_events=F1_MERGE_VERIFY,
+            merge_attempt_events=[],
+        )
+        monkeypatch.setattr(mod, 'load_events', _load_events_attempting_write)
+
+        with pytest.raises(sqlite3.OperationalError, match='readonly'):
+            mod.main([str(db_path)])
+
+
+def _load_events_attempting_write(conn, event_type, since_days):
+    """A load_events stand-in that attempts a write on the handle main passes it."""
+    conn.execute(
+        "INSERT INTO events (timestamp, run_id, event_type) VALUES ('t', 'r', 'x')"
+    )

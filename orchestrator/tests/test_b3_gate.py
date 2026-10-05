@@ -1672,7 +1672,7 @@ class TestPostMergeRedMainAbort:
         with the canonical merge_queue.POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX.
         """
         from orchestrator.b3_gate import POST_MERGE_RED_MAIN_REASON_PREFIX
-        from orchestrator.merge_queue import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+        from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
         assert POST_MERGE_RED_MAIN_REASON_PREFIX == POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX, (
             f'b3_gate prefix {POST_MERGE_RED_MAIN_REASON_PREFIX!r} '
             f'!= merge_queue prefix {POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX!r}'

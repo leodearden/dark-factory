@@ -396,15 +396,17 @@ def resolve_target(
     """Resolve *record*'s focus target.
 
     A SessionRecord resolves from its own display. A DecisionRecord has no
-    display of its own -- it resolves via the session named by its
-    session_id, looked up in *sessions_by_slug*. Fail-soft (PRD §2): a
-    session-less decision, an unresolvable session_id, or a linked session
-    with no display all degrade to None rather than raising -- a gone or
+    display of its own -- it resolves via the session named by
+    DecisionRecord.linked_session_slug (record_slug, falling back to
+    session_id), looked up in *sessions_by_slug*. Fail-soft (PRD §2): a
+    session-less decision, an unresolvable link, or a linked session with no
+    display all degrade to None rather than raising -- a gone or
     never-linked target simply means no focus/urgency call is possible for
     this item.
     """
     if isinstance(record, DecisionRecord):
-        session = sessions_by_slug.get(record.session_id) if record.session_id else None
+        slug = record.linked_session_slug
+        session = sessions_by_slug.get(slug) if slug else None
         display = session.display if session is not None else None
     else:
         display = record.display

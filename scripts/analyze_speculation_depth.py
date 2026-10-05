@@ -13,6 +13,9 @@ Mines the EXISTING event store (no schema migration) for:
     field (task 2340 instrumentation); otherwise a CONFOUNDED runner-split
     fallback (runner is a broken depth proxy — flips sign across windows).
 
+Read-only: the runs.db is opened via a ``mode=ro`` SQLite URI, so the script is
+structurally incapable of writing to a live, continuously-written event store.
+
 Ported from the Phase-0 calibration-mining scratchpad prototype.
 """
 from __future__ import annotations
@@ -23,6 +26,7 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 
@@ -271,7 +275,7 @@ def main(argv: Sequence[str]) -> int:
     )
     args = parser.parse_args(argv)
 
-    conn = sqlite3.connect(args.db_path)
+    conn = sqlite3.connect(f'{Path(args.db_path).resolve().as_uri()}?mode=ro', uri=True)
     try:
         merge_verify_events = load_events(conn, 'merge_verify', args.since)
         merge_attempt_events = load_events(conn, 'merge_attempt', args.since)

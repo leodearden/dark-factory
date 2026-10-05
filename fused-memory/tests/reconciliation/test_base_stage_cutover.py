@@ -15,6 +15,7 @@ from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import STAGE_REPORT_SCHEMA
 from fused_memory.reconciliation.stages.base import BaseStage
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
+from reconciliation.consolidator_fixtures import make_consolidator
 
 
 class _StubStage(BaseStage):
@@ -51,29 +52,6 @@ def _make_stage(
         recon_report_port=recon_report_port,
         recon_report_state=recon_report_state,
     )
-    return stage
-
-
-def _make_consolidator(recon_report_port: int = 8003) -> MemoryConsolidator:
-    """Build a MemoryConsolidator with mocked deps for _build_mcp_config tests."""
-    config = ReconciliationConfig()
-    memory_mock = AsyncMock()
-    memory_mock.get_episodes = AsyncMock(return_value=[])
-    memory_mock.mem0 = AsyncMock()
-    memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
-    memory_mock.get_status = AsyncMock(return_value={})
-
-    stage = MemoryConsolidator(
-        StageId.memory_consolidator,
-        memory_mock,
-        AsyncMock(),  # taskmaster
-        AsyncMock(),  # journal
-        config,
-        scope=ProjectScope(ProjectId('test_project'), ProjectRoot('/tmp/test')),
-        recon_report_port=recon_report_port,
-    )
-    stage.episode_limit = 5
-    stage.memory_limit = 10
     return stage
 
 
@@ -269,20 +247,24 @@ class TestReconStateFallbackToEmpty:
             report = await stage.run([], watermark, [], run_id='run-none')
 
         assert report.items_flagged == [], 'items_flagged must be empty on None assembled'
-        # stats carries ONLY the citation-verification triple, all zero. Task
-        # 2979 hoisted verify_cited_memories into BaseStage.run()'s shared
-        # assembly, and it sets its three counters unconditionally (the
-        # explicit-zero convention) so downstream consumers never need a
-        # .get(..., 0) fallback — including on this empty-report path, where
-        # there are no findings to verify. The claim is report-level, not just
-        # function-level: the only return that bypasses this assembly, the
-        # start_report_failed short-circuit, stamps the same zeroed triple
-        # itself (pinned in TestStartReportErrorHandling).
+        # stats carries ONLY the citation-verification counters, all zero: the
+        # structured TRIPLE (task 2979) plus the four PROSE counters (task
+        # 4818). Both passes run from BaseStage.run()'s shared assembly and set
+        # their counters unconditionally (the explicit-zero convention) so
+        # downstream consumers never need a .get(..., 0) fallback — including on
+        # this empty-report path, where there are no findings to scan. The claim
+        # is report-level, not just function-level: the only return that
+        # bypasses this assembly, the start_report_failed short-circuit, stamps
+        # the same zeroed keys itself (pinned in TestStartReportErrorHandling).
         assert report.stats == {
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
-        }, 'stats must carry only the zeroed citation triple on None assembled'
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
+        }, 'stats must carry only the zeroed citation triple + prose quartet on None assembled'
 
     @pytest.mark.asyncio
     async def test_timestamps_still_set_on_none_assembled(self):
@@ -400,8 +382,8 @@ class TestBuildMcpConfigReconReport:
     """_build_mcp_config must inject a recon-report HTTP entry from the configured port."""
 
     def test_recon_report_entry_default_port(self):
-        """recon-report server entry present with default port 8003."""
-        stage = _make_consolidator(recon_report_port=8003)
+        """recon-report server entry present with BaseStage's default port 8003."""
+        stage = make_consolidator()
         mcp_config = stage._build_mcp_config()
         servers = mcp_config['mcpServers']
         assert 'recon-report' in servers, 'recon-report must be in mcpServers'
@@ -410,14 +392,14 @@ class TestBuildMcpConfigReconReport:
 
     def test_recon_report_entry_custom_port(self):
         """recon-report entry uses the port passed at construction, not a hard-coded value."""
-        stage = _make_consolidator(recon_report_port=9999)
+        stage = make_consolidator(recon_report_port=9999)
         mcp_config = stage._build_mcp_config()
         entry = mcp_config['mcpServers']['recon-report']
         assert entry == {'type': 'http', 'url': 'http://127.0.0.1:9999/mcp/'}
 
     def test_existing_entries_preserved(self):
         """fused-memory and jcodemunch entries still present after recon-report injection."""
-        stage = _make_consolidator(recon_report_port=8003)
+        stage = make_consolidator()
         servers = stage._build_mcp_config()['mcpServers']
         assert 'fused-memory' in servers, 'fused-memory entry must remain'
         assert 'jcodemunch' in servers, 'jcodemunch entry must remain'
@@ -427,21 +409,21 @@ class TestReconJcodemunchLaunchPinned:
     """The recon-stage jcodemunch entry uses the launch contract in shared/jcodemunch_launch.py."""
 
     def test_command_matches_shared_constant(self):
-        stage = _make_consolidator()
+        stage = make_consolidator()
         jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
 
         assert jc['command'] == JCODEMUNCH_COMMAND
 
     def test_env_matches_shared_constant(self):
         """Full dict equality, so a dropped or extra key fails."""
-        stage = _make_consolidator()
+        stage = make_consolidator()
         jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
 
         assert jc['env'] == JCODEMUNCH_ENV
 
     def test_env_is_a_copy_not_the_shared_dict(self):
         """A caller mutating the returned config must not corrupt the process-wide constant."""
-        stage = _make_consolidator()
+        stage = make_consolidator()
         jc = stage._build_mcp_config()['mcpServers']['jcodemunch']
 
         assert jc['env'] is not JCODEMUNCH_ENV
@@ -476,15 +458,22 @@ class TestStartReportErrorHandling:
         assert report.items_flagged == [], (
             'Degraded stage must produce empty items_flagged, not the assembled report'
         )
-        # The degraded early return still stamps the zeroed citation triple: it
-        # is the one path that never reaches BaseStage.run's shared assembly,
-        # so without the stamp it would be the one StageReport missing the
-        # counters, and a consumer indexing report.stats['stage1_*'] would
-        # KeyError on exactly the degraded run it most needs to account for.
+        # The degraded early return still stamps the zeroed citation triple AND
+        # the four zeroed prose counters (task 4818): it is the one path that
+        # never reaches BaseStage.run's shared assembly, so without the stamp it
+        # would be the one StageReport missing the counters, and a consumer
+        # indexing report.stats['stage1_*'] would KeyError on exactly the
+        # degraded run it most needs to account for. That rationale applies
+        # verbatim to the prose keys — they are stamped for the same reason and
+        # on the same path, so the two halves cannot drift apart here.
         assert report.stats == {
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
         }
         # get_assembled_report must NOT have been called (no successful start)
         get_calls = [c for c in state.calls if c[0] == 'get_assembled_report']
@@ -556,9 +545,241 @@ class TestStartReportErrorHandling:
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
         }
         assert result.llm_calls == 0
         assert result.tokens_used == 0
+
+
+class TestProseCitationScanWiring:
+    """``scan_prose_citations`` runs from BaseStage.run()'s shared assembly, so
+    Stages 1-3 all get it and its counters reach the StageReport (task 4818).
+
+    The placement mirrors ``verify_cited_memories``: on the shared
+    ``items_flagged`` assembly, which is the one placement a new stage cannot
+    skip by forgetting to add it, and which converges BOTH the RRS-assembled
+    report and the structured-output JSON fallback.
+    """
+
+    @staticmethod
+    def _assembled_with(description: str) -> dict:
+        return {
+            'summary': 's',
+            'flagged_items': [
+                {
+                    'finding_id': 'f-prose',
+                    'description': description,
+                    'severity': 'minor',
+                    'cited_tasks': [{'task_id': '1', 'project_id': 'p', 'title': 't'}],
+                },
+            ],
+            'stats': {},
+        }
+
+    @pytest.mark.asyncio
+    async def test_fabricated_prose_uuid_reaches_report_stats(self):
+        """A finding whose DESCRIPTION names a fabricated memory id — resolving
+        to nothing, with no deletion tombstone — is counted as a prose phantom
+        on the returned StageReport."""
+        fabricated = '5197cac6-9a7c-4682-b4dc-8b17bf10a3f0'
+        description = f'The canonical entry {fabricated} contradicts this cluster.'
+        state = _FakeReconState(assembled_report=self._assembled_with(description))
+        stage = _make_stage(recon_report_state=state)
+        stage.memory.get_memory_by_id = AsyncMock(return_value=None)
+        stage.memory.get_mem0_deletion_tombstone = AsyncMock(return_value=None)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run([], watermark, [], run_id='run-prose')
+
+        assert report.stats['stage1_prose_phantom_citations'] == 1
+        # WARN-ONLY reaches all the way out: the finding's prose is returned
+        # byte-identical, and no citation_failures marker was manufactured (that
+        # key belongs to the STRUCTURED half, task 2979 — the two stay separate).
+        assert report.items_flagged[0]['description'] == description
+        assert 'citation_failures' not in report.items_flagged[0]
+
+    @pytest.mark.asyncio
+    async def test_tombstoned_prose_uuid_is_not_a_phantom(self):
+        """The three-way split survives the wiring: a deliberately-reaped id
+        named in prose lands in the tombstoned counter, not the phantom one."""
+        reaped = '5197cac6-9a7c-4682-b4dc-8b77b5f48689'
+        state = _FakeReconState(
+            assembled_report=self._assembled_with(f'superseded by {reaped}'),
+        )
+        stage = _make_stage(recon_report_state=state)
+        stage.memory.get_memory_by_id = AsyncMock(return_value=None)
+        stage.memory.get_mem0_deletion_tombstone = AsyncMock(
+            return_value={'deleter': 'memory_consolidator', 'deleting_run_id': 'run-old'},
+        )
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run([], watermark, [], run_id='run-prose-ts')
+
+        assert report.stats['stage1_prose_citations_tombstoned'] == 1
+        assert report.stats['stage1_prose_phantom_citations'] == 0
+
+    @staticmethod
+    def _assembled_citing_and_naming(memory_id: str) -> dict:
+        """One finding whose STRUCTURED citation and PROSE both name the same
+        mem0 id — the interaction the two passes' ordering turns on."""
+        return {
+            'summary': 's',
+            'flagged_items': [
+                {
+                    'finding_id': 'f-both',
+                    'description': f'Memory {memory_id} contradicts this cluster.',
+                    'severity': 'minor',
+                    'cited_memories': [{'memory_id': memory_id, 'store': 'mem0'}],
+                    'cited_tasks': [{'task_id': '1', 'project_id': 'p', 'title': 't'}],
+                },
+            ],
+            'stats': {},
+        }
+
+    @pytest.mark.asyncio
+    async def test_one_shared_resolver_serves_both_halves(self):
+        """BaseStage.run() builds ONE `make_memory_resolver` and hands it to
+        both passes, so an id that is both structurally cited and named in the
+        same report's prose costs ONE Qdrant point read, not two (reviewer
+        finding, task 4818 amendment pass).
+
+        Two independent memos would also let the two reads straddle a
+        concurrent delete and return contradictory verdicts for the same id in
+        the same report; sharing the instance makes them agree by construction
+        rather than by coincidence of timing."""
+        missing = '5197cac6-9a7c-4682-b4dc-8b17bf10a3f0'
+
+        class _WritebackState(_FakeReconState):
+            def apply_citation_verification(self, run_id, corrections):
+                self.calls.append(('apply_citation_verification', run_id, corrections))
+
+        state = _WritebackState(assembled_report=self._assembled_citing_and_naming(missing))
+        stage = _make_stage(recon_report_state=state)
+        stage.memory.get_memory_by_id = AsyncMock(return_value=None)
+        stage.memory.get_mem0_deletion_tombstone = AsyncMock(return_value=None)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            await stage.run([], watermark, [], run_id='run-shared-resolver')
+
+        stage.memory.get_memory_by_id.assert_awaited_once_with('test_project', missing)
+
+    @pytest.mark.asyncio
+    async def test_structured_drop_and_prose_warning_both_fire_for_the_same_id(self):
+        """Running the prose pass AFTER the structured one is deliberate, and
+        this pins WHY (reviewer finding, task 4818 amendment pass).
+
+        A phantom just dropped from `cited_memories` that is STILL named in the
+        finding's prose is a real, separate fact: the structured drop removes
+        the machine-readable claim, but the human-readable one survives into
+        the journal and will be chased by a reader. So both counters fire for
+        the one id, and they are NOT double-counting the same claim — they
+        count two claims with two different remedies. A future refactor that
+        reordered or merged the passes would silently break exactly this."""
+        missing = '5197cac6-9a7c-4682-b4dc-8b17bf10a3f0'
+        description = f'Memory {missing} contradicts this cluster.'
+
+        class _WritebackState(_FakeReconState):
+            def apply_citation_verification(self, run_id, corrections):
+                self.calls.append(('apply_citation_verification', run_id, corrections))
+
+        state = _WritebackState(assembled_report=self._assembled_citing_and_naming(missing))
+        stage = _make_stage(recon_report_state=state)
+        stage.memory.get_memory_by_id = AsyncMock(return_value=None)
+        stage.memory.get_mem0_deletion_tombstone = AsyncMock(return_value=None)
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run([], watermark, [], run_id='run-both-halves')
+
+        assert report.stats['stage1_phantom_citations_dropped'] == 1
+        assert report.stats['stage1_prose_phantom_citations'] == 1
+
+        item = report.items_flagged[0]
+        # The STRUCTURED half acted: the citation is gone and exactly ONE
+        # marker was appended. The PROSE half did not: warn-only means no
+        # second marker, and the description is returned byte-identical.
+        assert item['cited_memories'] == []
+        assert item['citation_failures'] == [
+            {'memory_id': missing, 'store': 'mem0', 'reason': 'memory_not_found'},
+        ]
+        assert item['description'] == description
+
+        # ...and the durable write-back carries only that one structured entry.
+        writebacks = [c for c in state.calls if c[0] == 'apply_citation_verification']
+        assert len(writebacks) == 1
+        assert writebacks[0][2] == [
+            {
+                'finding_id': 'f-both',
+                'cited_memories': [],
+                'citation_failures': [
+                    {'memory_id': missing, 'store': 'mem0', 'reason': 'memory_not_found'},
+                ],
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_start_report_failed_stamp_uses_stage_stat_prefix(self):
+        """The degraded short-circuit's zero-stamp derives its prefix from the
+        SAME ``STAGE_STAT_PREFIX.get(self.stage_id, ...)`` call the structured
+        triple already uses, so a Stage-2/Stage-3 degraded run would stamp
+        ``stage2_``/``stage3_``-prefixed prose keys rather than ``stage1_`` ones.
+
+        Asserted here for the Stage-1 spelling because this file's scaffolding
+        builds a ``_StubStage`` pinned to ``StageId.memory_consolidator``; the
+        per-stage renaming itself is pinned directly on the function in
+        ``test_citation_verifier.py::TestScanProseCitationsSafety``."""
+        from fused_memory.reconciliation.citation_verifier import STAGE_STAT_PREFIX
+
+        class _BrokenState(_FakeReconState):
+            def start_report(self, run_id, stage, project_id):
+                raise RuntimeError('start_report exploded')
+
+        stage = _make_stage(recon_report_state=_BrokenState(assembled_report=None))
+        prefix = STAGE_STAT_PREFIX[stage.stage_id]
+        watermark = Watermark(project_id='test_project')
+
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run([], watermark, [], run_id='run-degraded-prefix')
+
+        assert prefix == 'stage1'
+        for suffix in (
+            'prose_citations_verified',
+            'prose_citations_tombstoned',
+            'prose_phantom_citations',
+            'prose_citation_verification_errors',
+        ):
+            assert report.stats[f'{prefix}_{suffix}'] == 0
 
 
 class TestSessionCaptureLifecycle:

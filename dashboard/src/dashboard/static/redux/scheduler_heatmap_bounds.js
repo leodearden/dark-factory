@@ -57,7 +57,7 @@ function rowTouchesModule(row, module) {
 //   the composed rows.  When it is not (a stale `current_holders` entry whose
 //   task has left active_tasks, the same staleness `_stranded_park_rows`
 //   compensates for), one genuinely-blocked waiter scores contention 1 and
-//   dropping the column would take that waiter's red 'held-by-other' cell
+//   dropping the column would take that waiter's red 'lock-taken' cell
 //   with it.  Still requiring a waiter keeps a merely-held, uncontended
 //   module out: one coloured cell is not contention.
 //

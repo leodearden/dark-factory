@@ -20,6 +20,7 @@
   --warn: oklch(0.80 0.14 80);
   --bad:  oklch(0.68 0.18 25);
   --info: oklch(0.62 0.20 305);
+  --stranded: oklch(0.66 0.19 330);
   --merge-deferred:        oklch(0.74 0.15 60);
   --merge-deferred-bg:     oklch(0.74 0.15 60 / 0.10);
   --merge-deferred-border: oklch(0.74 0.15 60 / 0.4);
@@ -532,6 +533,12 @@ table { border-collapse: collapse; width: 100%; }
 .taskgraph .node.s-cancelled.in-tree          { --sel-color: var(--fg-3); }
 .taskgraph .node.s-cancelled       .status-pip { background: var(--fg-3); }
 .taskgraph .node.s-cancelled { opacity: 0.6; }
+.taskgraph .node.s-review.selected            { --sel-color: var(--info); }
+.taskgraph .node.s-review.in-tree             { --sel-color: var(--info); }
+.taskgraph .node.s-review          .status-pip { background: var(--info); }
+.taskgraph .node.s-infra-hold.selected        { --sel-color: var(--stranded); }
+.taskgraph .node.s-infra-hold.in-tree         { --sel-color: var(--stranded); }
+.taskgraph .node.s-infra-hold      .status-pip { background: var(--stranded); }
 .taskgraph .empty-tier { color: var(--fg-3); font-size: 10px; font-family: var(--mono); padding: 4px; }
 /* Component-block: one weakly-connected component's stacked tier rows, set
    off from neighboring components by a left accent bar + bottom margin. */
@@ -586,10 +593,6 @@ table { border-collapse: collapse; width: 100%; }
    width set inline (data-driven) by the JSX; color comes from the class. */
 .prd-bar { height: 4px; background: var(--bg-2); display: flex; overflow: hidden; }
 .prd-bar-seg { display: block; height: 100%; }
-.prd-bar-seg.s-done        { background: var(--ok); }
-.prd-bar-seg.s-in-progress { background: var(--accent); }
-.prd-bar-seg.s-blocked     { background: var(--bad); }
-.prd-bar-seg.s-pending     { background: var(--warn); }
 
 .prd-box-body { padding-top: 2px; } /* the nested .taskgraph supplies its own 12px padding */
 
@@ -739,11 +742,11 @@ table { border-collapse: collapse; width: 100%; }
   transition: opacity .1s, transform .1s;
 }
 .sched-cell:hover { transform: scale(1.15); }
-/* Cell color states — reuse --ok/--warn/--bad/--accent tokens */
-.sched-cell.free           { background: oklch(0.74 0.14 155 / 0.25); border: 1px solid var(--ok); }
-.sched-cell.held-by-other  { background: oklch(0.68 0.18 25 / 0.35); border: 1px solid var(--bad); }
-.sched-cell.parked-by-me   { background: oklch(0.80 0.14 80 / 0.35); border: 1px solid var(--warn); }
-.sched-cell.parked-by-other { background: oklch(0.80 0.14 80 / 0.18); border: 1px dashed var(--warn); }
+/* Cell states — lockChipState's vocabulary, the same classes the lock chips carry */
+.sched-cell.lock-free      { background: oklch(0.74 0.14 155 / 0.25); border: 1px solid var(--ok); }
+.sched-cell.lock-mine      { background: var(--ok); border: 1px solid var(--ok); }
+.sched-cell.lock-taken     { background: oklch(0.68 0.18 25 / 0.35); border: 1px solid var(--bad); }
+.sched-cell.lock-parked    { background: oklch(0.80 0.14 80 / 0.35); border: 1px solid var(--warn); }
 .sched-cell.not-in-set     { background: var(--bg-2); border: 1px solid transparent; opacity: 0.4; }
 
 .sched-empty {

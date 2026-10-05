@@ -219,13 +219,12 @@ def _register_fetch_tasks(monkeypatch, fetch) -> None:
     may still return an offline marker dict, which is propagated unchanged.
     """
 
-    # ``timeout``/``cached`` are accepted-and-ignored: the unit threads
-    # task_snapshot.PER_CALL_TIMEOUT into both reads and asks the row read for
-    # an UNCACHED answer, so a stub missing either keyword raises TypeError
-    # instead of shaping rows.
+    # ``timeout`` is accepted-and-ignored: the unit threads
+    # task_snapshot.PER_CALL_TIMEOUT into both reads, so a stub missing the
+    # keyword raises TypeError instead of shaping rows.
     async def _narrowed(
         client, config, project_root, *,
-        statuses=None, chunk_size=None, timeout=None, cached=True,
+        statuses=None, chunk_size=None, timeout=None,
     ):
         rows = await fetch(client, config, project_root)
         if not isinstance(rows, list):
@@ -1738,11 +1737,8 @@ class TestShapeOneProjectNarrowing:
 
     @pytest.fixture(autouse=True)
     def _isolate(self, monkeypatch):
-        import dashboard.data.tasks as tasks_mod
-        tasks_mod._fetch_tasks_cache_clear()
         _register_runtime(monkeypatch, {})
         yield
-        tasks_mod._fetch_tasks_cache_clear()
 
     @staticmethod
     def _one_project_config(tmp_path):
@@ -2030,11 +2026,8 @@ class TestDepsOutsideTheFetchedRows:
 
     @pytest.fixture(autouse=True)
     def _isolate(self, monkeypatch):
-        import dashboard.data.tasks as tasks_mod
-        tasks_mod._fetch_tasks_cache_clear()
         _register_runtime(monkeypatch, {})
         yield
-        tasks_mod._fetch_tasks_cache_clear()
 
     @staticmethod
     def _config(tmp_path):

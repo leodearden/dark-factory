@@ -838,3 +838,32 @@ class TestMergeSerialLaneBreachedEventType:
         assert rows[0][7] == 'task/5326'
         assert rows[0][8] == 'mr-29dfdbc2'
         assert rows[0][9] == 'local'
+
+
+class TestPinBlockedEventType:
+    """``pin_blocked`` names why a pinned task cannot dispatch (task 6040)."""
+
+    def test_pin_blocked_round_trips(self, tmp_path: Path) -> None:
+        assert EventType.pin_blocked.value == EventType.pin_blocked.name == 'pin_blocked'
+
+        db_path = tmp_path / 'e.db'
+        store = EventStore(db_path, 'run-1')
+        store.emit(
+            EventType.pin_blocked,
+            task_id='P',
+            data={
+                'task_id': 'P',
+                'pin_order': 1,
+                'head': True,
+                'blockers': [{'module': 'w.py', 'owner': 'H', 'kind': 'held'}],
+            },
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT task_id, json_extract(data, '$.blockers[0].owner') "
+            "FROM events WHERE event_type = 'pin_blocked'"
+        ).fetchall()
+        conn.close()
+
+        assert rows == [('P', 'H')]

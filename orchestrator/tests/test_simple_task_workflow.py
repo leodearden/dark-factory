@@ -15,6 +15,7 @@ from shared.cli_invoke import AgentResult
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.scheduler import BlastRadiusResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 
@@ -100,7 +101,9 @@ def _make(
     config.budgets.simple_task = 1.50
     config.max_turns.simple_task = 30
 
-    handle_blast_radius_expansion = AsyncMock(return_value=blast_radius_grants)
+    handle_blast_radius_expansion = AsyncMock(
+        return_value=BlastRadiusResult(applied=blast_radius_grants),
+    )
     update_task = AsyncMock(return_value=True)
     scheduler = MagicMock()
     scheduler.set_task_status = AsyncMock()

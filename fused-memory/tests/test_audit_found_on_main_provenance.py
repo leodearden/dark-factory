@@ -242,6 +242,19 @@ class TestExtractCitedTaskIdsConventions:
         """A bare `task/{id}` mention anywhere in the message cites the id."""
         assert extract_cited_task_ids('fix: touch task/50 handler') == {'50'}
 
+    @pytest.mark.parametrize('commit_type', ['config', 'perf', 'revert', 'pre', 'prereq'])
+    def test_less_common_conventional_types_cite_the_task_id(self, commit_type):
+        """Each of these types heads real `type(N):` self-citations on main; task
+        4517's `config(4456): ...` lost its only citation once the bare-paren
+        alternative was retired (task 4705)."""
+        subject = f'{commit_type}(4456): set verify_admission_pytest_n: "8" (interim)'
+        assert extract_cited_task_ids(subject) == {'4456'}
+
+    def test_unlisted_type_word_does_not_cite(self):
+        """The type vocabulary is a closed list: a word outside it does not cite,
+        even in `type(N):` shape."""
+        assert extract_cited_task_ids('misc(4456): stray subject') == set()
+
     def test_no_citation_returns_empty_set(self):
         """A message with no citation of any kind yields an empty set."""
         assert extract_cited_task_ids('chore: general cleanup, no ticket') == set()
@@ -912,6 +925,30 @@ class TestClassifyOk:
         verdict, reasons = classify(audit)
         assert verdict == 'ok'
         assert reasons == []
+
+    def test_revert_subject_attributes_the_commit_to_its_task(self):
+        """A `revert(N):` commit is task N's own in-branch step, so it self-cites
+        and outranks a foreign citation in the body."""
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='revert(50): roll back the step-3 filter\n\nSupersedes (task 77).',
+            declared_files=[],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'ok'
+        assert reasons == []
+
+    def test_revert_subject_does_not_vouch_for_the_deliverable(self):
+        """Self-citation is attribution only: a `revert(N):` commit whose diff
+        misses every declared file still reads deliverable_absent."""
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='revert(50): roll back the step-3 filter',
+            declared_files=['src/thing.py'],
+            commit_files=['src/other.py'],
+        )
+        verdict, _ = classify(audit)
+        assert verdict == 'deliverable_absent'
 
     def test_declared_files_present_in_commit_is_ok(self):
         """Declared files present in the commit diff are sufficient, even with no citation."""

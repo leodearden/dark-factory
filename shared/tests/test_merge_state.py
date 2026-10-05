@@ -57,7 +57,7 @@ _MERGE_STATE_SOURCE = _SRC / 'shared' / 'merge_state.py'
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MERGE_TYPES_SOURCE = (
-    _REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'merge_types.py'
+    _REPO_ROOT / 'orchestrator' / 'src' / 'orchestrator' / 'merge_lane' / 'types.py'
 )
 
 # ---------------------------------------------------------------------------

@@ -13,10 +13,10 @@ Human-readable twin of `memory-write-path-convergence.capability-manifest.yaml` 
 | η | 3132 | truncated-id delete hard-errors (API enforcement where DF 1144's prompt fix failed) | PASS |
 | θ | 3133 | `consolidate_memories` exists; closure proof returns survivors, never a claimed closure | PASS |
 | ι | 3134 | Stage-1 merges via the op; blanket `recon-stage-*` exemption retired | PASS |
-| κ | 3136 | timer unit committed (`OnCalendar`); gate filing cites deterministically enumerated clusters | PASS |
+| κ | 3136 | timer unit committed (`OnCalendar` in `scripts/fused-memory-duplicate-audit.timer`); gate filing cites deterministically enumerated clusters | PASS |
 | λ | 3137 | search hits carry `agent_id`/`task_id`/`created_at` | PASS |
 | μ | 3138 | style-based injection flag requires prior `agent_id` provenance check | PASS |
-| ν | 3139 | `reexamine_when` validated at the submit boundary (INV-1) | PASS |
+| ν | 3139 | `reexamine_when` validated at the submit boundary (INV-1); manual check, verified by 3139's own tests | PASS |
 | ξ | 3140 | terminal transitions flag citing memories (re-corroborated first — INV-3); flags never delete | PASS |
 | ο | 3141 | markup rejection names the matched pattern; rejection storm escalates naming DF 3083 | PASS |
 | π | 3142 | false completion claims ingest tagged `unverified_claim` + flag | PASS |

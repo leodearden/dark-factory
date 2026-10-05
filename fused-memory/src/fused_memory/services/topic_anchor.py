@@ -30,13 +30,20 @@ The two rejected arms are rejected for reasons that have not changed:
   (``x_contested``), placed in the Tier-C ``x_`` experimental namespace
   precisely so it needs no amendment to task 3195's closed
   ``RESERVED_VOCABULARY_KEYS`` set, and ``grouped_read.is_contested_child``
-  already reads it.  What is missing is a WRITER: nothing under ``src/``
-  stamps that key, and task 4004's stated basis for the exclusion is exactly
-  that ``contested`` "has no writer, and no adjudication surface anywhere in
-  the running system".  So PRD V2's esc-5712 protection — a contested child is
-  NEVER suppressed — cannot be satisfied by any suppressing arm today, and
-  every suppressing arm ships without it.  The precondition for re-deciding is
-  a writer plus an adjudication surface, NOT a vocabulary amendment.
+  already reads it.  A WRITER now exists in code (task 3128):
+  ``server/tools.py`` stamps the key on an amendment child that write-triage
+  judges to contradict its parent, behind the gate
+  ``server/write_triage.py::resolve_write_triage_enabled``
+  (``write_triage.enabled``), whose rollout state is tracked in
+  ``docs/prds/memory-metadata-vocabulary.md``, not here.  There is still no
+  adjudication surface anywhere in the running system.  Task 4004's stated
+  basis for the exclusion — that ``contested`` "has no writer, and no adjudication surface
+  anywhere in the running system" — was written before that writer landed;
+  the writer half of it is now out of date, the adjudication half is not.  So
+  PRD V2's esc-5712 protection — a contested child is NEVER suppressed —
+  cannot be satisfied by any suppressing arm today, and every suppressing arm
+  ships without it.  The preconditions for re-deciding are an adjudication
+  surface plus an enabled write-triage gate, NOT a vocabulary amendment.
   4004 says expressly that this is "an exclusion on landability, not a
   measurement verdict", so do not restate it as one: that arm's measured row
   is reported in full so a later reader with a LIVE ``contested`` key can

@@ -22,16 +22,15 @@ becomes a specimen of the very corruption under test and trips the read-side
 prefilter. Specimens are BUILT from ``shared.toolcall_markup``'s own constants
 by :func:`_leaked`, exactly as ``shared/tests/test_toolcall_markup.py`` and the
 middleware itself already do. The rule is enforced mechanically, not by
-convention alone, by the two guards at the foot of this file:
-``test_this_module_spells_no_raw_envelope_literal`` for this file and
-``test_the_guard_source_spells_no_raw_envelope_literal`` for ``markup_guard.py``.
+convention alone, repo-wide by
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``,
+which covers this file and ``markup_guard.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -49,7 +48,6 @@ from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import RepairPolicy
 from shared.toolcall_markup import (
     CANONICAL_OPENER_PREFIX,
-    ENVELOPE_LITERALS,
     closer_for,
 )
 
@@ -1359,69 +1357,3 @@ class TestUnrepairableResidueIsPreserved:
         assert payload['error_type'] == 'mcp_markup_unrepairable'
         assert payload['escalation_id'] is None
         mock_service.add_system_record.assert_not_awaited()
-
-
-# ---------------------------------------------------------------------------
-# Source-hygiene guards (task 4948): the AUTHORING RULE in this module's
-# docstring, enforced mechanically rather than by convention alone. Modelled
-# on tests/server/test_markup_tripwire.py's block (task 4228), whose needle
-# set and scanner it repeats; whether such per-file copies give way to one
-# shared scanner is task 5209's design call.
-# ---------------------------------------------------------------------------
-
-#: Every ENVELOPE_LITERALS member plus the two structural prefixes a
-#: hand-spelled specimen could use instead of the enumerated literals — the
-#: bare closing-tag prefix (catches any closer, not just the enumerated ones)
-#: and the ``parameter`` opening-tag prefix with no trailing space (so it also
-#: catches an attribute-less opener spelling).
-_RAW_SENTINEL_NEEDLES = (*ENVELOPE_LITERALS, chr(60) + '/', chr(60) + 'parameter')
-
-
-def _raw_sentinel_hits(source: str) -> dict[str, list[int]]:
-    """Map each offending needle found in ``source`` to its 1-based lines."""
-    source_lines = source.splitlines()
-    return {
-        needle: [i + 1 for i, line in enumerate(source_lines) if needle in line]
-        for needle in _RAW_SENTINEL_NEEDLES
-        if needle in source
-    }
-
-
-def test_the_guard_source_spells_no_raw_envelope_literal():
-    """CROSS-FILE: markup_guard.py's own source must carry no raw literal.
-
-    The path is resolved from this file rather than ``markup_guard.__file__``:
-    an editable install can resolve the import to ANOTHER checkout's source,
-    and the guard must read the tree this test came from.
-    """
-    source_path = (
-        Path(__file__).resolve().parents[1]
-        / 'src'
-        / 'fused_memory'
-        / 'server'
-        / 'markup_guard.py'
-    )
-    assert source_path.is_file(), f'expected markup_guard.py at {source_path}'
-    source = source_path.read_text(encoding='utf-8')
-
-    hits = _raw_sentinel_hits(source)
-    assert not hits, (
-        f'{source_path.name} contains raw envelope sentinel(s) {hits!r}. Spell '
-        'them with the \\x3c escape instead — see shared/src/shared/'
-        'toolcall_markup.py\'s "Sentinel-literal hazard" section for why.'
-    )
-
-
-def test_this_module_spells_no_raw_envelope_literal():
-    """SELF-FILE (the idiom task 4696 promoted): this test module's own source
-    must never contain a raw envelope literal either.
-    """
-    source = Path(__file__).read_text(encoding='utf-8')
-
-    hits = _raw_sentinel_hits(source)
-    assert not hits, (
-        'A raw envelope literal was written into this test file. Build it from '
-        "shared.toolcall_markup's constants, as _leaked() does, or spell it "
-        "with the \\x3c escape in prose — see the AUTHORING RULE in this module's "
-        f'docstring. Offending needle(s): {hits!r}.'
-    )

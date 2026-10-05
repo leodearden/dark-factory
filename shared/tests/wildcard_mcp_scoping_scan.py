@@ -6,10 +6,11 @@ Why this exists
 ``disallowed_tools=['*']`` wildcard verbatim when an ``output_schema`` is also
 present.  The schema is delivered through a synthetic ``StructuredOutput``
 tool that a ``'*'`` deny would block, failing every structured-output call, so
-the builder substitutes ``_REAL_BUILTIN_TOOLS_DENYLIST`` instead.
+the builder emits ``--tools ''`` instead.
 
-That list is **built-ins only**.  It carries no MCP tool pattern.  So at a call
-that reads as "deny every tool", MCP tools are still reachable — and the CLI
+That registry filter removes built-in and deferred tools, but it does **not**
+filter MCP.  So at a call that reads as "deny every tool", MCP tools are still
+reachable — and the CLI
 ambient-merges whatever ``.mcp.json`` sits at ``cwd``.  This repo's root holds a
 live one (servers ``escalation``, ``fused-memory``), and every one of these
 callers runs at ``permission_mode='bypassPermissions'``, so the result is
@@ -103,7 +104,7 @@ EXEMPT_NEUTRAL_CWD = 'neutral_cwd'
 NOT_EXEMPT = ''
 
 _VIOLATION_MESSAGE = (
-    'wildcard deny + output_schema expands to a BUILT-INS-ONLY deny-list, so MCP '
+    "wildcard deny + output_schema becomes --tools '', which does not filter MCP, so MCP "
     'tools stay reachable and the ambient .mcp.json at cwd is merged'
 )
 _STRICT_MCP_MESSAGE = (

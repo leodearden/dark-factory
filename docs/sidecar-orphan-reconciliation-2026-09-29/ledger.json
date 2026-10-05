@@ -1,0 +1,2744 @@
+{
+ "task_id": "4935",
+ "measured_at": "2026-09-29",
+ "dark_factory_main_sha": "7bb8138c4088cc4022f44f7c39a6d5b449ad35fd",
+ "reify_main_sha": "9663f2a5dc9dac70f2ecc517778f6f39791f9e92",
+ "action_vocabulary": [
+  "stamped",
+  "stamped_after_sidecar_repoint",
+  "sidecar_converted_to_manual",
+  "not_stamped_done_producer",
+  "not_stamped_superseded",
+  "deferred_inflight",
+  "owned_by_other_task",
+  "not_an_orphan_kind_drift",
+  "foreign_block_pending_external_task_id",
+  "write_rejected"
+ ],
+ "field_notes": {
+  "lint": "the polarity-lint verdict (shared.delivered_check_polarity.lint_delivered_checks, ref main, files = the producer's metadata.files, manifest_path = the sidecar) on the descriptor as it stood BEFORE this task acted; null means clean. A re-pointed descriptor's post-repoint verdict is in sidecar_adjudications.",
+  "producer_project": "the registry the producer task lives in; reify rows were read and written with project_root /home/leo/src/reify and linted against reify main",
+  "readback_verified": "a read-only tasks.db readback after the write: delivered_checks equals the written list and every other metadata key is byte-identical to the pre-write capture"
+ },
+ "baseline": {
+  "command": "uv run --project shared python scripts/audit_delivered_checks.py --project-root /home/leo/src/dark-factory --json (unmodified script, worktree HEAD 7ee6239001)",
+  "exit_code": 1,
+  "descriptors_total": 903,
+  "counts": {
+   "orphans": 60,
+   "delivered": 25,
+   "healthy": 14,
+   "no_task": 15,
+   "superseded": 1,
+   "vacuous_live_gate": 5
+  },
+  "rows": [
+   {
+    "task_id": 2574,
+    "name": "delivered-checks-metadata-submodel-registered",
+    "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+    "task_label": "α",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2574,
+    "name": "sidecar-loader-models-exist",
+    "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+    "task_label": "α",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2576,
+    "name": "decompose-step-2.5-names-the-yaml-sidecar",
+    "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+    "task_label": "β",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2578,
+    "name": "manifest-stamping-report-in-commit-planning-response",
+    "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+    "task_label": "γ",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2580,
+    "name": "deps-satisfied-consumes-delivered-check-cache",
+    "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+    "task_label": "δ",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2583,
+    "name": "l2-escalation-names-the-failed-check",
+    "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+    "task_label": "ε",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2773,
+    "name": "qdrant-compat-tests-integration-marked",
+    "manifest": "plans/cpu-load-robust-verify-prd.capability-manifest.yaml",
+    "task_label": "δ",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2862,
+    "name": "eval-bootstrap-smoke-gate",
+    "manifest": "plans/fable-architect-eval-admission-prd.capability-manifest.yaml",
+    "task_label": "τ1",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2889,
+    "name": "stranded-verified-green-direct-submit",
+    "manifest": "plans/stranding-remediation-scheduler-ergonomics-prd.capability-manifest.yaml",
+    "task_label": "α",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2891,
+    "name": "terminal-lane-reclaim",
+    "manifest": "plans/stranding-remediation-scheduler-ergonomics-prd.capability-manifest.yaml",
+    "task_label": "γ",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3081,
+    "name": "self-owned-lock-distinguished-from-contention",
+    "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+    "task_label": "δ2",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3127,
+    "name": "triage-behind-contract-fixed-flag",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "beta",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3128,
+    "name": "closed-output-routing-vocabulary",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "gamma",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3129,
+    "name": "add-only-child-representation",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "delta",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3130,
+    "name": "calibration-script-derives-thresholds",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "alpha",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3133,
+    "name": "closure-proof-survivors",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "theta",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3133,
+    "name": "consolidate-op-exists",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "theta",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3134,
+    "name": "stage1-uses-op",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "iota",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3135,
+    "name": "runtime-cluster-store-merged-with-seeds",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "zeta",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3141,
+    "name": "rejection-storm-escalates",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "omicron",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3142,
+    "name": "false-claims-tagged-not-dropped",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "pi",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3195,
+    "name": "census-line-grep-anchor",
+    "manifest": "docs/prds/memory-metadata-vocabulary.capability-manifest.yaml",
+    "task_label": "beta",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3195,
+    "name": "structured-rejection-contract-fixed",
+    "manifest": "docs/prds/memory-metadata-vocabulary.capability-manifest.yaml",
+    "task_label": "beta",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3195,
+    "name": "vocab-registry-wired-at-service",
+    "manifest": "docs/prds/memory-metadata-vocabulary.capability-manifest.yaml",
+    "task_label": "beta",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 3632,
+    "name": "realized-driver-path",
+    "manifest": "plans/fable-architect-trial-v2-prd.capability-manifest.yaml",
+    "task_label": "β2",
+    "status": "done",
+    "disposition": "delivered"
+   },
+   {
+    "task_id": 2890,
+    "name": "repend-while-paused-visible",
+    "manifest": "plans/stranding-remediation-scheduler-ergonomics-prd.capability-manifest.yaml",
+    "task_label": "β",
+    "status": "deferred",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 2892,
+    "name": "trip-reason-category-share",
+    "manifest": "plans/stranding-remediation-scheduler-ergonomics-prd.capability-manifest.yaml",
+    "task_label": "δ",
+    "status": "deferred",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 3131,
+    "name": "inverted-instruction-rendered",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "epsilon",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 3139,
+    "name": "schema-validated-at-submit-boundary",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "nu",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 3140,
+    "name": "terminal-transition-flags-citing-memories",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "xi",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 4681,
+    "name": "predicate-variant-script-exists",
+    "manifest": "docs/prds/recurring-deterministic-tasks.capability-manifest.yaml",
+    "task_label": "r6",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 5034,
+    "name": "reachback-patch-guard-retired",
+    "manifest": "plans/merge-lane-quality-prd.capability-manifest.yaml",
+    "task_label": "δ",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 5382,
+    "name": "cost-credits-and-cost-basis-columns",
+    "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+    "task_label": "α",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 5384,
+    "name": "glm-price-is-tagged-imputed-not-metered",
+    "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+    "task_label": "γ",
+    "status": "in-progress",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 5384,
+    "name": "zai-coding-plan-endpoint",
+    "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+    "task_label": "γ",
+    "status": "in-progress",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 5387,
+    "name": "cost-ratio-guard-does-not-compare-unlike-bases",
+    "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+    "task_label": "ε1",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 5387,
+    "name": "credit-exhaustion-is-a-named-terminal",
+    "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+    "task_label": "ε1",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 5389,
+    "name": "dual-cost-columns-credits-and-imputed-usd",
+    "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+    "task_label": "θ1",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 5614,
+    "name": "build-fingerprint-generalized",
+    "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+    "task_label": "θ",
+    "status": "pending",
+    "disposition": "healthy"
+   },
+   {
+    "task_id": 7334,
+    "name": "c-a1-is-re-sourced-and-its-contract-kept",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ1",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7334,
+    "name": "cpu-some-arm-switched-off",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ1",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7334,
+    "name": "harmonised-block-lands-in-the-reify-yaml",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ1",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7334,
+    "name": "the-detector-block-and-its-census-entry-are-untouched",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ1",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7334,
+    "name": "the-four-single-tenant-assertions-are-corrected",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ1",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7335,
+    "name": "admission-knob-parity-guard-satisfied-not-tripped",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ2",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7335,
+    "name": "one-unit-rendering-site",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ2",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7335,
+    "name": "own-slice-sentinel-in-both-implementations",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ2",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7335,
+    "name": "partof-and-the-canary-timer-survive",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ2",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7335,
+    "name": "redeploy-script-is-created-sourcing-the-one-renderer",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ2",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7335,
+    "name": "the-ambient-var-ledger-gains-a-row-per-knob",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ2",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7335,
+    "name": "the-sentinel-is-yaml-quoted",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ2",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7335,
+    "name": "the-slice-name-to-place-the-unit-under",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ2",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7335,
+    "name": "the-unit-pinning-guard-is-co-changed-not-broken",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ2",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 7336,
+    "name": "held-back-is-observable-for-the-signal",
+    "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+    "task_label": "ρ3",
+    "status": null,
+    "disposition": "no_task"
+   },
+   {
+    "task_id": 3141,
+    "name": "markup-rejection-with-named-pattern",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "omicron",
+    "status": "done",
+    "disposition": "superseded"
+   },
+   {
+    "task_id": 3136,
+    "name": "timer-unit-committed",
+    "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+    "task_label": "kappa",
+    "status": "pending",
+    "disposition": "vacuous_live_gate"
+   },
+   {
+    "task_id": 5613,
+    "name": "systemd-unit-points-at-df",
+    "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+    "task_label": "η",
+    "status": "pending",
+    "disposition": "vacuous_live_gate"
+   },
+   {
+    "task_id": 5615,
+    "name": "docs-no-longer-claim-reclaim-time-enforcement",
+    "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+    "task_label": "ι",
+    "status": "pending",
+    "disposition": "vacuous_live_gate"
+   },
+   {
+    "task_id": 5616,
+    "name": "reify-scripts-reduced-to-contract-primitives",
+    "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+    "task_label": "κ",
+    "status": "pending",
+    "disposition": "vacuous_live_gate"
+   },
+   {
+    "task_id": 5754,
+    "name": "watcher-per-task-limit-kept",
+    "manifest": "plans/plan-deviation-recording-prd.capability-manifest.yaml",
+    "task_label": "δ",
+    "status": "pending",
+    "disposition": "vacuous_live_gate"
+   }
+  ]
+ },
+ "actions": [
+  {
+   "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+   "label": "α",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2574,
+   "capability": "delivered-checks-metadata-submodel-registered",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+   "label": "α",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2574,
+   "capability": "sidecar-loader-models-exist",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+   "label": "β",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2576,
+   "capability": "decompose-step-2.5-names-the-yaml-sidecar",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+   "label": "γ",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2578,
+   "capability": "manifest-stamping-report-in-commit-planning-response",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+   "label": "δ",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2580,
+   "capability": "deps-satisfied-consumes-delivered-check-cache",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/capability-delivered-checks-prd.capability-manifest.yaml",
+   "label": "ε",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2583,
+   "capability": "l2-escalation-names-the-failed-check",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/cpu-load-robust-verify-prd.capability-manifest.yaml",
+   "label": "δ",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2773,
+   "capability": "qdrant-compat-tests-integration-marked",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/fable-architect-eval-admission-prd.capability-manifest.yaml",
+   "label": "τ1",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2862,
+   "capability": "eval-bootstrap-smoke-gate",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_an_orphan_kind_drift",
+   "owner": "6036",
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "metadata already carries a same-named kind=path check; the sidecar grep copy was a phantom of the audit's grep-only dedupe (fixed in step-2); the descriptor drift itself belongs to task 6036"
+  },
+  {
+   "manifest": "plans/stranding-remediation-scheduler-ergonomics-prd.capability-manifest.yaml",
+   "label": "α",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2889,
+   "capability": "stranded-verified-green-direct-submit",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/stranding-remediation-scheduler-ergonomics-prd.capability-manifest.yaml",
+   "label": "γ",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2891,
+   "capability": "terminal-lane-reclaim",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+   "label": "δ2",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3081,
+   "capability": "self-owned-lock-distinguished-from-contention",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "beta",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3127,
+   "capability": "triage-behind-contract-fixed-flag",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "gamma",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3128,
+   "capability": "closed-output-routing-vocabulary",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "delta",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3129,
+   "capability": "add-only-child-representation",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "alpha",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3130,
+   "capability": "calibration-script-derives-thresholds",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "theta",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3133,
+   "capability": "closure-proof-survivors",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "theta",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3133,
+   "capability": "consolidate-op-exists",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "iota",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3134,
+   "capability": "stage1-uses-op",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "zeta",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3135,
+   "capability": "runtime-cluster-store-merged-with-seeds",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "omicron",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3141,
+   "capability": "rejection-storm-escalates",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "pi",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3142,
+   "capability": "false-claims-tagged-not-dropped",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-metadata-vocabulary.capability-manifest.yaml",
+   "label": "beta",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3195,
+   "capability": "census-line-grep-anchor",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-metadata-vocabulary.capability-manifest.yaml",
+   "label": "beta",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3195,
+   "capability": "structured-rejection-contract-fixed",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "docs/prds/memory-metadata-vocabulary.capability-manifest.yaml",
+   "label": "beta",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3195,
+   "capability": "vocab-registry-wired-at-service",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/fable-architect-trial-v2-prd.capability-manifest.yaml",
+   "label": "β2",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3632,
+   "capability": "realized-driver-path",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; check delivered on main; deliberately not stamped (design decision: a stamped check on a done producer only adds regression-wedge exposure for its open dependents)"
+  },
+  {
+   "manifest": "plans/stranding-remediation-scheduler-ergonomics-prd.capability-manifest.yaml",
+   "label": "β",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2890,
+   "capability": "repend-while-paused-visible",
+   "kind": "grep",
+   "status_at_write": "deferred",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "repend_while_paused",
+    "expect": "present",
+    "paths": [
+     "orchestrator/src/orchestrator/"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "repend-while-paused-visible",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": "deferred; metadata carries x_coalesced_into=5311 (backlog sweep 2026-09-09)"
+  },
+  {
+   "manifest": "plans/stranding-remediation-scheduler-ergonomics-prd.capability-manifest.yaml",
+   "label": "δ",
+   "producer_project": "dark_factory",
+   "producer_task_id": 2892,
+   "capability": "trip-reason-category-share",
+   "kind": "grep",
+   "status_at_write": "deferred",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "storm:",
+    "expect": "present",
+    "paths": [
+     "orchestrator/src/orchestrator/harness.py"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "trip-reason-category-share",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": "deferred; metadata carries x_coalesced_into=5311 (backlog sweep 2026-09-09)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "epsilon",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3131,
+   "capability": "inverted-instruction-rendered",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "the server deduplicates",
+    "expect": "present",
+    "paths": [
+     "orchestrator/src/orchestrator/agents/"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "inverted-instruction-rendered",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "nu",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3139,
+   "capability": "schema-validated-at-submit-boundary",
+   "kind": "manual",
+   "status_at_write": "pending",
+   "lint": {
+    "severity": "reject",
+    "code": "filename_shaped"
+   },
+   "action": "sidecar_converted_to_manual",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "3139's description and details name no concrete validation symbol to re-point to"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "xi",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3140,
+   "capability": "terminal-transition-flags-citing-memories",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "reexamine_when",
+    "expect": "present",
+    "paths": [
+     "fused-memory/src/fused_memory/reconciliation/"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "terminal-transition-flags-citing-memories",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "docs/prds/recurring-deterministic-tasks.capability-manifest.yaml",
+   "label": "r6",
+   "producer_project": "dark_factory",
+   "producer_task_id": 4681,
+   "capability": "predicate-variant-script-exists",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "not_an_orphan_kind_drift",
+   "owner": "6036",
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "metadata already carries a same-named kind=path check; the sidecar grep copy was a phantom of the audit's grep-only dedupe (fixed in step-2); the descriptor drift itself belongs to task 6036"
+  },
+  {
+   "manifest": "plans/merge-lane-quality-prd.capability-manifest.yaml",
+   "label": "δ",
+   "producer_project": "dark_factory",
+   "producer_task_id": 5034,
+   "capability": "reachback-patch-guard-retired",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": {
+    "severity": "warn",
+    "code": "absent_overbroad"
+   },
+   "action": "owned_by_other_task",
+   "owner": "5446",
+   "payload_entry": {
+    "pattern": "test_merge_queue_reachback_patch_guard",
+    "expect": "absent",
+    "paths": [
+     "orchestrator/"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "reachback-patch-guard-retired",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": "stamped at 09:10:17Z then REVERTED at 09:11:04Z (5034 metadata restored byte-exactly): 5034 metadata x_reachback_guard_check_moved_to=5446 records that Leo's ruling esc-5024-2/esc-5025-2 moved this check to 5446, which carries it; the sidecar δ block still binds it to 5034 (esc-4935-4)"
+  },
+  {
+   "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+   "label": "α",
+   "producer_project": "dark_factory",
+   "producer_task_id": 5382,
+   "capability": "cost-credits-and-cost-basis-columns",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "cost_basis",
+    "expect": "present",
+    "paths": [
+     "orchestrator/src/orchestrator/run_store.py"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "cost-credits-and-cost-basis-columns",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+   "label": "γ",
+   "producer_project": "dark_factory",
+   "producer_task_id": 5384,
+   "capability": "glm-price-is-tagged-imputed-not-metered",
+   "kind": "grep",
+   "status_at_write": "in-progress",
+   "lint": null,
+   "action": "deferred_inflight",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "imputed",
+    "expect": "present",
+    "paths": [
+     "orchestrator/src/orchestrator/evals/configs.py"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "glm-price-is-tagged-imputed-not-metered",
+    "kind": "grep"
+   },
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "producer in-progress (a workflow holds it); lint clean; re-run the audit after it leaves the workflow and stamp if still unwired"
+  },
+  {
+   "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+   "label": "γ",
+   "producer_project": "dark_factory",
+   "producer_task_id": 5384,
+   "capability": "zai-coding-plan-endpoint",
+   "kind": "grep",
+   "status_at_write": "in-progress",
+   "lint": null,
+   "action": "deferred_inflight",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "coding/paas/v4",
+    "expect": "present",
+    "paths": [
+     "orchestrator/src/orchestrator/evals/configs.py"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "zai-coding-plan-endpoint",
+    "kind": "grep"
+   },
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "producer in-progress (a workflow holds it); lint clean; re-run the audit after it leaves the workflow and stamp if still unwired"
+  },
+  {
+   "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+   "label": "ε1",
+   "producer_project": "dark_factory",
+   "producer_task_id": 5387,
+   "capability": "cost-ratio-guard-does-not-compare-unlike-bases",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "cost_basis",
+    "expect": "present",
+    "paths": [
+     "orchestrator/src/orchestrator/shadow_eval.py"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "cost-ratio-guard-does-not-compare-unlike-bases",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+   "label": "ε1",
+   "producer_project": "dark_factory",
+   "producer_task_id": 5387,
+   "capability": "credit-exhaustion-is-a-named-terminal",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "credits_exhausted",
+    "expect": "present",
+    "paths": [
+     "orchestrator/src/orchestrator/"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "credit-exhaustion-is-a-named-terminal",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+   "label": "θ1",
+   "producer_project": "dark_factory",
+   "producer_task_id": 5389,
+   "capability": "dual-cost-columns-credits-and-imputed-usd",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "imputed",
+    "expect": "present",
+    "paths": [
+     "orchestrator/src/orchestrator/evals/"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "dual-cost-columns-credits-and-imputed-usd",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+   "label": "θ",
+   "producer_project": "reify",
+   "producer_task_id": 5614,
+   "capability": "build-fingerprint-generalized",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "build-fingerprint",
+    "expect": "present",
+    "paths": [
+     "scripts/refresh-warm-base.sh"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "build-fingerprint-generalized",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": "in dark-factory's audit this warm-lane block misjoins to unrelated DF 5614 until 4731 rebinds it"
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ1",
+   "producer_project": "reify",
+   "producer_task_id": 7334,
+   "capability": "c-a1-is-re-sourced-and-its-contract-kept",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "own-slice",
+    "expect": "present",
+    "paths": [
+     "docs/prds/cpu-load-admission-control.md"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "c-a1-is-re-sourced-and-its-contract-kept",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ1",
+   "producer_project": "reify",
+   "producer_task_id": 7334,
+   "capability": "cpu-some-arm-switched-off",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "cpu_some_avg10: 70",
+    "expect": "absent",
+    "paths": [
+     "dark-factory-orchestrator.yaml"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "cpu-some-arm-switched-off",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ1",
+   "producer_project": "reify",
+   "producer_task_id": 7334,
+   "capability": "harmonised-block-lands-in-the-reify-yaml",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "runqueue_ratio: 4\\.0",
+    "expect": "present",
+    "paths": [
+     "dark-factory-orchestrator.yaml"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "harmonised-block-lands-in-the-reify-yaml",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ1",
+   "producer_project": "reify",
+   "producer_task_id": 7334,
+   "capability": "the-detector-block-and-its-census-entry-are-untouched",
+   "kind": "manual",
+   "status_at_write": "pending",
+   "lint": {
+    "severity": "reject",
+    "code": "vacuous_present"
+   },
+   "action": "sidecar_converted_to_manual",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "linted against repo_root=/home/leo/src/reify ref=main with the reify task's metadata.files; 'capability→producer (wired)' fact"
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ1",
+   "producer_project": "reify",
+   "producer_task_id": 7334,
+   "capability": "the-four-single-tenant-assertions-are-corrected",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "multi-tenant",
+    "expect": "present",
+    "paths": [
+     "docs/prds/cpu-load-admission-control.md"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "the-four-single-tenant-assertions-are-corrected",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "admission-knob-parity-guard-satisfied-not-tripped",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "REIFY_PSI_GATE_PROC_PATH",
+    "expect": "present",
+    "paths": [
+     "tests/infra/test_verify_admission_knob_parity.sh"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "admission-knob-parity-guard-satisfied-not-tripped",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "one-unit-rendering-site",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "render_jobserver_unit",
+    "expect": "present",
+    "paths": [
+     "scripts/setup-dev.sh"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "one-unit-rendering-site",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "own-slice-sentinel-in-both-implementations",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "own-slice",
+    "expect": "present",
+    "paths": [
+     "scripts/cpu-admit.sh",
+     "scripts/jobserver-balancer.py"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "own-slice-sentinel-in-both-implementations",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "partof-and-the-canary-timer-survive",
+   "kind": "manual",
+   "status_at_write": "pending",
+   "lint": {
+    "severity": "reject",
+    "code": "vacuous_present"
+   },
+   "action": "sidecar_converted_to_manual",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "linted against repo_root=/home/leo/src/reify ref=main with the reify task's metadata.files; 'capability→producer (wired)' fact"
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "redeploy-script-is-created-sourcing-the-one-renderer",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "render_jobserver_unit",
+    "expect": "present",
+    "paths": [
+     "scripts/redeploy-jobserver-unit.sh"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "redeploy-script-is-created-sourcing-the-one-renderer",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "the-ambient-var-ledger-gains-a-row-per-knob",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "REIFY_(PSI|COMPILE)_GATE_PROC_PATH",
+    "expect": "present",
+    "paths": [
+     "tests/infra/run-all-ambient-vars.manifest"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "the-ambient-var-ledger-gains-a-row-per-knob",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "the-sentinel-is-yaml-quoted",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "\"@own-slice\"",
+    "expect": "present",
+    "paths": [
+     "dark-factory-orchestrator.yaml"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "the-sentinel-is-yaml-quoted",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "the-slice-name-to-place-the-unit-under",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "Slice=df-reify\\.slice",
+    "expect": "present",
+    "paths": [
+     "scripts/setup-dev.sh"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "the-slice-name-to-place-the-unit-under",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "the-unit-pinning-guard-is-co-changed-not-broken",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "render_jobserver_unit",
+    "expect": "present",
+    "paths": [
+     "tests/infra/test_host_global_unit_pinning.sh"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "the-unit-pinning-guard-is-co-changed-not-broken",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": null
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ3",
+   "producer_project": "reify",
+   "producer_task_id": 7336,
+   "capability": "held-back-is-observable-for-the-signal",
+   "kind": "manual",
+   "status_at_write": "pending",
+   "lint": {
+    "severity": "reject",
+    "code": "vacuous_present"
+   },
+   "action": "sidecar_converted_to_manual",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "linted against repo_root=/home/leo/src/reify ref=main with the reify task's metadata.files; 'capability→producer (wired)' fact"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "omicron",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3141,
+   "capability": "markup-rejection-with-named-pattern",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_superseded",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "done producer; later work legitimately undid the pattern; stamping would wedge dependents on a legitimately undone check"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "kappa",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3136,
+   "capability": "timer-unit-committed",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": {
+    "severity": "reject",
+    "code": "vacuous_present"
+   },
+   "action": "stamped_after_sidecar_repoint",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "OnCalendar",
+    "expect": "present",
+    "paths": [
+     "scripts/fused-memory-duplicate-audit.timer"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "timer-unit-committed",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": "paths narrowed to the timer file 3136's own metadata.files declares; absent on main, so the grep fails today and lints clean (repo_root=/home/leo/src/dark-factory, ref=main); post-repoint lint clean"
+  },
+  {
+   "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+   "label": "η",
+   "producer_project": "reify",
+   "producer_task_id": 5613,
+   "capability": "systemd-unit-points-at-df",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "stamped",
+   "owner": null,
+   "payload_entry": {
+    "pattern": "reify/scripts/warm-lane-gc-sweep\\.sh",
+    "expect": "absent",
+    "paths": [
+     "deploy/systemd/"
+    ],
+    "script": null,
+    "args": [],
+    "timeout_secs": null,
+    "name": "systemd-unit-points-at-df",
+    "kind": "grep"
+   },
+   "write_ok": true,
+   "readback_verified": true,
+   "note": "in dark-factory's audit this warm-lane block misjoins to unrelated DF 5613 until 4731 rebinds it"
+  },
+  {
+   "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+   "label": "ι",
+   "producer_project": "reify",
+   "producer_task_id": 5615,
+   "capability": "docs-no-longer-claim-reclaim-time-enforcement",
+   "kind": "grep",
+   "status_at_write": "done",
+   "lint": null,
+   "action": "not_stamped_done_producer",
+   "owner": null,
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "reify producer is done; in dark-factory's audit the ι block misjoins to unrelated DF 5615 (a false vacuous_live_gate) until 4731 rebinds it"
+  },
+  {
+   "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+   "label": "κ",
+   "producer_project": "reify",
+   "producer_task_id": 5616,
+   "capability": "reify-scripts-reduced-to-contract-primitives",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": {
+    "severity": "reject",
+    "code": "vacuous_absent"
+   },
+   "action": "foreign_block_pending_external_task_id",
+   "owner": "agent-followup-4935 (after 4731)",
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "reify producer; descriptor refused by the polarity lint at reify main; in dark-factory's audit the κ block misjoins to unrelated DF 5616 until 4731 rebinds it"
+  },
+  {
+   "manifest": "plans/plan-deviation-recording-prd.capability-manifest.yaml",
+   "label": "δ",
+   "producer_project": "dark_factory",
+   "producer_task_id": 5754,
+   "capability": "watcher-per-task-limit-kept",
+   "kind": "grep",
+   "status_at_write": "pending",
+   "lint": null,
+   "action": "owned_by_other_task",
+   "owner": "6036",
+   "payload_entry": null,
+   "write_ok": null,
+   "readback_verified": null,
+   "note": "comment-only vacuous descriptor in plans/plan-deviation-recording-prd.capability-manifest.yaml, which task 6036 (in-progress) owns"
+  }
+ ],
+ "action_counts": {
+  "not_stamped_done_producer": 25,
+  "not_an_orphan_kind_drift": 2,
+  "stamped": 22,
+  "sidecar_converted_to_manual": 4,
+  "owned_by_other_task": 2,
+  "deferred_inflight": 2,
+  "not_stamped_superseded": 1,
+  "stamped_after_sidecar_repoint": 1,
+  "foreign_block_pending_external_task_id": 1
+ },
+ "sidecar_adjudications": [
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "kappa",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3136,
+   "capability": "timer-unit-committed",
+   "before": {
+    "kind": "grep",
+    "pattern": "OnCalendar",
+    "paths": [
+     "scripts/"
+    ],
+    "expect": "present"
+   },
+   "lint_before": {
+    "severity": "reject",
+    "code": "vacuous_present"
+   },
+   "after": {
+    "kind": "grep",
+    "pattern": "OnCalendar",
+    "paths": [
+     "scripts/fused-memory-duplicate-audit.timer"
+    ],
+    "expect": "present"
+   },
+   "lint_after": null,
+   "action": "stamped_after_sidecar_repoint",
+   "note": "paths narrowed to the timer file 3136's own metadata.files declares; absent on main, so the grep fails today and lints clean (repo_root=/home/leo/src/dark-factory, ref=main)"
+  },
+  {
+   "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+   "label": "nu",
+   "producer_project": "dark_factory",
+   "producer_task_id": 3139,
+   "capability": "schema-validated-at-submit-boundary",
+   "before": {
+    "kind": "grep",
+    "pattern": "reexamine_when",
+    "paths": [
+     "fused-memory/src/fused_memory/"
+    ],
+    "expect": "present"
+   },
+   "lint_before": {
+    "severity": "reject",
+    "code": "filename_shaped"
+   },
+   "after": {
+    "kind": "manual",
+    "reason": "rejection-mechanism behaviour; a bare-identifier grep was refused by the polarity lint (filename_shaped); verified by 3139's own tests"
+   },
+   "lint_after": null,
+   "action": "sidecar_converted_to_manual",
+   "note": "3139's description and details name no concrete validation symbol to re-point to"
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ1",
+   "producer_project": "reify",
+   "producer_task_id": 7334,
+   "capability": "the-detector-block-and-its-census-entry-are-untouched",
+   "before": {
+    "kind": "grep",
+    "pattern": "fleet_load_detector",
+    "paths": [
+     "dark-factory-orchestrator.yaml"
+    ],
+    "expect": "present"
+   },
+   "lint_before": {
+    "severity": "reject",
+    "code": "vacuous_present"
+   },
+   "after": {
+    "kind": "manual",
+    "reason": "a preservation fact already present on reify main at authoring, which a present-grep can never gate (polarity lint vacuous_present); verified at review"
+   },
+   "lint_after": null,
+   "action": "sidecar_converted_to_manual",
+   "note": "linted against repo_root=/home/leo/src/reify ref=main with the reify task's metadata.files; 'capability→producer (wired)' fact"
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ2",
+   "producer_project": "reify",
+   "producer_task_id": 7335,
+   "capability": "partof-and-the-canary-timer-survive",
+   "before": {
+    "kind": "grep",
+    "pattern": "PartOf=orchestrator-reify\\.service",
+    "paths": [
+     "scripts/setup-dev.sh"
+    ],
+    "expect": "present"
+   },
+   "lint_before": {
+    "severity": "reject",
+    "code": "vacuous_present"
+   },
+   "after": {
+    "kind": "manual",
+    "reason": "a preservation fact already present on reify main at authoring, which a present-grep can never gate (polarity lint vacuous_present); verified at review"
+   },
+   "lint_after": null,
+   "action": "sidecar_converted_to_manual",
+   "note": "linted against repo_root=/home/leo/src/reify ref=main with the reify task's metadata.files; 'capability→producer (wired)' fact"
+  },
+  {
+   "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+   "label": "ρ3",
+   "producer_project": "reify",
+   "producer_task_id": 7336,
+   "capability": "held-back-is-observable-for-the-signal",
+   "before": {
+    "kind": "grep",
+    "pattern": "held-back",
+    "paths": [
+     "scripts/jobserver-balancer.py"
+    ],
+    "expect": "present"
+   },
+   "lint_before": {
+    "severity": "reject",
+    "code": "vacuous_present"
+   },
+   "after": {
+    "kind": "manual",
+    "reason": "a precondition fact already present on reify main at authoring, which a present-grep can never gate (polarity lint vacuous_present); verified at review"
+   },
+   "lint_after": null,
+   "action": "sidecar_converted_to_manual",
+   "note": "linted against repo_root=/home/leo/src/reify ref=main with the reify task's metadata.files; 'capability→producer (wired)' fact"
+  }
+ ],
+ "context": {
+  "task_4731": "pending at measurement (not landed): the warm-lane η–κ blocks still carry reify task ids that collide with unrelated dark-factory 5613–5616, so dark-factory's audit misjoins them",
+  "task_6036": "in-progress; owns the 2862/4681 descriptor drift and 5754",
+  "escalations": {
+   "esc-4935-4": "5034 write reverted: check deliberately moved to 5446",
+   "esc-4935-5": "2890/2892 coalesced into 5311, which carries no delivered_checks"
+  }
+ },
+ "follow_up": {
+  "ticket": "tkt_0RV7072RRXN8Z0HTZJTPDSFFBH",
+  "escalation_id": "agent-followup-4935",
+  "suggestion_hash": "4935-foreign-registry-blocks-external-task-id-after-4731",
+  "depends_on": "4731"
+ },
+ "after": {
+  "dark_factory": {
+   "command": "branch script (HEAD 8e72750b6d), --project-root /home/leo/src/dark-factory --json; 5m50s",
+   "exit_code": 1,
+   "coverage": {
+    "descriptors_total": 901,
+    "descriptors_without_task": 15,
+    "sidecars_unloadable": 0,
+    "unevaluable": 0
+   },
+   "all_dispositions": {
+    "delivered": 424,
+    "healthy": 391,
+    "vacuous_live_gate": 55,
+    "superseded": 4,
+    "broken": 2,
+    "inert": 5,
+    "unwired_live_gate": 5,
+    "no_task": 15
+   },
+   "orphan_counts": {
+    "delivered": 24,
+    "unwired_live_gate": 5,
+    "superseded": 1,
+    "no_task": 15,
+    "vacuous_live_gate": 4
+   },
+   "orphans_not_delivered": [
+    {
+     "task_id": 7334,
+     "name": "c-a1-is-re-sourced-and-its-contract-kept",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ1",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7334,
+     "name": "cpu-some-arm-switched-off",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ1",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7334,
+     "name": "harmonised-block-lands-in-the-reify-yaml",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ1",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7334,
+     "name": "the-detector-block-and-its-census-entry-are-untouched",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ1",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7334,
+     "name": "the-four-single-tenant-assertions-are-corrected",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ1",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7335,
+     "name": "admission-knob-parity-guard-satisfied-not-tripped",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ2",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7335,
+     "name": "one-unit-rendering-site",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ2",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7335,
+     "name": "own-slice-sentinel-in-both-implementations",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ2",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7335,
+     "name": "partof-and-the-canary-timer-survive",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ2",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7335,
+     "name": "redeploy-script-is-created-sourcing-the-one-renderer",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ2",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7335,
+     "name": "the-ambient-var-ledger-gains-a-row-per-knob",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ2",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7335,
+     "name": "the-sentinel-is-yaml-quoted",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ2",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7335,
+     "name": "the-slice-name-to-place-the-unit-under",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ2",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7335,
+     "name": "the-unit-pinning-guard-is-co-changed-not-broken",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ2",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 7336,
+     "name": "held-back-is-observable-for-the-signal",
+     "manifest": "plans/load-throttle-harmonisation-prd.capability-manifest.yaml",
+     "task_label": "ρ3",
+     "status": null,
+     "disposition": "no_task",
+     "open_dependents": []
+    },
+    {
+     "task_id": 3141,
+     "name": "markup-rejection-with-named-pattern",
+     "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+     "task_label": "omicron",
+     "status": "done",
+     "disposition": "superseded",
+     "open_dependents": []
+    },
+    {
+     "task_id": 3139,
+     "name": "schema-validated-at-submit-boundary",
+     "manifest": "docs/prds/memory-write-path-convergence.capability-manifest.yaml",
+     "task_label": "nu",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      3140
+     ]
+    },
+    {
+     "task_id": 5034,
+     "name": "reachback-patch-guard-retired",
+     "manifest": "plans/merge-lane-quality-prd.capability-manifest.yaml",
+     "task_label": "δ",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      5035,
+      5036,
+      5446
+     ]
+    },
+    {
+     "task_id": 5384,
+     "name": "glm-price-is-tagged-imputed-not-metered",
+     "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+     "task_label": "γ",
+     "status": "in-progress",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      5385,
+      5399
+     ]
+    },
+    {
+     "task_id": 5384,
+     "name": "zai-coding-plan-endpoint",
+     "manifest": "plans/live-shadow-eval-prd.capability-manifest.yaml",
+     "task_label": "γ",
+     "status": "in-progress",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      5385,
+      5399
+     ]
+    },
+    {
+     "task_id": 5614,
+     "name": "build-fingerprint-generalized",
+     "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+     "task_label": "θ",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": []
+    },
+    {
+     "task_id": 5613,
+     "name": "systemd-unit-points-at-df",
+     "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+     "task_label": "η",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": []
+    },
+    {
+     "task_id": 5615,
+     "name": "docs-no-longer-claim-reclaim-time-enforcement",
+     "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+     "task_label": "ι",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": []
+    },
+    {
+     "task_id": 5616,
+     "name": "reify-scripts-reduced-to-contract-primitives",
+     "manifest": "plans/warm-lane-infra-repatriation-prd.capability-manifest.yaml",
+     "task_label": "κ",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": []
+    },
+    {
+     "task_id": 5754,
+     "name": "watcher-per-task-limit-kept",
+     "manifest": "plans/plan-deviation-recording-prd.capability-manifest.yaml",
+     "task_label": "δ",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": []
+    }
+   ],
+   "reading": "the audit reads MAIN's sidecars, so step-5's edits (3139, ρ1/ρ2/ρ3 to manual) are invisible until this branch merges; after merge 3139 leaves UNWIRED LIVE GATES and the three ρ manual rows leave no_task. 5613–5616 remain until 4731 rebinds the warm-lane blocks."
+  },
+  "reify": {
+   "command": "branch script, --project-root /home/leo/src/reify --json; 5m14s",
+   "exit_code": 1,
+   "coverage": {
+    "descriptors_total": 986,
+    "descriptors_without_task": 0,
+    "sidecars_unloadable": 1,
+    "unevaluable": 3
+   },
+   "all_dispositions": {
+    "delivered": 217,
+    "healthy": 384,
+    "vacuous_live_gate": 359,
+    "unevaluable": 3,
+    "broken": 7,
+    "inert": 2,
+    "unwired_live_gate": 14
+   },
+   "stamped_rows": [
+    {
+     "task_id": 5613,
+     "name": "systemd-unit-points-at-df",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 5614,
+     "name": "build-fingerprint-generalized",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7334,
+     "name": "harmonised-block-lands-in-the-reify-yaml",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7334,
+     "name": "cpu-some-arm-switched-off",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7334,
+     "name": "c-a1-is-re-sourced-and-its-contract-kept",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7334,
+     "name": "the-four-single-tenant-assertions-are-corrected",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7335,
+     "name": "own-slice-sentinel-in-both-implementations",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7335,
+     "name": "one-unit-rendering-site",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7335,
+     "name": "admission-knob-parity-guard-satisfied-not-tripped",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7335,
+     "name": "the-unit-pinning-guard-is-co-changed-not-broken",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7335,
+     "name": "the-ambient-var-ledger-gains-a-row-per-knob",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7335,
+     "name": "the-sentinel-is-yaml-quoted",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7335,
+     "name": "the-slice-name-to-place-the-unit-under",
+     "source": "metadata",
+     "disposition": "healthy"
+    },
+    {
+     "task_id": 7335,
+     "name": "redeploy-script-is-created-sourcing-the-one-renderer",
+     "source": "metadata",
+     "disposition": "healthy"
+    }
+   ],
+   "reify_native_orphans_not_delivered": [
+    {
+     "task_id": 5284,
+     "name": "doc-chunk-carve-out-preserved",
+     "manifest": "docs/prds/merge-gate-compile-cost.capability-manifest.yaml",
+     "task_label": "CMP-2",
+     "status": "done",
+     "disposition": "broken",
+     "open_dependents": [
+      5286
+     ]
+    },
+    {
+     "task_id": 5403,
+     "name": "bolt-ons-subsumed-and-still-deletable",
+     "manifest": "docs/prds/v0_6/check-diagnostic-truthfulness.capability-manifest.yaml",
+     "task_label": "γ",
+     "status": "done",
+     "disposition": "broken",
+     "open_dependents": [
+      5386,
+      5404,
+      5438,
+      5542,
+      5543,
+      5749,
+      5811,
+      6251,
+      6608,
+      6769,
+      6913,
+      6917,
+      7393
+     ]
+    },
+    {
+     "task_id": 5627,
+     "name": "severity-safe-pre-delta-BY-MEASUREMENT-not-construction",
+     "manifest": "docs/prds/v0_6/dimensioned-construction-strictness.capability-manifest.yaml",
+     "task_label": "γ",
+     "status": "done",
+     "disposition": "broken",
+     "open_dependents": [
+      5646,
+      5767,
+      5798,
+      6240
+     ]
+    },
+    {
+     "task_id": 5658,
+     "name": "variadic-helper-exists",
+     "manifest": "docs/prds/v0_6/units-length-gate-completion.capability-manifest.yaml",
+     "task_label": "5658",
+     "status": "done",
+     "disposition": "broken",
+     "open_dependents": []
+    },
+    {
+     "task_id": 5695,
+     "name": "doc-chunk-carve-out-preserved",
+     "manifest": "docs/prds/merge-gate-compile-cost.capability-manifest.yaml",
+     "task_label": "CMP-5",
+     "status": "done",
+     "disposition": "broken",
+     "open_dependents": [
+      5286
+     ]
+    },
+    {
+     "task_id": 5791,
+     "name": "relocation-is-not-verbatim-13-self-paths",
+     "manifest": "docs/prds/v0_6/dimension-checked-readers.capability-manifest.yaml",
+     "task_label": "α",
+     "status": "done",
+     "disposition": "broken",
+     "open_dependents": [
+      5795,
+      5797,
+      5803,
+      5804,
+      5805,
+      5806,
+      5807,
+      5808,
+      5809,
+      6922,
+      6941,
+      6942
+     ]
+    },
+    {
+     "task_id": 5285,
+     "name": "leaf-crate-enters-release-sensitive-list",
+     "manifest": "docs/prds/merge-gate-compile-cost.capability-manifest.yaml",
+     "task_label": "E1",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      5286
+     ]
+    },
+    {
+     "task_id": 5285,
+     "name": "reify-eval-exits-release-sensitive-list",
+     "manifest": "docs/prds/merge-gate-compile-cost.capability-manifest.yaml",
+     "task_label": "E1",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      5286
+     ]
+    },
+    {
+     "task_id": 5312,
+     "name": "all-bare-string-call-sites-migrated",
+     "manifest": "docs/prds/v0_6/fea-load-support-selector-migration.capability-manifest.yaml",
+     "task_label": "Bmig2",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      4371,
+      4833,
+      5313,
+      7143
+     ]
+    },
+    {
+     "task_id": 5312,
+     "name": "residual-fields-flipped-to-selector-types",
+     "manifest": "docs/prds/v0_6/fea-load-support-selector-migration.capability-manifest.yaml",
+     "task_label": "Bmig2",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      4371,
+      4833,
+      5313,
+      7143
+     ]
+    },
+    {
+     "task_id": 5313,
+     "name": "pointload-point-drives-vertex-node-set",
+     "manifest": "docs/prds/v0_6/fea-load-support-selector-migration.capability-manifest.yaml",
+     "task_label": "Bmig2-consume",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      4371,
+      7143
+     ]
+    },
+    {
+     "task_id": 5482,
+     "name": "dynamic-count-rejection",
+     "manifest": "docs/prds/v0_6/indexed-sub-instantiation.capability-manifest.yaml",
+     "task_label": "β",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      5483,
+      5484,
+      5485,
+      6626
+     ]
+    },
+    {
+     "task_id": 5482,
+     "name": "relate-rejection",
+     "manifest": "docs/prds/v0_6/indexed-sub-instantiation.capability-manifest.yaml",
+     "task_label": "β",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      5483,
+      5484,
+      5485,
+      6626
+     ]
+    },
+    {
+     "task_id": 6689,
+     "name": "solver-free-is-by-omission",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "α",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      6690,
+      6691,
+      6692,
+      6693,
+      6694,
+      6695,
+      6696,
+      6698,
+      6704,
+      6728,
+      6736,
+      6773
+     ]
+    },
+    {
+     "task_id": 6691,
+     "name": "house-sort-pattern-exists",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "γ",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      6700,
+      6701,
+      6704,
+      6711,
+      6902
+     ]
+    },
+    {
+     "task_id": 6692,
+     "name": "one-sided-corner-pick",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "ε",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      6693,
+      6704
+     ]
+    },
+    {
+     "task_id": 6693,
+     "name": "posture-comment-retired",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "δ",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      6631,
+      6694,
+      6695,
+      6698,
+      6700,
+      6701,
+      6702,
+      6703,
+      6704,
+      6773
+     ]
+    },
+    {
+     "task_id": 6701,
+     "name": "invariant-file-and-family-convention",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "χ",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      6704
+     ]
+    },
+    {
+     "task_id": 6702,
+     "name": "readme-line-is-false",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "ψ",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      6704
+     ]
+    },
+    {
+     "task_id": 6804,
+     "name": "shared-seam-is-upstream-and-filed",
+     "manifest": "docs/prds/v0_6/driver-contract-implementation.capability-manifest.yaml",
+     "task_label": "φ",
+     "status": "pending",
+     "disposition": "unwired_live_gate",
+     "open_dependents": [
+      6807,
+      6808
+     ]
+    },
+    {
+     "task_id": 5482,
+     "name": "collection-elaboration-substrate",
+     "manifest": "docs/prds/v0_6/indexed-sub-instantiation.capability-manifest.yaml",
+     "task_label": "β",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": [
+      5483,
+      5484,
+      5485,
+      6626
+     ]
+    },
+    {
+     "task_id": 6689,
+     "name": "solver-registry-production-exists",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "α",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": [
+      6690,
+      6691,
+      6692,
+      6693,
+      6694,
+      6695,
+      6696,
+      6698,
+      6704,
+      6728,
+      6736,
+      6773
+     ]
+    },
+    {
+     "task_id": 6690,
+     "name": "cells-reaching-index-exists",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "β",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": [
+      6699,
+      6704
+     ]
+    },
+    {
+     "task_id": 6693,
+     "name": "compute-trampoline-registration",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "δ",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": [
+      6631,
+      6694,
+      6695,
+      6698,
+      6700,
+      6701,
+      6702,
+      6703,
+      6704,
+      6773
+     ]
+    },
+    {
+     "task_id": 6694,
+     "name": "reify-constraints-is-a-normal-dep",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "ζ",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": [
+      6700,
+      6704,
+      6781,
+      6793
+     ]
+    },
+    {
+     "task_id": 6694,
+     "name": "testresult-diagnostics-field-exists",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "ζ",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": [
+      6700,
+      6704,
+      6781,
+      6793
+     ]
+    },
+    {
+     "task_id": 6699,
+     "name": "tolerance-basis-is-in-tree",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "κ",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": [
+      6700,
+      6701,
+      6704,
+      6712,
+      6727,
+      6736,
+      6902
+     ]
+    },
+    {
+     "task_id": 6702,
+     "name": "chunk-registry-and-pinned-count",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "ψ",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": [
+      6704
+     ]
+    },
+    {
+     "task_id": 6703,
+     "name": "index-guard-exists",
+     "manifest": "docs/prds/v0_6/solver-driver-parity.capability-manifest.yaml",
+     "task_label": "ω",
+     "status": "pending",
+     "disposition": "vacuous_live_gate",
+     "open_dependents": [
+      6704
+     ]
+    }
+   ],
+   "reading": "every row this task stamped reads source=metadata, disposition healthy. The other rows are reify's OWN sidecar orphans, first made visible by the unwired_live_gate disposition; they are out of this task's scope and recorded as a finding."
+  }
+ }
+}

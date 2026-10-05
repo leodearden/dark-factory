@@ -46,8 +46,9 @@ test — the Write/Edit argument terminates early, truncating this file and
 silently dropping that call's sibling arguments.
 
 So every specimen is assembled from ``_markup_helpers``' builders, which build
-their angle bracket from ``chr(60)``, and its ``assert_no_raw_sentinels``
-enforces that on this module's OWN BYTES at import.
+their angle bracket from ``chr(60)``, and
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
+enforces the rule on this module, repo-wide.
 """
 
 from __future__ import annotations
@@ -62,7 +63,6 @@ import pytest
 from _markup_helpers import (
     INVOKE_CLOSER,
     LT,
-    assert_no_raw_sentinels,
     closer,
     param_opener,
     type_alternatives,
@@ -76,13 +76,6 @@ from shared.toolcall_markup import ENVELOPE_LITERALS, MARKUP_OVERRIDE_KEY, detec
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import markup_journal, markup_sink, plan_markup_stamp, plan_tools
 from orchestrator.workflow import _is_gating_escalation
-
-# The sentinel builders and the import-time self-scan live in
-# ``_markup_helpers``: three suites in this package need them and none may hold
-# a second copy (INV-5). Imported under this module's own local spellings so
-# every specimen below still reads as it always did.
-assert_no_raw_sentinels(__file__)
-
 
 # ---------------------------------------------------------------------------
 # Specimens — the measured plan-tools leak shapes.

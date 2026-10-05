@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 
 import anyio
@@ -17,6 +19,7 @@ import httpx
 from shared.mcp_idempotency import maybe_inject_client_op_id
 
 from dashboard.config import DashboardConfig
+from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.mcp_fanout import (
     FANOUT_FAILURE_EXCEPTIONS,
     call_with_deadline,
@@ -408,6 +411,7 @@ async def get_queue_stats(
     merged_counts: dict[str, int] = {}
     oldest_age: float | None = None
     any_success = False
+    errors: list[str] = []
 
     for url in config.fused_memory_urls:
         try:
@@ -422,6 +426,7 @@ async def get_queue_stats(
             # under-report queue counts at DEBUG with no journal trace at all.
             log_fanout_failure('get_queue_stats', url, e)
             invalidate_session(url)
+            errors.append(f'{url}: {describe_exc(e)}')
             continue
 
         note_fanout_success('get_queue_stats', url)
@@ -434,8 +439,47 @@ async def get_queue_stats(
             oldest_age = age
 
     if not any_success:
-        return {'offline': True, 'error': 'All servers unreachable'}
+        return {'offline': True, 'error': '; '.join(errors)}
     return {'counts': merged_counts, 'oldest_pending_age_seconds': oldest_age}
+
+
+WRITE_QUEUE_FRESHNESS_BOUND_SECONDS = 30
+"""How long a write-queue reading stays fresh.
+
+It must outlast the /memory route's own fan-out (each leg is bounded at 5 s),
+so the routine slow path does not serve its own probe stale — the same
+reasoning as ``merge_queue.py::LIVE_QUEUE_FRESHNESS_BOUND_SECONDS``.
+"""
+
+
+def write_queue_datum(
+    stats: Mapping[str, Any], *, measured_at: datetime,
+) -> Datum[dict[str, Any]]:
+    """The write queue as one Datum: the one normaliser of a get_queue_stats answer.
+
+    A reachable answer is a fresh ``{pending, retry, dead,
+    oldest_pending_age_seconds}``, a missing count reading 0. An offline one
+    is ``unknown`` carrying the probe's own error verbatim: an unmeasured
+    queue is a hole, never a row of zeros.
+    """
+    if stats.get('offline'):
+        return unknown_datum(
+            stats.get('error') or 'get_queue_stats reported offline without an error',
+            WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
+        )
+    counts = stats.get('counts') or {}
+    return Datum(
+        {
+            'pending': counts.get('pending', 0),
+            'retry': counts.get('retry', 0),
+            'dead': counts.get('dead', 0),
+            'oldest_pending_age_seconds': stats.get('oldest_pending_age_seconds'),
+        },
+        measured_at,
+        DatumState.FRESH,
+        None,
+        WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
+    )
 
 
 # Intentionally NOT converted to first_success: collects a per-URL entry from

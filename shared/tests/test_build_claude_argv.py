@@ -13,12 +13,27 @@ from unittest.mock import patch
 import pytest
 
 from shared.cli_invoke import (
-    _REAL_BUILTIN_TOOLS_DENYLIST,
     build_claude_argv,
     no_mcp_servers_config,
 )
 
 _TMP_PLACEHOLDER = '<TMP>'
+
+# The tool registry CLI 2.1.283 reported in its ``system/init`` event on
+# 2026-09-27 under the argv this module USED to build for output_schema +
+# ``disallowed_tools=['*']`` (an enumerated 18-name built-in deny list).  It is
+# an INDEPENDENT literal, deliberately not derived from cli_invoke: asserting an
+# argv against the module's own list is the tautology that let that list go
+# stale while ToolSearch loaded and ran CronList.  RemoteTrigger appeared only
+# on an authenticated run, so the real inventory is account-dependent and no
+# enumerated deny list can be complete.
+_CLI_2_1_283_INIT_INVENTORY = frozenset({
+    'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'EnterWorktree',
+    'ExitWorktree', 'ListAgents', 'Monitor', 'PushNotification',
+    'RemoteTrigger', 'ReportFindings', 'ScheduleWakeup', 'SendMessage',
+    'Skill', 'StructuredOutput', 'TaskCreate', 'TaskGet', 'TaskList',
+    'TaskUpdate', 'ToolSearch', 'Workflow',
+})
 
 
 def _normalize(cmd: list[str], temp_files: list[str]) -> list[str]:
@@ -181,37 +196,87 @@ def test_build_claude_argv_fresh_and_resume_carry_identical_system_prompt() -> N
         _cleanup(resume_temps)
 
 
-def test_build_claude_argv_expands_deny_list_when_schema_and_wildcard() -> None:
-    """CLI-2.1.168 fix: output_schema + disallowed_tools=['*'] expands the
-    wildcard into the real-builtins deny-list (which omits StructuredOutput)
-    instead of emitting the literal '*'.
-    """
-    cmd, temp_files = build_claude_argv(
+def _wildcard_argv(
+    disallowed_tools: list[str],
+    *,
+    output_schema: dict | None = None,
+    resume_session_id: str | None = None,
+) -> tuple[list[str], list[str]]:
+    return build_claude_argv(
         model='opus',
         max_budget_usd=5.0,
         system_prompt='sys',
         max_turns=10,
         permission_mode='bypassPermissions',
         allowed_tools=None,
-        disallowed_tools=['*'],
+        disallowed_tools=disallowed_tools,
         mcp_config=None,
-        output_schema={'type': 'object'},
+        output_schema=output_schema,
         effort=None,
-        resume_session_id=None,
+        resume_session_id=resume_session_id,
         session_id=None,
     )
+
+
+def _assert_registry_filtered(cmd: list[str]) -> None:
+    """The schema+wildcard contract: ``--tools ''`` stands in for ``'*'``.
+
+    ``--tools ''`` is the CLI's registry filter.  With ``--json-schema`` set it
+    leaves only the synthetic StructuredOutput tool, so no built-in or deferred
+    tool can be named, loaded via ToolSearch, or run.
+    """
+    assert cmd.count('--tools') == 1, f'expected one --tools flag; got {cmd!r}'
+    assert cmd[cmd.index('--tools') + 1] == '', f'got {cmd!r}'
+    assert '*' not in cmd
+    leaked = _CLI_2_1_283_INIT_INVENTORY & set(cmd)
+    assert not leaked, f'an enumerated tool list is back in argv: {sorted(leaked)}'
+
+
+def test_build_claude_argv_schema_wildcard_emits_empty_tools_registry_filter() -> None:
+    """output_schema + disallowed_tools=['*'] swaps the wildcard for
+    ``--tools ''`` and, with nothing else to deny, emits no
+    ``--disallowed-tools`` at all.
+    """
+    cmd, temp_files = _wildcard_argv(['*'], output_schema={'type': 'object'})
     try:
-        idx = cmd.index('--disallowed-tools')
-        next_flag_idx = cmd.index('--json-schema', idx)
-        values = cmd[idx + 1:next_flag_idx]
-        assert values == _REAL_BUILTIN_TOOLS_DENYLIST, f'got {values!r}'
-        assert '*' not in values
-        assert 'StructuredOutput' not in values
+        _assert_registry_filtered(cmd)
+        assert '--disallowed-tools' not in cmd
     finally:
         _cleanup(temp_files)
 
 
-def test_build_claude_argv_resume_keeps_system_prompt_schema_and_denylist() -> None:
+def test_build_claude_argv_schema_wildcard_keeps_explicit_extra_denies() -> None:
+    """Deny entries other than ``'*'`` survive the substitution unchanged."""
+    cmd, temp_files = _wildcard_argv(['*', 'mcp__x__y'], output_schema={'type': 'object'})
+    try:
+        _assert_registry_filtered(cmd)
+        idx = cmd.index('--disallowed-tools')
+        assert cmd[idx + 1:cmd.index('--json-schema', idx)] == ['mcp__x__y']
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_wildcard_without_schema_is_unchanged() -> None:
+    """With no output_schema a bare ``'*'`` deny is already an empty registry
+    (measured on CLI 2.1.283), so that branch is not the leak and its argv stays
+    byte-identical: ``--disallowed-tools *`` and no ``--tools``.
+    """
+    cmd, temp_files = _wildcard_argv(['*'])
+    try:
+        assert _normalize(cmd, temp_files) == [
+            'claude', '--print', '--output-format', 'json',
+            '--model', 'opus',
+            '--max-budget-usd', '5.0',
+            '--system-prompt-file', _TMP_PLACEHOLDER,
+            '--permission-mode', 'bypassPermissions',
+            '--max-turns', '10',
+            '--disallowed-tools', '*',
+        ]
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_resume_keeps_system_prompt_schema_and_tool_filter() -> None:
     """RESUME + output_schema: BOTH the system prompt and the schema survive.
 
     HISTORY.  This test used to pin the OPPOSITE — an asymmetry where a
@@ -235,8 +300,8 @@ def test_build_claude_argv_resume_keeps_system_prompt_schema_and_denylist() -> N
     machine-validated contract beats a prose one regardless.  It simply is no
     longer needed as a *resume* workaround.
 
-    Also confirms the wildcard deny-list expansion applies on the resume path,
-    so the synthetic StructuredOutput tool the schema rides on is not blocked.
+    Also confirms the ``'*'`` -> ``--tools ''`` substitution applies on the
+    resume path too, so a resumed classifier gets the same empty registry.
     """
     cmd, temp_files = build_claude_argv(
         model='opus',
@@ -264,13 +329,9 @@ def test_build_claude_argv_resume_keeps_system_prompt_schema_and_denylist() -> N
         assert '--json-schema' in cmd
         assert cmd[cmd.index('--json-schema') + 1] == json.dumps({'type': 'object'})
 
-        # ...and the wildcard was expanded, not emitted literally, so the
-        # synthetic StructuredOutput tool is never denied.
-        idx = cmd.index('--disallowed-tools')
-        values = cmd[idx + 1:cmd.index('--json-schema', idx)]
-        assert values == _REAL_BUILTIN_TOOLS_DENYLIST, f'got {values!r}'
-        assert '*' not in values
-        assert 'StructuredOutput' not in values
+        # ...and the wildcard became the registry filter, not a literal '*'.
+        _assert_registry_filtered(cmd)
+        assert '--disallowed-tools' not in cmd
     finally:
         _cleanup(temp_files)
 
@@ -375,8 +436,8 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
     """no_mcp_servers_config() is a TRUTHY zero-server scoping config, so a
     wildcard-deny caller under an output_schema still gets --strict-mcp-config.
 
-    The wildcard expansion above (``output_schema and '*' in disallowed_tools``)
-    substitutes a BUILT-INS-ONLY deny-list, which contains no MCP tool pattern.
+    The wildcard substitution above (``output_schema and '*' in
+    disallowed_tools``) emits ``--tools ''``, which does not filter MCP.
     A caller whose cwd carries an ambient ``.mcp.json`` therefore keeps MCP
     tools reachable unless it ALSO strict-scopes its MCP servers — and the
     ``--strict-mcp-config`` emit is gated on ``if mcp_config:``, so a bare
@@ -435,8 +496,8 @@ def test_build_claude_argv_resume_keeps_mcp_config_and_strict_flag() -> None:
     that block into the ``elif session_id:`` branch would silently drop both
     --mcp-config and --strict-mcp-config from every turn >= 2 — reinstating the
     ambient ``.mcp.json`` merge under ``bypassPermissions``, where the wildcard
-    deny is no protection because an ``output_schema`` expands it into a
-    BUILT-INS-ONLY list carrying no MCP pattern — while the whole existing
+    deny is no protection because an ``output_schema`` turns it into
+    ``--tools ''``, which does not filter MCP — while the whole existing
     suite stayed green.
     """
     cmd, temp_files = build_claude_argv(

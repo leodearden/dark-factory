@@ -616,3 +616,24 @@ class TestReconStatusLiteralsAreGone:
             f'ReconTab compares a run status against a literal: {compared} — '
             'the run vocabulary belongs to recon_status.js.'
         )
+
+
+class TestActiveAgentsReadsTheServedActivity:
+    """The Active agents hint is a disclosed sub-view of the headline's population.
+
+    Both the headline (``burst_state.length``) and the hint read the one rule
+    ``reconciliation.py::partition_burst_state`` applies on the server; the hint
+    reads its served ``agent_activity`` counts instead of re-deriving a second
+    client predicate over ``burst_state``.
+    """
+
+    def test_the_hint_reads_the_served_non_idle_count(self, recon_tab_code):
+        tile = _extract_stat_tile(recon_tab_code, 'Active agents')
+        assert re.search(r'hint=\{[^}]*agent_activity\.non_idle', tile), (
+            f'the Active agents hint does not read agent_activity.non_idle:\n{tile}'
+        )
+
+    def test_no_client_idle_predicate_remains(self, recon_tab_code):
+        assert not re.search(r"!==?\s*'idle'", recon_tab_code), (
+            "ReconTab still filters agents with a client-side `!== 'idle'` predicate."
+        )

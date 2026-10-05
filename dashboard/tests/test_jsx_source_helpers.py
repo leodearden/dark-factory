@@ -80,7 +80,7 @@ class TestExtractFunctionBody:
         anchored its regex at column 0 and sliced to the next top-level
         `function`, so an indented inner declaration could only ever be
         reached by returning the whole enclosing function.  The real instance
-        is `function statusMatches(s) {` nested inside `TasksTab` in
+        is `function searchMatches(t) {` nested inside `TasksTab` in
         tab_tasks.jsx.
         """
         src = "function Outer() {\n  function inner(s) { return s === 'x'; }\n  return 1;\n}"
@@ -542,7 +542,7 @@ class TestFindFunctionParams:
     def test_finds_a_declaration_nested_inside_another_function(self) -> None:
         """The regex is deliberately NOT line-anchored.
 
-        The real instance is `function statusMatches(s) {` indented inside
+        The real instance is `function searchMatches(t) {` indented inside
         `TasksTab` in tab_tasks.jsx.
         """
         src = (
@@ -1232,23 +1232,21 @@ class TestNestedDeclarationAgainstRealSource:
     back to it must fail here rather than quietly re-lose the ability to
     scope an indented declaration.
 
-    Ground truth in tab_tasks.jsx: `function statusMatches(s) {` is declared
+    Ground truth in tab_tasks.jsx: `function searchMatches(t) {` is declared
     INSIDE `TasksTab`, and `flipFilter` is a sibling const in the same
     enclosing function — so a fallback to the enclosing body is detectable.
     """
 
-    def test_status_matches_is_scoped_out_of_its_enclosing_component(
+    def test_search_matches_is_scoped_out_of_its_enclosing_component(
         self, tab_tasks_jsx_body: str
     ) -> None:
-        body = extract_function_body(tab_tasks_jsx_body, 'statusMatches')
+        body = extract_function_body(tab_tasks_jsx_body, 'searchMatches')
 
-        assert body, 'the nested `statusMatches` declaration could not be sliced out'
-        for status in ('in-progress', 'blocked', 'merge-deferred'):
-            assert status in body, (
-                f'{status!r} is missing from the extracted `statusMatches` body — '
-                f'either the status disjunction changed or the extractor returned '
-                f'the wrong slice'
-            )
+        assert body, 'the nested `searchMatches` declaration could not be sliced out'
+        assert 'haystack' in body, (
+            '`haystack` is missing from the extracted `searchMatches` body — either '
+            'the search match changed or the extractor returned the wrong slice'
+        )
         assert 'flipFilter' not in body, (
             'the extracted body contains `flipFilter`, a sibling const declared in '
             'the ENCLOSING `TasksTab` — so the extractor fell back to the whole '

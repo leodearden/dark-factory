@@ -48,11 +48,11 @@ class TestWorkerSideSurface:
 
     def test_import_train_callbacks_and_factory(self) -> None:
         """Importing TrainCallbacks and TrainCallbackFactory from merge_queue must not raise."""
-        from orchestrator.merge_queue import TrainCallbackFactory, TrainCallbacks  # noqa: F401
+        from orchestrator.merge_lane.types import TrainCallbacks  # noqa: F401
 
     def test_train_callbacks_holds_two_fields(self) -> None:
         """TrainCallbacks is a dataclass with status_check and mark_member_done attributes."""
-        from orchestrator.merge_queue import TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
 
         async def _fake_status_check(ids: list[str]) -> dict[str, str]:
             return {}
@@ -102,7 +102,8 @@ class TestRealTaskFlip:
     async def test_mark_member_done_flips_real_task(self) -> None:
         """Factory callbacks mark a seeded task done with kind='merged' provenance."""
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome, TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
+        from orchestrator.merge_queue import GroupMergeRequest, MergeOutcome
 
         sched = FakeScheduler()
         await sched.set_task_status('4442', 'merge-deferred')
@@ -383,7 +384,7 @@ class TestRedriveMember:
     async def test_factory_built_redrive_member_is_callable(self) -> None:
         """Factory-built TrainCallbacks.redrive_member is callable (not None)."""
         from orchestrator.harness import build_train_callback_factory
-        from orchestrator.merge_queue import TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
 
         sched = FakeScheduler()
         factory = build_train_callback_factory(sched)
@@ -468,7 +469,7 @@ class TestHarnessWiring:
         from orchestrator.config import OrchestratorConfig
         from orchestrator.event_store import EventStore
         from orchestrator.harness import Harness
-        from orchestrator.merge_queue import TrainCallbacks
+        from orchestrator.merge_lane.types import TrainCallbacks
 
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
@@ -514,10 +515,10 @@ class TestHarnessWiring:
                 CapturingWorker,
             ),
             patch(
-                'orchestrator.merge_queue.enforce_merge_liveness_margin',
+                'orchestrator.merge_lane.liveness.enforce_merge_liveness_margin',
             ),
             patch(
-                'orchestrator.merge_queue.enforce_persistent_worktree_serial_lane',
+                'orchestrator.merge_lane.liveness.enforce_persistent_worktree_serial_lane',
             ),
             patch.object(
                 harness,

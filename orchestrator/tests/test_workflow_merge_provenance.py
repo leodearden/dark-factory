@@ -200,7 +200,8 @@ class TestRecoverIfAlreadyMerged:
     async def test_journal_miss_on_main_with_prior_work_falls_back_to_found_on_main(
         self, tmp_path: Path,
     ):
-        """Journal miss + on-main + prior implementation work → fallback DONE."""
+        """Journal miss + on-main + prior implementation work → fallback DONE,
+        anchored on the task's own citation (task 4704), never main's tip."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
@@ -212,7 +213,7 @@ class TestRecoverIfAlreadyMerged:
         assert outcome == WorkflowOutcome.DONE
         assert f.wf._merge_recovery_basis == 'fallback'
         f.mark_done.assert_awaited_once_with(
-            f.wf.task_id, kind='found_on_main', sha='mainsha123',
+            f.wf.task_id, kind='found_on_main', sha='citationsha123',
             note='branch already on main at workflow start (pre-PLAN recovery)',
         )
 
@@ -417,7 +418,7 @@ class TestRecoverBeforeExecute:
     ):
         """Journal miss + on-main + non-empty branch-content diff (Layer C,
         task 2372: the ground-truth `git diff base..wt_head` gate) → fallback
-        DONE."""
+        DONE, anchored on the task's own citation (task 4704)."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj')
         f.wf._check_branch_on_main = AsyncMock(  # type: ignore[method-assign]
             return_value=('wthead123', 'mainsha123'),
@@ -429,7 +430,7 @@ class TestRecoverBeforeExecute:
         assert outcome == WorkflowOutcome.DONE
         assert f.wf._merge_recovery_basis == 'fallback'
         f.mark_done.assert_awaited_once_with(
-            f.wf.task_id, kind='found_on_main', sha='mainsha123',
+            f.wf.task_id, kind='found_on_main', sha='citationsha123',
             note='branch already on main at workflow start (pre-EXECUTE recovery)',
         )
 
@@ -536,7 +537,8 @@ class TestRecoverBeforeMerge:
         self, tmp_path: Path,
     ):
         """Journal miss + branch is ancestor of main + prior implementation
-        work → fallback DONE (provenance sha is main_sha, not branch_head)."""
+        work → fallback DONE (provenance sha is the task's own citation — task
+        4704 — never main_sha or branch_head)."""
         f = _make(worktree=tmp_path / 'wt', project_root=tmp_path / 'proj', branch_on_main=True)
         _record_prior_work(f)
 
@@ -545,10 +547,10 @@ class TestRecoverBeforeMerge:
         assert outcome == WorkflowOutcome.DONE
         assert f.wf._merge_recovery_basis == 'fallback'
         f.mark_done.assert_awaited_once_with(
-            f.wf.task_id, kind='found_on_main', sha='mainsha123',
+            f.wf.task_id, kind='found_on_main', sha='citationsha123',
             note='branch already on main at merge phase (pre-MERGE recovery)',
         )
-        f.is_ancestor.assert_awaited_once_with('branchhead123', 'mainsha123')
+        f.is_ancestor.assert_any_await('branchhead123', 'mainsha123')
 
     async def test_journal_miss_ancestor_with_no_prior_work_returns_none(
         self, tmp_path: Path,

@@ -106,7 +106,8 @@ order).
   `_ACTIVE_STATUSES`, its done/cancelled members are included as rows even
   beyond the bounded 50-cap, **with real `deps` populated** (they keep
   `started: 0` + `completed`). This makes "n/m done" counts and intra-box
-  edges truthful. `DONE_COUNTS` semantics unchanged.
+  edges truthful. `DONE_COUNTS` semantics unchanged (superseded: see the
+  2026-09-27 amendment under §Contract).
 
 **Frontend** (`tab_tasks.jsx` + `styles.css`):
 - A per-project **"group by PRD"** toggle (persisted via the existing
@@ -172,6 +173,33 @@ order).
   PRD with ≥1 member in `_ACTIVE_STATUSES` (`active_tasks.py:44`) is emitted
   with populated `deps`, exempt from the 50-cap; other terminal rows are
   unchanged (cap applies, `deps: []`).
+
+**Amended 2026-09-27 (task 5590, PRD dashboard-one-datum-one-path decision 5/8):**
+
+- **The Terminal-member exemption bullet above is RETIRED.** The default
+  `/tasks` render fetches no terminal rows. They arrive only through the
+  on-demand `?terminal=<project>` window
+  (`data/task_snapshot.py::acquire_terminal_window`): the newest 400 terminal
+  rows by task id, served as one `lower_bound` Datum.
+  `data/task_snapshot.py::_TERMINAL_FETCH_WINDOW` is deliberately NOT lowered.
+- **Task 4416 is resolved by its option (a).** A live PRD's terminal members
+  are "the live members inside the fetched window". The under-count is
+  disclosed, not sanctioned silently: the PRD box renders `≥ n/m terminal`
+  (n counts done + cancelled) from a `lower_bound` Datum,
+  `prd_grouping.js::prdProgress`, a `datum.js::combinedDatum` over the
+  snapshot rows and the window, with the window's reason as its tooltip. The
+  Tasks tab requests the window when the terminal view filter or that
+  project's PRD grouping toggle is on
+  (`task_snapshot.js::terminalWindowProjects`).
+- **`DONE_COUNTS` is retired** in favour of `TASKS_SNAPSHOT[p].census`. This
+  supersedes Part 2's "`DONE_COUNTS` semantics unchanged".
+- **Part 2's Box chrome aggregate and progress bucket rules are superseded**
+  by the generated views, `in_flight` / `backlog` / `terminal`, from
+  `shared.task_statuses` via `task_vocab.js`
+  (`prd_grouping.js::summarizePrdMembers`). The bar draws one segment per
+  member status (`prd_grouping.js::prdBarSegments`).
+
+The rationale lives in `plans/dashboard-one-datum-one-path-prd.md`.
 
 ## Pre-conditions for activating
 

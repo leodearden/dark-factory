@@ -74,8 +74,16 @@ from shared.proc_group import (
 )
 from shared.transcript_archive import archive_before_delete
 
-from orchestrator import rebase_recovery
+from orchestrator import branch_stack, rebase_recovery
 from orchestrator.artifacts import TaskArtifacts
+from orchestrator.branch_stack import (
+    StackBaseLedger,
+    UnstackOutcome,
+    UnstackResult,
+    base_owners,
+    foreign_commit_cut,
+    rebase_own_delta,
+)
 from orchestrator.config import TASK_META_DIRNAME, GitConfig, TranscriptArchiveConfig
 from orchestrator.lane_lifecycle import (
     ACQUIRE_ROUTE_TRANSITIONS,
@@ -2598,10 +2606,10 @@ async def _run(
     A thin adapter over :func:`shared.git_async.run_git` (task 3778), which
     owns the spawn mechanism and its rationale: the ``LC_ALL=C`` locale pin
     :func:`_git_clean_failure_is_benign` depends on, stdin feeding, and the
-    task-2608 cancellation kill+reap.  What stays here is orchestrator-
-    specific: the :class:`WorktreeMissing` taxonomy and the 3-tuple return.
-    ``run_git`` is imported by bare name so ``git_ops.run_git`` is the single
-    patchable spawn seam.
+    process-group kill+reap on cancellation (tasks 2608/4155).  What stays
+    here is orchestrator-specific: the :class:`WorktreeMissing` taxonomy and
+    the 3-tuple return.  ``run_git`` is imported by bare name so
+    ``git_ops.run_git`` is the single patchable spawn seam.
 
     ``input_text``, when given, is piped to the child's stdin, e.g. a diff
     into ``git patch-id`` (see :meth:`GitOps.find_equivalent_commit`).
@@ -3677,7 +3685,15 @@ class GitOps:
            concurrent in-process holder would be libelled, most sharply
            :meth:`task_verify_lease`, which by design never writes the
            rendezvous layer 3 reads.  This layer gets strictly more important
-           as in-process holds widen.
+           as in-process holds widen — and task 4189 is that widening made
+           concrete: :meth:`merge_verify_lease` on an EPHEMERAL
+           ``_merge-<hash>`` lane now also declines to write the rendezvous,
+           so layer 3 no longer vetoes there and this registry is what keeps a
+           healthy ephemeral hold (a cold-shadow verify, a drift check, the
+           DF-2822 cross-check) from being libelled as a self-owned leak.
+           :meth:`_acquire_lane_flock_off_thread` registers every won fd on its
+           OWN worker thread (task 3783), so the registry never lags the
+           kernel and this substitution is exact.
         3. **Liveness** — no live recorded verify
            (:meth:`_merge_verify_lease_active`, reused unchanged with its
            fail-OPEN semantics).  A genuine long verify holding the lane past
@@ -3975,12 +3991,53 @@ class GitOps:
         ``_merge-<hash>`` speculation worktree the DF 2822 per-land REMOTE-green
         cross-check actually verifies in) flocks THAT lane instead, so the
         cross-check mutually excludes a concurrent reseed/reclaim of its OWN
-        lane (task 2873). Only the flocked inode is parametrized — the
-        holder-pgid rendezvous below stays keyed to the GLOBAL
-        :attr:`worktree_base` (a fail-open liveness hint consumed only by
-        persistent-lane actors; an ephemeral-lane lease writing it is a safe
-        over-approximation that at worst makes a concurrent persistent
-        reseed/GC defer during the cross-check, never a clobber).
+        lane (task 2873).
+
+        The GLOBAL holder-pgid rendezvous below — the single FIXED-key
+        ``verify_cancel.LOCK_HOLDER_PGID_KEY`` file under
+        :attr:`worktree_base`, a fail-open liveness hint consumed only by
+        PERSISTENT-lane actors — is written AND removed ONLY when *lane_dir*
+        is ``None`` or satisfies :meth:`is_persistent_merge_lane` (task 4189).
+        An ephemeral lane still gets the flock and the
+        fail-closed contended raise below; it simply never touches the
+        global. Task 2873 kept the rendezvous unconditional as "a safe
+        over-approximation", but that argument contemplated only the SHORT
+        DF-2822 cross-check and only the DEFER direction, and it cost two
+        things:
+
+        (i) :meth:`_run_warm_lane_gc_reclaim` defers (127) unconditionally
+            while the rendezvous names a live pgid and deliberately does NOT
+            exclude self, so an hours-long cold-shadow verify on an ephemeral
+            lane (``merge_shadow.py``) blocked warm-lane reclaim for its WHOLE
+            window — while touching nothing in the pool that reclaim resets.
+
+        (ii) The key is not refcounted and carries no owner check (last writer
+            wins, first remover wins). Shadow compares run as background
+            asyncio tasks alongside the NEXT merge's persistent-lane verify,
+            so whichever lease exited FIRST stripped the other's LIVE
+            rendezvous — the exact remove-side stomp
+            :meth:`task_verify_lease`'s docstring already cites as its own
+            reason for being flock-only. On an ephemeral lane the two leases
+            now agree on the rendezvous.
+
+        :meth:`reset_persistent_merge_worktree` is unaffected either way: its
+        guard already excludes our own pgid, so an in-process ephemeral lease
+        never blocked it. The ``records_rendezvous`` flag is computed ONCE,
+        before the acquire, and reused for both the write and the ``finally``'s
+        remove, so the pair can never go asymmetric (a write with no remove
+        would leak a permanently live-looking rendezvous; a remove with no
+        write is stomp (ii) itself).
+
+        Neither side of that pair may orphan the won flock. The write runs
+        AFTER the acquire but BEFORE the ``try`` that owns the release, and
+        ``write_pgid_file`` is ``mkdir`` + ``write_text`` + ``os.replace`` with
+        nothing suppressed, so an ENOSPC/EACCES/EROFS there is caught only to
+        release the fd and re-raise; the remove sits inside a nested ``try``
+        whose ``finally`` IS the release, because ``remove_pgid_file``
+        suppresses ``FileNotFoundError`` alone. Both keep
+        :meth:`_release_lane_flock` reachable on every path out — the B12
+        orphaned-lane-flock invariant, which the pool-full case (when
+        warm-lane GC matters most) is the likeliest to test.
 
         On a contended flock (the bounded wait in
         :func:`acquire_merge_verify_flock` times out after
@@ -4003,6 +4060,23 @@ class GitOps:
         """
         lock_path = lane_lock_path(
             lane_dir if lane_dir is not None else self.persistent_merge_worktree_path
+        )
+        # Does this lease record the GLOBAL holder-pgid rendezvous?  ONLY for
+        # the persistent merge lane (task 4189).  The full argument — both
+        # consequences it retires, and why it is keyed on the RESOLVED PATH
+        # rather than on "was an argument passed" — is in the docstring above;
+        # the comparison itself lives once, in is_persistent_merge_lane.  The
+        # two facts a reader AT THIS LINE needs:
+        #
+        #   * computed ONCE, so the write below and the finally's remove can
+        #     never go asymmetric (a write with no remove leaks a permanently
+        #     live-looking rendezvous that wedges warm-lane GC until process
+        #     exit; a remove with no write IS the cross-lease stomp being
+        #     fixed);
+        #   * computed BEFORE the acquire, so anything it raises raises while
+        #     NO fd is held and can never orphan a lane flock (B12).
+        records_rendezvous = (
+            lane_dir is None or self.is_persistent_merge_lane(lane_dir)
         )
         # Off-thread bounded-wait acquire (shared skeleton, task 3027):
         # _acquire_lane_flock_off_thread wraps the asyncio.to_thread(
@@ -4062,12 +4136,38 @@ class GitOps:
                 _MERGE_VERIFY_LEASE_WAIT_SECS,
                 holder_facts=_lane_lock_holder_facts(lock_path, holder_pids),
             )
-        write_lock_holder_pgid(self.worktree_base, os.getpgrp())
+        if records_rendezvous:
+            # The flock is WON here but the try/finally that releases it has
+            # not been entered yet, and this write is not a pure in-memory op:
+            # write_pgid_file does mkdir + write_text + os.replace, none of
+            # them suppressed, so ENOSPC/EACCES/EROFS raises with `fd` HELD
+            # and unreleased — the lane would stay locked until process exit,
+            # the orphaned-lane-flock outage shape B12 exists to prevent. Most
+            # likely to fire when the pool mount is full, i.e. exactly when
+            # warm-lane GC matters most. Release, then re-raise (loudly — a
+            # lease that cannot record its rendezvous must not run as if it
+            # had). The write/remove pair stays symmetric by construction: a
+            # failed write never enters the try, so the finally can never
+            # remove a file this lease did not write, which would be stomp
+            # (ii) against whoever's rendezvous is actually live.
+            try:
+                write_lock_holder_pgid(self.worktree_base, os.getpgrp())
+            except OSError:
+                self._release_lane_flock(fd)
+                raise
         try:
             yield
         finally:
-            remove_lock_holder_pgid(self.worktree_base)
-            self._release_lane_flock(fd)
+            # Nested finally, not two statements: remove_pgid_file suppresses
+            # only FileNotFoundError, so an EACCES/EROFS unlink raising here
+            # would skip the release and orphan the lane the same way. The
+            # release must be unconditional BY CONSTRUCTION, not by the
+            # happenstance that the line above usually cannot raise.
+            try:
+                if records_rendezvous:
+                    remove_lock_holder_pgid(self.worktree_base)
+            finally:
+                self._release_lane_flock(fd)
 
     @contextlib.asynccontextmanager
     async def task_verify_lease(self, lane_dir: Path):
@@ -4097,6 +4197,17 @@ class GitOps:
           hold) and would spuriously gate merge-lane resets/GC. The per-lane
           flock alone is the cross-process mechanism reify consults, so the
           rendezvous stays single-purpose to the merge lane.
+
+          As of task 4189 this is no longer a CONTRAST on non-persistent
+          lanes: :meth:`merge_verify_lease` records the rendezvous only for
+          the PERSISTENT merge lane, so on an ephemeral ``_merge-<hash>``
+          speculation lane the two leases now agree — flock held, rendezvous
+          untouched. The stomp rationale written just above was the reason
+          this lease never wrote it, and is now the SHARED justification for
+          both; the ephemeral merge lane hit exactly that shape (a cold-shadow
+          compare's finally clearing the next merge's live persistent-lane
+          hold). What still diverges is the fail-mode (fail-OPEN below vs.
+          :meth:`merge_verify_lease`'s raise) and the timeout constant.
         * **fail-OPEN on contention** — on acquire timeout (a racing reseed
           held the lane lock past ``_TASK_VERIFY_LEASE_WAIT_SECS``) it logs a
           WARNING and yields WITHOUT the hold, rather than raising. The hold is
@@ -4379,16 +4490,19 @@ class GitOps:
         out-of-band to the orchestrator/operator (see
         docs/shared-repo-git-maintenance.md).
 
-        Idempotent: ``git config`` overwrites the value in place, so calling this
-        repeatedly (harness startup + every create_worktree) leaves the same
-        result.  Best-effort/loud: a non-zero git rc is logged at WARNING but
+        Idempotent: ``git config --replace-all`` converges from any prior state
+        (absent, single, or duplicated value) to exactly one value, so calling
+        this repeatedly (harness startup + every create_worktree) leaves the
+        same result.  A plain ``git config`` would be refused (exit 5) on an
+        already-multivalued key.  Best-effort/loud: a non-zero git rc is logged at WARNING but
         never raised — failing to set the key merely leaves auto-gc enabled
         (itself only a benign-but-noisy failure), which must not block
         orchestrator startup or a task dispatch (loud-over-silent-degradation).
         """
         for key, value in (('gc.auto', '0'), ('maintenance.auto', 'false')):
             rc, _, stderr = await _run(
-                ['git', 'config', key, value], cwd=self.project_root,
+                ['git', 'config', '--replace-all', key, value],
+                cwd=self.project_root,
             )
             if rc != 0:
                 logger.warning(
@@ -4465,12 +4579,9 @@ class GitOps:
         # maintenance.auto=false on every worktree-create so background
         # auto-gc never fires under the narrow shared-.git write-set (and
         # any config drift/re-clone is re-covered).  Idempotent & best-effort
-        # (never raises) — safe to run every time.  NOTE it does NOT share the
-        # core.hooksPath block's convergence property: it sets gc.auto /
-        # maintenance.auto with a plain single-value `git config`, which git
-        # refuses (exit 5) on an already-multivalued key.  Don't copy this as
-        # the model for a self-heal; the rc is logged at WARNING and the only
-        # consequence here is that auto-gc stays enabled.
+        # (never raises) — safe to run every time.  Like the core.hooksPath
+        # block above it uses --replace-all, so it converges from a
+        # duplicated key too.
         await self.disable_shared_repo_auto_maintenance()
 
         # ── Resolve start-ref: train-predecessor tip or freshened main ──
@@ -6076,13 +6187,32 @@ class GitOps:
         'nothing reclaimed' by the caller (``_warm_lane_disk_admission_blocked``).
 
         **Merge-verify lease guard (task 2315, BUG 1)**: defers (127) while
-        ANY merge-verify lease is held — INCLUDING our own.  The reclaim
-        script operates over the whole pool mount (which CONTAINS
+        any PERSISTENT-LANE merge-verify lease is held — INCLUDING our own.
+        The reclaim script operates over the whole pool mount (which CONTAINS
         ``_merge-verify``), so an in-process local verify must be deferred
         to just as much as a foreign one; unlike
         :meth:`reset_persistent_merge_worktree`'s lease guard, self is NOT
         excluded here.  Checked BEFORE the pool-storage guard below so the
         skip is attributable to the lease even when the sentinel is fine.
+
+        An EPHEMERAL ``_merge-<hash>`` speculation-lane lease no longer
+        records the holder-pgid rendezvous this predicate reads (task 4189),
+        so it no longer defers the reclaim: such a lane is not one the
+        reclaim resets, and an hours-long cold-shadow verify
+        (``merge_shadow.py``) previously blocked the whole pool's reclaim for
+        its entire window.  What keeps that ephemeral lane itself safe is the
+        script's own BAND protection, not this predicate: ``_merge-`` is a
+        :data:`PROTECTED_PREFIXES` key, so it is rendered into
+        ``warm-lane-gc.sh``'s ``PROTECT_GLOB`` (``lane_protect_glob _lane-
+        _spec-``, which subtracts only the pool bands that sweep OWNS) and the
+        entry is counted ``preserved`` and skipped in the enumeration loop
+        BEFORE either pass looks at it — the script never opens that lane's
+        lock at all.  Should ``_merge-`` ever leave that registry, the backstop
+        is Pass 1's and Pass 2's own non-blocking ``flock -n`` on the lane
+        lock, which is exactly the lock this lease holds for the whole verify
+        body.  Naming the flock as the PRIMARY gate would be drift: it is the
+        second line, and a later reader could use the misattribution to
+        license removing the first.
 
         **Pool-storage guard (task 2099, self-heal task 2315)**: routes
         through :meth:`_reconcile_pool_storage_before_sweep`, which refuses
@@ -9967,7 +10097,14 @@ class GitOps:
         ``rebase_onto_main(wt, onto=...)``.
 
         On a clean rebase the member is appended to *survivors* and becomes
-        the new last-good predecessor for the next member.
+        the new last-good predecessor for the next member, and the base it
+        was stacked onto is recorded (see
+        ``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``).
+        Records are only ever written here, so this is also where the
+        records of branches that no longer exist are pruned.
+        A member is always stacked from its own delta: before the rebase it
+        is un-stacked from any earlier unlanded base, and a member that
+        cannot be un-stacked is ejected.
 
         On a rebase conflict the member is added to *ejected*; the last-good
         predecessor is NOT advanced, so the next member re-links onto the last
@@ -9985,6 +10122,7 @@ class GitOps:
         """
         if not member_ids:
             return TrainStackResult(survivors=[], ejected=[])
+        await self._stack_ledger().prune_orphans()
 
         anchor_id = member_ids[0]
         survivors: list[str] = [anchor_id]
@@ -10003,7 +10141,8 @@ class GitOps:
                 continue
 
             onto_branch = f'{self.config.branch_prefix}{last_good_id}'
-            success = await self.rebase_onto_main(wt_path, onto=onto_branch)
+            member_branch = f'{self.config.branch_prefix}{member_id}'
+            success = await self._stack_member(wt_path, member_branch, onto_branch)
             if success:
                 survivors.append(member_id)
                 last_good_id = member_id
@@ -10012,6 +10151,153 @@ class GitOps:
                 # Do not advance last_good_id.
 
         return TrainStackResult(survivors=survivors, ejected=ejected)
+
+    async def _stack_member(
+        self, wt_path: Path, member_branch: str, onto_branch: str,
+    ) -> bool:
+        """Stack *member_branch* onto *onto_branch* from its own delta.
+
+        Returns False when the member must be ejected: it could not be
+        un-stacked from an earlier unlanded base, or the rebase conflicted.
+        """
+        earlier = await self.unstack_from_unlanded_base(member_branch)
+        if earlier.stops_merge:
+            logger.warning(
+                'stack_train_branches: ejecting %s — %s',
+                member_branch, earlier.merge_block_reason(),
+            )
+            return False
+        if not await self.rebase_onto_main(wt_path, onto=onto_branch):
+            return False
+        base_sha = await self.resolve_branch_sha(onto_branch)
+        if base_sha is None:
+            logger.warning(
+                'stack_train_branches: %s did not resolve after stacking %s '
+                'onto it; no stack base recorded',
+                onto_branch, member_branch,
+            )
+            return True
+        await self._stack_ledger().record(member_branch, base_sha)
+        return True
+
+    def _stack_ledger(self) -> StackBaseLedger:
+        return StackBaseLedger(self.project_root, _run)
+
+    async def forget_stack_bases(self, task_ids: Iterable[str]) -> None:
+        """Drop the stack-base records of *task_ids*' branches, e.g. once
+        their train has landed.  A failed delete is logged, not raised."""
+        ledger = self._stack_ledger()
+        for task_id in task_ids:
+            await ledger.forget(f'{self.config.branch_prefix}{task_id}')
+
+    async def unstack_from_unlanded_base(self, full_branch: str) -> UnstackResult:
+        """Strip the commits of a never-landed stack base from *full_branch*.
+
+        Reads the base recorded when the branch was stacked
+        (``orchestrator/src/orchestrator/branch_stack.py::StackBaseLedger``).
+        No record, a base already on main, a vanished branch, or no foreign
+        commits left: the record is cleared and the result is NOT_STACKED.
+        Otherwise the branch's own delta is replayed onto main with
+        ``git rebase --onto <main> <cut>`` inside the worktree that holds the
+        branch, and only when that tree is clean.
+
+        Never raises.  A failed git read, a dirty tree, no holding worktree or
+        a rebase that fails without a conflicted path (a contended lock, say)
+        is BLOCKED; a conflict in the branch's OWN delta is CONFLICT.  Both
+        keep the record, and their ``merge_block_reason()`` attributes the
+        stop to the base.
+        """
+        ledger = self._stack_ledger()
+        base = await ledger.base_of(full_branch)
+        if base is None:
+            return UnstackResult(
+                outcome=UnstackOutcome.NOT_STACKED,
+                branch=full_branch,
+                main_branch=self.config.main_branch,
+            )
+        try:
+            return await self._unstack_recorded(ledger, full_branch, base)
+        except (branch_stack.StackInspectionError, WorktreeMissing) as exc:
+            return UnstackResult(
+                outcome=UnstackOutcome.BLOCKED,
+                branch=full_branch,
+                main_branch=self.config.main_branch,
+                base=base,
+                detail=str(exc),
+            )
+
+    async def _unstack_recorded(
+        self, ledger: StackBaseLedger, full_branch: str, base: str,
+    ) -> UnstackResult:
+        tip = await self.resolve_branch_sha(full_branch)
+        main_sha = await self.get_main_sha()
+        cut = None
+        if tip is not None and not await self.is_ancestor(base, main_sha):
+            cut = await foreign_commit_cut(
+                _run, self.project_root, tip=tip, main_ref=main_sha, base=base,
+            )
+        if cut is None:
+            await ledger.forget(full_branch)
+            return UnstackResult(
+                outcome=UnstackOutcome.NOT_STACKED,
+                branch=full_branch,
+                main_branch=self.config.main_branch,
+            )
+        return await self._rebase_off_base(
+            ledger, full_branch, base=base, cut=cut, main_sha=main_sha,
+        )
+
+    async def _rebase_off_base(
+        self,
+        ledger: StackBaseLedger,
+        full_branch: str,
+        *,
+        base: str,
+        cut: str,
+        main_sha: str,
+    ) -> UnstackResult:
+        verdict = functools.partial(
+            UnstackResult,
+            branch=full_branch,
+            main_branch=self.config.main_branch,
+            base=base,
+            cut=cut,
+            base_owners=await base_owners(_run, self.project_root, base),
+        )
+        wt = await self._worktree_holding_branch(full_branch)
+        if wt is None:
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail=f'no worktree has {full_branch} checked out',
+            )
+        if await self.has_uncommitted_work(wt):
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail=f'worktree {wt} has uncommitted changes',
+            )
+        foreign_count = await self.get_rebase_distance(main_sha, cut)
+        rebased = await rebase_own_delta(_run, wt, onto=main_sha, cut=cut)
+        if rebased.conflicted_paths:
+            return verdict(
+                outcome=UnstackOutcome.CONFLICT,
+                conflicted_paths=rebased.conflicted_paths,
+                detail=rebased.stderr,
+            )
+        if not rebased.ok:
+            return verdict(
+                outcome=UnstackOutcome.BLOCKED,
+                detail='git rebase --onto failed without a conflict: '
+                + ' '.join(rebased.stderr.split()),
+            )
+        await ledger.forget(full_branch)
+        result = verdict(outcome=UnstackOutcome.UNSTACKED)
+        logger.warning(
+            'Un-stacked %s from unlanded base %s (owners: %s): dropped %d '
+            'foreign commit(s), own delta replayed onto %s',
+            full_branch, base, ', '.join(result.base_owners) or 'none',
+            foreign_count, self.config.main_branch,
+        )
+        return result
 
     async def materialize_member_solo(
         self,
@@ -12267,13 +12553,24 @@ class GitOps:
         TOCTOU). A live holder makes the non-blocking acquire fail
         immediately, in which case removal is skipped
         (``'skipped_lease_held'``, logged as a single WARNING naming the
-        holder pgid) rather than deferred or retried; a dead or stale
+        holder) rather than deferred or retried; a dead or stale
         holder's flock is auto-released by the kernel, so the acquire
         simply succeeds and removal proceeds (fail-open, intrinsic to
         flock — this method never consults holder liveness directly). The
         holder-pgid rendezvous file is read ONLY to name the holder in
         that WARNING — a best-effort, fail-open diagnostic hint, never a
         removal gate.
+
+        That WARNING carries TWO attributions, and ``rendezvous pgid=None``
+        in it is EXPECTED, not a defect: this method only reaches the refusal
+        on an EPHEMERAL lane (persistent ones return ``'skipped_persistent'``
+        above), and as of task 4189 an ephemeral :meth:`merge_verify_lease`
+        deliberately does not write the global rendezvous — so the cold-shadow
+        verify / drift check / DF-2822 cross-check that most often holds the
+        lane against this reaper is invisible to it. The kernel clause
+        (:func:`_lane_lock_holder_facts` over ``/proc/locks``) is what actually
+        names such a holder, and is fail-open in the same way: an unreadable
+        ``/proc`` degrades the clause, never the outcome.
 
         **Persistent-worktree exemption**: if *path* resolves to
         :attr:`persistent_merge_worktree_path` OR
@@ -12323,16 +12620,17 @@ class GitOps:
         (``OSError`` only) so ``CancelledError`` and programmer errors stay
         loud. Together they make this method total with respect to
         ``OSError``: every other call in its body — :func:`lane_lock_path`
-        (pure path math), :meth:`Path.exists`/:meth:`Path.resolve` (which
-        swallow ``OSError`` by contract), :func:`_register_held_lane_lock`,
-        :func:`read_lock_holder_pgid` and
+        (pure path math), :meth:`Path.exists`/:meth:`Path.resolve` and
+        :meth:`is_persistent_merge_lane` (which swallow ``OSError`` by
+        contract), :func:`_register_held_lane_lock`,
+        :func:`read_lock_holder_pgid`, :func:`_lane_lock_holder_facts` and
         :func:`_release_and_forget_held_lane_lock` — already suppresses its
         own.
 
         *reason* is a short caller-supplied label (e.g. the calling
         function's name) recorded in logs for diagnostics.
         """
-        if path.resolve() == self.persistent_merge_worktree_path.resolve():
+        if self.is_persistent_merge_lane(path):
             logger.debug('remove_merge_worktree_guarded: persistent merge worktree retained: %s', path)
             return 'skipped_persistent'
         if path.resolve() == self.persistent_offline_deep_worktree_path.resolve():
@@ -12370,12 +12668,40 @@ class GitOps:
             # never be reachable from a legitimate hold.
             _register_held_lane_lock(fd, lock_path)
         if fd is None:
+            # TWO attributions, because neither alone covers the holder set.
+            #
+            # The global holder-pgid rendezvous names a PERSISTENT-lane verify
+            # (and the host verify-merge CLI span, which writes the same fixed
+            # key) — but as of task 4189 an EPHEMERAL `_merge-<hash>` lease
+            # deliberately never writes it, and this method only ever reaches
+            # here on an ephemeral lane (persistent ones returned
+            # 'skipped_persistent' above). So `pgid=None` is now EXPECTED in
+            # exactly the case 4189 makes routine: a cold-shadow verify, a
+            # drift check, or the DF-2822 cross-check holding its own throwaway
+            # lane while the reaper tries to remove it. Before 4189 this log
+            # named the right pgid only ACCIDENTALLY, because the ephemeral
+            # lease wrote the global key it had no business writing.
+            #
+            # Kernel attribution replaces that accident with the real thing:
+            # /proc/locks names whoever actually holds THIS lane's flock — the
+            # gate that just refused us — for the persistent and ephemeral
+            # holder alike. This is the reaper's ONLY attribution for a refused
+            # removal, so it must not go blank on the common path.
+            #
+            # Both remain fail-open diagnostics and neither is a removal gate:
+            # read_lock_holder_pgid returns None on any read error, and
+            # lane_lock_holder_pids returns [] on an unreadable /proc, so
+            # _lane_lock_holder_facts degrades its clause rather than raising
+            # inside a method that backs cleanup_merge_worktree's never-raises
+            # contract. Unlike the two acquire-timeout sites, no settled
+            # snapshot is threaded in here: nothing downstream branches on the
+            # holder set, so a rare empty read costs a clause, not a decision.
             holder = read_lock_holder_pgid(self.worktree_base)
             logger.warning(
                 'remove_merge_worktree_guarded: merge-verify lease held by live '
-                'holder (pgid=%s); skipping removal of %s (reason=%s) -- leaving '
-                'for the merge reaper',
-                holder, path, reason,
+                'holder (rendezvous pgid=%s; %s); skipping removal of %s '
+                '(reason=%s) -- leaving for the merge reaper',
+                holder, _lane_lock_holder_facts(lock_path), path, reason,
             )
             return 'skipped_lease_held'
         # Only unlink the sibling ``.lock`` file when THIS call both acquired
@@ -12599,6 +12925,41 @@ class GitOps:
         when the feature is off.
         """
         return self.worktree_base / PERSISTENT_MERGE_WORKTREE_NAME
+
+    def is_persistent_merge_lane(self, path: Path) -> bool:
+        """Does *path* name the singleton PERSISTENT merge-verify lane?
+
+        The ONE spelling of the "is this the persistent merge lane?"
+        comparison (task 4189). Several call sites answered it with
+        hand-copied ``.resolve()`` pairs whose AGREEMENT is load-bearing:
+        :meth:`merge_verify_lease` gates the global holder-pgid rendezvous on
+        it (an ephemeral lane must never write or remove that single fixed-key
+        file), and :meth:`remove_merge_worktree_guarded` gates its
+        ``'skipped_persistent'`` exemption on it (the persistent lane survives
+        across attempts and is never removed). A site that drifted — to a bare
+        ``==``, or to "was a *lane_dir* argument passed at all" — would
+        misclassify the persistent lane as ephemeral and silently stop
+        recording the rendezvous for a genuine persistent-lane verify,
+        re-opening the warm-lane clobber the lease exists to prevent.
+
+        ``.resolve()`` on BOTH sides, so a symlinked ``.worktrees`` pool mount
+        or a caller-supplied relative/``..``-bearing path still compares equal
+        to the canonical location. Non-strict :meth:`Path.resolve` swallows
+        ``OSError`` by contract, which is what lets
+        :meth:`remove_merge_worktree_guarded` keep its
+        total-with-respect-to-``OSError`` contract while calling this.
+
+        ``merge_queue.py``'s LOCAL-dispatch gate ("should I take a lease at
+        all?") still carries its own copy of the comparison: it is outside
+        this task's module lock set. It compares the same two paths the same
+        way; folding it in is filed as follow-up work.
+
+        :attr:`persistent_offline_deep_worktree_path` is deliberately NOT
+        covered here — it is a different lane with a different owner, and only
+        :meth:`remove_merge_worktree_guarded` cares about it (as a separate,
+        separately-logged exemption).
+        """
+        return path.resolve() == self.persistent_merge_worktree_path.resolve()
 
     @property
     def persistent_offline_deep_worktree_path(self) -> Path:

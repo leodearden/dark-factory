@@ -619,6 +619,72 @@ class TestRunEndToEnd:
         mocks['save'].assert_called_once()
 
 
+@pytest.mark.asyncio
+class TestEndToEndCarriesReplayFrame:
+    """The live architect of a both-live cell is replay-framed and stamped (4844)."""
+
+    async def test_workflow_architect_is_briefed_with_the_replay_frame(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.agents.briefing import BriefingAssembler
+        from orchestrator.evals.replay_frame import (
+            ReplayFramedBriefingAssembler,
+            build_replay_frame_block,
+        )
+
+        _result, captured, _ = await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch,
+        )
+
+        briefing = captured['build_workflow']['briefing']
+        assert isinstance(briefing, ReplayFramedBriefingAssembler)
+        t = {'id': 'df_task_e2e', 'title': 'Widget', 'description': 'build the widget'}
+        production = BriefingAssembler(captured['build_workflow']['config'])
+        assert await briefing.build_architect_prompt(t, context='CTX') == (
+            await production.build_architect_prompt(t, context='CTX')
+            + build_replay_frame_block('basecommit123')
+        )
+
+    async def test_end_to_end_cell_is_stamped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        result, _captured, _ = await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch,
+        )
+
+        assert result.metrics['replay_frame'] == REPLAY_FRAME_ID
+
+    async def test_stamp_survives_metric_collection_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        result, _captured, _ = await _run_end_to_end_hermetic(
+            _arch_cfg(), _impl_cfg(), _base_config(tmp_path),
+            _e2e_task(tmp_path), monkeypatch, collect_side_effect=RuntimeError('x'),
+        )
+
+        assert result.metrics['replay_frame'] == REPLAY_FRAME_ID
+
+    async def test_frozen_plan_implementer_path_is_not_framed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from orchestrator.evals.replay_frame import ReplayFramedBriefingAssembler
+
+        result, captured = await _run_eval_hermetic(
+            _impl_cfg(), _base_config(tmp_path), _judge_task(tmp_path), monkeypatch,
+        )
+
+        assert not isinstance(
+            captured['build_workflow']['briefing'], ReplayFramedBriefingAssembler,
+        )
+        assert result.metrics.get('replay_frame') is None
+
+
 # ---------------------------------------------------------------------------
 # task 4427 — run_eval / run_end_to_end gain the same injected-gate contract
 # run_architect_eval got: build-and-tear-down only when the caller supplied

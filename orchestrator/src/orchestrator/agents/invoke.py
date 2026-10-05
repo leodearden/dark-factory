@@ -202,6 +202,23 @@ async def invoke_agent(
 # Claude backend — thin wrapper adding sandbox support over shared.cli_invoke
 # ---------------------------------------------------------------------------
 
+# The Claude CLI reads this as a request to return the Bash shell, silently,
+# to the session's launch directory after every Bash call, so a `cd` does not
+# outlive its command and relative Grep/Glob paths stay anchored to the
+# dispatch root.  Only an explicit '0' in env_overrides (e.g. via
+# config.role_env_overrides) opts out: env_overrides are layered over the
+# orchestrator's own os.environ, so an ambient value there is overwritten.
+# Pinned by orchestrator/tests/test_invoke_bash_cwd_reset.py.
+BASH_CWD_RESET_ENV_VAR = 'CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR'
+
+
+def apply_bash_cwd_reset_env(env_overrides: dict[str, str] | None) -> dict[str, str]:
+    """Return a copy of *env_overrides* with the Bash cwd reset on by default."""
+    merged: dict[str, str] = dict(env_overrides or {})
+    merged.setdefault(BASH_CWD_RESET_ENV_VAR, '1')
+    return merged
+
+
 async def _invoke_claude_with_sandbox(
     prompt: str,
     system_prompt: str,
@@ -236,13 +253,14 @@ async def _invoke_claude_with_sandbox(
     to ``build_claude_argv`` (both the sandboxed and non-sandbox sub-paths),
     emitting ``--strict-mcp-config`` alongside ``--mcp-config`` (task 2796).
     """
-    # Inject MCP_TIMEOUT into every claude agent's subprocess env so a slow,
-    # hung, or incompatible stdio MCP is dropped within a bounded time and the
-    # agent still reaches turn 1 (bounded drop-on-fail; reify esc-4415-232).
-    # Both sub-paths below consume env_overrides, so this single transform is
-    # project-agnostic and cannot miss a dispatch site.  setdefault lets
-    # explicit caller values win.
-    env_overrides = apply_mcp_startup_env(env_overrides)
+    # Inject per-session CLI env defaults into every claude agent's subprocess
+    # env.  MCP_TIMEOUT: a slow, hung, or incompatible stdio MCP is dropped
+    # within a bounded time and the agent still reaches turn 1 (bounded
+    # drop-on-fail; reify esc-4415-232).  BASH_CWD_RESET_ENV_VAR: the Bash cwd
+    # reset described at its definition above.  Both sub-paths below consume
+    # env_overrides, so this single transform is project-agnostic and cannot
+    # miss a dispatch site.  setdefault lets explicit caller values win.
+    env_overrides = apply_bash_cwd_reset_env(apply_mcp_startup_env(env_overrides))
 
     # For sandboxed invocations we need to build the command ourselves
     # and use the lower-level shared primitives
@@ -262,7 +280,7 @@ async def _invoke_claude_with_sandbox(
             # Build command via the shared single source of truth (task 2465
             # dedup) so this sandboxed path stays in lockstep with the
             # non-sandbox path in shared.cli_invoke._invoke_claude — including
-            # the CLI-2.1.168 StructuredOutput deny-list expansion.
+            # the schema + '*' deny → `--tools ''` registry-filter substitution.
             cmd, temp_files = build_claude_argv(
                 model=model,
                 max_budget_usd=max_budget_usd,

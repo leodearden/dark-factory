@@ -17,18 +17,31 @@ both packages are collected by the single root ``pytest`` invocation.
 Row coverage: rows 1–6, 9, 10, 11 end-to-end here; row 7 (synthetic-scale
 perf) is asserted by γ's own TestBuildEscalationAnalyticsPerf in the same
 root-pytest invocation and is deliberately NOT duplicated here.
+
+Since plans/dashboard-one-datum-one-path-prd.md leaf η (task 5596) the
+aggregator reads the escalation CORPUS — one walk of every queue's root and
+archive — so this gate walks the escalation-server-written tree with
+:func:`dashboard.data.escalation_corpus.measure_corpus` rather than handing the
+aggregator a directory. Two rows of that PRD run end-to-end here as well:
+sketch #10 (one walk, two named views, one instant) and the complete
+resolution-class split (every class shown, its parts summing to the terminal
+population that ``action_mix`` also counts).
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
+from _canned_mcp import CannedMCP
+from escalation.archive import archive_dir_for_date
 from escalation.classify import effective_benign
 from escalation.models import RESOLUTION_CLASSES, Escalation
 from escalation.queue import EscalationQueue
@@ -38,9 +51,12 @@ from starlette.testclient import (
 )
 
 from dashboard.config import DashboardConfig
-from dashboard.data.escalation_analytics import (
-    _aggregate_project,
-    build_escalation_analytics,
+from dashboard.data.datum import Datum
+from dashboard.data.escalation_analytics import build_escalation_analytics
+from dashboard.data.escalation_corpus import (
+    EscalationCorpus,
+    corpus_queues,
+    measure_corpus,
 )
 
 # ---------------------------------------------------------------------------
@@ -55,6 +71,9 @@ SRC_ROW2_L2 = 'gate-src-row2-l2'    # benign, stamped (L2 resolved with class='b
 SRC_ROW3 = 'gate-src-row3'          # actionable, inferred (L1, no class → proxy)
 SRC_ROW4 = 'gate-src-row4'          # PENDING (rejected class) → unclassified
 SRC_ROW5 = 'gate-src-row5'          # benign, stamped (L0 age-out auto-dismiss)
+SRC_STRAND = 'gate-src-strand'      # stale-strand, stamped (L0 strand sweep)
+SRC_MOOT = 'gate-src-moot'          # moot-terminal-subject, stamped (via the server)
+SRC_SKETCH = 'gate-src-sketch10'    # PENDING, root and archive (PRD sketch #10)
 
 # Deterministic escalation ids (task_id embedded per the esc-{task}-{seq} form).
 ID_ROW1 = 'esc-g1-1'
@@ -64,6 +83,8 @@ ID_ROW2_L2 = 'esc-g2l2-1'
 ID_ROW3 = 'esc-g3-1'
 ID_ROW4 = 'esc-g4-1'
 ID_ROW5 = 'esc-g5-1'
+ID_STRAND = 'esc-gs-1'
+ID_MOOT = 'esc-gm-1'
 CORRUPT_ID = 'esc-999-1'            # dropped as unparseable JSON at the queue root
 
 # Filed-at timestamps: anchored well before the (real wall-clock) resolved_at
@@ -96,6 +117,33 @@ def _make_config(tmp_path: Path, *, known_project_roots: list[Path] | None = Non
     return DashboardConfig(project_root=tmp_path, known_project_roots=known_project_roots or [])
 
 
+def _clear_escalation_caches() -> None:
+    """Clear every cache the two escalation routes read, so a route test walks its own tree.
+
+    The corpus cache and the analytics memo, plus the task snapshot units and
+    the per-id lookup cache the /escalations route's owner probe and cards read.
+    """
+    from dashboard.api.escalations import _analytics_memo_clear
+    from dashboard.data.escalation_corpus import _corpus_cache_clear
+    from dashboard.data.task_lookup import _lookup_cache_clear
+    from dashboard.data.task_snapshot import _snapshot_cache_clear
+
+    _corpus_cache_clear()
+    _analytics_memo_clear()
+    _snapshot_cache_clear()
+    _lookup_cache_clear()
+
+
+def _walk(tmp_path: Path) -> Datum[EscalationCorpus]:
+    """The corpus over *tmp_path*'s queues, walked at the fixed aggregation clock."""
+    return measure_corpus(corpus_queues(_make_config(tmp_path)), now=_now())
+
+
+def _no_tasks() -> CannedMCP:
+    """A fused-memory substrate holding no task, so no route read reaches a real server."""
+    return CannedMCP(rows=[], status_map={}, status_page_size=2000)
+
+
 async def _resolve_via_server(server: Any, esc_id: str, **kw: Any) -> dict[str, Any]:
     """Drive the REAL resolve_issue MCP tool (chokepoint for rows 1/3/4).
 
@@ -121,7 +169,7 @@ class _RecordExpectation:
     agent_role: str
     level: int
     expected_status: str        # 'resolved' | 'dismissed' | 'pending'
-    cls: str | None             # effective_benign class ('benign'|'actionable'|None)
+    cls: str | None             # effective_benign class (a RESOLUTION_CLASSES member, or None)
     prov: str                   # effective_benign provenance ('stamped'|'inferred'|'excluded')
     resolved_by: str | None = None
 
@@ -138,18 +186,36 @@ class _LiveArchive:
     def terminal(self) -> list[_RecordExpectation]:
         return [r for r in self.records if r.expected_status in ('resolved', 'dismissed')]
 
-    def expected_origin_by_source(self) -> dict[str, dict[str, int]]:
-        """Per-source (agent_role) benign/actionable/stamped truth over terminal records."""
-        out: dict[str, dict[str, int]] = {}
+    def expected_origin_by_source(self) -> dict[str, dict[str, Any]]:
+        """Per-source (agent_role) class split and stamped count, over terminal records.
+
+        ``classes`` is keyed by every :data:`RESOLUTION_CLASSES` member,
+        zero-filled — the shape the aggregator serves.
+        """
+        out: dict[str, dict[str, Any]] = {}
         for r in self.records:
-            bucket = out.setdefault(r.agent_role, {'benign': 0, 'actionable': 0, 'stamped': 0})
-            if r.cls == 'benign':
-                bucket['benign'] += 1
-            elif r.cls == 'actionable':
-                bucket['actionable'] += 1
+            bucket = out.setdefault(
+                r.agent_role, {'classes': dict.fromkeys(RESOLUTION_CLASSES, 0), 'stamped': 0},
+            )
+            if r.cls is not None:
+                bucket['classes'][r.cls] += 1
             if r.prov == 'stamped':
                 bucket['stamped'] += 1
         return out
+
+
+def _assert_origin_matches(sources: list[dict[str, Any]], arch: _LiveArchive) -> None:
+    """Every source's served class split and stamped share equal the round-tripped truth."""
+    expected = arch.expected_origin_by_source()
+    sources_by_name = {s['source']: s for s in sources}
+    assert set(sources_by_name) == set(expected)
+    for name, exp in expected.items():
+        s = sources_by_name[name]
+        assert s['classes'] == exp['classes'], f'{name} classes'
+        classified = sum(exp['classes'].values())
+        assert s['classified'] == classified, f'{name} classified'
+        expected_share = exp['stamped'] / classified if classified else 0.0
+        assert s['stamped_share'] == pytest.approx(expected_share), f'{name} stamped_share'
 
 
 def _submit_pending(
@@ -246,6 +312,33 @@ async def _build_live_boundary_archive(queue: EscalationQueue, server: Any) -> _
     # --- Corrupt file (INV-4): a non-JSON esc-*.json at the queue root. ---
     (queue.queue_dir / f'{CORRUPT_ID}.json').write_text('{ this is not valid json ,,,')
 
+    return arch
+
+
+async def _build_every_class_archive(queue: EscalationQueue, server: Any) -> _LiveArchive:
+    """The boundary archive, plus one record in each class it does not already hold.
+
+    Both go through α's production terminal-write paths: the L0 strand sweep
+    (``dismiss_all_pending`` with a strand threshold, the reaper's path) stamps
+    ``'stale-strand'``, and the server's ``resolve_issue`` stamps
+    ``'moot-terminal-subject'`` when the operator rules the subject moot.
+    """
+    arch = await _build_live_boundary_archive(queue, server)
+
+    _submit_pending(queue, ID_STRAND, 'gs', SRC_STRAND, level=0, filed_at=_BASE + timedelta(hours=7))
+    queue.dismiss_all_pending('strand sweep', strand_age_secs=3600)
+    arch.records.append(_RecordExpectation(
+        ID_STRAND, SRC_STRAND, 0, 'dismissed', 'stale-strand', 'stamped', resolved_by='auto-dismissed',
+    ))
+
+    _submit_pending(queue, ID_MOOT, 'gm', SRC_MOOT, level=1, filed_at=_BASE + timedelta(hours=8))
+    await _resolve_via_server(
+        server, ID_MOOT, resolution='subject already terminal', resolved_by='interactive',
+        resolution_class='moot-terminal-subject',
+    )
+    arch.records.append(_RecordExpectation(
+        ID_MOOT, SRC_MOOT, 1, 'resolved', 'moot-terminal-subject', 'stamped', resolved_by='interactive',
+    ))
     return arch
 
 
@@ -381,46 +474,32 @@ class TestAggregateOverLiveArchive:
         server = _make_server(queue)
         arch = await _build_live_boundary_archive(queue, server)
 
-        esc_dir = _make_config(tmp_path).escalations_dir
-        entry, pf = _aggregate_project(tmp_path.name, esc_dir, tmp_path / 'runs.db', now=_now())
+        corpus = _walk(tmp_path)
+        assert corpus.value is not None
 
         # INV-4: the one corrupt esc-999-1.json is counted, never silently dropped.
-        assert pf == 1
+        (unreadable,) = corpus.value.scan(str(tmp_path)).unreadable
+        assert unreadable.path.endswith(f'{CORRUPT_ID}.json')
 
-        # Per-source origin benign/actionable/stamped == the round-tripped truth
-        # (cascade members + age-out record → benign & stamped; the unstamped
-        # resume → actionable & inferred; the rejected row-4 record → pending,
-        # unclassified). effective_benign is the shared predicate (INV-5).
-        expected = arch.expected_origin_by_source()
-        sources_by_name = {s['source']: s for s in entry['origin']['sources']}
-        assert set(sources_by_name) == set(expected)
-        for name, exp in expected.items():
-            s = sources_by_name[name]
-            assert s['benign'] == exp['benign'], f'{name} benign'
-            assert s['actionable'] == exp['actionable'], f'{name} actionable'
-            # No 'moot-terminal-subject' records in this archive, so the
-            # classified count is exactly benign+actionable; derive the expected
-            # stamped_share from the stamped truth.
-            classified = exp['benign'] + exp['actionable']
-            expected_share = exp['stamped'] / classified if classified else 0.0
-            assert s['stamped_share'] == pytest.approx(expected_share), f'{name} stamped_share'
+        # Per-source origin class split + stamped share == the round-tripped
+        # truth (cascade members + age-out record → benign & stamped; the
+        # unstamped resume → actionable & inferred; the rejected row-4 record →
+        # pending, unclassified). effective_benign is the shared predicate (INV-5).
+        payload = build_escalation_analytics(corpus)
+        (entry,) = payload['per_project']
+        _assert_origin_matches(entry['origin']['sources'], arch)
 
-        # build_escalation_analytics wraps the same archive: parse_failures
-        # surfaces the corrupt file (+0 for the committed regime-markers file),
-        # and generated_at is a non-empty iso string.
-        payload = build_escalation_analytics(
-            [(tmp_path.name, esc_dir, tmp_path / 'runs.db')], now=_now(),
-        )
+        # The payload surfaces the corrupt file (+0 for the committed
+        # regime-markers file), and answers for the walk it was derived from.
         assert payload['parse_failures'] >= 1
-        assert isinstance(payload['generated_at'], str) and payload['generated_at']
+        assert payload['generated_at'] == _now().isoformat()
 
     async def test_row11_flow_cube_reconciles_over_live_archive(self, tmp_path: Path) -> None:
         queue = _live_queue(tmp_path)
         server = _make_server(queue)
         arch = await _build_live_boundary_archive(queue, server)
 
-        esc_dir = _make_config(tmp_path).escalations_dir
-        entry, _pf = _aggregate_project(tmp_path.name, esc_dir, tmp_path / 'runs.db', now=_now())
+        (entry,) = build_escalation_analytics(_walk(tmp_path))['per_project']
 
         samples = entry['lifespan']['samples']
         flow_daily = entry['workflow']['flow_daily']
@@ -454,13 +533,13 @@ class TestAggregateOverLiveArchive:
                 tier_weekly_totals[tier] += n
         assert flow_tier_counts == tier_weekly_totals == sample_tier_counts
 
-        # Per-(source, class) == sources[] benign/actionable.
+        # Per-(source, class) == sources[] classes, for every resolution class.
         flow_source_class_counts: Counter = Counter()
         for row in flow_daily:
             flow_source_class_counts[(row['source'], row['class'])] += row['n']
         for s in sources:
-            assert flow_source_class_counts.get((s['source'], 'benign'), 0) == s['benign']
-            assert flow_source_class_counts.get((s['source'], 'actionable'), 0) == s['actionable']
+            for cls in RESOLUTION_CLASSES:
+                assert flow_source_class_counts.get((s['source'], cls), 0) == s['classes'][cls]
 
 
 # ---------------------------------------------------------------------------
@@ -478,12 +557,11 @@ class TestEndpointOverLiveArchive:
     """
 
     def test_row6_route_contract_and_origin_stamps(self, client, tmp_path: Path) -> None:
-        from dashboard.app import _analytics_cache_clear
 
         _queue, arch = _live_archive_sync(tmp_path)
 
         client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp = client.get('/api/v2/dashboard/escalation-analytics')
 
         assert resp.status_code == 200
@@ -494,9 +572,11 @@ class TestEndpointOverLiveArchive:
             'generated_at', 'parse_failures', 'regime_markers', 'per_project',
             # The two archive-reach signals, and the only fields that can tell
             # an absent archive from an empty one: ``archives_present`` (all)
-            # is the completeness diagnostic, ``archives_reached`` (any) is the
-            # route's cacheability predicate.
+            # is the completeness diagnostic, ``archives_reached`` (any) is
+            # the corpus cache's own cacheability fact.
             'archives_present', 'archives_reached',
+            # The corpus' named views across every orchestrator queue.
+            'views',
         }
         assert isinstance(analytics['generated_at'], str) and analytics['generated_at']
         assert analytics['archives_present'] is True
@@ -508,27 +588,17 @@ class TestEndpointOverLiveArchive:
 
         # Origin reflects the round-tripped stamps (same per-source truth the
         # aggregator produced in step-3, now surfaced through the route/JSON layer).
-        expected = arch.expected_origin_by_source()
-        sources_by_name = {s['source']: s for s in entry['origin']['sources']}
-        assert set(sources_by_name) == set(expected)
-        for name, exp in expected.items():
-            s = sources_by_name[name]
-            assert s['benign'] == exp['benign'], f'{name} benign'
-            assert s['actionable'] == exp['actionable'], f'{name} actionable'
-            classified = exp['benign'] + exp['actionable']
-            expected_share = exp['stamped'] / classified if classified else 0.0
-            assert s['stamped_share'] == pytest.approx(expected_share), f'{name} stamped_share'
+        _assert_origin_matches(entry['origin']['sources'], arch)
 
     def test_row9_malformed_regime_markers_never_500s(self, client, tmp_path, monkeypatch) -> None:
         import dashboard.data.escalation_analytics as escalation_analytics_module
-        from dashboard.app import _analytics_cache_clear
 
         _live_archive_sync(tmp_path)
         client.app.state.config = _make_config(tmp_path)
 
         # Pre-corruption baseline: parse_failures already >= 1 (the corrupt esc
         # file in the live archive), regime_markers loads cleanly.
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp1 = client.get('/api/v2/dashboard/escalation-analytics')
         assert resp1.status_code == 200
         pre = resp1.json()['ESCALATION_ANALYTICS']['parse_failures']
@@ -541,7 +611,7 @@ class TestEndpointOverLiveArchive:
         monkeypatch.setattr(
             escalation_analytics_module, '_DEFAULT_REGIME_MARKERS_PATH', bad_markers,
         )
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp2 = client.get('/api/v2/dashboard/escalation-analytics')
 
         assert resp2.status_code == 200
@@ -550,7 +620,6 @@ class TestEndpointOverLiveArchive:
         assert analytics2['parse_failures'] > pre
 
     def test_row10_triage_segments_render_when_present(self, client, tmp_path: Path) -> None:
-        from dashboard.app import _analytics_cache_clear
 
         # Primary: the live archive (row 1 carries a round-tripped triaged_at).
         _live_archive_sync(tmp_path)
@@ -559,7 +628,7 @@ class TestEndpointOverLiveArchive:
         _plain_terminal_archive(secondary)
 
         client.app.state.config = _make_config(tmp_path, known_project_roots=[secondary])
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp = client.get('/api/v2/dashboard/escalation-analytics')
 
         assert resp.status_code == 200
@@ -595,11 +664,10 @@ class TestFrontendPayloadContract:
     """
 
     def test_served_payload_exposes_every_consumed_key(self, client, tmp_path: Path) -> None:
-        from dashboard.app import _analytics_cache_clear
 
         _live_archive_sync(tmp_path)
         client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
+        _clear_escalation_caches()
         resp = client.get('/api/v2/dashboard/escalation-analytics')
         assert resp.status_code == 200
         analytics = resp.json()['ESCALATION_ANALYTICS']
@@ -614,15 +682,22 @@ class TestFrontendPayloadContract:
 
         entry = analytics['per_project'][0]
 
-        # origin — δ donut/sparkline + ε StatTile strip.
+        # The project's terminal population (the action-mix donut's caption)
+        # and its corpus views (the strip's open-in-history tile).
+        assert isinstance(entry['terminal'], int)
+        assert {'queue_pending', 'open_in_history'} <= set(entry['views'])
+
+        # origin — δ donut/sparkline + ε StatTile strip. Every class is a key of
+        # `classes`: the origin bar draws one segment per served key.
         origin = entry['origin']
         assert isinstance(origin['daily_by_source'], dict)
         assert origin['sources']
         for source in origin['sources']:
             assert {
-                'source', 'filings', 'benign', 'actionable', 'stamped_share',
+                'source', 'filings', 'classes', 'classified', 'stamped_share',
                 'benign_rate', 'predictably_benign', 'daily_spark',
             } <= set(source)
+            assert set(RESOLUTION_CLASSES) <= set(source['classes'])
 
         # lifespan — δ percentiles + open-items table.
         lifespan = entry['lifespan']
@@ -644,3 +719,91 @@ class TestFrontendPayloadContract:
         assert workflow['flow_daily']
         for row in workflow['flow_daily']:
             assert {'date', 'source', 'level', 'tier', 'class', 'n'} <= set(row)
+
+
+# ---------------------------------------------------------------------------
+# PRD leaf η (task 5596) — the corpus' views and the complete class split,
+# end-to-end over a tree the escalation server wrote.
+# ---------------------------------------------------------------------------
+
+
+def _get_both_routes(client) -> tuple[dict, dict]:
+    with patch('dashboard.data.tasks.mcp_tool_call', new=_no_tasks()):
+        escalations = client.get('/api/v2/dashboard/escalations')
+        analytics = client.get('/api/v2/dashboard/escalation-analytics')
+    assert escalations.status_code == analytics.status_code == 200
+    return escalations.json(), analytics.json()
+
+
+class TestSketch10OverLiveQueue:
+    """PRD sketch #10: 2 pending in the live queue and 3 more in the archive read 2 and 5.
+
+    Filed through the REAL EscalationQueue, then three of the pending files
+    moved under its archive the way a stranded record sits there. The
+    /escalations pill counts the live queue, the analytics strip counts every
+    open record — two named views of ONE walk, so they share its instant.
+    """
+
+    def test_queue_pending_and_open_in_history_come_from_one_walk(self, client, tmp_path: Path) -> None:
+        queue = _live_queue(tmp_path)
+        for n in range(1, 6):
+            _submit_pending(
+                queue, f'esc-sk{n}-1', f'sk{n}', SRC_SKETCH, level=1,
+                filed_at=_BASE + timedelta(hours=n),
+            )
+        for n in (3, 4, 5):
+            archived = archive_dir_for_date(queue.queue_dir, _iso(_BASE))
+            archived.mkdir(parents=True, exist_ok=True)
+            os.replace(queue.queue_dir / f'esc-sk{n}-1.json', archived / f'esc-sk{n}-1.json')
+
+        config = _make_config(tmp_path)
+        config.reconciliation_escalations_dir.mkdir(parents=True, exist_ok=True)
+        client.app.state.config = config
+        _clear_escalation_caches()
+        try:
+            escalations, analytics = _get_both_routes(client)
+        finally:
+            _clear_escalation_caches()
+
+        queue_pending = escalations['ESCALATIONS']['views']['queue_pending']
+        (project,) = analytics['ESCALATION_ANALYTICS']['per_project']
+        open_in_history = project['views']['open_in_history']
+        assert (queue_pending['value'], open_in_history['value']) == (2, 5)
+        assert queue_pending['state'] == open_in_history['state'] == 'fresh'
+        assert queue_pending['as_of'] == open_in_history['as_of'], (
+            'the live-queue count and the history count came from two different walks'
+        )
+
+
+class TestEveryResolutionClassOverLiveQueue:
+    """Every resolution class is served, and its parts sum to the terminal population.
+
+    A strand-swept L0 and a record ruled moot join the boundary archive, so all
+    four classes are present. Each project's ``classes`` (summed over sources)
+    and its ``action_mix`` both count exactly its ``terminal`` records.
+    """
+
+    def test_classes_and_action_mix_sum_to_terminal(self, client, tmp_path: Path) -> None:
+        queue = _live_queue(tmp_path)
+        arch = asyncio.run(_build_every_class_archive(queue, _make_server(queue)))
+
+        client.app.state.config = _make_config(tmp_path)
+        _clear_escalation_caches()
+        try:
+            resp = client.get('/api/v2/dashboard/escalation-analytics')
+        finally:
+            _clear_escalation_caches()
+        assert resp.status_code == 200
+        (entry,) = resp.json()['ESCALATION_ANALYTICS']['per_project']
+        sources = entry['origin']['sources']
+
+        served_classes = {cls for source in sources for cls, n in source['classes'].items() if n}
+        assert served_classes == {r.cls for r in arch.terminal()} == set(RESOLUTION_CLASSES), (
+            'every resolution class the archive holds must be served — none folded away'
+        )
+        _assert_origin_matches(sources, arch)
+
+        terminal = entry['terminal']
+        assert terminal == len(arch.terminal())
+        assert sum(sum(source['classes'].values()) for source in sources) == terminal
+        assert sum(entry['workflow']['action_mix'].values()) == terminal

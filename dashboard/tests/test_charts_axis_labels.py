@@ -342,7 +342,7 @@ def _line_chart_format_y(body: str, anchor: str):
     Returns the expression text, or ``None`` when the site passes no formatY at
     all and therefore inherits LineChart's default. `body` is an already-sliced
     COMPONENT body: several tabs render more than one LineChart, and the anchor
-    (a series expression such as ``ts.reads``) is what names the axis.
+    (a series expression such as ``MEMORY_OPS.reads``) is what names the axis.
     """
     matches = [el for el in _jsx_elements(body, _LINE_CHART_TAG_RE) if anchor in el]
     assert len(matches) == 1, (
@@ -912,12 +912,12 @@ def test_memory_tab_reads_writes_axis_labels_whole_counts_only(
 ) -> None:
     """MemoryTab's reads-vs-writes axis is a COUNT axis and must read as one.
 
-    `write_journal.get_memory_timeseries` is a SQL ``COUNT(*)`` bucketed per
+    `write_journal.get_memory_ops` is a SQL ``COUNT(*)`` bucketed per
     hour, so a "3.5" gridline label is not a rounding nicety — it is a count
     that cannot exist.
     """
     axes = _render_caller_axis(
-        charts_jsx_body, _component_body(tabs_jsx_body, 'MemoryTab'), 'ts.reads', _COUNT_AXIS_MAX_VS
+        charts_jsx_body, _component_body(tabs_jsx_body, 'MemoryTab'), 'MEMORY_OPS.reads', _COUNT_AXIS_MAX_VS
     )
     assert axes == _COUNT_AXIS_EXPECTED, (
         f'MemoryTab reads/writes renders {axes}; expected {_COUNT_AXIS_EXPECTED}. '

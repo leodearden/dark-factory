@@ -215,25 +215,29 @@ def test_hard_constraint_stage2_reconciliation_preserved():
     active task's status/task_kind so a blocked task with no per-task evidence
     stops asserting liveness, and the corroboration verdict is what stops a
     post-redeploy task from being reported live and blocking remediation.
+
+    The pair lives in ``reconciliation/live_workflow_section.py``, and Stage 2
+    (``reconciliation/stages/task_knowledge_sync.py``) must still name the
+    renderer, which is its import and call site. Without that second check
+    "renderer preserved" could not be told apart from "Stage 2 stopped
+    calling it".
     """
-    p = (
-        REPO_ROOT
-        / "fused-memory"
-        / "src"
-        / "fused_memory"
-        / "reconciliation"
-        / "stages"
-        / "task_knowledge_sync.py"
-    )
-    text = p.read_text() if p.is_file() else ""
-    missing = [
-        symbol
-        for symbol in ("_render_live_workflow_section", "corroboration_for_task")
-        if symbol not in text
-    ]
-    assert p.is_file() and not missing, _HARD_CONSTRAINT_MESSAGE.format(
-        what=f"{p}::{{{', '.join(missing) or 'Stage 2: Task-Knowledge Sync'}}}"
-    )
+    reconciliation = REPO_ROOT / "fused-memory" / "src" / "fused_memory" / "reconciliation"
+    required_symbols = {
+        reconciliation / "live_workflow_section.py": (
+            "render_live_workflow_section",
+            "corroboration_for_task",
+        ),
+        reconciliation / "stages" / "task_knowledge_sync.py": (
+            "render_live_workflow_section",
+        ),
+    }
+    for p, symbols in required_symbols.items():
+        text = p.read_text() if p.is_file() else ""
+        missing = [symbol for symbol in symbols if symbol not in text]
+        assert p.is_file() and not missing, _HARD_CONSTRAINT_MESSAGE.format(
+            what=f"{p}::{{{', '.join(missing) or 'Stage 2: Task-Knowledge Sync'}}}"
+        )
 
 
 # ---------------------------------------------------------------------------

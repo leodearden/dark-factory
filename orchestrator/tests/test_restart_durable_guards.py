@@ -374,7 +374,8 @@ def _merge_worker(project_root: Path | None, config):
     persisted anything — the task-3223 incident conftest's
     ``_no_mock_derived_stray_dirs`` fence exists for.
     """
-    from orchestrator.merge_queue import SpeculativeMergeWorker, TrainCallbacks
+    from orchestrator.merge_lane.types import TrainCallbacks
+    from orchestrator.merge_queue import SpeculativeMergeWorker
 
     git_ops = MagicMock()
     git_ops.config = config

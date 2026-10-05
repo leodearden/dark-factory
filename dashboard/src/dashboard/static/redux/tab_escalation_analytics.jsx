@@ -18,6 +18,9 @@ const { pinningBadgeState } = window.DF_PINS_RECOVERY;
 // The Datum wrapper. Module scope, no fallback — see the CANONICAL note in
 // datum.js's header.
 const { plainDatum } = window.DF_DATUM;
+// The corpus' class split and views — read only through their one client
+// reader, escalation_views.js.
+const { resolutionSegments, corpusAgeCaption, openInHistoryOver } = window.DF_ESCALATION_VIEWS;
 
 // Every number this tab renders arrives on one endpoint, and the path is the
 // lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
@@ -209,6 +212,16 @@ const _CATEGORY_COLORS = [
   C.PALETTE.accent, C.PALETTE.ok, C.PALETTE.warn, C.PALETTE.info, C.PALETTE.accent2, C.PALETTE.bad,
 ];
 
+// One colour per resolution class. The classes drawn are the payload's, so a
+// class added server-side renders before it has a colour here — in the
+// neutral one.
+const _RESOLUTION_CLASS_COLORS = {
+  benign: C.PALETTE.ok,
+  actionable: C.PALETTE.bad,
+  'moot-terminal-subject': C.PALETTE.accent2,
+  'stale-strand': C.PALETTE.warn,
+};
+
 function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
   const daily = sliceDailyByWindow(origin.daily_by_source, generatedAt, win);
   const dates = Object.keys(daily).sort();
@@ -243,7 +256,7 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
   // source with a high rate but tiny volume sorts below a high-volume,
   // slightly-less-benign source, which is the more actionable ordering for
   // "where should triage attention go".
-  const rows = [...(origin.sources || [])].sort((a, b) => b.benign - a.benign);
+  const rows = [...(origin.sources || [])].sort((a, b) => b.classes.benign - a.classes.benign);
 
   return (
     <div style={{ marginBottom: 18 }}>
@@ -260,7 +273,7 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
           <tr>
             <th>Source</th>
             <th className="num">Filings</th>
-            <th>Benign / actionable</th>
+            <th>Resolution classes</th>
             <th>Stamped / inferred</th>
             <th>Trend</th>
             <th></th>
@@ -268,16 +281,18 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
         </thead>
         <tbody>
           {rows.map(s => {
-            const benignPct = Math.round((s.benign_rate || 0) * 100);
             const stampedPct = Math.round((s.stamped_share || 0) * 100);
             return (
               <tr key={s.source}>
                 <td>{s.source}</td>
                 <td className="num mono">{s.filings}</td>
                 <td>
-                  <div style={{ display: 'flex', height: 6, width: 90, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}>
-                    <div style={{ width: `${benignPct}%`, background: C.PALETTE.ok }} title={`benign ${s.benign}`} />
-                    <div style={{ width: `${100 - benignPct}%`, background: C.PALETTE.bad }} title={`actionable ${s.actionable}`} />
+                  <div style={{ display: 'flex', height: 6, width: 90, background: 'var(--bg-2)', borderRadius: 3, overflow: 'hidden' }}
+                    title={`${Math.round((s.benign_rate || 0) * 100)}% benign of ${s.classified} classified`}>
+                    {resolutionSegments(s.classes).map(seg => (
+                      <div key={seg.cls} style={{ width: `${seg.share * 100}%`, background: _RESOLUTION_CLASS_COLORS[seg.cls] || C.PALETTE.fg3 }}
+                        title={`${seg.cls} ${seg.n}`} />
+                    ))}
                   </div>
                 </td>
                 <td className="mono" style={{ fontSize: 10, color: 'var(--fg-3)' }}>{stampedPct}% / {100 - stampedPct}%</td>
@@ -464,7 +479,7 @@ function LifespanPanel({ lifespan, win, generatedAt }) {
 // an action-mix donut, churn/throughput time charts, and a reserved mount
 // seam for ζ's lifecycle-flow diagram (depends on δ).
 
-function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
+function WorkflowPanel({ workflow, terminal, win, generatedAt, regimeMarkers }) {
   const tierWeekly = sliceWeeklyByWindow(workflow.tier_weekly, generatedAt, win);
   const weeks = Object.keys(tierWeekly).sort();
   const weekTotals = weeks.map(w => Object.values(tierWeekly[w] || {}).reduce((s, n) => s + n, 0));
@@ -528,7 +543,10 @@ function WorkflowPanel({ workflow, win, generatedAt, regimeMarkers }) {
       )}
       <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center', marginBottom: 10 }}>
         {donutData.length > 0 && (
-          <C.Donut data={donutData} centerLabel="actions" centerValue={totalActions} />
+          <>
+            <C.Donut data={donutData} centerLabel="actions" centerValue={totalActions} />
+            <span style={{ fontSize: 10, color: 'var(--fg-3)' }}>of {terminal} terminal</span>
+          </>
         )}
       </div>
       {churnDates.length > 0 && (
@@ -592,6 +610,9 @@ function EscalationAnalyticsTab({ projectFilter }) {
           value={win}
           onChange={setWin}
         />
+        <span style={{ fontSize: 10, color: 'var(--fg-3)' }} title="When the escalation queues were last walked">
+          {corpusAgeCaption(openInHistoryOver(DF, null), Date.now())}
+        </span>
         {analytics.parse_failures > 0 && (
           <span className="badge warn" title="Escalation archive records that failed to parse (skipped, not silently dropped)">
             ⚠ {analytics.parse_failures} parse failure{analytics.parse_failures !== 1 ? 's' : ''}
@@ -619,6 +640,7 @@ function EscalationAnalyticsTab({ projectFilter }) {
             />
             <WorkflowPanel
               workflow={p.workflow}
+              terminal={p.terminal}
               win={win}
               generatedAt={analytics.generated_at}
               regimeMarkers={regimeMarkers}

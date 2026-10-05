@@ -12,9 +12,10 @@ metadata and retriage if it chooses.
 Routing parallels :mod:`curator_escalator`:
 
 * Per-project :class:`EscalationQueue` instances built lazily.
-* Orchestrator liveness probed via ``flock(LOCK_SH | LOCK_NB)`` on
-  ``{project_root}/data/orchestrator/orchestrator.lock``. No live orchestrator
-  → log + retry on the next tick (failures stay flagged until somebody runs).
+* Orchestrator liveness via
+  ``fused_memory/services/orchestrator_detector.py::is_orchestrator_lock_held``.
+  No live orchestrator → log + retry on the next tick (failures stay flagged
+  until somebody runs).
 * Per-group rolling cooldown to prevent escalation storms when the curator
   flaps. When the cooldown suppresses a fresh group, the rows still get
   ``escalated_at`` stamped — accepted loss-of-signal in exchange for no spam.
@@ -31,7 +32,7 @@ Notes:
 
 from __future__ import annotations
 
-import fcntl
+import asyncio
 import json
 import logging
 import time
@@ -41,6 +42,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fused_memory.models.scope import build_known_projects_map
+from fused_memory.services.orchestrator_detector import is_orchestrator_lock_held
 
 if TYPE_CHECKING:
     from escalation.models import Escalation  # type: ignore[import-untyped]
@@ -60,7 +62,6 @@ except ImportError:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
-_LOCK_FILENAME = 'data/orchestrator/orchestrator.lock'
 _QUEUE_DIRNAME = 'data/escalations'
 
 # Sentinel project_id used when the candidate_json is unparseable, so we can
@@ -79,36 +80,6 @@ _NO_ESCALATION = '_no_escalation_'
 # escalation_id) triples derived from candidate metadata.
 _PROBE_DEFECT = '_probe_defect_'
 
-
-
-def _orchestrator_running(project_root: str) -> bool:
-    """Return True if the project's orchestrator holds its exclusive lock.
-
-    Mirrors :meth:`CuratorEscalator._orchestrator_running` so the janitor
-    does not double-escalate when no orchestrator is around to handle the
-    queue.
-    """
-    lock_path = Path(project_root) / _LOCK_FILENAME
-    if not lock_path.exists():
-        return False
-    try:
-        fd = lock_path.open('rb')
-    except OSError:
-        return False
-    try:
-        try:
-            fcntl.flock(fd.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        except OSError as exc:
-            import errno
-            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                return True
-            raise
-        fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
-        return False
-    finally:
-        fd.close()
 
 
 class TicketJanitor:
@@ -239,11 +210,11 @@ class TicketJanitor:
         self._escalation_log[key] = log
         return bool(log)
 
-    def _surface_probe_defect(self, pid: str, count: int) -> None:
+    async def _surface_probe_defect(self, pid: str, count: int) -> None:
         """Surface an infra_issue escalation when the liveness probe has raised consecutively.
 
         Mirrors the routing guard ladder used by tick() step 4:
-        cooldown → HAS_ESCALATION → _known_projects → _orchestrator_running → submit.
+        cooldown → HAS_ESCALATION → _known_projects → is_orchestrator_lock_held → submit.
         Bail-out branches (no orchestrator / unresolved root / submit failure) do NOT
         record the cooldown so the next tick retries — identical to the ticket_failure
         flow.  Only a successful queue.submit records the cooldown timestamp.
@@ -272,7 +243,7 @@ class TicketJanitor:
             )
             return
 
-        if not _orchestrator_running(project_root):
+        if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
             logger.info(
                 'ticket_janitor: probe defect for %s (count=%d) but orchestrator '
                 'not running; will retry on next tick', pid, count,
@@ -350,7 +321,7 @@ class TicketJanitor:
                     self._probe_failures[pid] += 1
                     if self._probe_failures[pid] >= self._probe_defect_threshold:
                         try:
-                            self._surface_probe_defect(pid, self._probe_failures[pid])
+                            await self._surface_probe_defect(pid, self._probe_failures[pid])
                         except Exception:
                             logger.exception(
                                 'ticket_janitor: _surface_probe_defect raised for %s', pid,
@@ -449,7 +420,7 @@ class TicketJanitor:
                 )
                 continue
 
-            if not _orchestrator_running(project_root):
+            if not await asyncio.to_thread(is_orchestrator_lock_held, project_root):
                 logger.info(
                     'ticket_janitor: orchestrator not running for project %s; '
                     'leaving %d ticket(s) for retry on next tick',
@@ -529,8 +500,6 @@ class TicketJanitor:
 
     async def run_loop(self, interval_seconds: float) -> None:
         """Long-running tick loop. Cancellation is the only exit path."""
-        import asyncio
-
         while True:
             try:
                 await asyncio.sleep(interval_seconds)

@@ -29,6 +29,7 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
+from shared.eval_lane import eval_lane_provenance
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
 from shared.systemd_listeners import take_systemd_listeners
@@ -84,7 +85,12 @@ from orchestrator.landing_evidence import (
 from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.mcp_lifecycle import McpLifecycle
-from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
+from orchestrator.merge_queue import (
+    enqueue_merge_request,
+    reconcile_landed_outbox,
+    reconcile_landed_task,
+    select_recovery_winner,
+)
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.module_charter import sanitize_files_for_persist
@@ -1213,7 +1219,7 @@ def build_train_callback_factory(
     deliberately leaves unguarded, so even a permanently-ERRORing check
     descriptor cannot produce an infinite withhold/revert cycle.
     """
-    from orchestrator.merge_queue import TrainCallbacks
+    from orchestrator.merge_lane.types import TrainCallbacks
 
     async def _delivered_checks_withhold(
         mid: str, *, site: str,
@@ -11986,19 +11992,18 @@ class Harness:
         """Start the merge queue worker as a background asyncio task.
 
         Uses SpeculativeMergeWorker (two-coroutine pipeline) — the sole
-        production merge worker (MQ-refactor task ν retired the legacy serial
-        MergeWorker; its readable-reference role now lives as a test-local
-        fixture in ``tests/_serial_merge_worker.py``).
+        merge worker (MQ-refactor task ν retired the legacy serial
+        MergeWorker).
 
         Also builds and stores the StaleServiceRestartCoordinator and wires
         its note_merge method as the merge worker's on_merge_landed callback.
         """
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.liveness import (
             MergeLivenessConfigError,
-            SpeculativeMergeWorker,
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
+        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         # K = 1 (local trust-anchor) + number of enabled remote verify runners.
         # Sizes the liveness guard (merge_ahead_bound + num_hosts), the
@@ -13239,6 +13244,8 @@ class Harness:
             main_branch=self.config.git.main_branch,
             branch_prefix=self.config.git.branch_prefix,
             registry=self._merge_inflight_registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
         logger.info(
             '_recover_pending_merges: recovered=%d dropped=%d coalesced=%d '
@@ -13932,6 +13939,24 @@ class Harness:
             except (ValueError, TypeError):
                 continue
             if age_secs < timeout:
+                continue
+
+            eval_lane_reason = eval_lane_provenance(esc.task_id, esc.worktree)
+            if eval_lane_reason is not None:
+                self._escalation_queue.resolve(
+                    esc.id,
+                    (
+                        'Dismissed by orphan reaper — eval-lane artifact '
+                        f'({eval_lane_reason}); eval-lane escalations are '
+                        'contained to the eval harness and never promoted to L1/L2'
+                    ),
+                    dismiss=True,
+                    resolved_by='harness-orphan-reaper',
+                )
+                logger.info(
+                    'Orphan L0 reaper: dismissed eval-lane orphan for task_id=%s (%s)',
+                    esc.task_id, eval_lane_reason,
+                )
                 continue
 
             # The task row, fetched AT MOST ONCE per record and shared by the
@@ -15861,7 +15886,14 @@ class Harness:
         fut.add_done_callback(_log_if_raised)
 
     def _on_escalation_resolved(self, escalation) -> None:
-        """Callback when an escalation is resolved — wake the waiting workflow."""
+        """Callback when an escalation is resolved — wake the waiting workflow.
+
+        An eval-lane record (``shared/src/shared/eval_lane.py``) wakes no
+        workflow and dispatches no action, because a numeric id filed from an
+        eval worktree names a production task it must not touch.  The merge-halt
+        and scheduler-pause handlers key on the record's own identity, not its
+        task, so they still run.
+        """
         # Increment for any status transition (resolved or dismissed) — both are
         # escalation events, and resolutions feed the digest GATE so that a
         # window which only drains a backlog still fires a digest (and, with a
@@ -15872,8 +15904,9 @@ class Harness:
         # Best-effort observability counter — same concurrency caveat as _on_escalation
         # above; _maybe_write_digest snapshots it at entry to avoid double-skip drift.
         self._escalation_event_count += 1  # task 1327 AFK hardening
+        eval_lane_reason = eval_lane_provenance(escalation.task_id, escalation.worktree)
         event = self._escalation_events.get(escalation.task_id)
-        if event:
+        if event and eval_lane_reason is None:
             event.set()
 
         # Un-halt the merge queue only when the escalation that OWNS the
@@ -15943,6 +15976,14 @@ class Harness:
         # The _SCHEDULER_PAUSE_SENTINEL is a synthetic task-id that has its own
         # dedicated auto-resume handling above and is not a real task; skip it.
         if escalation.task_id == self._SCHEDULER_PAUSE_SENTINEL:
+            return
+
+        if eval_lane_reason is not None:
+            logger.info(
+                'escalation %s is an eval-lane artifact (%s): no workflow wake and no '
+                'action dispatch on task %s',
+                escalation.id, eval_lane_reason, escalation.task_id,
+            )
             return
 
         action = self._resolve_escalation_action(escalation)

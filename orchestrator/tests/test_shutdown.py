@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 SHUTDOWN_SCRIPT = textwrap.dedent('''
     """Minimal orchestrator shutdown shape for SIGTERM regression test."""
@@ -125,7 +126,7 @@ SHUTDOWN_SCRIPT = textwrap.dedent('''
 ''')
 
 
-@pytest.mark.timeout(120)  # task 2376: raised from 60 -- must exceed the widened 30+45s inner budget below
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # must exceed the 30+45s inner budget below
 def test_sigterm_exits_within_deadline(tmp_path: Path):
     """Reproducer for the shutdown hang.
 

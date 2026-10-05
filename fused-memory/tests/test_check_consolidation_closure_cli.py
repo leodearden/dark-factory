@@ -175,17 +175,29 @@ class TestCliUnstampedClusterMember:
         assert rc == mod.EXIT_CLOSED == 0
         assert memory.point_reads == []
 
-    def test_the_delete_arm_closes_and_is_never_probed(self):
-        absorbed = _uuid(42)
-        members = [
+    @staticmethod
+    def _claiming(absorbed):
+        return [
             _member(_uuid(1), canonical=True, supersedes=[absorbed]),
             _member(_uuid(2)),
         ]
-        # Armed to report it LIVE, so the SUPPRESSION is what closes the gate.
-        memory = FakeMemory(members, live_ids=[absorbed])
+
+    def test_a_correctly_executed_delete_arm_closes_after_one_probe(self):
+        absorbed = _uuid(42)
+        memory = FakeMemory(self._claiming(absorbed), live_ids=[])
         rc = _run(_gate_blob([_uuid(1), absorbed]), memory)
         assert rc == mod.EXIT_CLOSED
-        assert memory.point_reads == []
+        assert memory.point_reads == [(_PROJECT_ID, absorbed)]
+
+    def test_a_claimed_id_still_live_is_absorbed_member_still_live(self, capsys):
+        absorbed = _uuid(42)
+        memory = FakeMemory(self._claiming(absorbed), live_ids=[absorbed])
+        rc = _run(_gate_blob([_uuid(1), absorbed]), memory)
+        out = capsys.readouterr().out
+        assert rc == mod.EXIT_NOT_CLOSED
+        assert '[absorbed_member_still_live]' in out
+        assert absorbed in out
+        assert '[unstamped_cluster_member]' not in out
 
     def test_a_hard_deleted_unclaimed_id_closes_after_one_probe(self):
         gone = _uuid(42)
@@ -227,12 +239,12 @@ class TestCliAndSeamAgree:
     an operator is predicting — and NOT versus a local
     ``evaluate_closure(unstamped_live_ids=<list comprehension>)`` call. A
     hand-rolled reference derivation can only agree with production by
-    accident: the earlier version of this test omitted the canonical's
-    ``supersedes`` subtraction entirely (the subtlest rule in
-    ``unstamped_candidates``, and the one keeping every delete-arm
-    consolidation closeable) and stayed green only because no case exercised
-    it. Both sides now run the same production code, and the fourth case
-    below exercises exactly that rule.
+    accident: an earlier version of this test omitted the canonical's
+    ``supersedes`` rule entirely (the subtlest rule in
+    ``unstamped_candidates``) and stayed green only because no case exercised
+    it. Both sides now run the same production code, and the delete-arm cases
+    below exercise exactly that rule: the claim is probed, and a live hit is
+    ``absorbed_member_still_live``.
 
     The two sides are wired to ONE ``FakeMemory``: the CLI reaches it through
     ``scroll_cluster``, the seam through the three injected collaborators
@@ -279,14 +291,23 @@ class TestCliAndSeamAgree:
             ([_uuid(42)], [_uuid(42)], _WELL_FORMED),          # stray, live
             ([_uuid(42)], [], _WELL_FORMED),                    # stray, gone
             ([_uuid(1), _uuid(2)], [], _WELL_FORMED),           # all stamped
-            # THE DELETE ARM: the canonical claims it absorbed _uuid(42), and
-            # the store would report that id LIVE if either side probed it. Both
-            # must subtract the claim and close clean — if one side forgets, the
-            # CLI reassures an operator the seam is about to refuse (or the
-            # reverse, which makes a correct consolidation look uncloseable).
+            # THE DELETE ARM, claim still LIVE: the canonical claims it
+            # absorbed _uuid(42) but the store holds it. Both sides must probe
+            # the claim and refuse — if one side forgets, the CLI reassures an
+            # operator the seam is about to refuse (or the reverse).
             (
                 [_uuid(1), _uuid(42)],
                 [_uuid(42)],
+                [
+                    _member(_uuid(1), canonical=True, supersedes=[_uuid(42)]),
+                    _member(_uuid(2)),
+                ],
+            ),
+            # THE DELETE ARM, claim really gone: both sides read it once and
+            # close.
+            (
+                [_uuid(1), _uuid(42)],
+                [],
                 [
                     _member(_uuid(1), canonical=True, supersedes=[_uuid(42)]),
                     _member(_uuid(2)),
@@ -320,14 +341,16 @@ class TestCliAndSeamAgree:
             c[1] for c in seam_memory.point_reads
         ]
 
-    def test_the_delete_arm_case_really_would_have_probed(self, tmp_path):
-        """Guards the guard: the ``supersedes`` case above is only meaningful
-        because the claimed id WOULD otherwise be a probe candidate. Drop the
-        claim and both sides go looking for it."""
-        unclaimed = [_member(_uuid(1), canonical=True), _member(_uuid(2))]
-        memory = FakeMemory(unclaimed, live_ids=[_uuid(42)])
+    def test_the_live_claim_case_is_not_vacuous(self, tmp_path):
+        """Guards the guard: the live-claim case above must actually refuse
+        and read the claim, so two clean closes cannot satisfy its equality."""
+        claiming = [
+            _member(_uuid(1), canonical=True, supersedes=[_uuid(42)]),
+            _member(_uuid(2)),
+        ]
+        memory = FakeMemory(claiming, live_ids=[_uuid(42)])
         codes = asyncio.run(
             self._seam_codes(_gate_blob([_uuid(1), _uuid(42)]), memory, tmp_path)
         )
-        assert 'unstamped_cluster_member' in codes
+        assert codes == ['absorbed_member_still_live']
         assert [c[1] for c in memory.point_reads] == [_uuid(42)]

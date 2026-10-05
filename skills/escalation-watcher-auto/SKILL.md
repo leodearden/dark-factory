@@ -94,9 +94,16 @@ The auto-watcher's allowed tools strictly limit what you can access. Use these f
 | `Bash(git diff ...)` | Diff between commits or branches to identify breaking changes |
 | `Bash(git show ...)` | Read a specific commit's diff |
 | `Bash(git status ...)` | Working-tree state at the project root |
+| `python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py` | List and count one task's `runs.db` events before a `root_cause`/`evidence` narrative joins them (read-only). Advisory entry: not in `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS`; it runs because the rotation's `bypassPermissions` mode admits Bash, as `scripts/watcher-rearm.sh` does |
 | `mcp__fused-memory__get_task` | Full task record including metadata and recent history |
 | `mcp__fused-memory__get_tasks` | Task tree — useful for finding sibling tasks of the same parent |
 | `mcp__fused-memory__search` | Semantic search for prior decisions, related tasks, conventions |
+
+**MCP tool names are per-server.** The `mcp__<server>__` prefix names the server that owns a tool.
+
+- **Task records** are read ONLY through `mcp__fused-memory__get_task` / `mcp__fused-memory__get_tasks` — the escalation server has no `get_task`. This rotation's escalation reads, `mcp__escalation__get_pending_escalations` (pending records; full rows unless `compact=True`) and `mcp__escalation__get_task_escalations` (every escalation filed for one task, archive included), return escalation records, not task records.
+- **Reading one full escalation record.** Call a non-compact `mcp__escalation__get_pending_escalations(task_id=<its task_id>)` — or `mcp__escalation__get_task_escalations(task_id=<its task_id>)` to include the archive — and pick the row by `id`. Full rows are `Escalation.to_dict()` (`escalation/src/escalation/models.py`) and carry every field, including `detail` and `pin_declared_reason`.
+- **Tools the server lists but this rotation is not granted.** The escalation server's MCP instructions (`escalation/src/escalation/server_instructions.py`) describe what the SERVER offers, including `get_escalation`, `get_task_escalation_history` and `get_task_runtime_state`. None of those three is granted here: this rotation may call only what `orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` lists, and an MCP tool outside it is denied (see [Headless-mode permission gotchas](#headless-mode-permission-gotchas-credit-external-pr-4)).
 
 **You do NOT have** `df`, `systemctl`, `docker`, `kill`, or any host-health tool — you form infra hypotheses from symptom patterns only.
 
@@ -114,6 +121,8 @@ A hypothesis is a **stable, human-readable string** you will pass as `root_cause
 - Good: `"bad-merge-to-main-breaks-scheduler-imports"`, `"neo4j-connectivity-outage"`, `"prd-decomposition-scope-overlap-in-reconciler"`
 - Too vague: `"infra"`, `"failure"`
 - Too specific: `"task-42-import-error-line-17-of-reconciler.py"` (won't match task-43's variant)
+
+A hypothesis that joins two or more failure events of one task is formed from counted rows, per `$DARK_FACTORY_ROOT/skills/_shared/counting-failure-events.md`.
 
 ## Promote to L2
 
@@ -136,7 +145,11 @@ result = mcp__escalation__promote_to_l2(
 )
 # result: {'id': <l2_id>, 'status': 'created'|'updated', 'members': [...],
 #          'severity': <what was actually filed>}
+#   or, for an eval-lane task_id or any eval-lane member, the refusal
+#          {'error': ..., 'code': 'eval_lane_contained'}  (nothing minted)
 ```
+
+An `eval_lane_contained` refusal is final for the eval-lane records it names: close them instead, per [Eval-lane records](#eval-lane-records-any-category--close-never-promote), and re-promote any production members without them.
 
 ### Severity of a promoted L2
 
@@ -234,7 +247,7 @@ Such a record now carries `pin_declared_by` (task 4377). `resolve_issue` refuses
 
 Nothing is mutated on a refusal: the head and every member stay pending and un-archived. Read the structured `declared_pins` payload — don't parse the message.
 
-- **A compact drain surfaces `pin_declared_by` on every row.** Check it *before* designating a cluster for a bulk close. `pin_declared_reason` is not projected — a non-empty `pin_declared_by` is your signal to pull the full record with `get_escalation`.
+- **A compact drain surfaces `pin_declared_by` on every row.** Check it *before* designating a cluster for a bulk close. `pin_declared_reason` is not projected — a non-empty `pin_declared_by` is your signal to re-read the record without `compact`, as **Reading one full escalation record** under [Read-only investigation toolset](#read-only-investigation-toolset) describes. The pending read is sufficient because a declared-pin refusal mutates nothing — the head and every member stay pending.
 - **`acknowledge_declared_pins` is NOT a way to make the error go away.** It requires naming *every* blocked id (a partial acknowledgement still refuses, reporting only the remainder), and there is no un-declare verb. The correct response to this refusal is to go **read what `pin_declared_by` names and consult it** — a deviation notice, an operator gate — not to silence it. Acknowledge only when that thing has told you the pin may be spent.
 - **An UNMARKED record is not proof that nothing relies on it.** The marker is opt-in; its absence means "not declared", not "safe".
 - **You cannot declare a pin yourself — REPORT one.** `mcp__escalation__declare_pin` is not in this rotation's allowed tools (`orchestrator/src/orchestrator/harness.py::_WATCHER_ALLOWED_TOOLS` grants `stamp_triage`, not this); declaring is operator/steward-only for now. When a record looks load-bearing but carries no `pin_declared_by`, do NOT close it and do NOT invent a marker: leave it pending, `stamp_triage` it with what you found, and say in your report that it is a *candidate pin* naming what appears to rely on it. A human runs `declare_pin` to make it machine-readable.
@@ -452,6 +465,38 @@ Every `resolve_issue` you call — an autonomous-dispatch `resume` **or** a `clo
 - **`benign`** — a confirmed **no-action** close: the stated condition was stale, superseded, already-cleared, or a duplicate, and nothing real changed beyond closing the record. This covers the [L2 rubber-stamp carve-out](#auto-closing-a-rubber-stamp-l2-narrow-close_only-carve-out) closes and the [`stranded_blocked`](#stranded_blocked) predicate-stale close.
 
 The class describes the **escalation's usefulness**, not your effort — a `resume` you performed in one call is still `actionable`; a stale record you spent effort verifying is still `benign`. `promote_to_l2` takes **no** `resolution_class` (promotion does not resolve — member L1s stay pending; the class is stamped only when the resulting L2 is finally resolved). When genuinely unsure, prefer `actionable` (it never suppresses a record from the human-review benign-rate metric).
+
+### Eval-lane records (any category) — close, never promote
+
+**Class discriminator.** A pending record is eval-lane when **either** holds:
+- its `task_id` matches the eval fixture grammar — `<repo>_task_<n>[_<suffix>]` (e.g. `df_task_2430_adv_plan`, `reify_task_5221`, `kl_task_543`) or `shadow_<task_id>_<cell_id>` (e.g. `shadow_5383_01JCELL`);
+- its `worktree` has a path component ending in `-eval-worktrees` or named `.eval-worktrees` (e.g. `/home/leo/src/dark-factory-eval-worktrees/df_task_2339/run-ac3ab562`), even when its `task_id` is a real numeric task. A directory that merely contains `eval-worktree` in its name (a project called `eval-worktree-tools`) is production.
+
+The single source of both signals is `shared/src/shared/eval_lane.py::eval_lane_provenance`; match it, do not approximate it. Other non-numeric ids are **not** eval-lane: `task-path-guard`, `__recovery_veto_streak__*`, `main-sweep-*`, `__scheduler__` and their kin are production harness sentinels whose L2s must still reach a human. A reaper-minted L1 carries `worktree=None`, so on an L1 the `task_id` is usually the only signal.
+
+**Why they exist.** Adversarial eval fixtures seed a deliberately wrong plan step, and the implementer's refuse-and-escalate IS the measured behaviour. It is scored from the eval cell's result artifacts (`orchestrator/src/orchestrator/evals/scoring.py`), never from the escalation queue, so these records carry no production signal. The orphan reaper also used to flag throwaway fixture worktrees as orphans.
+
+**What the system does with them.** The escalation server files eval-lane escalations already-resolved (`resolved_by='escalation-eval-lane-containment'`); the orphan reaper dismisses an eval-lane L0 instead of promoting it; `promote_to_l2` refuses an eval-lane `task_id`, or any eval-lane member under whatever `task_id`, with `code: 'eval_lane_contained'` and mints nothing. A rotation should rarely meet one.
+
+**Disposition for any that still reach a rotation** (records filed before containment shipped, or written by a path that bypasses the server). Never `promote_to_l2`. Never `resolve_issue(action='resume')`. Close each member L1:
+
+```
+mcp__escalation__resolve_issue(
+  escalation_id="...",
+  resolution="eval-lane artifact (<task_id> / <worktree>) — eval fixture behaviour, scored from the eval cell result artifacts; not a production signal. Closed informational.",
+  action='close_only',
+  resolved_by="escalation-watcher-auto",
+  resolution_class="benign"
+)
+```
+
+Close it; do not `stamp_triage` it. A stamp leaves the record pending, and a pending L1 keeps `_watcher_has_actionable_l1` (`orchestrator/src/orchestrator/harness.py::_watcher_has_actionable_l1`) respawning rotations.
+
+**Report, don't just close.** The live queue held no eval-lane records on 2026-10-01, when containment was built, so a pending eval-lane record with a later `timestamp` most likely reached the queue without passing `escalation/src/escalation/server.py::_chokepoint_or_submit`. This rotation holds no escalation-filing tool, so the digest is the report: append `— BYPASS? filed <timestamp>` to that record's digest line.
+
+**Digest — one line per record, mandatory:**
+
+`AUTO-CLOSED (L1 <escalation_id>): eval-lane-contained — <task_id> — eval fixture artifact, measurement scored from cell result artifacts [benign]`
 
 ### Autonomous dispatch categories (handle and resolve)
 
@@ -1030,6 +1075,9 @@ Mode: <"L2-promotion (promote_to_l2 available)" | "LEGACY (promote_to_l2 not ava
 
 ### Auto-closed L1 (path-guard synthetic-anchor audit)
 - AUTO-CLOSED (L1 esc-task-path-guard-37): path-guard-audit — mode=rejection — synthetic anchor task-path-guard (no real task); closed informational [benign]
+
+### Auto-closed L1 (eval-lane contained)
+- AUTO-CLOSED (L1 esc-df_task_2430_adv_plan-7): eval-lane-contained — df_task_2430_adv_plan — eval fixture artifact, measurement scored from cell result artifacts [benign]
 
 ### Auto-closed L2 (narrow carve-out)
 - AUTO-CLOSED (L2 esc-main-sweep-abc123def456-1): superseded_main_sweep — main-sweep-abc123def456 — newer sweep esc-main-sweep-9f8e7d6c5b4a; swept SHA abc123def456 is-ancestor of clean tip [benign]

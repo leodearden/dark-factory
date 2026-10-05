@@ -476,6 +476,102 @@ class TestManifestTask:
         with pytest.raises(ValidationError):
             ManifestTask(label='α', task_id='not-an-int', capabilities=[])  # type: ignore[arg-type]
 
+    def test_external_task_id_accepted_in_canonical_form(self):
+        """A block whose producer lives in ANOTHER project's registry.
+
+        The value is the repo's canonical qualified form
+        (``"project_id:task_id"``, docs/task-authoring.md §3.2). An
+        already-canonical value round-trips unchanged, which is what makes
+        the normalisation in ``_check_producer_binding`` idempotent — see
+        ``test_external_task_id_surrounding_whitespace_normalised`` for the
+        non-canonical input it exists for.
+        """
+        task = ManifestTask(label='η', external_task_id='reify:5613', capabilities=[])
+        assert task.external_task_id == 'reify:5613'
+        assert task.task_id is None
+
+    def test_external_task_id_omitted_defaults_none(self):
+        task = ManifestTask(label='α', capabilities=[])
+        assert task.external_task_id is None
+
+    def test_external_task_id_loads_through_parse_capability_manifest(self):
+        doc = parse_capability_manifest(
+            {
+                'prd': 'plans/example-prd.md',
+                'schema_version': 1,
+                'tasks': [_task_dict('η', external_task_id='reify:5613')],
+            }
+        )
+        assert doc.tasks[0].external_task_id == 'reify:5613'
+        assert doc.tasks[0].task_id is None
+
+    def test_both_task_id_and_external_task_id_rejected(self):
+        """A block binds exactly one producer, in exactly one registry.
+
+        Guards the concrete path in ``manifest_stamping`` step 4: it stamps
+        any label present in the current ``commit_planning`` batch without
+        consulting the block's existing contents, so a future dark-factory
+        decompose re-using a label already bound to a foreign producer
+        would write a local ``task_id`` alongside the ``external_task_id``.
+        Failing loudly at load is the point — the corpus sweep turns it
+        into a red CI signal naming the file.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            ManifestTask(label='η', task_id=5613, external_task_id='reify:5613', capabilities=[])
+        message = str(exc_info.value)
+        assert 'η' in message
+        assert 'reify:5613' in message
+
+    @pytest.mark.parametrize(
+        'value',
+        [
+            pytest.param('reify', id='no-colon'),
+            pytest.param('reify:', id='empty-task-id'),
+            pytest.param(':5613', id='empty-project-id'),
+            pytest.param('a:b:c', id='three-parts'),
+            pytest.param('  ', id='blank'),
+            pytest.param('', id='empty'),
+        ],
+    )
+    def test_malformed_external_task_id_rejected(self, value):
+        """Structural form is delegated to ``ExternalDep.parse``, not re-implemented."""
+        with pytest.raises(ValidationError) as exc_info:
+            ManifestTask(label='η', external_task_id=value, capabilities=[])
+        message = str(exc_info.value)
+        # The message names the offending value AND the label, so a
+        # corpus-sweep failure is self-locating without opening the file.
+        assert repr(value) in message
+        assert 'η' in message
+
+    def test_external_task_id_surrounding_whitespace_normalised(self):
+        """Whitespace the shared parser tolerates is ACCEPTED and normalised away.
+
+        ``ExternalDep.parse`` strips before splitting, so this is a
+        well-formed value and validation must not reject it. But it is NOT
+        stored verbatim: every consumer treats this field as an opaque key
+        (the live-corpus test compares it with ``==``, and the docstring
+        promises the same spelling as ``metadata.external_deps``), so a
+        padded value would make any join against an ``external_deps``
+        entry silently miss. The model stores ``ExternalDep.render()``'s
+        canonical spelling instead, which is the one form callers may rely
+        on.
+        """
+        task = ManifestTask(label='η', external_task_id=' reify:5613 ', capabilities=[])
+        assert task.external_task_id == 'reify:5613'
+
+    def test_external_task_id_normalisation_is_idempotent(self):
+        """Re-validating a stored value is a no-op, so a round-trip is stable.
+
+        ``manifest_stamping``'s write-back re-dumps and the corpus sweep
+        re-loads; if normalisation were not idempotent, a sidecar would
+        churn on every pass.
+        """
+        once = ManifestTask(label='η', external_task_id=' reify:5613 ', capabilities=[])
+        twice = ManifestTask(
+            label='η', external_task_id=once.external_task_id, capabilities=[]
+        )
+        assert twice.external_task_id == once.external_task_id == 'reify:5613'
+
     def test_empty_label_rejected(self):
         with pytest.raises(ValidationError) as exc_info:
             ManifestTask(label='', capabilities=[])

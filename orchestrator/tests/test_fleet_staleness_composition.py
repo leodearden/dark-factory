@@ -222,7 +222,7 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
 
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         # Drained pipeline: no in-flight/verifying merge, empty queue.
@@ -283,7 +283,7 @@ class TestBurstCoalescingUnderCommittedConfig:
 
         with patch('orchestrator.merge_queue.SpeculativeMergeWorker') as mock_smw, \
              patch('asyncio.create_task'), \
-             patch('orchestrator.merge_queue.check_merge_liveness_margin'):
+             patch('orchestrator.merge_lane.liveness.check_merge_liveness_margin'):
             await harness._start_merge_worker()
 
         # Drained pipeline throughout: no in-flight/verifying merge, empty queue.

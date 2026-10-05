@@ -57,8 +57,13 @@ So the native rule is a real and better long-term mechanism, deferred as its
 own task rather than smuggled into a cleanup, and these guards are not a
 reimplementation of something unavailable — they are the part that can run in
 the pytest gate today, with an import-specific remedy in the failure message
-that a generic "unnecessary suppression" diagnostic cannot give. When the
-native rule is enabled repo-wide, shrink or delete this file.
+that a generic "unnecessary suppression" diagnostic cannot give. Task 5086
+was that task: it measured every ``[tool.pyright]`` table and kept the ROOT
+table off, because the root table carries import pragmas that are load-bearing
+only in narrower environments; the per-table decision and the opt-in set live in
+``tests/scripts/test_pyright_unnecessary_ignore_opt_in.py``. When the native
+rule is enabled in the ROOT ``[tool.pyright]`` table, shrink or delete this
+file.
 
 NOT A DOCUMENTATION META-TEST. These assert on suppression DIRECTIVES —
 load-bearing inputs to the type checker, in the same category as the

@@ -21,7 +21,9 @@ from typing import IO, Literal, overload
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import LoopFreedomProbe
 
+from fused_memory.middleware import ticket_janitor
 from fused_memory.middleware.ticket_janitor import TicketJanitor
 from fused_memory.middleware.ticket_store import TicketStore
 
@@ -747,7 +749,7 @@ async def test_probe_defect_bail_out_when_orchestrator_not_running(store, tmp_pa
     """
     from fused_memory.middleware.ticket_janitor import _PROBE_DEFECT
 
-    # Create the lock file but do NOT hold it — _orchestrator_running returns False.
+    # Create the lock file but do NOT hold it — is_orchestrator_lock_held returns False.
     _make_orchestrator_layout(tmp_path, hold_lock=False)
     project_id = _project_id_for(tmp_path)
     ticket_id = await store.submit(
@@ -793,6 +795,73 @@ async def test_probe_defect_bail_out_when_orchestrator_not_running(store, tmp_pa
     row = await store.get(ticket_id)
     assert row['status'] == 'pending'
     assert row['reason'] is None
+
+
+def _escalation_categories(root: Path) -> list[str]:
+    esc_dir = root / 'data' / 'escalations'
+    return [
+        json.loads(f.read_text())['category']
+        for f in sorted(esc_dir.glob('esc-*.json'))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ticket_failure_path_probes_orchestrator_off_the_event_loop(
+    store, tmp_path, monkeypatch,
+):
+    """tick()'s ticket_failure path runs the orchestrator probe off the loop thread."""
+    probe = LoopFreedomProbe()
+    seen: list[str] = []
+
+    def _blocking_lock_probe(project_root):
+        seen.append(project_root)
+        probe.block()
+        return True
+
+    monkeypatch.setattr(ticket_janitor, 'is_orchestrator_lock_held', _blocking_lock_probe)
+    ticket_id = await store.submit(
+        project_id=_project_id_for(tmp_path),
+        candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+    )
+    await _force_failed(store, ticket_id, reason='curator_rejected')
+
+    await TicketJanitor(store, primary_project_root=str(tmp_path)).tick()
+
+    probe.assert_loop_stayed_free()
+    assert seen == [str(tmp_path)]
+    assert _escalation_categories(tmp_path) == ['ticket_failure']
+
+
+@pytest.mark.asyncio
+async def test_probe_defect_path_probes_orchestrator_off_the_event_loop(
+    store, tmp_path, monkeypatch,
+):
+    """The probe-defect path runs the orchestrator probe off the loop thread."""
+    probe = LoopFreedomProbe()
+
+    def _blocking_lock_probe(project_root):
+        probe.block()
+        return True
+
+    def _raising_liveness_probe(pid: str) -> bool:
+        raise RuntimeError('probe broken')
+
+    monkeypatch.setattr(ticket_janitor, 'is_orchestrator_lock_held', _blocking_lock_probe)
+    await store.submit(
+        project_id=_project_id_for(tmp_path),
+        candidate_json=_candidate_blob(title='stranded task'),
+    )
+    janitor = TicketJanitor(
+        store,
+        primary_project_root=str(tmp_path),
+        liveness_probe=_raising_liveness_probe,
+        probe_defect_threshold=1,
+    )
+
+    await janitor.tick()
+
+    probe.assert_loop_stayed_free()
+    assert _escalation_categories(tmp_path) == ['infra_issue']
 
 
 @pytest.mark.asyncio

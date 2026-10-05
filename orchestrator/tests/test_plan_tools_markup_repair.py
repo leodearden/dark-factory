@@ -24,10 +24,10 @@ file and silently dropping that call's sibling arguments.
 
 So every specimen below is assembled at import time from ``_markup_helpers``'
 builders, which build their angle bracket from ``chr(60)``. The result is
-byte-identical at runtime and never appears verbatim in the file text. That
-module's ``assert_no_raw_sentinels`` enforces it on the bytes of whichever file
-passes its own ``__file__``, so a future editor cannot quietly reintroduce one
-(it is a check on this file's source text, not on any docstring's wording).
+byte-identical at runtime and never appears verbatim in the file text.
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
+enforces it on this file's source text, repo-wide, so a future editor cannot
+quietly reintroduce one.
 """
 
 from __future__ import annotations
@@ -48,7 +48,6 @@ from pathlib import Path
 import pytest
 from _markup_helpers import (
     INVOKE_CLOSER,
-    assert_no_raw_sentinels,
     closer,
     param_opener,
 )
@@ -67,13 +66,6 @@ from orchestrator.artifacts import (
     TaskArtifacts,
 )
 from orchestrator.mcp import plan_tools
-
-# The sentinel builders and the import-time self-scan live in
-# ``_markup_helpers``: three suites in this package need them and none may hold
-# a second copy (INV-5). Imported under this module's own local spellings so
-# every specimen below still reads as it always did.
-assert_no_raw_sentinels(__file__)
-
 
 # ---------------------------------------------------------------------------
 # The four REAL specimen shapes, measured on the 28 corrupted live plans.

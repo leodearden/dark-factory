@@ -308,7 +308,9 @@ def _expected_client_class(arm: str) -> type:
 
         return ForceJsonObjectOpenAIGenericClient
     if arm == 'openai_generic/auto':
-        return OpenAIGenericClient
+        from fused_memory.backends.llm_clients import TokenRecordingOpenAIGenericClient
+
+        return TokenRecordingOpenAIGenericClient
     return OpenAIClient
 
 

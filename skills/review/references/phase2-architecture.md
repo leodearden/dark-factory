@@ -1,376 +1,215 @@
 # Phase 2: Architectural Coherence — Detailed Guide
 
-This phase answers: **is the codebase internally consistent and complete?**
+This phase answers: **is the codebase internally consistent, complete, and cheap to change?**
 
-This is where the review earns its keep. Per-task verification can't catch the class of issues that only surface when you look across module boundaries — broken wiring, plausible-looking stubs, type mismatches at integration points, tests that mock so thoroughly they never test real integration.
+Per-task verification cannot see what only shows across module boundaries — broken wiring, plausible stubs, type mismatches at integration points, tests that mock so much they test nothing — nor the cost a change imposes on the next agent. That is this phase's job. Seat routing is SKILL.md "Routing: who does what"; everything below runs in the pinned tree.
 
-You (Opus) do the architectural reasoning. Spawn Sonnet sub-agents for the mechanical scanning, then synthesise their findings with your own analysis.
+## The judging lens
+
+Applies to every step that judges code (Steps 2–7) and to carried-finding re-verification.
+
+1. **Take in `$QUALITY_DOC` in full** before judging — `Read docs/code-quality.md`, or the embedded `guidance()` block when the project has no copy (SKILL.md) — and open every judging seat's prompt the same way (contract §10). Cite it; do not paraphrase its readings into prompts or findings.
+2. **Tag** every finding with the heuristics it rests on, lens first (`references/run-record.md`), and name the heuristic in the statement the way the doc asks.
+3. **Measurements the doc lists under "Do not steer by"** may appear in a statement as context, never as the reason for a finding or an input to its severity (§10).
+4. **Severity** is contract §4. **Class** (mechanical or structural) is §6 and is set in Phase 3, but say in the proposal whether it chooses between designs.
+
+### Look-fors by heuristic
+
+Steps 3 and 5 put their own questions to heuristics 1, 3, 7 and 9–13. The rest are judged where this table says, from candidates found with the instruments in the doc's "What to measure" table. The doc's reading of each heuristic is the test; a measurement only finds candidates.
+
+| Lens | Judged in | Candidates from |
+|---|---|---|
+| `h6` | Steps 4, 5 | modules and classes with fan-in from unrelated callers, or whose `git log` shows unrelated changes landing together |
+| `h2` | Step 4 | per-function cognitive complexity (`complexipy`) and nesting depth for files in the Phase 2 set; read as the doc's max/total pair |
+| `h4` | Step 4 | per-function length (AST counts or `radon raw`); functions that do more than one thing |
+| `h5` | Steps 4, 5 | instance attributes assigned outside construction, transient values promoted to instance or module lifetime, module-level mutable state |
+| `h8` | Step 5 | mutable structures crossing a module boundary; shared structures mutated in place after hand-off |
+| `comments` | Step 4 | prose-to-code ratio (`radon raw`); comments defending a decision or answering a reviewer; rationale pointing into memory or an escalation rather than a tracked file |
+| `tests` | Step 7 | tests patching private names by dotted path, reading private attributes, or needing a reach-back or function-local import to reach their subject |
+| `h14` | Step 4 | only through the doc's measurement protocol for heuristic 14, recorded in the statement; never a line count alone. Always `structural` (§6) |
+
+Install `radon` and `complexipy` into the pinned tree's venv if absent (`uv pip install radon complexipy`). A step that cannot run its instrument says so in `evidence`, not silently.
+
+## Step 0: Scope and carry set
+
+### Changed scope (`mode: since`)
+
+A sonnet seat (low effort) computes, in the pinned tree:
+
+1. **Changed files**: `git diff --name-only <since> <as_of_sha> -- <scope paths>`, minus the briefing's `exclude`/`global_exclude` and deleted paths.
+2. **Direct importers** of each changed module, one hop. Python in the `<pkg>/src/<pkg>/` layout: derive the dotted name from the path after `src/` (drop `.py` and `__init__`), then `git grep -l -E '^\s*(from|import)\s+<dotted>(\s|\.|$)' <as_of_sha> -- '*.py'`, plus relative imports inside the same package (`from .<leaf> import`, `from . import <leaf>`). Other languages: the same question in their import form (`use crate::<mod>`, `from './<mod>'`).
+3. **Phase 2 file set** = changed ∪ importers. Record both counts in `evidence`.
+
+`mode: full` uses every file in scope.
+
+### Carry set re-verification (both modes)
+
+The carry set is every finding in the `since` report with disposition `open`, `filed:<id>` or `accepted:<id>` (SKILL.md "Pin the run"). Split it across sonnet seats (medium effort, ≤10 findings each). Each seat's prompt carries `$QUALITY_DOC`; the seat then, for each finding, checks at the pinned tree whether the anchor exists and whether the statement still holds, and returns one of:
+
+- `present` — with `confirmed` or `weakened` and, if the severity or wording should change, what changed;
+- `gone` — the cost the statement describes is no longer in the code;
+- `moved` — the symbol was renamed or the file split; give the new anchor.
+
+The coordinator applies them: `present` → copy the finding, append `run_id` to `last_seen`, fill `change_note` if verdict or severity changed; `gone` → disposition `fixed:<as_of_sha>`; `moved` → new key per §2 with the old key appended to `supersedes`, disposition carried. An `accepted:<id>` whose accepting task is now `done`, or whose anchor moved, reopens as `open` (§7).
+
+A step below that mints a key already in the carry set merges into that entry rather than adding a second.
 
 ## Step 1: Run the project's `/audit` skill (if available)
 
-Some projects ship an `/audit` slash command — an automated architecture-coherence detector suite. (Reify, for example, runs `reify-audit` covering P1 producer-orphan, P2 consumer-stub, and P5 phantom-done patterns.) When present, `/audit` is the first Phase 2 step: it does the mechanical scanning that would otherwise be ad-hoc, and frees the rest of Phase 2 to focus on judgment-heavy work.
+Some projects ship an `/audit` slash command — an automated detector suite (reify's `reify-audit` covers P1 producer-orphan, P2 consumer-stub, P5 phantom-done). When present it runs first and takes the mechanical scanning off the later steps.
 
-### Detect and invoke
+1. **Detect.** `.claude/skills/audit/SKILL.md` at the project root. Absent → `f_infra.audit_skill_present: false`, skip.
+2. **Window.** `mode: since` → `--since` is the committer date of `since` (`git show -s --format=%cI <since>`). `mode: full` → now minus the briefing's `audit.window_days` (default 14).
+3. **Invoke.** `Skill(audit, args="--pattern P1,P2,P5 --since <iso>")`. It writes `data/audit-runs/<ts>.json`, escalates high, files medium, logs low, and keeps its own dedupe index.
+4. **Fold in.** Keep the raw counts in `f_infra` and convert each audit finding into a `findings` entry tagged `kind:audit` (lens first), disposition `filed:<filed_task_id>` for medium, `open` with the escalation id in the statement for high. Phase 3 never re-files or re-escalates them.
 
-1. **Detect.** Check whether `.claude/skills/audit/SKILL.md` exists at project root. If absent, skip this step and record `f_infra_findings.audit_skill_present: false` in the report.
+## Step 1.5: Read the other instruments' reports (contract §9)
 
-2. **Compute the window.** Use `audit.window_days` from the briefing (default 14). The `--since` argument is an ISO-8601 timestamp `now - window_days`. If a previous Phase 2 report exists under `review/reports/phase2-*.json` and is newer than `now - window_days`, use *its* timestamp instead — sweeps should not redundantly re-scan ranges already covered.
+Inputs prioritise; they are not findings to copy. Record every input in `inputs_consumed`.
 
-3. **Invoke.** Call the skill: `Skill(audit, args="--pattern P1,P2,P5 --since <iso>")`. The skill shells out to the project's detector binary, writes a per-run JSON artifact under `data/audit-runs/<ts>.json`, applies its own severity ladder (high → `escalate_info`, medium → `submit_task`, low → log-only), and updates `data/audit-runs/index.json` (its dedupe store).
+1. **Hotspot survey.** The newest `bug-hotspot-survey-*-full-findings.json` in the project's plans directory (dark-factory `plans/`, reify `docs/notes/`); its `method.run_id` is `hotspot-survey-<project_id>-…` and `method.as_of_sha` its tree. A report from before the contract has no `method.run_id` — record it as `legacy:<filename>` and treat its anchors as dated. Use its ranked areas as Step 4 candidates and its churn exonerations (when present) to down-weight healthy churn. Re-verify any anchor before acting on it; check its `as_of_sha` against ours.
+2. **`/review-all`.** The newest `review-all-<project_id>-<YYYYMMDD>[-<n>].json` in the plans directory, never a `review-all-program-*` file (`method.run_id`, `method.as_of_sha`). Its open findings in scope go to the top of Step 4's list.
+3. **Confusion codebook** (`docs/legibility/confusion-codebook.yaml`). Never Read it raw — it runs to tens of thousands of lines. A sonnet seat runs this digest from the pinned tree and returns its output sorted by sightings:
 
-4. **Parse the artifact.** Read the newest file under `data/audit-runs/` (or the path the skill returns). Each entry is a `Finding` with `pattern`, `severity`, `subject`, `location`, `evidence`, and — for medium-severity findings the audit already filed — a `filed_task_id`.
+   ```python
+   import re, yaml
+   book = yaml.load(open("docs/legibility/confusion-codebook.yaml"), Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+   for e in book.get("entries", []):
+       if e.get("status") in ("retired", "fixed"):
+           continue
+       anchors = e.get("anchor") or e.get("fix_where") or []
+       anchors = sorted({re.sub(r":[\d,\-]+$", "", a) for a in ([anchors] if isinstance(anchors, str) else anchors)})
+       print(len(e.get("sightings") or []), e["id"], e.get("finding_key", "-"), e.get("area", "-"),
+             ", ".join(anchors), e.get("title", "")[:80], sep=" | ")
+   ```
 
-### Fold into the Phase 2 report
+   Anchors with three or more sightings inside the Phase 2 file set are confusion-dense: add them to Step 4. A /review finding that rests on a codebook entry lists `agent-transcripts` in `evidence_source`. Record the codebook as `codebook@<as_of_sha>`.
 
-Render an "F-infra automated findings" section grouped by severity:
+A /review finding whose key equals one in a consumed report is the same finding (§9): keep that report's `first_seen`, append this `run_id` to `last_seen`, and say in `change_note` if our evidence changes its verdict or severity.
 
-- **High** — already escalated by `/audit` via `escalate_info`. List them in the report with the escalation IDs; do not re-escalate from Phase 2.
-- **Medium** — already filed as tasks by `/audit`. Capture `filed_task_id` for each. Phase 3 triage MUST skip these (see Phase 3 dedupe note).
-- **Low** — logged-only by `/audit`. List them in the report for the audit trail; no follow-up action.
-
-Carry these into the Phase 2 JSON report under `f_infra_findings` (schema in Step 8). Phase 3's task-creation loop reads `f_infra_findings.medium.filed_task_ids` to avoid double-filing.
-
-### Why this step runs first
-
-`/audit`'s detectors (especially P2 consumer-stub and P1 producer-orphan) overlap with Step 2's stub audit but operate at task-graph scope instead of grep scope. Running `/audit` first means Step 2 can downweight findings that the automated detector already classified, and concentrate on the patterns no detector covers (TODOs without owners, abstract-class stubs in unusual places, etc).
-
-## Step 1.5: Load the latest bug-hotspot survey (if present)
-
-Some projects have run `/hotspot-survey` — a longitudinal multi-agent survey of where bugs have historically clustered and why. Its report is empirical prioritisation data this phase otherwise lacks.
-
-1. **Detect.** Look for the newest `bug-hotspot-survey-*.md` under the project's plans/notes convention (dark-factory: `plans/`; reify: `docs/notes/`). If none exists, skip — and if the repo is mature with substantial fix history, mention `/hotspot-survey` in the Phase 2 report as a suggested follow-up. Do NOT launch the survey from here: it is an hour-scale, ~25-30-agent run and always a deliberate user decision.
-
-2. **Staleness check.** The report's method header pins an as-of main SHA/date. Count commits since (`git log --oneline <sha>.. | wc -l`). The *ranking* (which subsystems are bug-dense) ages slowly and stays useful; individual file:line anchors age fast — re-verify any anchor before acting on it.
-
-3. **Use it for prioritisation, not findings.** Feed the ranked-hotspots table into Step 4's high-risk module selection, and use the churn-exonerations section to avoid over-weighting healthy-churn modules. Do not re-report the survey's findings as Phase 2 findings — most already flowed into a remediation program (check the sibling `bug-hotspot-remediation-program-*.md` and its task ids); re-flagging them creates duplicate tasks at Phase 3.
+Never launch `/hotspot-survey` or `/review-all` from here: both are deliberate user decisions. If a mature repo has no hotspot report, suggest one in the summary.
 
 ## Step 2: Stub and placeholder audit
 
-### Mechanical scan (delegate to Sonnet agent)
+### Mechanical scan (sonnet seat, low effort)
 
-Scan the codebase for indicators of incomplete implementation:
+Over the Phase 2 file set:
 
 ```
-# Patterns to search for
 TODO, FIXME, HACK, XXX
 raise NotImplementedError
-pass  (as sole function body — not in except blocks or abstract methods)
-...   (Ellipsis as implementation — not in type stubs or overloads)
-return None  (in functions with non-None return type annotations)
+pass  (sole function body — not except blocks or abstract methods)
+...   (Ellipsis as implementation — not type stubs or overloads)
+return None  (in functions annotated with a non-None return type)
 return {}  or return []  (hardcoded empty returns in non-trivial functions)
 "not implemented", "placeholder", "stub"
 ```
 
-For each hit, capture: file, line, function name, surrounding context (5 lines each side).
+For each hit: file, enclosing `path::symbol`, five lines of context either side.
 
-### Cross-reference (your job)
+### Cross-reference (coordinator)
 
-For each potential stub, check three sources:
+1. **The task that claimed it.** `git log -S'<symbol>' --format='%h %s' -- <file>` finds the commits that introduced the symbol; read the task id from the commit message or branch, then `get_task`. A `done` task whose brief covered the symbol and a placeholder body is an **unintended stub** (`kind:stub`, high). Never scan the whole task tree with `get_tasks`.
+2. **Briefing `known_gaps`.** A matching gap counts only through its `accepted_by` task: record the finding anyway, naming that task in the statement; Phase 3 applies §8 step 1 to the task to set the disposition.
+3. **Memory** — `search(query="decision to defer {symbol}", project_id="<project_id>")`.
+4. **Code context** — ABC methods, Protocols, type stubs, fixtures: not findings.
 
-1. **Task tree** — query `get_tasks` and check: was this function's implementation assigned to a task marked `done`? If so, this is an **unintended stub** — the task claims complete but the implementation is placeholder. High severity.
+A marker with no owning task breaks the briefing's TODO-tracking convention when the project has one (`kind:convention`).
 
-2. **Review briefing known gaps** — does the briefing's `known_gaps` section mention this? If so, it's a **known gap** — documented, intentionally deferred. Info severity.
+## Step 3: Critical-path tracing (requires briefing)
 
-3. **Project memory** — `search(query="decision to defer {function_name} implementation")`. Was there an explicit decision to leave this as a stub? If so, it's **accepted**. Info severity.
+No briefing: skip. `mode: since`: trace only the paths whose trace touches the Phase 2 file set.
 
-4. **Code context** — is this an abstract base class method? A protocol definition? A test fixture placeholder? These are **acceptable** by nature. Skip them.
+For each key scenario, follow the code end to end. At each step:
 
-### Classify
+1. **Does the function exist** where the path expects it?
+2. **Does it call the next step**, or return early, call something else, or branch around it?
+3. **Are types compatible at the boundary?** `Optional[X]` where `X` is expected, `dict` where a dataclass is, `str` where an enum is (`h12`).
+4. **Are runtime dependencies satisfied?** Conditional imports, config keys read but undefined, undocumented env vars, services assumed running.
+5. **Is error handling coherent** along the path, or does each module do its own thing (`h10`)?
 
-| Classification | Criteria | Severity |
-|---------------|----------|----------|
-| Unintended stub | Task claims done, implementation is placeholder | High |
-| Known gap | Listed in briefing `known_gaps` | Info |
-| Accepted decision | Found in memory as explicit deferral | Info |
-| Structural | ABC, Protocol, type stub | Skip |
-| Unknown | No context found — needs human judgment | Warning |
+Common failures: wiring gaps (A and B built by separate tasks, never connected), mock-masked failures, conditional short-circuits, stale imports that still resolve.
 
-## Step 3: Critical path tracing (requires briefing)
-
-If no review briefing exists, skip this step. Without defined critical paths, path tracing is speculative — better to focus on the other steps.
-
-For each critical path in the briefing:
-
-### Trace the actual code
-
-Follow the execution flow described in the `trace` section. At each step:
-
-1. **Does the function exist?** Check that the module and function referenced in the trace are present and haven't been renamed or moved.
-
-2. **Does it call the next step?** Read the function body. Does it actually invoke the next function in the trace, or does it return early, call something else, or have a conditional branch that skips the call?
-
-3. **Are types compatible at the boundary?** Check that the return type of step N matches the parameter types of step N+1. Look for subtle mismatches: `Optional[X]` passed where `X` is expected, `dict` where a dataclass is expected, `str` where an enum is expected.
-
-4. **Are runtime dependencies satisfied?** Check for:
-   - Imports that could fail (conditional imports, optional dependencies)
-   - Config values read but not defined in config files
-   - Environment variables used but not documented
-   - Services assumed to be running (database, API, MCP server)
-
-5. **Is error handling consistent?** If step N raises `ValueError`, does step N+1 catch it or let it propagate? Is there a coherent error handling strategy across the path, or does each module do its own thing?
-
-### What to look for
-
-The most common critical path failures:
-- **Wiring gaps**: function A is supposed to call function B, but the call was never added (task implemented A and B independently but nobody wired them together)
-- **Mock-masked failures**: the integration test mocks the boundary between A and B so thoroughly that the real call path is never exercised
-- **Conditional short-circuits**: a feature flag, config check, or early return prevents the path from executing in practice
-- **Stale imports**: module was refactored, import path changed, but callers still import from the old location (Python may not error if the old module file still exists)
-
-### Record findings
-
-For each critical path issue:
-- Which path, which step
-- What the code actually does vs what the trace says it should do
-- Evidence (the specific code lines)
-- Suggested fix
+Record the path and step, what the code does against what the scenario needs, the evidence, and a proposal. Anchor at the step's function.
 
 ## Step 4: Deep read of high-risk modules
 
-Steps 2–3 find structural issues (stubs, broken paths). This step finds behavioral bugs — the kind that only surface when you actually read the code and think about what it does at runtime. These are the highest-value findings because they're the hardest to catch with automated tools or checklist-driven scanning.
+Steps 2–3 find structural gaps. This step finds behavioural bugs and the comprehension cost of the code, by reading it.
 
-### Identify high-risk modules
+### Choose the modules (5–10 per area)
 
-High-risk modules are those where a bug has outsized impact or where complexity creates hiding places for mistakes. Typically:
+From the Phase 2 file set, in this order:
 
-- **Server/application startup** — initialization order, service wiring, port bindings, config loading. Bugs here mean nothing works.
-- **Configuration and settings** — where values are defined, defaulted, and consumed. Mismatches between config files, code defaults, and documentation are common.
-- **Pipeline stages and orchestration** — multi-step processes where data flows through stages. Each handoff is a potential type or semantic mismatch.
-- **Infrastructure files** — Dockerfiles, docker-compose, CI configs. These often drift from the code they deploy (wrong ports, stale paths, missing dependencies).
-- **Shared utilities** — code used by multiple subsystems. A bug here multiplies.
-- **Historically bug-dense modules** — if Step 1.5 loaded a hotspot survey, its ranked hotspots belong on this list: empirical fix-commit density beats the static typology above. Skip modules the survey's churn-exonerations section cleared.
+- `/review-all`'s open findings (Step 1.5);
+- hotspot-ranked areas, minus exonerated churn (Step 1.5);
+- confusion-dense codebook anchors (Step 1.5);
+- server startup, config loading, pipeline stages and orchestration, infrastructure files (Dockerfiles, units, CI), shared utilities;
+- the briefing's `stability_concerns`.
 
 ### What to look for
 
-Read each high-risk module carefully — not scanning for patterns, but thinking about what the code actually does at runtime. The bugs you're hunting are semantic, not syntactic:
+Read bodies, not signatures, and think about what runs.
 
-- **Wrong variable passed** — a function receives `project_id` (a logical name like `"dark_factory"`) where it needs `project_root` (an absolute path like `"/home/leo/src/dark-factory"`). Both are strings, so the type system won't catch it. The only way to find this is to read the call site and the callee and notice the mismatch.
-- **Hardcoded assumptions** — code that creates `AsyncOpenAI()` regardless of the configured LLM provider. A function that hardcodes a port number that should come from config. A path that only works on the developer's machine.
-- **Missing initialization** — a fallback object is created but never has `.initialize()` called on it. A service is constructed but `.start()` is never invoked. A connection pool is created but never warmed.
-- **Missing cleanup** — server startup creates resources but shutdown never calls `.close()` or `.dispose()`. File handles or database connections that leak on exit.
-- **Port/path/ID drift** — a Dockerfile `EXPOSE`s port 8000 but the server binds to 8002. A config file says one thing, the code defaults to another, and the documentation says a third.
-- **Provider coupling** — code that's supposed to be provider-agnostic but imports or instantiates a specific provider unconditionally.
+- **Wrong variable passed** — a logical id where a path is needed; both strings, so only reading both sides catches it.
+- **Hardcoded assumptions** — a provider client constructed regardless of config; a port or path that only works on one machine.
+- **Missing initialization or cleanup** — constructed but never started, opened but never closed.
+- **Port/path/ID drift** between code, config, units and docs.
+- **The look-fors** for `h2`, `h4`, `h5`, `h6`, `comments` and `h14` from the table above.
 
 ### Process
 
-1. List the high-risk modules for the current scope (5–10 files max — focus on impact, not coverage)
-2. Read each one thoroughly, not just the function signatures but the bodies
-3. For each potential issue, verify it's real: trace the call chain, check the config, confirm the mismatch
-4. Record findings with the specific file, line, what's wrong, and why it matters
-
-This step is where unstructured deep reading pays off. Don't rush it — the bugs found here are typically higher severity than anything from the structural scans.
+1. List the modules; state why each was chosen.
+2. Read each thoroughly.
+3. Verify every candidate: trace the call chain, check the config, confirm the mismatch.
+4. Record the anchor, the claim with its measured facts, and the proposal.
 
 ## Step 5: Cross-module consistency
 
-### API surface consistency
+Over boundaries with at least one side in the Phase 2 file set.
 
-Compare public interfaces across modules in the review scope:
-
-- **Naming conventions**: do similar operations use consistent naming? (e.g., `add_memory` vs `create_memory` vs `insert_memory` — pick one)
-- **Error patterns**: do all modules use the same error types for the same kinds of failures?
-- **Return types**: do similar operations return consistent types? (e.g., some return `dict`, others return dataclasses for the same kind of data)
-- **Parameter ordering**: is there a consistent parameter convention? (e.g., `project_id` always first, or always last?)
-
-### Data flow across boundaries
-
-Trace how data structures transform as they cross module boundaries:
-- Is data serialised/deserialised correctly at each boundary?
-- Are optional fields handled consistently? (one module sets `None`, another expects the key to be absent)
-- Are enums/constants defined in one place and imported, or duplicated across modules?
-
-### Configuration coherence
-
-- Are all config keys referenced in code actually defined in config files?
-- Are default values consistent between code and config?
-- Are there config keys defined but never read?
-- **Port numbers** — do config files, code defaults, Dockerfiles, docker-compose, and documentation all agree on the same ports for each service?
-- **Paths** — are paths consistent between config, code, and infrastructure files? Are any hardcoded to a specific developer's machine?
-- **IDs and names** — where a logical name (like a project ID) and a filesystem path (like a project root) are both used, are they passed to the right parameters?
-
-### Import health
-
-- Circular dependencies (A imports B, B imports C, C imports A)
-- Missing transitive dependencies in `pyproject.toml`
-- Modules that import from internal paths of other packages (fragile coupling)
+- **API surface**: naming of like operations (`h1`), error types for like failures, return types for like data, parameter conventions.
+- **Data across boundaries**: serialisation at each crossing; optional fields one side sets `None` and the other expects absent; enums and constants duplicated rather than imported (`h11`); mutable values handed across and then mutated (`h8`); strings carrying structure (`h12`).
+- **Configuration**: keys read but undefined, defaults that disagree with config files, keys nothing reads, ports and paths that disagree across config, code, units and docs.
+- **Coupling**: reaching into another module's attributes or relying on call order (`h7`); reach-back imports, function-local imports placed to break cycles, re-export shims (`h13`); flat peer meshes where layering belongs (`h9`); one axis of variation implemented as flag checks scattered across modules (`h3`).
 
 ## Step 5.5: Design-invariants audit
 
-### Detect and audit
+1. **Detect** `docs/legibility/design-invariants.md`; absent → skip.
+2. **Read** it and audit the Phase 2 file set against each invariant's checkable question. The doc is normative: cite invariant ids, never restate the list.
+3. **Record** each violation as a finding whose lens is `inv-<n>` (INV-5 → `inv-5`), followed by the heuristic the invariant encodes when `$QUALITY_DOC` names one.
 
-1. **Detect.** Check whether `docs/legibility/design-invariants.md` exists at project root. If absent, skip this step.
+## Step 6: Dead code and orphans
 
-2. **Read and audit.** If present, Read it and audit the modules in scope against each invariant's checkable question. The doc is normative — reference invariant slugs only; do not restate the invariant list here.
+### Enumerate (sonnet seat, low effort, whole tree in both modes)
 
-3. **Classify severity.** Classify findings like stub findings in Step 2 (by blast radius): `severity` ∈ `{high, warning, info}` — the same vocabulary Step 2's classify table uses and Phase 3 triage's Priority mapping (`phase3-triage.md`) consumes.
+- Orphan modules never imported
+- Exports in `__init__.py` or `__all__` never imported
+- Functions defined but never called (excluding entry points, CLI and MCP handlers, fixtures)
+- Config keys nothing reads
+- Test files whose subjects no longer exist
 
-### Record findings
+### Validate (coordinator)
 
-Record findings under `invariant_findings` in the phase-2 JSON (schema in Step 8): `{"invariant": <slug>, "file": ..., "line": ..., "issue": ..., "severity": ...}`.
+Framework-called handlers, external entry points, pytest discovery and `importlib` imports are alive. Judge only candidates whose key is not already in the carry set. When unsure, say "possibly dead — verify before removing" in the statement and set `verdict: weakened`.
 
-## Step 6: Dead code and orphan detection
+## Step 7: Test coverage and the Tests stance
 
-### Delegate scanning to Sonnet agent
+Not line coverage: whether the tests that matter would catch breakage. Over the Phase 2 file set and the traced paths.
 
-Find:
-- **Orphan modules**: Python files that are never imported by anything else in the project
-- **Unused exports**: functions/classes defined in `__init__.py` or `__all__` but never imported
-- **Unused functions**: defined but never called (careful: exclude entry points, CLI handlers, MCP tool handlers, test fixtures)
-- **Dead config entries**: keys in config files that nothing reads
-- **Stale test files**: test files whose test subjects no longer exist
+- Is there an integration test that runs the path with real implementations? What exactly is mocked, and could the mock diverge from the real thing unnoticed?
+- Would the test fail if A stopped calling B?
+- The `tests` look-fors from the table above: each test reaching a module's internals is an interface-design finding anchored at the **module it reaches into** (the seam is usually the defect), lens `tests`, with the patch targets as evidence.
 
-### Validate findings
+## Step 8: Write the findings
 
-Not everything that looks dead is actually dead:
-- MCP tool handlers are called by the framework, not by direct import
-- CLI entry points are invoked externally
-- Fixtures are discovered by pytest
-- Some modules are imported dynamically (`importlib`)
+Every finding from Steps 0–7 goes into the report's one `findings` list with the schema in `references/run-record.md`; mint each key per contract §2 from the plain `area`, the normalised `anchor` and `tags[0]` with the one key implementation — `shared/src/shared/finding_key.py` once it lands, until then `python skills/hotspot-survey/scripts/findings_artefact.py key <area> <anchor> <primary_tag>` from a dark-factory checkout; never a hand-rolled hash. Set `verdict` from your own verification: `confirmed`, `weakened` (true but smaller than first claimed), `refuted` (kept with the refutation), `unverified` only when verification did not run, with the reason in `method.extra`. Fill `method.verification`.
 
-Check each candidate before flagging it. When in doubt, flag as "possibly dead — verify before removing" rather than definitively.
-
-## Step 7: Test coverage analysis (qualitative)
-
-This is not about line-coverage percentages. It's about whether the things that matter are tested in ways that would actually catch breakage.
-
-### For each critical path (from briefing)
-
-- Is there an integration test that exercises the full path with real implementations (not mocks)?
-- If mocks are used, what exactly is mocked? Is the mock realistic?
-- Would the test catch a wiring change (e.g., function A stops calling function B)?
-
-### For integration boundaries
-
-- Are there tests that cross module boundaries with real data?
-- Or do tests only exercise each module in isolation?
-- Where mocks are used at boundaries, could the mock diverge from the real implementation without the test noticing?
-
-### Gap identification
-
-Flag areas where:
-- Only unit tests exist for functionality that involves multiple modules
-- Mocks are so thorough that the tests would pass even if the real integration is completely broken
-- Critical paths have no dedicated integration/e2e test
-
-## Step 8: Compile Phase 2 report
-
-Write to `review/reports/phase2-{timestamp}.json`:
-
-```json
-{
-  "phase": 2,
-  "timestamp": "2026-03-24T14:45:00Z",
-  "scope": "full | subproject-name | focused:mod1,mod2",
-  "f_infra_findings": {
-    "audit_skill_present": true,
-    "window_since_iso": "2026-03-10T14:45:00Z",
-    "high": {
-      "count": 1,
-      "findings": [
-        {
-          "pattern": "P5",
-          "subject": "task 3520 marked done — metadata.files lists `reify-stdlib/src/loop.rs` but file is empty",
-          "evidence": "reify-stdlib/src/loop.rs:1 — file is 0 bytes",
-          "escalation_id": "esc-3520-2"
-        }
-      ]
-    },
-    "medium": {
-      "count": 2,
-      "filed_task_ids": [3681, 3682],
-      "findings": [
-        {
-          "pattern": "P1",
-          "subject": "reify-eval::SnapshotCache pub since 2026-04-30, no consumer task in flight",
-          "filed_task_id": 3681
-        }
-      ]
-    },
-    "low": {
-      "count": 3,
-      "findings": []
-    }
-  },
-  "stubs": {
-    "total": 8,
-    "unintended": 3,
-    "known_gaps": 2,
-    "accepted": 1,
-    "structural": 2,
-    "findings": [
-      {
-        "file": "fused_memory/graphiti_client.py",
-        "line": 142,
-        "function": "bulk_import",
-        "pattern": "raise NotImplementedError",
-        "classification": "known_gap",
-        "reference": "briefing known_gap: task 112",
-        "severity": "info"
-      }
-    ]
-  },
-  "critical_paths": {
-    "traced": 4,
-    "issues_found": 1,
-    "findings": [
-      {
-        "path": "Memory write → search round-trip",
-        "step": "Classifier routes to Mem0",
-        "issue": "classify_and_route returns category but never calls mem0_client.add()",
-        "evidence": "classifier.py:67 — returns after classification without invoking store",
-        "severity": "high",
-        "suggested_fix": "Add store dispatch after classification in classify_and_route()"
-      }
-    ]
-  },
-  "deep_read": {
-    "modules_read": 7,
-    "findings": [
-      {
-        "file": "fused_memory/routing/classifier.py",
-        "line": 23,
-        "issue": "WriteClassifier creates AsyncOpenAI() unconditionally — ignores configured LLM provider",
-        "category": "hardcoded_assumption",
-        "severity": "high",
-        "suggested_fix": "Use the configured provider from settings instead of hardcoding OpenAI"
-      }
-    ]
-  },
-  "cross_module": {
-    "findings": []
-  },
-  "dead_code": {
-    "orphan_modules": [],
-    "unused_exports": [],
-    "dead_config": []
-  },
-  "test_coverage_gaps": {
-    "findings": []
-  },
-  "invariant_findings": {
-    "findings": [
-      {
-        "invariant": "no-lockstep-duplication",
-        "file": "fused_memory/routing/classifier.py",
-        "line": 88,
-        "issue": "category table duplicated in classifier.py and router.py — no single source of truth",
-        "severity": "high"
-      }
-    ]
-  }
-}
-```
-
-## Display summary
+Display:
 
 ```markdown
 ### Phase 2: Architectural Coherence
-- F-infra automated findings: 1 high (escalated), 2 medium (filed: 3681, 3682), 3 low
-- Stubs: 3 unintended (tasks claimed done), 2 known gaps, 1 accepted
-- Critical paths: 1 issue — classifier returns without calling Mem0 store
-- Cross-module: no issues
-- Design invariants: 1 finding (no-lockstep-duplication)
-- Dead code: 2 orphan modules
-- Test gaps: no integration test for cross-store search
+- Scope: 41 changed + 22 importers (since 3f2a…); 12 carried: 9 present, 2 fixed, 1 moved
+- Inputs: hotspot-survey-<project_id>-20260930, review-all-<project_id>-20261003, codebook (3 dense anchors in scope)
+- Findings: 2 high · 5 medium · 3 low — h7 ×2, tests ×3, inv-9 ×1, h13 ×1, kind:defect ×1 …
+- Audit: 1 escalated, 2 filed by /audit
 ```
-
-If the project ships no `/audit` skill, omit the "F-infra automated findings" line (or render `audit skill not present` in its place).

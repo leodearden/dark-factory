@@ -325,6 +325,12 @@ class EvalMetrics:
     # today, and the count above deliberately does not.
     terminal_kind: str | None = None
 
+    # The replay regime the harness ran this architect-bearing cell under
+    # (``replay_frame.REPLAY_FRAME_ID``). ``None`` means not framed: a cell from
+    # before task 4844, or a path with no live architect such as ``run_eval``.
+    # The key is written unconditionally; see docs/eval-replay-frame.md.
+    replay_frame: str | None = None
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 

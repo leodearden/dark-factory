@@ -860,14 +860,14 @@ async def test_the_write_creates_a_real_episodic_node_in_falkordb(mock_config):
 
     backend = GraphitiBackend(config)
     # skip_maintenance=True is load-bearing, not an optimisation: the default
-    # path enumerates EVERY graph on the server and runs an index build plus a
-    # dup-uuid-edge REPAIR (a write) over each. A test must never sweep the
-    # real project graphs sharing this FalkorDB instance.
+    # path provisions every registered project graph and runs a dup-uuid-edge
+    # REPAIR (a write) over EVERY graph on the server. A test must never sweep
+    # the real project graphs sharing this FalkorDB instance.
     await backend.initialize(skip_maintenance=True)
     try:
         # The scratch graph is virgin, and graphiti's entity-dedup search needs
-        # its indices. _ensure_indices is a deliberate no-op (task 3707);
-        # ensure_indices is the real provisioning path.
+        # its indices. It is unregistered (PRD D5), so first-write provisioning
+        # skips it; this explicit ensure_indices call is what indexes it.
         await backend.ensure_indices(group_id=graph_name)
 
         svc = MemoryService(config)

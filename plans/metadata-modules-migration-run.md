@@ -262,3 +262,80 @@ the ε leaf: as long as the `modules` boundary exists, new carriers keep being
 filed, and any "the corpora are migrated" claim has a shelf life measured in
 hours. Retiring the boundary is what makes the migration terminal; re-running
 this script is only ever a sweep.
+
+## 7. ε backstop re-run (task 4529)
+
+Run 2026-10-03 from branch `task/4529` against the live fused-memory server at
+`http://127.0.0.1:8002`, as the idempotence backstop for the submit-time
+rejection that task lands (`fused_memory.middleware.retired_key_modules_guard::retired_key_modules_error`).
+Same command and the same seven roots as section 0, in three phases:
+(1) `--dry-run`, before; (2) live, once; (3) `--dry-run`, after.
+
+### Before (phase 1 dry-run)
+
+| project | visited | copied | sanitized_empty | dropped | failed | read_failed | pending |
+|---|---|---|---|---|---|---|---|
+| dark-factory | 1267 | 0 | 0 | 5 | 0 | 0 | 5 |
+| reify | 1426 | 0 | 2 | 2 | 0 | 0 | 4 |
+| autopilot-video | 1 | 0 | 0 | 0 | 0 | 0 | 0 |
+| know-live | 4 | 0 | 0 | 0 | 0 | 0 | 0 |
+| pump-web-ui | 4 | 0 | 0 | 0 | 0 | 0 | 0 |
+| solar-challenge | 120 | 0 | 0 | 0 | 0 | 0 | 0 |
+| solar-challenge-platform | 345 | 0 | 0 | 0 | 0 | 0 | 0 |
+| **total** | **3167** | **0** | **2** | **7** | **0** | **0** | **9** |
+
+Stragglers, all `pending` now; none of the eight new ones was a pending carrier
+at section 6's re-verification:
+
+- dark-factory, drop: 4665, 4763, 5321, 5405, 5569
+- reify, drop: 6431, 6432
+- reify, copy-sanitized-empty: 6434 (`modules == ['tests/prd-gate', 'docs/prds']`,
+  both directory-shaped, so `files` stays `[]`)
+- reify, copy-sanitized-empty: 5050, the accepted remainder from section 5
+
+dark-factory 3202, the new carrier section 6 named, is not among them: it has
+since reached `done`, so it now sits in the terminal skip set below.
+
+### Live run (phase 2)
+
+8 of 9 writes landed: the five dark-factory drops, reify 6431 and 6432, and
+reify 6434. The one failure is reify 5050, rejected exactly as in section 2
+(`TypeError: shared.task_metadata.Milestone() argument after ** must be a
+mapping, not bool`). No transient failures, so no retry was needed.
+
+### After (phase 3 dry-run)
+
+| project | visited | copied | sanitized_empty | dropped | failed | read_failed | pending |
+|---|---|---|---|---|---|---|---|
+| dark-factory | 1267 | 0 | 0 | 0 | 0 | 0 | **0** |
+| reify | 1426 | 0 | 1 | 0 | 0 | 0 | 1 (id 5050) |
+| autopilot-video | 1 | 0 | 0 | 0 | 0 | 0 | **0** |
+| know-live | 4 | 0 | 0 | 0 | 0 | 0 | **0** |
+| pump-web-ui | 4 | 0 | 0 | 0 | 0 | 0 | **0** |
+| solar-challenge | 120 | 0 | 0 | 0 | 0 | 0 | **0** |
+| solar-challenge-platform | 345 | 0 | 0 | 0 | 0 | 0 | **0** |
+| **total** | **3167** | **0** | **1** | **0** | **0** | **0** | **1** |
+
+### Residual carriers by status
+
+Identical in all three phases. These statuses are skipped by design (section 4).
+
+| project | done | cancelled | deferred |
+|---|---|---|---|
+| dark-factory | 1463 | 78 | 6 |
+| reify | 2300 | 245 | 6 |
+| autopilot-video | 416 | 26 | — |
+| know-live | 39 | — | — |
+| pump-web-ui | 2 | — | — |
+| solar-challenge | 34 | — | — |
+| solar-challenge-platform | 110 | — | — |
+| **total** | **4364** | **349** | **12** |
+
+### Why this sweep is the last one that should find new carriers
+
+Section 6 observed that, while the boundary accepted `metadata.modules`, every
+"the corpora are migrated" claim had a shelf life measured in hours, and this
+run confirms it: eight new pending carriers appeared in the six weeks since. With
+the submit-time rejection live, no new carrier can be minted on either
+creation path, so any later re-run is a terminal sweep. It can only find
+records that predate the rejection, plus reify 5050.

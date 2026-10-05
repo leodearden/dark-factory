@@ -15,7 +15,7 @@ call this helper, and merge_queue.py no longer carries a test-only method.
 
 This module lives in orchestrator/tests/ and is imported by bare module name
 (``from _merge_queue_harness import drive_verify_and_advance``), matching the
-flat-test-helper convention (see ``_serial_merge_worker.py``, ``_orch_helpers.py``
+flat-test-helper convention (see ``_orch_helpers.py``, ``_merge_lane_fakes.py``
 — orchestrator/tests/ has no ``__init__.py``).
 
 CRITICAL — dynamic module lookup, not from-import: every merge_queue
@@ -77,7 +77,7 @@ async def drive_verify_and_advance(
             task_id=_req_for_factory.task_id,
         )
 
-    lease = await allocator.acquire(_local_factory)
+    lease = await allocator.acquire(_local_factory, policy='prefer_local')
     if lease is None:
         # Fallback: force-acquire the local slot (harness path; no competing
         # acquirers in direct-call tests).

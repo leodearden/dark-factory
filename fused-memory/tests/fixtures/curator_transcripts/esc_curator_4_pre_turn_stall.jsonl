@@ -1,0 +1,8 @@
+{"type": "queue-operation", "timestamp": "2026-07-16T18:59:21.636Z", "operation": "enqueue"}
+{"type": "queue-operation", "timestamp": "2026-07-16T18:59:21.637Z", "operation": "dequeue"}
+{"type": "attachment", "timestamp": "2026-07-16T18:59:16.383Z", "attachment": {"type": "hook_success"}}
+{"type": "user", "timestamp": "2026-07-16T18:59:21.684Z", "message": {"role": "user", "content": "redacted"}}
+{"type": "attachment", "timestamp": "2026-07-16T18:59:21.683Z", "attachment": {"type": "deferred_tools_delta"}}
+{"type": "attachment", "timestamp": "2026-07-16T18:59:21.683Z", "attachment": {"type": "skill_listing"}}
+{"type": "attachment", "timestamp": "2026-07-16T18:59:21.683Z", "attachment": {"type": "budget_usd"}}
+{"type": "last-prompt", "lastPrompt": "redacted"}

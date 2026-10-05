@@ -188,9 +188,9 @@ class TestDisallowListForAmendAndEpisodeTools:
 
         output_schema={'type': 'object'} is passed to match the realistic
         recon call site and exercise (not dodge) `build_claude_argv`'s
-        wildcard-expansion branch (the `_REAL_BUILTIN_TOOLS_DENYLIST`
-        substitution). That branch only rewrites disallowed_tools
-        when '*' is present; DISALLOW_BUILTIN (['Bash', 'Edit', 'Write',
+        schema-wildcard branch (the `'*'` -> `--tools ''` substitution, which
+        removes built-in and deferred tools but not MCP). That branch only
+        rewrites disallowed_tools when '*' is present; DISALLOW_BUILTIN (['Bash', 'Edit', 'Write',
         'NotebookEdit']) carries no '*', so STAGE3_DISALLOWED renders as a
         straight passthrough here — confirmed against today's code.
         """

@@ -9,6 +9,12 @@
  * factory from a wedged fetch. This module holds the decision of WHEN to say
  * so and WHAT to say; app.jsx renders whatever it returns.
  *
+ * ITS SECOND ROLE (task 5825): the two surface -> endpoint maps declared here,
+ * TAB_ENDPOINTS and CHROME_ENDPOINTS, also decide what data.js FETCHES. The
+ * browser polls CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[activeTab] (data.js::
+ * pollSetFor), so a path missing from these maps is not merely unmonitored:
+ * the surface that reads it silently stops refreshing.
+ *
  * Pure by construction: no window/document access at load, every input
  * optional. It is loaded as a CLASSIC script (see index.html) whose top-level
  * bindings share one global lexical scope with the other /static/redux/*.js
@@ -26,12 +32,13 @@
 // a genuinely wedged endpoint then sits at indefinitely.
 const STALE_FAILURE_THRESHOLD = 3
 
-// Tab id -> the endpoint PATHS whose payload that tab renders.
+// Tab id -> the endpoint PATHS whose payload that tab renders, and therefore
+// the endpoints data.js polls while that tab is open (see the header).
 //
 // Derived mechanically from what each tab actually reads off window.DF_DATA,
 // mapped through data.js::endpointsFor's key lists: e.g. tab_overview.jsx
 // reads ORCHESTRATORS/ORCHESTRATORS_SPARK (-> /orchestrators), MEMORY_STATUS
-// (-> /memory), MEMORY_TIMESERIES (-> /memory-graphs), and so on. Paths are
+// (-> /memory), MEMORY_OPS (-> /memory-graphs), and so on. Paths are
 // QUERY-STRIPPED, matching data.js::pollKey — the four ?window= endpoints key
 // their flow-control state the same way, and a URL-keyed map would miss every
 // one of them after the first chip change.
@@ -41,8 +48,14 @@ const STALE_FAILURE_THRESHOLD = 3
 // one-line edit here. endpoint_staleness.test.mjs machine-checks BOTH
 // directions — every path is a real endpointsFor() key, and every app.jsx tab
 // id has an entry — because a map that silently stops matching a renamed
-// endpoint is a check that has quietly stopped checking. `toolbarConfig` in
-// app.jsx is the sibling per-tab map; keep the two tab-id lists in step.
+// endpoint is a check that has quietly stopped checking. test_app_poll_scope.py
+// walks each tab's components and fails when a path the tab reads is missing
+// from its entry. `toolbarConfig` in app.jsx is the sibling per-tab map; keep
+// the two tab-id lists in step.
+//
+// LIST /tasks FOR A TAB ONLY IF IT RENDERS TASK ROWS. Listing it polls the full
+// multi-MB render on that tab; the census every tab's chrome reads is already
+// polled through CHROME_ENDPOINTS, as /tasks?projection=census.
 const TAB_ENDPOINTS = {
   overview: [
     '/api/v2/dashboard/orchestrators',
@@ -52,11 +65,13 @@ const TAB_ENDPOINTS = {
     '/api/v2/dashboard/scheduler',
     '/api/v2/dashboard/costs',
     '/api/v2/dashboard/burndown',
+    '/api/v2/dashboard/merge-queue',
   ],
   orch: [
     '/api/v2/dashboard/orchestrators',
     '/api/v2/dashboard/tasks',
     '/api/v2/dashboard/burndown',
+    '/api/v2/dashboard/scheduler',
   ],
   tasks: [
     '/api/v2/dashboard/tasks',
@@ -85,6 +100,23 @@ const TAB_ENDPOINTS = {
   'esc-analytics': ['/api/v2/dashboard/escalation-analytics'],
 }
 
+// The endpoint PATHS the always-mounted chrome reads, whatever tab is open.
+// Polled on every tab, beside the open tab's own TAB_ENDPOINTS entry.
+//
+// EXACTLY the chrome's read set, no more: test_app_poll_scope.py derives what
+// app.jsx's rail/topbar and shell.jsx's toolbar actually read and fails if it
+// differs from this list in either direction — a missing path freezes a badge
+// on every other tab, and a dead one polls an endpoint for nothing.
+const CHROME_ENDPOINTS = Object.freeze([
+  '/api/v2/dashboard/orchestrators', // rail orch badge, topbar orch counts, Toolbar PROJECTS
+  '/api/v2/dashboard/tasks',         // rail and topbar census (census only)
+  '/api/v2/dashboard/recon',         // rail recon badge, Toolbar AGENTS
+  '/api/v2/dashboard/merge-queue',   // rail merge badge
+  '/api/v2/dashboard/escalations',   // rail esc badge
+  '/api/v2/dashboard/memory',        // topbar queue
+  '/api/v2/dashboard/costs',         // topbar spend
+])
+
 /**
  * The `{failures, lastSuccessAt}` record data.js published for `path`, or null.
  *
@@ -101,11 +133,12 @@ function staleEntryFor(stale, path) {
 }
 
 /**
- * A human age for `ms`, e.g. '45s', '6m', '19h 48m'.
+ * A human age for `ms`, e.g. '45s', '6m', '19h 48m', '1d 3h'.
  *
  * Hours are rendered as hours rather than as a four-digit minute count: the
  * incident this indicator exists for ran 19.8h, and an operator should not
- * have to divide 1188 by 60 to notice that.
+ * have to divide 1188 by 60 to notice that. Days are rendered as days for the
+ * same reason: an idle project's cards are weeks old, and '480h' is 20 days.
  */
 function formatAge(ms) {
   const n = Number(ms)
@@ -115,8 +148,13 @@ function formatAge(ms) {
   const mins = Math.floor(secs / 60)
   if (mins < 60) return mins + 'm'
   const hours = Math.floor(mins / 60)
-  const rest = mins % 60
-  return rest === 0 ? hours + 'h' : hours + 'h ' + rest + 'm'
+  if (hours < 24) {
+    const restMins = mins % 60
+    return restMins === 0 ? hours + 'h' : hours + 'h ' + restMins + 'm'
+  }
+  const days = Math.floor(hours / 24)
+  const restHours = hours % 24
+  return restHours === 0 ? days + 'd' : days + 'd ' + restHours + 'h'
 }
 
 function attemptPhrase(failures) {
@@ -181,12 +219,55 @@ function staleNoticesForTab(input) {
   return notices
 }
 
+/**
+ * The one "still loading" notice the given tab should render, or null.
+ *
+ * Returns `{kind: 'loading', paths, text}` naming every endpoint of that tab
+ * that has not delivered a response since this page loaded — read off
+ * `receipt`, data.js's success-only `DF_DATA.__receipt` map. A tab opened for
+ * the first time asks for its endpoints at once, and until they answer its
+ * body is the pre-fetch seed, which looks exactly like a measured empty
+ * payload.
+ *
+ * ONE NOTICE PER TAB, NOT PER ENDPOINT. Every path is pending at page load, so
+ * a per-endpoint banner would stack up to one per path (eight on Overview)
+ * for a single transient fact. A stale notice stays per-endpoint: there each
+ * endpoint's age and failure count is its own fact.
+ *
+ * A path already failing STALE_FAILURE_THRESHOLD times is left out:
+ * staleNoticesForTab names that one, and two banners for one fact is noise.
+ *
+ * ADDITIVE, like the stale notices, and every input optional: a missing
+ * `receipt` produces no notice rather than a claim about every path.
+ */
+function loadingNoticeForTab(input) {
+  const s = input || {}
+  const paths = TAB_ENDPOINTS[s.tab]
+  if (!Array.isArray(paths)) return null
+  if (!s.receipt || typeof s.receipt !== 'object') return null
+
+  const pending = paths.filter(path => {
+    if (s.receipt[path]) return false
+    const entry = staleEntryFor(s.stale, path)
+    return !(entry && Number(entry.failures) >= STALE_FAILURE_THRESHOLD)
+  })
+  if (pending.length === 0) return null
+  return {
+    kind: 'loading',
+    paths: pending,
+    text: pending.join(', ') + (pending.length === 1 ? ' has' : ' have') +
+      ' not delivered data yet — loading',
+  }
+}
+
 const ENDPOINT_STALENESS_API = {
   STALE_FAILURE_THRESHOLD,
   TAB_ENDPOINTS,
+  CHROME_ENDPOINTS,
   staleEntryFor,
   formatAge,
   staleNoticesForTab,
+  loadingNoticeForTab,
 }
 
 if (typeof module !== 'undefined' && module.exports) {

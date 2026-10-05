@@ -150,14 +150,10 @@ def _confine_stale_dir_sweep(monkeypatch, sweep_root) -> Iterator[None]:
 
     SCOPED to this module's OWN prefix, never the bare ``reset_sweep_once_state()``
     that clears every prefix.  The bare form also drops
-    ``claude-config-usage-gate-probe-``, which this module neither owns nor
-    protects: ``UsageGate.__init__`` sweeps at construction, and the mark left by
-    an earlier module is what keeps a LATER module's first gate from scandir-ing
-    and rmtree-ing the real /tmp.  Only ``test_usage_gate.py`` is autouse-guarded
-    against that (``_keep_gates_off_the_real_tmp``) — ``test_usage_gate_exhaustive
-    .py``, ``test_concurrency.py`` and four others build gates unprotected — so
-    clearing a prefix this module does not own would make whether they hit real
-    /tmp depend on pytest collection order.
+    ``claude-config-usage-gate-probe-``, which this module does not own, and
+    clearing another module's state is a widening.  That prefix's sweep needs no
+    help from here: conftest.py's ``_confine_usage_gate_sweep`` confines every
+    gate's sweep in this package.
     """
     real_sweep = probe.sweep_stale_pid_dirs
 

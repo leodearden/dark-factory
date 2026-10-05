@@ -9,28 +9,26 @@ still resolve, whether a superseded entry still outranks the entry that
 replaced it, and whether entries assert live task state for tasks that have
 since gone terminal.
 
-**What it measures** (four metrics across three families, all owned by this
+**What it measures** (five metrics across three families, all owned by this
 leaf):
 
 ======================================  ==========  ==================
 metric_id                               kind        direction
 ======================================  ==========  ==================
 ``superseded-still-surfacing``          count       higher_is_worse
-``dangling-pointers``                   count       higher_is_worse
+``dangling-pointers``                   scalar      (never alarmed)
+``dangling-pointers-unattributed``      count       higher_is_worse
 ``successor-pointer-present``           tripwire    (rule (a) is already
                                                     directional)
 ``task-terminal-staleness``             count       higher_is_worse
 ======================================  ==========  ==================
 
 ``dangling-pointers`` and ``successor-pointer-present`` are the two spellings
-leaf β's docstring and leaf α's committed exemplars reserve for THIS leaf, and
-they are not redundant with each other: the count feeds α's Poisson
-count-shift trend (is the corpus accumulating dangling pointers?), the
-tripwire feeds α's grandfathered structural rule with the ratchet (did THIS
-supersession edge newly break, or did a previously-broken one get fixed?). One
-aggregate count cannot express per-edge grandfathering; one tripwire cannot
-express a trend over ``parent_id``/``corrects`` targets that have no stable
-per-item identity.
+leaf β's docstring and leaf α's committed exemplars reserve for THIS leaf. The
+scalar is the total an operator needs, by-design reaping included; the
+unattributed count is the population α may alarm on, the edges no reaper's
+contract deletes; the tripwire is per-edge, over unattributed ``supersedes``
+edges, for α's grandfathered ratchet. See PRD D11.
 
 β's ``superseded-above-successor`` is NOT reused here. That metric is
 registry-declared-pair shaped and lives under β's ``e1-retrieval-health``;
@@ -124,10 +122,17 @@ METRIC_SUPERSEDED_STILL_SURFACING = 'superseded-still-surfacing'
 """Count of superseded entries that outranked their successor. n = comparable pairs."""
 
 METRIC_DANGLING_POINTERS = 'dangling-pointers'
-"""Count of pointer targets that do not resolve. n = pointers examined."""
+"""Total of pointer targets that do not resolve, over ALL pointers; n = pointers
+examined. ``kind='scalar'``: recorded and trended, never alarmed, because at
+corpus scale it tracks reaping activity rather than corpus health (PRD D11)."""
+
+METRIC_DANGLING_POINTERS_UNATTRIBUTED = 'dangling-pointers-unattributed'
+"""E4's dangling-pointer ALARM: unresolved targets over the edges no reaper's
+contract deletes. n = those edges."""
 
 METRIC_SUCCESSOR_POINTER_PRESENT = 'successor-pointer-present'
-"""Tripwire (M2 rule a). One item per ``supersedes`` edge, keyed by content."""
+"""Tripwire (M2 rule a). One item per UNATTRIBUTED ``supersedes`` edge, keyed
+by content."""
 
 METRIC_TASK_TERMINAL_STALENESS = 'task-terminal-staleness'
 """Count of entries asserting live state for a terminal task. n = entries
@@ -141,6 +146,61 @@ for why a second parser for the other two would re-introduce 3112's bug.
 ``parent_id`` is reserved vocabulary with zero live population today; it is
 swept anyway so the first genuine use is measured rather than discovered.
 """
+
+REAPER_CONSOLIDATION = 'consolidation'
+"""The consolidation reaper: a canonical minted by
+``fused_memory/services/consolidation_ops.py::apply_retain_arm`` (which stamps
+``canonical: True``), whose ``supersedes`` ``consolidate_memories`` narrows to
+the confirmed-gone set — plus legacy hand-rolled Stage-1 folds signed with
+:data:`CONSOLIDATOR_AGENT_ID`."""
+
+REAPER_STATUS_CORRECTION = 'status_correction'
+"""The status-correction reaper:
+``fused_memory/reconciliation/harness.py::ReconciliationHarness._reconcile_status_correction``
+writes ``harness.py::PROJECT_STATUS_CORRECTION_KIND`` plus ``supersedes``, then
+deletes that set."""
+
+BY_DESIGN_REAPERS: tuple[str, ...] = (REAPER_CONSOLIDATION, REAPER_STATUS_CORRECTION)
+"""Every writer whose contract deletes the targets it names in ``supersedes``.
+A new reaper is added HERE or its edges alarm (PRD D11)."""
+
+UNATTRIBUTED = 'unattributed'
+"""The partition-row key for edges no reaper's contract deletes — deliberately
+not a member of :data:`BY_DESIGN_REAPERS`."""
+
+CONSOLIDATOR_AGENT_ID = 'recon-stage-memory_consolidator'
+"""Stage 1's agent_id, composed in
+``fused_memory/reconciliation/stages/base.py`` as ``recon-stage-<stage id>``.
+The EXACT spelling, never the prefix: other stages write memories and reap
+nothing. A literal rather than derived from ``StageId``: it matches folds
+already stored, which renaming the stage would not rewrite."""
+
+
+def by_design_reaper(metadata: Any) -> str | None:
+    """The reaper whose contract deletes this record's ``supersedes`` targets, if any.
+
+    Read off the CITING record's metadata and never parsed from its content:
+    the "CANONICAL (consolidates ...)" prose is LLM-authored. ``canonical`` is
+    tested with ``is True``, the vocabulary validator's own idiom, so a ``1``
+    or ``'true'`` never attributes. Status correction is checked first, so a
+    record carrying both signatures gets the more specific writer.
+
+    One residual (PRD D11): a reaper-written edge whose target vanished for an
+    unrelated reason is indistinguishable from a reaped one, and is treated as
+    by-design because that target was going to be deleted anyway.
+    """
+    from fused_memory.reconciliation.harness import (  # noqa: PLC0415
+        PROJECT_STATUS_CORRECTION_KIND,
+    )
+
+    if not isinstance(metadata, dict):
+        return None
+    if metadata.get('kind') == PROJECT_STATUS_CORRECTION_KIND:
+        return REAPER_STATUS_CORRECTION
+    if metadata.get('canonical') is True or metadata.get('agent_id') == CONSOLIDATOR_AGENT_ID:
+        return REAPER_CONSOLIDATION
+    return None
+
 
 TRIPWIRE_ITEM_PREFIX = 's-'
 """``TripwireItem.item_key`` shape. A STORED key (α's grandfather set persists
@@ -227,12 +287,16 @@ class PointerRef:
     a UUID that rotated under re-consolidation would read as a brand-new
     failure and fire a false alarm. Carrying it on the ref is what lets
     :func:`successor_pointer_items` stay pure over the refs alone.
+
+    *reaped_by* is the by-design reaper whose contract deletes this edge's
+    target (:func:`by_design_reaper`), set only on ``supersedes`` edges.
     """
 
     source_id: str
     key: str
     target: Any
     source_content: str = ''
+    reaped_by: str | None = None
 
 
 def pointer_targets(record: dict) -> list[PointerRef]:
@@ -261,6 +325,7 @@ def pointer_targets(record: dict) -> list[PointerRef]:
     metadata = record.get('metadata') or {}
     source_id = str(record.get('id') or '')
     source_content = record.get('content') or ''
+    reaper = by_design_reaper(metadata)
     refs: list[PointerRef] = []
     for key in POINTER_KEYS:
         for target in normalize_supersedes(metadata.get(key)):
@@ -269,6 +334,7 @@ def pointer_targets(record: dict) -> list[PointerRef]:
                 key=key,
                 target=target,
                 source_content=source_content,
+                reaped_by=reaper if key == 'supersedes' else None,
             ))
     return refs
 
@@ -337,12 +403,19 @@ class DanglingCensus:
     zero-exposure metric: a fabricated "nothing wrong here" is worse than a
     gap, and the report names every family so the absence cannot read as
     health.
+
+    ``by_reaper`` is a second cut of the SAME edges, keyed by
+    ``ref.reaped_by`` or :data:`UNATTRIBUTED` and just as lazy. ``by_key``
+    answers which pointer kind broke; ``by_reaper`` answers whether anything
+    broke that was not deliberately reaped (PRD D11). They are orthogonal
+    cuts, read per question and never summed together.
     """
 
     examined: int
     resolved: int
     unresolved: int
     by_key: dict[str, dict[str, int]]
+    by_reaper: dict[str, dict[str, int]]
     unresolved_refs: list[PointerRef]
 
 
@@ -368,23 +441,33 @@ def dangling_census(
     costs no accounting.
     """
     by_key: dict[str, dict[str, int]] = {}
+    by_reaper: dict[str, dict[str, int]] = {}
     unresolved_refs: list[PointerRef] = []
     resolved = 0
     for ref in refs:
-        row = by_key.setdefault(ref.key, {'examined': 0, 'resolved': 0, 'unresolved': 0})
-        row['examined'] += 1
+        # Both cuts are bumped on the SAME branch of ONE traversal, so they
+        # cannot disagree about any ref.
+        rows = (
+            by_key.setdefault(ref.key, {'examined': 0, 'resolved': 0, 'unresolved': 0}),
+            by_reaper.setdefault(
+                ref.reaped_by or UNATTRIBUTED, {'examined': 0, 'resolved': 0, 'unresolved': 0},
+            ),
+        )
         target = ref.target if isinstance(ref.target, str) else None
-        if target is not None and resolution.get(target, False):
-            row['resolved'] += 1
+        outcome = 'resolved' if target is not None and resolution.get(target, False) else 'unresolved'
+        for row in rows:
+            row['examined'] += 1
+            row[outcome] += 1
+        if outcome == 'resolved':
             resolved += 1
         else:
-            row['unresolved'] += 1
             unresolved_refs.append(ref)
     return DanglingCensus(
         examined=len(refs),
         resolved=resolved,
         unresolved=len(unresolved_refs),
         by_key=by_key,
+        by_reaper=by_reaper,
         unresolved_refs=unresolved_refs,
     )
 
@@ -461,12 +544,34 @@ def unkeyable_successor_refs(refs: list[PointerRef]) -> list[PointerRef]:
     return [ref for ref in refs if _is_unkeyable_successor(ref)]
 
 
+def _is_by_design_successor(ref: PointerRef) -> bool:
+    """Is *ref* a ``supersedes`` edge whose target a reaper deletes by design?
+
+    The ONE site that decides, shared by :func:`by_design_successor_refs`
+    (which reports them) and :func:`successor_pointer_items` (which skips
+    them). A predicate, never set membership, for the unhashable-ref reason
+    :func:`_is_unkeyable_successor` documents.
+    """
+    return ref.key == 'supersedes' and ref.reaped_by is not None
+
+
+def by_design_successor_refs(refs: list[PointerRef]) -> list[PointerRef]:
+    """The ``supersedes`` refs the tripwire excludes as reaped by design, in ref order.
+
+    A DISCLOSED narrowing, not a suppression. These edges stay counted in the
+    ``dangling-pointers`` scalar and in the per-reaper rows; they stop being
+    graded by a rule (a) they can never meaningfully pass or fail, since a
+    by-design edge can never newly break or be fixed (PRD D11).
+    """
+    return [ref for ref in refs if _is_by_design_successor(ref)]
+
+
 def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool]) -> list:
     """One :class:`shared.memory_eval_metrics.TripwireItem` per ``supersedes`` edge.
 
     ``parent_id``/``corrects`` refs are deliberately excluded: they are
-    measured by the ``dangling-pointers`` COUNT, whose Poisson trend needs no
-    per-item identity. A tripwire over them could not be grandfathered, since
+    measured by the ``dangling-pointers-unattributed`` COUNT, whose Poisson
+    trend needs no per-item identity. A tripwire over them could not be grandfathered, since
     those targets have no stable item key to ratchet on.
 
     Returns the shared model directly so the tripwire's ``n == len(items)``
@@ -488,15 +593,24 @@ def successor_pointer_items(refs: list[PointerRef], resolution: dict[str, bool])
     ratchet for every future run. The skipped count is disclosed in
     ``corpus.counts`` and named in the report; ``dangling-pointers`` still
     counts those edges, so nothing measured becomes unmeasured.
+
+    Edges named by :func:`by_design_successor_refs` are skipped too, whether
+    or not their target resolves: otherwise every new canonical and every
+    diverged status-correction record would mint a new failing item, and so a
+    new alarm, on every run a reaper acted (PRD D11).
     """
     from shared.memory_eval_metrics import TripwireItem  # noqa: PLC0415
 
     by_key: dict[str, bool] = {}
     for ref in refs:
-        # `_is_unkeyable_successor`, not membership in a set of skipped refs: a
-        # ref whose target is a dict or a list is unhashable, and hashing one
-        # would abort the whole sweep. See that predicate's docstring.
-        if ref.key != 'supersedes' or _is_unkeyable_successor(ref):
+        # Predicates, not membership in a set of skipped refs: a ref whose
+        # target is a dict or a list is unhashable, and hashing one would
+        # abort the whole sweep. See `_is_unkeyable_successor`'s docstring.
+        if (
+            ref.key != 'supersedes'
+            or _is_unkeyable_successor(ref)
+            or _is_by_design_successor(ref)
+        ):
             continue
         target = ref.target if isinstance(ref.target, str) else None
         passed = bool(target is not None and resolution.get(target, False))
@@ -708,6 +822,21 @@ def unsearchable_supersedes_refs(refs: list[PointerRef]) -> list[PointerRef]:
     return [ref for ref in refs if _is_unsearchable_supersedes(ref)]
 
 
+def predecessor_gone_supersedes_refs(unresolved_refs: list[PointerRef]) -> list[PointerRef]:
+    """The searched ``supersedes`` refs whose superseded target did not resolve.
+
+    Family (1) DID pose a query for these, but a predecessor that is gone can
+    never be returned, so the pair can never be comparable (PRD D12). Pass
+    ``census.unresolved_refs``. Disjoint from
+    :func:`unsearchable_supersedes_refs` by construction — it reuses that
+    predicate — so the two rows name separate causes.
+    """
+    return [
+        ref for ref in unresolved_refs
+        if ref.key == 'supersedes' and not _is_unsearchable_supersedes(ref)
+    ]
+
+
 def _degraded_observation(
     ref: PointerRef,
     *,
@@ -903,6 +1032,7 @@ def pinned_metric_ids() -> tuple[str, ...]:
     return (
         METRIC_SUPERSEDED_STILL_SURFACING,
         METRIC_DANGLING_POINTERS,
+        METRIC_DANGLING_POINTERS_UNATTRIBUTED,
         METRIC_SUCCESSOR_POINTER_PRESENT,
         METRIC_TASK_TERMINAL_STALENESS,
     )
@@ -932,6 +1062,26 @@ def _count(metric_id: str, value: int, exposure: int, *, details_path: str | Non
         value=float(value),
         n=exposure,
         direction='higher_is_worse',
+        details_path=details_path,
+    )
+
+
+def _scalar(metric_id: str, value: int, exposure: int, *, details_path: str | None = None):
+    """A scalar Metric — recorded and trended, never alarmed — or ``None``.
+
+    :func:`_count`'s absent-when-zero-exposure rule, for the same reason. No
+    ``direction``: the shared validator rejects one on a scalar, which has no
+    alarm rule for a direction to steer.
+    """
+    from shared.memory_eval_metrics import Metric  # noqa: PLC0415
+
+    if exposure <= 0:
+        return None
+    return Metric(
+        metric_id=metric_id,
+        kind='scalar',
+        value=float(value),
+        n=exposure,
         details_path=details_path,
     )
 
@@ -1013,11 +1163,35 @@ def _disclosure_counts(
     from one the corpus genuinely stopped surfacing. Recorded on every run, a
     later change to the depth explains its own step in leaf α's trend; recorded
     nowhere, it looks like the corpus moved.
+
+    The ``pointers_by_reaper_{bucket}_{field}`` rows carry ``census.by_reaper``
+    the way the per-key rows carry ``by_key``, lazily. There are two reapers
+    with different mechanisms — an every-cycle Python writer capped at one live
+    record per project, and consolidation canonicals that accumulate — and an
+    aggregate cannot tell them apart. The ``by_reaper`` segment keeps these
+    rows disjoint from the per-key ones; they are a second cut of the same
+    edges, never a term to add to them.
+
+    ``successor_edges_by_design`` is the tripwire's attribution narrowing: the
+    supersedes edges :func:`by_design_successor_refs` excludes from its items
+    (PRD D11). Emitted every run, as ``0`` when none, so a tripwire whose ``n``
+    shrank because reaping grew is distinguishable from a corpus that stopped
+    superseding.
+
+    ``surfacing_edges_predecessor_gone`` is family (1)'s structural narrowing
+    and the answer to "why is ``pairs_comparable`` small": a reaped predecessor
+    cannot surface, so its pair can never be comparable (PRD D12). It counts
+    only edges family (1) DID search, so it never overlaps
+    ``surfacing_edges_unsearchable``.
     """
     counts: dict[str, int] = {
         'pointer_refs_malformed': malformed,
         'pointer_targets_unique_reads': len(unique_pointer_targets(refs)),
+        'successor_edges_by_design': len(by_design_successor_refs(refs)),
         'successor_edges_unkeyable': len(unkeyable_successor_refs(refs)),
+        'surfacing_edges_predecessor_gone': len(
+            predecessor_gone_supersedes_refs(census.unresolved_refs),
+        ),
         'surfacing_edges_unsearchable': len(unsearchable_supersedes_refs(refs)),
         'surfacing_queries_degraded': len(surfacing.degraded),
         'surfacing_search_depth': surfacing_depth,
@@ -1026,6 +1200,9 @@ def _disclosure_counts(
     for key, row in sorted(census.by_key.items()):
         for field_name, value in sorted(row.items()):
             counts[f'pointers_{key}_{field_name}'] = value
+    for bucket, row in sorted(census.by_reaper.items()):
+        for field_name, value in sorted(row.items()):
+            counts[f'pointers_by_reaper_{bucket}_{field_name}'] = value
     return counts
 
 
@@ -1044,7 +1221,8 @@ def build_series(
 ):
     """Assemble the M1 metric series for one sweep run.
 
-    Emits at most the four metrics this leaf owns, in the pinned vocabulary.
+    Emits at most the five metrics this leaf owns, in the pinned vocabulary
+    and in :func:`pinned_metric_ids` order.
     β's ``superseded-above-successor`` and its topic metrics are that leaf's
     and never appear here.
 
@@ -1079,6 +1257,8 @@ def build_series(
     # absolute path from this machine would be a dangling pointer there.
     details_path = report_artifact_path('.', eval_id, stamp).name
 
+    # A missing row is zero unattributed exposure, which `_count` omits.
+    unattributed = census.by_reaper.get(UNATTRIBUTED, {'examined': 0, 'unresolved': 0})
     metrics: list[Any] = []
     for metric in (
         _count(
@@ -1086,9 +1266,14 @@ def build_series(
             surfacing.still_surfacing, surfacing.pairs_comparable,
             details_path=details_path,
         ),
-        _count(
+        _scalar(
             METRIC_DANGLING_POINTERS,
             census.unresolved, census.examined,
+            details_path=details_path,
+        ),
+        _count(
+            METRIC_DANGLING_POINTERS_UNATTRIBUTED,
+            unattributed['unresolved'], unattributed['examined'],
             details_path=details_path,
         ),
     ):
@@ -1593,7 +1778,7 @@ async def fetch_terminal_task_ids(config: Any) -> TerminalTaskJoin:
 # a second home for it would drift from the first without anyone noticing.
 # ---------------------------------------------------------------------------
 
-_MAX_NAMED = 20
+MAX_NAMED_PER_SECTION = 20
 """Detail rows printed per section before the remainder is counted instead.
 
 The count of what was elided is always printed, so a long tail is visible as a
@@ -1698,6 +1883,7 @@ def sweep_report_sections(
         )))
 
     unsearchable = unsearchable_supersedes_refs(list(refs))
+    predecessor_gone = predecessor_gone_supersedes_refs(census.unresolved_refs)
     sections.append(ReportSection('superseded_surfacing', (
         '',
         'Family 1 — superseded entries still surfacing',
@@ -1713,21 +1899,33 @@ def sweep_report_sections(
             '    (no successor text, or a target that is not a memory id;',
             '     each is named under a disclosure below)',
         ] if unsearchable else []),
+        f'  supersedes edges whose predecessor is gone: {len(predecessor_gone)}',
+        *([
+            '    (a reaped predecessor can never surface, so these pairs can',
+            '     never be compared — PRD D12)',
+        ] if predecessor_gone else []),
         f'  comparable pairs (both returned): {surfacing.pairs_comparable}',
         f'  superseded above its successor:   {surfacing.still_surfacing}',
         *_elided(
             [
                 f'    {record.superseded_id} (rank {record.superseded_rank}) '
                 f'above {record.successor_id} (rank {record.successor_rank})'
-                for record in surfacing.inversions[:_MAX_NAMED]
+                for record in surfacing.inversions[:MAX_NAMED_PER_SECTION]
             ],
             len(surfacing.inversions),
         ),
     )))
 
+    # Unattributed edges first (a stable sort keeps scan order within each
+    # half): at corpus scale nearly every unresolved pointer is a deliberate
+    # deletion, and naming in scan order would spend the whole
+    # MAX_NAMED_PER_SECTION budget on those and elide the edge an operator
+    # actually has to fix.
+    actionable_first = sorted(census.unresolved_refs, key=lambda ref: ref.reaped_by is not None)
     unresolved_rows = [
-        f'    {ref.key}: {ref.source_id} -> {ref.target!r}'
-        for ref in census.unresolved_refs[:_MAX_NAMED]
+        f'    {ref.key}: {ref.source_id} -> {ref.target!r} '
+        f'[{ref.reaped_by or UNATTRIBUTED}]'
+        for ref in actionable_first[:MAX_NAMED_PER_SECTION]
     ]
     sections.append(ReportSection('dangling_pointers', (
         '',
@@ -1736,6 +1934,10 @@ def sweep_report_sections(
         f'  resolved:          {census.resolved}',
         f'  unresolved:        {census.unresolved}',
         *(f'  {key}: {row}' for key, row in sorted(census.by_key.items())),
+        '  by attribution (the same edges, cut by which reaper deletes the target):',
+        *(f'  {bucket}: {row}' for bucket, row in sorted(census.by_reaper.items())),
+        f'  The total is recorded, not alarmed; the {UNATTRIBUTED} bucket is',
+        '  the alarmed population (PRD D11).',
         # Named, not just counted: a bare total tells an operator that
         # something dangles but not which pointer to go and look at.
         *_elided(unresolved_rows, len(census.unresolved_refs)),
@@ -1746,8 +1948,12 @@ def sweep_report_sections(
         '',
         'Family 2b — successor pointer present (per supersedes edge)',
         f'  edges checked: {len(tripwire_items)}',
+        # Outside the tripwire, not lost: still in the census above.
+        f'  edges excluded, target reaped by design: {len(by_design_successor_refs(list(refs)))}',
         f'  edges whose predecessor is gone: {len(failing)}',
-        *_elided([f'    {item.item_key}' for item in failing[:_MAX_NAMED]], len(failing)),
+        *_elided(
+            [f'    {item.item_key}' for item in failing[:MAX_NAMED_PER_SECTION]], len(failing),
+        ),
     )))
 
     sections.append(ReportSection('task_terminal_staleness', (
@@ -1764,7 +1970,7 @@ def sweep_report_sections(
                 # something this run did not measure. See terminal_staleness.
                 f'    {record.record_id} frames live task state and references '
                 f'task {record.task_id} ({record.status})'
-                for record in staleness.records[:_MAX_NAMED]
+                for record in staleness.records[:MAX_NAMED_PER_SECTION]
             ],
             len(staleness.records),
         ),
@@ -1790,7 +1996,7 @@ def sweep_report_sections(
                 [
                     f'  {query.source_id} -> {query.target} '
                     f'(failed stores: {", ".join(query.failed_stores) or "unnamed"})'
-                    for query in surfacing.degraded[:_MAX_NAMED]
+                    for query in surfacing.degraded[:MAX_NAMED_PER_SECTION]
                 ],
                 len(surfacing.degraded),
             ),
@@ -1825,7 +2031,7 @@ def sweep_report_sections(
             *_elided(
                 [
                     f'  {ref.source_id} -> {ref.target!r} (source has no content)'
-                    for ref in unkeyable[:_MAX_NAMED]
+                    for ref in unkeyable[:MAX_NAMED_PER_SECTION]
                 ],
                 len(unkeyable),
             ),
@@ -1842,7 +2048,7 @@ def sweep_report_sections(
             *_elided(
                 [
                     f'  {ref.key}: {ref.source_id} -> {ref.target!r}'
-                    for ref in malformed[:_MAX_NAMED]
+                    for ref in malformed[:MAX_NAMED_PER_SECTION]
                 ],
                 len(malformed),
             ),

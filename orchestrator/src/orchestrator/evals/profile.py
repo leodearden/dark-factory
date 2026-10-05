@@ -31,7 +31,7 @@ inventory this closes):
     memory endpoint (``http://localhost:8002``). Every orchestrator-side eval
     memory write (``TaskWorkflow._write_completion_to_memory`` /
     ``_write_decisions_to_memory`` / ``_write_suggestions_to_memory``) POSTs
-    raw httpx to ``{self.mcp.url}/mcp/``, where
+    raw httpx to ``{self.mcp.url}/mcp``, where
     ``self.mcp = _EvalMcpStub(orch_config.fused_memory.url)`` — so an
     un-isolated green eval run would write observations/decisions/suggestions
     into PRODUCTION dark_factory memory. This one profiled leaf neutralizes

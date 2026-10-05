@@ -14,6 +14,7 @@ from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, NamedTuple, TypedDict, cast
 from urllib.parse import urlparse
 
@@ -30,9 +31,9 @@ from graphiti_core.helpers import validate_group_ids
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.llm_client.client import LLMClient
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
-from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 
+from fused_memory.backends.falkor_edge_search import FalkorEdgeSearch
 from fused_memory.backends.falkor_fulltext import build_query
 from fused_memory.backends.falkor_indices import (
     IndexCatalogUnsettledError,
@@ -48,9 +49,18 @@ from fused_memory.backends.falkor_indices import (
     vector_drop_statement,
     vector_index_properties,
 )
-from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+from fused_memory.backends.llm_clients import (
+    ForceJsonObjectOpenAIGenericClient,
+    TokenRecordingOpenAIGenericClient,
+)
+from fused_memory.backends.llm_token_usage import (
+    AttributingTokenUsageTracker,
+    TokenMeasurement,
+    measure_llm_tokens,
+)
 from fused_memory.config.env_precedence import warn_if_ambient_base_url_is_overridden
 from fused_memory.config.schema import FusedMemoryConfig, OpenAIProviderConfig
+from fused_memory.models.scope import build_known_projects_map, known_project_roots_from_env
 from fused_memory.utils.async_utils import gather_or_raise
 from fused_memory.utils.toolcall_xml_leak import has_toolcall_xml_leak
 from fused_memory.utils.validation import canonicalize_project_id
@@ -162,7 +172,18 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
 
     ``cfg.llm.client_class`` selects among the OpenAI-shaped clients only; the
     anthropic branch is unaffected by it.
+
+    Every returned client carries an ``AttributingTokenUsageTracker``, installed
+    here once rather than per arm, so ``measure_llm_tokens`` can attribute its
+    spend on whichever arm is configured.
     """
+    llm_client = _construct_llm_client(cfg)
+    if llm_client is not None:
+        llm_client.token_tracker = AttributingTokenUsageTracker()
+    return llm_client
+
+
+def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
     # LLMConfig's validator already rejects this combination at construction,
     # but pydantic does not re-validate on attribute assignment, so a config
     # mutated after loading — how tests and per-arm harnesses build variants —
@@ -232,10 +253,10 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 # shared construction call. Keeping a single call site is
                 # deliberate: two copies of the argument list are how one arm
                 # silently drifts from the other when a kwarg is added.
-                generic_cls: type[OpenAIGenericClient] = (
+                generic_cls: type[TokenRecordingOpenAIGenericClient] = (
                     ForceJsonObjectOpenAIGenericClient
                     if cfg.llm.structured_output_mode == 'json_object'
-                    else OpenAIGenericClient
+                    else TokenRecordingOpenAIGenericClient
                 )
                 llm_client = generic_cls(config=llm_config, max_tokens=cfg.llm.max_tokens)
             else:
@@ -1158,7 +1179,14 @@ class _MultiTenantFalkorDriver(FalkorDriver):
     path, which is exactly where 9950 originated.  If ``clone()`` ever returns a
     plain ``FalkorDriver`` again, the hardening silently stops applying
     everywhere that matters while the unit tests still pass.
+
+    ``search_interface`` is set (task 6238) so graphiti's edge search runs
+    Cypher FalkorDB can plan over the provisioned indices; see
+    :mod:`fused_memory.backends.falkor_edge_search`.  It is a class attribute, so
+    every ``clone()`` carries it on both the read and the write path.
     """
+
+    search_interface = FalkorEdgeSearch()
 
     async def build_indices_and_constraints(self, delete_existing=False):
         pass
@@ -1250,6 +1278,20 @@ _PROVENANCE_RANK_CLAUSE = (
 _PROVENANCE_RANK_ORDER = 'ORDER BY provenance_rank DESC, n.created_at ASC, n.uuid ASC'
 
 
+def _derive_registered_graph_ids(config: FusedMemoryConfig) -> frozenset[str]:
+    """The project registry's ids: ``build_known_projects_map`` over its two inputs.
+
+    The inputs are the taskmaster project_root and DASHBOARD_KNOWN_PROJECT_ROOTS,
+    the builder and inputs ``server/main.py`` uses for its own map.  The
+    primary-root normalisation below restates main.py's; nothing shared enforces
+    that the two stay equal.
+    """
+    primary = config.taskmaster.project_root if config.taskmaster else ''
+    if primary:
+        primary = str(Path(primary).expanduser().resolve())
+    return frozenset(build_known_projects_map(primary, known_project_roots_from_env()))
+
+
 class GraphitiBackend:
     """Owns the Graphiti client lifecycle.
 
@@ -1258,25 +1300,54 @@ class GraphitiBackend:
     so every operation targets the correct graph.
     """
 
-    def __init__(self, config: FusedMemoryConfig):
+    def __init__(
+        self,
+        config: FusedMemoryConfig,
+        *,
+        registered_graph_ids: Iterable[str] | None = None,
+    ):
         self.config = config
+        self._registered_graph_ids: frozenset[str] = (
+            _derive_registered_graph_ids(config)
+            if registered_graph_ids is None
+            else frozenset(canonicalize_project_id(g) for g in registered_graph_ids)
+        )
         self.client: Graphiti | None = None
         self._driver: FalkorDriver | None = None
         self._read_timeout: float = config.queue.backend_read_timeout_seconds
         self._write_timeout: float = config.queue.backend_write_timeout_seconds
+        # First-write provisioning runs INSIDE the triggering write's own budget
+        # (the durable queue's whole-write wait_for), so it gets the read budget:
+        # spending the write budget there would let a hung index read time out
+        # the very write it must never fail.
+        self._index_provision_timeout: float = self._read_timeout
         self._indexed_graphs: set[str] = set()
         self._cloned_drivers: dict[str, GraphDriver] = {}
         self._identity_locks: dict[str, asyncio.Lock] = {}
         # Guards ensure_indices' read-diff-write critical section, one Lock per
         # graph.  Deliberately SEPARATE from _identity_locks: asyncio.Lock is not
-        # reentrant, and task γ's first-write choke point calls ensure_indices
-        # from a write path that may already hold _identity_lock_for(group_id) —
+        # reentrant, and γ's first-write choke point provisions from a write
+        # path that may already hold _identity_lock_for(group_id) —
         # reusing that lock would deadlock rather than serialize.
         self._index_provision_locks: dict[str, asyncio.Lock] = {}
         self._llm_client = None
         self._embedder = None
         self._cross_encoder = None
         self._group_clients: dict[str, Graphiti] = {}
+
+    @property
+    def registered_graph_ids(self) -> frozenset[str]:
+        """The graphs this backend provisions — PRD D5, docs/prds/falkordb-index-provisioning.md."""
+        return self._registered_graph_ids
+
+    def token_probe(self) -> contextlib.AbstractAsyncContextManager[TokenMeasurement]:
+        """Measure the LLM tokens the calling asyncio context spends inside the window.
+
+        ``_llm_client`` is shared by ``self.client`` and every ``_client_for``
+        clone, which is why attribution is by context, never by tracker delta
+        or ``reset()``.
+        """
+        return measure_llm_tokens(self._llm_client)
 
     # --- Per-request driver routing ---
 
@@ -1378,6 +1449,19 @@ class GraphitiBackend:
             self._identity_locks[group_id] = lock
         return lock
 
+    def _index_provision_lock_for(self, group_id: str) -> asyncio.Lock:
+        """Return the per-graph index-provisioning lock, creating it lazily.
+
+        Same shape as :meth:`_identity_lock_for`, over the separate
+        ``_index_provision_locks`` registry (see ``__init__`` for why sharing the
+        identity lock would deadlock).  Undecorated: callers pass canonical ids.
+        """
+        lock = self._index_provision_locks.get(group_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._index_provision_locks[group_id] = lock
+        return lock
+
     def _require_driver(self) -> FalkorDriver:
         if self._driver is None:
             raise RuntimeError('GraphitiBackend not initialized — call initialize() first')
@@ -1389,53 +1473,86 @@ class GraphitiBackend:
         return cast(Any, driver).client
 
     async def _ensure_indices(self, group_id: str) -> None:
-        """A DELIBERATE no-op today. NOT the provisioning path — see ``ensure_indices``.
+        """Provision *group_id*'s indices if it is registered and not yet cached.
 
-        ``build_indices_and_constraints`` is overridden to ``pass`` on
-        ``_MultiTenantFalkorDriver`` (D4, kept on purpose: removing it is what
-        caused the ``723ec915c3`` connection storm), so this method builds
-        nothing.  It previously ended with a ``logger.debug`` line claiming the
-        graph's indices had been ensured — fired unconditionally after that
-        no-op, and at DEBUG, so at the service's INFO level it produced neither a
-        positive nor a negative signal.  There was no signal in the logs at all.
-        Task 3707 (β) deleted it; the structured :class:`IndexProvisionResult`
-        (INFO on change, WARNING on failure) replaces it at the boundary where the
-        work actually happens.  ``test_ensure_indices.py`` pins the property
-        behaviourally — this method must emit no log record at ANY level — so the
-        guard tracks the semantics rather than a substring, and stays valid under
-        any rewording here.
+        γ's single entry for both call sites, the startup sweep and the first
+        write, and it NEVER raises: a provisioning failure must fail neither the
+        write that triggered it nor the rest of the sweep.
 
-        β deliberately does NOT route this method through
-        :meth:`ensure_indices`, and that is not an abandoned half-fix.
-        ``initialize()`` enumerates every graph on the server under the
-        ``!= 'default_db' and not endswith('_db')`` filter — all 35 probe / test /
-        scratch graphs plus the 6 real trap graphs — and calls this on each.
-        Wiring it here would therefore provision every real project graph on the
-        next ``fused-memory.service`` restart: destroying esc-3375-1's protected
-        evidence (the current absence of indices) and bypassing PRD D10's
-        activation gate, which is exactly why the follow-on task γ depends on
-        external tasks 3658/3659/3660 and is named "the task whose merge changes
-        live graphs".
+        * A graph is cached once :meth:`_ensure_indices_locked` RETURNS, even with
+          per-statement ``failed`` entries: those are already WARNING-logged, and
+          δ's drift detector owns a persistent gap.
+        * When it RAISES or times out, it is logged and left uncached, so the next
+          write or sweep retries.
+        * The lock hold is bounded by the provisioning budget (see ``__init__``).
+        * No OPERATIONAL barrier (INV-7).
 
-        **Task γ owns the rewiring** — both call sites (the startup enumeration
-        and the first-write choke point) — and lands the D5 registry filter in the
-        same change, so the enumeration stops sweeping scratch graphs at the
-        moment it starts doing real work.
+        See docs/prds/falkordb-index-provisioning.md D4-D6.
         """
+        if group_id not in self._registered_graph_ids:
+            return
         if group_id in self._indexed_graphs:
             return
-        driver = self._driver_for(group_id)
-        await driver.build_indices_and_constraints()
-        self._indexed_graphs.add(group_id)
+        async with self._index_provision_lock_for(group_id):
+            # INV-3: _indexed_graphs is an in-process snapshot cache.  It can only
+            # skip redundant WORK, never cause a wrong ACTION: provisioning
+            # re-reads list_indices() (ground truth) and diffs before creating.
+            if group_id in self._indexed_graphs:
+                return
+            try:
+                await asyncio.wait_for(
+                    self._ensure_indices_locked(group_id),
+                    timeout=self._index_provision_timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    'Index provisioning on graph %r did not complete (%s: %s); left '
+                    'uncached, so the next write or restart retries it',
+                    group_id, type(exc).__name__, exc, exc_info=True,
+                )
+                return
+            self._indexed_graphs.add(group_id)
+
+    async def provision_registered_graphs(self) -> None:
+        """Provision every registered graph that already exists — PRD D6's startup half.
+
+        The scope is the registry, not a graph name (D5): the RAW listing is
+        intersected with :attr:`registered_graph_ids`, so probe, test and scratch
+        graphs are skipped by construction.  A registered graph with no key yet
+        is left to its first write.  Safe to call at any time (idempotent, and
+        cached per process).  A listing failure propagates; a failure on one
+        graph does not (see :meth:`_ensure_indices`).
+
+        The WHOLE sweep shares one provisioning budget, so a hung FalkorDB
+        delays ``initialize()`` by at most that budget rather than by one budget
+        per registered graph.  Graphs the sweep did not reach stay uncached and
+        are provisioned by their first write.
+        """
+        try:
+            await asyncio.wait_for(
+                self._provision_existing_registered_graphs(),
+                timeout=self._index_provision_timeout,
+            )
+        except TimeoutError:
+            logger.warning(
+                'Index provisioning sweep exceeded its %ss budget; registered graphs '
+                'it did not reach are left to their first write',
+                self._index_provision_timeout,
+            )
+
+    async def _provision_existing_registered_graphs(self) -> None:
+        existing = await self._require_falkor_client().list_graphs()
+        for graph_name in sorted(set(existing) & self._registered_graph_ids):
+            await self._ensure_indices(graph_name)
 
     async def initialize(self, *, skip_maintenance: bool = False) -> None:
         """Create FalkorDriver + Graphiti client from unified config.
 
         skip_maintenance: when True, skip both startup maintenance blocks
-        (the index-build loop and the W6-ε startup identity scan, which
-        REPAIRS dup-uuid edges — a write). Default False preserves current
-        behavior. Intended for lean, read-only callers (e.g. the ζ
-        migrate_cross_graph_leak.py dry-run/census) that need a
+        (the registered-graph index provisioning sweep and the W6-ε startup
+        identity scan, which REPAIRS dup-uuid edges — a write). Default False
+        preserves current behavior. Intended for lean, read-only callers (e.g.
+        the ζ migrate_cross_graph_leak.py dry-run/census) that need a
         driver/client-wired backend without mutating on init or contending
         with a running service's maintenance sweep.
         """
@@ -1516,13 +1633,10 @@ class GraphitiBackend:
             max_coroutines=cfg.queue.graphiti_max_coroutines,
         )
 
-        # Build indices on all existing project graphs (lazy set avoids repeats).
+        # Provision the registered project graphs that already exist (PRD D6).
         if not skip_maintenance:
             try:
-                existing = await self._require_falkor_client().list_graphs()
-                for graph_name in existing:
-                    if graph_name != 'default_db' and not graph_name.endswith('_db'):
-                        await self._ensure_indices(graph_name)
+                await self.provision_registered_graphs()
             except Exception:
                 logger.warning('Could not enumerate existing graphs for index setup', exc_info=True)
 
@@ -1580,6 +1694,7 @@ class GraphitiBackend:
                 does not resolve. Chained from graphiti_core's own, whose
                 message names only the caller's own input.
         """
+        await self._ensure_indices(group_id)
         client = self._client_for(group_id)
         ref_time = reference_time or datetime.now(UTC)
         if uuid is not None and content:
@@ -3989,6 +4104,7 @@ class GraphitiBackend:
                 more nodes share this name. Carries the conflicting uuids as
                 structured data, so the caller can name the duplicate group.
         """
+        await self._ensure_indices(group_id)
         # Only the RESOLVE half forks — the two resolvers share one `str | None`
         # contract, so the short-circuit below and the whole mint/embedding block
         # stay a single unforked site.
@@ -4951,11 +5067,7 @@ class GraphitiBackend:
         """
         # See the "Serialized per graph" contract bullet: the diff read and the
         # writes it plans must not interleave with another call for this graph.
-        lock = self._index_provision_locks.get(group_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._index_provision_locks[group_id] = lock
-        async with lock:
+        async with self._index_provision_lock_for(group_id):
             return await self._ensure_indices_locked(group_id)
 
     async def _ensure_indices_locked(self, group_id: str) -> IndexProvisionResult:

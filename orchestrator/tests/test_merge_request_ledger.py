@@ -427,33 +427,3 @@ class TestAlarmMergeRequestStuck:
 # step-5 RED: re-export shim identity
 # ---------------------------------------------------------------------------
 
-
-class TestReexportShim:
-    """merge_queue re-export shim identity (task 1992 step-5).
-
-    RED until step-6 GREEN adds the re-export shim block to merge_queue.py.
-    Both modules' names are bound by bare-name import (never reached through
-    a module object) so the identity assertions carry no attribute-path
-    coupling to either module's internals. merge_queue is imported LOCALLY
-    here (not at module scope — see module docstring) so this being RED does
-    not break collection of the rest of the file.
-    """
-
-    def test_shim_names_are_the_same_object_as_the_source_module(self):
-        from orchestrator.merge_queue import (
-            RequestLedger,
-            StuckRequest,
-            _alarm_merge_request_stuck,
-            _merge_request_stuck_sentinel,
-        )
-        from orchestrator.merge_request_ledger import RequestLedger as SourceLedger
-        from orchestrator.merge_request_ledger import StuckRequest as SourceStuck
-        from orchestrator.merge_request_ledger import _alarm_merge_request_stuck as _src_alarm
-        from orchestrator.merge_request_ledger import (
-            _merge_request_stuck_sentinel as _src_sentinel,
-        )
-
-        assert RequestLedger is SourceLedger
-        assert StuckRequest is SourceStuck
-        assert _alarm_merge_request_stuck is _src_alarm
-        assert _merge_request_stuck_sentinel is _src_sentinel

@@ -12,6 +12,8 @@ import logging
 import os
 import shutil
 import sys
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -57,6 +59,7 @@ if str(REPO_ROOT) not in sys.path:
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
+from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
     ExitContractViolationCollector,
@@ -78,7 +81,6 @@ from df_pytest_isolation import (  # noqa: E402
 )
 from shared.config_models import UsageCapConfig  # noqa: E402
 
-from orchestrator import merge_queue  # noqa: E402
 from orchestrator.agents.briefing import BriefingAssembler  # noqa: E402
 from orchestrator.config import (  # noqa: E402
     EscalationConfig,
@@ -88,12 +90,14 @@ from orchestrator.config import (  # noqa: E402
     ReviewConfig,
     SandboxConfig,
 )
+from orchestrator.landed_outbox import LandedOutbox, MergeProvenance  # noqa: E402
+from orchestrator.merge_lane import worker  # noqa: E402
 
 # Belt-and-braces direct assignment: defeats any import-order race where
 # orchestrator.merge_queue was imported (by another conftest/plugin) before
 # the os.environ.setdefault above took effect, which would have frozen its
 # module-level _DEBUG_ASSERTS seed at False.
-merge_queue._DEBUG_ASSERTS = True
+worker._DEBUG_ASSERTS = True
 
 track_async_mock_coroutines()
 
@@ -120,7 +124,7 @@ async def _drain_leaked_tasks():
 
 @pytest_asyncio.fixture(autouse=True)
 async def _reap_leaked_merge_workers(_drain_leaked_tasks):
-    """Gracefully stop any MergeWorker orphaned onto the test event loop (task 1907).
+    """Gracefully stop any merge worker orphaned onto the test event loop (task 1907).
 
     A merge-queue test that raises before its own ``await worker.stop()`` leaks
     the worker's ``run()`` task and its background loops, which do real ``git``
@@ -266,6 +270,23 @@ def repo_root() -> Path | None:
     return None
 
 
+@pytest.fixture(scope='session', autouse=True)
+def pristine_repo_templates(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[RepoTemplates]:
+    """Install the process-wide ``_git_fixtures`` templates that ``seed_repo`` copies from.
+
+    AUTOUSE because the shared ``_workflow_helpers`` seeders are awaited as
+    ``helper(repo)`` by ~20 modules and cannot request a fixture.  SESSION scope
+    under basetemp, so pytest owns the templates' lifetime and each xdist worker
+    gets its own, mirroring the set-and-restore shape of
+    ``df_pytest_isolation.py::_df_git_ceiling_at_basetemp``.  Templates build
+    lazily: an unused worker pays one mkdir.
+    """
+    with session_templates(tmp_path_factory.mktemp('git-templates')) as templates:
+        yield templates
+
+
 @pytest.fixture
 def briefing(tmp_path: Path) -> BriefingAssembler:
     """Minimal BriefingAssembler over a stub OrchestratorConfig (no I/O).
@@ -295,17 +316,9 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     ``dark-factory-orchestrator.yaml`` (absolute path) so tests load the
     operational config deterministically, independent of the process CWD.
 
-    Config source (task 2719): previously this fixture *deleted*
-    ORCH_CONFIG_PATH and relied on ``settings_customise_sources`` falling back
-    to the *relative* ``Path('config.yaml')`` — which, under ``cd orchestrator
-    && pytest`` (how the per-subproject test command invokes us), resolved via
-    the ``orchestrator/config.yaml`` symlink to the operational config.  That
-    transitional symlink was retired, so we now pin the absolute canonical path
-    explicitly.  It is byte-identical to the removed symlink's target, so the
-    operational values every test relies on (e.g. ``lock_depth``,
-    ``merge_verify_breadth='full'``) are unchanged; the absolute path is also
-    CWD-independent, so the config no longer depends on running from
-    ``orchestrator/``.
+    Config source (task 2719): the absolute path (not the retired relative
+    ``config.yaml`` symlink) keeps the operational values every test relies on
+    (e.g. ``lock_depth``, ``merge_verify_breadth='full'``) CWD-independent.
 
     project_root isolation (the other load-bearing part): any test that builds a
     bare ``OrchestratorConfig()`` and drives ``acquire_next`` writes
@@ -314,10 +327,10 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     state.  Pin ``project_root`` (via the ``ORCH_`` env prefix) to this test's
     ``tmp_path`` so those writes land in tmp instead.
 
-    Precedence keeps this safe: ``init_settings`` (explicit ``project_root=...``
-    kwargs) still win over the env, and ``env_settings`` only overrides
-    ``project_root`` — every other field still loads from config.yaml/defaults,
-    so tests that depend on config values (e.g. lock_depth) are unaffected.
+    Precedence keeps this safe: explicit kwargs still win over the env, and the
+    env overrides only ``project_root`` plus the live yaml's laptop runner and
+    ``prefer_remote`` (task 5053: pinned ``[]``/``prefer_local``, so a bare config
+    never ssh's the laptop); all else loads from config.yaml/defaults.
     Config-loading tests already use ``tmp_path`` as their project_root, so the
     env value agrees with the YAML they write.  The opt-in
     ``code_default_config`` fixture runs after this autouse fixture and still
@@ -326,6 +339,8 @@ def _isolate_orch_config(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(REPO_ROOT / "dark-factory-orchestrator.yaml"))
     monkeypatch.setenv("ORCH_PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setenv("ORCH_VERIFY_RUNNERS", "[]")
+    monkeypatch.setenv("ORCH_VERIFY_HOST_POLICY", "prefer_local")
 
 
 @pytest.fixture
@@ -361,6 +376,8 @@ def code_default_config(monkeypatch, tmp_path):
     rely on it.
     """
     monkeypatch.setenv("ORCH_CONFIG_PATH", str(tmp_path / "no-such-config.yaml"))
+    monkeypatch.delenv("ORCH_VERIFY_RUNNERS", raising=False)
+    monkeypatch.delenv("ORCH_VERIFY_HOST_POLICY", raising=False)
 
 
 #: Guaranteed-absent path for the autouse warm-lane script-dir pin below.
@@ -642,7 +659,7 @@ def forbid_live_mcp(monkeypatch):
     NOT ``orchestrator.scheduler.mcp_call`` — because ``scheduler.py`` binds
     ``mcp_call`` via ``from ... import``, a distinct binding from the
     canonical ``orchestrator.mcp_lifecycle.mcp_call`` (and
-    ``orchestrator.agents.briefing.mcp_call``).  Every alias, however,
+    ``orchestrator.agents.memory_recall.mcp_call``).  Every alias, however,
     ultimately constructs/uses an ``McpSession`` and issues its first
     network I/O through ``McpSession.initialize`` -> ``_raw_call`` (the
     one-shot fallback path inside ``mcp_call``, since the module-global
@@ -773,12 +790,26 @@ def _clear_probe_cache():
 
 
 @pytest.fixture(autouse=True)
+def _isolated_merge_provenance(tmp_path_factory):
+    """Start every test with MergeProvenance on a fresh, empty landed outbox.
+
+    MergeProvenance is process-global, and every lane built over a real repo
+    binds its own outbox there (SpeculativeMergeWorker.__init__) with nothing
+    to unbind it, so a row one test's lane recorded would answer a later test's
+    lookup in the same worker (task 5034). The file is never created unless
+    something records through the facade.
+    """
+    basetemp = tmp_path_factory.getbasetemp()
+    MergeProvenance.bind(LandedOutbox(basetemp / f'landed-outbox-{uuid.uuid4().hex}.json'))
+
+
+@pytest.fixture(autouse=True)
 def _mock_merge_queue_verification(monkeypatch, request):
     """Patch merge_queue's run_scoped_verification to return passed=True by default.
 
-    MergeWorker hardcodes orchestrator.merge_queue.run_scoped_verification in its
-    internal calls; tests that create a live MergeWorker need this patched or
-    pytest/ruff/pyright (not in PATH in test environments) cause BLOCKED outcomes.
+    A lane on the production verifier (``ports.py::ProductionVerifier``) resolves
+    orchestrator.merge_queue.run_scoped_verification on every call; tests that run
+    one need it patched or pytest/ruff/pyright cause BLOCKED outcomes.
     Tests that need specific merge-verification behaviour override this with their
     own monkeypatch.setattr call in the test body.
 
@@ -916,18 +947,18 @@ def make_steward(tmp_path: Path):
       serve exactly one consumer.  That factory instead adopted this one's
       ``project_root`` recipe directly (task 3551), so the sandbox invariant is
       shared even though the construction is not;
-    * a THIRD sanctioned site exists, which the lineage had missed:
-      ``test_verdict_servers_integration_gate.py``'s
-      ``_build_steward_for_triage``, added by task 2488 AFTER the 3514
-      consolidation.  It takes a REAL ``OrchestratorConfig`` and a real on-disk
-      meta-root, which this fixture's ``spec_set`` ``MagicMock`` cannot supply;
-      whether to grow a ``config=`` passthrough for it is filed as a follow-up,
-      not decided here.
+    * ``test_verdict_servers_integration_gate.py``'s ``_build_steward_for_triage``
+      (task 2488, after 3514) was FOLDED onto this fixture by task 4452 with NO
+      ``config=`` passthrough: its real config was only needed for
+      ``config.routing.*``, which ``stamp_stock_routing_config`` supplies, and its
+      meta-root pre-init is test-side seeding (``triage_steward``).  A passthrough
+      is a second mode with no consumer; add one only when a caller needs a real
+      config's VALUES, not just its routing containers.
 
     ENFORCEMENT, so the ruling is checkable rather than merely asserted in prose
     a fourth time: ``test_steward_scaffolding_guards.py`` censuses every steward
     construction in this tree against an allowlist that carries the reason for
-    each.  A fourth idiom cannot appear silently — its author must either use
+    each.  Another idiom cannot appear silently — its author must either use
     this fixture or record why they cannot.  That module also owns the
     recurrence guard for the sandboxed-``project_root`` block; the assertion
     itself is ``_orch_helpers.assert_sandboxed_project_root``, which the

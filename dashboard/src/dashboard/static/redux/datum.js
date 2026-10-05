@@ -295,11 +295,8 @@ const PLAIN_DATUM_BOUND_SECONDS = 12;
 // `undefined` is in, because an optional-chained read (`x?.y`) is the commonest
 // way a missing payload field reaches a tile.
 function plainDatum(value, endpointKey, receipts) {
-  const map = receipts === undefined || receipts === null ? plainDatumReceipts() : receipts;
-  const receipt = map ? map[endpointKey] : undefined;
-  if (!receipt || !Number.isFinite(Number(receipt.receivedAt))) {
-    return unknownDatum('not yet fetched');
-  }
+  const receipt = endpointReceipt(endpointKey, receipts);
+  if (!receipt) return unknownDatum('not yet fetched');
   if (value === null || value === undefined) {
     return unknownDatum('no value in the payload');
   }
@@ -343,6 +340,24 @@ function derivedDatum(value, endpointKey, absentReason, receipts) {
   if (value !== null && value !== undefined) return plainDatum(value, endpointKey, receipts);
   const probe = plainDatum(0, endpointKey, receipts);
   return probe.state === 'unknown' ? probe : unknownDatum(absentReason);
+}
+
+// ── A Datum the server DID serve, nested inside a PLAIN-registered payload ──
+// PERFORMANCE carries one cards Datum per project inside a payload data.js
+// registers as plain, as TASKS_SNAPSHOT and BURNDOWN_BY_PROJECT do. The Datum
+// is the server's; all this adds is its endpoint's receipt, so its displayed
+// age spans both clocks. It STAMPS, never constructs: the only envelopes it
+// builds are the two holes, so the count of client-built envelopes stated at
+// the head of this file is unchanged.
+//
+// No receipt outranks everything, as in plainDatum: before the first payload,
+// an absent Datum is not yet evidence of anything. `absentReason` is required
+// and names what the delivered payload lacks where the caller looked.
+function servedDatum(served, endpointKey, absentReason, receipts) {
+  const receipt = endpointReceipt(endpointKey, receipts);
+  if (!receipt) return unknownDatum('not yet fetched');
+  if (!isDatum(served)) return unknownDatum(absentReason);
+  return withReceipt(served, receipt);
 }
 
 // ── A total over several SERVED Datums ──
@@ -418,7 +433,14 @@ function labelledReasons(parts) {
   return parts.map(([label, part]) => label + ': ' + part.reason).join('; ');
 }
 
-// The browser default for plainDatum's third parameter, read LAZILY: a node
+// The receipt *endpointKey* last delivered under, or null before it has.
+function endpointReceipt(endpointKey, receipts) {
+  const map = receipts === undefined || receipts === null ? plainDatumReceipts() : receipts;
+  const receipt = map ? map[endpointKey] : undefined;
+  return receipt && Number.isFinite(Number(receipt.receivedAt)) ? receipt : null;
+}
+
+// The browser default for the receipts parameter, read LAZILY: a node
 // caller passing its own map never touches a browser global, and a render
 // before data.js has published degrades to "no receipt" rather than throwing.
 function plainDatumReceipts() {
@@ -439,6 +461,7 @@ const DATUM_API = {
   LOWER_BOUND_PREFIX,
   plainDatum,
   derivedDatum,
+  servedDatum,
   combinedDatum,
   PLAIN_DATUM_BOUND_SECONDS,
 };

@@ -25,8 +25,10 @@ THE FIVE PINNED SITES (see ``PINNED_SITES`` for the machine-readable registry):
     family-inventory row (ordered) and the G7 trigger-shape fallback list (set).
   * ``CONTRIBUTING.md`` — pinned as an ABSENCE: it may name at most one
     invariant, never a restatement of the family.
-  * ``docs/code-quality.md`` — a PARTIAL `INV-N`-to-heuristic mapping, pinned
-    pair-wise against the normative doc, never for completeness.
+  * ``orchestrator/src/orchestrator/agents/code_quality.md``
+    (``docs/code-quality.md`` is a symlink to it) — a PARTIAL
+    `INV-N`-to-heuristic mapping, pinned pair-wise against the normative doc,
+    never for completeness.
 
 STRUCTURE, NEVER WORDING. This guard pins WHICH SLUGS APPEAR WHERE across
 artifacts — the cross-artifact correspondence that fails to auto-extend when an
@@ -86,7 +88,9 @@ NORMATIVE_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants.md"
 FIXTURES_DOC = REPO_ROOT / "docs" / "legibility" / "design-invariants-fixtures.md"
 GATES_DOC = REPO_ROOT / "skills" / "prd" / "references" / "gates.md"
 CONTRIBUTING_DOC = REPO_ROOT / "CONTRIBUTING.md"
-CODE_QUALITY_DOC = REPO_ROOT / "docs" / "code-quality.md"
+CODE_QUALITY_DOC = (
+    REPO_ROOT / "orchestrator" / "src" / "orchestrator" / "agents" / "code_quality.md"
+)
 
 # A family this small would mean the normative doc stopped parsing, not that
 # dark-factory shrank its invariant list: eight are landed and none has ever been
@@ -427,7 +431,7 @@ PINNED_SITES = {
     "CONTRIBUTING.md": (
         "pinned as an ABSENCE: at most one by-name citation, never a restatement"
     ),
-    "docs/code-quality.md": (
+    "orchestrator/src/orchestrator/agents/code_quality.md": (
         "a partial `INV-N`-to-heuristic mapping, pinned pair-wise against the "
         "normative doc — never for completeness"
     ),
@@ -591,6 +595,10 @@ def _walk_repo_files(root: Path, suffixes: tuple[str, ...]) -> list[Path]:
         # 4971). The aggregate anti-vacuity guards still cover the case where
         # the skew is large enough to matter.
         if not path.is_file():
+            continue
+        # A tracked symlink is an alias, not a site: its target is scanned in
+        # its own right.
+        if path.is_symlink():
             continue
         found.append(path)
     # `git ls-files` lists an UNMERGED path once per merge stage — a
@@ -1712,8 +1720,8 @@ def test_contributing_does_not_restate_the_invariant_family() -> None:
 
 
 # ---------------------------------------------------------------------------
-# docs/code-quality.md — pinned as a PARTIAL mapping, pair-wise against the
-# normative doc
+# orchestrator/src/orchestrator/agents/code_quality.md — pinned as a PARTIAL
+# mapping, pair-wise against the normative doc
 #
 # The "Relationship to the design invariants" section maps a subset of the
 # family to Leo's fourteen numbered quality heuristics — four of eleven
@@ -2716,11 +2724,17 @@ def test_noncanonical_citations_fails_loudly_on_an_empty_family() -> None:
 # ---------------------------------------------------------------------------
 
 def _write_scan_tree(
-    root: Path, relative_paths: list[str], *, untracked: tuple[str, ...] = ()
+    root: Path,
+    relative_paths: list[str],
+    *,
+    untracked: tuple[str, ...] = (),
+    symlinks: tuple[tuple[str, str], ...] = (),
 ) -> None:
     """Build a real git repo at *root*: *relative_paths* end up TRACKED via
     ``git init`` + ``git add -A -f``; any *untracked* paths are written only
-    AFTER the add, so they stay out of the index.
+    AFTER the add, so they stay out of the index. Each *symlinks* pair is
+    ``(link_relative_path, target_as_written_in_the_link)``, created BEFORE the
+    add so the link itself is tracked.
 
     A real repo, not a bare directory: task 4971 re-sources the scan from
     ``git ls-files``, so trackedness must be exercised by the fixture rather
@@ -2735,6 +2749,11 @@ def _write_scan_tree(
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
+
+    for link, target in symlinks:
+        path = root / link
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, path)
 
     for args in (("init", "-q"), ("add", "-A", "-f")):
         _run_git(list(args), cwd=root)
@@ -2967,6 +2986,24 @@ def test_walk_repo_files_ignores_untracked_markdown(tmp_path: Path) -> None:
     )
 
     assert _walk_repo_files(tmp_path, (".md",)) == [tmp_path / "docs" / "site.md"]
+
+
+def test_walk_repo_files_skips_a_tracked_symlink(tmp_path: Path) -> None:
+    """A tracked symlink's indexed content is its target PATH, and the target is
+    scanned in its own right, so scanning the link double-counts one file. For an
+    untracked target it would read untracked content, against task 4971's
+    tracked-only oracle.
+    """
+    _write_scan_tree(
+        tmp_path, ["docs/real.md"], symlinks=(("notes/alias.md", "../docs/real.md"),)
+    )
+    index = _run_git(["ls-files", "-s"], cwd=tmp_path).stdout
+    assert any(
+        line.startswith("120000") and line.endswith("notes/alias.md")
+        for line in index.splitlines()
+    ), index
+
+    assert _walk_repo_files(tmp_path, (".md",)) == [tmp_path / "docs" / "real.md"]
 
 
 # ---------------------------------------------------------------------------

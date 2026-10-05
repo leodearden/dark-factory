@@ -508,7 +508,7 @@ class TestCheckGate2LiveWorkflow:
 # ---------------------------------------------------------------------------
 #
 # Three consumers compute liveness from the SAME detector, and before this task
-# they fed it DIFFERENT inputs. `_render_live_workflow_section` (task 2963)
+# they fed it DIFFERENT inputs. `render_live_workflow_section` (task 2963)
 # passes `corroborated`; Gate 2 did not. For an IN-PROGRESS task killed by a
 # fleet redeploy the worktree registration lingers and the restarted
 # orchestrator re-acquires the project-wide lock, so `worktree_registered or
@@ -629,7 +629,7 @@ class TestGate2CorroborationForwarding:
         self, monkeypatch, tmp_path, live_status,
     ):
         """SCOPE — the gate is in-progress-only, mirroring
-        `_render_live_workflow_section`'s `task.get('status') == 'in-progress'`
+        `render_live_workflow_section`'s `task.get('status') == 'in-progress'`
         guard. Every other status forwards None, so the detector gate cannot
         fire and this task changes nothing for them."""
         captured = self._capture_detector_kwargs(monkeypatch)

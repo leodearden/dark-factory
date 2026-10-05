@@ -274,7 +274,7 @@ class TestTasksTabRuntimeProbeBanner:
 
         That module also scopes itself to a distinction decided SERVER-SIDE in
         app.api_tasks, whereas the probe summary is by design a client-side
-        derivation over the ACTIVE_TASKS rows.  So the probe banner stays an
+        derivation over the snapshot rows.  So the probe banner stays an
         independent sibling of ``bannerNotices.map(...)``.
         """
         testids = _balanced_slice(tasks_tab_code, 'const bannerTestIds', '{', '}')
@@ -339,6 +339,17 @@ class TestTasksTabRuntimeProbeBanner:
         assert 'visibleProjectIds' not in tasks_tab_code, (
             'visibleProjectIds existed only to scope the summary; a lingering '
             'binding invites the scoped form to be silently reintroduced'
+        )
+
+    def test_the_unfiltered_rows_are_every_snapshot_row(self, tasks_tab_code):
+        """``allTasks`` is every row the /tasks snapshot holds, across projects.
+
+        The retired ACTIVE_TASKS key carried exactly that list;
+        task_snapshot.js::snapshotRowsOver reads it off the snapshot instead,
+        and task_snapshot.test.mjs executes that it is the same concatenation.
+        """
+        assert re.search(r'\bconst\s+allTasks\s*=\s*snapshotRowsOver\(\s*DF_T\s*\)', tasks_tab_code), (
+            'TasksTab does not bind allTasks = snapshotRowsOver(DF_T)'
         )
 
 

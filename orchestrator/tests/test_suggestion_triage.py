@@ -11,10 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch  # noqa: F401
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _review_fixtures import review_aggregation, review_issue
 from shared.cli_invoke import AllAccountsCappedException
 
+from orchestrator.agents.triage import suggestion_hash
 from orchestrator.artifacts import ReviewAggregation, TaskArtifacts
 from orchestrator.config import OrchestratorConfig
+from orchestrator.review_suggestions.disposition import SuggestionDisposition
 from orchestrator.workflow import StewardInterrupted, WorkflowOutcome
 
 # ---------------------------------------------------------------------------
@@ -275,8 +278,6 @@ class TestRouteReviewSuggestionsToCurator:
     @pytest.mark.asyncio
     async def test_payload_fields(self):
         """Each POST payload has the required fields per the spec."""
-        from orchestrator.review_suggestions.dedup import review_suggestion_payload_hash
-
         suggestions = self._suggestions()
         wf = _make_workflow()
 
@@ -293,7 +294,6 @@ class TestRouteReviewSuggestionsToCurator:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
         assert len(posted_bodies) == len(suggestions)
-        content_hash = review_suggestion_payload_hash(suggestions)
         task_id = wf.task_id
 
         for _i, (body, suggestion) in enumerate(zip(posted_bodies, suggestions, strict=True)):
@@ -310,7 +310,7 @@ class TestRouteReviewSuggestionsToCurator:
             assert meta['spawned_from'] == task_id
             assert meta['spawn_context'] == 'review_suggestions'
             assert meta['escalation_id'] == f'review-suggestions-{task_id}'
-            assert meta['suggestion_hash'] == content_hash
+            assert meta['suggestion_hash'] == suggestion_hash(suggestion)
 
             # title: [<cat>] <loc>: <desc[:60]>
             cat = suggestion.get('category', '')
@@ -324,6 +324,50 @@ class TestRouteReviewSuggestionsToCurator:
 
             # project_root is passed
             assert 'project_root' in args
+
+        item_hashes = [b['params']['arguments']['metadata']['suggestion_hash'] for b in posted_bodies]
+        assert len(set(item_hashes)) == len(suggestions)
+
+    @pytest.mark.asyncio
+    async def test_overlapping_batches_reuse_per_item_keys(self):
+        """A suggestion re-raised in a different batch keeps its R4 key.
+
+        The in-instance scalar cache only absorbs a byte-identical whole set,
+        so [a, b] then [b, c] posts b twice.  The curator R4 gate can absorb
+        the second b only if both tickets carry the same
+        (escalation_id, suggestion_hash) pair.
+        """
+        a, b = self._suggestions()
+        b_copy = dict(b)
+        c = {
+            'reviewer': 'security',
+            'severity': 'suggestion',
+            'location': 'src/auth.py:5',
+            'category': 'security',
+            'description': 'Validate input before use',
+            'suggested_fix': 'Add input validation',
+        }
+        wf = _make_workflow()
+        posted_bodies = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            posted_bodies.append(json)
+            return MagicMock(status_code=200, json=lambda: {'result': {'ticket': 'tkt-1'}})
+
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            await wf._route_review_suggestions_to_curator(_fake_reviews([a, b]))
+            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
+            await wf._route_review_suggestions_to_curator(_fake_reviews([b_copy, c]))
+            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
+
+        def r4_key(body):
+            meta = body['params']['arguments']['metadata']
+            return (meta['escalation_id'], meta['suggestion_hash'])
+
+        assert len(posted_bodies) == 4
+        first_a, first_b, second_b, second_c = (r4_key(body) for body in posted_bodies)
+        assert second_b == first_b
+        assert second_c[1] not in {first_a[1], first_b[1]}
 
     @pytest.mark.asyncio
     async def test_escalation_queue_never_touched(self):
@@ -661,6 +705,99 @@ class TestRouteReviewSuggestionsToCurator:
         )
 
 
+class TestRouteReviewSuggestionsDisposition:
+    """The router reports which sink it handed the suggestions to (task 3415)."""
+
+    def _suggestions(self):
+        return [
+            {
+                'reviewer': 'analyst',
+                'severity': 'suggestion',
+                'location': 'src/foo.py:10',
+                'category': 'coverage',
+                'description': 'Missing edge case for branch X',
+                'suggested_fix': 'Add a test covering branch X',
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_suggestions_returns_none(self):
+        wf = _make_workflow()
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            disposition = await wf._route_review_suggestions_to_curator(_fake_reviews([]))
+        assert disposition == SuggestionDisposition.NONE
+
+    @pytest.mark.asyncio
+    async def test_curator_path_returns_curator(self):
+        wf = _make_workflow()
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            disposition = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
+        assert disposition == SuggestionDisposition.CURATOR
+
+    @pytest.mark.asyncio
+    async def test_identical_second_call_returns_deduped(self):
+        wf = _make_workflow()
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            first = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+            second = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+            await asyncio.gather(*wf._background_tasks, return_exceptions=True)
+        assert (first, second) == (SuggestionDisposition.CURATOR, SuggestionDisposition.DEDUPED)
+
+    @pytest.mark.asyncio
+    async def test_mcp_none_with_queue_returns_escalation_queue(self):
+        queue = MagicMock()
+        queue.make_id.return_value = 'esc-42-0'
+        queue.get_by_task.return_value = []
+        wf = _make_workflow(escalation_queue=queue)
+        wf.mcp = None
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            disposition = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+        assert disposition == SuggestionDisposition.ESCALATION_QUEUE
+        queue.submit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_mcp_none_without_queue_returns_dropped(self):
+        wf = _make_workflow(escalation_queue=None)
+        wf.mcp = None
+        with patch.object(wf, '_post_submit_tasks', AsyncMock()):
+            disposition = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+        assert disposition == SuggestionDisposition.DROPPED
+
+    @pytest.mark.asyncio
+    async def test_scheduling_failure_returns_error_without_a_scheduled_log(self, caplog):
+        wf = _make_workflow()
+        # A synchronous MagicMock, not an AsyncMock: it must raise while the
+        # submit coroutine is being built, before anything is scheduled.
+        wf._post_submit_tasks = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError('cannot schedule submits'),
+        )
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.workflow'):
+            disposition = await wf._route_review_suggestions_to_curator(
+                _fake_reviews(self._suggestions())
+            )
+
+        assert disposition == SuggestionDisposition.ERROR
+        scheduled_logs = [
+            r for r in caplog.records
+            if r.name == 'orchestrator.workflow'
+            and r.levelno == logging.INFO
+            and 'scheduled' in r.getMessage()
+        ]
+        assert scheduled_logs == []
+
+
 # ---------------------------------------------------------------------------
 # Integration: stall guard + call-site routing
 # ---------------------------------------------------------------------------
@@ -863,18 +1000,24 @@ class TestDoneBranchCallSiteViaWorkflow:
 # ---------------------------------------------------------------------------
 
 class TestEscalateReviewIssues:
-    def test_creates_blocking_escalation(self):
+    def _queue(self):
         queue = MagicMock()
         queue.make_id.return_value = 'esc-42-5'
+        return queue
+
+    def test_creates_blocking_escalation(self):
+        queue = self._queue()
         wf = _make_workflow(escalation_queue=queue)
         wf.state = MagicMock(value='review')
 
-        reviews = _fake_reviews(
+        reviews = review_aggregation(
             blocking_issues=[{'description': 'bug'}, {'description': 'crash'}],
             suggestions=[{'description': 'style'}],
         )
 
-        wf._escalate_review_issues(reviews)
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.CURATOR, n_suggestions_raw=1,
+        )
 
         queue.submit.assert_called_once()
         esc = queue.submit.call_args[0][0]
@@ -885,8 +1028,102 @@ class TestEscalateReviewIssues:
 
     def test_noop_without_queue(self):
         wf = _make_workflow(escalation_queue=None)
-        reviews = _fake_reviews(blocking_issues=[{'description': 'bug'}])
-        wf._escalate_review_issues(reviews)  # Should not raise
+        reviews = review_aggregation(blocking_issues=[{'description': 'bug'}], suggestions=[])
+        wf._escalate_review_issues(  # Should not raise
+            reviews, suggestion_disposition=SuggestionDisposition.NONE, n_suggestions_raw=0,
+        )
+
+    def test_detail_inlines_every_suggestion(self):
+        queue = self._queue()
+        wf = _make_workflow(escalation_queue=queue)
+        wf.state = MagicMock(value='review')
+        reviews = review_aggregation(
+            blocking_issues=[review_issue('bug', 'blocking'), review_issue('crash', 'blocking')],
+            suggestions=[review_issue('style', 'suggestion'), review_issue('naming', 'suggestion')],
+        )
+
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.CURATOR, n_suggestions_raw=2,
+        )
+
+        esc = queue.submit.call_args[0][0]
+        assert esc.detail == reviews.format_for_escalation()
+        for suggestion in reviews.suggestions:
+            for key in ('description', 'location', 'suggested_fix'):
+                assert suggestion[key] in esc.detail
+        assert '2 blocking issue(s)' in esc.summary
+        assert '2 suggestion(s)' in esc.summary
+        assert esc.summary.endswith('[suggestions → curator]')
+        assert 'scoped out' not in esc.summary
+
+    def test_event_payload_carries_disposition(self):
+        from _recording_event_store import _RecordingEventStore
+
+        wf = _make_workflow(escalation_queue=self._queue())
+        wf.state = MagicMock(value='review')
+        store = _RecordingEventStore()
+        wf.event_store = store  # type: ignore[assignment]
+        reviews = review_aggregation(
+            blocking_issues=[review_issue('bug', 'blocking')],
+            suggestions=[review_issue('style', 'suggestion'), review_issue('naming', 'suggestion')],
+        )
+
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.CURATOR, n_suggestions_raw=2,
+        )
+
+        [data] = [
+            payload['data'] for event_type, payload in store.events
+            if event_type == 'escalation_created'
+        ]
+        assert data['n_blocking'] == 1
+        assert data['n_suggestions'] == 2
+        assert data['suggestion_disposition'] == 'curator'
+        assert data['n_suggestions_raw'] == 2
+
+    def test_no_suggestions_has_no_suffix_or_section(self):
+        queue = self._queue()
+        wf = _make_workflow(escalation_queue=queue)
+        wf.state = MagicMock(value='review')
+        reviews = review_aggregation(blocking_issues=[review_issue('bug', 'blocking')], suggestions=[])
+
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.NONE, n_suggestions_raw=0,
+        )
+
+        esc = queue.submit.call_args[0][0]
+        assert '[suggestions' not in esc.summary
+        assert '# Review Feedback — Suggestions' not in esc.detail
+        assert esc.detail == reviews.format_for_replan()
+
+    def test_summary_and_event_account_for_suggestions_scoped_out(self):
+        from _recording_event_store import _RecordingEventStore
+
+        queue = self._queue()
+        wf = _make_workflow(escalation_queue=queue)
+        wf.state = MagicMock(value='review')
+        store = _RecordingEventStore()
+        wf.event_store = store  # type: ignore[assignment]
+        reviews = review_aggregation(
+            blocking_issues=[review_issue('bug', 'blocking')],
+            suggestions=[review_issue('style', 'suggestion')],
+        )
+
+        wf._escalate_review_issues(
+            reviews, suggestion_disposition=SuggestionDisposition.CURATOR, n_suggestions_raw=3,
+        )
+
+        esc = queue.submit.call_args[0][0]
+        assert esc.summary == (
+            'Review cycles exhausted with 1 blocking issue(s) and 1 suggestion(s) '
+            '(+2 scoped out: routed separately or settled in a prior round) '
+            '[suggestions → curator]'
+        )
+        [data] = [
+            payload['data'] for event_type, payload in store.events
+            if event_type == 'escalation_created'
+        ]
+        assert (data['n_suggestions'], data['n_suggestions_raw']) == (1, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -1338,3 +1575,135 @@ class TestPreTriageCapHandling:
         assert any(
             'all accounts capped' in t.lower() for t in warning_texts
         ), f'Expected warning with "all accounts capped", got: {warning_texts}'
+
+
+# ---------------------------------------------------------------------------
+# _post_submit_tasks — transport regression (task 4023)
+# ---------------------------------------------------------------------------
+
+
+class TestCuratorSubmitTransport:
+    """WHERE the curator submit_task POST lands, not merely that it was made.
+
+    The payload-shape tests above stayed green through ~3 months of silently
+    discarded submissions: they patch ``httpx.AsyncClient.post`` and inspect
+    the body, which cannot distinguish a delivered POST from one absorbed by
+    the ``/mcp/`` -> ``/mcp`` 307.  These drive a real client through the
+    MockTransport server in ``_mcp_transport_harness`` instead — a
+    ``_``-prefixed sibling rather than the ``test_mcp_post_transport`` module
+    that also uses it, so no test module's collection depends on another's.
+    The older tests are left intact — they were never wrong, only insufficient.
+    """
+
+    def _suggestions(self):
+        return [
+            {
+                'reviewer': 'analyst',
+                'severity': 'suggestion',
+                'location': 'src/foo.py:10',
+                'category': 'coverage',
+                'description': 'Missing edge case for branch X',
+                'suggested_fix': 'Add a test covering branch X',
+            },
+        ]
+
+    async def _route_and_drain(self, wf, suggestions):
+        await wf._route_review_suggestions_to_curator(_fake_reviews(suggestions))
+        tasks = list(wf._background_tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_submit_task_call_lands_at_the_mcp_path(self):
+        """THE regression: the submit_task tools/call must arrive at /mcp."""
+        from _mcp_transport_harness import (
+            MCP_PATH,
+            RecordingClientFactory,
+            RecordingMcpServer,
+        )
+
+        wf = _make_workflow()
+        server = RecordingMcpServer()
+        factory = RecordingClientFactory(server)
+
+        with patch('httpx.AsyncClient', factory):
+            await self._route_and_drain(wf, self._suggestions())
+
+        calls = server.tool_calls('submit_task')
+        assert len(calls) == 1, (
+            f'expected 1 submit_task delivered at {MCP_PATH}, got {len(calls)}. '
+            f'redirected={server.redirected!r} not_acceptable={server.not_acceptable!r}'
+        )
+        assert server.redirected == [], 'POSTed to the redirecting /mcp/ path'
+        server.assert_every_request_accepted_json()
+
+    @pytest.mark.asyncio
+    async def test_client_is_constructed_with_follow_redirects(self):
+        """Task's explicit ask (a), first half."""
+        from _mcp_transport_harness import RecordingClientFactory, RecordingMcpServer
+
+        wf = _make_workflow()
+        factory = RecordingClientFactory(RecordingMcpServer())
+
+        with patch('httpx.AsyncClient', factory):
+            await self._route_and_drain(wf, self._suggestions())
+
+        factory.assert_follows_redirects()
+
+    @pytest.mark.asyncio
+    async def test_post_url_has_no_trailing_slash(self):
+        """Task's explicit ask (a), second half — asserted on the URL argument."""
+        urls = []
+
+        async def capture_post(url, *, json=None, **kwargs):
+            urls.append(url)
+            return MagicMock(status_code=200, json=lambda: {'result': {}})
+
+        wf = _make_workflow()
+        with patch('httpx.AsyncClient.post', side_effect=capture_post):
+            await self._route_and_drain(wf, self._suggestions())
+
+        assert urls, 'no POST was made at all'
+        for url in urls:
+            assert not url.endswith('/'), (
+                f'{url!r} ends in a slash — the server 307s it and the payload is lost'
+            )
+            assert url.endswith('/mcp'), f'{url!r} is not the canonical MCP endpoint'
+
+    @pytest.mark.asyncio
+    async def test_a_redirect_that_slips_through_warns_instead_of_passing_silently(
+        self, caplog,
+    ):
+        """A 3xx reaching the call site must be LOUD.
+
+        Pins that this site actually hands its response to
+        ``check_mcp_post_response``: simulate a redirect arriving unfollowed
+        (a proxy, or a future edit dropping ``follow_redirects``) and require a
+        WARNING attributed to ``shared.mcp_post``.  Silent success here is the
+        exact failure this task exists to end.
+        """
+        import httpx
+
+        async def redirect_post(url, *, json=None, **kwargs):
+            return httpx.Response(
+                307,
+                headers={'Location': 'http://localhost:8002/mcp'},
+                request=httpx.Request('POST', url),
+            )
+
+        wf = _make_workflow()
+        with (
+            caplog.at_level(logging.WARNING),
+            patch('httpx.AsyncClient.post', side_effect=redirect_post),
+        ):
+            await self._route_and_drain(wf, self._suggestions())
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and r.name == 'shared.mcp_post'
+        ]
+        assert warnings, (
+            'a 307 at the curator submit site passed silently; expected a WARNING '
+            f'from shared.mcp_post. records={[(r.name, r.getMessage()) for r in caplog.records]!r}'
+        )
+        assert 'redirect' in ' '.join(r.getMessage() for r in warnings).lower()

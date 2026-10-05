@@ -18,6 +18,8 @@ Contents
   that module's docstring for the measured ``ImportError`` behind the
   split.
 * ``normalize_supersedes`` — PRD D2's scalar/list/None normalizer.
+* ``render_metadata_vocabulary_guidance`` — the writer-facing statement of
+  this vocabulary that the writing reconciliation stage prompts interpolate.
 
 ``kind`` is deliberately **NOT** slug-validated: 321 of the 329 live
 ``kind`` values are snake_case, so applying this regex to ``kind`` would
@@ -82,9 +84,11 @@ from fused_memory.utils.validation import is_full_uuid
 
 __all__ = [
     'BLESSED_METADATA_KEYS',
+    'CHILD_KINDS',
     'KIND_REGISTRY',
     'MEM0_MANAGED_METADATA_KEYS',
     'CanonicalUniquenessViolation',
+    'EXPERIMENTAL_KEY_PREFIX',
     'MemoryMetadataValidationError',
     'MetadataViolation',
     'PARENT_ID_DEAD_CODE',
@@ -94,10 +98,12 @@ __all__ = [
     'SERVER_STAMPED_KEYS',
     'TOPIC_SLUG_MAX_LEN',
     'TOPIC_SLUG_RE',
+    'check_canonical_routing',
     'classify_unknown_keys',
     'is_valid_topic_slug',
     'normalize_supersedes',
     'parent_liveness_violation',
+    'render_metadata_vocabulary_guidance',
     'validate_memory_metadata',
 ]
 
@@ -152,6 +158,13 @@ def normalize_supersedes(value: Any) -> list[Any]:
     # Any other scalar (int, dict, ...) is wrapped rather than rejected —
     # the shape validator owns rejection, this function owns shape only.
     return [value]
+
+
+#: The ``kind`` values a child entry carries when its ``parent_id`` attaches it
+#: to a parent: the V1 child kinds, triage attach outcomes only.  Both were
+#: confirmed ABSENT from the live corpus, so :data:`KIND_REGISTRY` unions them
+#: in explicitly (its BLOCK 3) rather than inheriting them from the census.
+CHILD_KINDS: frozenset[str] = frozenset({'amendment', 'sighting'})
 
 
 #: The normative closed registry of Mem0 ``metadata.kind`` values
@@ -548,15 +561,9 @@ KIND_REGISTRY: frozenset[str] = frozenset({
     'entity_standing_decision',
     'stage1_flag_marker',
     # ---------------------------------------------------------------
-    # BLOCK 3 — NEW IN THIS PRD (2 values)
-    #
-    # V1 child kinds, triage attach outcomes only.  Both confirmed
-    # ABSENT from the live corpus, so they are added explicitly rather
-    # than inherited from the census.
+    # BLOCK 3 — NEW IN THIS PRD: CHILD_KINDS, unioned in below.
     # ---------------------------------------------------------------
-    'amendment',
-    'sighting',
-})
+}) | CHILD_KINDS
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +580,7 @@ KIND_REGISTRY: frozenset[str] = frozenset({
 # ---------------------------------------------------------------------------
 
 #: Keys this server stamps onto metadata itself.  They are NOT all stamped at
-#: the same layer, and a reviewer must not read these as three write-seam
+#: the same layer, and a reviewer must not read these as four write-seam
 #: stamps:
 #:
 #: * ``category``   -- stamped at the write seam:
@@ -586,6 +593,17 @@ KIND_REGISTRY: frozenset[str] = frozenset({
 #:                     ``:2921``, read back at ``:2962``).  It is listed here
 #:                     so that a round-tripped search result re-written as
 #:                     metadata does not census-warn on the server's own field.
+#: * ``unverified_claim`` -- stamped at the add_memory write seam
+#:                     (``services/memory_service.py::MemoryService.add_memory``)
+#:                     when the completion-claim gate
+#:                     (``services/completion_claim_gate.py::UNVERIFIED_CLAIM_TAG``)
+#:                     flags the write.  Episode-derived facts get it from
+#:                     ``MemoryService._execute_mem0_classify_and_add``, which
+#:                     does not pass through this validator.  Unlike the
+#:                     census, which only stops warning about it, both seams
+#:                     DISCARD a caller-supplied value
+#:                     (``services/memory_service.py::_stamp_unverified_claim``),
+#:                     so a caller can neither forge the tag nor persist False.
 #:
 #: DELIBERATELY ABSENT: ``run_id``.  It *is* server-stamped, by the same
 #: ``_apply_cycle_summary_metadata_tagging`` helper (``memory_service.py:389``)
@@ -599,6 +617,7 @@ SERVER_STAMPED_KEYS: frozenset[str] = frozenset({
     'category',
     'recon_pool',
     'planned',
+    'unverified_claim',
 })
 
 #: The five keys this PRD reserves and gives shape rules to (V1).  Every one
@@ -1131,3 +1150,180 @@ def validate_memory_metadata(
         ))
 
     return violations
+
+
+# ---------------------------------------------------------------------------
+# The routing rule
+# ---------------------------------------------------------------------------
+
+def check_canonical_routing(
+    meta: dict[str, Any], *, reaches_mem0: bool
+) -> list[MetadataViolation]:
+    """Refuse a ``canonical: True`` assertion on a write that misses Mem0.
+
+    Task 3508.  The third and last piece of ``canonical``, alongside the
+    SHAPE half (``canonical_without_topic`` / ``invalid_canonical_type``,
+    in :func:`validate_memory_metadata` above) and the LIVE half
+    (``_check_canonical_uniqueness`` at the service seam).
+
+    WHY A SEPARATE FUNCTION AND NOT A BRANCH IN THE VALIDATOR — the
+    boundary is structural, not stylistic.  :func:`validate_memory_metadata`
+    promises in its own docstring to be "a pure synchronous function taking
+    only a dict", and leaf ε recorded that as "deliberate, not an
+    oversight" precisely so a later leaf could not grow store- or
+    routing-dependent checks inside it (INV-5).  ``reaches_mem0`` is a
+    SERVICE-LAYER ROUTING fact — it is not derivable from *meta* at all —
+    so folding it in would blur exactly that boundary, and would churn four
+    external call sites that know nothing about routing.  The rule
+    nonetheless lives in THIS module so every violation code and message
+    stays single-homed with its siblings: the census vocabulary has one
+    registry, and an operator greps one file.
+
+    WHY THE RULE EXISTS — measured on graphiti_core 0.28.2, not assumed.
+    THIS DOCSTRING IS THE SINGLE HOME for that measurement: the two
+    service-seam docstrings and the three call-site comments (``add_memory``,
+    ``add_system_record``, ``update_memory``) carry at most a line, so there
+    is ONE thing to update when graphiti_core changes (INV-5).  Cited by
+    symbol, not line.  On a write that reaches only Graphiti the metadata is
+    not merely UNCOUNTED, it is DISCARDED:
+
+    * the ``add_memory_graphiti`` enqueue payload built in
+      :meth:`MemoryService.add_memory` carries no ``meta``; its only
+      metadata-derived fields are ``referents`` (bridged from ``task_id``
+      alone) and ``unverified_claim``, neither of which carries
+      ``canonical`` or ``topic``;
+    * :meth:`GraphitiBackend.add_episode` has no metadata parameter to
+      receive one; the string ``metadata`` occurs zero times in that module;
+    * ``entity_types``, the only route to ``EntityNode.attributes``, is
+      never supplied by any caller, so attributes are always ``{}``.
+
+    So the marker is never stored — hence never readable by its only live
+    reader (``pick_survivor`` in ``scripts/audit_duplicate_memories.py``,
+    which reads ``metadata.get('canonical')`` off Mem0 scroll results) and
+    never countable by the <=1-per-``(project, topic)`` probe, whose two
+    round-trips are Qdrant payload filters.  Admitting such a write would
+    silently destroy a caller's assertion, which is the fail-soft the house
+    no-silent-fail-soft invariant forbids.  Why a Graphiti-side COUNT was
+    rejected outright rather than deferred (four further measurements) is
+    likewise recorded once, in the leaf-ε section of
+    ``docs/prds/memory-metadata-vocabulary.md``.
+
+    WHAT THIS CLOSES, AND WHEN — do not over-read it.  Refusing the write
+    makes the <=1-per-``(project, topic)`` invariant hold for all six
+    categories by construction, at zero new I/O, but only ONCE
+    ``memory_metadata.enforce`` is on.  Under the SHIPPED default
+    (``enforce = False``) a Graphiti-only canonical write is censused
+    (``canonical_on_non_mem0_write``) and then PROCEEDS, and its marker is
+    discarded exactly as it was before this rule existed: the mechanism is
+    in place, the closure is not yet live, and the only live-fleet change
+    is one extra census line.  Task 3626 is the gate that re-measures and
+    decides the flip.
+
+    SCOPED TO ``canonical`` DELIBERATELY, not by oversight.  On that same
+    Graphiti-only write ``topic``, ``kind``, ``parent_id`` and
+    ``supersedes`` are equally discarded and stay admitted in silence
+    (``test_no_probe_and_no_new_code_on_a_graphiti_only_ordinary_write``
+    pins exactly that).  ``canonical`` alone carries a CROSS-RECORD
+    obligation — INV-3 uniqueness, which a discarded marker breaks for
+    records other than this one — while the others assert nothing another
+    record depends on.  Widening the refusal to the whole vocabulary is a
+    separate decision, not a follow-on of this one.
+
+    THE PREDICATE IS "WILL THIS LAND IN MEM0", NOT "IS THE CATEGORY
+    MEM0-PRIMARY".  That distinction is load-bearing: ``dual_write=True``
+    routes a Graphiti-primary category into Mem0 too, where ``canonical``
+    genuinely IS stored and IS enforceable, so a category-based test would
+    be wrong exactly when it mattered.  The caller passes the routing
+    OUTCOME (``resolved_category in MEM0_PRIMARY or dual_write``) rather
+    than the category, so this rule never restates the routing rule.
+    ``update_memory`` and ``add_system_record`` pass ``True`` because they
+    always land in Mem0, whatever their ``category`` tag.
+
+    ``fatal=True``, so it inherits warn-mode-first from the existing
+    ``memory_metadata.enforce`` flag exactly like every sibling shape
+    check — no new config leaf (see "WHAT THIS CLOSES" above for what that
+    means on the live fleet today).
+
+    Returns a list (never raises) for the same reason
+    :func:`validate_memory_metadata` does: the CALLER owns the
+    warn-vs-reject decision.  *meta* is NOT mutated — unlike the validator,
+    this normalizes nothing.  SYNCHRONOUS by design, unlike its sibling
+    ``_check_canonical_uniqueness``: that one is a coroutine because it
+    reads live store state, whereas this needs only the routing fact the
+    caller already holds, so there is nothing to await.
+
+    :param reaches_mem0: whether this write will actually be persisted to
+        Mem0.  Not defaulted anywhere up the call chain, deliberately: a
+        default would let a future write path skip the check silently,
+        which is the exact silence this rule removes.
+    """
+    # `is True`, not truthiness — the same discipline rule 2b documents
+    # above (`1 == True`).  The int form is `invalid_canonical_type`'s
+    # defect and is reported there; catching it here too would render one
+    # mistake as two.
+    if meta.get('canonical') is not True or reaches_mem0:
+        return []
+
+    return [_violation(
+        'canonical',
+        'canonical_on_non_mem0_write',
+        'canonical=True was asserted on a write that will not reach Mem0, '
+        'where the marker cannot be stored at all: the Graphiti write path '
+        'carries no metadata (the add_memory_graphiti payload omits it and '
+        'GraphitiBackend.add_episode has no metadata parameter), so canonical '
+        'and topic would be silently discarded — unreadable by pick_survivor '
+        'and uncountable by the <=1-per-(project, topic) uniqueness probe, '
+        'both of which read Mem0. Use a Mem0-primary category '
+        '(preferences_and_norms, procedural_knowledge, '
+        'observations_and_summaries), or pass dual_write=True to also land a '
+        'Mem0 twin, or drop the canonical marker',
+        fatal=True,
+    )]
+
+
+# ---------------------------------------------------------------------------
+# Writer guidance
+# ---------------------------------------------------------------------------
+
+def render_metadata_vocabulary_guidance() -> str:
+    """Teach a writing reconciliation stage this vocabulary, from the registry values.
+
+    Plain, brace-free text the stage prompts interpolate. Its hand-written
+    orchestrator twin is
+    ``orchestrator/src/orchestrator/agents/roles.py::METADATA_VOCABULARY_INSTRUCTIONS``;
+    ``fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py`` holds both
+    to this registry.
+    """
+    child_kinds = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
+    public_blessed_keys = ', '.join(
+        f'`{key}`' for key in sorted(BLESSED_METADATA_KEYS) if not key.startswith('_')
+    )
+    return (
+        '## Memory Metadata Vocabulary\n'
+        '`add_memory` and `update_memory` validate their `metadata` dict on write, '
+        "and `consolidate_memories`' `topic` argument is the same slug namespace. "
+        'Five keys are RESERVED:\n'
+        f'- `topic` — a kebab-case slug matching `{TOPIC_SLUG_RE.pattern}`, at most '
+        f'{TOPIC_SLUG_MAX_LEN} characters: `memory-write-path` is valid, '
+        '`memory_write_path` and `Memory Write Path` are not. A legacy snake_case '
+        'topic seen in the corpus is not a spelling to copy; `consolidate_memories` '
+        'refuses it.\n'
+        '- `canonical` — a bool marking the one authoritative entry for a topic; '
+        'requires `topic`, at most one entry per project and topic may claim it, and '
+        'it is only meaningful on a write that reaches Mem0.\n'
+        '- `kind` — the record type, drawn from a closed registry; distinct from '
+        '`source`, which records writer provenance rather than record type.\n'
+        '- `parent_id` — a full 36-character UUID of a live entry this one attaches '
+        f'to; triage attach outcomes only, with `kind` {child_kinds}.\n'
+        '- `supersedes` — a LIST of full 36-character UUIDs this entry replaces; '
+        'never a bare string, even for a single UUID.\n'
+        f'The blessed conventional keys {public_blessed_keys} do not warn; use those '
+        'exact spellings. Any other key still writes but warns to a census line; if such '
+        f'an annotation is deliberate, prefix it `{EXPERIMENTAL_KEY_PREFIX}` and it '
+        'passes silently.\n'
+        'A malformed reserved key is censused while `memory_metadata.enforce` is off '
+        'and rejected while it is on; the rejection names the violated rule and '
+        f'`{MemoryMetadataValidationError.REGISTRY_LOCATION}`. The registry module '
+        '`fused-memory/src/fused_memory/memory_metadata.py` is the single normative '
+        'source for all of this; consult it rather than guessing.'
+    )

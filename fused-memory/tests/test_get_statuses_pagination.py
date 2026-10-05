@@ -25,6 +25,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import MCP_SAFE_RESPONSE_CHARS
 
 from fused_memory.server.tools import create_mcp_server
 
@@ -489,9 +490,9 @@ async def test_auto_page_limit_fits_documented_safe_envelope(paging_server):
     assert result['pagination']['returned'] == LIMIT
 
     serialised = json.dumps(result)
-    assert len(serialised) < 62_000, (
+    assert len(serialised) < MCP_SAFE_RESPONSE_CHARS, (
         f'A worst-case full auto-page serialises to {len(serialised)} chars, at or '
-        f'over the {62_000}-char documented-safe envelope. Lower '
+        f'over the {MCP_SAFE_RESPONSE_CHARS}-char documented-safe envelope. Lower '
         f'_STATUSES_AUTO_PAGE_LIMIT (currently {LIMIT}) — do NOT relax this bound.'
     )
 

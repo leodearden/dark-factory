@@ -99,6 +99,7 @@ class TestModuleLevelAll:
             'AgentFailureKind',
             'AgentResult',
             'AllAccountsCappedException',
+            'TranscriptEvidence',
             'build_failure_message',
             'classify_agent_failure',
             'count_transcript_turns',
@@ -115,6 +116,8 @@ class TestModuleLevelAll:
             'read_transcript_records',
             'require_non_blank_prompt',
             'resumable_progress_for_session',
+            'transcript_evidence',
+            'transcript_evidence_for_session',
             'transcript_exists',
         }
 

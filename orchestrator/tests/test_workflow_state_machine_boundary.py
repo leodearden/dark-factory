@@ -38,8 +38,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -63,6 +65,7 @@ from _orch_helpers import pydantic_spec
 # invisible to the workflow's relocated meta_root, so a real run() never
 # reaches DONE (rows 5-6).
 from _workflow_helpers import (
+    PLAN,
     AgentStub,
     FakeBriefing,
     FakeMcp,
@@ -74,6 +77,7 @@ from _workflow_helpers import (
     _init_git_repo,
     _init_repo,
     _make,
+    _make_review,
     _make_warmlane_workflow,
 )
 from escalation.models import Escalation
@@ -89,7 +93,8 @@ from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.landed_outbox import MergeProvenance
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.module_charter import derive_modules
+from orchestrator.scheduler import BlastRadiusResult, TaskAssignment
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
@@ -461,6 +466,113 @@ def _force_blocked_exit_over_a_done_row(
     )
 
 
+class _WideningArchitectStub(AgentStub):
+    """Architect whose plan.files reaches a module the task does not lock, so
+    ``_plan`` must ask the scheduler for an additional lock."""
+
+    async def _architect(self, cwd: Path) -> AgentResult:
+        plan = dict(PLAN)
+        plan['files'] = ['lib.py', 'locked_module.py']
+        plan['_schema_version'] = 1
+        task_dir = TaskArtifacts(cwd).root
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Plan created', cost_usd=0.50)
+
+
+class _WideningReplanStub(AgentStub):
+    """The first comprehensive review blocks, and the architect's replan
+    widens plan.files to a module the task does not lock, so the replan must
+    ask the scheduler for an additional lock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._blocked = False
+
+    def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+        if self._blocked or role != 'reviewer_comprehensive':
+            review = _make_review(role)
+        else:
+            self._blocked = True
+            review = _make_review(role, 'ISSUES_FOUND', [{
+                'severity': 'blocking',
+                'location': 'lib.py:5',
+                'category': 'missing_edge_case',
+                'description': 'No test for empty name',
+                'suggested_fix': 'Add test_farewell_empty',
+            }])
+        return AgentResult(
+            success=True, output=json.dumps(review),
+            structured_output=review, cost_usd=0.10,
+        )
+
+    async def _architect(self, cwd: Path) -> AgentResult:
+        plan_path = TaskArtifacts(cwd).root / 'plan.json'
+        if plan_path.exists():
+            plan = json.loads(plan_path.read_text())
+            plan['files'] = [*plan['files'], 'locked_module.py']
+            plan['steps'].append({
+                'id': 'step-3', 'type': 'test',
+                'description': 'Add test for empty name',
+                'status': 'pending', 'commit': None,
+            })
+        else:
+            plan = {**PLAN, '_schema_version': 1}
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(json.dumps(plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Plan written', cost_usd=0.50)
+
+
+def _drive_plan_into_lock_conflict(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: BlastRadiusResult,
+) -> tuple[TaskWorkflow, FakeScheduler]:
+    """Wire a real run() whose ``_plan`` meets a blast-radius lock conflict
+    the scheduler reports as *conflict* (mirrors
+    test_workflow_e2e.py::TestBlastRadiusExpansion::test_expansion_denied_requeues)."""
+    stub = _WideningArchitectStub()
+    workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+    scheduler.blast_radius_result = conflict
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+    )
+    return workflow, scheduler
+
+
+def _drive_replan_into_lock_conflict(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: BlastRadiusResult,
+) -> tuple[TaskWorkflow, FakeScheduler]:
+    """Wire a real run() whose post-review replan meets a blast-radius lock
+    conflict the scheduler reports as *conflict*.  The task already locks the
+    first plan's modules, so the only scheduler call is the replan's widen
+    (mirrors test_workflow_e2e.py::TestReviewLoop::test_blocking_review_triggers_replan)."""
+    stub = _WideningReplanStub()
+    planned = replace(
+        task_assignment,
+        modules=derive_modules(PLAN['files'], config.lock_depth),
+    )
+    workflow, scheduler = _build_workflow(config, git_ops, planned, stub)
+    scheduler.blast_radius_result = conflict
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(return_value=VerifyResult(
+            passed=True, test_output='', lint_output='',
+            type_output='', summary='All checks passed',
+        )),
+    )
+    return workflow, scheduler
+
+
 @pytest.mark.asyncio
 class TestStateMachineLegalityAndConsistency:
     """Boundary rows 5-6 (PRD §9): ``WorkflowStateMachine``/``STATE_TO_STATUS``
@@ -708,6 +820,75 @@ class TestStateMachineLegalityAndConsistency:
         assert [e['verdict'] for e in events] == ['store_unavailable']
         assert events[0]['failed_write']['target_status'] == 'pending'
         assert queue.get_by_task(wf.task_id) == []
+
+    @pytest.mark.parametrize('enforce', [False, True])
+    @pytest.mark.parametrize(('drive', 'detail_prefix'), [
+        (_drive_plan_into_lock_conflict, 'Plan expansion blocked'),
+        (_drive_replan_into_lock_conflict, 'Replan expansion blocked'),
+    ], ids=['plan', 'replan'])
+    async def test_row6_lock_conflict_with_dead_repend_is_store_unavailable(
+        self, drive, detail_prefix, enforce,
+        config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
+    ):
+        """Relaxation 2 via a blast-radius lock conflict exit: the
+        scheduler's re-pend IS this REQUEUED exit's status write, so when it
+        dies (the row stays where dispatch put it) the exit is crash-shaped —
+        ONE store_unavailable record, never a violation, never an escalation."""
+        monkeypatch.setattr(config, 'workflow_exit_contract_enforce', enforce)
+        dead = RuntimeError(
+            'set_task_status(42, pending) failed after 4 transient retries: '
+            'TimeoutError'
+        )
+        workflow, scheduler = drive(
+            config, git_ops, task_assignment, monkeypatch,
+            BlastRadiusResult(applied=False, repend_error=dead),
+        )
+        event_store = MagicMock()
+        workflow.event_store = event_store
+        queue = EscalationQueue(tmp_path / 'esc')
+        workflow.escalation_queue = queue
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.reason == 'plan_blast_radius_lock_conflict'
+        assert report.detail.startswith(detail_prefix)
+        assert report.phase == workflow.machine.state
+        assert len(scheduler.blast_radius_calls) == 1
+        assert scheduler.statuses[workflow.task_id][-1] == 'in-progress'
+        assert len(_exit_contract_records(caplog, 'store_unavailable')) == 1
+        assert _exit_contract_records(caplog, 'violation') == []
+        events = _exit_contract_events(event_store)
+        assert [e['verdict'] for e in events] == ['store_unavailable']
+        assert events[0]['failed_write']['target_status'] == 'pending'
+        assert 'RuntimeError' in events[0]['failed_write']['error']
+        assert queue.get_by_task(workflow.task_id) == []
+
+    @pytest.mark.parametrize(
+        'drive', [_drive_plan_into_lock_conflict, _drive_replan_into_lock_conflict],
+        ids=['plan', 'replan'],
+    )
+    async def test_row6_lock_conflict_with_healthy_repend_is_consistent(
+        self, drive, config, git_ops, task_assignment, monkeypatch, caplog,
+    ):
+        """Control: a conflict whose re-pend landed is an ordinary consistent
+        REQUEUED exit — nothing is recorded against the exit contract."""
+        workflow, scheduler = drive(
+            config, git_ops, task_assignment, monkeypatch,
+            BlastRadiusResult(applied=False),
+        )
+        event_store = MagicMock()
+        workflow.event_store = event_store
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert scheduler.statuses[workflow.task_id][-1] == 'pending'
+        assert _exit_contract_records(caplog, 'store_unavailable') == []
+        assert _exit_contract_records(caplog, 'violation') == []
+        assert _exit_contract_events(event_store) == []
 
     async def test_row6_failed_bypass_reopen_is_store_unavailable(
         self, config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,

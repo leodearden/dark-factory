@@ -221,23 +221,21 @@ class TestCheckSerialLaneTripwire:
     def test_bound_defaults_to_engine_constant_resolved_at_call_time(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Omitted bound reaches back to merge_queue._MERGE_AHEAD_BOUND AT CALL TIME.
+        """Omitted bound resolves liveness._MERGE_AHEAD_BOUND AT CALL TIME.
 
-        A def-time default would need a top-level ``import
-        orchestrator.merge_queue`` in merge_liveness (module-load deadlock — the
-        shim needs merge_liveness fully defined first) AND would defeat this
-        monkeypatch, which the suite already relies on for
+        A def-time default would freeze the value at import and defeat this
+        monkeypatch, which the suite also relies on for
         ``enforce_persistent_worktree_serial_lane``.
         """
         from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
 
-        monkeypatch.setattr('orchestrator.merge_queue._MERGE_AHEAD_BOUND', 4)
+        monkeypatch.setattr('orchestrator.merge_lane.liveness._MERGE_AHEAD_BOUND', 4)
         assessment = check_serial_lane_tripwire(2)
         assert assessment.merge_ahead_bound == 4
         assert assessment.breached is False  # 2 > ceil(4/1)=4 is False
 
     def test_unpatched_bound_default_is_the_real_engine_constant(self) -> None:
-        """Unpatched, the reach-back yields the real _MERGE_AHEAD_BOUND (1)."""
+        """Unpatched, the omitted bound is the real _MERGE_AHEAD_BOUND (1)."""
         from orchestrator.merge_liveness import check_serial_lane_tripwire  # noqa: PLC0415
 
         assessment = check_serial_lane_tripwire(2)

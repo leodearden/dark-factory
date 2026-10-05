@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _markup_helpers import LT, assert_no_raw_sentinels, closer, type_alternatives
+from _markup_helpers import LT, closer, type_alternatives
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from shared.mcp_markup_middleware import MarkupGuardMiddleware, RepairPolicy
@@ -77,13 +77,6 @@ def specimen(tool_use_id: str) -> dict[str, Any]:
         if record.get('tool_use_id') == tool_use_id:
             return record
     raise AssertionError(f'specimen {tool_use_id!r} is missing from {CORPUS_PATH}')
-
-
-# The corpus escapes every literal as ``\u003c``, which is why this file can
-# carry specimens without ever spelling one. A hand-authored specimen earns the
-# same property through ``_markup_helpers``, which owns the builders and the
-# import-time self-scan for every markup suite in this package.
-assert_no_raw_sentinels(__file__)
 
 
 #: Recovers the REQUIRED list-typed ``issues`` — PRD boundary row B14's shape.

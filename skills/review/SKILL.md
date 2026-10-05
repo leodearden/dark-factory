@@ -1,257 +1,220 @@
 ---
 name: review
-description: "Deep, multi-phase code review — runs tests/lint/typecheck, audits architecture for stubs and broken wiring, then triages findings into tasks. ALWAYS use this skill for: /review commands, requests to verify software actually works end-to-end, post-orchestrator quality checks ('the tasks are done but does it actually work?'), finding stubs/NotImplementedError/placeholders, checking integration health across modules, finding dead code or orphan modules, auditing cross-module consistency after merges, running the full test suite with analysis (not just 'run pytest'), and qualitative test coverage analysis ('are the tests just mocking everything?'). This is NOT for: single-file PR reviews, creating review briefings (/review-briefing), unblocking tasks, explaining code, fixing lint, running tests without analysis, or implementing tasks. When in doubt about whether the user wants a deep project-wide review vs a simpler action, USE this skill — it handles scoping internally."
+description: "Deep, multi-phase code review — runs tests/lint/typecheck, audits architecture for stubs, broken wiring and quality-heuristic violations against docs/code-quality.md, then routes findings into tasks or deliberation. Incremental by default: re-reviews what changed since the last committed review report and re-verifies that report's open findings. ALWAYS use this skill for: /review commands, requests to verify software actually works end-to-end, post-orchestrator quality checks ('the tasks are done but does it actually work?'), finding stubs/NotImplementedError/placeholders, checking integration health across modules, finding dead code or orphan modules, auditing cross-module consistency after merges, running the full test suite with analysis (not just 'run pytest'), qualitative test coverage analysis ('are the tests just mocking everything?'), and a dispatched 'Run /review on <project>' human gate. This is NOT for: single-file PR reviews, creating review briefings (/review-briefing), historical bug-hotspot mining (/hotspot-survey), deciding which quality instrument to run (/review-all), unblocking tasks, explaining code, fixing lint, running tests without analysis, or implementing tasks. When in doubt about whether the user wants a deep project-wide review vs a simpler action, USE this skill — it handles scoping internally."
 ---
 
 # Deep Review
 
 Three-phase review that answers: does the software actually run, is it internally consistent, and what needs fixing?
 
-- **Phase 1 — Integration Verification**: run tests, smoke tests, lint, typecheck. Mechanical, parallelisable.
-- **Phase 2 — Architectural Coherence**: trace critical paths, find stubs, check cross-module consistency. Deep reasoning.
-- **Phase 3 — Triage**: classify findings, create tasks, escalate ambiguities. Judgment calls.
+- **Phase 1 — Integration Verification**: tests, smoke tests, lint, typecheck. Mechanical, always the whole scope.
+- **Phase 2 — Architectural Coherence**: trace critical paths, find stubs, judge the code against the quality definition. Incremental by default.
+- **Phase 3 — Triage**: dedup, route each finding by class, schedule the next run.
 
-The review is driven by a **review briefing** (`review/briefing.yaml`) — a project-specific file describing smoke tests, critical paths, invariants, and known gaps. Without it, the review still works but is less targeted. If no briefing exists, suggest `/review-briefing` and proceed with best-effort code inspection.
+Two documents are normative and are cited, never restated:
+
+- **The quality definition** (`$QUALITY_DOC`). Every prompt that judges code carries it and tags findings with the heuristics they rest on (contract §10), one of two ways: when the project carries `docs/code-quality.md`, the prompt says `Read docs/code-quality.md`; otherwise (reify today) the prompt embeds the block `orchestrator/src/orchestrator/agents/code_quality.py::guidance` renders — print it from a dark-factory checkout with `python -c 'from orchestrator.agents.code_quality import guidance; print(guidance())'`. Never restate it by hand.
+- **The findings contract** (`$CONTRACT`) — `docs/quality-findings-contract.md`. Finding fields, keys, severity, the method header, dispositions, dedup and the trigger chain all come from it; this skill cites it by section (`§n`). A project without its own copy uses the dark-factory checkout's.
+
+The review is driven by the **review briefing** (`review/briefing.yaml`, or `review.briefing_path` in the project's orchestrator config). Without it the review still runs, best-effort; suggest `/review-briefing`.
 
 ## Parse invocation
 
-The user may pass arguments. Parse them:
-
 ```
-/review                          → full review, all phases, entire project
-/review --scope fused-memory     → scoped to one subproject
-/review --focused mod1 mod2      → focused on specific modules
+/review                          → incremental: Phase 2 since the latest committed report, all phases
+/review --full                   → Phase 2 over the whole scope
+/review --since <sha>            → incremental from an explicit commit (`--since none` = `--full`)
+/review --scope <area>           → one briefing subproject
+/review --focused <path> <path>  → specific modules
 /review --phase integration      → Phase 1 only
 /review --phase architecture     → Phase 2 only
-/review --phase triage           → Phase 3 only (reads saved Phase 1+2 reports)
+/review --phase triage           → Phase 3 only, completing the latest report that has no Phase 3
+/review --as-of <sha>            → pin the run to this main commit instead of main's tip
+/review --findings-only          → Phases 1–2, write the report, stop: no Phase 3 filing, deliberation or trigger chain
+/review --launched-from <esc id> → the escalation that launched this run (a review_due human gate)
 ```
 
-Multiple flags can combine: `/review --scope fused-memory --phase integration`.
+Flags combine: `/review --scope fused-memory --phase integration`. `--full` and `--since` are mutually exclusive. `/review-all` runs `/review --as-of <its as_of_sha> --since <sha> --findings-only` and triages the merged findings itself.
 
 ## Before you begin
 
-### 1. Load the review briefing
+### 0. Pin the run
 
-Check for `review/briefing.yaml` (or the path from orchestrator config's `review.briefing_path`).
+Every anchor in a run is verified against one tree (§5).
 
-**If it exists:** parse it. The briefing contains durable project context — purpose, key scenarios, conventions, key decisions, known gaps, and exclusions — not code details (you discover those fresh from the code).
+1. **Project.** `project_root` is the main checkout root — `git worktree list | head -1 | awk '{print $1}'` (the derivation `skills/do/SKILL.md` owns; `git rev-parse --show-toplevel` answers the worktree you stand in). `project_id` is `fused_memory.project_id` in `<project_root>/dark-factory-orchestrator.yaml`. Never assume either.
+2. **`as_of_sha`** = the `--as-of` commit when given (it must be an ancestor of main), else `git -C <project_root> rev-parse main`. `--launched-from <esc id>` is recorded as `method.extra.launched_from`.
+3. **`run_id`** = `review-<project_id>-<YYYYMMDD>`, with `-<n>` when `review/reports/` already holds that day's id.
+4. **Pinned tree.** `git -C <project_root> worktree add --detach <project_root>/.claude/worktrees/review-<run_id> <as_of_sha>`, then run the project's `verify_cold_preprovision_command` (orchestrator config) inside it. Every phase reads and runs there. Reports are written to `<project_root>/review/reports/`, not the pinned tree.
+5. **`since`.** `--since <sha>` wins. Otherwise read the `method` of the newest committed report, `git -C <project_root> ls-files 'review/reports/review-*.json'`, whose `extra.phases_run` includes 2 and whose scope covers this run's (a `full` report covers everything; an `<area>` report covers that area). Its `as_of_sha` is `since` and its findings are the carry set. No such report, `--full`, `since` not an ancestor of `as_of_sha`, or a diff `since..as_of_sha` that touches `docs/code-quality.md` or `docs/legibility/design-invariants.md` → `mode: full`, with the reason in `extra.full_reason`.
 
-Extract the sections relevant to the current scope:
-- If `--scope X`: load only `subprojects.X` (plus top-level `conventions`)
-- If `--focused mod1 mod2`: load subproject sections whose purpose or key_scenarios relate to the specified modules
-- If no scope: load everything
+### 1. Load and validate the briefing
 
-Keep the briefing data in working memory. Use it to:
-- **Prioritise** — `key_scenarios` tells you what to trace; focus review effort there
-- **Contextualise** — `key_decisions` explains choices that might otherwise look wrong
-- **Construct verification** — `what_working_means` tells you the intent; you build the actual test commands from the code
-- **Avoid false positives** — `known_gaps` are intentional; don't flag them. `conventions` are rules with teeth; DO flag violations
-- **Scope** — `exclude` patterns are areas to skip
+Parse the briefing and keep it in working memory. Extract by scope: `--scope X` loads `subprojects.X` plus top-level `conventions`; `--focused` loads the subprojects that own the named paths; no scope loads everything.
 
-**Staleness check:** After loading the briefing, check its `last_updated` timestamp against recent git activity. Run `git log --oneline --since="<last_updated>" | wc -l` to count commits since the briefing was updated. If more than 20 commits have landed, warn the user: "Briefing was last updated {date} — {N} commits have landed since then. The briefing captures intent (not code details) so it's still useful, but known_gaps or conventions may have evolved. Consider running `/review-briefing --diff` after this review." Proceed regardless — a slightly stale briefing is much better than none.
+- **Prioritise** — `key_scenarios` and `stability_concerns` say what to trace.
+- **Contextualise** — `key_decisions` explain choices that would otherwise look wrong.
+- **Construct verification** — `what_working_means` is intent; build commands from the code.
+- **Conventions** are rules with teeth: a violation is a finding tagged `kind:convention` plus the heuristic it breaks.
+- **Known gaps** are accepted dispositions, each pointing at its accepting task (§7). They suppress a finding only through that pointer (Phase 3).
+- **Scope** — `exclude` and `global_exclude` are skipped.
 
-**If it doesn't exist:**
-1. Tell the user: "No review briefing found at `review/briefing.yaml`. Review effectiveness will be limited without one — consider running `/review-briefing` first. Proceeding with best-effort review using code inspection and project memory."
-2. Continue without briefing data. You can still run tests, lint, typecheck, and do architectural analysis — but you won't have prioritisation guidance, known-gap context, or convention rules. Everything is best-effort.
+Then run the `/review-briefing --validate` checks in report-only mode (no fix offers) and copy every defect into `method.extra.briefing_defects`. They never block the run. There is no commit-count staleness rule: staleness is what the validate checks find.
+
+No briefing: say so, suggest `/review-briefing`, skip smoke tests and critical-path tracing, use workspace member names as areas.
 
 ### 2. Load project context from memory
 
-Search fused-memory for context that informs the review:
-
 ```
-search(query="recent decisions, known issues, active conventions", project_id="dark_factory")
-search(query="known test flakes and pre-existing failures", project_id="dark_factory")
+search(query="recent decisions, known issues, active conventions", project_id="<project_id>")
+search(query="known test flakes and pre-existing failures", project_id="<project_id>")
 ```
 
-This context helps you:
-- Distinguish new issues from known ones
-- Avoid flagging intentional design choices as problems
-- Understand why certain patterns exist
-
-### 3. Determine which phases to run
+### 3. Determine phases
 
 | Invocation | Phases |
 |-----------|--------|
-| No `--phase` flag | All three, sequentially |
-| `--phase integration` | Phase 1 only |
-| `--phase architecture` | Phase 2 only |
-| `--phase triage` | Phase 3 only — load saved reports from `review/reports/` |
+| no `--phase` | 1, 2, 3 in order |
+| `--phase integration` | 1 |
+| `--phase architecture` | 2 (Steps 0–8 of the Phase 2 guide) |
+| `--phase triage` | 3, on the newest report whose `extra.phases_run` lacks 3; none → offer to run the earlier phases |
+| `--findings-only` | 1, 2, then write and commit the report and stop |
 
-For Phase 3 alone, check for existing `phase1-*.json` and `phase2-*.json` reports. If none exist, warn the user and offer to run the earlier phases first.
+## Incremental mode
 
----
+Phase 1 always runs in full: it is cheap, mechanical, and main may be red. Phase 2 narrows to the **changed scope** — files in `git diff --name-only <since> <as_of_sha>` inside the run's scope, minus excludes, plus the modules that import them — and re-verifies the **carry set**: every finding in the `since` report with disposition `open`, `filed:<id>` or `accepted:<id>`. How each is computed: `references/phase2-architecture.md` Step 0.
+
+| Item | `mode: since` | `mode: full` |
+|---|---|---|
+| Phase 1 tests, lint, typecheck, smoke | recomputed | recomputed |
+| Briefing validate checks | recomputed | recomputed |
+| Inputs (hotspot, `/review-all`, codebook) | re-read | re-read |
+| Project `/audit` | recomputed from `since`'s committer date | recomputed over `audit.window_days` |
+| Stub scan, invariants audit, deep read, cross-module, coverage | changed scope only | whole scope |
+| Critical-path tracing | paths whose trace touches the changed scope | every path |
+| Dead-code scan | mechanical scan whole tree; judged only for candidates whose key is not in the carry set | whole scope |
+| Carry set (prior `open`/`filed`/`accepted`) | re-verified at `as_of_sha`: still present → kept, `last_seen` appended; gone → `fixed:<as_of_sha>`; anchor moved → new key with `supersedes` | same |
+| Judgment of unchanged code holding no carried finding | reused: not re-read | recomputed |
+| Phase 3 dedup and routing | every finding in this report | every finding in this report |
 
 ## Phase 1: Integration Verification
 
-**Goal:** Does the software actually run and do what it claims?
+Does the software actually run? Detail: `references/phase1-integration.md`.
 
-This phase is mechanical — test execution, smoke tests, lint, typecheck. Parallelise where possible using Sonnet sub-agents.
+1. Run the project's configured `test_command`, `lint_command` and `type_check_command` in the pinned tree (scoped per member when `--scope` is set; `uv run --directory <member>`, never `--project`).
+2. Classify failures (new, known flake, pre-existing) and find each one's owner task.
+3. Run smoke checks built from the briefing's `what_working_means`.
+4. Write the `phase1` block of the report (`references/run-record.md`) and show a summary.
 
-Read `references/phase1-integration.md` for the detailed step-by-step process.
-
-**Summary of steps:**
-1. Run the full test suite (unit + integration + e2e), parse and classify results
-2. Run lint (`ruff check`) and typecheck (`pyright`) across the full scope
-3. Run smoke tests from the review briefing (if available)
-4. Compile a structured Phase 1 report
-
-**Agent allocation:** Spawn Sonnet sub-agents for parallel execution:
-- One agent for test suite execution and result parsing
-- One agent for lint + typecheck
-- One agent for smoke tests (sequential, since they may have setup/teardown)
-
-Collect all results and compile the Phase 1 report yourself (the coordinating agent).
-
-**Output:** Save report to `review/reports/phase1-{timestamp}.json` and display a summary to the user before proceeding.
-
----
+Blocking failures (nothing compiles, most tests red): ask whether to continue to Phase 2.
 
 ## Phase 2: Architectural Coherence
 
-**Goal:** Is the codebase internally consistent and complete?
+Is the codebase internally consistent, complete, and cheap to change? Detail: `references/phase2-architecture.md`.
 
-This is the expensive, high-value phase. You (Opus) do the architectural reasoning. Spawn Sonnet sub-agents for mechanical scanning tasks, then synthesise.
+0. Compute the changed scope (incremental) and re-verify the carry set (both modes).
+1. Project `/audit`, when the project ships one.
+1.5. Read the inputs: latest hotspot and `/review-all` reports, and the confusion codebook (§9).
+2. Stub and placeholder audit.
+3. Critical-path tracing (requires briefing).
+4. Deep read of high-risk modules, including the heuristic look-fors.
+5. Cross-module consistency.
+5.5. Design-invariants audit, tags `inv-<n>`.
+6. Dead code and orphans.
+7. Test coverage and the Tests stance.
+8. Write every finding into the one `findings` list (`references/run-record.md`).
 
-Read `references/phase2-architecture.md` for the detailed step-by-step process.
+## Phase 3: Triage and Routing
 
-**Summary of steps:**
-1. Run the project audit (if available) — if the project ships an `/audit` slash command (e.g. Reify's `reify-audit` detector suite), invoke it as the first Phase 2 step with `--pattern P1,P2,P5 --since <window-start>`. Fold its findings into the Phase 2 report under "F-infra automated findings"
-2. Stub and placeholder audit — find TODOs, NotImplementedError, pass bodies, etc. Cross-reference against task tree, briefing known gaps, and memory
-3. Critical path tracing — follow each critical path from the briefing through actual code, checking wiring at every module boundary
-4. Deep read of high-risk modules — read server startup, config loading, pipeline stages, Dockerfiles, and shared utilities line by line. This is where you find behavioral bugs that structural scanning misses: wrong variables passed, hardcoded assumptions, missing initialization, port/path drift. Prioritise module selection with the latest `/hotspot-survey` report when one exists (reference Step 1.5)
-5. Cross-module consistency — API naming, data flow across boundaries, config coherence, import health
-6. Design-invariants audit — audit against docs/legibility/design-invariants.md when present; findings keyed by invariant slug.
-7. Dead code and orphan detection
-8. Test coverage analysis (qualitative — are critical paths tested end-to-end?)
+Detail: `references/phase3-triage.md`.
 
-**Agent allocation:**
-- Spawn Sonnet agents for: stub scanning (grep patterns), import graph mapping, dead code enumeration
-- Do the reasoning yourself: project audit invocation + result folding, path tracing, deep read, cross-module analysis, coverage judgment
+1. Load the report.
+2. Phase 1 failures: find or file an owner (operational, outside the finding schema).
+3. Class each confirmed or weakened finding: mechanical or structural (§6).
+4. Dedup every finding by the §8 protocol and set its disposition.
+5. File mechanical findings as curator tickets carrying the §8 metadata.
+6. Take structural findings to deliberation with the user; acceptances become owned tasks.
+7. File the trigger chain for the next run (§11) by `skills/_shared/filing-the-trigger-chain.md`, superseding any open `/review` chain and resolving the `--launched-from` escalation.
+8. Write the review summary to memory.
 
-**Output:** Save report to `review/reports/phase2-{timestamp}.json` and display a summary before proceeding.
+## Routing: who does what
 
----
+The coordinator is the session running this skill. Seats are `Agent` calls; pass `model` on the call and state the effort in the seat prompt (and set it where the runtime exposes an effort control).
 
-## Phase 3: Triage and Task Creation
+| Work | Done by | Model | Effort |
+|---|---|---|---|
+| Pinning, scope computation, report assembly | coordinator | the session's model (an Opus-class model is recommended) | high |
+| Phase 1 test, lint+typecheck, smoke seats (parallel) | seats | sonnet | low |
+| Stub grep, import graph, importer lookup, dead-code enumeration, codebook digest | seats | sonnet | low |
+| Carried-finding re-verification, ≤10 findings per seat | seats | sonnet | medium |
+| Steps 3, 4, 5, 5.5, 7 judgment | coordinator; split by area into opus seats when the Phase 2 file set exceeds ~40 files | opus | high |
+| Phase 3 classing, dedup decisions, deliberation | coordinator | — | high |
 
-**Goal:** Convert findings into actionable work items or escalations.
+Every judging seat's prompt opens with `$QUALITY_DOC` — "Read `docs/code-quality.md` in full", or the embedded `guidance()` block — followed by: "Tag every finding with the heuristics it rests on (`h1`..`h14`, `comments`, `tests`, `inv-<n>`), lens first." (§10)
 
-This phase requires judgment — classifying severity, deciding what's a task vs an escalation, avoiding duplicate tasks.
+## Output
 
-Read `references/phase3-triage.md` for the detailed step-by-step process.
-
-**Summary of steps:**
-1. Load Phase 1 + Phase 2 reports (from files if running `--phase triage`, from memory if running all phases)
-2. Classify each finding: auto-fix, clear-cut issue, design question, known/accepted, or stale task
-3. Task tree health check — review pending tasks against current codebase state
-4. Create tasks via fused-memory MCP for actionable findings
-5. Escalate ambiguous findings to the user with options and recommendations
-6. Write review summary to memory
-
-**Output:** Display the full review summary (all three phases) and list created tasks and escalations.
-
----
-
-## Coordinating the phases
-
-When running all three phases:
-
-1. **Run Phase 1.** Display summary. If there are blocking failures (e.g., nothing compiles), ask the user whether to proceed to Phase 2 or stop and fix first.
-
-2. **Run Phase 2.** Display summary. Proceed to Phase 3.
-
-3. **Run Phase 3.** Display the full review report, created tasks, and escalations.
-
-Between phases, save intermediate reports to `review/reports/` so they can be consumed independently (e.g., `--phase triage` later).
-
-### Report directory setup
-
-```bash
-mkdir -p review/reports
-```
-
-Use ISO 8601 timestamps in filenames: `phase1-20260324T143000.json`, `phase2-20260324T144500.json`, `summary-20260324T150000.md`.
-
----
-
-## Output format
-
-### Interactive summary (shown to user)
-
-After all phases complete, display a structured summary:
+### Interactive summary
 
 ```markdown
-## Review Complete: {scope}
+## Review complete: {scope} — {run_id}
+as_of {as_of_sha:10} · since {since:10 | none} · mode {since|full}
 
-### Phase 1: Integration Verification
-- Test suite: {passed} passed, {failed} failed ({new_failures} new, {known} known)
-- Smoke tests: {pass_count}/{total} passed — FAILED: {list of failures}
-- Lint: {new_count} new issues
-- Type-check: {status}
+### Phase 1
+- Tests: {passed} passed, {failed} failed ({new} new — owners: {task ids or "filed {id}"})
+- Lint: {status} · Type-check: {status} · Smoke: {n}/{total}
 
-### Phase 2: Architectural Coherence
-- {n} unintended stubs found (tasks claimed done)
-- {n} critical path issues: {brief descriptions}
-- {n} orphan modules
-- {n} integration test gaps
+### Phase 2
+- Scope: {changed} changed files + {importers} importers; {carried} carried findings re-verified
+- Findings: {high} high · {medium} medium · {low} low — by lens: {h7: 3, tests: 2, …}
+- Fixed since last run: {keys}
+- Briefing defects: {n}
 
-### Phase 3: Triage
-Created {n} tasks:
-  - Task {id}: {title} ({priority})
-  ...
-
-Escalated {n} findings for your review:
-  1. {finding} — {question}
-  ...
+### Phase 3
+Filed {n} (mechanical): Task {id}: {title} ({priority}) …
+Already owned {n}: {key} → filed:{id} …
+For deliberation {n} (structural): 1. {statement} — {question}
+Next run: {chain form and task ids}
 ```
 
 ### Persistent outputs
 
-| File | Content |
+| Output | Content |
 |------|---------|
-| `review/reports/phase1-{ts}.json` | Structured test/lint/smoke results |
-| `review/reports/phase2-{ts}.json` | Architectural findings with evidence |
-| `review/reports/summary-{ts}.md` | Human-readable full summary |
-| fused-memory entries | Review observations and session summary |
-| Taskmaster tasks | Created via fused-memory MCP with `metadata.source: "review-cycle"` |
+| `review/reports/<run_id>.json` | the run record: `method`, `phase1`, `findings` (`references/run-record.md`) |
+| `review/reports/<run_id>.md` | rendering of the same |
+| tasks | mechanical findings, acceptances, the trigger chain — all through fused-memory MCP with `metadata.source: "review"` |
+| fused-memory | review summary and pattern observations |
 
----
+### Committing the report
+
+After the last phase run, write both files under `<project_root>/review/reports/` and commit only them to main by the project's direct-commit rule (in dark-factory: `git add` the two paths, then `git commit --only` them, never while a merge verify is in flight — `CLAUDE.md` §"Working in the main checkout"). A project that forbids direct commits gets them through `/merge-queue`. An uncommitted report is invisible to the next run's `since`. Then `git worktree remove` the pinned tree.
 
 ## Graceful degradation
 
-The skill should work across a range of project states:
+| Missing | Behaviour |
+|---------|-----------|
+| Review briefing | Warn, suggest `/review-briefing`, skip smoke and path tracing |
+| Prior committed report | `mode: full`, `since: none` |
+| Task store unreachable (MCP and read-only sqlite) | Report only; file nothing, say so (§8) |
+| fused-memory MCP down | No memory context, no filing; report says so |
+| Test suite / lint / typecheck config | Skip that command, note it in `phase1` |
+| `$QUALITY_DOC` (no `docs/code-quality.md` and no `guidance()` render) | Stop Phase 2: judging without the definition is not this skill |
 
-| Missing | Impact | Behaviour |
-|---------|--------|-----------|
-| Review briefing | No smoke tests, no critical path tracing | Warn, suggest `/review-briefing`, continue with code inspection |
-| fused-memory | No memory context, no task creation | Warn, produce report only (no tasks), suggest checking MCP connection |
-| Test suite | No Phase 1 test results | Run lint/typecheck only, note missing tests in report |
-| Lint/typecheck config | No static analysis | Skip, note in report |
-
-Never fail silently — always tell the user what's missing and how it limits the review.
-
----
+Never fail silently — say what is missing and what it costs the review.
 
 ## Writing to memory
 
-At the end of a review (after Phase 3, or after whichever phase is the last one run), write to fused-memory:
+After the last phase run:
 
 ```
 add_memory(
-  content="Review completed for {scope}: {key findings summary}. Created {n} tasks. Key concerns: {list}.",
+  content="Review {run_id} for {scope} at {as_of_sha:10}: {n} findings ({high} high), {filed} filed, {structural} for deliberation, {fixed} fixed since {since:10}. Key concerns: {list}.",
   category="observations_and_summaries",
-  project_id="dark_factory",
-  agent_id="claude-interactive"
+  project_id="<project_id>",
+  agent_id="claude-review",
+  entities=[]
 )
 ```
 
-If significant architectural issues were found, write those as separate memories:
-
-```
-add_memory(
-  content="{specific architectural finding and its implications}",
-  category="decisions_and_rationale",  # or observations_and_summaries
-  project_id="dark_factory",
-  agent_id="claude-interactive"
-)
-```
+A cross-cutting pattern (several findings sharing one cause) is a separate `observations_and_summaries` write.

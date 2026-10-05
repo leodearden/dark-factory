@@ -4,16 +4,13 @@ LEAF module: must NOT import anything from ``fused_memory`` (not even
 ``fused_memory.reconciliation``). That rule is enforced, not just documented:
 ``tests/test_mem0_tombstone.py::TestReconPoolMapIsImportFreeLeaf`` imports this
 module in a fresh interpreter and fails if doing so loads any other
-``fused_memory.*`` module. This map has two independent consumers,
-each keying on a different half of it, for ``metadata.kind ==
-'cycle_summary'`` writes: reconciliation/summary_pool.py trims a pool by
-the ``recon_pool`` *value* (passed in as a parameter — see
-``filters={'recon_pool': recon_pool}``), while
-scripts/prune_recon_cycle_summaries.py buckets records by
-``metadata.stage`` against this map's *keys* (``_POOL_STAGES =
-('memory_consolidator', 'task_knowledge_sync')``). Both derive from this
-single map, which is what makes tagging independent of LLM prompt
-compliance (task 2077).
+``fused_memory.*`` module.
+
+The map's keys are the ``metadata.stage`` values of the two per-cycle
+``kind='cycle_summary'`` pools; its values are those pools' ``recon_pool``
+tags. Tagging semantics live in
+services/memory_service.py::_apply_cycle_summary_metadata_tagging, and the
+pool-cap trim in reconciliation/summary_pool.py::enforce_summary_pool_cap.
 
 Before task 2140 these values were duplicated three ways — once here (well,
 once in services/memory_service.py) and once each in
@@ -79,3 +76,21 @@ CYCLE_SUMMARY_KIND = 'cycle_summary'
 # prompt-side literal in sync is a reviewed invariant, not an enforced one.
 CYCLE_SUMMARY_RECORD_TYPE_LEDGER_STAMP = 'ledger_stamp'
 CYCLE_SUMMARY_RECORD_TYPE_NARRATIVE = 'narrative'
+
+# Retention window for authoritative cycle_summary ledger rows (task 2229).
+# The ledger is a control-plane store, not a permanent audit log, and Stage 3
+# only ever consumes recent summaries — so rows are given a bounded TTL and
+# reaped by the existing ReconLedgerStore.gc() expires_at pass rather than kept
+# forever or given bespoke cleanup code.
+#
+# Lives in this leaf, and is re-exported from reconciliation/summary_pool.py
+# under its historical name, for the same lockstep reason as the record_type
+# literals above (task 3731): the WRITER stamps expires_at with it
+# (summary_pool.write_cycle_summary) while the READER now subtracts it to
+# decide whether an absent row was reaped rather than never written
+# (services/memory_service.py::MemoryService.get_cycle_summary_presence).
+# memory_service must not import summary_pool — that would close a
+# service <-> reconciliation import cycle — so a duplicated literal would
+# leave the two sides free to drift, and a drift would silently reclassify
+# reaped rows as genuine data loss.
+CYCLE_SUMMARY_TTL_DAYS = 30

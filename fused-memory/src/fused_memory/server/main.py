@@ -786,6 +786,12 @@ async def run_server():
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
         recon_journal.set_write_journal(write_journal)
+        # Read-only runs-table source for get_cycle_summary_presence (task
+        # 3731). Deliberately wired ABOVE the recon_ledger_enabled gate below:
+        # the journal exists whenever reconciliation does, while the ledger is
+        # feature-gated, so the presence payload reports the two availability
+        # signals separately rather than inferring one from the other.
+        memory_service.set_recon_journal(recon_journal)
 
         if config.reconciliation.recon_ledger_enabled:
             recon_ledger = await _build_recon_ledger_store(Path(config.reconciliation.data_dir))
@@ -1156,7 +1162,7 @@ async def run_server():
             import uvicorn
 
             display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
-            logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')
+            logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')  # mcp-url-sweep: allow display string in a startup log line, never fetched
             configure_uvicorn_logging()
             starlette_app = mcp.streamable_http_app()
 
@@ -1232,7 +1238,7 @@ async def run_server():
             recon_report_state.start_persistence()
             await recon_report_state.start_reaper()
             logger.info(
-                '  Recon Report Endpoint: http://%s:%d/mcp/',
+                '  Recon Report Endpoint: http://%s:%d/mcp/',  # mcp-url-sweep: allow display string in a startup log line, never fetched
                 display_host,
                 config.server.recon_report_port,
             )
@@ -2045,6 +2051,10 @@ def _build_recon_report_components(
     Optional service args (task β): when provided they are injected into the
     returned ReconReportState so cite_* tools can validate citations at call time.
 
+    Production enforces the known-stage vocabulary here (task 4865), not as a
+    ``ReconReportState`` default, because many test modules construct the state
+    directly with ad-hoc stage names.
+
     Args:
         recon_journal: the open ReconciliationJournal (task 3065), used solely by
             ``repair_memory_citation`` to reach the durable ``runs.stage_reports``
@@ -2056,7 +2066,11 @@ def _build_recon_report_components(
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
     """
-    from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+    from fused_memory.server.recon_report import (
+        KNOWN_RECON_STAGES,
+        ReconReportState,
+        create_recon_report_server,
+    )
     from fused_memory.server.recon_report_store import ReconReportStore
 
     ttl = config.reconciliation.recon_report_state_ttl_seconds
@@ -2078,6 +2092,7 @@ def _build_recon_report_components(
         task_interceptor=task_interceptor,
         store=recon_report_store,
         journal=recon_journal,
+        known_stages=KNOWN_RECON_STAGES,
     )
     if known_projects is not None:
         state.known_projects = known_projects

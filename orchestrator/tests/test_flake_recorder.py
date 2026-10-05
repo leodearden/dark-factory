@@ -30,6 +30,7 @@ from orchestrator.flake_ledger import (
     NEVER_WIDEN_A_TIMEOUT,
     UNKNOWN_TEST_ID,
     FlakeCallSite,
+    FlakeLedgerTaskClient,
     FlakeSuppression,
     FlakeVerdict,
     ledger_db_path,
@@ -202,6 +203,16 @@ class _FakeLedgerTaskClient:
         self._statuses[task_id] = 'done'
         if commit is not None:
             self._commits[task_id] = commit
+
+
+@pytest.mark.asyncio
+class TestFakeLedgerTaskClientConformance:
+    async def test_satisfies_the_protocol_statically(self) -> None:
+        """Pyright checks the annotated assignment, so this double cannot drift from
+        the seam it stands in for (the task-3533 pin,
+        ``escalation/tests/test_pins.py::TestPinRecordProtocol``)."""
+        client: FlakeLedgerTaskClient = _FakeLedgerTaskClient()
+        assert await client.get_statuses(['x']) == ({}, None)
 
 
 @pytest.fixture(autouse=True)

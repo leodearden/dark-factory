@@ -10,6 +10,7 @@ Skip automatically when Qdrant is not reachable.
 from __future__ import annotations
 
 import contextlib
+import uuid
 from typing import cast
 
 import pytest
@@ -255,3 +256,28 @@ class TestMem0VectorStoreUpdate:
         assert len(result[0].vector) == VECTOR_DIM
         assert result[0].payload is not None
         assert result[0].payload['v'] == '2'
+
+
+class TestUuidPointIdCasing:
+    """``reconciliation/citation_verifier.py::make_memory_resolver`` keys its
+    memo on the lowercase rendering of an ``is_full_uuid`` id. That is sound
+    only because Qdrant resolves a canonical UUID point id case-insensitively,
+    a store property no mock can pin."""
+
+    def test_canonical_uuid_point_id_resolves_in_any_casing(
+        self, qdrant: QdrantClient, test_collection: str,
+    ):
+        from qdrant_client.models import PointStruct
+
+        pid = str(uuid.uuid4())
+        qdrant.upsert(
+            collection_name=test_collection,
+            points=[PointStruct(id=pid, vector=[0.1] * VECTOR_DIM, payload={'data': 'x'})],
+        )
+        mixed = ''.join(c.upper() if i % 2 else c for i, c in enumerate(pid))
+
+        for spelling in (pid, pid.upper(), mixed):
+            records = qdrant.retrieve(
+                test_collection, ids=[spelling], with_payload=True, with_vectors=False,
+            )
+            assert [str(r.id) for r in records] == [pid], spelling

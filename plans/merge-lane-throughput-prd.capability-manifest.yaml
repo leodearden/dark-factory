@@ -67,7 +67,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: Remote verify host
+      pattern: remote merge-verify host
       paths:
       - SETUP.md
       expect: present

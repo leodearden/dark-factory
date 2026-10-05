@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -1183,6 +1184,57 @@ class TestPartitionBurstState:
         active, idle = partition_burst_state(agents, now=fixed)
         assert [a['agent_id'] for a in active] == ['inside']
         assert [a['agent_id'] for a in idle] == ['outside']
+
+
+class TestPartitionBurstStateActivity:
+    """Each active agent carries the arm of the one activity rule that admitted it."""
+
+    FIXED_NOW = datetime(2026, 10, 3, 12, 0, 0, tzinfo=UTC)
+    OLD_WRITE = '2020-01-01T00:00:00+00:00'
+
+    @pytest.mark.parametrize('state', ['bursting', 'cooling', 'running'])
+    def test_non_idle_state_is_stamped_non_idle_even_with_an_old_write(self, state):
+        from dashboard.data.reconciliation import AgentActivity, partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': state, 'last_write_at': self.OLD_WRITE}]
+        active, idle = partition_burst_state(agents, now=self.FIXED_NOW)
+
+        assert [a['activity'] for a in active] == [AgentActivity.NON_IDLE]
+        assert idle == []
+
+    def test_idle_agent_with_a_recent_write_is_stamped_recent_write(self):
+        from dashboard.data.reconciliation import AgentActivity, partition_burst_state
+
+        recent = (self.FIXED_NOW - timedelta(minutes=10)).isoformat()
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': recent}]
+        active, idle = partition_burst_state(agents, now=self.FIXED_NOW)
+
+        assert [a['activity'] for a in active] == [AgentActivity.RECENT_WRITE]
+        assert idle == []
+
+    def test_idle_agent_with_an_old_write_lands_in_idle_unstamped(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        agents = [{'agent_id': 'a1', 'state': 'idle', 'last_write_at': self.OLD_WRITE}]
+        active, idle = partition_burst_state(agents, now=self.FIXED_NOW)
+
+        assert active == []
+        assert [a['agent_id'] for a in idle] == ['a1']
+        assert 'activity' not in idle[0]
+
+    def test_caller_dicts_are_not_mutated(self):
+        from dashboard.data.reconciliation import partition_burst_state
+
+        recent = (self.FIXED_NOW - timedelta(minutes=10)).isoformat()
+        agents = [
+            {'agent_id': 'a1', 'state': 'bursting'},
+            {'agent_id': 'a2', 'state': 'idle', 'last_write_at': recent},
+        ]
+        before = copy.deepcopy(agents)
+        active, _ = partition_burst_state(agents, now=self.FIXED_NOW)
+
+        assert agents == before
+        assert all(stamped is not given for stamped, given in zip(active, agents, strict=True))
 
 
 class TestWithDb:

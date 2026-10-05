@@ -1563,7 +1563,7 @@ class TestSchema:
         )
         sys.path.insert(0, shared_src)
         try:
-            from shared.cost_store import (  # pyright: ignore[reportMissingImports]
+            from shared.cost_store import (
                 _SCHEMA as PROD_SCHEMA,  # noqa: PLC0415
             )
         finally:

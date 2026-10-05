@@ -33,6 +33,7 @@ import math
 import os
 import sqlite3
 import time
+from collections import Counter
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -1678,6 +1679,20 @@ class _FakeTaskClient:
         self.commit_calls.append(list(task_ids))
         if self._commit_raises is not None:
             raise self._commit_raises
+
+
+@pytest.mark.asyncio
+class TestFakeTaskClientConformance:
+    """ASYNC-ONLY CLASS (see the module docstring)."""
+
+    async def test_satisfies_the_protocol_statically(self) -> None:
+        """Pyright checks the annotated assignment, so this double cannot drift from
+        the seam it stands in for (the task-3533 pin,
+        ``escalation/tests/test_pins.py::TestPinRecordProtocol``)."""
+        from orchestrator.flake_ledger import FlakeLedgerTaskClient
+
+        client: FlakeLedgerTaskClient = _FakeTaskClient()
+        assert await client.get_statuses(['x']) == ({}, None)
 
 
 def _owner(db_path: Path, test_id: str) -> str | None:
@@ -4766,6 +4781,67 @@ class TestOpenDebtOverTheRealAdapter:
         assert scheduler.dispatched == ['get_task', 'get_statuses']
         assert _owner(db_path, self.TEST_ID) == 'task-901'
         assert row is not None and row.owner_task_id == 'task-901'
+
+    async def test_a_refused_filing_warns_once_in_each_layer(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """(g) Log volume over the composition.  The adapter, the only layer holding the
+        raw response, logs WHY (the server's text); the ledger logs WHAT it cost (an
+        unowned row).  One WARNING each, so a further layer joining in shows here."""
+        from orchestrator.flake_ledger import open_debt
+
+        scheduler = _RoutingStubScheduler(
+            {'submit_task': {'error': 'backlog full', 'error_type': 'BacklogFullError'}}
+        )
+
+        with caplog.at_level(logging.WARNING):
+            await open_debt(
+                tmp_path / 'runs.db',
+                'dark_factory',
+                self.TEST_ID,
+                task_client=self._client(scheduler),
+                now=self.NOW,
+            )
+
+        assert scheduler.dispatched == ['submit_task']
+        assert _warnings_by_logger(caplog) == {
+            'orchestrator.chronic_flake': 1,
+            'orchestrator.flake_ledger': 1,
+        }
+
+    async def test_a_refused_status_read_warns_once_in_each_layer(
+        self, tmp_path: Path, caplog
+    ) -> None:
+        """(h) The same pin for corroboration.  The shared parser, which
+        ``Scheduler.get_statuses`` runs too, logs the SHAPE; the adapter adds nothing;
+        the ledger logs one WARNING per failed read, and only a failed η ``get_task``
+        sends it on to ζ's ``get_statuses``, so there are two."""
+        from orchestrator.flake_ledger import open_debt
+
+        db_path = tmp_path / 'runs.db'
+        await self._seed(db_path)
+        refusal = {'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}
+        scheduler = _RoutingStubScheduler({'get_task': refusal, 'get_statuses': refusal})
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING):
+            await open_debt(
+                db_path,
+                'dark_factory',
+                self.TEST_ID,
+                task_client=self._client(scheduler),
+                now=self.LATER,
+            )
+
+        assert scheduler.dispatched == ['get_task', 'get_statuses']
+        assert _warnings_by_logger(caplog) == {
+            'shared.mcp_envelope': 1,
+            'orchestrator.flake_ledger': 2,
+        }
+
+
+def _warnings_by_logger(caplog) -> dict[str, int]:
+    return dict(Counter(r.name for r in caplog.records if r.levelno >= logging.WARNING))
 
 
 @pytest.mark.parametrize('make_path', _FAULTS, ids=['blocked_dir', 'corrupt_file'])

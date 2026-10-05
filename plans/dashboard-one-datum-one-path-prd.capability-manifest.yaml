@@ -107,6 +107,7 @@ tasks:
       pattern: _received_at
       paths:
       - dashboard/src/dashboard/static/redux/data.js
+      - dashboard/src/dashboard/static/redux/datum.js
       expect: present
 - label: γ2
   task_id: 5589

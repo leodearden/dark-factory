@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from fused_memory.config.schema import ReconciliationConfig
 from fused_memory.models.reconciliation import (
     AssembledPayload,
     ContextItem,
@@ -15,37 +14,8 @@ from fused_memory.models.reconciliation import (
     StageReport,
     Watermark,
 )
-from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.stages.base import BaseStage
-from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
-
-
-def _scope(project_id: str, project_root: str) -> ProjectScope:
-    """Build a ProjectScope from raw strings — DRYs the many test call sites."""
-    return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
-
-
-def _make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
-    """Build a MemoryConsolidator with mocked deps — mirrors test_stage1.py."""
-    config = ReconciliationConfig()
-    memory_mock = AsyncMock()
-    memory_mock.get_episodes = AsyncMock(return_value=[])
-    memory_mock.mem0 = AsyncMock()
-    memory_mock.mem0.get_all = AsyncMock(return_value={'results': []})
-    memory_mock.get_status = AsyncMock(return_value={})
-
-    stage = MemoryConsolidator(
-        StageId.memory_consolidator,
-        memory_mock,
-        AsyncMock(),  # taskmaster
-        AsyncMock(),  # journal
-        config,
-        scope=_scope('test_project', project_root),
-    )
-    stage.episode_limit = 5
-    stage.memory_limit = 10
-    return stage
-
+from reconciliation.consolidator_fixtures import make_consolidator, make_scope
 
 _SNAPSHOT_LINE = '1505 done / 148 cancelled / 1653 total'
 _BENIGN_LINE_A = 'Entity summary line A'
@@ -70,7 +40,7 @@ class TestAssemblePayloadSnapshotStripping:
         - Both benign lines are present.
         - stage._entity_summary_snapshot_lines_stripped == 2 (one from each source).
         """
-        stage = _make_consolidator()
+        stage = make_consolidator()
         stage.memory.get_episodes = AsyncMock(
             return_value=[
                 {
@@ -121,7 +91,7 @@ class TestAssemblePayloadSnapshotStripping:
         - Benign surrounding lines are present.
         - stage._entity_summary_snapshot_lines_stripped == 1.
         """
-        stage = _make_consolidator()
+        stage = make_consolidator()
         stage.assembled_payload = AssembledPayload(
             events=[],
             context_items={
@@ -160,8 +130,8 @@ class TestRunSurfacesSnapshotStrippedStat:
 
         Mirrors the census-inconsistency pattern from TestMemoryConsolidatorRunWiring.
         """
-        stage = _make_consolidator()
-        stage.scope = _scope('test_project', stage.scope.project_root)
+        stage = make_consolidator()
+        stage.scope = make_scope('test_project', stage.scope.project_root)
         stage._entity_summary_snapshot_lines_stripped = 3
 
         base_report = StageReport(

@@ -30,6 +30,7 @@ from _orch_helpers import make_placeholder_future
 from test_verify_merge_flake_suppression import _module_config
 
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.merge_lane.worker import enqueue_merge_request, select_recovery_winner
 from orchestrator.merge_queue import (
     GroupMergeRequest,
     MergeRequest,
@@ -469,6 +470,8 @@ class TestRecoverPendingMerges:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # --- queue assertions ---
@@ -567,6 +570,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # Exactly ONE enqueued winner; the duplicate coalesced.
@@ -628,6 +633,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -659,6 +666,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/', registry=registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 1
@@ -709,6 +718,8 @@ class TestRecoverPendingMergesRegistryDedup:
             report = await recover_pending_merges(
                 store, queue, git_ops, config, event_store=None,
                 main_branch='main', branch_prefix='task/', registry=registry,
+                enqueue_merge_request=enqueue_merge_request,
+                select_recovery_winner=select_recovery_winner,
             )
 
         assert queue.qsize() == 1
@@ -750,6 +761,8 @@ class TestRecoverPendingMergesRegistryDedup:
         report = await recover_pending_merges(
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/',
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert queue.qsize() == 2, (
@@ -803,6 +816,8 @@ class TestRecoverPendingMergesRegistryDedup:
             store, queue, git_ops, config, event_store=None,
             main_branch='main', branch_prefix='task/',
             registry=registry, retention=_FakeRetention(),
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # Nothing enqueued — both recovered records coalesced onto the entry.
@@ -957,6 +972,8 @@ class TestRecoverPendingMergesCorruptSignal:
                 event_store=None,
                 main_branch='main',
                 branch_prefix='task/',
+                enqueue_merge_request=enqueue_merge_request,
+                select_recovery_winner=select_recovery_winner,
             )
 
         assert report.get('journal_corrupt') is True, (
@@ -993,6 +1010,8 @@ class TestRecoverPendingMergesCorruptSignal:
                 event_store=None,
                 main_branch='main',
                 branch_prefix='task/',
+                enqueue_merge_request=enqueue_merge_request,
+                select_recovery_winner=select_recovery_winner,
             )
 
         assert report.get('journal_corrupt') is False, (
@@ -1155,6 +1174,8 @@ class TestRecoverPendingMergesPrefixedBranch:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         # --- live branch: re-enqueued, NOT dropped ---
@@ -1248,6 +1269,8 @@ class TestRecoverPendingMergesPrefixedBranch:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'
@@ -1363,6 +1386,8 @@ class TestRecoverPendingMergesTypedBranch:
             event_store=None,
             main_branch=main_branch,
             branch_prefix=branch_prefix,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
 
         assert report['recovered'] == 1, f'Expected 1 recovered; got {report}'

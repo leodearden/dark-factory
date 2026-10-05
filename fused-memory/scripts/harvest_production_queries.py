@@ -74,16 +74,13 @@ and writes no fixture: a silently-empty sample would read downstream as
 
 USAGE
 -----
-    ./harvest_production_queries.py \
+    uv run --project fused-memory python \
+        fused-memory/scripts/harvest_production_queries.py \
         --journal /home/leo/src/dark-factory/data/reconciliation/write_journal.db \
         --out fused-memory/tests/fixtures/production_query_sample.jsonl
 
-Run it FROM THE MAIN CHECKOUT. ``_repo_relative`` anchors ``_REPO_ROOT`` on
-this file's location, and the live journal sits under the main checkout's
-gitignored ``/data/``, so the same command run from a ``.worktrees/<id>``
-lane records the journal's ABSOLUTE path -- re-introducing the home-directory
-leak, and reddening
-``test_the_committed_sidecar_records_a_repo_relative_journal_path``.
+A run from a ``.worktrees/<id>`` lane records the same repo-relative
+journal path as one from the main checkout.
 """
 from __future__ import annotations
 
@@ -98,6 +95,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from fused_memory.models.scope import resolve_main_checkout
 
 # --------------------------------------------------------------------------
 # The briefing-assembler query family
@@ -129,9 +128,6 @@ BRIEFING_SEARCH_LIMIT = 5
 UNSPECIFIED_LIMIT = 'unspecified'
 
 DEFAULT_JOURNAL = Path('/home/leo/src/dark-factory/data/reconciliation/write_journal.db')
-
-#: Repo root, derived from this file: scripts/ -> fused-memory/ -> root.
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 #: sqlite's busy timeout for the journal connection, in SECONDS.
 #: NAMED after sqlite3's ``connect(timeout=)`` kwarg, which despite that
@@ -413,44 +409,41 @@ def _share(count: int, total: int) -> float | None:
     return round(count / total, 6)
 
 
+def _main_checkout_root() -> Path:
+    """The MAIN checkout's root, even when this file runs from a lane.
+
+    The journal is untracked runtime data that only exists under the main
+    checkout's gitignored `/data/`, so a `.worktrees/<id>` lane is the wrong
+    anchor for it.  Falls back to this file's own checkout
+    (scripts/ -> fused-memory/ -> root) when git cannot answer: not a
+    checkout, or no git.
+    """
+    here = Path(__file__).resolve()
+    try:
+        return Path(resolve_main_checkout(here.parent))
+    except ValueError:
+        return here.parents[2]
+
+
 def _repo_relative(path: Path | str) -> str:
     """`data/reconciliation/write_journal.db`, not somebody's home dir.
 
     An artifact naming an absolute checkout is neither reproducible nor
-    readable by anyone else, and it leaks the worktree the run happened
-    in -- the rule
+    readable by anyone else -- the rule
     `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`
-    already states.
+    already states.  Anchored on the MAIN checkout (`_main_checkout_root`);
+    a path outside it stays RESOLVED-ABSOLUTE so a journal parked elsewhere
+    remains identifiable.  Nothing reads `journal_path` back.
 
-    Paths outside the repo are returned RESOLVED-ABSOLUTE, not shortened
-    to a bare filename: they are genuinely checkout-independent, and a
-    journal parked outside the tree must stay identifiable.
-
-    THIRD copy of this helper under `fused-memory/scripts/`, and the three
-    DISAGREE on exactly that fallback -- so copy deliberately rather than by
-    proximity.  `census_memory_metadata.py::_repo_relative` also falls back
-    to resolved-absolute (this one is shaped after it), and pairs with a
-    READING-side `census_memory_metadata.py::_resolved_repo_path` that
-    re-anchors a recorded relative value at the repo root; this module has
-    no such reader because nothing reads `journal_path` back, so a future
-    consumer would have to add one.  `bake_off_storage_shape.py::_repo_relative`
-    falls back to `resolved.name` instead.  Each stays private: these
-    scripts are loaded via `_fm_helpers.load_script_module`, not imported
-    as a package.
-
-    `_REPO_ROOT` is derived from this file's location, so it differs
-    between the main checkout and every `.worktrees/<id>` lane -- the
-    caveat `census_memory_metadata.py::_repo_relative` already records.
-    The live journal sits under the main checkout's gitignored `/data/`,
-    so a harvest run from a worktree falls through to the absolute branch.
-    That is correct for the VALUE and a hazard for REGENERATION: re-running
-    the harvest from a lane re-emits the home-directory path this exists to
-    remove.  Regenerate from the MAIN checkout, which is where the committed
-    sidecar's relative value comes from.
+    Sibling copies stay private (these scripts load via
+    `_fm_helpers.load_script_module`, not as a package) and differ on anchor
+    and fallback, so copy deliberately rather than by proximity: see
+    `fused-memory/scripts/census_memory_metadata.py::_repo_relative` and
+    `fused-memory/scripts/bake_off_storage_shape.py::_repo_relative`.
     """
     resolved = Path(path).resolve()
     try:
-        return str(resolved.relative_to(_REPO_ROOT))
+        return str(resolved.relative_to(_main_checkout_root()))
     except ValueError:
         return str(resolved)
 

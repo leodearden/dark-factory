@@ -14,6 +14,7 @@ from typing import NamedTuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from shared.config_dir import CONFIG_DIR_PREFIX, TaskConfigDir
 
 from orchestrator.artifacts import TaskArtifacts
@@ -1581,7 +1582,7 @@ def _setup_lane_meta_plan(base: Path, lane_name: str, plan: dict) -> Path:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
 class TestRecoverCrashedTasksWarmLane:
     """_recover_crashed_tasks must correctly recover warm-lane worktrees.
 
@@ -1879,7 +1880,7 @@ class TestRecoverCrashedTasksWarmLane:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
 class TestRecoverCrashedTasksWarmLaneEdgeCases:
     """Edge cases for warm-lane crash recovery."""
 
@@ -2011,7 +2012,7 @@ class TestRecoverCrashedTasksWarmLaneEdgeCases:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
 class TestRecoverCrashedTasksPoolStorageAbsentGuard:
     """_recover_crashed_tasks must defer — not clean up — when pool storage
     is absent (task 2099).
@@ -2115,7 +2116,7 @@ class TestRecoverCrashedTasksPoolStorageAbsentGuard:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
 class TestRecoverCrashedTasksNoPoolConfiguredNoOp:
     """_recover_crashed_tasks() must proceed normally on a pool-less default
     host even though `.pool-root` is absent (step-17 review-fix).
@@ -2160,7 +2161,7 @@ class TestRecoverCrashedTasksNoPoolConfiguredNoOp:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
 class TestRecordDrivenRecovery:
     """B1 adopt / B2 quarantine / terminal-release / branch-mismatch / compat
     / .task-meta-relocation contracts for the record-driven lane recovery
@@ -2509,7 +2510,7 @@ class TestRecordDrivenRecovery:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)  # task 2376: heavy class, widened from the 60s default to tolerate host oversubscription
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)  # task 2376: heavy class
 class TestRecordDrivenRecoveryCompatAndRelocation:
     """(a) compat: a record-less lane recovers its plan but is never pinned.
     (b) .task-meta-only artifacts are read/cleared on the ADOPT path.

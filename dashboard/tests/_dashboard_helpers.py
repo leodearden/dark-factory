@@ -13,17 +13,21 @@ import json
 import re
 import sqlite3
 import threading
-from collections.abc import Awaitable, Callable, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
+from unittest.mock import patch
 
 import aiosqlite
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from dashboard.config import DashboardConfig
+from dashboard.data.db import DbPool
+from dashboard.loops import _metrics_loop, _MetricsStore
 
 
 def live_aiosqlite_worker_threads() -> list[threading.Thread]:
@@ -235,6 +239,93 @@ async def drain(*tasks: asyncio.Task[Any]) -> None:
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Background-loop driving harness (task 5095)
+#
+# ONE definition of "run a real dashboard loop until the caller has seen
+# enough, then cancel it": drive_loop_until for any loop, drive_metrics_loop
+# for _metrics_loop against a recorded collect_metrics_snapshot.  Their
+# contract is pinned by test_metrics_loop_harness.py.
+# ---------------------------------------------------------------------------
+
+
+async def yielding_noop_sleep(*_args: object, **_kwargs: object) -> None:
+    """Stand-in for ``dashboard.loops._sleep_to_aligned_tick`` that suspends.
+
+    It MUST actually suspend.  A plain ``AsyncMock`` never yields, so the loop
+    spins synchronously and starves the event loop: an ``Event.set()`` waiter
+    (scheduled via ``call_soon``) never runs and ``asyncio.wait_for`` cannot
+    even time out.
+    """
+    await asyncio.sleep(0)
+
+
+async def drive_loop_until(
+    loop: Coroutine[Any, Any, None], until: asyncio.Event, *, timeout: float = 2.0
+) -> None:
+    """Run the never-returning *loop* as a task until *until* is set, then cancel it.
+
+    *timeout* is a backstop that is SUPPRESSED, so a regression fails on the
+    caller's named assertions rather than a bare ``TimeoutError``; assert a
+    positive witness (``until.is_set()``) before any upper-bound or absence
+    assertion.  Only ``CancelledError`` is swallowed on the way out, so a loop
+    that died of a real exception still surfaces it.  The task never outlives
+    this call.
+    """
+    task = asyncio.create_task(loop)
+    try:
+        with suppress(TimeoutError):
+            await asyncio.wait_for(until.wait(), timeout=timeout)
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def drive_metrics_loop(
+    store: _MetricsStore,
+    app: FastAPI,
+    *,
+    pool: DbPool,
+    http_client: httpx.AsyncClient,
+    until: asyncio.Event | None = None,
+    on_collect: Callable[[dict[str, Any]], None] | None = None,
+    timeout: float = 2.0,
+) -> list[dict[str, Any]]:
+    """Run ``_metrics_loop`` until *until* is set; return each collect call's kwargs.
+
+    *pool* and *http_client* are passed to the loop explicitly, and
+    ``app.state`` is never read or written here -- the binding tests depend on
+    the caller's ``app.state`` staying exactly as it built it.
+
+    With no *until* the driver stops after the first collect.  Otherwise the
+    caller sets *until* from wherever its observable lives: an *on_collect*
+    hook, a checkpoint mock.  *timeout* is ``drive_loop_until``'s suppressed
+    backstop.  *on_collect* runs INSIDE the loop's ``_run_once``, whose
+    ``except Exception`` swallows whatever it raises, so a hook should record
+    and signal, never assert.
+    """
+    calls: list[dict[str, Any]] = []
+    first_collect = asyncio.Event()
+
+    async def _record(*_args: object, **kwargs: Any) -> None:
+        calls.append(kwargs)
+        first_collect.set()
+        if on_collect is not None:
+            on_collect(kwargs)
+
+    with (
+        patch('dashboard.loops.collect_metrics_snapshot', new=_record),
+        patch('dashboard.loops._sleep_to_aligned_tick', new=yielding_noop_sleep),
+    ):
+        await drive_loop_until(
+            _metrics_loop(store, app, pool=pool, http_client=http_client),
+            first_collect if until is None else until,
+            timeout=timeout,
+        )
+    return calls
 
 
 # ---------------------------------------------------------------------------
@@ -968,7 +1059,7 @@ def find_function_params(
 
     The search regex is deliberately NOT line-anchored, so a declaration NESTED
     inside another function is found (the real instance is
-    ``function statusMatches(s) {`` indented inside ``TasksTab`` in
+    ``function searchMatches(t) {`` indented inside ``TasksTab`` in
     tab_tasks.jsx).  Its trailing ``\\s*\\(`` is equally load-bearing in the
     other direction: without it a prefix sibling declared earlier would shadow
     the target — ``function TaskGraphEdges(`` at tab_tasks.jsx:33 precedes
@@ -1039,7 +1130,7 @@ def extract_function_body(source: str, func_name: str) -> str:
 
     The search regex is deliberately NOT line-anchored, so a declaration
     NESTED inside another function is found and scoped to its own body (the
-    real instance is ``function statusMatches(s) {`` indented inside
+    real instance is ``function searchMatches(t) {`` indented inside
     ``TasksTab`` in tab_tasks.jsx).  Its trailing ``\\s*\\(`` is equally
     load-bearing in the other direction: without it a prefix sibling declared
     earlier would shadow the target — ``function TaskGraphEdges(`` at

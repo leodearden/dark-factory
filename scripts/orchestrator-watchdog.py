@@ -507,14 +507,18 @@ def log(msg: str) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         # systemd-cat missing/unexecutable (OSError) or wedged past the bound
         # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
-        # The fallback is itself best-effort: writing to stderr raises on a
-        # broken pipe or a full/failing journal socket, and that OSError
-        # would otherwise escape log() and abort a caller's tick (see the
-        # never-raises contract in the docstring). Both journal routes are
-        # gone at this point, so there is nothing left to report WITH —
-        # dropping the message is the only remaining option, and it is
-        # strictly better than dropping the rest of the tick with it.
-        with contextlib.suppress(OSError):
+        # The fallback print is guarded BROADLY BY DESIGN, like
+        # _JournalLog.warning below: both journal routes are already gone by
+        # the time it runs, so there is nothing left to report WITH, and
+        # dropping the message beats dropping the rest of the tick with it
+        # (see the never-raises contract in the docstring). Enumerating what
+        # a degraded stderr can raise would close instances rather than the
+        # class that contract promises — a broken pipe or a full/failing
+        # journal socket raise OSError, a CLOSED stream raises ValueError,
+        # and the message is formatted INSIDE the guard. Bug-surfacing lives
+        # in the narrow OUTER clause above, which stays narrow and is pinned
+        # by test_log_swallows_only_os_and_subprocess_errors.
+        with contextlib.suppress(Exception):
             print(
                 f"orchestrator-watchdog: {msg} [systemd-cat unusable: {exc!r}]",
                 file=sys.stderr,

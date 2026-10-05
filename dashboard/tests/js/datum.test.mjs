@@ -45,6 +45,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'datumView',
   'plainDatum',
   'derivedDatum',
+  'servedDatum',
   'combinedDatum',
 ];
 const EXPECTED_EXPORT_NAMES = [
@@ -79,6 +80,7 @@ const { isDatum, unknownDatum, assertDatum, DATUM_STATES } = datum;
 const { withReceipt, displayedAgeMs } = datum;
 const { datumView, EM_DASH, LOWER_BOUND_PREFIX } = datum;
 const { plainDatum, derivedDatum, PLAIN_DATUM_BOUND_SECONDS } = datum;
+const { servedDatum } = datum;
 const { combinedDatum } = datum;
 
 // The five-key wire envelope datum.py::Datum.to_wire() emits, verbatim: `as_of`
@@ -758,6 +760,93 @@ test('derivedDatum: a site with no receipt still reads as never-fetched', () => 
   // to derive FROM, so 'no completed run' would be a claim about data this
   // browser has never seen.
   assert.equal(derivedDatum(null, TASKS_PATH, 'no completed run', {}).reason, 'not yet fetched');
+});
+
+// ---------------------------------------------------------------------------
+// servedDatum — a Datum the server DID serve, nested inside a payload that is
+// otherwise plain. It is only stamped with its endpoint's receipt; the client
+// builds nothing but the two holes.
+// ---------------------------------------------------------------------------
+
+const PERFORMANCE_PATH = '/api/v2/dashboard/performance';
+const NO_CARDS = 'the performance payload has no cards Datum for p1';
+const WINDOW_SECONDS = 7 * 86_400;
+
+function performanceReceipts(entry) {
+  return { [PERFORMANCE_PATH]: entry };
+}
+
+function perfCards(overrides) {
+  return {
+    value: {
+      paths: [],
+      escalation: { total_tasks: 0, steward_rate: 0, interactive_rate: 0 },
+      hist_outer: { labels: ['0', '1', '2', '3+'], values: [0, 0, 0, 0] },
+      hist_inner: { labels: ['0', '1', '2', '3', '4', '5+'], values: [0, 0, 0, 0, 0, 0] },
+      ttc: { p50: 0, p75: 0, p90: 0, p95: 0, count: 0 },
+    },
+    freshness_bound_seconds: WINDOW_SECONDS,
+    ...overrides,
+  };
+}
+
+const taskCount = cards => `${cards.ttc.count} tasks`;
+
+test('servedDatum: with no receipt for the endpoint, it reads as never-fetched', () => {
+  const d = servedDatum(STALE_WIRE, PERFORMANCE_PATH, NO_CARDS, {});
+  assert.equal(d.state, 'unknown');
+  assert.equal(d.reason, 'not yet fetched');
+});
+
+test('servedDatum: a delivered payload with no Datum there carries exactly the caller\'s reason', () => {
+  for (const served of [undefined, null, 42, { paths: [] }]) {
+    const d = servedDatum(served, PERFORMANCE_PATH, NO_CARDS, performanceReceipts(RECEIPT));
+    assert.equal(d.state, 'unknown', `${JSON.stringify(served)} is not a Datum`);
+    assert.equal(d.reason, NO_CARDS);
+  }
+});
+
+test('servedDatum: stamps the endpoint\'s receipt onto a COPY of the served Datum', () => {
+  const served = { ...STALE_WIRE };
+  const pristine = { ...served };
+  const stamped = servedDatum(served, PERFORMANCE_PATH, NO_CARDS, performanceReceipts(RECEIPT));
+
+  assert.notEqual(stamped, served, 'servedDatum must not return its input');
+  assert.deepEqual(served, pristine, 'the served Datum was mutated');
+  assert.equal(stamped._served_at, SERVED_AT);
+  assert.equal(stamped._received_at, RECEIVED_AT);
+  for (const key of WIRE_KEYS) {
+    assert.deepEqual(stamped[key], served[key], `${key} survived the stamp`);
+  }
+});
+
+test('servedDatum: an idle project\'s stale cards badge their last-completion age in days', () => {
+  const idle = perfCards({
+    as_of: '2026-08-31T12:00:00+00:00',
+    state: 'stale',
+    reason: 'no completions in the 7d window; last completion 2026-08-31T12:00:00+00:00',
+  });
+  const receipts = performanceReceipts({ servedAt: SERVED_AT, receivedAt: NOW });
+  const view = datumView(servedDatum(idle, PERFORMANCE_PATH, NO_CARDS, receipts), {
+    now: NOW,
+    format: taskCount,
+  });
+
+  assert.equal(view.age, '20d');
+  assert.ok(view.title.includes('last completion'), view.title);
+  assert.equal(view.text, '0 tasks');
+});
+
+test('servedDatum: an active project\'s fresh cards carry no badge', () => {
+  const active = perfCards({ as_of: '2026-09-20T11:00:00+00:00', state: 'fresh', reason: null });
+  const receipts = performanceReceipts({ servedAt: SERVED_AT, receivedAt: NOW });
+  const view = datumView(servedDatum(active, PERFORMANCE_PATH, NO_CARDS, receipts), {
+    now: NOW,
+    format: taskCount,
+  });
+
+  assert.equal(view.age, null);
+  assert.equal(view.title, null);
 });
 
 // ---------------------------------------------------------------------------

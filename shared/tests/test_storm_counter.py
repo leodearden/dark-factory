@@ -302,6 +302,68 @@ class TestPruneSweepHook:
         assert kept[-1] == fresh[-1]
 
 
+class TestObserveWithoutFiring:
+    """``observe()`` is the threshold-free entry point for a consumer that thresholds
+    OUTSIDE the counter (``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::LandingTally``,
+    whose fire is deduped by an open L1, not by time). ``record()`` is ``observe()``
+    plus the fire decision.
+    """
+
+    def test_returns_the_raw_live_count_and_never_a_summary(self, counter):
+        counts = [counter.observe(window_seconds=100.0, label='p') for _ in range(3)]
+
+        assert counts == [1, 2, 3]
+        assert all(type(c) is int for c in counts)
+        assert counter.prune(100.0) == 3
+
+    def test_window_is_half_open(self, clock):
+        aged_out = StormCounter(time_provider=clock)
+        aged_out.observe(window_seconds=100.0)
+        clock.advance(100.0)
+        assert aged_out.observe(window_seconds=100.0) == 1
+
+        just_inside = StormCounter(time_provider=clock)
+        just_inside.observe(window_seconds=100.0)
+        clock.advance(99.0)
+        assert just_inside.observe(window_seconds=100.0) == 2
+
+    def test_observed_events_count_toward_a_later_record(self, counter):
+        counter.observe(window_seconds=100.0, label='p')
+        counter.observe(window_seconds=100.0, label='p')
+
+        summary = counter.record(threshold=3, window_seconds=100.0, label='q')
+
+        assert summary is not None
+        assert summary['count'] == 3
+        assert summary['labels'] == ['p', 'q']
+
+    def test_observe_does_not_arm_the_rate_limit(self, counter, clock):
+        for _ in range(5):
+            counter.observe(window_seconds=100.0)
+        assert counter.record(threshold=3, window_seconds=100.0) is not None
+
+        latched = StormCounter(time_provider=clock, fire_mode='latched')
+        for _ in range(5):
+            latched.observe(window_seconds=100.0)
+        assert latched.latched is False
+        assert latched.record(threshold=3, window_seconds=100.0) is not None
+
+    def test_a_key_on_a_default_mode_counter_is_a_loud_error(self, counter):
+        with pytest.raises(ValueError, match='count_distinct'):
+            counter.observe(window_seconds=100.0, key='k')
+        assert counter.prune(100.0) == 0, 'the rejected call must not have been recorded'
+
+        assert StormCounter(count_distinct=True).observe(window_seconds=100.0, key='k') == 1
+        assert counter.observe(window_seconds=100.0, key=None) == 1
+        assert StormCounter(count_distinct=True).observe(window_seconds=100.0, key=None) == 1
+
+    def test_injected_now_drives_the_window(self):
+        counter = StormCounter(time_provider=lambda: 0.0)
+        counter.observe(window_seconds=100.0, now=1000.0)
+
+        assert counter.observe(window_seconds=100.0, now=1100.0) == 1
+
+
 class TestPerCallClockOverride:
     """``now=`` on :meth:`record` / :meth:`prune` — a PER-CALL clock override.
 

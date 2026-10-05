@@ -144,8 +144,79 @@ stream W5) which explicitly deferred this — treat this as a small W5 follow-on
 get_cycle_summary_presence(project_id: str, run_id: str, stage: str)
   -> { present: bool,
        ledger_available: bool,
-       project_id: str, run_id: str, stage: str }
+       project_id: str, run_id: str, stage: str,
+       remediation: bool | None,          # task 2652
+       reason: str,                       # task 3731
+       expected: bool | None,             # task 3731
+       run_lookup_available: bool,        # task 3731
+       run_status: str | None }           # task 3731
 ```
+
+**`reason` vocabulary and precedence ladder (task 3731).** Single-valued,
+evaluated top-down; `expected` is the gate consumers act on:
+
+| # | `reason` | meaning | `expected` |
+|---|---|---|---|
+| 1 | `present` | row found | `True` |
+| 2 | `ledger_unavailable` | no ledger wired | `None` |
+| 3 | `run_unknown` | journal unwired, no `runs` row, read raised, `stage_reports` unparseable, or the run has not settled yet | `None` |
+| 4 | `stage_not_run` | SETTLED `runs` row present, `stage` absent from `stage_reports` | `False` |
+| 5 | `expired` | `runs.started_at` older than `CYCLE_SUMMARY_TTL_DAYS`, so any row would have been `gc()`'d | `None` |
+| 6 | `missing` | stage ran, within retention, no row | `True` |
+
+`stage_not_run` deliberately outranks `expired`: it is a positive fact from the
+never-reaped `runs` table and stays true regardless of TTL, whereas `expired`
+only says the evidence was destroyed. Derived by joining `runs` through
+`ReconciliationJournal.get_run_stage_execution`, a four-column projection scoped
+to `(id, project_id)`.
+
+**Rung 5 ages from `started_at`, never `completed_at`, so the reader's cliff can
+never fall behind `gc()`'s.** `write_cycle_summary` stamps `expires_at` from its
+own write time, which lies strictly between the two: Stage 2 writes mid-loop,
+while the run row is completed only after the whole stage loop — after Stage 3's
+LLM turn, and far later for an interrupted-then-resumed run. Aging from
+`completed_at` would put the reader's cliff after `gc()`'s, and every absence in
+the window between them would be reported as a confident `missing` for a row that
+was merely reaped. `started_at <= write time` makes the skew land the safe way:
+the ambiguous window degrades to the inconclusive `expired`. A naive timestamp in
+that column is read as UTC, the convention every other reader of `runs` already
+applies; anything that still fails to age falls to rung 3.
+
+**`stage_reports` is only evidence once a run has SETTLED.** `harness.py`
+accumulates `run.stage_reports` in memory and persists the whole blob after the
+stage loop — from the success path, an error handler, or the terminal `finally`
+backstop, each of which completes the run in the same breath. A run on its first
+attempt therefore leaves the column reading `'{}'` however many stages have
+completed. Stage 3 verifies the CURRENT run's cycle summaries from INSIDE that
+loop (`stages/base.py` hands it the live `run_id`), so reading an absent key
+there as "the stage never ran" would report every in-flight run as
+`stage_not_run` and suppress exactly the current-cycle data loss this check
+exists to catch.
+
+A persisted status is necessary but **not sufficient**, because `interrupted` is
+the one terminal status a run can leave. `_resume_interrupted_runs` adopts
+exactly those runs, and `run_full_cycle` marks the adopted run running only on
+the in-memory object — `complete_run` is the sole writer of the column — so a run
+re-executing this very stage still reads back `interrupted` on disk. That pairing
+is worse than the empty first-attempt case: the stage key is absent precisely
+BECAUSE this attempt has not re-filed it yet, the shape most likely to be a
+genuine lost write. The adopt pass persists its `_resume` bookkeeping before
+adopting, so `get_run_stage_execution` reads that key and returns a `settled`
+verdict: a persisted status AND, for `interrupted`, positive evidence the run was
+never adopted. Rung 4 requires that verdict; everything else falls to rung 3
+(`run_unknown`) and the consumer's existing fallback. The gate is stated as the
+set of statuses that DO persist, so a future non-terminal status degrades to
+`run_unknown` rather than to a confident wrong answer.
+
+Settled-ness is decided in `journal.py`, next to the read, **not** in the presence
+reader: which statuses flush the blob and what an adopted run's status column
+means are harness lifecycle facts, and the `runs` table's owner is the one module
+that already holds them. `MemoryService` consumes the single `settled` signal and
+holds no run-lifecycle knowledge.
+
+`run_status` is **DIAGNOSTIC ONLY — never gate on it.** Three measured `failed`
+runs really did execute Stage 2 and lose the ledger write, so a status gate
+suppresses precisely the real findings it appears to filter.
 
 - **Read-only.** Delegates to `MemoryService.get_cycle_summary_presence(...)`,
   which calls `recon_ledger.get_by_identity(project_id, 'cycle_summary',
@@ -172,10 +243,15 @@ per-cycle summary missing for `run_id`:
 1. **Authoritative path (new, primary):** call
    `get_cycle_summary_presence(project_id, run_id, stage='task_knowledge_sync')`.
    - `ledger_available=true, present=true` → **present** → do not report missing. Done.
-   - `ledger_available=true, present=false` → the authoritative row is **genuinely
-     absent** → **report missing** (`missing_knowledge`, actionable,
-     suggested_action = reconstruct). *This is the new value.*
-   - `ledger_available=false` **or** tool error → **inconclusive** → fall to (2).
+   - `present=false` **and** `expected=true` (`reason='missing'`) → the stage ran,
+     the run is within retention, and the row is genuinely lost → **report missing**
+     (`missing_knowledge`, actionable, suggested_action = reconstruct).
+   - `present=false` **and** `expected=false` (`reason='stage_not_run'`) → the run
+     never reached the stage, so no summary was ever owed → **not a gap**; do not
+     report. *(Task 3731. Previously this reported missing — 61 of 64 such
+     findings were false.)*
+   - `present=false` **and** `expected=null` (`reason='expired'`, `'run_unknown'`
+     or `'ledger_unavailable'`) **or** tool error → **inconclusive** → fall to (2).
 2. **Fallback (existing two Mem0 paths), used ONLY on inconclusive:** the current
    Path 1 (semantic) + Path 2 (`count_memories_by_metadata`) rule, **unchanged** —
    declare missing only if BOTH return nothing; treat a count error as
@@ -191,8 +267,28 @@ Then **delete** the "Known gap" comment (`stage3.py:9-22`), and add the tool to
   protection, because the Mem0 fallback is retained for every non-definitive read.
 - **Stage disambiguation:** presence is always queried with an explicit `stage`;
   the Stage-2 verification hardcodes `'task_knowledge_sync'`.
+- **Accepted false negative — current-cycle loss (task 3731).** Stage 3's
+  dominant call site is the run it is executing inside, and that run's
+  `stage_reports` has not been flushed yet, so rung 3 answers `run_unknown`: for
+  the CURRENT `run_id` the primary path can confirm a row is PRESENT but never
+  that one is genuinely ABSENT. A Stage-2 ledger write lost during the current
+  cycle is therefore detected only by the §8.2 step-2 Mem0 fallback, whose
+  unreliability is why the ledger authority was introduced (tasks 2652, 4186).
+  Before this widening that absence was actionable on the primary path, so this
+  IS a sensitivity loss — a deliberate trade, not an oversight: it is what
+  removes the 61-of-64 false `stage_not_run` findings, and it is the fail-safe
+  direction (never flag on uncertainty). Pinned by
+  `test_current_cycle_loss_is_an_accepted_false_negative`, stated in the Stage 3
+  prompt, and recorded here so a later reader does not read the fallback-only
+  path as a defect. Restoring the sensitivity needs a WRITE-path change — the
+  harness flushing `stage_reports` per stage instead of once after the loop —
+  which §11 puts out of scope for both this PRD and task 3731.
 - **No write path touched:** `write_cycle_summary` is unchanged (read/visibility
-  fix only).
+  fix only). Reaffirmed by task 3731, which is also read-only: it adds a `runs`
+  projection and widens a return payload, and touches no writer. The Mem0
+  two-path fallback is retained verbatim, so fail-safe monotonicity holds in
+  both directions — 3731 only ever REMOVES false positives and adds no new
+  suppression on an inconclusive read.
 
 ## 9. Boundary-test sketch (B + H) — the integration-gate signal
 
@@ -275,9 +371,31 @@ hard-blocker token). `task_kind='normal'`.
   present, τ2 could emit `cross_store_inconsistency` instead of plain
   `missing_knowledge`. Default: reuse `missing_knowledge` (reconstruct fixes both).
   Upgrade only if a run surfaces a case where the distinction changes remediation.
-- **Return payload width:** whether to include the row's `state` / `created_at`
-  alongside `present` for richer Stage-3 reporting. Default: boolean-only (D5);
-  add fields only if a reporting need is named (guards against browse-API creep).
+- **Return payload width:** ~~whether to include the row's `state` /
+  `created_at` alongside `present` for richer Stage-3 reporting. Default:
+  boolean-only (D5); add fields only if a reporting need is named (guards
+  against browse-API creep).~~ **RESOLVED by task 3731.** The reporting need
+  the default gated on is now named, twice over:
+  - Stage 1 check A and Stage 3 filed **61 of 64** false "missing stage 2
+    summary" findings against runs that never reached Stage 2.
+  - The TTL cliff has since fired, making `present=false` permanently
+    ambiguous: **20287** runs older than the retention window hold no
+    `cycle_summary` row, and **6875** of those carry `stage_reports` proving
+    Stage 2 ran. Every one would otherwise classify as data loss.
+
+  The resolution stays inside D5's spirit rather than overturning it: **no
+  record body is returned** — not `state`, not `created_at`, not the payload —
+  only a typed *absence* (`reason`/`expected`) plus the two diagnostics needed
+  to report it. So this is not the browse-API creep D1/D5 guard against.
+
+  Cross-reference **esc-3421-1**, whose stated premise ("pre-ledger run_ids")
+  was measured **false**. Its example run
+  `745f2ffb-020c-4409-9543-e99980b9f1e9` is the reproduced counter-example: a
+  post-ledger run that simply never reached Stage 2. It has since crossed the
+  TTL boundary — its ledger rows are reaped while its `runs` row survives with
+  `stage_reports={}` — which makes it the live demonstration of why
+  `stage_not_run` must outrank `expired`: an `expired`-first ladder would
+  report destroyed evidence while the conclusive evidence sits intact.
 - **Test home:** `test_summary_pool.py` (co-located with the writer) vs a new
   `test_stage3_ledger_presence.py`. Either satisfies §9; implementer's call.
 

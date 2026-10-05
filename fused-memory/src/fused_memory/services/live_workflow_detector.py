@@ -193,6 +193,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
 from shared.git_async import run_git
@@ -428,7 +429,7 @@ async def detect_live_workflow(
             does not pass this kwarg. The verdict is computed by
             :func:`corroboration_for_task` and passed in by the three consumers
             that hold the task dict, which task 2964 made agree with each other:
-            :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._render_live_workflow_section`
+            :func:`~fused_memory.reconciliation.live_workflow_section.render_live_workflow_section`
             (the render-time Live-Workflow Signals section),
             ``recon_write_policy.check``'s Gate 2 (via its
             ``_corroboration_verdict`` helper), and ``reconciliation/harness.py``'s
@@ -439,7 +440,8 @@ async def detect_live_workflow(
         _orchestrator_live: Pre-computed project-level orchestrator-lock result.
             When provided, skips the ``is_orchestrator_live_for(project_root)``
             call — use this to hoist the constant project-level check out of
-            per-task loops (e.g. in :func:`_render_live_workflow_section`).
+            per-task loops (e.g. in
+            ``reconciliation/live_workflow_section.py::render_live_workflow_section``).
             ``None`` (default) triggers a fresh ``is_orchestrator_live_for``
             call.  Tests monkeypatch the module attribute directly; this
             parameter is only for performance hoisting, not test isolation.
@@ -697,7 +699,9 @@ def corroboration_for_task(
 
     then delegates to :func:`has_live_workflow_corroboration`. The *scheduler_state*
     and *orchestrator_started_at* inputs are hoisted once per render by the
-    caller (see :func:`_render_live_workflow_section`) and threaded through.
+    caller (see
+    ``reconciliation/live_workflow_section.py::render_live_workflow_section``)
+    and threaded through.
 
     Returns True when any signal corroborates a live workflow for *task_id*.
     """
@@ -711,6 +715,43 @@ def corroboration_for_task(
         routing_latest_decided_at=routing_latest_decided_at,
         orchestrator_started_at=orchestrator_started_at,
     )
+
+
+class ClaimantLabel(StrEnum):
+    LIVE = 'live'
+    STALE = 'stale'
+    NONE = 'none'
+    UNKNOWN = 'unknown'
+
+
+def claimant_label(
+    task: object,
+    *,
+    now: datetime,
+    heartbeat_ttl: timedelta = DEFAULT_HEARTBEAT_TTL,
+) -> ClaimantLabel:
+    """Label *task*'s claimant for display; total, and it changes no ``is_live`` verdict.
+
+    STALE (a claimant whose heartbeat is old, missing or unparseable) is the
+    killed-but-lingering shape the task-2963 corroboration gate exists for.
+    UNKNOWN (an unreadable task) is never collapsed into NONE, so absence of
+    evidence never renders as evidence of absence.
+    """
+    if not isinstance(task, Mapping):
+        return ClaimantLabel.UNKNOWN
+    claimant = task.get('claimant_run_id')
+    # The "no claimant" predicate of shared/task_claimant.py::_claimant_liveness_stranded.
+    if claimant is None or (isinstance(claimant, str) and not claimant.strip()):
+        return ClaimantLabel.NONE
+    try:
+        is_live = has_live_claimant(task, now, heartbeat_ttl)
+    except Exception:
+        logger.warning(
+            'live_workflow_detector.claimant_label: claimant liveness unreadable for %r',
+            claimant, exc_info=True,
+        )
+        return ClaimantLabel.UNKNOWN
+    return ClaimantLabel.LIVE if is_live else ClaimantLabel.STALE
 
 
 def is_pure_gate_metadata(metadata: object) -> bool:

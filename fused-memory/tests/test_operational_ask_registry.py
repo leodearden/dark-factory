@@ -115,6 +115,24 @@ class TestLoadOperationalRegistry:
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
 
+    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
+        """(b) File with bytes that are not valid UTF-8 returns [] and emits
+        exactly one WARNING, on this module's own logger.
+        """
+        from fused_memory.middleware.operational_ask_registry import load_operational_registry
+
+        bad_encoding = tmp_path / "bad_encoding.yaml"
+        bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
+
+        with caplog.at_level("WARNING"):
+            entries = load_operational_registry(bad_encoding)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert str(bad_encoding) in warnings[0].getMessage()
+        assert warnings[0].name == "fused_memory.middleware.operational_ask_registry"
+
     def test_load_non_list_top_level_returns_empty_and_warns(self, tmp_path, caplog):
         """(b) A non-list top-level YAML document returns [] and emits one WARNING."""
         from fused_memory.middleware.operational_ask_registry import load_operational_registry

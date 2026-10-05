@@ -113,8 +113,8 @@ class Timeouts(BaseModel):
     budgets (seconds).
 
     The census runs three claude-CLI-backed stages with very different
-    shapes, but originally handed every stage ``coder._invoke_cli``'s single
-    module default of 120s (sized for one Haiku trickle-coding call). That
+    shapes, but originally handed every stage the trickle coder's single
+    default of 120s (sized for one Haiku trickle-coding call). That
     default demonstrably killed the first dark_factory census: every Sonnet
     verify-vs-``main`` call (one per novel cluster, exploring current
     ``main`` via targeted reads) and the final large Fable synthesis call
@@ -126,6 +126,7 @@ class Timeouts(BaseModel):
     cluster exploring current ``main``), ``census_synthesis_secs`` (1800 —
     one large Fable call over all verified clusters). An omitted block loads
     with all three defaults, so a pre-existing legibility.yaml keeps working.
+    ``census.census_stage_specs`` binds each to its stage.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -292,8 +293,8 @@ def configure_logging(default_level: str = 'INFO') -> None:
     tinguishable from genuine no-change nights.
 
     ``LEGIBILITY_LOG_LEVEL`` overrides *default_level* (matching the
-    ``LEGIBILITY_SEARCH_ROOTS`` / ``LEGIBILITY_CLAUDE_BIN`` env convention
-    already used across these modules). Either spelling operators reach for
+    ``LEGIBILITY_SEARCH_ROOTS`` env convention already used across these
+    modules). Either spelling operators reach for
     is accepted — a level NAME (``DEBUG``, case-insensitive) or a numeric
     level (``10``, which is what ``logging``'s own API takes). An
     unparseable value degrades to *default_level* and logs one warning — it

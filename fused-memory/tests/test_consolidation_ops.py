@@ -457,6 +457,20 @@ class TestTheEnvelopeIsTheSharedBuilders:
 
         assert result['status'] == 'partial'
 
+    @pytest.mark.asyncio
+    async def test_the_executor_envelope_lists_the_same_projection(self):
+        svc = make_service(
+            scroll_rows=[_scroll_row(CANONICAL, canonical=True), _scroll_row(M1), _scroll_row(M2)]
+        )
+
+        result = await call_execute(svc)
+
+        assert result['topic_members'] == [
+            {'id': CANONICAL, 'canonical': True},
+            {'id': M1, 'canonical': False},
+            {'id': M2, 'canonical': False},
+        ]
+
 
 class TestTheArmsWritesStandApartFromItsClosure:
     """`apply_retain_arm` is the arm's writes alone, for a caller with a

@@ -2,7 +2,7 @@
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -474,7 +474,7 @@ async def test_no_tool_calls_propagates_cli_warning_origin(origin_token):
 
     async def mock_llm(messages, tool_schemas):
         return _CLIResponseAdapter(
-            {'thinking': '', 'tool_calls': [], 'warning': origin_token},
+            {'tool_calls': [], 'warning': origin_token},
             session_id='sess-1',
         )
 
@@ -534,7 +534,7 @@ async def test_no_tool_calls_drops_unknown_warning_origin(agent_warning):
 
     _CLIResponseAdapter.warning is just structured_output['warning'], so on a
     real turn it holds whatever the agent's own JSON put there — only
-    _call_llm_cli's synthesised dicts carry our tokens.  The value flows to
+    _call_claude_cli's synthesised dicts carry our tokens.  The value flows to
     VerificationResult.failure_token and into the reconciliation.db audit row
     operators GROUP BY, so an arbitrary string would pollute that census and a
     non-str would raise ValidationError inside CodebaseVerifier.verify —
@@ -546,7 +546,7 @@ async def test_no_tool_calls_drops_unknown_warning_origin(agent_warning):
 
     async def mock_llm(messages, tool_schemas):
         return _CLIResponseAdapter(
-            {'thinking': '', 'tool_calls': [], 'warning': agent_warning},
+            {'tool_calls': [], 'warning': agent_warning},
             session_id='sess-1',
         )
 
@@ -561,16 +561,20 @@ async def test_no_tool_calls_drops_unknown_warning_origin(agent_warning):
     )
 
 
-def test_cli_warning_origins_matches_the_tokens_call_llm_cli_synthesises():
+def test_cli_warning_origins_matches_the_tokens_call_claude_cli_synthesises():
     """The closed vocabulary must not drift from its only producer.
 
-    _call_llm_cli builds {'warning': 'cli_output_unparseable'} and
-    {'warning': 'cli_output_empty'} as literals; if either is renamed without
-    updating CLI_WARNING_ORIGINS, run() would silently start dropping a real
-    diagnosis.  Pin the set.
+    _call_claude_cli builds {'warning': 'cli_output_unparseable'},
+    {'warning': 'cli_output_empty'} and (task 6022) {'warning': 'api_refusal'}
+    as literals; if any is renamed without updating CLI_WARNING_ORIGINS, run()
+    would silently start dropping a real diagnosis.  Pin the set.
     """
-    assert set(CLI_WARNING_ORIGINS) == {'cli_output_unparseable', 'cli_output_empty'}, (
-        f'CLI_WARNING_ORIGINS drifted from _call_llm_cli: {CLI_WARNING_ORIGINS!r}'
+    assert set(CLI_WARNING_ORIGINS) == {
+        'cli_output_unparseable',
+        'cli_output_empty',
+        'api_refusal',
+    }, (
+        f'CLI_WARNING_ORIGINS drifted from _call_claude_cli: {CLI_WARNING_ORIGINS!r}'
     )
 
 
@@ -1124,7 +1128,7 @@ def _cli_result_json(structured_output: dict, session_id: str = 'sess-1') -> byt
 async def test_claude_cli_response_adapter():
     """_CLIResponseAdapter produces correct _TextBlock/_ToolUseBlock."""
     structured = {
-        'thinking': 'I should consolidate memories.',
+        'text': 'I should consolidate memories.',
         'tool_calls': [
             {'id': 'tc1', 'name': 'search_memory', 'input': {'query': 'test'}},
             {'id': 'tc2', 'name': 'delete_memory', 'input': {'id': 'mem-1'}},
@@ -1146,10 +1150,10 @@ async def test_claude_cli_response_adapter():
 
 
 @pytest.mark.asyncio
-async def test_claude_cli_response_adapter_no_thinking():
-    """_CLIResponseAdapter handles empty thinking."""
+async def test_claude_cli_response_adapter_no_text():
+    """_CLIResponseAdapter handles empty text."""
     structured = {
-        'thinking': '',
+        'text': '',
         'tool_calls': [{'id': 'tc1', 'name': 'stage_complete', 'input': {}}],
     }
     adapter = _CLIResponseAdapter(structured)
@@ -1195,7 +1199,7 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     """_call_claude_cli delegates to invoke_with_cap_retry instead of managing subprocess.
 
     Confirms that the new interface passes `prompt` and `tools` kwargs and that
-    the returned adapter exposes `.thinking`, `.tool_calls`, and `.session_id`.
+    the returned adapter exposes `.text`, `.tool_calls`, and `.session_id`.
     The dead `response` field has been dropped from both the schema and the
     adapter (Task 899 step-1/step-2).
     """
@@ -1212,7 +1216,7 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'reasoning',
+            'text': 'reasoning',
             'tool_calls': [],
         },
     )
@@ -1263,8 +1267,8 @@ async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
     else:
         assert call_positional[0] is fake_gate
 
-    # Adapter must expose direct attribute access for thinking/tool_calls/session_id.
-    assert result.thinking == 'reasoning'
+    # Adapter must expose direct attribute access for text/tool_calls/session_id.
+    assert result.text == 'reasoning'
     assert result.tool_calls == []
     assert result.session_id == 'sess-1'
 
@@ -1297,7 +1301,7 @@ async def test_call_claude_cli_passes_a_workable_max_turns():
         success=True,
         output='',
         session_id='sess-1',
-        structured_output={'thinking': 'reasoning', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1336,7 +1340,7 @@ async def test_call_claude_cli_threads_session_id_across_turns():
     fake_gate = make_gate_mock()
     config = _make_cli_config()
     tools: list = []
-    structured = {'thinking': '', 'tool_calls': []}
+    structured = {'tool_calls': []}
 
     first_result = AgentResult(
         success=True, output='', session_id='sess-A', structured_output=structured
@@ -1392,7 +1396,7 @@ async def test_call_claude_cli_clears_session_id_on_exception(raised_exc):
     fake_gate = make_gate_mock()
     config = _make_cli_config()
     tools: list = []
-    structured = {'thinking': '', 'tool_calls': []}
+    structured = {'tool_calls': []}
 
     first_result = AgentResult(
         success=True, output='', session_id='sess-A', structured_output=structured
@@ -1448,7 +1452,7 @@ async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
         success=True,
         output='',
         session_id='sess-cwd',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     # Patch at the level below invoke_with_cap_retry — this exercises the
@@ -1506,7 +1510,7 @@ async def test_agent_loop_explicit_cwd_overrides_config_explore_root(tmp_path):
         success=True,
         output='',
         session_id='sess-cwd-explicit',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1558,7 +1562,7 @@ async def test_agent_loop_cwd_defaults_to_config_explore_root(tmp_path):
         success=True,
         output='',
         session_id='sess-cwd-default',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1606,7 +1610,7 @@ async def test_explicit_cwd_survives_forwarding_to_invoke_claude_agent(tmp_path)
         success=True,
         output='',
         session_id='sess-cwd-fwd',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1636,8 +1640,8 @@ async def test_call_claude_cli_scopes_mcp_to_no_servers():
     """_call_claude_cli strict-scopes its run to ZERO MCP servers.
 
     ``disallowed_tools=['*']`` alone does NOT keep MCP tools unreachable here:
-    under an ``output_schema`` cli_invoke expands the wildcard into a
-    BUILT-INS-ONLY deny-list carrying no MCP tool pattern, and ``cwd`` is
+    under an ``output_schema`` cli_invoke turns the wildcard into
+    ``--tools ''``, a registry filter that does not cover MCP tools, and ``cwd`` is
     ``explore_codebase_root`` (the project root, task 1989), which holds a live
     ``.mcp.json`` the CLI would ambient-merge — under ``bypassPermissions``,
     that is unreviewed access to tools like ``halt_scheduler`` /
@@ -1655,7 +1659,7 @@ async def test_call_claude_cli_scopes_mcp_to_no_servers():
         success=True,
         output='',
         session_id='sess-mcp',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -1718,7 +1722,7 @@ async def test_call_claude_cli_forwards_mcp_scoping_to_invoke_claude_agent(tmp_p
         success=True,
         output='',
         session_id='sess-mcp-deep',
-        structured_output={'thinking': '', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     # autospec (not a bare AsyncMock): validates every kwarg against the real
@@ -1787,7 +1791,6 @@ def _two_turn_my_tool_fixture():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'calling my_tool',
             'tool_calls': [{'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}}],
         },
     )
@@ -1797,7 +1800,6 @@ def _two_turn_my_tool_fixture():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'done',
             'tool_calls': [
                 {'id': 'tc2', 'name': 'stage_complete', 'input': {'report': {'result': 14}}}
             ],
@@ -1972,7 +1974,6 @@ async def test_run_threads_parallel_tool_results_with_double_newline_joiner():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'calling two tools',
             'tool_calls': [
                 {'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}},
                 {'id': 'tc2', 'name': 'other_tool', 'input': {'x': 5}},
@@ -1985,7 +1986,6 @@ async def test_run_threads_parallel_tool_results_with_double_newline_joiner():
         output='',
         session_id='sess-1',
         structured_output={
-            'thinking': 'done',
             'tool_calls': [
                 {'id': 'tc3', 'name': 'stage_complete', 'input': {'report': {'ok': True}}}
             ],
@@ -2106,7 +2106,7 @@ class TestAgentLoopCapWaitSanityBound:
         empty_result = AgentResult(
             success=True,
             output='',
-            structured_output={'thinking': '', 'tool_calls': []},
+            structured_output={'tool_calls': []},
         )
         mock = AsyncMock(return_value=empty_result)
         with patch(
@@ -2186,7 +2186,7 @@ async def test_call_claude_cli_legitimate_empty_calls_no_warning(caplog):
         success=True,
         output='',
         session_id='s',
-        structured_output={'thinking': 'x', 'tool_calls': []},
+        structured_output={'tool_calls': []},
     )
 
     with patch(
@@ -2259,3 +2259,141 @@ async def test_call_claude_cli_empty_structured_output_emits_warning(
         f'Expected adapter.warning == "cli_output_empty", got {adapter.warning!r}'
     )
     assert adapter.tool_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Task 6022: API usage-policy refusals (reasoning_extraction)
+# ---------------------------------------------------------------------------
+
+_MEASURED_REFUSAL_OUTPUT = (
+    "API Error: Sonnet 5.5's safeguards flagged this message "
+    '(https://www.anthropic.com/legal/aup). This sometimes happens with safe, '
+    "normal conversations. Claude Code can't respond to this message with "
+    'Sonnet 5.5.\n\nRequest ID: req_x'
+)
+
+
+def _refused_cli_result() -> AgentResult:
+    return AgentResult(
+        success=False,
+        output=_MEASURED_REFUSAL_OUTPUT,
+        subtype='success',
+        stop_reason='refusal',
+        session_id='sess-r',
+    )
+
+
+def _terminal_cli_result() -> AgentResult:
+    return AgentResult(
+        success=True,
+        output='',
+        session_id='sess-ok',
+        structured_output={
+            'tool_calls': [{'id': 'tc1', 'name': 'stage_complete', 'input': {}}],
+        },
+    )
+
+
+def _cli_agent_with_terminal_tool() -> AgentLoop:
+    return AgentLoop(
+        config=_make_cli_config(),
+        system_prompt='Test system prompt',
+        tools={
+            'stage_complete': ToolDefinition(
+                name='stage_complete',
+                description='Complete',
+                parameters={'type': 'object', 'properties': {}},
+                function=lambda **kw: kw,
+            ),
+        },
+        terminal_tool='stage_complete',
+    )
+
+
+@pytest.mark.asyncio
+async def test_cli_invocation_requests_no_reasoning_emission():
+    """Task 6022 measured that a required reasoning field (a "thinking" field
+    plus an instruction to "explain your reasoning" in it) gets verify refused by the
+    API's reasoning_extraction classifier.  Any new schema property must be
+    re-probed with fused-memory/scripts/probe_schema_max_turns.py first.
+
+    The schema's property set is the pin.  The two system-prompt substring
+    checks catch only a revert of the exact removed instruction; a reworded
+    request for the model's reasoning would pass them.
+    """
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = _terminal_cli_result()
+        await _cli_agent_with_terminal_tool().run('p')
+
+    call_kwargs = mock_invoke.call_args.kwargs
+    output_schema = call_kwargs['output_schema']
+    assert set(output_schema['properties']) == {'tool_calls'}
+    assert output_schema['required'] == ['tool_calls']
+    assert '"thinking"' not in call_kwargs['system_prompt']
+    assert 'explain your reasoning' not in call_kwargs['system_prompt']
+
+
+@pytest.mark.asyncio
+async def test_api_refusal_ends_run_with_structured_origin(caplog):
+    """A refused call ends the run as a no-tool-call exit whose origin is the
+    closed-vocabulary token 'api_refusal', instead of raising — so verify()
+    writes an audited agent_failed row rather than a prose-only error row.
+    The refused session is never resumed: the CLI says it cannot continue.
+    """
+    agent = _cli_agent_with_terminal_tool()
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.side_effect = [_refused_cli_result(), _terminal_cli_result()]
+
+        with caplog.at_level(logging.WARNING):
+            payload, _entries = await agent.run('p')
+        await agent.run('p2')
+
+    assert payload.get('warning') == 'no_tool_calls'
+    assert payload.get('warning_origin') == 'api_refusal'
+
+    warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any('api_refusal' in m and 'req_x' in m for m in warning_messages), (
+        f'Expected a WARNING naming api_refusal and the request id, got: {warning_messages}'
+    )
+
+    assert mock_invoke.call_args_list[1].kwargs['resume_session_id'] is None
+
+
+@pytest.mark.asyncio
+async def test_api_refusal_is_counted_like_any_returned_call():
+    """A refused call reached the model and was billed, so it counts toward
+    llm_call_count and token_count exactly as a successful call does.
+    """
+    refused = replace(_refused_cli_result(), input_tokens=30, output_tokens=12)
+    agent = _cli_agent_with_terminal_tool()
+
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = refused
+        await agent.run('p')
+
+    assert agent.llm_call_count == 1
+    assert agent.token_count == 30 + 12
+
+
+@pytest.mark.asyncio
+async def test_non_refusal_cli_failure_still_raises():
+    """Only a refusal is converted; every other CLI failure still raises."""
+    with patch(
+        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
+        new_callable=AsyncMock,
+    ) as mock_invoke:
+        mock_invoke.return_value = AgentResult(
+            success=False, output='', subtype='error_max_turns', stop_reason=None
+        )
+        with pytest.raises(RuntimeError):
+            await _cli_agent_with_terminal_tool().run('p')

@@ -2,12 +2,14 @@
 """MANUAL diagnostic: measure the ``--max-turns`` x ``--json-schema`` interaction.
 
 Task 3241.  This docstring is the single record of the measured numbers behind
-every ``max_turns`` floor on a ``--json-schema`` invocation in fused-memory
+the recon-verify invocation SHAPE: every ``max_turns`` floor on a
+``--json-schema`` invocation in fused-memory
 (``agent_loop.py::_AGENT_CLI_MAX_TURNS``, ``judge.py::_JUDGE_CLI_MAX_TURNS``,
-and the curator / path-scope-adjudicator ``ge=3`` floors).  Those sites state
-the mechanism and point here; rates, sample sizes and CLI versions live only
-below.  The behaviour is CLI-VERSION-DEPENDENT: re-run this script rather than
-trusting a number copied anywhere else.
+and the curator / path-scope-adjudicator ``ge=3`` floors), and the property set
+of ``agent_loop.py::CLAUDE_CLI_RESPONSE_SCHEMA`` (task 6022, below).  Those
+sites state the mechanism and point here; rates, sample sizes and CLI versions
+live only below.  The behaviour is CLI-VERSION-DEPENDENT: re-run this script
+rather than trusting a number copied anywhere else.
 
 NOT part of the pytest suite, deliberately.  It requires live Claude CLI
 credentials and spends real tokens; the suite stays hermetic and offline.
@@ -33,6 +35,42 @@ rate of a few tens of percent.
 ``num_turns == max_turns + 1``, but successes at mt=10 reported 9, 11 and 14.
 
 The judge's shape (``--shape judge``) has no recorded baseline yet.
+
+Task 6022: reasoning_extraction refusals
+----------------------------------------
+Measured on Claude CLI 2.1.285, model alias ``sonnet`` = Sonnet 5.5, one pool
+account (max-g; the others were capped or org-disabled at the time).
+
+Provenance: these runs used the pre-task-3995 argv, where
+``disallowed_tools=['*']`` with an ``output_schema`` expanded into an
+enumerated built-in deny list.  Task 3995 has since replaced that with
+``--tools ''``.  Both strip real tools, and the bisected variable (the
+"thinking" schema field plus its prompt instruction) is independent of tool
+scoping.  Still, record the argv when re-running so results compare like for
+like.
+
+* End-to-end ``CodebaseVerifier.verify()`` on the claims of production-refused
+  tasks 5546, 4449, 6017 and 5945, with a required "thinking" schema field plus
+  the system-prompt line telling the model to use it to "explain your
+  reasoning": 4 of 4 refused.  One refusal came at outer step 3 (after two
+  tool-call steps); the others at step 1.
+* The same 4 tasks with that field and that line removed: 4 of 4 real verdicts
+  (3 confirmed, 1 inconclusive), 3 to 4 steps each with real tool calls.
+* Single-shot recon-verify shape: baseline 1 of 2 reached runs refused; field
+  removed 0 of 2; field renamed to "notes" 0 of 1.
+* The refused CLI JSON carries ``stop_reason='refusal'``,
+  ``terminal_reason='api_error'``, ``is_error=true``, ``subtype='success'``
+  and ``api_error_status=null``.  Its ``result`` text varies by model version
+  (Sonnet 5 named ``[reasoning_extraction]``; Sonnet 5.5 said its "safeguards
+  flagged this message"), which is why ``classify_agent_failure`` keys
+  ``API_REFUSAL`` on ``stop_reason`` and never on the prose.  Such runs are
+  reported here as ``api_refusal``.
+
+Hypothesis, not observable from outside the API: a required output field named
+"thinking", together with an instruction to explain reasoning in it, reads to
+the classifier as an attempt to extract the model's chain of thought.  The
+refusal is STOCHASTIC per call, so re-run any schema or prompt change with
+repeats rather than trusting a single clean run.
 
 Usage
 -----
@@ -90,7 +128,9 @@ for _p in (_FM_SRC, _SHARED_SRC):
         sys.path.insert(0, str(_p))
 
 from shared.cli_invoke import (  # noqa: E402
+    AgentFailureKind,
     AgentResult,
+    classify_agent_failure,
     invoke_claude_agent,
     no_mcp_servers_config,
 )
@@ -128,6 +168,9 @@ _OUTCOME_TIMEOUT = 'timed_out'
 _OUTCOME_AUTH = 'auth_failure'
 _OUTCOME_CREDIT = 'credit_exhausted'
 _OUTCOME_OTHER = 'other_failure'
+# The API's usage-policy safeguards refused the call (task 6022).  The run DID
+# reach the model, so unlike auth/credit it stays in the success-rate denominator.
+_OUTCOME_API_REFUSAL = 'api_refusal'
 # Not a CLI error at all: a success whose payload carries an EMPTY tool_calls
 # array.  agent_loop's run() reads that as the `no_tool_calls` sentinel and ends
 # the turn, so it is a SILENT failure mode distinct from error_max_turns and has
@@ -434,6 +477,11 @@ def _classify(
         auth_or_credit = _classify_failure_text(result.output + result.stderr)
         if auth_or_credit is not None:
             return auth_or_credit, 'NOT a turn-cap failure — this run never reached the model.'
+        if classify_agent_failure(result).kind == AgentFailureKind.API_REFUSAL:
+            return _OUTCOME_API_REFUSAL, (
+                'Refused by API usage-policy safeguards (stop_reason=refusal), '
+                'NOT a turn-cap failure.'
+            )
         if result.schema_tool_denied:
             return _OUTCOME_OTHER, 'StructuredOutput was DENIED — a config break, not a turn-cap failure.'
         if result.timed_out:

@@ -610,6 +610,147 @@ class ReconciliationJournal:
             return None
         return _row_to_run(row)
 
+    #: Run statuses at which ``runs.stage_reports`` is known to have been
+    #: PERSISTED, i.e. every status :meth:`complete_run` can write.
+    #:
+    #: ``reconciliation/harness.py`` mutates ``run.stage_reports`` in memory as
+    #: each stage returns and persists the whole blob after the stage loop —
+    #: from the success path, the error handlers, or the terminal ``finally``
+    #: backstop, each of which completes the run in the same breath. A run on
+    #: its first attempt therefore leaves the column reading ``'{}'`` however
+    #: many stages have finished.
+    #:
+    #: Stated as the statuses that DO persist, not the one that does not, so a
+    #: future non-terminal status reads as unsettled — an inconclusive answer —
+    #: rather than as a confident wrong one.
+    _STAGE_REPORTS_PERSISTED_STATUSES = frozenset(
+        {
+            RunStatus.completed.value,
+            RunStatus.failed.value,
+            RunStatus.rolled_back.value,
+            RunStatus.circuit_breaker.value,
+            RunStatus.interrupted.value,
+        }
+    )
+
+    @staticmethod
+    def _stage_reports_are_settled(
+        run_status: str | None, resumed: bool | None
+    ) -> bool:
+        """Is ``stage_reports`` a FINISHED account of the run, safe to read as
+        evidence that a stage did or did not execute?
+
+        A persisted status is necessary but not sufficient, because
+        ``'interrupted'`` is the one terminal status a run can leave: the
+        startup pass (``reconciliation/harness.py::_resume_interrupted_runs``)
+        adopts exactly those runs, and ``run_full_cycle`` marks the adopted run
+        running only on the in-memory object — :meth:`complete_run` is the sole
+        writer of the column, so a run re-executing this very stage still reads
+        back ``'interrupted'`` on disk. Pairing that terminal-looking status
+        with the stale blob its interrupted attempt flushed is worse than the
+        empty first-attempt case: the stage key is absent precisely BECAUSE
+        this attempt has not re-filed it yet, which is the shape most likely to
+        be a genuine lost write.
+
+        ``_resume`` bookkeeping is persisted before the adopt, so its presence
+        is the durable signal. A resumed run that has since reached any other
+        terminal status has been flushed by that run's own ``finally`` and is
+        settled again, which is why this narrows ``'interrupted'`` alone rather
+        than distrusting every run that was ever resumed.
+        """
+        if run_status not in ReconciliationJournal._STAGE_REPORTS_PERSISTED_STATUSES:
+            return False
+        if run_status == RunStatus.interrupted.value:
+            return resumed is False
+        return True
+
+    async def get_run_stage_execution(
+        self, project_id: str, run_id: str, stage: str
+    ) -> dict | None:
+        """Did ``stage`` execute during ``run_id``? Narrow, read-only projection.
+
+        Answers the one question the recon ledger cannot: a gc()-reaped
+        ``cycle_summary`` row is hard-DELETEd, so an absent row is byte-for-byte
+        indistinguishable from one that was never written. The ``runs`` table
+        carries no TTL and therefore outlives the ledger, which is what makes
+        the distinction recoverable at all. Sole caller today is
+        ``services/memory_service.py::MemoryService.get_cycle_summary_presence``.
+
+        ``stage_ran`` is deliberately three-valued:
+
+        - ``True``  — positive evidence the stage executed (it filed a report).
+        - ``False`` — positive evidence it did not, and it stays true regardless
+          of TTL, which is why the presence reader ranks it above "expired".
+        - ``None``  — INDETERMINATE: the stored ``stage_reports`` blob did not
+          parse as a JSON object. That is a fault, not a state, so it is logged
+          at WARNING and must never be collapsed into ``False`` — doing so would
+          silently suppress a real data-loss finding.
+
+        The membership test is keyed on ``stage``, never "is there any report at
+        all": ``reconciliation/harness.py`` writes the out-of-band ``_error`` and
+        ``_resume`` keys straight into ``run.stage_reports`` before persisting,
+        and a run holding only those did not run the stage.
+
+        ``settled`` is the signal a caller weighing ``stage_ran`` as evidence
+        should consume: ``stage_ran=False`` means "the stage never ran" ONLY
+        when the blob is a finished account of the run. Deciding that needs
+        harness lifecycle knowledge — which statuses flush the blob, and that
+        an adopted run is executing again behind a terminal-looking disk status
+        — so it is answered here, next to the read, rather than re-derived by
+        every consumer (see :meth:`_stage_reports_are_settled`).
+
+        ``resumed`` is the raw evidence behind that verdict: whether the
+        ``_resume`` key is present, i.e. whether the startup adopt-and-resume
+        pass (``reconciliation/harness.py::_resume_interrupted_runs``) has taken
+        this run over at least once. It is three-valued for the same reason
+        ``stage_ran`` is — an unparseable blob answers neither question, and
+        collapsing it to ``False`` would read as positive evidence the run was
+        never adopted.
+
+        Scoped by ``project_id`` — tighter than ``get_run``, which is keyed on
+        ``id`` alone — to match the project-scoped identity of the ledger row it
+        explains. A projection rather than a reuse of ``get_run`` because that
+        is ``SELECT *`` piped through ``_row_to_run``, materialising every
+        ``StageReport`` including the multi-KB ``items_flagged`` blobs, when four
+        columns answer the question.
+
+        Returns ``None`` when no such run row exists for that project.
+        """
+        row = await self._require_access().read_one(
+            """SELECT status, stage_reports, started_at, completed_at
+               FROM runs WHERE id = ? AND project_id = ?""",
+            (run_id, project_id),
+        )
+        if row is None:
+            return None
+
+        try:
+            reports = json.loads(row['stage_reports'] or '{}')
+            if not isinstance(reports, dict):
+                raise ValueError('stage_reports is not a JSON object')
+            stage_ran = stage in reports
+            resumed = '_resume' in reports
+        except (TypeError, ValueError):
+            logger.warning(
+                'reconciliation.get_run_stage_execution: '
+                'unparseable stage_reports for project_id=%s run_id=%s; '
+                'cannot tell whether stage=%s ran, reporting indeterminate',
+                project_id,
+                run_id,
+                stage,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            stage_ran = None
+            resumed = None
+
+        return {
+            'status': row['status'],
+            'stage_ran': stage_ran,
+            'resumed': resumed,
+            'settled': self._stage_reports_are_settled(row['status'], resumed),
+            'started_at': row['started_at'],
+            'completed_at': row['completed_at'],
+        }
     async def get_run_with_stage_reports_text(
         self, run_id: str
     ) -> tuple[ReconciliationRun, str | None] | None:

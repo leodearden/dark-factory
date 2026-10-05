@@ -25,6 +25,9 @@ The pgid MUST be captured by the caller immediately after spawn::
     except TimeoutError:
         await terminate_process_group(proc, pgid, grace_secs=5.0)
 
+``terminate_process_group`` gives the group a graceful SIGTERM grace period;
+``sigkill_process_group`` kills it at once and leaves the reap to the caller.
+
 Why the caller captures pgid instead of the helper calling
 ``os.getpgid(proc.pid)``:
 - Once ``proc`` has been reaped (``proc.returncode is not None``), the kernel
@@ -59,8 +62,8 @@ Limitations
 If a grandchild calls ``setsid()`` on its own it will escape into a new
 session and process group, making it invisible to ``killpg``.  This is
 acceptable for the current codebase because cargo/rustc do not call
-``setsid``.  Git sub-processes spawned by short-lived helpers are out of
-scope (they are bounded and never appear in stuck-process incidents).
+``setsid``.  ``shared.git_async``'s children are group-killed through
+``sigkill_process_group`` when interrupted (task 4155).
 """
 
 from __future__ import annotations
@@ -91,14 +94,24 @@ logger = logging.getLogger(__name__)
 _PROC_ROOT = Path('/proc')
 
 
-class _StatFields(NamedTuple):
+def _read_proc_text(path: Path) -> str:
+    """Read a /proc text field for display; raises only OSError.
+
+    Its bytes are arbitrary (a process sets its own comm and argv), so
+    undecodable ones become U+FFFD rather than raising.  Pathnames that are
+    compared, not displayed, need ``os.fsdecode`` instead.
+    """
+    return path.read_bytes().decode('utf-8', 'replace')
+
+
+class StatFields(NamedTuple):
     comm: str
     state: str
     ppid: int
     pgrp: int
 
 
-def _read_stat_fields(entry: Path) -> _StatFields | None:
+def read_stat_fields(entry: Path) -> StatFields | None:
     """Parse ``<entry>/stat`` (entry = /proc/<pid>); None if unreadable or malformed.
 
     comm is delimited by the LAST ``)``, so a comm containing spaces or parens
@@ -106,7 +119,7 @@ def _read_stat_fields(entry: Path) -> _StatFields | None:
     rather than costing the pid its entry.
     """
     try:
-        text = (entry / 'stat').read_bytes().decode('utf-8', 'replace')
+        text = _read_proc_text(entry / 'stat')
     except OSError:
         return None
     rparen = text.rfind(')')
@@ -115,7 +128,7 @@ def _read_stat_fields(entry: Path) -> _StatFields | None:
     comm = text[text.find('(') + 1 : rparen]
     fields = text[rparen + 2 :].split()
     try:
-        return _StatFields(
+        return StatFields(
             comm=comm, state=fields[0], ppid=int(fields[1]), pgrp=int(fields[2])
         )
     except (IndexError, ValueError):
@@ -174,13 +187,13 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
             continue
         pid = int(entry.name)
 
-        fields = _read_stat_fields(entry)
+        fields = read_stat_fields(entry)
         if fields is None or fields.pgrp != pgid:
             continue
 
         # Read wchan (kernel function the task is blocked in, or '0' when running).
         try:
-            wchan = (entry / 'wchan').read_text().strip()
+            wchan = _read_proc_text(entry / 'wchan').strip()
         except OSError:
             wchan = '?'
 
@@ -190,8 +203,7 @@ def _snapshot_process_group_unsafe(pgid: int) -> str:
         # log friendliness.  Mirrors the wchan try/except idiom so
         # snapshot_process_group never raises (module invariant).
         try:
-            raw = (entry / 'cmdline').read_bytes()
-            cmdline = raw.replace(b'\x00', b' ').decode('utf-8', 'replace').strip()
+            cmdline = _read_proc_text(entry / 'cmdline').replace('\x00', ' ').strip()
             if not cmdline:
                 cmdline = fields.comm  # kernel thread — fall back to short comm
             if len(cmdline) > 200:
@@ -303,6 +315,43 @@ async def terminate_process_group(
             await asyncio.wait_for(proc.wait(), grace_secs)
 
 
+def sigkill_process_group(proc: asyncio.subprocess.Process, pgid: int) -> None:
+    """SIGKILL group *pgid* at once; signal-only, never raises, never reaps.
+
+    *pgid* must be the value frozen at a ``start_new_session=True`` spawn of
+    *proc* — see the module docstring's "Why the caller captures pgid".  The
+    caller owns ``await proc.wait()``.
+
+    Immediate SIGKILL rather than :func:`terminate_process_group`'s SIGTERM
+    stage: that helper stops escalating once the LEADER exits, so a grandchild
+    that ignores SIGTERM would survive.
+
+    An already-reaped *proc* gets no signal (its pid may be recycled).  A
+    refused or failed group kill degrades to a direct ``proc.kill()``, which is
+    safe while the pid is unreaped.
+    """
+    if proc.returncode is not None:
+        return
+
+    reason = unsafe_pgid_reason(pgid, proc.pid)
+    if reason is not None:
+        logger.error(
+            'sigkill_process_group: refusing to killpg — %s. '
+            'Falling back to a direct kill() of pid %s.',
+            reason,
+            proc.pid,
+        )
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+        return
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+
+
 # ---------------------------------------------------------------------------
 # At-or-under /proc scan + foreign-pgid reap (task 2828 startup survivor
 # barrier). These generalize the two idioms above — the snapshot /proc-walk
@@ -345,7 +394,7 @@ def _group_members_by_pgid(pgids: Iterable[int]) -> dict[int, list[ProcessGroupM
     for entry in entries:
         if not entry.name.isdigit():
             continue
-        fields = _read_stat_fields(entry)
+        fields = read_stat_fields(entry)
         if fields is None or fields.pgrp not in members:
             continue
         members[fields.pgrp].append(
@@ -416,6 +465,10 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
     Short-circuits cheapest-first: cwd, then open fds, then mmap'd pathnames
     from ``maps``.  Every per-pid I/O is wrapped so a vanished or
     permission-denied pid is skipped rather than raising (module invariant).
+    ``maps`` pathnames are decoded with ``os.fsdecode``, the surrogateescape
+    str space ``os.readlink`` returns for the cwd and fd signals, and lines are
+    split only on ``'\\n'``, the one byte the kernel escapes in them, so a
+    pathname holding any other byte compares correctly and never raises.
     """
     # 1. cwd — the most common and cheapest signal (cargo/rustc run in the tree).
     with contextlib.suppress(OSError):
@@ -434,10 +487,10 @@ def _pid_references_path_at_or_under(entry: Path, root: str) -> bool:
 
     # 3. mmap'd pathnames — an mmap'd .rlib / .so living under the tree.
     try:
-        maps_text = (entry / 'maps').read_text()
+        maps_text = os.fsdecode((entry / 'maps').read_bytes())
     except OSError:
         return False
-    for line in maps_text.splitlines():
+    for line in maps_text.split('\n'):
         # maps line: "addr perms offset dev inode  pathname" — pathname is the
         # 6th field (may contain spaces; keep it whole with maxsplit=5). Skip
         # anonymous/special regions ([heap], [stack], anon → no leading '/').
@@ -469,7 +522,7 @@ def _scan_process_groups_under_path_unsafe(root: str, exclude_pgids: Iterable[in
         if not entry.name.isdigit():
             continue
 
-        fields = _read_stat_fields(entry)
+        fields = read_stat_fields(entry)
         if fields is None:
             continue
         pgrp = fields.pgrp

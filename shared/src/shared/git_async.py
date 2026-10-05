@@ -60,13 +60,20 @@ locale the matcher silently stops recognising it, defeating the R3
 ENOENT-tolerance fix for the 4892-class warm-lane FAULT. Do not "simplify"
 this away.
 
-CANCELLATION SAFETY (task 2608). If the ``communicate()`` await is
+CANCELLATION SAFETY (tasks 2608, 4155). If the ``communicate()`` await is
 interrupted — a caller-side ``asyncio.wait_for``, an outer cancellation, or
 this module's own ``timeout`` — the spawned child would otherwise keep
 running as an orphan holding its stdout/stderr pipes open. For a
 persistently-hung script that recurred every scheduler sweep, leaking a
-process and file descriptors each time. The child is best-effort killed and
-reaped on every interrupted path.
+process and file descriptors each time. Every interrupted path therefore
+SIGKILLs the child's whole process group, so helpers a script forked die with
+it (task 2608 killed only the direct child), then best-effort reaps the child.
+The accepted residual: if the child has already exited and been reaped — a
+script that backgrounded a pipe-holding helper and exited — no signal is sent,
+since its pid may have been recycled (``shared.proc_group``'s house trade-off).
+
+Each child leads a new session, so it has no controlling terminal: a git
+credential or ssh-passphrase prompt fails fast instead of blocking on a tty.
 
 FAIL-OPEN VS RAISE. A non-zero returncode and a timeout are RETURNED as
 data (``GitResult.ok`` is False), never raised: every fused-memory probe
@@ -86,6 +93,8 @@ from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from weakref import WeakKeyDictionary
+
+from shared.proc_group import sigkill_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -142,10 +151,9 @@ def _semaphore_for_running_loop() -> asyncio.Semaphore:
     return sem
 
 
-async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
-    """Best-effort kill + reap of an interrupted child. Never raises."""
-    with contextlib.suppress(ProcessLookupError):
-        proc.kill()  # may already have exited
+async def _kill_and_reap(proc: asyncio.subprocess.Process, pgid: int) -> None:
+    """Best-effort group kill + reap of an interrupted child. Never raises."""
+    sigkill_process_group(proc, pgid)
     with contextlib.suppress(BaseException):
         await proc.wait()  # reap is best-effort; never let it mask the original error
 
@@ -208,7 +216,9 @@ async def _spawn_and_communicate(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=env,
+        start_new_session=True,
     )
+    pgid = proc.pid  # frozen at spawn: see shared.proc_group's module docstring (task 845)
     communicate = proc.communicate(
         input=input_text.encode() if input_text is not None else None,
     )
@@ -222,7 +232,7 @@ async def _spawn_and_communicate(
         # the child is still alive: kill + reap it before degrading. This
         # branch DEGRADES (returns a result), so it logs loudly — a silent
         # timeout is indistinguishable from a clean negative answer.
-        await _kill_and_reap(proc)
+        await _kill_and_reap(proc, pgid)
         logger.warning(
             'git_async.timeout cmd=%s cwd=%s timeout=%.3fs rc=%s '
             '(child killed and reaped; returning fail-open timed-out result)',
@@ -237,10 +247,10 @@ async def _spawn_and_communicate(
     except BaseException:
         # The await was interrupted by something OTHER than our own timeout —
         # most commonly asyncio.CancelledError from a caller-side wait_for.
-        # Kill + reap so the child does not leak as an orphan (task 2608),
+        # Kill + reap so the child's group does not leak (tasks 2608/4155),
         # then propagate the original exception unchanged. No log here: this
         # path re-raises, so it is not a silent fallthrough.
-        await _kill_and_reap(proc)
+        await _kill_and_reap(proc, pgid)
         raise
     return GitResult(
         returncode=proc.returncode if proc.returncode is not None else 1,

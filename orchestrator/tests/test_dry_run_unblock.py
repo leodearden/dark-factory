@@ -1875,7 +1875,7 @@ class _ForcedCapUsageGate:
     active_account_name = 'forced-cap-account'
     soonest_resets_at = None
 
-    def invoke_slot(self, scope=None):
+    def invoke_slot(self, scope=None, *, park=True):
         return _ForcedCapSlot()
 
 

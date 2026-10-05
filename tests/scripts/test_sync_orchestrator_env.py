@@ -18,8 +18,11 @@ Both assert on the PARSED invocation rather than on a substring of the file,
 because a substring check cannot tell an argument from a word in a comment, and
 this file discusses the very commands it runs.
 """
+import os
 import pathlib
 import shlex
+import shutil
+import subprocess
 
 from systemd_unit_invariants import ALL_ORCHESTRATOR_SERVICE_FILES
 
@@ -249,4 +252,60 @@ def test_sync_stops_every_committed_orchestrator_unit() -> None:
         "already stops its TIMER first and starts it last precisely so a 60s "
         "probe cannot revive a unit mid-sync. Stopping the service here would "
         "not stop the timer and would break that ordering."
+    )
+
+
+def _write_fake_tool(path: pathlib.Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\n{body}\n")
+    path.chmod(0o755)
+
+
+def test_sync_resolves_uv_before_stopping_anything(tmp_path: pathlib.Path) -> None:
+    """uv must be resolved BEFORE the watchdog timer or any unit is stopped.
+
+    Resolving it only at `"$UV" sync` means an unresolvable uv is discovered
+    after the whole fleet is already down, and the script exits there with
+    every orchestrator stopped. Resolving first aborts with the fleet still up.
+
+    Runs the REAL script with an unusable UV_BIN pin and fake systemctl,
+    pgrep and sleep first on PATH. The fake pgrep ALWAYS reports a live
+    orchestrator: a script that resolves uv too late therefore aborts at its
+    liveness check, before it can ever reach a real `uv sync`. That is what
+    makes running this test against a regressed script safe.
+    """
+    fake_bin = tmp_path / "fake-bin"
+    systemctl_log = tmp_path / "systemctl.log"
+    _write_fake_tool(fake_bin / "systemctl", 'echo "$*" >> "$FAKE_SYSTEMCTL_LOG"\nexit 0')
+    _write_fake_tool(fake_bin / "pgrep", "exit 0")
+    _write_fake_tool(fake_bin / "sleep", "exit 0")
+
+    bad_uv = tmp_path / "bad-uv"
+    bad_uv.write_text("#!/bin/sh\nexit 0\n")
+    bad_uv.chmod(0o644)
+
+    home = tmp_path / "home"
+    home.mkdir()
+
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}{os.pathsep}/usr/bin{os.pathsep}/bin"
+    env["FAKE_SYSTEMCTL_LOG"] = str(systemctl_log)
+    env["HOME"] = str(home)
+    env["UV_BIN"] = str(bad_uv)
+
+    result = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", str(SYNC_SCRIPT)],
+        env=env, cwd=tmp_path, stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=60,
+    )
+    diag = f"rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
+
+    assert result.returncode != 0, diag
+    assert "sync-orchestrator-env.sh: ERROR:" in result.stderr, diag
+    assert str(bad_uv) in result.stderr, diag
+    stopped = systemctl_log.read_text() if systemctl_log.exists() else ""
+    assert stopped == "", (
+        f"{SYNC_SCRIPT.name} ran `systemctl {stopped.strip()!r}` before finding "
+        f"out it had no usable uv, so a failed resolution leaves the fleet down. "
+        f"Resolve uv before the first stop. {diag}"
     )

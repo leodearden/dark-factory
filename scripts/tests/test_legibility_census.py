@@ -30,8 +30,12 @@ import digest as digest_mod
 import filing_policy
 import inventory
 import pytest
-from legibility import census_trigger, unlanded
-from shared.cap_markers import BLOCKING_BANNER_MARKERS, REAL_CLI_CAP_MESSAGES
+from legibility import account_pool, census_trigger, session_runner, unlanded
+from shared.cap_markers import (
+    BLOCKING_BANNER_MARKERS,
+    REAL_CLI_CAP_HIT_MESSAGES,
+    REAL_CLI_CAP_MESSAGES,
+)
 
 import config as config_mod
 
@@ -622,7 +626,7 @@ def test_preflight_headroom_banner_match_is_case_insensitive():
 
 def test_preflight_headroom_invocation_error_defers_fail_safe():
     def raising_invoke(prompt, model):
-        raise coder.CoderInvocationError(
+        raise session_runner.InvocationFailed(
             "claude CLI exited 1 (model='sonnet'): simulated backend outage"
         )
 
@@ -4310,6 +4314,52 @@ def _write_legibility_yaml(project_root, *, config_path=None, project_id="dark_f
     return config_path
 
 
+class _SpyRunner:
+    """Stands in for the pooled session runner census.main opens: records
+    each stage it hands an invoker for, each call, and each close, and
+    answers every call with a parseable verdict."""
+
+    def __init__(self, label):
+        self.label = label
+        self.stages = []
+        self.calls = []
+        self.closed = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    def invoker(self, stage):
+        self.stages.append(stage)
+
+        def invoke(prompt, model):
+            self.calls.append((stage.name, model))
+            return '{"verified": true, "reason": "observed"}'
+
+        return invoke
+
+    def close(self):
+        self.closed += 1
+
+
+@pytest.fixture(autouse=True)
+def opened_runners(monkeypatch):
+    """Every runner census.main opens here is a :class:`_SpyRunner`, so no
+    main() test reads the real roster, the repo .env or the operator's
+    tokens. Returns the runners opened, in order."""
+    opened = []
+
+    def _open(label, **_kwargs):
+        runner = _SpyRunner(label)
+        opened.append(runner)
+        return runner
+
+    monkeypatch.setattr(session_runner, "open_pooled_runner", _open)
+    return opened
+
+
 def _make_fake_main_run_census(outcome=None):
     """Fake `run_census(**kwargs) -> CensusOutcome` seam for main()-level
     tests — records every call's kwargs in `.calls`, never touches a real
@@ -4342,7 +4392,9 @@ def test_main_force_bypasses_gate_and_calls_run_census(tmp_path, monkeypatch):
     assert fake_run_census.calls[0]["force"] is True
 
 
-def test_main_without_force_no_fire_noops_with_exit_zero(tmp_path, monkeypatch, capsys):
+def test_main_without_force_no_fire_noops_with_exit_zero(
+    tmp_path, monkeypatch, capsys, opened_runners,
+):
     _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
@@ -4356,6 +4408,7 @@ def test_main_without_force_no_fire_noops_with_exit_zero(tmp_path, monkeypatch, 
 
     assert exit_code == 0
     assert fake_run_census.calls == [], "a no-fire decision must never call run_census"
+    assert opened_runners == [], "a no-fire decision must open no pooled runner"
     out = capsys.readouterr().out
     assert "no-fire" in out.lower(), "an explanatory stdout line naming the no-fire decision"
     assert "max-interval: not yet due" in out
@@ -5122,12 +5175,10 @@ def test_own_endpoint_grant_does_not_outlive_its_block(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _build_stage_invokes — each census stage gets its OWN claude-CLI subprocess
-# timeout, threaded through the invoke(prompt, model) seam via
-# functools.partial(coder._invoke_cli, timeout=...). The shared 120s coder
-# default is fine for mining/headroom but fatal for the per-cluster Sonnet
-# verify-vs-main and the one large Fable synthesis; this is where that split
-# is bound.
+# census_stage_specs + main()'s runner — every census stage runs on ONE pooled
+# session runner (task 6042), each stage with its OWN timeout from
+# cfg.timeouts: the 120s mining default is fatal for the per-cluster Sonnet
+# verify-vs-main and the one large Fable synthesis.
 # ---------------------------------------------------------------------------
 
 def _config_with_timeouts(mining, verify, synthesis):
@@ -5145,71 +5196,126 @@ def _config_with_timeouts(mining, verify, synthesis):
     )
 
 
-def test_build_stage_invokes_threads_each_stage_timeout(monkeypatch):
-    # Record the timeout every stage invoke threads to coder._invoke_cli.
-    recorded = []
+def test_census_stage_specs_carry_each_stages_timeout_tools_and_the_project_cwd(tmp_path):
+    mining, verify, synthesis = mod.census_stage_specs(
+        _config_with_timeouts(111, 222, 333), project_root=tmp_path,
+    )
 
-    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None, cwd=None):
-        recorded.append(timeout)
-        return "dummy"
-
-    monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
-
-    cfg = _config_with_timeouts(111, 222, 333)
-    mining, verify, synth = mod._build_stage_invokes(cfg, project_root="/home/leo/src/dark-factory")
-
-    # Drive each partial exactly as its census seam does: two positional
-    # args, no kwargs (invoke(prompt, model)).
-    mining("p", "haiku")
-    verify("p", "sonnet")
-    synth("p", "fable")
-
-    # Each stage's own timeout threads through, in [mining, verify, synth]
-    # order — proving every stage carries its distinct budget.
-    assert recorded == [111, 222, 333]
+    assert [spec.timeout_secs for spec in (mining, verify, synthesis)] == [111, 222, 333]
+    assert [spec.cwd for spec in (mining, verify, synthesis)] == [tmp_path] * 3
+    assert mining.tools is session_runner.CLASSIFIER
+    assert synthesis.tools is session_runner.CLASSIFIER
+    assert verify.tools is session_runner.READ_ONLY_EXPLORER, (
+        "the verifier reads the censused tree and must never be able to write it"
+    )
+    assert len({spec.name for spec in (mining, verify, synthesis)}) == 3
 
 
-def test_main_wires_per_stage_timeouts_into_run_census(tmp_path, monkeypatch):
-    # REGRESSION for the exact bug: main() once handed the raw
-    # coder._invoke_cli (120s module default) to EVERY stage, so every
-    # per-cluster Sonnet verify-vs-main call and the large Fable synthesis
-    # call died at 120s and census-state.json never advanced. Pin that each
-    # stage now receives its own budget.
-    #
-    # DEFAULT config — NO timeouts block — so cfg.timeouts falls back to the
-    # schema defaults (120/900/1800). This is exactly the shape of a
-    # pre-existing legibility.yaml.
-    _write_legibility_yaml(tmp_path)
-
-    recorded = []
-
-    def fake_invoke_cli(prompt, model, *, claude_bin=None, timeout=None, cwd=None):
-        recorded.append({"model": model, "timeout": timeout})
-        return '{"verified": true}'
-
-    monkeypatch.setattr(coder, "_invoke_cli", fake_invoke_cli)
-
+def test_main_hands_run_census_one_runners_invokers_for_the_census_stages(
+    tmp_path, monkeypatch, opened_runners,
+):
+    """REGRESSION for the bug the per-stage timeouts fixed: main() once handed
+    one 120s invoke to EVERY stage, so every verify and synthesis call died
+    at 120s. DEFAULT config (no timeouts block), the shape of a pre-existing
+    legibility.yaml."""
+    config_path = _write_legibility_yaml(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
-    # --force must never reach the gate.
+    monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
+
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
+
+    [runner] = opened_runners
+    assert runner.label == "legibility-census[dark_factory]"
+    specs = mod.census_stage_specs(
+        config_mod.load_config(config_path), project_root=tmp_path.resolve(),
+    )
+    assert tuple(runner.stages) == specs
+    assert [spec.timeout_secs for spec in specs] == [120, 900, 1800]
+
+    kwargs = fake_run_census.calls[0]
+    kwargs["invoke"]("ping", "haiku")
+    assert runner.calls[-1] == (specs[0].name, "haiku")
+    kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
+    assert runner.calls[-1] == (specs[1].name, "sonnet")
+    kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
+    assert runner.calls[-1] == (specs[2].name, "fable")
+
+
+@pytest.mark.parametrize("run_fails", [False, True], ids=["done", "failed"])
+def test_main_closes_its_one_runner_on_the_done_and_the_failed_exit(
+    tmp_path, monkeypatch, opened_runners, run_fails,
+):
+    _write_legibility_yaml(tmp_path)
+    if run_fails:
+        def raising_run_census(**kwargs):
+            raise RuntimeError("codebook merge produced an invalid codebook")
+
+        monkeypatch.setattr(mod, "run_census", raising_run_census)
+        monkeypatch.setattr(mod, "_post_mcp_tool_call", lambda *a, **k: {})
+    else:
+        monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census())
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
     exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
-    assert exit_code == 0
 
-    kwargs = fake_run_census.calls[0]
+    assert exit_code == (1 if run_fails else 0)
+    assert [runner.closed for runner in opened_runners] == [1]
 
-    # (1) mining/headroom invoke -> mining budget 120 (unchanged; short calls).
-    kwargs["invoke"]("ping", "haiku")
-    assert recorded[-1] == {"model": "haiku", "timeout": 120}
 
-    # (2) verify_fn -> per-cluster Sonnet call carries 900 (was the fatal 120).
-    kwargs["verify_fn"]([{"title": "x"}], model="sonnet")
-    assert recorded[-1] == {"model": "sonnet", "timeout": 900}
+# ---------------------------------------------------------------------------
+# task 5515, absorbed by 6042: the headroom probe rides the pooled runner, so
+# ONE capped account no longer defers the whole census -- the probe fails over
+# to the next account, and only a pool with no headroom left defers.
+# ---------------------------------------------------------------------------
 
-    # (3) synthesize_fn -> the one large Fable call carries 1800.
-    kwargs["synthesize_fn"]([{"title": "x"}], model="fable")
-    assert recorded[-1] == {"model": "fable", "timeout": 1800}
+_P, _Q = "max-p", "max-q"
+_CAPPED = {"is_error": True, "rc": 1, "result": REAL_CLI_CAP_HIT_MESSAGES[2]}
+"""Strictly a cap whose "resets in 3 hours" parses to a FUTURE reset."""
+
+
+def _probe_over_the_pool(tmp_path, fake_claude_cli, pool_roster, by_name):
+    """Run census's headroom probe on the mining stage of a real runner over
+    a two-account pool; return ``(HeadroomResult, gate)``."""
+    accounts_file, env_file = pool_roster(_P, _Q)
+    fake_claude_cli.plan(
+        {pool_roster.token(name): response for name, response in by_name.items()},
+        default={"result": "pong"},
+    )
+    mining, _verify, _synthesis = mod.census_stage_specs(
+        _config_with_timeouts(30, 30, 30), project_root=tmp_path,
+    )
+    gate = account_pool.build_pool(accounts_file=accounts_file, env_file=env_file)
+    with session_runner.SessionRunner(gate, label="census-test") as runner:
+        result = mod.preflight_headroom(runner.invoker(mining), model="haiku")
+    return result, gate
+
+
+@pytest.mark.timeout(120)
+def test_the_headroom_probe_fails_over_past_a_capped_account(
+    tmp_path, fake_claude_cli, pool_roster, sentinel_login,
+):
+    result, gate = _probe_over_the_pool(tmp_path, fake_claude_cli, pool_roster, {_P: _CAPPED})
+
+    assert result.ok is True, result.reason
+    assert gate.active_account_name == _Q
+    assert gate.soonest_resets_at is not None, "the capped account's reset must be learned"
+    assert [call["env"]["CLAUDE_CODE_OAUTH_TOKEN"] for call in fake_claude_cli.calls()] == [
+        pool_roster.token(_P), pool_roster.token(_Q),
+    ]
+
+
+@pytest.mark.timeout(120)
+def test_the_headroom_probe_defers_only_when_no_pool_account_has_headroom(
+    tmp_path, fake_claude_cli, pool_roster, sentinel_login,
+):
+    result, _gate = _probe_over_the_pool(
+        tmp_path, fake_claude_cli, pool_roster, {_P: _CAPPED, _Q: _CAPPED},
+    )
+
+    assert result.ok is False
+    assert result.reason is not None
+    assert "all 2 pool accounts capped" in result.reason, result.reason
 
 
 # ---------------------------------------------------------------------------
@@ -5560,7 +5666,7 @@ def test_default_verify_fn_raises_when_an_invocation_error_reprobes_capped():
     def invoke(prompt, model):
         calls.append(prompt)
         if len(calls) == 2:
-            raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+            raise session_runner.InvocationFailed("claude CLI exited 1: simulated cap")
         return _verdict()
 
     probe = _make_recording_probe(
@@ -5593,7 +5699,7 @@ def test_default_verify_fn_still_rejects_when_the_reprobe_says_healthy():
     def invoke(prompt, model):
         calls.append(prompt)
         if len(calls) == 2:
-            raise coder.CoderInvocationError("claude CLI exited 1: unrelated outage")
+            raise session_runner.InvocationFailed("claude CLI exited 1: unrelated outage")
         return _verdict()
 
     probe = _make_recording_probe(mod.HeadroomResult(ok=True))
@@ -5620,7 +5726,7 @@ def test_default_verify_fn_without_probe_args_behaves_exactly_as_before():
     def invoke(prompt, model):
         calls.append(prompt)
         if len(calls) == 2:
-            raise coder.CoderInvocationError("claude CLI exited 1: simulated outage")
+            raise session_runner.InvocationFailed("claude CLI exited 1: simulated outage")
         return _verdict()
 
     verify_fn = mod._build_default_verify_fn("/tmp/root", invoke)
@@ -5980,7 +6086,7 @@ def test_default_verify_fn_treats_a_raising_probe_as_no_headroom():
     def invoke(prompt, model):
         calls.append(prompt)
         if len(calls) == 2:
-            raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+            raise session_runner.InvocationFailed("claude CLI exited 1: simulated cap")
         return _verdict()
 
     verify_fn = mod._build_default_verify_fn(
@@ -6411,7 +6517,7 @@ def test_census_headroom_exhausted_counts_account_for_every_offered_cluster_at_t
             return _verdict()                  # cluster 0 verifies
         if len(calls) == 2:
             return _UNPARSEABLE_PLAIN_PROSE    # cluster 1 rejects
-        raise coder.CoderInvocationError("claude CLI exited 1: simulated cap")
+        raise session_runner.InvocationFailed("claude CLI exited 1: simulated cap")
 
     clusters = _clusters(5)
     verify_fn = mod._build_default_verify_fn(

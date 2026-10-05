@@ -4,9 +4,9 @@ The invariant
 -------------
 ``shared/src/shared/cli_invoke.py::build_claude_argv`` does NOT forward a
 ``disallowed_tools=['*']`` wildcard verbatim when an ``output_schema`` is also
-present.  It substitutes ``_REAL_BUILTIN_TOOLS_DENYLIST`` — a list of BUILT-INS
-ONLY, carrying no MCP tool pattern — so the schema's synthetic
-``StructuredOutput`` tool survives.  MCP tools are therefore still REACHABLE at
+present.  It emits ``--tools ''`` instead, so the schema's synthetic
+``StructuredOutput`` tool survives.  That registry filter removes built-in and
+deferred tools but does NOT filter MCP, so MCP tools are still REACHABLE at
 such a call, even though the call reads as "deny everything".
 
 The CLI ambient-merges the ``.mcp.json`` found at ``cwd``, and this repo's root
@@ -548,10 +548,11 @@ class TestNeutralCwdExemption:
 # The whole-tree gate
 # --------------------------------------------------------------------------- #
 
-#: Every matching call site in the first-party tree, measured at HEAD
-#: 89e37fd6fb on 2026-09-22: 5 matched, 0 violations. Three are protected by
-#: running at ``neutral_cli_cwd()``, two by ``no_mcp_servers_config()`` +
-#: ``strict_mcp_config=True``. Kept as an exact SET, not a count: a new
+#: Every matching call site in the first-party tree, measured on 2026-09-27
+#: (task 3995): 5 matched, 0 violations. Four are protected by
+#: ``no_mcp_servers_config()`` + ``strict_mcp_config=True``; only
+#: ``PathScopeAdjudicator.adjudicate`` relies on running at
+#: ``neutral_cli_cwd()``. Kept as an exact SET, not a count: a new
 #: matching caller anywhere in the tree must be looked at even when it is
 #: correctly scoped, and none of these five may silently vanish.
 _KNOWN_SITES: frozenset[tuple[str, str]] = frozenset({
@@ -626,10 +627,10 @@ class TestWholeTreeGate:
             f'\n'
             f"THE SUBTLETY: that call reads as \"deny every tool\", and it is not. "
             f"shared/src/shared/cli_invoke.py::build_claude_argv silently replaces "
-            f"the '*' with _REAL_BUILTIN_TOOLS_DENYLIST whenever an output_schema "
-            f'is present, because the schema rides on a synthetic StructuredOutput '
-            f'tool a wildcard would block. That list is BUILT-INS ONLY and carries '
-            f'no MCP pattern, so MCP tools stay REACHABLE — and the CLI '
+            f"the '*' with --tools '' whenever an output_schema is present, "
+            f'because the schema rides on a synthetic StructuredOutput tool a '
+            f"wildcard would block. --tools '' removes built-in and deferred tools "
+            f'but does NOT filter MCP, so MCP tools stay REACHABLE — and the CLI '
             f'ambient-merges the .mcp.json at cwd. Under bypassPermissions, which '
             f'every one of these callers uses, that is unreviewed MCP WRITE access; '
             f'halt_scheduler and delete_memory are in the blast radius.\n'

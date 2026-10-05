@@ -94,7 +94,7 @@ asyncio_mode = "auto"
 # escalation/pyproject.toml record themselves measured green under exactly those
 # flags (task 5408) — not because anything rooted here is serial. NOT flipped to
 # `thread`, and that trade is not reopened here: it lives once, in
-# fused-memory/pyproject.toml's own timeout_method block.
+# tests/scripts/test_timeout_method_policy.py.
 #
 # The VALUE's provenance is
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md; the RATIONALE for the

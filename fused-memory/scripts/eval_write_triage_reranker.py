@@ -51,7 +51,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +78,14 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
 
 _calibrate = _load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
-_arms = _load_script(
-    _SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
-)
+# Pyright cannot follow the by-path loader, so it alone resolves `_arms` through
+# the scripts/ extraPath; at runtime the module is always the by-path load.
+if TYPE_CHECKING:
+    import eval_write_triage_reranker_arms as _arms
+else:
+    _arms = _load_script(
+        _SCRIPTS / 'eval_write_triage_reranker_arms.py', 'eval_write_triage_reranker_arms',
+    )
 
 
 def load_retrieval() -> types.ModuleType:
@@ -377,12 +382,15 @@ def _score_case(scorer: _arms.Scorer, case: RerankCase) -> _arms.SlateScores:
     return slate
 
 
-def _sum_or_none(values: Sequence[float | int | None]) -> float | int | None:
+_Num = TypeVar('_Num', int, float)
+
+
+def _sum_or_none(values: Sequence[_Num | None]) -> _Num | None:
     """The sum, or None when there is nothing to sum or any term was unmeasured."""
     measured = [value for value in values if value is not None]
     if not values or len(measured) != len(values):
         return None
-    return sum(measured)
+    return sum(measured[1:], start=measured[0])
 
 
 def measure_arm(
