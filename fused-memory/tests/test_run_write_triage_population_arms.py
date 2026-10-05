@@ -941,3 +941,90 @@ class TestTheFixtureReadout:
             published.artifact(fixture_reports={
                 'shipped': _fixture_report('shipped'), 'pre-psi': _fixture_report('shipped'),
             })
+
+
+# ---------------------------------------------------------------------------
+# The committed artifacts
+# ---------------------------------------------------------------------------
+
+_PACKAGE = Path(__file__).parent.parent
+_COMMITTED_POPULATION = _PACKAGE / 'calibration' / 'write_triage_population.json'
+_COMMITTED_PAIRS = _PACKAGE / 'calibration' / 'write_triage_pairs_to_rate.jsonl'
+_SEED_VERDICTS = Path(__file__).parent / 'fixtures' / 'write_triage_pair_verdicts_seed.jsonl'
+_TRUNCATION = re.compile(r'…\[truncated, \d+ chars total\]$')
+
+
+@functools.cache
+def _committed() -> dict:
+    return json.loads(_COMMITTED_POPULATION.read_text(encoding='utf-8'))
+
+
+@functools.cache
+def _committed_pairs() -> tuple[bytes, tuple[dict, ...]]:
+    body = _COMMITTED_PAIRS.read_bytes()
+    return body, tuple(json.loads(line) for line in body.decode('utf-8').splitlines())
+
+
+class TestCommittedPopulationIsTraceable:
+    """The committed π artifacts say which arms ran, how, and over what.
+
+    No numeric floor is asserted here (e.g. ``n_judge_band >= 300``): that is
+    the flip gate's predicate (PRD D3/D10), and a floor in a test would make
+    the test the decision.
+    """
+
+    def test_the_arms_are_the_arm_table_in_order(self) -> None:
+        rows = _committed()['arms']
+        assert [row['arm'] for row in rows] == [arm.name for arm in _mod().ARMS]
+        for row, arm in zip(rows, _mod().ARMS, strict=True):
+            assert (row['model'], row['reasoning_effort'], row['width'], row['wording']) == (
+                arm.model, arm.reasoning_effort, arm.width, arm.wording,
+            )
+
+    def test_each_arm_names_the_prompt_its_wording_sends(self) -> None:
+        for row in _committed()['arms']:
+            assert row['system_prompt_sha256'] == _sha(
+                _wording().system_prompt(row['wording']),
+            ), row['arm']
+
+    def test_every_arm_ran_the_whole_run_set(self) -> None:
+        n_judge_band = _committed()['population']['n_judge_band']
+        for row in _committed()['arms']:
+            assert {'calls', 'parse_failures', 'usd'} <= set(row), row['arm']
+            assert row['calls'] == n_judge_band, row['arm']
+
+    def test_the_population_says_what_was_frozen(self) -> None:
+        population = _committed()['population']
+        assert {
+            'n_writes', 'n_judge_band', 'frozen_at', 'by_category', 'recon_marker_writes',
+        } <= set(population)
+        assert population['projects'] == ['dark_factory', 'reify']
+        assert re.fullmatch(r'[0-9a-f]{64}', population['snapshot_sha256'])
+
+    def test_the_pairs_file_is_the_one_the_artifact_names(self) -> None:
+        body, rows = _committed_pairs()
+        block = _committed()['pairs_to_rate']
+        assert len(rows) == block['n_pairs']
+        assert _sha(body) == block['sha256']
+
+    def test_every_pair_row_is_blind(self) -> None:
+        _, rows = _committed_pairs()
+        for row in rows:
+            assert set(row) == {'entry_id', 'target_id', 'entry_text', 'target_text'}, row
+
+    def test_no_text_exceeds_the_rater_cap(self) -> None:
+        _, rows = _committed_pairs()
+        for row in rows:
+            for key in ('entry_text', 'target_text'):
+                text = row[key]
+                if text is not None and len(text) > 4_000:
+                    assert len(_TRUNCATION.sub('', text)) == 4_000, (row['entry_id'], key)
+                    assert _TRUNCATION.search(text), (row['entry_id'], key)
+
+    def test_no_seed_pair_is_asked_again(self) -> None:
+        seed = {
+            (row['entry_id'], row['target_id'])
+            for row in map(json.loads, _SEED_VERDICTS.read_text().splitlines())
+        }
+        _, rows = _committed_pairs()
+        assert not seed & {(row['entry_id'], row['target_id']) for row in rows}
