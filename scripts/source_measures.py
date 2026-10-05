@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import enum
 import subprocess
 import tokenize
+import tomllib
 from collections.abc import Collection, Mapping
 from io import StringIO
 from pathlib import Path
@@ -723,6 +725,16 @@ def _git_output(root: Path, *args: str) -> str:
     return completed.stdout
 
 
+def _require_work_tree_top(root: Path) -> None:
+    above_root = _git_output(root, 'rev-parse', '--show-cdup').strip()
+    if above_root:
+        raise MetricsError(
+            f'{root} is not the top of a git work tree ({above_root!r} leads up '
+            'to it), so its tracked files cannot be listed as the repo; pass the '
+            'repo root instead'
+        )
+
+
 def tracked_files(root: Path, *pathspecs: str) -> tuple[str, ...]:
     """Every file git tracks under *root* matching *pathspecs*, repo-relative and sorted.
 
@@ -731,13 +743,7 @@ def tracked_files(root: Path, *pathspecs: str) -> tuple[str, ...]:
     files -- usually none -- and that partial listing would read as the whole
     tree.
     """
-    above_root = _git_output(root, 'rev-parse', '--show-cdup').strip()
-    if above_root:
-        raise MetricsError(
-            f'{root} is not the top of a git work tree ({above_root!r} leads up '
-            'to it), so its tracked files cannot be listed as the repo; pass the '
-            'repo root instead'
-        )
+    _require_work_tree_top(root)
     listing = _git_output(root, 'ls-files', '-z', '--', *pathspecs)
     return tuple(sorted(path for path in listing.split('\0') if path))
 
@@ -745,3 +751,117 @@ def tracked_files(root: Path, *pathspecs: str) -> tuple[str, ...]:
 def tracked_python_files(root: Path) -> tuple[str, ...]:
     """Every ``.py`` file git tracks under *root*; see ``tracked_files``."""
     return tracked_files(root, '*.py')
+
+
+# ---------------------------------------------------------------------------
+# The workspace domain: each member's tracked .py files, classified.
+
+
+class FileKind(enum.StrEnum):
+    SRC = 'src'
+    TESTS = 'tests'
+
+
+@dataclasses.dataclass(frozen=True)
+class MemberRoots:
+    """Where one member's source and test files live, repo-relative.
+
+    One rule for real and pseudo members alike: a path under ``tests_root`` is a
+    test file, else a path under ``src_root`` is a source file named by its
+    dotted path below that root, else it is not the member's.
+    """
+
+    name: str
+    pseudo: bool
+    src_root: str | None
+    tests_root: str
+
+    @classmethod
+    def declared(cls, name: str) -> MemberRoots:
+        return cls(name=name, pseudo=False, src_root=f'{name}/src', tests_root=f'{name}/tests')
+
+    def kind_of(self, path: str) -> FileKind | None:
+        if path.startswith(self.tests_root + '/'):
+            return FileKind.TESTS
+        if self.src_root is not None and path.startswith(self.src_root + '/'):
+            return FileKind.SRC
+        return None
+
+    def import_name(self, path: str) -> str | None:
+        """The dotted import name of source file *path*; None for anything else.
+
+        A package's ``__init__.py`` is named by its package.
+        """
+        if self.src_root is None or self.kind_of(path) is not FileKind.SRC:
+            return None
+        dotted = path[len(self.src_root) + 1:].removesuffix('.py').replace('/', '.')
+        return dotted.removesuffix('.__init__')
+
+
+@dataclasses.dataclass(frozen=True)
+class DomainFile:
+    path: str
+    blob: str
+    kind: FileKind
+    import_name: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class DomainMember:
+    name: str
+    pseudo: bool
+    files: tuple[DomainFile, ...]
+
+
+#: The repo's two Python roots that are not workspace members, described by the
+#: same rule as a member: plans/quality-metrics-snapshot-prd.md decision 3.
+PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (
+    MemberRoots(name='scripts', pseudo=True, src_root='scripts', tests_root='scripts/tests'),
+    MemberRoots(name='tests', pseudo=True, src_root=None, tests_root='tests'),
+)
+
+
+def _declared_members(root: Path) -> tuple[str, ...]:
+    """``[tool.uv.workspace].members`` of *root*'s pyproject.toml."""
+    with (root / 'pyproject.toml').open('rb') as handle:
+        config = tomllib.load(handle)
+    return tuple(config['tool']['uv']['workspace']['members'])
+
+
+def _tracked_blobs(root: Path, *pathspecs: str) -> tuple[tuple[str, str], ...]:
+    """``(path, blob sha)`` of every index entry matching *pathspecs*."""
+    listing = _git_output(root, 'ls-files', '-s', '-z', '--', *pathspecs)
+    entries: list[tuple[str, str]] = []
+    for record in filter(None, listing.split('\0')):
+        meta, path = record.split('\t', 1)
+        _mode, blob, _stage = meta.split(' ')
+        entries.append((path, blob))
+    return tuple(entries)
+
+
+def _domain_member(
+    member: MemberRoots, entries: tuple[tuple[str, str], ...]
+) -> DomainMember:
+    files = tuple(
+        DomainFile(path=path, blob=blob, kind=kind, import_name=member.import_name(path))
+        for path, blob in sorted(entries)
+        if (kind := member.kind_of(path)) is not None
+    )
+    return DomainMember(name=member.name, pseudo=member.pseudo, files=files)
+
+
+def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
+    """Every workspace member's tracked ``.py`` files, classified src or tests.
+
+    The member list's one home is the root pyproject.toml's
+    ``[tool.uv.workspace].members``, followed by ``PSEUDO_MEMBERS``. Files come
+    from the index, not the disk, so an untracked file is outside the domain, as
+    is every file under no member's src or tests root (``hooks/`` included).
+    """
+    _require_work_tree_top(root)
+    members = (
+        *(MemberRoots.declared(name) for name in _declared_members(root)),
+        *PSEUDO_MEMBERS,
+    )
+    entries = _tracked_blobs(root, '*.py')
+    return tuple(_domain_member(member, entries) for member in members)
