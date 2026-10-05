@@ -18,6 +18,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 PLANS_DIR = "plans"
 REPORT_NAME_RE = re.compile(
     r"^confusion-census-(?P<date>\d{4}-\d{2}-\d{2})(?:-(?P<n>\d+))?\.(?P<ext>json|md)$"
@@ -33,6 +35,8 @@ SECTIONS = (
     "Structural",
     "Synthesis",
 )
+METHOD_KEYS = ("run_id", "as_of_sha", "since", "evidence", "verification", "cost", "inputs_consumed", "extra")
+METHOD_BLOCK = "## Method yaml block"
 NOTE_CAP = 400
 
 
@@ -104,8 +108,12 @@ def unfenced_lines(md_text: str) -> Iterator[tuple[int, str]]:
             yield index, line
 
 
+def level2_headings(md_text: str) -> list[tuple[int, str]]:
+    return [(index, line[3:].strip()) for index, line in unfenced_lines(md_text) if line.startswith("## ")]
+
+
 def level2_titles(md_text: str) -> list[str]:
-    return [line[3:].strip() for _, line in unfenced_lines(md_text) if line.startswith("## ")]
+    return [title for _, title in level2_headings(md_text)]
 
 
 def heading(title: str) -> str:
@@ -120,6 +128,77 @@ def check_sections(md_text: str) -> list[Gap]:
 def check_halves(report: Report) -> list[Gap]:
     absent = [ext for ext, path in (("json", report.record), ("md", report.rendering)) if path is None]
     return [Gap(GapKind.MISSING, report.shown(ext)) for ext in absent]
+
+
+def one_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def lines_after_heading(md_text: str, title: str) -> list[str]:
+    start = next((index for index, found in level2_headings(md_text) if found == title), None)
+    return [] if start is None else md_text.splitlines()[start + 1 :]
+
+
+def parse_method_yaml(text: str) -> dict | Gap:
+    try:
+        loaded = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        return Gap(GapKind.MALFORMED, METHOD_BLOCK, one_line(str(exc)))
+    if not isinstance(loaded, dict):
+        return Gap(GapKind.MALFORMED, METHOD_BLOCK, f"loads to {type(loaded).__name__}, not a mapping")
+    return loaded
+
+
+def method_block(md_text: str) -> dict | Gap:
+    body = lines_after_heading(md_text, METHOD_TITLE)
+    first = next((index for index, line in enumerate(body) if line.strip()), None)
+    if first is None or body[first].rstrip() != "```yaml":
+        return Gap(GapKind.MISSING, METHOD_BLOCK, f"the first element under {heading(METHOD_TITLE)} is not a ```yaml fence")
+    rest = body[first + 1 :]
+    close = next((index for index, line in enumerate(rest) if line.startswith("```")), None)
+    if close is None:
+        return Gap(GapKind.MALFORMED, METHOD_BLOCK, "the ```yaml fence never closes")
+    return parse_method_yaml("\n".join(rest[:close]))
+
+
+def check_method_mapping(mapping: dict, prefix: str) -> list[Gap]:
+    missing = [Gap(GapKind.MISSING, f"{prefix}.{key}") for key in METHOD_KEYS if key not in mapping]
+    stray = [
+        Gap(GapKind.MALFORMED, f"{prefix}.{key}", "outside extra (contract §5)") for key in mapping if key not in METHOD_KEYS
+    ]
+    return missing + stray
+
+
+def check_rendered_method(md_text: str) -> list[Gap]:
+    if METHOD_TITLE not in level2_titles(md_text):
+        return []
+    block = method_block(md_text)
+    return [block] if isinstance(block, Gap) else check_method_mapping(block, "method")
+
+
+def load_record(path: Path, shown: str) -> dict | Gap:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return Gap(GapKind.MALFORMED, shown, one_line(str(exc)))
+    if not isinstance(record, dict):
+        return Gap(GapKind.MALFORMED, shown, "not a JSON object")
+    return record
+
+
+def check_record_method(record: dict) -> list[Gap]:
+    if "method" not in record:
+        return [Gap(GapKind.MISSING, "record.method")]
+    if not isinstance(record["method"], dict):
+        return [Gap(GapKind.MALFORMED, "record.method", f"{type(record['method']).__name__}, not a mapping")]
+    return check_method_mapping(record["method"], "record.method")
+
+
+def check_record(path: Path, shown: str) -> list[Gap]:
+    record = load_record(path, shown)
+    if isinstance(record, Gap):
+        return [record]
+    return check_record_method(record)
 
 
 def predates_header(report: Report, titles: list[str]) -> bool:
@@ -163,7 +242,9 @@ def post_header_result(report: Report, gaps: tuple[Gap, ...]) -> Result:
 def post_header_gaps(report: Report, md_text: str | None) -> list[Gap]:
     gaps = check_halves(report)
     if md_text is not None:
-        gaps += check_sections(md_text)
+        gaps += check_sections(md_text) + check_rendered_method(md_text)
+    if report.record is not None:
+        gaps += check_record(report.record, report.shown("json"))
     return gaps
 
 
