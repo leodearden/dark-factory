@@ -52,6 +52,9 @@ def test_instrument_check_ids_are_a_closed_vocabulary():
         'reference-nonempty',
         'arm-config-symmetry',
         'single-code-sha',
+        'endpoint-conformance',
+        'validator-negative-control',
+        'index-configuration',
     }
 
 
