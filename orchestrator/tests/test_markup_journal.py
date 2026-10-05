@@ -35,10 +35,9 @@ envelope literal has to emit that literal INSIDE its own tool-call argument,
 which reproduces the very over-consumption defect under test.
 
 So every specimen is assembled from :func:`_close` / :func:`_open_param`, which
-build their angle bracket from ``chr(60)``, and :func:`_assert_no_raw_sentinels`
-enforces that on this module's OWN BYTES at import — checked against
-``shared.toolcall_markup.ENVELOPE_LITERALS``, the single owner of the literal
-set (INV-5), plus the two structural prefixes.
+build their angle bracket from ``chr(60)``, and
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
+enforces that on this module's source, repo-wide.
 """
 
 from __future__ import annotations
@@ -78,25 +77,8 @@ def _open_param(name: str) -> str:
 #: ``shared.toolcall_markup.ENVELOPE_LITERALS`` (the single owner of the literal
 #: set, INV-5) plus the two structural prefixes every built specimen uses, so a
 #: builder output spelled out by hand is caught even when it is not itself one
-#: of the enumerated literals. Applied to this module's OWN BYTES at import, and
-#: to the JOURNAL FILE the sink writes — the same predicate, two artifacts.
+#: of the enumerated literals. Applied to the JOURNAL FILE the sink writes.
 _FORBIDDEN_SEQUENCES = (*ENVELOPE_LITERALS, _LT + '/', _LT + 'parameter ')
-
-
-def _assert_no_raw_sentinels() -> None:
-    """Fail at IMPORT if this file's own bytes carry a raw envelope literal."""
-    source = Path(__file__).read_text(encoding='utf-8')
-    for sequence in _FORBIDDEN_SEQUENCES:
-        if sequence in source:
-            raise AssertionError(
-                f'{Path(__file__).name} contains a RAW envelope sentinel '
-                f'({sequence!r}). Build it from _close()/_open_param() instead '
-                '— a verbatim literal here corrupts the tool call that writes '
-                'this file. See the module docstring.'
-            )
-
-
-_assert_no_raw_sentinels()
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +338,7 @@ class TestTheJournalNeverHoldsARawEnvelopeLiteral:
 
     @pytest.mark.asyncio
     async def test_the_written_file_holds_no_raw_sentinel(self, tmp_path):
-        """(a) The same predicate ``_assert_no_raw_sentinels`` applies to source."""
+        """(a) The written journal carries none of ``_FORBIDDEN_SEQUENCES``."""
         sink = build_sink(tmp_path)
 
         await sink(make_fact())

@@ -49,7 +49,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: archive_task_transcripts
+      pattern: archive_before_delete
       paths:
       - orchestrator/src/orchestrator/git_ops.py
       expect: present

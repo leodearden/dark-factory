@@ -649,13 +649,14 @@ class _FusedMemoryClient:
             await self._client.aclose()
 
     async def _post(self, payload: dict) -> dict:
+        from shared.mcp_post import mcp_endpoint_url  # local: E402-safe
         headers = {
             'Content-Type': 'application/json',
             'Accept': 'application/json, text/event-stream',
             'mcp-session-id': self._session_id or '',
         }
         resp = await self._client.post(
-            f'{self._url}/mcp/', json=payload, headers=headers,
+            mcp_endpoint_url(self._url), json=payload, headers=headers,
         )
         resp.raise_for_status()
         # 202 Accepted (notifications) returns no body.

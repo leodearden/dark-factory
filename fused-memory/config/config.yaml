@@ -238,6 +238,14 @@ task_status:
 
 reconciliation:
   enabled: true
+  # Leo 2026-09-27 (esc-3135-8, A′): ζ's autoseed stays on; the three derived
+  # clusters with the most off-topic matches in the 2026-09-26 replay are retired
+  # (docs/prds/memory-write-path-convergence.md §10: 39 + 33 + 27 of 267).
+  procedural_knowledge_topic_cluster_autoseed_retired:
+    dark_factory:
+      - worktree-stale-base-premise-verification
+      - orchestrator-full-suite-runtime-budget
+      - wip-requeue-plan-step-attribution
   # Phase 2 enforcement of done_provenance: require commit|note payload on done transitions
   require_done_provenance: true
   data_dir: "${RECONCILIATION_DATA_DIR:./data/reconciliation}"
@@ -576,7 +584,7 @@ summary_rebuild:
 write_triage:
   # OPERATOR KNOBS — hand-set, NOT calibration outputs. The keys above the
   # CALIBRATION OUTPUT fence are the ones a human is meant to edit — these two
-  # and the six judge knobs below them; everything below the fence is
+  # and the eight judge knobs below them; everything below the fence is
   # derived. All of them are green-tier hot-reloadable, and
   # scripts/calibrate_write_triage.py --write-config preserves them when it
   # rewrites the calibrated keys below.
@@ -596,7 +604,7 @@ write_triage:
   candidate_k: 20
   # JUDGE KNOBS (leaf gamma, task 3128) — also hand-set operator knobs, and
   # deliberately ABOVE the calibration fence below so --write-config preserves
-  # them. All six are green-tier hot-reloadable and read live per middle-band
+  # them. All eight are green-tier hot-reloadable and read live per middle-band
   # write.
   #
   # judge_enabled: the kill switch for the LLM arm alone. Defaults TRUE,
@@ -616,12 +624,25 @@ write_triage:
   # sets a timeout and the openai SDK default is 600s; on the synchronous
   # add_memory write path that is a wedge, not a degradation. A timeout
   # propagates into triage_write's fail-open arm — stored, plus a counted
-  # fail-open (INV-4).
-  judge_timeout_seconds: 10.0
+  # fail-open (INV-4). Why this value: the field's description in
+  # fused-memory/src/fused_memory/config/schema.py::WriteTriageConfig.
+  judge_timeout_seconds: 15.0
+  # judge_reasoning_effort: null OMITS the reasoning parameter and sends
+  # temperature 0.0 (what a non-reasoning model such as gpt-4o-mini needs; a
+  # reasoning model rejects a temperature); none|low|medium|high is sent as
+  # reasoning.effort. Only a Responses-API endpoint (llm.client_class
+  # 'openai') can send it — elsewhere a set value is a counted fail-open. Set
+  # together with judge_model at the 3169 flip; see
+  # plans/write-triage-flip-readiness-prd.md §11.3 C1''.
+  judge_reasoning_effort: null
   # judge_candidate_count: how many of the `candidate_k` retrieved records
   # reach the prompt — PRD C1's "top 3-5". The band's own winner is always
   # included regardless of this cap.
   judge_candidate_count: 5
+  # judge_field_chars: the per-field character cap on the entry and on every
+  # candidate the judge reads, cut fields marked `…[elided]`. Why 4000 and
+  # not the old 1200: calibration/write_triage_judge_field_chars_report.md.
+  judge_field_chars: 4000
   # judge_accuracy_report_path: traceability from the judge shipped here back
   # to the run that MEASURED it against leaf alpha's curator-labelled fixture,
   # exactly as calibration_report_path points at the run that produced

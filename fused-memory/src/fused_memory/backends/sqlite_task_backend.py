@@ -49,6 +49,7 @@ from fused_memory.backends.task_backend_types import (
     UpdateTaskResult,
     ValidateDependenciesResult,
 )
+from fused_memory.backends.task_text_markup_gate import refuse_leaked_task_text
 from fused_memory.config.schema import TaskmasterConfig
 from fused_memory.middleware.candidate_key import compute_candidate_key
 from fused_memory.middleware.candidate_key_escalation import (
@@ -2007,6 +2008,30 @@ class SqliteTaskBackend:
             out['id'] = int(out['id'])
         return out
 
+    async def get_dependency_edges(
+        self, project_root: str, tag: str | None = None,
+    ) -> dict[int, list[int]]:
+        """Return ``{task_id: [depends_on, ...]}`` for *tag* — the edge set alone.
+
+        The compact counterpart of :meth:`get_tasks`, as :meth:`get_statuses`
+        is, and a thin wrapper over :meth:`_fetch_dependencies`:
+
+        - each dependency list is SORTED ascending;
+        - a task with NO dependencies is **absent** from the map, not present
+          with an empty list;
+        - it is a single statement, so self-consistent, but not a joint
+          snapshot with any other read a caller issues around it.
+
+        Args:
+            project_root: Project whose task DB to read.
+            tag: Tag context; defaults to ``DEFAULT_TAG`` when ``None``. An
+                unknown tag yields ``{}``.
+        """
+        await self.ensure_connected()
+        tag = tag or DEFAULT_TAG
+        async with self._fresh_read_conn(project_root) as conn:
+            return await self._fetch_dependencies(conn, tag)
+
     async def _statuses_from_conn(
         self,
         conn: aiosqlite.Connection,
@@ -2937,6 +2962,11 @@ class SqliteTaskBackend:
         tag: str | None = None,
         status: str = 'pending',
     ) -> AddTaskResult:
+        arguments_as_received = dict(
+            project_root=project_root, prompt=prompt, title=title,
+            description=description, details=details, dependencies=dependencies,
+            priority=priority, metadata=metadata, tag=tag, status=status,
+        )
         await self.ensure_connected()
         tag = tag or DEFAULT_TAG
         if status not in _VALID_STATUSES:
@@ -3030,6 +3060,10 @@ class SqliteTaskBackend:
 
                 await self._validate_metadata_on_write(
                     metadata, project_root=project_root, tag=tag, task_id=next_id,
+                )
+                refuse_leaked_task_text(
+                    {'title': title, 'description': description, 'details': details},
+                    arguments=arguments_as_received,
                 )
 
                 # Index-independent dedup guard (fm-task-dedup self-heal
@@ -3150,30 +3184,50 @@ class SqliteTaskBackend:
         status: str | None = None,
         dependencies: list[str] | None = None,
     ) -> UpdateTaskResult:
+        arguments_as_received = dict(
+            task_id=task_id, project_root=project_root, prompt=prompt,
+            metadata=metadata, append=append, tag=tag, metadata_mode=metadata_mode,
+            title=title, description=description, details=details,
+            priority=priority, status=status, dependencies=dependencies,
+        )
         # Write-authority floors mirroring the server/tools.py + interceptor
         # ceiling (2026-05-08 forensics). set_task_status is the only
         # sanctioned writer for status AND metadata.done_provenance — it
         # enforces the terminal-exit, phantom-done, and done-provenance
-        # gates. Both floors reject unconditionally, before ensure_connected()
-        # and the task SELECT, so a write-authority rejection takes
-        # precedence over any existence or connection error.
+        # gates — so update_task may never ADD, CHANGE or REMOVE
+        # metadata.done_provenance. The status floor, and the done_provenance
+        # floor in every mode except 'replace', reject unconditionally before
+        # ensure_connected() and the task SELECT, so a write-authority
+        # rejection takes precedence over any existence or connection error.
+        # Only metadata_mode='replace' defers: a whole-blob replace must
+        # carry the STORED done_provenance through verbatim, which can only
+        # be judged against the row, so _assert_done_provenance_passthrough
+        # checks it inside the transaction below. The gate reads the RAW
+        # metadata_mode because _resolve_metadata_mode can itself raise, and
+        # resolving first would change which error a bad call surfaces.
         if status is not None:
             raise StatusWriteAuthorityError(task_id, status)
+        parsed_metadata: dict | None = None
         if metadata is not None:
-            # Mirror the interceptor's _reject_done_provenance_in_update_metadata:
-            # accept an already-parsed dict directly before falling back to
+            # Accept an already-parsed dict directly before falling back to
             # json.loads. A caller that bypasses the documented ``str | None``
             # signature and passes a dict would otherwise hit
             # ``json.loads(dict)`` -> TypeError -> parsed_metadata=None,
             # silently permitting a done_provenance write past this floor.
             if isinstance(metadata, dict):
-                parsed_metadata: dict | None = metadata
+                parsed_metadata = metadata
             else:
                 try:
-                    parsed_metadata = json.loads(metadata)
+                    loaded_metadata = json.loads(metadata)
                 except (ValueError, TypeError):
-                    parsed_metadata = None
-            if isinstance(parsed_metadata, dict) and 'done_provenance' in parsed_metadata:
+                    loaded_metadata = None
+                if isinstance(loaded_metadata, dict):
+                    parsed_metadata = loaded_metadata
+            if (
+                parsed_metadata is not None
+                and 'done_provenance' in parsed_metadata
+                and metadata_mode != 'replace'
+            ):
                 raise DoneProvenanceWriteAuthorityError(task_id)
             # Same floor family, different remedy (task 3816 review
             # remediation): the wait-anchor keys are MACHINE-authored, so a
@@ -3206,7 +3260,11 @@ class SqliteTaskBackend:
         # connection errors, and so a call tripping BOTH this guard and
         # _resolve_metadata_mode's merge+append carve-out surfaces the
         # content-loss message rather than the metadata one (the description
-        # wipe is the hazard that was silent). See
+        # wipe is the hazard that was silent). Under metadata_mode='replace'
+        # the done_provenance half of the floors is the in-transaction
+        # passthrough check, which runs after this guard: a replace call
+        # tripping both surfaces AppendUnsupportedFieldError, and either way
+        # nothing is written. See
         # sqlite_task_backend.py::_reject_append_on_replace_only_fields.
         _reject_append_on_replace_only_fields(
             append, title=title, description=description, priority=priority,
@@ -3258,6 +3316,11 @@ class SqliteTaskBackend:
                     'TASKMASTER_TOOL_ERROR',
                     f'No tasks found for ID(s): {task_id}',
                 )
+            done_provenance_passed_through = False
+            if metadata_mode == 'replace':
+                done_provenance_passed_through = _assert_done_provenance_passthrough(
+                    row['metadata'], parsed_metadata, task_id,
+                )
 
             # Build the SET clause from non-None structured fields plus
             # the prompt-derived details path.
@@ -3277,7 +3340,30 @@ class SqliteTaskBackend:
             # this method unconditionally raises before reaching this point.
 
             # details: explicit param wins over prompt. Both honor ``append``.
+            #
+            # ``append`` IS NOT SCOPED TO METADATA (task 4216). The same flag
+            # that selects the additive metadata merge also drives the
+            # ``details`` and ``prompt`` TEXT columns here: when the row
+            # already has a non-empty body, the write becomes
+            # ``existing + '\n\n' + new`` rather than a replacement.
+            #
+            # So a SINGLE update_task carrying BOTH a details rewrite and a
+            # metadata attach under ``append=True`` splits in two: the
+            # metadata half unions exactly as advertised while the details
+            # half is silently DUPLICATED, and the response still reads as a
+            # clean success. Callers wanting a details rewrite alongside a
+            # hints attach must SPLIT the call — a metadata-only write with
+            # ``append=True``, then a details-only write with ``append``
+            # OMITTED. Every clause above is pinned in
+            # tests/test_sqlite_task_backend.py — the ``details=`` spelling of
+            # the hazard by
+            # test_update_task_details_and_metadata_append_true_concatenates_details,
+            # the ``prompt=`` spelling by
+            # test_update_task_prompt_and_metadata_append_true_concatenates_details,
+            # and the split-call remedy by
+            # test_update_task_split_call_details_rewrite_leaves_one_body_and_unions_hints.
             existing_details = row['details'] or ''
+            new_details: str | None = None
             if details is not None:
                 new_details = (
                     f'{existing_details}\n\n{details}'
@@ -3292,6 +3378,14 @@ class SqliteTaskBackend:
                 )
                 set_columns.append('details = ?')
                 set_values.append(new_details)
+
+            # Only the columns this write supplies, judged on the values it
+            # would persist: a pre-gate corrupt column elsewhere in the row
+            # must not block the write that remediates it.
+            refuse_leaked_task_text(
+                {'title': title, 'description': description, 'details': new_details},
+                arguments=arguments_as_received,
+            )
 
             new_metadata: str | None = None
             if metadata is not None:
@@ -3308,7 +3402,10 @@ class SqliteTaskBackend:
                 # TaskmasterError if the stored blob is corrupt — preventing a
                 # silent clobber.  The _txn wrapper rolls back, leaving the
                 # original bytes intact.  To repair a corrupt row, pass
-                # metadata_mode='replace' (bypasses the guard intentionally).
+                # metadata_mode='replace' (bypasses the guard intentionally);
+                # the repair payload may not carry a done_provenance, since
+                # passthrough identity cannot be established against a blob
+                # that does not parse (_assert_done_provenance_passthrough).
                 new_metadata = _merge_metadata(
                     row['metadata'], metadata,
                     mode=resolved_mode,
@@ -3329,7 +3426,10 @@ class SqliteTaskBackend:
                 # row. Falls back to None (enforce-all) when the payload
                 # isn't a JSON object — _merge_metadata already treats a
                 # non-dict incoming blob as last-write-wins, so there is no
-                # narrower "responsibility" to scope to here.
+                # narrower "responsibility" to scope to here. Under replace, a
+                # done_provenance the passthrough check admitted is not this
+                # write's responsibility either: the caller had to send it
+                # back unchanged.
                 incoming_keys: set[str] | None = None
                 try:
                     _loaded_incoming = json.loads(metadata)
@@ -3338,6 +3438,8 @@ class SqliteTaskBackend:
                 else:
                     if isinstance(_loaded_incoming, dict):
                         incoming_keys = set(_loaded_incoming.keys())
+                if done_provenance_passed_through and incoming_keys is not None:
+                    incoming_keys.discard('done_provenance')
                 await self._validate_metadata_on_write(
                     new_metadata, project_root=project_root, tag=tag, task_id=tid,
                     incoming_keys=incoming_keys,
@@ -3477,8 +3579,11 @@ class SqliteTaskBackend:
         """Privileged, non-protocol writer of done_provenance/reopen_* audit fields.
 
         Reachable only from :class:`TaskInterceptor` (PRD C-C) — ``update_task``
-        remains the sole PUBLIC metadata writer and unconditionally rejects
-        ``metadata.done_provenance`` (see the floor above). Performs a
+        remains the sole PUBLIC metadata writer and never adds, changes or
+        removes ``metadata.done_provenance`` (see the floor above; its
+        metadata_mode='replace' carve-out admits only a verbatim passthrough,
+        which is not a write). This seam, with ``set_status_and_stamp_audit``,
+        remains the only writer that can CHANGE done_provenance. Performs a
         read-modify-write merge under the same write-lock + txn pattern as
         ``update_task``/``set_task_claimant``: last-write-wins on the supplied
         keys, preserving every omitted sibling key (``memory_hints``, ``files``,
@@ -4074,6 +4179,61 @@ def _merge_values(old: object, new: object) -> object:
     return old
 
 
+def _assert_done_provenance_passthrough(
+    stored_raw: str | None, incoming: dict | None, task_id: str,
+) -> bool:
+    """Refuse a whole-blob replace that would move ``metadata.done_provenance``.
+
+    The contract: update_task may never ADD, CHANGE or REMOVE
+    metadata.done_provenance. Under metadata_mode='replace' the payload must
+    carry the stored value verbatim; under every other mode the key must be
+    absent (update_task's pre-connect floor). set_task_status and the
+    privileged stamp_audit_metadata seam remain the only writers of the key.
+    Carrying the whole blob through is the shape the orchestrator's
+    read-modify-write callers already use:
+    orchestrator/src/orchestrator/workflow.py::_clear_merge_retry_pending,
+    orchestrator/src/orchestrator/workflow.py::_clear_merge_phase_entered and
+    orchestrator/src/orchestrator/harness.py::_clear_merge_retry_pending_for_restart.
+
+    update_task calls this inside its transaction, against the row it just
+    SELECTed, so the stored value cannot change before the UPDATE and a raise
+    rolls back with nothing written. The caller's own copy of the stored
+    value is never trusted.
+
+    Identity is JSON VALUE equality (deep ``==`` on the parsed values), not
+    byte identity: inner key order and whitespace do not survive a
+    get_task -> json.dumps round trip, which is exactly how a
+    read-modify-write caller builds its payload.
+
+    * ``incoming`` is None (unparseable or non-dict payload): no check, the
+      same fail-open the pre-connect floor applies. Known residual: such a
+      payload still replaces the blob and can destroy done_provenance.
+    * The stored blob is absent or not a JSON object: identity cannot be
+      established, so a payload carrying done_provenance is refused, while
+      one omitting it is the corrupt-row repair replace mode exists for.
+    * Otherwise the key's presence and value must match the stored row
+      exactly: an ADD, a CHANGE and a drop-by-omission are all refused.
+
+    Returns True exactly when the payload carried a done_provenance and it
+    was admitted as a passthrough — the licence update_task needs to exclude
+    that key from enforce-mode responsibility.
+    """
+    if incoming is None:
+        return False
+    try:
+        stored = json.loads(stored_raw) if stored_raw is not None else None
+    except (TypeError, ValueError):
+        stored = None
+    if not isinstance(stored, dict):
+        if 'done_provenance' in incoming:
+            raise DoneProvenanceWriteAuthorityError(task_id)
+        return False
+    absent = object()
+    if stored.get('done_provenance', absent) != incoming.get('done_provenance', absent):
+        raise DoneProvenanceWriteAuthorityError(task_id)
+    return 'done_provenance' in incoming
+
+
 def _merge_metadata(
     existing_raw: str | None,
     incoming: str,
@@ -4089,7 +4249,11 @@ def _merge_metadata(
     :func:`_resolve_metadata_mode`:
 
     * ``'replace'`` — return ``incoming`` verbatim; bypasses the corrupt-blob
-      guard (the sanctioned path to repair a corrupt row).
+      guard (the sanctioned path to repair a corrupt row). One restriction
+      applies upstream, in update_task: on a row whose stored blob does not
+      parse, the repair payload may not carry a done_provenance, because
+      passthrough identity cannot be established. The authority is
+      :func:`_assert_done_provenance_passthrough`.
     * ``'merge'`` — shallow last-write-wins: ``{**existing, **incoming}``.
       Omitted keys are preserved; every supplied key (scalar **or** list)
       overwrites wholesale.  Falls back to ``incoming`` when either side is

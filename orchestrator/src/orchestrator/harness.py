@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import errno
@@ -10,6 +11,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import time
 from collections import Counter, deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -19,6 +21,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, ClassVar, cast
 
 from escalation.pins import classify_pins
+from shared import delivered_check_polarity
 from shared.cli_invoke import (
     AllAccountsCappedException,
     invoke_with_cap_retry,
@@ -26,8 +29,10 @@ from shared.cli_invoke import (
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
 from shared.cost_store import CostStore
+from shared.eval_lane import eval_lane_provenance
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
+from shared.systemd_listeners import take_systemd_listeners
 from shared.task_claimant import compose_claimant_run_id, has_live_claimant
 from shared.task_metadata import RoutingState
 from shared.timestamps import parse_timestamp_or_warn
@@ -80,7 +85,12 @@ from orchestrator.landing_evidence import (
 from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
 from orchestrator.mcp_lifecycle import McpLifecycle
-from orchestrator.merge_queue import reconcile_landed_outbox, reconcile_landed_task
+from orchestrator.merge_queue import (
+    enqueue_merge_request,
+    reconcile_landed_outbox,
+    reconcile_landed_task,
+    select_recovery_winner,
+)
 from orchestrator.merge_queue_store import MergeQueueStore, recover_pending_merges
 from orchestrator.merge_skew_tripwire import emit_pipeline_landing_tripwire
 from orchestrator.module_charter import sanitize_files_for_persist
@@ -505,6 +515,8 @@ _WATCHER_ALLOWED_TOOLS: list[str] = [
     # (promote_to_l2 is needed by the consumer-per-level contract so the
     # watcher can escalate out-of-scope L1s directly to a human L2 stream)
     'mcp__escalation__get_pending_escalations',
+    # archive-inclusive read for the drain (task 3999); get_pending_escalations is pending-only
+    'mcp__escalation__get_task_escalations',
     'mcp__escalation__resolve_issue',
     'mcp__escalation__promote_to_l2',
     # Triage-ack annotation, ungated by level — lets the watcher stamp a
@@ -1207,7 +1219,7 @@ def build_train_callback_factory(
     deliberately leaves unguarded, so even a permanently-ERRORing check
     descriptor cannot produce an infinite withhold/revert cycle.
     """
-    from orchestrator.merge_queue import TrainCallbacks
+    from orchestrator.merge_lane.types import TrainCallbacks
 
     async def _delivered_checks_withhold(
         mid: str, *, site: str,
@@ -8210,6 +8222,107 @@ class Harness:
             task_id,
         )
 
+    # ── task 3500: authoring-defect diagnosis for a failed delivered check ──
+
+    #: Recovers the failed check's descriptor from the detail
+    #: ``scheduler._build_delivered_check_escalation`` renders. Parsing a
+    #: rendered string is not the shape anyone would choose — the descriptor
+    #: exists as a dict three frames up — but the ``on_delivered_check_block``
+    #: callback's signature is ``(task_id, *, summary, detail, category)`` and
+    #: widening it means editing ``scheduler.py``, which is outside task 3500's
+    #: lock scope. The coupling is filed as a follow-up; until then this is
+    #: deliberately total-or-nothing (any shape it does not recognise yields
+    #: None -> no diagnosis), and its only consumer is best-effort, so a format
+    #: drift costs the enhancement and never the escalation.
+    _DELIVERED_CHECK_DETAIL_RE = re.compile(
+        r"^Delivered check '(?P<name>[^']*)' \(kind=(?P<kind>[^)]*)\)", re.MULTILINE
+    )
+    _DELIVERED_CHECK_FIELD_RE = re.compile(
+        r'^(?P<key>pattern|paths|expect): (?P<value>.*)$', re.MULTILINE
+    )
+
+    @classmethod
+    def _parse_delivered_check_detail(cls, detail: str) -> dict | None:
+        """Recover ``{name, kind, pattern, expect, paths}`` from *detail*.
+
+        Returns None for anything it does not fully recognise — a grep check
+        without a pattern cannot be linted, and guessing at a half-parsed
+        descriptor would produce a diagnosis about a check nobody authored.
+        """
+        head = cls._DELIVERED_CHECK_DETAIL_RE.search(detail or '')
+        if head is None:
+            return None
+        fields = {
+            m.group('key'): m.group('value')
+            for m in cls._DELIVERED_CHECK_FIELD_RE.finditer(detail)
+        }
+        pattern = fields.get('pattern')
+        if not pattern or pattern == 'None':
+            return None
+        try:
+            # `paths` is rendered as a Python list repr by the escalation
+            # builder; literal_eval, never eval — this string reaches us from
+            # task metadata an agent authored.
+            paths = ast.literal_eval(fields.get('paths') or '[]')
+        except (ValueError, SyntaxError):
+            paths = []
+        return {
+            'name': head.group('name'),
+            'kind': head.group('kind'),
+            'pattern': pattern,
+            'expect': fields.get('expect'),
+            'paths': list(paths) if isinstance(paths, list) else [],
+        }
+
+    def _diagnose_delivered_check_authoring(self, detail: str) -> str | None:
+        """An ``AUTHORING DIAGNOSIS`` block for *detail*, or None if clean.
+
+        THE POINT OF TASK 3500. ``DEP_CAPABILITY_NOT_DELIVERED`` reads
+        identically whether the check is mis-authored or the capability
+        genuinely has not landed, and the two need opposite responses — edit
+        the producer's metadata, or chase work that never happened. Naming the
+        authoring defect here is what separates them at the one moment a human
+        actually reads the record.
+
+        ONLY ``severity='reject'`` findings are surfaced, which in practice
+        means ``filename_shaped``. The exclusions are deliberate:
+
+        * The ``vacuous_*`` codes are unreachable on this path by
+          construction — they fire on a check that PASSES, and we are here
+          precisely because it FAILED.
+        * ``absent_overbroad`` is a WARN defined relative to the producer's
+          declared ``metadata.files``, which this callback does not carry.
+          Reporting it without that input would assert "these matches are
+          outside the task's scope" without being able to check it — a
+          confident-sounding diagnosis built on data we do not have is worse
+          than none, because the reader cannot tell it is unfounded.
+        """
+        parsed = self._parse_delivered_check_detail(detail)
+        if parsed is None:
+            return None
+        findings = [
+            f
+            for f in delivered_check_polarity.lint_delivered_checks(
+                [parsed],
+                files=None,
+                repo_root=self.config.project_root,
+                # The same tree the gate itself evaluated against, so the
+                # diagnosis cannot disagree with the verdict it explains.
+                ref=delivered_check_polarity.GATE_REF,
+            )
+            if f.severity == 'reject'
+        ]
+        if not findings:
+            return None
+        lines = ['', 'AUTHORING DIAGNOSIS — this check appears MIS-AUTHORED, not merely unmet.']
+        for finding in findings:
+            lines.append(f'  code: {finding.code}')
+            lines.append(f'  {finding.message}')
+            for site in finding.detail:
+                lines.append(f'    - {site}')
+        lines.append(f'  remedy: {delivered_check_polarity.polarity_error(findings)["hint"]}')
+        return '\n'.join(lines)
+
     async def _block_and_escalate_delivered_check(
         self,
         task_id: str,
@@ -8242,6 +8355,22 @@ class Harness:
         runner's ``orchestrator-deterministic`` L2). No-ops gracefully when
         no escalation queue is attached (bare-Harness unit tests stay
         green).
+
+        AUTHORING DIAGNOSIS (task 3500). That task's originating complaint is
+        that this escalation reads IDENTICALLY whether the check is malformed
+        or the capability genuinely has not landed: both say
+        ``DEP_CAPABILITY_NOT_DELIVERED``, both name the check, and nothing
+        distinguishes them. The two need opposite responses — repair the
+        producer's metadata, or chase work that never happened — so a reader
+        who cannot tell them apart either waits forever on a check that can
+        never go green (the 5799 -> 5919 wedge) or "fixes" a descriptor that
+        was correct all along. :meth:`_diagnose_delivered_check_authoring`
+        appends a named diagnosis when, and only when, a reject-tier finding
+        fires; that call sits AFTER the dedupe (so it cannot affect what is
+        deduped) and inside its OWN try/except (so a lint failure costs the
+        diagnosis and never the file). It is deliberately ADDITIVE — only
+        ``detail`` grows, ``summary`` is untouched — so no existing assertion
+        on this escalation's shape changes.
         """
         # Set task to blocked regardless of queue state — the queue is only for
         # human notification; the gate stays closed via the delivered-check cache.
@@ -8272,6 +8401,29 @@ class Harness:
             )
             return
 
+        # Task 3500: name the authoring defect, if there is one, so a reader
+        # can tell a mis-authored check from a genuinely undelivered
+        # capability. Its OWN try/except, and deliberately not the caller's:
+        # the escalation is the load-bearing signal and the diagnosis is an
+        # enhancement to it, so a lint failure must cost the enhancement and
+        # nothing else. Runs AFTER the dedupe read so it can neither trigger a
+        # second file nor change what the existing one matches on, and in a
+        # worker thread because the lint shells out to git.
+        try:
+            diagnosis = await asyncio.to_thread(
+                self._diagnose_delivered_check_authoring, detail
+            )
+        except Exception:
+            logger.warning(
+                'Delivered-check block for task %s — authoring diagnosis '
+                'failed; filing the escalation undiagnosed',
+                task_id,
+                exc_info=True,
+            )
+            diagnosis = None
+        if diagnosis:
+            detail = f'{detail}\n{diagnosis}'
+
         from escalation.models import Escalation
 
         esc = Escalation(
@@ -8280,6 +8432,9 @@ class Harness:
             agent_role='orchestrator-scheduler',
             severity='critical',
             category=category,
+            # `summary` is deliberately UNTOUCHED: it is truncated to 200
+            # chars and existing e2e tests assert its contents, so the
+            # diagnosis is additive to `detail` alone.
             summary=summary[:200],
             detail=detail,
             suggested_action='manual_intervention',
@@ -10818,8 +10973,7 @@ class Harness:
             'routing': {
                 'routing_tier': RoutingState.from_metadata(task_metadata).routing_tier + 1,
             },
-            'modules': list(task_metadata.get('modules') or []),
-            'files': list(task_metadata.get('files') or []),
+            'files': sanitize_files_for_persist(task_metadata.get('files') or []),
         }
 
         title = (
@@ -10917,13 +11071,14 @@ class Harness:
                 )
 
         # Cross-reference the new id back onto the original task.
+        # ``task_metadata`` is the dispatch-time snapshot, so only the owned
+        # key is written; see
+        # orchestrator/src/orchestrator/workflow.py::TaskWorkflow._stamp_optimistic_path.
         try:
             await self.scheduler.update_task(
                 original_id,
-                metadata={
-                    **task_metadata,
-                    'auto_eval_pair': str(new_task_id),
-                },
+                metadata={'auto_eval_pair': str(new_task_id)},
+                metadata_mode='merge',
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -11284,7 +11439,8 @@ class Harness:
           the healthy majority of every sweep, and emitting for it would bury
           the strands this mechanism exists to surface.
 
-        ``classify_pins`` is consulted ONLY to bucket ids for the payload.
+        ``classify_pins`` is consulted ONLY to bucket ids for the payload and
+        to gate the streak alarm on whether the hold is human-parked.
         Since task 3541 the veto answer is the caller's, taken from the SAME
         classifier through ``orchestrator.recovery_pins`` before it ever
         reaches this method — describing and deciding stay separate.
@@ -11336,9 +11492,10 @@ class Harness:
                 self._recovery_veto_tracker = tracker
 
             # Shared with the Scheduler's twin adapter rather than hand-rolled
-            # here: classify_pins is consulted for BUCKETING only (never for
-            # the veto answer), and records=None carries its store-unavailable
-            # third state, which must never collapse into "no records".
+            # here: classify_pins is consulted for BUCKETING and the streak
+            # alarm's human-parked gate only (never for the veto answer), and
+            # records=None carries its store-unavailable third state, which
+            # must never collapse into "no records".
             pins = pin_buckets(
                 task_id, records, store_unavailable=store_unavailable,
             )
@@ -11364,7 +11521,8 @@ class Harness:
                 # dimension (span) can be cleared on a LATER, quiet observation
                 # than the threshold crossing itself, and a hold that alarms
                 # only when it also happens to be re-stated would be silently
-                # dependent on the event cadence.
+                # dependent on the event cadence.  The alarm is also
+                # pin-class-aware — see recovery_emission's module docstring.
                 if (
                     site in STREAK_CHARGING_SITES
                     and cfg.streak_escalation_enabled
@@ -11384,6 +11542,8 @@ class Harness:
                             as_ageable_records(records), now=datetime.now(UTC),
                         ),
                         filed_at=self._recovery_streak_memo(),
+                        human_parked=pins.human_parked,
+                        suppress_human_parked=cfg.streak_escalation_suppress_human_parked,
                     )
                 if not should_emit_event(
                     observation, threshold=cfg.veto_streak_threshold,
@@ -11832,19 +11992,18 @@ class Harness:
         """Start the merge queue worker as a background asyncio task.
 
         Uses SpeculativeMergeWorker (two-coroutine pipeline) — the sole
-        production merge worker (MQ-refactor task ν retired the legacy serial
-        MergeWorker; its readable-reference role now lives as a test-local
-        fixture in ``tests/_serial_merge_worker.py``).
+        merge worker (MQ-refactor task ν retired the legacy serial
+        MergeWorker).
 
         Also builds and stores the StaleServiceRestartCoordinator and wires
         its note_merge method as the merge worker's on_merge_landed callback.
         """
-        from orchestrator.merge_queue import (
+        from orchestrator.merge_lane.liveness import (
             MergeLivenessConfigError,
-            SpeculativeMergeWorker,
             enforce_merge_liveness_margin,
             enforce_persistent_worktree_serial_lane,
         )
+        from orchestrator.merge_queue import SpeculativeMergeWorker
 
         # K = 1 (local trust-anchor) + number of enabled remote verify runners.
         # Sizes the liveness guard (merge_ahead_bound + num_hosts), the
@@ -12717,6 +12876,13 @@ class Harness:
         )
         host = self.config.escalation.host
         port = self.config.escalation.port
+        listeners = take_systemd_listeners()
+        listener = listeners.pop(port, None)
+        if listeners:
+            logger.warning(
+                'systemd passed listening sockets for ports %s that nothing here serves',
+                sorted(listeners),
+            )
 
         async def _serve():
             import uvicorn
@@ -12725,10 +12891,11 @@ class Harness:
                 app, host=host, port=port, log_level='warning',
             )
             server = uvicorn.Server(uv_config)
-            await server.serve()
+            await server.serve(sockets=[listener] if listener else None)
 
         self._escalation_task = asyncio.create_task(_serve(), name='escalation-server')
-        logger.info(f'Escalation MCP server starting on {host}:{port}')
+        held = ' on the systemd-held socket (survives restarts)' if listener else ''
+        logger.info(f'Escalation MCP server starting on {host}:{port}{held}')
         # Give the server a moment to bind, then verify it didn't crash
         await asyncio.sleep(0.5)
         if self._escalation_task.done():
@@ -13077,6 +13244,8 @@ class Harness:
             main_branch=self.config.git.main_branch,
             branch_prefix=self.config.git.branch_prefix,
             registry=self._merge_inflight_registry,
+            enqueue_merge_request=enqueue_merge_request,
+            select_recovery_winner=select_recovery_winner,
         )
         logger.info(
             '_recover_pending_merges: recovered=%d dropped=%d coalesced=%d '
@@ -13772,6 +13941,24 @@ class Harness:
             if age_secs < timeout:
                 continue
 
+            eval_lane_reason = eval_lane_provenance(esc.task_id, esc.worktree)
+            if eval_lane_reason is not None:
+                self._escalation_queue.resolve(
+                    esc.id,
+                    (
+                        'Dismissed by orphan reaper — eval-lane artifact '
+                        f'({eval_lane_reason}); eval-lane escalations are '
+                        'contained to the eval harness and never promoted to L1/L2'
+                    ),
+                    dismiss=True,
+                    resolved_by='harness-orphan-reaper',
+                )
+                logger.info(
+                    'Orphan L0 reaper: dismissed eval-lane orphan for task_id=%s (%s)',
+                    esc.task_id, eval_lane_reason,
+                )
+                continue
+
             # The task row, fetched AT MOST ONCE per record and shared by the
             # liveness arm below with the divergence / done-step-commit
             # branches further down.  `_UNFETCHED` distinguishes "not read yet"
@@ -14307,6 +14494,10 @@ class Harness:
         members — a common steady state while a human is slow to resolve
         L2s — defeating the entire cost optimisation this precheck exists
         for.
+
+        A pending member of a RESOLVED or DISMISSED (archived) L2 stays
+        actionable: its L2's best-effort cascade missed it, and the rotation's
+        drain closes it (SKILL.md "Draining pending escalations").
 
         Scope: only L1 work counts.  A queue containing only L0s, or only
         pending L2s, is treated as non-actionable — L0->L1 promotion is
@@ -15695,7 +15886,14 @@ class Harness:
         fut.add_done_callback(_log_if_raised)
 
     def _on_escalation_resolved(self, escalation) -> None:
-        """Callback when an escalation is resolved — wake the waiting workflow."""
+        """Callback when an escalation is resolved — wake the waiting workflow.
+
+        An eval-lane record (``shared/src/shared/eval_lane.py``) wakes no
+        workflow and dispatches no action, because a numeric id filed from an
+        eval worktree names a production task it must not touch.  The merge-halt
+        and scheduler-pause handlers key on the record's own identity, not its
+        task, so they still run.
+        """
         # Increment for any status transition (resolved or dismissed) — both are
         # escalation events, and resolutions feed the digest GATE so that a
         # window which only drains a backlog still fires a digest (and, with a
@@ -15706,8 +15904,9 @@ class Harness:
         # Best-effort observability counter — same concurrency caveat as _on_escalation
         # above; _maybe_write_digest snapshots it at entry to avoid double-skip drift.
         self._escalation_event_count += 1  # task 1327 AFK hardening
+        eval_lane_reason = eval_lane_provenance(escalation.task_id, escalation.worktree)
         event = self._escalation_events.get(escalation.task_id)
-        if event:
+        if event and eval_lane_reason is None:
             event.set()
 
         # Un-halt the merge queue only when the escalation that OWNS the
@@ -15777,6 +15976,14 @@ class Harness:
         # The _SCHEDULER_PAUSE_SENTINEL is a synthetic task-id that has its own
         # dedicated auto-resume handling above and is not a real task; skip it.
         if escalation.task_id == self._SCHEDULER_PAUSE_SENTINEL:
+            return
+
+        if eval_lane_reason is not None:
+            logger.info(
+                'escalation %s is an eval-lane artifact (%s): no workflow wake and no '
+                'action dispatch on task %s',
+                escalation.id, eval_lane_reason, escalation.task_id,
+            )
             return
 
         action = self._resolve_escalation_action(escalation)

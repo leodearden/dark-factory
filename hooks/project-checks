@@ -14,11 +14,12 @@
 # WHY THE RATCHET AUDIT IS UNIVERSAL. A ratchet raise is INTRODUCED by a
 # commit on a task branch and reaches main by MERGE -- exactly like the
 # .task/ contamination the neighbouring universal guard in hooks/pre-commit
-# exists to stop. Merge commits run pre-merge-commit rather than pre-commit,
-# and the merge worker advances main with `git update-ref`, which runs no
-# hooks at all, so a main-only audit would never see the two raises that
-# actually landed (0b04534c7b, 52d98220ad -- both merge commits). Catching a
-# raise where it is introduced is the only placement that bites.
+# exists to stop. A CLEAN merge runs pre-merge-commit rather than pre-commit
+# (a conflicted one finished with `git commit` does run pre-commit), and the
+# merge worker advances main with `git update-ref`, which runs no hooks at
+# all, so a main-only audit would never see the two raises that actually
+# landed (0b04534c7b, 52d98220ad -- both merge commits). Catching a raise
+# where it is introduced is the only placement that bites.
 #
 # $2 DEFAULTS TO main, not to a `rev-parse` of the working tree, and that is
 # measured rather than stylistic. Before the branch was passed down this
@@ -48,20 +49,38 @@ BRANCH="${2:-main}"
 # a baseline it can READ first; what it cannot see is that baseline deleted
 # before the write, or rendered elsewhere and copied over. The auditor below
 # asks the other question -- does this COMMIT raise anything -- by comparing
-# the staged baseline against HEAD's blob, so every route to a widened
+# the staged baseline against HEAD's blob, or, finishing a conflicted merge,
+# against what merging both parents may hold, so every route to a widened
 # baseline lands in front of one comparison.
 #
 # NO `|| true` on this filter, unlike the grep-terminated ones below: an empty
 # listing must mean "nothing staged", never "git could not answer". A corrupt
 # or locked index would otherwise disarm the audit in silence -- the very shape
 # this gate exists to close, reproduced one layer out (INV-11).
+ratchet_artifacts=(
+    orchestrator/tests/merge_lane_ratchet_baseline.json
+    orchestrator/tests/merge_lane_ratchet_authorized_raises.json
+)
 staged_ratchet="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD -- \
-    orchestrator/tests/merge_lane_ratchet_baseline.json \
-    orchestrator/tests/merge_lane_ratchet_authorized_raises.json)" || {
+    "${ratchet_artifacts[@]}")" || {
     echo "pre-commit: could not list staged ratchet artifacts (git rc=$?);"
     echo "  refusing the commit rather than skipping the audit."
     exit 1
 }
+# FINISHING A MERGE, the listing runs against MERGE_HEAD too: a resolution
+# that keeps HEAD's artifacts byte-for-byte while dropping MERGE_HEAD's moves
+# or entries differs from MERGE_HEAD alone, and it is exactly the one that
+# breaks a merge's invariant. Still PRECISE rather than "audit every merge":
+# a merge that never touches the artifacts must spawn no python, or an
+# environment that cannot import `shared` would refuse an unrelated merge.
+if merge_head="$(cd "$ROOT" && git rev-parse -q --verify MERGE_HEAD)"; then
+    staged_ratchet+="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMRD \
+        "$merge_head" -- "${ratchet_artifacts[@]}")" || {
+        echo "pre-commit: could not list ratchet artifacts staged against MERGE_HEAD (git rc=$?);"
+        echo "  refusing the commit rather than skipping the audit."
+        exit 1
+    }
+fi
 if [ -n "$staged_ratchet" ]; then
     echo "pre-commit: merge-lane ratchet audit (staged)..."
     # Plain python3, matching the three staged-file checks below: no uv
@@ -94,23 +113,37 @@ fi
 
 echo "pre-commit: linting (main branch)..."
 
-# All first-party packages (for ruff)
-ALL_PACKAGES=(shared escalation fused-memory orchestrator dashboard)
-# Packages with [tool.pyright] config (pyright runs per-package from its directory)
-PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard)
-# Shared dependency packages imported by every PYRIGHT_PACKAGES package. These
-# aren't pyright-configured themselves, so a staged change here can't be
-# caught by the per-package prefix filter below — it must instead force a
-# full pyright sweep across all PYRIGHT_PACKAGES. See task 2551.
+# Every path the merge gate lints, in the order of the `ruff check` leg of
+# dark-factory-orchestrator.yaml::lint_command -- a wider set than
+# PYRIGHT_PACKAGES, since it also names non-member paths. That leg is the
+# source of truth: tests/scripts/test_hook_ruff_targets_drift.py fails when
+# this list and the leg disagree, so widen both together.
+RUFF_TARGETS=(shared escalation fused-memory orchestrator dashboard sampler cockpit conftest.py df_pytest_isolation.py skills)
+# Every package the merge gate type-checks, in the order of
+# dark-factory-orchestrator.yaml::type_check_command (all carry [tool.pyright];
+# pyright runs per-package from its directory). That chain is the source of
+# truth: tests/scripts/test_hook_pyright_packages_drift.py fails when this list
+# and the chain disagree, so widen both together.
+PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard shared escalation sampler cockpit)
+# Dependency packages that the other PYRIGHT_PACKAGES import. They are
+# pyright-checked like any other member, but a staged change here can break a
+# consumer without touching the consumer's files, so it forces a sweep across
+# all PYRIGHT_PACKAGES instead of just its own. See task 2551.
 DEP_PACKAGES=(shared escalation)
 
-DIRS=()
-for pkg in "${ALL_PACKAGES[@]}"; do
-    [ -d "$ROOT/$pkg" ] && DIRS+=("$ROOT/$pkg")
+# Every tests/ directory the merge gate's check_bare_magicmock_config.py tail leg
+# scans, in the order of dark-factory-orchestrator.yaml::lint_command. That leg is
+# the source of truth: tests/scripts/test_hook_magicmock_test_dirs_drift.py fails
+# when this list and the leg disagree, so widen both together.
+MAGICMOCK_TEST_DIRS=(shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests)
+
+RUFF_PATHS=()
+for target in "${RUFF_TARGETS[@]}"; do
+    [ -e "$ROOT/$target" ] && RUFF_PATHS+=("$ROOT/$target")
 done
 
-# ruff check (runs from repo root, all packages at once)
-if ! uv run ruff check --quiet "${DIRS[@]}"; then
+# ruff check (runs from repo root, every target at once)
+if ! uv run ruff check --quiet "${RUFF_PATHS[@]}"; then
     echo "pre-commit: ruff check failed. Fix lint errors before committing to main."
     exit 1
 fi
@@ -138,7 +171,7 @@ fi
 # Script is stdlib-only (ast/argparse/pathlib/re/sys) — invoked via plain python3 to skip uv env-resolution overhead.
 echo "pre-commit: bare-magicmock-config check (staged)..."
 staged_mm="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMR -- \
-    shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests \
+    "${MAGICMOCK_TEST_DIRS[@]}" \
     | grep -E '\.py$' || true)"
 if [ -n "$staged_mm" ]; then
     if ! (cd "$ROOT" && printf '%s\n' "$staged_mm" | xargs python3 fused-memory/scripts/check_bare_magicmock_config.py); then
@@ -177,12 +210,11 @@ fi
 
 # pyright (must run from each package directory to pick up [tool.pyright] config)
 # Path-filtered: only run for packages with staged .py changes, so docs/plans-only
-# commits (and commits scoped to a single package) don't pay for an unconditional
-# 3x pyright run. A staged change under a DEP_PACKAGES dependency (shared,
-# escalation) forces a full sweep across all PYRIGHT_PACKAGES instead: those
-# packages aren't in PYRIGHT_PACKAGES themselves, so the per-package prefix
-# filter would otherwise match nothing and skip pyright everywhere, even
-# though fused-memory/orchestrator/dashboard all import from them. See task 2551.
+# commits (and commits scoped to a single package) don't pay for an
+# unconditional all-package pyright run. A staged change under a DEP_PACKAGES
+# dependency (shared, escalation) forces a full sweep across all
+# PYRIGHT_PACKAGES instead, because consumers import from them and can go red
+# without any of their own files being staged. See task 2551.
 # -c core.quotepath=false stops git from quoting/escaping non-ASCII path
 # bytes (its default quoting only covers bytes >= 0x80; control characters and
 # literal quote/backslash bytes are always escaped regardless of this

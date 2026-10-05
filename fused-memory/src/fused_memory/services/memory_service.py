@@ -14,7 +14,7 @@ import time
 import uuid as uuid_mod
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
@@ -24,6 +24,7 @@ from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     GraphitiBackend,
 )
+from fused_memory.backends.llm_token_usage import TokenMeasurement
 from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     Mem0Backend,
@@ -37,12 +38,19 @@ from fused_memory.memory_metadata import (
     MemoryMetadataValidationError,
     MetadataViolation,
     ParentHasChildrenError,
+    check_canonical_routing,
     is_valid_topic_slug,
     parent_liveness_violation,
     validate_memory_metadata,
 )
 from fused_memory.middleware.dead_letter_escalator import (
     emit_dead_letter_escalation,
+)
+from fused_memory.middleware.dependency_direction_check import (
+    DependencyDirectionFinding,
+    build_dependency_index,
+    check_dependency_direction,
+    extract_dependency_facts,
 )
 from fused_memory.middleware.entity_mint_storm_escalator import (
     emit_entity_mint_storm_escalation,
@@ -71,7 +79,13 @@ from fused_memory.models.reconciliation import (
 )
 from fused_memory.models.scope import Scope
 from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_KIND as _CYCLE_SUMMARY_KIND,
+)
+from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL as _CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
+)
+from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_TTL_DAYS,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_MERGE,
@@ -83,6 +97,7 @@ from fused_memory.reconciliation.standing_decision_writer import (
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
 from fused_memory.server.storm_counter import StormCounter
+from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
 from fused_memory.services.memory_metadata_census import (
     UnknownKeyStormDetector,
@@ -132,6 +147,7 @@ from fused_memory.utils.validation import _safe_repr, require_full_uuid
 if TYPE_CHECKING:
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
     from fused_memory.reconciliation.event_buffer import EventBuffer
+    from fused_memory.reconciliation.journal import ReconciliationJournal
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.services.planned_episode_registry import PlannedEpisodeRegistry
     from fused_memory.services.write_journal import WriteJournal
@@ -406,7 +422,7 @@ def _infer_recon_pool(meta: dict) -> str | None:
     pool cannot be inferred; callers must not clobber any caller-supplied
     recon_pool in that case).
     """
-    if meta.get('kind') != 'cycle_summary':
+    if meta.get('kind') != _CYCLE_SUMMARY_KIND:
         return None
     stage = meta.get('stage')
     if not isinstance(stage, str):
@@ -430,7 +446,7 @@ def _missing_cycle_summary_keys(meta: dict) -> list[str]:
     count_memories_by_metadata({kind, run_id, stage}) pre-check as an absent
     one). Order is stable: 'stage' before 'run_id'.
     """
-    if meta.get('kind') != 'cycle_summary':
+    if meta.get('kind') != _CYCLE_SUMMARY_KIND:
         return []
 
     missing: list[str] = []
@@ -489,7 +505,7 @@ def _cycle_summary_run_id_backfill(meta: dict, causation_id: str | None) -> str 
     tests/test_memory_service.py, which pins today's behavior so this stays
     a tracked, visible follow-up rather than silent debt.
     """
-    if meta.get('kind') != 'cycle_summary':
+    if meta.get('kind') != _CYCLE_SUMMARY_KIND:
         return None
     run_id = meta.get('run_id')
     if isinstance(run_id, str) and run_id.strip():
@@ -547,6 +563,21 @@ def _normalize_task_id_metadata(meta: dict) -> None:
         meta['task_id'] = str(meta['task_id'])
 
 
+def _stamp_unverified_claim(meta: dict, unverified_claim: bool) -> None:
+    """Make the completion-claim gate the ONLY writer of ``UNVERIFIED_CLAIM_TAG``.
+
+    The key is server-stamped, like ``category``, so a caller-supplied value
+    is discarded rather than trusted: a write can neither forge the tag nor
+    persist it as False, and an untagged record carries no key at all.
+    Shared by add_memory and add_system_record, the two seams whose metadata
+    reaches the validator that lists the key in ``SERVER_STAMPED_KEYS`` and so
+    no longer censuses it as unknown (task 4715).
+    """
+    meta.pop(UNVERIFIED_CLAIM_TAG, None)
+    if unverified_claim:
+        meta[UNVERIFIED_CLAIM_TAG] = True
+
+
 async def _apply_memory_metadata_validation(
     meta: dict,
     *,
@@ -556,6 +587,7 @@ async def _apply_memory_metadata_validation(
     storm_detector: UnknownKeyStormDetector,
     project_root: str,
     parent_lookup: Callable[[str, str], Awaitable[dict | None]],
+    reaches_mem0: bool,
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
     baseline: dict | None = None,
@@ -583,7 +615,10 @@ async def _apply_memory_metadata_validation(
     Discharges five obligations:
 
     1. **Normalize + shape-check** via ``validate_memory_metadata`` (the only
-       in-place mutation is ``supersedes`` scalar→list, PRD D2).
+       in-place mutation is ``supersedes`` scalar→list, PRD D2), plus (task
+       3508) ``check_canonical_routing`` — the one shape rule that needs a
+       routing fact the pure validator cannot see: ``canonical: True`` on a
+       write that will not reach Mem0 is refused.
     2. **Resolve ``parent_id`` LIVENESS** (task 3197, leaf δ) — see below.
     3. **Census** every violation, fatal or not, so warn-mode leaves a trace.
     4. **Reject** — but ONLY when ``enforce`` is on AND at least one
@@ -677,6 +712,15 @@ async def _apply_memory_metadata_validation(
     defaultable resolver would let a future third write path construct this
     helper without one and silently skip liveness — reintroducing the exact
     silent-orphan class leaf δ exists to close, and doing it invisibly.
+
+    ``reaches_mem0`` IS THE ROUTING OUTCOME, NOT THE CATEGORY, and is
+    REQUIRED — no default, for the same reason as ``parent_lookup`` above.
+    "Will this land in Mem0", not "is the category Mem0-primary", because
+    ``dual_write=True`` routes a Graphiti-primary category into Mem0 too,
+    where ``canonical`` IS stored and IS enforceable.  ``add_memory`` passes
+    its own ``write_mem0``; ``add_system_record`` and ``update_memory`` pass
+    ``True``, because both always land in Mem0 whatever their ``category``
+    tag.
 
     The enforce flags are read PER CALL off the shared config object rather
     than captured, so a config edit takes effect on the next write.
@@ -817,6 +861,18 @@ async def _apply_memory_metadata_validation(
             or meta.get(v.key, _unset) != before.get(v.key, _unset)
         ]
 
+    # Extended IMMEDIATELY BEFORE the `if violations:` block below, and that
+    # placement is load-bearing (task 3508): folding the routing rule into the
+    # SAME list gives it census emission and the `enforce and any(v.fatal)`
+    # rejection — which precedes the write-ahead Mem0 intent and every backend
+    # call — with zero new machinery.
+    #
+    # AFTER the delta subtraction on purpose: the subtraction scopes only
+    # codes the PURE validator can emit about the record at rest, whereas
+    # this rule is a fact about THIS write's routing.  The only caller that
+    # supplies a baseline (`update_memory`) passes `reaches_mem0=True`, under
+    # which the rule cannot fire, so delta-scoping it would be moot.
+    violations += check_canonical_routing(meta, reaches_mem0=reaches_mem0)
     # NOTE: this is `if violations:`, not an early `return` — the canonical
     # uniqueness re-check below must still run for metadata that is
     # perfectly well-formed, which is the overwhelmingly common case for a
@@ -853,6 +909,7 @@ async def _apply_memory_metadata_validation(
         project_id=project_id,
         agent_id=agent_id,
         config=config,
+        reaches_mem0=reaches_mem0,
         count_canonical=count_canonical,
         find_canonical=find_canonical,
         baseline=baseline,
@@ -872,6 +929,7 @@ async def _check_canonical_uniqueness(
     project_id: str,
     agent_id: str | None,
     config: MemoryMetadataConfig,
+    reaches_mem0: bool,
     count_canonical: Callable[[str, dict], Awaitable[int]],
     find_canonical: Callable[..., Awaitable[list[dict]]],
     baseline: dict | None = None,
@@ -888,35 +946,53 @@ async def _check_canonical_uniqueness(
     module-level helper stays decoupled from ``MemoryService`` and trivially
     stubbable.
 
-    SCOPE — THE INVARIANT IS MEM0-SCOPED (3198 amendment, stated because
-    the silence read as coverage).  Both probes go to Mem0/Qdrant payload
-    filters, but this seam deliberately runs BEFORE the
-    ``write_graphiti``/``write_mem0`` branching so that no write path can
-    bypass the vocabulary rules.  The consequence, spelled out rather than
-    left to be discovered: for a Graphiti-primary category
-    (``entities_and_relations``, ``temporal_facts``,
-    ``decisions_and_rationale``) a ``canonical: True`` record never lands
-    in Mem0, so the count cannot see a previously-written Graphiti-primary
-    canonical and the <=1-per-``(project, topic)`` rule does NOT hold for
-    those categories.  This matches the PRD, whose whole vocabulary is
-    framed as the Mem0 metadata vocabulary.
+    SCOPE — THE INVARIANT HOLDS FOR ALL SIX CATEGORIES ONCE ``enforce`` IS
+    ON, NOT TODAY (task 3508; supersedes the 3198 amendment, whose text
+    said the scope limit was permanent and is now wrong).  Both probes are
+    still Mem0/Qdrant payload filters, and this seam still runs BEFORE the
+    ``write_graphiti``/``write_mem0`` branching so no write path can bypass
+    the vocabulary rules.  What changed is what happens to a canonical
+    write that will not reach Mem0: the seam now REFUSES it
+    (``check_canonical_routing`` → ``canonical_on_non_mem0_write``, fatal)
+    instead of admitting it, so either the write lands in Mem0 and this
+    probe checks uniqueness exactly as before, or the assertion never
+    happens — at zero new I/O.
 
-    The probe is nonetheless issued for every canonical write rather than
-    skipped for Graphiti-primary ones, deliberately: ``dual_write`` can
-    route any category into Mem0 too, so a category-based skip would be
-    wrong exactly when it mattered, and a Graphiti-primary canonical that
-    DOES have a Mem0 twin still gets caught.  The cost is one count that
-    can only return 0 on a Graphiti-only canonical write — a rare write on
-    a rare key.  ``TestCanonicalUniquenessAtSeam`` pins this behaviour for
-    ``decisions_and_rationale`` so a later reader cannot mistake it for
-    coverage.  Closing the gap properly needs a Graphiti-side count, which
-    the PRD does not specify — do not fake it here.
+    BUT THAT REFUSAL IS WARN-MODE-FIRST, behind the same
+    ``memory_metadata.enforce`` flag as every sibling check, and the flag
+    SHIPS OFF.  Under the default a doomed canonical write is censused and
+    still proceeds, its marker discarded exactly as before: the mechanism
+    is in place, the closure is not yet live, and the only live-fleet
+    change is one extra census line.  Do not read the paragraph above as
+    describing today's fleet.  Task 3626 is the gate for the flip.
+
+    THE PREDICATE IS ``reaches_mem0``, NOT CATEGORY MEMBERSHIP — and that
+    is the hazard the superseded text correctly identified, preserved
+    rather than lost.  ``dual_write=True`` routes a Graphiti-primary
+    category into Mem0 too, where ``canonical`` genuinely IS stored and IS
+    enforceable; keying on category would be wrong exactly when it
+    mattered.  Keying on the routing OUTCOME is what lets the probe be
+    skipped safely: the old always-probe rule was a conservative PROXY for
+    "dual_write might route this into Mem0", and ``reaches_mem0`` measures
+    that condition exactly instead of approximating it.
+    ``test_dual_write_canonical_is_rejected_when_a_mem0_twin_exists`` pins
+    the dual_write direction specifically so a later reader cannot
+    "simplify" this to ``resolved_category in MEM0_PRIMARY``.
+
+    WHY A GRAPHITI-SIDE COUNT WAS REJECTED RATHER THAN DEFERRED — do not
+    fake one here.  On the Graphiti path the metadata is DISCARDED, not
+    merely uncounted, and there is no filtered count to issue against it
+    even if it were kept.  The measurement (graphiti_core 0.28.2) is
+    single-homed rather than restated: see
+    :func:`~fused_memory.memory_metadata.check_canonical_routing`'s
+    docstring for the discard finding, and the leaf-ε section of
+    ``docs/prds/memory-metadata-vocabulary.md`` for the four findings that
+    make a Graphiti-side count a PRD-sized change rather than a leaf.
 
     PROBE FAILURE (3198 amendment).  Both probes talk to Qdrant and
     ``Mem0Backend.count_by_metadata`` propagates a read timeout by
     contract, so the probe can fail for reasons that have nothing to do
-    with the write — including for a Graphiti-primary write that would
-    never have touched Mem0 at all.  Explicitly decided, not incidental:
+    with the write.  Explicitly decided, not incidental:
 
     * a failure is ALWAYS censused, under ``code``
       ``canonical_uniqueness_check_unavailable`` — degradation is loud, and
@@ -966,9 +1042,12 @@ async def _check_canonical_uniqueness(
        Compared as a PAIR, not on ``canonical`` alone: a canonical record
        re-homed from topic T to topic U changes no ``canonical`` value but
        is acquiring a claim at U, where it genuinely is not the incumbent.
-    4. count == 0 → return.  The happy path pays exactly one exact Qdrant
+    4. the write will not reach Mem0 → return (task 3508).  The seam already
+       censused — and under ``enforce`` refused — it as
+       ``canonical_on_non_mem0_write``; the probe could only ever count 0.
+    5. count == 0 → return.  The happy path pays exactly one exact Qdrant
        count and never scrolls.
-    5. otherwise resolve the incumbent's id and reject.
+    6. otherwise resolve the incumbent's id and reject.
 
     WHY COUNT THEN SCROLL: V1 contract-fixes ``count_memories_by_metadata``
     as the INV-3 mechanism, but also requires the error to name the existing
@@ -1000,9 +1079,41 @@ async def _check_canonical_uniqueness(
     * θ was necessary bookkeeping but nearly irrelevant to blast radius.
       ``enforce`` rejects WRITES and never re-validates the corpus, so
       normalizing records at rest moved the measured false-rejection rate
-      by ~1/week (~20 → ~19).  Rejections come from NEW writes by writers
-      who were never told the rule: ``_MEMORY_INSTRUCTIONS`` still carries
-      no slug guidance.  THE REAL PRECONDITION is leaf ι (task 3202).
+      by ~1/week (~20 → ~19).  Rejections came from NEW writes by writers
+      who had never been told the rule — and leaf ι (task 3202) has now
+      told SOME of them.  Read the coverage precisely before flipping
+      anything; "ι landed" is the same wrong question θ set above.
+
+      COVERED by ι: ``orchestrator.agents.roles`` splices
+      ``METADATA_VOCABULARY_INSTRUCTIONS`` onto ``_MEMORY_INSTRUCTIONS``,
+      reaching the five memory-writing agent roles (architect, implementer,
+      debugger, deep_reviewer, simple_task), plus the two interactive
+      surfaces ``CLAUDE.md`` and ``.claude/commands/memory.md``.
+
+      NOT COVERED by ι — and this is the one that matters: the
+      reconciliation STAGE prompts.  ``reconciliation/prompts/stage1.py``
+      still says nothing about slugs, kebab-case or ``topic``, and Stage 1's
+      ``recon-stage-memory_consolidator`` is the writer the PRD measured as
+      the TOP source of rejections in BOTH projects
+      (``docs/prds/memory-metadata-vocabulary.md``, the 2026-08-04
+      amendment).  It is unattended, so a hard reject there is silent.
+
+      What the pin actually guarantees is likewise narrower than "the
+      vocabulary agrees with this registry".
+      ``fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py``
+      relates the prose to this module on exactly two axes: the five
+      ``RESERVED_VOCABULARY_KEYS`` names each have a documented line, and
+      the quoted slug cap resolves to ``TOPIC_SLUG_MAX_LEN``.  The prose's
+      kebab-case DESCRIPTION is not pinned to ``TOPIC_SLUG_RE`` — no test
+      would fail if the regex changed shape and the prose did not.
+
+      So 3626 must do one of two things before flipping ``enforce``, not
+      assume ι discharged the precondition: extend the vocabulary section to
+      the stage prompts (``prompts/stage1.py`` first), or re-measure the
+      rejection rate PER WRITER and confirm the uncovered stages are not
+      still generating it.  Either way the empirical question stands —
+      whether the measured false-rejection rate ACTUALLY fell for the
+      writers that WERE told.  Re-measure it; do not assume it did.
 
     STILL TRUE AFTER TASK 3523, and deliberately so.  Wiring this seam into
     ``update_memory`` added a third write path, but its enforcement is
@@ -1041,6 +1152,13 @@ async def _check_canonical_uniqueness(
     if baseline is not None and (
         (baseline.get('canonical'), baseline.get('topic')) == (True, topic)
     ):
+        return
+
+    # Guard 4 (task 3508) — this write cannot land in Mem0, so the probe could
+    # only ever count 0.  Skipping it saves the round-trip and keeps a probe
+    # failure from censusing `canonical_uniqueness_check_unavailable` for a
+    # write the seam has already censused as `canonical_on_non_mem0_write`.
+    if not reaches_mem0:
         return
 
     filters = {'topic': topic, 'canonical': True}
@@ -1103,26 +1221,67 @@ async def _check_canonical_uniqueness(
     _census('canonical_uniqueness_violation', str(error))
 
 
+def _strip_recon_pool_from_non_cycle_summary(
+    meta: dict,
+    *,
+    project_id: str,
+    agent_id: str | None,
+) -> None:
+    """Enforce "a Mem0 record carries recon_pool only if kind == cycle_summary"
+    (task 3239) by popping a caller-supplied recon_pool from any other write,
+    with one WARNING so the prompt-compliance failure behind it stays visible.
+
+    Keys on the key's presence, not its value: an unhashable LLM-supplied
+    value cannot raise, and a list value (which Qdrant would still match
+    element-wise against the pool filter) is stripped too.
+    """
+    if meta.get('kind') == _CYCLE_SUMMARY_KIND or 'recon_pool' not in meta:
+        return
+    stripped = meta.pop('recon_pool')
+    logger.warning(
+        'MemoryService: stripped caller-supplied recon_pool=%s from a '
+        'non-cycle_summary write (kind=%s, agent_id=%s) — recon_pool is '
+        'server-stamped on kind=cycle_summary writes only, and a stray tag '
+        'would join a reconciliation trim pool',
+        _safe_repr(stripped), _safe_repr(meta.get('kind')), agent_id,
+        extra={
+            'project_id': project_id,
+            'agent_id': agent_id,
+            'kind': meta.get('kind'),
+            'caller_recon_pool': stripped,
+        },
+    )
+
+
 def _apply_cycle_summary_metadata_tagging(
     meta: dict,
     causation_id: str | None,
     *,
     project_id: str,
+    agent_id: str | None,
 ) -> None:
     """Apply server-side cycle_summary metadata tagging to ``meta`` in place.
 
     Shared by add_memory and add_system_record (task 2222 amendment) so
     every write path that can carry a cycle_summary payload gets the same
     authoritative treatment: recon_pool auto-tag from metadata.stage (task
-    2077) — recon_pool is the only key the pool-cap trim and
-    prune_recon_cycle_summaries.py filter on; run_id auto-backfill from the
-    causation id (task 2109) — run_id drives the Path-2 triple-filter
-    verification pre-check; and a WARNING for whatever remains
-    missing/invalid after the backfill (task 2094/2109), so an untagged or
-    unverifiable cycle_summary write is observable instead of silently
-    piling up unbounded or dropping out of the Path-2 pre-check. No-op
-    (and no warning) for any meta['kind'] != 'cycle_summary'.
+    2077) — the pool-cap trim
+    (reconciliation/summary_pool.py::enforce_summary_pool_cap) enumerates on
+    recon_pool together with kind, while
+    fused-memory/scripts/prune_recon_cycle_summaries.py keys on kind and
+    stage; run_id auto-backfill from the causation id (task 2109) — run_id
+    drives the Path-2 triple-filter verification pre-check; and a WARNING
+    for whatever remains missing/invalid after the backfill (task
+    2094/2109), so an untagged or unverifiable cycle_summary write is
+    observable instead of silently piling up unbounded or dropping out of
+    the Path-2 pre-check. A write whose kind is not cycle_summary is left
+    untouched EXCEPT that a caller-supplied recon_pool is stripped, with one
+    WARNING (task 3239, :func:`_strip_recon_pool_from_non_cycle_summary`).
     """
+    _strip_recon_pool_from_non_cycle_summary(
+        meta, project_id=project_id, agent_id=agent_id,
+    )
+
     inferred_recon_pool = _infer_recon_pool(meta)
     if inferred_recon_pool is not None:
         meta['recon_pool'] = inferred_recon_pool
@@ -1631,12 +1790,31 @@ def _store_failure_diagnostics(
     """Build a structured failure-diagnostics dict for a degraded search() store.
 
     Called from search() for both root-cause variants a selected store can hit:
-    ``reason='exception'`` when the store's search task raised (any exception other
-    than the inner GraphitiBackend.search TimeoutError swallow — see search()'s
+    ``reason='exception'`` when the store's search task raised (see search()'s
     per-task except block), and ``reason='timeout'`` when the store's task was
     still pending when the OUTER ``search_timeout_seconds`` asyncio.wait deadline
     elapsed and was cancelled (there, *exc* is None — there is no exception object,
     only the fact of the timeout).
+
+    INNER vs OUTER TIMEOUT, and why ``reason`` is the only discriminator.  Since
+    task 5265 a mem0 BACKEND read timeout (``Mem0Backend.search`` exceeding
+    ``backend_read_timeout_seconds``) also arrives at the ``'exception'`` branch,
+    where it used to be swallowed into an empty response and never reach here at
+    all.  Both variants carry ``error_type='TimeoutError'``, so they are told
+    apart ONLY by ``reason``: inner backend read timeout → ``'exception'``;
+    outer fan-out deadline → ``'timeout'``.  The inner one additionally carries
+    a non-empty ``error`` naming the backend read timeout, because
+    ``Mem0Backend`` re-raises with that text rather than letting
+    ``asyncio.wait_for``'s empty-stringifying ``TimeoutError`` through.
+
+    GraphitiBackend still swallows its own inner ``TimeoutError`` (at
+    ``search`` and several sibling reads), so a Graphiti backend read timeout
+    does NOT reach this function and leaves the search reported as clean.  That
+    asymmetry is deliberate and temporary: it is entangled with a second,
+    independent degrade mechanism in this module
+    (``_graphiti_classify_or_degrade`` / ``_graphiti_degraded_entity_result`` /
+    ``get_entity``'s fallback arms), so reversing it is design work on the
+    degrade contract and was explicitly held out of task 5265's scope.
 
     This is the diagnosability fix for task 2653: search()'s prior degraded-path
     WARNING carried only ``{'store': ..., 'error': str(e)}`` — no exception type, no
@@ -1729,8 +1907,8 @@ class ReconcileStats:
     """Aggregated counts from one ``_reconcile_episode_identity`` run.
 
     Returned to the caller and logged for observability — NOT wired into the
-    durable write-journal schema (extending that schema is out of scope for
-    task 2202 / W6-β). Each field mirrors the int return of the
+    durable write-journal schema (extending that schema is out of scope for task
+    2202 / W6-β). Each int field mirrors the int return of the
     correspondingly-named post-write sweep — including
     ``stale_ttl_edges_invalidated`` (task 2319), the under-invalidation-
     direction counterpart of ``sibling_edges_restored``. ``errors`` collects
@@ -1761,7 +1939,16 @@ class ReconcileStats:
     repair_stats: ReferentRepairStats = field(
         default_factory=lambda: ReferentRepairStats()
     )
+    #: The dependency-direction check's records (task 3770, the ninth
+    #: sub-pass), one per finding it reported. A record whose
+    #: ``contradicts_ground_truth`` is true names an edge that was retired.
+    dependency_direction_findings: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+
+    @property
+    def dependency_direction_flagged(self) -> int:
+        """The number of dependency-direction findings reported this run."""
+        return len(self.dependency_direction_findings)
 
 
 #: Fallback bound on the ensure_entity_node identity-lock acquire, used only when
@@ -2056,6 +2243,11 @@ class DescendantScan(NamedTuple):
     truncated: bool
 
 
+def _elapsed_ms_since(started: float) -> float:
+    """Milliseconds since a ``time.perf_counter()`` reading, to 3 decimals."""
+    return round((time.perf_counter() - started) * 1000, 3)
+
+
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
@@ -2071,6 +2263,7 @@ class MemoryService:
         self.taskmaster: TaskBackendProtocol | None = None
         self.planned_episode_registry: PlannedEpisodeRegistry | None = None
         self.recon_ledger: ReconLedgerStore | None = None
+        self.recon_journal: ReconciliationJournal | None = None
         # {project_id: project_root} registry snapshot (task 3088). Injected by
         # set_known_projects at server startup — MemoryService is constructed
         # before build_known_projects_map runs, so it cannot arrive by
@@ -2230,6 +2423,24 @@ class MemoryService:
     def set_recon_ledger(self, store: ReconLedgerStore) -> None:
         """Wire the recon ledger store into the service."""
         self.recon_ledger = store
+
+    def set_recon_journal(self, journal: ReconciliationJournal) -> None:
+        """Wire the reconciliation journal in as a READ-ONLY runs-table source.
+
+        ``get_cycle_summary_presence`` uses it, and only it, to tell a reaped
+        or never-written ``cycle_summary`` row from a genuinely lost one. The
+        service never calls a journal WRITER — the harness owns every write —
+        and it takes the same already-``initialize()``d instance the harness
+        holds rather than opening a second connection: one process, and
+        aiosqlite serialises its own connection.
+
+        Wired UNCONDITIONALLY at startup, above the ``recon_ledger_enabled``
+        gate that guards ``set_recon_ledger``. That asymmetry is the point:
+        journal availability and ledger availability are independent signals,
+        and the presence payload reports them separately as
+        ``run_lookup_available`` and ``ledger_available``.
+        """
+        self.recon_journal = journal
 
     def set_known_projects(self, known_projects: Mapping[str, str] | None) -> None:
         """Wire the ``{project_id: project_root}`` registry snapshot (task 3088).
@@ -2407,11 +2618,29 @@ class MemoryService:
         operation: str,
         payload: dict[str, Any],
         coro: Any,
+        *,
+        token_probe: Callable[[], contextlib.AbstractAsyncContextManager[TokenMeasurement]]
+        | None = None,
     ) -> Any:
-        """Execute a backend call and log to write journal."""
+        """Execute a backend call and log to write journal.
+
+        Every backend inherits ``duration_ms`` (the awaited call's wall time,
+        on success and failure alike) from this choke point, with no
+        per-call-site opt-in. A ``token_probe`` window wraps only the awaited
+        call, and the LLM tokens it measured are journaled with the row. A
+        probe that fails to open is journaled as this call's failure, and
+        ``coro`` is closed unawaited.
+        """
+        measurement = TokenMeasurement()
         result = None
+        duration_ms: float | None = None
+        started = time.perf_counter()
         try:
-            result = await coro
+            async with (
+                token_probe() if token_probe is not None else contextlib.nullcontext(measurement)
+            ) as measurement:
+                result = await coro
+            duration_ms = _elapsed_ms_since(started)
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2421,9 +2650,15 @@ class MemoryService:
                     payload=payload,
                     result_summary=str(result)[:500] if result else None,
                     success=True,
+                    duration_ms=duration_ms,
+                    llm_tokens=measurement.usage,
                 )
             return result
         except (Exception, asyncio.CancelledError) as e:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            if duration_ms is None:
+                duration_ms = _elapsed_ms_since(started)
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2433,6 +2668,8 @@ class MemoryService:
                     payload=payload,
                     success=False,
                     error=f'{type(e).__name__}: {e}',
+                    duration_ms=duration_ms,
+                    llm_tokens=measurement.usage,
                 )
             raise
 
@@ -3190,6 +3427,111 @@ class MemoryService:
                 failed,
             )
         return invalidated
+
+    async def _check_dependency_direction(
+        self, result: Any, *, group_id: str
+    ) -> list[dict]:
+        """Report extracted dependency facts whose direction Taskmaster rejects.
+
+        The ninth post-write sub-pass (task 3770). The classification rules live
+        in ``middleware/dependency_direction_check.py``.
+
+        - Scope gate first: an episode with no dependency shorthand returns
+          ``[]`` without reading Taskmaster.
+        - The project root is ``self._known_projects[group_id]`` with no
+          fallback. Task ids overlap across projects, so an unregistered group
+          is refused with a WARNING rather than judged against another
+          project's graph.
+        - A finding that contradicts ground truth retires its edge with
+          ``invalid_at`` only; the fact text is never rewritten. An UNSUPPORTED
+          finding is reported and its edge stays valid.
+        - Best-effort: a missing Taskmaster, a failed read or a failed retire
+          never raises. ``CancelledError``, ``KeyboardInterrupt`` and
+          ``SystemExit`` propagate.
+
+        Returns:
+            One record (``DependencyDirectionFinding.to_dict()``) per reported
+            finding. A contradicting finding is reported only once its edge
+            has actually been retired.
+        """
+        if result is None:
+            return []
+        edges = (
+            getattr(result, 'edges', None)
+            or getattr(result, 'entity_edges', None)
+            or []
+        )
+        facts = extract_dependency_facts(edges)
+        if not facts or self.taskmaster is None:
+            return []
+        project_root = self._known_projects.get(group_id)
+        if not project_root:
+            logger.warning(
+                'Dependency-direction check SKIPPED for group_id=%r: the group is '
+                'absent from `_known_projects` (%d known project(s)), and no '
+                'fallback root is used. %d dependency fact(s) go unchecked.',
+                group_id, len(self._known_projects), len(facts),
+            )
+            return []
+
+        try:
+            edge_map = await self.taskmaster.get_dependency_edges(project_root)
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'Dependency-direction check could not read ground truth for %s; '
+                'skipping this episode',
+                project_root,
+            )
+            return []
+
+        index = build_dependency_index(edge_map or {})
+        records: list[dict] = []
+        for finding in check_dependency_direction(facts, index):
+            record = await self._report_dependency_direction_finding(
+                finding, group_id=group_id,
+            )
+            if record is not None:
+                records.append(record)
+        return records
+
+    async def _report_dependency_direction_finding(
+        self, finding: DependencyDirectionFinding, *, group_id: str
+    ) -> dict | None:
+        """Log *finding*, retiring its edge if it contradicts ground truth.
+
+        Returns its record, or ``None`` when the retire failed.
+        """
+        record = finding.to_dict()
+        if not finding.contradicts_ground_truth:
+            logger.warning(
+                'Extracted dependency fact is unsupported by Taskmaster ground '
+                'truth (%s), edge %s left valid: %r — %s',
+                finding.classification, finding.edge_uuid, finding.fact,
+                record['ground_truth'],
+            )
+            return record
+        logger.warning(
+            'Extracted dependency fact contradicts Taskmaster ground truth (%s), '
+            'retiring edge %s: %r — %s',
+            finding.classification, finding.edge_uuid, finding.fact,
+            record['ground_truth'],
+        )
+        try:
+            await self.graphiti.update_edge(
+                finding.edge_uuid, group_id=group_id, invalid_at=datetime.now(UTC),
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            logger.exception(
+                'Failed to retire direction-mismatched edge %s; '
+                'will retry on the next episode that re-asserts it',
+                finding.edge_uuid,
+            )
+            return None
+        return record
 
     async def _normalize_task_node_names(self, result: Any, *, group_id: str) -> int:
         """Collapse every spelling of a touched task's node onto 'Task N'.
@@ -5157,7 +5499,7 @@ class MemoryService:
         content: str = '', referent_source: str = 'derived',
         ambiguous: ReferentSet | None = None,
     ) -> ReconcileStats:
-        """Fold the eight post-write identity/verification/repair sweeps into one call.
+        """Fold the nine post-write identity/verification/repair sweeps into one call.
 
         Task 2202 (W6-β): the single reconcile step ``_execute_graphiti_write``
         runs immediately after ``add_episode``, inside α's (task 2198)
@@ -5169,7 +5511,7 @@ class MemoryService:
         lock and could race with a concurrent same-group write; folding them
         into one locked reconcile closes that race.
 
-        Runs the six sub-passes in their pre-existing chain order —
+        Runs the first six sub-passes in their pre-existing chain order —
         dependency-restore before sibling-restore, matching the ordering
         this replaces at the ``_execute_graphiti_write`` call site (a
         dependency edge must be un-superseded before the sibling-restore
@@ -5218,11 +5560,18 @@ class MemoryService:
         stays the documented MANUAL escape hatch for that case. Overwriting a
         summary verbatim is not a decision a write-time pass may take unattended.
 
+        ``_check_dependency_direction`` (task 3770) is the ninth and last. It
+        checks the direction of freshly-extracted dependency facts against live
+        Taskmaster edges, retiring an edge only when ground truth contradicts
+        it and never rewriting a fact. It reads only edge ``.fact`` text, so it
+        runs after eta and leaves zeta's and eta's ordering contracts alone.
+
         Each sub-pass runs under its own best-effort guard: a generic
         ``Exception`` is logged and recorded as that sub-pass's label in
         ``ReconcileStats.errors`` (leaving its count at its default — ``0`` for
         the six int passes, an empty ``ReferentStats`` for zeta, an empty
-        ``ReferentRepairStats`` for eta), and the remaining sub-passes still
+        ``ReferentRepairStats`` for eta, and an empty list for the
+        dependency-direction check), and the remaining sub-passes still
         run — a single sub-pass failure must never fail the already-committed
         episode write. That guarantee is worth most at eta, the one pass that
         WRITES: its failure is the likeliest to be real, and it arrives after
@@ -5333,6 +5682,11 @@ class MemoryService:
                 episode_uuid=_episode_uuid_of(result),
             ),
             ReferentRepairStats(),
+        )
+        stats.dependency_direction_findings = await _run_pass(
+            '_check_dependency_direction',
+            self._check_dependency_direction(result, group_id=group_id),
+            [],
         )
         return stats
 
@@ -5624,6 +5978,10 @@ class MemoryService:
                     reference_time=reference_time,
                     unverified_claim=unverified_claim,
                 ),
+                # The only LLM-bearing graphiti path. Deletes and edge updates
+                # spend no LLM, so they stay unprobed rather than journaling a
+                # zero that reads like a measurement.
+                token_probe=self.graphiti.token_probe,
             )
             reconcile_stats = await self._reconcile_episode_identity(
                 result, group_id=payload['group_id'], referents=referents,
@@ -6181,10 +6539,18 @@ class MemoryService:
         metadata: dict | None = None,
         dual_write: bool = False,
         causation_id: str | None = None,
+        unverified_claim: bool = False,
         _source: str = 'mcp_tool',
         declared_referents: list[dict] | None = None,
     ) -> AddMemoryResponse:
         """Lightweight classified write — skip extraction pipeline.
+
+        ``unverified_claim`` (task 4715) is a LABEL set by the tool-layer
+        completion-claim gate, never a rejection: the write lands either way.
+        On the Graphiti leg it rides the queue payload exactly as add_episode's
+        does; on the Mem0 leg it is stamped into the record's metadata under
+        the same key episode-derived facts carry, and omitted when untagged.
+        Only this parameter sets it: the same key in ``metadata`` is discarded.
 
         ``declared_referents`` (task 3669, PRD leaf delta) is the caller's
         EXPLICIT statement of which referents this write is about — the
@@ -6260,6 +6626,7 @@ class MemoryService:
         stores_written: list[SourceStore] = []
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
+        _stamp_unverified_claim(meta, unverified_claim)
 
         # Normalize metadata.task_id to str at this shared write boundary
         # (task 2620, sibling of task 2454's flag_dedup-specific fix; shared
@@ -6273,7 +6640,9 @@ class MemoryService:
         # task 2094/2109) — factored into a shared helper (task 2222
         # amendment) so add_system_record gets the identical authoritative
         # treatment. See _apply_cycle_summary_metadata_tagging's docstring.
-        _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+        _apply_cycle_summary_metadata_tagging(
+            meta, causation_id, project_id=project_id, agent_id=agent_id,
+        )
 
         # Mem0 metadata vocabulary validation (task 3195, leaf β). Placement is
         # load-bearing at BOTH ends:
@@ -6287,6 +6656,15 @@ class MemoryService:
         #   or a half-written Graphiti twin. Being before the branching is also
         #   what makes this cover Graphiti-primary writes, which never reach
         #   Mem0 at all — V1 covers the seam, not just the Mem0 branch.
+        #
+        # `write_mem0` is HOISTED above the call (task 3508) so ONE expression
+        # answers both "does this write go to Mem0" and the seam's
+        # `reaches_mem0`. Never restate it: a copy that forgot `dual_write`
+        # would refuse valid canonical writes that do land in Mem0.
+        write_mem0 = (
+            resolved_category in MEM0_PRIMARY or dual_write
+        )
+
         await _apply_memory_metadata_validation(
             meta,
             project_id=project_id,
@@ -6294,6 +6672,7 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            reaches_mem0=write_mem0,
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
             # how it already takes storm_detector/config as collaborators.
@@ -6305,9 +6684,8 @@ class MemoryService:
         write_graphiti = (
             resolved_category in GRAPHITI_PRIMARY or dual_write
         )
-        write_mem0 = (
-            resolved_category in MEM0_PRIMARY or dual_write
-        )
+        # `write_mem0` is computed above, hoisted to feed the validation
+        # seam's `reaches_mem0`. See the comment at that call site.
 
         _graphiti_error = None
         _mem0_error = None
@@ -6359,6 +6737,10 @@ class MemoryService:
                         '_write_op_id': write_op_id,
                         # Popped and decoded by _execute_graphiti_write.
                         'referents': _encode_referents(resolution),
+                        # Popped by _execute_graphiti_write exactly as on
+                        # add_episode's payload, which prefixes the episodic
+                        # source_description with '[unverified_claim] '.
+                        'unverified_claim': unverified_claim,
                     },
                     callback_type='refresh_entity_summaries',
                 )
@@ -6668,6 +7050,8 @@ class MemoryService:
 
         meta = dict(metadata or {})
         meta['category'] = resolved_category.value
+        # No completion-claim gate runs on this path, so it never tags.
+        _stamp_unverified_claim(meta, False)
 
         # Same task_id normalization add_memory applies (task 2620 amendment
         # review): this Mem0-only path shares add_memory's exact-match read
@@ -6682,7 +7066,9 @@ class MemoryService:
         # the pool-cap trim and Path-2 triple-filter pre-check rely on — a
         # system-record cycle_summary must not go untagged just because it
         # bypassed add_memory.
-        _apply_cycle_summary_metadata_tagging(meta, causation_id, project_id=project_id)
+        _apply_cycle_summary_metadata_tagging(
+            meta, causation_id, project_id=project_id, agent_id=agent_id,
+        )
 
         # Same vocabulary validation add_memory applies (task 3195, leaf β).
         # PRD D8/§2 name add_system_record as the second unguarded write path
@@ -6691,6 +7077,11 @@ class MemoryService:
         # drift. Placed after the tagging helpers and before the
         # _journaled_backend_call below, for the reasons spelled out at
         # add_memory's call site.
+        #
+        # `reaches_mem0=True` unconditionally (task 3508): this path never
+        # routes to Graphiti (this method's docstring), and `category` is a
+        # metadata TAG here, so a canonical marker is always stored. Copying
+        # add_memory's category test would refuse valid records on a tag.
         await _apply_memory_metadata_validation(
             meta,
             project_id=project_id,
@@ -6698,6 +7089,7 @@ class MemoryService:
             config=self.config.memory_metadata,
             storm_detector=self._metadata_storm_detector,
             project_root=self._memory_metadata_project_root(),
+            reaches_mem0=True,
             # Bound methods, not `self`: the module-level helper stays
             # decoupled from MemoryService and trivially stubbable, matching
             # how it already takes storm_detector/config as collaborators.
@@ -6742,6 +7134,9 @@ class MemoryService:
         # guaranteed-persistence system-write path exists to rule out, so it
         # must not be journaled as an unconditional success.
         _empty_result = not mem0_ids
+        # mem0 is claimed only when it returned an id (task 4045).
+        stores_written: list[SourceStore] = [] if _empty_result else [SourceStore.mem0]
+        _empty_result_error = 'empty_result: mem0 add_system_record returned zero memory_ids'
         if _empty_result and not _mem0_error:
             logger.warning(
                 'MemoryService.add_system_record: mem0 add_system_record '
@@ -6767,13 +7162,12 @@ class MemoryService:
                 params={'content': content[:200], 'category': resolved_category.value},
                 result_summary={
                     'memory_ids': mem0_ids,
-                    'stores': [SourceStore.mem0.value],
+                    'stores': [s.value for s in stores_written],
                 },
                 success=not _empty_result,
                 error=(
                     _mem0_error if _mem0_error else
-                    ('empty_result: mem0 add_system_record returned zero memory_ids'
-                     if _empty_result else None)
+                    (_empty_result_error if _empty_result else None)
                 ),
             )
 
@@ -6802,13 +7196,15 @@ class MemoryService:
             agent_id=agent_id,
         ))
 
-        msg = f'Memory queued for {[SourceStore.mem0.value]}'
+        msg = f'Memory queued for {[s.value for s in stores_written]}'
         if _mem0_error:
             msg += f' [mem0_error: {_mem0_error}]'
+        elif _empty_result:
+            msg += f' [{_empty_result_error}]'
 
         return AddMemoryResponse(
             memory_ids=mem0_ids,
-            stores_written=[SourceStore.mem0],
+            stores_written=stores_written,
             category=resolved_category,
             message=msg,
         )
@@ -7298,8 +7694,7 @@ class MemoryService:
                 # is shared by every MemoryService.search call site, so without
                 # this one Qdrant read timeout would break every search in the
                 # system — and get_memories_by_metadata genuinely PROPAGATES a
-                # TimeoutError (unlike Mem0Backend.search, which swallows into
-                # {}), so that is a live path, not a hypothetical.
+                # TimeoutError, so that is a live path, not a hypothetical.
                 #
                 # `results` is left exactly as the sort/filter tail produced it
                 # — including its ORDER and every result's topic_anchored flag —
@@ -7761,7 +8156,59 @@ class MemoryService:
         Returns a minimal metadata fingerprint dict:
           {category, agent_id, created_at} for mem0;
           {name, fact_snippet} for graphiti.
-        Raises EdgeNotFoundError (graphiti) or ValueError (mem0 not found).
+
+        WHERE EACH MEM0 FIELD LIVES, and why it is not obvious.  mem0's
+        ``Memory.get`` / ``AsyncMemory.get`` (verified against installed mem0
+        1.0.11, ``mem0/memory/main.py``) do not hand back the stored Qdrant
+        payload as-is.  They LIFT ``promoted_payload_keys`` — ``user_id``,
+        ``agent_id``, ``run_id``, ``actor_id``, ``role`` — to the record's TOP
+        LEVEL, and EXCLUDE those same keys from ``metadata`` via
+        ``core_and_promoted_keys``.  Every other payload key, ``category``
+        among them, stays INSIDE ``metadata``.  So the correct reads are
+        split across two levels, and reading either field at the other one
+        yields ``None`` for every record ever stored — which is the defect
+        task 5265 fixed, after 5/5 real ``cite_memory`` calls came back with
+        ``category`` and ``agent_id`` null against payloads that carried both.
+
+        TWO TRAPS the reads below must survive, both measured against the
+        installed package:
+          * ``metadata`` can be literally ``None``, not merely absent:
+            ``MemoryItem.model_dump()`` always emits ``metadata: None`` and
+            ``result_item['metadata']`` is overwritten only ``if
+            additional_metadata:``.  The ``or {}`` is load-bearing.
+          * a promoted key is copied only ``if key in memory.payload``, so
+            ``agent_id`` can be absent from the record entirely — hence
+            ``.get()``, never a subscript.
+
+        AUDIT OF THE REMAINING PROMOTED KEYS.  ``agent_id`` is the only one
+        this fingerprint touches.  ``user_id`` / ``run_id`` / ``actor_id`` /
+        ``role`` are equally available at the top level and are deliberately
+        NOT added: the three-key shape is a contract with
+        ``ReconReportState.cite_memory``, ``reconciliation/prompts/__init__``
+        and ``cli_stage_runner``'s JSON schema.
+
+        This read is deliberately NOT re-routed through
+        ``Mem0Backend.get_point_by_id`` to share
+        ``reconciliation/citation_repair.py::_fingerprint_from_record``'s
+        extraction: that would read ``created_at`` off the unnormalised raw
+        payload instead of mem0's ``_normalize_iso_timestamp_to_utc`` value,
+        regressing the one field that was always correct.  The two extractions
+        agree on VALUES while still reading different SHAPES; that agreement
+        is pinned by a test rather than by unifying the call path.
+
+        Raises:
+            EdgeNotFoundError: graphiti path, edge absent.
+            MemoryNotFoundError: mem0 path, the id genuinely does not exist.
+            TimeoutError: PROPAGATED from the backend read, never converted.
+
+        A MISS and a TIMEOUT must never be conflated, in either direction:
+        this function is where the two are still distinguishable, and
+        ``ReconReportState.cite_memory`` renders a ``MemoryNotFoundError`` as
+        ``memory_not_found`` — a false absence in a durable report.  The full
+        chain, and the corroboration gate that bounds it, are stated once at
+        ``backends/mem0_client.py::Mem0Backend.get``; do not re-derive them
+        here.  Do not add a ``try/except TimeoutError`` either: ``Mem0Backend.
+        get`` propagates precisely so this function can tell the two apart.
         """
         if store == 'graphiti':
             name, fact = await self.graphiti.get_edge_text(memory_id, group_id=project_id)
@@ -7776,8 +8223,8 @@ class MemoryService:
             raise MemoryNotFoundError(memory_id)
         metadata = rec.get('metadata') or {}
         return {
-            'category': rec.get('category'),
-            'agent_id': metadata.get('agent_id'),
+            'category': metadata.get('category'),
+            'agent_id': rec.get('agent_id'),
             'created_at': rec.get('created_at'),
         }
 
@@ -8098,6 +8545,7 @@ class MemoryService:
         project_id: str,
         run_id: str,
         stage: str,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         """Report whether the AUTHORITATIVE cycle_summary ReconLedgerStore row exists.
 
@@ -8125,8 +8573,83 @@ class MemoryService:
         cycle_summary — Stage 1 still runs a focused turn on such a pass and
         may still emit findings; it only skips its own per-cycle summary
         write, by design (task 2652) — from a genuine Stage 1 write failure.
+
+        **Typed absence (task 3731).** ``present=False`` on its own conflates
+        four unrelated situations, only ONE of which is a defect:
+
+        1. the stage RAN and its ledger write was lost — a genuine gap;
+        2. the stage never ran (the run died before reaching it);
+        3. the row existed and was reaped by ``ReconLedgerStore.gc()``, which
+           hard-DELETEs, leaving nothing to distinguish it from (2);
+        4. nothing is wired to answer the question.
+
+        ``reason`` names which one, resolved by joining the ``runs`` table —
+        which carries no TTL and so outlives the ledger — through
+        ``recon_journal``. It is single-valued and evaluated top-down:
+
+        ================== ========================================= ========
+        reason             meaning                                   expected
+        ================== ========================================= ========
+        present            row found                                 True
+        ledger_unavailable no ledger wired                           None
+        run_unknown        journal unwired, no runs row, read
+                           raised, stage_reports unparseable, or
+                           the run is in flight and has not
+                           settled its stage_reports yet             None
+        stage_not_run      SETTLED runs row present, stage absent
+                           from stage_reports                        False
+        expired            run older than the retention window, so
+                           any row would have been gc()'d            None
+        missing            stage ran, within retention, no row       True
+        ================== ========================================= ========
+
+        ``stage_not_run`` deliberately outranks ``expired``: it is a positive
+        fact from the never-reaped ``runs`` table and stays true regardless of
+        TTL, whereas ``expired`` only says the evidence was destroyed.
+
+        ``stage_not_run`` is reachable only for a run whose ``stage_reports``
+        have SETTLED (the journal projection's ``settled`` verdict, see
+        ``reconciliation/journal.py::ReconciliationJournal._stage_reports_are_settled``).
+        A run still executing
+        has not had the blob written yet, so the absence of a stage key there is
+        not evidence — and Stage 3 checks the CURRENT run from inside the
+        still-running stage loop, which is the common case, not an edge one.
+        Such a run reports ``run_unknown``, sending the caller to its existing
+        fallback rather than declaring the stage never ran. That covers the
+        adopt-and-resume case too, where the run is executing again behind a
+        disk status that still reads ``'interrupted'``.
+
+        **The consumer rule is: flag a genuine gap ONLY when ``present`` is
+        False AND ``expected`` is True.** ``expected=False`` means there was
+        nothing to write; ``expected=None`` means the question is unanswerable
+        and the caller should fall through to its existing best-effort
+        fallback exactly as it does today.
+
+        ``run_status`` is carried as evidence for a finding's report line and
+        is **DIAGNOSTIC ONLY — never gate on it**. Gating on it looks right on
+        the majority case and is wrong: three measured ``failed`` runs really
+        did execute Stage 2 and lose the ledger write, so a status gate would
+        suppress precisely the real data-loss findings it appears to filter.
+
+        Residual false negative, accepted deliberately: if a stage ran but
+        BOTH its ``stage_reports`` entry and its ledger row were lost, this
+        reports ``stage_not_run`` and the gap is suppressed. That is the
+        fail-safe direction — never flag on uncertainty — and matches the
+        contract's existing inconclusive-means-do-not-report norm (PRD
+        plans/stage3-ledger-presence-prd.md §8.3).
+
+        Now that reaping is routine, ``present=False`` on any run older than
+        the retention window carries NO information about whether the stage
+        wrote a summary — the row would have been hard-DELETEd either way.
+        That is exactly why ``expected`` is ``None`` there rather than True.
+
+        *now* injects the clock for the retention comparison, matching the
+        convention ``ReconLedgerStore`` and ``summary_pool.write_cycle_summary``
+        already follow, so tests can pin the boundary deterministically. The
+        MCP tool surface does not expose it.
         """
         ledger = getattr(self, 'recon_ledger', None)
+        journal = getattr(self, 'recon_journal', None)
         if ledger is None:
             return {
                 'present': False,
@@ -8135,6 +8658,10 @@ class MemoryService:
                 'run_id': run_id,
                 'stage': stage,
                 'remediation': None,
+                'reason': 'ledger_unavailable',
+                'expected': None,
+                'run_lookup_available': journal is not None,
+                'run_status': None,
             }
         # Presence is intentionally state-agnostic here: any row matching the
         # five-part identity counts as present, regardless of `record.state`.
@@ -8157,6 +8684,8 @@ class MemoryService:
             # a malformed payload degrades to remediation=None rather than
             # crashing presence detection, while a genuine ledger read error
             # still propagates uncaught (test_ledger_read_error_is_not_swallowed_as_definitive_absent).
+            # The runs-table guard below follows the same rule for the same
+            # reason: it wraps only the journal read, never the ledger read.
             try:
                 payload = json.loads(record.payload_json)
             except (TypeError, ValueError):
@@ -8169,6 +8698,15 @@ class MemoryService:
             # be trusted as a suppression signal for Stage 3 (task 2652
             # amendment).
             remediation = raw_remediation if isinstance(raw_remediation, bool) else None
+
+        reason, expected, run_status = await self._classify_summary_absence(
+            journal,
+            project_id,
+            run_id,
+            stage,
+            present=record is not None,
+            now=now or datetime.now(UTC),
+        )
         return {
             'present': record is not None,
             'ledger_available': True,
@@ -8176,7 +8714,105 @@ class MemoryService:
             'run_id': run_id,
             'stage': stage,
             'remediation': remediation,
+            'reason': reason,
+            'expected': expected,
+            'run_lookup_available': journal is not None,
+            'run_status': run_status,
         }
+
+    async def _classify_summary_absence(
+        self,
+        journal: ReconciliationJournal | None,
+        project_id: str,
+        run_id: str,
+        stage: str,
+        *,
+        present: bool,
+        now: datetime,
+    ) -> tuple[str, bool | None, str | None]:
+        """Explain an absent cycle_summary row as ``(reason, expected, run_status)``.
+
+        See :meth:`get_cycle_summary_presence` for the full ladder. Best-effort
+        by construction: it only ever EXPLAINS an absence the ledger has
+        already established, so every failure degrades to the inconclusive
+        ``run_unknown`` rather than propagating.
+        """
+        if present:
+            # Presence needs no explanation — don't pay for the runs query.
+            return 'present', True, None
+        if journal is None:
+            return 'run_unknown', None, None
+
+        try:
+            execution = await journal.get_run_stage_execution(project_id, run_id, stage)
+        except Exception:
+            # A FAULT, not an ordinary state — the caller cannot tell a broken
+            # runs lookup from an unrecorded run by the return value alone.
+            logger.warning(
+                'get_cycle_summary_presence: runs lookup FAILED for run_id=%s '
+                'stage=%s in project=%s; cannot type the absence',
+                run_id,
+                stage,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            return 'run_unknown', None, None
+
+        if execution is None:
+            return 'run_unknown', None, None
+        run_status = execution['status']
+        if execution['stage_ran'] is None:
+            return 'run_unknown', None, run_status
+        if execution['stage_ran'] is False:
+            if not execution['settled']:
+                # The blob is not a finished account of this run, so the
+                # absence of the key is not evidence of anything.
+                return 'run_unknown', None, run_status
+            # Checked BEFORE retention: a positive fact from the never-reaped
+            # runs table, true regardless of TTL.
+            return 'stage_not_run', False, run_status
+
+        # The stage ran. Whether its missing row is data loss depends on
+        # whether the row could still exist at all: past the retention window
+        # gc() has hard-DELETEd it either way, so absence says nothing.
+        #
+        # Aged from started_at, never completed_at, because the two cliffs must
+        # not cross. write_cycle_summary stamps expires_at from ITS OWN write
+        # time, which falls between the two: the run row is completed only
+        # after the whole stage loop — after Stage 3's LLM turn, and far later
+        # for an interrupted-then-resumed run. Aging from completed_at would
+        # put the reader's cliff AFTER gc()'s, and every absence in that window
+        # would read as a confident `missing` for a row that was merely reaped.
+        # started_at is always <= the write time, so the reader's cliff lands
+        # at or before gc()'s and the ambiguous window degrades to the
+        # inconclusive `expired` — the fail-safe direction.
+        reference_iso = execution['started_at']
+        try:
+            reference = datetime.fromisoformat(reference_iso)
+            # A naive journal timestamp is UTC, the convention every other
+            # reader of this column already applies (throughput.py,
+            # summary_pool.py::_assume_utc). Normalising INSIDE the guard keeps
+            # the docstring's promise that every failure here degrades to
+            # run_unknown: a residual mixed-awareness comparison raises
+            # TypeError, which a read-only presence check must not propagate.
+            if reference.tzinfo is None:
+                reference = reference.replace(tzinfo=UTC)
+            expired = reference + timedelta(days=CYCLE_SUMMARY_TTL_DAYS) < now
+        except (TypeError, ValueError):
+            logger.warning(
+                'get_cycle_summary_presence: could not age run timestamp %r '
+                'for run_id=%s stage=%s in project=%s; cannot age the absence',
+                reference_iso,
+                run_id,
+                stage,
+                project_id,
+                extra={'project_id': project_id, 'run_id': run_id, 'stage': stage},
+            )
+            return 'run_unknown', None, run_status
+        if expired:
+            return 'expired', None, run_status
+        return 'missing', True, run_status
 
     # ------------------------------------------------------------------
     # Delete
@@ -8866,9 +9502,9 @@ class MemoryService:
         # so the metadata-only fast paths would otherwise emit a success
         # envelope AND a journal row for a write that touched nothing.
         #
-        # A TimeoutError from here PROPAGATES untouched. Mem0Backend.
-        # get_point_by_id deliberately does not swallow it (unlike get()), which
-        # is what keeps "genuinely absent" distinguishable from "backend timed
+        # A TimeoutError from here PROPAGATES untouched — the uniform posture
+        # of every Mem0Backend read since task 5265, get() included. That is
+        # what keeps "genuinely absent" distinguishable from "backend timed
         # out"; catching both into one MemoryNotFound outcome would throw that
         # distinction away at the one layer that still has it.
         existing = await self.get_memory_by_id(project_id=project_id, memory_id=memory_id)
@@ -8948,6 +9584,12 @@ class MemoryService:
                 config=self.config.memory_metadata,
                 storm_detector=self._metadata_storm_detector,
                 project_root=self._memory_metadata_project_root(),
+                # `True` unconditionally (task 3508), as in add_system_record:
+                # this amends a record that already lives in Mem0 and never
+                # routes to Graphiti, and `category` in a patch is a metadata
+                # TAG. Testing the patched category would wrongly refuse
+                # canonical patches on Graphiti-tagged Mem0 records.
+                reaches_mem0=True,
                 parent_lookup=self.get_memory_by_id,
                 count_canonical=self.count_memories_by_metadata,
                 find_canonical=self.get_memories_by_metadata,

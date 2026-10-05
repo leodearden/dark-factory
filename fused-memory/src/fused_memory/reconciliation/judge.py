@@ -90,17 +90,16 @@ JUDGE_VERDICT_SCHEMA: dict[str, Any] = {
     },
 }
 
-# max_turns for the judge CLI invocation.  NOT 1: ``max_turns=1`` is incompatible
-# with ``--json-schema`` because the schema mechanism burns a tool-use turn, so
-# the CLI returns ``error_max_turns`` even when the structured payload is already
-# attached (task_curator.py:2366-2372).  3 is the floor both migrated siblings
-# use (curator ``ge=3``, path_scope_adjudicator ``ge=3``): schema tool-use +
-# optional reasoning + final response.  We deliberately do NOT rely on
-# cli_invoke's ``schema_salvaged`` boundary fallback (:1794-1797), which would
-# make every judge run report an internal ``is_error`` and spend its turn on an
-# error path.  Cost/duration exposure stays bounded by
-# ``judge_cli_timeout_seconds`` (validated ≤ stage_timeout_seconds) and
-# cli_invoke's ``max_budget_usd`` default.
+# max_turns for the judge CLI invocation.  Never 1 — see
+# fused-memory/src/fused_memory/reconciliation/agent_loop.py::_AGENT_CLI_MAX_TURNS
+# for why a cap of 1 fails with --json-schema and why schema salvage does not
+# cover it.  3 is the floor both migrated siblings use (curator ``ge=3``,
+# path_scope_adjudicator ``ge=3``).  The judge's own prompt/schema shape has not
+# been measured, so 3 is the established value, not a revalidated one: run
+# fused-memory/scripts/probe_schema_max_turns.py --shape judge before retuning.
+#
+# Cost/duration exposure stays bounded by ``judge_cli_timeout_seconds``
+# (validated ≤ stage_timeout_seconds) and cli_invoke's ``max_budget_usd`` default.
 _JUDGE_CLI_MAX_TURNS = 3
 
 # run_id for the throwaway JudgeVerdict built by _call_judge_cli's validation
@@ -620,18 +619,17 @@ Review this run and provide your verdict as JSON.
         resume_session_id:`` branch too — both the schema and the system
         prompt survive every resume (cli_invoke.py, task 3983).
 
-        ``disallowed_tools=['*']`` is still passed VERBATIM.  cli_invoke expands
-        the wildcard into ``_REAL_BUILTIN_TOOLS_DENYLIST`` when a schema is
-        present — a list that omits the synthetic ``StructuredOutput`` tool the
-        schema is delivered through — so no real file/bash/web tool access is
-        preserved while the schema tool gets through.  Pre-expanding here would
-        duplicate a list documented as needing to stay in sync with the CLI's
-        built-ins and would skip future central fixes.
+        ``disallowed_tools=['*']`` is still passed VERBATIM.  When a schema is
+        present, cli_invoke replaces the wildcard with ``--tools ''``, the
+        registry filter that leaves only the synthetic ``StructuredOutput`` tool
+        the schema is delivered through.  So no built-in or deferred tool is
+        reachable while the schema tool gets through.  Doing that substitution
+        here would skip future central fixes.
 
         MCP tools are closed SEPARATELY, by ``mcp_config=no_mcp_servers_config()``
-        + ``strict_mcp_config=True``.  The wildcard expansion above covers
-        built-ins ONLY — it carries no MCP tool pattern — so it does NOT deny MCP
-        tools, and ``cwd`` here is the project root, which holds a live
+        + ``strict_mcp_config=True``.  ``--tools ''`` removes built-in and
+        deferred tools but does NOT filter MCP tools, and ``cwd`` here is the
+        project root, which holds a live
         ``.mcp.json`` (servers ``escalation``, ``fused-memory``) that the CLI
         would otherwise ambient-merge and expose under ``bypassPermissions``.
         These two kwargs emit ``--strict-mcp-config`` and scope the run to zero
@@ -654,13 +652,11 @@ Review this run and provide your verdict as JSON.
                 disallowed_tools=['*'],
                 output_schema=JUDGE_VERDICT_SCHEMA,
                 # Closes MCP separately from the wildcard deny above, which the
-                # schema expands into a BUILT-INS-ONLY list. See the docstring:
+                # schema turns into --tools '' (no MCP filter). See the docstring:
                 # must stay truthy, or --strict-mcp-config is never emitted.
                 mcp_config=no_mcp_servers_config(),
                 strict_mcp_config=True,
-                # See _JUDGE_CLI_MAX_TURNS: 1 is incompatible with --json-schema
-                # (the schema mechanism burns a tool-use turn — see
-                # task_curator.py:2366-2372).
+                # See _JUDGE_CLI_MAX_TURNS for why this is not 1.
                 max_turns=_JUDGE_CLI_MAX_TURNS,
                 permission_mode='bypassPermissions',
                 timeout_seconds=float(self.config.judge_cli_timeout_seconds),
@@ -802,11 +798,11 @@ Review this run and provide your verdict as JSON.
         #
         # Schema-tool denial first (CLI 2.1.168 regression guard). The verdict
         # contract now rides --json-schema, which is delivered through the
-        # synthetic ``StructuredOutput`` tool that cli_invoke's wildcard expansion
-        # deliberately omits from _REAL_BUILTIN_TOOLS_DENYLIST (:207-226). If a
+        # synthetic ``StructuredOutput`` tool, the one tool cli_invoke's
+        # ``'*'`` -> ``--tools ''`` substitution keeps in the registry. If a
         # future CLI change starts denying that tool, EVERY judge run is starved
-        # of its verdict, and the remedy is specific (fix the cli_invoke
-        # deny-list) — so it gets its own machine-readable code rather than being
+        # of its verdict, and the remedy is specific (fix that substitution in
+        # build_claude_argv) — so it gets its own machine-readable code rather than being
         # folded into the anonymous UNKNOWN dump below.
         #
         # This is the ONLY branch where the check can fire: cli_invoke sets

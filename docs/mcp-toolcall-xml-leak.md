@@ -119,12 +119,16 @@ it is a witness, not a culprit.
 The silent default that turns the corruption into a *wrong value* is real and
 in this repo, though:
 
-- `fused-memory/src/fused_memory/backends/sqlite_task_backend.py:2491` —
-  `status, priority or 'medium', metadata, _now(),` in the INSERT
-- `fused-memory/src/fused_memory/middleware/task_interceptor.py:1565` —
+- `fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.add_task` —
+  `priority or 'medium'` in the INSERT
+- `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._build_candidate` —
   `priority=str(kwargs.get('priority') or 'medium'),`
 
-Both catch `None`. Neither logs anything.
+Both catch `None`. Neither logs anything. Since task 4419, a write whose text
+carries a leaked fragment can no longer reach either default, because the
+task-store chokepoint refuses it first and names the swallowed value (§4,
+"The storage-layer refusal"). An ordinary omitted priority still defaults
+silently, and that is correct.
 
 ### The single literal source (INV-5)
 
@@ -344,21 +348,30 @@ failure class this whole task exists to kill.
 | Change | What it does |
 |---|---|
 | `fused_memory/utils/toolcall_xml_leak.py` | The single shared detector. Promoted from `scripts/scan_task_toolcall_leaks.py` (task 2939) and generalized for the Mem0 specimens; its envelope literals are now `shared.toolcall_markup` re-exports (task 3688, §1). |
-| `fused_memory/server/markup_tripwire.py` (task 3141 — NOT this task) | Live rejection at the MCP write boundary. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
+| `fused_memory/server/markup_guard.py::install_markup_guard` (task 4458, which replaced task 3141's `markup_tripwire.py` gate, see §1 — NOT this task) | Live rejection at the MCP write boundary, for every tool on the fused-memory server. Listed here only so the picture is complete; see "The boundary rejection" below for why this task ships no guard of its own. |
+| `fused_memory/backends/task_text_markup_gate.py` (task 4419 — NOT this task) | Storage-layer refusal inside `SqliteTaskBackend.add_task` / `.update_task`, covering the task writers that never cross MCP dispatch. See "The storage-layer refusal" below. |
 | `Mem0Backend.scan_payload_text` → `MemoryService.scan_memory_content` → `scan_memory_content` MCP tool | The missing read capability (§3). |
 | `fused-memory/scripts/sweep_toolcall_xml_leak.py` | The corpus sweep (§5). |
 | `GraphitiBackend.redact_episode_content` + MCP tool | The residual-episode path (§6). |
 
-### The boundary rejection — owned by task 3141, not by this task
+### The boundary rejection — owned by task 4458, not by this task
 
-`submit_task`, `update_task`, `add_memory`, and `add_episode` **reject** a call
-whose text carries a leaked fragment, returning
-`error_type = 'McpEnvelopeMarkupWriteRejected'` before anything is persisted.
-Opt-out: `metadata={'allow_mcp_markup': True}` — load-bearing rather than
-theoretical, since this task's own description quotes every sentinel verbatim
-and this document could not otherwise be filed as a task.
+Every tool on the fused-memory server **rejects** a call whose arguments carry
+envelope markup, before anything is persisted. The live guard is
+`fused-memory/src/fused_memory/server/markup_guard.py::install_markup_guard`
+(task 4458). It wraps the server's `call_tool` with
+`shared/src/shared/mcp_markup_middleware.py::MarkupGuardMiddleware` and answers
+with one of two `error_type` values. `mcp_markup_detected` carries a
+`repaired_call`: the complete argument map with the swallowed parameters
+restored and named in `recovered_params`. `mcp_markup_unrepairable` refuses
+without one. Opt-out: `metadata={'allow_mcp_markup': True}` — load-bearing
+rather than theoretical, since this task's own description quotes every
+sentinel verbatim and this document could not otherwise be filed as a task.
 
-That guard is `fused_memory/server/markup_tripwire.py`, delivered by task 3141.
+When this section was first written, the guard was task 3141's
+`fused_memory/server/markup_tripwire.py`, returning
+`error_type = 'McpEnvelopeMarkupWriteRejected'` at four tools. §1 records its
+replacement on 2026-08-20.
 **This task deliberately ships no write-boundary guard of its own.** An earlier
 revision of this branch did, and it had to be withdrawn: it would have been a
 second enumeration of the envelope literals at the same four call sites, which
@@ -372,12 +385,12 @@ to reproduce.
 The division of labour that survives is real and worth stating, because the two
 detectors are calibrated in **opposite** directions on purpose:
 
-| | `markup_tripwire` (3141) | `utils/toolcall_xml_leak` (this task) |
-|---|---|---|
-| Runs at | write time, before persistence | over already-stored content |
-| Method | bare substring scan | precise regex, requires real whitespace |
-| Calibration | over-reports to maximise recall | under-reports to avoid false positives |
-| Cost of a false positive | a retry | an unnecessary rewrite of stored memory |
+| | MCP boundary guard (4458) | `utils/toolcall_xml_leak` (this task) | storage gate (4419) |
+|---|---|---|---|
+| Runs at | write time, at MCP dispatch | over already-stored content | write time, inside the task store's write transaction |
+| Method | substring scan over the envelope literals | precise regex, requires real whitespace | the same precise regex, over `SCANNED_COLUMNS` |
+| Calibration | over-reports to maximise recall | under-reports to avoid false positives | under-reports, like the sweep |
+| Cost of a false positive | a retry | an unnecessary rewrite of stored memory | a refused write that no caller can resubmit |
 
 Neither is redundant, and they must not be collapsed. A write-time false
 positive costs the caller one retry; a sweep-time false positive silently
@@ -388,13 +401,88 @@ defined once in `shared.toolcall_markup` — see §1, "The single literal
 source" for the two tuples' exact membership. What still differs, on
 purpose, is method and calibration, exactly as the table above states.
 
-One diagnostic did not survive the withdrawal and is worth recovering later:
+The storage gate is not a third predicate. It reuses the read-time detector
+and its column list, because it judges text a writer has already composed,
+where a false positive refuses a write that no caller can resubmit. That
+precision is also what lets it pass prose quoting the leak in the escaped
+convention (the nine prose-mention tasks below). Nor is it redundant with the
+MCP guard, which wraps `call_tool` only and so never sees the in-process
+writers below it. The two must not be collapsed.
+
+One diagnostic did not survive the withdrawal and was worth recovering:
 the retired guard's message named the **sibling-argument risk** explicitly —
 that a sentinel in `description` means parameters such as `priority` may have
 been silently dropped. That sentence converts the invisible vector-1 failure
 into a visible one at the moment it happens, and `matched_pattern` plus a
-200-character excerpt does not convey it. Folding it into
-`markup_tripwire.build_markup_block` is a clean, self-contained follow-up.
+200-character excerpt does not convey it. It has since been recovered as
+structured data rather than a sentence: at the MCP boundary as
+`recovered_params` and `repaired_call` (task 4458), and at the storage layer
+too, as `LeakedEnvelopeMarkupError.recovered` (task 4419).
+
+### The storage-layer refusal — task 4419
+
+`SqliteTaskBackend.add_task` and `SqliteTaskBackend.update_task` in
+`fused-memory/src/fused_memory/backends/sqlite_task_backend.py` hold the only
+INSERT INTO tasks and the only UPDATE that can set task text, so every task
+writer passes through them. Five writers of task text run in-process below
+`call_tool`, where the MCP guard cannot see them:
+
+| Writer | What it writes |
+|---|---|
+| `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._execute_combine` | the curator LLM's rewrite of a live task's title, description and details |
+| `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._dispatch_ticket_decision` | the curator worker's deferred replay of a ticket, hours after the guarded submit |
+| `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._submit_task_planning_mode` | a `deferred` insert under planning mode |
+| `fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor.update_task` | description and details, for any in-process caller |
+| `fused-memory/src/fused_memory/reconciliation/stages/task_knowledge_sync.py::_queue_briefing_refresh_tasks` | a briefing-refresh task composed from stage output, bypassing the curator |
+
+Both sinks call
+`fused-memory/src/fused_memory/backends/task_text_markup_gate.py::refuse_leaked_task_text`
+inside their write transaction, beside the metadata validation, so a refusal
+rolls the whole write back. The rules:
+
+- The predicate is `toolcall_xml_leak.detect_leak` over
+  `toolcall_xml_leak.SCANNED_COLUMNS`, the same detector and columns as the
+  task-DB sweep. `metadata` is outside those columns, so remediation records
+  that quote a fragment stay writable.
+- `update_task` judges only the columns the write supplies, and `details` on
+  the value that would be persisted: the append concatenation, or a `prompt`
+  fed into details. A row corrupted before the gate existed stays writable, so
+  its remediation can land.
+- There is no override. The `allow_mcp_markup` flag is consumed before
+  dispatch, and prose written in the escaped convention never matches the
+  precise detector.
+- The refusal is `LeakedEnvelopeMarkupError`
+  (`fused-memory/src/fused_memory/backends/task_backend_errors.py`), a
+  `TaskmasterError` carrying `column`, `fragment`, `recovered` and
+  `clean_value`. `recovered` comes from `shared.toolcall_markup.repair` and
+  names the swallowed arguments, which are the values a default would
+  otherwise have replaced. It is empty when no boundary is provable.
+- The fragment is never stripped, because it is the evidence of which writer
+  leaked.
+- The two riskiest writers classify the refusal ahead of their broad fallback.
+  The combine logs `task_curator: combine refused ...` and the briefing refresh
+  logs `briefing_refresh_add_task_refused_leaked_markup`. Each record carries
+  `column`, `fragment` and `recovered` in its `extra`.
+
+**Audit answer, 2026-09-25.** Task 4358, filed 2026-08-17 as an agent-followup
+from task 3842, lost `priority='low'` to a leaked description closer and was
+stored as `medium`. The agent-followup path is an ordinary, guarded
+`submit_task` MCP call. Task 4458's boundary guard landed on 2026-08-20, after
+task 4358 was filed. Measured while planning task 4419, the byte-exact 4358
+specimen is now refused at that boundary, with `priority='low'` recovered into
+`repaired_call`. So the specimen predates the fix and is not evidence of a live
+MCP hole. The gap it pointed at was the in-process writers above.
+
+**Re-scan, 2026-09-25. This is a report; nothing was remediated.**
+`scripts/scan_task_toolcall_leaks.py --project-root /home/leo/src/dark-factory`
+over all 5838 rows of the live dark_factory store printed "no leaked tool-call
+fragments found" and exited 0. A naive substring scan for the envelope literals
+hits 9 tasks, and so does `shared.toolcall_markup.detect`: 2938, 2939, 2944,
+3083, 3141, 3233, 4696, 4896 and 5055. Each of them only discusses the leak.
+The same 9 were measured on 2026-09-20 over 5669 rows. So nothing has
+accumulated since task 2944's sweep, and those 9 tasks are the standing
+negative control for the precise detector: the storage gate accepts all of
+them.
 
 ---
 

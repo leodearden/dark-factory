@@ -53,6 +53,19 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # knobs above; _iter_leaves treats the whole list[ProceduralTopicCluster]
     # as a single atomic leaf, so the clusters list reloads atomically (task 2845).
     'reconciliation.procedural_knowledge_topic_guard_clusters',
+    # Read live by resolve_topic_cluster_autoseed_enabled
+    # (server/near_duplicate_guard.py) at BOTH of its consumers -- per
+    # add_memory merge and per consolidate_memories seed -- off the shared
+    # memory_service.config.reconciliation object, never at store construction
+    # (main.py builds the store unconditionally). So False drops derived
+    # clusters from the very next guard read and True restores them, both
+    # without a restart (task 3135).
+    'reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled',
+    # Read live by resolve_retired_derived_topic_ids
+    # (server/near_duplicate_guard.py) at the same two consumers as the
+    # switch above, off the same shared object, so retiring one misfiring
+    # derived cluster is a reload, not a restart (task 3135 review).
+    'reconciliation.procedural_knowledge_topic_cluster_autoseed_retired',
     # Read live per MemoryService.search by resolve_topic_anchor_enabled
     # (services/topic_anchor.py) off the shared memory_service.config.reconciliation
     # object — never captured at construction — so an in-place reload flips the
@@ -109,7 +122,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # Retrieval width, tuned against measured recall on a running server rather
     # than by redeploying. Read live per write, same path as the flag above.
     'write_triage.candidate_k',
-    # The six write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
+    # The eight write-triage JUDGE knobs (task 3128, PRD leaf gamma). Green-tier
     # for exactly the reason the two operator knobs above are: every one of
     # them is read LIVE off the shared memory_service.config.write_triage
     # object per middle-band write by server/write_triage_judge.py's resolvers,
@@ -117,7 +130,7 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     # makes this registration real rather than restart-only in disguise.
     # tests/test_config_reload.py::TestWriteTriageJudgeLeavesAreGreenTier pins
     # both halves, and derives the expected leaf set from
-    # WriteTriageConfig.model_fields, so a SEVENTH judge_* leaf added later
+    # WriteTriageConfig.model_fields, so a NINTH judge_* leaf added later
     # without a line here fails there rather than degrading silently.
     #
     # `judge_enabled` in particular MUST be green-tier, for the same reason
@@ -132,6 +145,8 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset({
     'write_triage.judge_model',
     'write_triage.judge_timeout_seconds',
     'write_triage.judge_candidate_count',
+    'write_triage.judge_reasoning_effort',
+    'write_triage.judge_field_chars',
     # The traceability pointer to leaf gamma's committed accuracy report, the
     # exact sibling of calibration_report_path above: reloaded alongside the
     # knobs it describes so config never names a stale measurement run. This is

@@ -794,6 +794,30 @@ class _StubScheduler:
         return self.return_value
 
 
+def _jsonrpc_body(inner_result: dict) -> dict:
+    return {'jsonrpc': '2.0', 'id': 1, 'result': inner_result}
+
+
+def _mcp_is_error_body(tool: str) -> dict:
+    """FastMCP's refusal of a tool call (e.g. argument validation): prose, not JSON,
+    flagged by ``isError``."""
+    return _jsonrpc_body({
+        'content': [{'type': 'text', 'text': f'Error executing tool {tool}: boom'}],
+        'isError': True,
+    })
+
+
+_JSONRPC_PROTOCOL_ERROR = {
+    'jsonrpc': '2.0', 'id': 1, 'error': {'code': -32602, 'message': 'Invalid params'},
+}
+
+# fused-memory's structured tool error (server/tool_errors.py::mcp_tool_errors), plus a
+# key that is not part of the server's text, so the key-name report stays observable.
+_GET_STATUSES_REFUSAL = {
+    'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError', 'request_id': 'r-1',
+}
+
+
 class TestSchedulerChronicFlakeTaskClient:
     """``SchedulerChronicFlakeTaskClient``: the concrete adapter over a
     duck-typed scheduler exposing ``dispatch_tool`` — mirrors
@@ -941,6 +965,19 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         scheduler = _StubScheduler(return_value, raises)
         return scheduler, SchedulerChronicFlakeTaskClient(scheduler, '/proj')
 
+    @pytest.mark.asyncio
+    async def test_satisfies_the_protocol_statically(self):
+        """Pyright checks the annotated assignment, so the adapter cannot drift from
+        the seam the ledger consumes (the task-3533 pin,
+        ``escalation/tests/test_pins.py::TestPinRecordProtocol``)."""
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.flake_ledger import FlakeLedgerTaskClient
+
+        client: FlakeLedgerTaskClient = SchedulerChronicFlakeTaskClient(
+            _StubScheduler(mcp_tool_envelope({'statuses': {}})), '/proj',
+        )
+        assert await client.get_statuses(['x']) == ({}, None)
+
     # ── get_statuses ──────────────────────────────────────────────────────────
     #
     # The return shape is the ``(statuses, error)`` PAIR that
@@ -996,7 +1033,8 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
 
         THE FIRST CASE IS THE ONLY ONE PRODUCTION EVER SENDS, and it is listed first
         for that reason.  The other four are already-unwrapped spellings this seam
-        tolerates because fakes and the eval-mode ``_StubMcpSession`` produce them;
+        tolerates because test fakes produce them (the eval-mode ``_StubMcpSession``
+        does not: it emits the full JSON-RPC body);
         ``{'result': {'statuses': …}}`` in particular is a shape the transport never
         emits — the real inner ``result`` carries ``content``/``structuredContent``/
         ``isError``, never the payload keys directly.  A suite made only of those
@@ -1040,6 +1078,37 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         statuses, error = await client.get_statuses(['42'])
         assert statuses == {}
         assert error is raised
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [mcp_tool_envelope(_GET_STATUSES_REFUSAL), _GET_STATUSES_REFUSAL],
+        ids=['production_jsonrpc_body', 'legacy_bare_payload'],
+    )
+    async def test_get_statuses_refusal_carries_the_servers_text_and_the_key_names(
+        self, envelope,
+    ):
+        """The server's own account of a refusal survives into the error, beside the
+        envelope key names, which stay the diagnosis when the SHAPE is the problem."""
+        _, client = await self._client(envelope)
+        statuses, error = await client.get_statuses(['42'])
+        assert statuses == {}
+        assert 'taskmaster unavailable' in str(error)
+        assert 'TaskmasterError' in str(error)
+        assert 'request_id' in str(error)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('envelope', 'server_text'),
+        [(_mcp_is_error_body('get_statuses'), 'boom'), (_JSONRPC_PROTOCOL_ERROR, 'Invalid params')],
+        ids=['mcp_is_error', 'jsonrpc_protocol_error'],
+    )
+    async def test_get_statuses_failure_carries_the_servers_text(self, envelope, server_text):
+        _, client = await self._client(envelope)
+        statuses, error = await client.get_statuses(['42'])
+        assert statuses == {}
+        assert server_text in str(error)
+
     # ── commit_planning ───────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
@@ -1134,6 +1203,52 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         assert arguments == {'title': 't'}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('envelope', 'server_text'),
+        [
+            (
+                mcp_tool_envelope({'error': 'backlog full', 'error_type': 'BacklogFullError'}),
+                'backlog full',
+            ),
+            (_mcp_is_error_body('submit_task'), 'boom'),
+        ],
+        ids=['structured_refusal', 'mcp_is_error'],
+    )
+    async def test_a_refused_submit_task_logs_the_servers_text_once(
+        self, envelope, server_text, caplog,
+    ):
+        """The refusal behind a ledger row with NO OWNER.  ``''`` still means a failed
+        filing, so control flow is unchanged, but the server's reason is no longer
+        dropped with it: the adapter is the only layer that holds the raw response."""
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.submit_task({'title': 't'}) == ''
+        records = [r for r in caplog.records if r.name == 'orchestrator.chronic_flake']
+        assert [r.levelno for r in records] == [logging.WARNING], [
+            r.getMessage() for r in records
+        ]
+        assert server_text in records[0].getMessage()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope({'task_id': '4242', 'status': 'deferred'}),
+            mcp_tool_envelope({'ticket': 'tkt_abc'}),
+        ],
+        ids=['planning_mode_task_id', 'two_phase_ticket'],
+    )
+    async def test_a_successful_submit_task_is_SILENT(self, envelope, caplog):
+        """The negative control for the refusal warning above, as
+        ``test_commit_planning_is_SILENT_on_success`` is for commit_planning's."""
+        _, client = await self._client(envelope)
+        with caplog.at_level(logging.WARNING, logger='orchestrator.chronic_flake'):
+            assert await client.submit_task({'title': 't'})
+        assert [r for r in caplog.records if r.name == 'orchestrator.chronic_flake'] == [], (
+            [r.getMessage() for r in caplog.records]
+        )
+
+    @pytest.mark.asyncio
     async def test_chronic_flakes_own_block_reaches_the_wire_unchanged(self):
         """Regression guard on the shared path: chronic_flake's own builder sets
         ``project_root`` explicitly, so the injection must be a no-op for it."""
@@ -1151,6 +1266,225 @@ class TestSchedulerClientServesTheFlakeLedgerSeam:
         scheduler, client = await self._client({'task_id': 'fix-7'})
         await client.submit_task(dict(expected))
         assert scheduler.calls[0][1] == expected
+
+
+class _CannedMcpSession:
+    """The duck-typed ``call_tool`` seam ``Scheduler.dispatch_tool`` routes an injected
+    session through (the eval runner's ``_StubMcpSession`` pattern), answering every
+    call with one canned JSON-RPC body."""
+
+    def __init__(self, body: dict) -> None:
+        self.body = body
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, name: str, arguments: dict, timeout: float = 30) -> dict:
+        self.calls.append((name, arguments))
+        return self.body
+
+
+class TestGetStatusesHasOneParser:
+    """The adapter and ``scheduler.py::Scheduler.get_statuses`` read one tool's answer,
+    so they must agree on every JSON-RPC body the transport and the eval stub emit.
+
+    Driven through BOTH public entry points over the SAME real ``Scheduler`` — the
+    adapter's production composition (``merge_lane/worker.py``, ``workflow.py``) —
+    rather than by inspecting which parser runs.  The data-wrapped and the
+    structuredContent-vs-text cases are the ones where two independent parsers differ.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'body',
+        [
+            mcp_tool_envelope({'statuses': {'42': 'pending'}}),
+            mcp_tool_envelope({'statuses': {}}),
+            _jsonrpc_body({
+                'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}],
+            }),
+            mcp_tool_envelope({'data': {'statuses': {'42': 'pending'}}}),
+            _jsonrpc_body({
+                'content': [{'type': 'text', 'text': json.dumps({'statuses': {'42': 'pending'}})}],
+                'structuredContent': {'statuses': {'42': 'done'}},
+                'isError': False,
+            }),
+            mcp_tool_envelope({'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}),
+            mcp_tool_envelope({'statuses': ['not', 'a', 'dict']}),
+            _mcp_is_error_body('get_statuses'),
+            _JSONRPC_PROTOCOL_ERROR,
+        ],
+        ids=[
+            'known_id',
+            'corroborated_absence',
+            'content_only_eval_stub_body',
+            'data_wrapped',
+            'structured_content_disagrees_with_text',
+            'structured_refusal',
+            'non_dict_statuses',
+            'mcp_is_error',
+            'jsonrpc_protocol_error',
+        ],
+    )
+    async def test_adapter_and_scheduler_agree(self, body, tmp_path):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        from orchestrator.scheduler import Scheduler
+
+        config = OrchestratorConfig(project_root=tmp_path)
+        session = _CannedMcpSession(body)
+        scheduler = Scheduler(config, mcp_session=session)
+        adapter = SchedulerChronicFlakeTaskClient(scheduler, config.project_root)
+
+        scheduler_statuses, scheduler_error = await scheduler.get_statuses(['42'])
+        adapter_statuses, adapter_error = await adapter.get_statuses(['42'])
+
+        assert session.calls[0] == session.calls[1]
+        assert adapter_statuses == scheduler_statuses
+        assert (adapter_error is None) == (scheduler_error is None), (
+            adapter_error, scheduler_error,
+        )
+
+
+_DONE_TASK = {
+    'id': '7',
+    'status': 'done',
+    'metadata': {'done_provenance': {'kind': 'merged', 'commit': 'c0ffee' + '0' * 34}},
+}
+
+_NOT_FOUND = {'error': 'No tasks found for ID(s): 7', 'error_type': 'TaskNotFoundError'}
+
+
+class TestSchedulerClientReadsOneTaskLive:
+    """``get_task``: the live single-task read ``flake_ledger.resolve_debt`` stamps a
+    resolution from (task η).
+
+    The ``(task, error)`` pair carries THREE readings, and the ledger acts on each
+    differently, so each is pinned on its own:
+
+    - ``(task, None)``: a task was read, and only this may close a debt cycle;
+    - ``(None, None)``: a CORROBORATED ABSENCE, the server's structured
+      ``TaskNotFoundError``;
+    - ``(None, exc)``: nothing was read.
+
+    Same construct-don't-raise convention as ``get_statuses``, for the same reason: a
+    failure swallowed into ``None`` would be byte-identical to an absence.
+    """
+
+    async def _client(self, return_value, raises=None):
+        from orchestrator.chronic_flake import SchedulerChronicFlakeTaskClient
+        scheduler = _StubScheduler(return_value, raises)
+        return scheduler, SchedulerChronicFlakeTaskClient(scheduler, '/proj')
+
+    @pytest.mark.asyncio
+    async def test_dispatches_the_id_and_project_root(self):
+        scheduler, client = await self._client(mcp_tool_envelope(_DONE_TASK))
+        await client.get_task('7')
+        assert [call[:2] for call in scheduler.calls] == [
+            ('get_task', {'id': '7', 'project_root': '/proj'}),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_int_id_is_coerced_to_str(self):
+        """The ledger's ``owner_task_id`` column is TEXT, but a caller may hold an
+        int — the same wire coercion ``get_statuses`` applies."""
+        scheduler, client = await self._client(mcp_tool_envelope(_DONE_TASK))
+        # DELIBERATE type violation: the point is coercion at the wire.
+        await client.get_task(7)  # type: ignore[arg-type]
+        assert scheduler.calls[0][1]['id'] == '7'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope(_DONE_TASK),
+            _DONE_TASK,
+            {'data': _DONE_TASK},
+            mcp_tool_envelope({'data': _DONE_TASK}),
+        ],
+        ids=['production_jsonrpc_body', 'bare_task', 'data_wrapper', 'production_data_wrapper'],
+    )
+    async def test_a_read_task_is_returned_with_no_error(self, envelope):
+        """(task, None) across every shape the sibling parsers tolerate, the production
+        JSON-RPC body FIRST because it is the only one the transport emits.  The
+        ``data`` wrapper is the layer ``scheduler.py::Scheduler.get_task`` unwraps."""
+        _, client = await self._client(envelope)
+        assert await client.get_task('7') == (_DONE_TASK, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope(_NOT_FOUND),
+            _NOT_FOUND,
+            {'error': 'any wording at all', 'error_type': 'TaskNotFoundError'},
+        ],
+        ids=['production_jsonrpc_body', 'bare', 'reworded_message'],
+    )
+    async def test_task_not_found_is_a_corroborated_absence(self, envelope):
+        """(None, None).  The server raised its DEFINITIVE zero-row ``TaskNotFoundError``
+        (fused-memory ``backends/task_backend_errors.py::TaskNotFoundError``), which
+        ``mcp_tool_errors`` hands back as a structured ``error_type``.  The discriminator
+        is that type, never the message: a reworded message is still an absence."""
+        _, client = await self._client(envelope)
+        assert await client.get_task('7') == (None, None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'envelope',
+        [
+            mcp_tool_envelope({'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}),
+            {'error': 'No tasks found for ID(s): 7', 'error_type': 'TaskmasterError'},
+            {'error': 'No tasks found for ID(s): 7'},
+            {'id': '7', 'title': 'a task shape with no status'},
+            {'data': 'not a dict'},
+            {'unexpected': 'shape'},
+            None,
+            ['not', 'a', 'dict'],
+        ],
+        ids=[
+            'other_error_type',
+            'not_found_wording_without_the_type',
+            'untyped_error',
+            'no_status',
+            'non_dict_data',
+            'unrecognised',
+            'none',
+            'list',
+        ],
+    )
+    async def test_anything_else_is_a_failed_read(self, envelope):
+        """(None, exc).  An error that is not the structured absence, or an answer with
+        no task in it, is not evidence of anything — least of all that a de-flake task
+        finished.  The not-found WORDING under another error type stays a failure, which
+        is what "never on the message text" means."""
+        _, client = await self._client(envelope)
+        task, error = await client.get_task('7')
+        assert task is None
+        assert isinstance(error, Exception)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('envelope', 'server_text'),
+        [
+            (
+                mcp_tool_envelope({'error': 'taskmaster unavailable', 'error_type': 'TaskmasterError'}),
+                'taskmaster unavailable',
+            ),
+            (_mcp_is_error_body('get_task'), 'boom'),
+        ],
+        ids=['other_error_type', 'mcp_is_error'],
+    )
+    async def test_a_failed_read_carries_the_servers_text(self, envelope, server_text):
+        _, client = await self._client(envelope)
+        task, error = await client.get_task('7')
+        assert task is None
+        assert server_text in str(error)
+
+    @pytest.mark.asyncio
+    async def test_a_raising_dispatch_is_reported_not_raised(self):
+        """The CAUGHT object comes back in the error half, so the ledger's warning can
+        carry the real cause via ``exc_info``."""
+        raised = RuntimeError('mcp down')
+        _, client = await self._client(None, raises=raised)
+        assert await client.get_task('7') == (None, raised)
 
 
 class TestExtractTaskId:

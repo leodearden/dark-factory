@@ -15,6 +15,13 @@ docs/reify-task-fragmentation-report-2026-04-11.txt for the motivating analysis.
 The curator is best-effort: any failure (embedder, Qdrant, LLM, taskmaster) degrades
 to ``action="create"`` so task creation is never blocked.
 
+A timed-out LLM call is classified from its own transcript when the curator is gated
+(task 3995): a pre-turn stall (0 assistant turns) degrades to create and files a ZOT
+escalation that folds into one record per project; a run killed with progress returns
+a verdict the CLI accepted (its ``structured_output`` attachment) if the transcript
+holds one, else escalates with its real turn count and tool sequence; any non-schema
+tool use logs a loud WARNING. A schema-tool denial is always escalated, never salvaged.
+
 Batch API (task 924)
 --------------------
 :meth:`TaskCurator.curate_batch` is the preferred entry point for the ticket worker:
@@ -30,6 +37,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
 import uuid as uuid_mod
 from collections.abc import Callable, Iterable, Mapping
@@ -41,8 +49,17 @@ from typing import TYPE_CHECKING, Any, Literal
 from shared.cli_invoke import (
     AgentResult,
     AllAccountsCappedException,
+    TranscriptEvidence,
     invoke_with_cap_retry,
     is_zero_output_timeout,
+    no_mcp_servers_config,
+    transcript_evidence_for_session,
+)
+from shared.config_dir import (
+    CONFIG_DIR_PREFIX,
+    TaskConfigDir,
+    sweep_stale_pid_dirs,
+    sweep_stale_pid_dirs_once,
 )
 from shared.locking import files_to_modules
 from shared.neutral_cwd import neutral_cli_cwd
@@ -88,6 +105,10 @@ class CuratorFailureError(RuntimeError):
     ``StructuredOutput`` schema tool was permission-denied (a systemic deny-list
     break, not a flaky candidate).  When set, :class:`CuratorEscalator` raises a
     distinct, un-suppressed escalation so the deny-list gets fixed promptly.
+
+    On a killed run ``turns`` and ``cost_usd`` are empty-stdout defaults, so
+    ``transcript_turns`` is the observation, and ``tools_used`` lists the
+    non-schema tools the call's transcript recorded (None when it was not read).
     """
 
     def __init__(
@@ -102,6 +123,8 @@ class CuratorFailureError(RuntimeError):
         proc_tree: str = '',
         account_name: str = '',
         cost_usd: float | None = None,
+        transcript_turns: int | None = None,
+        tools_used: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(message)
         self.timed_out = timed_out
@@ -112,6 +135,8 @@ class CuratorFailureError(RuntimeError):
         self.proc_tree = proc_tree
         self.account_name = account_name
         self.cost_usd = cost_usd
+        self.transcript_turns = transcript_turns
+        self.tools_used = tools_used
 
 
 # 'drop', 'combine' and 'create' are the only actions the LLM may request — see
@@ -144,6 +169,72 @@ if DEFAULT_PRIORITY not in _PRIORITY_RANK:
 # best-effort path — a real behavioural regression — so we override with a short
 # minutes-scale bound that preserves the fast-fail/defer contract.
 _CURATOR_CAP_WAIT_SANITY_SECS = 120.0  # 2 minutes; override for shared 14-day default
+
+# Stem of a gated curator's per-process CLAUDE_CONFIG_DIR. The dead-PID sweep
+# builds its prefix from the same constant, so the two cannot drift apart.
+_CONFIG_DIR_TASK_PREFIX = 'fm-curator-'
+
+
+def _sweep_stale_curator_config_dirs_once(base_dir: Path | None) -> None:
+    """Reclaim curator config dirs whose owning process is dead. Never raises."""
+    prefix = CONFIG_DIR_PREFIX + _CONFIG_DIR_TASK_PREFIX
+    sweep_stale_pid_dirs_once(
+        prefix,
+        sweep=sweep_stale_pid_dirs,
+        on_reclaimed=lambda reclaimed: logger.info(
+            'TaskCurator: reclaimed %d stale config dir(s) under %s (dead-PID sweep)',
+            reclaimed, prefix,
+        ),
+        on_failure=lambda _exc: logger.warning(
+            'TaskCurator: dead-PID sweep of %s failed; continuing without it',
+            prefix, exc_info=True,
+        ),
+        base_dir=base_dir,
+    )
+
+
+@dataclass(frozen=True)
+class _TranscriptScope:
+    """Where one gated curator call's transcript lands, and its first-turn grace.
+
+    config_dir and session_id together make ``transcript_turns`` stampable,
+    which is what makes ``is_zero_output_timeout`` transcript-authoritative.
+    The grace equals the call's own timeout because the curator's measured
+    first-turn latency tail exceeds the 120s default (task 3995 plan).
+    """
+
+    config_dir: TaskConfigDir
+    session_id: str
+    startup_grace_secs: float
+
+    def as_invoke_kwargs(self) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that thread this scope."""
+        return {
+            'config_dir': self.config_dir,
+            'session_id': self.session_id,
+            'startup_grace_secs': self.startup_grace_secs,
+        }
+
+
+def _salvageable_verdict(
+    agent_result: AgentResult, evidence: TranscriptEvidence | None,
+) -> dict | None:
+    """The verdict a failed call may be salvaged with, else None.
+
+    Only a run that was KILLED (so its stdout never arrived) after the CLI
+    accepted its verdict qualifies. Any other failure's stdout was already
+    parsed by ``_parse_claude_output``, which owns stdout salvage, and a denied
+    schema tool must reach its loud escalation.
+    """
+    if (
+        not agent_result.timed_out
+        or agent_result.schema_tool_denied
+        or agent_result.structured_output is not None
+        or evidence is None
+    ):
+        return None
+    return evidence.accepted_schema_payload
+
 
 # JSON schema for the curator's structured output — used by invoke_with_cap_retry
 # to constrain the LLM's response.  See also CURATOR_BATCH_OUTPUT_SCHEMA below.
@@ -330,6 +421,10 @@ class CuratorDecision:
     # candidate in the same batch (neither yet materialised as a task).
     # The worker substitutes the sibling's resulting task_id at dispatch time.
     batch_target_index: int | None = None
+    # Structured signal that dedupe was silently skipped for this create by a
+    # zero-output hang; never derived from ``justification``, which is shared.
+    degraded_by_zot: bool = False
+    zot_escalation_id: str | None = None
 
     def to_log_fields(self) -> dict[str, Any]:
         return {
@@ -635,6 +730,20 @@ def normalize_title(title: str | None) -> str:
     return ' '.join((title or '').strip().lower().split())
 
 
+def embedding_text(title: str, description: str, files_to_modify: list[str]) -> str:
+    """Compose the text every curator corpus embedding is computed over.
+
+    Single owner: a caller comparing cosine scores against stored tasks must
+    compose its query with this, or the scores are not comparable.
+    """
+    parts = [title]
+    if description:
+        parts.append(description)
+    if files_to_modify:
+        parts.append('\n'.join(files_to_modify))
+    return '\n\n'.join(parts)
+
+
 def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float:
     """Compute a scaled LLM budget clamped at ``cap``.
 
@@ -649,6 +758,117 @@ def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float
     return min(base + per_entry * size, cap)
 
 
+class _LazyRegistry:
+    """One-shot, off-loop lazy load of a YAML registry file.
+
+    Owns the ``(entries, attempted, lock)`` triple for exactly one registry
+    so the double-checked-lock + ``asyncio.to_thread`` + fail-open idiom
+    (see :meth:`entries`) exists once for all three curator guards
+    (:meth:`TaskCurator._maybe_blocklist_drop`,
+    :meth:`TaskCurator._maybe_route_deterministic`,
+    :meth:`TaskCurator._maybe_premise_refuted_drop`) instead of being copied
+    at each site. The idiom is subtle in exactly the way that punishes
+    copies: the attempted flag must latch AFTER the load settles and never
+    in a ``finally``, because ``asyncio.CancelledError`` is a
+    ``BaseException`` (task 4201).
+    """
+
+    def __init__(self, config_key: str, label: str) -> None:
+        # CuratorConfig field name for this registry's path — named in the
+        # relative-path-without-cwd WARNING so an operator knows which
+        # config field to make absolute.
+        self._config_key = config_key
+        # Short guard label ('blocklist' / 'operational-ask' / 'recon-premise')
+        # — named in the load-error WARNING so an operator knows which guard
+        # just went dark. Deliberately distinct from config_key: the two
+        # warnings name genuinely different things, and 'recon-premise' does
+        # not appear in 'recon_code_fix_premise_registry_path' (hyphen vs
+        # underscore), which an existing test asserts on verbatim.
+        self._label = label
+        # _attempted (not _entries) is the not-yet-loaded-vs-settled signal
+        # — see entries() below. _entries holds the loader's result once
+        # settled, or None when the load raised and the guard failed open:
+        # None therefore means "not yet attempted" OR "load raised", while
+        # [] means only "loaded but empty". Every caller treats both falsy
+        # cases identically (`if not entries: return None`). No hot-reload
+        # — a server restart is required to pick up YAML changes.
+        self._entries: list | None = None
+        self._attempted = False
+        # Guards the one-shot load. Needed because the load is offloaded via
+        # asyncio.to_thread: the await point means a concurrent caller could
+        # otherwise observe attempted=True while _entries is still None and
+        # silently fail the guard open. One TaskCurator instance is shared
+        # across projects while the interceptor's curator lock is
+        # per-project, so concurrent entry is reachable. asyncio.Lock() is
+        # loop-agnostic at construction on Python 3.13, so building it here
+        # in __init__ is safe.
+        self._lock = asyncio.Lock()
+
+    def _resolve(self, cfg_path: str, cwd: Path | None) -> Path:
+        """Resolve *cfg_path* against *cwd*, warning once when relative with no cwd."""
+        raw_path = Path(cfg_path)
+        if raw_path.is_absolute():
+            return raw_path
+        if cwd is not None:
+            return cwd / raw_path
+        logger.warning(
+            'task_curator: %s %r is relative but TaskCurator was constructed '
+            'without cwd — resolving against process CWD which may be '
+            'incorrect; use an absolute path in CuratorConfig',
+            self._config_key, cfg_path,
+        )
+        return raw_path
+
+    async def entries(
+        self, loader: Callable[[Path], list], cfg_path: str, cwd: Path | None,
+    ) -> list | None:
+        """Return this registry's parsed entries, loading at most once.
+
+        Offloaded via ``asyncio.to_thread`` so the blocking read/YAML-parse
+        work never stalls the event loop (INV-8
+        loop-thread-occupancy-bounded, docs/legibility/design-invariants.md).
+
+        Double-checked lock: the await point inside the offloaded load means
+        a concurrent second caller could otherwise observe attempted=True
+        while entries is still None and silently fail the guard open. The
+        outer unlocked check keeps the steady-state path (every call after
+        the first) lock-free; the inner re-check under the lock is what
+        makes concurrent first calls correct. The flag is set only AFTER the
+        assignment so nobody can observe the attempted-but-unassigned window.
+        """
+        if not self._attempted:
+            async with self._lock:
+                if not self._attempted:
+                    path = self._resolve(cfg_path, cwd)
+                    try:
+                        self._entries = await asyncio.to_thread(loader, path)
+                    except Exception as exc:
+                        # The loaders never raise (their file-level contract is
+                        # fused_memory/utils/safe_yaml.py::load_yaml_list_file),
+                        # but asyncio.to_thread adds a raise path of its own
+                        # (thread-pool failure or shutdown) that no loader-
+                        # internal except can cover. Fail OPEN (guard
+                        # disabled) rather than escaping into curate() /
+                        # curate_batch_prepared, which call the guard
+                        # methods unguarded — an escape would fail the whole
+                        # task submission.
+                        logger.warning(
+                            'task_curator: %s registry load errored for %s, '
+                            'failing open (guard disabled): %s',
+                            self._label, path, exc,
+                        )
+                        self._entries = None
+                    # Settled outcome (loaded, or failed open) — latch the
+                    # one-shot contract. Deliberately NOT a `finally`:
+                    # asyncio.CancelledError is a BaseException, so it
+                    # bypasses the except above, and latching in a `finally`
+                    # would permanently disable the guard because an
+                    # unrelated caller was cancelled mid-load. Leaving the
+                    # flag clear on cancellation lets the next call retry.
+                    self._attempted = True
+        return self._entries
+
+
 class TaskCurator:
     """LLM-judged drop/combine/create gate plus the Qdrant corpus backing it."""
 
@@ -660,6 +880,7 @@ class TaskCurator:
         cwd: Path | None = None,
         escalator: CuratorEscalator | None = None,
         prompt_store: PromptArtifactStore | None = None,
+        config_dir_base: Path | None = None,
     ) -> None:
         self._config = config
         self._taskmaster = taskmaster
@@ -667,6 +888,9 @@ class TaskCurator:
         self._cwd = cwd
         self._escalator = escalator
         self._prompt_store = prompt_store
+        # Parent of the per-process config dir; None means the system tempdir.
+        self._config_dir_base = config_dir_base
+        self._config_dir: TaskConfigDir | None = None  # lazy, gated only
         self._qdrant_client = None  # AsyncQdrantClient, lazy
         self._embedder = None  # OpenAIEmbedder, lazy
         self._initialized_collections: set[str] = set()
@@ -677,32 +901,25 @@ class TaskCurator:
         # case cheaply — skips embedding + LLM entirely on the second call.
         self._recent_creates: dict[str, dict[str, tuple[str, float]]] = {}
         # Cancelled-premise blocklist — lazy-loaded on first curate() call.
-        # None means "not yet attempted"; [] means "loaded but empty or failed".
-        self._blocklist: list | None = None
-        self._blocklist_load_attempted: bool = False
+        self._blocklist = _LazyRegistry(
+            config_key='cancelled_premise_blocklist_path', label='blocklist',
+        )
         # Recon code-fix premise-verification registry — lazy-loaded on first
         # curate() call, same shape as _blocklist above. Unlike the blocklist,
         # a match here is re-verified against the live source tree on every
         # call (see recon_code_fix_premise_guard.verify_premise_refuted) —
         # only the YAML load itself is cached for the instance lifetime.
-        self._premise_registry: list | None = None
-        self._premise_registry_load_attempted: bool = False
-        # Guards the one-shot lazy load above. Needed because the load is
-        # offloaded via asyncio.to_thread: the await point means a concurrent
-        # caller could otherwise observe load_attempted=True with
-        # _premise_registry still None and silently fail the guard open. One
-        # TaskCurator instance is shared across projects while the
-        # interceptor's curator lock is per-project, so concurrent entry is
-        # reachable. asyncio.Lock() is loop-agnostic at construction on
-        # Python 3.13, so building it here in __init__ is safe.
-        self._premise_registry_load_lock = asyncio.Lock()
+        self._premise_registry = _LazyRegistry(
+            config_key='recon_code_fix_premise_registry_path', label='recon-premise',
+        )
         # Operational-ask registry (filing-policy gate) — lazy-loaded on first
         # curate() call, same shape as _blocklist above. A match routes the
         # candidate straight to a deterministic PURE-GATE instead of the LLM;
         # unlike the blocklist, the resulting decision is deliberately NOT
         # written to the idempotency cache (see _maybe_route_deterministic).
-        self._operational_registry: list | None = None
-        self._operational_registry_load_attempted: bool = False
+        self._operational_registry = _LazyRegistry(
+            config_key='operational_ask_registry_path', label='operational-ask',
+        )
         # Consecutive-ZOT circuit breaker (task 1743).
         # Counts zero-output/full-timeout curator LLM failures since the
         # last real LLM success; a non-ZOT failure neither increments nor
@@ -832,18 +1049,6 @@ class TaskCurator:
             logger.info('Created task curator collection: %s', name)
         self._initialized_collections.add(name)
         return name
-
-    @staticmethod
-    def _embedding_text(
-        title: str, description: str, files_to_modify: list[str],
-    ) -> str:
-        """Text used for embedding — title + description + file list."""
-        parts = [title]
-        if description:
-            parts.append(description)
-        if files_to_modify:
-            parts.append('\n'.join(files_to_modify))
-        return '\n\n'.join(parts)
 
     # ------------------------------------------------------------------
     # Public API
@@ -985,12 +1190,16 @@ class TaskCurator:
         Lazy-loads the blocklist from ``self._config.curator.cancelled_premise_blocklist_path``
         on the first call and caches it for the lifetime of this :class:`TaskCurator`
         instance (no hot-reload; a server restart is required to pick up YAML changes).
+        The load runs off the event-loop thread via :class:`_LazyRegistry`
+        (``asyncio.to_thread``), so it cannot stall the fused-memory event loop.
 
         Returns ``None`` when:
         - The blocklist path is not configured (``None``).
         - The blocklist file is missing, unreadable, or unparseable (one WARNING logged).
         - The blocklist is empty.
         - No entry matches the candidate.
+        - The offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per call).
 
         Never raises.
         """
@@ -1003,23 +1212,7 @@ class TaskCurator:
         if cfg_path is None:
             return None
 
-        # Lazy load — run at most once per TaskCurator instance.
-        if not self._blocklist_load_attempted:
-            self._blocklist_load_attempted = True
-            raw_path = Path(cfg_path)
-            if not raw_path.is_absolute():
-                if self._cwd is not None:
-                    raw_path = self._cwd / raw_path
-                else:
-                    logger.warning(
-                        'task_curator: cancelled_premise_blocklist_path %r is relative but '
-                        'TaskCurator was constructed without cwd — resolving against process '
-                        'CWD which may be incorrect; use an absolute path in CuratorConfig',
-                        cfg_path,
-                    )
-            self._blocklist = load_blocklist(raw_path)
-
-        entries = self._blocklist
+        entries = await self._blocklist.entries(load_blocklist, cfg_path, self._cwd)
         if not entries:
             return None
 
@@ -1068,47 +1261,43 @@ class TaskCurator:
         signature symmetry with ``_maybe_blocklist_drop`` and is unused here.
 
         Both blocking halves of this method run off the event-loop thread
-        (task 4201, 2026-08-29): the one-shot registry load and the
-        per-match live-source re-verification are each dispatched via
-        ``asyncio.to_thread``. The textual match (``match_candidate``) is
-        deliberately kept ON the loop — it is pure string work with no I/O,
-        so the common case of a non-matching candidate pays no thread-pool
-        dispatch. Measured on the shipped registry: registry load ~9.9ms
-        (8.15ms of it ``yaml.safe_load``, only 21us the ``read_text``);
-        worst per-match verification 1.2ms warm / 6.2ms cold on a 664 KB
-        cited file; thread-dispatch overhead ~67us. This resolves an
-        instance of INV-8 ``loop-thread-occupancy-bounded``
-        (docs/legibility/design-invariants.md), mirroring the offload
-        pattern already used by :meth:`_maybe_flag_unverified_claims` and
-        the claim-verification block in :meth:`curate_batch_prepared`.
+        (task 4201, 2026-08-29): the one-shot registry load (via the shared
+        :class:`_LazyRegistry`) and the per-match live-source re-verification
+        are each dispatched via ``asyncio.to_thread``. The textual match
+        (``match_candidate``) is deliberately kept ON the loop — it is pure
+        string work with no I/O, so the common case of a non-matching
+        candidate pays no thread-pool dispatch. Measured on the shipped
+        registry: registry load ~9.9ms (8.15ms of it ``yaml.safe_load``,
+        only 21us the ``read_text``); worst per-match verification 1.2ms
+        warm / 6.2ms cold on a 664 KB cited file; thread-dispatch overhead
+        ~67us. This resolves an instance of INV-8
+        ``loop-thread-occupancy-bounded`` (docs/legibility/design-invariants.md),
+        mirroring the offload pattern already used by
+        :meth:`_maybe_flag_unverified_claims` and the claim-verification
+        block in :meth:`curate_batch_prepared`.
 
-        This bounds the loop stall for THIS guard only. The two sibling
-        one-shot lazy loads invoked earlier in the same :meth:`curate` /
-        :meth:`curate_batch_prepared` sequence — :meth:`_maybe_blocklist_drop`
-        loading ``cancelled_premise_blocklist_path`` (2.2 KB) and
-        :meth:`_maybe_route_deterministic` loading
-        ``operational_ask_registry_path`` (6.7 KB, ~60% the size of this
-        guard's own 11 KB registry) — still run synchronously on the loop, so
-        the first-submission loop stall under the per-project curator write
-        lock is reduced by this change, not bounded by it. Left as-is here
-        (task 4201 scope); tracked as a follow-up to either extend the
-        offload to those two sites or fold all three into one shared
-        lazy-load helper so the idiom exists once.
+        All three curator guards — this one, :meth:`_maybe_blocklist_drop`,
+        and :meth:`_maybe_route_deterministic` — now share
+        :class:`_LazyRegistry` for their one-shot lazy loads (task 5007), so
+        the event-loop stall those loads can cause is bounded for the whole
+        :meth:`curate` / :meth:`curate_batch_prepared` first-submission
+        sequence, not just this guard.
 
         Returns ``None`` (fail-open) when:
         - The registry path is not configured (``None``).
         - The registry file is missing, unreadable, or unparseable, or the
-          offloaded load raised — for example a registry file that is not
-          valid UTF-8 (one WARNING logged; the guard then stays disabled for
-          this TaskCurator instance rather than retrying per call). This is
+          offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per
+          call). This is
           deliberate even for a cause that is transient in principle (a
           partially-written file observed mid-deploy, a momentary worker
-          thread I/O error): the load's ``except Exception`` below does not
-          distinguish exception type, so any raise latches the same as a
-          permanently-malformed file, and a process restart is the recovery
-          path. Only ``asyncio.CancelledError`` is excluded from the latch
-          (see the comment on that except block) — every other exception is
-          treated as permanent by design, not oversight.
+          thread I/O error): :class:`_LazyRegistry.entries`'s
+          ``except Exception`` does not distinguish exception type, so any
+          raise latches the same as a permanently-malformed file, and a
+          process restart is the recovery path. Only
+          ``asyncio.CancelledError`` is excluded from the latch (see the
+          comment on that except block) — every other exception is treated
+          as permanent by design, not oversight.
         - The registry is empty.
         - No entry textually matches the candidate.
         - ``self._cwd`` is ``None`` — the source root cannot be resolved, so the
@@ -1138,58 +1327,9 @@ class TaskCurator:
             )
             return None
 
-        # Lazy load — run at most once per TaskCurator instance. Offloaded:
-        # measured 9.9ms for the shipped 11 KB registry, of which 8.15ms is
-        # pure-Python yaml.safe_load (not the 21us read_text) — the largest
-        # single event-loop stall in this method, paid on the first task
-        # submission per process while the per-project curator write lock is
-        # held.
-        #
-        # Double-checked lock: the await point inside the offloaded load
-        # means a concurrent second caller could otherwise observe
-        # load_attempted=True while self._premise_registry is still None and
-        # silently fail the guard open. The outer unlocked check keeps the
-        # steady-state path (every call after the first) lock-free; the
-        # inner re-check under the lock is what makes concurrent first calls
-        # correct. The flag is set only AFTER the assignment so nobody can
-        # observe the attempted-but-unassigned window.
-        if not self._premise_registry_load_attempted:
-            async with self._premise_registry_load_lock:
-                if not self._premise_registry_load_attempted:
-                    raw_path = Path(cfg_path)
-                    if not raw_path.is_absolute():
-                        raw_path = self._cwd / raw_path
-                    try:
-                        self._premise_registry = await asyncio.to_thread(
-                            load_premise_registry, raw_path,
-                        )
-                    except Exception as exc:
-                        # load_premise_registry documents "never raises" and,
-                        # since task 4483, actually honours it for the whole
-                        # read/parse path (FileNotFoundError, OSError,
-                        # UnicodeDecodeError, yaml.YAMLError all degrade to []).
-                        # This wrapper is still required: asyncio.to_thread is a
-                        # raise path of its own (thread-pool failure/shutdown)
-                        # that the guard module's internal excepts cannot cover.
-                        # Fail OPEN (guard disabled) rather than escaping into
-                        # curate()/curate_batch_prepared, which call this
-                        # unguarded — an escape fails the whole task submission.
-                        logger.warning(
-                            'task_curator: recon-premise registry load errored for %s, '
-                            'failing open (guard disabled): %s',
-                            raw_path, exc,
-                        )
-                        self._premise_registry = None
-                    # Settled outcome (loaded, or failed open) — latch the
-                    # one-shot contract. Deliberately NOT a `finally`:
-                    # asyncio.CancelledError is a BaseException, so it bypasses
-                    # the except above, and latching in a `finally` would
-                    # permanently disable the guard because an unrelated caller
-                    # was cancelled mid-load. Leaving the flag clear on
-                    # cancellation lets the next call retry.
-                    self._premise_registry_load_attempted = True
-
-        entries = self._premise_registry
+        entries = await self._premise_registry.entries(
+            load_premise_registry, cfg_path, self._cwd,
+        )
         if not entries:
             return None
 
@@ -1378,7 +1518,10 @@ class TaskCurator:
         ``self._config.curator.operational_ask_registry_path`` on the first
         call and caches the parsed entries for the lifetime of this
         :class:`TaskCurator` instance (no hot-reload; a server restart is
-        required to pick up YAML changes) — mirrors ``_maybe_blocklist_drop``.
+        required to pick up YAML changes). The load runs off the event-loop
+        thread through the shared :class:`_LazyRegistry` (``asyncio.to_thread``),
+        so it cannot stall the fused-memory event loop — mirrors
+        ``_maybe_blocklist_drop``.
 
         Unlike ``_maybe_blocklist_drop``, the resulting decision is
         deliberately NOT written to the idempotency cache
@@ -1411,6 +1554,8 @@ class TaskCurator:
           WARNING logged by the loader).
         - The registry is empty.
         - No entry matches the candidate.
+        - The offloaded load raised (one WARNING logged; the guard then stays
+          disabled for this TaskCurator instance rather than retrying per call).
 
         Note (task δ demotion): a candidate whose ``metadata.execution_class``
         is ``"operational"`` or ``"decision"`` now returns ``None`` here too —
@@ -1435,23 +1580,9 @@ class TaskCurator:
         if cfg_path is None:
             return None
 
-        # Lazy load — run at most once per TaskCurator instance.
-        if not self._operational_registry_load_attempted:
-            self._operational_registry_load_attempted = True
-            raw_path = Path(cfg_path)
-            if not raw_path.is_absolute():
-                if self._cwd is not None:
-                    raw_path = self._cwd / raw_path
-                else:
-                    logger.warning(
-                        'task_curator: operational_ask_registry_path %r is relative but '
-                        'TaskCurator was constructed without cwd — resolving against process '
-                        'CWD which may be incorrect; use an absolute path in CuratorConfig',
-                        cfg_path,
-                    )
-            self._operational_registry = load_operational_registry(raw_path)
-
-        entries = self._operational_registry
+        entries = await self._operational_registry.entries(
+            load_operational_registry, cfg_path, self._cwd,
+        )
         if not entries:
             return None
 
@@ -1570,6 +1701,7 @@ class TaskCurator:
                 justification='zero-output-breaker-open',
                 pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
                 latency_ms=int((time.monotonic() - start) * 1000),
+                degraded_by_zot=True,
             )
 
         if prepared is not None and prepared.corpus_error is None:
@@ -1632,9 +1764,10 @@ class TaskCurator:
                 latency_ms=int((time.monotonic() - start) * 1000),
             )
         except CuratorFailureError as exc:
+            zot_escalation_id: str | None = None
             if self._escalator is not None:
                 # May re-raise CuratorFailureError on the interactive path.
-                await self._escalator.report_failure(
+                zot_escalation_id = await self._escalator.report_failure(
                     project_root=project_root,
                     project_id=project_id,
                     justification=str(exc),
@@ -1648,6 +1781,8 @@ class TaskCurator:
                     subtype=exc.subtype,
                     cost_usd=exc.cost_usd,
                     pool_sizes=pool_sizes,
+                    transcript_turns=exc.transcript_turns,
+                    tools_used=exc.tools_used,
                 )
             else:
                 logger.warning(
@@ -1665,6 +1800,8 @@ class TaskCurator:
                 justification='llm-error-escalated',
                 pool_sizes=pool_sizes,
                 latency_ms=int((time.monotonic() - start) * 1000),
+                degraded_by_zot=exc.zero_output_timeout,
+                zot_escalation_id=zot_escalation_id if exc.zero_output_timeout else None,
             )
         except Exception as exc:
             logger.warning(
@@ -2007,6 +2144,7 @@ class TaskCurator:
                     justification='zero-output-breaker-open',
                     pool_sizes=_empty_pool_sizes,
                     latency_ms=int((batch_breaker_now - start) * 1000),
+                    degraded_by_zot=True,
                 )
             llm_k_list = []
 
@@ -2116,7 +2254,7 @@ class TaskCurator:
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
@@ -2232,7 +2370,7 @@ class TaskCurator:
 
         Args:
             query: Free-text query, embedded as-is (NOT passed through
-                ``_embedding_text``, which composes stored-task fields).
+                ``embedding_text``, which composes stored-task fields).
             project_id: Project identifier selecting the collection.
             limit: Max number of hits to return.
             score_threshold: Drop hits below this cosine score server-side.
@@ -2317,7 +2455,7 @@ class TaskCurator:
 
             description = str(task.get('description', '') or '')
             files = _task_files(task)
-            text = self._embedding_text(title, description, files)
+            text = embedding_text(title, description, files)
 
             try:
                 async with sem:
@@ -2575,7 +2713,7 @@ class TaskCurator:
         try:
             collection = await self._ensure_collection(project_id)
             embedder = await self._get_embedder()
-            text = self._embedding_text(
+            text = embedding_text(
                 candidate.title, candidate.description, candidate.files_to_modify,
             )
             embedding = await embedder.create(text)
@@ -2770,6 +2908,99 @@ class TaskCurator:
     # LLM call
     # ------------------------------------------------------------------
 
+    def _transcript_config_dir(self) -> TaskConfigDir | None:
+        """This process's curator config dir, or None when there is no UsageGate.
+
+        Gate-less, no per-call OAuth token is passed, so the CLI needs the login
+        in its default config dir, which an isolated one would hide. Concurrent
+        gated calls share this dir safely: each authenticates from its own
+        ``CLAUDE_CODE_OAUTH_TOKEN``, never from the ``.credentials.json`` they
+        all rewrite (``shared/tests/test_config_dir_credentials_live.py``).
+        """
+        if self._usage_gate is None:
+            return None
+        if self._config_dir is None:
+            _sweep_stale_curator_config_dirs_once(self._config_dir_base)
+            self._config_dir = TaskConfigDir(
+                f'{_CONFIG_DIR_TASK_PREFIX}{os.getpid()}', base_dir=self._config_dir_base,
+            )
+        return self._config_dir
+
+    def _transcript_scope(self, timeout_seconds: float) -> _TranscriptScope | None:
+        """A fresh transcript scope for one call, or None when there is no UsageGate."""
+        config_dir = self._transcript_config_dir()
+        if config_dir is None:
+            return None
+        return _TranscriptScope(config_dir, str(uuid_mod.uuid4()), timeout_seconds)
+
+    async def _read_failure_evidence(
+        self, transcript_scope: _TranscriptScope,
+    ) -> TranscriptEvidence | None:
+        """What a failed call's own transcript recorded, or None when unknown.
+
+        Reads once per failed call, off the event loop (a bisected batch fails
+        as several concurrent calls), and never raises: a transcript fault must
+        not replace the LLM failure on the synchronous add_task path.
+        """
+        session_id = transcript_scope.session_id
+        try:
+            evidence = await asyncio.to_thread(
+                transcript_evidence_for_session, transcript_scope.config_dir.path, session_id,
+            )
+        except Exception:
+            logger.warning(
+                'TaskCurator: could not read the transcript of failed session %s; '
+                'reporting the failure without it', session_id, exc_info=True,
+            )
+            return None
+        if evidence is not None and evidence.other_tool_uses:
+            logger.warning(
+                'TaskCurator: pure-classifier contract violated: failed session %s '
+                'used tools %s over %d assistant turn(s), but its registry should '
+                "hold only StructuredOutput. Check the schema + '*' -> --tools '' "
+                'substitution in shared.cli_invoke.build_claude_argv.',
+                session_id, list(evidence.other_tool_uses), evidence.assistant_turns,
+            )
+        return evidence
+
+    async def _resolve_failed_result(
+        self, agent_result: AgentResult, transcript_scope: _TranscriptScope | None,
+    ) -> tuple[AgentResult, TranscriptEvidence | None]:
+        """Read a failed call's transcript evidence, and salvage its verdict if allowed.
+
+        Returns ``(result, evidence)``. A successful or gate-less result comes
+        back unchanged and unread. A failed gated one gets ONE evidence read,
+        for reporting.
+        Salvage is only for a run KILLED after the CLI accepted its verdict (the
+        transcript's ``structured_output`` attachment). The result then becomes
+        a success carrying that verdict, which meets exactly the parsing and
+        validation a returned one does. A denied or non-kill failure is never
+        salvaged.
+
+        Known limitation: when ``invoke_with_cap_retry`` re-mints the session id
+        for a fresh retry (after a cap hit or a pre-turn rejection,
+        ``_reset_for_fresh_retry``), the curator's session id names an EARLIER
+        attempt. Evidence is then absent or stale. That can only cause a missed
+        salvage, never a false one, since a capped or rejected attempt has no
+        acceptance record.
+        """
+        if agent_result.success or transcript_scope is None:
+            return agent_result, None
+        evidence = await self._read_failure_evidence(transcript_scope)
+        verdict = _salvageable_verdict(agent_result, evidence)
+        if verdict is None:
+            return agent_result, evidence
+        logger.warning(
+            'TaskCurator: salvaged an accepted verdict from the transcript of killed '
+            'session %s (subtype=%s, transcript_turns=%s); stdout never delivered it: %.300s',
+            transcript_scope.session_id, agent_result.subtype,
+            agent_result.transcript_turns, json.dumps(verdict, default=str),
+        )
+        salvaged = replace(
+            agent_result, success=True, structured_output=verdict, schema_salvaged=True,
+        )
+        return salvaged, evidence
+
     async def _call_llm(
         self,
         candidate: CandidateTask,
@@ -2804,6 +3035,7 @@ class TaskCurator:
             self._config.curator.single_call_budget_cap_usd,
         )
         system_prompt = self._resolve_curator_prompt(CURATOR_SINGLE_SPEC)
+        transcript_scope = self._transcript_scope(self._config.curator.timeout_seconds)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
@@ -2813,27 +3045,36 @@ class TaskCurator:
             system_prompt=system_prompt,
             cwd=cwd,
             model=self._config.curator.model,
-            # ``max_turns=1`` is incompatible with ``--json-schema`` because
-            # the schema mechanism burns a tool-use turn; the CLI returns
-            # ``error_max_turns`` after the schema turn, even when the
-            # structured payload is already attached. The configured floor
-            # is 3 (schema tool-use + optional reasoning + final response);
-            # the default of 8 leaves headroom for harder combine-vs-create
-            # decisions. Schema salvage in cli_invoke.py covers the boundary.
+            # Never 1: a cap of 1 leaves no room for the prose turn the model
+            # emits before calling ``StructuredOutput`` (see
+            # fused-memory/src/fused_memory/reconciliation/agent_loop.py::_AGENT_CLI_MAX_TURNS).
+            # Schema salvage in cli_invoke is not a backstop for that: on the
+            # measured recon-verify shape the ``error_max_turns`` result carried
+            # no payload, so salvage had nothing to recover.  The curator's own
+            # shape has not been measured, so the ``ge=3`` floor and the default
+            # of 8 are established values, not revalidated ones; 8 leaves
+            # headroom for harder combine-vs-create decisions.
             max_turns=self._config.curator.max_turns,
             max_budget_usd=budget,
-            disallowed_tools=['*'],  # no tool access — this is a pure classifier
+            # Pure classifier: build_claude_argv turns '*' into --tools '', which
+            # removes built-in and deferred tools; the two MCP kwargs remove MCP.
+            disallowed_tools=['*'],
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
             output_schema=CURATOR_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=self._config.curator.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
+        agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
             raise CuratorFailureError(
                 f'curator LLM call failed: output={agent_result.output[:200]!r} '
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'transcript_turns={agent_result.transcript_turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
                 f'schema_tool_denied={agent_result.schema_tool_denied} '
@@ -2846,6 +3087,8 @@ class TaskCurator:
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
                 cost_usd=agent_result.cost_usd,
+                transcript_turns=agent_result.transcript_turns,
+                tools_used=evidence.other_tool_uses if evidence else None,
             )
 
         return _parse_decision(
@@ -2907,6 +3150,7 @@ class TaskCurator:
             self._config.curator.batch_budget_cap_usd,
         )
         system_prompt = self._resolve_curator_prompt(CURATOR_BATCH_SPEC)
+        transcript_scope = self._transcript_scope(timeout)
 
         agent_result: AgentResult = await invoke_with_cap_retry(
             usage_gate=self._usage_gate,
@@ -2918,19 +3162,26 @@ class TaskCurator:
             model=self._config.curator.model,
             max_turns=max_turns,
             max_budget_usd=budget,
+            # Pure classifier: build_claude_argv turns '*' into --tools '', which
+            # removes built-in and deferred tools; the two MCP kwargs remove MCP.
             disallowed_tools=['*'],
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
             output_schema=CURATOR_BATCH_OUTPUT_SCHEMA,
             permission_mode='bypassPermissions',
             timeout_seconds=timeout,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
+        agent_result, evidence = await self._resolve_failed_result(agent_result, transcript_scope)
         latency_ms = int((time.monotonic() - start) * 1000)
         if not agent_result.success:
             raise CuratorFailureError(
                 f'curator batch LLM call failed: batch_size={n} '
                 f'output={agent_result.output[:200]!r} '
                 f'subtype={agent_result.subtype!r} turns={agent_result.turns} '
+                f'transcript_turns={agent_result.transcript_turns} '
                 f'timed_out={agent_result.timed_out} '
                 f'duration_ms={agent_result.duration_ms} '
                 f'schema_tool_denied={agent_result.schema_tool_denied} '
@@ -2943,6 +3194,8 @@ class TaskCurator:
                 proc_tree=agent_result.proc_tree,
                 account_name=agent_result.account_name,
                 cost_usd=agent_result.cost_usd,
+                transcript_turns=agent_result.transcript_turns,
+                tools_used=evidence.other_tool_uses if evidence else None,
             )
 
         # Success: a real LLM round-trip completed, so the service is not

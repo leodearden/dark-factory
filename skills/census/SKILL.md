@@ -1,106 +1,148 @@
 ---
 name: census
-description: "Run an operator-initiated LEGIBILITY CENSUS: the first census for a newly-enabled project (never censused, so the trigger fails safe and never auto-fires), or an ad-hoc forced census on demand (e.g. after a big remediation wave). ALWAYS use this skill for: '/census <project-root>', 'run a census', 'run a legibility census', 'first census for <project>', 'force a census now'. Recurring census runs need NO skill — the nightly trickle's evaluate_census_step launches scripts/legibility/census.py automatically when census_trigger fires; this skill covers only the two cases where a human has to kick it off by hand. NOT in scope: editing scripts/legibility/* code, the nightly trickle, or the census trigger logic itself — this is an operator run-and-verify skill, not a dev skill."
+description: "Run an operator-initiated LEGIBILITY CENSUS: an attended first census for a newly-enabled project (run with cost caps and review-before-filing, before the nightly trickle auto-fires an unattended one), or an ad-hoc forced census on demand (e.g. after a big remediation wave). ALWAYS use this skill for: '/census <project-root>', 'run a census', 'run a legibility census', 'first census for <project>', 'force a census now'. Recurring census runs need NO skill — the nightly trickle's evaluate_census_step launches scripts/legibility/census.py automatically when census_trigger fires; this skill covers only the cases where a human kicks it off by hand. NOT in scope: editing scripts/legibility/* code, the nightly trickle, or the census trigger logic itself — this is an operator run-and-verify skill, not a dev skill."
 argument-hint: "[project-root — absolute path to the project being censused; omit to use the current project]"
 ---
 
 # /census — operator-initiated legibility census
 
-A LEGIBILITY CENSUS is a saturation-mining sweep (`scripts/legibility/census.py`) that mines the codebase for confusion sightings until novelty saturates, verifies and synthesizes them into a dated report, updates the confusion codebook, and files remediation tasks. Normally this runs unattended: the nightly trickle evaluates `census_trigger` at the end of every run and launches `census.py` itself the moment a fire condition is met. **This skill exists only for the two cases a human has to start it by hand:**
+A legibility census (`scripts/legibility/census.py`) does the following:
 
-1. **First census for a newly-enabled project.** `census_trigger.load_census_state` reads `docs/legibility/census-state.json` three ways — `"ok"`, `"malformed"`, or `"missing"`. A project that has never been censused has no file, so the read returns `"missing"` → `never_censused=True` → there is no `last_census_at` anchor to measure `days_since` against → every interval-based fire condition evaluates to "N/A", never "FIRE". **A first census can never auto-fire.** This is deliberate fail-safe design (see the module docstring in `scripts/legibility/census_trigger.py`), not a bug — but it means someone has to run it manually, once, per project.
-2. **Ad-hoc forced census.** An operator wants a census right now regardless of the trigger's verdict — e.g. right after a large remediation wave, to capture fresh sightings and re-baseline the codebook before the next scheduled interval.
+1. Mines agent **session transcripts** for confusion sightings, in stratified-random batches, until novelty saturates. The transcripts come from `~/.claude/projects` plus the project's `agent_transcript_roots`, matched by `cwd_prefixes` in `docs/legibility/legibility.yaml`.
+2. Verifies each novel cluster against the project's current tree. The verifier is the only stage that reads the code.
+3. Synthesizes the verified clusters into a dated report.
+4. Updates `docs/legibility/confusion-codebook.yaml`.
+5. Files remediation tickets.
 
-## Why one skill, not two
+What a finding must carry (key, area, anchor, tags, severity, disposition), what a report must pin, and how a run schedules the next are all defined in `docs/quality-findings-contract.md`. This skill points there and does not restate it.
 
-The recurring case needs no skill at all — it's fully automatic (nightly trickle → `evaluate_census_step` → `census.py`, no human in the loop). The two cases this skill *does* cover (first-run bootstrap, ad-hoc `--force`) both terminate in the exact same command and the exact same pre/post checklist; the only difference is *why* the operator is running it, which is context for the report header, not a different procedure. Splitting this into two skills would duplicate the checklist for no operational benefit.
+Statements marked *(until Ln)* describe today's code and change when that leaf of `plans/census-incremental-prd.md` lands. The final section lists what changes.
 
-## Preflight checklist
+Normally the census runs unattended. Each nightly trickle run ends by evaluating `census_trigger.decide_for_project` and, on FIRE, launches `census.py` with the caps from `legibility.yaml` `census.trickle_caps`. Run it by hand only in these two cases:
 
-Before running, confirm there's something worth mining and headroom to mine it:
+1. **Attended first census.** A first census can auto-fire. When `docs/legibility/census-state.json` is missing, `decide_for_project` anchors `last_census_at` on the earliest codebook date and exempts the floor. Condition (c), the novelty spike, needs no anchor. It counts candidates whose `first_seen` falls in the last 72 h against a threshold of 4, and a running trickle exceeds that on almost every night *(until L8a)*. So a project's first census fires unattended within a night or two of its trickle producing candidates. That run is capped by `trickle_caps` but files tickets for real. Run the first census by hand, before installing the trickle timer, when you want it bounded and reviewed (`--dry-run-filing`). A project with no trickle data and no codebook does not fire.
+2. **Ad-hoc forced census.** Run one when you want fresh sightings now, regardless of the trigger's verdict, for example right after a remediation wave.
 
-1. **Trickle data is present and fresh.** The census mines sightings the nightly trickle has already been accumulating in the confusion codebook; check the trickle has actually been running for this project:
+Both cases run the same command and the same checklists. Only the reason differs, so this is one skill.
+
+## Preflight
+
+1. **Is the trickle healthy?** For a project with a running trickle:
    ```bash
-   journalctl --user -u legibility-trickle@<project>.service --since "-3 days" | tail -50
+   uv run --directory <factory checkout>/shared python <factory checkout>/scripts/legibility/check_trickle_progress.py <project_id> 3
+   journalctl --user -u legibility-trickle@<project_id>.service --since "-3 days" | grep -E 'census trigger:|digest|failed' | tail -20
    ```
-   Look for recent successful runs and a logged census-trigger decision line each time. If the trickle unit isn't installed or hasn't run recently, the codebook may be stale or empty — a census can still run, but expect a smaller/duller sweep (more likely to saturate on near-zero novel sightings).
-2. **Fresh codebook sightings exist.** Skim `docs/legibility/confusion-codebook.yaml` for recent `sightings`/`candidates` dates. A census mines fresh ground beyond what's already coded — if the codebook hasn't moved in weeks, mining will spend most of its budget rediscovering what's already known before saturating.
-3. **Usage headroom.** The run itself preflights this (`preflight_headroom` — a cheap probe against the lightweight trickle model (haiku) that defers the whole run rather than burning budget mid-sweep on a rate-limited/degraded session), but it's worth a sanity glance yourself first: mining uses Sonnet (`census_miner`), synthesis uses Fable exclusively (`census_synthesis`) — make sure neither is already under heavy load from other concurrent work before kicking off a long saturation-mining sweep.
+   Exit 0 means signal is flowing. Any other exit names its own cause. A failed trickle does not block a census, because the census mines transcripts directly, but a forced census on top of a broken trickle is worth knowing about.
+2. **What would the trigger say?** Do not skim the codebook: it is over 2 MB.
+   ```bash
+   PYTHONPATH=<factory checkout>/scripts uv run --directory <factory checkout>/shared python <factory checkout>/scripts/legibility/census_trigger.py evaluate --project-root <target-root>
+   ```
+   It prints FIRE or NO-FIRE and one reason line per condition: days since the last census, tasks landed, the 72 h candidate count, and the floor. It makes one read-only `get_statuses` call.
+3. **Headroom.** The run probes this itself (`preflight_headroom`, one trickle-model call, which defers the whole run when the account pool is capped), and probes again before verification. Mining uses `census_miner` (Sonnet), verification `census_verify` (Sonnet) and synthesis `census_synthesis` (Fable). Avoid starting an uncapped census while other heavy work holds the pool.
 
-## Running the census
+## Running
 
-The canonical operator command, from the dark_factory main checkout:
+From the factory checkout. `<factory checkout>` is the dark-factory checkout that ships `scripts/legibility/`. `uv run --directory` changes the working directory to `shared/`, so every path below is absolute. Use `--directory`, not `--project`, following the `uv run --directory <member>` convention in `review/briefing.yaml`.
 
 ```bash
-cd /home/leo/src/dark-factory && uv run --project shared python scripts/legibility/census.py \
+uv run --directory <factory checkout>/shared python <factory checkout>/scripts/legibility/census.py \
   --project-root <target-root> --force
 ```
 
-- `<target-root>` is the absolute path to the project being censused (its own checkout, with its own `docs/legibility/` — not necessarily `dark_factory` itself).
-- `--force` is what makes this an *operator*-initiated run: it bypasses the `census_trigger.decide_for_project` gate entirely (the same gate the nightly trickle checks before launching), so it works identically whether the trigger would have said NO-FIRE (first-census case — it always would, per above) or you simply don't want to wait for the next scheduled fire (ad-hoc case). Without `--force`, the CLI prints the NO-FIRE reasons and exits 0 without mining anything — expected behavior for a first census, not an error.
-- Optional flags: `--config <path>` to point at a non-default `legibility.yaml`, `--date YYYY-MM-DD` to stamp the report with a date other than today (rare — mainly for backfilling a report for a run that started the previous day).
+- `<target-root>` is the absolute root of the censused project. It must agree with `project_root` in that project's `legibility.yaml`, or the run refuses.
+- `--force` bypasses the trigger. Without it, the CLI prints the NO-FIRE reasons and exits 0.
+- `--config <path>` names a non-default `legibility.yaml`. `--date YYYY-MM-DD` stamps the report with another date.
+- `--harness-config <path>` names the `legibility.yaml` of the project that owns harness fix surfaces. It defaults to this checkout's own, which is dark_factory.
 
-The run mines, verifies, synthesizes, updates the codebook, and files remediation tasks unattended — it can take a while (saturation mining runs until novelty drops below the configured duplicate-rate threshold for several consecutive batches). Watch the terminal for the final `census: done -- report=... filed_tickets=N stop_reason=...` line, or `census: deferred -- <reason>` if the headroom preflight declined to start. Each of those N is a **ticket**, not a task: `submit_task` hands the run a `tkt_*` id and the curator decides create/combine/drop asynchronously, so the tasks do not exist yet — pass a ticket id to `resolve_ticket` to see what it became. The report's Filed Tasks section lists the same ticket ids and says the same thing.
+### Cost-control flags (each optional; omitted means unbounded)
 
-The done line gains a trailing **`unresolved_verdicts=N`** when — and only when — N is non-zero. It means N verify verdicts this run *paid for* found no `pending` candidate to apply to, because a prior adjudication of the same title is standing and the merger correctly declined to fabricate a pending twin over it. Nothing is lost and the run is not a failure, but nothing changes on its own either: re-open those titles by hand (the run's log names them, one warning per title) or the same verify spend repeats every census.
+- **`--max-batches N`** stops mining after N batches (N ≥ 1). The report marks coverage as partial and `stop_reason=capped`. *(until L1)* The run still advances `last_census_at`, and the next window starts there, so capped-away sessions are never mined. To sweep them, roll `last_census_at` back first.
+- **`--max-verify-clusters N`** hands the verifier at most N novel clusters, in mining order. The rest merge as `pending` candidates. *(until L7)* A pending candidate is re-adjudicated only if a later run reproduces its exact title, so in practice it stays pending until someone adjudicates it by hand.
+- **`--dry-run-filing`** writes every would-be `submit_task` payload to `plans/confusion-census-<date>-payloads.json` (or `…-payloads-2.json`, never overwritten) and files nothing. The codebook and census-state still advance, so filing that JSON by hand is the only way those tasks will ever land.
 
-### Operator cost-control flags
-
-Three composable flags bound what one run may spend. Each is optional and defaults to today's unbounded behavior, so omitting them all is exactly the command above.
-
-- **`--max-batches N`** — stop mining after N batches (N ≥ 1; omit the flag for no cap — `0` is rejected, not treated as "unbounded"). The report states the cap and that coverage is **partial** (sessions beyond the cap were never mined), and `stop_reason` becomes `capped` rather than `exhausted`. **Partial does not mean "the rest comes next run":** this run still advances `last_census_at`, and the next census window is anchored there, so the capped-away sessions fall outside every future window. Sweeping them means rolling `last_census_at` back in `docs/legibility/census-state.json` first.
-- **`--max-verify-clusters N`** — hand the verifier at most N novel clusters, taken in mining order (N ≥ 1; `0` is rejected). Verification costs one Sonnet call per cluster, and that is the spend being bounded. The rest still merge into the codebook as `pending` candidates — **deferred, never dropped** — but a later census re-adjudicates one only if that confusion **recurs** in a later window; this window's sightings are not re-mined. A one-off deferred by the cap stays `pending` until someone adjudicates it by hand.
-- **`--dry-run-filing`** — write every would-be `submit_task` payload to `plans/confusion-census-<date>-payloads.json` for human review and file **nothing**. Everything else — codebook update, promotions, report, census-state advance — proceeds normally, and *because* those do happen, hand-filing the payload JSON is the only way to land the tasks. An existing payload file is never overwritten: a second run's payloads go to `…-payloads-2.json`.
-
-For an attended **first** census, run with all three:
+For an attended first census, use all three:
 
 ```bash
-cd /home/leo/src/dark-factory && uv run --project shared python scripts/legibility/census.py \
+uv run --directory <factory checkout>/shared python <factory checkout>/scripts/legibility/census.py \
   --project-root <target-root> --force \
   --max-batches 50 --max-verify-clusters 150 --dry-run-filing
 ```
 
-Why: a first census cannot rely on saturation to bound spend — against an empty codebook, a batch's `dup_rate` only measures "the miner found nothing to match", so mining runs to source exhaustion, per-cluster verification scales with however many novel clusters that produces, and filing would bulk-load a live task tree in one shot.
+Against an empty codebook, `dup_rate` only measures "the miner found nothing to match", so saturation cannot bound the run. A bounded first census is a sample, not a sweep. The trickle-launched census passes these same two caps from `census.trickle_caps` (schema default 50/150; `null` on a key means uncapped). Flags typed on a manual run are unaffected by that block.
 
-What you're trading for that: a bounded first census is a *sample*, not a sweep, and nothing re-sweeps the remainder automatically. If you want full coverage of the first window, either run uncapped, or plan on rolling `last_census_at` back (per the bullets above) and running again.
+### What the run does with verified findings
+
+- **Filing is through tickets.** `submit_task` returns a `tkt_*` id. The curator decides create, combine or drop asynchronously, and `resolve_ticket(ticket, project_root)` returns the task id once it has. Each ticket carries `metadata.source=legibility_census` and `origin_project_id`.
+- **Harness routing.** When a cluster's descriptive fields name a harness component, the ticket files into the harness project's tree, with the matched markers under `metadata.x_fix_surface`. The rule is in `scripts/legibility/filing_policy.py::resolve_target`. When the verifier proposed an in-tree remediation, the ticket stays in the observed project. The report lists each cross-project ticket with the `project_root` that `resolve_ticket` needs.
+- **Singleton filing gate** (`filing_policy.is_fileable`, since 2026-09-27). A verified cluster files only when the verifier proposed an existing in-tree remediation path, or when its title has at least `MIN_UNREMEDIATED_SIGHTINGS` (2) distinct-session sightings. Anything else is promoted into the codebook, marked `filing: withheld`, and listed under **Recorded, Not Filed**. A withheld entry files automatically on a later run once its sightings reach 2.
+
+Watch for the final line:
+
+- `census: done -- report=... filed_tickets=N stop_reason=...`, with `unresolved_verdicts=N` appended only when the run paid for verdicts that a standing adjudication of the same title overrode.
+- `census: deferred -- stage=... unverified_clusters=...` when a headroom gate deferred the run. Nothing was persisted, so re-run once capacity returns.
 
 ## Post-run checklist
 
-1. **Read the dated report.** `plans/confusion-census-<date>.md` in the *censused* project's own checkout — open it and read the origin × manifestation matrix (where confusions came from vs. how they showed up) plus the narrative sections. This is the actual deliverable; don't just trust the one-line CLI summary.
+1. **Read the report** at `plans/confusion-census-<date>.md` in the censused project. *(until L1)* A second run on the same date overwrites it, and the earlier one survives only in git history (each run commits its report). Its sections:
+   - **Saturation:** batch count, stop reason and per-batch `dup_rate`. A stop at the two-batch minimum is the common case, and it is not evidence of full coverage.
+   - **Verification:** present on every run given `--max-verify-clusters`, and therefore on every trickle-launched run. The anomaly to look for is the bullet **"ALL N … were REJECTED and none survived"**. It signals a suspected systemic verifier failure. Check the per-cluster `verify failed` warnings in the journal before accepting the run.
+   - **Unresolved Verdicts:** verdicts paid for and dropped against a standing record.
+   - **Origin x Manifestation Matrix:** from the verifier's phase stamps.
+   - **Synthesis:** prose. *(until L10)* It is not parsed. Its "inputs to the merger" dispositions are not applied, so act on any you agree with by hand.
+   - **Filed Tasks:** ticket ids, plus the cross-project list.
+   - **Recorded, Not Filed** and **Cost**.
+   The report has no per-stratum coverage section.
+2. **Resolve the tickets.** Call `resolve_ticket` for each id; for cross-project tickets, use the project root the report names. *(until L4)* The report cannot name task ids, because the curator decides after the report is rendered. Triage or re-prioritise what landed, since every ticket is filed at priority `medium` *(until L3)*.
+3. **Check `docs/legibility/census-state.json` advanced:**
+   - `last_census_at` is this run's **date**, `YYYY-MM-DD` (date-only, not a timestamp).
+   - `last_census_report` names the new report (written as an absolute path *(until L1)*).
+   - `last_census_done_count` *(until L8b)* is three-valued:
+     - an integer matching the project's done-task count: correct.
+     - `0` on a project that has done tasks: wrong. The `get_statuses` call failed and a fabricated baseline was persisted (task 3291). Repair it with a dated `get_statuses` readback and investigate the endpoint.
+     - `0` on a project with no done tasks: legitimate.
+     - `null`: the count was unobservable. The run stands, and the tasks-landed condition fails safe until the next successful census.
+4. **If you ran `--dry-run-filing`,** file the payload JSON by hand. A later census will not re-file it, because those confusions now code as matches and the window has moved.
 
-   **Check for a `## Verification` section on a run you gave no `--max-verify-clusters`.** On a flagless run that section only appears when something is wrong: it means every offered cluster was rejected and none survived. Treat that as a suspected *systemic* verifier failure (model unreachable, tool access denied, unparseable verdicts) rather than a genuinely unremarkable census, and read the per-cluster verify warnings in `journalctl --user -u legibility-trickle@<project>` before accepting the run.
-2. **Sanity-check per-stratum coverage counts.** The report should show mining coverage across the strata the sampler drew from — if one stratum has near-zero sightings while others are dense, that's worth a second look (could be a genuinely clean area, could be a sampling gap).
-3. **Confirm `census-state.json` advanced.** Check `docs/legibility/census-state.json` in the censused project — `last_census_at` should now be this run's timestamp and `last_census_report` should point at the new report. This is what makes the *next* census automatic: with a real anchor in place, `census_trigger` can now compute `days_since` and the interval/tasks-landed/novelty-spike conditions become live instead of perpetually "N/A".
+## Anchor seeding — when an equivalent manual survey already exists
 
-   **Also check the baseline.** `last_census_done_count` should be a plausible integer — roughly the *censused project's* current done-task count, and an *unquoted* one (a non-integer there disarms the tasks-landed condition entirely and logs a warning on every evaluation — see the seeding block below). Compare it against reality rather than against zero:
-
-   - **An integer that matches the project's done-task count** — correct, nothing to do.
-   - **`0` on a project that demonstrably has done tasks** — wrong, and the run is **not** clean. It means the `get_statuses` call failed and a fabricated baseline was persisted (the 2026-07-24 / 2026-07-31 incident, task 3291). Repair the file with a real readback (same procedure as the anchor-seeding block below) and investigate the fused-memory endpoint. Left in place it makes the tasks-landed delta `current_done - 0` — every done task ever, ~24× the threshold — so that condition fires on every evaluation once its `tasks_landed_min_days` window clears.
-   - **`0` on a project with no done tasks yet** — legitimate. A newly-onboarded project genuinely has a done-count of zero, and the code deliberately keeps that distinguishable from a failed call. Nothing to do.
-   - **`null`** — the count was unobservable at census time (endpoint down, or it answered with something that wasn't a status snapshot). The census itself is fine and its report stands; the tasks-landed condition just fails safe until the next successful census, with `max_interval_days` still the backstop. Worth investigating the endpoint, but not a reason to distrust the run.
-4. **Review the filed remediation tasks.** The run submits tasks through the normal curator path (`submit_fn`) — check the project's task tree for what landed and whether it needs triage/re-prioritization.
-5. **If you ran `--dry-run-filing`: review the payload JSON and file by hand.** This is the only path — the census-state anchor and the codebook have already advanced, so a second run mines a fresh window and files nothing. Work through `plans/confusion-census-<date>-payloads.json` (if you ran the census twice, the second run's payloads are in `…-payloads-2.json`; the first file is never overwritten). Until they're filed, the remediation half of the census is still outstanding.
-
-## Anchor-seeding alternative — when a manual survey already happened
-
-If a project already had an equivalent manual survey *before* this skill/pipeline existed for it — a hand-run agent-legibility survey, not `census.py` itself — you don't need to re-run mining from scratch just to unblock the trigger. Seed `docs/legibility/census-state.json` directly with the survey's own date/report/done-count, so the trigger treats that survey as the first census:
+To have the trigger treat an earlier hand-run legibility survey as the first census, seed the state file directly:
 
 ```json
 {
-  "last_census_at": "<survey-date>T00:00:00+00:00",
-  "last_census_report": "<path to the survey report>",
+  "last_census_at": "<survey-date>",
+  "last_census_report": "<repo-relative path to the survey report>",
   "last_census_done_count": <done-task count at survey time, from get_statuses>
 }
 ```
 
-`last_census_done_count` is three-valued. Seed it with a real integer from a dated `get_statuses` readback — that is the whole point of seeding, since it is what arms the tasks-landed condition. A real `0` is valid if the project genuinely has no done tasks yet. `null` is the machine-written value for "the count could not be observed at census time"; write it by hand only if you are seeding an anchor and have no way to take a readback, and expect the tasks-landed condition to stay inert until the first successful census.
+`last_census_at` may be a date or an ISO datetime (`datetime.fromisoformat`). `last_census_done_count` *(until L8b)* must be an **unquoted non-negative JSON integer**, or `null` if no readback is possible. `census_trigger.compute_tasks_landed` validates rather than coerces it, so a bad value fails that condition safe and logs a warning naming the value. Every threshold in `legibility.yaml`'s `census:` block must likewise be an unquoted non-negative integer. `CensusConfig.from_mapping` falls back per field and names each rejected value in one warning.
 
-Write it as an **unquoted JSON integer** — `2872`, not `"2872"`, not `2872.0`, not `true`, and never negative. `census_trigger.compute_tasks_landed` validates the value rather than coercing it, so anything else fails the tasks-landed condition **safe** (it never fires) and logs one warning naming the bad value and its type. That failure is silent to the *trigger* but loud in the *log*: a mis-seeded baseline shows up as a recurring warning in the nightly journal rather than as a mysteriously inert condition, and `max_interval_days` remains the backstop meanwhile. So if you seeded a baseline and the tasks-landed condition never seems to arm, check the journal before re-deriving the count.
+Precedent: dark_factory was seeded this way in commit `0b99cf4ca2`, from `plans/agent-legibility-survey-2026-07-13.md`, with `last_census_done_count: 2321`. Use this only when an equivalent survey really exists.
 
-The same rule covers the other hand-edited input to the trigger: every threshold in `docs/legibility/legibility.yaml`'s `census:` block (`max_interval_days`, `tasks_landed_threshold`, `tasks_landed_min_days`, `floor_days`, `novelty_spike.count`, `novelty_spike.window_hours`) must be an unquoted, non-negative integer. `CensusConfig.from_mapping` validates each one independently: an unusable value falls back to *that field's* default — never the whole block — and every rejected value is named, with its type, in one warning. Per-field fallback is deliberate, so a typo in one threshold cannot disarm the `max_interval_days` backstop the paragraph above relies on.
+## What changes when `plans/census-incremental-prd.md` lands
 
-Precedent: dark_factory itself was seeded this way — commit `0b99cf4ca2` set `last_census_at` from `plans/agent-legibility-survey-2026-07-13.md` (the 2026-07-13 survey, treated as the de-facto first census) with `last_census_done_count: 2321` (a 2026-07-14 done-count readback, intentionally slightly conservative so the tasks-landed condition doesn't over-fire on a stale baseline). Use this path only when a genuinely equivalent survey already exists — it's a substitute for *running* a first census, not a shortcut around wanting one.
+- **L1:** The run writes a JSON record and renders the report from it under one basename (contract §5), with a `run_id` and a `## Method` YAML block (the seven §5 keys plus `extra`). A same-day rerun writes `…-2.json`/`…-2.md` instead of overwriting.
+  - The trickle and the census record every coded session in a host-local ledger. The census skips ledgered and zero-signal sessions, and a capped run's unmined sessions are picked up by the next run, so rolling `last_census_at` back is no longer needed.
+  - `census-state.json` gains `last_census_run_id`, `last_census_as_of_sha` and `session_watermark`, and `last_census_report` becomes repo-relative. Check the ledger with `session_ledger.py stats --project-id <id>`.
+- **L8a:** The novelty spike becomes relative to its trailing baseline, and the floor is measured from the session watermark, so the trigger stops firing every night.
+- **L8b:** The tasks-landed condition and `last_census_done_count` are retired. The trigger fires on the weighted completion of the tasks the previous run filed (contract §11), or on a novelty spike. The anchor-seeding JSON then needs only `last_census_at` and `last_census_report`.
+  - **Open for Leo:** whether the 10-day `max_interval_days` backstop survives. The contract allows the calendar only as the minimum transcript window. If the backstop is kept, a first census still auto-fires once the earliest codebook date is `max_interval_days` old. If it is dropped, a first census fires only on a novelty spike or by hand.
+- **L2, L3:**
+  - Verdicts carry anchor, tags, severity with a reason, and route.
+  - Entries carry `finding_key`/`finding_area`/`finding_anchor`/`finding_tags`, and the report gains `## Findings` in the contract §1 shape.
+  - Tickets carry `x_finding_key`/`x_finding_run`, at a priority equal to severity.
+- **L4:** Filing follows the contract §8 dedup protocol, and the report names task ids and the step that decided each finding.
+  - Structural findings are listed, not filed.
+  - Entries carry `filed_tickets` back-links. A run that cannot reach the task store files nothing and says so.
+- **L5:** `## Dispositions` carries earlier tickets forward to their task outcomes. A done task triggers re-verification (`fixed` or re-filed), and a cancelled task with a reason makes its entry `accepted`.
+- **L6, L7:**
+  - `## Screened` counts clusters attached to existing records with no verify spend.
+  - `## Adjudication` drains the pending-candidate backlog through a capped, similarity-clustered queue and lists every attach for audit.
+  - `--max-verify-clusters` deferrals then reach adjudication without recurring.
+- **L9:** The coder is given the project's invariant slugs, and unknown slugs are dropped and counted.
+- **L10:** Synthesis is rendered from validated JSON as new versus re-observed findings, and its phase refinements and corrections are applied rather than left in prose.
+- **G:** A deterministic gate checks the first automatic report after the batch lands for all of the above.
 
 ## Out of scope
 
-This skill only runs and verifies a census. It does not cover: modifying `scripts/legibility/*` (census mining/verification/synthesis logic, the codebook merger, etc.), the nightly trickle (`scripts/legibility/nightly.py`, the `legibility-trickle@.service`/`.timer` units), or the census trigger's fire-condition logic (`scripts/legibility/census_trigger.py`). Those are code changes for `/prd`/`/do`, not an operator run.
+This skill runs and verifies a census. It does not change `scripts/legibility/*`, the trickle units, or the trigger logic. Those changes go through `/prd` (see `plans/census-incremental-prd.md`) or `/do`.

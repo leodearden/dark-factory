@@ -13,6 +13,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from cli_subprocess_timeout import cli_timeout_from_env
 from drain_check import classify, heartbeat_path, resolve_fleet_dir
 
 FRESH_WINDOW = 120.0
@@ -131,6 +132,9 @@ def test_default_fleet_dir_matches_orchestrator_fleet_heartbeat():
 
 # ---------------------------------------------------------------------------
 # step-5: CLI (argparse) tests -- drive via subprocess.run
+#
+# The budget comes from cli_subprocess_timeout.py, shared with
+# test_recon_busy_check.py and test_scan_task_toolcall_leaks.py.
 # ---------------------------------------------------------------------------
 
 def _write_raw_heartbeat(fleet_dir: Path, unit: str, **overrides):
@@ -147,7 +151,10 @@ def _write_raw_heartbeat(fleet_dir: Path, unit: str, **overrides):
     return payload
 
 
-def _run_cli(*args, env=None):
+_CLI_TIMEOUT = cli_timeout_from_env("DRAIN_CHECK_TEST_TIMEOUT")
+
+
+def _run_cli(*args, env=None, timeout=_CLI_TIMEOUT):
     full_env = dict(os.environ)
     if env:
         full_env.update(env)
@@ -156,8 +163,26 @@ def _run_cli(*args, env=None):
         env=full_env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
     )
+
+
+def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
+    captured = {}
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="idle\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _run_cli("--unit", UNIT)
+    # No bound on the magnitude: the 60.0 default is pinned in
+    # test_cli_subprocess_timeout.py, and a bound here would break
+    # DRAIN_CHECK_TEST_TIMEOUT whenever it lowers the budget.
+    assert captured["timeout"] == _CLI_TIMEOUT
+
+    _run_cli("--unit", UNIT, timeout=3)
+    assert captured["timeout"] == 3
 
 
 def test_cli_prints_idle_for_fresh_merge_idle_heartbeat(tmp_path):

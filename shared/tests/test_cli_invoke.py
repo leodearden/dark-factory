@@ -3245,10 +3245,10 @@ class TestCapWaitPeriodicLog:
 #
 # CLI 2.1.168 delivers --json-schema structured output through a synthetic tool
 # named ``StructuredOutput``.  A ``disallowed_tools=['*']`` wildcard (used by the
-# pure-classifier curator/recon callers) now also denies that tool, so every
-# structured answer is permission-denied → error_max_structured_output_retries.
-# ``_invoke_claude`` must expand the ``'*'`` (only when an ``output_schema`` is
-# set) into an explicit deny-list of real built-ins that OMITS StructuredOutput.
+# pure-classifier curator/recon callers) would also deny that tool, so every
+# structured answer would be permission-denied → error_max_structured_output_retries.
+# When an ``output_schema`` is set, the ``'*'`` is replaced by ``--tools ''``,
+# the registry filter that leaves only StructuredOutput.
 
 
 def _capture_cmd_exec(captured_cmd):
@@ -3285,8 +3285,8 @@ def _disallowed_segment(cmd):
 
 @pytest.mark.asyncio
 class TestSchemaToolNotDisallowed:
-    """The ``'*'`` deny wildcard must be expanded (excluding StructuredOutput)
-    only when an output schema is requested; otherwise it is preserved verbatim.
+    """With an output schema, the ``'*'`` deny wildcard becomes ``--tools ''``;
+    without one, it is preserved verbatim.
     """
 
     _SCHEMA = {
@@ -3296,7 +3296,7 @@ class TestSchemaToolNotDisallowed:
         'additionalProperties': False,
     }
 
-    async def test_wildcard_with_schema_expands_excluding_structuredoutput(self, tmp_path):
+    async def test_wildcard_with_schema_emits_empty_tools_registry(self, tmp_path):
         captured_cmd = []
         with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
                    side_effect=_capture_cmd_exec(captured_cmd)):
@@ -3304,15 +3304,10 @@ class TestSchemaToolNotDisallowed:
                 prompt='hi', system_prompt='sys', cwd=tmp_path,
                 disallowed_tools=['*'], output_schema=self._SCHEMA,
             )
-        seg = _disallowed_segment(captured_cmd)
-        # Real built-ins are denied explicitly...
-        assert 'Bash' in seg
-        assert 'Glob' in seg
-        # ...but the wildcard and the schema tool are NOT in the deny-list,
-        # and StructuredOutput must not appear anywhere on the command line.
-        assert '*' not in seg
+        assert captured_cmd[captured_cmd.index('--tools') + 1] == ''
+        assert '--disallowed-tools' not in captured_cmd
+        assert '*' not in captured_cmd
         assert 'StructuredOutput' not in captured_cmd
-        # --json-schema is still rendered.
         assert '--json-schema' in captured_cmd
 
     async def test_wildcard_without_schema_is_preserved(self, tmp_path):

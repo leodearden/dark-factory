@@ -140,6 +140,46 @@ class TestDiffConfig:
         assert d.applied_candidates[path] == {'old': old, 'new': []}
         assert path not in d.restart_required
 
+    def test_topic_cluster_autoseed_leaf_is_green_tier_applied_candidate(self):
+        """The derived-cluster kill switch is green-tier (task 3135): both the
+        seed and the guard merge read it live, so a flip buckets as an
+        applied_candidate, NOT restart_required."""
+        path = 'reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled'
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        assert live.reconciliation.procedural_knowledge_topic_cluster_autoseed_enabled is True
+        object.__setattr__(
+            fresh.reconciliation, 'procedural_knowledge_topic_cluster_autoseed_enabled', False
+        )
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': True, 'new': False}
+        assert path not in d.restart_required
+
+    def test_topic_cluster_retired_leaf_is_green_tier_applied_candidate(self):
+        """The per-topic derived-cluster kill switch is green-tier: the seed and
+        the guard merge read it live, so retiring a misfiring cluster is a
+        reload_config, NOT a restart."""
+        path = 'reconciliation.procedural_knowledge_topic_cluster_autoseed_retired'
+        assert path in RELOADABLE_FIELDS, f'{path} must be allowlisted for hot-reload'
+
+        live = FusedMemoryConfig()
+        fresh = FusedMemoryConfig()
+        retired = {'dark_factory': ['worktree-stale-base-premise-verification']}
+        object.__setattr__(
+            fresh.reconciliation, 'procedural_knowledge_topic_cluster_autoseed_retired', retired
+        )
+
+        d = diff_config(live, fresh)
+
+        assert path in d.applied_candidates
+        assert d.applied_candidates[path] == {'old': {}, 'new': retired}
+        assert path not in d.restart_required
+
 
 class TestDiffConfigOptionalSubmodels:
     """diff_config / apply_reload tolerate an OPTIONAL submodel field toggling
@@ -593,7 +633,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
 
     The expected leaf set is DERIVED from ``WriteTriageConfig.model_fields``
     rather than listed by hand, and that inversion is the whole point: a
-    SEVENTH ``judge_*`` leaf added later without a reload registration fails
+    NINTH ``judge_*`` leaf added later without a reload registration fails
     here instead of silently degrading to restart-only. ``config/reload.py``
     states the rule its own way — "anything absent from this frozenset
     silently degrades to restart-only" — and a kill switch that quietly needs
@@ -615,7 +655,7 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
 
     def test_the_schema_actually_declares_judge_leaves(self):
         """Guards the derivation itself: an empty set would pass vacuously."""
-        assert len(self.JUDGE_FIELDS) >= 6, self.JUDGE_FIELDS
+        assert len(self.JUDGE_FIELDS) >= 8, self.JUDGE_FIELDS
 
     @pytest.mark.parametrize('field', JUDGE_FIELDS)
     def test_every_judge_leaf_is_allowlisted(self, field):
@@ -635,6 +675,8 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_timeout_seconds', 3.5),
             ('judge_candidate_count', 3),
             ('judge_accuracy_report_path', 'calibration/judge_report.json'),
+            ('judge_reasoning_effort', 'low'),
+            ('judge_field_chars', 1_200),
         ],
     )
     def test_a_changed_judge_leaf_lands_in_applied_candidates(self, field, new_value):
@@ -659,6 +701,8 @@ class TestWriteTriageJudgeLeavesAreGreenTier:
             ('judge_model', 'resolve_judge_model', 'gpt-4.1-nano'),
             ('judge_timeout_seconds', 'resolve_judge_timeout', 3.5),
             ('judge_candidate_count', 'resolve_judge_candidate_count', 3),
+            ('judge_reasoning_effort', 'resolve_judge_reasoning_effort', 'low'),
+            ('judge_field_chars', 'resolve_judge_field_chars', 1_200),
         ],
     )
     def test_an_applied_reload_is_observed_by_the_live_resolver(

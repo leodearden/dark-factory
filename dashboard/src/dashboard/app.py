@@ -29,14 +29,16 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from shared.asyncio_tasks import abandon_task, track_task
 
 from dashboard.api import burndown as api_burndown_routes
 from dashboard.api import escalations as api_escalations_routes
 from dashboard.api import memory as api_memory_routes
 from dashboard.api import merge_queue as api_merge_queue_routes
 from dashboard.api import orchestrators as api_orchestrators_routes
+from dashboard.api import task_prose as api_task_prose_routes
 from dashboard.api import tasks as api_tasks_routes
-from dashboard.api.window import _parse_window
+from dashboard.api.window import _parse_window, with_window
 from dashboard.config import DashboardConfig
 from dashboard.data import memory as memory_data
 from dashboard.data import redux_api
@@ -57,14 +59,10 @@ from dashboard.data.costs import (
     aggregate_cost_summary,
     aggregate_cost_trend,
 )
-from dashboard.data.db import DbPool, track_task
-from dashboard.data.escalation_analytics import (
-    archive_scan_succeeded,
-    build_escalation_analytics,
-)
-from dashboard.data.escalations import fetch_pins_recovery
+from dashboard.data.db import DbPool
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import (
+    FANOUT_FAILURE_EXCEPTIONS,
     PreformattedFanoutError,
     TTLCache,
     describe_exc,
@@ -79,11 +77,8 @@ from dashboard.data.metrics import (
 )
 from dashboard.data.model_role import aggregate_model_role_rollup
 from dashboard.data.performance import (
-    aggregate_completion_paths,
-    aggregate_escalation_rates,
-    aggregate_loop_histograms,
+    aggregate_performance_cards,
     aggregate_performance_history,
-    aggregate_time_centiles,
 )
 from dashboard.data.reconciliation import (
     get_buffer_stats,
@@ -102,10 +97,7 @@ from dashboard.data.tasks import (
     fetch_tasks,
 )
 from dashboard.data.utils import safe_gather_result
-from dashboard.data.write_journal import (
-    get_memory_timeseries,
-    get_operations_breakdown,
-)
+from dashboard.data.write_journal import empty_memory_ops, get_memory_ops
 from dashboard.http_pool import reaper_loop
 from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
 from dashboard.project_dbs import _cost_dbs
@@ -407,6 +399,9 @@ async def lifespan(app: FastAPI):
         # flight can start a bypass behind it, which is the ordinary
         # abandon-don't-cancel leak this reap narrows rather than abolishes.
         await reap_detached_refreshes()
+        # After that reap, which cancels callers but not the exchanges they
+        # started (memory.py::_post).
+        await memory_data.cancel_inflight_exchanges()
     finally:
         await _close_each(
             burndown_store.close,
@@ -428,6 +423,7 @@ app.include_router(api_burndown_routes.router)
 app.include_router(api_memory_routes.router)
 app.include_router(api_orchestrators_routes.router)
 app.include_router(api_escalations_routes.router)
+app.include_router(api_task_prose_routes.router)
 
 
 # ---------------------------------------------------------------------------
@@ -524,17 +520,9 @@ def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
     ]
 
 
-# Abandoned _probe_db tasks (see below) — the event loop only holds a WEAK
-# reference to a Task, so an unreferenced one can be garbage-collected
-# mid-flight; this set holds the strong reference until track_task's
-# done-callback removes it.
+# Abandoned _probe_db tasks (see below): the strong references that keep them
+# alive until they unwind, per shared/src/shared/asyncio_tasks.py::track_task.
 _ABANDONED_PROBES: set[asyncio.Task] = set()
-
-
-def _abandon_probe(task: asyncio.Task) -> None:
-    """Cancel *task* fire-and-forget and hold a strong reference until it ends."""
-    task.cancel()  # fire-and-forget — do NOT await the unwinding
-    track_task(task, _ABANDONED_PROBES)
 
 
 async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
@@ -604,10 +592,10 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
         # asyncio.wait() does not cancel what it waits on, and we catch
         # BaseException (not just CancelledError) so no exceptional exit
         # from this await leaves the task untracked — rationale above.
-        _abandon_probe(task)
+        abandon_task(task, _ABANDONED_PROBES)
         raise
     if task not in done:
-        _abandon_probe(task)
+        abandon_task(task, _ABANDONED_PROBES)
         return 'timeout'  # ONLY a real budget expiry is a 'timeout'
     try:
         return task.result()
@@ -623,8 +611,7 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
 #
 # The single-flight probe, and the loop time at which a fan-out last
 # COMPLETED. Module state rather than app.state because /healthz is the only
-# reader and a test hook resets both; _mcp_probe_state_clear mirrors
-# _task_cards_cache_clear.
+# reader and a test hook resets both: _mcp_probe_state_clear.
 
 
 class _LiveProbe(NamedTuple):
@@ -643,10 +630,8 @@ class _LiveProbe(NamedTuple):
 _mcp_probe: _LiveProbe | None = None
 _mcp_fanout_last_ok: float | None = None
 
-# Strong references to live probe tasks. The event loop holds only a WEAK
-# reference to a Task, so an unreferenced one can be garbage-collected
-# mid-flight -- the same hazard _ABANDONED_PROBES exists for, and track_task's
-# done-callback removes the entry when it ends.
+# Strong references to live probe tasks, held until they end -- the same hazard
+# _ABANDONED_PROBES exists for; see shared/src/shared/asyncio_tasks.py::track_task.
 _MCP_PROBES: set[asyncio.Task] = set()
 
 
@@ -970,22 +955,16 @@ async def _performance_resources(
 
 @app.get('/api/v2/dashboard/memory-graphs')
 async def api_memory_graphs(request: Request) -> JSONResponse:
-    """MEMORY_TIMESERIES + MEMORY_OPS_BREAKDOWN from the write journal."""
+    """MEMORY_OPS from the write journal."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.write_journal_db)
-    ts_r, ops_r = await asyncio.gather(
-        get_memory_timeseries(db),
-        get_operations_breakdown(db),
-        return_exceptions=True,
-    )
-    timeseries = safe_gather_result(
-        ts_r, {'labels': [], 'reads': [], 'writes': []}, 'memory-graphs/ts'
-    )
-    ops = cast(
-        ChartData, safe_gather_result(ops_r, {'labels': [], 'values': []}, 'memory-graphs/ops')
-    )
-    return JSONResponse(redux_api.shape_memory_graphs(timeseries, ops))
+    try:
+        ops = await get_memory_ops(db)
+    except Exception:
+        logger.warning('memory-graphs: memory ops read failed', exc_info=True)
+        ops = empty_memory_ops()
+    return JSONResponse(redux_api.shape_memory_graphs(ops))
 
 
 @app.get('/api/v2/dashboard/recon')
@@ -1040,58 +1019,52 @@ async def api_costs(request: Request) -> JSONResponse:
     """COSTS — flat summary, per-project / per-account / per-role / trend / events."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
-    days = _parse_window(request.query_params)
+    window = _parse_window(request.query_params)
     dbs = await _cost_dbs(config, pool)
     now = datetime.now(UTC)  # clock-exempt: single-capture route
     summary, by_project, by_account, by_role, trend, events, by_model_role = await asyncio.gather(
-        aggregate_cost_summary(dbs, days=days, now=now),
-        aggregate_cost_by_project(dbs, days=days, now=now),
-        aggregate_cost_by_account(dbs, days=days, now=now),
-        aggregate_cost_by_role(dbs, days=days, now=now),
-        aggregate_cost_trend(dbs, days=days, now=now),
-        aggregate_account_events(dbs, days=days, now=now),
-        aggregate_model_role_rollup(dbs, days=days, now=now),
+        aggregate_cost_summary(dbs, days=window.days, now=now),
+        aggregate_cost_by_project(dbs, days=window.days, now=now),
+        aggregate_cost_by_account(dbs, days=window.days, now=now),
+        aggregate_cost_by_role(dbs, days=window.days, now=now),
+        aggregate_cost_trend(dbs, days=window.days, now=now),
+        aggregate_account_events(dbs, days=window.days, now=now),
+        aggregate_model_role_rollup(dbs, days=window.days, now=now),
         return_exceptions=True,
     )
-    return JSONResponse(
-        redux_api.shape_costs(
-            summary=safe_gather_result(summary, {}, 'costs/summary'),
-            by_project=safe_gather_result(by_project, {}, 'costs/by_project'),
-            by_account=safe_gather_result(by_account, {}, 'costs/by_account'),
-            by_role=safe_gather_result(by_role, {}, 'costs/by_role'),
-            trend=safe_gather_result(trend, {}, 'costs/trend'),
-            events=safe_gather_result(events, [], 'costs/events'),
-            by_model_role=safe_gather_result(
-                by_model_role, {'rows': [], 'turn_cap_saturation': {}}, 'costs/by_model_role',
-            ),
-        )
+    shaped = redux_api.shape_costs(
+        summary=safe_gather_result(summary, {}, 'costs/summary'),
+        by_project=safe_gather_result(by_project, {}, 'costs/by_project'),
+        by_account=safe_gather_result(by_account, {}, 'costs/by_account'),
+        by_role=safe_gather_result(by_role, {}, 'costs/by_role'),
+        trend=safe_gather_result(trend, {}, 'costs/trend'),
+        events=safe_gather_result(events, [], 'costs/events'),
+        by_model_role=safe_gather_result(
+            by_model_role, {'rows': [], 'turn_cap_saturation': {}}, 'costs/by_model_role',
+        ),
     )
+    return JSONResponse(with_window(shaped, window))
 
 
 @app.get('/api/v2/dashboard/performance')
 async def api_performance(request: Request) -> JSONResponse:
-    """PERFORMANCE — completion paths / escalation / loop histograms / TTC."""
+    """PERFORMANCE + served_at — per-project cards Datum and sparkline histories."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
-    days = _parse_window(request.query_params, default=7)
-    paths_r, esc_r, hist_r, ttc_r, history_r = await asyncio.gather(
-        aggregate_completion_paths(dbs, esc_dirs),
-        aggregate_escalation_rates(dbs, esc_dirs),
-        aggregate_loop_histograms(dbs),
-        aggregate_time_centiles(dbs),
-        aggregate_performance_history(dbs, days=days),
+    window = _parse_window(request.query_params, default='7d')
+    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    cards_r, history_r = await asyncio.gather(
+        aggregate_performance_cards(dbs, esc_dirs, days=window.days, now=now),
+        aggregate_performance_history(dbs, days=window.days, now=now),
         return_exceptions=True,
     )
-    return JSONResponse(
-        redux_api.shape_performance(
-            paths=safe_gather_result(paths_r, {}, 'perf/paths'),
-            escalations=safe_gather_result(esc_r, {}, 'perf/escalations'),
-            histograms=safe_gather_result(hist_r, {}, 'perf/histograms'),
-            ttc=safe_gather_result(ttc_r, {}, 'perf/ttc'),
-            history=safe_gather_result(history_r, {}, 'perf/history'),
-        )
+    shaped = redux_api.shape_performance(
+        cards=safe_gather_result(cards_r, {}, 'perf/cards'),
+        history=safe_gather_result(history_r, {}, 'perf/history'),
+        served_at=now,
     )
+    return JSONResponse(with_window(shaped, window))
 
 
 # Cap str(exc) inside the 502 `detail` field to bound arbitrary-length
@@ -1166,12 +1139,7 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
                 'cancel_ticket',
                 {'ticket_id': ticket_id},
             )
-        except (
-            httpx.ConnectError,
-            httpx.TimeoutException,
-            httpx.HTTPStatusError,
-            ValueError,
-        ) as exc:
+        except FANOUT_FAILURE_EXCEPTIONS as exc:
             logger.warning('cancel_ticket failed for %s: %s', url, exc)
             # PreformattedFanoutError, not ValueError: the message below is
             # already a rendered 'Type: message', and first_success renders
@@ -1412,12 +1380,7 @@ async def _scheduler_proxy(
     async def _call(url: str) -> JSONResponse:
         try:
             result = await memory_data.mcp_tool_call(http_client, url, tool_name, args)
-        except (
-            httpx.ConnectError,
-            httpx.TimeoutException,
-            httpx.HTTPStatusError,
-            ValueError,
-        ) as exc:
+        except FANOUT_FAILURE_EXCEPTIONS as exc:
             # describe_exc, not the bare exc: several exceptions on this path
             # stringify to '' (most importantly httpx.PoolTimeout, i.e. THIS
             # client's pool is saturated rather than the server being down), so
@@ -1684,116 +1647,7 @@ async def api_load(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Escalation-analytics TTL cache
-# (mirrors dashboard/api/escalations.py::_task_cards_cache)
-# ---------------------------------------------------------------------------
-
-_ANALYTICS_TTL_SECONDS = 60.0
-_analytics_cache: TTLCache[dict] = TTLCache(ttl_seconds=lambda: _ANALYTICS_TTL_SECONDS)
-
-
-def _analytics_cache_clear() -> None:
-    """Clear the escalation-analytics TTL cache (test hook)."""
-    _analytics_cache.clear()
-
-
-def _analytics_project_dirs(config: DashboardConfig) -> list[tuple[str, Path, Path]]:
-    """Escalation-analytics project dirs: primary root first, then known_project_roots.
-
-    Mirrors build_escalation_queues' primary-first, de-duped root iteration
-    (label=root.name). The primary entry is built from config.escalations_dir /
-    config.runs_db (rather than hand-building `config.project_root / 'data' / ...`)
-    so a DASHBOARD_PROJECT_ROOT env override is honored automatically.
-    """
-    seen: set[Path] = {config.project_root}
-    dirs: list[tuple[str, Path, Path]] = [
-        (config.project_root.name, config.escalations_dir, config.runs_db),
-    ]
-    for root in config.known_project_roots:
-        if root not in seen:
-            seen.add(root)
-            dirs.append((
-                root.name,
-                root / 'data' / 'escalations',
-                root / 'data' / 'orchestrator' / 'runs.db',
-            ))
-    return dirs
-
-
-@app.get('/api/v2/dashboard/escalation-analytics')
-async def api_escalation_analytics(request: Request) -> JSONResponse:
-    """ESCALATION_ANALYTICS — origin/lifespan/workflow aggregates over the escalation archive.
-
-    The archive walk (potentially ~10k records across all project roots) runs
-    in a worker thread via asyncio.to_thread behind a ~60s single-flight TTL
-    cache, so a cold scan never blocks the event loop and repeated polls
-    within the TTL window are free. No clock read here — the aggregator
-    resolves `now` once internally via resolve_now (clock-discipline guard
-    scans dashboard/data/*.py + app.py; resolve_now is the sanctioned site).
-
-    A scan that reached NO archive at all is served but NOT cached
-    (cache_ok=archive_scan_succeeded), matching api_memory_evals'
-    root_scan_succeeded gate — the two routes are one idiom and are kept so
-    deliberately. Both decline to cache a build that walked nothing: it is
-    O(1) to re-derive (one negative is_dir stat per project), while caching it
-    keeps the tab reporting an empty archive for a full TTL window after the
-    volume mounts, and the archive is the thing most likely to appear on the
-    next poll. The only asymmetry is that memory-evals has ONE root, so
-    "reached nothing" and "reached not everything" coincide there.
-
-    A PARTIAL scan IS cached, and archives_present: false rides along in the
-    payload as the diagnostic. That is not a concession — keyed on
-    archives_present (all) instead, this cache is dead in the installed
-    config: measured 2026-08-01 against the unit's own
-    DASHBOARD_KNOWN_PROJECT_ROOTS (9 roots), 2 roots have no data/escalations
-    dir while the other 7 hold ~9.1k records, so the predicate never passes,
-    the 60s TTL never stores anything, and every 3s poll re-runs the whole
-    multi-second walk. Trade-off actually being accepted: an archive that
-    disappears mid-life leaves that project's panel up to one TTL window
-    stale — the right side of it, since the alternative costs the full
-    re-walk on every poll, forever, for every ordinary multi-project config.
-
-    Deliberately NOT keyed on parse_failures: that counts unparseable records
-    and is permanent for a corrupt file, so gating on it would defeat the
-    cache forever in front of the very walk it protects.
-    """
-    config: DashboardConfig = request.app.state.config
-    http_client: httpx.AsyncClient = request.app.state.http_client
-    project_dirs = _analytics_project_dirs(config)
-    key = str(project_dirs)
-
-    async def _refresh() -> dict:
-        # The pins_recovery fan-out is async and MUST stay on this side of the
-        # to_thread boundary: build_escalation_analytics is the pure-sync
-        # archive walker, and an MCP round-trip inside it would block a worker
-        # thread on the network. It runs inside _refresh (not per request) so
-        # it is paid only on a cache miss, giving the annotation the same ~60s
-        # freshness as the payload it rides in — a fresher annotation could not
-        # be shown anyway, since the cache serves the whole dict.
-        #
-        # fetch_pins_recovery already isolates per-project failures (an
-        # unreachable orchestrator maps to None, i.e. unknown, and never sinks
-        # its siblings). This guard covers only the unexpected: whatever the
-        # cause, the analytics tab must still render, one annotation short.
-        try:
-            pins = await fetch_pins_recovery(http_client, config.escalation_urls)
-        except Exception as exc:  # noqa: BLE001 — the tab must survive this
-            logger.warning(
-                'pins_recovery fan-out failed (analytics served unannotated): %s', exc,
-            )
-            pins = None
-        return await asyncio.to_thread(
-            build_escalation_analytics, project_dirs, pins_by_project=pins,
-        )
-
-    result = await _analytics_cache.get_or_refresh(
-        key, _refresh, cache_ok=archive_scan_succeeded,
-    )
-    return JSONResponse({'ESCALATION_ANALYTICS': result})
-
-
-# ---------------------------------------------------------------------------
-# Memory-evals TTL cache (mirrors _analytics_cache above)
+# Memory-evals TTL cache
 # ---------------------------------------------------------------------------
 
 _MEMORY_EVALS_TTL_SECONDS = 60.0
@@ -1818,8 +1672,7 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     resolve_now is the sanctioned site).
 
     A scan that never REACHED the tree is served but NOT cached (cache_ok=
-    root_scan_succeeded), mirroring how _load_task_cards declines to cache an
-    offline marker: an absent root and an unwalkable one are both O(1) to
+    root_scan_succeeded): an absent root and an unwalkable one are both O(1) to
     re-derive, so re-checking each poll costs nothing, while caching them
     would keep reporting "no evals have ever run" for a full TTL window after
     the tree lands. A build-ABORTING bug (a top-level internal_error, carrying
@@ -1831,10 +1684,12 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     to prevent. The issue rides the payload either way, so which side of that
     line a degradation falls on costs the operator no visibility.
 
-    Same idiom as api_escalation_analytics' archive_scan_succeeded: both
-    routes decline to cache only a scan that reached NOTHING. The asymmetry
-    is that memory-evals has ONE root, so "reached nothing" and "reached not
-    everything" coincide here; analytics has N and must distinguish them.
+    Same idiom as the escalation corpus cache
+    (dashboard/src/dashboard/data/escalation_corpus.py::acquire_corpus): both
+    decline to cache only a scan that reached NOTHING. The asymmetry is that
+    memory-evals has ONE root, so "reached nothing" and "reached not
+    everything" coincide here; the corpus has N queues and must distinguish
+    them.
 
     The escalation source is config.reconciliation_escalations_dir: memory-eval
     regressions are filed onto the 8103 recon queue (memory-eval-program.md
@@ -1859,6 +1714,5 @@ __all__: Sequence[str] = (
     'lifespan',
     '_performance_resources',
     '_mcp_probe_state_clear',
-    '_analytics_cache_clear',
     '_memory_evals_cache_clear',
 )

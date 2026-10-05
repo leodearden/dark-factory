@@ -99,13 +99,6 @@ ALLOWLIST_ENTRIES: list[tuple[str, str, str, str]] = [
         "dict (dashboard display only, not on critical path)",
     ),
     (
-        "orchestrator/src/orchestrator/agents/briefing.py",
-        "BriefingAssembler._mcp_search",
-        "9c9af4cd3b98",
-        "debug-logged fail-safe: MCP search error returns None for graceful "
-        "briefing degradation (non-critical context enrichment)",
-    ),
-    (
         "orchestrator/src/orchestrator/b3_gate.py",
         "_read_latest_proposal",
         "92b98f5b67f9",
@@ -134,7 +127,7 @@ ALLOWLIST_ENTRIES: list[tuple[str, str, str, str]] = [
         "bare return avoids infinite escalation loop inside done-callback",
     ),
     (
-        "orchestrator/src/orchestrator/merge_queue.py",
+        "orchestrator/src/orchestrator/merge_lane/worker.py",
         "_classify_main_health_red",
         "92b98f5b67f9",
         "pre-existing optional probe helper: exception during health check "

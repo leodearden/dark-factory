@@ -26,13 +26,15 @@ therefore checked once, in one place, rather than re-typed per caller.
 calls NONE of this: PRD C2 makes the benign codes the emit boundary's business,
 and the predicate re-derives none of them.
 
-WHY VALIDATION IS A SEPARATE, FIRST STEP
-----------------------------------------
+WHY VALIDATION IS A SEPARATE, PRE-WRITE STEP (2)
+------------------------------------------------
 ``consolidate_memories`` is irreversible by construction: it writes a
 canonical, patches retained peers and DELETES its supersedes.  Argument
-validation is the only stage that can refuse at zero cost, so everything
-decidable from the arguments alone is decided here — before the canonical
-exists, before a single victim is touched.
+validation runs as step (2): immediately after the fail-closed
+authorization gate, which deliberately precedes it, and before anything
+reads or writes the corpus.  It is the last point where everything
+decidable from the arguments alone can be refused for free — before the
+canonical exists, before a single victim is touched.
 
 Two properties follow from that position and are not incidental:
 
@@ -515,6 +517,16 @@ def validate_consolidate_args(
     )
 
 
+def _closure_member_ref(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {'id': None, 'canonical': False}
+    meta = row.get('metadata')
+    return {
+        'id': row.get('id'),
+        'canonical': isinstance(meta, dict) and meta.get('canonical') is True,
+    }
+
+
 def build_consolidation_result(
     *,
     canonical_id: str,
@@ -536,6 +548,7 @@ def build_consolidation_result(
     citation_repoint: dict[str, Any] | None = None,
     tombstones_written: int = 0,
     tombstones_expected: int = 0,
+    topic_cluster_seed: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The op's response envelope, and the ONE home of its status rule.
 
@@ -565,17 +578,18 @@ def build_consolidation_result(
     missing.
 
     WHAT THE STATUS RULE DELIBERATELY IGNORES: a tombstone shortfall
-    (``tombstones_written < tombstones_expected``).  The memory operation
-    genuinely completed — the cluster is folded and closed — and only its
-    AUDIT TRAIL did not land, e.g. on a deployment running
-    ``recon_ledger_enabled=False`` where the fail-safe writer returns 0.
-    Reporting the two counts satisfies structured-facts and
-    no-silent-fail-soft without conflating the two failures, which matters
-    because ``'partial'`` is an invitation to RETRY: a caller that re-ran a
-    COMPLETED consolidation would re-write a canonical whose supersedes are
-    already gone, which is precisely the net-+1 ratchet this op exists to
-    end.  An audit gap is fixed by looking at the logs, never by repeating
-    the delete.
+    (``tombstones_written < tombstones_expected``) and the topic-guard seed
+    outcome (``topic_cluster_seed``).  In both the memory operation genuinely
+    completed — the cluster is folded and closed — and only a side effect did
+    not land: the AUDIT TRAIL, e.g. on a deployment running
+    ``recon_ledger_enabled=False`` where the fail-safe writer returns 0, or
+    the derived topic cluster that teaches the write-time guard (task 3135).
+    Reporting them satisfies structured-facts and no-silent-fail-soft without
+    conflating either with a consolidation failure, which matters because
+    ``'partial'`` is an invitation to RETRY: a caller that re-ran a COMPLETED
+    consolidation would re-write a canonical whose supersedes are already
+    gone, which is precisely the net-+1 ratchet this op exists to end.  Such
+    a gap is fixed by looking at the logs, never by repeating the op.
 
     WHAT ``'partial'`` IS NOT: a retry signal.  The lists say which ids keep
     the cluster open, and they are there to be FINISHED BY HAND — never by
@@ -598,13 +612,23 @@ def build_consolidation_result(
 
     Every disposition key is ALWAYS present, empty lists included, so a
     caller can read ``result['survivors']`` without a membership test and a
-    later arm cannot quietly stop reporting by omitting its key.  Three keys
+    later arm cannot quietly stop reporting by omitting its key.  Four keys
     are deliberate exceptions, each present only when the thing it describes
     actually happened: ``citation_repoint`` (an empty map would read as "the
     gate ran and found nothing" on a call where the gate never ran at all),
     ``supersedes_correction`` (absent means the canonical's claim was right
-    as written, not that a correction ran and changed nothing) and ``hint``
-    (recovery guidance on a clean run would be noise).
+    as written, not that a correction ran and changed nothing),
+    ``topic_cluster_seed`` (absent means no topic-cluster store is wired, so
+    no seed was attempted) and ``hint`` (recovery guidance on a clean run
+    would be noise).
+
+    ``topic_members`` rows are projected to ``{'id', 'canonical'}``.  This
+    envelope is the ONLY record of an irreversible multi-delete, and a
+    dumping-ground topic's raw rows could push it past the MCP transport
+    limit, where it is rejected wholesale and ``deleted``, ``survivors`` and
+    ``failed_deletes`` are lost for records that are already gone.  A
+    closure proof needs only the id and the canonical flag, and the
+    projection never raises, for the same reason.
     """
     failed_deletes = list(failed_deletes)
     survivors = list(survivors)
@@ -618,7 +642,7 @@ def build_consolidation_result(
         or survivors
         or survivor_check_failed
     )
-    members = list(topic_members or [])
+    members = [_closure_member_ref(row) for row in (topic_members or [])]
     result: dict[str, Any] = {
         'status': 'partial' if open_business else 'consolidated',
         'canonical_id': canonical_id,
@@ -658,6 +682,8 @@ def build_consolidation_result(
         result['citation_repoint'] = citation_repoint
     if supersedes_correction:
         result['supersedes_correction'] = supersedes_correction
+    if topic_cluster_seed is not None:
+        result['topic_cluster_seed'] = topic_cluster_seed
     if open_business:
         # Carried IN the envelope, not just in the docstring: the caller
         # holding a partial result is the one about to re-run the op, and a

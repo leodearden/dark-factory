@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import pydantic_spec
 from pydantic import ValidationError
+from shared.testing_virtual_clock import virtual_clock_test
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.offline_lane import OfflineLaneWorker, _parse_confirmed_failures
@@ -370,11 +371,15 @@ async def test_run_once_snapshots_head_at_run_start_and_invokes_seam(tmp_path: P
 
 # ---------------------------------------------------------------------------
 # run() — coalescing loop core (step-7/8)
+#
+# The run() loop tests race the worker's poll/backoff timers against a wedge
+# deadline, so each is a @virtual_clock_test: on that loop clock a host stall
+# cannot expire the deadline.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
+@virtual_clock_test
 async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
     """Multiple dirty-sets during one run collapse into exactly one re-run.
 
@@ -439,8 +444,8 @@ async def test_loop_coalesces_to_exactly_one_rerun(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
+@virtual_clock_test
 async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
     """A missed trigger is caught by a periodic get_main_sha poll.
 
@@ -517,8 +522,8 @@ async def test_poll_backstop_runs_on_missed_trigger(tmp_path: Path):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
+@virtual_clock_test
 async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
     """A broken lane run can never wedge the process (worker leg of C7).
 
@@ -585,8 +590,8 @@ async def test_loop_is_fail_open_and_cancellation_clean(tmp_path: Path):
         await task2
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
+@virtual_clock_test
 async def test_loop_backoff_grows_and_caps_on_consecutive_failures(tmp_path: Path):
     """Consecutive run() failures back off exponentially, capped (task 2016 amendment).
 
@@ -1043,8 +1048,16 @@ async def test_handle_red_run_threads_priority_into_filed_task(tmp_path: Path):
     escalation_queue2 = MagicMock()
     escalation_queue2.get_by_task.return_value = []
     escalation_queue2.make_id.return_value = 'esc-T2-1'
+    # Its own project_root, because the red-path state is restart-durable and
+    # therefore SHARED by every worker rooted at one project (task 5352): left
+    # on tmp_path, worker2 would see worker1's open fix task for this same
+    # failing-test set and take the append-suspect-range branch instead of
+    # filing.  The subject here is the priority default, not the dedup.
     worker2 = _make_worker(
-        tmp_path, task_client=task_client2, escalation_queue=escalation_queue2,
+        tmp_path,
+        config=_make_config(tmp_path / 'project-2'),
+        task_client=task_client2,
+        escalation_queue=escalation_queue2,
     )
     await worker2._handle_red_run(wt, 'HEAD1', confirmation_runner=confirmation_runner2)
     task_client2.submit_fix_task.assert_awaited_once()
@@ -2001,8 +2014,8 @@ async def test_run_once_infra_leg_exception_does_not_advance_last_run_head(
     )
 
 
-@pytest.mark.asyncio
 @pytest.mark.timeout(10)
+@virtual_clock_test
 async def test_loop_retries_after_red_handling_exception(tmp_path: Path):
     """run()'s poll backstop retries a red-handling exception (Bug #2, end-to-end).
 

@@ -13,8 +13,10 @@ checking each one:
   the cycle_summary mirror pool trim in
   ``reconciliation.summary_pool.enforce_summary_pool_cap``.
 - The two protected-record predicates (:func:`is_protected_mirror_record`,
-  :func:`is_protected_audit_record`) are consumed at the
-  ``_sweep_stale_mem0_pool`` choke point ONLY. ``summary_pool`` calls
+  :func:`is_protected_audit_record`) are consumed at two choke points: the
+  in-cycle ``_sweep_stale_mem0_pool``, and the manual sweep's
+  ``fused-memory/scripts/sweep_orphan_flag_markers.py::delete_orphan_markers``
+  (through that script's ``protection_reason``). ``summary_pool`` calls
   neither, and does not need to: it trims a pool it enumerated by
   construction, so it is never at risk of matching a record belonging to
   someone else. Its only mentions of these names are comments.
@@ -189,7 +191,10 @@ _KIND_CYCLE_SUMMARY: str = CYCLE_SUMMARY_KIND
 # as long as its task stays open. All 40 measured victims would have survived
 # on that arm alone (task 452 is ``deferred``, which is not terminal). This
 # denylist is defence in depth for the residual intersection only: a permanent
-# audit record whose cited task LATER goes terminal.
+# audit record whose cited task LATER goes terminal. The manual sweep's primary
+# arm is instead its foreign-kind arm
+# (``fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason``),
+# because its ``--terminal-drain`` inverts the terminal gate.
 PROTECTED_AUDIT_KINDS: frozenset[str] = frozenset({'cadence_check'})
 
 # Identifying victim keys copied into a tombstone payload. Deliberately an

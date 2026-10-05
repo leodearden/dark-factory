@@ -541,7 +541,14 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
+    # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
+    # Every emitted reservation_* event carries data.source in {pin, fairness}
+    # (task 6040): an operator pin's reservation, or the automatic machinery's.
+    # Pin-sourced installed / shadowed / install_blocked carry pin_order in
+    # place of the tier fields (priority, preempted_by_priority): a pin rank
+    # lies above every tier, so no tier describes it.
     reservation_installed = 'reservation_installed'
+    reservation_install_blocked = 'reservation_install_blocked'
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
     reservation_shadowed = 'reservation_shadowed'
@@ -549,6 +556,13 @@ class EventType(StrEnum):
     reservation_used = 'reservation_used'
     reservation_force_evicted = 'reservation_force_evicted'
     reservation_force_evict_refused = 'reservation_force_evict_refused'
+    # A pinned task failed to take its module locks (task 6040).  Producer:
+    # scheduler.py::Scheduler._phase_select_pins.  Payload: {task_id,
+    # pin_order, head, blockers: [{module, owner, kind: held|parked}]}, with
+    # the blockers named BEFORE the head's own reservation installs.  Emitted
+    # when the pin becomes blocked, then at most once per
+    # pin_blocked_emit_interval_secs while it stays blocked.
+    pin_blocked = 'pin_blocked'
     # Emitted once per acquire_next tick when the fused-memory task read
     # FAILED (distinct from a genuinely empty project) and the park-eviction
     # drain was therefore SKIPPED (fail-safe, survey finding C3).
@@ -875,6 +889,23 @@ class EventType(StrEnum):
     # these rows for a stranded task is therefore meaningful: nothing held it.
     recovery_vetoed = 'recovery_vetoed'
     recovery_left = 'recovery_left'
+
+    # workflow_exit_contract — one row per run() exit whose contract verdict is
+    # a violation or store-unavailable (spec docs/task-escalation-state-spec.md
+    # §5/E11; task theta 3542).  The canonical WHY lives in
+    # orchestrator/src/orchestrator/exit_contract.py (module docstring).
+    # Payload vocabulary:
+    #   {verdict, mode, check, outcome, status, report_phase, machine_state,
+    #    failed_write, escalation_id}
+    #   verdict       — 'violation' | 'store_unavailable'.
+    #   mode          — 'log' | 'enforce' (workflow_exit_contract_enforce).
+    #   check         — 'phase' | 'outcome_status' for a violation, else null.
+    #   failed_write  — {target_status, error} for store_unavailable, else null.
+    #   escalation_id — the L1 an enforce-mode violation filed; null when
+    #                   deduped against an open one, or in log mode.
+    # task_id is ALSO a first-class column.  Task mu's soak counts
+    # verdict='violation' rows with mode='log' before flipping enforce on.
+    workflow_exit_contract = 'workflow_exit_contract'
 
 
 class EventStore:

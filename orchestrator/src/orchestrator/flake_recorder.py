@@ -33,8 +33,14 @@ The COUPLING RULE that comes with it is binding — the ledger READS task status
 WRITES it only as part of the initial filing, never marking a task done, blocked or
 reprioritised.
 
-Import discipline: this module imports ``flake_ledger`` (which depends only on
-``shared.sqlite_sync_base``) at runtime and NOTHING else from ``orchestrator``.
+Task η added a FIFTH, on a narrower trigger: a suppression that RE-OPENS a debt
+cycle whose de-flake task had finished means the test flaked again after its fix
+landed, and a born-at-L2 ``regressed_after_resolution`` escalation cites the fix
+that did not hold.  The ledger detects the re-entry and reports it through
+``open_debt``'s hook; this module only files it.
+
+Import discipline: this module imports ``flake_ledger`` (which depends on ``shared``
+alone) at runtime and NOTHING else from ``orchestrator``.
 ``VerifyResult`` is a ``TYPE_CHECKING``-only annotation and ``EventType`` /
 ``Escalation`` are imported lazily inside their functions, so ``flake_recorder``
 never imports ``verify`` or ``event_store`` at runtime and cannot participate in an
@@ -51,6 +57,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from orchestrator.flake_ledger import (
+    NEVER_WIDEN_A_TIMEOUT,
+    DebtRow,
     FlakeVerdict,
     ledger_db_path,
     open_debt,
@@ -224,6 +232,147 @@ def _bump_suppression_streak_and_maybe_escalate(
     escalation_queue.submit(esc)
 
 
+#: The escalation category that IS the ``regressed_after_resolution`` flag (task η): a
+#: test re-entered flake debt after its de-flake task finished, so the fix did not hold.
+REGRESSED_AFTER_RESOLUTION = 'regressed_after_resolution'
+
+#: ``make_id`` namespace for those escalations.  It names a counter FILE
+#: (``esc-{key}.seq``), so it is fixed and filename-safe, never the raw pytest node-id;
+#: each regression's identity lives in :func:`_regression_sentinel` instead.
+_REGRESSION_ESCALATION_KEY = 'flake-regressed-after-resolution'
+
+#: The ``orchestrator-`` prefix marks a harness sentinel, which the escalation server
+#: never downgrades from ``critical``.
+_REGRESSION_AGENT_ROLE = 'orchestrator-flake-ledger'
+
+
+def _regression_sentinel(row: DebtRow) -> str:
+    """The dedup task_id for *row*'s regression: one per (test, cycle).
+
+    Not the storm's single fixed sentinel, because each regression is a DISTINCT failed
+    fix citing a distinct commit: one pending L2 must not swallow another test's
+    regression, or a later cycle's.  It lives only in the stored ``task_id`` field,
+    which ``get_by_task`` filters on.
+    """
+    return f'{_REGRESSION_ESCALATION_KEY}:{row.test_id}:cycle-{row.open_count}'
+
+
+def _cited_commit(row: DebtRow) -> str:
+    """*row*'s prior resolving commit, VERBATIM, or an explicit statement that none was
+    recorded — never the literal ``None``."""
+    return row.prior_resolving_commit or '(none recorded)'
+
+
+def _regression_detail(row: DebtRow, *, merge_sha: str, task_id: str | None) -> str:
+    """The escalation detail for *row*'s regression: every fact a human needs to judge
+    whether the prior fix was cosmetic (§5.5), with the fix's commit quoted VERBATIM or
+    stated as not recorded."""
+    return (
+        f'{row.test_id} flaked again after its de-flake fix landed. The flake ledger '
+        f'closed its debt cycle when the de-flake task was observed done, and a '
+        f'merge-gate suppression has now RE-OPENED it: this is cycle {row.open_count} of '
+        f'the same debt, and the fix below did not hold.\n'
+        f'\n'
+        f'  test:                    {row.test_id}\n'
+        f'  project:                 {row.project_id}\n'
+        f'  prior resolving commit:  {_cited_commit(row)}\n'
+        f'  prior resolved_at:       {row.prior_resolved_at}  (when the ledger OBSERVED '
+        f'the task done, not when the fix merged)\n'
+        f'  opened_at:               {row.opened_at}\n'
+        f'  open_count:              {row.open_count}\n'
+        f'  observed at merge_sha:   {merge_sha or "(none)"}\n'
+        f'  observing task_id:       {task_id or "(none)"}\n'
+        f'\n'
+        f"The ledger files this cycle's de-flake task itself, straight after this "
+        f'escalation; `orchestrator flake-ledger` shows its owner, or the unowned breach '
+        f'if that filing failed.\n'
+        f'\n'
+        f'{NEVER_WIDEN_A_TIMEOUT}'
+    )
+
+
+def _escalate_regressed_after_resolution(
+    escalation_queue: Any, row: DebtRow, *, merge_sha: str, task_id: str | None,
+) -> None:
+    """File the born-at-L2 ``regressed_after_resolution`` escalation for *row*, a test
+    that re-entered flake debt after its de-flake task finished (task η).
+
+    Modelled on :func:`_bump_suppression_streak_and_maybe_escalate`: ``severity=
+    'critical'``, ``level=2`` and a harness-sentinel ``agent_role``, deduped on an open
+    L2 through ``get_by_task``'s root-only ``'pending'`` fast path, never the
+    archive-wide scan.  The dedup is belt-and-braces — ``open_debt`` reports each
+    re-entry once — and it is per (test, cycle): see :func:`_regression_sentinel`.
+
+    None-safe but LOUD: with no queue the regression is logged as a WARNING.  A failing
+    submit raises, and the caller's guard reports that loss.
+    """
+    if escalation_queue is None:
+        logger.warning(
+            'flake_recorder: %s — test_id=%s re-entered flake debt (cycle %d) after its '
+            'fix landed (prior resolving commit %s), but no escalation queue is wired, '
+            'so it is visible only in `orchestrator flake-ledger` (merge_sha=%s, '
+            'task_id=%s)',
+            REGRESSED_AFTER_RESOLUTION,
+            row.test_id,
+            row.open_count,
+            _cited_commit(row),
+            merge_sha,
+            task_id,
+        )
+        return
+
+    from escalation.models import Escalation  # noqa: PLC0415 — local, escalation optional dep
+
+    sentinel = _regression_sentinel(row)
+    if escalation_queue.get_by_task(sentinel, status='pending', level=2):
+        logger.info(
+            'flake_recorder: an open %s escalation already covers test_id=%s cycle %d',
+            REGRESSED_AFTER_RESOLUTION,
+            row.test_id,
+            row.open_count,
+        )
+        return
+
+    commit = row.prior_resolving_commit
+    if commit:
+        inspect_the_fix = f'Inspect the fix that did not hold (git show {commit})'
+    else:
+        inspect_the_fix = (
+            'No resolving commit was recorded for the fix that did not hold; find the '
+            "prior de-flake task's change"
+        )
+    escalation_queue.submit(
+        Escalation(
+            id=escalation_queue.make_id(_REGRESSION_ESCALATION_KEY),
+            task_id=sentinel,
+            agent_role=_REGRESSION_AGENT_ROLE,
+            severity='critical',
+            level=2,
+            category=REGRESSED_AFTER_RESOLUTION,
+            summary=(
+                f'Flake regressed after its fix: {row.test_id} re-entered flake debt '
+                f'(cycle {row.open_count})'
+            ),
+            detail=_regression_detail(row, merge_sha=merge_sha, task_id=task_id),
+            suggested_action=(
+                f'{inspect_the_fix} and judge whether it was cosmetic — a widened '
+                'timeout, a lengthened sleep, an added retry — before the new '
+                "cycle's de-flake task repeats it."
+            ),
+            evidence=[
+                {
+                    'observation': (
+                        f'{row.test_id} re-entered flake debt: open_count '
+                        f'{row.open_count}, prior cycle resolved at {row.prior_resolved_at}'
+                    ),
+                    'measured_at': f'opened_at={row.opened_at}',
+                    'ref': f'prior_resolving_commit={_cited_commit(row)}',
+                },
+            ],
+        )
+    )
+
+
 def _unowned_first(db_path: Path, test_ids: list[str]) -> list[str]:
     """*test_ids* with those lacking an OPEN, OWNED debt row moved to the front, each
     half in its original order.  A ledger read failure degrades to the input order."""
@@ -248,9 +397,10 @@ async def record_merge_flake_suppression(
     debt_filing_cap: int = _DEBT_FILINGS_PER_OBSERVATION_CAP,
     debt_filing_budget_secs: float = _DEBT_FILING_BUDGET_SECS,
 ) -> None:
-    """Record the flake observation *result* carries — ε's job, plus ζ's fourth effect.
+    """Record the flake observation *result* carries — ε's job, plus ζ's fourth effect
+    and η's fifth.
 
-    Four side-effects, on two different triggers:
+    Five side-effects, on three different triggers:
 
     * the durable ``flake_occurrence`` ledger row(s) — on EVERY carried verdict,
       including ``fails_in_isolation`` and ``unconfirmable``.  §5.5: record the
@@ -265,7 +415,10 @@ async def record_merge_flake_suppression(
       WHEN they fire changes here, only WHERE.  The debt row joins them on the same
       trigger because §5.9's invariant is about tests that are IN the ledger, and only
       a suppression puts one there: a confirmed red is a bug, not a flake, and an
-      unconfirmable observation names no test to own.
+      unconfirmable observation names no test to own;
+    * the ``regressed_after_resolution`` escalation — on a RE-ENTRY only: a
+      suppression whose ``open_debt`` re-opens a cycle that a finished de-flake task
+      had closed.
 
     THE FOURTH EFFECT (task ζ, PRD §5.9): each carried ``test_id`` gets
     ``flake_ledger.open_debt``, which enforces at WRITE TIME that the test has a
@@ -290,13 +443,26 @@ async def record_merge_flake_suppression(
     "incapable" is what let §5.9 go unenforced there while a comment asserted the
     opposite reason.
 
+    THE FIFTH EFFECT (task η): a re-entry means the test flaked again after its fix
+    landed, so a born-at-L2 escalation cites the fix that did not hold
+    (:func:`_escalate_regressed_after_resolution`).  It rides ``open_debt``'s
+    ``on_regressed_after_resolution`` hook rather than being read off the returned row,
+    because the hook fires BEFORE the ledger's owner filing awaits anything: the filing
+    budget below can cancel that filing, and the returned row with it, but never the
+    escalation of a re-entry already written.  The one await AHEAD of the ledger's
+    upsert is its owner read, which the ledger bounds itself so a slow read cannot eat
+    this budget; a budget that expires inside that read costs the test its occurrence
+    upsert this time, exactly as it does a test it skipped, and the re-entry and its
+    escalation land at the next suppression.  It needs a ``task_client`` like the debt
+    row it rides on.
+
     ORDER IS THE CONTRACT, not an incidental sequence — local/durable first (the
     occurrence rows), then the in-process live signals (the event, the streak), then the
     NETWORK-BOUND filing LAST:
 
     * the occurrence row outlives this process and is the evidence θ reads, so if
       anything is lost to a crash mid-call, lose the recoverable half;
-    * the filing dispatches an MCP tool, so it is by far the likeliest of the four to
+    * the filing dispatches an MCP tool, so it is by far the likeliest of the effects to
       fail or hang, and INV-4's fixed-sentinel storm escape
       (:func:`_bump_suppression_streak_and_maybe_escalate`) is the one signal whose
       entire job is to fire when α is masking too much.  Bumping the streak BEFORE the
@@ -320,7 +486,7 @@ async def record_merge_flake_suppression(
     filing failing is a lost measurement; letting it propagate would fail a VERIFY, or
     stall the merge queue, over bookkeeping.
 
-    The four side-effects are INDEPENDENTLY guarded — one ``try`` each — so losing one
+    The side-effects are INDEPENDENTLY guarded — one ``try`` each — so losing one
     really does not cost the others.  A single shared ``try`` made that claim false by
     ordering alone: an ``event_store.emit`` that raised (a locked or closed sqlite
     store) would skip straight to the catch-all and the streak bump would never run, so
@@ -418,7 +584,7 @@ async def record_merge_flake_suppression(
             ),
         )
         # LAST, and that ordering is the contract (see the docstring): the streak above
-        # is now armed, so the NETWORK-BOUND filing below — the likeliest of the four to
+        # is now armed, so the NETWORK-BOUND filing below — the likeliest of the effects to
         # fail or hang — cannot disarm INV-4's escape by failing.
         #
         # ONE GUARD PER TEST, not one for the batch: a two-test observation is two
@@ -456,6 +622,14 @@ async def record_merge_flake_suppression(
 
         remaining = list(carried)
 
+        def _on_regression(row: DebtRow) -> None:
+            _guarded(
+                'regression',
+                lambda: _escalate_regressed_after_resolution(
+                    escalation_queue, row, merge_sha=merge_sha, task_id=task_id,
+                ),
+            )
+
         async def _file_all() -> None:
             for carried_test_id in carried:
                 await _guarded_async(
@@ -465,6 +639,7 @@ async def record_merge_flake_suppression(
                         project_id,
                         tid,
                         task_client=task_client,
+                        on_regressed_after_resolution=_on_regression,
                     ),
                 )
                 remaining.remove(carried_test_id)

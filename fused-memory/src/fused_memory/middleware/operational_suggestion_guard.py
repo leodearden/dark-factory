@@ -86,23 +86,13 @@ this module is only:
   gate — a suppression path this guard has and ``routing_intent_guard`` does
   not — is evaluated INSIDE the marker loop and keeps reading RAW field
   text. So a stamp that merely NAMES a code-level artifact noun still gates
-  a weak marker (``confirm``/``reload``/``deploy``) in that field. Measured:
-  ``'Confirm the fused-memory service is healthy.\n\n[RECON CORRECTION
-  2026-08-08] the dependencies field was wrong; a bug.'`` -> ``None``, while
-  the same stamp with "field" replaced by "prose" -> a ``'confirm'``
-  finding. Left unfixed deliberately: task 4569 is scoped to the
-  code-change-signal scan; ``routing_intent_guard``'s directional-safety
-  rule widens the carve-out only against observed-corpus evidence, and no
-  live-data measurement of this shape exists; and under-fixing degrades to
-  pre-4569 behaviour (a finding is lost, never manufactured), the safe
-  direction. Extending the strip here would also break the monotonicity
-  invariant above, so it needs its own precision matrix rather than a copy
-  of this one. Follow-up ticket ``tkt_0RT8E1WV27YBJ2RYS22GYK1Q49``; its
-  regression anchor is this measurement's own test,
-  ``test_operational_suggestion_guard.py::
-  test_stamp_naming_a_code_artifact_still_gates_a_weak_marker`` -- pinned on
-  the guard's RETURN VALUES rather than on this prose, so closing the ticket
-  means flipping that assertion rather than rediscovering the behaviour.
+  a weak marker (``confirm``/``reload``/``deploy``) in that field. Won't-fix
+  (task 5106, which records the live-corpus measurement): gating on
+  stamp-stripped text would un-gate a weak marker that sits inside a stamp
+  next to that stamp's own artifact noun, manufacturing a finding from
+  annotator wording rather than recovering one the filing author wrote.
+  Both behaviours are pinned on return values in
+  ``tests/test_operational_suggestion_guard.py::TestProvenanceStampDoesNotDisarmOperationalSuggestion``.
 
 This module is declaration-only and WARN-ONLY: it never coerces
 ``task_kind`` or ``execution_class`` and never rejects a submission — see

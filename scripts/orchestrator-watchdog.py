@@ -2,17 +2,29 @@
 """Orchestrator escalation-MCP watchdog.
 
 For each enabled orchestrator (dark-factory + reify): probes its escalation-MCP
-TCP port via ``ss``, and performs a three-phase ``systemctl --user stop`` →
-``reset-failed`` → ``start`` if the port is not listening. The probe-fails →
-restart path covers BOTH failure modes:
+TCP port via ``ss``, and revives it via ``systemctl --user reset-failed`` →
+``restart --no-block`` on either of two dead signals — the port is not
+listening, or (under systemd socket activation) the port
+IS listening but the unit's own ActiveState says it is dead. Either signal
+covers BOTH failure modes:
 
   * **Wedged** (alive-but-hung): the unit is active but the port stopped
     answering — systemd Restart= won't fire. The watchdog forces a restart.
   * **Dead-but-enabled** (e.g. a boot-race dependency-cancel that systemd
     never retries, or a unit that gave up after exhausting StartLimitBurst):
-    the unit is inactive, the port isn't listening, ``stop`` is a no-op, and
-    ``reset-failed`` + ``start`` revives it. This is what self-heals the
-    2026-05-27 powercut failure mode.
+    the unit is inactive. Pre-socket-activation this always meant the port
+    wasn't listening either; under socket activation each unit's escalation
+    port is held by a systemd ``.socket`` unit independent of the service, so
+    a dead-but-enabled unit's port can still read LISTEN — see
+    ``UNIT_DEAD_ACTIVE_STATES`` / ``_unit_active_state()``. Either way
+    ``reset-failed`` + ``restart --no-block`` revives it. This is what
+    self-heals the 2026-05-27 powercut failure mode.
+
+restart_unit() deliberately never calls ``systemctl stop``: each socket-
+activated unit's ``ExecStopPost`` hook closes its socket only when the unit
+has a genuine ``stop`` job, so a watchdog-issued stop would sever every open
+MCP connection through the ~50s restart takes to come back — see
+restart_unit()'s own docstring.
 
 Disabled units are skipped — disabling is explicit operator intent. Runs as a
 oneshot systemd service on a 60-second timer.
@@ -495,14 +507,18 @@ def log(msg: str) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         # systemd-cat missing/unexecutable (OSError) or wedged past the bound
         # (TimeoutExpired, a SubprocessError) — still emit, just via stderr.
-        # The fallback is itself best-effort: writing to stderr raises on a
-        # broken pipe or a full/failing journal socket, and that OSError
-        # would otherwise escape log() and abort a caller's tick (see the
-        # never-raises contract in the docstring). Both journal routes are
-        # gone at this point, so there is nothing left to report WITH —
-        # dropping the message is the only remaining option, and it is
-        # strictly better than dropping the rest of the tick with it.
-        with contextlib.suppress(OSError):
+        # The fallback print is guarded BROADLY BY DESIGN, like
+        # _JournalLog.warning below: both journal routes are already gone by
+        # the time it runs, so there is nothing left to report WITH, and
+        # dropping the message beats dropping the rest of the tick with it
+        # (see the never-raises contract in the docstring). Enumerating what
+        # a degraded stderr can raise would close instances rather than the
+        # class that contract promises — a broken pipe or a full/failing
+        # journal socket raise OSError, a CLOSED stream raises ValueError,
+        # and the message is formatted INSIDE the guard. Bug-surfacing lives
+        # in the narrow OUTER clause above, which stays narrow and is pinned
+        # by test_log_swallows_only_os_and_subprocess_errors.
+        with contextlib.suppress(Exception):
             print(
                 f"orchestrator-watchdog: {msg} [systemd-cat unusable: {exc!r}]",
                 file=sys.stderr,
@@ -672,8 +688,15 @@ def _fused_memory_liveness_verdict() -> str:
     _print_fused_memory_liveness()'s recon-busy column.
 
     The port probe runs first and short-circuits before the (up to 15s)
-    /alive fetch, so a fully-dead unit is classified quickly without waiting
-    on probe_health()'s timeout.
+    /alive fetch. 'port-down' does NOT mean "the process is gone" — under
+    systemd socket activation (fused-memory.socket holds port 8002) the
+    socket stays bound across a crash awaiting
+    auto-restart or a mid-``restart`` gap; ExecStopPost closes it only for a
+    genuine ``stop``/disable job. So 'port-down' means the SOCKET is down —
+    a deliberate stop, a disable, or (pre-socket-activation hosts) the
+    process never having bound the port at all — and a crashed-but-
+    restarting process is instead classified 'wedged' by the /alive fetch
+    below, once the queued connection fails to get an answer in time.
     """
     if not probe_port(FUSED_MEMORY_PORT):
         return "port-down"
@@ -683,41 +706,56 @@ def _fused_memory_liveness_verdict() -> str:
 
 
 def restart_unit(unit: str) -> None:
-    """Three-phase restart: stop → reset-failed → start *unit* via ``systemctl --user``.
+    """Revive *unit* via ``systemctl --user reset-failed`` then ``restart --no-block``.
 
-    - ``stop`` allows systemd's TimeoutStopSec=30 to escalate SIGTERM→SIGKILL
-      gracefully so in-flight work gets a 30-second grace period; we never
-      invoke ``systemctl kill`` directly.
-    - ``reset-failed`` clears the StartLimit state (StartLimitBurst / start-limit-hit)
-      so the subsequent start is not a silent no-op on a rate-limited unit.
-    - ``start`` re-launches the unit.
+    NEVER STOPS THE UNIT. Each service unit gets
+    an ``ExecStopPost`` hook that stops ITS SOCKET whenever the unit has a
+    ``stop`` job — a deliberate operator stop or disable — but leaves the
+    socket bound across a ``restart`` job or a crash awaiting auto-restart.
+    So a watchdog-issued ``stop`` would close the listening socket on every
+    revive, and every open MCP client would see refused connections for the
+    ~50s the restart takes, instead of the queued-but-silent gap socket
+    activation exists to avoid. A prior stop→reset-failed→start sequence
+    (task 4131 era) is retired for exactly this reason.
 
-    An explicit timeout of 45s (comfortably above TimeoutStopSec=30) prevents
-    the oneshot watchdog from hanging indefinitely if systemctl blocks.
-    TimeoutExpired is caught and logged; the remaining phases still execute.
+    - ``reset-failed <unit> <unit-with-.socket-for-.service>`` clears the
+      StartLimit state (StartLimitBurst / start-limit-hit) on BOTH the
+      service and its socket-activation sibling, so a rate-limited unit is
+      not a silent no-op on the restart below. It also runs, and still
+      matters, against a unit that is not currently failed — it resets the
+      start-rate-limit counter regardless of current state. A project whose
+      *unit* has no matching ``.socket`` unit just makes that half of the
+      call exit non-zero (``check=False``), which is fine.
+    - ``restart --no-block`` re-launches *unit* without waiting for it to
+      finish starting. A blocking ``restart`` on a ``Type=notify`` unit can
+      take 45s+ to return, which is most of this oneshot watchdog's own 60s
+      tick; ``--no-block`` returns as soon as the job is QUEUED. Callers must
+      not assume *unit* has finished restarting when this function returns —
+      they only log "restart issued", never "restart complete".
+
+    Each phase is independently bounded (reset-failed 10s, restart 45s) so a
+    wedged systemctl invocation cannot hang the oneshot watchdog.
+    ``subprocess.TimeoutExpired`` is caught and logged, never raised, and the
+    restart phase still runs after a reset-failed timeout.
     """
+    socket_unit = unit.replace(".service", ".socket")
     try:
         subprocess.run(
-            ["systemctl", "--user", "stop", unit], check=False, timeout=45
+            ["systemctl", "--user", "reset-failed", unit, socket_unit],
+            check=False,
+            timeout=10,
         )
     except subprocess.TimeoutExpired:
-        log(f"systemctl stop {unit} timed out after 45s")
-
-    # Always run reset-failed regardless of stop outcome so a rate-limited unit
-    # (StartLimitBurst exhausted) can be recovered even after the timeout path.
-    try:
-        subprocess.run(
-            ["systemctl", "--user", "reset-failed", unit], check=False, timeout=10
-        )
-    except subprocess.TimeoutExpired:
-        log(f"systemctl reset-failed {unit} timed out after 10s")
+        log(f"systemctl reset-failed {unit} {socket_unit} timed out after 10s")
 
     try:
         subprocess.run(
-            ["systemctl", "--user", "start", unit], check=False, timeout=45
+            ["systemctl", "--user", "restart", "--no-block", unit],
+            check=False,
+            timeout=45,
         )
     except subprocess.TimeoutExpired:
-        log(f"systemctl start {unit} timed out after 45s")
+        log(f"systemctl restart --no-block {unit} timed out after 45s")
 
 
 def _unit_start_elapsed_secs(unit: str) -> float | None:
@@ -1844,12 +1882,75 @@ def _record_fm_liveness_failure(
     return count
 
 
+def _unit_active_state(unit: str) -> str | None:
+    """Return *unit*'s systemd ActiveState, or None on any probe failure.
+
+    Queries ``systemctl --user show -p ActiveState --value <unit>`` — the
+    signal main() needs under socket activation (module docstring): each
+    service's escalation port is held by an independent systemd ``.socket``
+    unit, so it can stay LISTEN-ing across a dead service and probe_port()
+    alone can no longer tell a dead-but-enabled unit from a live one merely
+    holding its socket.
+
+    Fails SAFE like probe_port(): a missing systemctl, a timeout, a non-zero
+    exit, or blank output all return None. Every caller must read None as
+    "not dead" — a tooling hiccup here must never manufacture a restart.
+    """
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "ActiveState", "--value", unit],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    state = result.stdout.strip()
+    return state or None
+
+
+# ActiveState values under which an enabled unit counts as dead even while its
+# escalation port still listens (systemd socket activation — module
+# docstring). Deliberately NOT derived from UNIT_IN_FLIGHT_ACTIVE_STATES /
+# _unit_is_active: that pair answers a different question ("is a TRANSIENT
+# registration unit still in flight") and its vocabulary reads "deactivating"
+# as NOT in-flight (task 4131's own parametrization pins this negative) — the
+# wrong direction here, since a unit mid-stop (an orchestrator's stop can take
+# up to 90s) must NOT be revived out from under itself. This set instead names
+# the dead states directly; every other ActiveState — "active", "activating",
+# "deactivating", "reloading", anything unrecognised, and None — is "not dead"
+# by omission, which is what keeps every transitional state safe without
+# having to enumerate them.
+UNIT_DEAD_ACTIVE_STATES = frozenset({"inactive", "failed"})
+
+
 def main() -> None:
-    """Probe each watched port; restart the unit if the port is not listening.
+    """Probe each watched unit; restart it on either of two dead signals.
+
+    ``probe_port`` reads LISTEN False — the original signal: a wedged-but-
+    active unit, or a dead-but-enabled one whose port was never (re)bound.
+
+    Under systemd socket activation an escalation port is held by its own
+    ``.socket`` unit independent of the service, so it can keep reading
+    LISTEN across a dead service (module docstring) — probe_port() alone can
+    no longer prove liveness. ``_unit_active_state()`` is therefore consulted
+    whenever the port IS up: an ActiveState of ``inactive`` or ``failed``
+    (``UNIT_DEAD_ACTIVE_STATES``) revives the unit exactly as a down port
+    would. A transitional ActiveState — ``active``, ``activating``,
+    ``deactivating``, ``reloading`` — is never treated as dead: a unit
+    mid-restart (an orchestrator stop can take up to 90s) is not dead, it is
+    working.
+
+    Either signal takes the same revive path — restart_unit()'s
+    reset-failed + restart --no-block — gated by the same is_unit_enabled /
+    STARTUP_GRACE_SECS / in-flight-fleet-lease checks, and the log line names
+    which signal fired.
 
     One exception, scoped to ONE unit (task 4755): the unit an in-flight fleet
     sweep is currently restarting is skipped, because a unit mid-restart is
-    indistinguishable from a wedged one to a port probe.
+    indistinguishable from a dead one to either probe.
     """
     for port, unit in WATCHED:
         try:
@@ -1863,38 +1964,54 @@ def main() -> None:
                     f"skipping probe (grace window {STARTUP_GRACE_SECS}s)"
                 )
                 continue
-            if not probe_port(port):
+
+            port_up = probe_port(port)
+            if port_up:
+                # Socket activation keeps the port LISTEN-ing across a dead
+                # service, so a live port no longer proves a live process —
+                # ask systemd directly. This runs on every healthy tick (the
+                # cost socket activation adds); the lease read below stays
+                # lazy regardless.
+                state = _unit_active_state(unit)
+                if state not in UNIT_DEAD_ACTIVE_STATES:
+                    continue
+                reason = (
+                    f"ActiveState={state!r} while escalation port {port} "
+                    "still listens (socket activation)"
+                )
+            else:
                 # A down port means this unit is wedged, dead — or being
                 # restarted right now by an in-flight fleet sweep, which the
                 # probe cannot tell apart from the other two precisely BECAUSE
                 # the sweep is restarting it. Measured: the probe cancelled the
                 # sweep's own restart jobs ("Job for ... canceled"), twice
                 # escalating to code=killed status=9/KILL.
-                #
-                # The lease read is LAZY — it happens only HERE, after a probe
-                # has already come back down, so an all-healthy tick (the
-                # overwhelmingly common case) costs zero extra I/O, and the
-                # read is maximally fresh at the decision point.
-                #
-                # Scoped to current_unit and nothing else: I5 (liveness stays
-                # uncapped, non-clock-gated and non-stamping — brokenness is
-                # not a scheduled deploy) must survive for every OTHER unit. A
-                # blanket liveness disable for the ~80 minutes of a sweep would
-                # leave a genuinely wedged unit unattended for over an hour.
-                lease = _live_fleet_lease()
-                if lease is not None and lease.get("current_unit") == unit:
-                    log(
-                        f"{unit} escalation port {port} not listening, but an "
-                        f"in-flight fleet redeploy (lease {_describe_lease(lease)}) "
-                        "is restarting this unit; skipping the liveness restart"
-                    )
-                    continue
-                # Covers both wedged-active and dead-enabled (boot-race
-                # cancelled, or StartLimit-exhausted): restart_unit's
-                # stop+reset-failed+start sequence revives either case.
-                log(f"{unit} escalation port {port} not listening; restarting")
-                restart_unit(unit)
-                log(f"{unit} restart issued")
+                reason = f"escalation port {port} not listening"
+
+            # The lease read is LAZY — it happens only HERE, after a dead
+            # signal has already fired, so an all-healthy tick (the
+            # overwhelmingly common case) costs zero extra I/O, and the
+            # read is maximally fresh at the decision point.
+            #
+            # Scoped to current_unit and nothing else: I5 (liveness stays
+            # uncapped, non-clock-gated and non-stamping — brokenness is
+            # not a scheduled deploy) must survive for every OTHER unit. A
+            # blanket liveness disable for the ~80 minutes of a sweep would
+            # leave a genuinely wedged unit unattended for over an hour.
+            lease = _live_fleet_lease()
+            if lease is not None and lease.get("current_unit") == unit:
+                log(
+                    f"{unit} {reason}, but an "
+                    f"in-flight fleet redeploy (lease {_describe_lease(lease)}) "
+                    "is restarting this unit; skipping the liveness restart"
+                )
+                continue
+            # Covers wedged-active, dead-enabled (boot-race cancelled, or
+            # StartLimit-exhausted), and dead-but-socket-held: restart_unit's
+            # reset-failed + restart --no-block sequence revives every case.
+            log(f"{unit} {reason}; restarting")
+            restart_unit(unit)
+            log(f"{unit} restart issued")
         except Exception as exc:  # noqa: BLE001
             log(f"watchdog error for {unit} (port {port}): {exc}")
 
@@ -1957,8 +2074,10 @@ def fused_memory_liveness_pass() -> None:
         a 503 means alive, since a degraded backing store is not something a
         restart fixes;
       - _fused_memory_liveness_verdict()'s port-probe short-circuit, so a
-        fully-dead unit is still classified without waiting on the up-to-15s
-        /alive fetch;
+        socket that is actually down (a deliberate stop/disable, or a
+        pre-socket-activation host) is still classified without waiting on
+        the up-to-15s /alive fetch — see that function's own docstring for
+        why 'port-down' no longer implies the process itself is gone;
       - the is_unit_enabled and STARTUP_GRACE_SECS gates above, which still
         return before any streak read or write (operator intent and a
         not-yet-bound port are neither failure evidence nor recovery);

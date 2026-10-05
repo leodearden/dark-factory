@@ -24,10 +24,10 @@ file and silently dropping that call's sibling arguments.
 
 So every specimen below is assembled at import time from ``_markup_helpers``'
 builders, which build their angle bracket from ``chr(60)``. The result is
-byte-identical at runtime and never appears verbatim in the file text. That
-module's ``assert_no_raw_sentinels`` enforces it on the bytes of whichever file
-passes its own ``__file__``, so a future editor cannot quietly reintroduce one
-(it is a check on this file's source text, not on any docstring's wording).
+byte-identical at runtime and never appears verbatim in the file text.
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
+enforces it on this file's source text, repo-wide, so a future editor cannot
+quietly reintroduce one.
 """
 
 from __future__ import annotations
@@ -48,7 +48,6 @@ from pathlib import Path
 import pytest
 from _markup_helpers import (
     INVOKE_CLOSER,
-    assert_no_raw_sentinels,
     closer,
     param_opener,
 )
@@ -67,13 +66,6 @@ from orchestrator.artifacts import (
     TaskArtifacts,
 )
 from orchestrator.mcp import plan_tools
-
-# The sentinel builders and the import-time self-scan live in
-# ``_markup_helpers``: three suites in this package need them and none may hold
-# a second copy (INV-5). Imported under this module's own local spellings so
-# every specimen below still reads as it always did.
-assert_no_raw_sentinels(__file__)
-
 
 # ---------------------------------------------------------------------------
 # The four REAL specimen shapes, measured on the 28 corrupted live plans.
@@ -137,6 +129,7 @@ _EXPECTED_PAIRS = {
     ('reuse', 'what'),
     ('reuse', 'where'),
     ('reuse', 'how'),
+    ('dropped_files', 'reason'),
 }
 
 #: Which plan-tools entry point AUTHORED each collection, i.e. whose parameter
@@ -147,6 +140,7 @@ _ORIGINATING_TOOL = {
     'steps': plan_tools._add_plan_step,
     'design_decisions': plan_tools._add_design_decision,
     'reuse': plan_tools._add_reuse_item,
+    'dropped_files': plan_tools._drop_plan_file,
 }
 
 
@@ -166,7 +160,9 @@ def _tool_params(fn) -> tuple[str, ...]:
 #: not prose at all (``files`` is a list, ``task_id`` an identifier). Writing a
 #: recovered tail into any of them is silent-wrong-value corruption of the
 #: artifact that the lock charter and the merge gate both consume.
-_NON_PROSE_PARAMS = frozenset({'task_id', 'files', 'prereq_id', 'step_id', 'step_type'})
+_NON_PROSE_PARAMS = frozenset(
+    {'task_id', 'files', 'path', 'prereq_id', 'step_id', 'step_type'}
+)
 
 #: The tool name a fact reports as ``tool`` for each collection — its SCHEMA
 #: OWNER, spelled independently of the module's own mapping so the two cannot
@@ -177,6 +173,7 @@ _COLLECTION_SCHEMA_TOOL_NAME = {
     'steps': 'add_plan_step',
     'design_decisions': 'add_design_decision',
     'reuse': 'add_reuse_item',
+    'dropped_files': 'drop_plan_file',
 }
 
 #: The only three ``TaskArtifacts`` methods that mutate plan.json — measured,
@@ -338,17 +335,24 @@ def _seed_plan_through_real_writers(root) -> TaskArtifacts:
 
     The single source of the seeding shape. Both :func:`_observed_plan_keys`
     and :func:`_alternate_writer_changed_the_cell` build their fixture plan
-    through this helper rather than each restating the same five calls, so
-    adding a sixth writer — or changing one of these five signatures — is one
+    through this helper rather than each restating the same six calls, so
+    adding a seventh writer — or changing one of these six signatures — is one
     edit instead of two silently-divergeable ones.
+
+    Seeds THREE files, not one, so ``_drop_plan_file``'s never-narrow-to-empty
+    guard does not fire — neither for the seeding drop below, nor for a probe
+    that drops a second entry.
     """
     artifacts = TaskArtifacts(root)
     artifacts.init('test-1', 'Test task', 'A test')
-    plan_tools._create_plan(artifacts, 'test-1', 'A title.', 'An analysis.', ['a.py'])
+    plan_tools._create_plan(
+        artifacts, 'test-1', 'A title.', 'An analysis.', ['a.py', 'b.py', 'c.py'],
+    )
     plan_tools._add_prerequisite(artifacts, 'pre-1', 'A prerequisite.')
     plan_tools._add_plan_step(artifacts, 'step-1', 'test', 'A step.')
     plan_tools._add_design_decision(artifacts, 'A decision.', 'A rationale.')
     plan_tools._add_reuse_item(artifacts, 'A thing', 'somewhere.py', 'By importing it.')
+    plan_tools._drop_plan_file(artifacts, 'c.py', 'A drop reason.')
     return artifacts
 
 
@@ -364,7 +368,9 @@ def _observed_plan_keys(root) -> dict[str | None, set[str]]:
     plan = _seed_plan_through_real_writers(root).read_plan()
 
     observed: dict[str | None, set[str]] = {None: set(plan)}
-    for collection in ('prerequisites', 'steps', 'design_decisions', 'reuse'):
+    for collection in (
+        'prerequisites', 'steps', 'design_decisions', 'reuse', 'dropped_files',
+    ):
         items = plan[collection]
         assert items, f'{collection} came back empty — the writers did not run'
         observed[collection] = {key for item in items for key in item}
@@ -468,9 +474,13 @@ def _alternate_writer_changed_the_cell(
             kwargs[name] = ['a.py']
         elif name == 'task_id':
             kwargs[name] = 'test-1'
+        elif name == 'path':
+            # A path the seeded plan really declares, so the probe exercises
+            # the write rather than bouncing off the unknown-path guard.
+            kwargs[name] = 'b.py'
         elif name in (
             'description', 'analysis', 'title', 'decision', 'rationale',
-            'what', 'where', 'how',
+            'what', 'where', 'how', 'reason',
         ):
             kwargs[name] = f'Probe marker for {tool_name}.{name}.'
         else:
@@ -575,7 +585,7 @@ class TestRepairableFieldTable:
         assert pairs == _EXPECTED_PAIRS
         # 'reuse' contributes three of the nine, so a set of pairs alone would
         # not catch a duplicated row: pin the record count too.
-        assert len(table) == len(_EXPECTED_PAIRS) == 9
+        assert len(table) == len(_EXPECTED_PAIRS) == 10
 
     # There is deliberately NO test pinning ``schema_params`` against
     # ``inspect.signature`` of the originating tool. The table now DERIVES that
@@ -615,6 +625,21 @@ class TestRepairableFieldTable:
         assert 'files' not in {r.field for r in table}
         assert 'files' not in {name for r in table for name in r.target_keys}
         assert 'files' not in {key for r in table for key in r.target_keys.values()}
+
+    def test_path_is_neither_a_repaired_field_nor_a_recovery_target(self):
+        """``dropped_files[].path`` is a path, not prose — same as ``files``.
+
+        BOTH directions, for the same two reasons. Not being a repaired FIELD
+        stops the walk from rewriting the identity of a dropped entry; not
+        being a recovery TARGET stops an absorbed tail from landing there and
+        silently re-pointing a recorded drop at a different file — which would
+        turn an honest-drop record into a false one, the exact failure the
+        recorded reason exists to prevent.
+        """
+        table = plan_tools._REPAIRABLE_PLAN_FIELDS
+        assert 'path' not in {r.field for r in table}
+        assert 'path' not in {name for r in table for name in r.target_keys}
+        assert 'path' not in {key for r in table for key in r.target_keys.values()}
 
     def test_every_record_declares_an_immutable_target_keys_mapping(self):
         """A recovery target must be DECLARED, not inferred from the param name.

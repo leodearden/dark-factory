@@ -1,5 +1,7 @@
 # Deep Review Skill — PRD
 
+> Historical design record (2026-03). Live behaviour is `SKILL.md` and `references/`, under `docs/quality-findings-contract.md`; where this file disagrees with them, it is out of date.
+
 ## Overview
 
 The `/review` skill performs deep, multi-phase code review of a project (or scoped subset), going beyond per-task verification to catch integration gaps, stubbed pipelines, broken wiring, and architectural drift. It is the primary mechanism for closing the systematic gap between "all tasks complete" and "software is actually finished enough to use."
@@ -42,7 +44,7 @@ subprojects:
     root: fused-memory/
     smoke_tests:
       - name: "Server starts"
-        command: "uv run --project fused-memory python -m fused_memory.server --help"
+        command: "uv run --directory fused-memory python -m fused_memory.server --help"
         expect: "exit 0"
       - name: "Health endpoint"
         command: "curl -s http://localhost:8002/health"
@@ -63,7 +65,7 @@ subprojects:
     root: orchestrator/
     smoke_tests:
       - name: "CLI loads"
-        command: "uv run --project orchestrator orchestrator --help"
+        command: "uv run --directory orchestrator orchestrator --help"
         expect: "exit 0"
     critical_paths:
       - name: "Task lifecycle"
@@ -201,9 +203,7 @@ This is the expensive, high-value phase. An Opus agent (or coordinated team) rea
    - Flag tasks that are blocked on something that no longer exists
 
 4. **Create tasks**
-   - Use `submit_task` + `resolve_ticket` via fused-memory MCP (two-phase pattern). See `references/phase3-triage.md` for the full snippet including required metadata (`source`, `review_id`, `spawn_context`, `modules`, `memory_hints`) and failure-reason handling (`server_restart`, `timeout`, `unknown_ticket`, `server_closed`, `expired`).
-   - Each task tagged with `metadata.source: "review-cycle"` and `metadata.review_id: "<timestamp>"`
-   - Include `memory_hints` pointing to the review findings and relevant briefing sections
+   - Use `submit_task` + `resolve_ticket` via fused-memory MCP (two-phase pattern); the live metadata and dedup protocol are in `references/phase3-triage.md`
    - Set dependencies appropriately (fix-up tasks may depend on each other)
 
 5. **Escalate ambiguous findings**
@@ -260,7 +260,9 @@ Escalated 2 findings for your review:
 
 ## Configuration
 
-Extends the orchestrator config with a `review` section:
+Historical: this block was never built — `orchestrator/src/orchestrator/config.py::ReviewConfig` has no `models`, `effort`, `budgets` or `focused_review_interval` fields, and model routing lives in `SKILL.md` "Routing: who does what".
+
+Proposed (2026-03) as an extension of the orchestrator config:
 
 ```yaml
 review:
@@ -309,7 +311,7 @@ The within-run modes are not part of this skill — they are orchestrator infras
 2. Smoke test failures are detected and correctly diagnosed
 3. Stubs are found and correctly classified (unintended vs known vs acceptable)
 4. Critical path tracing catches broken wiring that per-task reviews missed
-5. Created tasks are well-formed, have correct dependencies, and include memory hints
+5. Created tasks are well-formed, have correct dependencies, and carry the finding key and run id
 6. Escalated findings include enough context for the user to make a decision
 7. Running `/review` without a briefing degrades gracefully with a suggestion to create one
 8. Focused mode correctly narrows scope to the specified modules

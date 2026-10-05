@@ -308,8 +308,11 @@ def test_shared_find_dropins_counts_only_conf_files(tmp_path: pathlib.Path):
 # The unit registry, and its staleness guard  (step-3 / step-4)
 # ---------------------------------------------------------------------------
 
-# The nine units scripts/setup-host.sh installs by copying VERBATIM. Stated
-# as a literal here so a bug in the shell-parsing helper below cannot make the
+# The sixteen units scripts/setup-host.sh installs by copying VERBATIM —
+# including the seven `orchestrator-<project>.socket` units, whose committed
+# source is `<unit>.template` but whose `cp` is exactly as verbatim as every
+# other unit's (see UNITS' own comment for why the name differs). Stated as a
+# literal here so a bug in the shell-parsing helper below cannot make the
 # equality assertion vacuously true against itself.
 _EXPECTED_UNITS = {
     "orchestrator-watchdog.service",
@@ -321,10 +324,17 @@ _EXPECTED_UNITS = {
     "orchestrator-solar-challenge-platform.service",
     "orchestrator-know-live.service",
     "orchestrator-pump-web-ui.service",
+    "orchestrator-dark-factory.socket",
+    "orchestrator-reify.socket",
+    "orchestrator-autopilot-video.socket",
+    "orchestrator-my-solar-challenge.socket",
+    "orchestrator-solar-challenge-platform.socket",
+    "orchestrator-know-live.socket",
+    "orchestrator-pump-web-ui.socket",
 }
 
-def test_registry_covers_the_nine_verbatim_copied_units():
-    """UNITS registers exactly the nine units setup-host.sh copies verbatim."""
+def test_registry_covers_the_sixteen_verbatim_copied_units():
+    """UNITS registers exactly the sixteen units setup-host.sh copies verbatim."""
     checker = _load_checker()
 
     assert set(checker.UNITS) == _EXPECTED_UNITS, (
@@ -954,7 +964,7 @@ def test_cli_undecodable_repo_unit_names_the_repo_side(tmp_path: pathlib.Path):
 def test_cli_drift_dominates_absence(tmp_path: pathlib.Path):
     """PRECEDENCE: one unit drifted + another absent => 1, not 2.
 
-    With nine units a single run can hit both at once. Returning 2 would let
+    With sixteen units a single run can hit both at once. Returning 2 would let
     an unrelated uninstalled unit MASK an actionable finding, because
     setup-host.sh treats 2 as a benign skip. The absent unit is still
     reported — dominated, not hidden.
@@ -1829,7 +1839,7 @@ def _installer_section() -> str:
 def _fake_repo(
     tmp_path: pathlib.Path, *, checker_body: str | None = None, with_checker: bool = True
 ) -> pathlib.Path:
-    """A tmp repo root holding the nine committed units (+ optionally the checker).
+    """A tmp repo root holding the sixteen committed units (+ optionally the checker).
 
     The unit files are copied from the real repo so the comparison under test is
     the real one; only the TREE is fake.
@@ -1967,6 +1977,50 @@ def test_installer_copies_the_units_when_the_gate_reports_parity(
     assert result.returncode == 0, result.stderr
     assert "SKIPPING" not in result.stdout, result.stdout
     assert "installed and enabled" in result.stdout, result.stdout
+
+
+def test_installer_installs_a_socket_unit_under_its_own_name_and_enables_it(
+    tmp_path: pathlib.Path,
+):
+    """A `.socket` unit installs from its `.template` source, named by itself.
+
+    The one property specific to sockets: `_orch_unit_source` reads FROM
+    `<unit>.socket.template` (the committed spelling, forced by the
+    lock-charter extension allowlist), but the installed copy must be named
+    `<unit>.socket` — the plain `cp ... "$UNIT_DIR/"` this section used before
+    would instead have installed a file literally named
+    `orchestrator-dark-factory.socket.template`, which systemd never loads.
+    """
+    repo = _fake_repo(tmp_path)
+    unit_dir = tmp_path / "installed"
+    _install_all_units(repo, unit_dir)
+    socket = unit_dir / "orchestrator-dark-factory.socket"
+    socket.unlink()
+
+    result = _run_installer_section(tmp_path, repo, unit_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert socket.is_file(), (
+        "orchestrator-dark-factory.socket was absent (install-eligible) but "
+        f"was not installed.\n{result.stdout}"
+    )
+    assert socket.read_text(encoding="utf-8") == (
+        repo / "scripts" / "orchestrator-dark-factory.socket.template"
+    ).read_text(encoding="utf-8"), (
+        "The installed socket's bytes do not match its committed .template "
+        "source."
+    )
+    assert not (unit_dir / "orchestrator-dark-factory.socket.template").exists(), (
+        "The installer wrote the socket under its SOURCE basename "
+        "(...socket.template) rather than its unit name "
+        "(...socket) — systemd never loads a unit installed under the "
+        "wrong name."
+    )
+    assert "orchestrator-dark-factory.socket" in enabled_units(tmp_path), (
+        "orchestrator-dark-factory.socket declares [Install] WantedBy="
+        "sockets.target but was not enabled.\n"
+        f"calls: {systemctl_calls(tmp_path)}"
+    )
 
 
 def test_installer_does_not_overwrite_units_the_gate_reported_drift_on(
@@ -2265,7 +2319,7 @@ def _verdict_stub(exit_code: int, verdicts: dict[str, str]) -> str:
     is what an older checker, a refactor that dropped the emit, or a registry
     that does not know a unit would each produce.
     """
-    lines = ["[orchestrator_unit_parity] stub report over 9 units"]
+    lines = ["[orchestrator_unit_parity] stub report over 16 units"]
     lines += [
         f"[orchestrator_unit_parity] verdict {unit} {kinds}"
         for unit, kinds in sorted(verdicts.items())

@@ -290,8 +290,8 @@ def test_guidance_placement_is_structural() -> None:
 def test_missing_required_parameter_shape_is_composed_into_the_splice_unit() -> None:
     """``TOOL_CALL_REJECTION_GUIDANCE`` carries BOTH composed halves.
 
-    Mirrors `test_combined_guidance_composes_both_rules`, which asserts BOTH
-    halves of its splice unit rather than only the newer one. An
+    Mirrors `test_combined_guidance_composes_every_rule`, which asserts EVERY
+    half of its splice unit rather than only the newer one. An
     earlier revision of this test pinned only the new half: a future prompt
     refactor could empty or drop `_TOOL_CALL_REJECTION_KNOWN_SHAPES` and
     every other test in this module would stay green —

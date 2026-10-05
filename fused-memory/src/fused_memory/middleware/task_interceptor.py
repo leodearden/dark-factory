@@ -32,6 +32,7 @@ except ImportError:
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
+from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
@@ -40,10 +41,17 @@ from fused_memory.backends.sqlite_task_backend import task_timestamp_now
 from fused_memory.backends.task_backend_errors import (
     DoneProvenanceWriteAuthorityError,
     DuplicateCandidateKeyError,
+    LeakedEnvelopeMarkupError,
     StatusWriteAuthorityError,
 )
 from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
+from fused_memory.config.schema import CuratorConfig
 from fused_memory.middleware import recon_write_policy
+from fused_memory.middleware.curator_zot_duplicate_sweep import (
+    CorpusSearcher,
+    build_duplicate_metadata,
+    sweep_zot_duplicate,
+)
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
     guarded_recon_task_write,
@@ -94,6 +102,7 @@ from fused_memory.models.reconciliation import (
 from fused_memory.models.scope import resolve_project_id
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
+    declared_gate_topic,
     evaluate_closure,
     handrolled_member_enumeration,
     resolve_unstamped_live_ids,
@@ -140,49 +149,35 @@ _METADATA_DISCARD_CODES = frozenset({'unparseable_json', 'not_an_object'})
 # which uses it to build the `declared` dict named in the log line.
 _GATE_MARKER_KEYS = ('execution_class', 'operational_mode', 'task_kind', 'always_escalates')
 
+# The metadata keys through which a filer DECLARES a deliverable, in the order
+# ``TaskInterceptor._extract_deliverable_signals_from_meta`` unions them.
+# ``TaskInterceptor._pure_consolidation_gate_topic`` reads the same keys for
+# mere presence, so the two cannot disagree about what counts as a declaration.
+# The retired ``metadata.modules`` is deliberately absent
+# (plans/metadata-modules-retirement-prd.md decision 6).
+_DELIVERABLE_SIGNAL_KEYS = ('files', 'files_to_modify')
+
 
 def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
-    """Best-effort parse of *metadata* into a raw dict.
+    """Resolve *metadata* by ``shared.task_metadata_wire.coerce_task_metadata``.
 
-    Returns ``(None, warnings)`` when *metadata* is non-None but cannot be
-    resolved to a JSON object at all — *warnings* then carries
-    ``shared.task_metadata.parse_metadata``'s diagnosis
-    (``direction='read'``). Returns ``(None, [])`` for ``None`` and for an
-    empty string (both benign-absent — mirrors the pre-collapse
-    ``isinstance(raw, str) and raw`` guard so a blank string is never a
-    discard), and ``(dict, [])`` for anything already resolvable to a dict.
+    Returns ``(dict, [])`` for absent metadata (a fresh ``{}``) and for
+    readable metadata, and ``(None, warnings)`` for present-but-unreadable
+    metadata. *warnings* then carries
+    ``shared.task_metadata.parse_metadata``'s diagnosis (``direction='read'``);
+    its ``unparseable_json`` / ``not_an_object`` codes cover every value
+    ``coerce_task_metadata`` rejects, so the list is never empty.
 
-    The returned dict — when not ``None`` — is always independently
-    re-derived from *metadata*, never ``parse_metadata(...).model_dump()``,
-    so unknown/curator-internal keys round-trip byte-for-value (I1) instead
-    of gaining ``TaskMetadata``'s typed-field defaults.
-
-    A string is parsed with a local ``json.loads`` first; ``parse_metadata``
-    is only invoked on the failure path to obtain its diagnosis. The two
-    discard codes this function surfaces (``unparseable_json`` /
-    ``not_an_object``) are fully determined by that same
-    loads-then-isinstance check, so a string that already parses to a dict
-    never pays for ``parse_metadata``'s ``apply_migrations`` /
-    submodel-validation / ``TaskMetadata`` construction — none of that
-    output is used here.
+    ``parse_metadata`` runs only on that failure path, for its diagnosis.
+    The returned dict is never ``parse_metadata(...).model_dump()``, so
+    unknown/curator-internal keys round-trip byte-for-value (I1) instead of
+    gaining ``TaskMetadata``'s typed-field defaults.
     """
-    if metadata is None:
-        return None, []
-    if isinstance(metadata, dict):
-        return metadata, []
-    if isinstance(metadata, str):
-        if not metadata:
-            return None, []
-        try:
-            parsed = json.loads(metadata)
-        except ValueError:
-            _, warnings = parse_metadata(metadata, direction='read')
-            return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-        if isinstance(parsed, dict):
-            return parsed, []
-        _, warnings = parse_metadata(metadata, direction='read')
-        return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-    return None, []
+    meta = coerce_task_metadata(metadata)
+    if meta is not None:
+        return meta, []
+    _, warnings = parse_metadata(metadata, direction='read')
+    return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
 
 
 def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
@@ -261,6 +256,10 @@ def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
 def _is_ticket_id(value: object) -> bool:
     """Return True when *value* looks like a two-phase ticket id (``tkt_…``)."""
     return isinstance(value, str) and value.startswith('tkt_')
+
+
+class TicketStoreNotConfiguredError(RuntimeError):
+    """Raised by a read that needs the ticket store when the interceptor has none."""
 
 
 def _looks_like_task_id(value: object) -> bool:
@@ -366,6 +365,15 @@ def _format_ticket_result(row: dict) -> dict:
     if row.get('reason') is not None:
         result['reason'] = row['reason']
     return result
+
+
+def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
+    """Degrade a curator failure that escaped ``curate()`` to create.
+
+    Keeps the ZOT marker, so the no-orchestrator path still gets swept and
+    stamped even though no escalation could be filed for it.
+    """
+    return CuratorDecision(action='create', degraded_by_zot=exc.zero_output_timeout)
 
 
 class TaskInterceptor:
@@ -1166,18 +1174,28 @@ class TaskInterceptor:
             # (stale-snapshot) is reachable only via update_task in
             # practice, even though check()'s gate 3 itself is op-agnostic.
             #
-            # check() is dispatched via asyncio.to_thread because gate 2
-            # (live workflow) calls is_workflow_live_for_task, which shells
-            # out to git synchronously (up to _GIT_TIMEOUT seconds per git
-            # call). This whole branch runs under _write_lock, so an inline
-            # call would both block the event loop and hold this project's
-            # write lock for however long git takes — stalling every other
-            # write to the project. to_thread keeps the lock's ordering
-            # guarantee (the awaiting coroutine still holds it across the
-            # call) while freeing the event loop to service other work
-            # meanwhile — the same pattern curator_escalator.py's
-            # _persist_state uses to offload a blocking write while holding
-            # _persist_lock.
+            # check() is a coroutine function and is awaited DIRECTLY (task
+            # 3778). It used to be dispatched via asyncio.to_thread, because
+            # gate 2 (live workflow) called is_workflow_live_for_task, which
+            # shelled out to git synchronously (up to _GIT_TIMEOUT seconds per
+            # git call); this whole branch runs under _write_lock, so an inline
+            # call would have both blocked the event loop and held this
+            # project's write lock for however long git took — stalling every
+            # other write to the project. That offload is now INTRINSIC rather
+            # than bolted on here: the detector's git probes await
+            # shared.git_async.run_git, and check() offloads its one remaining
+            # blocking call (the corroboration verdict's two on-disk reads) via
+            # its own asyncio.to_thread. The lock's ordering guarantee is
+            # unchanged — this coroutine still holds it across the await — and
+            # the event loop is free to service other work meanwhile.
+            #
+            # Wrapping a coroutine function in asyncio.to_thread would now be a
+            # BUG, not merely redundant: the worker thread would return an
+            # un-awaited coroutine object, `verdict.is_rejection` would raise
+            # AttributeError, and every gate would stop rejecting. The sibling
+            # call site in update_task (further down this module) was already
+            # inline and is likewise a plain await now, so the two are
+            # symmetric for the first time.
             #
             # task_metadata (task 3751) comes off the SAME `before` snapshot
             # as old_status, so the metadata and live_status the gate sees can
@@ -1208,10 +1226,9 @@ class TaskInterceptor:
             # fields live at the task's top level, not inside `metadata` — see
             # check()'s Gate 2 docstring. The corroboration assembly performs
             # two more blocking on-disk reads (scheduler_state.json and
-            # orchestrator.lock); they ride the asyncio.to_thread hop that
-            # already exists for gate 2's blocking git I/O rather than needing
-            # a second hop or re-blocking the event loop, which is why the
-            # verdict is computed inside check() rather than here. What it
+            # orchestrator.lock); check() owns their asyncio.to_thread offload
+            # (task 3778) rather than re-blocking the event loop, which is why
+            # the verdict is computed inside check() rather than here. What it
             # unlocks is the detector's in-progress corroboration gate (task
             # 2963): an in-progress task killed by a fleet redeploy, whose
             # lingering worktree registration and freshly re-acquired
@@ -1232,8 +1249,7 @@ class TaskInterceptor:
                 # boolean, matching the recon_write_policy.check(agent_id: str)
                 # signature below.
                 assert isinstance(agent_id, str)
-                verdict = await asyncio.to_thread(
-                    recon_write_policy.check,
+                verdict = await recon_write_policy.check(
                     'set_task_status',
                     task_id=task_id,
                     project_root=project_root,
@@ -1812,28 +1828,21 @@ class TaskInterceptor:
     def _parse_metadata(kwargs: dict[str, Any]) -> dict:
         """Parse and normalise ``kwargs['metadata']`` to a plain dict.
 
-        Accepts a pre-parsed dict, a JSON string, or missing / non-dict values.
-        Always returns a dict (empty on failure or missing input) so callers
-        can read keys without additional guarding.
+        Always returns a dict (empty for absent or unreadable input) so
+        callers such as :meth:`_extract_meta_files` and
+        :meth:`_build_candidate` can read keys without additional guarding.
 
-        Single source of truth for the get / json.loads / isinstance-dict
-        dance shared by :meth:`_extract_meta_files` and :meth:`_build_candidate`.
-
-        Delegates the malformed-string-policy to
-        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
-        and emits a ``task_metadata.schema_warning`` WARNING when a
-        non-empty string is a genuine whole-metadata discard (unparseable
-        JSON / non-object) — I4: this replaces a silent ``{}`` coercion.
+        The absent/readable/unreadable rule is
+        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
+        :func:`_parse_metadata_value`. Unreadable metadata emits a
+        ``task_metadata.schema_warning`` WARNING before collapsing to ``{}``
+        — I4: this replaces a silent ``{}`` coercion.
         """
-        meta = kwargs.get('metadata') or {}
-        if isinstance(meta, str):
-            parsed, warnings = _parse_metadata_value(meta)
-            if warnings:
-                _warn_metadata_discard('TaskInterceptor._parse_metadata', meta, warnings)
-            meta = parsed if parsed is not None else {}
-        if not isinstance(meta, dict):
-            meta = {}
-        return meta
+        metadata = kwargs.get('metadata')
+        parsed, warnings = _parse_metadata_value(metadata)
+        if warnings:
+            _warn_metadata_discard('TaskInterceptor._parse_metadata', metadata, warnings)
+        return parsed if parsed is not None else {}
 
     @staticmethod
     def _extract_meta_files_from_meta(meta: dict) -> list[str]:
@@ -1909,10 +1918,9 @@ class TaskInterceptor:
     def _extract_deliverable_signals_from_meta(meta: dict) -> list[str]:
         """Extract the UNION of declared deliverable signals from *meta*.
 
-        Reads ``files``, ``files_to_modify`` and ``modules`` in that order,
-        coercing a scalar string to a one-element list, ``str()``-coercing
-        each entry, dropping falsy ones, and deduplicating while preserving
-        first-occurrence order.
+        Reads ``files`` then ``files_to_modify``, coercing a scalar string to
+        a one-element list, ``str()``-coercing each entry, dropping falsy
+        ones, and deduplicating while preserving first-occurrence order.
 
         SEPARATE HELPER, NOT A WIDENING of
         :meth:`_extract_meta_files_from_meta` — deliberately (task 3106).
@@ -1920,32 +1928,32 @@ class TaskInterceptor:
         (:func:`check_files_for_scope`) and the cross-repo tagger
         (:func:`all_files_foreign_owner`), where its ``files``-over-
         ``files_to_modify`` PRECEDENCE is correct because those callers need
-        ONE authoritative declared file list, and where admitting ``modules``
-        would mean a foreign lock-key entry starts hard-REJECTING
-        submissions — a behaviour change well outside this task.
+        ONE authoritative declared file list.
 
         Attribution wants the widest view of what the filer declared, and
         this list feeds ONLY :meth:`_local_attesting_signals`, so it can
         never weaken a rejection.  :func:`local_attesting_signals` documents
-        how the extra keys are treated in BOTH directions — they can attest,
-        and a foreign one vetoes.
+        how the extra entries are treated in BOTH directions — they can
+        attest, and a foreign one vetoes.  The retired ``metadata.modules``
+        contributes nothing in either direction: it neither attests nor
+        vetoes.
         """
         out: list[str] = []
         seen: set[str] = set()
-        for key in ('files', 'files_to_modify', 'modules'):
+        for key in _DELIVERABLE_SIGNAL_KEYS:
             values = meta.get(key) or []
             if isinstance(values, str):
                 values = [values]
             if not isinstance(values, (list, tuple, set)):
-                # Malformed caller metadata (``modules: 5``, ``modules:
-                # {...}``).  ``metadata`` is still unvalidated kwargs at this
-                # seam and :func:`_parse_metadata` deliberately
-                # warns-and-continues rather than raising, so degrade the
-                # same way: an unusable value contributes NO signal (falling
-                # back to the unchanged advisory) instead of raising
-                # ``TypeError`` out of ``submit_task`` as an unstructured
-                # crash.  A dict is the quiet variant — iterating it would
-                # walk its KEYS and could silently attest.
+                # Malformed caller metadata (``files_to_modify: 5``,
+                # ``files_to_modify: {...}``).  ``metadata`` is still
+                # unvalidated kwargs at this seam and :func:`_parse_metadata`
+                # deliberately warns-and-continues rather than raising, so
+                # degrade the same way: an unusable value contributes NO
+                # signal (falling back to the unchanged advisory) instead of
+                # raising ``TypeError`` out of ``submit_task`` as an
+                # unstructured crash.  A dict is the quiet variant —
+                # iterating it would walk its KEYS and could silently attest.
                 logger.warning(
                     'task_metadata.schema_warning source=%s error=%s '
                     '(type=%s); deliverable-signal key discarded',
@@ -1963,21 +1971,6 @@ class TaskInterceptor:
                 seen.add(entry)
                 out.append(entry)
         return out
-
-    @staticmethod
-    def _extract_deliverable_signals(kwargs: dict[str, Any]) -> list[str]:
-        """Extract declared deliverable signals from add_task kwargs.
-
-        Thin wrapper around :meth:`_extract_deliverable_signals_from_meta`
-        that handles the ``kwargs → meta`` parsing step via
-        :meth:`_parse_metadata` — the SAME parsing path
-        :meth:`_extract_meta_files` uses, so JSON-string metadata is
-        normalised identically with no new parsing branch.  Only the
-        key-selection policy differs (union of three keys vs. precedence
-        over two); see that method's docstring for why.
-        """
-        meta = TaskInterceptor._parse_metadata(kwargs)
-        return TaskInterceptor._extract_deliverable_signals_from_meta(meta)
 
     @staticmethod
     def _build_candidate(kwargs: dict[str, Any]) -> CandidateTask | None:
@@ -2071,10 +2064,10 @@ class TaskInterceptor:
 
     def _local_attesting_signals(
         self,
-        kwargs: dict[str, Any],
+        meta: dict,
         project_id: str,
     ) -> list[str]:
-        """Return the declared deliverable signals that ATTEST *project_id*.
+        """Return the declared deliverable signals in *meta* that ATTEST *project_id*.
 
         Thin wrapper — registry guard here, all registry logic in the pure
         :func:`local_attesting_signals` (which documents the two conditions
@@ -2082,11 +2075,11 @@ class TaskInterceptor:
         :meth:`_all_files_foreign_owner`, and, like it, returns the WITNESS
         rather than a bare bool so the caller can name it in the log.
 
-        Reads ``kwargs`` directly rather than ``candidate.files_to_modify``:
+        Reads the parsed metadata rather than ``candidate.files_to_modify``:
         the candidate's list has already been narrowed by
         :meth:`_extract_meta_files_from_meta`'s ``files``-over-
-        ``files_to_modify`` precedence and carries no ``modules`` at all, so
-        it is the wrong signal for attribution, which wants the UNION (see
+        ``files_to_modify`` precedence, so it is the wrong signal for
+        attribution, which wants the UNION (see
         :meth:`_extract_deliverable_signals_from_meta`).
 
         Returns ``[]`` when no :attr:`_prefix_registry` is configured — with
@@ -2097,7 +2090,48 @@ class TaskInterceptor:
         if registry is None:
             return []
         return local_attesting_signals(
-            self._extract_deliverable_signals(kwargs), project_id, registry,
+            self._extract_deliverable_signals_from_meta(meta), project_id, registry,
+        )
+
+    @staticmethod
+    def _pure_consolidation_gate_topic(meta: dict) -> str | None:
+        """Return the declared topic iff *meta* describes a PURE consolidation gate.
+
+        A pure consolidation gate declares no deliverable, and its subject is
+        the filing project's own memory topic (the closure scroll is resolved
+        with this project's ``project_id``), so a foreign path in its prose is
+        quoted memory content.  Any declared deliverable leaves attribution to
+        :meth:`_local_attesting_signals`.  See
+        ``reconciliation/consolidation_gate.py::declared_gate_topic`` and
+        outcome (3) of :mod:`fused_memory.middleware.path_scope_guard`.
+
+        "Declares" means the key carries a value at all, malformed or not:
+        :meth:`_extract_deliverable_signals_from_meta` discards a
+        ``files_to_modify: 5`` as unusable, but the filer still claimed a
+        deliverable, so that gate is not pure and keeps the advisory.  The
+        retired ``metadata.modules`` is not a declaration, so a gate carrying
+        it stays pure.
+        """
+        if any(meta.get(key) for key in _DELIVERABLE_SIGNAL_KEYS):
+            return None
+        return declared_gate_topic(meta)
+
+    @staticmethod
+    def _log_prose_advisory_suppressed(
+        verdict: PathGuardVerdict, project_id: str, *, attested_by: list[str],
+    ) -> None:
+        """Emit the ONE structured INFO record for a suppressed prose advisory."""
+        logger.info(
+            'path-guard PROSE ADVISORY SUPPRESSED: the declared metadata '
+            'attributes the submission to the filing project, so the prose '
+            'citation is incidental — '
+            'no possible_scope_mismatch stamp and no escalation. '
+            'project_id=%s matched_paths=%s suggested_project=%s '
+            'attested_by=%s',
+            project_id,
+            list(verdict.matched_paths),
+            verdict.suggested_project,
+            attested_by,
         )
 
     def _path_guard_check(
@@ -2555,7 +2589,8 @@ class TaskInterceptor:
           or it isn't, so there is nothing to adjudicate.
         * Outcome (2), CROSS-REPO allow-and-tag — :meth:`_all_files_foreign_owner`.
         * Outcome (3), PROSE-ADVISORY — :meth:`_path_guard_check`, gated on
-          :meth:`_local_attesting_signals`.  The registry is always present
+          :meth:`_local_attesting_signals` and then on
+          :meth:`_pure_consolidation_gate_topic`.  The registry is always present
           (defaults to ``ProjectPrefixRegistry.default()``, task 2208), so
           the advisory is the ONLY prose path — the pre-task-2208
           hard-reject-on-prose back-compat branch has been retired.  On an
@@ -2717,18 +2752,18 @@ class TaskInterceptor:
         # triage. But it is never SILENT — the guard's most consequential
         # branch has to stay auditable by anyone asking why a task was not
         # flagged, so the record carries every fact the decision turned on.
-        attesting_signals = self._local_attesting_signals(kwargs, project_id)
+        meta = self._parse_metadata(kwargs)
+        attesting_signals = self._local_attesting_signals(meta, project_id)
         if attesting_signals:
-            logger.info(
-                'path-guard PROSE ADVISORY SUPPRESSED: declared deliverable '
-                'attests local work, so the prose citation is incidental — '
-                'no possible_scope_mismatch stamp and no escalation. '
-                'project_id=%s matched_paths=%s suggested_project=%s '
-                'attested_by=%s',
-                project_id,
-                list(verdict.matched_paths),
-                verdict.suggested_project,
-                attesting_signals,
+            self._log_prose_advisory_suppressed(
+                verdict, project_id, attested_by=attesting_signals,
+            )
+            return None
+        gate_topic = self._pure_consolidation_gate_topic(meta)
+        if gate_topic is not None:
+            self._log_prose_advisory_suppressed(
+                verdict, project_id,
+                attested_by=[f'{GATE_METADATA_KEY}.topic={gate_topic}'],
             )
             return None
 
@@ -2952,7 +2987,7 @@ class TaskInterceptor:
             # decision itself is unchanged either way. Re-checks the SAME
             # `target_metadata` the condition above consulted, deliberately.
             target_meta, _target_warnings = _parse_metadata_value(target_metadata)
-            if target_metadata and target_meta is None:
+            if target_meta is None:
                 target_reason = 'the target metadata could not be read (corrupt/unparseable)'
             else:
                 target_reason = 'the target does not declare a gate'
@@ -3033,6 +3068,19 @@ class TaskInterceptor:
                     priority=rt.priority,
                 )
             )
+        except LeakedEnvelopeMarkupError as exc:
+            logger.warning(
+                'task_curator: combine refused for target=%s: the rewrite carries '
+                'leaked tool-call markup in %r',
+                decision.target_id,
+                exc.column,
+                extra={
+                    'column': exc.column,
+                    'fragment': exc.fragment,
+                    'recovered': exc.recovered,
+                },
+            )
+            return None
         except Exception as exc:
             logger.warning(
                 'task_curator: combine update failed for target=%s: %s',
@@ -3083,18 +3131,40 @@ class TaskInterceptor:
 
     @staticmethod
     def _extract_metadata_dict(metadata) -> dict | None:
-        """Best-effort parse of ``metadata`` into a dict, or None.
+        """Resolve ``metadata`` to ``{}`` (absent: None / ``''``), a dict, or None.
 
-        Delegates the malformed-string policy to
-        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
-        and emits a ``task_metadata.schema_warning`` WARNING when a non-None
-        *metadata* cannot be resolved to a dict — I4: this replaces a silent
-        ``None`` coercion.
+        None means present-but-unreadable, and in that case the
+        ``task_metadata.schema_warning`` census WARNING has already been
+        emitted — I4: this replaces a silent ``None`` coercion. The rule is
+        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
+        :func:`_parse_metadata_value`.
         """
         parsed, warnings = _parse_metadata_value(metadata)
         if warnings:
             _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
         return parsed
+
+    @staticmethod
+    def _fresh_metadata_copy(metadata: Any, site: str) -> dict:
+        """Return a mutable dict resolved from *metadata* by :meth:`_extract_metadata_dict`.
+
+        Absent metadata gives a fresh ``{}``, and a readable dict is
+        shallow-copied, so the caller's dict is never mutated. Unreadable
+        metadata is DISCARDED for a fresh ``{}``. On top of the census line
+        :meth:`_extract_metadata_dict` already emitted, a second WARNING
+        prefixed with *site* is logged: two log lines for one failure, so the
+        discard can be grepped by caller.
+        """
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if meta is None:
+            logger.warning(
+                '%s: non-dict metadata discarded (type=%s); using fresh dict. Original value: %r',
+                site,
+                type(metadata).__name__,
+                metadata,
+            )
+            return {}
+        return dict(meta)
 
     @staticmethod
     def _is_gate_metadata(metadata: Any) -> bool:
@@ -3128,12 +3198,11 @@ class TaskInterceptor:
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
         """Return a metadata dict with ``routing_override_reason`` set to *reason*.
 
-        Builds on :meth:`_extract_metadata_dict` to normalise the incoming
-        shape (None / JSON-string / dict / unparseable → fresh dict when None
-        or unparseable) before writing the key, so the result is always a
-        plain dict ready for JSON serialisation.
+        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
+        shape (absent or unreadable → fresh dict) before writing the key, so
+        the result is always a plain dict ready for JSON serialisation.
 
-        **Data loss note**: when *metadata* is non-None but cannot be parsed
+        **Data loss note**: when *metadata* is present but cannot be parsed
         as a JSON-object (e.g. a bare list, an unparseable string), the
         original value is discarded and a fresh dict is used.  A WARNING is
         emitted in that case so the loss is visible in logs and greppable.
@@ -3141,18 +3210,7 @@ class TaskInterceptor:
         the ticket blob, so enabling an override would otherwise silently
         change behaviour for such inputs.
         """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            if metadata is not None:
-                logger.warning(
-                    'routing-override: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'routing-override')
         meta['routing_override_reason'] = reason
         return meta
 
@@ -3160,11 +3218,10 @@ class TaskInterceptor:
     def _inject_deterministic_pure_gate(metadata: Any) -> dict:
         """Return a metadata dict stamped as a deterministic PURE-GATE.
 
-        Builds on :meth:`_extract_metadata_dict` to normalise the incoming
-        shape (None / JSON-string / dict / unparseable → fresh dict when None
-        or unparseable) before writing the keys, so the result is always a
-        plain dict ready for JSON serialisation — mirrors
-        :meth:`_inject_routing_override`.
+        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
+        shape (absent or unreadable → fresh dict) before writing the keys, so
+        the result is always a plain dict ready for JSON serialisation —
+        mirrors :meth:`_inject_routing_override`.
 
         Unconditionally sets ``task_kind='deterministic'`` and
         ``always_escalates=True``, and DELETES any ``before_done`` key so the
@@ -3174,25 +3231,7 @@ class TaskInterceptor:
         ill-formed no-op. This holds regardless of what task_kind/before_done
         the recon LLM originally supplied in metadata.
         """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            if metadata is not None:
-                # NOTE: _extract_metadata_dict() already emitted a WARNING
-                # (via _warn_metadata_discard) when it failed to parse this
-                # non-None metadata. This second WARNING is intentional, not
-                # a duplicate bug — it names *this* call site
-                # (deterministic-pure-gate stamping) so the discard is
-                # greppable by caller, mirroring the identical double-log in
-                # _inject_routing_override above. Two log lines, one failure.
-                logger.warning(
-                    'deterministic-pure-gate: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'deterministic-pure-gate')
         meta['task_kind'] = 'deterministic'
         meta['always_escalates'] = True
         meta.pop('before_done', None)
@@ -3208,11 +3247,11 @@ class TaskInterceptor:
         """Attach a ``possible_scope_mismatch`` advisory marker to ``kwargs['metadata']``.
 
         Task 2206: the PROSE-ADVISORY counterpart to :meth:`_inject_routing_override`
-        — normalises the existing ``kwargs['metadata']`` (None / JSON-string /
-        dict / unparseable, via :meth:`_extract_metadata_dict`; malformed input
-        is discarded with a WARNING, same as the override path) into a plain
-        dict, sets ``possible_scope_mismatch``, and writes the result back into
-        ``kwargs['metadata']`` in place.
+        — normalises the existing ``kwargs['metadata']`` (via
+        :meth:`_fresh_metadata_copy`: absent or unreadable → fresh dict,
+        unreadable input discarded with a WARNING, same as the override path)
+        into a plain dict, sets ``possible_scope_mismatch``, and writes the
+        result back into ``kwargs['metadata']`` in place.
 
         Called from :meth:`_path_guard_or_skip`, which runs BEFORE
         ``submit_task`` pops ``kwargs['metadata']`` and serialises it into the
@@ -3234,19 +3273,9 @@ class TaskInterceptor:
         added — so a second marker key would be silently un-clearable there,
         and would force every consumer to read two keys where one suffices.
         """
-        metadata = kwargs.get('metadata')
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            if metadata is not None:
-                logger.warning(
-                    'scope-mismatch-advisory: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(
+            kwargs.get('metadata'), 'scope-mismatch-advisory'
+        )
         meta['possible_scope_mismatch'] = {
             'matched_paths': list(verdict.matched_paths),
             'suggested_project': verdict.suggested_project,
@@ -3263,9 +3292,9 @@ class TaskInterceptor:
         the task's own branch is legitimately empty because the deliverable
         lands on *owner*'s branch, so this is NOT a scope error.  Mirrors
         :meth:`_attach_possible_scope_mismatch`'s in-place metadata
-        normalisation (None / JSON-string / dict / unparseable via
-        :meth:`_extract_metadata_dict`; malformed input discarded with a
-        WARNING) and, like it, runs inside :meth:`_path_guard_or_skip` BEFORE
+        normalisation (via :meth:`_fresh_metadata_copy`: absent or unreadable
+        → fresh dict, unreadable input discarded with a WARNING) and, like
+        it, runs inside :meth:`_path_guard_or_skip` BEFORE
         ``submit_task`` serialises ``kwargs['metadata']`` into the ticket blob,
         so the in-place write carries the marker with no new plumbing.
 
@@ -3274,19 +3303,7 @@ class TaskInterceptor:
         ``OutcomeKind.plan_files_cross_repo`` instead of flagging 'files not
         touched'.
         """
-        metadata = kwargs.get('metadata')
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            if metadata is not None:
-                logger.warning(
-                    'cross-repo-marker: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(kwargs.get('metadata'), 'cross-repo-marker')
         meta['cross_repo'] = True
         meta['cross_repo_project'] = owner
         kwargs['metadata'] = meta
@@ -3788,17 +3805,16 @@ class TaskInterceptor:
         a dark_factory ticket) be adjudicated without knowing the writer's
         project.
 
-        Returns None — never raises — when no ticket store is configured, so
-        the ingestion path can map that onto "unresolvable" and tag the episode
-        instead of failing the write.
+        None means only "the registry has no such ticket". A missing store
+        raises :class:`TicketStoreNotConfiguredError` instead, so a caller
+        cannot mistake misconfiguration for absence; the gate would otherwise
+        report every ``tkt_`` claim as a fabricated ticket.
         """
         if self._ticket_store is None:
-            logger.warning(
-                'get_ticket_row: ticket_store not configured; '
-                'existence of ticket %s is unresolvable',
-                ticket_id,
+            raise TicketStoreNotConfiguredError(
+                f'ticket_store not configured; existence of ticket {ticket_id} '
+                f'cannot be read',
             )
-            return None
         return await self._ticket_store.get(ticket_id)
 
     async def cancel_ticket(self, ticket_id: str) -> dict:
@@ -4398,7 +4414,103 @@ class TaskInterceptor:
                         {'stage': 'record_task', 'error': str(exc)}
                     )
 
+        if (
+            decision is not None and decision.degraded_by_zot
+            and curator is not None and candidate is not None
+        ):
+            # After the write lock: the task is latched, and the sweep's embed,
+            # corpus query and escalation I/O must not stall every other write.
+            assert task_id is not None and result_dict is not None
+            await self._flag_zot_duplicate(
+                tm=tm,
+                project_root=project_root,
+                project_id=project_id,
+                task_id=task_id,
+                candidate=candidate,
+                decision=decision,
+                curator=curator,
+                result_dict=result_dict,
+            )
+
         return (status, task_id, reason, result_dict, curator_degrade_reason)
+
+    async def _flag_zot_duplicate(
+        self,
+        *,
+        tm: Any,
+        project_root: str,
+        project_id: str,
+        task_id: str,
+        candidate: CandidateTask,
+        decision: CuratorDecision,
+        curator: CorpusSearcher,
+        result_dict: dict,
+    ) -> None:
+        """Flag a near-duplicate of a create whose curator dedupe a ZOT hang skipped.
+
+        Advisory and best-effort: the task already exists, so a failure here is
+        a ``post_create_warnings`` entry and never changes the ticket status.
+        Runs outside the write lock; only the stamp itself takes it.
+        """
+        curator_cfg = self._config.curator if self._config is not None else CuratorConfig()
+        if not curator_cfg.zot_duplicate_sweep_enabled:
+            return
+        finding = await sweep_zot_duplicate(
+            curator,
+            project_id=project_id,
+            task_id=task_id,
+            title=candidate.title,
+            description=candidate.description,
+            files_to_modify=candidate.files_to_modify,
+            read_statuses=lambda ids: tm.get_statuses(project_root, ids=ids),
+            threshold=curator_cfg.zot_duplicate_score_threshold,
+            limit=curator_cfg.zot_duplicate_search_limit,
+        )
+        if finding is None:
+            return
+        logger.info(
+            'zot duplicate sweep: task %s ~ task %s (score %.3f, zot escalation %s)',
+            finding.task_id, finding.duplicate_task_id, finding.score,
+            decision.zot_escalation_id,
+        )
+        stamped = False
+        try:
+            async with self._write_lock(project_id):
+                await tm.update_task(
+                    task_id=task_id,
+                    metadata=json.dumps(build_duplicate_metadata(
+                        finding, zot_escalation_id=decision.zot_escalation_id,
+                    )),
+                    metadata_mode='merge',
+                    project_root=project_root,
+                )
+            stamped = True
+        except Exception as exc:
+            logger.warning(
+                '_flag_zot_duplicate: stamping %s failed', task_id, exc_info=True,
+            )
+            result_dict.setdefault('post_create_warnings', []).append(
+                {'stage': 'zot_duplicate_stamp', 'error': str(exc)}
+            )
+        if self._escalator is None:
+            return
+        try:
+            await self._escalator.report_zot_duplicate(
+                project_root=project_root,
+                project_id=project_id,
+                finding=finding,
+                candidate_title=candidate.title,
+                zot_escalation_id=decision.zot_escalation_id,
+                stamped=stamped,
+            )
+        except Exception as exc:
+            logger.warning(
+                '_flag_zot_duplicate: escalating duplicate of %s failed', task_id,
+                exc_info=True,
+            )
+            result_dict.setdefault('post_create_warnings', []).append(
+                {'stage': 'zot_duplicate_escalation', 'error': str(exc)}
+            )
 
     async def _persist_worker_terminal(
         self,
@@ -4566,7 +4678,7 @@ class TaskInterceptor:
                         # transient LLM failures.  Record the failure so the facade
                         # and callers can see it in result_json.
                         curator_degrade_reason = str(exc)
-                        decision = CuratorDecision(action='create')
+                        decision = _create_after_curator_failure(exc)
 
                 status, task_id, reason, result_dict, _ = await self._dispatch_ticket_decision(
                     ticket_id=ticket_id,
@@ -4894,7 +5006,7 @@ class TaskInterceptor:
                                 project_root,
                             )
                         except CuratorFailureError as e:
-                            rec.decision = CuratorDecision(action='create')
+                            rec.decision = _create_after_curator_failure(e)
                             rec.degrade_reason = str(e)
                     # Refer to exc to satisfy linters; main signal logged above.
                     _ = exc
@@ -4927,7 +5039,7 @@ class TaskInterceptor:
                             project_root,
                         )
                     except CuratorFailureError as exc:
-                        rec.decision = CuratorDecision(action='create')
+                        rec.decision = _create_after_curator_failure(exc)
                         rec.degrade_reason = str(exc)
 
             # ── Topologically-ordered dispatch ────────────────────────────────
@@ -5107,8 +5219,11 @@ class TaskInterceptor:
         Gates (run in order; each returns early with a structured error dict on rejection):
 
         1. The SqliteTaskBackend write-authority floor (task C1) — unconditionally
-           rejects non-None ``status`` and ``metadata.done_provenance`` writes by
-           raising :class:`~fused_memory.backends.task_backend_errors.StatusWriteAuthorityError`
+           rejects a non-None ``status``, and rejects any add, change or removal of
+           ``metadata.done_provenance``: unconditionally in merge/additive/default
+           mode, and under ``metadata_mode='replace'`` unless the payload carries
+           the stored value verbatim (checked in-transaction). It raises
+           :class:`~fused_memory.backends.task_backend_errors.StatusWriteAuthorityError`
            / :class:`~fused_memory.backends.task_backend_errors.DoneProvenanceWriteAuthorityError`;
            caught below and converted via ``.to_error_dict()`` into the canonical
            ``{'success': False, 'error': 'status_via_update_task' | 'done_provenance_via_update_task',
@@ -5169,7 +5284,16 @@ class TaskInterceptor:
                 # signature below.
                 assert isinstance(agent_id, str)
                 before = await tm.get_task(task_id, project_root)
-                verdict = recon_write_policy.check(
+                # Awaited, not inline (task 3778): check() is a coroutine
+                # function now, so an un-awaited call would evaluate
+                # `.is_rejection` on a coroutine object — never a rejection —
+                # and silently disable Gates 1 and 3 on this path. This was
+                # also the latent sibling of _apply_status_transition's
+                # to_thread hop: gate 2 fires only for op == 'set_task_status',
+                # so this call site never paid for the blocking git I/O, but
+                # any widening of that scope would have put it on the event
+                # loop under _write_lock. Both call sites are plain awaits now.
+                verdict = await recon_write_policy.check(
                     'update_task',
                     task_id=task_id,
                     project_root=project_root,
@@ -5234,8 +5358,10 @@ class TaskInterceptor:
                 else:
                     result = dict(await _do_update_task_write())
             except (StatusWriteAuthorityError, DoneProvenanceWriteAuthorityError) as e:
-                # SqliteTaskBackend write-authority floor (task C1): status /
-                # metadata.done_provenance writes are unconditionally rejected.
+                # SqliteTaskBackend write-authority floor (task C1): a status
+                # write is always rejected, and so is any add, change or
+                # removal of metadata.done_provenance (under replace, anything
+                # but a verbatim passthrough of the stored value).
                 # _journal_around already logged the failing backend_op row and
                 # re-raised; convert to the canonical rejection dict here so
                 # this surface's long-standing contract — return a dict, never

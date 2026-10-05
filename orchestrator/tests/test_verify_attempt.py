@@ -75,7 +75,7 @@ class TestCheckRun:
         d = run.to_dict()
         assert set(d) == {
             'label', 'cmd', 'rc', 'output', 'timed_out', 'started_at', 'duration_secs',
-            'segments', 'load',
+            'segments', 'load', 'slot_wait_secs',
         }
 
     def test_to_dict_started_at_passthrough_when_not_none(self):
@@ -116,6 +116,7 @@ class TestCheckRun:
             'duration_secs': 3.25,
             'segments': None,
             'load': None,
+            'slot_wait_secs': None,
         }
 
 

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
+from shared.task_metadata_wire import coerce_task_metadata
 
 from orchestrator.config import (
     TIER_BASE,
@@ -24,6 +25,7 @@ from orchestrator.evals.runner import _StubMcpSession
 from orchestrator.event_store import EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.scheduler import (
+    BlastRadiusResult,
     ExternalResolverError,
     ModuleLockTable,
     Scheduler,
@@ -584,7 +586,9 @@ class TestNormalizeTaskMetadataLoudness:
         )
         assert task['metadata'] == {'foo': 1}
 
-    @pytest.mark.parametrize('task', [{'id': '3', 'metadata': None}, {'id': '4'}])
+    @pytest.mark.parametrize(
+        'task', [{'id': '3', 'metadata': None}, {'id': '4'}, {'id': '6', 'metadata': ''}]
+    )
     def test_absent_or_none_metadata_is_silent(self, task, caplog):
         """Most tasks carry no metadata — warning here would be pure noise."""
         caplog.set_level(logging.WARNING, logger=self.LOGGER)
@@ -608,6 +612,27 @@ class TestNormalizeTaskMetadataLoudness:
         assert len(message) < 1000, (
             f'the discarded repr must be truncated; got a {len(message)}-char message'
         )
+
+    @pytest.mark.parametrize(
+        'raw',
+        [None, '', '{"a": 1}', '{not json', '[1,2]', '"x"', '   ', [1], 42, False, {'a': 1}],
+    )
+    def test_collapse_matches_shared_wire_rule(self, raw, caplog):
+        """The wire-boundary collapse is the shared rule's, with unreadable -> {} made loud."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '77', 'metadata': raw}
+        expected = coerce_task_metadata(raw)
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert task['metadata'] == (expected if expected is not None else {})
+        warnings = self._warnings(caplog)
+        assert bool(warnings) == (expected is None), (
+            f'metadata={raw!r}: must warn exactly when the shared rule says unreadable; '
+            f'got {warnings!r}'
+        )
+        if warnings:
+            assert '77' in ' '.join(warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -2062,6 +2087,32 @@ class TestUpdateTaskStructuredRejection:
 
         ok = await scheduler.update_task('1', {'files': ['backend/src/main.py']})
         assert ok is True, 'update_task must return True on a success envelope'
+
+    @pytest.mark.asyncio
+    async def test_update_task_returns_false_and_logs_on_is_error_envelope(
+        self, scheduler: Scheduler, monkeypatch, caplog
+    ):
+        """A tool that reports its own failure through isError must not read as success."""
+        wire_envelope = {
+            'result': {
+                'isError': True,
+                'content': [{'type': 'text', 'text': 'Error: backend refused'}],
+            }
+        }
+
+        async def mock_mcp_call(url, method, payload, **kwargs):
+            return wire_envelope
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mock_mcp_call)
+
+        with caplog.at_level(logging.ERROR, logger='orchestrator.scheduler'):
+            ok = await scheduler.update_task('1', {'files': ['x.py']})
+
+        assert ok is False
+        assert any(
+            r.levelno == logging.ERROR and 'backend refused' in r.getMessage()
+            for r in caplog.records
+        )
 
 
 class TestRequeueCooldown:
@@ -4735,7 +4786,7 @@ class TestBlastRadiusRefinement:
             current=['crates/reify-compiler/src/lib.rs'],
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
-        assert ok is True
+        assert ok == BlastRadiusResult(applied=True)
         # lib.rs is free for another task
         assert lt.try_acquire('2035', ['crates/reify-compiler/src/lib.rs'])
         # 936 now holds conformance.rs, not lib.rs
@@ -4773,7 +4824,7 @@ class TestBlastRadiusRefinement:
                 'crates/reify-compiler/tests/trait_conformance_tests.rs',
             ],
         )
-        assert ok is True
+        assert ok.applied is True
         held = lt._held['936']
         assert held == {
             'crates/reify-compiler/src/conformance.rs',
@@ -4800,7 +4851,7 @@ class TestBlastRadiusRefinement:
             current=['a/lib.rs'],
             needed=['a/lib.rs', 'a/other.rs'],
         )
-        assert ok is True
+        assert ok.applied is True
         assert lt._held['T'] == {'a/lib.rs', 'a/other.rs'}
         event_store = scheduler.event_store
         assert event_store is not None
@@ -4820,7 +4871,7 @@ class TestBlastRadiusRefinement:
             current=['a/lib.rs', 'a/other.rs'],
             needed=['a/other.rs', 'a/lib.rs'],  # order differs, set equal
         )
-        assert ok is True
+        assert ok.applied is True
         assert lt._held['T'] == {'a/lib.rs', 'a/other.rs'}
         event_store = scheduler.event_store
         assert event_store is not None
@@ -4846,7 +4897,7 @@ class TestBlastRadiusRefinement:
             current=['crates/reify-compiler/src/lib.rs'],
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
-        assert ok is False
+        assert ok.applied is False
         # Full release ran: 936 should no longer hold anything
         assert '936' not in lt._held
 
@@ -4879,7 +4930,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is False
+        assert ok.applied is False
         assert update_task.await_args is not None
         persisted = update_task.await_args.args[1]
         assert persisted == {
@@ -4915,7 +4966,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         assert update_task.await_args is not None, (
             'update_task must be called to make the narrowed set durable'
         )
@@ -4958,7 +5009,7 @@ class TestBlastRadiusRefinement:
             needed=['a/lib.rs', 'a/other.rs'],  # pure widen: additional=[other], stale=[]
         )
 
-        assert ok is True
+        assert ok.applied is True
         assert update_task.await_args is not None, (
             'a pure widen must persist metadata.files so plan.files does not '
             'become a durable strict-superset of metadata.files'
@@ -5001,7 +5052,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         event_store = scheduler.event_store
         assert event_store is not None
         set_to_plan_events = [
@@ -5041,7 +5092,7 @@ class TestBlastRadiusRefinement:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         # In-memory narrowing applied: lib.rs released, conformance.rs held
         assert lt.try_acquire('2035', ['crates/reify-compiler/src/lib.rs'])
         assert not lt.try_acquire('9999', ['crates/reify-compiler/src/conformance.rs'])
@@ -5081,7 +5132,7 @@ class TestBlastRadiusRefinement:
             needed=['a/lib.rs', 'a/other.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         event_store = scheduler.event_store
         assert event_store is not None
         set_to_plan_events = [
@@ -5142,7 +5193,7 @@ class TestBlastRadiusRefinement:
             persist_files=[deep],  # NEW parameter: supply file-level paths
         )
 
-        assert ok is True
+        assert ok.applied is True
         assert update_task.await_args is not None, (
             'update_task must be called for the narrowing persist'
         )
@@ -5236,7 +5287,7 @@ class TestBlastRadiusRequeueEmitsRelease:
         scheduler.set_task_status = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
     @staticmethod
-    async def _requeue(scheduler: Scheduler) -> bool:
+    async def _requeue(scheduler: Scheduler) -> BlastRadiusResult:
         return await scheduler.handle_blast_radius_expansion(
             '936',
             current=[TestBlastRadiusRequeueEmitsRelease.HELD],
@@ -5266,9 +5317,12 @@ class TestBlastRadiusRequeueEmitsRelease:
         depth = scheduler.config.lock_depth
         expected = [normalize_lock(self.HELD, depth)]
 
-        ok = await self._requeue(scheduler)
+        result = await self._requeue(scheduler)
 
-        assert ok is False
+        assert result == BlastRadiusResult(applied=False), (
+            'a healthy conflict requeue re-pends the row, so it carries no '
+            f're-pend error; got {result!r}'
+        )
         released = self._lock_released_events(scheduler)
         assert len(released) == 1, (
             'the blast-radius requeue must emit exactly one lock_released '
@@ -5298,7 +5352,7 @@ class TestBlastRadiusRequeueEmitsRelease:
         expected = [normalize_lock(self.HELD, depth)]
 
         ok = await self._requeue(scheduler)
-        assert ok is False
+        assert ok.applied is False
 
         # The teardown release the workflow runs when the slot exits.
         scheduler.release('936')
@@ -5332,15 +5386,21 @@ class TestBlastRadiusRequeueEmitsRelease:
         silently free locks under a running task.
         """
         self._arrange_contention(scheduler)
+        dead = RuntimeError('backend unreachable')
         scheduler.set_task_status = AsyncMock(  # type: ignore[method-assign]
-            side_effect=RuntimeError('backend unreachable')
+            side_effect=dead
         )
         scheduler._dispatched.add('936')
         scheduler._dispatched_priority['936'] = 'medium'
 
-        ok = await self._requeue(scheduler)
+        result = await self._requeue(scheduler)
 
-        assert ok is False
+        assert result.applied is False
+        assert result.repend_error is dead, (
+            'the dead pending write must come back as the exact error, so the '
+            'workflow can report it to its run()-exit write-failure ledger; '
+            f'got {result!r}'
+        )
         # Non-vacuity: the branch under test is only reached if the status
         # write was actually attempted (and raised) — without this the
         # still-held / still-dispatched assertions below would also pass if
@@ -5397,7 +5457,7 @@ class TestBlastRadiusRequeueEmitsRelease:
 
         ok = await self._requeue(scheduler)
 
-        assert ok is False
+        assert ok.applied is False
         assert 'status' in order, f'set_task_status was never awaited; got {order}'
         assert 'release' in order, (
             f'no lock_released was emitted during the requeue; got {order}'
@@ -5430,7 +5490,7 @@ class TestBlastRadiusRequeueEmitsRelease:
 
         ok = await self._requeue(scheduler)
 
-        assert ok is False
+        assert ok.applied is False
         assert '936' not in scheduler._dispatched, (
             'the requeue must clear the dispatch guard, else _eligible_for_'
             'dispatch refuses the task forever'
@@ -5443,6 +5503,15 @@ class TestBlastRadiusRequeueEmitsRelease:
             're-dispatch straight back into the same contention; got '
             f'{scheduler._requeue_until.get("936")!r}'
         )
+
+
+class TestBlastRadiusResult:
+    @staticmethod
+    def test_applied_refinement_cannot_carry_a_repend_error():
+        """An applied refinement writes no pending row, so a re-pend error
+        alongside it is an impossible shape the type refuses."""
+        with pytest.raises(ValueError):
+            BlastRadiusResult(applied=True, repend_error=RuntimeError('x'))
 
 
 class TestBlastRadiusModuleCacheSeam:
@@ -5499,7 +5568,7 @@ class TestBlastRadiusModuleCacheSeam:
             needed=needed,
         )
 
-        assert ok is False
+        assert ok.applied is False
         assert calls == [('936', expected)], (
             f'Expected exactly one _write_module_cache(936, {expected}) call; '
             f'got {calls}'
@@ -5533,7 +5602,7 @@ class TestBlastRadiusModuleCacheSeam:
             persist_files=['pkg/dir', 'pkg/mod/real.py'],
         )
 
-        assert ok is False
+        assert ok.applied is False
         assert update_task.await_args is not None
         persisted = update_task.await_args.args[1]
         assert persisted == {'files': ['pkg/mod/real.py']}, (
@@ -5582,7 +5651,7 @@ class TestBlastRadiusModuleCacheSeam:
             needed=['crates/reify-compiler/src/conformance.rs'],
         )
 
-        assert ok is True
+        assert ok.applied is True
         expected = ['crates/reify-compiler/src/conformance.rs']
         assert ('936', expected) in calls, (
             f'Expected _write_module_cache(936, {expected}) call on the '
@@ -8422,7 +8491,9 @@ class TestParkStopTrip:
         """Once paused, additional blocked transitions must not fire the callback again."""
         config = OrchestratorConfig(
             max_per_module=1,
+            park_stop_enabled=True,  # pinned: the yaml must not disarm the control
             park_stop_parked_threshold=3,
+            park_stop_parked_window_hours=1.0,
         )
         scheduler = Scheduler(config)
         scheduler.finish_startup()
@@ -8441,9 +8512,20 @@ class TestParkStopTrip:
         await scheduler.set_task_status('2', 'blocked')
         scheduler.pause('manual')  # already paused; trip check should be suppressed
         await scheduler.set_task_status('3', 'blocked')
+        await asyncio.sleep(0)
 
         assert callback_count[0] == 0, (
             f'Callback must not fire while already paused; fired {callback_count[0]} time(s)'
+        )
+
+        scheduler.resume()
+        for task_id in ('4', '5', '6'):
+            await scheduler.set_task_status(task_id, 'blocked')
+        await asyncio.sleep(0)
+
+        assert callback_count[0] == 1, (
+            f'control: once resumed, three fresh transitions must trip, else the '
+            f'zero above proves nothing; fired {callback_count[0]} time(s)'
         )
 
     @pytest.mark.asyncio
@@ -8451,7 +8533,9 @@ class TestParkStopTrip:
         """Below-threshold transitions must never invoke the callback."""
         config = OrchestratorConfig(
             max_per_module=1,
+            park_stop_enabled=True,  # pinned: the yaml must not disarm the control
             park_stop_parked_threshold=5,
+            park_stop_parked_window_hours=1.0,
         )
         scheduler = Scheduler(config)
         scheduler.finish_startup()
@@ -8467,9 +8551,18 @@ class TestParkStopTrip:
 
         for i in range(4):
             await scheduler.set_task_status(str(i), 'blocked')
+        await asyncio.sleep(0)
 
         assert callback_count[0] == 0, (
             f'Expected 0 callback invocations (only 4 of 5 threshold); got {callback_count[0]}'
+        )
+
+        await scheduler.set_task_status('4', 'blocked')
+        await asyncio.sleep(0)
+
+        assert callback_count[0] == 1, (
+            f'control: the 5th transition must trip, else the zero above proves '
+            f'nothing; fired {callback_count[0]} time(s)'
         )
 
 
@@ -8607,6 +8700,7 @@ class TestParkStopDisabled:
         await scheduler.set_task_status('1', 'blocked')
         await scheduler.set_task_status('2', 'blocked')
         await scheduler.set_task_status('3', 'blocked')
+        await asyncio.sleep(0)
 
         # Transitions are recorded even when disabled.
         assert len(scheduler._blocked_transitions) == 3, (

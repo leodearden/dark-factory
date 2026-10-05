@@ -1,10 +1,15 @@
 /* Overview tab — command-center grid */
 const { Sparkline, LineChart, StatTile, PALETTE: P } = window.DF_CHARTS;
-const { Glyph, LiveFeed } = window.DF_SHELL;
+const { Glyph, LiveFeed, DatumReading } = window.DF_SHELL;
 const D = window.DF_DATA;
-// The Datum wrappers. Module scope, no fallback — see the CANONICAL note in
-// datum.js's header.
-const { plainDatum, derivedDatum } = window.DF_DATUM;
+// The census readers and the Datum wrappers. Module scope, no fallback — see
+// the CANONICAL note in datum.js's header.
+const {
+  projectCensus, censusOver, censusSegments, censusHistory, censusTotal, terminalOfTotal, viewShareText,
+  CENSUS_VIEWS: TASK_CENSUS_VIEWS, CENSUS_TILES: TASK_CENSUS_TILES,
+} = window.DF_TASK_SNAPSHOT;
+const { plainDatum } = window.DF_DATUM;
+const { writeQueue, queueCountsText, queueHealth, newestHourOps, opsTotals, opsCaption } = window.DF_MEMORY_READINGS;
 const { useState, useEffect } = React;
 
 // Which endpoint each tile's number arrived on — plainDatum's provenance is
@@ -13,7 +18,6 @@ const { useState, useEffect } = React;
 // per polled endpoint by its URL with the query stripped).
 const EP_OVERVIEW = Object.freeze({
   orchestrators: '/api/v2/dashboard/orchestrators',
-  memoryGraphs:  '/api/v2/dashboard/memory-graphs',
   costs:         '/api/v2/dashboard/costs',
 });
 
@@ -193,21 +197,10 @@ function OverviewTab({ paused }) {
 
   // Compute live numbers
   const orchRunning = D.ORCHESTRATORS.filter(o => o.running).length;
-  const tasksTotal = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.total, 0);
-  const tasksDone = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.done, 0);
-  const tasksInP = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.in_progress, 0);
-  const tasksBlocked = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.blocked, 0);
-  const tasksPending = D.ORCHESTRATORS.reduce((s, o) => s + o.summary.pending, 0);
+  const fleetCensus = censusOver(D, null);
+  const runningTile = TASK_CENSUS_TILES.find(t => t.key === 'running');
   const memTotal = Object.values(D.MEMORY_STATUS.projects).reduce((s, p) => s + p.graphiti_nodes + p.mem0_memories, 0);
-  const queue = D.MEMORY_STATUS.queue.counts;
-  const queueDepth = queue.pending + queue.retry + queue.dead;
-
-  // Combined memory throughput sparkline: per-hour read+write counts (last 24h).
-  const memOpsSpark = D.MEMORY_TIMESERIES.reads.map(
-    (r, i) => r + (D.MEMORY_TIMESERIES.writes[i] || 0),
-  );
-  // ops/min in the most recent hour bucket.
-  const opsLast = memOpsSpark.length ? memOpsSpark[memOpsSpark.length - 1] : null;
+  const queue = writeQueue(D);
   // Real recon-latency sparkline: most-recent N run durations, oldest first.
   const reconRuns = D.RECON_STATE.runs || [];
   const reconLatencySpark = reconRuns
@@ -215,6 +208,7 @@ function OverviewTab({ paused }) {
     .slice(0, 40)
     .map(r => r.duration_seconds)
     .reverse();
+
   const costSpark = (D.COSTS.trend.values || []).slice(-30);
   const deltaPct = D.COSTS.summary?.delta_pct;
 
@@ -225,10 +219,10 @@ function OverviewTab({ paused }) {
       <div className="col-span-12 grid cols-4">
         <StatTile label="Orchestrators running" datum={plainDatum(orchRunning, EP_OVERVIEW.orchestrators)} unit={`/ ${D.ORCHESTRATORS.length}`}
           history={(D.ORCHESTRATORS_SPARK?.values || []).slice(-30)} sparkColor={P.accent} hint="live" />
-        <StatTile label="Active tasks" datum={plainDatum(tasksInP + tasksBlocked, EP_OVERVIEW.orchestrators)} unit={`/ ${tasksTotal}`}
-          history={D.BURNDOWN.in_progress} sparkColor={P.accent} hint={`${tasksDone} done`} />
-        <StatTile label="Memory ops / min" datum={derivedDatum(opsLast, EP_OVERVIEW.memoryGraphs, 'no ops recorded in this window')} format={ops => (ops / 60).toFixed(1)} unit="ops"
-          history={memOpsSpark} sparkColor={P.ok} hint="last 24h hourly" />
+        <StatTile label={runningTile.label} datum={fleetCensus} format={runningTile.reading}
+          history={censusHistory(D, null, runningTile)} sparkColor={P[runningTile.tone]} />
+        <StatTile label="Memory ops / min" datum={newestHourOps(D)} format={ops => (ops / 60).toFixed(1)} unit="ops"
+          history={D.MEMORY_OPS.total} sparkColor={P.ok} hint="last 24h hourly" />
         <StatTile label="Spend (today)" datum={plainDatum(D.COSTS.summary?.today, EP_OVERVIEW.costs)} format={spend => `$${spend.toFixed(2)}`}
           delta={deltaPct != null ? `${deltaPct}%` : null}
           deltaDir={deltaPct != null ? (deltaPct < 0 ? 'down' : 'up') : null}
@@ -241,7 +235,7 @@ function OverviewTab({ paused }) {
         <div className="panel-head">
           <span className="title">Activity timeline</span>
           <span style={{ color: 'var(--fg-3)' }}>· last 24h · 1h buckets</span>
-          <span className="meta">{Math.round(D.MEMORY_TIMESERIES.reads.reduce((a,b)=>a+b,0))} reads · {Math.round(D.MEMORY_TIMESERIES.writes.reduce((a,b)=>a+b,0))} writes</span>
+          <span className="meta"><DatumReading datum={opsTotals(D)} format={opsCaption} /></span>
         </div>
         <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div style={{ display: 'flex', gap: 16, fontSize: 11, color: 'var(--fg-2)' }}>
@@ -250,10 +244,10 @@ function OverviewTab({ paused }) {
           </div>
           <div style={{ flex: 1, minHeight: 200 }}>
             <LineChart
-              labels={D.MEMORY_TIMESERIES.labels}
+              labels={D.MEMORY_OPS.labels}
               series={[
-                { values: D.MEMORY_TIMESERIES.reads,  color: P.accent },
-                { values: D.MEMORY_TIMESERIES.writes, color: P.ok, fill: false },
+                { values: D.MEMORY_OPS.reads,  color: P.accent },
+                { values: D.MEMORY_OPS.writes, color: P.ok, fill: false },
               ]}
               height={210}
               formatY={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : Math.round(v)}
@@ -266,26 +260,20 @@ function OverviewTab({ paused }) {
       <div className="col-span-4 panel">
         <div className="panel-head">
           <span className="title">Task pipeline</span>
-          <span className="meta">{tasksTotal} total</span>
+          <span className="meta"><DatumReading datum={fleetCensus} format={censusTotal} /></span>
         </div>
         <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           <div className="stack-bar" style={{ height: 18, borderRadius: 4 }}>
-            <span style={{ width: `${tasksDone/tasksTotal*100}%`, background: P.ok }} title={`done ${tasksDone}`} />
-            <span style={{ width: `${tasksInP/tasksTotal*100}%`, background: P.accent }} title={`in-progress ${tasksInP}`} />
-            <span style={{ width: `${tasksBlocked/tasksTotal*100}%`, background: P.bad }} title={`blocked ${tasksBlocked}`} />
-            <span style={{ width: `${tasksPending/tasksTotal*100}%`, background: P.warn }} title={`pending ${tasksPending}`} />
+            {censusSegments(fleetCensus).map(s => (
+              <span key={s.key} style={{ width: `${s.share}%`, background: P[s.tone] }} />
+            ))}
           </div>
-          {[
-            { l: 'done',        v: tasksDone,    c: P.ok },
-            { l: 'in-progress', v: tasksInP,     c: P.accent },
-            { l: 'blocked',     v: tasksBlocked, c: P.bad },
-            { l: 'pending',     v: tasksPending, c: P.warn },
-          ].map(r => (
-            <div key={r.l} style={{ display: 'grid', gridTemplateColumns: '12px 1fr auto auto', gap: 8, alignItems: 'center', fontSize: 12 }}>
-              <span style={{ width: 8, height: 8, background: r.c, borderRadius: 2 }}></span>
-              <span style={{ color: 'var(--fg-2)' }}>{r.l}</span>
-              <span className="mono" style={{ color: 'var(--fg-0)' }}>{r.v}</span>
-              <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10, width: 36, textAlign: 'right' }}>{(r.v/tasksTotal*100).toFixed(0)}%</span>
+          {TASK_CENSUS_VIEWS.map(v => (
+            <div key={v.key} style={{ display: 'grid', gridTemplateColumns: '12px 1fr auto auto', gap: 8, alignItems: 'center', fontSize: 12 }}>
+              <span style={{ width: 8, height: 8, background: P[v.tone], borderRadius: 2 }}></span>
+              <span style={{ color: 'var(--fg-2)' }}>{v.label}</span>
+              <span className="mono" style={{ color: 'var(--fg-0)' }}><DatumReading datum={fleetCensus} format={v.count} /></span>
+              <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10, minWidth: 36, textAlign: 'right' }}><DatumReading datum={fleetCensus} format={viewShareText(v.key)} /></span>
             </div>
           ))}
         </div>
@@ -300,7 +288,7 @@ function OverviewTab({ paused }) {
         <div className="panel-body flush">
           <table className="tbl">
             <thead>
-              <tr><th>Orch</th><th>Project</th><th className="num">Modules</th><th className="num">Done</th><th className="num">⏱</th><th>Updated</th></tr>
+              <tr><th>Orch</th><th>Project</th><th className="num">Modules</th><th className="num">Terminal</th><th className="num">⏱</th><th>Updated</th></tr>
             </thead>
             <tbody>
               {D.ORCHESTRATORS.map(o => (
@@ -332,7 +320,7 @@ function OverviewTab({ paused }) {
                       </span>
                     );
                   })()}</td>
-                  <td className="num"><span className="mono">{o.summary.done}/{o.summary.total}</span></td>
+                  <td className="num mono"><DatumReading datum={projectCensus(D, o.project)} format={terminalOfTotal} /></td>
                   <td className="num" style={{ color: 'var(--fg-3)', fontSize: 11 }}>{o.started}</td>
                   <td style={{ color: 'var(--fg-3)', fontSize: 11 }}>{window.DF_SHELL.timeago(o.last_update)}</td>
                 </tr>
@@ -353,7 +341,7 @@ function OverviewTab({ paused }) {
             { l: 'Mem0',     sub: `${D.MEMORY_STATUS.mem0.memory_count.toLocaleString()} memories`, ok: true },
             { l: 'Taskmaster', sub: 'mcp v0.18 · responsive', ok: true },
             { l: 'fused-memory', sub: `up ${window.DF_SHELL.fmtUptime(D.MEMORY_STATUS.uptime_seconds)}`, ok: !D.MEMORY_STATUS.offline, title: D.MEMORY_STATUS.started_at || undefined },
-            { l: 'Write queue', sub: `${queue.pending} pending · ${queue.retry} retry · ${queue.dead} dead`, ok: queue.dead === 0, warn: queue.pending > 5 || queue.retry > 0 },
+            { l: 'Write queue', sub: <DatumReading datum={queue} format={queueCountsText} />, ...queueHealth(queue) },
             (() => {
               const v = D.RECON_STATE.verdict;
               const sev = v?.severity || 'none';

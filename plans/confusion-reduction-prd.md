@@ -103,6 +103,8 @@ candidates:
     sightings: [...]                         # same shape as above
 ```
 
+**The sighting `note` field is human-readable provenance only — it is not machine-read signal, and no census feedback loop runs through it.** `note` is written by `scripts/legibility/codebook.py::_build_sighting` (and requested from the coder by `scripts/legibility/coder.py::build_prompt`), but no code path reads a sighting's `note` back; its readers are humans and agents skimming the raw YAML (`skills/census/SKILL.md` directs that skim). The coder's matching prompt takes codebook content from one seam alone, `scripts/legibility/coder.py::build_codebook_index`, which emits `{id}: {title} — {one-line cause}` per entry and never includes sightings; the census miner reaches the LLM through that same seam. The claim is about `note` alone, not about sightings: other sighting fields do have automated readers (`scripts/legibility/census.py::_entry_cluster`, for one, copies `evidence_quote` into a filed task's evidence). Consequence: a stale present-tense `note` cannot make a census pass re-derive an already-fixed defect as live — unlike an entry's `cause`, which `build_codebook_index` renders to the matcher. Wiring `note` into matching would be new work to file separately, not something this PRD assumes exists.
+
 Phase enum everywhere: `prd | decompose | architect | implement | verify | review | merge | recon | ops | unknown`.
 
 ### 7.2 Digest (extractor output)
@@ -136,6 +138,8 @@ Motivation: `plans/confusion-census-2026-07-31.md:97` (cluster 1.3) found sessio
 
 - **1** — the implicit pre-3610 baseline, **never emitted**. An **absent** `instrument_version` key is the normative "this digest predates task 3610's filter change" marker. There is no sentinel value and no backfill: digests are rendered on demand and cached only in-process, so there is no persisted corpus to migrate.
 - **2** — the relaxed anchor+corroborator briefing filter plus the genuine/designed error split.
+- **3** — the re-ingested-content classifier (`scripts/legibility/digest.py::is_reingested_content`, task 5685), consulted by every text-pattern detector and the gold-turn filter. It bumps under the same-transcript test above: session `b203a05c` now renders `self_correct` 1 → 0, and `6a527d51` renders `self_correct` 1 → 0 and `df_guard` 1 → 0.
+- **4** — the non-human-origin record rule (`scripts/legibility/digest.py::has_non_human_origin`, task 5956): a user record whose Claude Code `origin.kind` is anything but `human` (`task-notification`, `auto-continuation`, `coordinator`, `peer`) is dropped from the gold-turn filter and from every dialogue carrier. It bumps under the same-transcript test above: reify session `50e12d17` renders `n_user_turns` 1 → 0, because its only gold turn, record 196, is a `<task-notification>` for a sub-agent's weekly-limit failure. There is deliberately no text fallback. On 2026-09-27 no non-sidechain user record opening with `<task-notification>` lacked `origin` in either local corpus (`~/.claude/projects` and the archived agent transcripts), and the usage-limit-reset auto-continuation literal only ever appeared with `isMeta=True`. A text rule would therefore guard nothing, while risking the loss of a human turn that opens with a pasted notification.
 
 This is the pre-fix-trace vs live-regression discriminator that `plans/confusion-census-2026-07-31.md:151` (§6) asked the next census for.
 

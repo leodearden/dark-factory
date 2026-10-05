@@ -53,15 +53,18 @@ import json
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from types import MappingProxyType
 
 import pytest
+from _git_fixtures import RepoSeed, build_repo
 from _merge_lane_ratchet_fixtures import synthetic_report
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 
 # This module AST-parses the Appendix A cluster (23 CLUSTER_PATHS entries, two
-# of them globs) plus every *.py under orchestrator/tests/, and runs complexipy
-# over the cluster. All of that is ONE measurement per session, taken by the
-# module-scoped `live_measurement` fixture below.
+# of them globs), plus every *.py under orchestrator/tests/ and every tracked
+# file that may import an alias module (one pass, `sweep_repo`, one parse per
+# file), and runs complexipy over the cluster. All of that is ONE measurement per
+# session, taken by the module-scoped `live_measurement` fixture below.
 #
 # WALL CLOCK ON THIS HOST IS NOT A RELIABLE MEASURE of this module: repeated
 # runs over ONE unchanged tree spread as widely as the effect of task 5101,
@@ -253,7 +256,6 @@ _APPENDIX_A_SRC = (
 )
 _GIT_OPS = 'orchestrator/src/orchestrator/git_ops.py'
 _APPENDIX_A_TESTS = (
-    'orchestrator/tests/_serial_merge_worker.py',
     'orchestrator/tests/_merge_queue_harness.py',
     'orchestrator/tests/conftest.py',
 )
@@ -518,7 +520,7 @@ class TestFileSizeMeasures:
         # regenerating the baseline with --write-baseline in the same commit,
         # actually applies. That is where exactness lives; here, only the
         # anti-vacuity property.
-        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py').read_text(
+        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py').read_text(
             encoding='utf-8'
         )
         measures = metrics.file_size_measures(source, path='merge_queue.py')
@@ -673,70 +675,6 @@ class TestReexportNames:
             metrics.reexport_names('def (:\n', path='broken.py')
         assert 'broken.py' in str(excinfo.value)
 
-    def test_merge_queue_structural_reading_overlaps_the_annotated_shims(self) -> None:
-        # Anti-vacuity anchor AND the evidence for the STRUCTURAL-not-comment
-        # decision: the structural predicate (a module-level ImportFrom binding
-        # never referenced elsewhere -- exactly what ruff's F401 computes, which
-        # is why those blocks carry the suppression) must land squarely on the
-        # nine annotated `noqa: F401  re-export shim` blocks at lines
-        # 57/64/89/112/118/150/154/188/198.
-        #
-        # OVERLAP, not containment, and the asymmetry is the interesting part:
-        # a `noqa: F401` suppresses a whole BLOCK, so a name that merge_queue.py
-        # both re-exports AND uses internally sits inside an annotated block
-        # while being perfectly F401-clean. MEASURED on this tree: 127 names
-        # across the nine blocks, 63 of them structurally unused. So the
-        # structural set is a proper subset per block (8 of the 9 blocks
-        # contribute at least one; merge_speculation_controller's two names are
-        # both used internally), and a proper SUPERSET cluster-wide, because it
-        # also catches pure re-exports nobody annotated.
-        import ast as _ast
-
-        path = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py'
-        source = path.read_text(encoding='utf-8')
-        reported = set(metrics.reexport_names(source, path=str(path)))
-        assert reported
-
-        # The annotated blocks are DERIVED, never line-pinned. This test used to
-        # carry `annotated_linenos = {57, 64, ...}` -- nine hard line numbers
-        # into merge_queue.py, which is both the hottest file in the repo and
-        # the explicit refactor target of this very PRD (gamma1..gamma10,
-        # zeta1/zeta2). Inserting one line above 198 shifted every pin and
-        # reddened the whole orchestrator suite on a change that had nothing to
-        # do with shims -- a false-failure generator inside a gate, and against
-        # CLAUDE.md's `path::symbol` citation convention.
-        #
-        # `_comment_lines` (stdlib tokenize) decides what is REALLY a comment,
-        # so a string literal merely mentioning the marker cannot qualify; the
-        # marker text is then matched on those lines only. Matching anywhere in
-        # the node's line SPAN, not just `node.lineno`, keeps a block annotated
-        # on a continuation line in the set.
-        #
-        # Verified equivalent when it replaced the pins: this derivation
-        # reproduced exactly {57, 64, 89, 112, 118, 150, 154, 188, 198} -- same
-        # nine blocks, 127 names, 63 structurally unused, 8 blocks hit.
-        source_lines = source.splitlines()
-        marked = {
-            lineno
-            for lineno in metrics._comment_lines(source, path=str(path))
-            if 'noqa: F401' in source_lines[lineno - 1]
-        }
-        assert marked, 'no `noqa: F401` annotated blocks found in merge_queue.py'
-        tree = _ast.parse(source)
-        blocks = [
-            {a.asname or a.name for a in node.names}
-            for node in tree.body
-            if isinstance(node, _ast.ImportFrom)
-            and marked & set(range(node.lineno, (node.end_lineno or node.lineno) + 1))
-        ]
-        # FLOORS, not exact counts -- the PRD exists to lower these, and this
-        # module's live-tree anchors are one-sided by convention (d54acca456).
-        assert len(blocks) >= 6, f'only {len(blocks)} annotated shim blocks found'
-        hit_blocks = [names for names in blocks if names & reported]
-        assert len(hit_blocks) >= 6, f'{len(hit_blocks)}/{len(blocks)} annotated blocks hit'
-        annotated_names = set().union(*blocks)
-        assert len(annotated_names & reported) >= 50
-
     def test_deleting_the_noqa_comment_does_not_change_the_measure(self) -> None:
         # THE ungameable property, pinned directly. A comment-scanning detector
         # would zero out on this purely cosmetic edit; the structural one cannot
@@ -860,7 +798,7 @@ class TestCognitiveComplexity:
         # test_pyproject_pin_matches_the_scripts_requirement and the
         # comparator's params.complexipy_version check already hard-block every
         # other major with a named failure.
-        target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py'
+        target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py'
         measures = metrics.file_cognitive_measures(target)
         assert measures.per_function['SpeculativeMergeWorker::_verifier_loop'] >= 100
         assert measures.per_function['SpeculativeMergeWorker::stop'] >= 50
@@ -940,7 +878,7 @@ class TestMaintainabilityIndex:
         # The PRD Background table's "Maintainability index (radon) | 0" row.
         # Reported, never ratcheted -- but genuinely exercised, so the `radon`
         # dev-group entry is not dead weight.
-        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_queue.py').read_text(
+        source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py').read_text(
             encoding='utf-8'
         )
         assert metrics.maintainability_index(source, path='merge_queue.py') == 0.0
@@ -1192,6 +1130,82 @@ class TestPrivateReads:
         assert 'broken.py' in str(excinfo.value)
 
 
+class TestTheTreeAndSourceFormsAgree:
+    """Each measure has a source-taking form and a tree-taking one.
+
+    The sweeps parse once and call the tree form; everything else calls the
+    source form, which is a parse plus a call of the tree form. They are one
+    implementation, and this is what notices a change that makes them two.
+    """
+
+    _SOURCE = (
+        '"""Docstring."""\n'
+        'from orchestrator import merge_queue\n'
+        'from unittest.mock import patch\n'
+        'from pathlib import Path\n\n'
+        '# a comment\n'
+        'def test_x():\n'
+        '    from json import dumps\n'
+        "    with patch('orchestrator.merge_queue.helper'):\n"
+        '        assert merge_queue._worker\n'
+    )
+
+    @pytest.mark.parametrize(
+        ('from_source', 'from_tree'),
+        [
+            pytest.param(
+                lambda src: metrics.file_size_measures(src, path='t.py'),
+                lambda src, tree: metrics.file_size_measures_in_tree(
+                    src, tree, path='t.py'
+                ),
+                id='file_size_measures',
+            ),
+            pytest.param(
+                lambda src: metrics.function_local_imports(src, path='t.py'),
+                lambda src, tree: metrics.function_local_imports_in_tree(tree),
+                id='function_local_imports',
+            ),
+            pytest.param(
+                lambda src: metrics.reexport_names(src, path='t.py'),
+                lambda src, tree: metrics.reexport_names_in_tree(tree),
+                id='reexport_names',
+            ),
+            pytest.param(
+                lambda src: metrics.patch_targets(src, path='t.py'),
+                lambda src, tree: metrics.patch_targets_in_tree(tree),
+                id='patch_targets',
+            ),
+            pytest.param(
+                lambda src: metrics.private_reads(src, path='t.py'),
+                lambda src, tree: metrics.private_reads_in_tree(tree),
+                id='private_reads',
+            ),
+            pytest.param(
+                lambda src: metrics.imports_lane_module(src, path='t.py'),
+                lambda src, tree: metrics.imports_lane_module_in_tree(tree),
+                id='imports_lane_module',
+            ),
+            pytest.param(
+                lambda src: metrics.test_file_measures(src, path='t.py'),
+                lambda src, tree: metrics.test_file_measures_in_tree(tree),
+                id='test_file_measures',
+            ),
+            pytest.param(
+                lambda src: metrics.referenced_alias_modules(src, path='t.py'),
+                lambda src, tree: metrics.referenced_alias_modules_in_tree(tree),
+                id='referenced_alias_modules',
+            ),
+        ],
+    )
+    def test_the_two_forms_return_the_same_measure(self, from_source, from_tree) -> None:
+        tree = metrics._parse(self._SOURCE, path='t.py')
+        expected = from_source(self._SOURCE)
+        assert from_tree(self._SOURCE, tree) == expected
+        # ANTI-VACUITY: the snippet exercises every measure, so none is trivially
+        # equal as an empty value.
+        assert expected not in (0, [], set(), frozenset(), None)
+
+
 class TestTestFileMeasures:
     def test_a_non_lane_importing_file_yields_none(self) -> None:
         # The exclusion is a property of the MEASURE, not of the caller: a
@@ -1250,6 +1264,14 @@ class TestDeriveTotals:
         assert totals['cognitive'] == 150
         assert totals['function_local_imports'] == 4
         assert totals['reexport_names'] == 5
+
+    def test_external_importers_are_summed_over_the_files_that_carry_them(self) -> None:
+        # Only alias modules carry the measure, so a path without it adds zero
+        # rather than raising -- the total is a sum over the files that have it.
+        report = synthetic_report()
+        assert metrics.derive_totals(report)['external_importers'] == 0
+        report['files']['a.py']['external_importers'] = 7
+        assert metrics.derive_totals(report)['external_importers'] == 7
 
     def test_private_reads_are_summed_over_tests(self) -> None:
         assert metrics.derive_totals(synthetic_report())['private_reads'] == 25
@@ -1322,7 +1344,7 @@ class TestBuildReport:
         assert report['enumeration']['unreadable'] == []
 
     def test_file_entries_carry_the_five_measures(self, report: dict) -> None:
-        entry = report['files']['orchestrator/src/orchestrator/merge_queue.py']
+        entry = report['files']['orchestrator/src/orchestrator/merge_lane/worker.py']
         assert set(entry) == {
             'lines',
             'prose_lines',
@@ -1337,8 +1359,32 @@ class TestBuildReport:
         assert entry['lines'] >= 10000
         assert entry['cognitive'] >= 1000
 
+    def test_exactly_the_alias_modules_carry_external_importers(
+        self, report: dict
+    ) -> None:
+        carrying = {
+            path for path, entry in report['files'].items() if 'external_importers' in entry
+        }
+        assert carrying == {
+            f'orchestrator/src/{old.replace(".", "/")}.py'
+            for old in metrics.ALIAS_MODULES
+        }
+        for path in carrying:
+            count = report['files'][path]['external_importers']
+            assert isinstance(count, int) and not isinstance(count, bool), path
+            assert count >= 0, path
+
+    def test_the_derived_importer_total_is_the_sum_of_the_alias_counts(
+        self, report: dict
+    ) -> None:
+        # Not a floor: this one is a target. Task eta drives it to zero, and a
+        # floor here would turn that success into a red suite.
+        assert metrics.derive_totals(report)['external_importers'] == sum(
+            entry.get('external_importers', 0) for entry in report['files'].values()
+        )
+
     def test_functions_is_a_flat_path_qualname_map(self, report: dict) -> None:
-        key = 'orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker::_verifier_loop'
+        key = 'orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_verifier_loop'
         # Floor, not equality (measured 245): a fall is permitted by the
         # ratchet contract -- see test_real_merge_queue_line_count_anchor.
         assert report['functions'][key] >= 100
@@ -1440,8 +1486,7 @@ class TestReportEnumerationSplitsTheTwoHalves:
     ) -> None:
         # THE HEADLINE PROPERTY, executably: the only orchestrator/tests paths
         # left in any list are CLUSTER_PATHS literals. Measured today: exactly
-        # the 3 that live there (conftest.py, _merge_queue_harness.py,
-        # _serial_merge_worker.py).
+        # the 2 that live there (conftest.py, _merge_queue_harness.py).
         assert _test_tree_strays(enumeration) == {}, (
             'the live report still carries per-path test-tree entries'
         )
@@ -1469,35 +1514,47 @@ class TestReportEnumerationSplitsTheTwoHalves:
         assert enumeration['complete'] is True
 
 
+def _committed_tree(tmp_path: Path, files: dict[str, str]) -> Path:
+    """A throwaway committed repo holding *files*, built by the suite's own recipe.
+
+    ``sweep_repo`` takes the importer count's domain from git, so a fixture tree
+    for it is a repository. It lives under ``tmp_path`` so that no git call can
+    walk up out of it into the checkout this suite runs in.
+    """
+    return build_repo(
+        tmp_path / 'repo', RepoSeed(files=tuple(files.items()), message='seed')
+    )
+
+
 class TestTestTreeSweep:
-    """`_sweep_test_tree` in isolation -- no complexipy, so this runs in ms."""
+    """The test-tree half of `sweep_repo` in isolation -- no complexipy, so ms."""
 
     @staticmethod
     def _tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-        tests = tmp_path / 'orchestrator' / 'tests'
-        tests.mkdir(parents=True)
-        (tests / 'test_lane.py').write_text(
-            'from orchestrator import merge_queue\n\n'
-            'def test_x():\n'
-            '    assert merge_queue._worker is None\n',
-            encoding='utf-8',
-        )
-        (tests / 'test_unrelated.py').write_text(
-            'import json\n\ndef test_y():\n    assert json\n', encoding='utf-8'
-        )
-        (tests / 'test_broken.py').write_text('def (:\n', encoding='utf-8')
         monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
-        return tmp_path
+        return _committed_tree(
+            tmp_path,
+            {
+                'orchestrator/tests/test_lane.py': (
+                    'from orchestrator import merge_queue\n\n'
+                    'def test_x():\n'
+                    '    assert merge_queue._worker is None\n'
+                ),
+                'orchestrator/tests/test_unrelated.py': (
+                    'import json\n\ndef test_y():\n    assert json\n'
+                ),
+                'orchestrator/tests/test_broken.py': 'def (:\n',
+            },
+        )
 
     def test_counts_are_integers_not_path_lists(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The sweep's contract: 3 files asked for, 1 measured, as COUNTS.
-        root = self._tree(tmp_path, monkeypatch)
-        tests, unreadable, coverage = metrics._sweep_test_tree(root)
-        assert coverage.requested == 3
-        assert coverage.resolved == 1
-        assert list(tests) == ['orchestrator/tests/test_lane.py']
+        sweep = metrics.sweep_repo(self._tree(tmp_path, monkeypatch))
+        assert sweep.test_tree.requested == 3
+        assert sweep.test_tree.resolved == 1
+        assert list(sweep.tests) == ['orchestrator/tests/test_lane.py']
 
     def test_the_unparseable_file_is_named_and_only_it(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1505,21 +1562,19 @@ class TestTestTreeSweep:
         # INV-11 POLARITY at the sweep boundary: the skip is fail-SOFT per file
         # (an unrelated mid-edit test must not redden the lane's ratchet) but the
         # RECORD is not -- the path is named verbatim.
-        root = self._tree(tmp_path, monkeypatch)
-        _tests, unreadable, _coverage = metrics._sweep_test_tree(root)
-        assert list(unreadable) == ['orchestrator/tests/test_broken.py']
+        sweep = metrics.sweep_repo(self._tree(tmp_path, monkeypatch))
+        assert list(sweep.unreadable) == ['orchestrator/tests/test_broken.py']
 
     def test_a_skipped_file_marks_the_composed_block_incomplete(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The seam that makes check_against_baseline REFUSE to compare: the
         # sweep's soft skip must still reach `complete` in the report block.
-        root = self._tree(tmp_path, monkeypatch)
-        _tests, unreadable, coverage = metrics._sweep_test_tree(root)
+        sweep = metrics.sweep_repo(self._tree(tmp_path, monkeypatch))
         cluster = metrics.Enumeration(
             requested=('a.py',), resolved=('a.py',), unreadable=(), complete=True
         )
-        block = metrics._report_enumeration(cluster, unreadable, coverage)
+        block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['complete'] is False
         assert block['unreadable'] == ['orchestrator/tests/test_broken.py']
         with pytest.raises(metrics.MetricsError) as excinfo:
@@ -1530,15 +1585,15 @@ class TestTestTreeSweep:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # The other polarity, so the test above cannot pass vacuously.
-        tests_dir = tmp_path / 'orchestrator' / 'tests'
-        tests_dir.mkdir(parents=True)
-        (tests_dir / 'test_ok.py').write_text('import json\n', encoding='utf-8')
         monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
-        _tests, unreadable, coverage = metrics._sweep_test_tree(tmp_path)
+        root = _committed_tree(
+            tmp_path, {'orchestrator/tests/test_ok.py': 'import json\n'}
+        )
+        sweep = metrics.sweep_repo(root)
         cluster = metrics.Enumeration(
             requested=('a.py',), resolved=('a.py',), unreadable=(), complete=True
         )
-        block = metrics._report_enumeration(cluster, unreadable, coverage)
+        block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['complete'] is True
         assert block['unreadable'] == []
         assert block['test_tree'] == {'requested': 1, 'resolved': 0}
@@ -1548,16 +1603,502 @@ class TestTestTreeSweep:
     ) -> None:
         # Both halves' unreadable paths travel verbatim in ONE top-level list --
         # the cluster half's finding must not be diluted or dropped.
-        tests_dir = tmp_path / 'orchestrator' / 'tests'
-        tests_dir.mkdir(parents=True)
         monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
-        _tests, unreadable, coverage = metrics._sweep_test_tree(tmp_path)
+        sweep = metrics.sweep_repo(_committed_tree(tmp_path, {'README.md': 'x\n'}))
         cluster = metrics.Enumeration(
             requested=('a.py',), resolved=(), unreadable=('a.py',), complete=False
         )
-        block = metrics._report_enumeration(cluster, unreadable, coverage)
+        block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['unreadable'] == ['a.py']
         assert block['complete'] is False
+
+
+# ---------------------------------------------------------------------------
+# external_importers (PRD task zeta2): the fan-in of the fourteen old module
+# paths that the move leaves behind as aliases. Task eta drives it to 0.
+
+_MQ_MODULE = 'orchestrator.merge_queue'
+_GATES_MODULE = 'orchestrator.merge_gates'
+
+
+class TestAliasModules:
+    """The one mapping, checked so that it holds BEFORE the move and AFTER it.
+
+    Nothing here asks whether an old file is an alias or still the real module:
+    only that it exists and is listed, which is true on both trees.
+    """
+
+    def test_every_old_name_is_a_listed_cluster_path_that_exists(self) -> None:
+        for old in metrics.ALIAS_MODULES:
+            path = f'orchestrator/src/{old.replace(".", "/")}.py'
+            assert path in metrics.CLUSTER_PATHS, f'{old}: {path} is not in CLUSTER_PATHS'
+            assert (_REPO_ROOT / path).is_file(), f'{old}: {path} does not exist'
+
+    def test_the_cluster_derives_every_old_name(self) -> None:
+        assert set(metrics.ALIAS_MODULES) <= metrics.lane_module_names()
+
+    def test_every_new_name_is_a_distinct_module_inside_the_package(self) -> None:
+        new_names = list(metrics.ALIAS_MODULES.values())
+        assert len(set(new_names)) == len(new_names)
+        for old, new in metrics.ALIAS_MODULES.items():
+            assert new.startswith('orchestrator.merge_lane.'), (old, new)
+            assert new not in metrics.ALIAS_MODULES, (old, new)
+
+    def test_the_mapping_cannot_be_edited_at_runtime(self) -> None:
+        with pytest.raises(TypeError):
+            metrics.ALIAS_MODULES[_MQ_MODULE] = 'elsewhere'  # type: ignore[index]
+
+    def test_the_package_dir_is_the_prefix_of_the_cluster_glob(self) -> None:
+        assert f'{metrics.MERGE_LANE_PACKAGE_DIR}**/*.py' in metrics.CLUSTER_PATHS
+
+    def test_an_alias_with_no_cluster_path_is_a_named_hard_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Else its count would be measured and then dropped for want of a files
+        # entry to land on -- which reads as a measure that is fine.
+        monkeypatch.setattr(
+            metrics,
+            'ALIAS_MODULES',
+            MappingProxyType(
+                {**metrics.ALIAS_MODULES, 'orchestrator.merge_unlisted': 'x'}
+            ),
+        )
+        with pytest.raises(metrics.MetricsError, match='orchestrator.merge_unlisted'):
+            metrics._require_aliases_in_cluster()
+
+
+class TestReferencedAliasModules:
+    """The detector, on source snippets: import forms, and string paths into a module."""
+
+    @pytest.mark.parametrize(
+        ('source', 'expected'),
+        [
+            pytest.param('import orchestrator.merge_queue\n', {_MQ_MODULE}, id='import'),
+            pytest.param(
+                'import orchestrator.merge_queue as mq\n', {_MQ_MODULE}, id='import-as'
+            ),
+            pytest.param(
+                'import json, orchestrator.merge_queue\n',
+                {_MQ_MODULE},
+                id='import-among-others',
+            ),
+            pytest.param(
+                'from orchestrator.merge_queue import X\n', {_MQ_MODULE}, id='from-import'
+            ),
+            pytest.param(
+                'from orchestrator.merge_queue import X as Y\n',
+                {_MQ_MODULE},
+                id='from-import-as',
+            ),
+            pytest.param(
+                'from orchestrator.merge_queue import *\n', {_MQ_MODULE}, id='star'
+            ),
+            pytest.param(
+                'from orchestrator.merge_queue import (\n    X,\n    Y,\n)\n',
+                {_MQ_MODULE},
+                id='parenthesised',
+            ),
+            pytest.param(
+                'from orchestrator import merge_queue\n',
+                {_MQ_MODULE},
+                id='package-import-of-the-leaf',
+            ),
+            pytest.param(
+                'from orchestrator import merge_queue as mq\n',
+                {_MQ_MODULE},
+                id='package-import-of-the-leaf-as',
+            ),
+            pytest.param(
+                'from orchestrator import (\n    merge_gates,\n    merge_queue,\n)\n',
+                {_MQ_MODULE, _GATES_MODULE},
+                id='package-import-of-two-leaves',
+            ),
+            pytest.param(
+                'import orchestrator.merge_queue\n'
+                'from orchestrator.merge_gates import G\n',
+                {_MQ_MODULE, _GATES_MODULE},
+                id='two-aliases-in-one-file',
+            ),
+            pytest.param(
+                'def f():\n    from orchestrator.merge_queue import X\n',
+                {_MQ_MODULE},
+                id='function-local',
+            ),
+            pytest.param(
+                'async def f():\n    import orchestrator.merge_queue\n',
+                {_MQ_MODULE},
+                id='async-function-local',
+            ),
+            pytest.param(
+                'class C:\n    def m(self):\n        from orchestrator import merge_gates\n',
+                {_GATES_MODULE},
+                id='method-local',
+            ),
+            pytest.param(
+                'from typing import TYPE_CHECKING\n'
+                'if TYPE_CHECKING:\n'
+                '    from orchestrator.merge_queue import X\n',
+                {_MQ_MODULE},
+                id='under-type-checking',
+            ),
+            pytest.param(
+                'try:\n    import orchestrator.merge_queue\n'
+                'except ImportError:\n    pass\n',
+                {_MQ_MODULE},
+                id='guarded',
+            ),
+            pytest.param(
+                'from orchestrator.merge_queue import X\n'
+                'from orchestrator.merge_queue import Y\n',
+                {_MQ_MODULE},
+                id='the-same-alias-twice-is-one',
+            ),
+            pytest.param(
+                'from unittest.mock import patch\n'
+        'from pathlib import Path\n\n'
+                'def test_x():\n'
+                "    with patch('orchestrator.landing_evidence._helper'):\n"
+                '        pass\n',
+                {'orchestrator.landing_evidence'},
+                id='string-path-patch-target-with-no-import',
+            ),
+            pytest.param(
+                'def test_x(monkeypatch):\n'
+                "    monkeypatch.setattr('orchestrator.merge_queue.X', 1)\n",
+                {_MQ_MODULE},
+                id='string-path-setattr',
+            ),
+            pytest.param(
+                "PATH = 'orchestrator.merge_queue.helper.deep'\n",
+                {_MQ_MODULE},
+                id='string-path-below-the-module',
+            ),
+            pytest.param(
+                "def f():\n    'a docstring'\n    'orchestrator.merge_queue.X'\n",
+                {_MQ_MODULE},
+                id='a-second-string-statement-is-code-not-a-docstring',
+            ),
+            pytest.param(
+                "PATH = 'orchestrator.merge_queue_store.X'\n",
+                {'orchestrator.merge_queue_store'},
+                id='string-path-names-the-longer-module-only',
+            ),
+            pytest.param(
+                'from orchestrator import merge_queue\n'
+                "PATH = 'orchestrator.merge_queue.X'\n",
+                {_MQ_MODULE},
+                id='import-and-string-path-are-one-dependent',
+            ),
+        ],
+    )
+    def test_every_dependency_form_counts(self, source: str, expected: set[str]) -> None:
+        assert metrics.referenced_alias_modules(source) == expected
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            pytest.param(
+                '"""from orchestrator import merge_queue"""\nx = 1\n', id='docstring'
+            ),
+            pytest.param('# import orchestrator.merge_queue\nx = 1\n', id='comment'),
+            pytest.param("PATH = 'orchestrator.merge_queue'\n", id='bare-module-name-string'),
+            pytest.param(
+                'import orchestrator\nvalue = orchestrator.merge_queue.X\n',
+                id='attribute-access-alone',
+            ),
+            pytest.param(
+                'from dashboard.data import merge_queue\n', id='unrelated-leaf-from-import'
+            ),
+            pytest.param(
+                'from dashboard.data.merge_queue import X\n', id='unrelated-leaf-module'
+            ),
+            pytest.param('import dashboard.data.merge_queue\n', id='unrelated-leaf-import'),
+            pytest.param('import merge_queue\n', id='bare-top-level-leaf'),
+            pytest.param('from . import merge_queue\n', id='relative-package-import'),
+            pytest.param('from .merge_queue import X\n', id='relative-module'),
+            pytest.param('from .. import merge_gates\n', id='relative-parent'),
+            pytest.param(
+                'from orchestrator.merge_lane.worker import W\n', id='the-new-module'
+            ),
+            pytest.param('from orchestrator import merge_lane\n', id='the-new-package'),
+            pytest.param('import orchestrator.merge_lane.worker\n', id='the-new-import'),
+            pytest.param('from orchestrator import git_ops\n', id='another-orchestrator-module'),
+            pytest.param('import orchestrator\n', id='the-bare-package'),
+            pytest.param(
+                "import logging\nlog = logging.getLogger('orchestrator.merge_queue')\n",
+                id='bare-logger-name',
+            ),
+            pytest.param(
+                'def test_x(caplog):\n'
+                "    caplog.set_level('INFO', logger='orchestrator.merge_queue')\n",
+                id='bare-logger-name-in-caplog',
+            ),
+            pytest.param(
+                '"""Patches \'orchestrator.merge_queue.X\' in every test."""\n',
+                id='string-path-in-a-module-docstring',
+            ),
+            pytest.param(
+                "def f():\n    '''Reaches orchestrator.merge_queue.X.'''\n",
+                id='string-path-in-a-function-docstring',
+            ),
+            pytest.param(
+                "class C:\n    '''See orchestrator.merge_queue.X.'''\n",
+                id='string-path-in-a-class-docstring',
+            ),
+            pytest.param(
+                "# 'orchestrator.merge_queue.X'\nx = 1\n", id='string-path-in-a-comment'
+            ),
+            pytest.param("PATH = 'dashboard.merge_queue.X'\n", id='unrelated-string-path'),
+            pytest.param(
+                "PATH = 'orchestrator.merge_lane.worker.X'\n",
+                id='string-path-into-the-new-module',
+            ),
+            pytest.param(
+                "PATH = 'orchestrator.merge_queue_helpers.X'\n", id='lookalike-prefix'
+            ),
+        ],
+    )
+    def test_everything_else_does_not(self, source: str) -> None:
+        assert metrics.referenced_alias_modules(source) == frozenset()
+
+    def test_unparseable_source_raises_naming_the_path(self) -> None:
+        with pytest.raises(metrics.MetricsError) as excinfo:
+            metrics.referenced_alias_modules('def (:\n', path='pkg/broken.py')
+        assert 'pkg/broken.py' in str(excinfo.value)
+
+
+_IMPORTER_TREE = {
+    # Counted: two files importing merge_queue, three importing merge_gates.
+    'app/uses_both.py': 'from orchestrator import merge_queue, merge_gates\n',
+    'app/uses_dotted.py': 'import orchestrator.merge_queue as mq\n',
+    'tests/test_lazy.py': 'def f():\n    from orchestrator.merge_gates import X\n',
+    # One alias importing ANOTHER is fan-in; importing ITSELF is not.
+    'orchestrator/src/orchestrator/merge_queue.py': (
+        'import orchestrator.merge_queue\nfrom orchestrator.merge_gates import G\n'
+    ),
+    'orchestrator/src/orchestrator/merge_gates.py': 'G = 1\n',
+    # Not counted.
+    'orchestrator/src/orchestrator/merge_lane/worker.py': (
+        'from orchestrator.merge_queue import W\n'
+    ),
+    'app/collision.py': 'from dashboard.data import merge_queue\n',
+    'dashboard/data/merge_queue.py': 'VALUE = 1\n',
+    'node_modules/pkg/m.py': 'import orchestrator.merge_queue\n',
+    '.venv/lib/m.py': 'import orchestrator.merge_queue\n',
+    'tools/.worktrees/t1/m.py': 'import orchestrator.merge_queue\n',
+    '.claude/worktrees/t2/m.py': 'import orchestrator.merge_queue\n',
+}
+
+
+class TestExternalImporterSweep:
+    """`sweep_repo`'s importer half over a committed fixture repo."""
+
+    def test_counts_distinct_importing_files_per_alias(self, tmp_path: Path) -> None:
+        sweep = metrics.sweep_repo(_committed_tree(tmp_path, _IMPORTER_TREE))
+        assert sweep.alias_importers[_MQ_MODULE] == 2
+        assert sweep.alias_importers[_GATES_MODULE] == 3
+        assert sweep.unreadable == ()
+
+    def test_every_alias_is_recorded_zeros_included(self, tmp_path: Path) -> None:
+        # An alias that reaches zero is the goal state and must read as 0, not
+        # vanish from the report where the ratchet could no longer see it rise.
+        sweep = metrics.sweep_repo(_committed_tree(tmp_path, _IMPORTER_TREE))
+        assert set(sweep.alias_importers) == set(metrics.ALIAS_MODULES)
+        assert sweep.alias_importers['orchestrator.landed_outbox'] == 0
+
+    @pytest.mark.parametrize(
+        ('relpath', 'external'),
+        [
+            ('app/uses_both.py', True),
+            ('orchestrator/src/orchestrator/merge_queue.py', True),
+            ('orchestrator/src/orchestrator/merge_lane/worker.py', False),
+            ('orchestrator/src/orchestrator/merge_lane/sub/deep.py', False),
+            ('node_modules/pkg/m.py', False),
+            ('dashboard/node_modules/pkg/m.py', False),
+            ('.venv/lib/python3.13/site-packages/x.py', False),
+            ('tools/venv/x.py', False),
+            ('lib/site-packages/x.py', False),
+            ('.worktrees/t1/m.py', False),
+            ('tools/.worktrees/t1/m.py', False),
+            ('.claude/worktrees/t2/m.py', False),
+            ('.claude/hooks/h.py', True),
+            ('orchestrator/src/orchestrator/merge_lane_extras.py', True),
+        ],
+    )
+    def test_the_exclusions(self, relpath: str, external: bool) -> None:
+        assert metrics.is_external_importer_source(relpath) is external
+
+    def test_an_untracked_file_is_not_counted(self, tmp_path: Path) -> None:
+        # The domain is the TRACKED files, so it is the same in every checkout:
+        # the main checkout holds untracked scratch and gitignored run data that
+        # a clean worktree does not.
+        root = _committed_tree(tmp_path, _IMPORTER_TREE)
+        (root / 'app' / 'scratch.py').write_text(
+            'import orchestrator.merge_queue\n', encoding='utf-8'
+        )
+        sweep = metrics.sweep_repo(root)
+        assert sweep.alias_importers[_MQ_MODULE] == 2
+
+    def test_a_file_that_names_an_alias_and_cannot_be_parsed_is_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        # INV-11 for this sweep: the file is skipped, the path is NAMED, and the
+        # composed enumeration goes incomplete so --check refuses to compare.
+        root = _committed_tree(
+            tmp_path,
+            {
+                **_IMPORTER_TREE,
+                'app/broken.py': 'from orchestrator import merge_queue\ndef (:\n',
+            },
+        )
+        sweep = metrics.sweep_repo(root)
+        assert sweep.unreadable == ('app/broken.py',)
+        assert sweep.alias_importers[_MQ_MODULE] == 2
+        cluster = metrics.Enumeration(
+            requested=('a.py',), resolved=('a.py',), unreadable=(), complete=True
+        )
+        block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
+        assert block['complete'] is False
+        with pytest.raises(metrics.MetricsError, match='app/broken.py'):
+            metrics._require_complete_enumeration({'enumeration': block})
+
+    def test_a_tracked_file_that_is_gone_from_disk_is_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        root = _committed_tree(tmp_path, _IMPORTER_TREE)
+        (root / 'app' / 'uses_dotted.py').unlink()
+        assert metrics.sweep_repo(root).unreadable == ('app/uses_dotted.py',)
+
+    def test_a_file_that_names_no_alias_is_never_parsed(self, tmp_path: Path) -> None:
+        # THE PREFILTER'S CONTRACT, stated where it can be seen: an import
+        # statement must spell the leaf, so a file silent about every leaf cannot
+        # be an importer and costs a read, not a parse. Its unparseability is
+        # therefore not this measure's finding.
+        root = _committed_tree(
+            tmp_path, {**_IMPORTER_TREE, 'app/silent_but_broken.py': 'def (:\n'}
+        )
+        assert metrics.sweep_repo(root).unreadable == ()
+
+    def test_parsing_remembers_nothing_between_calls(self) -> None:
+        # Two callers of one source must not share a tree: a measure that
+        # mutated it would corrupt the other, and the only guard would be prose.
+        source = 'import json\n'
+        assert metrics._parse(source, path='a.py') is not metrics._parse(
+            source, path='a.py'
+        )
+
+    def test_a_string_path_dependent_counts_and_a_logger_name_does_not(
+        self, tmp_path: Path
+    ) -> None:
+        # The file patches `orchestrator.merge_gates._x` and never imports the
+        # module, so deleting the alias breaks it while no import changes.
+        root = _committed_tree(
+            tmp_path,
+            {
+                **_IMPORTER_TREE,
+                'tests/test_patches.py': (
+                    'def test_x(monkeypatch):\n'
+                    "    monkeypatch.setattr('orchestrator.merge_gates._x', 1)\n"
+                ),
+                'app/logs.py': (
+                    "import logging\nlog = logging.getLogger('orchestrator.merge_queue')\n"
+                ),
+            },
+        )
+        sweep = metrics.sweep_repo(root)
+        assert sweep.alias_importers[_GATES_MODULE] == 4
+        assert sweep.alias_importers[_MQ_MODULE] == 2
+
+    def test_a_file_in_both_domains_is_parsed_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Task 5101's discipline, counted as WORK rather than timed: a
+        # lane-importing test file is wanted by three test-suite measures AND the
+        # importer count, and the sweep must hand all four ONE parse -- by
+        # construction, because it parses once and passes the tree on; nothing
+        # in the instrument remembers a parse. A second walk for the importer
+        # count would show here as a second parse.
+        monkeypatch.setattr(metrics, 'TESTS_ROOT', 'orchestrator/tests')
+        root = _committed_tree(
+            tmp_path,
+            {
+                'orchestrator/tests/test_both.py': (
+                    'from orchestrator import merge_queue\n\n'
+                    'def test_x():\n    assert merge_queue._worker\n'
+                ),
+                'app/other.py': 'import orchestrator.merge_gates\n',
+            },
+        )
+        parsed: list[int] = []
+        real_parse = metrics.ast.parse
+
+        def counting_parse(source, *args, **kwargs):
+            parsed.append(len(source))
+            return real_parse(source, *args, **kwargs)
+
+        monkeypatch.setattr(metrics.ast, 'parse', counting_parse)
+        sweep = metrics.sweep_repo(root)
+        assert sweep.alias_importers[_MQ_MODULE] == 1
+        assert sweep.alias_importers[_GATES_MODULE] == 1
+        assert list(sweep.tests) == ['orchestrator/tests/test_both.py']
+        assert len(parsed) == 2
+
+    def test_alias_modules_alone_carry_the_measure_into_the_report(self) -> None:
+        counts = {_MQ_MODULE: 7}
+        assert metrics.alias_importer_measure(
+            'orchestrator/src/orchestrator/merge_queue.py', counts
+        ) == {'external_importers': 7}
+        assert metrics.alias_importer_measure('scripts/merge_lane_metrics.py', counts) == {}
+        assert metrics.alias_importer_measure(
+            'orchestrator/src/orchestrator/merge_lane/**/*.py', counts
+        ) == {}
+
+
+class TestTheImporterDomainFailsHard:
+    """No tracked-file list means no measurement, never a measurement of zero."""
+
+    def test_a_missing_git_is_a_named_hard_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = _committed_tree(tmp_path, _IMPORTER_TREE)
+        empty_bin = tmp_path / 'empty-bin'
+        empty_bin.mkdir()
+        monkeypatch.setenv('PATH', str(empty_bin))
+        with pytest.raises(metrics.MetricsError, match='could not run git'):
+            metrics.tracked_python_files(root)
+
+    def test_a_directory_that_is_not_a_repository_is_a_named_hard_failure(
+        self, tmp_path: Path
+    ) -> None:
+        plain = tmp_path / 'plain'
+        plain.mkdir()
+        with pytest.raises(metrics.MetricsError, match='git'):
+            metrics.tracked_python_files(plain)
+
+    def test_a_subdirectory_of_a_repository_is_refused_not_listed(
+        self, tmp_path: Path
+    ) -> None:
+        # Listing from inside a repo yields only that subtree's files, so the
+        # sweep would run happily and report zero importers of everything.
+        root = _committed_tree(tmp_path, _IMPORTER_TREE)
+        with pytest.raises(metrics.MetricsError, match='not the top of a git work tree'):
+            metrics.tracked_python_files(root / 'app')
+
+    def test_the_listing_is_repo_relative_sorted_and_python_only(
+        self, tmp_path: Path
+    ) -> None:
+        root = _committed_tree(
+            tmp_path, {'b/z.py': '\n', 'a.py': '\n', 'notes.md': 'x\n', 'c/d/e.py': '\n'}
+        )
+        assert metrics.tracked_python_files(root) == ('a.py', 'b/z.py', 'c/d/e.py')
+
+    def test_the_real_checkout_is_listed_whole(self) -> None:
+        # ANTI-VACUITY for every importer count: a listing that collapsed to a
+        # few files would report zero importers and read as a finished migration.
+        # A floor, in this module's idiom (2,192 when this landed).
+        tracked = metrics.tracked_python_files(_REPO_ROOT)
+        assert len(tracked) >= 1500
+        assert 'scripts/merge_lane_metrics.py' in tracked
 
 
 # ---------------------------------------------------------------------------
@@ -1693,6 +2234,16 @@ class TestRenderBaseline:
                 # not merely started there and continued on the next.
                 tail = hits[0].lstrip()[len(prefix):].strip().rstrip(',')
                 assert json.loads(tail) == value, f'{section}.{key} value spans lines'
+
+    def test_an_alias_entry_carrying_external_importers_is_still_one_line(self) -> None:
+        report = synthetic_report()
+        report['files']['a.py']['external_importers'] = 138
+        lines = metrics.render_baseline(report).splitlines()
+        hits = [line for line in lines if line.lstrip().startswith('"a.py":')]
+        assert len(hits) == 1
+        assert json.loads(hits[0].lstrip()[len('"a.py":'):].strip().rstrip(','))[
+            'external_importers'
+        ] == 138
 
     def test_per_path_keys_are_emitted_in_sorted_order(self) -> None:
         report = synthetic_report()
@@ -2067,6 +2618,29 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         assert breach['current'] == metrics.FILE_LINE_CEILING + 1
 
 
+def _baseline_image(tmp_path: Path, name: str, report: dict) -> Path:
+    """*report* written as committed baseline bytes, for a path-taking face."""
+    target = tmp_path / name
+    target.write_text(metrics.render_baseline(report), encoding='utf-8')
+    return target
+
+
+def _violation_fields(violation: metrics.Violation) -> tuple[str, str, int, int]:
+    """The four fields a ledger record is projected from, message excluded.
+
+    Asserting on the tuple rather than on ``message`` is what keeps these
+    tests about the COMPARISON: the wording lives in ``Violation.rose`` and is
+    pinned by ``TestViolationShape``, so re-deriving it here would be a
+    second copy that drifts.
+    """
+    return (
+        violation.measure,
+        violation.key,
+        violation.baseline,
+        violation.current,
+    )
+
+
 class TestCompareBaselineFiles:
     """The comparison the WRITER cannot make: two committed IMAGES, not a tree.
 
@@ -2081,35 +2655,13 @@ class TestCompareBaselineFiles:
     """
 
     @staticmethod
-    def _image(tmp_path: Path, name: str, report: dict) -> Path:
-        target = tmp_path / name
-        target.write_text(metrics.render_baseline(report), encoding='utf-8')
-        return target
-
-    @staticmethod
-    def _fields(violation: metrics.Violation) -> tuple[str, str, int, int]:
-        """The four fields a ledger record is projected from, message excluded.
-
-        Asserting on the tuple rather than on ``message`` is what keeps these
-        tests about the COMPARISON: the wording lives in ``Violation.rose`` and is
-        pinned by ``TestViolationShape``, so re-deriving it here would be a
-        second copy that drifts.
-        """
-        return (
-            violation.measure,
-            violation.key,
-            violation.baseline,
-            violation.current,
-        )
-
-    @classmethod
-    def _pair(cls, tmp_path: Path, mutate) -> tuple[Path, Path]:
+    def _pair(tmp_path: Path, mutate) -> tuple[Path, Path]:
         """Two images: the seed, and the seed with one measure perturbed."""
         moved = copy.deepcopy(synthetic_report())
         mutate(moved)
         return (
-            cls._image(tmp_path, 'previous.json', synthetic_report()),
-            cls._image(tmp_path, 'current.json', moved),
+            _baseline_image(tmp_path, 'previous.json', synthetic_report()),
+            _baseline_image(tmp_path, 'current.json', moved),
         )
 
     def test_a_rise_is_reported_per_path_and_in_the_derived_total(
@@ -2125,8 +2677,8 @@ class TestCompareBaselineFiles:
         # would have produced, so a ledger record derived from either describes
         # the same raise. The total comes along because it is DERIVED -- moving
         # the mass to a new path is the shape that check exists for.
-        assert [self._fields(v) for v in raises] == [
-            self._fields(metrics.Violation.rose('lines', 'a.py', 1000, 1005)),
+        assert [_violation_fields(v) for v in raises] == [
+            _violation_fields(metrics.Violation.rose('lines', 'a.py', 1000, 1005)),
             ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1200, 1205),
         ]
 
@@ -2177,12 +2729,12 @@ class TestCompareBaselineFiles:
             'new_big.py',
             metrics.FILE_LINE_CEILING,
             oversized,
-        ) in [self._fields(v) for v in raises]
+        ) in [_violation_fields(v) for v in raises]
 
     def test_a_missing_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         # Inherited from load_baseline, never re-implemented: an unreadable
         # image must never read as an empty-baseline pass (INV-11).
-        previous = self._image(tmp_path, 'previous.json', synthetic_report())
+        previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
         absent = tmp_path / 'gone.json'
 
         with pytest.raises(metrics.MetricsError) as excinfo:
@@ -2191,7 +2743,7 @@ class TestCompareBaselineFiles:
         assert str(absent) in str(excinfo.value)
 
     def test_a_malformed_image_is_a_named_hard_failure(self, tmp_path: Path) -> None:
-        previous = self._image(tmp_path, 'previous.json', synthetic_report())
+        previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
         broken = tmp_path / 'broken.json'
         broken.write_text('{"files": {', encoding='utf-8')
 
@@ -2201,6 +2753,208 @@ class TestCompareBaselineFiles:
         message = str(excinfo.value)
         assert str(broken) in message
         assert 'not valid JSON' in message
+
+
+class TestCompareMergedBaselineFiles:
+    """The 3-WAY BOUND a merge commit's staged baseline is compared against.
+
+    A conflicted merge finished with `git commit` stages a baseline descended
+    from two parents (esc-3620-11). Read against HEAD alone, every measure
+    MERGE_HEAD moved is a raise; read against either parent, keeping one side's
+    stale value re-absorbs the other side's lowering. The bound is what git does
+    to the file text, applied per measure against the merge base: a measure one
+    side moved stands at that side's value, up or down, and where both moved,
+    the higher side bounds it.
+
+    The seed's numbers: a.py lines 1000, b.py lines 200, total:lines 1200.
+    """
+
+    @staticmethod
+    def _moved(*moves: tuple[str, str, int]) -> dict:
+        """The seed with each ``(path, measure, value)`` set in its ``files``."""
+        report = synthetic_report()
+        for path, measure, value in moves:
+            report['files'][path][measure] = value
+        return report
+
+    @staticmethod
+    def _bounded(
+        tmp_path: Path,
+        current: dict,
+        *,
+        base: dict | None,
+        ours: dict | None,
+        theirs: dict | None,
+    ) -> list[tuple[str, str, int, int]]:
+        """The raises *current* makes over the bound, as field tuples."""
+
+        def image(name: str, report: dict | None) -> Path | None:
+            return None if report is None else _baseline_image(tmp_path, name, report)
+
+        raises = metrics.compare_merged_baseline_files(
+            base=image('base.json', base),
+            ours=image('ours.json', ours),
+            theirs=image('theirs.json', theirs),
+            current=_baseline_image(tmp_path, 'current.json', current),
+        )
+        return [_violation_fields(violation) for violation in raises]
+
+    def test_a_measure_only_theirs_moved_stands_at_theirs_value(
+        self, tmp_path: Path
+    ) -> None:
+        # THE INCIDENT'S SHAPE: ours never touched the baseline, so the bound IS
+        # theirs' image -- and the reported baseline is the bound, not HEAD's.
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=seed, theirs=theirs) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1006)),
+            base=seed,
+            ours=seed,
+            theirs=theirs,
+        ) == [
+            ('lines', 'a.py', 1005, 1006),
+            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
+        ]
+
+    @pytest.mark.parametrize('lowered_by', ['ours', 'theirs'])
+    def test_a_lowering_one_side_made_is_not_reabsorbed_from_the_other(
+        self, tmp_path: Path, lowered_by: str
+    ) -> None:
+        # THE CASE EVERY EITHER-PARENT RULE ADMITS. Keeping the unmoved side's
+        # 1000 is clean against that side, and in a conflicted merge on main it
+        # would land an unrecorded widening.
+        seed, lowered = synthetic_report(), self._moved(('a.py', 'lines', 995))
+
+        assert self._bounded(
+            tmp_path,
+            seed,
+            base=seed,
+            ours=lowered if lowered_by == 'ours' else seed,
+            theirs=lowered if lowered_by == 'theirs' else seed,
+        ) == [
+            ('lines', 'a.py', 995, 1000),
+            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
+        ]
+
+    def test_own_moves_stand_per_measure_not_per_path(self, tmp_path: Path) -> None:
+        # Both sides moved a.py, but different MEASURES of it: taking theirs'
+        # whole entry keeps theirs' cognitive lowering and undoes ours' lines one.
+        ours = self._moved(('a.py', 'lines', 995))
+        theirs = self._moved(('a.py', 'cognitive', 110))
+
+        assert self._bounded(
+            tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
+        ) == [
+            ('lines', 'a.py', 995, 1000),
+            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1195, 1200),
+        ]
+
+    def test_where_both_sides_moved_a_measure_the_higher_bounds_it(
+        self, tmp_path: Path
+    ) -> None:
+        seed = synthetic_report()
+        ours = self._moved(('a.py', 'lines', 990))
+        theirs = self._moved(('a.py', 'lines', 1005))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=ours, theirs=theirs) == []
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1006)),
+            base=seed,
+            ours=ours,
+            theirs=theirs,
+        ) == [
+            ('lines', 'a.py', 1005, 1006),
+            ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1205, 1206),
+        ]
+
+    def test_moves_on_different_paths_add_up_in_the_derived_total(
+        self, tmp_path: Path
+    ) -> None:
+        # ONE side moved each path, so each move stands, and the total is
+        # DERIVED from the bound: 1215. A per-measure max of the parents' own
+        # totals would read 1210 and refuse the merge.
+        ours = self._moved(('a.py', 'lines', 1005))
+        theirs = self._moved(('b.py', 'lines', 210))
+        merged = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 210))
+
+        assert self._bounded(
+            tmp_path, merged, base=synthetic_report(), ours=ours, theirs=theirs
+        ) == []
+
+    def test_a_path_one_side_deleted_stays_deleted(self, tmp_path: Path) -> None:
+        seed, ours = synthetic_report(), synthetic_report()
+        del ours['files']['b.py']
+
+        assert ('total:lines', metrics.CLUSTER_TOTAL_KEY, 1000, 1200) in self._bounded(
+            tmp_path, seed, base=seed, ours=ours, theirs=seed
+        )
+
+    def test_a_deletion_does_not_undo_the_other_sides_move(
+        self, tmp_path: Path
+    ) -> None:
+        # git's modify/delete conflict: the modification stands.
+        ours = synthetic_report()
+        del ours['files']['b.py']
+        theirs = self._moved(('b.py', 'lines', 190))
+
+        assert self._bounded(
+            tmp_path, theirs, base=synthetic_report(), ours=ours, theirs=theirs
+        ) == []
+
+    def test_an_absent_base_bounds_each_measure_by_the_higher_parent(
+        self, tmp_path: Path
+    ) -> None:
+        # No common ancestor, or no baseline at it: git merges such histories
+        # against the empty tree, so each side moved every measure it holds.
+        ours = synthetic_report()
+        theirs = self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 190))
+
+        assert self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1005)),
+            base=None,
+            ours=ours,
+            theirs=theirs,
+        ) == []
+        assert ('lines', 'b.py', 200, 201) in self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1005), ('b.py', 'lines', 201)),
+            base=None,
+            ours=ours,
+            theirs=theirs,
+        )
+
+    def test_an_absent_parent_image_moved_nothing(self, tmp_path: Path) -> None:
+        # A parent without a baseline must not read as having lowered every
+        # measure to nothing, which would refuse a resolver who keeps theirs.
+        seed, theirs = synthetic_report(), self._moved(('a.py', 'lines', 1005))
+
+        assert self._bounded(tmp_path, theirs, base=seed, ours=None, theirs=theirs) == []
+        assert ('lines', 'a.py', 1005, 1006) in self._bounded(
+            tmp_path,
+            self._moved(('a.py', 'lines', 1006)),
+            base=seed,
+            ours=None,
+            theirs=theirs,
+        )
+
+    def test_a_name_set_both_sides_moved_is_bounded_by_the_side_naming_more(
+        self, tmp_path: Path
+    ) -> None:
+        # DISTINCT names, the unit the per-path comparison counts in.
+        seed, ours, theirs = synthetic_report(), synthetic_report(), synthetic_report()
+        ours['tests']['t1.py']['patch_targets'] = ['foo', 'bar', 'qux']
+        theirs['tests']['t1.py']['patch_targets'] = ['foo']
+        widened = copy.deepcopy(ours)
+        widened['tests']['t1.py']['patch_targets'].append('zap')
+
+        assert self._bounded(tmp_path, ours, base=seed, ours=ours, theirs=theirs) == []
+        assert ('patch_targets', 't1.py', 3, 4) in self._bounded(
+            tmp_path, widened, base=seed, ours=ours, theirs=theirs
+        )
 
 
 class TestAuthorizedRaise:
@@ -2481,6 +3235,18 @@ class TestAuthorizedRaiseLedger:
         assert path.read_text(encoding='utf-8') == metrics.render_ledger(committed)
 
 
+def _ledger_record(task_id: str, reason: str = 'net-additive work') -> dict:
+    """One ledger entry, built by the real writer rather than hand-written."""
+    return metrics.authorization_record(
+        metrics.RaiseAuthorization(task_id=task_id, reason=reason),
+        [metrics.Violation.rose('lines', _MQ, 21550, 21653)],
+    )
+
+
+def _ledger(*records: dict) -> dict:
+    return {**metrics.empty_ledger(), 'raises': list(records)}
+
+
 class TestLedgerAppendedEntries:
     """The ledger delta, and what makes append_authorization's promise checkable.
 
@@ -2492,28 +3258,17 @@ class TestLedgerAppendedEntries:
     that checks it.
     """
 
-    @staticmethod
-    def _record(task_id: str, reason: str = 'net-additive work') -> dict:
-        return metrics.authorization_record(
-            metrics.RaiseAuthorization(task_id=task_id, reason=reason),
-            [metrics.Violation.rose('lines', _MQ, 21550, 21653)],
-        )
-
-    @classmethod
-    def _ledger(cls, *records: dict) -> dict:
-        return {**metrics.empty_ledger(), 'raises': list(records)}
-
     def test_an_unchanged_ledger_appended_nothing(self) -> None:
-        ledger = self._ledger(self._record('5485'))
+        ledger = _ledger(_ledger_record('5485'))
 
         assert metrics.ledger_appended_entries(ledger, copy.deepcopy(ledger)) == []
 
     def test_the_appended_suffix_is_returned_in_order(self) -> None:
-        history = self._record('5485')
-        first, second = self._record('5722'), self._record('5723')
+        history = _ledger_record('5485')
+        first, second = _ledger_record('5722'), _ledger_record('5723')
 
         appended = metrics.ledger_appended_entries(
-            self._ledger(history), self._ledger(history, first, second)
+            _ledger(history), _ledger(history, first, second)
         )
 
         assert appended == [first, second]
@@ -2521,19 +3276,17 @@ class TestLedgerAppendedEntries:
     def test_the_day_one_shape_is_the_whole_list(self) -> None:
         # Previous is the fail-CLOSED empty ledger -- the state a commit that
         # authorizes the very first raise starts from.
-        record = self._record('5722')
+        record = _ledger_record('5722')
 
         assert metrics.ledger_appended_entries(
-            metrics.empty_ledger(), self._ledger(record)
+            metrics.empty_ledger(), _ledger(record)
         ) == [record]
 
     def test_dropping_a_historical_entry_is_refused_by_name(self) -> None:
-        history = [self._record('5485'), self._record('5675')]
+        history = [_ledger_record('5485'), _ledger_record('5675')]
 
         with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.ledger_appended_entries(
-                self._ledger(*history), self._ledger(history[0])
-            )
+            metrics.ledger_appended_entries(_ledger(*history), _ledger(history[0]))
 
         message = str(excinfo.value)
         assert 'append-only' in message
@@ -2545,21 +3298,202 @@ class TestLedgerAppendedEntries:
         # LENGTH EQUALITY IS NOT PREFIX EQUALITY. A rewrite keeps the count
         # identical, so any check that compared lengths would pass it -- and a
         # rewritten `reason` is exactly how a raise stops reading as what it was.
-        history = self._record('5485')
-        forged = self._record('5485', reason='actually it was a refactor')
+        history = _ledger_record('5485')
+        forged = _ledger_record('5485', reason='actually it was a refactor')
 
         with pytest.raises(metrics.MetricsError):
-            metrics.ledger_appended_entries(
-                self._ledger(history), self._ledger(forged)
-            )
+            metrics.ledger_appended_entries(_ledger(history), _ledger(forged))
 
     def test_reordering_history_is_refused(self) -> None:
-        first, second = self._record('5485'), self._record('5675')
+        first, second = _ledger_record('5485'), _ledger_record('5675')
 
         with pytest.raises(metrics.MetricsError):
             metrics.ledger_appended_entries(
-                self._ledger(first, second), self._ledger(second, first)
+                _ledger(first, second), _ledger(second, first)
             )
+
+
+class TestLedgerMergedEntries:
+    """The ledger delta of a MERGE commit, read against BOTH parents' histories.
+
+    A conflicted merge finished with `git commit` runs pre-commit with
+    MERGE_HEAD set (esc-3620-11), so its staged ledger descends from two
+    recorded histories, not one. Each parent's entries must survive whole AND
+    in that parent's own order; the two histories may interleave, the way git's
+    merge of the text interleaves them, but nothing foreign may sit among them.
+    Only what follows both histories and belongs to NEITHER parent is the
+    merge's OWN -- the one thing that may cover a raise the merge makes.
+    """
+
+    @staticmethod
+    def _entries() -> tuple[dict, dict, dict]:
+        """History both parents share, then one entry only ours / only theirs added."""
+        return _ledger_record('5485'), _ledger_record('5722'), _ledger_record('3620')
+
+    def test_a_parent_without_a_ledger_constrains_nothing(self) -> None:
+        # THE INCIDENT'S SHAPE: the task branch predates the ledger, so HEAD
+        # reads as the fail-closed empty one and main's entries are history.
+        _history, _ours_own, theirs_own = self._entries()
+
+        assert metrics.ledger_merged_entries(
+            metrics.empty_ledger(), _ledger(theirs_own), _ledger(theirs_own)
+        ) == []
+
+    def test_one_sides_additions_are_history_not_the_merges_own(self) -> None:
+        history, _ours_own, theirs_own = self._entries()
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history),
+            _ledger(history, theirs_own),
+            _ledger(history, theirs_own),
+        ) == []
+
+    @pytest.mark.parametrize(
+        'theirs_first', [True, False], ids=['theirs-then-ours', 'ours-then-theirs']
+    )
+    def test_both_sides_additions_are_accepted_in_either_block_order(
+        self, theirs_first: bool
+    ) -> None:
+        # A resolver facing a both-sides-appended conflict keeps both entries in
+        # whichever order the conflict shows them; either interleaving keeps
+        # each parent's entries unchanged and in that parent's own order.
+        history, ours_own, theirs_own = self._entries()
+        blocks = [theirs_own, ours_own] if theirs_first else [ours_own, theirs_own]
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, ours_own),
+            _ledger(history, theirs_own),
+            _ledger(history, *blocks),
+        ) == []
+
+    def test_the_merges_own_additions_are_returned_in_order(self) -> None:
+        history, ours_own, theirs_own = self._entries()
+        first, second = _ledger_record('5792'), _ledger_record('5793')
+
+        appended = metrics.ledger_merged_entries(
+            _ledger(history, ours_own),
+            _ledger(history, theirs_own),
+            _ledger(history, theirs_own, ours_own, first, second),
+        )
+
+        assert appended == [first, second]
+
+    @pytest.mark.parametrize('dropped', ['ours', 'theirs'])
+    def test_dropping_an_entry_either_side_recorded_is_refused(
+        self, dropped: str
+    ) -> None:
+        # BOTH histories, not either: a merge resolved on main that kept only
+        # the task's entries would silently drop main's recorded ones.
+        history, ours_own, theirs_own = self._entries()
+        kept = theirs_own if dropped == 'ours' else ours_own
+
+        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
+            metrics.ledger_merged_entries(
+                _ledger(history, ours_own),
+                _ledger(history, theirs_own),
+                _ledger(history, kept),
+            )
+
+        assert 'append-only' in str(excinfo.value)
+
+    def test_rewriting_an_entry_one_side_recorded_is_refused(self) -> None:
+        # Same count, changed `reason`: length equality is not prefix equality
+        # here either.
+        history, ours_own, theirs_own = self._entries()
+        forged = _ledger_record('3620', reason='actually it was a refactor')
+
+        with pytest.raises(metrics.AppendOnlyViolation):
+            metrics.ledger_merged_entries(
+                _ledger(history, ours_own),
+                _ledger(history, theirs_own),
+                _ledger(history, forged, ours_own),
+            )
+
+    @staticmethod
+    def _merged_before() -> tuple[dict, dict, dict, dict]:
+        """Shared history, ours' own, theirs' own, and theirs' next addition.
+
+        The shape of a branch that merged main once, kept ours-then-theirs, and
+        now merges main again after main appended one more entry.
+        """
+        return (
+            _ledger_record('5485'),
+            _ledger_record('5792'),
+            _ledger_record('3620'),
+            _ledger_record('3790'),
+        )
+
+    def test_a_branch_that_kept_ours_then_theirs_can_merge_again(self) -> None:
+        # The reviewer's case, measured: git merges [h,o,t] and [h,t,t2] over
+        # base [h,t] cleanly to [h,o,t,t2]. No block order reproduces that.
+        history, ours_own, theirs_own, theirs_next = self._merged_before()
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, ours_own, theirs_own),
+            _ledger(history, theirs_own, theirs_next),
+            _ledger(history, ours_own, theirs_own, theirs_next),
+        ) == []
+
+    def test_a_branch_merging_after_another_landed_interleaves(self) -> None:
+        # Main now carries another branch's ours-then-theirs order, and this
+        # branch appended past the entry the two share.
+        history, other_own, shared, _theirs_next = self._merged_before()
+        ours_next = _ledger_record('5801')
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, shared, ours_next),
+            _ledger(history, other_own, shared),
+            _ledger(history, other_own, shared, ours_next),
+        ) == []
+
+    def test_the_merges_own_entries_follow_an_interleaved_history(self) -> None:
+        history, ours_own, theirs_own, theirs_next = self._merged_before()
+        own = _ledger_record('5900')
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, ours_own, theirs_own),
+            _ledger(history, theirs_own, theirs_next),
+            _ledger(history, ours_own, theirs_own, theirs_next, own),
+        ) == [own]
+
+    def test_reordering_one_parents_own_entries_is_refused(self) -> None:
+        # Ours recorded its own entry BEFORE the shared one; moving it after
+        # theirs' history rewrites the order ours recorded.
+        history, ours_own, theirs_own, theirs_next = self._merged_before()
+
+        with pytest.raises(metrics.AppendOnlyViolation) as excinfo:
+            metrics.ledger_merged_entries(
+                _ledger(history, ours_own, theirs_own),
+                _ledger(history, theirs_own, theirs_next),
+                _ledger(history, theirs_own, theirs_next, ours_own),
+            )
+
+        assert 'append-only' in str(excinfo.value)
+
+    def test_a_foreign_entry_inside_the_histories_is_refused(self) -> None:
+        history, ours_own, theirs_own, theirs_next = self._merged_before()
+        foreign = _ledger_record('5900')
+
+        with pytest.raises(metrics.AppendOnlyViolation):
+            metrics.ledger_merged_entries(
+                _ledger(history, ours_own, theirs_own),
+                _ledger(history, theirs_own, theirs_next),
+                _ledger(history, foreign, ours_own, theirs_own, theirs_next),
+            )
+
+    @pytest.mark.parametrize('with_own', [False, True], ids=['copy-only', 'copy-then-own'])
+    def test_a_copied_parent_entry_is_not_the_merges_own(self, with_own: bool) -> None:
+        # A duplicate of a recorded entry after both histories is still
+        # HISTORY: counting it as coverage is the standing permission
+        # LEDGER_README forbids.
+        history, ours_own, theirs_own, _theirs_next = self._merged_before()
+        own = [_ledger_record('5900')] if with_own else []
+
+        assert metrics.ledger_merged_entries(
+            _ledger(history, ours_own),
+            _ledger(history, theirs_own),
+            _ledger(history, ours_own, theirs_own, theirs_own, *own),
+        ) == own
 
 
 class TestUnrecordedRaises:
@@ -2703,6 +3637,7 @@ def _ratchet_baseline() -> dict:
                 'cognitive': 2133,
                 'function_local_imports': 12,
                 'reexport_names': 9,
+                'external_importers': 138,
             },
             _GIT_OPS: {
                 'lines': 14721,
@@ -2770,6 +3705,12 @@ _SEEDS = [
     ),
     ('files.reexport_names', _bump_file('reexport_names'), 'reexport_names', _MQ),
     (
+        'files.external_importers',
+        _bump_file('external_importers'),
+        'external_importers',
+        _MQ,
+    ),
+    (
         'functions',
         lambda cur: cur['functions'].__setitem__(
             _VERIFIER_LOOP, cur['functions'][_VERIFIER_LOOP] + 1
@@ -2814,6 +3755,12 @@ _SEEDS = [
         'total.reexport_names',
         _add_file('reexport_names'),
         'total:reexport_names',
+        metrics.CLUSTER_TOTAL_KEY,
+    ),
+    (
+        'total.external_importers',
+        _add_file('external_importers'),
+        'total:external_importers',
         metrics.CLUSTER_TOTAL_KEY,
     ),
     (
@@ -2881,6 +3828,63 @@ class TestCheckAgainstBaseline:
         current['functions'][_VERIFIER_LOOP] = 12
         current['tests'][_TEST_FILE]['private_reads'] = 0
         assert metrics.check_against_baseline(current, baseline) == []
+
+
+class TestIntroducingTheMeasure:
+    """A baseline from before ``external_importers`` has no value for it.
+
+    Its first recording is therefore a raise from 0, and it is admitted the way
+    every other raise is: by an authorization recorded in the ledger, never
+    silently. There is deliberately no "absent means not comparable" rule -- it
+    would be the same rule that lets a baseline delete the measure in one commit
+    and re-add it larger in the next.
+    """
+
+    @staticmethod
+    def _before_the_measure() -> dict:
+        baseline = _ratchet_baseline()
+        del baseline['files'][_MQ]['external_importers']
+        return baseline
+
+    def test_the_first_recording_is_a_raise_per_path_and_in_the_total(self) -> None:
+        raises = metrics.check_against_baseline(
+            _ratchet_baseline(), self._before_the_measure()
+        )
+        assert [(v.measure, v.key, v.baseline, v.current) for v in raises] == [
+            ('external_importers', _MQ, 0, 138),
+            ('total:external_importers', metrics.CLUSTER_TOTAL_KEY, 0, 138),
+        ]
+
+    def test_the_write_gate_refuses_it_without_an_authorization(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / 'b.json'
+        metrics.write_baseline(target, self._before_the_measure())
+        before = target.read_text(encoding='utf-8')
+        with pytest.raises(metrics.UnauthorizedRaise, match='external_importers'):
+            metrics.write_baseline(target, _ratchet_baseline())
+        assert target.read_text(encoding='utf-8') == before
+
+    def test_an_authorized_first_recording_is_written_and_recorded(
+        self, tmp_path: Path
+    ) -> None:
+        target, ledger = tmp_path / 'b.json', tmp_path / 'ledger.json'
+        metrics.write_baseline(target, self._before_the_measure())
+        authorization = metrics.RaiseAuthorization(
+            task_id='5036', reason='introduces the external_importers measure'
+        )
+        written = metrics.write_baseline(
+            target, _ratchet_baseline(), authorization=authorization, ledger=ledger
+        )
+        assert target.read_text(encoding='utf-8') == metrics.render_baseline(
+            _ratchet_baseline()
+        )
+        assert written.record is not None
+        assert {row['measure'] for row in written.record['measures']} == {
+            'external_importers',
+            'total:external_importers',
+        }
+        assert metrics.load_ledger(ledger)['raises'] == [written.record]
 
 
 class TestCeilingsApplyOnlyToNewKeys:
@@ -3116,6 +4120,21 @@ class TestReportCli:
         totals = metrics.derive_totals(stub_measurement)
         assert str(totals['cognitive']) in out
         assert str(totals['lines']) in out
+
+    def test_report_carries_the_external_importers_per_alias_and_in_total(
+        self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        metrics.main(['--report'])
+        lines = capsys.readouterr().out.splitlines()
+        total = metrics.derive_totals(stub_measurement)['external_importers']
+        assert f'external_importers      {total:>7}' in lines
+        for old, new in metrics.ALIAS_MODULES.items():
+            count = stub_measurement['files'][
+                f'orchestrator/src/{old.replace(".", "/")}.py'
+            ]['external_importers']
+            rows = [line for line in lines if f'{old} ' in line and f'-> {new} ' in line]
+            assert len(rows) == 1, f'{old} is not reported on exactly one row'
+            assert rows[0].split()[-1] == str(count), rows[0]
 
     def test_report_carries_the_test_suite_measures(
         self, stub_measurement: dict, capsys: pytest.CaptureFixture[str]
@@ -3618,6 +4637,18 @@ class TestBaselineIsNotVacuous:
     ) -> None:
         # Measured 226 lane-importing files under orchestrator/tests.
         assert len(committed_baseline['tests']) >= 150
+
+    def test_the_baseline_records_external_importers_for_every_alias_module(
+        self, committed_baseline: dict
+    ) -> None:
+        # Recorded for EACH alias, zeros included: an alias missing from the file
+        # is one whose count could rise unseen, since a path's absent measure
+        # reads as 0.
+        for old in metrics.ALIAS_MODULES:
+            entry = committed_baseline['files'][f'orchestrator/src/{old.replace(".", "/")}.py']
+            count = entry['external_importers']
+            assert isinstance(count, int) and not isinstance(count, bool), old
+            assert count >= 0, old
 
     def test_the_baseline_enumeration_was_complete_when_recorded(
         self, committed_baseline: dict

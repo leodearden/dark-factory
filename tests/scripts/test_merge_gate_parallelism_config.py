@@ -3,17 +3,15 @@
 Task 5408. Four of the nine discovered module configs ran their pytest leg
 single-process at the merge role while ``orchestrator`` and ``fused-memory``
 had carried ``-n auto --dist loadgroup`` in their own addopts for some time.
-This guard pins the four that were brought onto that same footing, and pins
-the exclusions that were left serial DELIBERATELY, so a later reader cannot
-tell a ruled-out module from a forgotten one.
+Task 5408 brought four onto that same footing and task 5470 brought in a fifth,
+``tests/scripts``. This guard pins those five, and pins the exclusions that
+were left serial DELIBERATELY, so a later reader cannot tell a ruled-out module
+from a forgotten one.
 
-The exclusions are TWO tables, because there are two kinds. Workspace members
-are recorded in ``RULED_SERIAL_MEMBERS`` and read out of their own
-``pyproject.toml``; module-config prefixes that own no pyproject.toml are
-recorded in ``RULED_SERIAL_MODULE_LEGS`` and read out of their
-``test_command``. An entry in either is not automatically a RULING: each states
-what it actually is, and the one open divergence carries the task it is filed
-as.
+The exclusions are ONE table, ``RULED_SERIAL_MEMBERS``: workspace members, read
+out of their own ``pyproject.toml``. The two module-config prefixes that own no
+pyproject.toml are both parallel, recorded with their measurements in
+``PARALLEL_TEST_COMMAND_LEGS`` and read out of their ``test_command``.
 
 PLACEMENT IS LOAD-BEARING, and follows the family convention recorded in
 ``test_module_verify_budgets.py`` and ``test_module_type_check_invocation.py``:
@@ -58,8 +56,9 @@ if TYPE_CHECKING:
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
 # The workspace members whose OWN pyproject.toml addopts gained the parallel
-# flags. `scripts` is absent on purpose and is covered separately: it has no
-# pyproject.toml of its own, so its flags live on its test_command instead.
+# flags. `scripts` and `tests/scripts` are absent on purpose and are covered
+# separately (PARALLEL_TEST_COMMAND_LEGS): neither has a pyproject.toml of its
+# own, so their flags live on their test_command instead.
 PARALLEL_ADDOPTS_MEMBERS = ('dashboard', 'escalation', 'cockpit')
 
 # The spelling every parallel module shares, copied from
@@ -200,13 +199,13 @@ def test_parallel_member_addopts_declare_xdist_with_loadgroup(member: str) -> No
 def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> None:
     """No parallelised member copies ``--max-worker-restart`` across.
 
-    ``orchestrator/pyproject.toml`` carries ``--max-worker-restart=0``, and
-    copying it here would look like completing the family. It is deliberately
-    NOT copied: that flag turns a worker killed by pytest-timeout's thread
-    handler into a false-failing per-test "node down" on whatever test happened
-    to be running — a SHIFTING VICTIM rather than the starved test — and
-    whether orchestrator should keep it is its own open question (tasks 5114 /
-    5115), not something this task pre-answers for four more modules.
+    The flag is required exactly where ``timeout_method = "thread"`` is set —
+    orchestrator and fused-memory — and that invariant, with its
+    executable reproduction, lives in ``test_xdist_worker_restart_policy.py``.
+    Copying it here would look like completing the family, but these members
+    run ``timeout_method = "signal"``: a timeout raises inside the test and the
+    worker survives, so the case the flag exists for does not arise from their
+    cap, and task 5408 declined to widen it to them without a measured need.
     """
     offenders = [
         token
@@ -215,12 +214,12 @@ def test_parallel_member_addopts_do_not_copy_max_worker_restart(member: str) -> 
     ]
     assert not offenders, (
         f"{member}/pyproject.toml's addopts declares {offenders!r} (task 5408). "
-        'That flag was deliberately not carried over from '
-        'orchestrator/pyproject.toml: under it a worker that pytest-timeout '
-        "os._exit()s becomes a per-test 'node down' failure attributed to a "
-        'shifting victim rather than to the starved test, and tasks 5114/5115 '
-        "are still open on whether orchestrator should keep it. Do not widen "
-        'that exposure to four more modules as a side effect of adding workers'
+        'That flag is required only where timeout_method = "thread" is set '
+        '(orchestrator, fused-memory — see '
+        'test_xdist_worker_restart_policy.py). This member runs '
+        'timeout_method = "signal", where a timeout raises inside the test and '
+        'the worker survives, so the case the flag exists for does not arise '
+        'from its cap. Do not widen it here without a measured need'
     )
 
 
@@ -355,8 +354,9 @@ def _pytest_legs_carrying_workers(
     ``-n`` can reach pytest from either of two places, and both count because
     pytest cannot tell them apart:
 
-      * the command's own POST-anchor argv (how the ``scripts`` leg gets it, its
-        targets being repo-root paths under no member's pyproject.toml);
+      * the command's own POST-anchor argv (how the ``scripts`` and
+        ``tests/scripts`` legs get it, their targets being repo-root paths under
+        no member's pyproject.toml);
       * the SELECTED member's own addopts (how the ``--directory <m>`` legs get
         it).
 
@@ -417,8 +417,8 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
 
     THE MEMBER ASSERTED ABOUT is the one uv's PRE-anchor selector names, because
     that is the environment the plugin has to be installed into — not whichever
-    module config happens to declare the command. For the ``scripts`` leg those
-    differ: it selects ``shared``.
+    module config happens to declare the command. For the ``scripts`` and
+    ``tests/scripts`` legs those differ: both select ``shared``.
     """
     legs = _pytest_legs_carrying_workers(discover_module_configs())
     assert legs, (
@@ -460,14 +460,29 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
 
 
 # ---------------------------------------------------------------------------
-# The `scripts` leg, the non-leakage claim, and the ruled exclusions (task 5408)
+# The non-member legs, the non-leakage claim, and the ruled exclusions
+# (tasks 5408, 5470)
 # ---------------------------------------------------------------------------
 
-# The module config that defines the `scripts` verify leg. It has no
-# pyproject.toml of its own, so its flags live on its test_command instead —
-# see `test_root_addopts_never_leaks_the_parallel_flags` for why that is the
-# SPOT rather than the root inifile.
-SCRIPTS_MODULE_PREFIX = 'scripts'
+# The module-config prefixes that own no pyproject.toml and run parallel, each
+# with the measurement that put it there. Their flags live on their
+# test_command — see `test_root_addopts_never_leaks_the_parallel_flags` for why
+# that is the SPOT rather than the root inifile.
+PARALLEL_TEST_COMMAND_LEGS = {
+    'scripts': (
+        'task 5408: the slowest leg in the gate, MEASURED on the 5408 tree at '
+        '5333 passed / 2 skipped in 117.71s at -n 8 --dist loadgroup, against '
+        '394-490s serial'
+    ),
+    'tests/scripts': (
+        'task 5470: measured several times faster parallel than serial, every '
+        "run of both forms recorded in tests/scripts/orchestrator.yaml's "
+        'MEASUREMENT PROVENANCE block. It matters because '
+        'dark-factory-orchestrator.yaml sets merge_verify_max_concurrent_modules: '
+        '1, which runs module legs one at a time, so this leg\'s wall clock adds '
+        'directly onto the merge gate'
+    ),
+}
 
 # The members left SERIAL on purpose, each with the reason it was ruled out.
 # A table rather than prose, so a later "helpful" widening fails against a
@@ -513,27 +528,6 @@ RULED_SERIAL_MEMBERS = {
 }
 
 
-# The module-config LEGS left serial on purpose, keyed by module PREFIX rather
-# than by member. A second table and not a row in the one above, because these
-# are a different kind of thing: a prefix here owns no pyproject.toml, so its
-# flags would live on a test_command and its absence from the parallel set is
-# invisible in every pyproject in the tree — exactly the case
-# RULED_SERIAL_MEMBERS cannot record.
-RULED_SERIAL_MODULE_LEGS = {
-    'tests/scripts': (
-        'NOT ruled out on a measurement, and this entry exists to say so '
-        'rather than let silence read as a ruling. Task 5408 was scoped to '
-        'four named modules and this is not one of them, so '
-        "tests/scripts/orchestrator.yaml was never in that task's lock set. It "
-        'is an acknowledged DIVERGENCE rather than a settled exclusion: this '
-        "leg's test_command runs `tests/scripts/`, a strict SUBSET of the "
-        "`scripts` leg's `tests/scripts/ scripts/tests/` targets, so as of "
-        '5408 the same directory runs parallel on one leg and serial on the '
-        'other at the same gate. Filed as residue 1 of task 5470 — when that '
-        'lands, add the flags and DELETE this entry in the same commit'
-    ),
-}
-
 # The two modules that were already parallel before task 5408 and are NOT this
 # task's to re-spell. Task 3589 is the one that proposes replacing `auto` with a
 # literal `-n 8` here, and reconciling that against
@@ -541,75 +535,74 @@ RULED_SERIAL_MODULE_LEGS = {
 TASK_3589_MEMBERS = ('orchestrator', 'fused-memory')
 
 
-def _scripts_pytest_argv(module_configs: dict[str, ModuleConfig]) -> list[str]:
-    """pytest's OWN argv in the ``scripts`` module's test_command.
+def _leg_pytest_argv(module_configs: dict[str, ModuleConfig], prefix: str) -> list[str]:
+    """pytest's OWN argv in the *prefix* module's test_command.
 
     Post-anchor only, via ``vci.anchor_split``: the pre-anchor
     ``uv run --project shared`` tokens are uv's, and reading the whole segment
     would confuse an environment selector with one of pytest's own flags.
     """
-    assert SCRIPTS_MODULE_PREFIX in module_configs, (
-        f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml is not discovered by the '
-        'production config._discover_module_configs walk, so there is no '
-        f'scripts verify leg to assert about. Discovered: '
+    label = f'{prefix}/orchestrator.yaml test_command'
+    assert prefix in module_configs, (
+        f'{prefix}/orchestrator.yaml is not discovered by the production '
+        'config._discover_module_configs walk, so there is no '
+        f'{prefix} verify leg to assert about. Discovered: '
         f'{sorted(module_configs)}'
     )
-    command = module_configs[SCRIPTS_MODULE_PREFIX].test_command
+    command = module_configs[prefix].test_command
     assert command, (
-        f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml declares no test_command, '
-        'so the assertions below would be satisfied for the wrong reason'
+        f'{prefix}/orchestrator.yaml declares no test_command, so the '
+        'assertions below would be satisfied for the wrong reason'
     )
-    segment = vci.required_segment(
-        command, vci.PYTEST, label=f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml test_command'
-    )
-    return vci.anchor_split(
-        segment, vci.PYTEST, label=f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml test_command'
-    )[1]
+    segment = vci.required_segment(command, vci.PYTEST, label=label)
+    return vci.anchor_split(segment, vci.PYTEST, label=label)[1]
 
 
-def test_scripts_leg_carries_the_parallel_flags_on_its_test_command(
+@pytest.mark.parametrize('prefix', sorted(PARALLEL_TEST_COMMAND_LEGS))
+def test_non_member_legs_carry_the_parallel_flags_on_their_test_command(
+    prefix: str,
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],
 ) -> None:
-    """The ``scripts`` verify leg runs parallel, declared on its test_command.
+    """Each non-member verify leg runs parallel, declared on its test_command.
 
-    ``scripts/`` has no pyproject.toml, so it is the one parallelised leg whose
-    flags cannot live in addopts. Its command runs from the worktree root over
-    ``tests/scripts/ scripts/tests/``, so pytest's rootdir — and therefore its
-    inifile — resolves to the REPO ROOT, not to anything scripts-specific. The
-    single place that defines this leg is its ``test_command``, so that is where
+    Neither ``scripts/`` nor ``tests/scripts/`` has a pyproject.toml, so these
+    are the parallelised legs whose flags cannot live in addopts. Both commands
+    run from the worktree root, so pytest's rootdir — and therefore its inifile
+    — resolves to the REPO ROOT pyproject, not to anything leg-specific. The
+    single place that defines each leg is its ``test_command``, so that is where
     the flags belong (heuristic 11); the companion assertion in
     ``test_root_addopts_never_leaks_the_parallel_flags`` is what makes the other
     half of that claim checkable.
 
     With this in place the structural invariant in
     ``test_every_pytest_leg_running_workers_declares_the_plugin`` then requires
-    ``shared`` — the member this command's ``--project`` selects — to declare
+    ``shared`` — the member both commands' ``--project`` selects — to declare
     pytest-xdist, even though ``shared``'s own suite stays serial.
     """
-    argv = _scripts_pytest_argv(discover_module_configs())
+    argv = _leg_pytest_argv(discover_module_configs(), prefix)
+    reason = PARALLEL_TEST_COMMAND_LEGS[prefix]
 
     assert _flag_value(argv, WORKERS_FLAG) == WORKERS_VALUE, (
-        f"{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml's test_command passes pytest "
-        f'{argv!r}, which does not carry `{WORKERS_FLAG} {WORKERS_VALUE}` '
-        '(task 5408). This leg is the slowest in the gate — MEASURED on the 5408 '
-        'tree at `-n 8 --dist loadgroup`: 5333 passed / 2 skipped in 117.71s, '
-        'against 394-490s serial. The flags go HERE and not in the root '
-        "pyproject.toml's addopts, because that inifile also governs every bare "
-        'root-bound pytest run'
+        f"{prefix}/orchestrator.yaml's test_command passes pytest {argv!r}, "
+        f'which does not carry `{WORKERS_FLAG} {WORKERS_VALUE}` — {reason}. The '
+        "flags go HERE and not in the root pyproject.toml's addopts, because "
+        'that inifile also governs every bare root-bound pytest run'
     )
     assert _flag_value(argv, DIST_FLAG) == DIST_VALUE, (
-        f"{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml's test_command passes pytest "
-        f'{argv!r}, which does not carry `{DIST_FLAG} {DIST_VALUE}` (task 5408) — '
-        f'the grouping discipline that must travel with {WORKERS_FLAG} so '
-        '@pytest.mark.xdist_group is a guarantee rather than a hint'
+        f"{prefix}/orchestrator.yaml's test_command passes pytest {argv!r}, "
+        f'which does not carry `{DIST_FLAG} {DIST_VALUE}` — the grouping '
+        f'discipline that must travel with {WORKERS_FLAG} so '
+        '@pytest.mark.xdist_group is a guarantee rather than a hint '
+        f'({reason})'
     )
 
 
 def test_root_addopts_never_leaks_the_parallel_flags() -> None:
     """The ROOT pyproject.toml's addopts must carry neither ``-n`` nor ``--dist``.
 
-    THE SPOT CLAIM, MADE CHECKABLE. The root inifile is NOT the ``scripts``
-    module's private config even though that leg resolves its rootdir there: the
+    THE SPOT CLAIM, MADE CHECKABLE. The root inifile is NOT the private config
+    of either leg in ``PARALLEL_TEST_COMMAND_LEGS``, even though both resolve
+    their rootdir there: the
     root pyproject's own comment records that it equally governs a bare
     root-bound ``pytest``, a ``-c pyproject.toml`` run, and any argument set
     spanning two subprojects. Confirmed empirically on the 5408 tree — a
@@ -619,19 +612,23 @@ def test_root_addopts_never_leaks_the_parallel_flags() -> None:
     anything there.
 
     So putting the flags here would parallelise all of those as a side effect of
-    a change scoped to ONE verify leg — including runs in members that declare no
+    a change scoped to those verify legs — including runs in members that declare no
     pytest-xdist, where pytest would exit 4. This assertion holds from the
     start; it exists so a later widening fails loudly rather than passing as a
     convenience.
     """
     tokens = shlex.split(_declared_addopts('.'))
     offenders = [token for token in tokens if token in (WORKERS_FLAG, DIST_FLAG)]
+    leg_commands = ', '.join(
+        f'{prefix}/orchestrator.yaml::test_command'
+        for prefix in sorted(PARALLEL_TEST_COMMAND_LEGS)
+    )
     assert not offenders, (
         f"the ROOT pyproject.toml's addopts is {_declared_addopts('.')!r}, which "
-        f'carries {offenders!r} (task 5408). Those flags belong on '
-        f'{SCRIPTS_MODULE_PREFIX}/orchestrator.yaml::test_command, the single '
-        'place that defines the scripts verify leg. This inifile is not that '
-        "leg's private config: it is also what a bare root-bound `pytest`, a "
+        f'carries {offenders!r} (tasks 5408, 5470). Those flags belong on '
+        f'{leg_commands} — each the single place that defines its verify leg. '
+        "This inifile is not those legs' private config: it is also what a "
+        'bare root-bound `pytest`, a '
         '`-c pyproject.toml` run and any argument set spanning two subprojects '
         'read, so parallelising here reaches every one of those — including '
         'members that declare no pytest-xdist, where pytest exits 4 with '
@@ -659,54 +656,6 @@ def test_ruled_serial_members_stay_serial(member: str) -> None:
     )
 
 
-@pytest.mark.parametrize('prefix', sorted(RULED_SERIAL_MODULE_LEGS))
-def test_ruled_serial_module_legs_stay_serial(
-    prefix: str,
-    discover_module_configs: Callable[[], dict[str, ModuleConfig]],
-) -> None:
-    """A module LEG left serial stays serial, with its reason attached.
-
-    The sibling of :func:`test_ruled_serial_members_stay_serial` for the
-    configs that own no pyproject.toml. Same contract, different place to read:
-    the flags would live on ``test_command``, so that is what is inspected —
-    post-anchor, so uv's own wrapper tokens can never be mistaken for pytest's.
-
-    Read the failure message before deleting this: an entry here is not always
-    a RULING. The ``tests/scripts`` one records an acknowledged divergence with
-    a follow-up task attached, so the correct response to tripping it is to
-    finish that work and remove the entry, not to argue with the assertion.
-    """
-    module_configs = discover_module_configs()
-    assert prefix in module_configs, (
-        f'{prefix}/orchestrator.yaml is not discovered by the production '
-        'config._discover_module_configs walk, so this exclusion is recorded '
-        f'about a leg that no longer exists. Discovered: {sorted(module_configs)}'
-    )
-    command = module_configs[prefix].test_command
-    assert command, (
-        f'{prefix}/orchestrator.yaml declares no test_command, so the '
-        'assertion below would be satisfied for the wrong reason'
-    )
-    label = f'{prefix}/orchestrator.yaml test_command'
-    segment = vci.optional_token_segment(command, vci.PYTEST)
-    assert segment is not None, (
-        f'{label} no longer runs pytest at all, so the parallel flags this '
-        'entry is about have nowhere to go. Re-read '
-        f'RULED_SERIAL_MODULE_LEGS[{prefix!r}] and retire it if it is stale'
-    )
-    _, post = vci.anchor_split(segment, vci.PYTEST, label=label)
-
-    offenders = [token for token in post if token in (WORKERS_FLAG, DIST_FLAG)]
-    assert not offenders, (
-        f'{label} now passes pytest {offenders!r}, but this leg was recorded '
-        f'as staying serial by task 5408: {RULED_SERIAL_MODULE_LEGS[prefix]}. '
-        'If that work has now been done, DELETE this entry in the same commit '
-        'rather than loosening the assertion — the table is the record of '
-        'which legs are deliberately out of the parallel set, and an entry '
-        'that no longer holds is worse than no entry'
-    )
-
-
 @pytest.mark.parametrize('member', TASK_3589_MEMBERS)
 def test_the_already_parallel_members_still_resolve_through_the_shared_knob(
     member: str,
@@ -720,8 +669,8 @@ def test_the_already_parallel_members_still_resolve_through_the_shared_knob(
     subject, stated in that key's own comment block.
 
     Pinned so the reconciliation is a deliberate edit here rather than a silent
-    divergence: today all five parallel modules resolve their worker count
-    through the same one knob, and the next A/B cut moves them together.
+    divergence: today every parallel module resolves its worker count through
+    the same one knob, and the next A/B cut moves them together.
     """
     tokens = shlex.split(_declared_addopts(member))
     workers = _flag_value(tokens, WORKERS_FLAG)
@@ -732,7 +681,7 @@ def test_the_already_parallel_members_still_resolve_through_the_shared_knob(
         'here is TASK 3589\'s, whose subject is reconciling that literal against '
         "dark-factory-orchestrator.yaml's verify_env pin and stating which layer "
         'is authoritative. If 3589 is what you are landing, update this pin in '
-        'that commit and say so; do not let the five parallel modules diverge '
+        'that commit and say so; do not let the parallel modules diverge '
         'silently onto two different worker-count sources'
     )
 
@@ -766,17 +715,15 @@ PYRIGHT_USAGE_ERROR_RC = 4
 # `--dist loadgroup` is in force, so the pair cannot land on two workers and
 # run two concurrent pyright processes on an already-loaded host.
 #
-# THAT QUALIFIER IS LOAD-BEARING — the guarantee is not universal, because TWO
-# registered module configs collect this file. The `scripts` leg passes
-# `--dist loadgroup`, so the grouping holds there. The `tests/scripts` leg
-# passes no `--dist` at all (RULED_SERIAL_MODULE_LEGS above), so at the roles
-# `shared.verify_admission.is_gated_role` names, where verify injects
-# `-n <config.verify_admission_pytest_n>`, it runs under xdist's default
-# `load` — and there an xdist_group mark is ignored OUTRIGHT, so the two probes
-# can land on different workers. Neither probe mutates shared state and each
-# measured ~1.4s on the 5408 tree, so that case costs a small optimisation
-# rather than correctness; it is stated rather than claimed away. Task 5470
-# residue 1 is where `--dist loadgroup` would reach that leg.
+# Since task 5470 that is every registered module config that collects this
+# file: both the `scripts` and the `tests/scripts` legs pass
+# `--dist loadgroup` (PARALLEL_TEST_COMMAND_LEGS above). At the roles
+# `shared.verify_admission.is_gated_role` names, verify only appends
+# `-n <config.verify_admission_pytest_n>` (verify._with_pytest_numprocesses_str)
+# and leaves `--dist loadgroup` in force. A bare ad-hoc `-n` run that omits
+# `--dist` falls back to xdist's default `load`, where the mark is ignored;
+# neither probe mutates shared state and each measured ~1.4s on the 5408 tree,
+# so that case costs a small optimisation rather than correctness.
 PYRIGHT_PROBE_GROUP = 'pyright_threads_probe'
 
 # Bounds the probe subprocess itself, INSIDE each probe's @pytest.mark.timeout,
@@ -909,8 +856,8 @@ def test_the_configured_pyright_actually_accepts_threads_eight(
     Its companion negative control is
     ``test_pyright_refuses_threads_together_with_stats``; the two share an
     ``xdist_group`` so they do not run as two concurrent pyright processes on
-    any leg that passes ``--dist loadgroup`` — which is not every leg that
-    collects this file. See ``PYRIGHT_PROBE_GROUP``.
+    any leg that passes ``--dist loadgroup`` — which, since task 5470, is every
+    registered leg that collects this file. See ``PYRIGHT_PROBE_GROUP``.
     """
     pre, _ = _pyright_argv(discover_module_configs(), THREADS_PROBE_MODULE)
     result = _run_probe(pre, _write_probe(tmp_path))

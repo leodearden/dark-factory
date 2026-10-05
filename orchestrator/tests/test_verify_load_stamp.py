@@ -49,11 +49,16 @@ def _sample(**overrides):
     return PsiSample(**fields)
 
 
+def _loadavg():
+    """A fixed ``os.getloadavg()`` reading, so the record under test is deterministic."""
+    return (3.5, 2.0, 1.0)
+
+
 class TestLoadSample:
     """``verify._load_sample()`` — ONE dict describing host load at an instant."""
 
     def test_the_exact_key_set(self):
-        """The record is flat and closed: three keys, no nesting.
+        """The record is flat and closed: four keys, no nesting.
 
         Flat for the same reason the rest of this schema is flat — the value is
         written straight into JSON, so anything needing its own serialisation
@@ -61,10 +66,11 @@ class TestLoadSample:
         """
         from orchestrator.verify import _load_sample  # noqa: PLC0415
 
-        assert set(_load_sample(read=_sample)) == {
+        assert set(_load_sample(read=_sample, loadavg=_loadavg)) == {
             'cpu_some10',
             'cpu_some60',
             'runqueue_ratio',
+            'loadavg1',
         }
 
     def test_a_healthy_sample_carries_floats(self):
@@ -89,9 +95,15 @@ class TestLoadSample:
 
         record = _load_sample(
             read=lambda: _sample(cpu_some10=0.0, cpu_some60=0.0, runqueue_ratio=0.0),
+            loadavg=lambda: (0.0, 0.0, 0.0),
         )
 
-        assert record == {'cpu_some10': 0.0, 'cpu_some60': 0.0, 'runqueue_ratio': 0.0}
+        assert record == {
+            'cpu_some10': 0.0,
+            'cpu_some60': 0.0,
+            'runqueue_ratio': 0.0,
+            'loadavg1': 0.0,
+        }
 
     def test_a_degraded_host_reads_null_not_zero(self):
         """``read_ok=False`` governs the HOST component — both CPU windows."""
@@ -134,13 +146,16 @@ class TestLoadSample:
 
         assert record['runqueue_ratio'] is None
 
-    def test_a_raising_reader_returns_the_all_none_record(self, caplog):
+    def test_a_raising_psi_reader_nulls_only_the_psi_components(self, caplog):
         """INV-1: a telemetry failure may not raise into a verify verdict.
 
         WARNING, not DEBUG: the reader already fails open BY VALUE via its
         read_ok flags, so reaching this handler at all means the telemetry path
         broke in a way it does not itself model. Swallowing that quietly is the
         silent-degradation shape the tree-wide gate exists to catch.
+
+        The loadavg is a separate read, so a broken PSI path does not discard
+        it: per-component degradation (INV-11), as for the runqueue above.
         """
         from orchestrator.verify import _load_sample  # noqa: PLC0415
 
@@ -148,15 +163,56 @@ class TestLoadSample:
             raise RuntimeError('/proc went away')
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            record = _load_sample(read=boom)
+            record = _load_sample(read=boom, loadavg=_loadavg)
 
         assert record == {
             'cpu_some10': None,
             'cpu_some60': None,
             'runqueue_ratio': None,
+            'loadavg1': 3.5,
         }
         assert any(r.levelno == logging.WARNING for r in caplog.records)
         assert '_load_sample' in caplog.text
+
+    def test_loadavg1_is_the_one_minute_load_average_as_a_float(self):
+        """Comparable with the sar loadavg series the host was measured on.
+
+        An int from the source is still recorded as a float, so a reader never
+        has to special-case the type of one column.
+        """
+        from orchestrator.verify import _load_sample  # noqa: PLC0415
+
+        assert _load_sample(read=_sample, loadavg=_loadavg)['loadavg1'] == 3.5
+        whole = _load_sample(read=_sample, loadavg=lambda: (4, 2, 1))['loadavg1']
+        assert whole == 4.0
+        assert isinstance(whole, float)
+
+    def test_an_unobtainable_loadavg_reads_null_not_zero(self):
+        """``os.getloadavg`` documents OSError; that reads None, never 0.0.
+
+        The PSI components are read independently and stay intact.
+        """
+        from orchestrator.verify import _load_sample  # noqa: PLC0415
+
+        def unobtainable():
+            raise OSError('Load averages are unobtainable')
+
+        record = _load_sample(read=_sample, loadavg=unobtainable)
+
+        assert record['loadavg1'] is None
+        assert record['cpu_some10'] == pytest.approx(2.50)
+        assert record['cpu_some60'] == pytest.approx(1.80)
+        assert record['runqueue_ratio'] == pytest.approx(0.75)
+
+    def test_a_raising_loadavg_is_not_a_bare_except(self):
+        """Same as the PSI half: a BaseException from the loadavg read propagates."""
+        from orchestrator.verify import _load_sample  # noqa: PLC0415
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        with pytest.raises(KeyboardInterrupt):
+            _load_sample(read=_sample, loadavg=interrupt)
 
     def test_a_raising_reader_is_not_a_bare_except(self, caplog):
         """A BaseException — KeyboardInterrupt, SystemExit — must propagate.
@@ -196,7 +252,7 @@ class TestLoadSample:
 
         record = _load_sample()
 
-        assert set(record) == {'cpu_some10', 'cpu_some60', 'runqueue_ratio'}
+        assert set(record) == {'cpu_some10', 'cpu_some60', 'runqueue_ratio', 'loadavg1'}
         assert all(v is None or isinstance(v, float) for v in record.values())
 
     def test_there_is_exactly_one_psi_reader_in_the_module(self):
@@ -547,6 +603,7 @@ class TestLoadReachesTheSummaryPayload:
             [self._run('test'), self._run('lint', load=self._load(cpu=7.5))],
             'clean',
             '',
+            role='task',
         )
 
         assert [e['load'] for e in payload['commands']] == [
@@ -566,7 +623,7 @@ class TestLoadReachesTheSummaryPayload:
         legacy = self._run()
         del legacy['load']
 
-        payload = _build_summary_payload([legacy], 'clean', '')
+        payload = _build_summary_payload([legacy], 'clean', '', role='task')
 
         assert payload['commands'][0]['load'] is None
 
@@ -577,7 +634,9 @@ class TestLoadReachesTheSummaryPayload:
         legacy = self._run()
         del legacy['load']
 
-        payload = _build_summary_payload([legacy, self._run('lint')], 'clean', '')
+        payload = _build_summary_payload(
+            [legacy, self._run('lint')], 'clean', '', role='task',
+        )
 
         assert all('load' in entry for entry in payload['commands'])
 
@@ -589,6 +648,7 @@ class TestLoadReachesTheSummaryPayload:
             [self._run('test'), self._run('type', cmd=None, load=None)],
             'clean',
             '',
+            role='task',
         )
 
         assert [e['label'] for e in payload['commands']] == ['test']
@@ -596,7 +656,7 @@ class TestLoadReachesTheSummaryPayload:
     def test_the_payload_is_json_native(self):
         from orchestrator.verify import _build_summary_payload  # noqa: PLC0415
 
-        payload = _build_summary_payload([self._run()], 'clean', '')
+        payload = _build_summary_payload([self._run()], 'clean', '', role='task')
 
         assert json.loads(json.dumps(payload)) == payload
 
@@ -882,7 +942,11 @@ class TestTelemetryFailureDoesNotChangeTheVerdict:
     async def test_the_load_fields_are_null_throughout_rather_than_zero(
         self, tmp_path, segmented,
     ):
-        """Null, not 0.0 — a broken read must not render as an idle host."""
+        """Null, not 0.0 — a broken read must not render as an idle host.
+
+        Only the PSI keys: the live host's loadavg is a separate read that a
+        broken PSI reader does not degrade.
+        """
         _result, summary = await _run_and_read_summary(
             tmp_path, segmented=segmented, reader=_raising_reader(),
         )
@@ -891,11 +955,13 @@ class TestTelemetryFailureDoesNotChangeTheVerdict:
         assert entries
         for entry in entries:
             for end in ('start', 'end'):
-                assert entry['load'][end] == {
+                record = entry['load'][end]
+                assert {k: record[k] for k in ('cpu_some10', 'cpu_some60', 'runqueue_ratio')} == {
                     'cpu_some10': None,
                     'cpu_some60': None,
                     'runqueue_ratio': None,
                 }
+                assert record['loadavg1'] is None or isinstance(record['loadavg1'], float)
 
     @pytest.mark.asyncio
     async def test_the_record_is_still_structurally_complete(

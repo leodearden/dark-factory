@@ -1,10 +1,13 @@
-"""Non-fixture test helpers for fused-memory tests.
+"""Shared test helpers for fused-memory tests, imported by name.
 
 Lives outside conftest.py to avoid the `sys.modules['conftest']` collision
 that arises when root-level pytest loads multiple subprojects' conftests in
 the same process.  Each subproject exports its helpers under a unique
 module name so test files can `from _fm_helpers import X` without
 colliding with sibling subprojects' helpers.
+
+An opt-in fixture defined here applies only to the modules that import it
+by name (see `lease_dir_fixture`).
 """
 
 import asyncio
@@ -16,7 +19,9 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
+import threading
 import types
 import uuid
 import warnings
@@ -30,6 +35,13 @@ import httpx
 import pytest
 from openai import RateLimitError
 from pydantic import BaseModel
+
+from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
+    INCOMPLETE_STRUCTURAL_KINDS,
+    PagedRead,
+)
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -292,6 +304,87 @@ def extract_params(call_args: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# PagedRead test doubles (task 4386)
+# ---------------------------------------------------------------------------
+#
+# The paginated whole-graph reads (`enumerate_all_valid_edges`,
+# `enumerate_entity_nodes`) return `(collection, PagedRead)`, and the
+# consumers wired in task 4386 project that PagedRead's completeness into
+# their own per-cycle stats.  Every stub of one of those methods therefore has
+# to supply a second tuple element, across five test modules in two
+# directories — so the doubles live here rather than being hand-rolled per
+# site, where they would be unreadable and would drift.
+#
+# `rows` is deliberately always empty: these stand in for the SECOND tuple
+# element only.  The collection a consumer actually iterates is the stub's
+# FIRST element, while `rows_seen`/`expected_rows` are what a consumer
+# projects into stats — so the two must be settable independently.
+# ---------------------------------------------------------------------------
+
+_KNOWN_INCOMPLETE_KINDS: frozenset[str] = INCOMPLETE_STRUCTURAL_KINDS | {
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
+}
+
+
+def complete_paged_read(
+    *, rows_seen: int = 0, expected_rows: int | None = None
+) -> PagedRead:
+    """A PagedRead reporting a PROVEN-complete enumeration.
+
+    `expected_rows` defaults to `rows_seen`, which is what a healthy read
+    looks like: the census and the pages agree.  Pass it explicitly only to
+    build a shape the real backend would not produce.
+    """
+    return PagedRead(
+        rows=[],
+        complete=True,
+        rows_seen=rows_seen,
+        expected_rows=rows_seen if expected_rows is None else expected_rows,
+        reason=None,
+        incomplete_kind=None,
+    )
+
+
+def incomplete_paged_read(
+    kind: str,
+    *,
+    rows_seen: int = 0,
+    expected_rows: int | None = None,
+    reason: str | None = None,
+) -> PagedRead:
+    """A PagedRead reporting an INCOMPLETE enumeration of the given kind.
+
+    `kind` is validated against the four `INCOMPLETE_*` constants rather than
+    taken on trust: a typo'd kind string matches no policy branch, so it would
+    quietly behave like a complete read and the test would pass for the wrong
+    reason.
+
+    `reason` defaults to a diagnostic string naming the kind and both counts,
+    mirroring the real backend's shape closely enough that an assertion on the
+    reason reaching an operator-facing message is meaningful.
+    """
+    assert kind in _KNOWN_INCOMPLETE_KINDS, (
+        f'unknown incomplete_kind {kind!r}; expected one of '
+        f'{sorted(_KNOWN_INCOMPLETE_KINDS)}'
+    )
+    if reason is None:
+        reason = (
+            f'test double: enumeration reported incomplete '
+            f'(incomplete_kind={kind}) with rows_seen={rows_seen} '
+            f'expected_rows={expected_rows}'
+        )
+    return PagedRead(
+        rows=[],
+        complete=False,
+        rows_seen=rows_seen,
+        expected_rows=expected_rows,
+        reason=reason,
+        incomplete_kind=kind,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 8df8bdcd regression scenario builder + shared parse helpers
 # ---------------------------------------------------------------------------
 #
@@ -545,6 +638,12 @@ async def submit_and_resolve(
         f'submit_and_resolve: ticket {ticket!r} resolved with no result_json '
         f'(resolve_result={resolve_result!r})'
     )
+
+
+#: The documented-safe MCP tool-response size, in serialised chars. Derived in
+#: test_get_statuses_pagination.py::test_auto_page_limit_fits_documented_safe_envelope
+#: (see also server/tools.py::_STATUSES_AUTO_PAGE_LIMIT).
+MCP_SAFE_RESPONSE_CHARS = 62_000
 
 
 # ---------------------------------------------------------------------------
@@ -1183,6 +1282,90 @@ async def retry_until_observed(
 
 
 # ---------------------------------------------------------------------------
+# Shared LoopFreedomProbe loop-freedom oracle (task 5920)
+# ---------------------------------------------------------------------------
+
+#: Loop turns LoopFreedomProbe.suspend() yields before recording a held loop.
+#: One turn suffices on a free loop, because the marker is queued ahead of the
+#: stub's own resumption; the slack only absorbs a future reordering of
+#: asyncio's ready queue. It counts loop turns, never seconds.
+LOOP_FREEDOM_TURN_BUDGET = 10
+
+#: Seconds an off-loop-thread caller waits for the captured loop to run its
+#: marker. A CEILING, not a floor: a free loop answers within microseconds, so
+#: only a held loop reaches it, and it bounds how long that failure takes.
+LOOP_FREEDOM_CEILING_SECONDS = 30.0
+
+
+class LoopFreedomProbe:
+    """Did the test's event loop stay free while the code under test was paused?
+
+    Construct it inside the test coroutine (it captures the running loop and
+    its thread). A stubbed await point calls ``await probe.suspend()``; a
+    stubbed blocking call calls ``probe.block()``. Then call
+    :meth:`assert_loop_stayed_free`. Each call queues a marker on the captured
+    loop and records True iff the marker ran:
+
+    * ``suspend()`` on the captured loop yields a bounded number of loop turns,
+      so a call site that resumes the coroutine itself reads False.
+    * ``block()``, or ``suspend()`` on another thread's loop, waits for the
+      marker up to a ceiling, so a call site that holds the loop's thread while
+      that work runs elsewhere reads False. ``block()`` on the loop's own
+      thread reads False at once, because it is the holder.
+
+    Every verdict is deterministic and none hangs. It replaces a FLOOR on ticker
+    wake-ups inside a wall-clock window, which reds under host/GIL contention
+    (task 5920; the same defect
+    ``orchestrator/tests/test_verify_ruff_config_boundary.py::TestProbeDoesNotBlockTheEventLoop``
+    fixed for task 4520 / esc-4520-6).
+    """
+
+    def __init__(self, *, ceiling_seconds: float = LOOP_FREEDOM_CEILING_SECONDS) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._loop_thread = threading.get_ident()
+        self._ceiling_seconds = ceiling_seconds
+        self._observations: list[bool] = []
+
+    @property
+    def observations(self) -> tuple[bool, ...]:
+        return tuple(self._observations)
+
+    async def suspend(self) -> None:
+        if asyncio.get_running_loop() is not self._loop:
+            self.block()
+            return
+
+        marker_ran = False
+
+        def _mark() -> None:
+            nonlocal marker_ran
+            marker_ran = True
+
+        self._loop.call_soon_threadsafe(_mark)
+        for _ in range(LOOP_FREEDOM_TURN_BUDGET):
+            if marker_ran:
+                break
+            await asyncio.sleep(0)
+        self._observations.append(marker_ran)
+
+    def block(self) -> None:
+        if threading.get_ident() == self._loop_thread:
+            self._observations.append(False)
+            return
+
+        loop_answered = threading.Event()
+        self._loop.call_soon_threadsafe(loop_answered.set)
+        self._observations.append(loop_answered.wait(self._ceiling_seconds))
+
+    def assert_loop_stayed_free(self) -> None:
+        assert self._observations, 'LoopFreedomProbe: the probe was never reached by a stubbed call'
+        assert all(self._observations), (
+            'LoopFreedomProbe: the event loop was held while the code under test '
+            f'was paused (observations={self.observations})'
+        )
+
+
+# ---------------------------------------------------------------------------
 # Shared FalkorDB index-readiness barrier (task 3377; extracted from task 3334)
 # ---------------------------------------------------------------------------
 #
@@ -1788,6 +1971,120 @@ def load_script_module(
     return module
 
 
+_CLEANUP_TEST_COLLECTIONS_SCRIPT = (
+    pathlib.Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py'
+)
+
+
+@functools.cache
+def _lease_dir_env() -> str:
+    """The env var name, read from the reaper that defines it.
+
+    Read rather than spelled out here so a rename of the constant cannot
+    leave `lease_dir_fixture` setting a variable nothing consults any more —
+    which would look exactly like isolation while every test fell through to
+    the real machine-global directory.
+
+    Loaded lazily and cached, because conftest.py and most test modules
+    import this module and an eager load would charge every pytest session.
+    Only the resulting STRING is kept: the modules that import the fixture
+    load the reaper through their own loaders, and holding a second reference
+    to a module object they may replace is a hazard with nothing to buy it.
+    """
+    return load_script_module(_CLEANUP_TEST_COLLECTIONS_SCRIPT).LEASE_DIR_ENV
+
+
+@pytest.fixture(autouse=True, name='lease_dir')
+def lease_dir_fixture(tmp_path, monkeypatch):
+    """Point ``DF_EPHEMERAL_COLLECTION_LEASE_DIR`` at a per-test directory.
+
+    A hard isolation boundary, not a convenience.  The lease directory
+    ``cleanup_test_collections.lease_dir()`` returns by default is a
+    HARDCODED machine-global absolute path (that is the property the guard's
+    correctness rests on — see the design note on that function), and it is
+    the very directory the live 6-hourly cron reads.  A test that wrote a
+    lease into it would hold a real sweep off this host; a test that reaped
+    it would unlink the lease of a live bake-off running in another checkout.
+
+    Autouse, and applied to EVERY test in an importing module rather than
+    only its lease tests, for exactly that reason: a test that forgets to
+    request the isolation must not be able to fall through silently to the
+    real directory.  Tests that need the path can still request this fixture
+    by name; the directory is not created here, because a lease-dir-absent
+    case is one of the behaviours under test.
+
+    Activation is by import, per module
+    (``from _fm_helpers import lease_dir_fixture  # noqa: F401``), and NEVER
+    from conftest.py: an autouse fixture there would apply to every test in
+    the package, redirecting the ``-m integration`` lane away from the
+    directory the live cron reads and silently disabling the guard task 4775
+    built.  The attribute is ``lease_dir_fixture`` while the fixture NAME
+    stays ``lease_dir`` because a module-level ``lease_dir`` binding would be
+    shadowed by every ``def test_x(self, lease_dir)`` parameter, which ruff
+    reports as F811 once per test.
+    """
+    directory = tmp_path / 'ephemeral-collection-leases'
+    monkeypatch.setenv(_lease_dir_env(), str(directory))
+    return directory
+
+
+def as_async_run_git(side_effect):
+    """Adapt a `subprocess.run` side_effect to a `shared.git_async.run_git` fake.
+
+    Task 3778 moved the detector's three git probes off blocking
+    `subprocess.run` and onto the async `run_git` helper, which invalidated the
+    `patch('subprocess.run', ...)` seam this suite was built on. Rather than
+    hand-rewrite ~90 canned git responses, every existing side_effect is passed
+    through this one adapter, so the *responses* stay byte-for-byte what they
+    were and only the seam changes.
+
+    It faithfully reproduces `run_git`'s contract, which differs from
+    `subprocess.run`'s in exactly two ways that matter here:
+
+    - stdout/stderr are `.strip()`ed by `run_git` itself, so the adapter strips
+      too (a fake that did not would let a test pass against behaviour the real
+      helper cannot produce).
+    - a TIMEOUT is RETURNED as `timed_out=True` with a non-zero returncode, not
+      raised. `subprocess.run` raises `TimeoutExpired`, so any side_effect that
+      raises it is converted here. Every other exception (notably `OSError`)
+      propagates, because `run_git` propagates it too.
+
+    Accepts the two shapes `unittest.mock` accepts for `side_effect`: a
+    callable, or an exception instance/class to raise.
+    """
+    from shared.git_async import TIMEOUT_RETURNCODE, GitResult
+
+    def _timed_out(timeout) -> GitResult:
+        return GitResult(
+            returncode=TIMEOUT_RETURNCODE,
+            stdout='',
+            stderr=f'timed out after {timeout}s',
+            timed_out=True,
+        )
+
+    async def fake_run_git(cmd, cwd=None, *, input_text=None, timeout=None):
+        # mock's own semantics: a bare exception instance/class means "raise".
+        if isinstance(side_effect, BaseException) or (
+            isinstance(side_effect, type) and issubclass(side_effect, BaseException)
+        ):
+            if isinstance(side_effect, subprocess.TimeoutExpired) or (
+                side_effect is subprocess.TimeoutExpired
+            ):
+                return _timed_out(timeout)
+            raise side_effect
+
+        try:
+            completed = side_effect(list(cmd), timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return _timed_out(timeout)
+
+        return GitResult(
+            returncode=completed.returncode,
+            stdout=(completed.stdout or '').strip(),
+            stderr=(completed.stderr or '').strip(),
+        )
+
+    return fake_run_git
 # ---------------------------------------------------------------------------
 # Cross-run citation repair fixtures (task 3065)
 #

@@ -38,23 +38,21 @@ echo "${ORCH_CONFIG_PATH:-unset}"
 # If "unset": continue below.
 ```
 
-If unset, find the config file in the target project. Filenames vary across projects (no auto-discovery — every project chose its own name); check all common locations:
+If unset, the config is the target project's `dark-factory-orchestrator.yaml` — the
+canonical, required filename for every factory-operated project (`CLAUDE.md`, "Repo Map";
+it is what the dashboard's escalation-URL discovery keys on):
 
 ```bash
-ls "$TARGET_PROJECT"/dark-factory-orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator.yaml \
-   "$TARGET_PROJECT"/orchestrator-config.yaml \
-   "$TARGET_PROJECT"/config.yaml \
-   "$TARGET_PROJECT"/orchestrator/config.yaml 2>/dev/null
+TARGET_CONFIG="$TARGET_PROJECT"/dark-factory-orchestrator.yaml
+ls "$TARGET_CONFIG"
 ```
 
-Known locations for the three current projects:
-
-| Project | TARGET_CONFIG |
-|---------|---------------|
-| dark-factory | `/home/leo/src/dark-factory/dark-factory-orchestrator.yaml` |
-| reify | `/home/leo/src/reify/orchestrator.yaml` |
-| autopilot-video | `/home/leo/src/autopilot-video/orchestrator-config.yaml` |
+As of 2026-09-29 every project under `DASHBOARD_KNOWN_PROJECT_ROOTS` carries that file.
+The legacy spellings (`orchestrator.yaml`, `orchestrator-config.yaml`, `config.yaml`,
+`orchestrator/config.yaml`) are honoured only as a discovery fallback for a not-yet-migrated
+project, never as a choice for a new one — and a stray legacy file can sit BESIDE the canonical
+one (autopilot-video still has a `config.yaml`, pump-web-ui an `orchestrator.yaml`), so never let a
+glob over the legacy names win over the canonical path when both exist.
 
 Verify the file actually points at the target:
 
@@ -323,7 +321,7 @@ If children (agent subprocesses) are orphaned, kill them by PID. Do **not** use 
 
 ## Reload Config (vs Restart)
 
-Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
+Some config edits don't need a restart. `mcp__escalation__reload_config` hot-applies a **safe, allowlisted subset** of `dark-factory-orchestrator.yaml` changes to the already-running orchestrator process — no SIGTERM, no cold start, no in-flight agents or verify suites killed.
 
 ### Why this exists
 
@@ -530,11 +528,13 @@ All paths below operate on the **target** project (`$TARGET_PROJECT`), not dark-
 
    **If `MERGE_SHA` is not in hand** — step 6 reached in a fresh shell, a resumed session, or a merge performed earlier — do **not** substitute `git rev-parse HEAD`. Re-derive by the *hand-merge* subject and prove containment first:
    ```bash
-   sha=$(git log main --fixed-strings --grep="Merge branch 'task/<task-id>'" --max-count=1 --format=%H)
+   S="Merge branch 'task/<task-id>'"
+   sha=$(git log main --fixed-strings --grep="$S" --format='%H%x09%s' \
+           | awk -F'\t' -v s="$S" '$2==s && !seen {print $1; seen=1}')
    echo "hand-merge sha=$sha"
    [ -n "$sha" ] && { git merge-base --is-ancestor task/<task-id> "$sha"; echo "containment rc=$?"; }
    ```
-   `--fixed-strings` against the full quoted subject is substring-safe — the trailing `'` stops `task/1` matching inside `Merge branch 'task/10'`. Stamp `$sha` only when it is **non-empty AND containment rc=0**, which is what proves that merge brought *this* branch in. rc=1 means it did not (a different or earlier merge), rc=128 means one of the two shas did not resolve, and an empty `$sha` means no hand-merge subject is on main: on any of those, stamp nothing here and fall through to the ladder below. **Never stamp a bare `git rev-parse HEAD`** — that is main's current tip, not necessarily your merge, and the server's only backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main, so nothing downstream would catch the substitution.
+   `--fixed-strings` against the full quoted subject is substring-safe — the trailing `'` stops `task/1` matching inside `Merge branch 'task/10'`. The `awk` half selects the newest hit whose **subject** is exactly that, scanning past commits that merely quote it in a body; **do not add `--max-count=1`**, which would stop at the newest *message* match and discard a genuine merge shadowed behind it — see [step 1](../_shared/deriving-landed-sha.md#step-1-subject-check) for the measured population. Stamp `$sha` only when it is **non-empty AND containment rc=0**, which together prove that merge brought *this* branch in — the subject conjunct is already discharged by the selection. The subject conjunct is load-bearing and **containment does not supply it**: `git log --grep` matches the whole commit message, so a commit that merely *quotes* the hand-merge subject in its body is matched too, and containment cannot reject it — containment exists to reject a **stale** marker from a previous incarnation (whose tip is a *descendant*, not an ancestor), but for a branch that genuinely landed earlier, *any* later commit on main has the branch as an ancestor and so passes rc=0. This is the same body-match hole [step 1](../_shared/deriving-landed-sha.md#step-1-subject-check) closes for the orchestrator-shaped marker. rc=1 means it did not (a different or earlier merge), rc=128 means one of the two shas did not resolve, and an empty `$sha` means no commit on main carries the hand-merge subject: on any of those, stamp nothing here and fall through to the ladder below. **Never stamp a bare `git rev-parse HEAD`** — that is main's current tip, not necessarily your merge, and the server's only backstop (`git merge-base --is-ancestor <sha> main`) passes for every recent commit on main, so nothing downstream would catch the substitution.
 
    **Otherwise** — when the work was already on main and you are deriving rather than recording a merge you performed — derive the sha with the task-scoped ladder, never from main's current HEAD and never from an eyeballed listing: [`skills/_shared/deriving-landed-sha.md`](../_shared/deriving-landed-sha.md#the-ladder), the single normative copy (exact-subject marker search, ref-existence gate, containment, the group-merge candidate, the phantom-branch citation gate, and the `DoneProvenance` contract). Run it in full. Two adaptations for this call site: run every command in `$TARGET_PROJECT`, not dark-factory, and the shared doc writes the task id as `<TASK_ID>` where this workflow writes `<task-id>` — same value.
 

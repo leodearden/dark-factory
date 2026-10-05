@@ -89,7 +89,14 @@ def _make_hanging_proc():
     return proc, call_count
 
 
-def _make_delayed_success_proc(delay_secs, stdout_bytes=b'{"type":"result","subtype":"success"}'):
+def _make_delayed_success_proc(
+    delay_secs,
+    stdout_bytes=b'{"type":"result","subtype":"success"}',
+    *,
+    reads_observed=None,
+    min_reads=0,
+    max_extra_wait_secs=2.0,
+):
     """Return a proc whose communicate() sleeps *delay_secs* then succeeds once.
 
     Mirrors ``TestRunSubprocessWorkingRegimeProgressExtension._make_delayed_success_proc``
@@ -97,10 +104,32 @@ def _make_delayed_success_proc(delay_secs, stdout_bytes=b'{"type":"result","subt
     reads in isolation: the run leaves the loop via ``comm_task in done`` and
     never enters the ``except TimeoutError:`` handler, so the handler's own
     one-shot re-read cannot land in the recorded-ident list.
+
+    READS GATE — why *delay_secs* alone is not enough.  A test that asserts "at
+    least N reads happened" needs the process to stay pending across N watchdog
+    iterations, and *delay_secs* only buys that by WALL-CLOCK proxy: it assumes
+    the loop gets N turns inside the delay.  That assumption is exactly the one
+    this module's header docstring warns against.  When the host is
+    oversubscribed the loop is descheduled past *delay_secs*, its first
+    ``asyncio.wait`` returns with ``comm_task`` already done, the loop ``break``s
+    BEFORE the read, and the run ends with zero or one read — code under test
+    entirely innocent (observed: a 0.7 s first poll at a patched 5 ms cadence,
+    load average 57 on 32 cores).
+
+    Passing *reads_observed* (the list the patched ``count_transcript_turns``
+    appends to) and *min_reads* makes the precondition causal instead: the
+    process stays pending until the reads have actually been observed.  The wait
+    is bounded by *max_extra_wait_secs* so a genuine regression — reads that
+    never happen — still fails loudly on the caller's own assertion rather than
+    hanging until the suite timeout.
     """
 
     async def communicate_side_effect(input=None):  # noqa: A002
         await asyncio.sleep(delay_secs)
+        if reads_observed is not None:
+            deadline = time.monotonic() + max_extra_wait_secs
+            while len(reads_observed) < min_reads and time.monotonic() < deadline:
+                await asyncio.sleep(0.005)
         return (stdout_bytes, b'')
 
     proc = MagicMock()
@@ -187,8 +216,8 @@ class TestStartupRegimePollOffLoop:
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
 
-        proc = _make_delayed_success_proc(0.3)
         recorded: list[int] = []
+        proc = _make_delayed_success_proc(0.3, reads_observed=recorded, min_reads=1)
 
         with (
             patch(
@@ -328,8 +357,11 @@ class TestWorkingRegimeExtensionPollOffLoop:
         cfg_dir = tmp_path / 'cfg'
         cfg_dir.mkdir()
 
-        proc = _make_delayed_success_proc(0.3)
         recorded: list[int] = []
+        # min_reads=2 matches the `len(recorded) >= 2` assertion below; the gate
+        # makes that precondition causal rather than a wall-clock bet, and its
+        # 2.0s bound keeps the worst case (0.3 + 2.0 = 2.3s) under absolute_cap_secs=5.0.
+        proc = _make_delayed_success_proc(0.3, reads_observed=recorded, min_reads=2)
 
         with (
             patch(

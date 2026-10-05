@@ -67,6 +67,7 @@ import pytest
 from _orch_helpers import (
     ORCH_PYPROJECT,
     PYPROJECT_DEFAULT_TIMEOUT,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
 
@@ -96,15 +97,14 @@ _TESTS_DIR = Path(__file__).resolve().parent
 # loudly if the sweep itself ever breaks (a wrong _TESTS_DIR, a read that
 # silently yields nothing, a detector rotted to always-False).  The house
 # pattern for exactly this risk:
-# test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES,
-# test_killpg_frozen_pgid_guard.py's measured file
-# floor, test_serial_merge_worker_import_guard.py::test_allowlist_has_no_stale_entries.
+# test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES and
+# test_killpg_frozen_pgid_guard.py's measured file floor.
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_SCANNERS = 10
 
 # Worst per-call wall clock MEASURED for a member of this family under REAL
-# load: 30.75s for test_serial_merge_worker_import_guard at loadavg 120-176
-# (task 4215's record; ~4.8x its 6.46s unloaded figure).  Named rather than
+# load: 30.75s for the serial-worker import guard (deleted by task 5034) at
+# loadavg 120-176 (task 4215's record; ~4.8x its 6.46s unloaded figure).  Named rather than
 # left in prose so the floor below is anchored to a measurement instead of only
 # to a ratio against a setting that can itself move.
 _MEASURED_UNDER_LOAD_WORST_CASE = 30.75
@@ -150,6 +150,31 @@ def _pytest_ini_options() -> dict[str, object]:
 class TestTimeoutConstants:
     """The two constants this guard's remediation advice depends on."""
 
+    def test_a_hung_test_dumps_its_stacks_before_any_kill_can_reach_it(self) -> None:
+        """``faulthandler_timeout`` must fire below the tightest kill a test meets.
+
+        Under ``timeout_method = "thread"`` the kill is an ``os._exit()`` that
+        leaves no traceback.  pytest-timeout's own banner goes through the
+        terminal writer to the worker's STDOUT, which execnet's
+        ``init_popen_io`` dup2s to /dev/null, so under xdist it never reaches
+        the controller; the faulthandler dump goes to STDERR, which the worker
+        inherits from the controller, and verify merges stderr into its log.
+        The dump is evidence only if it lands first, and the tightest kill an
+        UNMARKED test can meet is verify's CLI ``--timeout=300``, not this
+        file's ini default.  Marked tests below this value still die silently.
+        """
+        ini_options = _pytest_ini_options()
+
+        dump_after = ini_options['faulthandler_timeout']
+        assert isinstance(dump_after, int | float), (
+            f'faulthandler_timeout must be a TOML number, got {dump_after!r}'
+        )
+        assert 0 < dump_after < VERIFY_CLI_PER_TEST_TIMEOUT, (
+            f'faulthandler_timeout ({dump_after}) must be positive and below '
+            f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}), or a '
+            'hung test is killed before its stacks reach the verify log'
+        )
+
     def test_pyproject_default_timeout_mirrors_pyproject(self) -> None:
         """``PYPROJECT_DEFAULT_TIMEOUT`` must equal the REAL configured default.
 
@@ -194,9 +219,9 @@ class TestTimeoutConstants:
 
         * 8.25s / 6.70s / 6.46s per call unloaded and serial (``-n0``) on a
           32-core box for test_merge_queue_reachback_patch_guard,
-          test_event_loop_antipattern_guard and
-          test_serial_merge_worker_import_guard respectively;
-        * 17.85 / 21.32 / 30.75s per call for test_serial_merge_worker_import_guard
+          test_event_loop_antipattern_guard and the serial-worker import
+          guard (deleted by task 5034) respectively;
+        * 17.85 / 21.32 / 30.75s per call for that serial-worker guard
           at loadavg 120-176 (task 4215's record) -- ~4.8x its unloaded figure;
         * xdist worker deaths observed at loadavg 250-423 (esc-3980-1,
           esc-3787-1), i.e. past the 60s default then in force.

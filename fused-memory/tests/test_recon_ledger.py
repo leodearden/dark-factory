@@ -37,13 +37,17 @@ from fused_memory.reconciliation.recon_ledger import (
     MARKER_KINDS,
     ReconLedgerRecord,
     ReconLedgerStore,
+    SuppressionStreakRow,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_TTL,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     RECORD_KIND_ENTITY_STANDING_DECISION,
+    RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
     STATE_ACTIVE,
     STATE_EXPIRED,
+    STREAK_PAYLOAD_KEY,
+    STREAK_WINDOW_PAYLOAD_KEY,
 )
 from fused_memory.server import main as server_main
 from fused_memory.services.memory_service import MemoryService
@@ -1170,6 +1174,361 @@ async def test_gc_flip_defensively_wraps_non_dict_standing_payload(store):
         'expiry_reason': EXPIRY_REASON_TTL,
     }
     assert await store.get_active_entity_standing_decision('proj-p', 'uuid-scalar') is None
+    assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# entity_standing_decision_suppression_streak rows (task 2943)
+#
+# One row per (project, entity, grounds) carrying the count of consecutive
+# full cycles in which that entity's standing decision suppressed a flag. The
+# PK slots mirror the decision row so the two share an identity a reader can
+# join on; unlike the decision row, gc() hard-deletes a streak row on expiry.
+# ---------------------------------------------------------------------------
+
+_STREAK_WRITE = dict(
+    project_id='proj-s',
+    entity_uuid='uuid-streak',
+    grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+    streak=2,
+    recent_counts=(),
+    last_run_id='run-2',
+    updated_at='2026-07-01T00:00:00+00:00',
+    expires_at='2026-09-29T00:00:00+00:00',
+)
+
+
+def _streak_row(**overrides: object) -> SuppressionStreakRow:
+    """The decoded row _STREAK_WRITE (plus *overrides*) reads back as."""
+    fields: dict = dict(
+        entity_uuid='uuid-streak',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        streak=2,
+        recent_counts=(),
+        last_run_id='run-2',
+    )
+    fields.update(overrides)
+    return SuppressionStreakRow(**fields)
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_round_trips_with_decision_pk_slots(store):
+    """A streak row is listed under its project, decoded, and stored with the
+    decision row's PK-slot mapping (task_id '', flag_type=grounds,
+    run_id=entity_uuid), the entity_uuid column set, state active, and the
+    expiry it was given."""
+    await store.upsert_suppression_streak(**_STREAK_WRITE)
+
+    assert await store.list_suppression_streaks('proj-s') == [_streak_row()]
+
+    record = await store.get_by_identity(
+        'proj-s',
+        RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+        task_id='',
+        flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        run_id='uuid-streak',
+    )
+    assert record is not None
+    assert record.entity_uuid == 'uuid-streak'
+    assert record.state == STATE_ACTIVE
+    assert record.created_at == '2026-07-01T00:00:00+00:00'
+    assert record.expires_at == '2026-09-29T00:00:00+00:00'
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_updates_in_place(store):
+    """A second write for the same (entity, grounds) updates that row rather
+    than appending a second one."""
+    await store.upsert_suppression_streak(**_STREAK_WRITE)
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 3, 'last_run_id': 'run-3'}
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, last_run_id='run-3')
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_suppression_streaks_is_scoped_to_project_and_kind(store):
+    """Another project's streak row and a same-entity decision row are not
+    listed."""
+    await store.upsert_suppression_streak(**_STREAK_WRITE)
+    await store.upsert_suppression_streak(**{**_STREAK_WRITE, 'project_id': 'proj-other'})
+    await store.upsert_entity_standing_decision(
+        project_id='proj-s',
+        entity_uuid='uuid-streak',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-07-01T00:00:00+00:00',
+        expires_at='2026-09-29T00:00:00+00:00',
+        edge_count_at_decision=1,
+        evidence=[],
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [_streak_row()]
+
+
+@pytest.mark.asyncio
+async def test_suppression_streak_rows_are_per_entity_and_per_grounds(store, monkeypatch):
+    """Two entities each get their own row, and so do two grounds for one
+    entity. GROUNDS_ENUM has one member today, so the second grounds value is
+    admitted by widening the enum the store validates against."""
+    from fused_memory.reconciliation import recon_ledger as recon_ledger_module
+
+    monkeypatch.setattr(
+        recon_ledger_module,
+        'GROUNDS_ENUM',
+        frozenset({GROUNDS_STRUCTURAL_SIZE_CONFLATION, 'some_future_grounds'}),
+    )
+    await store.upsert_suppression_streak(**{**_STREAK_WRITE, 'entity_uuid': 'uuid-a'})
+    await store.upsert_suppression_streak(**{**_STREAK_WRITE, 'entity_uuid': 'uuid-b'})
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'entity_uuid': 'uuid-a', 'grounds': 'some_future_grounds'}
+    )
+
+    listed = await store.list_suppression_streaks('proj-s')
+    assert sorted((r.entity_uuid, r.grounds) for r in listed) == [
+        ('uuid-a', 'some_future_grounds'),
+        ('uuid-a', GROUNDS_STRUCTURAL_SIZE_CONFLATION),
+        ('uuid-b', GROUNDS_STRUCTURAL_SIZE_CONFLATION),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('field', 'bad_value'),
+    [
+        ('entity_uuid', ''),
+        ('streak', -1),
+        ('streak', True),
+        ('grounds', 'not_a_real_grounds'),
+        ('expires_at', None),
+    ],
+)
+async def test_upsert_suppression_streak_rejects_malformed_writes_loudly(
+    store, field, bad_value
+):
+    """INV-1: a malformed write raises ValueError naming the failing field and
+    writes no row."""
+    with pytest.raises(ValueError, match=field):
+        await store.upsert_suppression_streak(**{**_STREAK_WRITE, field: bad_value})
+
+    assert await store.list_suppression_streaks('proj-s') == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_round_trips_its_per_cycle_window(store):
+    """The row carries the streak's recent per-cycle suppression counts, in
+    order, next to the streak count and the last run id.  Every field reading
+    back as written is also what shows that no two of the payload keys the
+    row writes collide: a shared key would let one value overwrite another."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 3, 'recent_counts': (2, 1, 2)}
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, recent_counts=(2, 1, 2))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_accepts_the_reset_shape(store):
+    """A reset is a zero streak with an empty window."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 0, 'recent_counts': ()}
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=0, recent_counts=())
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('streak', 'recent_counts'),
+    [
+        pytest.param(3, (1, 0, 1), id='zero-entry'),
+        pytest.param(3, (1, -2), id='negative-entry'),
+        pytest.param(3, (True,), id='bool-entry'),
+        pytest.param(3, ('1',), id='str-entry'),
+        pytest.param(3, '1', id='str-as-the-sequence'),
+        pytest.param(1, (1, 1), id='longer-than-the-streak'),
+    ],
+)
+async def test_upsert_suppression_streak_rejects_a_malformed_window_loudly(
+    store, streak, recent_counts
+):
+    """INV-1: each window entry is one suppressing cycle's count (a non-bool
+    int >= 1), and the window holds at most one entry per cycle of the streak.
+    Anything else raises ValueError naming recent_counts and writes no row."""
+    with pytest.raises(ValueError, match='recent_counts'):
+        await store.upsert_suppression_streak(
+            **{**_STREAK_WRITE, 'streak': streak, 'recent_counts': recent_counts}
+        )
+
+    assert await store.list_suppression_streaks('proj-s') == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_suppression_streak_replaces_the_stored_window(store):
+    """A second write stores exactly the window it was given; it never merges
+    into the one already on the row."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 3, 'recent_counts': (2, 1, 2)}
+    )
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'streak': 4, 'recent_counts': (5,)}
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=4, recent_counts=(5,))
+    ]
+
+
+async def _seed_raw_streak_record(
+    store: ReconLedgerStore, payload_json: str, *, entity_uuid: str | None = 'uuid-streak'
+) -> None:
+    """A streak record written past upsert_suppression_streak's validation, as
+    a hand-edited or older-shaped row would arrive."""
+    await store.upsert(
+        ReconLedgerRecord(
+            project_id='proj-s',
+            record_kind=RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+            payload_json=payload_json,
+            state=STATE_ACTIVE,
+            created_at='2026-07-01T00:00:00+00:00',
+            flag_type=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+            run_id='uuid-streak',
+            entity_uuid=entity_uuid,
+            expires_at='2026-09-29T00:00:00+00:00',
+        )
+    )
+
+
+def _raw_streak_payload(**fields: object) -> str:
+    payload: dict = {
+        STREAK_PAYLOAD_KEY: 3,
+        STREAK_WINDOW_PAYLOAD_KEY: [2, 1, 2],
+        'last_run_id': 'run-2',
+    }
+    payload.update(fields)
+    return json.dumps(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'payload_json',
+    [
+        pytest.param('not json', id='not-json'),
+        pytest.param('[2, 3]', id='json-array'),
+        pytest.param('"two"', id='json-string'),
+    ],
+)
+async def test_list_suppression_streaks_reads_a_non_object_payload_as_empty(
+    store, payload_json
+):
+    await _seed_raw_streak_record(store, payload_json)
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=0, recent_counts=(), last_run_id='')
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'stored_streak',
+    [
+        pytest.param(True, id='bool'),
+        pytest.param('3', id='str'),
+        pytest.param(-3, id='negative'),
+        pytest.param(None, id='null'),
+    ],
+)
+async def test_list_suppression_streaks_reads_a_malformed_streak_as_zero(
+    store, stored_streak
+):
+    """A zero streak holds no window, so the stored window is dropped with it."""
+    await _seed_raw_streak_record(
+        store, _raw_streak_payload(**{STREAK_PAYLOAD_KEY: stored_streak})
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=0, recent_counts=())
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'stored_window',
+    [
+        pytest.param('2,2', id='str'),
+        pytest.param({'0': 2}, id='object'),
+        pytest.param(4, id='int'),
+        pytest.param([True, 2], id='bool-entry'),
+        pytest.param([2, 0], id='zero-entry'),
+        pytest.param([2, -1], id='negative-entry'),
+        pytest.param([2, '2'], id='str-entry'),
+        pytest.param([1, 1, 1, 1], id='longer-than-the-streak'),
+    ],
+)
+async def test_list_suppression_streaks_reads_a_malformed_window_as_empty(
+    store, stored_window
+):
+    """One malformed entry discards the whole window, and so does a window
+    holding more entries than its streak has cycles."""
+    await _seed_raw_streak_record(
+        store, _raw_streak_payload(**{STREAK_WINDOW_PAYLOAD_KEY: stored_window})
+    )
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, recent_counts=())
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_suppression_streaks_reads_a_non_string_run_id_as_empty(store):
+    await _seed_raw_streak_record(store, _raw_streak_payload(last_run_id=7))
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, recent_counts=(2, 1, 2), last_run_id='')
+    ]
+
+
+@pytest.mark.asyncio
+async def test_list_suppression_streaks_falls_back_to_the_run_id_slot_for_the_entity(store):
+    """run_id mirrors entity_uuid on every streak row, so a row whose
+    entity_uuid column is NULL is still attributed to its entity."""
+    await _seed_raw_streak_record(store, _raw_streak_payload(), entity_uuid=None)
+
+    assert await store.list_suppression_streaks('proj-s') == [
+        _streak_row(streak=3, recent_counts=(2, 1, 2))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gc_deletes_expired_streak_row_but_keeps_active_decision(store):
+    """gc() hard-deletes an expired streak row (the TTL-flip arm is scoped to
+    entity_standing_decision alone) and leaves the same entity's unexpired
+    active decision row intact."""
+    await store.upsert_suppression_streak(
+        **{**_STREAK_WRITE, 'expires_at': '2026-06-30T00:00:00+00:00'}
+    )
+    await store.upsert_entity_standing_decision(
+        project_id='proj-s',
+        entity_uuid='uuid-streak',
+        grounds=GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        decided_at='2026-06-01T00:00:00+00:00',
+        expires_at='2026-12-01T00:00:00+00:00',
+        edge_count_at_decision=1,
+        evidence=[],
+    )
+
+    count = await store.gc('proj-s', now='2026-07-01T00:00:00+00:00', terminal_task_ids=[])
+
+    assert await store.list_suppression_streaks('proj-s') == []
+    decision = await store.get_active_entity_standing_decision('proj-s', 'uuid-streak')
+    assert decision is not None
+    assert decision.state == STATE_ACTIVE
     assert count == 1
 
 
