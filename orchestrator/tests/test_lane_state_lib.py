@@ -1527,6 +1527,39 @@ def _uncovered_bands(rendered: str, fallback: str) -> list[str]:
     ]
 
 
+def _fallback_band_diff(rendered: str, fallback: str) -> tuple[list[str], list[str]]:
+    """(bands only in *rendered*, bands only in *fallback*), each in its own order."""
+    rendered_bands = [b for b in rendered.split(',') if b]
+    fallback_bands = [b for b in fallback.split(',') if b]
+    return (
+        [b for b in rendered_bands if b not in fallback_bands],
+        [b for b in fallback_bands if b not in rendered_bands],
+    )
+
+
+def _fallback_drift_report(rendered: str, fallback: str) -> str | None:
+    """``None`` iff *fallback* is byte-equal to *rendered*, else a fix-it report."""
+    if rendered == fallback:
+        return None
+    only_rendered, only_fallback = _fallback_band_diff(rendered, fallback)
+    lines = [
+        'LANE_PROTECT_GLOB_FALLBACK is not a verbatim render of PROTECTED_PREFIXES.',
+        f'  in the render, missing from the fallback: {only_rendered}',
+        f'  in the fallback, missing from the render: {only_fallback}',
+    ]
+    if not only_rendered and not only_fallback:
+        lines.append('  same bands, different order')
+    return '\n'.join([
+        *lines,
+        f'  rendered: {rendered}',
+        f'  fallback: {fallback}',
+        'Fix: in orchestrator/scripts/warm-lane/lib_lane_state.sh set',
+        f"  LANE_PROTECT_GLOB_FALLBACK='{rendered}'",
+        'Both gc suites pin REIFY_WARM_LANE_GC_PROTECT_GLOB to it, so until then '
+        'they exercise warm-lane-gc.sh with a protect set production never uses.',
+    ])
+
+
 @pytest.fixture
 def fallback() -> str:
     """``LANE_PROTECT_GLOB_FALLBACK``, read out of the SHIPPED lib."""

@@ -545,14 +545,16 @@ to `e1c04cf316`'s. Quote the reachable ones.
 - **No four-point bisect was run.** The endpoint pair does not reproduce, so
   there is no jump to localise, and forcing a guilty commit out of a flat
   bisect would manufacture a finding.
-- **A latent hazard, named but not gated here.** Both gc suites now drive gc.sh
-  through a pin set to `$LANE_PROTECT_GLOB_FALLBACK`, which is behaviour-neutral
-  only because the fallback currently equals the rendered set byte-for-byte
-  (re-verified 2026-08-05). `TestProtectGlobFallbackDrift` enforces only
-  fallback ⊇ rendered. The day a band is added to `PROTECTED_PREFIXES` and the
-  fallback becomes a strict superset, both suites silently begin testing gc.sh
-  with a protect set production never uses, and nothing fails. Closing that
-  means changing the drift gate, which is outside task 3655's file set.
+- **A latent hazard, named here and since closed by task 5307.** Both gc suites
+  drive gc.sh through a pin set to `$LANE_PROTECT_GLOB_FALLBACK`, which is
+  behaviour-neutral only while the fallback equals the rendered set
+  byte-for-byte. `TestProtectGlobFallbackDrift` enforces only fallback ⊇
+  rendered, so a removed band, a covered exact-name band or a fallback-only band
+  would have let both suites test gc.sh with a protect set production never
+  uses. `test_lane_state_lib.py::TestProtectGlobFallbackIsAVerbatimRender` now
+  gates equality and fails with a directional diff in either direction plus the
+  exact replacement; containment remains the separate production-safety
+  contract.
 
 #### Block Y: the seam is now pinned
 
