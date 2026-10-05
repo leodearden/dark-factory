@@ -7,13 +7,6 @@ from typing import Any
 
 import pytest
 from _mock_openai_server import mock_openai_server
-from fused_memory.arm_harness.checks import (
-    INDEX_PROBE_ATTEMPTS,
-    INDEX_PROBE_INTERVAL_S,
-    check_index_configuration,
-    control_variance_check,
-    smoke_endpoint,
-)
 from redis.exceptions import ResponseError
 from shared.memory_eval_metrics import Metric
 
@@ -22,6 +15,13 @@ from arm_harness._fakes import (
     incumbent_control_spec,
     llm_spec,
     run_manifest_for,
+)
+from fused_memory.arm_harness.checks import (
+    INDEX_PROBE_ATTEMPTS,
+    INDEX_PROBE_INTERVAL_S,
+    check_index_configuration,
+    control_variance_check,
+    smoke_endpoint,
 )
 from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
 from fused_memory.arm_harness.metrics_record import (

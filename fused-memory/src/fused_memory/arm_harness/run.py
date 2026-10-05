@@ -83,7 +83,7 @@ async def run_llm_arm(
     reference: Sequence[EpisodeOutcome] | None,
     base_config: FusedMemoryConfig,
 ) -> RunManifest:
-    pre_run = _pre_run_checks(spec, repo_root)
+    pre_run = require_pre_run_checks(spec, repo_root)
     started_at = datetime.now(UTC)
     result = await replay_arm(spec, items, graph=graph, journal=journal, settings=settings)
     ranks = await _retrieval_ranks(graph, spec, result, items)
@@ -108,7 +108,8 @@ async def run_llm_arm(
     return manifest
 
 
-def _pre_run_checks(spec: LlmArmSpec, repo_root: Path) -> tuple[CheckResult, ...]:
+def require_pre_run_checks(spec: LlmArmSpec, repo_root: Path) -> tuple[CheckResult, ...]:
+    """The passed pre-run checks, or ``PreRunCheckError``; callable before any resource opens."""
     checks = (
         check_code_sha_matches_checkout(spec, repo_root),
         check_preregistration_sha(spec, repo_root),

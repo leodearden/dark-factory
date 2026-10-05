@@ -177,3 +177,10 @@ def write_metrics_record(record: MetricsRecord, run_dir: Path) -> Path:
 
 def load_metrics_record(path: Path | str) -> MetricsRecord:
     return MetricsRecord.model_validate_json(Path(path).read_text())
+
+
+def load_metrics_records(run_dir: Path) -> tuple[MetricsRecord, ...]:
+    """Every record ``write_metrics_record`` left in ``run_dir``, in file-name order."""
+    return tuple(
+        load_metrics_record(path) for path in sorted((run_dir / METRICS_DIRNAME).glob('*.json'))
+    )

@@ -3,7 +3,7 @@
 import dataclasses
 import importlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -145,7 +145,7 @@ class DepsLog:
 
 def _opener(value: Any, on_open: Callable[..., None]) -> Callable[..., Any]:
     @asynccontextmanager
-    async def open_(*args: Any) -> Any:
+    async def open_(*args: Any) -> AsyncIterator[Any]:
         on_open(*args)
         yield value
 
