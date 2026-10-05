@@ -34,6 +34,7 @@ from shared.cli_invoke import (
     _to_token_count,
     build_failure_message,
     classify_agent_failure,
+    classify_cap_kill,
     count_transcript_turns,
     detect_transcript_model_id,
     invoke_claude_agent,
@@ -5843,3 +5844,109 @@ class TestRunSubprocessStampsModelId:
         agent = _parse_claude_output(sub)
         assert agent.subtype == 'error_timeout_killed_with_progress'
         assert agent.model_id == 'claude-opus-5'
+
+
+# ── classify_cap_kill: was this run ended by a configured ceiling? (task 4826) ─
+
+
+def _cap_result(**overrides: Any) -> AgentResult:
+    fields: dict[str, Any] = {'success': False, 'output': ''}
+    fields.update(overrides)
+    return AgentResult(**fields)
+
+
+class TestClassifyCapKill:
+    """``classify_cap_kill(result, *, budget_usd, max_turns)`` names which
+    configured ceiling ended a run — ``'budget'`` | ``'turns'`` — or None.
+
+    The CLI subtype is authoritative; the numeric comparison is only a
+    fallback for a FAILED run whose subtype is inconclusive.
+    """
+
+    def test_budget_subtype_is_budget(self):
+        result = _cap_result(subtype='error_max_budget_usd', cost_usd=5.01)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=100) == 'budget'
+
+    def test_turns_subtype_is_turns(self):
+        result = _cap_result(subtype='error_max_turns', turns=100)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=100) == 'turns'
+
+    def test_budget_subtype_holds_with_no_ceilings_known(self):
+        result = _cap_result(subtype='error_max_budget_usd')
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) == 'budget'
+
+    def test_turns_subtype_holds_with_no_ceilings_known(self):
+        result = _cap_result(subtype='error_max_turns')
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) == 'turns'
+
+    def test_budget_subtype_outranks_contradicting_arithmetic(self):
+        """Cost far under the budget and turns AT the turn ceiling: the
+        subtype still says budget, and the subtype wins."""
+        result = _cap_result(subtype='error_max_budget_usd', cost_usd=0.10, turns=50)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_turns_subtype_outranks_contradicting_arithmetic(self):
+        """Cost OVER the budget, which the fallback would call 'budget': the
+        subtype says turns, and the subtype wins."""
+        result = _cap_result(subtype='error_max_turns', cost_usd=9.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_turns_subtype_counts_even_when_schema_salvaged(self):
+        """A schema-salvaged run is reported success=True, but the CLI still
+        ended it at the turn ceiling — the subtype is not gated on success."""
+        result = _cap_result(
+            success=True, subtype='error_max_turns', schema_salvaged=True, turns=50,
+        )
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_successful_run_at_both_ceilings_is_not_a_cap_kill(self):
+        """The false-positive guard: a healthy run that spends its full budget
+        and uses every turn finished on its own terms."""
+        result = _cap_result(success=True, subtype='success', cost_usd=5.0, turns=50)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) is None
+
+    def test_successful_run_over_both_ceilings_is_not_a_cap_kill(self):
+        result = _cap_result(success=True, subtype='success', cost_usd=7.5, turns=80)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) is None
+
+    def test_plain_failure_under_ceilings_is_not_a_cap_kill(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=0.4, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) is None
+
+    def test_failed_run_over_budget_with_inconclusive_subtype_is_budget(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=5.2, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_failed_run_over_turns_with_inconclusive_subtype_is_turns(self):
+        result = _cap_result(subtype='', cost_usd=0.4, turns=51)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_budget_wins_when_both_fallbacks_fire(self):
+        """Documented precedence: when a failed run is over BOTH ceilings with
+        an inconclusive subtype, the budget ceiling is reported."""
+        result = _cap_result(subtype='error_during_execution', cost_usd=6.0, turns=60)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_exact_budget_equality_is_a_hit(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=5.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'budget'
+
+    def test_exact_turns_equality_is_a_hit(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=0.4, turns=50)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == 'turns'
+
+    def test_none_budget_disables_the_budget_fallback(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=1_000.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=None, max_turns=50) is None
+
+    def test_none_budget_falls_through_to_the_turns_fallback(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=1_000.0, turns=50)
+        assert classify_cap_kill(result, budget_usd=None, max_turns=50) == 'turns'
+
+    def test_none_max_turns_disables_the_turns_fallback(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=0.4, turns=10_000)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=None) is None
+
+    def test_both_ceilings_none_never_raises(self):
+        result = _cap_result(subtype='error_during_execution', cost_usd=1_000.0, turns=10_000)
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) is None

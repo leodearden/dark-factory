@@ -101,6 +101,7 @@ class TestModuleLevelAll:
             'AllAccountsCappedException',
             'build_failure_message',
             'classify_agent_failure',
+            'classify_cap_kill',
             'count_transcript_turns',
             'detect_ended_awaiting_background',
             'detect_resumable_progress',
