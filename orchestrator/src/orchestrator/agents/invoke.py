@@ -202,6 +202,21 @@ async def invoke_agent(
 # Claude backend — thin wrapper adding sandbox support over shared.cli_invoke
 # ---------------------------------------------------------------------------
 
+# With this set, the Claude CLI silently returns the Bash shell to the
+# session's launch directory after every Bash call, so a `cd` never outlives
+# its command and relative Grep/Glob paths stay anchored to the dispatch root.
+# An explicit '0' (e.g. via config.role_env_overrides) opts out.  Pinned by
+# orchestrator/tests/test_invoke_bash_cwd_reset.py.
+BASH_CWD_RESET_ENV_VAR = 'CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR'
+
+
+def apply_bash_cwd_reset_env(env_overrides: dict[str, str] | None) -> dict[str, str]:
+    """Return a copy of *env_overrides* with the Bash cwd reset on by default."""
+    merged: dict[str, str] = dict(env_overrides or {})
+    merged.setdefault(BASH_CWD_RESET_ENV_VAR, '1')
+    return merged
+
+
 async def _invoke_claude_with_sandbox(
     prompt: str,
     system_prompt: str,
@@ -242,7 +257,7 @@ async def _invoke_claude_with_sandbox(
     # Both sub-paths below consume env_overrides, so this single transform is
     # project-agnostic and cannot miss a dispatch site.  setdefault lets
     # explicit caller values win.
-    env_overrides = apply_mcp_startup_env(env_overrides)
+    env_overrides = apply_bash_cwd_reset_env(apply_mcp_startup_env(env_overrides))
 
     # For sandboxed invocations we need to build the command ourselves
     # and use the lower-level shared primitives
