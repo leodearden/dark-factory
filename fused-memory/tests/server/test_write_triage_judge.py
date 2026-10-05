@@ -2600,3 +2600,86 @@ class TestTheFrontierArmLive:
         assert isinstance(usage.input_tokens, int) and usage.input_tokens > 0
         assert isinstance(usage.reasoning_tokens, int)
         assert usage.reasoning_tokens <= usage.output_tokens
+
+
+def _contests_exemplar() -> judge_module.JudgeExemplar:
+    """The worked `contests` example, looked up through the public tuple."""
+    return next(
+        exemplar for exemplar in judge_module.JUDGE_EXEMPLARS
+        if exemplar.verdict == 'contests'
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get('OPENAI_API_KEY'),
+    reason='needs OPENAI_API_KEY for a live Responses API call',
+)
+@pytest.mark.timeout(120)
+class TestTheShippedWordingLive:
+    """Boundary row 3 (flip-readiness PRD §11.4): `contests` covers an outdated candidate.
+
+    Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
+    the old wording too, so only Sol tells the two wordings apart.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('entry', 'expected'),
+        [
+            (_contests_exemplar().entry, OUTCOME_CONTESTED),
+            (
+                'The greenhouse thermostat was recalibrated to Celsius last '
+                'week, so it no longer reads in Fahrenheit.',
+                OUTCOME_CONTESTED,
+            ),
+            (
+                'Since the March firmware update, the greenhouse thermostat '
+                'is calibrated in Celsius.',
+                OUTCOME_CONTESTED,
+            ),
+            (
+                "The glasshouse thermostat's calibration uses the Fahrenheit scale.",
+                OUTCOME_RESTATED,
+            ),
+            (
+                'The greenhouse thermostat is calibrated in Fahrenheit and is '
+                'accurate to within half a degree.',
+                OUTCOME_AMENDED,
+            ),
+        ],
+        ids=[
+            'contests-exemplar',
+            'explicitly-outdated',
+            'implicitly-outdated',
+            'paraphrase-restates',
+            'agreeing-addition-amends',
+        ],
+    )
+    async def test_the_judge_reads_the_entry_against_the_thermostat_record(
+        self, entry: str, expected: str,
+    ) -> None:
+        candidate_id = str(uuid.uuid4())
+        slate = [
+            _result(candidate_id, 0.80, content=_contests_exemplar().candidate),
+            _result(
+                str(uuid.uuid4()), 0.60,
+                content='The irrigation pump in the greenhouse runs for ten '
+                        'minutes every morning at six.',
+            ),
+        ]
+        config = FusedMemoryConfig()
+        write_triage = config.write_triage
+        write_triage.judge_enabled = True
+        write_triage.judge_provider = 'openai'
+        write_triage.judge_model = 'gpt-6.1-sol'
+        write_triage.judge_reasoning_effort = 'low'
+        service = types.SimpleNamespace(config=config)
+
+        verdict = await judge_write(
+            memory_service=service, content=entry, project_id='p',
+            decision=_decision(candidate_id), candidates=slate,
+        )
+
+        assert verdict.outcome == expected
+        assert verdict.candidate_id == candidate_id
