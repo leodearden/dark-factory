@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -229,9 +230,9 @@ def test_converged_resume_over_the_real_stateful_transport(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Step 1's own two exits, both of which end the run before the orchestrator is
-# ever contacted: the rehearsal, and the refusal to edit a config it cannot
-# find a verify_env block in.
+# Exits that end the run before the orchestrator is ever contacted: the
+# rehearsal, the refusal of a port no socket can reach, and step 1's refusal
+# to edit a config it cannot find a verify_env block in.
 # ---------------------------------------------------------------------------
 
 def test_dry_run_neither_commits_nor_reloads(tmp_path):
@@ -280,6 +281,22 @@ def test_a_config_with_no_verify_env_block_is_refused_before_the_commit(tmp_path
     assert head(repo) == before_head, "the refusal must precede the commit"
     assert config.read_bytes() == before_bytes
     assert received == [], f"a refused edit must not reload anything: {received}"
+
+
+@pytest.mark.parametrize("bad_port", ["0", "65536", "99999"])
+def test_an_unconnectable_port_is_refused_before_the_commit(tmp_path, bad_port):
+    """A port outside 1-65535 can never deliver the reload, so it is refused
+    before a value that could never be hot-applied is committed."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    before_head = head(repo)
+    before_bytes = config.read_bytes()
+
+    proc = _run(types.SimpleNamespace(port=bad_port), config, "8")
+
+    assert _failure(proc) == "invalid_port"
+    assert head(repo) == before_head, "the refusal must precede the commit"
+    assert config.read_bytes() == before_bytes
 
 
 # ---------------------------------------------------------------------------
