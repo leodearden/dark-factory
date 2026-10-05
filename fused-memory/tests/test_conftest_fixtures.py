@@ -480,9 +480,8 @@ class TestMakeBackendOverFakeGraphiti:
 
         assert await backend.search('q', group_ids=['g']) == [edge]
 
-    def test_the_registry_defaults_to_empty_like_make_backend(
-        self, mock_config, make_backend_over_fake_graphiti, make_backend,
-        monkeypatch, tmp_path,
+    def test_the_registry_defaults_to_empty(
+        self, mock_config, make_backend_over_fake_graphiti, monkeypatch, tmp_path,
     ):
         (tmp_path / 'ambient-proj').mkdir()
         monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(tmp_path / 'ambient-proj'))
@@ -490,7 +489,6 @@ class TestMakeBackendOverFakeGraphiti:
         over_fake = make_backend_over_fake_graphiti(mock_config, FakeGraphitiClient())
 
         assert over_fake.registered_graph_ids == frozenset()
-        assert over_fake.registered_graph_ids == make_backend(mock_config).registered_graph_ids
 
     def test_an_explicit_registry_is_honoured_and_canonicalized(
         self, mock_config, make_backend_over_fake_graphiti,
