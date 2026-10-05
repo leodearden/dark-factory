@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -84,6 +84,8 @@ class MockOpenAIServer:
         self._requests: list[dict[str, Any]] = []
         self._responses: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         self.chat_content = '{"ok": true}'
+        self.chat_responder: Callable[[Any], str] | None = None
+        """When set, each chat reply's content is computed from that request's JSON body."""
         self.embedding_len = DEFAULT_EMBEDDING_LEN
 
     @property
@@ -165,7 +167,9 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
                 return
 
             if self.path.endswith('/chat/completions'):
-                self._send_json(200, chat_completion_body(state.chat_content))
+                responder = state.chat_responder
+                content = responder(json_body) if responder else state.chat_content
+                self._send_json(200, chat_completion_body(content))
                 return
 
             if self.path.endswith('/embeddings'):
