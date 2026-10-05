@@ -13,9 +13,9 @@ import types
 from pathlib import Path
 
 import pytest
-from _fm_helpers import load_script_module
+from _fm_helpers import load_script_module, make_populated_task_store
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreMissing, task_store_path
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'correct_found_on_main_backlog.py'
 
@@ -723,16 +723,15 @@ class _FakeFusedMemoryConfigWithoutTaskmaster:
 
 
 def _project_root_with_task_store(tmp_path) -> str:
-    """Return a project_root whose ``.taskmaster/tasks/tasks.db`` really exists.
+    """Return a project_root whose ``.taskmaster/tasks/tasks.db`` holds a task.
 
-    ``_run()`` preflights the task store (task 4319), so every ``_run()`` test
-    needs a root that passes the guard. A literal like ``'/proj'`` does not
-    exist, so it would be refused — correctly. These tests exercise the REAL
-    guard rather than monkeypatching it away.
+    ``_run()`` preflights the task store (tasks 4319, 5468), so every ``_run()``
+    test needs a root that passes the guard. A literal like ``'/proj'`` does
+    not exist, and an empty db holds nothing, so either would be refused —
+    correctly. These tests exercise the REAL guard rather than monkeypatching
+    it away.
     """
-    db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
-    db.parent.mkdir(parents=True, exist_ok=True)
-    db.touch()
+    make_populated_task_store(tmp_path)
     return str(tmp_path)
 
 
@@ -931,6 +930,25 @@ class TestRunTargetStorePreflight:
 
         assert not (tmp_path / '.taskmaster').exists()
 
+    async def test_refuses_a_zero_byte_task_store(self, tmp_path, monkeypatch):
+        """An existing but EMPTY tasks.db is refused too (task 5468).
+
+        A zero-byte file holds no tasks, so a scan of it could only report a
+        clean run it cannot vouch for -- the same lie as a missing store.
+        """
+        db = task_store_path(tmp_path)
+        db.parent.mkdir(parents=True)
+        db.touch()
+        constructions = self._patch(monkeypatch)
+        args = argparse.Namespace(
+            project_root=str(tmp_path), config=None, ref='main', apply=False,
+        )
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(args)
+
+        assert constructions == []
+
     async def test_refusal_is_not_an_apply_exit_code(self, tmp_path, monkeypatch):
         """A refusal is an exception, never ``_apply_exit_code``'s 0 or 1.
 
@@ -950,7 +968,7 @@ class TestRunTargetStorePreflight:
 
         assert _mod._apply_exit_code({'errors': 0, 'reopen_failed': []}) == 0
 
-    async def test_proceeds_when_the_db_exists(self, tmp_path, monkeypatch):
+    async def test_proceeds_when_the_db_holds_tasks(self, tmp_path, monkeypatch):
         constructions = self._patch(monkeypatch)
         args = argparse.Namespace(
             project_root=_project_root_with_task_store(tmp_path),

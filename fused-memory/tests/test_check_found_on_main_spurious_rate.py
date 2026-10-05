@@ -16,9 +16,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _fm_helpers import load_script_module
+from _fm_helpers import load_script_module, make_populated_task_store
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing
+from fused_memory.utils.target_store_preflight import TargetStoreMissing, task_store_path
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'check_found_on_main_spurious_rate.py'
@@ -627,24 +627,15 @@ def _install_fake_backend(monkeypatch, tasks):
     return backend_holder
 
 
-def _make_task_store(project_root: Path) -> Path:
-    """Create the tasks.db a `--project-root` resolves to — the same
-    three-segment path `target_store_preflight.task_store_path` derives."""
-    db = project_root / '.taskmaster' / 'tasks' / 'tasks.db'
-    db.parent.mkdir(parents=True)
-    db.touch()
-    return db
-
-
 @pytest.fixture
 def project_root(tmp_path: Path) -> Path:
-    """A project root whose task store EXISTS.
+    """A project root whose task store EXISTS and holds a task.
 
-    A `--project-root` with no task store is a mis-target, and `_run()`'s
-    preflight refuses one — so every test meaning to exercise the wiring
-    PAST that guard needs a real store rather than a bare path. Tests of the
-    refusal itself take `tmp_path` directly."""
-    _make_task_store(tmp_path)
+    A `--project-root` with no task store, or an empty one, is a mis-target,
+    and `_run()`'s preflight refuses one — so every test meaning to exercise
+    the wiring PAST that guard needs a populated store rather than a bare path.
+    Tests of the refusal itself take `tmp_path` directly."""
+    make_populated_task_store(tmp_path)
     return tmp_path
 
 
@@ -735,7 +726,23 @@ class TestRunTargetStorePreflight:
 
         assert not (tmp_path / '.taskmaster').exists()
 
-    async def test_proceeds_when_the_db_exists(self, project_root, monkeypatch):
+    async def test_refuses_a_zero_byte_task_store(self, tmp_path, monkeypatch):
+        """An existing but EMPTY tasks.db is refused too (task 5468).
+
+        A zero-byte file holds no tasks, so a scan of it could only report a
+        clean run it cannot vouch for -- the same lie as a missing store.
+        """
+        db = task_store_path(tmp_path)
+        db.parent.mkdir(parents=True)
+        db.touch()
+        backend_holder = _install_clean_run_fakes(monkeypatch)
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(_run_args(tmp_path), SINCE)
+
+        assert 'backend' not in backend_holder
+
+    async def test_proceeds_when_the_db_holds_tasks(self, project_root, monkeypatch):
         """The regression pair: a guard that refuses a project which works
         would be caught here, not by the three refusal tests above."""
         backend_holder = _install_clean_run_fakes(monkeypatch)

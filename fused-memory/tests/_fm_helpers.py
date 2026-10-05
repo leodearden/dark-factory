@@ -19,6 +19,7 @@ import json
 import os
 import pathlib
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -42,6 +43,7 @@ from fused_memory.backends.graphiti_client import (
     INCOMPLETE_STRUCTURAL_KINDS,
     PagedRead,
 )
+from fused_memory.utils.target_store_preflight import task_store_path
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -1969,6 +1971,27 @@ def load_script_module(
         _LOADED_SCRIPT_MODULE_NAMES.discard(name)
         raise
     return module
+
+
+def make_populated_task_store(project_root: pathlib.Path) -> pathlib.Path:
+    """Create the tasks.db *project_root* resolves to, holding one task row.
+
+    This is the shape ``target_store_preflight``'s guard reads -- a ``tasks``
+    table with at least one row -- NOT the backend schema. The suites using it
+    patch ``SqliteTaskBackend`` out, so the guard is the only reader of the
+    file; agreement with the real backend is pinned once, in
+    tests/test_target_store_preflight.py.
+    """
+    db = task_store_path(project_root)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute('CREATE TABLE tasks (id INTEGER PRIMARY KEY)')
+        connection.execute('INSERT INTO tasks (id) VALUES (1)')
+        connection.commit()
+    finally:
+        connection.close()
+    return db
 
 
 _CLEANUP_TEST_COLLECTIONS_SCRIPT = (
