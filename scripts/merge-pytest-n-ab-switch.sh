@@ -44,7 +44,7 @@ VALUE="${ARGS[0]}"
 CONFIG="${ARGS[1]:-/home/leo/src/dark-factory/dark-factory-orchestrator.yaml}"
 PORT="${ARGS[2]:-8102}"
 [[ "$VALUE" =~ ^[0-9]+$ ]] || die invalid_value "value must be a positive integer, got '$VALUE'"
-[[ "$PORT" =~ ^[0-9]+$ ]] || die invalid_port "escalation_port must be a port number, got '$PORT'"
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || die invalid_port "escalation_port must be a TCP port in 1-65535, got '$PORT'"
 [ -f "$CONFIG" ] || die config_not_found "config not found: $CONFIG"
 # The reload step imports its MCP transport from the checkout the SCRIPT lives
 # in — never from $REPO below, which is the CONFIG's checkout and may be a
