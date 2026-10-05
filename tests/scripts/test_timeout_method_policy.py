@@ -74,11 +74,12 @@ import pathlib
 import re
 import subprocess
 import sys
-import tomllib
 
 import pytest
 
-REPO_ROOT = pathlib.Path(__file__).parents[2]
+# The one config-discovery walk, with its anti-vacuity floors. Resolves because
+# tests/scripts/conftest.py puts this directory on sys.path.
+import test_pytest_per_test_timeout_policy as per_test_timeout_policy
 
 SIGNAL_METHOD = 'signal'
 THREAD_METHOD = 'thread'
@@ -88,14 +89,13 @@ THREAD_METHOD = 'thread'
 # is retained.
 THREAD_TIMEOUT_METHOD_CONFIGS = frozenset({'orchestrator', 'fused-memory'})
 
-ROOT_CONFIG_NAME = '.'
-
-# Root pyproject.toml plus the seven workspace members at authorship. This is
-# the same floor as test_pytest_per_test_timeout_policy.py::MIN_EXPECTED_PYTEST_CONFIGS.
-MIN_EXPECTED_PYTEST_CONFIGS = 8
-
 PROBE_WORKERS = 2
 PROBE_TIMEOUT_SECS = 2
+
+# Every probe test except the blocking one overrides the ini cap with this, so
+# that only the blocking test races PROBE_TIMEOUT_SECS. On a loaded host a
+# trivial test can take longer than 2s, and the tally must not depend on that.
+NON_BLOCKING_TIMEOUT_SECS = 60
 
 # Below each probe's @pytest.mark.timeout, so a wedged child surfaces as a
 # TimeoutExpired carrying its captured output rather than as pytest's axe.
@@ -122,14 +122,17 @@ def {BLOCKING_TEST}():
 
 
 @pytest.mark.xdist_group('same_worker')
+@pytest.mark.timeout({NON_BLOCKING_TIMEOUT_SECS})
 def {SAME_WORKER_SUCCESSOR}():
     assert threading.current_thread() is threading.main_thread()
 
 
+@pytest.mark.timeout({NON_BLOCKING_TIMEOUT_SECS})
 def {MAIN_THREAD_TEST}():
     assert threading.current_thread() is threading.main_thread()
 
 
+@pytest.mark.timeout({NON_BLOCKING_TIMEOUT_SECS})
 @pytest.mark.parametrize('peer', range(6))
 def test_peer(peer):
     pass
@@ -242,10 +245,16 @@ def test_signal_timeout_fails_the_test_and_the_xdist_worker_survives(
 def test_thread_timeout_kills_the_xdist_worker(tmp_path: pathlib.Path) -> None:
     """THE PAIRED CONTROL: the same suite under thread, as orchestrator and fused-memory run.
 
-    This proves the probe can tell a worker death apart from a survival, and it
-    measures the other half of the trade. It asserts only the crash signature,
-    not which later tests were lost: that set depends on xdist's shutdown
-    ordering.
+    Run on the signal probe's OWN suite, this is that probe's non-vacuity check:
+    on this input, a method that kills the worker does produce the crash
+    signature the signal probe asserts absent.
+    ``test_xdist_worker_restart_policy.py::test_restarts_disabled_attribute_the_worker_death``
+    also shows a thread timeout killing a worker, but on a different suite (a
+    fixture-level sleep, its crashes ordered by controller-side signals), so it
+    cannot vouch for this one.
+
+    It asserts only the crash signature, not which later tests were lost: that
+    set depends on xdist's shutdown ordering.
     """
     result = _run_probe_suite(
         _write_probe_suite(tmp_path, THREAD_METHOD), '--max-worker-restart=0'
@@ -267,37 +276,11 @@ def test_thread_timeout_kills_the_xdist_worker(tmp_path: pathlib.Path) -> None:
     )
 
 
-def _timeout_methods() -> dict[str, str | None]:
-    """Config name -> its ``timeout_method``, for every config declaring ``[tool.pytest.ini_options]``."""
-    root_data = tomllib.loads((REPO_ROOT / 'pyproject.toml').read_text(encoding='utf-8'))
-    members = root_data.get('tool', {}).get('uv', {}).get('workspace', {}).get('members', [])
-    assert members, (
-        '[tool.uv.workspace].members is empty or missing in the root '
-        'pyproject.toml. This guard reads it to discover which configs to '
-        'check, so it would otherwise pass vacuously.'
-    )
-
-    methods: dict[str, str | None] = {}
-    for name in [ROOT_CONFIG_NAME, *members]:
-        pyproject = REPO_ROOT / name / 'pyproject.toml'
-        if not pyproject.exists():
-            continue
-        data = tomllib.loads(pyproject.read_text(encoding='utf-8'))
-        ini_options = data.get('tool', {}).get('pytest', {}).get('ini_options')
-        if ini_options is not None:
-            methods[name] = ini_options.get('timeout_method')
-
-    assert len(methods) >= MIN_EXPECTED_PYTEST_CONFIGS, (
-        f'only discovered {sorted(methods)} as pytest configs, expected at '
-        f'least {MIN_EXPECTED_PYTEST_CONFIGS}. Finding fewer means this '
-        'discovery walk rotted, not that the repo changed.'
-    )
-    return methods
-
-
 def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
     thread_configs = {
-        name for name, method in _timeout_methods().items() if method == THREAD_METHOD
+        name
+        for name, ini_options in per_test_timeout_policy.discovered_pytest_configs().items()
+        if ini_options.get('timeout_method') == THREAD_METHOD
     }
     assert thread_configs == THREAD_TIMEOUT_METHOD_CONFIGS, (
         f'the configs running timeout_method = {THREAD_METHOD!r} are '
