@@ -6,15 +6,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fused_memory.arm_harness.run import (
-    ABORT_FILENAME,
-    OUTCOMES_FILENAME,
-    RUN_MANIFEST_FILENAME,
-    PreRunCheckError,
-    load_outcomes,
-    run_llm_arm,
-    write_outcomes,
-)
 from graphiti_core.helpers import SEMAPHORE_LIMIT
 
 from arm_harness._fakes import (
@@ -42,6 +33,15 @@ from fused_memory.arm_harness.replay import (
     EpisodeOutcome,
     ReplayItem,
     ReplaySettings,
+)
+from fused_memory.arm_harness.run import (
+    ABORT_FILENAME,
+    OUTCOMES_FILENAME,
+    RUN_MANIFEST_FILENAME,
+    PreRunCheckError,
+    load_outcomes,
+    run_llm_arm,
+    write_outcomes,
 )
 from fused_memory.arm_harness.run_manifest import load_run_manifest
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
@@ -76,7 +76,7 @@ def _reference(count: int) -> list[EpisodeOutcome]:
             ok=True,
             error_class=None,
             duration_ms=12.0,
-            tokens=LlmTokenUsage(input_tokens=30, output_tokens=10),
+            tokens=LlmTokenUsage(input_tokens=30, output_tokens=10, llm_calls=1),
             replay_episode_uuid=f'ref-ep-{i}',
             entity_names=('alice', 'carol'),
             edge_triples=(),
