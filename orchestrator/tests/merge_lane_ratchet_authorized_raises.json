@@ -1927,6 +1927,66 @@
           "current": 31832
         }
       ]
+    },
+    {
+      "task_id": "5447",
+      "reason": "task 5447: publishes _run_inflight_verify's dispatch-time base facts (VerifyBaseFacts) on snapshot()['entries'][*]['verify_base'] so the task-2357 frozen-main claim is pinned at a public seam; net-additive observation, not a failed refactor",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2152,
+          "current": 2156
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_run_inflight_verify",
+          "baseline": 101,
+          "current": 103
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::snapshot",
+          "baseline": 58,
+          "current": 60
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1720,
+          "current": 1742
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21813,
+          "current": 21815
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 921,
+          "current": 935
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4784,
+          "current": 4788
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56987,
+          "current": 57011
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31829,
+          "current": 31834
+        }
+      ]
     }
   ]
 }

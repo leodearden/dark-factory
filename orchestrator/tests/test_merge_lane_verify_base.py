@@ -188,8 +188,9 @@ class TestVerifyBaseOnTheSnapshot:
         assert entry is not None
         assert entry['state'] == 'verifying'
         assert entry['verify_base'] == {'main_sha': base, 'merge_base_sha': fork}, (
-            f'main_sha must be the FROZEN merge-time base {base} (task 2357); '
-            f'the outside landing SHA {git_ops.outside_landing} here means the '
-            f'verify re-read main'
+            f'main_sha must be the FROZEN merge-time base {base} (task 2357) -- '
+            f'the outside landing SHA {git_ops.outside_landing} there means the '
+            f'verify re-read main -- and merge_base_sha its merge-base {fork} '
+            f'with the merged branch tip'
         )
         assert outcome.status == 'blocked', outcome

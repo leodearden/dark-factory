@@ -166,6 +166,7 @@ from orchestrator.merge_lane.types import (
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
     TrainCallbackFactory,
+    VerifyBaseFacts,
     VerifyWorktreeHandle,
     _HostUnavailability,
     _InFlightEntry,
@@ -13407,6 +13408,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
           task_id, branch, state, enqueued_at, age_secs, position,
           waiter_alive, worktree, pre_rebased, request_id, lane.
           host, verify_started_at, verify_age_secs — non-None only on _inflight entries.
+          verify_base — the dispatch-time base facts ({main_sha, merge_base_sha},
+            VerifyBaseFacts) the entry's verify classifies against; None until
+            its verify resolves them.
         State values: queued, merging, awaiting_host, awaiting_verify,
           dispatching, verifying, passthrough, gate_reverify, finalizing.
           (task 2435 kappa-b: 'remerging' collapsed into 'merging' now that
@@ -13440,6 +13444,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 'host': None,
                 'verify_started_at': None,
                 'verify_age_secs': None,
+                'verify_base': None,
             }
 
         def _infl_entry(infl: InflightEntry, position: int) -> dict:
@@ -13459,6 +13464,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             e['verify_age_secs'] = (
                 max(0.0, now - infl.started_at)
                 if infl.started_at is not None else None
+            )
+            e['verify_base'] = (
+                dataclasses.asdict(infl.verify_base)
+                if infl.verify_base is not None else None
             )
             return e
 
@@ -18305,23 +18314,16 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 f'worktree={merge_wt.name})'
             )
 
-            # Merge-skew attribution (task 2383 β, 2357): dispatch-time base
-            # facts for the classifier.  main_sha is item.base_sha — the
-            # FROZEN main SHA captured at merge-dispatch time — never a
-            # fresh git_ops.get_main_sha() re-read.  merge_base_sha is the
-            # best-effort git merge-base of that SHA and the item's frozen
-            # merged_branch_tip; None (branch tip unavailable, or the git
-            # call fails) skips classification inside _run_post_merge_verify
-            # and degrades to INDETERMINATE (I3, fail-open).
-            #
-            # task 2359: probe_base (when set by a firing variable-depth
-            # probe) OVERRIDES main_sha to the probed deeper cumulative tip
-            # -- item itself is never touched, so this is purely a
-            # classification-facts substitution.
+            # Merge-skew attribution: see merge_lane/types.py::VerifyBaseFacts.
             main_sha = item.base_sha if probe_base is None else probe_base
-            merge_base_sha = await _resolve_dispatch_time_merge_base(
-                req.config.project_root, main_sha, item.merged_branch_tip,
+            verify_base = VerifyBaseFacts(
+                main_sha=main_sha,
+                merge_base_sha=await _resolve_dispatch_time_merge_base(
+                    req.config.project_root, main_sha, item.merged_branch_tip,
+                ),
             )
+            if entry_slot is not None and entry_slot.entry is not None:
+                entry_slot.entry.verify_base = verify_base
 
             verify_task = asyncio.ensure_future(_run_post_merge_verify(
                 self._git_ops, req, merge_wt,
@@ -18356,8 +18358,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 speculative=item.speculative,
                 chain_items=chain_items,
                 chain_build_ms=chain_build_ms,
-                merge_base_sha=merge_base_sha,
-                main_sha=main_sha, verifier=self._verifier,
+                merge_base_sha=verify_base.merge_base_sha,
+                main_sha=verify_base.main_sha, verifier=self._verifier,
             ))
             # task 2420 (DEFECT 1, split from 2357; extends #1728), revised by
             # task 4579: no-progress budget seed.  Content-mtime is sampled
