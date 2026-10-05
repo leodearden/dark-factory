@@ -1478,6 +1478,7 @@ def run_nightly(
 
         applied = 0
         conflicts = 0
+        correction_skipped = 0
         deletion_skipped: list[str] = []
         for record in run.records:
             try:
@@ -1502,17 +1503,22 @@ def run_nightly(
                 deletion_skipped.append(detail)
                 continue
             conflicts += stats['candidate_disposition_conflicts']
+            correction_skipped += stats['correction_skipped']
             # A conflict-appended sighting IS a codebook mutation (a
             # recurrence appended to an already-adjudicated candidate), so it
             # must count toward the dump/commit gate below -- otherwise a
             # night whose ONLY effect is conflict sightings ends with
             # applied == 0, `if applied > 0` skips dump(), and the merged `cb`
             # is discarded as a "no-change night", destroying the exact signal
-            # the elif-branch exists to preserve.
+            # the elif-branch exists to preserve. An applied correction is the
+            # same shape: it rewrites an entry's framing in place, and losing
+            # it to a "no-change night" is the failure the op exists to
+            # prevent.
             applied += (
                 stats['matched']
                 + stats['candidates_applied']
                 + stats['candidate_disposition_conflicts']
+                + stats['corrections_applied']
             )
 
         if conflicts:
@@ -1520,6 +1526,14 @@ def run_nightly(
                 'legibility trickle: %d candidate sighting(s) appended to an '
                 'already-adjudicated record; disposition left to the census',
                 conflicts,
+            )
+
+        if correction_skipped:
+            logger.warning(
+                'legibility trickle: %d correction(s) dropped because an '
+                'earlier op in the same record already recorded the session on '
+                'that entry; their field writes did not land',
+                correction_skipped,
             )
 
         # ONE escalation for the whole night, not one per record -- mirroring

@@ -3275,6 +3275,58 @@ def test_run_nightly_persists_a_disposition_conflict_sighting(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# A corrections-only night must PERSIST the withdrawn framing. The trickle
+# coder never emits `corrections` today, so the op is injected at the merger
+# seam: a correction bumps neither `matched` nor `candidates_applied`, and
+# would otherwise end with applied == 0 and a discarded codebook.
+# ---------------------------------------------------------------------------
+
+def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
+    work_cwd = str(tmp_path / 'work')
+    repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+
+    projects_root = tmp_path / 'projects'
+    session_path = projects_root / _encode_cwd(work_cwd) / 'session-1.jsonl'
+    target_date = date(2026, 7, 13)
+    _write_transcript(
+        session_path, cwd=work_cwd, timestamp='2026-07-13T10:00:00Z', session_id='session-1',
+    )
+
+    real_apply = codebook.apply_coding_record
+
+    def apply_with_correction(cb, record):
+        return real_apply(cb, {
+            **record,
+            'corrections': [{
+                'entry_id': 'known-cause',
+                'note': 'framing refuted',
+                'title': 'Corrected Cause',
+            }],
+        })
+
+    monkeypatch.setattr(nightly.codebook, 'apply_coding_record', apply_with_correction)
+
+    result = nightly.run_nightly(
+        config_path=config_path,
+        projects_root=projects_root,
+        target_date=target_date,
+        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        invoke=_fake_invoke_empty,
+        status_fetcher=None,
+        poster=lambda url, envelope: None,
+    )
+
+    assert result.exit_code == 0
+    assert result.commit_made is True
+    assert result.applied == 1
+
+    committed = codebook.load(repo / 'docs' / 'legibility' / 'confusion-codebook.yaml')
+    entry = committed['entries'][0]
+    assert entry['title'] == 'Corrected Cause'
+    assert entry['sightings'][0]['note'] == 'framing refuted'
+
+
+# ---------------------------------------------------------------------------
 # step-21/22: run_nightly -- no-change night commits nothing (§6.7)
 # ---------------------------------------------------------------------------
 
