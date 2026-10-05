@@ -142,24 +142,20 @@ Design notes
 - No ``--fix``, unlike that precedent.  Propagating repo units into
   ``~/.config/systemd/user/`` and daemon-reloading is already what
   ``scripts/setup-host.sh`` does; duplicating it here would be a fourth copy of
-  the install logic.  It would also be actively unsafe today: the repo
-  watchdog timer's own comment records that RE-ARMING the installed timer is
-  task 3289's job, so a ``--fix`` that installed and reloaded it would
-  silently re-arm a watchdog someone deliberately left disarmed — a
-  supervision change disguised as a parity fix.  Drift is reported with a
-  remediation pointer instead.
+  the install logic.  Drift is reported with a remediation pointer instead.
+- Two consumers branch on the 0/1/2 exit codes: ``setup-host.sh``, and
+  ``scripts/orchestrator-watchdog.py::unit_parity_pass``, which runs this
+  checker read-only, at most hourly, on the watchdog's timer tick.  Changing
+  the codes changes both.
 
 Testing note
 ------------
 All drift-logic tests run against ``tmp_path`` fixtures — never the host's
 real ``~/.config/systemd/user/`` — mirroring the rule the fused-memory test
-module states in its own docstring.  This is not merely for portability: as
-measured on 2026-08-01 the installed watchdog service is still the
-pre-incident inline-shell copy, so this checker exits 1 against the live host
-today.  That is the CORRECT signal (installing the post-3308 units belongs to
-task 3289), but a test asserting parity against the live host would be red on
-landing, and one asserting drift would flip red the moment 3289 fixes it.
-Either encodes host state rather than checker behaviour.
+module states in its own docstring.  This is not merely for portability: a
+test asserting parity or drift against the live host encodes that host's
+state rather than this checker's behaviour, so it is red or green for reasons
+no change to this file can affect.
 """
 
 import argparse
@@ -940,8 +936,7 @@ UNITS: dict[str, UnitSpec] = {
             # for Type=oneshot by default, and the timer's OnUnitActiveSec
             # measures from this unit's last activation — so a tick that never
             # returns is not a slow tick, it is the END of supervision, with
-            # nothing saying so. Its absence from the installed copy is
-            # precisely the drift measured on this host.
+            # nothing saying so.
             ("Service", "TimeoutStartSec"),
             ("Service", "StandardOutput"),
             ("Service", "StandardError"),

@@ -938,8 +938,7 @@ info "Installing dashboard systemd units"
 # open since April".
 #
 # Deliberately no --fix in the checker (see its module docstring): re-running
-# this installer is the propagation path, and re-ARMING the watchdog timer
-# belongs to task 3289.
+# this installer is the propagation path.
 #
 # The gate distinguishes "ran and found drift" from "did not run at all", and
 # the install proceeds either way. Exit code alone is NOT trusted, because 2 is

@@ -5,13 +5,10 @@ directories — NEVER the host's real ~/.config/systemd/user/ — mirroring the
 rule tests/scripts/test_check_fused_memory_unit_parity.py states in its own
 docstring.
 
-That rule is load-bearing here for a specific reason, not just portability:
-as measured on 2026-08-01 the installed dark-factory-dashboard-watchdog.service
-is still the pre-incident inline-shell copy, so the checker exits 1 against the
-live host today. That is the CORRECT signal — installing the post-3308 units
-belongs to task 3289 — but a test asserting parity against the live host would
-be red on landing, and one asserting drift would flip red the moment 3289 fixes
-it. Either encodes host state rather than checker behaviour.
+That rule is load-bearing here for a specific reason, not just portability: a
+test asserting parity or drift against the live host encodes that host's state
+rather than the checker's behaviour, so it turns red or green for reasons no
+change to the checker can affect.
 
 The only real-tree reads are REPO-side (the committed dashboard/*.service and
 *.timer files), used by the registry staleness guard.
@@ -1169,9 +1166,8 @@ def test_exec_start_flag_helper_reads_the_parsed_value():
 # ---------------------------------------------------------------------------
 #
 # These read REPO-side files only — never ~/.config/systemd/user/ — so they
-# stay green on a host whose installed units are drifted (which this one is,
-# deliberately, until task 3289 lands) and on CI, which has no installed units
-# at all.
+# stay green on a host whose installed units are drifted and on CI, which has
+# no installed units at all.
 
 _DASHBOARD_SERVICE = "dark-factory-dashboard.service"
 _WATCHDOG_SERVICE = "dark-factory-dashboard-watchdog.service"
@@ -2159,7 +2155,7 @@ def test_main_reports_the_watchdog_pre_incident_drift(tmp_path: pathlib.Path, ca
     """The real measured host drift: the pre-incident inline-shell watchdog.
 
     Reproduced as a FIXTURE rather than read from ~/.config/systemd/user/, so
-    the assertion survives task 3289 installing the post-3308 units.
+    the assertion pins checker behaviour whatever that host has installed since.
     """
     mod = _load_checker()
     repo = _fake_repo(tmp_path, mod)
