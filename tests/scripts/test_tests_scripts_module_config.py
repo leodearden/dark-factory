@@ -386,8 +386,10 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
 # estimate ("Full warm verify here is ~2 min") was left standing in the root
 # yaml until it was off by an order of magnitude.
 #
-#   VERBATIM runs of the test_command this module config declares
-#   (`uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300`):
+#   SERIAL-FORM runs of the test_command this module config declares
+#   (`uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300`,
+#   i.e. without `-n auto --dist loadgroup`). Every one was the verbatim command
+#   until task 5470:
 #     233.50s, 167.73s               task 3350's worktree at HEAD 9d6af5289f;
 #                                    369 passed / 1 skipped each
 #     146.93s wall / 142.11s pytest  task 3703 pre-1 run A, base d6a5e32535;
@@ -424,6 +426,18 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
 #                                    loadavg 80.03 -> 85.81
 #     148.20s wall / 145.77s pytest  pre-1 run 5, same base/counts, rc=0;
 #                                    loadavg 85.81 -> 103.79
+#     307.13s wall / 301.06s pytest  task 5470 architect run, base
+#                                    54a84fba86; rc=0, 2535 passed / 2 skipped
+#                                    / 10 deselected; loadavg 51.04 -> 139.61
+#
+#   PARALLEL runs (verbatim since task 5470) — NOT a sizing input:
+#     70.12s wall / 68.16s pytest    task 5470 architect run, base 54a84fba86,
+#                                    PYTEST_XDIST_AUTO_NUM_WORKERS=16; rc=0,
+#                                    2535 passed / 2 skipped; loadavg
+#                                    176.28 -> 164.10
+#     59.04s wall / 57.10s pytest    task 5470 implementer run, step-2 tree,
+#                                    same pin; rc=0, 2535 passed / 2 skipped;
+#                                    loadavg 127.32 -> 101.59
 #
 #   FALLBACK-PATH runs — A DIFFERENT COMMAND, kept for history and LABELLED so
 #   nobody sizes this budget against them again:
@@ -433,7 +447,11 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
 #                                    command declared here
 #
 # SIZING RULE: the WORST RUN, never the mean and never fresh-only, across the
-# UNION of every VERBATIM run above. Task 4320's own five fresh runs all came in
+# UNION of every SERIAL-FORM run above. Serial, because verify's ENV_TRANSIENT
+# recovery (verify.py::_serial_pytest_str, then _run_or_skip_timed) sheds
+# -n/--dist and re-runs this leg single-process under the SAME per-command
+# budget; sizing on the parallel form would re-create the false-infra_timeout
+# trap on that recovery path. Task 4320's own five fresh runs all came in
 # BELOW the 397.47s worst — the freshest of them at 148.20s — so sizing on them
 # would have LOWERED the floor from 700 back to 400 and left the then-declared
 # 600s budget passing. That is the unsafe direction, and recording the
@@ -603,7 +621,8 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget(
 
     - Below (b): at least ``MIN_MODULE_BUDGET_SECS``, which is not a literal
       but ``min_budget(MEASURED_SUITE_WORST_SECS)`` — ~2x the worst RECORDED
-      run of this module's VERBATIM test_command, floored to the nearest 100s.
+      run of the SERIAL form of this module's test_command (the form verify's
+      ENV_TRANSIENT recovery runs), floored to the nearest 100s.
       An achievable floor derived from measurement, not a guess, and derived
       rather than transcribed so it cannot fall out of step with the figure it
       is derived from.
@@ -643,8 +662,8 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget(
         f'{MODULE_PREFIX}/orchestrator.yaml declares no '
         'verify_command_timeout_secs (task 3350), so this suite silently '
         'inherits the repo-root whole-fleet ceiling — the budget sized for '
-        'seven subprojects, applied to a suite whose worst RECORDED run of its '
-        f'own declared test_command is {MEASURED_SUITE_WORST_SECS}s'
+        'seven subprojects, applied to a suite whose worst RECORDED run of the '
+        f'serial form of its own test_command is {MEASURED_SUITE_WORST_SECS}s'
     )
 
     # (b) Measurement-derived floor — DERIVED by min_budget from
@@ -654,8 +673,9 @@ def test_tests_scripts_module_carries_its_own_tight_verify_budget(
         f'{mc.verify_command_timeout_secs} is below the '
         f'{MIN_MODULE_BUDGET_SECS}s floor (task 3350). That floor is not a '
         f'literal: it is min_budget(MEASURED_SUITE_WORST_SECS='
-        f'{MEASURED_SUITE_WORST_SECS}), ~2x the worst RECORDED run of this '
-        "module's VERBATIM test_command floored to the nearest 100s — see the "
+        f'{MEASURED_SUITE_WORST_SECS}), ~2x the worst RECORDED run of the '
+        "SERIAL form of this module's test_command floored to the nearest 100s "
+        '— see the '
         'provenance block above that constant for every run behind it. A budget '
         'under the floor would manufacture infra_timeout on the honest green '
         'path — the exact defect this task exists to remove, reintroduced one '
