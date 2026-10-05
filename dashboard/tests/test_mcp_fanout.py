@@ -2248,8 +2248,9 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
             windows = elapsed / fanout_mod._LOCK_ACQUIRE_TIMEOUT_SECONDS
 
             assert windows >= 5, (
-                f'precondition: the run must cover several bound-windows to '
-                f'distinguish a TOTAL bound from a RATE bound, got {windows:.1f}'
+                f'precondition: the driven callers must span several '
+                f'bound-windows of loop time to distinguish a TOTAL bound '
+                f'from a RATE bound -- raise count, got {windows:.1f}'
             )
             assert calls['n'] <= 3, (
                 'a wedged key must never start more than 3 live refreshes '
