@@ -52,20 +52,8 @@ rounding-default control proving the guard actually fires.  The helper itself
 lives in spark_path.js and is behaviourally tested under ``node --test``; what
 is measured HERE is the wiring only charts.jsx and the tabs can express.
 
-ALSO HERE: COUNT-AXIS SNAPPING (task 5121) — LineChart and StackedAreaChart
-take an opt-in ``snapMax`` that maps the folded data maximum to the axis
-maximum, and count callers pass spark_path.js's ``niceCountMax``.  The
-scaled-axis programs below execute each component's REAL ``const`` statements
-that carry a data maximum to its raw ticks (LineChart's own scale lines;
-StackedAreaChart's call into the real ``stackedAreaPaths``) against the real
-spark_path.js.  They emit those statements in SOURCE ORDER, so a snap line that
-reads ``ticks`` before its declaration throws the same TDZ ReferenceError the
-browser would, and they return RAW ticks rather than labels, so one expectation
-table holds across callers whose formatters differ.  The caller audit is pinned
-in both directions: the seven COUNT call sites must pass ``snapMax``, and the
-three FRACTION sites (the esc-per-done ratio, the 100%-normalized stack and the
-ECDF percent axis) must not, because a snapped 1 reads as 400%.  The duration
-and dollar charts are deliberately left unpinned either way.
+ALSO HERE: the count-axis ``snapMax`` wiring and its two-direction caller audit
+(task 5121) — see ``_scaled_axis_program`` and the audit block at the bottom.
 """
 
 from __future__ import annotations

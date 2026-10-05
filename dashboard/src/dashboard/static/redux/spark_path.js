@@ -403,7 +403,7 @@ function formatCountTick(v) {
 //
 // Exact, with no tolerance: a multiple of `ticks` divided by `ticks` is an
 // exact integer in IEEE-754, so formatCountTick's `Number.isInteger` labels all
-// five ticks. spark_path.test.mjs pins the table and the 1..200 sweep.
+// five ticks. spark_path_count_axis.test.mjs pins the table and the 1..200 sweep.
 //
 // OPT-IN, never a default: a fraction axis snaps 0.8 or 1 up to 4, so a ratio
 // or 100%-normalized chart would read 0%..400%.
