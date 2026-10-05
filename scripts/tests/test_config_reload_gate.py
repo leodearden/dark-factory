@@ -2,6 +2,8 @@
 over a real loopback socket against the stateful escalation MCP fake."""
 from __future__ import annotations
 
+import sys
+
 import pytest
 from _config_reload_gate import ReloadFailure, ReloadNotConfirmed, fetch_reload_report
 from config_reload_script_fakes import (
@@ -82,3 +84,17 @@ def test_a_reply_slower_than_the_timeout_is_reply_timed_out():
     assert refusal.failure is ReloadFailure.REPLY_TIMED_OUT
     assert "reload_config" in tools, tools
     assert COMMITTED_AS in refusal.detail, refusal.detail
+
+
+def test_an_interpreter_without_httpx_is_transport_not_importable(monkeypatch):
+    """A host with pydantic but no httpx: the transport is not importable, and
+    that is known before anything is sent."""
+    monkeypatch.setitem(sys.modules, "httpx", None)
+
+    with FakeEscalationMcp(reload_report(config_path="/x")) as server:
+        refusal = _refusal(server.port)
+        received = list(server.received)
+
+    assert refusal.failure is ReloadFailure.TRANSPORT_NOT_IMPORTABLE
+    assert sys.executable in refusal.detail, refusal.detail
+    assert received == [], received
