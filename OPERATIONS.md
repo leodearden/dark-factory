@@ -1839,6 +1839,19 @@ Slots are staggered deliberately: these jobs share one machine and, in two
 cases, the same backing stores. **Check this table before adding a job** —
 04:00 is already double-booked.
 
+**A row here is a claim about the host, not about `scripts/`.** An installer
+committed to main installs nothing; only running it does. So a timer job is
+done when its timer is listed, not when its installer lands. The check is one
+command: `systemctl --user list-timers --all` must list an instance for every
+row, which for a templated `@` unit means one `@<project_id>` instance per
+project. An agent cannot run the installer, because `~/.config/systemd/user/`
+is outside the sandbox write-set
+(`orchestrator/src/orchestrator/agents/write_set.py`). The deploy is therefore
+a `task_kind='deterministic'` `before_done` task, one per project, paired with
+a liveness predicate so that a timer which stops firing is loud. History:
+tasks 2901, 4557 and 5351 (rows that were never installed); task 5400 (the
+missing `LoadState` detector).
+
 | Slot | Job | Units |
 |---|---|---|
 | 03:00 | Legibility trickle coder | `legibility-trickle@.timer` |
@@ -1854,7 +1867,7 @@ caught up on next boot/login rather than silently skipped) and
 `RandomizedDelaySec=300`.
 
 Per-job docs: [docs/flag-marker-sweep-recurring.md](docs/flag-marker-sweep-recurring.md)
-for the 03:30 job; the sections below for the 03:00 and 05:00 ones, and
+for the 03:30 job; the sections below for the 03:00, 04:00 and 05:00 ones, and
 [Cross-project return brief (05:30)](#cross-project-return-brief-0530) for the 05:30 one.
 
 **04:30 was freed by task 5247 and is taken as of task 4514** by the legibility
@@ -2143,6 +2156,56 @@ resolution they silently read and wrote different files.
 lever. **No shipped unit sets it** — production always takes the anchored
 branch — and if you do set it, set it for **both** units at once: pinning one
 half is exactly how the writer/reader divergence comes back.
+
+### Nightly legibility transcript check (04:00)
+
+**What it does.** Runs `check_transcript_persistence.py`, task 2893's
+registry-to-transcript reconciliation detector, once a day per project. It
+alarms on "a session ran but left no transcript". Exit 0 means clean. Exit 1
+means a lost-transcript finding; the detector also best-effort POSTs an
+`escalate_info`, but the non-zero exit is the authoritative signal, since a
+down escalation server is swallowed. So a night with a finding leaves the
+unit `failed`. That is the alarm, not a broken unit, and the liveness probe
+below tells the two apart.
+
+**Why no `--check-preventer`.** The comment in
+`legibility-transcript-check@.service` (task 2901 DD2) says the 2893 guard
+regex missed `spawn-claude.sh`'s mid-line export, so the flag would make the
+timer exit 1 every night. Task 2923 fixed that regex on 2026-07-23. Measured
+on 2026-09-24, the guard finds the export, so the comment is stale. Whether to
+enable the flag is an open decision owned by task 5859.
+
+| File | Role |
+|---|---|
+| `scripts/legibility/check_transcript_persistence.py` | The detector |
+| `scripts/legibility-transcript-check@.service` | `Type=oneshot`, `%i` = project_id |
+| `scripts/legibility-transcript-check@.timer` | `OnCalendar=*-*-* 04:00:00` |
+| `scripts/legibility/install-transcript-check-timer.sh` | Idempotent, self-verifying installer |
+| `scripts/legibility/check_transcript_check_liveness.sh` | The "did the unit run?" probe |
+
+**Deploy.** `scripts/legibility/install-transcript-check-timer.sh
+<project_id>`, run from `/home/leo/src/dark-factory` once per project
+(`dark_factory`, `reify`). It runs as a deterministic `before_done` task,
+because the sandbox cannot write `~/.config/systemd/user/`: task 5855
+(dark_factory) and task 5856 (reify).
+
+**Liveness.** Tasks 5857 (dark_factory) and 5858 (reify) are delayed-milestone
+predicates. Each runs `check_transcript_check_liveness.sh <project_id> 72`
+seven days after its project's deploy lands. Both a clean run
+(`Result=success`, `ExecMainStatus=0`) and a firing run (`Result=exit-code`,
+`ExecMainStatus=1`) count as ALIVE, because for this detector exit 1 is the
+normal alarm. Never-ran, staleness, an abnormal `Result`, or `ExecMainStatus`
+empty or ≥2 all FAIL. That is the opposite of `check_trickle_liveness.sh`,
+where exit 1 means the pipeline broke. These milestones are one-shot: a `done`
+predicate never runs again.
+
+**Superseded by a recurring chain.** This timer is the interim runner. The
+recurring-deterministic-tasks PRD
+([docs/prds/recurring-deterministic-tasks.md](docs/prds/recurring-deterministic-tasks.md),
+r6 = task 4681) makes transcript-check a chain of predicate tasks. When that
+chain is seeded, retire this timer and `check_transcript_check_liveness.sh` in
+the same change, or every finding is filed twice. Do not add a second
+recurring probe here.
 
 ### Nightly canonical/topic coverage census (05:00)
 
