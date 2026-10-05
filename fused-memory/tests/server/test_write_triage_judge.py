@@ -265,12 +265,12 @@ class TestJudgeExemplars:
         Checking the fields individually cannot see that: all four verdict
         words already appear in the vocabulary bullets above the examples, so
         ``exemplar.verdict in prompt`` is true whatever the renderer emits.
-        Measured by simulation — a ``_render_exemplars`` that dropped its
+        Measured by simulation — a ``render_judge_exemplars`` that dropped its
         ``answer:`` line entirely, shipping four unanswered riddles, left the
         per-field version of this test green.
 
         Asserted as the contiguous triple, which is executable structure and
-        not a wording pin. It restates ``_render_exemplars``' block layout on
+        not a wording pin. It restates ``render_judge_exemplars``' block layout on
         purpose — that layout IS the contract between the tuple and the model
         — while leaving the prompt's prose around the examples free to be
         reworded. It subsumes the per-field presence check, so there is no
@@ -350,53 +350,41 @@ class TestJudgeExemplars:
     def test_the_worst_case_prompt_stays_within_the_char_budget(self) -> None:
         """PRD C1 bounds the whole call, and the exemplars spend against it.
 
-        The worst case is not hypothetical: the calibration fixture holds a
-        ~9k-char canonical, so a full slate of over-long candidates plus an
-        over-long entry is what a real call looks like when the corpus is at
-        its largest. Built rather than arithmetic, so the scaffolding between
-        the fields is counted too.
-
-        BUILT THE WAY ``judge_write`` CALLS IT, which is the whole point —
-        a construction the production path never makes bounds nothing. The
-        candidate ids are the 36-char uuids every record actually carries (all
-        104 in ``tests/fixtures/write_triage_calibration.jsonl`` are, and
-        ``build_judge_prompt`` renders ``- id:`` UN-elided); a 5-char stand-in
-        id under-measures every candidate line, so the length is asserted
-        rather than assumed.
-
-        THE FIELDS ARE OVER THE DEFAULT FIELD CAP, NOT AT IT. ``_elide``
-        returns a field of exactly the cap untouched and cuts a longer one to
-        the cap PLUS ``_ELIDED_MARKER`` — so the input that elides
-        renders 9 chars wider per field, 54 across a full slate, than the
-        input that merely fills. A worst case built at the cap is therefore
-        not the worst case; it is the widest input that never trips the
-        behaviour this budget exists to bound.
-
         The ceiling is a module constant, not a literal here, so the budget
         has one home — raising it is an edit to the thing being budgeted,
         made next to the C1 rationale, rather than a number quietly relaxed in
         a test.
         """
-        maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + 1)
-        candidates = [
-            _result(str(uuid.uuid4()), 0.9, content=maximal)
-            for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
-        ]
-        assert {len(c.id) for c in candidates} == {36}, (
-            'the slate must carry the 36-char uuids production carries — a '
-            'shorter stand-in id under-measures every candidate line'
-        )
-        rendered = build_judge_prompt(
-            maximal, candidates, field_chars=_DEFAULT_JUDGE_FIELD_CHARS,
-        )
-        assert _ELIDED_MARKER in rendered, (
-            'the worst case must be an ELIDED render — otherwise it misses '
-            'the marker _elide appends, and under-measures the real ceiling'
-        )
-        worst_case = len(JUDGE_SYSTEM_PROMPT) + len(rendered)
-        assert worst_case <= judge_module._PROMPT_CHAR_BUDGET, (
+        worst_case = _worst_case_call_chars()
+        assert worst_case <= judge_module.JUDGE_PROMPT_CHAR_BUDGET, (
             f'worst-case prompt is {worst_case} chars against a budget of '
-            f'{judge_module._PROMPT_CHAR_BUDGET}'
+            f'{judge_module.JUDGE_PROMPT_CHAR_BUDGET}'
+        )
+
+    def test_the_budget_admits_no_further_worked_example(self) -> None:
+        """The ceiling's slack stays under the cheapest further exemplar.
+
+        ``JUDGE_PROMPT_CHAR_BUDGET``'s rationale says a ceiling that admitted
+        another worked example would have stopped bounding anything. Asserted
+        so a prompt that SHRINKS — leaving the old ceiling roomy — fails here
+        instead of silently widening what a future addition may spend.
+
+        A further exemplar costs what the module's own renderer adds when it
+        is appended, joiner included, so the layout is not restated here.
+        """
+        budget = judge_module.JUDGE_PROMPT_CHAR_BUDGET
+        worst_case = _worst_case_call_chars()
+        slack = budget - worst_case
+        render = judge_module.render_judge_exemplars
+        shipped = judge_module.JUDGE_EXEMPLARS
+        cheapest = min(
+            len(render((*shipped, exemplar))) - len(render(shipped))
+            for exemplar in shipped
+        )
+        assert 0 <= slack < cheapest, (
+            f'budget {budget} against a measured worst case of {worst_case} '
+            f'leaves {slack} chars of slack; it must be at least 0 and under '
+            f'the cheapest further worked example ({cheapest} chars)'
         )
 
 
@@ -625,6 +613,49 @@ def _result(
 def _decision(canonical_id: str | None, similarity: float | None = 0.80) -> BandDecision:
     """A middle-band decision naming *canonical_id* as the attach target."""
     return BandDecision(OUTCOME_JUDGE, canonical_id, similarity, 0.95, 0.70)
+
+
+def _worst_case_call_chars() -> int:
+    """Characters in the widest judge call the shipped defaults allow.
+
+    The worst case is not hypothetical: the calibration fixture holds a
+    ~9k-char canonical, so a full slate of over-long candidates plus an
+    over-long entry is what a real call looks like when the corpus is at its
+    largest. Built rather than arithmetic, so the scaffolding between the
+    fields is counted too.
+
+    BUILT THE WAY ``judge_write`` CALLS IT, which is the whole point — a
+    construction the production path never makes bounds nothing. The
+    candidate ids are the 36-char uuids every record actually carries (all
+    104 in ``tests/fixtures/write_triage_calibration.jsonl`` are, and
+    ``build_judge_prompt`` renders ``- id:`` UN-elided); a 5-char stand-in id
+    under-measures every candidate line, so the length is asserted rather
+    than assumed.
+
+    THE FIELDS ARE OVER THE DEFAULT FIELD CAP, NOT AT IT. ``_elide`` returns a
+    field of exactly the cap untouched and cuts a longer one to the cap PLUS
+    ``_ELIDED_MARKER`` — so the input that elides renders 9 chars wider per
+    field, 54 across a full slate, than the input that merely fills. A worst
+    case built at the cap is therefore not the worst case; it is the widest
+    input that never trips the behaviour the budget exists to bound.
+    """
+    maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + 1)
+    candidates = [
+        _result(str(uuid.uuid4()), 0.9, content=maximal)
+        for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
+    ]
+    assert {len(c.id) for c in candidates} == {36}, (
+        'the slate must carry the 36-char uuids production carries — a '
+        'shorter stand-in id under-measures every candidate line'
+    )
+    rendered = build_judge_prompt(
+        maximal, candidates, field_chars=_DEFAULT_JUDGE_FIELD_CHARS,
+    )
+    assert _ELIDED_MARKER in rendered, (
+        'the worst case must be an ELIDED render — otherwise it misses the '
+        'marker _elide appends, and under-measures the real ceiling'
+    )
+    return len(JUDGE_SYSTEM_PROMPT) + len(rendered)
 
 
 #: The repo root, reached from `<repo>/fused-memory/tests/server/`.
@@ -2600,3 +2631,86 @@ class TestTheFrontierArmLive:
         assert isinstance(usage.input_tokens, int) and usage.input_tokens > 0
         assert isinstance(usage.reasoning_tokens, int)
         assert usage.reasoning_tokens <= usage.output_tokens
+
+
+def _contests_exemplar() -> judge_module.JudgeExemplar:
+    """The worked `contests` example, looked up through the public tuple."""
+    return next(
+        exemplar for exemplar in judge_module.JUDGE_EXEMPLARS
+        if exemplar.verdict == 'contests'
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get('OPENAI_API_KEY'),
+    reason='needs OPENAI_API_KEY for a live Responses API call',
+)
+@pytest.mark.timeout(120)
+class TestTheShippedWordingLive:
+    """Boundary row 3 (flip-readiness PRD §11.4): `contests` covers an outdated candidate.
+
+    Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
+    the old wording too, so only Sol tells the two wordings apart.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('entry', 'expected'),
+        [
+            (_contests_exemplar().entry, OUTCOME_CONTESTED),
+            (
+                'The greenhouse thermostat was recalibrated to Celsius last '
+                'week, so it no longer reads in Fahrenheit.',
+                OUTCOME_CONTESTED,
+            ),
+            (
+                'Since the March firmware update, the greenhouse thermostat '
+                'is calibrated in Celsius.',
+                OUTCOME_CONTESTED,
+            ),
+            (
+                "The glasshouse thermostat's calibration uses the Fahrenheit scale.",
+                OUTCOME_RESTATED,
+            ),
+            (
+                'The greenhouse thermostat is calibrated in Fahrenheit and is '
+                'accurate to within half a degree.',
+                OUTCOME_AMENDED,
+            ),
+        ],
+        ids=[
+            'contests-exemplar',
+            'explicitly-outdated',
+            'implicitly-outdated',
+            'paraphrase-restates',
+            'agreeing-addition-amends',
+        ],
+    )
+    async def test_the_judge_reads_the_entry_against_the_thermostat_record(
+        self, entry: str, expected: str,
+    ) -> None:
+        candidate_id = str(uuid.uuid4())
+        slate = [
+            _result(candidate_id, 0.80, content=_contests_exemplar().candidate),
+            _result(
+                str(uuid.uuid4()), 0.60,
+                content='The irrigation pump in the greenhouse runs for ten '
+                        'minutes every morning at six.',
+            ),
+        ]
+        config = FusedMemoryConfig()
+        write_triage = config.write_triage
+        write_triage.judge_enabled = True
+        write_triage.judge_provider = 'openai'
+        write_triage.judge_model = 'gpt-6.1-sol'
+        write_triage.judge_reasoning_effort = 'low'
+        service = types.SimpleNamespace(config=config)
+
+        verdict = await judge_write(
+            memory_service=service, content=entry, project_id='p',
+            decision=_decision(candidate_id), candidates=slate,
+        )
+
+        assert verdict.outcome == expected
+        assert verdict.candidate_id == candidate_id
