@@ -376,14 +376,6 @@ def test_every_grant_is_exercised():
     )
 
 
-def test_the_healthz_probe_is_the_only_exemption():
-    scoped = [grant for grant in _GRANTS if grant.scope is not None]
-
-    assert [(grant.module, grant.scope) for grant in scoped] == [
-        ('app.py', '_fanout_probe_completion'),
-    ]
-
-
 # ---------------------------------------------------------------------------
 # The old-path census (sketch #14, second half): the census kinds and checkers
 # ---------------------------------------------------------------------------

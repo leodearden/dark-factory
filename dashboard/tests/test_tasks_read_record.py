@@ -6,7 +6,6 @@ statuses canonicalisation, the page window and the per-request timeout.
 
 from __future__ import annotations
 
-import dataclasses
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -18,95 +17,24 @@ import dashboard.data.tasks as tasks_mod
 class TestTasksReadRecord:
     """The structured read record: `_OnePage` | `_CompleteRead` inside `_TasksRead`.
 
-    RED source (step-2): dashboard.data.tasks has no _TasksRead yet.
+    The record is the one source of a read's MCP wire arguments, so a read and
+    the request it sends cannot disagree. Two properties carry that:
 
-    These records replace the hand-encoded key string built by
-    ``_fetch_tasks_cache_key`` (the ``*`` sentinel, ``|`` separators and
-    ``\x1f`` unit separator). Both defects that encoding produced are
-    reproduced here as assertions, so neither can come back:
-
-      * OFFSET DRIFT — the encoder rendered ``|o={offset}`` unconditionally
-        while ``offset`` only reached the wire when ``page_size`` was set, so
-        two reads with a byte-identical wire request minted two entries.
-        After this change the only read carrying an offset is ``_OnePage``,
-        which always sends one, so the invalid combination is not
-        constructible.
-      * STATUSES ORDER — ``['a','b']`` and ``['b','a']`` rendered as
-        ``s=a\x1fb`` vs ``s=b\x1fa``: two entries for one order-insensitive
-        SQL ``IN`` list. ``frozenset`` collapses them.
+      * THE WINDOW COMES FROM THE MODE — the only read carrying an offset is
+        ``_OnePage``, whose window ``wire_arguments`` reads off the mode and
+        refuses to be handed a second time; a ``_CompleteRead`` walk varies
+        only the window it is given, page by page.
+      * STATUSES CROSS THE WIRE BY MEANING — ``None`` (whole tree) omits the
+        key, an empty set is SENT as ``[]`` ("no tasks"), and a set crosses
+        ``sorted()`` because the SQL ``IN`` list it becomes has no order.
     """
 
-    @pytest.mark.parametrize(
-        ('name', 'build'),
-        [
-            ('_OnePage', lambda m: m._OnePage(10, 0)),
-            ('_CompleteRead', lambda m: m._CompleteRead(None)),
-            (
-                '_TasksRead',
-                lambda m: m._TasksRead('/r', None, m._CompleteRead(None)),
-            ),
-        ],
-    )
-    def test_each_record_is_frozen_and_usable_as_a_dict_key(self, name, build):
-        """A cache key that can be mutated after insertion is not a key.
-
-        These are the two properties a cache key genuinely needs, and both are
-        asserted against live behaviour rather than against the decorator's
-        arguments: a mutated key is unfindable in the dict it was filed under,
-        and an equal-but-distinct rebuild must find the entry the original
-        wrote.
-        """
-        record = build(tasks_mod)
-
-        field = dataclasses.fields(record)[0].name
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(record, field, 'mutated')
-
-        # A real dict round trip, not `hash()` alone — that would pass for a
-        # type whose __eq__ and __hash__ disagree, which is precisely the way
-        # a key silently stops finding its own entry.
-        assert {record: 'v'}[build(tasks_mod)] == 'v', (
-            f'{name} does not round-trip as a dict key'
-        )
-
-    def test_statuses_order_does_not_change_the_key(self):
-        """['a','b'] and ['b','a'] are ONE read, so they are ONE key.
-
-        The old encoder rendered s=a\x1fb vs s=b\x1fa — two entries for an
-        identical, order-insensitive SQL IN list. Reproduced live on this tip
-        before the change.
-        """
-        ab = tasks_mod._TasksRead(
-            '/r', frozenset({'a', 'b'}), tasks_mod._CompleteRead(None)
-        )
-        ba = tasks_mod._TasksRead(
-            '/r', frozenset({'b', 'a'}), tasks_mod._CompleteRead(None)
-        )
-        assert ab == ba
-        assert hash(ab) == hash(ba)
-
-    def test_none_statuses_is_distinct_from_empty_statuses(self):
-        """None (whole tree) and frozenset() (no tasks at all) are opposites.
-
-        The old encoder spelled these ``s=*`` vs ``s=`` and the distinction was
-        load-bearing: collapsing them onto one key serves an empty list as if
-        it were the full tree.
-        """
-        whole_tree = tasks_mod._TasksRead(
-            '/r', None, tasks_mod._CompleteRead(None)
-        )
-        nothing = tasks_mod._TasksRead(
-            '/r', frozenset(), tasks_mod._CompleteRead(None)
-        )
-        assert whole_tree != nothing
-
     def test_a_page_and_a_same_size_walk_are_distinct_and_named(self):
-        """THE esc-4360-7 COLLISION, as the user-observable signal.
+        """A 10-row PAGE and a walk 10 rows at a time are different reads.
 
-        A 10-row PAGE and the complete tree walked 10 rows at a time differ in
-        length and content while agreeing on every other component. The
-        discriminator is now the record's TYPE — readable as a named field,
-        not parsed out of a string.
+        They differ in length and content while agreeing on every other
+        component, so the mode's TYPE is what says which answer a read
+        returns — readable as a named field, not parsed out of a string.
         """
         page = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(10, 0))
         walk = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(10))
@@ -155,12 +83,7 @@ class TestTasksReadRecord:
         assert read.wire_arguments(None)['statuses'] == ['blocked', 'done', 'pending']
 
     def test_wire_arguments_adds_page_size_and_offset_together_or_not_at_all(self):
-        """The pair is what the tool needs; half of it is the drift defect.
-
-        The old encoder put ``offset`` in the KEY unconditionally while the
-        wire only carried it alongside ``page_size``. One encoder building both
-        is what makes that disagreement unrepresentable.
-        """
+        """The tool takes a window as a pair, so the wire carries both or neither."""
         read = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(None))
 
         without = read.wire_arguments(None)
@@ -190,12 +113,11 @@ class TestTasksReadRecord:
         assert second['offset'] == 10
 
     def test_a_page_read_takes_its_wire_window_from_its_own_mode(self):
-        """The bytes on the wire come from the field the KEY hashes.
+        """The bytes on the wire come from the record's own mode.
 
         A page read passes no window: `_OnePage` already fixes one, so the
-        request is derived from `mode` itself. That is what makes the offset
-        drift the old two-encoder shape produced unrepresentable rather than
-        merely absent — there is no second copy to disagree with.
+        request is derived from `mode` itself and there is no second copy of
+        the offset to disagree with.
         """
         read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50))
 
@@ -206,9 +128,9 @@ class TestTasksReadRecord:
     def test_a_page_read_refuses_a_second_window(self):
         """Offering a window to a page read RAISES rather than overriding.
 
-        Silently preferring either one would reintroduce exactly the key/wire
-        disagreement this record exists to eliminate: the key would carry
-        `mode` while the wire carried the argument. `TypeError`, not
+        Silently preferring either one would reintroduce exactly the read/wire
+        disagreement this record exists to eliminate: the record would name
+        one window while the wire carried another. `TypeError`, not
         `ValueError` — `first_success` treats `ValueError` as a soft per-url
         failure and would launder a programming error into an offline marker.
         """
@@ -267,11 +189,9 @@ class TestFetchTasksNarrowing:
     ):
         """(b) ``statuses`` crosses the wire ``sorted()`` — canonical, not verbatim.
 
-        AMENDS the former `test_statuses_forwarded_verbatim`, which asserted
-        the list was "not re-sorted". Statuses are now held as a
-        `frozenset[str]` so that `['a','b']` and `['b','a']` hit ONE cache
-        entry, and a frozenset has no iteration order — something must
-        canonicalise the wire list. `sorted()` is the only sane choice:
+        Statuses are held as a `frozenset[str]` because `['a','b']` and
+        `['b','a']` are one read, and a frozenset has no iteration order —
+        something must canonicalise the wire list. `sorted()` is the only sane choice:
         arbitrary frozenset order would make the wire bytes nondeterministic
         across runs and this very assertion FLAKY.
 

@@ -565,6 +565,19 @@ the same file enforces the absence of request-path whole-tree fetches.
 `collect_done_counts`, `_STATUS_MAP` and `dailyDeltas` were deleted by their
 producing leaves and have no name guard.
 
+**The `/healthz` probe reads the whole tree (task 5598, 2026-10-05).** Decision
+17's exemption stays an unnarrowed `fetch_tasks`, the 3.4 s / 29 MB read that
+decision 20 costs. It is paid at most once per 30 s grace lapse, and only while
+something calls `/healthz`. Nothing calls it on a schedule: the watchdog probes
+the shallow `/api/health`, and `scripts/restart-dashboard.sh` calls `/healthz`
+only to wait for readiness after a restart. Two cheaper reads were weighed.
+`fetch_tasks(statuses=[])` never reaches SQL, because fused-memory's
+`sqlite_task_backend.py::_get_tasks_internal` returns before opening a
+connection, so it would not traverse the path the probe exists to test. A
+one-row `fetch_task_page` would cut the transfer but not the server read,
+because `get_tasks` builds the whole list and slices it in memory. At this call
+rate neither earns a change to decision 17.
+
 ## Decomposition plan
 
 Sizing per the overlay bands (300–1500 LOC, ≤10–12 files); every pair of leaves that
