@@ -139,6 +139,23 @@ def _neutralize_fm_clock_gates(
     monkeypatch.setattr(wdog, "_within_fm_staleness_head_start", lambda: False)
 
 
+def _isolate_unit_parity(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> pathlib.Path:
+    """Point the dashboard unit-parity clock at a tmp file and return it.
+
+    Same hazard as _neutralize_fleet_clock_gates: UNIT_PARITY_CLOCK_PATH
+    resolves off the hardcoded REPO_DIR, so a test that lets unit_parity_pass
+    run for real without this would read — and, because the pass stamps on
+    every attempt, WRITE — the main checkout's live clock. Redirects rather
+    than stubs, so the tests that use it exercise the real clock read and
+    stamp.
+    """
+    clock = tmp_path / "last_unit_parity_check.json"
+    monkeypatch.setattr(wdog, "UNIT_PARITY_CLOCK_PATH", str(clock))
+    return clock
+
+
 # ---------------------------------------------------------------------------
 # probe_port tests
 # ---------------------------------------------------------------------------
@@ -4151,6 +4168,9 @@ def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(
         wdog, "fused_memory_staleness_pass", lambda: calls.append("fused_memory_staleness_pass")
     )
+    monkeypatch.setattr(
+        wdog, "unit_parity_pass", lambda: calls.append("unit_parity_pass"), raising=False
+    )
 
     wdog._cli([])
 
@@ -4159,7 +4179,11 @@ def test_cli_default_runs_main_then_staleness_pass(monkeypatch: pytest.MonkeyPat
         "fused_memory_liveness_pass",
         "staleness_pass",
         "fused_memory_staleness_pass",
-    ], f"Expected liveness passes then both staleness passes (fm last), got {calls}"
+        "unit_parity_pass",
+    ], (
+        "Expected liveness passes, then both staleness passes, then the purely "
+        f"observational dashboard unit-parity pass LAST, got {calls}"
+    )
 
 
 def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4176,6 +4200,9 @@ def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(
         wdog, "fused_memory_staleness_pass", lambda: calls.append("fused_memory_staleness_pass")
     )
+    monkeypatch.setattr(
+        wdog, "unit_parity_pass", lambda: calls.append("unit_parity_pass"), raising=False
+    )
 
     # Must not raise
     wdog._cli(["--bogus"])
@@ -4185,6 +4212,7 @@ def test_cli_unknown_flag_does_not_crash(monkeypatch: pytest.MonkeyPatch) -> Non
         "fused_memory_liveness_pass",
         "staleness_pass",
         "fused_memory_staleness_pass",
+        "unit_parity_pass",
     ]
 
 
@@ -8003,6 +8031,11 @@ def test_a_fleet_probe_error_does_not_abort_the_tick(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         wdog, "fused_memory_staleness_pass", lambda: reached.append("fm_staleness_pass")
     )
+    # Stubbed, not run: the real pass would stamp the main checkout's parity
+    # clock and hand the checker's argv to the _registration_run fake below.
+    monkeypatch.setattr(
+        wdog, "unit_parity_pass", lambda: reached.append("unit_parity_pass"), raising=False
+    )
     monkeypatch.setattr(wdog, "log", lambda _m: None)
 
     unit = "orchestrator-probe-escape.service"
@@ -8029,8 +8062,9 @@ def test_a_fleet_probe_error_does_not_abort_the_tick(monkeypatch: pytest.MonkeyP
     assert _probe_calls(calls), (
         f"the stale unit must have reached the delegation and its probe: {calls}"
     )
-    assert reached == ["main", "fm_liveness_pass", "fm_staleness_pass"], (
-        f"the fm staleness backstop must still run after a fleet probe error; got {reached}"
+    assert reached == ["main", "fm_liveness_pass", "fm_staleness_pass", "unit_parity_pass"], (
+        "the fm staleness backstop and the unit-parity pass must still run after "
+        f"a fleet probe error; got {reached}"
     )
 
 
@@ -10924,6 +10958,9 @@ def test_cli_continues_past_a_liveness_persistence_failure(
     monkeypatch.setattr(
         wdog, "fused_memory_staleness_pass", lambda: calls.append("fm_staleness_pass")
     )
+    monkeypatch.setattr(
+        wdog, "unit_parity_pass", lambda: calls.append("unit_parity_pass"), raising=False
+    )
     _wire_liveness_pass(wdog, monkeypatch, tmp_path, ["wedged"])
 
     def boom(*_a, **_k):  # noqa: ANN002, ANN003
@@ -10932,7 +10969,7 @@ def test_cli_continues_past_a_liveness_persistence_failure(
     monkeypatch.setattr(wdog, "_record_fm_liveness_failure", boom)
 
     assert wdog._cli([]) == 0
-    assert calls == ["main", "staleness_pass", "fm_staleness_pass"], (
+    assert calls == ["main", "staleness_pass", "fm_staleness_pass", "unit_parity_pass"], (
         f"the tick must continue past a liveness persistence failure; got {calls}"
     )
 
@@ -12389,3 +12426,374 @@ def test_report_distinguishes_a_future_dated_lease_from_a_live_one(
 
     assert "live" in live_line, f"sanity: a genuine lease still renders live: {live_line!r}"
     assert "live" not in future_line, future_line
+
+
+# ---------------------------------------------------------------------------
+# Dashboard unit-parity backstop (task 4883)
+#
+# A read-only, hourly-throttled run of scripts/check_dashboard_unit_parity.py
+# on the already-armed watchdog tick, so the parity gate runs without anyone
+# having to run setup-host.sh. No live systemd, no real checker, no real clock:
+# subprocess.run is faked, and every test that lets unit_parity_pass run for
+# real redirects its clock through _isolate_unit_parity.
+# ---------------------------------------------------------------------------
+
+_DRIFT_REPORT = (
+    "[dashboard_unit_parity] [drift] 1 directive(s) differ between repo and "
+    "installed units:\n"
+    "[dashboard_unit_parity]   dark-factory-dashboard.service [Service] "
+    "SuccessExitStatus\n"
+)
+
+
+def _checker_run(
+    calls: list[list[str]],
+    *,
+    returncode: int = 0,
+    stdout: str = "",
+    stderr: str = "",
+    raises: BaseException | None = None,
+):
+    """A subprocess.run fake that records every argv and answers like the checker."""
+
+    def fake_run(argv, **_kwargs):  # noqa: ANN001, ANN003
+        calls.append(list(argv))
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
+
+    return fake_run
+
+
+@pytest.mark.parametrize(
+    ("returncode", "verdict"), [(0, "parity"), (1, "drift"), (2, "absent")]
+)
+def test_unit_parity_verdict_classifies_the_checkers_exit_code(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, verdict: str
+) -> None:
+    """0/1/2 map to the checker's own parity/drift/absent vocabulary.
+
+    The same 0/1/2 setup-host.sh branches on, so the watchdog and the
+    installer cannot read one exit code two ways. The combined stdout/stderr
+    comes back with the verdict because that text is how an operator learns
+    WHICH directive drifted.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _checker_run(
+            calls, returncode=returncode, stdout=_DRIFT_REPORT, stderr="checker stderr line"
+        ),
+    )
+
+    got_verdict, report = wdog.unit_parity_verdict()
+
+    assert got_verdict == verdict
+    assert "SuccessExitStatus" in report, f"stdout must reach the report: {report!r}"
+    assert "checker stderr line" in report, f"stderr must reach the report: {report!r}"
+
+
+def test_unit_parity_verdict_runs_the_checker_against_the_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The checker is pointed at REPO_DIR and left to choose its installed dir.
+
+    --installed-dir is deliberately NOT passed: the checker's own default is
+    the one setup-host.sh gates against, and re-deriving it here would be a
+    second copy of it.
+    """
+    wdog = _load_watchdog()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", _checker_run(calls))
+
+    wdog.unit_parity_verdict()
+
+    assert len(calls) == 1, calls
+    (argv,) = calls
+    assert any(arg.endswith("check_dashboard_unit_parity.py") for arg in argv), argv
+    assert "--repo-root" in argv, argv
+    assert argv[argv.index("--repo-root") + 1] == wdog.REPO_DIR, argv
+    assert "--installed-dir" not in argv, argv
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError(2, "No such file or directory", "python3"),
+        PermissionError(13, "Permission denied"),
+        subprocess.TimeoutExpired(cmd="check_dashboard_unit_parity.py", timeout=30),
+    ],
+    ids=["not-found", "permission", "timeout"],
+)
+def test_unit_parity_verdict_tooling_failure_is_unknown_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    """A checker that cannot run is 'unknown', never an exception.
+
+    Same never-raises contract as probe_port and log(): a tooling failure in
+    an observational pass must not abort the tick it runs on.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(subprocess, "run", _checker_run([], raises=error))
+
+    verdict, _report = wdog.unit_parity_verdict()
+
+    assert verdict == "unknown"
+
+
+def test_unit_parity_verdict_unexpected_exit_code_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exit code outside 0/1/2 is not a parity claim, and says which code it was."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(subprocess, "run", _checker_run([], returncode=7, stdout="boom"))
+
+    verdict, report = wdog.unit_parity_verdict()
+
+    assert verdict == "unknown"
+    assert "7" in report, f"the report must name the unexpected exit code: {report!r}"
+
+
+def _pass_log_lines(
+    wdog: types.ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    verdict: str,
+    report: str = "REPORT-TEXT naming [Service] SuccessExitStatus",
+) -> list[str]:
+    """Run unit_parity_pass once against a stubbed *verdict*; return what it logged."""
+    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    lines: list[str] = []
+    monkeypatch.setattr(wdog, "log", lines.append)
+    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: (verdict, report))
+    wdog.unit_parity_pass()
+    return lines
+
+
+def test_unit_parity_pass_warns_once_on_drift_with_the_checkers_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Drift is the one verdict an operator must act on, so it is the one WARNING."""
+    wdog = _load_watchdog()
+
+    lines = _pass_log_lines(wdog, monkeypatch, tmp_path, "drift")
+
+    assert len(lines) == 1, lines
+    (line,) = lines
+    assert "WARNING" in line, line
+    assert "unit parity" in line, line
+    assert "REPORT-TEXT naming [Service] SuccessExitStatus" in line, line
+
+
+@pytest.mark.parametrize("verdict", ["parity", "absent"])
+def test_unit_parity_pass_is_silent_on_parity_and_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, verdict: str
+) -> None:
+    """Parity needs no line, and neither does 'absent'.
+
+    Exit 2 means the dashboard units are not installed on this host, which
+    setup-host.sh already treats as benign. Warning on it would make every
+    checkout on a host without the dashboard permanently noisy.
+    """
+    wdog = _load_watchdog()
+
+    assert _pass_log_lines(wdog, monkeypatch, tmp_path, verdict) == []
+
+
+def test_unit_parity_pass_reports_a_broken_checker_without_a_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """'unknown' gets one line, worded apart from drift.
+
+    A gate that could not run must be distinguishable from a green one, but it
+    is a tooling problem rather than a parity claim, so it is not a WARNING.
+    """
+    wdog = _load_watchdog()
+
+    lines = _pass_log_lines(wdog, monkeypatch, tmp_path, "unknown", report="PermissionError")
+
+    assert len(lines) == 1, lines
+    (line,) = lines
+    assert "WARNING" not in line, line
+    assert "unit parity" in line, line
+    assert "PermissionError" in line, line
+
+
+def test_unit_parity_pass_never_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """An unexpected failure inside the pass is logged, never raised out of the tick."""
+    wdog = _load_watchdog()
+    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    lines: list[str] = []
+    monkeypatch.setattr(wdog, "log", lines.append)
+
+    def boom() -> tuple[str, str]:
+        raise RuntimeError("unexpected parity failure")
+
+    monkeypatch.setattr(wdog, "unit_parity_verdict", boom)
+
+    wdog.unit_parity_pass()
+
+    assert any("unexpected parity failure" in line for line in lines), lines
+
+
+def test_unit_parity_pass_issues_no_mutating_systemd_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """READ-ONLY: the pass detects drift and never acts on it.
+
+    log() runs for real here, so every subprocess the pass spawns — the
+    checker and the journal write alike — reaches the recorder.
+    """
+    wdog = _load_watchdog()
+    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        subprocess, "run", _checker_run(calls, returncode=1, stdout=_DRIFT_REPORT)
+    )
+
+    wdog.unit_parity_pass()
+
+    assert any(
+        arg.endswith("check_dashboard_unit_parity.py") for argv in calls for arg in argv
+    ), f"sanity: the checker must have run: {calls}"
+    mutating = [argv for argv in calls if argv and argv[0] in {"systemctl", "systemd-run"}]
+    assert mutating == [], mutating
+
+
+def _count_checker_runs(
+    wdog: types.ModuleType, monkeypatch: pytest.MonkeyPatch, verdict: str = "parity"
+) -> list[str]:
+    """Stub the verdict with a recorder; return the list each run appends to."""
+    runs: list[str] = []
+
+    def fake_verdict() -> tuple[str, str]:
+        runs.append(verdict)
+        return verdict, ""
+
+    monkeypatch.setattr(wdog, "unit_parity_verdict", fake_verdict)
+    monkeypatch.setattr(wdog, "log", lambda _m: None)
+    return runs
+
+
+def test_unit_parity_pass_skips_inside_the_min_interval(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A fresh stamp holds the checker off: ~1440 ticks/day must not mean ~1440 runs."""
+    wdog = _load_watchdog()
+    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    clock.write_text(json.dumps({"ts": int(time.time())}))
+    runs = _count_checker_runs(wdog, monkeypatch)
+
+    wdog.unit_parity_pass()
+
+    assert runs == []
+
+
+def test_unit_parity_pass_runs_and_stamps_when_the_clock_is_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """No clock yet means the check is due: it runs once and stamps the clock."""
+    wdog = _load_watchdog()
+    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    runs = _count_checker_runs(wdog, monkeypatch)
+
+    wdog.unit_parity_pass()
+
+    assert len(runs) == 1, runs
+    assert clock.exists(), "the pass must stamp its clock"
+    assert abs(json.loads(clock.read_text())["ts"] - time.time()) < 60
+
+
+def test_unit_parity_pass_stamps_on_attempt_even_when_the_checker_cannot_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The stamp is written on ATTEMPT, not on success.
+
+    Otherwise a persistently broken checker would re-run, and re-log, on every
+    one of the ~1440 ticks a day.
+    """
+    wdog = _load_watchdog()
+    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    runs = _count_checker_runs(wdog, monkeypatch, verdict="unknown")
+
+    wdog.unit_parity_pass()
+    wdog.unit_parity_pass()
+
+    assert clock.exists(), "an 'unknown' verdict must still stamp the clock"
+    assert len(runs) == 1, f"the second tick must be held off by the stamp: {runs}"
+
+
+def test_unit_parity_pass_fails_open_on_a_corrupt_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """A corrupt clock body lets the check RUN — the _read_clock_epoch contract.
+
+    Failing the other way would let one unreadable file silence the gate for
+    good.
+    """
+    wdog = _load_watchdog()
+    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    clock.write_text("{not json")
+    runs = _count_checker_runs(wdog, monkeypatch)
+
+    wdog.unit_parity_pass()
+
+    assert len(runs) == 1, runs
+
+
+def test_unit_parity_min_interval_of_zero_disables_the_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """<=0 disables the throttle, the shared _within_min_interval contract."""
+    wdog = _load_watchdog()
+    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    clock.write_text(json.dumps({"ts": int(time.time())}))
+    monkeypatch.setattr(wdog, "UNIT_PARITY_MIN_INTERVAL_SECS", 0)
+    runs = _count_checker_runs(wdog, monkeypatch)
+
+    wdog.unit_parity_pass()
+
+    assert len(runs) == 1, runs
+
+
+def test_unit_parity_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The parity clock is its OWN file under REPO_DIR/data/orchestrator/.
+
+    Distinct from every deploy and restart clock, so a redeploy never resets
+    the parity cadence and a parity check never moves a deploy gate.
+    """
+    monkeypatch.delenv("ORCH_UNIT_PARITY_CLOCK", raising=False)
+    wdog = _load_watchdog()
+
+    assert os.path.join(
+        wdog.REPO_DIR, "data", "orchestrator", "last_unit_parity_check.json"
+    ) == wdog.UNIT_PARITY_CLOCK_PATH
+    assert wdog.UNIT_PARITY_CLOCK_PATH not in {
+        wdog.FLEET_DEPLOY_CLOCK_PATH,
+        wdog.FM_DEPLOY_CLOCK_PATH,
+        wdog.FM_LIVENESS_RESTART_CLOCK_PATH,
+    }
+
+
+def test_unit_parity_knobs_honor_their_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ORCH_UNIT_PARITY_CLOCK and ORCH_UNIT_PARITY_MIN_INTERVAL_SECS are read at import."""
+    monkeypatch.setenv("ORCH_UNIT_PARITY_CLOCK", "/tmp/custom_unit_parity_clock.json")
+    monkeypatch.setenv("ORCH_UNIT_PARITY_MIN_INTERVAL_SECS", "120")
+    wdog = _load_watchdog()
+
+    assert wdog.UNIT_PARITY_CLOCK_PATH == "/tmp/custom_unit_parity_clock.json"
+    assert wdog.UNIT_PARITY_MIN_INTERVAL_SECS == 120
+
+
+def test_unit_parity_min_interval_falls_back_on_a_malformed_env_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo'd interval falls back to the hourly default rather than crashing the oneshot."""
+    monkeypatch.setenv("ORCH_UNIT_PARITY_MIN_INTERVAL_SECS", "hourly")
+    wdog = _load_watchdog()
+
+    assert wdog.UNIT_PARITY_MIN_INTERVAL_SECS == 3600
