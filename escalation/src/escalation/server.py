@@ -9,7 +9,7 @@ import logging
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, assert_never, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
@@ -65,7 +65,7 @@ from escalation.models import (
     max_severity,
 )
 from escalation.pins import classify_pins
-from escalation.queue import AmendmentOutcome, AmendResult, EscalationQueue, ResolveOutcome
+from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
@@ -253,6 +253,18 @@ def _eval_lane_refusal(subject: str) -> dict[str, str]:
             'production task_id.'
         ),
         'code': 'eval_lane_contained',
+    }
+
+
+def _amend_not_pending_refusal(escalation_id: str, status: str) -> dict[str, str]:
+    """The ``amend_escalation`` refusal for a record that exists but is *status*."""
+    return {
+        'error': (
+            f'Escalation {escalation_id} is {status}, not pending; only a pending '
+            'record can be amended. Nothing was recorded.'
+        ),
+        'code': 'not_pending',
+        'status': status,
     }
 
 
@@ -3010,49 +3022,43 @@ def create_server(
         if identity is not None:
             agent_role = identity
 
-        def amend_and_enrich() -> tuple[AmendResult, Escalation | None]:
-            result = queue.amend(
-                escalation_id, root_cause=root_cause, summary=summary,
-                detail=detail, options=options, agent_role=agent_role,
-            )
-            if result['status'] != 'not_found':
-                return result, result['escalation']
-            # Archive-inclusive and read-only, so it cannot resurrect anything.
-            return result, queue.get(escalation_id)
-
-        result, esc = await asyncio.to_thread(amend_and_enrich)
-        # An alarm whose census excluded a truncation source would under-report
-        # exactly the cap pressure it exists to detect.
-        if result['dropped'] > 0:
-            await _report_amendment_truncation_storm(escalation_id)
-        status = result['status']
-        if status == 'amended' and esc is not None:
-            return {**esc.to_dict(), 'amendment_recorded': True}
-        if status == 'repeat_framing' and esc is not None:
-            return {
-                **esc.to_dict(),
-                'amendment_recorded': False,
-                'no_op_reason': 'repeat_framing',
-            }
-        if status == 'no_framing':
-            return {
-                'error': (
-                    f'amend_escalation on {escalation_id} carries no framing: pass at '
-                    'least one of summary / detail / options / root_cause. Nothing '
-                    'was recorded.'
-                ),
-                'code': 'empty_amendment',
-            }
-        if esc is not None and esc.status != 'pending':
-            return {
-                'error': (
-                    f'Escalation {escalation_id} is {esc.status}, not pending; only a '
-                    'pending record can be amended. Nothing was recorded.'
-                ),
-                'code': 'not_pending',
-                'status': esc.status,
-            }
-        return {'error': f'Escalation {escalation_id} not found', 'code': 'not_found'}
+        result = await asyncio.to_thread(
+            queue.amend, escalation_id, root_cause=root_cause, summary=summary,
+            detail=detail, options=options, agent_role=agent_role,
+        )
+        match result['status']:
+            case 'amended':
+                # An alarm whose census excluded a truncation source would
+                # under-report exactly the cap pressure it exists to detect.
+                if result['dropped'] > 0:
+                    await _report_amendment_truncation_storm(escalation_id)
+                return {**result['escalation'].to_dict(), 'amendment_recorded': True}
+            case 'repeat_framing':
+                return {
+                    **result['escalation'].to_dict(),
+                    'amendment_recorded': False,
+                    'no_op_reason': 'repeat_framing',
+                }
+            case 'not_pending':
+                return _amend_not_pending_refusal(escalation_id, result['escalation'].status)
+            case 'no_framing':
+                return {
+                    'error': (
+                        f'amend_escalation on {escalation_id} carries no framing: pass '
+                        'at least one of summary / detail / options / root_cause. '
+                        'Nothing was recorded.'
+                    ),
+                    'code': 'empty_amendment',
+                }
+            case 'not_found':
+                # queue.amend reads the queue root only, and a closed record
+                # lives in the archive.  Read-only, so it resurrects nothing.
+                archived = await asyncio.to_thread(queue.get, escalation_id)
+                if archived is not None and archived.status != 'pending':
+                    return _amend_not_pending_refusal(escalation_id, archived.status)
+                return {'error': f'Escalation {escalation_id} not found', 'code': 'not_found'}
+            case unhandled:
+                assert_never(unhandled)
 
     # --- L2 promotion tool ---
 

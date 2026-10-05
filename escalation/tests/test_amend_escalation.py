@@ -396,6 +396,26 @@ class TestAmendEscalationTool:
         assert _json_files(queue) == snapshot, 'the archived file is byte-identical'
         assert not _record_path(queue, l2.id).exists(), 'nothing re-created in the root'
 
+    async def test_closed_record_still_in_queue_root_is_not_pending(self, tmp_path):
+        queue = EscalationQueue(tmp_path / 'esc')
+        l2 = _framed_l2(queue)
+        closed = _on_disk(queue, l2.id)
+        closed.status = 'dismissed'
+        closed.resolution = 'decided'
+        closed.resolved_at = datetime.now(UTC).isoformat()
+        _record_path(queue, l2.id).write_text(closed.to_json())
+        server = create_server(queue, startup_sweep=False)
+        snapshot = _json_files(queue)
+
+        response = await _amend(
+            server, escalation_id=l2.id, summary='too late', agent_role='interactive',
+        )
+
+        assert response['code'] == 'not_pending'
+        assert response['status'] == 'dismissed'
+        assert response['error']
+        assert _json_files(queue) == snapshot
+
     async def test_empty_amendment_is_refused(self, tmp_path):
         queue = EscalationQueue(tmp_path / 'esc')
         l2 = _framed_l2(queue)

@@ -278,23 +278,31 @@ class AmendmentOutcome(TypedDict):
     variants: int
 
 
-AmendStatus = Literal['amended', 'repeat_framing', 'no_framing', 'not_found', 'not_pending']
+class AmendWithRecord(TypedDict):
+    """An :meth:`EscalationQueue.amend` call that read the record it names."""
+
+    status: Literal['amended', 'repeat_framing', 'not_pending']
+    escalation: Escalation  # as amended, or as found when nothing was recorded
+    recorded: bool          # THIS call appended an amendment
+    dropped: int            # entries THIS call shed at the _MAX_AMENDMENTS cap
 
 
-class AmendResult(TypedDict):
-    """What ONE :meth:`EscalationQueue.amend` call did.
+class AmendWithoutRecord(TypedDict):
+    """An :meth:`EscalationQueue.amend` call that read no record."""
 
-    A RETURN value rather than an out-param, unlike :class:`AmendmentOutcome`:
-    ``amend`` has no pre-existing call sites to keep reading a bare
-    ``Escalation``.  Computed inside ``escalation_id_lock`` for the same TOCTOU
-    reason ``AmendmentOutcome`` states, and every key is populated on every
-    return path.
-    """
+    status: Literal['no_framing', 'not_found']
+    escalation: None
+    recorded: bool
+    dropped: int
 
-    status: AmendStatus
-    escalation: Escalation | None  # the record as amended; None when not found
-    recorded: bool                 # THIS call appended an amendment
-    dropped: int                   # entries THIS call shed at the _MAX_AMENDMENTS cap
+
+# What ONE `amend` call did.  A RETURN value rather than an out-param, unlike
+# `AmendmentOutcome`: `amend` has no pre-existing call sites to keep reading a
+# bare `Escalation`.  Computed inside `escalation_id_lock` for the TOCTOU reason
+# `AmendmentOutcome` states.  Discriminated on `status`, so a caller matching on
+# it gets `escalation` typed exactly for that status and a type checker flags
+# any status the caller leaves unhandled.
+AmendResult = AmendWithRecord | AmendWithoutRecord
 
 
 class ResolveOutcome(TypedDict):
@@ -572,6 +580,18 @@ def _is_repeat_framing(esc: Escalation, candidate: Amendment) -> bool:
     return _framing_view(baseline) == _framing_view(candidate)
 
 
+def _has_framing(
+    *, root_cause: str, summary: str, evidence: str, options: list[str] | None,
+) -> bool:
+    """True when incoming framing carries anything an amendment could record.
+
+    THE one definition of "empty framing", read by every writer that must tell
+    a no-op apart from a write before it decides what to do: an empty amendment
+    carries no information and would still burn a ``_MAX_AMENDMENTS`` slot.
+    """
+    return bool(root_cause or summary or evidence or options)
+
+
 def _append_amendment_capped(
     esc: Escalation, *, root_cause: str, summary: str, evidence: str,
     options: list[str] | None, agent_role: str, caller: str,
@@ -586,8 +606,7 @@ def _append_amendment_capped(
     ``_MAX_AMENDMENTS`` into ``amendments_truncated``.  Every loss is a durable
     structured fact on the record and a WARNING, never log-only.
 
-    No framing at all — all four arguments falsy — records nothing: an empty
-    amendment carries no information and would still burn a cap slot.
+    Framing that fails :func:`_has_framing` records nothing.
 
     Mutates *esc* in memory only.  The caller holds ``escalation_id_lock``, owns
     the single ``_rewrite``, and decides whether to bump ``updated_at``, so the
@@ -598,7 +617,9 @@ def _append_amendment_capped(
     Returns ``(recorded, dropped)``: whether an entry was appended, and how many
     oldest entries the cap shed.
     """
-    if not (root_cause or evidence or options or summary):
+    if not _has_framing(
+        root_cause=root_cause, summary=summary, evidence=evidence, options=options,
+    ):
         return False, 0
     candidate, chars_elided = _build_amendment(
         root_cause=root_cause, summary=summary, evidence=evidence,
@@ -2196,7 +2217,10 @@ class EscalationQueue:
                 logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
                 return None
 
-            incoming_framing = bool(root_cause or evidence or options or summary)
+            incoming_framing = _has_framing(
+                root_cause=root_cause, summary=summary, evidence=evidence,
+                options=options,
+            )
             if not new_member_ids and severity_floor is None and not incoming_framing:
                 return esc  # no-op
 
@@ -2400,35 +2424,34 @@ class EscalationQueue:
         Serialized per-id by ``escalation_id_lock``; the result is computed
         inside it.  See :class:`AmendResult`.
         """
-        result: AmendResult = {
-            'status': 'no_framing', 'escalation': None, 'recorded': False, 'dropped': 0,
-        }
-        if not (root_cause or summary or detail or options):
-            return result
+        if not _has_framing(
+            root_cause=root_cause, summary=summary, evidence=detail, options=options,
+        ):
+            return {'status': 'no_framing', 'escalation': None, 'recorded': False, 'dropped': 0}
         with escalation_id_lock(self.queue_dir, escalation_id):
             path = self.queue_dir / f'{escalation_id}.json'
             if not path.exists():
-                result['status'] = 'not_found'
-                return result
+                return {'status': 'not_found', 'escalation': None, 'recorded': False, 'dropped': 0}
             try:
                 esc = Escalation.from_json(path.read_text())
             except (json.JSONDecodeError, KeyError, TypeError) as e:
                 logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
-                result['status'] = 'not_found'
-                return result
+                return {'status': 'not_found', 'escalation': None, 'recorded': False, 'dropped': 0}
 
-            result['escalation'] = esc
             if esc.status != 'pending':
-                result['status'] = 'not_pending'
-                return result
+                return {'status': 'not_pending', 'escalation': esc, 'recorded': False, 'dropped': 0}
 
             recorded, dropped = _append_amendment_capped(
                 esc, root_cause=root_cause, summary=summary, evidence=detail,
                 options=options, agent_role=agent_role, caller='amend',
             )
+            # Framing already passed _has_framing above, so nothing recorded
+            # can only mean the record already says it.
             if not recorded:
-                result['status'] = 'repeat_framing'
-                return result
+                return {
+                    'status': 'repeat_framing', 'escalation': esc, 'recorded': False,
+                    'dropped': 0,
+                }
 
             esc.updated_at = datetime.now(UTC).isoformat()
             self._rewrite(escalation_id, esc)
@@ -2436,10 +2459,7 @@ class EscalationQueue:
                 'amend: %s recorded an amendment by %r (amendments=%d, shed=%d)',
                 escalation_id, agent_role, len(esc.amendments), dropped,
             )
-            result['status'] = 'amended'
-            result['recorded'] = True
-            result['dropped'] = dropped
-            return result
+            return {'status': 'amended', 'escalation': esc, 'recorded': True, 'dropped': dropped}
 
     def declare_pin(
         self, escalation_id: str, *, declared_by: list[str], reason: str = '',
