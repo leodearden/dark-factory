@@ -1745,15 +1745,9 @@ still ends up staged.
 # constants — unlike the curator's single global prompt, every reviewer role
 # has a distinct identity literal and specialization text.
 #
-# Every section's PROSE below is copied VERBATIM from the pre-split
-# _reviewer_role prompt — no instruction is reworded or dropped. The EMITTED
-# prompt is NOT byte-identical to the pre-split text though: compose_prompt()
-# (shared/prompt_artifact.py) always renders CONTRACT, then the "\n\n---\n\n"
-# separator, then HEURISTICS, which moves the "## Rules" + specialization
-# footer to the end of the prompt instead of directly following the verdict
-# schema. Treat parity as content-preservation (no instruction lost), not
-# byte-identity — see TestReviewerPromptSplit's superset test in
-# test_reviewer_prompt_split.py.
+# shared/src/shared/prompt_artifact.py::compose_prompt renders CONTRACT, then
+# the "\n\n---\n\n" separator, then HEURISTICS, so the "## Rules" +
+# specialization footer always follows the whole contract.
 # ----------------------------------------------------------------------
 
 _REVIEWER_CONTRACT_TEMPLATE = """\
@@ -1790,8 +1784,8 @@ _REVIEWER_HEURISTICS_TEMPLATE = """\
    - Formatting or layout preferences
 
    Naming and structure are NOT preferences: judge them under the code-quality heuristics
-   below (heuristic 1 informative names, heuristic 13 files make internal sense in
-   isolation), which govern here.
+   below. A heuristic violation is always reportable; it is `blocking` only when it also
+   meets this rule's definition of broken, and otherwise a `suggestion`.
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
 """ + CODE_QUALITY_GUIDANCE + """
