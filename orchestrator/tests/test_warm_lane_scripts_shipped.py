@@ -180,6 +180,7 @@ class TestSiblingLibsTravelledWithTheScripts:
             'warm-lane-gc-sweep.sh',
             'warm-lane-audit.sh',
             'warm-lane-degenerate-ref-check.sh',
+            'thin-warm-lane.sh',
         ],
     )
     def test_help_does_not_hit_a_sibling_wiring_error(self, name: str) -> None:
@@ -905,7 +906,12 @@ class TestSiblingResolutionIgnoresTheCallersCwd:
 
     @pytest.mark.parametrize(
         'name',
-        ['warm-lane-gc.sh', 'warm-lane-gc-sweep.sh', 'warm-lane-audit.sh'],
+        [
+            'warm-lane-gc.sh',
+            'warm-lane-gc-sweep.sh',
+            'warm-lane-audit.sh',
+            'thin-warm-lane.sh',
+        ],
     )
     def test_help_does_not_source_a_lib_from_the_callers_cwd(
         self, name: str, tmp_path: Path,
