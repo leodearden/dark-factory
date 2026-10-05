@@ -1412,6 +1412,54 @@ def test_dashboard_service_spec_pins_the_tasks_minimum_coverage():
         )
 
 
+def test_dashboard_service_spec_compares_the_success_exit_status():
+    """SuccessExitStatus= is value-compared on the dashboard service.
+
+    It is load-bearing: ``uv run`` propagates its child's SIGTERM death as
+    128+15, so without the directive systemd records every graceful stop as
+    "Failed with result exit-code" (status=143) and a real crash reads exactly
+    like a deploy.
+
+    The measured history is why this needs its own pin. The directive was
+    absent from the installed unit for ~3 weeks after commit d50235fa66 added
+    it to the committed one, and this gate reported parity throughout —
+    BECAUSE THIS KEY WAS NOT IN THE REGISTRY. That is the silent-green failure
+    the staleness guards above exist to prevent, arriving from the one
+    direction they do not cover: they prove every registered key is declared,
+    never that every declared key is registered.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+
+    assert ("Service", "SuccessExitStatus") in spec.compared, (
+        "the dashboard spec does not value-compare SuccessExitStatus=, so an "
+        "installed unit that lost it reports parity while systemd records "
+        f"every graceful stop as a failure. compared: {spec.compared}"
+    )
+
+
+def test_installed_copy_missing_success_exit_status_is_drift():
+    """The registry entry has teeth: dropping the line from the installed copy is drift.
+
+    Membership in ``compared`` proves only that a string is in a tuple. This
+    drives the real registered spec through compare_unit with an installed
+    copy that is the repo copy minus that one line — the exact shape measured
+    on this host before task 3289 — and requires exactly one drift naming it.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+    repo_text = "[Service]\nType=simple\nSuccessExitStatus=143\nTimeoutStopSec=15\n"
+    installed_text = "[Service]\nType=simple\nTimeoutStopSec=15\n"
+
+    drifts = mod.compare_unit(spec, repo_text, installed_text)
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "SuccessExitStatus"
+    assert drift.repo_value == "143"
+    assert drift.installed_value == mod._ABSENT
+
+
 def test_dashboard_service_spec_pins_the_project_root_env_contract():
     """The dashboard service relates DASHBOARD_PROJECT_ROOT to WorkingDirectory=.
 
