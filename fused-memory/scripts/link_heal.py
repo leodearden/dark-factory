@@ -64,6 +64,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     UnknownRun,
 )
 from fused_memory.maintenance.link_heal_store import (
+    CensusFailed,
     LinkCensus,
     LinkHealStore,
     QdrantLinkCensus,
@@ -115,7 +116,11 @@ async def qdrant_census(config: FusedMemoryConfig) -> AsyncIterator[LinkCensus]:
 
 @dataclass(frozen=True)
 class LinkHealEnv:
-    """What a command reaches beyond its arguments. The defaults are production's."""
+    """What a command reaches beyond its arguments. The defaults are production's.
+
+    ``home_root_for`` names the server's own project: escapes file into its queue,
+    and a run with no project of its own probes it.
+    """
 
     config_loader: Callable[[str | None], FusedMemoryConfig] = load_config
     tool_caller_for: Callable[[str], AbstractAsyncContextManager[ToolCaller]] = (
@@ -125,14 +130,17 @@ class LinkHealEnv:
         qdrant_census
     )
     ledger_dir_for: Callable[[FusedMemoryConfig], Path] = config_ledger_dir
-    escalation_root_for: Callable[[FusedMemoryConfig], str] = home_project_root
+    home_root_for: Callable[[FusedMemoryConfig], str] = home_project_root
 
 
 class Refused(Exception):
     """A command refused before any run started."""
 
 
-REFUSALS = (Refused, RunLockHeld, ApprovalMismatch, UnknownRun, AmbiguousRun, CorpusFormatError)
+REFUSALS = (
+    Refused, RunLockHeld, ApprovalMismatch, UnknownRun, AmbiguousRun, CorpusFormatError,
+    CensusFailed,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -211,9 +219,13 @@ class _Session:
     def limits(self) -> RunLimits:
         return RunLimits.from_config(self.config.link_heal)
 
+    @property
+    def home_root(self) -> str:
+        return self.env.home_root_for(self.config)
+
     async def probe(self, first_project: str | None) -> None:
         """Refuse unless the server reads the run's first project, else its own."""
-        project_id = first_project or resolve_project_id(home_project_root(self.config))
+        project_id = first_project or resolve_project_id(self.home_root)
         try:
             await self.store.probe(project_id)
         except StoreUnreachable as failure:
@@ -234,11 +246,19 @@ def _load_corpus(path: Path) -> tuple[LinkBasis, ...]:
         raise Refused(f'cannot read the corpus {path}: {exc}') from exc
 
 
+def _plan_path(out: Path | None, ledger_dir: Path) -> Path:
+    if out is None:
+        return ledger_dir / PLAN_STAGING_FILENAME
+    if not out.parent.is_dir():
+        raise Refused(f'cannot write the plan to {out}: {out.parent} is not a directory')
+    return out
+
+
 async def _plan(args: argparse.Namespace, session: _Session) -> RunReport:
     bases = _load_corpus(args.from_corpus)
+    plan_path = _plan_path(args.out, session.ledger_dir)
     projects = list(dict.fromkeys(basis.project_id for basis in bases))
     await session.probe(projects[0] if projects else None)
-    plan_path = args.out or session.ledger_dir / PLAN_STAGING_FILENAME
     async with session.env.census_for(session.config) as census:
         report = await run_plan(
             bases,
@@ -250,7 +270,7 @@ async def _plan(args: argparse.Namespace, session: _Session) -> RunReport:
             source=RunSource.CORPUS,
             plan_path=plan_path,
         )
-    if args.out is not None:
+    if args.out is not None or report.plan_path is None:
         return report
     named = session.ledger_dir / f'link-heal-plan-{report.run_id[:8]}.json'
     return replace(report, plan_path=plan_path.replace(named))
@@ -262,7 +282,7 @@ async def _apply(args: argparse.Namespace, session: _Session) -> RunReport:
         store=session.store,
         ledger=session.ledger,
         limits=session.limits,
-        filer=FoldedEscapeFiler(session.env.escalation_root_for(session.config)),
+        filer=FoldedEscapeFiler(session.home_root),
         source=RunSource.CORPUS,
         approved_plan_sha256=args.approved_plan_sha,
     )
@@ -272,7 +292,7 @@ async def _undo(args: argparse.Namespace, session: _Session) -> RunReport:
     target = session.ledger.resolve_run(args.run)
     await session.probe(_first_project(session.ledger.applied_actions(target.run_id)))
     return await run_undo(
-        target.run_id, store=session.store, ledger=session.ledger, limits=session.limits,
+        target, store=session.store, ledger=session.ledger, limits=session.limits,
     )
 
 

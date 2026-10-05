@@ -18,11 +18,13 @@ from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     CHILD,
     CHILD_TEXT,
+    DEFAULT_LIMITS,
     DF,
     PARENT,
     PARENT_TEXT,
     PROJECTS,
     REIFY,
+    FailingCensus,
     LinkHealHarness,
     build_harness,
     corpus_basis,
@@ -40,13 +42,20 @@ from fused_memory.maintenance.link_heal import (
 )
 from fused_memory.maintenance.link_heal_executor import (
     BACKLOG_ANCHOR,
+    PLAN_DOCUMENT_STOP,
     WRITE_FAILURE_ANCHOR,
     RunLimits,
     RunReport,
     render_plan_document,
+    run_plan,
 )
 from fused_memory.maintenance.link_heal_ledger import ActionState, LinkHealLedger, RunSource
-from fused_memory.maintenance.link_heal_store import text_sha256
+from fused_memory.maintenance.link_heal_store import (
+    COUNT_TOOL,
+    CensusFailed,
+    LinkHealStore,
+    text_sha256,
+)
 from fused_memory.server.grouped_read import (
     AMENDMENT_KIND,
     PARENT_ID_KEY,
@@ -193,6 +202,40 @@ class TestReportedLinks:
         assert result.actions == ()
         assert result.counts.has_children == 1
         assert result.counts.chain_reported == 1  # the grandchild's link onto a link
+
+
+async def plan_counting_children(harness: LinkHealHarness, basis: LinkBasis) -> tuple[Plan, int]:
+    """The plan for *basis*, and how many children counts the server was asked for."""
+    calls: list[tuple[str, dict]] = []
+    result = await build_plan(
+        (basis,),
+        store=LinkHealStore(harness.recording_tool_caller(calls)),
+        census=harness.mem0,
+        projects=PROJECTS,
+    )
+    return result, sum(1 for tool, _arguments in calls if tool == COUNT_TOOL)
+
+
+class TestChildrenAreCountedOnlyForAHalfLink:
+    @pytest.mark.asyncio
+    async def test_a_sighting_is_planned_without_a_children_count(self, harness):
+        harness.seed_link(kind=SIGHTING_KIND)
+
+        result, counted = await plan_counting_children(harness, corpus_basis('EXTENDS'))
+
+        assert dict(result.counts.planned_by_action) == {HealAction.RELABEL.value: 1}
+        assert counted == 0
+
+    @pytest.mark.asyncio
+    async def test_a_half_link_counts_its_children_once(self, harness):
+        harness.seed_link(kind=None)
+
+        result, counted = await plan_counting_children(harness, corpus_basis('EXTENDS'))
+
+        assert dict(result.counts.planned_by_action) == {
+            HealAction.COMPLETE_AMENDMENT.value: 1,
+        }
+        assert counted == 1
 
 
 class TestReadFailures:
@@ -417,6 +460,52 @@ class TestRunPlanLedgersANonWritingRun:
 
         assert harness.mem0.write_count == 0
         assert harness.journal_rows() == []
+
+
+class TestRunPlanLeavesNothingHalfDone:
+    @pytest.mark.asyncio
+    async def test_a_failed_census_raises_before_any_run_row(self, harness, ledger, tmp_path):
+        with pytest.raises(CensusFailed):
+            await run_plan(
+                seed_three_heals(harness),
+                store=harness.store(),
+                census=FailingCensus(),
+                ledger=ledger,
+                limits=DEFAULT_LIMITS,
+                projects=PROJECTS,
+                source=RunSource.CORPUS,
+                plan_path=tmp_path / 'plan.json',
+            )
+
+        assert ledger.recent_runs(10) == []
+
+    @pytest.mark.asyncio
+    async def test_an_unwritable_document_rolls_back_the_new_heals(
+        self, harness, ledger, tmp_path,
+    ):
+        report = await run_corpus_plan(
+            harness, ledger, tmp_path / 'missing' / 'plan.json', seed_three_heals(harness),
+        )
+
+        assert ledger.pending_actions(RunSource.CORPUS) == []
+        assert report.counts.stopped_by == PLAN_DOCUMENT_STOP
+        assert report.counts.complete is False
+        assert (report.plan_sha256, report.plan_path) == (None, None)
+        (run,) = ledger.recent_runs(10)
+        assert run.finished_at is not None
+        assert run.plan_sha256 is None
+        assert run.counts == report.counts.as_json()
+
+    @pytest.mark.asyncio
+    async def test_heals_already_pending_survive_an_unwritable_document(
+        self, harness, ledger, tmp_path,
+    ):
+        bases = seed_three_heals(harness)
+        first = await run_corpus_plan(harness, ledger, tmp_path / 'plan.json', bases)
+
+        await run_corpus_plan(harness, ledger, tmp_path / 'missing' / 'plan.json', bases)
+
+        assert ledger.pending_actions(RunSource.CORPUS) == ledger.run_actions(first.run_id)
 
 
 class TestRePlanning:

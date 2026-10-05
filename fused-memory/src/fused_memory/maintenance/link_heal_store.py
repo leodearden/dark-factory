@@ -258,8 +258,21 @@ def mcp_tool_caller(client: Any, base_url: str) -> ToolCaller:
     return call
 
 
+class CensusFailed(Exception):
+    """A census that could not enumerate a project's linked records."""
+
+    def __init__(self, project_id: str, error_type: str, detail: str = '') -> None:
+        self.project_id = project_id
+        self.error_type = error_type
+        self.detail = detail
+        super().__init__(f'the link census of {project_id} failed with {error_type}: {detail}')
+
+
 class LinkCensus(Protocol):
-    """Enumerates the ids of a project's records that carry a ``parent_id``."""
+    """Enumerates the ids of a project's records that carry a ``parent_id``.
+
+    One that cannot raises :class:`CensusFailed`.
+    """
 
     async def linked_ids(self, project_id: str) -> list[str]: ...
 
@@ -281,4 +294,7 @@ class QdrantLinkCensus:
         points: AsyncIterator[Any] = self._backend.scroll_collection_pages(
             collection, scroll_filter=has_parent,
         )
-        return [str(point.id) async for point in points]
+        try:
+            return [str(point.id) async for point in points]
+        except Exception as exc:  # noqa: BLE001 -- a partial census is no census
+            raise CensusFailed(project_id, type(exc).__name__, str(exc)) from exc

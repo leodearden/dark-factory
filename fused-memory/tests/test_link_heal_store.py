@@ -16,6 +16,7 @@ import pytest
 from _fm_helpers import QDRANT_URL, ensure_fresh_collection, qdrant_skipif
 
 from fused_memory.maintenance.link_heal_store import (
+    CensusFailed,
     LinkHealStore,
     LiveRecord,
     MetadataChange,
@@ -269,13 +270,16 @@ class _Point:
 
 
 class _FakeScrollBackend:
-    def __init__(self, points: list[_Point]) -> None:
+    def __init__(self, points: list[_Point], *, fail_after: int | None = None) -> None:
         self._points = points
+        self._fail_after = fail_after
         self.scrolls: list[tuple[str, Any]] = []
 
     async def scroll_collection_pages(self, collection_name: str, *, scroll_filter: Any = None):
         self.scrolls.append((collection_name, scroll_filter))
-        for point in self._points:
+        for index, point in enumerate(self._points):
+            if index == self._fail_after:
+                raise ConnectionError('qdrant went away mid-scroll')
             yield point
 
 
@@ -302,6 +306,17 @@ class TestQdrantLinkCensus:
         (condition,) = scroll_filter.must_not
         assert isinstance(condition, IsEmptyCondition)
         assert condition.is_empty.key == 'parent_id'
+
+    @pytest.mark.asyncio
+    async def test_a_scroll_failing_part_way_is_a_census_failure_not_a_short_census(self):
+        backend = _FakeScrollBackend([_Point(CHILD), _Point(NIL_UUID)], fail_after=1)
+
+        with pytest.raises(CensusFailed) as excinfo:
+            await QdrantLinkCensus(cast('Mem0Backend', backend), 'fused').linked_ids(PROJECT)
+
+        assert excinfo.value.project_id == PROJECT
+        assert excinfo.value.error_type == 'ConnectionError'
+        assert 'mid-scroll' in str(excinfo.value)
 
 
 @qdrant_skipif()

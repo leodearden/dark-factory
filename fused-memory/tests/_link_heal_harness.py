@@ -37,7 +37,12 @@ from fused_memory.maintenance.link_heal_executor import (
     run_plan,
 )
 from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
-from fused_memory.maintenance.link_heal_store import LinkHealStore, ToolCaller, text_sha256
+from fused_memory.maintenance.link_heal_store import (
+    CensusFailed,
+    LinkHealStore,
+    ToolCaller,
+    text_sha256,
+)
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.models.scope import Scope
@@ -101,6 +106,7 @@ class FakeMem0:
     def __init__(self) -> None:
         self.points: dict[tuple[str, str], dict[str, Any]] = {}
         self.read_failures: set[str] = set()
+        self.write_failures: Counter[str] = Counter()
         self.writes: Counter[str] = Counter()
 
     @property
@@ -116,11 +122,19 @@ class FakeMem0:
         payload = self.points.get((scope.project_id, memory_id))
         return None if payload is None else dict(payload)
 
+    def _fail_if_scheduled(self, route: str) -> None:
+        """Raise, landing nothing, while ``write_failures[route]`` has calls left."""
+        if self.write_failures[route] > 0:
+            self.write_failures[route] -= 1
+            raise TimeoutError(f'qdrant {route} timed out')
+
     async def set_payload(self, memory_id: str, payload: dict[str, Any], scope: Scope) -> None:
+        self._fail_if_scheduled('set_payload')
         self.writes['set_payload'] += 1
         self.points[(scope.project_id, memory_id)].update(payload)
 
     async def delete_payload(self, memory_id: str, keys: list[str], scope: Scope) -> None:
+        self._fail_if_scheduled('delete_payload')
         self.writes['delete_payload'] += 1
         point = self.points[(scope.project_id, memory_id)]
         for key in keys:
@@ -171,6 +185,15 @@ class FakeMem0:
         return SearchResults(hits[:limit])
 
 
+class FailingCensus:
+    """A ``LinkCensus`` that cannot enumerate any project."""
+
+    DETAIL = 'qdrant is down'
+
+    async def linked_ids(self, project_id: str) -> list[str]:
+        raise CensusFailed(project_id, 'ResponseHandlingException', self.DETAIL)
+
+
 def _memory_result(memory_id: str, payload: dict[str, Any]) -> MemoryResult:
     _managed, custom = split_managed_metadata(dict(payload))
     return MemoryResult(
@@ -211,6 +234,16 @@ class LinkHealHarness:
 
     def tool_caller(self) -> ToolCaller:
         return in_process_tool_caller(self.server)
+
+    def recording_tool_caller(self, calls: list[tuple[str, dict[str, Any]]]) -> ToolCaller:
+        """:meth:`tool_caller`, appending every call's tool and arguments to *calls*."""
+        inner = self.tool_caller()
+
+        async def call(tool: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+            calls.append((tool, dict(arguments)))
+            return await inner(tool, arguments)
+
+        return call
 
     def store(self) -> LinkHealStore:
         return LinkHealStore(self.tool_caller())

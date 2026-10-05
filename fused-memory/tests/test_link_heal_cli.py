@@ -26,6 +26,7 @@ from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     DF,
     WITHOUT_LINK_HEAL_PREFIX,
+    FailingCensus,
     LinkHealHarness,
     assert_store_invariants,
     build_harness,
@@ -40,7 +41,13 @@ from fused_memory.maintenance.link_heal_ledger import (
     RunLock,
     RunRow,
 )
-from fused_memory.maintenance.link_heal_store import ToolCaller, text_sha256
+from fused_memory.maintenance.link_heal_store import (
+    READ_TOOL,
+    LinkCensus,
+    ToolCaller,
+    text_sha256,
+)
+from fused_memory.models.scope import resolve_project_id
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'link_heal.py'
@@ -72,8 +79,8 @@ class Workspace:
         return self.ledger_dir / LEDGER_FILENAME
 
     @property
-    def escalation_root(self) -> Path:
-        return self.root / 'escalations'
+    def home_root(self) -> Path:
+        return self.root / 'home-project'
 
     @property
     def data_dir(self) -> Path:
@@ -135,8 +142,9 @@ def env_for(
     *,
     tool_caller: ToolCaller | None = None,
     server_urls: list[str] | None = None,
+    census: LinkCensus | None = None,
 ) -> Any:
-    """The CLI env over *harness*, with the ledger and escalations under *workspace*."""
+    """The CLI env over *harness*, with the ledger and the home project under *workspace*."""
     caller = tool_caller or harness.tool_caller()
 
     def tool_caller_for(server_url: str):
@@ -146,9 +154,9 @@ def env_for(
 
     return cli.LinkHealEnv(
         tool_caller_for=tool_caller_for,
-        census_for=lambda _config: contextlib.nullcontext(harness.mem0),
+        census_for=lambda _config: contextlib.nullcontext(census or harness.mem0),
         ledger_dir_for=lambda _config: workspace.ledger_dir,
-        escalation_root_for=lambda _config: str(workspace.escalation_root),
+        home_root_for=lambda _config: str(workspace.home_root),
     )
 
 
@@ -375,6 +383,51 @@ class TestRefusedBeforeAnyRun:
         assert code == 2
         assert 'abcdef12' in capsys.readouterr().err
         assert workspace.runs() == []
+
+    @pytest.mark.asyncio
+    async def test_plan_refuses_an_out_path_in_a_missing_directory(
+        self, harness, workspace, capsys,
+    ):
+        out_path = workspace.root / 'no-such-dir' / 'plan.json'
+
+        code = await run_cli(
+            env_for(harness, workspace), workspace,
+            'plan', '--from-corpus', str(seed_corpus(harness, workspace, 1)),
+            '--out', str(out_path),
+        )
+
+        assert code == 2
+        assert str(out_path.parent) in capsys.readouterr().err
+        assert workspace.runs() == []
+
+    @pytest.mark.asyncio
+    async def test_plan_refuses_a_failed_census_naming_its_failure(
+        self, harness, workspace, capsys,
+    ):
+        env = env_for(harness, workspace, census=FailingCensus())
+
+        code = await run_cli(
+            env, workspace, 'plan', '--from-corpus', str(seed_corpus(harness, workspace, 1)),
+        )
+
+        assert code == 2
+        assert FailingCensus.DETAIL in capsys.readouterr().err
+        assert workspace.runs() == []
+
+
+class TestTheHomeProject:
+    @pytest.mark.asyncio
+    async def test_a_run_with_no_project_of_its_own_probes_the_home_project(
+        self, harness, workspace, capsys,
+    ):
+        calls: list[tuple[str, dict[str, Any]]] = []
+        env = env_for(harness, workspace, tool_caller=harness.recording_tool_caller(calls))
+
+        code, _applied = await apply(env, workspace, capsys)
+
+        assert code == 0
+        read_projects = [arguments['project_id'] for tool, arguments in calls if tool == READ_TOOL]
+        assert read_projects == [resolve_project_id(str(workspace.home_root))]
 
 
 class TestApplyAndUndo:

@@ -303,6 +303,64 @@ class TestActions:
         assert ledger.pending_actions(RunSource.UNDO) == []
         assert ledger.applied_actions(undo_run) == []
 
+    def test_the_last_applied_undo_step_is_the_newest_that_applied_in_any_undo_run(
+        self, ledger,
+    ):
+        run_id = ledger.start_run(RunSource.CORPUS, writes=False)
+        (action_id,) = ledger.add_planned(run_id, [_planned()])
+        apply_run = ledger.start_run(RunSource.CORPUS, writes=True)
+        ledger.set_outcome(action_id, ActionState.APPLIED, apply_run, None)
+        (original,) = ledger.applied_actions(apply_run)
+        assert ledger.last_applied_undo_step(action_id) is None
+        part_way = LinkImage(parent_id=PARENT)
+        first_undo = ledger.start_run(RunSource.UNDO, writes=True)
+        for before, after, state in (
+            (original.planned.post_image, part_way, ActionState.APPLIED),
+            (part_way, original.planned.pre_image, ActionState.FAILED),
+        ):
+            ledger.add_undo_step(
+                first_undo, original, before=before, after=after, state=state, detail=None,
+            )
+        ledger.add_undo_step(
+            ledger.start_run(RunSource.UNDO, writes=True), original,
+            before=part_way, after=original.planned.pre_image,
+            state=ActionState.SKIPPED_STALE, detail=None,
+        )
+
+        step = ledger.last_applied_undo_step(action_id)
+
+        assert step is not None
+        assert (step.undo_run_id, step.after) == (first_undo, part_way)
+
+
+class TestPublishingPlanned:
+    def test_yields_the_pending_rows_with_the_new_ones_and_commits_them(self, ledger):
+        earlier = ledger.start_run(RunSource.CORPUS, writes=False)
+        ledger.add_planned(earlier, [_planned(1)])
+        run_id = ledger.start_run(RunSource.CORPUS, writes=False)
+
+        with ledger.publishing_planned(run_id, [_planned(2)], RunSource.CORPUS) as pending:
+            assert [row.planned for row in pending] == [_planned(1), _planned(2)]
+
+        assert [row.planned for row in ledger.run_actions(run_id)] == [_planned(2)]
+
+    def test_a_raising_body_rolls_the_new_rows_back(self, ledger, tmp_path):
+        run_id = ledger.start_run(RunSource.CORPUS, writes=False)
+
+        with (
+            pytest.raises(OSError, match='disk full'),
+            ledger.publishing_planned(run_id, [_planned(1)], RunSource.CORPUS),
+        ):
+            raise OSError('disk full')
+
+        assert ledger.run_actions(run_id) == []
+        reopened = LinkHealLedger(tmp_path / 'link_heal.db')
+        try:
+            assert [run.run_id for run in reopened.recent_runs(10)] == [run_id]
+            assert reopened.run_actions(run_id) == []
+        finally:
+            reopened.close()
+
 
 class TestRunLock:
     def test_acquiring_records_the_holder(self, tmp_path):

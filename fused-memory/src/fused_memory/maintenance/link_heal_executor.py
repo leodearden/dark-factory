@@ -16,7 +16,8 @@ An undo run takes every heal one apply run applied back to its pre-image,
 newest first. Each step is corroborated against the image it expects and
 verified after its one write; the heal's row is marked undone by the undo run
 only once every step applied, and that row keeps a re-plan from proposing the
-heal again at the same texts.
+heal again at the same texts. A heal an earlier undo left part-way is taken
+back from the last step that applied.
 
 The escape anchors below belong to these filers alone; no other filer may
 share them.
@@ -54,6 +55,7 @@ from fused_memory.maintenance.link_heal_ledger import (
     ActionRow,
     ActionState,
     LinkHealLedger,
+    RunRow,
     RunSource,
 )
 from fused_memory.maintenance.link_heal_store import (
@@ -76,6 +78,7 @@ PLAN_FORMAT = 'link-heal-plan/1'
 
 CAP_BIT = 'max_actions_per_run'
 STREAK_STOP = 'write_failure_streak'
+PLAN_DOCUMENT_STOP = 'plan_document_unwritten'
 
 
 @dataclass(frozen=True)
@@ -296,24 +299,35 @@ async def run_plan(
     source: RunSource,
     plan_path: Path,
 ) -> RunReport:
-    """A non-writing run: ledger the plan, write its document, report what would escape."""
-    run_id = ledger.start_run(source, writes=False)
+    """A non-writing run: ledger the plan, write its document, report what would escape.
+
+    Every read is made before the run row exists, so a read that raises leaves no
+    run. The new heals are committed only once their document is written: a
+    document that cannot be written leaves nothing new pending, and the run
+    finishes stopped by it.
+    """
     plan = await build_plan(bases, store=store, census=census, projects=projects)
+    run_id = ledger.start_run(source, writes=False)
     staged = _stage(plan.actions, ledger)
-    ledger.add_planned(run_id, staged.new)
-    pending = ledger.pending_actions(source)
-    document = render_plan_document(pending)
-    await asyncio.to_thread(plan_path.write_bytes, document)
-    sha = plan_sha256(document)
-    escape = backlog_escape(len(pending), limits, projects=projects)
     counts = replace(
         plan.counts,
         planned=len(staged.standing),
         planned_by_action=Counter(action.action.value for action in staged.standing),
         already_pending=staged.already_pending,
         undo_suppressed=staged.undo_suppressed,
-        would_escape=() if escape is None else (escape.anchor,),
     )
+    try:
+        with ledger.publishing_planned(run_id, staged.new, source) as pending:
+            document = render_plan_document(pending)
+            await asyncio.to_thread(plan_path.write_bytes, document)
+    except OSError as failure:
+        logger.error('link-heal plan %s: cannot write %s: %s', run_id[:8], plan_path, failure)
+        counts = replace(counts, stopped_by=PLAN_DOCUMENT_STOP)
+        ledger.finish_run(run_id, counts=counts.as_json())
+        return RunReport(run_id=run_id, counts=counts)
+    sha = plan_sha256(document)
+    escape = backlog_escape(len(pending), limits, projects=projects)
+    counts = replace(counts, would_escape=() if escape is None else (escape.anchor,))
     ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha)
     return RunReport(run_id=run_id, counts=counts, plan_sha256=sha, plan_path=plan_path)
 
@@ -563,39 +577,45 @@ async def _undo_step(
     )
 
 
+def _undo_start(row: ActionRow, ledger: LinkHealLedger) -> LinkImage:
+    """Where an undo of *row* starts: past the steps an earlier undo already applied."""
+    resumed = ledger.last_applied_undo_step(row.action_id)
+    return row.planned.post_image if resumed is None else resumed.after
+
+
 async def _undo_heal(
-    row: ActionRow, *, store: LinkHealStore, ledger: LinkHealLedger, run_id: str, drain: _Drain,
-) -> None:
-    """Take one heal back step by step; it is undone only once every step applied."""
+    row: ActionRow, *, store: LinkHealStore, ledger: LinkHealLedger, run_id: str,
+) -> _Outcome:
+    """Take one heal back step by step; it is undone only once every step applied.
+
+    Every step is ledgered; the heal's outcome is its first step that did not apply.
+    """
     heal = row.planned
-    before = heal.post_image
-    for change in undo_changes(heal.post_image, heal.pre_image):
+    before = _undo_start(row, ledger)
+    wrote = False
+    for change in undo_changes(before, heal.pre_image):
         after = apply_change(before, change)
         outcome = await _undo_step(heal, change, before, after, store=store, run_id=run_id)
         ledger.add_undo_step(
             run_id, row, before=before, after=after, state=outcome.state, detail=outcome.detail,
         )
-        drain.record(outcome)
+        wrote = wrote or outcome.wrote
         if outcome.state is not ActionState.APPLIED:
-            return
+            return replace(outcome, wrote=wrote)
         before = after
     ledger.mark_undone(row.action_id, run_id)
+    return _Outcome(ActionState.APPLIED, wrote=wrote)
 
 
 async def run_undo(
-    target_run_id: str, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
+    target: RunRow, *, store: LinkHealStore, ledger: LinkHealLedger, limits: RunLimits,
 ) -> RunReport:
-    """A writing run taking back every heal *target_run_id* applied, newest first.
-
-    *target_run_id* may be a run id or a unique prefix of one. An unknown or
-    ambiguous one raises before any run row.
-    """
-    target = ledger.resolve_run(target_run_id)
+    """A writing run taking back every heal *target* applied, newest first."""
     heals = ledger.applied_actions(target.run_id)[::-1]
     run_id = ledger.start_run(RunSource.UNDO, writes=True)
     drain = _Drain()
     for index, row in enumerate(heals):
-        await _undo_heal(row, store=store, ledger=ledger, run_id=run_id, drain=drain)
+        drain.record(await _undo_heal(row, store=store, ledger=ledger, run_id=run_id))
         if drain.streak >= limits.write_failure_streak:
             drain.stop(not_attempted=len(heals) - index - 1)
             break

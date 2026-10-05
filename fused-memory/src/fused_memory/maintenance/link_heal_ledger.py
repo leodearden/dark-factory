@@ -18,7 +18,7 @@ import os
 import re
 import sqlite3
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -240,9 +240,22 @@ class LinkHealLedger:
         return _run_row(rows[0])
 
     def add_planned(self, run_id: str, actions: Sequence[PlannedAction]) -> list[int]:
-        at = _now()
         with self._conn:
-            return [self._insert_planned(run_id, planned, at) for planned in actions]
+            return self._insert_all_planned(run_id, actions)
+
+    @contextlib.contextmanager
+    def publishing_planned(
+        self, run_id: str, actions: Sequence[PlannedAction], source: RunSource,
+    ) -> Iterator[list[ActionRow]]:
+        """Add *actions* as *run_id*'s planned rows and yield *source*'s pending rows, theirs
+        included. The rows commit when the body returns and are rolled back when it raises."""
+        with self._conn:
+            self._insert_all_planned(run_id, actions)
+            yield self.pending_actions(source)
+
+    def _insert_all_planned(self, run_id: str, actions: Sequence[PlannedAction]) -> list[int]:
+        at = _now()
+        return [self._insert_planned(run_id, planned, at) for planned in actions]
 
     def _insert_planned(self, run_id: str, planned: PlannedAction, at: str) -> int:
         cursor = self._conn.execute(
@@ -359,6 +372,15 @@ class LinkHealLedger:
             (undo_run_id, BasisSource.UNDO.value),
         )
         return [_undo_step_row(row) for row in rows]
+
+    def last_applied_undo_step(self, action_id: int) -> UndoStepRow | None:
+        """The newest undo step, of any undo run, that applied to heal *action_id*."""
+        row = self._conn.execute(
+            'SELECT * FROM actions WHERE basis_source = ? AND basis_key = ? AND state = ? '
+            'ORDER BY id DESC LIMIT 1',
+            (BasisSource.UNDO.value, str(action_id), ActionState.APPLIED.value),
+        ).fetchone()
+        return None if row is None else _undo_step_row(row)
 
     def _action_rows(self, sql: str, params: Sequence[Any]) -> list[ActionRow]:
         return [_action_row(row) for row in self._conn.execute(sql, params)]

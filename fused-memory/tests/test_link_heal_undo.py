@@ -70,7 +70,9 @@ async def plan_and_apply(
 
 
 async def undo(harness: LinkHealHarness, ledger: LinkHealLedger, run_ref: str) -> RunReport:
-    return await run_undo(run_ref, store=harness.store(), ledger=ledger, limits=DEFAULT_LIMITS)
+    return await run_undo(
+        ledger.resolve_run(run_ref), store=harness.store(), ledger=ledger, limits=DEFAULT_LIMITS,
+    )
 
 
 def the_heal(ledger: LinkHealLedger, plan: RunReport) -> ActionRow:
@@ -200,6 +202,48 @@ class TestUndoARelabelAndFlag:
         assert [step.state for step in steps] == [ActionState.APPLIED, ActionState.APPLIED]
         assert steps[0].after == steps[1].before
         assert link_keys(harness) == {PARENT_ID_KEY: PARENT, 'kind': SIGHTING_KIND}
+        assert (report.counts.planned, report.counts.applied) == (1, 1)
+
+
+class TestResumingAPartUndoneHeal:
+    """A relabel+flag undo whose second step (the kind patch) fails once."""
+
+    async def _part_undone(self, harness, ledger, tmp_path):
+        harness.seed_link(kind=SIGHTING_KIND)
+        plan, applied = await plan_and_apply(harness, ledger, tmp_path, corpus_basis('CORRECTS'))
+        harness.mem0.write_failures['set_payload'] = 1
+        first = await undo(harness, ledger, applied.run_id)
+        return plan, applied, first
+
+    @pytest.mark.asyncio
+    async def test_the_heal_counts_once_as_failed_and_stays_applied(
+        self, harness, ledger, tmp_path,
+    ):
+        plan, _applied, first = await self._part_undone(harness, ledger, tmp_path)
+
+        steps = ledger.undo_steps(first.run_id)
+        assert [step.state for step in steps] == [ActionState.APPLIED, ActionState.FAILED]
+        assert (first.counts.applied, first.counts.failed) == (0, 1)
+        assert the_heal(ledger, plan).state is ActionState.APPLIED
+        assert link_keys(harness) == {PARENT_ID_KEY: PARENT, 'kind': AMENDMENT_KIND}
+
+    @pytest.mark.asyncio
+    async def test_undoing_again_finishes_from_the_last_applied_step(
+        self, harness, ledger, tmp_path,
+    ):
+        plan, applied, _first = await self._part_undone(harness, ledger, tmp_path)
+        writes_before = harness.mem0.write_count
+
+        again = await undo(harness, ledger, applied.run_id)
+
+        (step,) = ledger.undo_steps(again.run_id)
+        assert step.state is ActionState.APPLIED
+        assert step.before == LinkImage(parent_id=PARENT, kind=AMENDMENT_KIND)
+        assert step.after == LinkImage(parent_id=PARENT, kind=SIGHTING_KIND)
+        assert harness.mem0.write_count == writes_before + 1
+        assert link_keys(harness) == {PARENT_ID_KEY: PARENT, 'kind': SIGHTING_KIND}
+        assert the_heal(ledger, plan).state is ActionState.UNDONE
+        assert (again.counts.applied, again.counts.skipped_stale) == (1, 0)
 
 
 class TestUndoCorroboration:

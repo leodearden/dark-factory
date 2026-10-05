@@ -315,13 +315,17 @@ class ParentPresence(StrEnum):
 
 @dataclass(frozen=True)
 class LinkState:
-    """One live link as read just now: the child, and its parent in the child's project."""
+    """One live link as read just now: the child, and its parent in the child's project.
+
+    ``has_children`` is read only for a half-link, the one kind whose row it
+    decides, and is ``None`` for every other kind.
+    """
 
     project_id: str
     child: LiveRecord
     parent_presence: ParentPresence
     parent: LiveRecord | None
-    has_children: bool
+    has_children: bool | None
 
     @property
     def link(self) -> LinkImage:
@@ -619,13 +623,17 @@ async def read_link_state(
         if parent is not None
         else await _presence_elsewhere(store, parent_id, project_id, projects)
     )
-    children = await store.count_children(project_id, child_id)
+    has_children = (
+        await store.count_children(project_id, child_id) > 0
+        if kind_class(LinkImage.from_metadata(child.metadata).kind) is KindClass.HALF_LINK
+        else None
+    )
     return LinkState(
         project_id=project_id,
         child=child,
         parent_presence=presence,
         parent=parent,
-        has_children=children > 0,
+        has_children=has_children,
     )
 
 
