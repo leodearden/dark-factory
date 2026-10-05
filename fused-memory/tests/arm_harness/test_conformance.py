@@ -18,7 +18,10 @@ from fused_memory.arm_harness.conformance import (
     install_conformance_audit,
 )
 from fused_memory.backends.graphiti_client import build_llm_client
-from fused_memory.backends.llm_clients import ForceJsonObjectOpenAIGenericClient
+from fused_memory.backends.llm_clients import (
+    ForceJsonObjectOpenAIGenericClient,
+    TokenRecordingOpenAIGenericClient,
+)
 
 
 class _Entity(BaseModel):
@@ -40,10 +43,12 @@ def _messages() -> list[Message]:
     ]
 
 
-def _arm_client(mock_config, base_url: str, mode: str = 'json_schema'):
+def _arm_client(
+    mock_config, base_url: str, mode: str = 'json_schema'
+) -> TokenRecordingOpenAIGenericClient:
     spec = llm_spec(base_url=base_url, structured_output_mode=mode)
     client = build_llm_client(llm_arm_config(spec, mock_config))
-    assert client is not None
+    assert isinstance(client, TokenRecordingOpenAIGenericClient)
     return client
 
 
