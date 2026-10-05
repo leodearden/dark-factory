@@ -84,28 +84,26 @@ message, at the cost of creating a scratch file inside live production state.
 Hence: a READ-ONLY check that the target already holds a record, which never
 creates the store.
 
-WHAT COUNTS AS POPULATED, PER ARM (task 5468, measured)
--------------------------------------------------------
-* Queue: the directory has at least one entry, of any name. The residue is the
-  EMPTY directory ``EscalationQueue.__init__`` mkdirs (``get_pending()`` writes
-  nothing). A queue that has minted once is never empty again: ``archive/``,
-  lock sidecars and ``.seq`` counters all survive a resolve.
+WHAT COUNTS AS POPULATED (task 5468)
+------------------------------------
+* Queue: the directory holds at least one entry. The residue is the empty
+  directory ``EscalationQueue.__init__`` mkdirs; a live queue never returns to
+  empty, because a resolve leaves ``archive/`` and lock sidecars behind.
 * Task store: a ``tasks`` table with at least one row, read through a
   ``mode=ro`` URI so the probe cannot create the file. The residues are a
-  zero-byte file and the schema-seeded, row-less db ``get_tasks`` leaves.
+  zero-byte file and the row-less db ``get_tasks`` seeds.
 
-EMPTY is refused although a live store that never held a record is empty too:
-at every call site an empty store is also nothing to scan, so refusing costs
-an exit code, while accepting IS the false-clean report. An UNREADABLE target
-(a file at the queue path, non-SQLite bytes or a directory at tasks.db) fails
-OPEN: the backend's own open already fails loudly, and the guard must not
-invent a new way to block a legitimate run.
+MISSING and EMPTY are refused. An UNREADABLE target (a file at the queue path,
+non-SQLite bytes or a directory at tasks.db) fails OPEN, because the backend's
+own open already fails loudly.
 
-RESIDUAL HOLES, left open deliberately: a POPULATED wrong location — another
-deployment's queue, another project's tasks.db — passes, since nothing pins
-the live store (see below); a stray file makes a residue directory pass; and
-a read-only open of a CLOSED WAL-mode tasks.db materialises ``-shm``/``-wal``
-sidecars (measured, sqlite 3.50.4), which the next read-write close removes.
+RESIDUAL HOLES, left open deliberately:
+
+* a POPULATED wrong location (another deployment's queue, another project's
+  tasks.db) passes, since nothing pins the live store (see below);
+* a stray file makes a residue queue directory pass;
+* a read-only probe of a closed WAL-mode tasks.db may leave ``-shm``/``-wal``
+  sidecars beside it.
 
 PRIOR ART
 ---------
