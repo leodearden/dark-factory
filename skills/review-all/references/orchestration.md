@@ -544,10 +544,10 @@ Set in `args.routing` by the lead, explicit on every `agent()`; the session mode
 | area review (per slice) | opus | high | judgment-dense: architectural review against a definition, not a checklist |
 | skeptic (per seat) | sonnet | high | bounded verification of concrete claims that rewards thinking; the cheapest seat that reproduces a measurement |
 | cross-area lens (×4) | opus | high | cross-input synthesis over a graph plus N reports |
-| synthesis | fable (proposed) | high | synthesis of conflicting complex reports — the team skill's named fable case; fallback opus / xhigh |
-| critic | fable (proposed) | high | adversarial review of that synthesis — the other named case; fallback opus / xhigh |
+| synthesis | fable (standing in the DF overlay; else per the provenance rule) | high | synthesis of conflicting complex reports — the team skill's named fable case; fallback opus / xhigh |
+| critic | fable (standing in the DF overlay; else per the provenance rule) | high | adversarial review of that synthesis — the other named case; fallback opus / xhigh |
 
-Provenance rule (`skills/team/SKILL.md` §Fable): a fable lead sets the two fable seats directly; an opus lead sets them only under `--fable` or a statement in the conversation, otherwise runs the fallback and the report's `cost` line says a fable seat was wanted and why. Phase 1 (metrics) and Phase 5 (digest) are scripts the lead runs, not seats.
+Provenance rule (`skills/team/SKILL.md` §Fable): a fable lead sets the two fable seats directly; an opus lead sets them under the project overlay's standing ruling (`.claude/skills/review-all/project.md`, as dark-factory's grants since 2026-10-05), `--fable`, or a statement in the conversation, otherwise runs the fallback and says in the report that fable was wanted.
 
 Expected per-seat spend, extrapolated from the hotspot run's measured 100–140k for a deep reviewer: area seats 150–250k (they read more), skeptics 60–100k, cross seats 150–250k, synthesis 200–300k, critic 100–200k.
 
