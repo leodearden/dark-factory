@@ -32,7 +32,8 @@ set -euo pipefail
 # orchestrator fleet-redeploy PRD): before restarting each unit, its
 # α-produced (task 2395) merge-idle heartbeat
 # (orchestrator/src/orchestrator/fleet_heartbeat.py) is read via
-# scripts/drain_check.py, classified into idle/busy/stale/absent. Two
+# scripts/drain_check.py, classified into idle/busy/stale/absent (plus
+# verifying/overdue/refused, see the two-stage drain below). Two
 # deliberately-opposite fail directions:
 #   - busy (fresh, mid-merge): restart is DEFERRED — rechecked every
 #     ORCH_DRAIN_POLL_INTERVAL_SECS — until the unit drains (goes idle) or
@@ -53,6 +54,33 @@ set -euo pipefail
 #     the fleet restart forever).
 # Without --drain, the script behaves exactly as before: an immediate,
 # uncapped restart-all with zero heartbeat reads.
+#
+# TWO-STAGE DRAIN (task 5371): "busy" above only says the merge QUEUE is
+# non-empty, which on a permanently-loaded unit is always, so the gate used to
+# wait out the whole busy grace and then kill whatever merge verify was running.
+# Under --drain the sweep therefore also asks each unit to stop STARTING merge
+# verifies, and waits for the ones already running to finish:
+#   - Stage A (fleet-wide, up front, after the lease is acquired and units are
+#     enumerated): write a drain request <fleet_dir>/<unit>.drain.json for EVERY
+#     unit (drain_stage_a). Each orchestrator's 15 s merge-heartbeat service
+#     reads its own request, halts merge admission and acknowledges it in its
+#     heartbeat. Every unit stops starting verifies at once, so the sweep waits
+#     for about the longest single verify, not the sum. The price: a unit late
+#     in the order (SELF_UNIT is last) keeps its merge lane halted until its
+#     turn comes.
+#   - Stage B (per unit, in the restart loop): drain_gate polls the heartbeat
+#     with the unit's requested_ts. verifying (a merge verify is still inside
+#     its own deadline) is awaited WITHOUT the busy grace, up to
+#     ORCH_DRAIN_VERIFY_MAX_WAIT_SECS counted from Stage A; idle (acknowledged,
+#     halted, nothing in flight) resumes; overdue (every in-flight verify is past
+#     its own command timeout, so it is about to be killed regardless) restarts
+#     at once; refused (the unit examined the request and declined it) drops that
+#     unit back to the merge-idle gate above. A unit still running pre-5371 code
+#     cannot see the request, and keeps the merge-idle gate unchanged.
+# A unit's request is removed right after its restart, success or failure, and
+# the EXIT trap removes any still carrying this sweep's pid -- never another
+# sweep's. An orchestrator also drops a request whose sweep pid is dead, so a
+# SIGKILLed sweep cannot leave a merge lane halted.
 #
 # Env knobs (all optional, ${VAR:-default} style):
 #   ORCH_FLEET_DIR                       fleet-common heartbeat dir
@@ -76,11 +104,17 @@ set -euo pipefail
 #                                         lease's READERS, never by this
 #                                         script, which holds its lease for as
 #                                         long as the sweep takes
-#                                         (default: 7200 = 2h)
+#                                         (default: 14400 = 4h)
 #   ORCH_DRAIN_POLL_TRACE_FILE            append one <verdict>\t<unit> line per
 #                                         drain poll to this file (default:
 #                                         unset = off; no other behaviour
 #                                         changes)
+#   ORCH_DRAIN_VERIFY_MAX_WAIT_SECS       cap on awaiting in-flight merge
+#                                         verifies, counted ONCE from Stage A
+#                                         for the whole sweep, after which the
+#                                         unit is restarted anyway (default:
+#                                         11400 = 10800, the longest configured
+#                                         merge-verify command timeout, + 600)
 
 FIELDS="MainPID,ActiveState,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic"
 VERIFY_TIMEOUT="${RESTART_VERIFY_TIMEOUT:-30}"
@@ -204,6 +238,12 @@ DRAIN_FRESH_WINDOW_SECS="${ORCH_DRAIN_FRESH_WINDOW_SECS:-120}"
 DRAIN_POLL_INTERVAL_SECS="${ORCH_DRAIN_POLL_INTERVAL_SECS:-30}"
 DRAIN_UNKNOWN_GRACE_SECS="${ORCH_DRAIN_UNKNOWN_GRACE_SECS:-120}"
 DRAIN_POLL_TRACE_FILE="${ORCH_DRAIN_POLL_TRACE_FILE:-}"
+DRAIN_VERIFY_MAX_WAIT_SECS="${ORCH_DRAIN_VERIFY_MAX_WAIT_SECS:-11400}"
+# Sweep state written by drain_stage_a and read by drain_check_verdict: the
+# requested_ts this sweep wrote for each unit (cleared for a unit that refuses
+# it), and the $SECONDS at which Stage A finished.
+declare -A DRAIN_REQUESTED_TS=()
+DRAIN_STAGE_A_SECS=0
 # Return channel for drain_await_fresh -- never declare 'local' anywhere
 # (full contract and incident rationale live in drain_await_fresh's own
 # docstring, task 3852).
@@ -270,6 +310,81 @@ lease_release() {
     return 0
 }
 
+drain_request_path() {
+    # $1 = unit name.  Mirrors orchestrator.fleet_drain.drain_request_path.
+    printf '%s/%s.drain.json' "$FLEET_DIR" "$1"
+}
+
+drain_request_write() {
+    # $1 = unit name.  Writes the unit's drain request atomically (mktemp
+    # sibling + `mv -f`, like lease_set_current_unit) and records its
+    # requested_ts in DRAIN_REQUESTED_TS.
+    #
+    # The body is the contract orchestrator.fleet_drain reads: exactly the keys
+    # unit, invocation_id, sweep_pid, requested_ts. invocation_id identifies ONE
+    # incarnation of the unit (systemd exports the same value to every process
+    # of that service run as $INVOCATION_ID), so a request meant for the
+    # process this sweep is about to replace is inert in its successor. An
+    # empty or malformed InvocationID is still written, as "": the unit then
+    # refuses the request with invocation_mismatch and falls back to the
+    # merge-idle gate, visibly, instead of this sweep silently skipping it.
+    #
+    # Returns non-zero, having recorded nothing, if the file cannot be written.
+    # Every step is chained with `||` because the caller invokes this from an
+    # `if`, where `set -e` is off.
+    local unit="$1"
+    local invocation_id requested_ts tmp_file
+    invocation_id="$(systemctl --user show -p InvocationID --value "$unit" 2>/dev/null)" || true
+    if [[ ! "$invocation_id" =~ ^[0-9a-f]{32}$ ]]; then
+        invocation_id=""
+    fi
+    requested_ts="$(date +%s)" || return 1
+    mkdir -p "$FLEET_DIR" || return 1
+    tmp_file="$(mktemp "$FLEET_DIR/.${unit}.drain.XXXXXX")" || return 1
+    printf '{"unit": "%s", "invocation_id": "%s", "sweep_pid": %s, "requested_ts": %s}\n' \
+        "$unit" "$invocation_id" "$$" "$requested_ts" > "$tmp_file" || return 1
+    mv -f "$tmp_file" "$(drain_request_path "$unit")" || return 1
+    DRAIN_REQUESTED_TS["$unit"]="$requested_ts"
+}
+
+drain_request_release() {
+    # $1 = path of a drain request.  Removes it ONLY if this sweep wrote it,
+    # for exactly the reason lease_release checks its pid: a request of another
+    # sweep's is its to remove, and an unconditional `rm -f` here would lift
+    # the admission halt that sweep is still waiting on.  Matched against the
+    # format drain_request_write emits.  Never fails (it runs in the EXIT trap,
+    # where a non-zero status would replace the sweep's own).
+    if grep -q "\"sweep_pid\": $$," "$1" 2>/dev/null; then
+        rm -f "$1"
+    elif [[ -e "$1" ]]; then
+        echo "leaving the drain request ${1} in place: it belongs to another sweep, not to pid $$" >&2
+    fi
+    return 0
+}
+
+drain_requests_release_all() {
+    # Every request in the fleet dir this sweep wrote, whether or not it got as
+    # far as recording it -- globbed rather than read from DRAIN_REQUESTED_TS so
+    # a sweep killed between a write and its bookkeeping still cleans up.
+    # Only under --drain: a plain sweep wrote none and reads nothing here.
+    local request
+    if [[ $DRAIN_ENABLED -eq 1 ]]; then
+        for request in "$FLEET_DIR"/*.drain.json; do
+            if [[ -e "$request" ]]; then
+                drain_request_release "$request"
+            fi
+        done
+    fi
+    return 0
+}
+
+release_sweep_state() {
+    # The EXIT trap.  Requests first, so no halt outlives the lease that says
+    # a sweep is running.
+    drain_requests_release_all
+    lease_release
+}
+
 DRAIN_ENABLED=0
 for arg in "$@"; do
     case "$arg" in
@@ -295,7 +410,7 @@ done
 # whole max-age bound. SIGKILL is uncatchable by construction and DOES strand
 # it -- that is precisely why the readers bound the lease's age and never trust
 # its presence alone.
-trap lease_release EXIT
+trap release_sweep_state EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 # Unconditional, not only under --drain: a non-drain sweep is still a fleet
@@ -366,8 +481,9 @@ restart_and_verify() {
 }
 
 drain_check_verdict() {
-    # $1 = unit name.  Prints exactly one of idle/busy/stale/absent to
-    # stdout -- never more, never less -- regardless of what drain_check.py
+    # $1 = unit name.  Prints exactly one of idle/busy/verifying/overdue/
+    # refused/stale/absent to stdout -- never more, never less -- regardless
+    # of what drain_check.py
     # itself produced.  If the python3 invocation fails to exit 0 (e.g.
     # python3 missing from PATH, or a future drain_check.py change that
     # raises before -- or after partially printing -- a verdict), any
@@ -378,15 +494,19 @@ drain_check_verdict() {
     # token (e.g. a future change emits a partial token plus a trailing
     # line), that is ALSO coerced to "absent" rather than trusted verbatim,
     # so a malformed or multi-line reading can't silently misclassify the
-    # downstream idle/busy/stale/absent string comparisons.  The drain gate
+    # downstream verdict string comparisons.  The drain gate
     # must not become a hard dependency on drain_check.py always behaving.
     # stderr is left unsuppressed so a real failure is still visible in the
     # script's own output.
     local raw verdict
+    local -a requested_ts_args=()
+    if [[ -n "${DRAIN_REQUESTED_TS[$1]:-}" ]]; then
+        requested_ts_args=(--drain-requested-ts "${DRAIN_REQUESTED_TS[$1]}")
+    fi
     raw="$(python3 "$SCRIPT_DIR/drain_check.py" --unit "$1" --fleet-dir "$FLEET_DIR" \
-        --fresh-window "$DRAIN_FRESH_WINDOW_SECS")" || raw="absent"
+        --fresh-window "$DRAIN_FRESH_WINDOW_SECS" ${requested_ts_args[@]+"${requested_ts_args[@]}"})" || raw="absent"
     case "$raw" in
-        idle|busy|stale|absent) verdict="$raw" ;;
+        idle|busy|verifying|overdue|refused|stale|absent) verdict="$raw" ;;
         *)                      verdict="absent" ;;
     esac
     # POLL LEDGER (task 4486), off unless ORCH_DRAIN_POLL_TRACE_FILE is set.
@@ -394,7 +514,7 @@ drain_check_verdict() {
     # drain_check.py` invocation passes through -- drain_await_fresh's opening
     # poll, its in-loop re-polls, and drain_gate's busy poll loop -- so one
     # write site yields a COMPLETE ledger. It records the COERCED verdict, not
-    # $raw, so the ledger's vocabulary is exactly the four tokens the gate
+    # $raw, so the ledger's vocabulary is exactly the seven tokens the gate
     # branches on, and a reading the gate never acted on cannot appear in it.
     #
     # An `if` block, never `[[ -n ... ]] && printf ...`: as a trailing command
@@ -468,7 +588,7 @@ _drain_validate_verdict() {
     # $1 = unit name (for the error message only), $2 = verdict to check.
     # Defensive backstop, independent of drain_await_fresh's own guard
     # (task 3852): drain_gate must never branch on a verdict that is not
-    # one of the four tokens drain_check_verdict can produce -- mirroring
+    # one of the seven tokens drain_check_verdict can produce -- mirroring
     # the token-whitelist coercion drain_check_verdict already applies to
     # its own python3 subprocess output. It earns its keep even with
     # drain_await_fresh's BASH_SUBSHELL guard in place because that guard
@@ -482,7 +602,7 @@ _drain_validate_verdict() {
     # into its busy-defer branch (withholding a restart for up to
     # FORCE_FIRE_AFTER_SECS) for a unit that was actually stale/absent.
     case "$2" in
-        idle|busy|stale|absent) ;;
+        idle|busy|verifying|overdue|refused|stale|absent) ;;
         *)
             echo "BUG(task 3852): drain_await_fresh produced verdict '$2' for unit $1" >&2
             exit 1
@@ -494,80 +614,117 @@ drain_gate() {
     # $1 = unit name.  Only called when --drain was passed.  Blocks
     # (poll-and-recheck) until it is safe to restart $1.
     #
-    # - idle (fresh, merge_idle) returns immediately (transparent).
+    # - idle (fresh, merge_idle -- or, once the unit has acknowledged this
+    #   sweep's drain request, nothing in flight) returns immediately
+    #   (transparent), or with a "resuming" line if it had been waiting.
+    # - overdue (every in-flight merge verify is past its own command timeout)
+    #   restarts at once: that verify is about to be killed regardless.
     # - stale/absent (heartbeat missing or too old) is given a bounded
     #   ORCH_DRAIN_UNKNOWN_GRACE_SECS grace via drain_await_fresh: a fresh
-    #   idle/busy reading that appears during the grace re-classifies into
-    #   the branches below; if the grace elapses with the heartbeat still
-    #   stale/absent, the restart proceeds anyway (fail-toward-convergence
-    #   -- the opposite fail direction from a confirmed-busy unit, which
-    #   fails toward protecting the merge).
+    #   reading that appears during the grace re-classifies into the branches
+    #   here; if the grace elapses with the heartbeat still stale/absent, the
+    #   restart proceeds anyway (fail-toward-convergence -- the opposite fail
+    #   direction from a confirmed-busy unit, which fails toward protecting the
+    #   merge).
+    # - refused (the unit declined this sweep's drain request) falls back to
+    #   the merge-idle gate for THAT unit: its requested_ts is dropped, so every
+    #   later poll classifies by merge_idle exactly as before 5371, and it is
+    #   then treated as busy/idle below.
     # - busy (fresh, mid-merge) defers with a journal line and polls every
-    #   DRAIN_POLL_INTERVAL_SECS until the unit drains (idle) or
-    #   FORCE_FIRE_AFTER_SECS elapses, at which point it force-proceeds
-    #   anyway.  A unit that goes stale/absent WHILE deferred (it stopped
-    #   heartbeating -- e.g. crashed mid-merge) is NOT held for the rest of
-    #   that busy grace: it drops into the same bounded drain_await_fresh
-    #   handling as the top-level stale/absent case, since a dead unit
-    #   isn't actually merging.  If it resumes busy afterward, deferral
-    #   keeps counting from when the unit FIRST went busy, not from that
-    #   resumption -- the force-fire deadline is anchored once, so a
-    #   busy<->stale/absent oscillation can't defer the forced restart
-    #   indefinitely.
+    #   DRAIN_POLL_INTERVAL_SECS until the unit drains or FORCE_FIRE_AFTER_SECS
+    #   elapses, at which point it force-proceeds anyway.  That deadline is
+    #   anchored ONCE, from when this unit first went busy, so a busy<->
+    #   stale/absent (or busy<->verifying) oscillation cannot keep deferring
+    #   the forced restart indefinitely.
+    # - verifying (a merge verify is still inside its own deadline) waits
+    #   WITHOUT the busy grace -- killing the verify is exactly what the grace
+    #   would do -- bounded instead by DRAIN_VERIFY_MAX_WAIT_SECS from Stage A.
+    #
+    # A unit that goes stale/absent while waiting is not held for the rest of
+    # the wait: a dead unit isn't merging, so it drops into the same bounded
+    # drain_await_fresh handling as the top-level stale/absent case.  A line is
+    # printed only when the waiting verdict changes.
     local unit="$1"
-    local verdict start_secs elapsed
+    local verdict announced="" busy_start=""
     drain_await_fresh "$unit"
     verdict="$_DRAIN_VERDICT"
-    _drain_validate_verdict "$unit" "$verdict"
-
-    if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
-        echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
-        return 0
-    fi
-
-    if [[ "$verdict" == "idle" ]]; then
-        return 0
-    fi
-
-    # verdict == "busy" here: idle and stale/absent are both handled above.
-    echo "deferring restart of ${unit}: mid-merge (grace $((FORCE_FIRE_AFTER_SECS / 60))m)"
-    start_secs=$SECONDS
     while true; do
-        elapsed=$((SECONDS - start_secs))
-        if [[ $elapsed -ge $FORCE_FIRE_AFTER_SECS ]]; then
-            echo "force-restarting ${unit}: mid-merge grace of ${FORCE_FIRE_AFTER_SECS}s exceeded"
-            return 0
-        fi
-        sleep "$DRAIN_POLL_INTERVAL_SECS"
-        verdict="$(drain_check_verdict "$unit")"
-        if [[ "$verdict" == "idle" ]]; then
-            echo "resuming restart of ${unit}: drained"
-            return 0
-        fi
-        if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
-            # Stopped heartbeating mid-defer -- apply the shorter bounded
-            # grace instead of continuing to wait out the full busy grace.
-            drain_await_fresh "$unit"
-            verdict="$_DRAIN_VERDICT"
-            _drain_validate_verdict "$unit" "$verdict"
-            if [[ "$verdict" == "idle" ]]; then
-                echo "resuming restart of ${unit}: drained"
+        _drain_validate_verdict "$unit" "$verdict"
+        case "$verdict" in
+            refused)
+                echo "drain request not honoured by ${unit}; falling back to the merge-idle gate"
+                unset 'DRAIN_REQUESTED_TS[$unit]'
+                drain_await_fresh "$unit"
+                verdict="$_DRAIN_VERDICT"
+                continue
+                ;;
+            idle)
+                if [[ -n "$announced" ]]; then
+                    echo "resuming restart of ${unit}: drained"
+                fi
                 return 0
-            elif [[ "$verdict" == "busy" ]]; then
-                # Alive and merging again -- resume deferring.  start_secs
-                # is intentionally NOT reset here: the force-fire deadline
-                # is anchored once, from when this unit first went busy, so
-                # a busy<->stale/absent oscillation can't keep deferring
-                # the forced restart indefinitely (the elapsed check at the
-                # top of the loop measures total wall-clock since draining
-                # began, not since the most recent busy transition).
-                echo "deferring restart of ${unit}: mid-merge (grace $((FORCE_FIRE_AFTER_SECS / 60))m)"
-            else
+                ;;
+            overdue)
+                echo "force-restarting ${unit}: in-flight merge verify past its own timeout"
+                return 0
+                ;;
+            stale|absent)
                 echo "proceeding with restart of ${unit}: heartbeat ${verdict} after ${DRAIN_UNKNOWN_GRACE_SECS}s grace"
                 return 0
-            fi
+                ;;
+            busy)
+                if [[ -z "$busy_start" ]]; then
+                    busy_start=$SECONDS
+                fi
+                if [[ "$announced" != "busy" ]]; then
+                    echo "deferring restart of ${unit}: mid-merge (grace $((FORCE_FIRE_AFTER_SECS / 60))m)"
+                    announced="busy"
+                fi
+                if [[ $((SECONDS - busy_start)) -ge $FORCE_FIRE_AFTER_SECS ]]; then
+                    echo "force-restarting ${unit}: mid-merge grace of ${FORCE_FIRE_AFTER_SECS}s exceeded"
+                    return 0
+                fi
+                ;;
+            verifying)
+                if [[ "$announced" != "verifying" ]]; then
+                    echo "awaiting in-flight merge verify on ${unit}"
+                    announced="verifying"
+                fi
+                if [[ $((SECONDS - DRAIN_STAGE_A_SECS)) -ge $DRAIN_VERIFY_MAX_WAIT_SECS ]]; then
+                    echo "force-restarting ${unit}: drain verify-wait cap of ${DRAIN_VERIFY_MAX_WAIT_SECS}s exceeded"
+                    return 0
+                fi
+                ;;
+        esac
+        sleep "$DRAIN_POLL_INTERVAL_SECS"
+        verdict="$(drain_check_verdict "$unit")"
+        if [[ "$verdict" == "stale" || "$verdict" == "absent" ]]; then
+            # Stopped heartbeating mid-wait -- apply the shorter bounded grace
+            # instead of continuing to wait out the full one.  "stale" marks
+            # the change of verdict, so a unit that comes back busy defers
+            # again, and one that comes back idle says it is resuming.
+            announced="stale"
+            drain_await_fresh "$unit"
+            verdict="$_DRAIN_VERDICT"
         fi
     done
+}
+
+drain_stage_a() {
+    # $@ = every unit this sweep will restart.  Stage A of the two-stage
+    # drain: ask them ALL to stop starting merge verifies before the first
+    # restart, so the per-unit waits that follow overlap instead of adding up.
+    local unit
+    for unit in "$@"; do
+        # A request that cannot be written leaves that unit on the merge-idle
+        # gate (no requested_ts recorded) -- loudly, never by aborting a fleet
+        # redeploy over the drain's own plumbing.
+        if ! drain_request_write "$unit"; then
+            echo "WARNING: could not write a drain request for ${unit} under ${FLEET_DIR}; using the merge-idle gate for it" >&2
+        fi
+    done
+    DRAIN_STAGE_A_SECS=$SECONDS
+    echo "requested a merge-admission drain on $# orchestrator unit(s)"
 }
 
 stamp_fleet_deploy_clock() {
@@ -645,6 +802,10 @@ fi
 
 echo "Restarting ${#ordered_units[@]} orchestrator unit(s): ${ordered_units[*]}"
 
+if [[ $DRAIN_ENABLED -eq 1 ]]; then
+    drain_stage_a "${ordered_units[@]}"
+fi
+
 failures=()
 for unit in "${ordered_units[@]}"; do
     # Before the gate, not after it: a unit deferred for its whole busy grace
@@ -656,6 +817,9 @@ for unit in "${ordered_units[@]}"; do
     fi
     if ! restart_and_verify "$unit"; then
         failures+=("$unit")
+    fi
+    if [[ $DRAIN_ENABLED -eq 1 ]]; then
+        drain_request_release "$(drain_request_path "$unit")"
     fi
 done
 

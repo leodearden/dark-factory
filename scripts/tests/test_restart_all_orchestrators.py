@@ -69,7 +69,8 @@ support and PER-UNIT state. State shape:
                           "ActiveEnterTimestampMonotonic": int,
                           "scenario": "fresh"|"stale"|"delayed-fresh",
                           "fresh_after": int, "restarted": bool,
-                          "post_restart_shows": int}},
+                          "post_restart_shows": int,
+                          "InvocationID": str}},
       "calls": [...],
     }
 `list-units` prints one line per entry in running_units (first
@@ -83,6 +84,10 @@ mirroring tests/scripts/test_restart_all_orchestrators.py's bash
 "delayed-fresh" fake's semantics, but keyed by per-unit state
 (`restarted`, `post_restart_shows`, `fresh_after`) rather than an env var,
 since this fake is already per-unit-state-based.
+
+`show -p InvocationID --value UNIT` (task 5371) prints the unit's
+"InvocationID" state key (default: 32 zeros) bare, as the real systemctl
+does under --value: the sweep reads it to address its drain request.
 """
 import json
 import os
@@ -169,12 +174,16 @@ def main(argv):
     if verb == "show":
         fields = None
         unit = None
+        value_only = False
         i = 0
         while i < len(rest):
             tok = rest[i]
             if tok == "-p":
                 fields = rest[i + 1]
                 i += 2
+            elif tok == "--value":
+                value_only = True
+                i += 1
             elif tok.startswith("--property="):
                 fields = tok.split("=", 1)[1]
                 i += 1
@@ -198,10 +207,11 @@ def main(argv):
             "ActiveState": ustate.get("ActiveState", "active"),
             "ActiveEnterTimestamp": ustate.get("ActiveEnterTimestamp", "baseline"),
             "ActiveEnterTimestampMonotonic": str(ustate.get("ActiveEnterTimestampMonotonic", 0)),
+            "InvocationID": ustate.get("InvocationID", "0" * 32),
         }
         keys = fields.split(",") if fields else list(current.keys())
         for k in keys:
-            print(f"{k}={current.get(k, '')}")
+            print(current.get(k, "") if value_only else f"{k}={current.get(k, '')}")
         _save(state)
         return 0
 
@@ -2052,7 +2062,7 @@ def test_every_exit_after_acquisition_is_covered_by_the_release_trap():
         )
         return hits[0]
 
-    trap_at = _sole_index(r"^trap lease_release EXIT$", "EXIT-trap install")
+    trap_at = _sole_index(r"^trap release_sweep_state EXIT$", "EXIT-trap install")
     acquire_at = _sole_index(r"^lease_acquire$", "top-level lease_acquire call")
     enumerate_at = _sole_index(r"^mapfile -t running_units", "unit-enumeration")
 

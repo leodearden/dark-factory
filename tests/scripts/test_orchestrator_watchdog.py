@@ -4417,12 +4417,16 @@ def main(argv):
     if verb == "show":
         fields = None
         unit = None
+        value_only = False
         i = 0
         while i < len(rest):
             tok = rest[i]
             if tok == "-p":
                 fields = rest[i + 1]
                 i += 2
+            elif tok == "--value":
+                value_only = True
+                i += 1
             elif tok.startswith("--property="):
                 fields = tok.split("=", 1)[1]
                 i += 1
@@ -4446,10 +4450,11 @@ def main(argv):
             "ActiveState": ustate.get("ActiveState", "active"),
             "ActiveEnterTimestamp": ustate.get("ActiveEnterTimestamp", "baseline"),
             "ActiveEnterTimestampMonotonic": str(ustate.get("ActiveEnterTimestampMonotonic", 0)),
+            "InvocationID": ustate.get("InvocationID", "0" * 32),
         }
         keys = fields.split(",") if fields else list(current.keys())
         for k in keys:
-            print(f"{k}={current.get(k, '')}")
+            print(current.get(k, "") if value_only else f"{k}={current.get(k, '')}")
         _save(state)
         return 0
 
