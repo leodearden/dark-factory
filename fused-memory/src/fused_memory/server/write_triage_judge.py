@@ -332,25 +332,18 @@ _ELIDED_MARKER = '…[elided]'
 #:
 #: WHY THE SLACK STAYS SMALL. What has to stay small is the SLACK, budget minus
 #: the measured worst case, which is what a future addition could spend
-#: without anyone having to come here. That slack is 45 chars. The four worked
-#: examples presently rendered cost 157 to 192 chars apiece including the
-#: blank line between them, so even the cheapest fifth one does not fit and
-#: its author has to either make room or make the case here. A ceiling that
-#: admitted another example would have stopped bounding anything.
-#:
-#: Measured at task 6149, PRODUCTION-SHAPED and with the elision marker
-#: counted: the worst case is 26_955 chars — system 2_281, plus a 24_674-char
-#: render of six fields at 4_009 chars each and 620 chars of scaffold. The ids
-#: are not slop: every stored record's id is a 36-char uuid — all 104 in
-#: ``tests/fixtures/write_triage_calibration.jsonl`` are — and
-#: :func:`build_judge_prompt` renders ``- id: {candidate.id}`` UN-elided, so a
-#: full slate costs 155 chars more than 5-char stand-in ids suggest.
+#: without anyone having to come here. It stays under the cost of one more
+#: worked example, so that example's author has to either make room or make
+#: the case here: a ceiling that admitted another example would have stopped
+#: bounding anything.
+#: fused-memory/tests/server/test_write_triage_judge.py::TestJudgeExemplars::test_the_budget_admits_no_further_worked_example
+#: holds it there, measuring both sides afresh on every run.
 #:
 #: Note "over" the cap, not "at": `_elide` returns a field of exactly the cap
 #: unchanged and cuts a longer one to the cap plus `_ELIDED_MARKER`, so the
 #: widest render is 9 chars per field — 54 across the six — wider than a slate
 #: built at the cap.
-_PROMPT_CHAR_BUDGET = 27_000
+JUDGE_PROMPT_CHAR_BUDGET = 27_000
 
 
 def _elide(text: object, field_chars: int) -> str:
@@ -439,7 +432,7 @@ def select_judge_candidates(
 
 # --- prompt -----------------------------------------------------------------
 
-def _render_exemplars(exemplars: Sequence[JudgeExemplar]) -> str:
+def render_judge_exemplars(exemplars: Sequence[JudgeExemplar]) -> str:
     """The EXAMPLES section of the system prompt: one block per exemplar.
 
     A FUNCTION OF THE TUPLE ALONE — pure, total, and walking the sequence in
@@ -505,7 +498,7 @@ Answer "distinct", naming none, only when no candidate qualifies.
 
 Worked examples:
 
-{_render_exemplars(JUDGE_EXEMPLARS)}
+{render_judge_exemplars(JUDGE_EXEMPLARS)}
 
 Reply with a bare JSON object and nothing else:
 

@@ -265,12 +265,12 @@ class TestJudgeExemplars:
         Checking the fields individually cannot see that: all four verdict
         words already appear in the vocabulary bullets above the examples, so
         ``exemplar.verdict in prompt`` is true whatever the renderer emits.
-        Measured by simulation — a ``_render_exemplars`` that dropped its
+        Measured by simulation — a ``render_judge_exemplars`` that dropped its
         ``answer:`` line entirely, shipping four unanswered riddles, left the
         per-field version of this test green.
 
         Asserted as the contiguous triple, which is executable structure and
-        not a wording pin. It restates ``_render_exemplars``' block layout on
+        not a wording pin. It restates ``render_judge_exemplars``' block layout on
         purpose — that layout IS the contract between the tuple and the model
         — while leaving the prompt's prose around the examples free to be
         reworded. It subsumes the per-field presence check, so there is no
@@ -356,38 +356,35 @@ class TestJudgeExemplars:
         a test.
         """
         worst_case = _worst_case_call_chars()
-        assert worst_case <= judge_module._PROMPT_CHAR_BUDGET, (
+        assert worst_case <= judge_module.JUDGE_PROMPT_CHAR_BUDGET, (
             f'worst-case prompt is {worst_case} chars against a budget of '
-            f'{judge_module._PROMPT_CHAR_BUDGET}'
+            f'{judge_module.JUDGE_PROMPT_CHAR_BUDGET}'
         )
 
     def test_the_budget_admits_no_further_worked_example(self) -> None:
-        """The ceiling's slack stays under the cheapest exemplar block.
+        """The ceiling's slack stays under the cheapest further exemplar.
 
-        ``_PROMPT_CHAR_BUDGET``'s rationale says a ceiling that admitted
+        ``JUDGE_PROMPT_CHAR_BUDGET``'s rationale says a ceiling that admitted
         another worked example would have stopped bounding anything. Asserted
         so a prompt that SHRINKS — leaving the old ceiling roomy — fails here
         instead of silently widening what a future addition may spend.
 
-        A block is the per-exemplar layout
-        ``test_each_exemplar_renders_as_an_answered_pair`` treats as the
-        contract, plus the blank line that joins it to its neighbour.
+        A further exemplar costs what the module's own renderer adds when it
+        is appended, joiner included, so the layout is not restated here.
         """
-        budget = judge_module._PROMPT_CHAR_BUDGET
+        budget = judge_module.JUDGE_PROMPT_CHAR_BUDGET
         worst_case = _worst_case_call_chars()
         slack = budget - worst_case
+        render = judge_module.render_judge_exemplars
+        shipped = judge_module.JUDGE_EXEMPLARS
         cheapest = min(
-            len(
-                f'new entry: {exemplar.entry}\n'
-                f'candidate: {exemplar.candidate}\n'
-                f'answer: {exemplar.verdict}'
-            ) + len('\n\n')
-            for exemplar in judge_module.JUDGE_EXEMPLARS
+            len(render((*shipped, exemplar))) - len(render(shipped))
+            for exemplar in shipped
         )
         assert 0 <= slack < cheapest, (
             f'budget {budget} against a measured worst case of {worst_case} '
             f'leaves {slack} chars of slack; it must be at least 0 and under '
-            f'the cheapest worked-example block ({cheapest} chars)'
+            f'the cheapest further worked example ({cheapest} chars)'
         )
 
 
