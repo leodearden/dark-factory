@@ -332,14 +332,14 @@ _ELIDED_MARKER = '…[elided]'
 #:
 #: WHY THE SLACK STAYS SMALL. What has to stay small is the SLACK, budget minus
 #: the measured worst case, which is what a future addition could spend
-#: without anyone having to come here. That slack is 58 chars. The four worked
+#: without anyone having to come here. That slack is 45 chars. The four worked
 #: examples presently rendered cost 157 to 192 chars apiece including the
 #: blank line between them, so even the cheapest fifth one does not fit and
 #: its author has to either make room or make the case here. A ceiling that
 #: admitted another example would have stopped bounding anything.
 #:
-#: Measured at task 6076, PRODUCTION-SHAPED and with the elision marker
-#: counted: the worst case is 27_142 chars — system 2_468, plus a 24_674-char
+#: Measured at task 6149, PRODUCTION-SHAPED and with the elision marker
+#: counted: the worst case is 26_955 chars — system 2_281, plus a 24_674-char
 #: render of six fields at 4_009 chars each and 620 chars of scaffold. The ids
 #: are not slop: every stored record's id is a 36-char uuid — all 104 in
 #: ``tests/fixtures/write_triage_calibration.jsonl`` are — and
@@ -350,7 +350,7 @@ _ELIDED_MARKER = '…[elided]'
 #: unchanged and cuts a longer one to the cap plus `_ELIDED_MARKER`, so the
 #: widest render is 9 chars per field — 54 across the six — wider than a slate
 #: built at the cap.
-_PROMPT_CHAR_BUDGET = 27_200
+_PROMPT_CHAR_BUDGET = 27_000
 
 
 def _elide(text: object, field_chars: int) -> str:
