@@ -39,7 +39,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _orch_helpers import script_check, write_exec_script
+from _delivered_check_fixtures import install_delivered_check_script, script_check
 from _recording_event_store import _RecordingEventStore
 from escalation.queue import EscalationQueue
 
@@ -468,7 +468,7 @@ class TestScriptRunnerErrorFailSafe:
             )
 
         # --- real recovery: create the script as an executable exit-0 file ---
-        write_exec_script(project_root, _SCRIPT_REL_PATH_7, '#!/bin/sh\nexit 0\n')
+        install_delivered_check_script(project_root, _SCRIPT_REL_PATH_7, '#!/bin/sh\nexit 0\n')
 
         result = await _run_tick(harness)
         assert result == 'D7', (

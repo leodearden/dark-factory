@@ -26,7 +26,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _orch_helpers import script_check, write_exec_script
+from _delivered_check_fixtures import install_delivered_check_script, script_check
 
 from orchestrator.landed_outbox import LandedOutbox, LandedRow
 from orchestrator.merge_queue import reconcile_landed_task
@@ -321,7 +321,7 @@ class TestReconcileLandedTaskDeliveredChecksWithheld:
             'id': 'Z',
             'metadata': {'delivered_checks': [_absent_capability_check('cap-x')]},
         })
-        write_exec_script(tmp_path, _CHECK_SCRIPT_REL_PATH, _ABSENT_CAPABILITY_SCRIPT)
+        install_delivered_check_script(tmp_path, _CHECK_SCRIPT_REL_PATH, _ABSENT_CAPABILITY_SCRIPT)
 
         result = await reconcile_landed_task(
             'Z', git_ops=git_ops, scheduler=scheduler, outbox=outbox,
