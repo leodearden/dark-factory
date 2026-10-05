@@ -1478,7 +1478,6 @@ def run_nightly(
 
         applied = 0
         conflicts = 0
-        correction_skipped = 0
         deletion_skipped: list[str] = []
         for record in run.records:
             try:
@@ -1503,7 +1502,6 @@ def run_nightly(
                 deletion_skipped.append(detail)
                 continue
             conflicts += stats['candidate_disposition_conflicts']
-            correction_skipped += stats['correction_skipped']
             # A conflict-appended sighting IS a codebook mutation (a
             # recurrence appended to an already-adjudicated candidate), so it
             # must count toward the dump/commit gate below -- otherwise a
@@ -1526,14 +1524,6 @@ def run_nightly(
                 'legibility trickle: %d candidate sighting(s) appended to an '
                 'already-adjudicated record; disposition left to the census',
                 conflicts,
-            )
-
-        if correction_skipped:
-            logger.warning(
-                'legibility trickle: %d correction(s) dropped because an '
-                'earlier op in the same record already recorded the session on '
-                'that entry; their field writes did not land',
-                correction_skipped,
             )
 
         # ONE escalation for the whole night, not one per record -- mirroring

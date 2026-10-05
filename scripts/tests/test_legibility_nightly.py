@@ -3321,7 +3321,7 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
     assert result.applied == 1
 
     committed = codebook.load(repo / 'docs' / 'legibility' / 'confusion-codebook.yaml')
-    entry = committed['entries'][0]
+    entry = next(e for e in committed['entries'] if e['id'] == 'known-cause')
     assert entry['title'] == 'Corrected Cause'
     assert entry['sightings'][0]['note'] == 'framing refuted'
 
