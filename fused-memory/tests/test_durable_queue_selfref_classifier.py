@@ -7,6 +7,9 @@ dead-letter on attempt 1 rather than burn the full ``max_attempts`` budget (and,
 after a ``replay_dead``, burn it again — the mechanism behind the recorded
 55-retry item in esc-3561-3).
 
+The rule is opt-in through ``identity_payload_keys=``, so these tests inject a
+synthetic mapping.
+
 WHY THIS FILE IMPORTS THE REAL ``graphiti_core.errors``, WHERE
 ``test_durable_queue.py:1533-1545`` (task 3585) DELIBERATELY DOES NOT.
 Those two positions are consistent, not contradictory — they assert different
@@ -38,11 +41,9 @@ explicit ``@pytest.mark.asyncio``.
 
 from __future__ import annotations
 
-import ast
 import json
 import logging
 import uuid as uuid_mod
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -58,8 +59,7 @@ from fused_memory.services.durable_queue import DurableWriteQueue, QueueItem
 
 
 def _uuid() -> str:
-    """A fresh uuid4 string, as ``MemoryService`` mints for each episode
-    (``memory_service.py:2516``)."""
+    """A fresh uuid4 string."""
     return str(uuid_mod.uuid4())
 
 
@@ -71,35 +71,10 @@ def _uuid() -> str:
 # shapes that must NOT match, where the uuid's value is irrelevant.
 _FIXED_UUID = '00000000-0000-4000-8000-000000000000'
 
-
-def _enqueued_operations() -> set[str]:
-    """Operation strings ``MemoryService`` actually enqueues, read from the
-    producer's SOURCE rather than restated here.
-
-    Parses ``memory_service.py`` (a sibling of the module under test) and
-    collects the literal ``operation=`` keyword of every
-    ``self.durable_queue.enqueue(...)`` call. Deliberately a partial view: a
-    producer expressed some other way — e.g. the dict-shaped batch enqueue at
-    ``memory_service.py:2463`` that supplies ``mem0_classify_and_add`` — is not
-    seen here, which is why the caller asserts a SUBSET and never equality.
-    """
-    source = Path(dq_module.__file__).with_name('memory_service.py').read_text()
-    operations: set[str] = set()
-    for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        if not (isinstance(func, ast.Attribute) and func.attr == 'enqueue'):
-            continue
-        target = func.value
-        if not (isinstance(target, ast.Attribute) and target.attr == 'durable_queue'):
-            continue
-        for kw in node.keywords:
-            if kw.arg != 'operation':
-                continue
-            if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
-                operations.add(kw.value.value)
-    return operations
+# A synthetic operation whose payload 'uuid' is the node it creates. Deliberately
+# not 'add_episode', whose payload has carried no graph uuid since task 3561.
+_IDENTITY_OP = 'create_node'
+_IDENTITY_KEYS = {_IDENTITY_OP: 'uuid'}
 
 
 async def _poll_until_dead(
@@ -176,6 +151,12 @@ def _queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
     )
     kwargs.update(overrides)
     return DurableWriteQueue(**kwargs)
+
+
+def _identity_queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
+    """``_queue`` with ``_IDENTITY_KEYS`` injected, so the self-identity rule is
+    live for ``_IDENTITY_OP``."""
+    return _queue(tmp_path, execute, identity_payload_keys=_IDENTITY_KEYS, **overrides)
 
 
 class TestUpstreamNotFoundMessageFormat:
@@ -288,36 +269,10 @@ class TestIdentityUuidResolution:
     minted identity licenses the "retrying cannot possibly help" conclusion.
     """
 
-    def test_every_mapped_operation_is_one_the_producer_enqueues(self):
-        """Each key must name an operation ``MemoryService`` really enqueues.
-
-        Deliberately DERIVED from the producer's source rather than restated: an
-        assertion like ``set(map) == {'add_episode'}`` would only echo the
-        constant it is testing, and would be edited to match whatever the
-        constant became. This one goes RED if a key is misspelled or names an
-        operation the producer stopped enqueueing — the drift that would make
-        the rule silently dead.
-
-        A SUBSET, not equality: the map claiming fewer operations than exist is
-        the safe direction (those fall open to the ordinary policy), and
-        ``_enqueued_operations`` sees only the keyword-argument enqueue sites.
-        """
-        enqueued = _enqueued_operations()
-        mapped = set(dq_module.DEFAULT_IDENTITY_PAYLOAD_KEYS)
-        assert mapped <= enqueued, (
-            f'DEFAULT_IDENTITY_PAYLOAD_KEYS names {sorted(mapped - enqueued)}, '
-            f'which no self.durable_queue.enqueue(operation=...) call site in '
-            f'memory_service.py produces (found: {sorted(enqueued)}). Either the '
-            f'key is stale/misspelled — in which case the permanent rule can '
-            f'never fire and the doomed-retry loop is back — or the producer now '
-            f'enqueues it some other way, in which case update '
-            f'_enqueued_operations().'
-        )
-
-    def test_resolves_the_add_episode_identity(self, tmp_path):
+    def test_resolves_the_mapped_identity(self, tmp_path):
         u = _uuid()
-        q = _queue(tmp_path, AsyncMock())
-        item = _item('add_episode', {'uuid': u, 'content': 'c', 'group_id': 'g'})
+        q = _identity_queue(tmp_path, AsyncMock())
+        item = _item(_IDENTITY_OP, {'uuid': u, 'content': 'c', 'group_id': 'g'})
         assert q._identity_uuid(item) == u
 
     def test_unmapped_operation_returns_none_even_with_a_uuid_key(self, tmp_path):
@@ -327,7 +282,7 @@ class TestIdentityUuidResolution:
         appearing in its payload would be a REFERENCE to some other node — a
         node that genuinely may be in flight or in another graph.
         """
-        q = _queue(tmp_path, AsyncMock())
+        q = _identity_queue(tmp_path, AsyncMock())
         item = _item('add_memory_graphiti', {'uuid': _uuid(), 'content': 'c'})
         assert q._identity_uuid(item) is None, (
             'An unmapped operation must resolve to None even when its payload '
@@ -354,49 +309,12 @@ class TestIdentityUuidResolution:
     def test_fails_open_on_unusable_payloads(self, tmp_path, payload):
         """Every unusable shape resolves to None, which falls back to today's
         policy. Failing open here is the safe direction."""
-        q = _queue(tmp_path, AsyncMock())
-        item = _item('add_episode', payload)
+        q = _identity_queue(tmp_path, AsyncMock())
+        item = _item(_IDENTITY_OP, payload)
         assert q._identity_uuid(item) is None, (
             f'payload {payload!r} must resolve to None; got '
             f'{q._identity_uuid(item)!r}.'
         )
-
-    def test_constructor_override_fully_replaces_the_default(self, tmp_path):
-        """identity_payload_keys= is the test seam and the generic-component
-        property: it REPLACES the default map rather than extending it."""
-        u = _uuid()
-        q = _queue(
-            tmp_path, AsyncMock(),
-            identity_payload_keys={'custom_op': 'node_id'},
-        )
-        custom = _item('custom_op', {'node_id': u, 'content': 'c'})
-        assert q._identity_uuid(custom) == u
-
-        episode = _item('add_episode', {'uuid': _uuid(), 'content': 'c'})
-        assert q._identity_uuid(episode) is None, (
-            'An explicit identity_payload_keys= must fully replace the default '
-            'map, not merge with it.'
-        )
-
-    def test_empty_map_disables_the_rule_entirely(self, tmp_path):
-        """``identity_payload_keys={}`` is the documented OFF-SWITCH.
-
-        durable_queue.py's REINSTATEMENT CONDITION tells a future operator that
-        this is how the permanent rule is disabled if Graphiti ever moves to a
-        clustered, read-routed backend where a self-referential not-found could
-        be genuinely transient. An advertised escape hatch that nothing
-        exercises is an escape hatch that quietly stops working, so pin it.
-        """
-        q = _queue(tmp_path, AsyncMock(), identity_payload_keys={})
-        item = _item('add_episode', {'uuid': _uuid(), 'content': 'c'})
-        assert q._identity_uuid(item) is None, (
-            'identity_payload_keys={} must express "no operation has a '
-            'self-identity"; {} is falsy but is NOT None, so the constructor '
-            'must not silently fall back to the default map.'
-        )
-        assert q._classify_failure(item, NodeNotFoundError('x')) == (
-            'normal', item.max_attempts
-        ), 'with the map emptied, every failure returns to the ordinary policy.'
 
 
 class TestClassifyFailure:
@@ -423,8 +341,8 @@ class TestClassifyFailure:
         solely at the parser level.
         """
         u = _uuid()
-        q = _queue(tmp_path, AsyncMock())
-        item = _item('add_episode', {'uuid': u, 'content': 'c', 'group_id': 'proj1'})
+        q = _identity_queue(tmp_path, AsyncMock())
+        item = _item(_IDENTITY_OP, {'uuid': u, 'content': 'c', 'group_id': 'proj1'})
         assert q._classify_failure(item, exc_class(u)) == ('permanent', 1), (
             f'{exc_class.__name__}({u!r}) names this item\'s own identity uuid '
             f'and must classify permanent at attempt 1.'
@@ -439,9 +357,9 @@ class TestClassifyFailure:
         both of which retrying can genuinely resolve.
         """
         identity, referenced = _uuid(), _uuid()
-        q = _queue(tmp_path, AsyncMock())
+        q = _identity_queue(tmp_path, AsyncMock())
         item = _item(
-            'add_episode',
+            _IDENTITY_OP,
             {'uuid': identity, 'referenced_uuid': referenced, 'content': 'c'},
         )
         assert q._classify_failure(item, NodeNotFoundError(referenced)) == (
@@ -452,15 +370,15 @@ class TestClassifyFailure:
         )
 
     def test_transient_error_keeps_the_extended_budget(self, tmp_path):
-        q = _queue(tmp_path, AsyncMock())
-        item = _item('add_episode', {'uuid': _uuid(), 'content': 'c'})
+        q = _identity_queue(tmp_path, AsyncMock())
+        item = _item(_IDENTITY_OP, {'uuid': _uuid(), 'content': 'c'})
         assert q._classify_failure(item, ConnectionResetError('reset')) == (
             'transient', 12
         )
 
     def test_unrelated_error_is_normal(self, tmp_path):
-        q = _queue(tmp_path, AsyncMock())
-        item = _item('add_episode', {'uuid': _uuid(), 'content': 'c'})
+        q = _identity_queue(tmp_path, AsyncMock())
+        item = _item(_IDENTITY_OP, {'uuid': _uuid(), 'content': 'c'})
         assert q._classify_failure(item, RuntimeError('boom')) == ('normal', 5)
 
     def test_unrecognised_message_falls_open_at_the_policy_layer(self, tmp_path):
@@ -471,8 +389,8 @@ class TestClassifyFailure:
         because the message is not the pinned format we can reason about.
         """
         u = _uuid()
-        q = _queue(tmp_path, AsyncMock())
-        item = _item('add_episode', {'uuid': u, 'content': 'c'})
+        q = _identity_queue(tmp_path, AsyncMock())
+        item = _item(_IDENTITY_OP, {'uuid': u, 'content': 'c'})
         assert q._classify_failure(item, Exception(f'Entity node not found: {u}')) == (
             'normal', 5
         )
@@ -488,11 +406,11 @@ class TestClassifyFailure:
         payload-derived proof must outrank the name-based guess.
         """
         u = _uuid()
-        q = _queue(
+        q = _identity_queue(
             tmp_path, AsyncMock(),
             transient_error_names={'NodeNotFoundError'},
         )
-        item = _item('add_episode', {'uuid': u, 'content': 'c'})
+        item = _item(_IDENTITY_OP, {'uuid': u, 'content': 'c'})
         assert q._is_transient(NodeNotFoundError(u)), (
             'precondition: the operator override really did make this name '
             'transient'
@@ -516,11 +434,11 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
         """ACCEPTANCE: one backend round-trip, then dead. Not five."""
         u = _uuid()
         execute = AsyncMock(side_effect=NodeNotFoundError(u))
-        q = _queue(tmp_path, execute)
+        q = _identity_queue(tmp_path, execute)
         await q.initialize()
         try:
             await q.enqueue(
-                group_id='proj1', operation='add_episode',
+                group_id='proj1', operation=_IDENTITY_OP,
                 payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
             )
             await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
@@ -528,7 +446,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
             dead = await q.get_dead_items()
             assert len(dead) == 1
             assert dead[0]['attempts'] == 1, (
-                'A not-found naming the episode\'s OWN uuid is unsatisfiable by '
+                'A not-found naming the item\'s OWN identity uuid is unsatisfiable by '
                 f'construction and must dead-letter on attempt 1; got '
                 f'{dead[0]["attempts"]} — it is still burning the retry budget.'
             )
@@ -552,11 +470,11 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
         """
         identity, referenced = _uuid(), _uuid()
         execute = AsyncMock(side_effect=NodeNotFoundError(referenced))
-        q = _queue(tmp_path, execute)
+        q = _identity_queue(tmp_path, execute)
         await q.initialize()
         try:
             await q.enqueue(
-                group_id='proj1', operation='add_episode',
+                group_id='proj1', operation=_IDENTITY_OP,
                 payload={
                     'uuid': identity, 'referenced_uuid': referenced,
                     'name': 'ep', 'content': 'c', 'group_id': 'proj1',
@@ -579,11 +497,11 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
         today's behaviour, never to permanent failure."""
         u = _uuid()
         execute = AsyncMock(side_effect=Exception(f'Entity node not found: {u}'))
-        q = _queue(tmp_path, execute)
+        q = _identity_queue(tmp_path, execute)
         await q.initialize()
         try:
             await q.enqueue(
-                group_id='proj1', operation='add_episode',
+                group_id='proj1', operation=_IDENTITY_OP,
                 payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
             )
             await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
@@ -602,7 +520,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
         'uuid' key happens to sit in its payload."""
         u = _uuid()
         execute = AsyncMock(side_effect=NodeNotFoundError(u))
-        q = _queue(tmp_path, execute)
+        q = _identity_queue(tmp_path, execute)
         await q.initialize()
         try:
             await q.enqueue(
@@ -677,14 +595,14 @@ class TestDeadLetterLogNamesOperationAndGroup:
         budget" without a second lookup."""
         u = _uuid()
         execute = AsyncMock(side_effect=NodeNotFoundError(u))
-        q = _queue(tmp_path, execute)
+        q = _identity_queue(tmp_path, execute)
         await q.initialize()
         try:
             with caplog.at_level(
                 logging.WARNING, logger='fused_memory.services.durable_queue'
             ):
                 await q.enqueue(
-                    group_id='proj-alpha', operation='add_episode',
+                    group_id='proj-alpha', operation=_IDENTITY_OP,
                     payload={'uuid': u, 'content': 'c', 'group_id': 'proj-alpha'},
                 )
                 await _poll_until_dead(
