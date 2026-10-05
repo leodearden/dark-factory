@@ -65,6 +65,18 @@ def die(prog: str, message: str) -> NoReturn:
     sys.exit(1)
 
 
+def load_transport():
+    """`legibility.census_trigger`, the reload transport, or ImportError when
+    this interpreter cannot run it.
+
+    httpx is imported first because census_trigger imports it only lazily, at
+    send time, where its absence would masquerade as a transport fault.
+    """
+    import httpx  # noqa: F401
+    from legibility import census_trigger
+    return census_trigger
+
+
 def fetch_reload_report(
     port: str, *, committed_as: str, timeout: float = RELOAD_REPLY_TIMEOUT_SECS,
 ) -> dict:
@@ -82,15 +94,16 @@ def fetch_reload_report(
     never ran still tells the operator the value lands at the next restart.
     """
     scripts_dir = Path(__file__).parent
+    checkout = scripts_dir.parent
     try:
-        from legibility import census_trigger
+        census_trigger = load_transport()
     except ImportError as exc:
         raise ReloadNotConfirmed(
             ReloadFailure.TRANSPORT_NOT_IMPORTABLE,
             f"the MCP reload transport is not importable under {sys.executable}: {exc}\n"
             f"  looked for legibility/ under: {scripts_dir}\n"
-            f"  remedy: sync this checkout so {scripts_dir.parent / '.venv'} exists, or re-run\n"
-            f"  this script under `uv run --project shared`",
+            f"  remedy: run `uv sync --all-packages` in {checkout} so {checkout / '.venv'}\n"
+            f"  provides httpx and pydantic, or re-run this script under `uv run --project shared`",
         ) from exc
     import httpx
 

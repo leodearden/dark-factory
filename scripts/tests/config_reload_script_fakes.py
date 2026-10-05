@@ -20,6 +20,7 @@ import socket
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 
 def sse_frame(payload):
@@ -259,10 +260,23 @@ class ClosedPort:
 #
 # Measured on 2026-09-12: the system interpreter (/usr/bin/python3, 3.12.3)
 # lacks httpx and pydantic, both of which the reload transport needs, while
-# every venv in this tree has them.
+# every venv in this tree has them. Whether an interpreter lacks the transport
+# is decided by running the gate's own import step under it, so the premise a
+# test skips on is the very branch the gate takes.
 # ---------------------------------------------------------------------------
 
 SYSTEM_PYTHON = "/usr/bin/python3"
+
+_LACKS_THE_TRANSPORT = 3
+_TRANSPORT_PROBE = f"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from _config_reload_gate import load_transport
+try:
+    load_transport()
+except ImportError:
+    sys.exit({_LACKS_THE_TRANSPORT})
+"""
 
 
 def system_python_without_the_transport():
@@ -270,17 +284,24 @@ def system_python_without_the_transport():
 
     Returns (interpreter, "") or (None, reason). An interpreter that CAN
     import the transport would make an interpreter-resolution test pass while
-    proving nothing, so the premise is checked rather than assumed.
+    proving nothing, so the premise is checked rather than assumed. A probe
+    that breaks any other way raises: misreading it as "lacks the transport"
+    would run those tests on a false premise.
     """
     if not os.path.exists(SYSTEM_PYTHON):
         return None, f"{SYSTEM_PYTHON} is absent"
+    scripts_dir = Path(__file__).resolve().parent.parent
     probe = subprocess.run(
-        [SYSTEM_PYTHON, "-c", "import httpx, pydantic"],
+        [SYSTEM_PYTHON, "-c", _TRANSPORT_PROBE, str(scripts_dir)],
         capture_output=True, text=True,
     )
     if probe.returncode == 0:
         return None, f"{SYSTEM_PYTHON} can import the transport, so it proves nothing"
-    return SYSTEM_PYTHON, ""
+    if probe.returncode == _LACKS_THE_TRANSPORT:
+        return SYSTEM_PYTHON, ""
+    raise RuntimeError(
+        f"the transport probe broke under {SYSTEM_PYTHON} (rc={probe.returncode}): {probe.stderr}"
+    )
 
 
 def venvless_checkout_copy(tmp_path, script):
