@@ -350,53 +350,44 @@ class TestJudgeExemplars:
     def test_the_worst_case_prompt_stays_within_the_char_budget(self) -> None:
         """PRD C1 bounds the whole call, and the exemplars spend against it.
 
-        The worst case is not hypothetical: the calibration fixture holds a
-        ~9k-char canonical, so a full slate of over-long candidates plus an
-        over-long entry is what a real call looks like when the corpus is at
-        its largest. Built rather than arithmetic, so the scaffolding between
-        the fields is counted too.
-
-        BUILT THE WAY ``judge_write`` CALLS IT, which is the whole point —
-        a construction the production path never makes bounds nothing. The
-        candidate ids are the 36-char uuids every record actually carries (all
-        104 in ``tests/fixtures/write_triage_calibration.jsonl`` are, and
-        ``build_judge_prompt`` renders ``- id:`` UN-elided); a 5-char stand-in
-        id under-measures every candidate line, so the length is asserted
-        rather than assumed.
-
-        THE FIELDS ARE OVER THE DEFAULT FIELD CAP, NOT AT IT. ``_elide``
-        returns a field of exactly the cap untouched and cuts a longer one to
-        the cap PLUS ``_ELIDED_MARKER`` — so the input that elides
-        renders 9 chars wider per field, 54 across a full slate, than the
-        input that merely fills. A worst case built at the cap is therefore
-        not the worst case; it is the widest input that never trips the
-        behaviour this budget exists to bound.
-
         The ceiling is a module constant, not a literal here, so the budget
         has one home — raising it is an edit to the thing being budgeted,
         made next to the C1 rationale, rather than a number quietly relaxed in
         a test.
         """
-        maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + 1)
-        candidates = [
-            _result(str(uuid.uuid4()), 0.9, content=maximal)
-            for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
-        ]
-        assert {len(c.id) for c in candidates} == {36}, (
-            'the slate must carry the 36-char uuids production carries — a '
-            'shorter stand-in id under-measures every candidate line'
-        )
-        rendered = build_judge_prompt(
-            maximal, candidates, field_chars=_DEFAULT_JUDGE_FIELD_CHARS,
-        )
-        assert _ELIDED_MARKER in rendered, (
-            'the worst case must be an ELIDED render — otherwise it misses '
-            'the marker _elide appends, and under-measures the real ceiling'
-        )
-        worst_case = len(JUDGE_SYSTEM_PROMPT) + len(rendered)
+        worst_case = _worst_case_call_chars()
         assert worst_case <= judge_module._PROMPT_CHAR_BUDGET, (
             f'worst-case prompt is {worst_case} chars against a budget of '
             f'{judge_module._PROMPT_CHAR_BUDGET}'
+        )
+
+    def test_the_budget_admits_no_further_worked_example(self) -> None:
+        """The ceiling's slack stays under the cheapest exemplar block.
+
+        ``_PROMPT_CHAR_BUDGET``'s rationale says a ceiling that admitted
+        another worked example would have stopped bounding anything. Asserted
+        so a prompt that SHRINKS — leaving the old ceiling roomy — fails here
+        instead of silently widening what a future addition may spend.
+
+        A block is the per-exemplar layout
+        ``test_each_exemplar_renders_as_an_answered_pair`` treats as the
+        contract, plus the blank line that joins it to its neighbour.
+        """
+        budget = judge_module._PROMPT_CHAR_BUDGET
+        worst_case = _worst_case_call_chars()
+        slack = budget - worst_case
+        cheapest = min(
+            len(
+                f'new entry: {exemplar.entry}\n'
+                f'candidate: {exemplar.candidate}\n'
+                f'answer: {exemplar.verdict}'
+            ) + len('\n\n')
+            for exemplar in judge_module.JUDGE_EXEMPLARS
+        )
+        assert 0 <= slack < cheapest, (
+            f'budget {budget} against a measured worst case of {worst_case} '
+            f'leaves {slack} chars of slack; it must be at least 0 and under '
+            f'the cheapest worked-example block ({cheapest} chars)'
         )
 
 
@@ -625,6 +616,49 @@ def _result(
 def _decision(canonical_id: str | None, similarity: float | None = 0.80) -> BandDecision:
     """A middle-band decision naming *canonical_id* as the attach target."""
     return BandDecision(OUTCOME_JUDGE, canonical_id, similarity, 0.95, 0.70)
+
+
+def _worst_case_call_chars() -> int:
+    """Characters in the widest judge call the shipped defaults allow.
+
+    The worst case is not hypothetical: the calibration fixture holds a
+    ~9k-char canonical, so a full slate of over-long candidates plus an
+    over-long entry is what a real call looks like when the corpus is at its
+    largest. Built rather than arithmetic, so the scaffolding between the
+    fields is counted too.
+
+    BUILT THE WAY ``judge_write`` CALLS IT, which is the whole point — a
+    construction the production path never makes bounds nothing. The
+    candidate ids are the 36-char uuids every record actually carries (all
+    104 in ``tests/fixtures/write_triage_calibration.jsonl`` are, and
+    ``build_judge_prompt`` renders ``- id:`` UN-elided); a 5-char stand-in id
+    under-measures every candidate line, so the length is asserted rather
+    than assumed.
+
+    THE FIELDS ARE OVER THE DEFAULT FIELD CAP, NOT AT IT. ``_elide`` returns a
+    field of exactly the cap untouched and cuts a longer one to the cap PLUS
+    ``_ELIDED_MARKER`` — so the input that elides renders 9 chars wider per
+    field, 54 across a full slate, than the input that merely fills. A worst
+    case built at the cap is therefore not the worst case; it is the widest
+    input that never trips the behaviour the budget exists to bound.
+    """
+    maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + 1)
+    candidates = [
+        _result(str(uuid.uuid4()), 0.9, content=maximal)
+        for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
+    ]
+    assert {len(c.id) for c in candidates} == {36}, (
+        'the slate must carry the 36-char uuids production carries — a '
+        'shorter stand-in id under-measures every candidate line'
+    )
+    rendered = build_judge_prompt(
+        maximal, candidates, field_chars=_DEFAULT_JUDGE_FIELD_CHARS,
+    )
+    assert _ELIDED_MARKER in rendered, (
+        'the worst case must be an ELIDED render — otherwise it misses the '
+        'marker _elide appends, and under-measures the real ceiling'
+    )
+    return len(JUDGE_SYSTEM_PROMPT) + len(rendered)
 
 
 #: The repo root, reached from `<repo>/fused-memory/tests/server/`.
