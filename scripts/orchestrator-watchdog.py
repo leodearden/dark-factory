@@ -3126,6 +3126,33 @@ def _print_fused_memory_liveness() -> None:
     )
 
 
+def _print_unit_parity() -> None:
+    """Print the dashboard unit-parity row for ``--report``.
+
+    The operator's right-now view of the check unit_parity_pass() runs hourly.
+    NOT clock-gated — an operator asking now wants an answer now — and it
+    writes no clock, so running --report never shifts the timer path's
+    cadence.
+
+    On 'drift' the checker's own report follows the row, naming the drifted
+    directive without a second command; on 'unknown' the reason the checker
+    could not run follows it instead.
+
+    Informational only, like the fm row: never alters report()'s exit code.
+    An unexpected failure degrades the verdict to a logged 'unknown' rather
+    than crashing --report after report() has already computed its exit code.
+    """
+    try:
+        verdict, detail = unit_parity_verdict()
+    except Exception as exc:  # noqa: BLE001
+        log(f"watchdog error printing the dashboard unit parity row: {exc}")
+        verdict, detail = "unknown", ""
+    checker = os.path.relpath(DASHBOARD_PARITY_SCRIPT, REPO_DIR)
+    print(f"dashboard unit parity: {verdict} | CHECKER: {checker}")
+    if verdict in ("drift", "unknown") and detail:
+        print(detail)
+
+
 def _cli(argv: list[str] | None = None) -> int:
     """Dispatch the CLI: ``--stamp-fm-deploy-clock`` / ``--report`` / timer path.
 
@@ -3137,13 +3164,14 @@ def _cli(argv: list[str] | None = None) -> int:
     restart-fused-memory.sh exit-0 (task 2714).
 
     If ``--report`` is present, runs the read-only report() followed by the
-    read-only _print_fused_memory_liveness() (B4) and returns report()'s OWN
-    exit code (0 = all fresh, 1 = at least one stale unit) — the fm row is
-    informational only and never alters this exit code. main(),
-    fused_memory_liveness_pass(), staleness_pass(), and
-    fused_memory_staleness_pass() are NOT invoked under --report, so this path
-    never mutates systemd state (I7 at the CLI boundary): the fm staleness
-    backstop runs on the timer path only.
+    read-only _print_fused_memory_liveness() (B4) and _print_unit_parity()
+    rows, and returns report()'s OWN exit code (0 = all fresh, 1 = at least
+    one stale unit) — both rows are informational only and never alter this
+    exit code. main(), fused_memory_liveness_pass(), staleness_pass(),
+    fused_memory_staleness_pass() and unit_parity_pass() are NOT invoked under
+    --report, so this path never mutates systemd state or stamps a clock (I7
+    at the CLI boundary): the fm staleness backstop and the hourly parity
+    check run on the timer path only.
 
     Otherwise runs the timer path: the liveness passes first (main() =
     orchestrator liveness, then fused_memory_liveness_pass() = fm liveness),
@@ -3166,6 +3194,7 @@ def _cli(argv: list[str] | None = None) -> int:
     if "--report" in argv:
         rc = report()
         _print_fused_memory_liveness()
+        _print_unit_parity()
         return rc
     main()
     fused_memory_liveness_pass()
