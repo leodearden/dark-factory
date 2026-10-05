@@ -21,6 +21,7 @@ and traceability — never about whether a number is large enough.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import types
@@ -896,6 +897,9 @@ class TestBuildReport:
         assert isinstance(caveats, list) and caveats
         assert all(isinstance(c, str) and c for c in caveats)
 
+    def test_the_prompt_hash_is_provenance_vocabulary(self) -> None:
+        assert 'judge_system_prompt_sha256' in _mod().PROVENANCE_KEYS
+
 
 class TestRenderMarkdown:
     """Positional column binding — the `_row_cells` idiom from the sibling suite."""
@@ -1560,6 +1564,17 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
             _mod().PROVENANCE_KEYS,
         )
 
+    def test_provenance_records_the_system_prompt_it_measured(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+            JUDGE_SYSTEM_PROMPT,
+        )
+
+        recorded = self._captured(tmp_path, monkeypatch)['judge_system_prompt_sha256']
+        assert recorded == hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode('utf-8')).hexdigest()
+        assert len(recorded) == 64 and set(recorded) <= set('0123456789abcdef')
+
 
 class TestADotMdReportPathIsRejectedAtArgumentTime:
     """`--report-path foo.md` is a bad ARGUMENT, so `_run` refuses it up front.
@@ -2124,6 +2139,28 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         _block, report, _resolved = self._committed()
         assert report is not None
         assert report['provenance']['slate_mode'] == _mod().SLATE_RETRIEVED
+
+    def test_the_committed_report_measured_the_shipped_system_prompt(self) -> None:
+        """The prompt is source, not a hot-reloadable knob, so an artifact that
+        measured another prompt does not describe production (PRD C2').
+
+        Unlike `judge_candidate_count`, which the sibling test above
+        deliberately leaves unbound to the shipped config.
+        """
+        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+            JUDGE_SYSTEM_PROMPT,
+        )
+
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        shipped = hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode('utf-8')).hexdigest()
+        measured = report['provenance'].get('judge_system_prompt_sha256')
+        assert measured == shipped, (
+            f'the committed report measured system prompt {measured!r}, but the '
+            f'shipped JUDGE_SYSTEM_PROMPT hashes to {shipped!r} — re-run the '
+            f'committed arbiter command from the module docstring of '
+            f'scripts/eval_write_triage_judge.py'
+        )
 
     def test_every_duplicate_is_in_the_attach_population(self, records) -> None:
         """Recounted from the fixture rather than hardcoded (75 today; gate Γ1 reads it)."""
