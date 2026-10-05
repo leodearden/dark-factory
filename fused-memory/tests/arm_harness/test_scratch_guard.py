@@ -4,24 +4,13 @@ from enum import Enum
 
 import pytest
 
+from arm_harness._fakes import PROTECTED_GRAPHS
 from fused_memory.arm_harness.scratch_guard import (
     SCRATCH_NAME_PATTERN,
     GuardCheckpoint,
     ScratchGuardError,
     require_scratch_name,
 )
-
-PROTECTED_GRAPHS = [
-    'dark_factory',
-    'reify',
-    'know_live',
-    'solar_challenge_platform',
-    'autopilot_video',
-    'pump_web_ui',
-    'my_solar_challenge',
-    'probe_e1_master',
-    '_probe',
-]
 
 MALFORMED_SCRATCH_NAMES = [
     'evalmem_',
@@ -40,7 +29,7 @@ def test_accepts_scratch_names_and_returns_them_unchanged(name):
     assert require_scratch_name(name, checkpoint=GuardCheckpoint.REPLAY) == name
 
 
-@pytest.mark.parametrize('name', PROTECTED_GRAPHS + MALFORMED_SCRATCH_NAMES + [None, 3])
+@pytest.mark.parametrize('name', [*PROTECTED_GRAPHS, *MALFORMED_SCRATCH_NAMES, None, 3])
 def test_rejects_everything_outside_the_allow_list(name):
     with pytest.raises(ScratchGuardError):
         require_scratch_name(name, checkpoint=GuardCheckpoint.TEARDOWN_GRAPH)

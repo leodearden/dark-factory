@@ -19,6 +19,18 @@ CODE_SHA = 'a' * 40
 CORPUS_SHA = 'b' * 64
 PREREG_SHA = 'c' * 40
 UNREACHABLE_BASE_URL = 'http://127.0.0.1:9/v1'
+PROTECTED_GRAPHS = (
+    'dark_factory',
+    'reify',
+    'know_live',
+    'solar_challenge_platform',
+    'autopilot_video',
+    'pump_web_ui',
+    'my_solar_challenge',
+    'probe_e1_master',
+    '_probe',
+)
+"""The live graphs of plans/local-memory-models-eval-prd.md §Hazards, as test inputs only."""
 
 
 def llm_spec(*, base_url: str = UNREACHABLE_BASE_URL, **overrides) -> LlmArmSpec:
