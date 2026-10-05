@@ -3,13 +3,20 @@ and the autouse ``_forbid_agent_cli_spawn`` fixture in ``conftest.py``."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
+import re
+import subprocess
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from _agent_cli_guard import AGENT_CLI_BINARIES, AgentCliSpawnGuard, agent_cli_in
 from shared.cli_invoke import build_claude_argv
 
+import orchestrator.workflow
+from orchestrator.agents import invoke, sandbox_dispatch
 from orchestrator.agents.landlock import build_landlock_command
 
 
@@ -156,3 +163,81 @@ class TestAgentCliSpawnGuard:
         assert repr(_NICE_CLAUDE) in message
         assert repr(second) in message
         assert guard.take_attempts() == [_NICE_CLAUDE, second]
+
+
+class TestForbidAgentCliSpawnFixture:
+    def test_sync_agent_spawn_fails_at_the_seam(self, _forbid_agent_cli_spawn, request):
+        with pytest.raises(pytest.fail.Exception, match=re.escape(request.node.nodeid)):
+            subprocess.run(['claude', '--version'])
+
+        assert _forbid_agent_cli_spawn.take_attempts() == [('claude', '--version')]
+
+    @pytest.mark.asyncio
+    async def test_async_agent_spawn_fails_at_the_seam(self, _forbid_agent_cli_spawn, request):
+        with pytest.raises(pytest.fail.Exception, match=re.escape(request.node.nodeid)):
+            await asyncio.create_subprocess_exec(
+                'claude', '--print',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+
+        assert _forbid_agent_cli_spawn.take_attempts() == [('claude', '--print')]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('backend', ['claude', 'codex', 'gemini', 'pi'])
+    async def test_unmocked_invoke_agent_is_stopped_before_spawning(
+        self, _forbid_agent_cli_spawn, request, tmp_path, backend,
+    ):
+        nice = {'DF_AGENT_CPU_NICE': '5'} if backend == 'claude' else None
+
+        with pytest.raises(pytest.fail.Exception, match=re.escape(request.node.nodeid)):
+            await invoke.invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path, backend=backend,
+                env_overrides=nice,
+            )
+
+        [attempt] = _forbid_agent_cli_spawn.take_attempts()
+        assert agent_cli_in(attempt) == backend
+
+    @pytest.mark.asyncio
+    async def test_the_sandbox_branch_is_stopped_before_spawning(
+        self, _forbid_agent_cli_spawn, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setattr(sandbox_dispatch, 'resolve_active_backend', lambda: 'landlock')
+
+        with pytest.raises(pytest.fail.Exception):
+            await invoke.invoke_agent(
+                prompt='p', system_prompt='s', cwd=tmp_path, backend='claude',
+                sandbox_modules=['mod_a'],
+            )
+
+        [attempt] = _forbid_agent_cli_spawn.take_attempts()
+        assert agent_cli_in(attempt) == 'claude'
+
+    @pytest.mark.asyncio
+    async def test_the_task_882_stale_patch_is_caught_at_the_seam(
+        self, _forbid_agent_cli_spawn, tmp_path,
+    ):
+        with (
+            patch('orchestrator.agents.invoke.invoke_agent', new=AsyncMock()) as stale,
+            pytest.raises(pytest.fail.Exception),
+        ):
+            await orchestrator.workflow.invoke_agent(prompt='p', system_prompt='s', cwd=tmp_path)
+
+        stale.assert_not_awaited()
+        [attempt] = _forbid_agent_cli_spawn.take_attempts()
+        assert agent_cli_in(attempt) == 'claude'
+
+    def test_a_swallowed_spawn_is_still_recorded(self, _forbid_agent_cli_spawn):
+        with contextlib.suppress(BaseException):
+            subprocess.run(['claude'])
+
+        assert _forbid_agent_cli_spawn.take_attempts() == [('claude',)]
+
+    def test_non_agent_sync_spawns_still_run(self):
+        assert subprocess.run(['true']).returncode == 0
+
+    @pytest.mark.asyncio
+    async def test_non_agent_async_spawns_still_run(self):
+        process = await asyncio.create_subprocess_exec('true')
+
+        assert await process.wait() == 0
