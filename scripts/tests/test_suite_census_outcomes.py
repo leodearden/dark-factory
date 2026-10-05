@@ -235,3 +235,32 @@ class TestRenderMarkdown:
 
     def test_rendering_is_deterministic(self, census):
         assert oc.render_markdown(census, top=10) == oc.render_markdown(census, top=10)
+
+
+_THIN_PREFIX = f'Ranked on fewer than {oc.THIN_SAMPLE_RUNS} runs: '
+
+
+def _thin_ranks(text: str) -> str:
+    (line,) = [line for line in text.splitlines() if line.startswith(_THIN_PREFIX)]
+    return line.removeprefix(_THIN_PREFIX).split('.')[0]
+
+
+class TestThinSampleNote:
+    @pytest.fixture
+    def census(self) -> oc.OutcomeCensus:
+        steady, once, also_once = (
+            _test(f't.py::test_{name}') for name in ('steady', 'once', 'also_once')
+        )
+        records = [_obs('r0', once, PASSED, 9.0), _obs('r0', also_once, PASSED, 1.0)]
+        records += [_obs(f'r{i}', steady, PASSED, 5.0) for i in range(oc.THIN_SAMPLE_RUNS)]
+        return _census(records)
+
+    def test_shown_rows_under_the_threshold_are_named_by_rank(self, census):
+        assert [cost.runs for cost in census.ranking] == [1, oc.THIN_SAMPLE_RUNS, 1]
+        assert _thin_ranks(oc.render_markdown(census, top=10)) == '1, 3'
+
+    def test_rows_beyond_top_are_not_named(self, census):
+        assert _thin_ranks(oc.render_markdown(census, top=2)) == '1'
+
+    def test_a_ranking_without_thin_rows_says_none(self, census):
+        assert _thin_ranks(oc.render_markdown(census, top=0)) == 'none'

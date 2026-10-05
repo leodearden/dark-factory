@@ -11,10 +11,11 @@ import math
 import statistics
 from array import array
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 
 _UNRESOLVED_SAMPLES = 5
+THIN_SAMPLE_RUNS = 3
 
 
 class Outcome(enum.Enum):
@@ -343,6 +344,18 @@ def _ranking_table(census: OutcomeCensus, top: int) -> str:
     return (
         f'### Never failed × per-run cost (top {len(shown)} of {len(census.ranking)})\n\n'
         + _table(('rank', 'test', 'package', 'runs', 'median s', 'max s', 'total s'), rows)
+        + '\n\n' + _thin_sample_note(shown)
+    )
+
+
+def _thin_sample_note(shown: Sequence[TestCost]) -> str:
+    thin = [str(rank) for rank, cost in enumerate(shown, start=1)
+            if cost.runs < THIN_SAMPLE_RUNS]
+    return (
+        f'Ranked on fewer than {THIN_SAMPLE_RUNS} runs: {", ".join(thin) or "none"}. '
+        "Each run's time depends on the host load and parallelism it ran under, so a "
+        f'median of fewer than {THIN_SAMPLE_RUNS} runs is weak evidence beside a median '
+        'over many.'
     )
 
 
