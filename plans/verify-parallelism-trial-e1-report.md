@@ -1052,3 +1052,243 @@ setting, and it would no longer hold if `merge_verify_max_concurrent_modules` we
   not set `DF_REQUIRE_SANDBOX_TESTS=1`, and the agent shell runs inside the agent sandbox. A
   controlled run is not production: production gates also run with other verifies and agents
   beside them.
+
+## 5. Stop rule, verdict, caveats, follow-ups
+
+The stop rule, from 5408 WORK item 4: "verify timeouts above the 4% baseline or gate cgroup peak
+RSS +25% → revert the addopts".
+
+### (a) Timeout half, from production
+
+A merge-role verify timeout can show up in two places:
+
+- the `[category: …]` tag in a `merge_finalized` or `merge_blocked` reason. The category is a tag
+  inside the reason string; it is not a separate field;
+- an archived summary whose top-level or per-command `timed_out` is true, or whose category is
+  `infra_timeout`. The summary is kept only if it matches a `merge_verify` row by §3's rule.
+
+Each source is keyed to the tree of the verify it belongs to. A reason event is matched to the
+verify of the same task that ended at most 600 s earlier. The same block also counts the
+peak-memory proxies for (b). Run from the worktree root:
+
+```python
+import glob, json, re, sqlite3, subprocess, sys
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+sys.path.insert(0, 'scripts')
+from verify_budget_census import parse_record_path
+DB = 'file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro'
+EDIT = 'b39a4f57caa4818967fbf9ccb9c1556891a8fed5'
+T = datetime(2026, 9, 17, 6, 30, 1, 881486, tzinfo=timezone.utc)
+LO, HI = T - timedelta(days=7), T + timedelta(days=7)
+con = sqlite3.connect(DB, uri=True)
+
+verifies, cells = defaultdict(list), Counter()
+for ts, task, data in con.execute("SELECT timestamp, task_id, data FROM events WHERE event_type = 'merge_verify' "
+                                  "AND timestamp >= ? AND timestamp < ?", (LO.isoformat(), HI.isoformat())):
+    d = json.loads(data); end = datetime.fromisoformat(ts)
+    edit = {0: 'edit', 1: 'no-edit'}[subprocess.run(['git', 'merge-base', '--is-ancestor', EDIT, d['merge_sha']]).returncode]
+    cell = ('BEFORE' if end < T else 'AFTER', edit)
+    verifies[task].append(dict(start=end - timedelta(milliseconds=d['duration_ms']), end=end, cell=cell))
+    cells[cell] += 1
+
+def verify_for(task, at, slack):
+    hits = [v for v in verifies[task] if v['start'] <= at <= v['end'] + slack]
+    return hits[0] if len(hits) == 1 else None
+
+# Source 1: the category tag in merge failure reasons, matched to the verify that just ended.
+reason_cats, worded = defaultdict(Counter), Counter()
+OOM = re.compile(r'out of memory|OOM|oom_kill|MemoryError|SIGKILL|signal 9|rc[=: ]+-?(137|9)\b|exit (code|status) -?(137|9)\b|Killed')
+for ts, task, data in con.execute("SELECT timestamp, task_id, data FROM events WHERE event_type IN ('merge_finalized', 'merge_blocked') "
+                                  "AND timestamp >= ? AND timestamp < ?", (LO.isoformat(), HI.isoformat())):
+    reason = json.loads(data).get('reason') or ''
+    m = re.search(r'\[category: (\w+)\]', reason)
+    worded['reasons'] += bool(reason)
+    worded['oom/kill wording'] += bool(OOM.search(reason))
+    if re.search(r'(?i)timed out|timeout', reason):
+        worded[f"timeout wording, category {m[1] if m else None}"] += 1
+    if m:
+        v = verify_for(task, datetime.fromisoformat(ts), timedelta(seconds=600))
+        reason_cats[v['cell'] if v else 'unmatched'][m[1]] += 1
+print('reason categories:', {k: dict(c) for k, c in reason_cats.items()})
+print('reason wording:', dict(worded))
+
+# Source 2: archived summaries of merge-role legs (matched as in §3), every module.
+flags, kept, skipped = defaultdict(list), Counter(), 0
+for p in sorted(glob.glob('/home/leo/src/dark-factory/data/verify-logs/*/*.summary-*.json')):
+    rec = parse_record_path(Path(p))
+    if rec is None:
+        continue
+    stamp = datetime.strptime(rec.archived_at.split('_')[0].rstrip('Z'), '%Y%m%dT%H%M%S').replace(tzinfo=timezone.utc)
+    if not LO <= stamp < HI:
+        continue
+    v = verify_for(rec.task_id, stamp, timedelta(seconds=300))
+    if v is None:
+        skipped += 1
+        continue
+    d = json.load(open(p)); cmds = d.get('commands') or []
+    kept[v['cell']] += 1
+    timed_out = bool(d.get('timed_out')) or any(c.get('timed_out') for c in cmds) or d.get('category') == 'infra_timeout'
+    killed = d.get('category') == 'infra_kill' or any(c.get('rc') in (-9, 137) for c in cmds) or d.get('rc') in (-9, 137)
+    if timed_out or killed:
+        flags[v['cell']].append((rec.task_id, rec.module_prefix, stamp.isoformat(), d.get('category'), d.get('rc'),
+                                 'timed_out' if timed_out else 'killed'))
+print('merge-role summaries kept per cell:', dict(kept), 'not merge-role:', skipped)
+print('timeout/kill summaries:', dict(flags))
+for cell in sorted(cells):
+    timeouts = reason_cats[cell]['infra_timeout'] + sum(1 for f in flags[cell] if f[-1] == 'timed_out')
+    print(cell, 'merge_verify rows', cells[cell], 'timeouts', timeouts, f'rate {timeouts / cells[cell]:.1%}')
+```
+
+```
+reason categories: {('BEFORE', 'no-edit'): {'unknown_test_failure': 6, 'test_failure': 27}, ('AFTER', 'edit'): {'test_failure': 26, 'unknown_test_failure': 2}}
+reason wording: {'reasons': 154, 'oom/kill wording': 0, 'timeout wording, category test_failure': 3}
+merge-role summaries kept per cell: {('AFTER', 'edit'): 34, ('BEFORE', 'no-edit'): 35} not merge-role: 6
+timeout/kill summaries: {('AFTER', 'edit'): [('4427', 'orchestrator', '2026-09-21T00:01:43+00:00', 'infra_kill', -9, 'killed')]}
+('AFTER', 'edit') merge_verify rows 146 timeouts 0 rate 0.0%
+('BEFORE', 'edit') merge_verify rows 1 timeouts 0 rate 0.0%
+('BEFORE', 'no-edit') merge_verify rows 111 timeouts 0 rate 0.0%
+```
+
+- **No `infra_timeout` tag** appears in any of the 154 merge failure reasons in either window.
+  The tags present are `test_failure` and `unknown_test_failure`. One failed verify can tag both
+  its `merge_finalized` and its `merge_blocked` event, so the tag counts are not verify counts.
+- Three reasons contain timeout wording, and all three are tagged `test_failure`. The wording is
+  in test names or assertion text, not a verify clock:
+  `TestRow11TimeoutMargin::…`, a `CHAIN_BUILD_TIMEOUT_SECS` set member, and
+  "(crash, not a timeout)".
+- **No merge-role summary** has `timed_out` true or category `infra_timeout`. That covers 35 in
+  the edit-absent cell and 34 in the edit-present cell, across all modules. So the four 5408
+  modules had **0 timeouts each** in both cells.
+
+| tree | `merge_verify` rows | verify timeouts | rate | vs 4% baseline |
+|---|---|---|---|---|
+| edit-absent (all in BEFORE) | 111 | 0 | 0.0% | below |
+| edit-present (146 AFTER + 5408's own) | 147 | 0 | **0.0%** | below. With 0 of 147, the one-sided 95% upper bound ("rule of three") is 3 / 147 = 2.0%, also below 4% |
+
+The 4% baseline comes from the verify-speed study's `A-baseline.md` §3, quoted because that
+directory is untracked: "Categories over the same corpus: passed 392, test_failure 48,
+unknown_test_failure 37, **infra_timeout 19**, infra_kill 1. So ~4 % of task-leg verifies die on
+the clock". That is 19 / 497 = 3.8%, over the 30 days to 2026-09-10. It is weaker as a
+comparator than it looks, for two reasons:
+
+- it is a **task-leg** rate, and this trial is merge-role;
+- it predates the 2026-09-12 fleet budget doubling, 3600 → 7200 s warm (§1(f)), which applies to
+  both of this trial's arms almost entirely.
+
+A 0-against-0 reading under a doubled budget says little about headroom. It does say the half of
+the stop rule that the data can test did not trip.
+
+### (b) Peak-RSS half
+
+**From the controlled run (§4): 0%.** The gate runs one module at a time. The unchanged
+orchestrator test leg reached at least 10,429 MiB. Every after-edit upper bound for a changed
+module is below that, the largest being scripts at ≤ 5,594 MiB. So the gate's peak, which is
+orchestrator's, did not move.
+
+That is a bound, not a production measurement. One production data point corroborates it: task
+5415's record (2026-09-30) quotes a single full DF merge gate on the laptop, with cgroup scopes
+on, `merge_verify_max_concurrent_modules: 1` and 16 workers. It peaked at "13.3 GiB, in the
+orchestrator pytest leg; fused-memory was second at 12.6 GiB". Neither module is one 5408
+changed.
+
+**Production proxies, per tree, from the same block:**
+
+- **No merge failure reason** mentions OOM, `MemoryError`, `SIGKILL`, signal 9, rc 137 / −9, or
+  `Killed`, in either window.
+- **One merge-role summary is a kill: 4427, orchestrator leg, edit-present.**
+  - Summary: `attempt-1.orchestrator.summary-20260921T000143_884680Z.json`, category
+    `infra_kill`, test rc −9 after 1,674.8 s. Its lint and type legs passed. The log ends in an
+    xdist `OSError: cannot send (already closed?)` at `pytest_sessionfinish`.
+  - `journalctl -k --since '2026-09-20 23:55:00 UTC' --until '2026-09-21 00:05:00 UTC'` is
+    readable for that window and contains no OOM-killer line.
+  - The verify's attempt 1 then failed on a real branch test (`fails_in_isolation`).
+  - The killed leg belongs to the unchanged orchestrator module, not to one of 5408's four.
+  - Hypothesis: the SIGKILL came from somewhere other than the kernel OOM killer. This was not
+    investigated further.
+- The edit-absent cell has no kill.
+
+### (c) Verdict
+
+Rule (5408 WORK item 4): **REVERT iff** the edit-present timeout rate exceeds 4%, **or** the gate
+cgroup peak rises by more than 25%.
+
+| half | measured how | result | trips? |
+|---|---|---|---|
+| timeouts | **from production**: every merge verify in both windows, keyed by tree | 0 / 147 edit-present (≤ 2.0% at 95%), against 0 / 111 edit-absent | no |
+| gate peak | **bounded by the controlled run (§4)**, corroborated by 5415's laptop gate | +0%: the gate peak stays orchestrator's | no |
+
+**Verdict: KEEP the addopts.** Neither half trips, so no revert escalation is filed.
+
+### (d) Expected signal
+
+From §3(d): each of scripts, dashboard and escalation runs under half its serial median, with
+AFTER medians of 97.2, 64.2 and 36.4 s. Cockpit (16.1 s) is under half the serial range's
+midpoint (19.0 s), but not under half its low end (14.5 s).
+
+### (e) Attribution, against 5204's caveat
+
+| quantity | seconds | source |
+|---|---|---|
+| naive gate delta, AFTER − BEFORE clean medians | −1,019 (4188 → 3169) | §2 (i) |
+| what the arm switch alone predicts | −965 (4224 → 3259, ÷ 1.296) | §2, 5204 |
+| residual left for 5408 and the other confounds | **−123** (3136 against 3259) | §2 |
+| residual from the restart split: full treatment against part 1 only | −51 (3159 → 3108) | §3(f) |
+| sum of per-module savings, serial midpoint − AFTER junit median | **−558** (scripts 345, dashboard 141, escalation 51, cockpit 22) | §3(a), (c) |
+| the same four suites in the controlled run, serial − parallel | −1,060 (at that day's load) | §4 |
+
+- **The naive −24% is not 5408's.** The arm switch alone accounts for about 965 of its 1,019 s.
+- 5408's effect on each module's wall is large and directly measured. Its effect on the whole
+  gate is small: about −123 s, or −4%, against −558 s expected from the per-module savings.
+- Three hypotheses for the gap, none tested here:
+  - gate-wall noise. In every cell with at least 28 clean rows, the p90 sits 700-1,100 s above
+    the median, and the arm-matched comparison cells have n = 5 and n = 3;
+  - host contention. The parallel legs add about 570 CPU-seconds per gate (§4) on a host shared
+    with task verifies and agents;
+  - the 1.296 arm ratio may not carry over unchanged from edit-absent trees, measured 09-08 to
+    09-16, to edit-present trees.
+- The scripts leg, the largest expected saving at 345 s, only went parallel on 09-21 (§3(f)).
+  Comparing the periods before and after that restart showed −51 s.
+
+### (f) Caveats
+
+- **Junit coverage gap.** There is no per-module junit for all of BEFORE or for AFTER's first
+  four days (09-17 to 09-21). AFTER's per-module walls come from 09-21 to 09-24 only.
+- **BEFORE's per-module walls rest on failure-selected samples**: n = 3 for scripts and n = 4 for
+  dashboard, with none for escalation or cockpit. The serial baseline is quoted from the 09-10
+  study, not measured in-window.
+- **Worker-seconds are not CPU-seconds** (§3(e)). Real CPU-seconds come only from §4's
+  controlled run.
+- **§4 is a single controlled repetition** per arm (two for cockpit parallel), on a loaded,
+  shared host. Its peaks include page cache.
+- **Confounds** (§1(f)), inside the AFTER window:
+  - the arm switch;
+  - the 09-21 restart, which deployed five days of process code together with 5408's own
+    `orchestrator.yaml` half;
+  - 5442's per-test timeout raise;
+  - the 09-23 admission-slot increase.
+- **The CPUWeight / cgroup cpu.weight mechanism does not apply** to these windows. DF verifies ran
+  unscoped inside `orchestrator-dark-factory.service`'s cgroup, because
+  `verify_use_cgroup_scope` is off, so no per-role CPU weighting separated the gate from agents
+  or task verifies.
+- **The gate-peak result is structural.** It holds while `merge_verify_max_concurrent_modules`
+  is 1, and it would need re-measuring if that is raised.
+
+### (g) Follow-ups
+
+- **Production peak RSS** is owned by task **5206** (enable DF verify cgroup scopes) and task
+  **5415** (measure `memory.peak` of merge-verify scopes over 7 days). Both are pending. Nothing
+  new is filed for RSS.
+- **Per-verify CPU-seconds.** `search_tasks` found no existing owner: 3353 stamps load and
+  worker count, 5671 role and slot wait, 5651 plan hash and outcomes. So one follow-up was filed:
+  stamp `cpu.stat` usage, user and system CPU-seconds (and `memory.peak`, once 5206 lands) on
+  each verify command's summary. Ticket **`tkt_0RVE1CW1SX7JWX6JXAJPNZYFK9`**, low priority,
+  `suggestion_hash` `e1-cpu-seconds-per-verify-leg`.
+- **The dashboard parallel failure** in §4: ticket **`tkt_0RVE0WBY3YQM9CEX9DFZ1PWAPR`**, low
+  priority. `test_evict_park_endpoint_rejects_invalid_body[missing-project_root]` sees a
+  background metrics sampler's MCP calls under 16 workers.
+- **The startup-snapshot behaviour** in §3(f), where a module `orchestrator.yaml` edit reaches the
+  local merge gate only at the next restart, is already recorded (task 1818's incident, task
+  4536's analysis). It is a known property, not a new defect, so nothing is filed. A future
+  before/after trial of an `orchestrator.yaml` edit must key by restart, not by git ancestry.
