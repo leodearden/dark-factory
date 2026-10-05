@@ -393,11 +393,12 @@ def _spawned_child(marker: str) -> int | None:
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
+        fields = read_stat_fields(entry)
+        if fields is None or fields.ppid != os.getpid():
+            continue
         with contextlib.suppress(OSError):
-            fields = read_stat_fields(entry)
-            if fields is not None and fields.ppid == os.getpid():
-                if marker in (entry / 'cmdline').read_bytes().decode('utf-8', 'replace'):
-                    return int(entry.name)
+            if marker in (entry / 'cmdline').read_bytes().decode('utf-8', 'replace'):
+                return int(entry.name)
     return None
 
 

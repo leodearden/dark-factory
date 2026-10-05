@@ -60,7 +60,7 @@ locale the matcher silently stops recognising it, defeating the R3
 ENOENT-tolerance fix for the 4892-class warm-lane FAULT. Do not "simplify"
 this away.
 
-CANCELLATION SAFETY (tasks 2608, 4155). If the ``communicate()`` await is
+CANCELLATION SAFETY (tasks 2608, 4155, 6346). If the ``communicate()`` await is
 interrupted — a caller-side ``asyncio.wait_for``, an outer cancellation, or
 this module's own ``timeout`` — the spawned child would otherwise keep
 running as an orphan holding its stdout/stderr pipes open. For a
@@ -68,7 +68,9 @@ persistently-hung script that recurred every scheduler sweep, leaking a
 process and file descriptors each time. Every interrupted path therefore
 SIGKILLs the child's whole process group, so helpers a script forked die with
 it (task 2608 killed only the direct child), then best-effort reaps the child.
-The accepted residual: if the child has already exited and been reaped — a
+An interruption during the spawn itself, after the fork but before a Process
+exists, is covered too: the spawn is shielded, then its group is killed (task
+6346). The accepted residual: if the child has already exited and been reaped — a
 script that backgrounded a pipe-holding helper and exited — no signal is sent,
 since its pid may have been recycled (``shared.proc_group``'s house trade-off).
 
@@ -158,6 +160,52 @@ async def _kill_and_reap(proc: asyncio.subprocess.Process, pgid: int) -> None:
         await proc.wait()  # reap is best-effort; never let it mask the original error
 
 
+async def _spawn_session_leader(
+    cmd: Sequence[str], cwd: Path | str | None, *, pipe_stdin: bool,
+) -> asyncio.subprocess.Process:
+    """Spawn *cmd* as a new session's leader, its output piped, in the C locale.
+
+    asyncio's own cleanup for a spawn interrupted after the fork kills only the
+    direct child, so an interrupted spawn is waited out and its whole group
+    killed before the original exception propagates (task 6346).
+    """
+    # Force a stable C locale so child output is always English and amenable
+    # to substring matching (see the module docstring — this is load-bearing).
+    env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
+    spawn = asyncio.ensure_future(asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=str(cwd) if cwd is not None else None,
+        stdin=asyncio.subprocess.PIPE if pipe_stdin else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    ))
+    try:
+        return await asyncio.shield(spawn)
+    except BaseException:
+        proc = await _spawn_outcome(spawn)
+        if proc is not None:
+            await _kill_and_reap(proc, proc.pid)
+        raise
+
+
+async def _spawn_outcome(
+    spawn: asyncio.Future[asyncio.subprocess.Process],
+) -> asyncio.subprocess.Process | None:
+    """Wait *spawn* out, absorbing cancellations: its Process, or None if it failed.
+
+    Never raises the spawn's own failure, so it cannot replace the exception
+    that interrupted the caller.
+    """
+    while not spawn.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait((spawn,))
+    if spawn.cancelled() or spawn.exception() is not None:
+        return None
+    return spawn.result()
+
+
 async def run_git(
     cmd: Sequence[str],
     cwd: Path | str | None = None,
@@ -206,18 +254,7 @@ async def _spawn_and_communicate(
     timeout: float | None,
 ) -> GitResult:
     """The primitive itself, run under the caller's semaphore slot."""
-    # Force a stable C locale so child output is always English and amenable
-    # to substring matching (see the module docstring — this is load-bearing).
-    env = {**os.environ, 'LC_ALL': 'C', 'LANG': 'C'}
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(cwd) if cwd is not None else None,
-        stdin=asyncio.subprocess.PIPE if input_text is not None else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-        start_new_session=True,
-    )
+    proc = await _spawn_session_leader(cmd, cwd, pipe_stdin=input_text is not None)
     pgid = proc.pid  # frozen at spawn: see shared.proc_group's module docstring (task 845)
     communicate = proc.communicate(
         input=input_text.encode() if input_text is not None else None,
