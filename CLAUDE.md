@@ -144,6 +144,15 @@ Any workspace member works; `shared` is used because it is the one member every
 resolves to its OWN tree, an un-synced one to the main checkout — both are
 correct, and knowing which you are in is the whole point of asking.
 
+**Never `find .`, nor `Glob` with no `path`, from the main checkout root to
+locate a first-party file.** That root holds a full copy of the tree per
+worktree under `.worktrees/`, `.worktrees-orphaned/`, `.eval-worktrees/` and
+`.claude/worktrees/`, all four in the root `.gitignore`, so a walk times out
+printing every copy. `Glob` passes `--no-ignore` and fails the same way;
+`Grep` honours `.gitignore`. Ask git's index instead:
+`git ls-files -- '*<name>'`, adding `--others --exclude-standard` for untracked
+files. Inside a task worktree both walks are fine.
+
 ### Anchoring ad-hoc paths
 
 In an interactive session the Bash working directory PERSISTS across calls, and
