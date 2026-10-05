@@ -1318,6 +1318,110 @@ def test_committed_environment_declarations_are_all_registered():
             )
 
 
+def _unregistered_directives(spec, parsed) -> list[tuple[str, str]]:
+    """Every ``(section, key)`` in *parsed* that *spec* neither covers nor waives.
+
+    Takes the spec and the parsed unit rather than a unit name so the same
+    code drives both the real registry and the throwaway fixture that proves
+    it fires — the guard and its own proof cannot diverge.
+    """
+    covered = spec.covered_directives()
+    waived = {(section, key) for section, key, _reason in spec.unchecked_directives}
+    return [
+        (section, key)
+        for section, directives in parsed.items()
+        for key in directives
+        if (section, key) not in covered and (section, key) not in waived
+    ]
+
+
+def test_every_committed_directive_is_registered_or_explicitly_unchecked():
+    """COMPLETENESS GUARD: every directive a committed unit declares was considered.
+
+    The staleness guards above all run one way — a registered key must be
+    declared — and test_committed_environment_declarations_are_all_registered
+    inverts that for Environment= alone. This is the same inversion for every
+    directive. Without it a committed unit can gain a directive nobody
+    registered, every registered key still compares equal, and the gate reports
+    parity on a host that never received it. SuccessExitStatus= did exactly
+    that for ~3 weeks.
+
+    Comparison stays BOUNDED — the module docstring's case against an
+    unbounded diff is sound — but bounded must mean every directive was
+    considered, not that someone remembered to.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        unregistered = _unregistered_directives(spec, parsed)
+        assert unregistered == [], (
+            f"{name}: the committed unit {spec.repo_relpath} declares "
+            + ", ".join(f"[{section}] {key}" for section, key in unregistered)
+            + " but the registry neither compares nor waives it, so drift in it "
+            "would be reported as parity. Either register it on the branch that "
+            "fits (compared / present_only / override_directives / "
+            "environment_section), or add it to unchecked_directives with a "
+            "specific reason — a reasoned waiver is a legitimate answer, not a "
+            "way around this guard."
+        )
+
+
+def test_completeness_guard_fires_on_an_unregistered_directive():
+    """The guard's own proof, in both directions.
+
+    OOMPolicy= is a real systemd directive, absent from all three committed
+    units, and plainly not cosmetic — the shape of directive a future edit
+    could add without anyone registering it.
+    """
+    mod = _load_checker()
+    parsed = mod.parse_unit_directives(
+        "[Unit]\n"
+        "Description=Throwaway fixture\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/bin/true\n"
+        "OOMPolicy=stop\n"
+    )
+    spec = mod.UnitSpec(
+        name="throwaway.service",
+        repo_relpath="dashboard/throwaway.service",
+        compared=(("Unit", "Description"), ("Service", "Type")),
+        present_only=(("Service", "ExecStart"),),
+    )
+
+    assert _unregistered_directives(spec, parsed) == [("Service", "OOMPolicy")]
+
+    waived = mod.UnitSpec(
+        name="throwaway.service",
+        repo_relpath="dashboard/throwaway.service",
+        compared=(("Unit", "Description"), ("Service", "Type")),
+        present_only=(("Service", "ExecStart"),),
+        unchecked_directives=(("Service", "OOMPolicy", "throwaway fixture directive"),),
+    )
+
+    assert _unregistered_directives(waived, parsed) == []
+
+
+def test_unchecked_directives_all_carry_a_nonempty_reason():
+    """Every waiver states a reason, or it is an invisible hole.
+
+    Same stance as test_divergence_allowlist_names_are_declared_in_a_committed_unit:
+    the gate's deliberate holes stay believable only while each one says why,
+    specifically enough for a reviewer to check.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        for section, key, reason in spec.unchecked_directives:
+            assert reason.strip(), (
+                f"{name}: unchecked_directives waives [{section}] {key} with an "
+                "empty reason. State why it is safe not to compare it."
+            )
+
+
 def test_registry_env_matches_directive_entries_are_declared_in_the_committed_units():
     """STALENESS GUARD, intra-copy-relation edition.
 
