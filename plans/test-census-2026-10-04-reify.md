@@ -465,3 +465,61 @@ crate-name order and are not ranked.
 Unreadable files (0; the census is complete):
 
 - none
+
+## Reading against the 2026-09-10 studies
+
+This section is written by hand; everything above it is generated and unedited.
+The study is `plans/verify-speed-study-reify-2026-09-10.md`, an untracked file
+that exists only in the reify main checkout.
+
+### Where cost comes from
+
+Reify configures no nextest junit, and none is archived anywhere. Per-test cost
+therefore comes from the nextest `PASS` and `LEAK` status lines in the archived
+verify logs. The study recorded that those logs are failure-biased: passing
+merge logs are not archived.
+
+`run_all.sh` logs no per-member wall time, so every `tests/infra/*.sh` member is
+uncosted. That is 191 tests: 152 that never failed and 39 in the floor.
+
+Ranked ids are nextest binary ids plus test paths, and they are not resolved
+against the tree. A test renamed or removed since its last logged run can
+therefore still be ranked.
+
+### Failure evidence
+
+| measure | study | census |
+| --- | --- | --- |
+| failed gates / red runs | 46 merge-gate failures in the 30 d to 2026-09-10 | 54 red runs among the 78 logs that carry nextest status or run_all lines, out of 116 logs from 2026-09-04 to 2026-10-04 |
+| flaky ledger | 120 entries (59 in 30 d), all `tests/infra/*.sh` | 217 entries (111 in the 30 d to 2026-10-04), 23 distinct tests, all `tests/infra/*.sh` |
+| flake_occurrence | — | 77 rows, every one with test_id `<unknown>` and verdict `unconfirmable`; none reaches the floor |
+
+The study counted merge-gate failures only. The census counts logs of every
+role, task leg and merge alike.
+
+The floor holds 48 tests:
+
+- 9 Rust tests, from `FAIL` and `TIMEOUT` status lines;
+- 39 infra scripts, from run_all `FAILED` lines and the flaky ledger.
+
+### Duplication
+
+| measure | study | census |
+| --- | --- | --- |
+| non-trivial test lines that are exact duplicates | 45.5% | 64.3% counting every occurrence (329,239 of 511,920); 54.8% counting occurrences beyond the first (280,493) |
+| test fns in same-file name families of 3 or more | 16.9% | 1.2% (311 of 26,044) |
+
+The study's definitions lived in its `trimming.md`, a session scratchpad file
+that was not retained. So the gap cannot be split between growth and
+definition. What is known about the census side:
+
+- lines count only inside test-fn bodies, with comments blanked;
+- duplicates are grouped per crate, not across the workspace;
+- the family key is strict: the whole fn name minus its last `_segment`,
+  within one file.
+
+### No retirement
+
+No test is retired here. Retiring any listed test needs a planted-defect check
+(INV-10) in a follow-up. A slow test that guards something real is an
+offline-lane candidate, not a deletion.
