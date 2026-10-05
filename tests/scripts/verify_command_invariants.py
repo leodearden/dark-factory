@@ -297,39 +297,59 @@ def positional_targets(
     ``'scripts/' in cmd`` for both.
 
     *value_flags* is the caller's POLICY, and its default is the reason one
-    implementation serves five call sites unchanged. With it EMPTY, ``consume``
+    implementation serves every call site unchanged. With it EMPTY, ``consume``
     can never become True and the loop below reduces byte-for-byte to
-    ``[t for t in post if not t.startswith('-')]`` — exactly what
-    ``test_root_lint_covers_nonmember_py.py``, ``test_scripts_module_config.py``
-    and ``test_fallback_verify_config.py`` do today, phantom flag values
-    included. Supplying a set (the CONTRIBUTING guard's
-    ``_RUFF_FLAGS_TAKING_A_VALUE``, the skills guard's ``_PYTEST_VALUE_FLAGS``)
-    drops the following token instead. The
+    ``[t for t in post if not t.startswith('-')]``, phantom flag values
+    included. Supplying a set drops the following token instead. The
     ``--flag=value`` spelling needs no entry either way: ``shlex`` keeps it as
-    one token and the ``-`` prefix drops it whole.
+    one token and the ``-`` prefix drops it whole. Which call site passes which
+    set is the census below, counted per call site rather than per file: one
+    file can pass a set at one site and none at another.
 
     WHAT THIS GUARANTEES, stated no more strongly than it holds: every returned
     token was a positional argument after the anchor. It is NOT a proof that no
     unlisted value-taking flag exists — an unknown one still donates its value as
     a PHANTOM target, and nothing here can tell that phantom from a real path.
 
+    THE CALLER CENSUS. Each row is one call site: the set it passes, then what
+    it asserts of the returned targets.
+
+      * ``test_root_lint_covers_nonmember_py.py::_ruff_targets`` — none; each
+        EXISTS.
+      * ``test_fallback_verify_config.py::_lint_leg_targets`` — none; each
+        EXISTS.
+      * ``test_hook_ruff_targets_drift.py::_gate_ruff_targets`` — none; the
+        list EQUALS the hook's ``RUFF_TARGETS``.
+      * ``test_hook_magicmock_test_dirs_drift.py::_gate_magicmock_test_dirs``
+        — none; the list EQUALS the hook's ``MAGICMOCK_TEST_DIRS``.
+      * ``test_scripts_module_config.py::_targets`` — none for the ruff and
+        pyright legs, which check MEMBERSHIP; its own ``_PYTEST_VALUE_FLAGS``
+        for the pytest leg via ``_pytest_targets``, which checks MEMBERSHIP
+        and EQUALITY.
+      * ``test_contributing_lint_command_drift.py::_ruff_targets`` —
+        ``_RUFF_FLAGS_TAKING_A_VALUE``; each EXISTS.
+      * ``test_skills_module_config_decision.py::_pytest_collected_dirs`` —
+        its own ``_PYTEST_VALUE_FLAGS``; each EXISTS.
+      * ``test_fallback_verify_config.py::_fleet_pytest_suite_names`` — its
+        own ``_PYTEST_VALUE_FLAGS``; the suite keys EQUAL its measured tables.
+      * ``test_member_scripts_type_gate.py``'s one inline call —
+        ``_PYRIGHT_VALUE_FLAGS``; COVERAGE via :func:`covers`.
+
     A PHANTOM IS NOT UNIFORMLY HARMLESS, and which callers can tolerate one does
-    NOT partition by which ones supply a set. Against a COVERAGE check a phantom
-    is inert: :func:`covers` over an extra target can only ever pass spuriously,
-    never fail. But a caller that ALSO asserts each target exists on disk reads
-    the list for exactly what a phantom adds, and goes red naming a flag value as
-    a missing path — a misleading diagnosis on a change that broke nothing.
-    Measured across the five callers: FOUR assert existence
-    (``test_root_lint_covers_nonmember_py.py``,
-    ``test_contributing_lint_command_drift.py``,
-    ``test_skills_module_config_decision.py``,
-    ``test_fallback_verify_config.py``) while only two of those four supply a
-    set; ``test_scripts_module_config.py`` supplies none and asserts no
-    existence. The remaining exposure is therefore root_lint's AND fallback's,
-    and each is recorded on that guard's own extractor —
-    ``test_root_lint_covers_nonmember_py.py::_ruff_targets`` and
-    ``test_fallback_verify_config.py::_lint_leg_targets`` — rather than papered
-    over here.
+    NOT partition by which ones supply a set. Against a COVERAGE or MEMBERSHIP
+    check a phantom is inert: :func:`covers` over an extra target can only ever
+    pass spuriously, never fail. But a check that each target EXISTS on disk, or
+    that the list EQUALS a second copy, reads the list for exactly what a
+    phantom adds, and goes red naming a flag value as a path — a misleading
+    diagnosis on a change that broke nothing. A set narrows that exposure to
+    UNLISTED flags only. Four call sites assert existence, and only two of
+    those four supply a set at that call site:
+    ``test_fallback_verify_config.py`` passes one at
+    ``_fleet_pytest_suite_names``, which asserts no existence, and none at
+    ``_lint_leg_targets``, which does. The remaining exposure is therefore
+    every set-less EXISTS or EQUALS row. The two set-less EXISTS rows each
+    record it on their own extractor rather than papering over it here; the
+    two hook-drift EQUALS rows carry no such record yet.
 
     Discarding unrecognised tokens instead is not an option: that would silently
     shrink the target list and re-open the false-pass hazard the parsing exists
