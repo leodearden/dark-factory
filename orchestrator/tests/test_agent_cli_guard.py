@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 import pytest
-from _agent_cli_guard import AGENT_CLI_BINARIES, agent_cli_in
+from _agent_cli_guard import AGENT_CLI_BINARIES, AgentCliSpawnGuard, agent_cli_in
 from shared.cli_invoke import build_claude_argv
 
 from orchestrator.agents.landlock import build_landlock_command
@@ -87,3 +87,72 @@ class TestAgentCliIn:
     )
     def test_non_agent_argv_is_not_classified(self, args):
         assert agent_cli_in(args) is None
+
+
+_NODEID = 'tests/test_x.py::test_y'
+_NICE_CLAUDE = ('nice', '-n', '5', 'claude', '--print')
+
+
+class TestAgentCliSpawnGuard:
+    @pytest.fixture
+    def calls(self) -> list[tuple]:
+        return []
+
+    @pytest.fixture
+    def guard(self) -> AgentCliSpawnGuard:
+        return AgentCliSpawnGuard(_NODEID)
+
+    @pytest.fixture
+    def wrapped(self, guard, calls):
+        def fake_init(popen_self, args, *a, **kw):
+            calls.append((args, a, kw))
+
+        return guard.guarded(fake_init)
+
+    def test_non_agent_spawns_are_delegated_unchanged(self, guard, wrapped, calls):
+        wrapped(object(), ['git', 'status'], cwd='/tmp')
+
+        assert calls == [(['git', 'status'], (), {'cwd': '/tmp'})]
+        assert guard.violation_message() is None
+
+    def test_an_agent_spawn_is_blocked_at_the_seam(self, wrapped, calls):
+        with pytest.raises(pytest.fail.Exception) as exc:
+            wrapped(object(), _NICE_CLAUDE)
+
+        assert calls == []
+        message = str(exc.value)
+        assert _NODEID in message
+        assert "'claude'" in message
+        assert repr(_NICE_CLAUDE) in message
+        assert 'spawns_agent_cli' in message
+        assert 'orchestrator.workflow.invoke_agent' in message
+        assert not isinstance(exc.value, Exception)
+
+    def test_a_blocked_spawn_is_recorded(self, guard, wrapped):
+        with pytest.raises(pytest.fail.Exception):
+            wrapped(object(), _NICE_CLAUDE)
+
+        message = guard.violation_message()
+        assert message is not None
+        assert _NODEID in message
+        assert repr(_NICE_CLAUDE) in message
+
+    def test_taking_the_attempts_acknowledges_them(self, guard, wrapped):
+        with pytest.raises(pytest.fail.Exception):
+            wrapped(object(), _NICE_CLAUDE)
+
+        assert guard.take_attempts() == [_NICE_CLAUDE]
+        assert guard.take_attempts() == []
+        assert guard.violation_message() is None
+
+    def test_every_blocked_spawn_is_recorded_in_order(self, guard, wrapped):
+        second = ('/usr/bin/codex', 'exec', '-')
+        for argv in (_NICE_CLAUDE, second):
+            with pytest.raises(pytest.fail.Exception):
+                wrapped(object(), argv)
+
+        message = guard.violation_message()
+        assert message is not None
+        assert repr(_NICE_CLAUDE) in message
+        assert repr(second) in message
+        assert guard.take_attempts() == [_NICE_CLAUDE, second]
