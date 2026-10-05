@@ -446,6 +446,11 @@ def routed_record_covers_finding(
     keeps ``detail`` (with a suffix appended) but not ``dedupe_fingerprint``,
     which is why the level alone decides here.
 
+    That closes the loop for a ROUTED L1 only.  The reaper's ``has_open_l1``
+    read ignores category, so an UNRELATED open L1 still dismisses each routed
+    L0 and the next cycle refiles it.  Folding behind any L1 would give up the
+    task-2757 property above; task 6341 owns that decision.
+
     The caller passes PENDING records only, so a finding reaches the ladder
     again once the covering record is adjudicated.
     """

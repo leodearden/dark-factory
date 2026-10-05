@@ -21824,9 +21824,10 @@ def test_unroutable_target_files_nothing_and_touches_no_queue_directory(
 ):
     """An id unsafe as a queue key is refused BEFORE any I/O.
 
-    The production call site passes a PRE-RESOLVED target, which skips the
-    resolver's shape check, so the filer must enforce
-    `finding_task_escalation.py::is_routable_task_id` again at the point of use.
+    A caller-supplied ``task_id`` need not have come from the resolver, so the
+    filer enforces `finding_task_escalation.py::is_routable_task_id` again at
+    the point of use; the resolver branch pins that the check also holds when
+    the filer resolves the target itself.
     """
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     _wire_orchestrator_queue(harness, tmp_path, monkeypatch)

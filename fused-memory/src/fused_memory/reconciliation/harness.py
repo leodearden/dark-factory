@@ -135,6 +135,13 @@ supersedes. A STORED spelling, also read by E4 to attribute this writer's
 reaped ``supersedes`` edges
 (``fused-memory/scripts/memory_eval_staleness_sweep.py::by_design_reaper``)."""
 
+_RECON_INTEGRITY_ISSUE_CATEGORY = 'recon_integrity_issue'
+"""The recon-queue category of a Stage-3 integrity finding, and the category
+that keys the finding's persistence identity (:func:`_recon_finding_fingerprint`).
+The routed orchestrator record carries that identity, so the recon filing, the
+persistence count, the pending check and the routed filer must all read this
+one spelling: a drifted literal would silently stop folding."""
+
 # Recon-wide dedup config: covers all four recon escalation categories.
 # Wider than DedupeConfig.for_recon() (which only covers recon_integrity_issue)
 # because A7b also folds non-finding categories so each DISTINCT recurring message
@@ -168,7 +175,7 @@ _RECON_DEDUP_CONFIG = (
     dataclasses.replace(
         DedupeConfig.for_recon(),  # type: ignore[possibly-undefined]
         infra_dedupe_categories=(
-            'recon_integrity_issue',
+            _RECON_INTEGRITY_ISSUE_CATEGORY,
             'recon_failure',
             'recon_stale_run',
             'recon_backlog_overflow',
@@ -2921,7 +2928,7 @@ class ReconciliationHarness:
                 task_id=f'recon-{run_id[:8]}',
                 agent_role='reconciliation-harness',
                 severity='info' if category in (
-                    'recon_stale_run', 'recon_integrity_issue', TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
+                    'recon_stale_run', _RECON_INTEGRITY_ISSUE_CATEGORY, TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
                 ) else 'blocking',
                 category=category,
                 summary=summary,
@@ -3011,7 +3018,8 @@ class ReconciliationHarness:
                 },
             )
             return None
-        # A supplied target skipped the resolver's shape check; re-check before any I/O.
+        # Re-check at the point of use, before any I/O: a caller-supplied
+        # task_id need not have come from the resolver.
         if not is_routable_task_id(task_id):
             logger.warning(
                 'reconciliation.finding_task_escalation_unroutable_target',
@@ -3047,7 +3055,7 @@ class ReconciliationHarness:
             queue = EscalationQueue(  # type: ignore[possibly-undefined]
                 Path(project_root) / _ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME
             )
-            fingerprint = _recon_finding_fingerprint('recon_integrity_issue', finding)
+            fingerprint = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, finding)
             # Cross-cycle dedupe: the fold policy is
             # `finding_task_escalation.py::routed_record_covers_finding`. The
             # scan reads PENDING records only, so a finding re-files once its
@@ -4828,7 +4836,7 @@ class ReconciliationHarness:
         if not HAS_ESCALATION:
             return 0
         try:
-            target_fp = _recon_finding_fingerprint('recon_integrity_issue', finding)
+            target_fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, finding)
         except Exception as exc:
             logger.warning(
                 'reconciliation.persistence_fingerprint_failed',
@@ -4856,7 +4864,7 @@ class ReconciliationHarness:
                 # Count this run once if any item matches the target fingerprint
                 for item in items:
                     try:
-                        fp = _recon_finding_fingerprint('recon_integrity_issue', item)
+                        fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, item)
                     except Exception:
                         any_item_fp_failed = True
                         continue
@@ -5025,13 +5033,13 @@ class ReconciliationHarness:
     ) -> bool:
         """Return True iff an OPEN pending escalation already covers this finding.
 
-        Uses the same compute_content_fingerprint key as _escalate and
-        _finding_persistence_count (category='recon_integrity_issue', finding
-        category, _derive_affected_ids, description) to guarantee suppression
-        is consistent with what _escalate would fold via submit_or_dedupe.
+        Uses the same _recon_finding_fingerprint key as _escalate and
+        _finding_persistence_count (category _RECON_INTEGRITY_ISSUE_CATEGORY)
+        to guarantee suppression is consistent with what _escalate would fold
+        via submit_or_dedupe.
 
         pending_fps: pre-fetched set of dedupe_fingerprints for
-        'recon_integrity_issue' pending escalations.  When supplied (built once
+        _RECON_INTEGRITY_ISSUE_CATEGORY pending escalations.  When supplied (built once
         by _maybe_remediate), the check is an O(1) set membership test — no
         extra disk scan.  Pass None to fall back to a full get_pending() scan
         per-finding (direct / unit-test use).
@@ -5045,13 +5053,13 @@ class ReconciliationHarness:
         if not HAS_ESCALATION or self._escalation_queue is None:
             return False
         try:
-            target_fp = _recon_finding_fingerprint('recon_integrity_issue', finding)
+            target_fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, finding)
             if pending_fps is not None:
                 return target_fp in pending_fps
             # Fallback: per-finding scan (no pre-fetched set supplied).
             for e in self._escalation_queue.get_pending():
                 if (
-                    e.category == 'recon_integrity_issue'
+                    e.category == _RECON_INTEGRITY_ISSUE_CATEGORY
                     and e.dedupe_fingerprint == target_fp
                 ):
                     return True
@@ -5361,7 +5369,7 @@ class ReconciliationHarness:
                     pending_fps = {
                         e.dedupe_fingerprint
                         for e in self._escalation_queue.get_pending()
-                        if e.category == 'recon_integrity_issue'
+                        if e.category == _RECON_INTEGRITY_ISSUE_CATEGORY
                         and e.dedupe_fingerprint is not None
                     }
                 except Exception as _fps_err:
@@ -5477,7 +5485,7 @@ class ReconciliationHarness:
         except Exception as e:
             logger.error(f'Remediation check failed for run {parent_run_id}: {e}')
             self._escalate(
-                'recon_integrity_issue',
+                _RECON_INTEGRITY_ISSUE_CATEGORY,
                 parent_run_id,
                 f'Remediation orchestration failed: {e}',
             )
@@ -6096,7 +6104,7 @@ class ReconciliationHarness:
                             )
                         else:
                             self._escalate(
-                                'recon_integrity_issue',
+                                _RECON_INTEGRITY_ISSUE_CATEGORY,
                                 run_id,
                                 f'Persistently unresolved after remediation '
                                 f'({persistence} cycles): {finding.get("description", "?")}',
@@ -6316,7 +6324,7 @@ class ReconciliationHarness:
             # Do NOT re-raise — parent run already completed
             # Do NOT restore events — there are none
             self._escalate(
-                'recon_integrity_issue',
+                _RECON_INTEGRITY_ISSUE_CATEGORY,
                 run_id,
                 f'Remediation pass failed at {current_stage_name}: {e}',
             )
