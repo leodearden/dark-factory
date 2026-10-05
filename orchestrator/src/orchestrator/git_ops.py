@@ -12949,10 +12949,8 @@ class GitOps:
         :meth:`remove_merge_worktree_guarded` keep its
         total-with-respect-to-``OSError`` contract while calling this.
 
-        ``merge_queue.py``'s LOCAL-dispatch gate ("should I take a lease at
-        all?") still carries its own copy of the comparison: it is outside
-        this task's module lock set. It compares the same two paths the same
-        way; folding it in is filed as follow-up work.
+        The merge lane's LOCAL-dispatch gate ("should I take a lease at
+        all?", ``merge_lane/worker.py``) calls this too (task 4575).
 
         :attr:`persistent_offline_deep_worktree_path` is deliberately NOT
         covered here — it is a different lane with a different owner, and only
