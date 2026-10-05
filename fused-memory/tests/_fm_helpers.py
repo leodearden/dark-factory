@@ -1994,6 +1994,18 @@ def make_populated_task_store(project_root: pathlib.Path) -> pathlib.Path:
     return db
 
 
+def make_zero_byte_task_store(project_root: pathlib.Path) -> pathlib.Path:
+    """Create the tasks.db *project_root* resolves to as an EMPTY file.
+
+    The residue shape ``target_store_preflight``'s guard must refuse, and the
+    counterpart of :func:`make_populated_task_store`.
+    """
+    db = task_store_path(project_root)
+    db.parent.mkdir(parents=True)
+    db.touch()
+    return db
+
+
 _CLEANUP_TEST_COLLECTIONS_SCRIPT = (
     pathlib.Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py'
 )

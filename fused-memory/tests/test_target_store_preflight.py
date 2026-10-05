@@ -37,7 +37,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _fm_helpers import make_populated_task_store
+from _fm_helpers import make_populated_task_store, make_zero_byte_task_store
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
@@ -135,13 +135,6 @@ class TestQueueDirArm:
         assert '--queue-dir' in message
 
 
-def _zero_byte_task_store(project_root: Path) -> Path:
-    db = task_store_path(project_root)
-    db.parent.mkdir(parents=True)
-    db.touch()
-    return db
-
-
 def _real_backend(project_root: Path) -> SqliteTaskBackend:
     return SqliteTaskBackend(TaskmasterConfig(project_root=str(project_root)))
 
@@ -156,7 +149,7 @@ class TestTaskStoreArm:
     """
 
     def test_a_zero_byte_store_is_refused_and_left_untouched(self, tmp_path: Path):
-        db = _zero_byte_task_store(tmp_path)
+        db = make_zero_byte_task_store(tmp_path)
 
         with pytest.raises(TargetStoreMissing):
             assert_task_store_populated(tmp_path, operation='audit_duplicate_tasks')
@@ -240,7 +233,7 @@ class TestTaskStoreArm:
 
     def test_the_empty_refusal_names_operation_resolved_path_and_flag(self, tmp_path: Path):
         """An existing store is refused as EMPTY, never misreported as absent."""
-        _zero_byte_task_store(tmp_path)
+        make_zero_byte_task_store(tmp_path)
 
         with pytest.raises(TargetStoreMissing) as excinfo:
             assert_task_store_populated(tmp_path, operation='correct_found_on_main_backlog')

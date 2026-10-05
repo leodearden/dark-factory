@@ -124,11 +124,9 @@ class TestRunTargetStorePreflight:
             main()
 
     def test_an_empty_existing_queue_dir_is_refused(self, tmp_path: Path):
-        """An empty directory is the residue a mis-targeted run leaves behind.
+        """An empty queue dir is refused before the scan (task 5468).
 
-        ``EscalationQueue.__init__`` mkdirs its target and a dry run writes
-        nothing else, so existence alone cannot tell a wrong location from a
-        quiet queue; a queue that has ever held a record is never empty again.
+        The predicate is pinned in test_target_store_preflight.py::TestQueueDirArm.
         """
         with pytest.raises(TargetStoreMissing):
             run(tmp_path, apply=False)

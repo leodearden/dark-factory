@@ -10,9 +10,13 @@ import logging
 from pathlib import Path
 
 import pytest
-from _fm_helpers import load_script_module, make_populated_task_store
+from _fm_helpers import (
+    load_script_module,
+    make_populated_task_store,
+    make_zero_byte_task_store,
+)
 
-from fused_memory.utils.target_store_preflight import TargetStoreMissing, task_store_path
+from fused_memory.utils.target_store_preflight import TargetStoreMissing
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_tasks.py'
 
@@ -1295,14 +1299,11 @@ class TestRunTargetStorePreflight:
         assert not (tmp_path / '.taskmaster').exists()
 
     async def test_refuses_a_zero_byte_task_store(self, tmp_path: Path, monkeypatch):
-        """An existing but EMPTY tasks.db is refused too (task 5468).
+        """A zero-byte tasks.db is refused before any backend is built (task 5468).
 
-        A zero-byte file holds no tasks, so a scan of it could only report a
-        clean run it cannot vouch for -- the same lie as a missing store.
+        The predicate is pinned in test_target_store_preflight.py::TestTaskStoreArm.
         """
-        db = task_store_path(tmp_path)
-        db.parent.mkdir(parents=True)
-        db.touch()
+        make_zero_byte_task_store(tmp_path)
         factory = _RecordingBackendFactory()
         monkeypatch.setattr(
             'fused_memory.config.schema.FusedMemoryConfig',
