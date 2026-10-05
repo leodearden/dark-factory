@@ -1153,6 +1153,39 @@ def caveats_for(slate_mode: Any) -> list[str]:
     return [*CAVEATS, *MODE_CAVEATS.get(str(slate_mode), MODE_CAVEATS[SLATE_SEEDED])]
 
 
+def pseudo_contradiction_caveat(
+    scored: Mapping[str, Any], production_shape: Mapping[str, Any] | None,
+) -> str:
+    """How the pseudo_contradiction class read under the shipped `contests` definition.
+
+    Derived from the scored confusion row, and from the band split where the
+    run measured one, so the counts have one source. It reports the reading
+    and asserts nothing about whether it is right: the records keep the labels
+    they were adjudicated under and are still scored against them.
+    """
+    label = LABEL_PSEUDO_CONTRADICTION
+    row = scored['confusion'][label]
+    n = scored['per_class'][label]['n']
+    breakdown = ', '.join(f'`{outcome}` {row[outcome]}' for outcome in EVAL_OUTCOMES)
+    band_split = (production_shape or {}).get('band_split') or {}
+    judged = (
+        f' (of the {band_split[label][OUTCOME_JUDGE]} the judge saw)'
+        if label in band_split else ''
+    )
+    return (
+        'Under the shipped `contests` definition — the entry says a candidate '
+        "is wrong, outdated or different (Leo's ruling 2026-09-30, "
+        "plans/write-triage-flip-readiness-prd.md §11.3 C1'') — the judge "
+        f'answered `contested` on {row[OUTCOME_CONTESTED]} of {n} {label} '
+        f'cases{judged}; all outcomes: {breakdown}. These records were '
+        'adjudicated NOT contradictions under the EARLIER definition ("cannot '
+        'be true at the same time"), and this report still scores `contested` '
+        'on them as wrong and counts it in false_contested. The fixture is '
+        'deliberately not relabelled, so this reports how the new definition '
+        'reads them without asserting which reading is right.'
+    )
+
+
 def build_report(
     *,
     scored: Mapping[str, Any],
@@ -1210,7 +1243,10 @@ def build_report(
             'available': False,
             'reason': CONTESTED_GROUND_TRUTH_REASON,
         },
-        'caveats': caveats_for(run_provenance.get('slate_mode')),
+        'caveats': [
+            *caveats_for(run_provenance.get('slate_mode')),
+            pseudo_contradiction_caveat(scored, production_shape),
+        ],
         'provenance': run_provenance,
     }
 
