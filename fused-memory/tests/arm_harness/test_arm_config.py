@@ -2,10 +2,10 @@
 
 import pytest
 from _mock_openai_server import mock_openai_server
-from arm_harness._fakes import embedding_spec, incumbent_control_spec, llm_spec
 from graphiti_core.llm_client import OpenAIClient
 from graphiti_core.prompts.models import Message
 
+from arm_harness._fakes import embedding_spec, incumbent_control_spec, llm_spec
 from fused_memory.arm_harness.arm_config import (
     LOCAL_ARM_API_KEY,
     embedding_arm_config,
