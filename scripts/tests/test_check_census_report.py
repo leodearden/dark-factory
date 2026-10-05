@@ -84,14 +84,15 @@ def write_report(
     sections: tuple[str, ...] | list[str] = SECTIONS,
     bodies: dict[str, str] | None = None,
     record: bool = True,
+    record_text: str | None = None,
     md: bool = True,
 ) -> None:
     method = method_for(stem) if method is None else method
     findings = [copy.deepcopy(FINDING)] if findings is None else findings
     plans_dir.mkdir(parents=True, exist_ok=True)
     if record:
-        doc = {"method": method, "findings": findings}
-        (plans_dir / f"{stem}.json").write_text(json.dumps(doc), encoding="utf-8")
+        text = json.dumps({"method": method, "findings": findings}) if record_text is None else record_text
+        (plans_dir / f"{stem}.json").write_text(text, encoding="utf-8")
     if md:
         overrides = bodies or {}
         parts = ["# confusion census\n\n"]
@@ -243,3 +244,111 @@ def test_rendering_without_method_heading_is_named_missing(tmp_path, capsys):
     assert rc == 1
     assert verdict["verdict"] == "nonconforming"
     assert "## Method" in verdict["missing"]
+
+
+STEM = "confusion-census-2026-10-20"
+
+
+def method_lacking(*keys: str) -> dict:
+    return {k: v for k, v in method_for(STEM).items() if k not in keys}
+
+
+def assert_nonconforming(rc: int, verdict: dict) -> None:
+    assert rc == 1
+    assert verdict["verdict"] == "nonconforming"
+
+
+def test_method_block_missing_keys_are_named(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM, bodies={"Method": method_section(method_lacking("extra", "inputs_consumed"))})
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert set(verdict["missing"]) == {"method.extra", "method.inputs_consumed"}
+    assert verdict["malformed"] == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Run notes first.\n\n" + method_section(method_for(STEM)),
+        "```json\n" + json.dumps(method_for(STEM)) + "\n```\n",
+    ],
+    ids=["prose-before-fence", "json-fence"],
+)
+def test_method_first_element_must_be_a_yaml_fence(tmp_path, capsys, body):
+    write_report(tmp_path / "plans", STEM, bodies={"Method": body})
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert "## Method yaml block" in verdict["missing"]
+
+
+UNPARSEABLE_YAML = "run_id: [unclosed\n"
+
+
+def yaml_error_text(text: str) -> str:
+    try:
+        yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        return str(exc).splitlines()[0]
+    raise AssertionError(f"expected {text!r} not to parse")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "```yaml\nrun_id: census-dark_factory-20261020\n",
+        "```yaml\n" + UNPARSEABLE_YAML + "```\n",
+        "```yaml\n- run_id\n- as_of_sha\n```\n",
+    ],
+    ids=["unclosed-fence", "invalid-yaml", "yaml-list"],
+)
+def test_method_block_unparseable_or_not_a_mapping_is_malformed(tmp_path, capsys, body):
+    write_report(tmp_path / "plans", STEM, bodies={"Method": body})
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert "## Method yaml block" in verdict["malformed"]
+    if UNPARSEABLE_YAML in body:
+        error = yaml_error_text(UNPARSEABLE_YAML)
+        assert any("## Method yaml block" in line and error in line for line in lines)
+
+
+def test_method_key_outside_extra_is_malformed(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM, bodies={"Method": method_section({**method_for(STEM), "screened": 3})})
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert "method.screened" in verdict["malformed"]
+    assert any("method.screened" in line and "extra" in line for line in lines[1:-1])
+
+
+def test_method_key_nested_under_extra_conforms(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM, method={**method_for(STEM), "extra": {"screened": 3}})
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert rc == 0
+    assert verdict["verdict"] == "conforms"
+
+
+def test_record_method_missing_keys_are_named(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM, method=method_lacking("cost"), bodies={"Method": method_section(method_for(STEM))})
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert verdict["missing"] == ["record.method.cost"]
+
+
+def test_record_without_method_is_named(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM, record_text=json.dumps({"findings": [FINDING]}))
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert "record.method" in verdict["missing"]
