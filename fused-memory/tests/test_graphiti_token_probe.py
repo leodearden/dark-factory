@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -51,6 +52,7 @@ async def test_window_reports_the_tokens_recorded_inside_it():
     async with measure_llm_tokens(client) as m:
         client.token_tracker.record('extract_nodes', 30, 10)
 
+    assert m.usage is not None
     assert m.usage == LlmTokenUsage(input_tokens=30, output_tokens=10, llm_calls=1)
     assert m.usage.total_tokens == 40
     assert m.usage.as_journal_dict() == {
@@ -179,7 +181,8 @@ class TestGraphitiBackendTokenProbe:
     @pytest.mark.asyncio
     async def test_probe_counts_tokens_on_the_backend_llm_client(self, mock_config):
         backend = GraphitiBackend(mock_config)
-        client = _attributing_client()
+        client = build_llm_client(mock_config)
+        assert client is not None
         backend._llm_client = client
 
         async with backend.token_probe() as m:
@@ -201,13 +204,16 @@ def no_ambient_openai_env(monkeypatch):
     monkeypatch.setenv('OPENAI_API_KEY', 'env-key-must-not-be-used')
 
 
-def _openai_arm_config(base_url: str, arm: str) -> FusedMemoryConfig:
-    client_class, _, mode = arm.partition('/')
+def _openai_arm_config(
+    base_url: str,
+    client_class: Literal['openai', 'openai_generic'],
+    mode: Literal['auto', 'json_object'],
+) -> FusedMemoryConfig:
     return FusedMemoryConfig(
         llm=LLMConfig(
             provider='openai',
             client_class=client_class,
-            structured_output_mode=mode or 'auto',
+            structured_output_mode=mode,
             model='mock-model',
             providers=LLMProvidersConfig(
                 openai=OpenAIProviderConfig(api_key='test-key', api_url=base_url),
@@ -239,13 +245,16 @@ def _chat_body(content: str, prompt_tokens: int, completion_tokens: int) -> dict
 
 @pytest.mark.timeout(60)
 @pytest.mark.asyncio
-@pytest.mark.parametrize('arm', ['openai', 'openai_generic/auto', 'openai_generic/json_object'])
+@pytest.mark.parametrize(
+    ('client_class', 'mode'),
+    [('openai', 'auto'), ('openai_generic', 'auto'), ('openai_generic', 'json_object')],
+)
 async def test_wire_usage_is_recorded_and_attributed_on_every_openai_shaped_arm(
-    no_ambient_openai_env, arm,
+    no_ambient_openai_env, client_class, mode,
 ):
     with mock_openai_server() as server:
         server.set_response('/chat/completions', _chat_body('{"ok": true}', 120, 45))
-        client = build_llm_client(_openai_arm_config(server.base_url, arm))
+        client = build_llm_client(_openai_arm_config(server.base_url, client_class, mode))
         assert client is not None
 
         async with measure_llm_tokens(client) as m:
