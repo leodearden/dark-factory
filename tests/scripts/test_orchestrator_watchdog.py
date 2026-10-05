@@ -4128,6 +4128,7 @@ def test_cli_report_flag_routes_to_report_only(monkeypatch: pytest.MonkeyPatch) 
     # ss/urllib I/O. raising=False: tolerates the attribute not existing yet
     # (pre-B4-impl) so this test can be written before the impl lands.
     monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
+    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
 
     exit_code = wdog._cli(["--report"])
 
@@ -4149,6 +4150,7 @@ def test_cli_report_flag_returns_reports_exit_code(monkeypatch: pytest.MonkeyPat
     # No-op the fused-memory liveness row (B4) — see comment in
     # test_cli_report_flag_routes_to_report_only above.
     monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
+    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
 
     assert wdog._cli(["--report"]) == 1
 
@@ -4224,6 +4226,7 @@ def test_cli_report_does_not_run_fm_staleness_pass(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(wdog, "report", lambda: 0)
     monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
+    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
     monkeypatch.setattr(
         wdog,
         "fused_memory_staleness_pass",
@@ -4243,6 +4246,7 @@ def test_cli_defaults_to_sys_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     # No-op the fused-memory liveness row (B4) — see comment in
     # test_cli_report_flag_routes_to_report_only above.
     monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None, raising=False)
+    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
 
     exit_code = wdog._cli()
 
@@ -6442,6 +6446,8 @@ def test_cli_report_includes_fused_memory_row(
     # socket for the recon-busy verdict nor depends on a real clock file.
     monkeypatch.setattr(wdog, "_read_last_fm_deploy_epoch", lambda: None)
     monkeypatch.setattr(wdog, "_fused_memory_recon_busy_verdict", lambda: "idle")
+    # The dashboard unit-parity row would otherwise run the real checker.
+    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
 
     exit_code = wdog._cli(["--report"])
 
@@ -11207,6 +11213,8 @@ def test_cli_report_exit_code_unchanged_by_the_new_fields(
         json.dumps({"count": 2, "verdict": "wedged", "ts": 1783000000.0})
     )
     monkeypatch.setattr(wdog, "report", lambda: 1)
+    # The dashboard unit-parity row would otherwise run the real checker.
+    monkeypatch.setattr(wdog, "_print_unit_parity", lambda: None, raising=False)
 
     assert wdog._cli(["--report"]) == 1
     assert "2/" in capsys.readouterr().out
@@ -12797,3 +12805,144 @@ def test_unit_parity_min_interval_falls_back_on_a_malformed_env_value(
     wdog = _load_watchdog()
 
     assert wdog.UNIT_PARITY_MIN_INTERVAL_SECS == 3600
+
+
+# ---------------------------------------------------------------------------
+# The dashboard unit-parity --report row (task 4883)
+#
+# The operator's "right now" view of the same check unit_parity_pass runs
+# hourly: never clock-gated, never writes a clock, never alters --report's
+# exit code. The checker itself is always faked.
+# ---------------------------------------------------------------------------
+
+
+def _parity_row(out: str) -> str:
+    """Return the single dashboard unit-parity row from --report output."""
+    rows = [line for line in out.splitlines() if line.startswith("dashboard unit parity")]
+    assert len(rows) == 1, f"expected exactly one parity row, got {rows!r} in {out!r}"
+    return rows[0]
+
+
+@pytest.mark.parametrize("verdict", ["parity", "drift", "absent", "unknown"])
+def test_print_unit_parity_prints_one_labelled_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], verdict: str
+) -> None:
+    """One row, in the fm row's ``LABEL: value | LABEL: value`` shape."""
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: (verdict, ""))
+
+    wdog._print_unit_parity()
+
+    row = _parity_row(capsys.readouterr().out)
+    assert verdict in row, row
+    assert " | " in row, f"the row must keep --report's LABEL: value | LABEL: value shape: {row!r}"
+
+
+def test_print_unit_parity_shows_the_drifted_directive(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """On drift the checker's report follows the row, naming the directive.
+
+    The operator must see WHICH directive drifted without a second command.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: ("drift", _DRIFT_REPORT))
+
+    wdog._print_unit_parity()
+
+    out = capsys.readouterr().out
+    assert "drift" in _parity_row(out)
+    assert "SuccessExitStatus" in out, out
+
+
+def test_print_unit_parity_is_not_clock_gated_and_writes_no_clock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--report answers RIGHT NOW, and leaves the timer path's cadence alone.
+
+    A fresh stamp would hold unit_parity_pass off; it must not hold the row
+    off. And a read-only doctor invocation must not move the clock, or running
+    --report would itself change when the next hourly check happens.
+    """
+    wdog = _load_watchdog()
+    clock = _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    clock.write_text(json.dumps({"ts": int(time.time()), "iso": "fresh"}) + "\n")
+    before = clock.read_bytes()
+    calls: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", _checker_run(calls, returncode=0))
+
+    wdog._print_unit_parity()
+
+    checker_runs = [
+        argv for argv in calls if any(a.endswith("check_dashboard_unit_parity.py") for a in argv)
+    ]
+    assert len(checker_runs) == 1, f"the row must run the checker despite a fresh stamp: {calls}"
+    assert clock.read_bytes() == before, "--report must never write the parity clock"
+    assert "parity" in _parity_row(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("report_rc", [0, 1])
+def test_cli_report_exit_code_is_unchanged_by_a_drifted_parity_row(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], report_rc: int
+) -> None:
+    """The parity row is informational: --report returns report()'s OWN code.
+
+    A drifted dashboard unit must not silently change what --report's exit
+    code means to its existing callers.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "report", lambda: report_rc)
+    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None)
+    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: ("drift", _DRIFT_REPORT))
+
+    assert wdog._cli(["--report"]) == report_rc
+    assert "drift" in _parity_row(capsys.readouterr().out)
+
+
+def test_cli_report_runs_no_mutating_pass_including_unit_parity(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--report never runs a timer-path pass — unit_parity_pass included.
+
+    That pass STAMPS a clock, so running it under --report would break the
+    read-only doctor contract even though the check itself is read-only.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(wdog, "report", lambda: 0)
+    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None)
+    monkeypatch.setattr(wdog, "unit_parity_verdict", lambda: ("parity", ""))
+    for name in (
+        "main",
+        "fused_memory_liveness_pass",
+        "staleness_pass",
+        "fused_memory_staleness_pass",
+        "unit_parity_pass",
+    ):
+        monkeypatch.setattr(
+            wdog,
+            name,
+            lambda name=name: pytest.fail(f"{name}() must not run under --report"),
+        )
+
+    assert wdog._cli(["--report"]) == 0
+    assert "parity" in _parity_row(capsys.readouterr().out)
+
+
+def test_print_unit_parity_degrades_to_unknown_on_an_unexpected_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A failure inside the verdict costs this row its verdict, not --report its run."""
+    wdog = _load_watchdog()
+    logged: list[str] = []
+    monkeypatch.setattr(wdog, "log", logged.append)
+    monkeypatch.setattr(wdog, "report", lambda: 0)
+    monkeypatch.setattr(wdog, "_print_fused_memory_liveness", lambda: None)
+
+    def boom() -> tuple[str, str]:
+        raise RuntimeError("parity checker exploded")
+
+    monkeypatch.setattr(wdog, "unit_parity_verdict", boom)
+
+    assert wdog._cli(["--report"]) == 0
+    assert "unknown" in _parity_row(capsys.readouterr().out)
+    assert any("parity checker exploded" in line for line in logged), logged
