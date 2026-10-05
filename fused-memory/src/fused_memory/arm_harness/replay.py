@@ -283,7 +283,8 @@ def _drain(finished: _Finished) -> list[EpisodeOutcome]:
 async def _cancel(in_flight: dict[str, asyncio.Task[None]]) -> tuple[str, ...]:
     for task in in_flight.values():
         task.cancel()
-    await asyncio.gather(*in_flight.values(), return_exceptions=True)
+    if in_flight:
+        await asyncio.wait(in_flight.values())
     return tuple(episode_id for episode_id, task in in_flight.items() if task.cancelled())
 
 
