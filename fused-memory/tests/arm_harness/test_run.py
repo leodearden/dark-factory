@@ -40,6 +40,7 @@ from fused_memory.arm_harness.run import (
     RUN_MANIFEST_FILENAME,
     PreRunCheckError,
     load_outcomes,
+    require_pre_run_checks,
     run_llm_arm,
     write_outcomes,
 )
@@ -258,6 +259,24 @@ async def test_a_code_sha_other_than_head_refuses_before_anything(run_arm, run_d
     assert list(run_dir.iterdir()) == []
     assert graph.events == []
     assert journal.calls == []
+
+
+def test_pre_run_checks_are_callable_alone_before_any_resource_is_opened(repo):
+    stale = incumbent_control_spec(code_sha=repo.without_prereg)
+    current = incumbent_control_spec(code_sha=repo.with_prereg)
+
+    with pytest.raises(PreRunCheckError) as caught:
+        require_pre_run_checks(stale, repo.root)
+    passed = require_pre_run_checks(current, repo.root)
+
+    assert InstrumentCheckId.CODE_SHA_MATCHES_CHECKOUT in {
+        check.check_id for check in caught.value.check_results if not check.passed
+    }
+    assert [check.check_id for check in passed] == [
+        InstrumentCheckId.CODE_SHA_MATCHES_CHECKOUT,
+        InstrumentCheckId.PREREGISTRATION_SHA,
+    ]
+    assert all(check.passed for check in passed)
 
 
 # --- (c) INV-4 abort -----------------------------------------------------------------

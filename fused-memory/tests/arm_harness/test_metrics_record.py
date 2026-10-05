@@ -22,6 +22,7 @@ from fused_memory.arm_harness.metrics_record import (
     IndexConfiguration,
     MetricsRecord,
     load_metrics_record,
+    load_metrics_records,
     record_for,
     serialize_metrics_record,
     write_metrics_record,
@@ -261,3 +262,25 @@ def test_write_validates_before_creating_anything(tmp_path):
         write_metrics_record(malformed, tmp_path)
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_load_metrics_records_reads_back_every_record_a_run_dir_holds(tmp_path):
+    spec = embedding_spec()
+    written = [
+        record_for(spec, _scalar('mrr', 0.4), measured_at=MEASURED_AT, incomplete=False,
+                   index_configuration=configuration)
+        for configuration in IndexConfiguration
+    ] + [record_for(spec, _scalar('reembed-throughput', 9.0), measured_at=MEASURED_AT,
+                    incomplete=False)]
+    for record in written:
+        write_metrics_record(record, tmp_path)
+
+    loaded = load_metrics_records(tmp_path)
+
+    assert sorted(loaded, key=serialize_metrics_record) == sorted(
+        written, key=serialize_metrics_record
+    )
+
+
+def test_load_metrics_records_of_a_run_dir_without_metrics_is_empty(tmp_path):
+    assert load_metrics_records(tmp_path) == ()
