@@ -146,6 +146,17 @@ class TestCoerceFiles:
             'residual bracket/quote characters' in r.getMessage() for r in caplog.records
         )
 
+    @pytest.mark.parametrize('value', [{'a.py': 1}, 42])
+    def test_unrecognized_type_maps_to_empty_and_logs_warning(self, caplog, value):
+        """A ``files`` value read back from a stored plan has passed no
+        pydantic boundary, so a type that is neither list, str nor None must
+        degrade to no files, loudly, rather than raise."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+            result = _coerce_files(value)
+
+        assert result == []
+        assert any('unrecognized type' in r.getMessage() for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Architect tool tests
@@ -914,6 +925,57 @@ class TestDropPlanFile:
         assert result['status'] == 'error'
         assert result['message']
         self._assert_record_untouched(artifacts, ['mod_a/only.py'])
+
+    def test_stringified_files_are_normalized_not_iterated_by_character(
+        self, artifacts
+    ):
+        """A stored non-list ``files`` must be coerced, not treated as a
+        string whose substrings and characters are the "entries"."""
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = '["mod_a/foo.py","mod_a/bar.py"]'
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/foo.py', reason='Needed no edit'
+        )
+
+        assert result['status'] == 'ok'
+        assert artifacts.read_plan()['files'] == ['mod_a/bar.py']
+
+    def test_stringified_files_single_entry_still_refuses_last_drop(
+        self, artifacts
+    ):
+        stored = '["mod_a/only.py"]'
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = stored
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/only.py', reason='Turned out unnecessary'
+        )
+
+        assert result['status'] == 'error'
+        assert 'last file' in result['message']
+        self._assert_record_untouched(artifacts, stored)
+
+    @pytest.mark.parametrize('stored', [{'mod_a/foo.py': True}, 42])
+    def test_unrecognized_stored_files_type_is_refused_not_raised(
+        self, artifacts, stored
+    ):
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = stored
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/foo.py', reason='Needed no edit'
+        )
+
+        assert result['status'] == 'error'
+        assert 'not in the plan files list' in result['message']
+        self._assert_record_untouched(artifacts, stored)
 
 
 class TestRemovePlanStep:
