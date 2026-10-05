@@ -2514,3 +2514,30 @@ class ExitContractViolationCollector(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         if getattr(record, self._verdict_attribute, None) == self._violation:
             self.violations.append(record)
+
+
+def write_exec_script(project_root: Path, rel_path: str, body: str) -> None:
+    """Write *body* to *rel_path* under *project_root* and mark it executable.
+
+    Backs a ``kind='script'`` delivered check: a missing script produces a
+    genuine ``FileNotFoundError`` from the subprocess spawn (->
+    ``DeliveredCheckResult.ERRORED``), and writing + chmod-ing it makes the
+    real (unmocked) runner succeed on the next evaluation. Deliberately NOT
+    committed to git — the script kind is evaluated against the WORKING
+    CHECKOUT, not the committed ``main`` tree (unlike the grep kind; see
+    ``orchestrator.delivered_checks``'s module docstring).
+    """
+    target = project_root / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(body, encoding='utf-8')
+    os.chmod(target, 0o755)
+
+
+def script_check(name: str, script_rel_path: str, *, timeout_secs: float = 5) -> dict:
+    """Build a script-kind ``metadata.delivered_checks`` entry — the same
+    shape ``commit_planning`` stamps from a capability-manifest sidecar's
+    script capability."""
+    return {
+        'name': name, 'kind': 'script', 'script': script_rel_path,
+        'args': [], 'timeout_secs': timeout_secs,
+    }
