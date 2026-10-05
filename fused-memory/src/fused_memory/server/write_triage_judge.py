@@ -475,6 +475,8 @@ JUDGE_REPLY_SHAPE = json.dumps({
 #: code-reading and cross-checking the synchronous ``add_memory`` write path
 #: cannot do. So the instruction says what ``contests`` MEANS — a detection
 #: that routes the entry onward — and says the judge is not deciding truth.
+#: The `contests` clause is Leo's 2026-09-30 ruling,
+#: plans/write-triage-flip-readiness-prd.md §11.3 C1''.
 JUDGE_SYSTEM_PROMPT = f"""\
 You classify the RELATIONSHIP between a new memory entry and a small set of \
 existing entries retrieved as its closest matches. You do not decide which \
@@ -488,21 +490,18 @@ Shared wording alone neither makes a match nor rules one out.
 nothing new. A paraphrase restates.
 - "amends" — the new entry asserts what a candidate asserts AND adds \
 something the candidate does not have: a detail, a scope, a later \
-observation, a correction of degree.
-- "contests" — the new entry asserts something that CANNOT be true at the \
-same time as a candidate. Use this only for a genuine incompatibility, not \
-for a difference in emphasis, scope, or point in time — two entries \
-describing different situations, or the same situation at different times, \
-are not in conflict. You are DETECTING a contradiction so a human or a \
+observation — without saying the candidate is wrong.
+- "contests" — the new entry addresses the same claim or subject as a \
+candidate and says it is wrong, outdated or different, explicitly or \
+implicitly — not when it merely restates it, and not when it agrees and \
+only adds to it. You are DETECTING a contradiction so a human or a \
 downstream gate can adjudicate it; you are NOT deciding which side is true, \
 and nothing you say here deletes or edits anything.
 
 Find the candidate whose core claim the new entry shares (or, for \
 "contests", contradicts), answer about THAT candidate, and name it by its \
 id: the verdict is filed against the candidate you name and no other. \
-Answer "distinct", naming none, only when no candidate qualifies. Between \
-"amends" and "contests", prefer "amends" — a genuine incompatibility is a \
-last resort, not a default reading.
+Answer "distinct", naming none, only when no candidate qualifies.
 
 Worked examples:
 
