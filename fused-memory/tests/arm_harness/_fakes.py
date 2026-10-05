@@ -1,13 +1,17 @@
 """Shared arm-harness test doubles: valid spec builders and public-Protocol fakes."""
 
 import asyncio
+import dataclasses
+import subprocess
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec
+from fused_memory.arm_harness.instrument_checks import PREREGISTRATION_DOC_PATH
 from fused_memory.arm_harness.run_manifest import RunManifest
 from fused_memory.backends.llm_token_usage import (
     AttributingTokenUsageTracker,
@@ -222,3 +226,39 @@ class RecordingJournal:
 
     async def log_backend_op(self, **kwargs: Any) -> None:
         self.calls.append(('log_backend_op', kwargs))
+
+
+def git(root: Path, *args: str) -> str:
+    """Run real git in ``root`` with a throwaway identity; returns stripped stdout."""
+    completed = subprocess.run(
+        ['git', '-C', str(root), '-c', 'user.name=T', '-c', 'user.email=t@e.example',
+         '-c', 'commit.gpgsign=false', *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+@dataclasses.dataclass(frozen=True)
+class PreregRepo:
+    root: Path
+    without_prereg: str
+    with_prereg: str
+
+
+def make_prereg_repo(root: Path) -> PreregRepo:
+    """A real two-commit repo at ``root``: the second (HEAD) commit adds the preregistration doc."""
+    root.mkdir(parents=True)
+    git(root, 'init', '-q', '-b', 'main')
+    (root / 'seed.txt').write_text('seed\n')
+    git(root, 'add', '-A')
+    git(root, 'commit', '-q', '--no-verify', '-m', 'seed')
+    without_prereg = git(root, 'rev-parse', 'HEAD')
+    doc = root / PREREGISTRATION_DOC_PATH
+    doc.parent.mkdir(parents=True)
+    doc.write_text('# preregistration\n')
+    git(root, 'add', '-A')
+    git(root, 'commit', '-q', '--no-verify', '-m', 'prereg')
+    with_prereg = git(root, 'rev-parse', 'HEAD')
+    return PreregRepo(root=root, without_prereg=without_prereg, with_prereg=with_prereg)

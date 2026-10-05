@@ -2,7 +2,6 @@
 
 import dataclasses
 import json
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,7 +9,13 @@ import pytest
 from pydantic import ValidationError
 from shared.memory_eval_metrics import Metric
 
-from arm_harness._fakes import incumbent_control_spec, llm_spec, run_manifest_for
+from arm_harness._fakes import (
+    PreregRepo,
+    incumbent_control_spec,
+    llm_spec,
+    make_prereg_repo,
+    run_manifest_for,
+)
 from fused_memory.arm_harness.instrument_checks import (
     PREREGISTRATION_DOC_PATH,
     CheckResult,
@@ -31,41 +36,9 @@ from fused_memory.arm_harness.run_manifest import (
 MEASURED_AT = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
 
 
-def _git(root: Path, *args: str) -> str:
-    completed = subprocess.run(
-        ['git', '-C', str(root), '-c', 'user.name=T', '-c', 'user.email=t@e.example',
-         '-c', 'commit.gpgsign=false', *args],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return completed.stdout.strip()
-
-
-@dataclasses.dataclass(frozen=True)
-class Repo:
-    root: Path
-    without_prereg: str
-    with_prereg: str
-
-
 @pytest.fixture
-def repo(tmp_path: Path) -> Repo:
-    """A real two-commit repo: the second commit adds the preregistration doc."""
-    root = tmp_path / 'repo'
-    root.mkdir()
-    _git(root, 'init', '-q', '-b', 'main')
-    (root / 'seed.txt').write_text('seed\n')
-    _git(root, 'add', '-A')
-    _git(root, 'commit', '-q', '--no-verify', '-m', 'seed')
-    without_prereg = _git(root, 'rev-parse', 'HEAD')
-    doc = root / PREREGISTRATION_DOC_PATH
-    doc.parent.mkdir(parents=True)
-    doc.write_text('# preregistration\n')
-    _git(root, 'add', '-A')
-    _git(root, 'commit', '-q', '--no-verify', '-m', 'prereg')
-    with_prereg = _git(root, 'rev-parse', 'HEAD')
-    return Repo(root=root, without_prereg=without_prereg, with_prereg=with_prereg)
+def repo(tmp_path: Path) -> PreregRepo:
+    return make_prereg_repo(tmp_path / 'repo')
 
 
 # --- CheckResult ---------------------------------------------------------------------
@@ -94,7 +67,7 @@ def test_check_result_is_frozen():
 # --- code sha vs checkout ------------------------------------------------------------
 
 
-def test_code_sha_check_passes_on_a_clean_checkout_at_the_spec_sha(repo: Repo):
+def test_code_sha_check_passes_on_a_clean_checkout_at_the_spec_sha(repo: PreregRepo):
     result = check_code_sha_matches_checkout(llm_spec(code_sha=repo.with_prereg), repo.root)
 
     assert result.check_id is InstrumentCheckId.CODE_SHA_MATCHES_CHECKOUT
@@ -102,7 +75,7 @@ def test_code_sha_check_passes_on_a_clean_checkout_at_the_spec_sha(repo: Repo):
     assert result.offenders == ()
 
 
-def test_code_sha_check_fails_when_head_differs(repo: Repo):
+def test_code_sha_check_fails_when_head_differs(repo: PreregRepo):
     result = check_code_sha_matches_checkout(llm_spec(code_sha=repo.without_prereg), repo.root)
 
     assert not result.passed
@@ -111,7 +84,7 @@ def test_code_sha_check_fails_when_head_differs(repo: Repo):
     assert repo.with_prereg in result.detail
 
 
-def test_code_sha_check_fails_on_a_dirty_tree_listing_the_dirty_paths(repo: Repo):
+def test_code_sha_check_fails_on_a_dirty_tree_listing_the_dirty_paths(repo: PreregRepo):
     (repo.root / 'seed.txt').write_text('edited\n')
     (repo.root / 'untracked.txt').write_text('new\n')
 
@@ -140,13 +113,13 @@ def test_a_control_arm_needs_no_preregistration(tmp_path: Path):
     assert result.passed, result.detail
 
 
-def test_a_candidate_passes_when_its_sha_carries_the_preregistration_doc(repo: Repo):
+def test_a_candidate_passes_when_its_sha_carries_the_preregistration_doc(repo: PreregRepo):
     result = check_preregistration_sha(llm_spec(preregistration_sha=repo.with_prereg), repo.root)
 
     assert result.passed, result.detail
 
 
-def test_a_candidate_fails_when_its_sha_lacks_the_preregistration_doc(repo: Repo):
+def test_a_candidate_fails_when_its_sha_lacks_the_preregistration_doc(repo: PreregRepo):
     result = check_preregistration_sha(
         llm_spec(preregistration_sha=repo.without_prereg), repo.root
     )
@@ -156,7 +129,7 @@ def test_a_candidate_fails_when_its_sha_lacks_the_preregistration_doc(repo: Repo
     assert PREREGISTRATION_DOC_PATH in result.detail
 
 
-def test_a_candidate_fails_on_a_sha_the_repo_does_not_have(repo: Repo):
+def test_a_candidate_fails_on_a_sha_the_repo_does_not_have(repo: PreregRepo):
     result = check_preregistration_sha(llm_spec(preregistration_sha='d' * 40), repo.root)
 
     assert not result.passed
