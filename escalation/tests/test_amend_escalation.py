@@ -212,10 +212,12 @@ class TestQueueAmend:
             "re-sending the record's own framing must not rewrite anything"
         )
 
-        ruling = {'summary': 'a genuinely new ruling', 'agent_role': 'interactive'}
-        assert queue.amend(l2.id, **ruling)['status'] == 'amended'
+        ruling = 'a genuinely new ruling'
+        assert queue.amend(
+            l2.id, summary=ruling, agent_role='interactive',
+        )['status'] == 'amended'
         after_real = _json_files(queue)
-        again = queue.amend(l2.id, **ruling)
+        again = queue.amend(l2.id, summary=ruling, agent_role='interactive')
         assert again['status'] == 'repeat_framing'
         assert again['recorded'] is False
         assert len(_on_disk(queue, l2.id).amendments) == 1
