@@ -477,24 +477,13 @@ _MCP_FANOUT_OK_GRACE_SECONDS = 30.0
 
 # How long a LIVE probe may be outstanding before it is reported as a wedge.
 #
-# WHAT THIS CLOSES. Only a completed probe stamps the grace, so on an
-# UNATTENDED dashboard the grace lapses every 30.0 s, and without this bound
-# every later /healthz would launch a probe it cannot possibly observe inside
-# a 0.2 s budget and report ``'timeout'`` — a strict 503/200 alternation on an
-# idle but perfectly healthy dashboard, which is a false alarm on the very
-# signal this check adds.
-#
-# So a probe that is merely YOUNG reports ``'probing'``, not ``'timeout'``: a
-# fan-out started a moment ago has demonstrated nothing yet, and saying
-# otherwise is the same unknown-reported-as-fact the ``degraded`` vs
-# ``offline`` split exists to prevent.
-#
-# The value is derived from the fact it bounds: a healthy cold whole-tree
-# fetch of the largest measured tree costs ~6 s, which
-# ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET`` (7.0) caps. A probe outstanding for
-# 20.0 s has outlived that budget nearly three times over, so it is no longer
-# young, and the wedge is reported for as long as it lasts — the 19.8 h fact
-# nothing reported. Invariant (machine-checked by
+# Only a completed probe stamps the grace, so an unattended dashboard's grace
+# lapses every 30.0 s and the next /healthz launches a probe it cannot observe
+# inside 0.2 s. Younger than this, that probe reports 'probing' -- it has shown
+# nothing yet -- rather than a false 'timeout'. Older, it has outlived
+# tasks.DEFAULT_WHOLE_OPERATION_BUDGET (the cap on a healthy cold whole-tree
+# fetch) nearly three times over, and the wedge is reported for as long as it
+# lasts. Invariant (machine-checked by
 # test_healthz_data_plane_budget_is_structurally_deliverable):
 #   _MCP_PROBE_OUTSTANDING_LIMIT >= tasks.DEFAULT_WHOLE_OPERATION_BUDGET
 _MCP_PROBE_OUTSTANDING_LIMIT = 20.0

@@ -30,11 +30,9 @@ different clocks: the TTL is 15 s, the last good is held for
 
 A FULLY-STALE UNIT IS ITSELF CACHED for the TTL (``cache_ok`` is left at its
 always-true default). That is the only retry suppression on this path: a wedged
-root costs one attempt per 15 s instead of one per 3 s browser poll. It took
-over from the 5 s offline-marker cache that once sat under ``fetch_tasks``,
-which task 5598 removed. The price is up to 15 s of recovery latency — a
-recovered root is noticed on the next refresh, not on the next poll — and that
-is deliberate.
+root costs one attempt per 15 s instead of one per 3 s browser poll. The price
+is up to 15 s of recovery latency — a recovered root is noticed on the next
+refresh, not on the next poll — and that is deliberate.
 """
 
 from __future__ import annotations
@@ -141,10 +139,8 @@ halves.
 SNAPSHOT_TTL_SECONDS = 15.0
 """How long one acquired unit is served before both halves are re-read.
 
-THE ONLY TTL ON THIS PATH. Nothing beneath the unit caches — the 5 s
-``fetch_statuses`` cache and the 20 s ``fetch_tasks`` cache were removed
-(tasks 5587 and 5598) — so no read underneath can return a value older than
-the ``as_of`` this unit stamps on it.
+THE ONLY TTL ON THIS PATH. Nothing beneath the unit caches, so no read
+underneath can return a value older than the ``as_of`` this unit stamps on it.
 
 15 s sits inside the PRD's 15-30 s staleness window for a monitoring view, and
 is five times ``data.js``'s 3 s poll, so a browser polling two endpoints that

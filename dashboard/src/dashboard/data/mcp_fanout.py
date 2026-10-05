@@ -56,17 +56,11 @@ from typing_extensions import TypeVar as TypeVarD
 logger = logging.getLogger(__name__)
 
 V = TypeVar('V')
-# TTLCache's KEY type. Defaulted to `str` and declared TRAILING so every
-# existing single-argument `TTLCache[V]` keeps checking unedited — a
-# defaulted TypeVar may not precede a non-defaulted one, so V stays first.
-#
-# THE TRADE, since the result reads backwards against every stdlib mapping
-# generic (`TTLCache[dict, _AnalyticsKey]` looks like `Mapping[value, key]`):
-# declaring K FIRST with no default would read conventionally, at the cost of
-# editing all six single-argument `TTLCache[V]` annotations in src plus 32 in
-# test_mcp_fanout.py — churn across five modules, none of which cares what the
-# key type is. The default was chosen instead, and the inversion it forces is
-# deliberate rather than a typo.
+# TTLCache's KEY type. Defaulted to `str` and declared TRAILING so a
+# single-argument `TTLCache[V]` annotation checks without naming a key type —
+# a defaulted TypeVar may not precede a non-defaulted one, so V stays first.
+# The value-first order (`TTLCache[dict, _AnalyticsKey]`) therefore reads
+# backwards against `Mapping[key, value]`, deliberately rather than by typo.
 K = TypeVarD('K', default=str)
 
 
@@ -109,7 +103,7 @@ _failure_streaks: dict[tuple[str, str], int] = {}
 # The task-snapshot path has exactly ONE per-key lock: the unit's own
 # task_snapshot._snapshot_cache. Nothing beneath the unit has a
 # get_or_refresh at all — tasks.fetch_statuses and tasks.fetch_tasks are live
-# reads (task 5598) — so a wedged read can only ever be parked inside that
+# reads — so a wedged read can only ever be parked inside that
 # one refresh.
 #
 # Whether this bound is reachable on that lock depends on the caller's
@@ -154,7 +148,7 @@ _LOCK_BYPASS_REWARN_EVERY = 100
 # point UNRELATED endpoint families start raising httpx.PoolTimeout — turning
 # the incident's per-key outage (3 of 14 endpoints dead, the other 11 healthy
 # for the full 19.8h) into a whole-dashboard one. The amplification is worse
-# for the two to_thread-backed caches (app._analytics_cache,
+# for the two to_thread-backed caches (api.escalations._analytics_memo,
 # app._memory_evals_cache): abandoned to_thread work cannot be cancelled at
 # all, so each re-arm permanently consumes a default-executor worker.
 #

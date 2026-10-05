@@ -30,9 +30,7 @@ root, so its fixed label is already a correct single key.
 
 Caching: none. Every read here is live; staleness is owned by
 ``task_snapshot``'s unit TTL, the one cache a task datum has
-(one-datum-one-path PRD decision 20). ``fetch_tasks`` held a 20 s TTL cache
-and a 5 s offline-marker cache until task 5598, and ``fetch_statuses`` a 5 s
-cache until task 5587. ``fetch_task``'s caller owns its cache
+(one-datum-one-path PRD decision 20). ``fetch_task``'s caller owns its cache
 (``task_lookup``), because only the caller knows which answers may be held.
 """
 
@@ -123,12 +121,10 @@ guarantee it is not.
 # ---------------------------------------------------------------------------
 # The task read record: structured, not an encoded string
 # ---------------------------------------------------------------------------
-# These replaced a hand-rolled string encoder (a ``*`` sentinel for None, ``|``
-# field separators and a ``\x1f`` unit separator) whose OFFSET rendering
-# disagreed with the wire request it stood for.  The cache that encoder keyed
-# is gone (task 5598); the record survives as the one source of a read's wire
-# arguments.  The only read that HAS an offset is :class:`_OnePage`, and
-# ``wire_arguments`` sends THAT field rather than a window handed to it.
+# A read's MCP wire arguments are derived from one record, so no second copy
+# of a window can disagree with the read it stands for.  The only read that
+# HAS an offset is :class:`_OnePage`, and ``wire_arguments`` sends THAT field
+# rather than a window handed to it.
 #
 # The mode is a UNION rather than three flat fields because flat fields would
 # permit `page_size` set with `offset` unset, and a read that is somehow both a
@@ -161,8 +157,8 @@ class _TasksRead:
     """One task read: the record its MCP wire arguments are derived from.
 
     The request dict is derived from this record, never assembled beside it,
-    so a read and the request it sends cannot disagree about ``offset`` the
-    way two separate encoders once did.  For a PAGE read that is enforced
+    so a read and the request it sends cannot disagree about ``offset``.
+    For a PAGE read that is enforced
     rather than merely intended: :meth:`wire_arguments` reads the window off
     :attr:`mode` and REFUSES a second one, so no call site can hand the wire a
     window the read does not name.
@@ -215,13 +211,12 @@ class _TasksRead:
 # Safe page size for the fetch_statuses walk
 # ---------------------------------------------------------------------------
 #
-# NO CACHE sits here, deliberately, and that is a change: fetch_statuses held
-# a 5 s TTL cache until task 5587.  Its only consumer now is
-# ``task_snapshot.acquire_snapshot``, which owns a 15 s TTL over the whole
-# snapshot unit — a second, shorter TTL layered under that one is the
-# duplicated staleness the one-datum-one-path PRD removes, and it would let
-# the unit stamp an ``as_of`` newer than the map it is stamping.  The row
-# reads lost their cache for the same reason (task 5598).
+# NO CACHE sits here, deliberately.  The only consumer,
+# ``task_snapshot.acquire_snapshot``, owns a 15 s TTL over the whole snapshot
+# unit — a second, shorter TTL layered under that one is the duplicated
+# staleness the one-datum-one-path PRD removes, and it would let the unit
+# stamp an ``as_of`` newer than the map it is stamping.  The row reads are
+# uncached for the same reason.
 
 STATUSES_SAFE_PAGE_SIZE = 2000
 """How many statuses one ``get_statuses`` page may carry.
