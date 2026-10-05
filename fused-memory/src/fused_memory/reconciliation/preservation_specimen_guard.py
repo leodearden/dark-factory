@@ -55,7 +55,7 @@ through the one shared splitter, ``flag_task_ids.task_id_components``.
 LEAF CONTRACT.  This module imports only from
 ``standing_decision_constants`` (for the one genuinely shared fact, the
 ``investigation_outcome`` mem0 kind), ``flag_task_ids`` (the shared flag
-task-id splitter), ``flag_dedup`` (its public ``contains_any_casefolded``
+task-id splitter), ``flag_shape`` (the leaf ``contains_any_casefolded``
 matcher), ``services.memory_service`` (for the canonical raw-payload content
 extractor) and, optionally, ``escalation.dedupe.file_or_fold_l1``.  It reaches
 nothing in ``stages/``, ``middleware/`` or ``prompts/``; the consolidator
@@ -83,7 +83,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from fused_memory.reconciliation.flag_dedup import contains_any_casefolded
+from fused_memory.reconciliation.flag_shape import contains_any_casefolded
 from fused_memory.reconciliation.flag_task_ids import task_id_components
 from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,

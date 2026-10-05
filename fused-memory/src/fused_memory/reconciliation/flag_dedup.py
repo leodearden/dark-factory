@@ -361,6 +361,7 @@ from fused_memory.reconciliation.flag_record_contract import (
     canonical_flag_types,
     normalize_flag_record_metadata,
 )
+from fused_memory.reconciliation.flag_shape import contains_any_casefolded
 from fused_memory.reconciliation.flag_task_ids import task_id_components
 from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import (
@@ -863,19 +864,6 @@ def extract_flag_uuids(flag: dict[str, Any]) -> set[str]:
     values are ignored.  Pure, sync, no I/O.
     """
     return _extract_uuids(_flag_text_blob(flag))
-
-
-def contains_any_casefolded(text: Any, family: tuple[str, ...]) -> bool:
-    """Return True iff *text* is a non-empty ``str`` containing a *family* member.
-
-    Both sides are casefolded and a member matches as a SUBSTRING.  Total over
-    malformed input: a non-``str`` or empty *text* is ``False``, never an
-    exception.  Pure, sync, no I/O.
-    """
-    if not isinstance(text, str) or not text:
-        return False
-    folded = text.casefold()
-    return any(member.casefold() in folded for member in family)
 
 
 def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
