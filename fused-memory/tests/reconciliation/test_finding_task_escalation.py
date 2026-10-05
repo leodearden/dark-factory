@@ -8,7 +8,7 @@ on plain dicts with no harness, no journal, no event buffer and no tmp_path.
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+from dataclasses import dataclass
 
 import pytest
 
@@ -415,7 +415,14 @@ class TestBuildFindingTaskEscalationKwargs:
 _REAPER_DETAIL_SUFFIX = '\n\n[note] originating worktree may be reaped; branch=task/4458'
 
 
-def _record(fp: str | None = 'fp-a', **over) -> SimpleNamespace:
+@dataclass
+class _PendingRecord:
+    category: str
+    level: int
+    detail: str
+
+
+def _record(fp: str | None = 'fp-a', **over) -> _PendingRecord:
     """A pending routed record as `get_by_task` hands it to the coverage check."""
     payload = build_finding_task_escalation_kwargs(
         _finding_with_task(),
@@ -427,7 +434,7 @@ def _record(fp: str | None = 'fp-a', **over) -> SimpleNamespace:
     )
     fields = {k: payload[k] for k in ('category', 'level', 'detail')}
     fields.update(over)
-    return SimpleNamespace(**fields)
+    return _PendingRecord(**fields)
 
 
 class TestRoutedRecordCoversFinding:
