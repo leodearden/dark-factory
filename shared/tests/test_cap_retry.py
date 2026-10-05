@@ -2617,6 +2617,38 @@ class TestCapRetryUnattributedCapHit:
         assert kw['capped'] is True, (
             f'Expected capped=True for unattributed cap hit, got capped={kw["capped"]!r}'
         )
+        assert kw['capped_reason'] == 'account', (
+            'Widening capped to ceiling kills must preserve its original meaning: an '
+            f'unattributed account cap records capped_reason=account, got {kw["capped_reason"]!r}'
+        )
+
+    async def test_account_reason_outranks_a_ceiling_reason(self):
+        """An unattributed usage cap ends the run before any ceiling could be
+        reached, so 'account' wins even when the numeric turn fallback would
+        also fire (turns=1 >= max_turns=1 on a failed result)."""
+        gate = _mock_gate(
+            account_count=1,
+            detect_cap_hit=MagicMock(return_value=False),
+        )
+        gate._handle_cap_detected = MagicMock(return_value=False)
+        gate.lease_is_current = MagicMock(return_value=False)
+        heuristic_result = self._make_heuristic_result()
+
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=heuristic_result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'unattributed-capped-at-turns',
+                cost_store=cost_store, prompt='hi', max_turns=1, max_budget_usd=5.0,
+            )
+
+        kw = cost_store.save_invocation.call_args.kwargs
+        assert kw['capped'] is True
+        assert kw['capped_reason'] == 'account'
 
     async def test_save_invocation_capped_false_for_normal_success(self):
         """cost_store.save_invocation uses capped=False for a normal successful result.
@@ -2647,6 +2679,95 @@ class TestCapRetryUnattributedCapHit:
         assert kw['capped'] is False, (
             f'Expected capped=False for normal success, got capped={kw["capped"]!r}'
         )
+        assert kw['capped_reason'] is None, (
+            f'Expected capped_reason=None for normal success, got {kw["capped_reason"]!r}'
+        )
+
+
+@pytest.mark.asyncio
+class TestSaveInvocationCeilingAndModelId:
+    """``invoke_with_cap_retry``'s ``save_invocation`` records which configured
+    ceiling ended the run and the exact CLI-served model id (task 4826).
+
+    Results here are long, costly runs — never the zero-cost instant exit the
+    heuristic cap net converts into a synthetic cap hit — so each reaches
+    ``save_invocation`` exactly once with the ceiling attribution under test.
+    """
+
+    async def _save_kwargs(self, result: AgentResult, **invoke_kwargs) -> dict:
+        gate = _mock_gate(
+            account_count=1,
+            detect_cap_hit=MagicMock(return_value=False),
+        )
+        cost_store = MagicMock()
+        cost_store.save_invocation = AsyncMock()
+
+        with (
+            patch(_INVOKE_PATCH, new_callable=AsyncMock, return_value=result),
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await invoke_with_cap_retry(
+                gate, 'ceiling-task', cost_store=cost_store, prompt='hi', **invoke_kwargs,
+            )
+
+        cost_store.save_invocation.assert_awaited_once()
+        return cost_store.save_invocation.call_args.kwargs
+
+    async def test_budget_subtype_records_budget_cap(self):
+        result = make_result(
+            success=False, subtype='error_max_budget_usd',
+            cost_usd=5.02, turns=31, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(result, model='opus', max_budget_usd=5.0, max_turns=100)
+        assert kw['capped'] is True
+        assert kw['capped_reason'] == 'budget'
+
+    async def test_turns_subtype_records_turns_cap(self):
+        result = make_result(
+            success=False, subtype='error_max_turns',
+            cost_usd=1.4, turns=100, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(result, model='opus', max_budget_usd=5.0, max_turns=100)
+        assert kw['capped'] is True
+        assert kw['capped_reason'] == 'turns'
+
+    async def test_ceilings_are_read_from_the_invoke_kwargs(self):
+        """The numeric fallback compares against the max_budget_usd that
+        reached invoke_with_cap_retry via **invoke_kwargs."""
+        result = make_result(
+            success=False, subtype='error_during_execution',
+            cost_usd=5.0, turns=12, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(result, model='opus', max_budget_usd=5.0, max_turns=100)
+        assert kw['capped'] is True
+        assert kw['capped_reason'] == 'budget'
+
+    async def test_successful_run_at_its_budget_is_not_capped(self):
+        result = make_result(
+            success=True, subtype='success',
+            cost_usd=5.0, turns=100, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(result, model='opus', max_budget_usd=5.0, max_turns=100)
+        assert kw['capped'] is False
+        assert kw['capped_reason'] is None
+
+    async def test_exact_model_id_is_recorded_beside_the_alias(self):
+        """The crux of task 4826: ``model`` keeps the lineage alias the caller
+        routed on, while ``model_id`` carries the exact version that served the
+        run — asserted to differ in the SAME call."""
+        result = make_result(cost_usd=0.5, duration_ms=60_000, model_id='claude-opus-5')
+        kw = await self._save_kwargs(result, model='opus')
+        assert kw['model'] == 'opus'
+        assert kw['model_id'] == 'claude-opus-5'
+        assert kw['model'] != kw['model_id']
+
+    async def test_model_id_none_passes_through_as_none(self):
+        """No transcript → NULL, the honest unknown; never the alias."""
+        result = make_result(cost_usd=0.5, duration_ms=60_000)
+        kw = await self._save_kwargs(result, model='sonnet')
+        assert 'model_id' in kw
+        assert kw['model_id'] is None
+        assert kw['model'] == 'sonnet'
 
 
 # ===================================================================
