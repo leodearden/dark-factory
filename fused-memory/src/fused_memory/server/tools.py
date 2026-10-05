@@ -3375,8 +3375,8 @@ def create_mcp_server(
 
         * ``routed`` — what triage did with the write, one of ``stored``
           (a new standalone memory), ``restated`` (it restates an existing
-          memory), ``amended`` (it adds to one) or ``contested`` (it
-          contradicts one).
+          memory), ``amended`` (it adds to one) or ``contested`` (it says
+          one is wrong, outdated or different).
         * ``canonical_id`` — the memory the write was attached to. Present
           ONLY on an attach outcome; absent entirely for ``stored``.
 
@@ -3388,7 +3388,9 @@ def create_mcp_server(
 
         A ``contested`` write becomes an AMENDMENT CHILD flagged as contesting
         its parent. Nothing was blocked and nothing was decided: triage
-        DETECTS that your write contradicts the memory it names, it does not
+        DETECTS that your write says the memory it names is wrong, outdated
+        or different, explicitly or implicitly (ruling:
+        plans/write-triage-flip-readiness-prd.md §11.3 C1''); it does not
         adjudicate which of the two is right. Your full text is stored and
         readable in the canonical's grouped document (amendment text is
         digested there; sighting text is only counted) and marked as
@@ -3396,8 +3398,8 @@ def create_mcp_server(
         adjudication is scheduled and nothing is escalated: the flag is a
         marker a human reads, not a work item anything picks up. Getting a ``contested`` ack is not a
         rejection and needs no action from you — but it is the ack worth
-        reading, because it says the corpus now holds two claims that cannot
-        both be true.
+        reading, because it says the corpus now holds a claim your write
+        disputes.
 
         With triage on, ``metadata={'allow_near_duplicate': True}`` is
         reinterpreted rather than retired: it now means FORCE-STORE — store
@@ -3916,9 +3918,12 @@ def create_mcp_server(
                 # is stamped here, and two spellings would produce children
                 # flagged in a way nothing reads.
                 #
-                # Triage DETECTS the contradiction; it does not adjudicate it
-                # (D3). What the flag actually does, measured rather than
-                # assumed: the only consumer of CONTESTED_METADATA_KEY /
+                # Triage DETECTS that the entry contests the record it names
+                # (wrong, outdated or different:
+                # plans/write-triage-flip-readiness-prd.md §11.3 C1''); it
+                # does not adjudicate it (D3). What the flag actually does,
+                # measured rather than assumed: the only consumer of
+                # CONTESTED_METADATA_KEY /
                 # is_contested_child is grouped_read's READ-SIDE suppression,
                 # which keeps the submitted text visible and digested in the
                 # canonical's grouped document while marking it as contesting.
