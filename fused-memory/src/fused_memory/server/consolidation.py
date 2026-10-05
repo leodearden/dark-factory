@@ -225,6 +225,12 @@ _CLAIM_HINT = (
     'becomes the canonical\'s first paragraph verbatim.'
 )
 
+_PROPOSAL_TEXT_HINT = (
+    'A proposal carries no canonical text: the canonical is rendered from '
+    '`claim` by `reconciliation/consolidation_auto.py::build_auto_canonical`, '
+    'its one home. Put the assertion in `claim` instead.'
+)
+
 
 def _claim_problems(claim: str, topic: str, *, max_chars: int) -> list[str]:
     """The ONE home of the five claim-shape rules. Collects, never short-circuits.
@@ -315,9 +321,11 @@ def validate_consolidate_args(
       of having its claim (and therefore every cap on it) silently dropped.
       ``server/tools.py::consolidate_memories`` takes this arm by omission,
       which is why it needs no edit.
-    * ``limits is not None`` — the PROPOSAL shape. ``canonical_content`` is not
-      required (a proposal has no canonical text yet, by construction), *claim*
-      is, and the retain arm's length must fall in
+    * ``limits is not None`` — the PROPOSAL shape. A proposal has no canonical
+      text yet, by construction, so a non-``None`` ``canonical_content`` is
+      REFUSED rather than dropped — the same fail-closed reason the op arm
+      refuses a claim without limits. *claim* is required, and the retain
+      arm's length must fall in
       ``[member_min, member_max]``. Task gamma's ``propose_consolidation`` takes
       this arm at the EMIT boundary so the LLM fixes its own shape in-turn, and
       task delta's executor takes it again when re-checking an aged ledger row
@@ -374,19 +382,27 @@ def validate_consolidate_args(
                 'ConsolidationAutoConfig to select the proposal shape'
             )
             _add_hint(_CLAIM_HINT)
-    elif not isinstance(claim, str) or not claim.strip():
-        problems.append(
-            '`claim` must be a non-empty string in a proposal, got '
-            f'{_safe_repr(claim)}'
-        )
-        _add_hint(_CLAIM_HINT)
     else:
-        claim_problems = _claim_problems(
-            claim, topic, max_chars=limits.claim_max_chars,
-        )
-        if claim_problems:
-            problems.extend(claim_problems)
+        if canonical_content is not None:
+            problems.append(
+                '`canonical_content` was passed with `limits`, so the proposal '
+                'shape was selected and the text would be dropped; omit it, or '
+                'pass `limits=None` to select the op shape'
+            )
+            _add_hint(_PROPOSAL_TEXT_HINT)
+        if not isinstance(claim, str) or not claim.strip():
+            problems.append(
+                '`claim` must be a non-empty string in a proposal, got '
+                f'{_safe_repr(claim)}'
+            )
             _add_hint(_CLAIM_HINT)
+        else:
+            claim_problems = _claim_problems(
+                claim, topic, max_chars=limits.claim_max_chars,
+            )
+            if claim_problems:
+                problems.extend(claim_problems)
+                _add_hint(_CLAIM_HINT)
 
     if not is_valid_topic_slug(topic):
         problems.append(f'`topic` is not a valid topic slug: {_safe_repr(topic)}')

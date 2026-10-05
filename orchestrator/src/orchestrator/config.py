@@ -3156,6 +3156,15 @@ class OrchestratorConfig(BaseSettings):
     # separate from the paused-idle constant (_PAUSED_IDLE_POLL_SECS) so the
     # poll cadence can be tuned independently of the pause-recovery cadence.
     idle_poll_secs: float = Field(default=15.0)
+    # Cadences of the merge-heartbeat and stale-service-restart background
+    # services, which run whatever the dispatch loop is doing (task 5344).
+    # The heartbeat must refresh well inside the drain gate's fresh window
+    # (ORCH_DRAIN_FRESH_WINDOW_SECS, scripts/drain_check.py --fresh-window);
+    # the restart interval bounds how late an owed force-fire can be.
+    # Restart-only (not in RELOADABLE_FIELDS): captured once by
+    # Harness._build_lifecycle_registry.
+    merge_heartbeat_interval_secs: float = Field(default=15.0, gt=0)
+    stale_service_restart_interval_secs: float = Field(default=15.0, gt=0)
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
@@ -3846,23 +3855,14 @@ class OrchestratorConfig(BaseSettings):
     fused_memory_restart_script: str = Field(
         default='scripts/restart-fused-memory.sh'
     )
-    # Force-fire escape for the fused-memory coordinator (task 2817): once a
-    # restart is pending, the coordinator normally only fires from the polite
-    # idle path (agents_idle + debounce). Under chronic fleet saturation
-    # agents_idle is rarely true, so that path can starve indefinitely and the
-    # armed restart never fires (fire-once-or-never) — the operator then has to
-    # restart fused-memory by hand (born-at-L2 esc-2814-1). Once a pending
-    # restart has been owed for this many seconds, maybe_restart bypasses
-    # agents_idle and the debounce and force-fires even on the busy-wait branch,
-    # while still preferring the polite idle path for the common (healthy) case.
-    # fused-memory keeps no min_interval rate cap, so nothing throttles the
-    # force-fire. 0 disables force-fire (byte-identical prior behaviour); the
-    # 15-min default caps the worst-case stale-bytecode window under saturation
-    # (far below the orchestrator's 4500s bound — a `--drain` fused-memory
-    # restart is far cheaper than a full orchestrator fleet redeploy).
-    # Deliberately NOT in RELOADABLE_FIELDS: red-tier / restart-only, captured
-    # once at coordinator construction (_build_service_restart_coordinator),
-    # matching its orchestrator_restart_force_fire_after_secs sibling.
+    # Force-fire escape for the fused-memory coordinator (task 2817): the
+    # polite path needs agents_idle, which chronic fleet saturation can deny
+    # indefinitely (esc-2814-1). Once a restart has been owed this long,
+    # maybe_restart bypasses agents_idle and the debounce; the
+    # stale-service-restart service evaluates it whatever the dispatch loop
+    # is doing (task 5344). 0 disables. No
+    # min_interval cap throttles it. Restart-only (not in RELOADABLE_FIELDS),
+    # like orchestrator_restart_force_fire_after_secs.
     fused_memory_restart_force_fire_after_secs: float = Field(
         default=900.0,
         description=(

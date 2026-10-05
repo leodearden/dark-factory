@@ -13,20 +13,20 @@ This guarantees:
 - The restart script runs detached / fire-and-forget so it never blocks the
   orchestrator event loop.
 
-Two instances are used in production:
+The harness polls ``maybe_restart`` on its own cadence, independent of the
+dispatch loop (``Harness._run_stale_service_restart_pass``), passing
+``agents_idle`` from live state.  Three instances are used in production:
 
-* **fused-memory** (``service_name='fused-memory'``, ``require_idle=True``):
-  prefers the run-loop's idle quiet-window (no dispatched agents), but
-  additionally force-fires on the busy-wait branch once a pending restart is
-  owed past ``force_fire_after_secs`` (wired from
-  ``config.fused_memory_restart_force_fire_after_secs``, task 2817) — the
-  anti-starvation backstop for chronic fleet saturation, where the idle branch
-  never runs and an armed restart would otherwise starve forever.
+* **fused-memory** (``require_idle=True``): prefers a quiet window with no
+  live agents, and force-fires once a pending restart is owed past
+  ``force_fire_after_secs`` (``config.fused_memory_restart_force_fire_after_secs``,
+  task 2817), so chronic fleet saturation cannot starve it.
   Script: ``scripts/restart-fused-memory.sh --drain``.
 
-* **dashboard** (``service_name='dashboard'``, ``require_idle=False``):
-  leaf service — fires even while agents are dispatching (promptly on the
-  busy-wait branch).  Script: ``scripts/restart-dashboard.sh`` (no drain).
+* **dashboard** (``require_idle=False``): leaf service — fires even while
+  agents are dispatching.  Script: ``scripts/restart-dashboard.sh`` (no drain).
+
+* **orchestrator** itself — see ``Harness._build_orchestrator_restart_coordinator``.
 """
 
 from __future__ import annotations
@@ -737,9 +737,8 @@ class StaleServiceRestartCoordinator:
         ``force_fire_after_secs`` (disabled when ``0.0``), the agents_idle
         gate, the debounce, and the restart_precondition preference are all
         bypassed — but the min_interval cap below is NEVER bypassed. This
-        exists so the polite path (which requires ``agents_idle=True``, only
-        reachable from the run-loop's idle branch) cannot starve a pending
-        restart indefinitely under chronic fleet saturation.
+        exists so the polite path (which requires ``agents_idle=True``) cannot
+        starve a pending restart indefinitely under chronic fleet saturation.
 
         This class does NOT itself provide an interrupt-safety net for
         whatever ``restart_precondition`` was standing in for (e.g. a
