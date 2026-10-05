@@ -111,6 +111,7 @@ from orchestrator.merge_lane.liveness import (
 )
 from orchestrator.merge_lane.ports import (
     ClockPort,
+    ContainmentPredicate,
     EscalationPort,
     ProductionClock,
     ProductionVerifier,
@@ -5734,6 +5735,7 @@ async def classify_and_merge(
     *,
     speculative: bool,
     started_monotonic: float | None,
+    content_contained: ContainmentPredicate = patch_content_contained,
 ) -> MergedOk | Decided:
     """Shared pre-merge guard + merge + drop-guard pipeline (MQ-refactor kappa).
 
@@ -5877,15 +5879,13 @@ async def classify_and_merge(
         # 3 `git rev-parse` subprocesses.  This branch runs on the COMMON merge
         # path (non-ancestor clean branch = the majority case), so that saving
         # is worth taking here (review 2945).
-        # patch_content_contained requires ALL of the live tip's commits to be
-        # patch-id-present in main, so a branch that gained a novel commit after
-        # snapshotting shows a `+` line -> False -> falls through and merges
-        # (never a partial-containment skip).  Fail-open: any git error -> False
-        # -> control leaves this branch without a return and falls through to
-        # the normal merge in step 3.
+        # Fail-open: see orchestrator/src/orchestrator/merge_lane/ports.py::ContainmentPredicate.
+        # A branch that gained a novel commit after snapshotting is not
+        # contained, so it falls through to step 3's merge (never a
+        # partial-containment skip).
         branch_sha = await git_ops.resolve_branch_sha(req.branch.full_name)
         candidate_tip = branch_sha or branch_head
-        if await patch_content_contained(candidate_tip, actual_main, git_ops):
+        if await content_contained(candidate_tip, actual_main, git_ops):
             logger.info(
                 'Task %s: branch content already on main via a rebased/'
                 'cherry-picked landing (patch-id contained) — skipping merge',

@@ -1885,6 +1885,48 @@
           "current": 56976
         }
       ]
+    },
+    {
+      "task_id": "5475",
+      "reason": "task 5475: threads an injectable patch-id containment predicate (merge_lane/ports.py::ContainmentPredicate) into classify_and_merge so the task-2945 fail-open arm is test-drivable without a dotted-path patch; net-additive seam with a behaviour-preserving production default, not a failed refactor",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/ports.py",
+          "baseline": 273,
+          "current": 284
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21813,
+          "current": 21816
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/ports.py",
+          "baseline": 59,
+          "current": 65
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12438,
+          "current": 12439
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56976,
+          "current": 56990
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31825,
+          "current": 31832
+        }
+      ]
     }
   ]
 }
