@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -430,6 +431,14 @@ async def test_cancellation_mid_spawn_kills_a_backgrounded_grandchild(
 ) -> None:
     """A cancel landing after the fork but before create_subprocess_exec returns
     must still reach the child's whole group."""
+    real_spawn = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+
+    async def _recording_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        spawned.append(await real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', _recording_spawn)
     leaker = _leaker_argv(tmp_path, monkeypatch)
     task = asyncio.ensure_future(run_git(leaker))
     leader_pid = leaked_pid = None
@@ -446,6 +455,11 @@ async def test_cancellation_mid_spawn_kills_a_backgrounded_grandchild(
         # Held on the loop thread, not to_thread: this freezes run_git inside
         # create_subprocess_exec's post-fork pipe connect, as load does.
         leaked_pid = read_leaked_pid(tmp_path / 'leaked.pid')
+        assert not spawned, (
+            'create_subprocess_exec returned before the cancel: asyncio connected '
+            "the child's pipes ahead of this poll, so the test no longer reaches "
+            'the mid-spawn window'
+        )
         task.cancel()
 
         assert await asyncio.to_thread(_wait_pid_exited, leaked_pid), (
@@ -476,7 +490,7 @@ async def test_cancellation_mid_spawn_wins_over_a_spawn_that_then_fails() -> Non
     with mock.patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
         task = asyncio.ensure_future(run_git(['git', 'status']))
         await _settle_until(lambda: entered)
-        assert entered
+        assert entered, 'run_git never reached the spawn, so there was nothing to cancel'
 
         task.cancel()
         released.set()
