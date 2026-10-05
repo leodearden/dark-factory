@@ -3158,10 +3158,11 @@ class OrchestratorConfig(BaseSettings):
     idle_poll_secs: float = Field(default=15.0)
     # Cadences of the merge-heartbeat and stale-service-restart background
     # services, which run whatever the dispatch loop is doing (task 5344).
-    # The heartbeat must refresh well inside the fresh window of
-    # scripts/drain_check.py::classify; the restart interval bounds how late
-    # an owed force-fire can be.  Restart-only (not in RELOADABLE_FIELDS):
-    # captured once by Harness._build_lifecycle_registry.
+    # The heartbeat must refresh well inside the drain gate's fresh window
+    # (ORCH_DRAIN_FRESH_WINDOW_SECS, scripts/drain_check.py --fresh-window);
+    # the restart interval bounds how late an owed force-fire can be.
+    # Restart-only (not in RELOADABLE_FIELDS): captured once by
+    # Harness._build_lifecycle_registry.
     merge_heartbeat_interval_secs: float = Field(default=15.0, gt=0)
     stale_service_restart_interval_secs: float = Field(default=15.0, gt=0)
 

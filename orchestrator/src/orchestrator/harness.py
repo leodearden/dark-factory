@@ -11771,11 +11771,14 @@ class Harness:
         """Done-callback of a slot task: record its TaskReport the moment it ends.
 
         ``task_reports`` is the list of the cycle that dispatched the slot.  A
-        task cancelled before ``_run_slot``'s body ran has no report.
+        task that ends cancelled (before ``_run_slot``'s body ran, or during
+        its cleanup) has no report.
         """
         self._live_tasks.discard(t)
         if t.cancelled():
-            logger.warning('%s was cancelled before it ran; no report', t.get_name())
+            logger.warning(
+                '%s was cancelled without returning a report', t.get_name(),
+            )
             return
         error = t.exception()
         if error is not None:
