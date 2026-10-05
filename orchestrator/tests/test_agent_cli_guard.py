@@ -241,3 +241,14 @@ class TestForbidAgentCliSpawnFixture:
         process = await asyncio.create_subprocess_exec('true')
 
         assert await process.wait() == 0
+
+    @pytest.mark.spawns_agent_cli
+    def test_spawns_agent_cli_marker_restores_real_spawning(self, tmp_path):
+        fake_claude = tmp_path / 'claude'
+        fake_claude.write_text('#!/bin/sh\necho fake-claude\n')
+        fake_claude.chmod(0o755)
+
+        result = subprocess.run([str(fake_claude)], capture_output=True, text=True)
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == 'fake-claude'
