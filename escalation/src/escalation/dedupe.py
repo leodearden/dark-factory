@@ -754,8 +754,8 @@ def file_or_fold_l1(
             extra={'project_id': project_id},
         )
         return False
-    # != rather than == 'queued': observed_submit_response's auto-resolved
-    # branch still minted a record.
+    # Every status but 'dedup_skipped' minted a record — an auto-resolved one
+    # (observed_submit_response) included — so this is not a `== 'queued'` test.
     return True
 
 
