@@ -47,6 +47,7 @@ const {
   plottableMax,
   axisY,
   formatCountTick,
+  niceCountMax,
   axisPaths,
   barFractions,
   stackedAreaPaths,
@@ -68,6 +69,8 @@ const MODULE_SPECIFIER = '../../src/dashboard/static/redux/spark_path.js';
 // is the y-tick LABEL formatter for an integer-count axis. It lives here for the
 // same reason the rest do — it composes with `plottableMax`/`axisY`, and unlike
 // anything defined in charts.jsx it can actually be EXECUTED by a test.
+// `niceCountMax` (task 5121) is the count-axis MAXIMUM rule that pairs with
+// formatCountTick's label rule.
 const EXPECTED_FUNCTION_NAMES = [
   'isPlottable',
   'sparkPaths',
@@ -76,6 +79,7 @@ const EXPECTED_FUNCTION_NAMES = [
   'plottableMax',
   'axisY',
   'formatCountTick',
+  'niceCountMax',
   'axisPaths',
   'barFractions',
   'stackedAreaPaths',
@@ -1026,6 +1030,75 @@ test('formatCountTick: Math.round would fail the no-duplicate invariant it repla
   );
   assert.ok(roundedDupes.includes(1), 'maxV=1 (the seed floor) is among them');
   assert.ok(roundedDupes.includes(2), 'and maxV=2');
+});
+
+// ---------------------------------------------------------------------------
+// niceCountMax — snap a count axis's MAXIMUM up to a multiple of the tick count
+// (task 5121), so every tick is a whole number and formatCountTick labels all
+// five of them instead of blanking the fractional ones.
+// ---------------------------------------------------------------------------
+
+test('niceCountMax: the measured table', () => {
+  assert.equal(niceCountMax(1, 4), 4, 'the plottableMax seed floor of an idle count series');
+  assert.equal(niceCountMax(4, 4), 4);
+  assert.equal(niceCountMax(7, 4), 8);
+  assert.equal(niceCountMax(8, 4), 8);
+  assert.equal(niceCountMax(999, 4), 1000);
+  assert.equal(niceCountMax(1000, 4), 1000);
+  assert.equal(niceCountMax(1001, 4), 1004);
+  assert.equal(niceCountMax(0, 4), 0);
+
+  // The rule is generic in the tick count, not hardwired to 4.
+  assert.equal(niceCountMax(7, 5), 10);
+  assert.equal(niceCountMax(11, 3), 12);
+});
+
+test('niceCountMax: smallest whole multiple, fixed point, every tick labelled — every count axis 1..200', () => {
+  for (let m = 1; m <= 200; m++) {
+    const r = niceCountMax(m, 4);
+    assert.equal(r % 4, 0, `m=${m}: ${r} is not a multiple of the tick count`);
+    assert.ok(r >= m, `m=${m}: ${r} would clip the data`);
+    assert.ok(r - 4 < m, `m=${m}: ${r} is not the SMALLEST such multiple`);
+    assert.equal(niceCountMax(r, 4), r, `m=${m}: not idempotent at ${r}`);
+
+    const labels = countAxisLabels(r);
+    assert.ok(!labels.includes(''), `m=${m}: blank tick in ${JSON.stringify(labels)}`);
+    assert.equal(new Set(labels).size, labels.length, `m=${m}: duplicate in ${JSON.stringify(labels)}`);
+    assert.equal(labels[4], String(r), `m=${m}: the peak must be labelled`);
+  }
+});
+
+test('niceCountMax: the cost it removes, measured', () => {
+  // The control that keeps the sweep above from being vacuous: WITHOUT the
+  // snap, half of all count axes in 1..200 label only their floor and peak.
+  const histogram = {};
+  for (let m = 1; m <= 200; m++) {
+    const labelled = countAxisLabels(m).filter(l => l !== '').length;
+    histogram[labelled] = (histogram[labelled] || 0) + 1;
+  }
+  assert.deepEqual(histogram, { 2: 100, 3: 50, 5: 50 });
+});
+
+test('niceCountMax: a non-finite max or an invalid tick count passes the max through, never NaN', () => {
+  // This runs inside a render. Unguarded, (7, 0) is Math.ceil(Infinity) * 0 =
+  // NaN, which blanks the whole chart — passing the max through is exactly the
+  // un-snapped behaviour.
+  for (const bad of [NaN, Infinity, -Infinity, null, undefined, '7']) {
+    assert.ok(
+      Object.is(niceCountMax(bad, 4), bad),
+      `niceCountMax(${String(bad)}, 4) must pass the max through`,
+    );
+  }
+  for (const bad of [0, -4, 2.5, NaN, undefined, null]) {
+    assert.equal(niceCountMax(7, bad), 7, `niceCountMax(7, ${String(bad)}) must pass 7 through`);
+  }
+});
+
+test('niceCountMax: a fraction axis must not opt in', () => {
+  // The executable reason snapping is opt-in per caller: a 100%-normalized or
+  // ratio axis would read 0%..400%.
+  assert.equal(niceCountMax(0.8, 4), 4);
+  assert.equal(niceCountMax(1, 4), 4);
 });
 
 // ---------------------------------------------------------------------------
