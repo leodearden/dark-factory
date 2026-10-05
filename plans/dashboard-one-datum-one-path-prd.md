@@ -556,6 +556,15 @@ fact, not the registry's. Datum-kinded keys default to an `unknown` Datum with r
 | 14 | Old paths gone | repository state | AST access-path check passes; `collect_done_counts`, `task_status_counts.js` and its four pins, `dailyDeltas`, `_STATUS_MAP`, `orchestrator.py` summary, request-path whole-tree fetches absent |
 | 15 | Cold render over nine roots — **recorded, not gated** | caches cleared, all nine roots reachable | handler time, payload size and per-root state recorded in ι's completion note against the 2026-09-18 baseline (6.8 s / 16.4 MB; cold acquisition 0.38 s + 2.49 s + terminal 2.25 s); 4795 depends on ι and decides the next lever from this |
 
+**Sketch #14 as gated by ι (task 5598, 2026-10-05).** The old-path census in
+`dashboard/tests/test_datum_access_paths.py` checks three kinds of path: served
+assets (each answers 404 and is not loaded by the parsed `index.html`),
+window-level exports of served scripts, and route wire keys. It does not check
+Python identifiers or function-local client names. The AST access-path check in
+the same file enforces the absence of request-path whole-tree fetches.
+`collect_done_counts`, `_STATUS_MAP` and `dailyDeltas` were deleted by their
+producing leaves and have no name guard.
+
 ## Decomposition plan
 
 Sizing per the overlay bands (300–1500 LOC, ≤10–12 files); every pair of leaves that

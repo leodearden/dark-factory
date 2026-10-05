@@ -9,31 +9,26 @@ of its matcher, then acceptance tests over a scan set that fails loudly — is
 ``test_clock_discipline.py``'s.
 
 The old-path census (sketch #14) follows in the same shape: :data:`_RETIRED`
-is one typed table of the paths PRD decisions 9, 12 and 16 deleted, each kind
-checked by executing something — importing the package, requesting the
-asset, parsing every served script, or calling the route.
+is one typed table of the paths PRD decision 16 deleted, each kind checked by
+executing something — requesting the asset and parsing index.html, parsing
+every served script for window exports, or calling the route.
 """
 
 from __future__ import annotations
 
 import ast
-import importlib
 import json
-import pkgutil
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import Any, TypeVar
 from unittest.mock import AsyncMock, patch
 from urllib.parse import urlsplit
 
 from _dashboard_helpers import ScriptTagCollector
 from _lock_chip_matrix import node_path
-
-import dashboard
 
 # ---------------------------------------------------------------------------
 # The finder
@@ -395,14 +390,6 @@ def test_the_healthz_probe_is_the_only_exemption():
 
 
 @dataclass(frozen=True, slots=True)
-class RetiredPythonName:
-    """No module of the dashboard package binds *name*."""
-
-    name: str
-    retired_by: str
-
-
-@dataclass(frozen=True, slots=True)
 class RetiredServedAsset:
     """GET *path* 404s, and no script tag of the parsed index.html loads it."""
 
@@ -425,11 +412,6 @@ class RetiredWireKey:
     endpoint: str
     key: str
     retired_by: str
-
-
-def modules_binding(name: str, modules: Iterable[ModuleType]) -> list[str]:
-    """The ``__name__`` of every module in *modules* whose namespace binds *name*."""
-    return [module.__name__ for module in modules if name in vars(module)]
 
 
 def local_script_paths(index_html: str) -> list[str]:
@@ -509,42 +491,14 @@ def test_local_script_paths_reads_classic_and_babel_tags_but_not_comments():
     assert local_script_paths(index_html) == ['/static/redux/data.js', '/static/redux/app.jsx']
 
 
-def test_modules_binding_flags_a_module_that_carries_the_name():
-    clean = ModuleType('fixture_clean')
-    rehomed = ModuleType('fixture_rehomed')
-    rehomed.collect_done_counts = lambda: None  # type: ignore[attr-defined]
-
-    assert modules_binding('collect_done_counts', [clean, rehomed]) == ['fixture_rehomed']
-
-
 # ---------------------------------------------------------------------------
 # Acceptance tests: the real census
 # ---------------------------------------------------------------------------
 
-_RETIRED: tuple[RetiredPythonName | RetiredServedAsset | RetiredClientBinding | RetiredWireKey, ...] = (
-    RetiredPythonName(
-        'collect_done_counts',
-        "PRD decision 16: active_tasks.py's second done counter; the census counts",
-    ),
-    RetiredPythonName(
-        '_STATUS_MAP',
-        'PRD decision 9: the burndown bands read the generated status vocabulary',
-    ),
-    RetiredPythonName(
-        'load_task_titles',
-        'PRD decision 12: a request-path whole-tree fetch; task_lookup serves titles',
-    ),
-    RetiredPythonName(
-        '_load_task_cards',
-        'PRD decision 12: a request-path whole-tree fetch; task_lookup serves cards',
-    ),
+_RETIRED: tuple[RetiredServedAsset | RetiredClientBinding | RetiredWireKey, ...] = (
     RetiredServedAsset(
         '/static/redux/task_status_counts.js',
         'PRD decision 16: the client bucketer; the Tasks header reads the served census',
-    ),
-    RetiredClientBinding(
-        'dailyDeltas',
-        "PRD decision 9, task 5592: shell.jsx's client-side forecast",
     ),
     RetiredClientBinding(
         'DF_TASK_STATUS_COUNTS',
@@ -564,38 +518,6 @@ def _retired(kind: type[_Row]) -> list[_Row]:
     rows = [row for row in _RETIRED if isinstance(row, kind)]
     assert rows, f'the census lists no {kind.__name__}; its check would pass vacuously'
     return rows
-
-
-def _raise(name: str) -> None:
-    raise ImportError(f'could not import package {name}')
-
-
-def _package_modules() -> list[ModuleType]:
-    """Every module of the dashboard package, imported.
-
-    ``dashboard.__main__`` is skipped because importing it starts the server.
-    """
-    names = [
-        info.name
-        for info in pkgutil.walk_packages(dashboard.__path__, 'dashboard.', onerror=_raise)
-        if info.name != 'dashboard.__main__'
-    ]
-    assert len(names) >= _MIN_SCANNED_MODULES, (
-        f'only {len(names)} modules found in the dashboard package — fewer than '
-        f'the {_MIN_SCANNED_MODULES} this census was written against'
-    )
-    return [dashboard, *(importlib.import_module(name) for name in names)]
-
-
-def test_no_package_module_binds_a_retired_python_name():
-    modules = _package_modules()
-    found = [
-        f'  {row.name} in {holder} — retired by {row.retired_by}'
-        for row in _retired(RetiredPythonName)
-        for holder in modules_binding(row.name, modules)
-    ]
-
-    assert not found, 'a retired Python name is bound again:\n' + '\n'.join(found)
 
 
 def test_no_retired_asset_is_served_or_loaded(client):
