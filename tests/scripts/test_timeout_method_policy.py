@@ -92,6 +92,10 @@ THREAD_TIMEOUT_METHOD_CONFIGS = frozenset({'orchestrator', 'fused-memory'})
 PROBE_WORKERS = 2
 PROBE_TIMEOUT_SECS = 2
 
+# The pytest11 entry-point names of the only plugins the probe child may load.
+# pytest's `plugins:` header shows the same names for the two distributions.
+PROBE_PLUGINS = ('xdist', 'timeout')
+
 # Every probe test except the blocking one overrides the ini cap with this, so
 # that only the blocking test races PROBE_TIMEOUT_SECS. On a loaded host a
 # trivial test can take longer than 2s, and the tally must not depend on that.
@@ -174,7 +178,7 @@ def _run_probe_suite(suite: _ProbeSuite, *extra: str) -> subprocess.CompletedPro
         'run; this is a missing plugin, not a measurement.'
     )
     env = {key: value for key, value in os.environ.items() if not key.startswith('PYTEST_')}
-    return subprocess.run(
+    result = subprocess.run(
         [
             sys.executable, '-m', 'pytest',
             '-c', str(suite.ini),
@@ -191,6 +195,21 @@ def _run_probe_suite(suite: _ProbeSuite, *extra: str) -> subprocess.CompletedPro
         timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
         check=False,
     )
+    loaded = _header_plugins(result.stdout)
+    assert loaded == set(PROBE_PLUGINS), (
+        f'the probe child loaded the plugins {loaded!r}, not exactly xdist and '
+        'pytest-timeout. The probe measures only those two, so any other plugin '
+        f'can change its result.\n{_captured(result)}'
+    )
+    return result
+
+
+def _header_plugins(output: str) -> set[str] | None:
+    """The plugin names on pytest's ``plugins:`` header line, versions stripped."""
+    header = re.search(r'^plugins: (.*)$', output, re.MULTILINE)
+    if header is None:
+        return None
+    return {entry.rsplit('-', 1)[0] for entry in header.group(1).split(', ')}
 
 
 def _captured(result: subprocess.CompletedProcess[str]) -> str:
