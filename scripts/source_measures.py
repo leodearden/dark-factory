@@ -821,21 +821,83 @@ PSEUDO_MEMBERS: tuple[MemberRoots, ...] = (
 )
 
 
+_MEMBERS_KEY = '[tool.uv.workspace].members'
+
+
+def _load_toml(path: Path) -> dict[str, object]:
+    try:
+        return tomllib.loads(path.read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise MetricsError(
+            f'{path}: could not be read -- {exc.__class__.__name__}: {exc}'
+        ) from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise MetricsError(f'{path}: is not valid TOML -- {exc}') from exc
+
+
+def _member_list(path: Path, config: dict[str, object]) -> list[str]:
+    found: object = config
+    for key in ('tool', 'uv', 'workspace', 'members'):
+        found = found.get(key) if isinstance(found, dict) else None
+    if (
+        not isinstance(found, list)
+        or not found
+        or not all(isinstance(member, str) for member in found)
+    ):
+        raise MetricsError(
+            f'{path}: {_MEMBERS_KEY} must be a non-empty list of member directory '
+            f'names; found {found!r}'
+        )
+    return found
+
+
 def _declared_members(root: Path) -> tuple[str, ...]:
-    """``[tool.uv.workspace].members`` of *root*'s pyproject.toml."""
-    with (root / 'pyproject.toml').open('rb') as handle:
-        config = tomllib.load(handle)
-    return tuple(config['tool']['uv']['workspace']['members'])
+    """``[tool.uv.workspace].members`` of *root*'s pyproject.toml.
+
+    Each must be a plain directory name (uv's glob expansion cannot be
+    reproduced from the index), listed once, and not a pseudo-member's name.
+    """
+    path = root / 'pyproject.toml'
+    members = _member_list(path, _load_toml(path))
+    globbed = [member for member in members if any(char in member for char in '*?[')]
+    if globbed:
+        raise MetricsError(
+            f'{path}: {_MEMBERS_KEY} holds glob member(s) {globbed!r}, which are not '
+            'supported -- list each member directory by name'
+        )
+    duplicates = sorted({member for member in members if members.count(member) > 1})
+    if duplicates:
+        raise MetricsError(f'{path}: {_MEMBERS_KEY} lists duplicate member(s) {duplicates!r}')
+    collisions = sorted(set(members) & {pseudo.name for pseudo in PSEUDO_MEMBERS})
+    if collisions:
+        raise MetricsError(
+            f'{path}: {_MEMBERS_KEY} names {collisions!r}, which collide with the '
+            'pseudo-member of the same name'
+        )
+    return tuple(members)
 
 
 def _tracked_blobs(root: Path, *pathspecs: str) -> tuple[tuple[str, str], ...]:
-    """``(path, blob sha)`` of every index entry matching *pathspecs*."""
+    """``(path, blob sha)`` of every index entry matching *pathspecs*.
+
+    An unmerged entry is refused: a conflicted path has one blob per stage, so it
+    has no single content to measure and would be counted once per stage.
+    """
     listing = _git_output(root, 'ls-files', '-s', '-z', '--', *pathspecs)
     entries: list[tuple[str, str]] = []
+    unmerged: set[str] = set()
     for record in filter(None, listing.split('\0')):
         meta, path = record.split('\t', 1)
-        _mode, blob, _stage = meta.split(' ')
+        _mode, blob, stage = meta.split(' ')
+        if stage != '0':
+            unmerged.add(path)
+            continue
         entries.append((path, blob))
+    if unmerged:
+        raise MetricsError(
+            f'{root}: the index holds unmerged path(s) {sorted(unmerged)!r}; resolve '
+            'the merge before measuring'
+        )
     return tuple(entries)
 
 
@@ -848,6 +910,21 @@ def _domain_member(
         if (kind := member.kind_of(path)) is not None
     )
     return DomainMember(name=member.name, pseudo=member.pseudo, files=files)
+
+
+def _require_declared_members_populated(domain: tuple[DomainMember, ...]) -> None:
+    """A DECLARED member with no files would read as measured and clean.
+
+    A pseudo-member is a convention, not a declaration, so it may be empty.
+    """
+    empty = [member.name for member in domain if not member.pseudo and not member.files]
+    if empty:
+        raise MetricsError(
+            '; '.join(
+                f'{name} has no tracked .py under {name}/src or {name}/tests'
+                for name in empty
+            )
+        )
 
 
 def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
@@ -864,4 +941,6 @@ def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
         *PSEUDO_MEMBERS,
     )
     entries = _tracked_blobs(root, '*.py')
-    return tuple(_domain_member(member, entries) for member in members)
+    domain = tuple(_domain_member(member, entries) for member in members)
+    _require_declared_members_populated(domain)
+    return domain
