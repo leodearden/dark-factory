@@ -26,13 +26,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 import pytest
 from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid
 
 from shared.git_async import MAX_CONCURRENT_SPAWNS, GitResult, run_git
-from shared.proc_group import read_stat_fields
+from shared.proc_group import process_group_members, read_stat_fields
 
 
 @pytest.fixture
@@ -388,6 +389,20 @@ def _abandon(task: asyncio.Future, leaked_pid: int | None) -> None:
             os.kill(leaked_pid, signal.SIGKILL)
 
 
+def _spawned_child(marker: str) -> int | None:
+    """The pid of this process's child whose cmdline contains *marker*, if any."""
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        fields = read_stat_fields(entry)
+        if fields is None or fields.ppid != os.getpid():
+            continue
+        with contextlib.suppress(OSError):
+            if marker in (entry / 'cmdline').read_bytes().decode('utf-8', 'replace'):
+                return int(entry.name)
+    return None
+
+
 # Each test below judges the grandchild while the call is still in flight and
 # only then awaits it: a surviving group member holds the call's pipes open, so
 # awaiting first would hang rather than fail.
@@ -409,6 +424,78 @@ async def test_cancellation_kills_a_backgrounded_grandchild(
             await task
     finally:
         _abandon(task, leaked_pid)
+
+
+async def test_cancellation_mid_spawn_kills_a_backgrounded_grandchild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancel landing after the fork but before create_subprocess_exec returns
+    must still reach the child's whole group."""
+    real_spawn = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+
+    async def _recording_spawn(*args: Any, **kwargs: Any) -> asyncio.subprocess.Process:
+        spawned.append(await real_spawn(*args, **kwargs))
+        return spawned[-1]
+
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', _recording_spawn)
+    leaker = _leaker_argv(tmp_path, monkeypatch)
+    task = asyncio.ensure_future(run_git(leaker))
+    leader_pid = leaked_pid = None
+    try:
+        deadline = time.monotonic() + 10.0
+        while (leader_pid := _spawned_child(leaker[1])) is None:
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    'the leaker never forked within 10.0s; the harness is broken, '
+                    'which says nothing either way about process-group containment.',
+                    pytrace=False,
+                )
+            await asyncio.sleep(0)
+        # Held on the loop thread, not to_thread: this freezes run_git inside
+        # create_subprocess_exec's post-fork pipe connect, as load does.
+        leaked_pid = read_leaked_pid(tmp_path / 'leaked.pid')
+        assert not spawned, (
+            'create_subprocess_exec returned before the cancel: asyncio connected '
+            "the child's pipes ahead of this poll, so the test no longer reaches "
+            'the mid-spawn window'
+        )
+        task.cancel()
+
+        assert await asyncio.to_thread(_wait_pid_exited, leaked_pid), (
+            f'pid {leaked_pid}, a backgrounded grandchild, survived a run_git '
+            'cancelled mid-spawn'
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        _abandon(task, leaked_pid)
+        if leader_pid is not None:
+            for member in process_group_members(leader_pid):
+                if not member.terminated:
+                    with contextlib.suppress(OSError):
+                        os.kill(member.pid, signal.SIGKILL)
+
+
+async def test_cancellation_mid_spawn_wins_over_a_spawn_that_then_fails() -> None:
+    """A cancel that waits out a spawn which then fails still raises CancelledError."""
+    entered: list[str] = []
+    released = asyncio.Event()
+
+    async def _fake_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        entered.append('spawn')
+        await released.wait()
+        raise FileNotFoundError(args[0])
+
+    with mock.patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
+        task = asyncio.ensure_future(run_git(['git', 'status']))
+        await _settle_until(lambda: entered)
+        assert entered, 'run_git never reached the spawn, so there was nothing to cancel'
+
+        task.cancel()
+        released.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
 
 
 async def test_own_timeout_kills_a_backgrounded_grandchild(

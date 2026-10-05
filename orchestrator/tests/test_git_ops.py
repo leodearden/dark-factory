@@ -6854,13 +6854,10 @@ async def _assert_child_reaped(
 # had to do both jobs at once and was tuned down to 0/40 misses on one box
 # rather than eliminated (task 4109).
 #
-# One narrow parent-side window is covered probabilistically rather than by
-# construction: the child's pid can land on disk while _run's own coroutine
-# is still inside create_subprocess_exec's pipe/transport setup rather than
-# the try block that owns kill+reap. That window is covered by
-# _wait_for_child_pid's 0.1s poll interval giving the parent time to reach
-# the owning await point before cancellation lands, not eliminated
-# structurally.
+# A cancel landing while _run is still inside create_subprocess_exec's
+# post-fork setup is closed structurally (task 6346):
+# shared/src/shared/git_async.py::_spawn_session_leader shields the spawn and
+# kills what it forked.
 _CANCEL_TIMEOUT = 0.05
 
 
