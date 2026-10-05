@@ -244,8 +244,9 @@ class TestStartupSweep:
 class TestFirstWriteProvisioning:
     """PRD D6, first-write half: a registered graph is provisioned before its first write.
 
-    Only the graphiti_core client is stubbed (the ``tests/_graphiti_fake.py``
-    idiom), so the real ``add_episode`` / ``ensure_entity_node`` bodies run.
+    Only the graphiti_core client is stubbed (the
+    ``conftest.py::make_backend_over_fake_graphiti`` idiom), so the real
+    ``add_episode`` / ``ensure_entity_node`` bodies run.
     """
 
     UPSTREAM_RESULT = object()
