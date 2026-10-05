@@ -804,3 +804,251 @@ a clean median of 3,159 s (n = 34). The full treatment had 3,108 s (n = 28). Tha
 −1.6%. The scripts saving that (a) and (c) predict is about 490 − 97 ≈ 390 s, and it does not
 show up at the gate at this n. The second period also carries the other 09-21 restart changes
 and the 09-23 admission-slot increase (§1(f)). §5(e) takes this up.
+
+## 4. Controlled CPU-seconds and cgroup peak memory, serial vs parallel
+
+Production records neither CPU-seconds nor peak memory (§1(g)), and the stop rule needs peak
+memory. This section measures both directly, on this host, for each module 5408 changed.
+
+**Host.** 32 cores and 125 GiB RAM, measured on 2026-10-05: `nproc`, `free -g`.
+
+- The agent shell runs in `orchestrator-dark-factory.service`'s cgroup, whose peak covers the
+  whole fleet. So each run gets its own `systemd-run --user --scope`, and memory and CPU are read
+  from inside that scope.
+- `systemd-run --user --wait` reports a bogus "Memory peak: 256.0K" here. The in-scope readout
+  was probed first: a 150 MB child read `memory.peak=161898496`.
+- Runs went from 01:45Z to 02:36Z. The 1-minute load average ran from 54 to 446 across them, and
+  CPU PSI `some avg10` from 8% to 68%. The host was shared and loaded throughout.
+
+**Tree.** The runs before 02:15Z (cockpit, escalation, dashboard, scripts serial) are at base
+1498265b10. The orchestrator restarted at about 02:15Z and the branch was rebased, so later runs
+are at base 54a84fba86. `git diff --stat 1498265b10 54a84fba86 -- tests/scripts scripts cockpit
+dashboard escalation uv.lock pyproject.toml shared/pyproject.toml orchestrator/orchestrator.yaml
+orchestrator/pyproject.toml` is empty. The ten files that differ are under `fused-memory/` and
+`orchestrator/`, one of them a new orchestrator test file. So every A/B pair below ran on
+identical module trees.
+
+**Arms.** Both arms use each module's CURRENT `test_command`, so suite growth since 09-17 cancels
+out and only 5408's edit differs.
+
+| module | PARALLEL: the verbatim command, `PYTEST_XDIST_AUTO_NUM_WORKERS=16` | SERIAL: `verify_cmd.py::serial_pytest`, applied by hand |
+|---|---|---|
+| cockpit | `uv run --directory cockpit pytest tests/ --tb=short -q` | `… -q -p no:xdist -o addopts= -m 'not smoke'`. Re-adds the smoke deselect that `-o addopts=` drops |
+| escalation | `uv run --directory escalation pytest tests/ --tb=short -q --timeout=300` | `… --timeout=300 -p no:xdist -o addopts=` |
+| dashboard | `uv run --directory dashboard pytest tests/ --tb=short -q --timeout=300` | `… --timeout=300 -p no:xdist -o addopts=` |
+| scripts | `uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q --timeout=300 --import-mode=importlib -n auto --dist loadgroup` | the same without `-n auto --dist loadgroup`, plus `-p no:xdist`. `--dist` without workers is a usage error |
+
+**Wrapper.** Each run is one foreground call, `bash /tmp/5469-e1-run.sh <module> <arm> '<command>'`.
+It does three things around the run:
+
+- It strips the inherited venv the way `verify.py::_target_subprocess_env` does: no
+  `VIRTUAL_ENV`, and no `.venv/bin` on `PATH`.
+- It records `/proc/loadavg` and `/proc/pressure/cpu` before and after.
+- It counts xdist workers from OUTSIDE the scope, so the counter's own CPU stays out of the
+  scope's `cpu.stat`. pytest's `-q`, non-tty output never prints the worker count: xdist's
+  `TerminalDistReporter.getstatus` prints only "bringing up nodes..." at verbosity < 0. So the
+  sampler counts the scope's processes whose command line is execnet's worker bootstrap,
+  `exec(eval(sys.stdin.readline()))`.
+
+```bash
+#!/bin/bash
+# usage: bash /tmp/5469-e1-run.sh <module> <arm> '<verbatim command>'
+# One (module, arm) run in its own systemd --user scope; prints the scope's own
+# wall, memory.peak, pids.peak and cpu.stat, plus the peak xdist worker count.
+cd /home/leo/src/dark-factory/.worktrees/5469 || exit 99
+module=$1; arm=$2; cmd=$3
+unit=e1-5469-$module-$arm
+cg=/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/$unit.scope
+out=/tmp/5469-$module-$arm
+clean_path=$(printf '%s' "$PATH" | tr ':' '\n' | grep -v '/\.venv/bin$' | paste -sd:)
+echo 0 > "$out.workers"
+cat /proc/loadavg /proc/pressure/cpu > "$out.load-before"
+# Sampler runs OUTSIDE the scope, so its own CPU is not in the scope's cpu.stat.
+( peak=0; while sleep 2; do
+    [ -d "$cg" ] || continue
+    n=$(sed 's|.*|/proc/&/cmdline|' "$cg/cgroup.procs" 2>/dev/null | xargs -r grep -zlsF 'exec(eval(sys.stdin.readline()))' | wc -l)
+    if [ "$n" -gt "$peak" ]; then peak=$n; echo "$peak" > "$out.workers"; fi
+  done ) &
+sampler=$!
+env -u VIRTUAL_ENV PATH="$clean_path" PYTEST_XDIST_AUTO_NUM_WORKERS=16 \
+  systemd-run --user --scope --quiet --unit="$unit" -p MemoryAccounting=yes \
+  bash -c 's=$(date +%s.%N); eval "$1"; rc=$?; e=$(date +%s.%N); cg=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "E1 rc=$rc wall=$(echo "$e - $s" | bc) memory.peak=$(cat $cg/memory.peak) pids.peak=$(cat $cg/pids.peak)"; grep -E "^(usage|user|system)_usec" $cg/cpu.stat; exit $rc' e1 "$cmd" \
+  > "$out.log" 2>&1
+rc=$?
+kill "$sampler" 2>/dev/null; wait "$sampler" 2>/dev/null
+cat /proc/loadavg /proc/pressure/cpu > "$out.load-after"
+echo "rc=$rc xdist_workers_max=$(cat "$out.workers")"
+tail -6 "$out.log"
+```
+
+The first cockpit parallel run, `parallel-run1`, used an earlier sampler that read
+`PYTEST_XDIST_WORKER` from `/proc/<pid>/environ`. That file shows only a process's initial
+environment, and xdist sets the variable after the worker starts, so that sampler under-counted
+(5). Cockpit parallel was re-run with the cmdline sampler and read 16. Both cockpit parallel runs
+are reported.
+
+**Comparator, the unchanged leg.** orchestrator's verbatim `test_command` at
+`PYTEST_XDIST_AUTO_NUM_WORKERS=16`, run in the same wrapper behind `timeout 300`:
+`bash /tmp/5469-e1-run.sh orchestrator bounded300 'timeout 300 uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300'`.
+It stopped at 40% of the suite. Its `memory.peak` is therefore a **lower bound** on the
+orchestrator leg's full peak.
+
+**Other legs.** The plan's peak argument assumed 5408 changed only the four test legs. It also
+added `pyright --threads 8` to the shared and sampler type legs. And within a module, the gate
+runs the test, lint and type legs side by side. So two more kinds of run were made with
+`/tmp/5469-e1-legs.sh`:
+
+- for the four test-leg modules, their unchanged lint and type legs together (`typelint`);
+- for shared and sampler, all three legs together, exactly as the gate runs that module
+  (`module`).
+
+```bash
+#!/bin/bash
+# usage: bash /tmp/5469-e1-legs.sh <module> <arm> '<lint>' '<type>' ['<test>']
+# Runs a module's legs CONCURRENTLY in one scope, the way the gate runs them.
+lint=$3; type=$4; test=${5:-}
+if [ -n "$test" ]; then
+  cmd="($lint) > /dev/null 2>&1 & lp=\$!; ($type) > /tmp/5469-$1-$2.type.log 2>&1 & tp=\$!; ($test); xr=\$?; wait \$lp; lr=\$?; wait \$tp; tr=\$?; echo legs test_rc=\$xr lint_rc=\$lr type_rc=\$tr; [ \$xr -eq 0 ] && [ \$lr -eq 0 ] && [ \$tr -eq 0 ]"
+else
+  cmd="($lint) > /dev/null 2>&1 & lp=\$!; ($type) > /tmp/5469-$1-$2.type.log 2>&1; tr=\$?; wait \$lp; lr=\$?; echo legs lint_rc=\$lr type_rc=\$tr; [ \$lr -eq 0 ] && [ \$tr -eq 0 ]"
+fi
+exec bash /tmp/5469-e1-run.sh "$1" "$2" "$cmd"
+```
+
+The commands are each module's verbatim `lint_command` and `type_check_command` from
+`<module>/orchestrator.yaml` (and `test_command`, for `module`). For example:
+
+`bash /tmp/5469-e1-legs.sh shared module "uv run --directory shared ruff check src/ tests/ && python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests" "uv run --directory shared pyright --threads 8 src/ tests/" "uv run --directory shared pytest tests/ --tb=short -q --timeout=300"`
+
+**Readout.** The table is parsed from the logs by:
+
+```python
+import re
+from pathlib import Path
+RUNS = [('cockpit', 'serial'), ('cockpit', 'parallel'), ('cockpit', 'parallel-run1'),
+        ('escalation', 'serial'), ('escalation', 'parallel'),
+        ('dashboard', 'serial'), ('dashboard', 'parallel'),
+        ('scripts', 'serial'), ('scripts', 'parallel'), ('orchestrator', 'bounded300'),
+        ('scripts', 'typelint'), ('dashboard', 'typelint'), ('escalation', 'typelint'),
+        ('cockpit', 'typelint'), ('shared', 'module'), ('sampler', 'module')]
+OUTCOMES = ('passed', 'failed', 'skipped', 'xfailed', 'xpassed', 'error', 'errors')
+for module, arm in RUNS:
+    base = Path(f'/tmp/5469-{module}-{arm}')
+    log = base.with_suffix('.log').read_text() if base.with_suffix('.log').exists() else Path(f'{base}.log').read_text()
+    e1 = dict(re.findall(r'(rc|wall|memory\.peak|pids\.peak)=(\S+)', log.split('E1 ', 1)[1].splitlines()[0]))
+    cpu = dict(re.findall(r'^(usage|user|system)_usec (\d+)$', log, re.M))
+    summary = [l for l in log.splitlines() if re.search(r' in [0-9.]+s', l) and re.search(r'\d+ (passed|failed)', l)]
+    total = sum(int(n) for n, k in re.findall(r'(\d+) (\w+)', summary[-1]) if k in OUTCOMES) if summary else None
+    loads = [Path(f'{base}.load-{w}').read_text().split()[0] for w in ('before', 'after')]
+    workers = Path(f'{base}.workers').read_text().strip()
+    print(f"{module:12} {arm:13} rc={e1['rc']:>3} wall={float(e1['wall']):7.1f} "
+          f"cpu={int(cpu['usage'])/1e6:7.1f} (u {int(cpu['user'])/1e6:6.1f} s {int(cpu['system'])/1e6:6.1f}) "
+          f"peak_MiB={int(e1['memory.peak'])/2**20:7.0f} pids={e1['pids.peak']:>3} workers={workers:>2} "
+          f"outcomes={total} load={loads[0]}->{loads[1]}")
+```
+
+```
+cockpit      serial        rc=  0 wall=   59.7 cpu=   32.3 (u   28.1 s    4.2) peak_MiB=    327 pids= 10 workers= 0 outcomes=503 load=111.41->132.30
+cockpit      parallel      rc=  0 wall=   14.6 cpu=   63.6 (u   59.6 s    3.9) peak_MiB=   1102 pids= 70 workers=16 outcomes=503 load=98.79->97.90
+cockpit      parallel-run1 rc=  0 wall=   16.8 cpu=   64.5 (u   59.2 s    5.3) peak_MiB=   1117 pids= 70 workers= 5 outcomes=503 load=146.56->138.89
+escalation   serial        rc=  0 wall=  142.5 cpu=  104.5 (u   96.1 s    8.4) peak_MiB=    373 pids= 38 workers= 0 outcomes=2159 load=104.13->71.45
+escalation   parallel      rc=  0 wall=   40.4 cpu=  213.9 (u  196.7 s   17.2) peak_MiB=   2661 pids= 91 workers=16 outcomes=2159 load=68.72->78.25
+dashboard    serial        rc=  0 wall=  294.3 cpu=  211.0 (u  150.2 s   60.8) peak_MiB=    634 pids=145 workers= 0 outcomes=3129 load=80.03->397.35
+dashboard    parallel      rc=  1 wall=   72.7 cpu=  429.8 (u  319.2 s  110.5) peak_MiB=   2553 pids=225 workers=16 outcomes=3129 load=445.81->266.73
+scripts      serial        rc=  0 wall=  789.8 cpu=  474.5 (u  340.6 s  133.9) peak_MiB=   1106 pids=140 workers= 2 outcomes=7697 load=85.93->127.32
+scripts      parallel      rc=  0 wall=   99.1 cpu=  685.1 (u  555.6 s  129.4) peak_MiB=   4604 pids=418 workers=16 outcomes=7697 load=73.80->75.89
+orchestrator bounded300    rc=124 wall=  300.3 cpu= 2038.3 (u 1691.2 s  347.1) peak_MiB=  10429 pids=709 workers=17 outcomes=None load=62.61->86.57
+scripts      typelint      rc=  0 wall=   56.3 cpu=   65.9 (u   63.2 s    2.7) peak_MiB=    990 pids= 43 workers= 0 outcomes=None load=53.80->97.82
+dashboard    typelint      rc=  0 wall=   38.7 cpu=   48.3 (u   46.4 s    1.9) peak_MiB=    764 pids= 52 workers= 0 outcomes=None load=135.49->144.90
+escalation   typelint      rc=  0 wall=   30.3 cpu=   33.7 (u   31.9 s    1.8) peak_MiB=    723 pids= 42 workers= 0 outcomes=None load=144.90->150.31
+cockpit      typelint      rc=  0 wall=   14.2 cpu=   17.0 (u   16.1 s    0.9) peak_MiB=    377 pids= 50 workers= 0 outcomes=None load=147.42->147.67
+shared       module        rc=  0 wall=  231.6 cpu=  319.7 (u  287.2 s   32.6) peak_MiB=   2998 pids= 75 workers= 0 outcomes=6766 load=149.36->42.46
+sampler      module        rc=  0 wall=   11.6 cpu=   26.5 (u   22.6 s    3.9) peak_MiB=    912 pids= 74 workers= 0 outcomes=142 load=147.67->150.54
+```
+
+`wall` is the scope's own clock around the command. `cpu` is `cpu.stat` `usage_usec` / 1e6,
+with user and system. `peak_MiB` is `memory.peak` / 2^20. `outcomes` sums passed, failed,
+skipped, xfailed, xpassed and errors from pytest's last summary line.
+
+### Validity checks
+
+- **Same collected outcome total in both arms, for all four modules.** cockpit 503 / 503,
+  escalation 2,159 / 2,159, dashboard 3,129 / 3,129, scripts 7,697 / 7,697. The serial lines also
+  report deselected items (cockpit 4, scripts 10); the xdist controller does not report
+  deselection, and deselected items are not outcomes.
+- **Parallel arms ran 16 xdist workers.** The sampler read 16 for cockpit (re-run), escalation,
+  dashboard and scripts. Every parallel log contains xdist's "bringing up nodes..." and no serial
+  log does.
+  - The sampler counts every process in the scope that carries execnet's bootstrap command
+    line. Some scripts tests spawn their own xdist subprocesses, which is why scripts SERIAL reads
+    2 with no xdist in the run itself. The orchestrator comparator's 17 is the same effect.
+- **One arm failed, and it is reported.** dashboard PARALLEL, rc 1:
+  `1 failed, 3127 passed, 1 xfailed`.
+  - The failing test is `tests/test_scheduler_page.py::test_evict_park_endpoint_rejects_invalid_body[missing-project_root]`,
+    on worker gw1. Its assertion reads "Unexpected MCP tool call(s) on 400 path:
+    {'get_curator_state'}", and the call list includes a background metrics sampler's
+    `get_queue_stats` / `get_curator_state` calls.
+  - The serial arm, run just before, passed the same test.
+  - `flake_occurrence` has no row for this test id, so it has not yet shown up at the merge gate.
+  - This is the order- and timing-dependence risk 5408 named. It is filed as a low-priority
+    follow-up, ticket `tkt_0RVE0WBY3YQM9CEX9DFZ1PWAPR`.
+  - The failed arm still ran the whole suite, so its wall, CPU and peak stand.
+
+### Per-module result, parallel ÷ serial
+
+| module | wall s, serial → parallel | ratio | CPU-s, serial → parallel | ratio | peak MiB, serial → parallel | ratio |
+|---|---|---|---|---|---|---|
+| cockpit | 59.7 → 14.6 (run1 16.8) | 0.24 | 32.3 → 63.6 (run1 64.5) | 1.97 | 327 → 1,102 (run1 1,117) | 3.37 |
+| escalation | 142.5 → 40.4 | 0.28 | 104.5 → 213.9 | 2.05 | 373 → 2,661 | 7.13 |
+| dashboard | 294.3 → 72.7 | 0.25 | 211.0 → 429.8 | 2.04 | 634 → 2,553 | 4.03 |
+| scripts | 789.8 → 99.1 | 0.13 | 474.5 → 685.1 | 1.44 | 1,106 → 4,604 | 4.16 |
+| **Σ four modules** | **1,286.3 → 226.8 (−1,059.5 s)** | **0.18** | **822.3 → 1,392.4 (+570.1 CPU-s)** | **1.69** | — | — |
+| comparator: orchestrator, first 300 s | — | — | 2,038.3 in 300 s | — | **≥ 10,429** (lower bound) | — |
+
+**CPU-seconds.** The four suites take 1.4-2.1× the CPU when run at 16 workers. Each 16-worker
+process imports and sets up its fixtures separately. That is real CPU spent per gate, which
+3353's ruling makes a binding objective. On this host and load:
+
+- each edit-present merge gate runs the four suites about 1,060 s faster;
+- it spends about 570 more CPU-seconds doing so;
+- 570 CPU-s is 28% of what the orchestrator suite burns in its first 300 s alone (2,038 CPU-s).
+
+These ratios agree with §3(e)'s worker-seconds proxy, 1.4-2.3× per test.
+
+### Gate-peak argument
+
+`merge_verify_max_concurrent_modules: 1`, unchanged since 2026-07-19, means the gate runs one
+module at a time. The gate's peak is therefore the largest module peak. A module's peak is at
+most the sum of its concurrent legs' peaks. The orchestrator module is untouched by 5408, and its
+test leg alone reached **≥ 10,429 MiB** in its first 300 s, in both arms. The changed modules,
+after the edit, at most:
+
+| module | after-edit legs | module peak upper bound, MiB | vs the orchestrator lower bound |
+|---|---|---|---|
+| scripts | test 4,604 (parallel) + type+lint 990 | ≤ 5,594 | below |
+| escalation | test 2,661 + type+lint 723 | ≤ 3,384 | below |
+| dashboard | test 2,553 + type+lint 764 | ≤ 3,317 | below |
+| cockpit | test 1,102 + type+lint 377 | ≤ 1,479 | below |
+| shared | all three legs measured together, with `pyright --threads 8` | 2,998 | below |
+| sampler | all three legs measured together, with `pyright --threads 8` | 912 | below |
+
+**Every changed module's after-edit upper bound is below the unchanged orchestrator module's
+lower bound.** The largest module peak in a gate is orchestrator's in both arms, so 5408 moved the
+gate's cgroup peak by **0%**, far inside the stop rule's +25%. This comes from two numbers measured
+on the same host on the same day. The 0% is a structural result. It rests on the one-module-at-a-time
+setting, and it would no longer hold if `merge_verify_max_concurrent_modules` were raised above 1.
+
+### Caveats
+
+- `memory.peak` includes page cache charged to the scope, so it over-states anonymous memory,
+  more so for the serial arms. The comparison runs in the safe direction: the upper bounds are
+  inflated, not the orchestrator lower bound.
+- There is one repetition per arm (two for cockpit parallel), on a shared host whose load swung
+  from 54 to 446. Serial and parallel ran back to back, which limits drift between the arms of a
+  pair but does not remove it. Absolute walls are not comparable with other days. Scripts serial
+  took 790 s here for 7,697 outcomes, against 490 s for 5,182 tests in the 09-10 study, which
+  reflects both suite growth and load. CPU-seconds are much less affected by load than wall is.
+- The wrapper sets only `PYTEST_XDIST_AUTO_NUM_WORKERS` from production's `verify_env`. It does
+  not set `DF_REQUIRE_SANDBOX_TESTS=1`, and the agent shell runs inside the agent sandbox. A
+  controlled run is not production: production gates also run with other verifies and agents
+  beside them.
