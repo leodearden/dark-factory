@@ -5,6 +5,7 @@ Kept out of the already-large ``graphiti_client.py``, following the
 """
 
 import json
+from contextvars import ContextVar
 from typing import Any
 
 from graphiti_core.llm_client.config import DEFAULT_MAX_TOKENS, ModelSize
@@ -43,7 +44,92 @@ def _with_inline_schema(
     ]
 
 
-class ForceJsonObjectOpenAIGenericClient(OpenAIGenericClient):
+class _CallUsage:
+    """The ``usage`` block of the latest completion inside one ``generate_response``."""
+
+    def __init__(self) -> None:
+        self.latest: Any = None
+
+    def tokens(self) -> tuple[int, int]:
+        return (
+            getattr(self.latest, 'prompt_tokens', 0) or 0,
+            getattr(self.latest, 'completion_tokens', 0) or 0,
+        )
+
+
+_CALL_USAGE: ContextVar[_CallUsage | None] = ContextVar('generic_client_call_usage', default=None)
+
+
+class _Delegate:
+    """Forwards every attribute to ``target`` except the ``overrides``."""
+
+    def __init__(self, target: Any, **overrides: Any) -> None:
+        self._target = target
+        vars(self).update(overrides)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._target, name)
+
+
+class _UsageCapturingCompletions(_Delegate):
+    async def create(self, **kwargs: Any) -> Any:
+        response = await self._target.create(**kwargs)
+        call_usage = _CALL_USAGE.get()
+        if call_usage is not None:
+            call_usage.latest = getattr(response, 'usage', None)
+        return response
+
+
+def _with_usage_capture(openai_client: Any) -> _Delegate:
+    chat = openai_client.chat
+    return _Delegate(
+        openai_client,
+        chat=_Delegate(chat, completions=_UsageCapturingCompletions(chat.completions)),
+    )
+
+
+class TokenRecordingOpenAIGenericClient(OpenAIGenericClient):
+    """OpenAIGenericClient that records token usage, which upstream drops.
+
+    graphiti-core 0.28.2's ``OpenAIGenericClient`` discards ``response.usage``
+    and never calls ``token_tracker.record``, so this arm would otherwise report
+    a fabricated zero. Usage is captured from the wire response through a
+    delegating wrapper around ``self.client`` (nothing upstream is vendored) and
+    recorded once per successful ``generate_response``, for the successful
+    attempt only, exactly as ``BaseOpenAIClient.generate_response`` records it.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.client = _with_usage_capture(self.client)
+
+    async def generate_response(
+        self,
+        messages: list[Message],
+        response_model: type[BaseModel] | None = None,
+        max_tokens: int | None = None,
+        model_size: ModelSize = ModelSize.medium,
+        group_id: str | None = None,
+        prompt_name: str | None = None,
+    ) -> dict[str, Any]:
+        call_usage = _CallUsage()
+        reset_token = _CALL_USAGE.set(call_usage)
+        try:
+            response = await super().generate_response(
+                messages,
+                response_model=response_model,
+                max_tokens=max_tokens,
+                model_size=model_size,
+                group_id=group_id,
+                prompt_name=prompt_name,
+            )
+        finally:
+            _CALL_USAGE.reset(reset_token)
+        self.token_tracker.record(prompt_name, *call_usage.tokens())
+        return response
+
+
+class ForceJsonObjectOpenAIGenericClient(TokenRecordingOpenAIGenericClient):
     """OpenAIGenericClient that always requests ``response_format=json_object``.
 
     Selected by ``llm.structured_output_mode='json_object'`` (only meaningful

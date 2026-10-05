@@ -24,6 +24,7 @@ from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     GraphitiBackend,
 )
+from fused_memory.backends.llm_token_usage import TokenMeasurement
 from fused_memory.backends.mem0_client import (
     _FUSED_MEMORY_OWNED_METADATA_KEYS,
     Mem0Backend,
@@ -2242,6 +2243,11 @@ class DescendantScan(NamedTuple):
     truncated: bool
 
 
+def _elapsed_ms_since(started: float) -> float:
+    """Milliseconds since a ``time.perf_counter()`` reading, to 3 decimals."""
+    return round((time.perf_counter() - started) * 1000, 3)
+
+
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
@@ -2612,11 +2618,29 @@ class MemoryService:
         operation: str,
         payload: dict[str, Any],
         coro: Any,
+        *,
+        token_probe: Callable[[], contextlib.AbstractAsyncContextManager[TokenMeasurement]]
+        | None = None,
     ) -> Any:
-        """Execute a backend call and log to write journal."""
+        """Execute a backend call and log to write journal.
+
+        Every backend inherits ``duration_ms`` (the awaited call's wall time,
+        on success and failure alike) from this choke point, with no
+        per-call-site opt-in. A ``token_probe`` window wraps only the awaited
+        call, and the LLM tokens it measured are journaled with the row. A
+        probe that fails to open is journaled as this call's failure, and
+        ``coro`` is closed unawaited.
+        """
+        measurement = TokenMeasurement()
         result = None
+        duration_ms: float | None = None
+        started = time.perf_counter()
         try:
-            result = await coro
+            async with (
+                token_probe() if token_probe is not None else contextlib.nullcontext(measurement)
+            ) as measurement:
+                result = await coro
+            duration_ms = _elapsed_ms_since(started)
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2626,9 +2650,15 @@ class MemoryService:
                     payload=payload,
                     result_summary=str(result)[:500] if result else None,
                     success=True,
+                    duration_ms=duration_ms,
+                    llm_tokens=measurement.usage,
                 )
             return result
         except (Exception, asyncio.CancelledError) as e:
+            if asyncio.iscoroutine(coro):
+                coro.close()
+            if duration_ms is None:
+                duration_ms = _elapsed_ms_since(started)
             if self._write_journal:
                 await self._write_journal.log_backend_op(
                     write_op_id=write_op_id,
@@ -2638,6 +2668,8 @@ class MemoryService:
                     payload=payload,
                     success=False,
                     error=f'{type(e).__name__}: {e}',
+                    duration_ms=duration_ms,
+                    llm_tokens=measurement.usage,
                 )
             raise
 
@@ -5946,6 +5978,10 @@ class MemoryService:
                     reference_time=reference_time,
                     unverified_claim=unverified_claim,
                 ),
+                # The only LLM-bearing graphiti path. Deletes and edge updates
+                # spend no LLM, so they stay unprobed rather than journaling a
+                # zero that reads like a measurement.
+                token_probe=self.graphiti.token_probe,
             )
             reconcile_stats = await self._reconcile_episode_identity(
                 result, group_id=payload['group_id'], referents=referents,
