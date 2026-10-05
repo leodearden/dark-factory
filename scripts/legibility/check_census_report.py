@@ -22,8 +22,9 @@ PLANS_DIR = "plans"
 REPORT_NAME_RE = re.compile(
     r"^confusion-census-(?P<date>\d{4}-\d{2}-\d{2})(?:-(?P<n>\d+))?\.(?P<ext>json|md)$"
 )
+METHOD_TITLE = "Method"
 SECTIONS = (
-    "Method",
+    METHOD_TITLE,
     "Findings",
     "Filed Tasks",
     "Dispositions",
@@ -64,9 +65,12 @@ class Report:
     def stem(self) -> str:
         return f"confusion-census-{self.date}" + (f"-{self.suffix}" if self.suffix else "")
 
+    def shown(self, ext: str) -> str:
+        return f"{PLANS_DIR}/{self.stem}.{ext}"
+
     @property
     def shown_path(self) -> str:
-        return f"{PLANS_DIR}/{self.stem}" + (".md" if self.rendering else ".json")
+        return self.shown("md" if self.rendering else "json")
 
 
 @dataclass(frozen=True)
@@ -104,19 +108,41 @@ def level2_titles(md_text: str) -> list[str]:
     return [line[3:].strip() for _, line in unfenced_lines(md_text) if line.startswith("## ")]
 
 
+def heading(title: str) -> str:
+    return f"## {title}"
+
+
 def check_sections(md_text: str) -> list[Gap]:
     present = set(level2_titles(md_text))
-    return [Gap(GapKind.MISSING, f"## {title}") for title in SECTIONS if title not in present]
+    return [Gap(GapKind.MISSING, heading(title)) for title in SECTIONS if title not in present]
 
 
-def check_rendering(report: Report) -> list[Gap]:
-    if report.rendering is None:
-        return []
-    return check_sections(report.rendering.read_text(encoding="utf-8"))
+def check_halves(report: Report) -> list[Gap]:
+    absent = [ext for ext, path in (("json", report.record), ("md", report.rendering)) if path is None]
+    return [Gap(GapKind.MISSING, report.shown(ext)) for ext in absent]
+
+
+def predates_header(report: Report, titles: list[str]) -> bool:
+    return report.record is None and METHOD_TITLE not in titles
 
 
 def names(gaps: tuple[Gap, ...], kind: GapKind) -> list[str]:
     return [gap.name for gap in gaps if gap.kind is kind]
+
+
+def no_report_result(project_root: Path) -> Result:
+    pattern = f"{PLANS_DIR}/confusion-census-<YYYY-MM-DD>[-<n>].{{json,md}}"
+    headline = f"no conforming report yet -- no {pattern} report under {project_root}"
+    return Result(Verdict.NO_CONFORMING_REPORT_YET, None, (), headline)
+
+
+def predates_header_result(report: Report) -> Result:
+    gaps = (Gap(GapKind.MISSING, heading(METHOD_TITLE)), Gap(GapKind.MISSING, report.shown("json")))
+    headline = (
+        f"no conforming report yet -- {report.shown_path} predates the contract §5 header; "
+        f"missing: {', '.join(names(gaps, GapKind.MISSING))}"
+    )
+    return Result(Verdict.NO_CONFORMING_REPORT_YET, report.shown_path, gaps, headline)
 
 
 def nonconforming_headline(report: str, gaps: tuple[Gap, ...]) -> str:
@@ -128,14 +154,27 @@ def nonconforming_headline(report: str, gaps: tuple[Gap, ...]) -> str:
     return f"{report} does not conform -- " + "; ".join(parts)
 
 
-def check(project_root: Path) -> Result:
-    report = newest_report(project_root / PLANS_DIR)
-    if report is None:
-        return Result(Verdict.NONCONFORMING, None, (), f"no census report under {project_root / PLANS_DIR}")
-    gaps = tuple(check_rendering(report))
+def post_header_result(report: Report, gaps: tuple[Gap, ...]) -> Result:
     if gaps:
         return Result(Verdict.NONCONFORMING, report.shown_path, gaps, nonconforming_headline(report.shown_path, gaps))
     return Result(Verdict.CONFORMS, report.shown_path, (), f"{report.shown_path} conforms")
+
+
+def post_header_gaps(report: Report, md_text: str | None) -> list[Gap]:
+    gaps = check_halves(report)
+    if md_text is not None:
+        gaps += check_sections(md_text)
+    return gaps
+
+
+def check(project_root: Path) -> Result:
+    report = newest_report(project_root / PLANS_DIR)
+    if report is None:
+        return no_report_result(project_root)
+    md_text = report.rendering.read_text(encoding="utf-8") if report.rendering else None
+    if predates_header(report, level2_titles(md_text or "")):
+        return predates_header_result(report)
+    return post_header_result(report, tuple(post_header_gaps(report, md_text)))
 
 
 def gap_line(gap: Gap) -> str:
