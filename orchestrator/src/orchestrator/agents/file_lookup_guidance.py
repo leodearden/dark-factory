@@ -24,10 +24,9 @@ A task checkout holds ONE copy of its project's tree, so a by-name `Glob` or
 `find` from your own checkout root is fine. Two kinds of root are different:
 
 - A project's MAIN checkout, the directory that holds its task worktrees,
-  carries a full copy of the tree for every one of them: under `.worktrees/`,
-  and in dark-factory's own root also under `.worktrees-orphaned/`,
-  `.eval-worktrees/` and `.claude/worktrees/`. You land in such a root when you
-  look in your project's main checkout, or in another project's root.
+  carries a full copy of the tree for every one of them, under `.worktrees/`
+  and similar per-worktree directories. You land in such a root when you look
+  in your project's main checkout, or in another project's root.
 - Build trees (`target/`, `.venv`, `node_modules`) can dwarf the source, even
   inside a single checkout.
 

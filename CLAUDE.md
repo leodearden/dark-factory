@@ -147,16 +147,11 @@ correct, and knowing which you are in is the whole point of asking.
 **Never `find .`, nor `Glob` with no `path`, from the main checkout root to
 locate a first-party file.** That root holds a full copy of the tree per
 worktree under `.worktrees/`, `.worktrees-orphaned/`, `.eval-worktrees/` and
-`.claude/worktrees/`, all four in the root `.gitignore`. Measured 2026-10-05:
-`find . -path ./node_modules -prune -o -name test_lock_charter_guard.py -print`
-printed 1 real match plus 115 worktree copies and was still walking when
-`timeout 120` killed it. `Glob` from there fails on a 20-second ripgrep timeout
-because Claude Code's Glob passes `--no-ignore`; `Grep` honours `.gitignore`
-and answers promptly. Ask git's index instead:
-`git ls-files -- '*test_lock_charter_guard.py'` answered in 0.005s (add
-`--others --exclude-standard` for untracked files). Git skips ignored trees
-either way, so there is no prune list to maintain. Inside a task worktree
-both walks are fine. Task 3267's `.worktrees/` retention sweep owns the bloat.
+`.claude/worktrees/`, all four in the root `.gitignore`, so a walk times out
+printing every copy. `Glob` passes `--no-ignore` and fails the same way;
+`Grep` honours `.gitignore`. Ask git's index instead:
+`git ls-files -- '*<name>'`, adding `--others --exclude-standard` for untracked
+files. Inside a task worktree both walks are fine.
 
 ### Anchoring ad-hoc paths
 
