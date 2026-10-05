@@ -4,7 +4,7 @@
 
 | class | n | correct | accuracy |
 |---|---|---|---|
-| duplicate | 75 | 54 | 0.72 |
+| duplicate | 75 | 55 | 0.7333 |
 | distinct | 3 | 0 | 0.0 |
 | pseudo_contradiction | 6 | 3 | 0.5 |
 | distractor | 0 | 0 | None |
@@ -13,21 +13,21 @@
 
 | class | amended | contested | restated | stored |
 |---|---|---|---|---|
-| duplicate | 33 | 19 | 21 | 2 |
+| duplicate | 34 | 18 | 21 | 2 |
 | distinct | 2 | 0 | 1 | 0 |
 | pseudo_contradiction | 2 | 3 | 1 | 0 |
 | distractor | 0 | 0 | 0 | 0 |
 
 ## Where the writes attached, and which band answered
 
-- duplicates attaching to their OWN canonical (strict): 15/75 = `0.2`
+- duplicates attaching to their OWN canonical (strict): 14/75 = `0.1867`
 - duplicates attaching to ANYTHING: 73/75 = `0.9733`
-- attaches landing on a record that is NOT the case's canonical: 65/82 of all attaches = `0.7927`
+- attaches landing on a record that is NOT the case's canonical: 66/82 of all attaches = `0.8049`
 - attaches on a `distinct`/`pseudo_contradiction`/`distractor` case: 9/9 = `1.0`
 - the case's canonical was ON the slate: 29/84 = `0.3452`
 - cases whose canonical is no longer in the corpus: `21`
-- judge accuracy restricted to the MIDDLE band: 47/73 = `0.6438`
-- LLM calls made: `73`, tokens: `195029`
+- judge accuracy restricted to the MIDDLE band: 48/73 = `0.6575`
+- LLM calls made: `73`, tokens: `195041`
 
 ### Band split — expected class by the band that answered
 
@@ -41,11 +41,11 @@
 ## Duplicate attach split (a distribution, not an error term)
 
 - `restated`: 21
-- `amended`: 33
+- `amended`: 34
 
 ## Contested
 
-- contested verdicts observed: **22**, all of which are FALSE POSITIVES.
+- contested verdicts observed: **21**, all of which are FALSE POSITIVES.
 - ground truth available: `False`
 - `no_positive_contested_labels: the fixture carries 6 pseudo_contradiction records, every one curator-adjudicated NOT a contradiction, and 0 records labelled as a genuine contradiction. Contested recall and precision are therefore unmeasurable against this corpus; only the false-positive count below is a measurement.`
 
@@ -57,6 +57,7 @@
 - There is NO distractor control class in this mode. A retrieved slate carrying no correct attach target is the ORDINARY case here rather than one this script constructs, so the control would measure nothing the population does not already show. `production_shape.canonical_in_slate` is the measured equivalent — the share of cases whose own canonical reached the prompt at all — and `canonical_absent` counts the cases whose canonical is no longer in the corpus. Those are KEPT in the population, because production meets them.
 - Every figure here is measured over the population production would actually route: the slate, the band winner and the band all come from a live retrieval through `retrieve_candidates` / `decide_band` / `select_judge_candidates` at this config's `candidate_k`, `t_high` and `t_low`, and the judge was asked ONLY for the middle band. So `per_class` MIXES bands — a deterministic `restated` and a below-floor `stored` are counted there without an LLM having seen the case — and `production_shape.middle_band` is the judge's own accuracy. A verdict that is correct for its curator label can still attach to ANOTHER RECORD, which `per_class` cannot show. `production_shape.duplicate_attach.strict` and `production_shape.wrong_record_attach` score `attach_target_id`, the record production files the write against. For a middle-band attach that is the candidate the judge NAMED, hoisted to its canonical (`judged_candidate_id`); otherwise it is the band winner (`band_winner_id`). So for the middle band `strict` is recall at `judge_candidate_count`, not at 1. An artifact from a judge that named no candidate (before task 5794) attached every judged write to the band winner, and its rows carry no `judged_candidate_id`.
 - Under the shipped `contests` definition — the entry says a candidate is wrong, outdated or different (Leo's ruling 2026-09-30, plans/write-triage-flip-readiness-prd.md §11.3 C1'') — the judge answered `contested` on 3 of 6 pseudo_contradiction cases (of the 5 the judge saw); all outcomes: `amended` 2, `contested` 3, `restated` 1, `stored` 0. These records were adjudicated NOT contradictions under the EARLIER definition ("cannot be true at the same time"), and this report still scores `contested` on them as wrong and counts it in false_contested. The fixture is deliberately not relabelled, so this reports how the new definition reads them without asserting which reading is right.
+- The judge, `gpt-4o-mini`, answered `contested` on 18 of 75 duplicate cases (of the 66 the judge saw). The curator labelled each duplicate the same claim as its canonical, so this report scores `contested` on one as wrong; with triage enabled, each is a write this judge would flag `contested` for a human to read. The `contests` definition was settled on a frontier reasoning judge: its live boundary test, fused-memory/tests/server/test_write_triage_judge.py::TestTheShippedWordingLive, pins one, because gpt-4o-mini answers that test's outdated cases `contested` under the earlier wording too. Where this judge is not the model that test pins, the figure measures the wording on a judge it was not settled on: read it beside a run on that model before deciding which judge the flip ships.
 
 ## Provenance
 
