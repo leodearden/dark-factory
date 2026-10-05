@@ -46,14 +46,17 @@ PORT="${ARGS[2]:-8102}"
 [[ "$VALUE" =~ ^[0-9]+$ ]] || die invalid_value "value must be a positive integer, got '$VALUE'"
 [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || die invalid_port "escalation_port must be a TCP port in 1-65535, got '$PORT'"
 [ -f "$CONFIG" ] || die config_not_found "config not found: $CONFIG"
-# The reload step imports its MCP transport from the checkout the SCRIPT lives
-# in — never from $REPO below, which is the CONFIG's checkout and may be a
-# different project entirely. That transport is not stdlib (httpx, pydantic),
-# so the interpreter is resolved for the same reason: inheriting whatever
-# `python3` a login shell offers makes this gate unreachable. This tree's one
-# root .venv (CLAUDE.md, "Locating installed code"), else the caller's python3.
-# Derived from the path rather than `git rev-parse` so a copy of this script
-# outside any checkout still resolves under `set -e`.
+# One interpreter, resolved once, runs both python steps below. The reload
+# step imports its MCP transport from the checkout the SCRIPT lives in — never
+# from $REPO below, which is the CONFIG's checkout and may be a different
+# project entirely. That transport is not stdlib (httpx, pydantic), so the
+# interpreter is resolved for the same reason: inheriting whatever `python3` a
+# login shell offers makes this gate unreachable. Step 1's editor is
+# stdlib-only but runs under the same interpreter, so the script has one
+# resolution mechanism rather than two. This tree's one root .venv (CLAUDE.md,
+# "Locating installed code"), else the caller's python3. Derived from the path
+# rather than `git rev-parse` so a copy of this script outside any checkout
+# still resolves under `set -e`.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKOUT="$SCRIPT_DIR/.."
 PY="$CHECKOUT/.venv/bin/python3"
@@ -69,7 +72,7 @@ if [ "$DRY" -eq 1 ]; then TARGET="$(mktemp)"; cp "$CONFIG" "$TARGET"; fi
 # 1. Rewrite the value inside the top-level `verify_env:` mapping. Line-based
 #    on purpose (no yaml round-trip: the file is 1000 lines of load-bearing
 #    comments). Replaces an existing A/B marker line rather than stacking them.
-python3 - "$TARGET" "$KEY" "$VALUE" "$STAMP" <<'PY' || die config_edit_refused "step 1 left ${CONFIG} unedited (reason above)"
+"$PY" - "$TARGET" "$KEY" "$VALUE" "$STAMP" <<'PY' || die config_edit_refused "step 1 left ${CONFIG} unedited (reason above)"
 import re, sys
 path, key, value, stamp = sys.argv[1:5]
 lines = open(path, encoding='utf-8').read().split('\n')

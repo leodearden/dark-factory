@@ -85,7 +85,7 @@ def _run(server, config_path, value, *, script=SCRIPT, env=None, cwd=None, flags
 
     *script* and *env* are the seams the interpreter-resolution tests need: a
     COPY of the script in a checkout with no venv, and a PATH whose `python3`
-    cannot import the transport. *cwd* is the seam the relative-config_path
+    lacks the transport or cannot run at all. *cwd* is the seam the relative-config_path
     case needs (the client cwd is what a relative path is resolved against),
     and *flags* carries `--dry-run`.
     """
@@ -538,7 +538,7 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Which interpreter runs the reload
+# Which interpreter runs the script's python steps
 #
 # The transport is not stdlib: it needs httpx, plus pydantic via
 # census_trigger's module-level `legibility.config` import. Measured here on
@@ -547,7 +547,8 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
 # reload step that inherits whatever `python3` the caller's shell offers is a
 # deploy gate an operator cannot reach from a login shell -- the same
 # unreachable-gate outcome as the transport defect above, with a different
-# cause.
+# cause. Step 1's editor shares the reload's resolved interpreter, so neither
+# step reaches PATH's `python3` while the checkout venv exists.
 # ---------------------------------------------------------------------------
 
 CHECKOUT_VENV_PYTHON = SCRIPT.parent.parent / ".venv" / "bin" / "python3"
@@ -579,9 +580,8 @@ def test_an_interpreter_without_the_transport_fails_loud_with_a_remedy(tmp_path)
     """No venv to fall back on: fail naming the interpreter and the remedy.
 
     The script is copied into a checkout carrying its real reload step but NO
-    `.venv`, so the bare-`python3` fallback leg is taken and the
-    interpreter is the only thing that differs from the passing case above. A
-    raw ImportError traceback would leave an operator with no next step.
+    `.venv`, so the bare-`python3` fallback leg is taken. A raw ImportError
+    traceback would leave an operator with no next step.
     """
     system_python, why = system_python_without_the_transport()
     if system_python is None:
