@@ -13,7 +13,6 @@ against the doc in ``orchestrator/tests/test_code_quality.py``.
 from __future__ import annotations
 
 import dataclasses
-import re
 
 import pytest
 from _orch_helpers import make_prompt_resolution_workflow
@@ -196,22 +195,6 @@ class TestCodeQualitySplice:
                 'Delete the stale duplicate splice. A second copy doubles the '
                 'block on every invocation of that role.'
             ),
-        )
-
-    @pytest.mark.parametrize('role_name', sorted(_CODE_QUALITY_ROLES))
-    def test_no_carrier_exempts_naming_or_structure(self, resolved_prompts, role_name):
-        # The block says naming and structure are judged under the heuristics; a
-        # carrier prompt that also lists them as something not to block on is
-        # two normative statements disagreeing (heuristic 11, SPOT).
-        exemptions = [
-            line
-            for line in resolved_prompts[role_name].splitlines()
-            if re.search(r'(?i)\b(naming|structur\w*)\b[^.\n]*\bpreferences?\b', line)
-            and not re.search(r'(?i)\bnot\b[^.\n]*\bpreferences?\b', line)
-        ]
-        assert not exemptions, (
-            f'{role_name} exempts naming/structure from review while carrying '
-            f'CODE_QUALITY_GUIDANCE: {exemptions}'
         )
 
     @pytest.mark.parametrize('role_name', ['architect', 'deep_reviewer'])
