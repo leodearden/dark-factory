@@ -47,11 +47,14 @@ import pytest
 # own docstring's instruction, and it resolves by the conftest.py sys.path
 # insertion this directory relies on under --import-mode=importlib.
 import verify_command_invariants as vci
+from orchestrator.config import ModuleConfig
+
+from orchestrator import verify_cmd
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from orchestrator.config import ModuleConfig
+    from orchestrator.config import OrchestratorConfig
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
 
@@ -343,29 +346,40 @@ def _selected_member(pre_anchor_tokens: list[str]) -> str | None:
 
 def _pytest_legs_carrying_workers(
     module_configs: dict[str, ModuleConfig],
+    injected_workers: str,
 ) -> list[tuple[str, str, str]]:
     """``(module prefix, selected member, where -n came from)`` for every parallel leg.
 
     DERIVED STRUCTURALLY from the production config walk, never from a
-    hardcoded list: a tenth module config that declares ``-n`` must be caught by
+    hardcoded list: a tenth module config that runs ``-n`` must be caught by
     this guard on the day it lands, not on the day someone remembers to extend a
     table here.
 
-    ``-n`` can reach pytest from either of two places, and both count because
+    ``-n`` can reach pytest from any of THREE places, and all count because
     pytest cannot tell them apart:
 
       * the command's own POST-anchor argv (how the ``scripts`` and
         ``tests/scripts`` legs get it, their targets being repo-root paths under
         no member's pyproject.toml);
       * the SELECTED member's own addopts (how the ``--directory <m>`` legs get
-        it).
+        it);
+      * verify's own injection of ``-n <injected_workers>`` (task 5486), which
+        reaches even a member whose addopts are serial. Whether it applies is
+        decided by CALLING the production transform,
+        ``verify_cmd.apply_pytest_numprocesses``, on the same segment — its
+        identity no-op contract is the single home of every rule for when it
+        refuses (``''``/``'auto'``, ``-p no:xdist``, a non-pytest tool), so
+        none of them is restated here.
 
     Read no more strongly than it holds: the addopts consulted is the selected
     member's, which for a ``--directory <m>`` command is also the rootdir
     inifile pytest reads, but for a root-cwd ``--project <m>`` command is not.
-    In that second shape this can only ever require a declaration pytest would
-    not in fact have needed — over-requiring, never under-requiring — which is
-    the safe direction for a guard whose failure mode is a missing plugin.
+    Likewise the injection is counted whenever the transform WOULD inject,
+    without modelling the role gate (``shared.verify_admission.is_gated_role``)
+    or ``verify_admission_enabled``. In both shapes this can only ever require a
+    declaration pytest would not in fact have needed — over-requiring, never
+    under-requiring — which is the safe direction for a guard whose failure
+    mode is a missing plugin.
     """
     legs: list[tuple[str, str, str]] = []
     for prefix, module_config in sorted(module_configs.items()):
@@ -388,6 +402,13 @@ def _pytest_legs_carrying_workers(
             sources.append(f'{prefix}/orchestrator.yaml::test_command argv')
         if WORKERS_FLAG in shlex.split(_declared_addopts(member)):
             sources.append(f'{member}/pyproject.toml addopts')
+        parsed = verify_cmd.parse_config_command(segment)
+        if verify_cmd.apply_pytest_numprocesses(parsed, injected_workers) is not parsed:
+            sources.append(
+                f'verify_admission_pytest_n={injected_workers!r}, which verify '
+                f'appends as {WORKERS_FLAG} at the roles '
+                'shared.verify_admission.is_gated_role names'
+            )
         if sources:
             legs.append((prefix, member, ' and '.join(sources)))
     return legs
@@ -395,13 +416,19 @@ def _pytest_legs_carrying_workers(
 
 def test_every_pytest_leg_running_workers_declares_the_plugin(
     discover_module_configs: Callable[[], dict[str, ModuleConfig]],
+    root_config: OrchestratorConfig,
 ) -> None:
-    """A module config that runs ``-n`` must select a member that DECLARES pytest-xdist.
+    """Every pytest leg that will RUN ``-n``, declared or injected, selects a member declaring pytest-xdist.
 
     HEURISTIC 13 — a file has to make internal sense in isolation. A
     ``pyproject.toml`` whose addopts says ``-n auto`` while its dependency
     groups never mention the plugin that implements ``-n`` does not: read on its
-    own it describes a configuration that cannot run.
+    own it describes a configuration that cannot run. Nor does a member that
+    verify runs with ``-n <verify_admission_pytest_n>`` while declaring no
+    plugin — the measured instance (task 5486) was sampler, whose serial addopts
+    hid that its leg ran 8-way at the gated roles all the same. The knob is read
+    through ``root_config``, the production loader anchored at THIS worktree's
+    yaml, so the guard follows it when an operator moves it.
 
     AND IT IS NOT MERELY UNTIDY — MEASURED on the task-5408 tree. From a venv
     lacking the plugin, ``uv run --directory dashboard python -c "import
@@ -420,7 +447,9 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
     module config happens to declare the command. For the ``scripts`` and
     ``tests/scripts`` legs those differ: both select ``shared``.
     """
-    legs = _pytest_legs_carrying_workers(discover_module_configs())
+    legs = _pytest_legs_carrying_workers(
+        discover_module_configs(), root_config.verify_admission_pytest_n
+    )
     assert legs, (
         f'no discovered module config runs pytest with {WORKERS_FLAG} at all, so '
         'this guard has nothing to check and would pass vacuously. At least '
@@ -439,7 +468,7 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
         'these pytest legs run with '
         f'{WORKERS_FLAG} while the member their uv selector names declares no '
         f'{XDIST_DISTRIBUTION} in its [dependency-groups] '
-        f'{DEFAULT_DEPENDENCY_GROUP} group (task 5408):\n'
+        f'{DEFAULT_DEPENDENCY_GROUP} group (tasks 5408, 5486):\n'
         + '\n'.join(
             f'  - module {prefix!r} selects member {member!r}; {WORKERS_FLAG} '
             f'comes from {source}'
@@ -456,6 +485,58 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
         f'{DEFAULT_DEPENDENCY_GROUP} specifically: it is the group uv installs '
         'by default, so a declaration parked anywhere else never reaches the '
         'interpreter that runs the leg'
+    )
+
+
+@pytest.mark.parametrize(
+    ('injected_workers', 'extra_flags', 'expect_counted'),
+    [
+        pytest.param('8', '', True, id='numeral-injects'),
+        pytest.param('auto', '', False, id='auto-is-a-no-op'),
+        pytest.param('8', ' -p no:xdist', False, id='forced-serial-refuses'),
+    ],
+)
+def test_the_injected_worker_count_is_counted_exactly_when_verify_would_inject(
+    injected_workers: str, extra_flags: str, expect_counted: bool
+) -> None:
+    """THE CONTROL that keeps the third ``-n`` source from silently narrowing back.
+
+    The probe leg selects a RULED serial member, whose addopts
+    ``test_ruled_serial_members_stay_serial`` pins free of ``-n``, and its own
+    argv carries none either — so the injection is the ONLY way it can count.
+    The positive case proves the helper sees the injection at all; the two
+    negative cases prove it defers to the production transform's refusals
+    rather than counting every knob value, the same shape as this file's
+    pyright ``--stats`` negative control.
+    """
+    member = sorted(RULED_SERIAL_MEMBERS)[0]
+    probe = {
+        'probe': ModuleConfig(
+            prefix='probe',
+            test_command=f'uv run --directory {member} pytest tests/{extra_flags}',
+        ),
+    }
+
+    legs = _pytest_legs_carrying_workers(probe, injected_workers)
+
+    if not expect_counted:
+        assert legs == [], (
+            f'with verify_admission_pytest_n={injected_workers!r} and '
+            f'{probe["probe"].test_command!r}, verify_cmd.apply_pytest_numprocesses '
+            f'appends no {WORKERS_FLAG}, yet the guard counted {legs!r}'
+        )
+        return
+    assert len(legs) == 1, (
+        f'with verify_admission_pytest_n={injected_workers!r}, verify appends '
+        f'{WORKERS_FLAG} {injected_workers} to {probe["probe"].test_command!r}, '
+        f'yet the guard counted {legs!r} — it no longer sees the injected '
+        f'{WORKERS_FLAG} (task 5486)'
+    )
+    prefix, selected, source = legs[0]
+    assert (prefix, selected) == ('probe', member)
+    assert 'verify_admission_pytest_n' in source, (
+        f'the probe leg counted, but from {source!r}: the injection must be '
+        'the only source here, so the attribution is wrong'
     )
 
 
