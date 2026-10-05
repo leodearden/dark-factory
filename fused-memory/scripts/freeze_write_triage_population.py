@@ -11,11 +11,32 @@ live store. The snapshot is the input of the judge arms
 
 READ-ONLY against the store: it scrolls, searches and reads points, and
 writes nothing but the snapshot files.
+
+Usage
+-----
+  uv run python scripts/freeze_write_triage_population.py \\
+      --out-root /home/leo/src/dark-factory/data
+
+``--out-root`` is required and never derived: the snapshot must outlive the
+worktree that froze it, so point it at the MAIN checkout's gitignored
+``data/``. The retrieval loop is sequential, one search per write, and takes
+roughly 5–15 minutes for ~1,500 writes; run it detached
+(``setsid … > log 2>&1``) and poll the log.
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
+import collections
+import hashlib
+import importlib.util
+import json
+import os
+import sys
+import types
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, TypedDict
 
 from fused_memory.models.enums import MEM0_PRIMARY
@@ -24,11 +45,45 @@ from fused_memory.reconciliation.prompts import (
     FLAG_FOR_STAGE2_MARKER_KIND,
     STAGE2_SUPPRESS_GUARD_KIND,
 )
-from fused_memory.server.write_triage import declares_attach_keys
+from fused_memory.server.write_triage import (
+    declares_attach_keys,
+    resolve_bands,
+    resolve_candidate_k,
+)
+
+_SCRIPTS = Path(__file__).resolve().parent
+
+
+def _load_script(path: Path, mod_name: str) -> types.ModuleType:
+    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
+    cached = sys.modules.get(mod_name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(mod_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'Cannot load {path}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    return module
+
+
+_retrieval = _load_script(
+    _SCRIPTS / 'eval_write_triage_retrieval.py', 'eval_write_triage_retrieval',
+)
 
 POPULATION_SINCE = datetime(2026, 9, 29, tzinfo=UTC)
 POPULATION_PROJECTS = ('dark_factory', 'reify')
 POPULATION_CATEGORIES = tuple(sorted(category.value for category in MEM0_PRIMARY))
+
+SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_DIR_PREFIX = 'write-triage-population-'
+SNAPSHOT_NAME = 'snapshot.json'
+SNAPSHOT_DIGEST_NAME = 'snapshot.sha256'
 
 #: The boolean flags the reconciliation stage prompts (reconciliation/prompts/)
 #: wrote on their marker records before χ gave those markers a declared kind.
@@ -120,3 +175,256 @@ async def enumerate_population(
                 keyed.append(((project_id, instant, write['memory_id']), write))
     keyed.sort(key=lambda pair: pair[0])
     return [write for _, write in keyed], excluded
+
+
+# --- freeze ------------------------------------------------------------------
+
+def _by_project(writes: Sequence[PopulationWrite]) -> dict[str, list[PopulationWrite]]:
+    grouped: dict[str, list[PopulationWrite]] = {}
+    for write in writes:
+        grouped.setdefault(write['project_id'], []).append(write)
+    return grouped
+
+
+def _refuse_degraded(retrievals: Mapping[str, Mapping[str, Any]]) -> None:
+    degraded = sorted(memory_id for memory_id, r in retrievals.items() if r['degraded'])
+    if degraded:
+        raise ValueError(
+            f'{len(degraded)} retrieval(s) came back degraded, so nothing is frozen: '
+            f'a degraded slate is an infra blip, not a production band. '
+            f'Writes: {", ".join(degraded)}',
+        )
+
+
+def _without_own_children(
+    memory_id: str, retrieval: Mapping[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """*retrieval* minus the write's own children, and how many there were.
+
+    Production never sees a write's own later children, and keeping one would
+    let the judge name it, hoisting to a self-pair.
+    """
+    kept = [
+        row for row in retrieval['results']
+        if _retrieval.normalize(row)['canonical_id'] != memory_id
+    ]
+    return {**retrieval, 'results': kept}, len(retrieval['results']) - len(kept)
+
+
+def _frozen_write(
+    write: PopulationWrite, slate: Any, rows: Sequence[Any], own_children_dropped: int,
+) -> dict[str, Any]:
+    created_at = {row.id: row.created_at for row in rows}
+    return {
+        **write,
+        'band': slate.band,
+        'band_winner_id': slate.attach_target_id,
+        'similarity': slate.similarity,
+        'retrieved_count': slate.retrieved_count,
+        'self_retrieved': slate.self_retrieved,
+        'own_children_dropped': own_children_dropped,
+        'candidates': [
+            {**candidate, 'created_at': created_at.get(candidate['memory_id'])}
+            for candidate in slate.candidates
+        ],
+    }
+
+
+async def _off_slate_targets(
+    memory_service: Any, project_id: str, frozen: Sequence[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """The hoisted canonical of every candidate whose canonical is not on its slate."""
+    targets: dict[str, dict[str, Any]] = {}
+    for write in frozen:
+        on_slate = {candidate['memory_id'] for candidate in write['candidates']}
+        for candidate in write['candidates']:
+            target_id = candidate['canonical_id']
+            if target_id in on_slate or target_id in targets:
+                continue
+            stored = await memory_service.get_memory_by_id(project_id, target_id)
+            targets[target_id] = {
+                'project_id': project_id,
+                'content': stored['content'] if stored is not None else None,
+            }
+    return targets
+
+
+async def freeze_population(
+    memory_service: Any,
+    writes: Sequence[PopulationWrite],
+    *,
+    k: int,
+    t_high: float | None,
+    t_low: float | None,
+) -> dict[str, Any]:
+    """Each write with the slate and band production retrieval gives it now.
+
+    One shipped retrieval per write (own id dropped), the write's own children
+    dropped, then the shipped banding with nothing comparable trimmed below
+    *k*. Refuses (``ValueError``) if any retrieval is degraded. Returns
+    ``writes``, the off-slate hoisted ``targets`` and the ``excluded`` counts.
+    """
+    frozen: list[dict[str, Any]] = []
+    targets: dict[str, dict[str, Any]] = {}
+    excluded = {'own_children_dropped': 0, 'self_retrieved': 0}
+    for project_id, project_writes in _by_project(writes).items():
+        records = [
+            {'memory_id': w['memory_id'], 'content': w['content'], 'cluster_id': w['memory_id']}
+            for w in project_writes
+        ]
+        retrievals = await _retrieval.prefetch_retrievals(
+            memory_service, records, project_id=project_id, k=k,
+        )
+        _refuse_degraded(retrievals)
+        pruned = {mid: _without_own_children(mid, r) for mid, r in retrievals.items()}
+        kept = {mid: retrieval for mid, (retrieval, _) in pruned.items()}
+        slates = _retrieval.retrieved_slates(
+            records, kept, t_high=t_high, t_low=t_low, judge_candidate_count=k,
+        )
+        project_frozen = [
+            _frozen_write(
+                write, slate, kept[write['memory_id']]['results'], pruned[write['memory_id']][1],
+            )
+            for write, slate in zip(project_writes, slates, strict=True)
+        ]
+        excluded['own_children_dropped'] += sum(w['own_children_dropped'] for w in project_frozen)
+        excluded['self_retrieved'] += sum(1 for w in project_frozen if w['self_retrieved'])
+        targets |= await _off_slate_targets(memory_service, project_id, project_frozen)
+        frozen.extend(project_frozen)
+    return {'writes': frozen, 'targets': targets, 'excluded': excluded}
+
+
+async def freeze_snapshot(
+    memory_service: Any,
+    *,
+    projects: Sequence[str],
+    since: datetime,
+    frozen_at: datetime,
+    k: int,
+    t_high: float | None,
+    t_low: float | None,
+) -> dict[str, Any]:
+    """The whole snapshot: the enumerated population, frozen, with how it was made."""
+    writes, enumeration_excluded = await enumerate_population(
+        memory_service, projects=projects, since=since, frozen_at=frozen_at,
+    )
+    frozen = await freeze_population(memory_service, writes, k=k, t_high=t_high, t_low=t_low)
+    return {
+        'schema_version': SNAPSHOT_SCHEMA_VERSION,
+        'frozen_at': frozen_at.astimezone(UTC).isoformat(),
+        'since': since.astimezone(UTC).isoformat(),
+        'projects': list(projects),
+        'categories': list(POPULATION_CATEGORIES),
+        'candidate_k': k,
+        't_high': t_high,
+        't_low': t_low,
+        'excluded': {**enumeration_excluded, **frozen['excluded']},
+        'writes': frozen['writes'],
+        'targets': frozen['targets'],
+    }
+
+
+# --- snapshot files ----------------------------------------------------------
+
+def write_snapshot(out_root: Path, snapshot: Mapping[str, Any]) -> Path:
+    """Write *snapshot* and its sha256 sidecar into a fresh dated directory.
+
+    The directory is named for the UTC date of ``frozen_at`` and must not
+    exist yet (``FileExistsError``): a frozen population is never re-frozen in
+    place. Returns the path of ``snapshot.json``.
+    """
+    frozen_on = datetime.fromisoformat(snapshot['frozen_at']).astimezone(UTC).date()
+    directory = Path(out_root) / f'{SNAPSHOT_DIR_PREFIX}{frozen_on.isoformat()}'
+    directory.mkdir(parents=True, exist_ok=False)
+    body = json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode('utf-8')
+    path = directory / SNAPSHOT_NAME
+    path.write_bytes(body)
+    (directory / SNAPSHOT_DIGEST_NAME).write_text(hashlib.sha256(body).hexdigest() + '\n')
+    return path
+
+
+def load_snapshot(path: Path) -> tuple[dict[str, Any], str]:
+    """The snapshot at *path* and its sha256, refused if it no longer matches its sidecar."""
+    path = Path(path)
+    body = path.read_bytes()
+    actual = hashlib.sha256(body).hexdigest()
+    recorded = (path.parent / SNAPSHOT_DIGEST_NAME).read_text().strip()
+    if actual != recorded:
+        raise ValueError(
+            f'{path} was edited after it was frozen: recorded sha256 {recorded}, '
+            f'on disk {actual}',
+        )
+    return json.loads(body), actual
+
+
+# --- CLI ---------------------------------------------------------------------
+
+def _aware_datetime(text: str) -> datetime:
+    parsed = _parse_created_at(text)
+    if parsed is None:
+        raise argparse.ArgumentTypeError(f'{text!r} is not an ISO timestamp with an offset')
+    return parsed
+
+
+def _summary(snapshot: Mapping[str, Any], path: Path, sha256: str) -> dict[str, Any]:
+    writes = snapshot['writes']
+
+    def count(key: str) -> dict[str, int]:
+        return dict(sorted(collections.Counter(w[key] for w in writes).items()))
+
+    return {
+        'n_writes': len(writes),
+        'by_project': count('project_id'),
+        'by_category': count('category'),
+        'by_band': count('band'),
+        'recon_marker_writes': sum(1 for w in writes if w['recon_marker']),
+        'excluded': snapshot['excluded'],
+        'path': str(path),
+        'sha256': sha256,
+    }
+
+
+async def _freeze_live(args: argparse.Namespace) -> dict[str, Any]:
+    from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    frozen_at = datetime.now(UTC)
+    config = FusedMemoryConfig()
+    configured = types.SimpleNamespace(config=config)
+    t_high, t_low = resolve_bands(configured)
+    memory = MemoryService(config)
+    await memory.initialize()
+    try:
+        snapshot = await freeze_snapshot(
+            memory, projects=args.projects, since=args.since, frozen_at=frozen_at,
+            k=resolve_candidate_k(configured), t_high=t_high, t_low=t_low,
+        )
+    finally:
+        await memory.close()
+    path = write_snapshot(args.out_root, snapshot)
+    _, sha256 = load_snapshot(path)
+    return _summary(snapshot, path, sha256)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('--out-root', dest='out_root', type=Path, required=True,
+                        help='directory the dated snapshot directory is created in')
+    parser.add_argument('--config', default=None,
+                        help='path to a fused-memory config file (sets CONFIG_PATH)')
+    parser.add_argument('--since', type=_aware_datetime, default=POPULATION_SINCE,
+                        help=f'earliest created_at, with an offset '
+                             f'(default: {POPULATION_SINCE.isoformat()})')
+    parser.add_argument('--projects', nargs='+', default=list(POPULATION_PROJECTS),
+                        help=f'projects to freeze (default: {" ".join(POPULATION_PROJECTS)})')
+    args = parser.parse_args(argv)
+    if args.config:
+        os.environ['CONFIG_PATH'] = str(args.config)
+    print(json.dumps(asyncio.run(_freeze_live(args)), indent=2))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
