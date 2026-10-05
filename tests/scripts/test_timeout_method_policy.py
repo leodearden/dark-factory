@@ -167,7 +167,9 @@ def _run_probe_suite(suite: _ProbeSuite, *extra: str) -> subprocess.CompletedPro
 
     ``PYTEST_*`` is scrubbed from the child's environment, so an inherited
     ``PYTEST_ADDOPTS``, ``PYTEST_TIMEOUT`` or ``PYTEST_XDIST_WORKER`` cannot
-    change what the child runs or suppress the literals asserted on.
+    change what the child runs or suppress the literals asserted on. Only
+    ``PYTEST_DISABLE_PLUGIN_AUTOLOAD`` is then set, so the child loads exactly
+    ``PROBE_PLUGINS`` and nothing else installed in the venv.
     """
     missing = [
         plugin for plugin in ('xdist', 'pytest_timeout')
@@ -178,11 +180,13 @@ def _run_probe_suite(suite: _ProbeSuite, *extra: str) -> subprocess.CompletedPro
         'run; this is a missing plugin, not a measurement.'
     )
     env = {key: value for key, value in os.environ.items() if not key.startswith('PYTEST_')}
+    env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
     result = subprocess.run(
         [
             sys.executable, '-m', 'pytest',
             '-c', str(suite.ini),
             '-p', 'no:cacheprovider',
+            *(arg for name in PROBE_PLUGINS for arg in ('-p', name)),
             '-n', str(PROBE_WORKERS),
             '--dist', 'loadgroup',
             '-rA',
