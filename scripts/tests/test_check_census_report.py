@@ -179,3 +179,67 @@ def test_cli_entry_point_exit_status(tmp_path):
 
     assert proc.returncode == 1
     assert json.loads(proc.stdout.splitlines()[-1])["verdict"] == "nonconforming"
+
+
+PRE_CONTRACT_REPORT = (
+    "# confusion census 2026-10-03\n\n"
+    "## Saturation\n\nprose\n\n"
+    "## Verification\n\nprose\n\n"
+    "## Synthesis\n\nprose\n\n"
+    "## Filed Tasks\n\nprose\n\n"
+    "## Cost\n\nprose\n"
+)
+
+
+def test_newest_report_predating_the_header_is_no_conforming_report_yet(tmp_path, capsys):
+    write_report(tmp_path / "plans", "confusion-census-2026-09-30")
+    (tmp_path / "plans" / "confusion-census-2026-10-03.md").write_text(PRE_CONTRACT_REPORT, encoding="utf-8")
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert rc == 1
+    assert verdict["verdict"] == "no_conforming_report_yet"
+    assert verdict["report"] == "plans/confusion-census-2026-10-03.md"
+    assert verdict["missing"] == ["## Method", "plans/confusion-census-2026-10-03.json"]
+    assert "no conforming report yet" in lines[0]
+    assert "plans/confusion-census-2026-10-03.md" in lines[0]
+    assert "keys missing" not in lines[0]
+
+
+@pytest.mark.parametrize("plans_present", [False, True], ids=["no-plans-dir", "only-unrelated-files"])
+def test_no_report_at_all_is_no_conforming_report_yet(tmp_path, capsys, plans_present):
+    if plans_present:
+        plans = tmp_path / "plans"
+        plans.mkdir()
+        (plans / "confusion-census-2026-10-03-payloads.json").write_text("{}", encoding="utf-8")
+        (plans / "census-incremental-prd.md").write_text("# PRD\n", encoding="utf-8")
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert rc == 1
+    assert verdict["verdict"] == "no_conforming_report_yet"
+    assert verdict["report"] is None
+    assert "no conforming report yet" in lines[0]
+    assert "plans/confusion-census-" in lines[0]
+
+
+def test_rendering_with_method_but_no_record_is_nonconforming(tmp_path, capsys):
+    write_report(tmp_path / "plans", "confusion-census-2026-10-20", record=False)
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert rc == 1
+    assert verdict["verdict"] == "nonconforming"
+    assert "plans/confusion-census-2026-10-20.json" in verdict["missing"]
+    assert "keys missing" in lines[0]
+    assert "no conforming report yet" not in lines[0]
+
+
+def test_rendering_without_method_heading_is_named_missing(tmp_path, capsys):
+    write_report(tmp_path / "plans", "confusion-census-2026-10-20", sections=without(SECTIONS, "Method"))
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert rc == 1
+    assert verdict["verdict"] == "nonconforming"
+    assert "## Method" in verdict["missing"]
