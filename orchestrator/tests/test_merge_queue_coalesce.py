@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
-from _merge_lane_fakes import FakeClock, FakeVerifier
+from _merge_lane_fakes import FakeClock, FakeVerifier, hangs_until
 from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.landing_evidence import LandingEvidenceVerdict
@@ -1020,11 +1020,24 @@ class TestDebounce:
 
 # ─── Step 13 ────────────────────────────────────────────────────────────────
 
+def _first_verify_gated(
+    gate_release: asyncio.Event,
+    gate_entered: asyncio.Event | None = None,
+) -> FakeVerifier:
+    """The verify port, holding its FIRST scoped verify until *gate_release*.
+
+    *gate_entered*, when given, is set on that verify's arrival -- while it is
+    held, the merge commit is on the verifier queue and main has NOT advanced
+    to it, the state these scenes exist to observe. Every later verify passes.
+    """
+    return FakeVerifier(sequence=[hangs_until(gate_release, entered=gate_entered)])
+
+
 def _gated_verify(
     gate_release: asyncio.Event,
     gate_entered: asyncio.Event | None = None,
 ):
-    """A ``run_scoped_verification``-shaped gate wrapping :class:`_GatedVerifier`.
+    """A ``run_scoped_verification``-shaped gate wrapping :func:`_first_verify_gated`.
 
     For the two callers that must still patch the module global rather than
     inject the port: the TRAIN scene below (see its comment — _do_train_merge
@@ -1032,47 +1045,7 @@ def _gated_verify(
     test_coalesce_integration_gate.py, which imports this name. One gate
     implementation, two ways of installing it.
     """
-    return AsyncMock(side_effect=_GatedVerifier(gate_release, gate_entered).run_scoped)
-
-
-class _GatedVerifier(FakeVerifier):
-    """The verify port, holding its FIRST verify open until *gate_release*.
-
-    Injected through ``SpeculativeMergeWorker(..., verifier=...)`` rather than
-    patching ``orchestrator.merge_queue.run_scoped_verification``: the gate is
-    a property of the VERIFY the lane runs, so it belongs on the port the lane
-    was handed.
-
-    *gate_entered*, when given, is set the moment that first verify starts,
-    giving the test a synchronisation point — while it is held, the merge
-    commit is on the verifier queue and main has NOT advanced to it, which is
-    the state these scenes exist to observe.  Every later verify passes
-    immediately.
-
-    Only the arguments this double actually READS are named; the rest of
-    ``VerifyPort.run_scoped``'s signature travels as ``*args``/``**options`` --
-    the shape ``orchestrator/merge_lane/ports.py::ProductionVerifier`` uses
-    too -- so a port-signature change lands in the port and its one fake, not
-    in every double that wraps them.
-    """
-
-    def __init__(
-        self,
-        gate_release: asyncio.Event,
-        gate_entered: asyncio.Event | None = None,
-    ) -> None:
-        super().__init__()
-        self.gate_release = gate_release
-        self.gate_entered = gate_entered
-        self._first_blocked = False
-
-    async def run_scoped(self, *args, **options):
-        if not self._first_blocked:
-            self._first_blocked = True
-            if self.gate_entered is not None:
-                self.gate_entered.set()
-            await self.gate_release.wait()
-        return await super().run_scoped(*args, **options)
+    return AsyncMock(side_effect=_first_verify_gated(gate_release, gate_entered).run_scoped)
 
 
 @pytest.mark.asyncio
@@ -2765,7 +2738,7 @@ class TestCoalesceAfterHealthyMerge:
         gate_entered = asyncio.Event()
         worker = SpeculativeMergeWorker(
             git_ops, queue, event_store=es, train_callback_factory=factory,
-            verifier=_GatedVerifier(gate_release, gate_entered),
+            verifier=_first_verify_gated(gate_release, gate_entered),
         )
 
         warm_req = _make_req('hm0', 'hm0', wt_warm, coalesce_config)
