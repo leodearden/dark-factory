@@ -1,0 +1,109 @@
+prd: plans/task-metadata-lookup-prd.md
+schema_version: 1
+tasks:
+  - label: "L1"
+    task_id: null
+    title: "find_tasks_by_metadata: backend query, protocol, interceptor pass-through, MCP tool, docs"
+    note: "Single-leaf batch. Consumers depend on L1 from their own batches: completion-driven-triggers γ, δ, ε and census-incremental L4. Signal exemplar re-pointed from 5414 to 5021 at decompose (5414 landed with its files rewritten). Envelope binding FAIL resolved by the 2026-10-05 lead ruling (include_value + 48,000 B budget)."
+    capabilities:
+      - name: "per-project-read-guard"
+        binding: "capability→producer (wired) — sqlite_task_backend.py::SqliteTaskBackend._fresh_read_conn, used by SqliteTaskBackend.get_task"
+        verdict: PASS
+      - name: "status-index-for-filter"
+        binding: "capability→producer (wired) — ix_tasks_status ON tasks (tag, status) in sqlite_task_backend.py::_SCHEMA_SQL"
+        verdict: PASS
+      - name: "sqlite-json1-functions"
+        binding: "substrate — the live store answered json_valid/json_type/json_extract/json_each read-only on 2026-10-05; venv sqlite 3.50.4"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "runtime library capability, not a tree property"
+      - name: "backend-method-on-store-owner"
+        binding: "producer:L1 — SqliteTaskBackend.find_tasks_by_metadata, absent on main"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def find_tasks_by_metadata\\("
+          paths: ["fused-memory/src/fused_memory/backends/sqlite_task_backend.py"]
+          expect: present
+      - name: "protocol-declares-method"
+        binding: "producer:L1 — TaskBackendProtocol.find_tasks_by_metadata; SqliteTaskBackend is the only production implementer"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "def find_tasks_by_metadata\\("
+          paths: ["fused-memory/src/fused_memory/backends/task_backend_protocol.py"]
+          expect: present
+      - name: "interceptor-pass-through"
+        binding: "producer:L1 — TaskInterceptor.find_tasks_by_metadata in the Pure reads section (precedent TaskInterceptor.get_task); in-process consumer completion-driven-triggers γ"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def find_tasks_by_metadata\\("
+          paths: ["fused-memory/src/fused_memory/middleware/task_interceptor.py"]
+          expect: present
+      - name: "mcp-tool-registered"
+        binding: "producer:L1 — @mcp.tool find_tasks_by_metadata in server/tools.py; plumbing tools.py::_normalize_project_root, tools.py::_log_read, tool_errors.py::mcp_tool_errors exist"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "async def find_tasks_by_metadata\\("
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "paging-envelope-and-validation"
+        binding: "capability→producer (wired) — tools.py::_pagination_meta, tools.py::_validate_paging; limit clamp mirrors tools.py::search_tasks; bare-string statuses rejection in tools.py::get_tasks"
+        verdict: PASS
+      - name: "store-error-is-error-payload-not-empty"
+        binding: "mechanism-with-precedent — tool_errors.py::mcp_tool_errors wraps a raised store error; L1's backend method must raise, bound by L1's tests (INV-11)"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a behavioural property of the error path, bound by L1's tests, not greppable"
+      - name: "bool-value-and-bad-key-rejected"
+        binding: "rejection-mechanism — built by L1 and bound by boundary rows 5-6; precedent _validate_paging rejects page_size=True today"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "rejection quality is judged by L1's boundary rows 5-6"
+      - name: "live-producer-for-signal-key"
+        binding: "INV-13 — metadata.files written by submit_task in production (5,356 rows); task 5021 (done since 2026-09-11) carries scripts/merge_lane_metrics.py; 14 matches measured read-only 2026-10-05T16:43Z, count not asserted"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "a live-store observation, re-checked by the signal's same-moment forensic comparison"
+      - name: "page-fits-mcp-envelope"
+        binding: "floor (decision 6 as amended 2026-10-05) — default include_value=False, measured read-only 2026-10-05T16:57Z on 6,340 rows: worst row 2,036 B, worst 100 rows 40,798 B < 62,000; include_value=True: results held to RESULT_BYTE_BUDGET 48,000 B, largest single live row 44,375 B; wall ~62-80 KB per the tools.py comment on the get_statuses cap (task 3064). Was FAIL at first walk: measured without matched_value; with it, files presence worst100 184,760 B"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "RESULT_BYTE_BUDGET"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "opt-in-value-and-lone-row-elision"
+        binding: "producer:L1 — include_value (default False), truncated_value and the {_elided, bytes} placeholder, bound by boundary rows 13-15; completion-driven-triggers γ/ε must pass include_value=True"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "truncated_value"
+          paths: ["fused-memory/src/fused_memory/server/tools.py"]
+          expect: present
+      - name: "interim-forensic-fallback-removed-from-skills"
+        binding: "producer:L1 — the json_each(t.metadata, ...) snippet in skills/review/references/phase3-triage.md is present on main and removed by L1 (N→0)"
+        verdict: PASS
+        delivered_check:
+          kind: grep
+          pattern: "json_each\\(t\\.metadata"
+          paths: ["skills/"]
+          expect: absent
+      - name: "contract-step-1-fallback-clause-removed"
+        binding: "producer:L1 — docs/quality-findings-contract.md §8 step 1's 'until it lands' forensic clause and the matching prose in skills/review-all/SKILL.md and skills/_shared/filing-the-trigger-chain.md §1"
+        verdict: PASS
+        delivered_check:
+          kind: manual
+          reason: "prose removal; a regex over prose would pin wording, not behaviour (INV-10)"
+      - name: "boundary-row-12-consumer-face"
+        binding: "scripts/legibility/census_trigger.py::post_mcp_tool_call exists; no fused-memory test reaches it today; open question 2 lets L1 hand the row to completion-driven-triggers λ"
+        verdict: OPEN
+        delivered_check:
+          kind: manual
+          reason: "decided inside L1 (open question 2)"

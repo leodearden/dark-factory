@@ -6,6 +6,9 @@ decomposed.
 **Approach:** B+H, small — one seam, three consuming plans (G5 "cross-PRD consumers ≥ 2").
 **Code anchors** verified against `92af0716e8` (worktree `quality-skills-alignment`,
 2026-10-04). Cite-by-symbol; re-locate at implementation time.
+**Amended 2026-10-05 at decompose (lead ruling):** `include_value` (opt-in
+`matched_value`) and `RESULT_BYTE_BUDGET`, in decisions 4 and 6, the Contract and
+boundary rows 13–15. The signal exemplar moved from task 5414 to task 5021.
 **Ruling (Leo, 2026-10-04):** add a `find_tasks_by_metadata` fused-memory MCP tool for
 finding-key lookups; the task store is the disposition home (no new store).
 
@@ -16,8 +19,10 @@ ask fused-memory "which tasks carry this?" and get an exact, complete answer ove
 task in every status, including `deferred` and `cancelled`. Observable when it lands:
 
 - `find_tasks_by_metadata(project_root="/home/leo/src/dark-factory", key="files",
-  value="scripts/merge_lane_metrics.py")` over MCP returns task 5414 among 15 matches
-  (count measured 2026-10-04; a list-valued key matched by membership).
+  value="scripts/merge_lane_metrics.py")` over MCP returns task 5021 among its matches
+  (a list-valued key matched by membership). 5021 has been `done` since 2026-09-11, so
+  its `files` is no longer rewritten; the match count is not asserted, because open
+  tasks gain and lose the path (14 at 2026-10-05T16:43Z, read-only).
 - `docs/quality-findings-contract.md` §8 step 1 and the triage text of `/review`,
   `/review-all` and `/hotspot-survey` call the tool, with no interim forensic-sqlite
   fallback left in them.
@@ -102,13 +107,21 @@ process reach it over MCP; nothing outside fused-memory opens the store for this
    `x_finding_key` alone, with membership still scanned. `candidate_key` is not the
    precedent here: it is a server-computed scalar with a uniqueness invariant, not a
    caller-chosen key.
-4. **Row shape: `search_tasks`' row minus the bulky fields.** Each row is
-   `{task_id, title, status, priority, updated_at, matched_value}` — `search_tasks`'
+4. **Row shape: `search_tasks`' row minus the bulky fields; the value is opt-in.**
+   Each row is `{task_id, title, status, priority, updated_at}`. That is `search_tasks`'
    fields minus `score` (no ranking), `description` and `files_to_modify`. Including
-   the last two puts 50 median rows past the documented-safe MCP envelope (Background);
-   without them the worst 50 rows measured 25.6 KB. A caller that needs the record
-   (contract §8 step 1b reads a `cancelled` task's stated reason) calls `get_task` on the
-   one id, which it must do anyway to read `details`.
+   the last two puts 50 median rows past the documented-safe MCP envelope (Background).
+   With `include_value=True` a row also carries `matched_value`, the task's whole
+   `metadata[key]`. The default is `False`, because `matched_value` is unbounded per
+   key: measured 2026-10-05 on the live store, a presence page on `files` totals
+   113,201 B over its worst 50 rows, and one `dry_run_proposals` row reaches 41,415 B.
+   Contract §8 step-1 callers need only ids and status, so they use the default.
+   Completion-triggers γ and ε pass `include_value=True`, because they read
+   `trigger_chain` dicts, which are small. A caller that needs the record (contract §8
+   step 1b reads a `cancelled` task's stated reason) calls `get_task` on the one id,
+   which it must do anyway to read `details`. (Amended 2026-10-05 at decompose, lead
+   ruling: the first draft returned `matched_value` unconditionally, and its envelope
+   bound was measured without it.)
 5. **Match semantics.** `key` is one top-level `metadata` key; nested paths are out of
    scope. `value=None` matches every task where the key is present (including a JSON
    `null`). A `str` or `int` value matches a scalar by equality and a JSON list by
@@ -120,9 +133,29 @@ process reach it over MCP; nothing outside fused-memory opens the store for this
 6. **Completeness is in the result, not a log line** (INV-11). The response always
    carries `pagination` from `tools.py::_pagination_meta` (`total`, `offset`,
    `page_size`, `returned`, `has_more`), so a truncated page cannot read as complete.
-   `limit` defaults to 50 and is clamped to [1, 100] like `search_tasks`; the worst 100
-   rows of the reduced shape stay under the envelope (≤ 51 KB: the worst 50 total
-   25.6 KB, so each of the next 50 is at most the 50th's ~0.5 KB). A row whose `metadata` fails
+   `limit` defaults to 50 and is clamped to [1, 100], like `search_tasks`.
+
+   **Envelope bound.** The transport rejects a response past ~62–80 KB wholesale (see
+   the `tools.py` comment on the `get_statuses` cap, task 3064). Each mode has its own
+   bound:
+   - **`include_value=False`:** the `limit` cap is the bound. Measured read-only
+     2026-10-05T16:57Z on 6,340 rows, the worst row is 2,036 B, the worst 50 total
+     23,803 B and the worst 100 total 40,798 B.
+   - **`include_value=True`:** the tool additionally holds `RESULT_BYTE_BUDGET = 48_000`,
+     defined beside the limit cap, as the serialized size of `results`. It stops adding
+     rows once the next row would exceed the budget, so `returned` may be less than
+     `limit`. `has_more` and `offset` stay honest because the next offset is
+     `offset + returned`, and pages still tile.
+   - **A single row over the budget** is returned alone, with `truncated_value: true`
+     and `matched_value` replaced by `{"_elided": true, "bytes": N}`. The caller reads
+     it with `get_task`, and it never meets a transport error. No live row exceeds the
+     budget today: the largest single row over any top-level key is 44,375 B. The elided
+     path is reachable, though, and boundary row 14 pins it.
+
+   The budget is a transport concern, so it lives in the MCP tool. The in-process
+   `TaskInterceptor` method takes `include_value` but applies no byte budget.
+
+   A row whose `metadata` fails
    `json_valid` is skipped by a `CASE` guard (so one corrupt row cannot fail the whole
    query) and its id is reported under `malformed_metadata_ids`, present only when
    non-empty.
@@ -145,7 +178,7 @@ landed code.
 | Other PRD / surface | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
 | `docs/quality-findings-contract.md` §8 step 1 | consumes | the tool's name, signature and all-status corpus. §8 lets `x_finding_key` be a list, so step 1 relies on the tool's list-membership semantics (decision 5): a task filed with several keys must be found by any one of them | **this PRD** implements; the contract names it. L1 deletes the contract's "until it lands" fallback clause | contract in authoring 2026-10-04 |
-| `plans/completion-driven-triggers-prd.md` leaf γ (in-process) | consumes | the one-open-chain guard `fused-memory/src/fused_memory/middleware/trigger_chain_guard.py::trigger_chain_open_error`, wired into `tools.py::submit_task`, calls `TaskInterceptor.find_tasks_by_metadata(key='trigger_chain', value=None, statuses=ACTIVE)` — a presence query. It filters each row's `matched_value["skill"]` itself, which is why `matched_value` carries the whole top-level value (decision 5, nested paths out of scope). The in-process signature is the Contract's, minus the MCP-only `project_id`/`project_root` echo | **this PRD** owns the interceptor method; γ depends on L1. γ's own PRD decides that the guard fails open on a read error; this PRD's method raises and never returns an empty result on failure, so the guard can tell the two apart | that PRD in authoring 2026-10-04 |
+| `plans/completion-driven-triggers-prd.md` leaf γ (in-process) | consumes | the one-open-chain guard `fused-memory/src/fused_memory/middleware/trigger_chain_guard.py::trigger_chain_open_error`, wired into `tools.py::submit_task`, calls `TaskInterceptor.find_tasks_by_metadata(key='trigger_chain', value=None, statuses=ACTIVE, include_value=True)` — a presence query. It filters each row's `matched_value["skill"]` itself, which is why `matched_value` carries the whole top-level value (decision 5, nested paths out of scope) and why γ must opt in (decision 4). The same opt-in applies to that PRD's ε (`--pending`), which presence-queries `trigger_chain` over MCP. The in-process signature is the Contract's, minus the MCP-only `project_id`/`project_root` echo | **this PRD** owns the interceptor method; γ depends on L1. γ's own PRD decides that the guard fails open on a read error; this PRD's method raises and never returns an empty result on failure, so the guard can tell the two apart | that PRD in authoring 2026-10-04 |
 | `plans/completion-driven-triggers-prd.md` | consumes | `find_tasks_by_metadata(key="x_finding_run", value=<run_id>, limit=100)` paged on `has_more`, called from `scripts/check_run_completion.py` via `scripts/legibility/census_trigger.py::post_mcp_tool_call`; needs `status` and `priority` per row for the §11 weighted share | **this PRD** owns the tool; that PRD owns the script and its task depends on L1 | that PRD in authoring 2026-10-04; dependency wired at its decompose |
 | `plans/census-incremental-prd.md` | consumes | L4: contract §8 step 1 on `key="x_finding_key"` plus the backfill keyed on `source`, over `census_trigger.py::post_mcp_tool_call`. L6 consumes L4's back-links (a fixed entry re-observed after its fix), so it reaches the tool only through L4. The trigger's weighted completion reads `x_finding_run` inside `check_run_completion.py` (its L8b), not in census code | **this PRD** owns the tool; that PRD's L4 hard-depends on L1 (its own R7), and L6 follows L4. A store or transport failure reaches it as an `error` payload, not a raised exception — its boundary row 8 must test for the payload | that PRD in authoring 2026-10-04 |
 | `skills/review/references/phase3-triage.md`, `skills/review-all/**`, `skills/hotspot-survey/**`, `skills/_shared/filing-the-trigger-chain.md` | consume | contract §8 step 1 | the skills' seats own their text; L1 only removes the interim forensic-query sentences once the tool is live | skill edits in flight 2026-10-04 |
@@ -165,9 +198,13 @@ find_tasks_by_metadata(
     limit: int = 50,                       # clamped to [1, 100]
     offset: int = 0,
     tag: str | None = None,
+    include_value: bool = False,           # True adds matched_value; MCP page then held to RESULT_BYTE_BUDGET = 48_000
 ) -> {
     'project_id', 'project_root', 'key', 'value', 'statuses',
-    'results': [{'task_id': int, 'title', 'status', 'priority', 'updated_at', 'matched_value'}],
+    'results': [{'task_id': int, 'title', 'status', 'priority', 'updated_at',
+                 'matched_value',          # only when include_value=True
+                 'truncated_value': True,  # only on a lone over-budget row
+                }],
     'tasks_with_key': int,
     'pagination': {'total', 'offset', 'page_size', 'returned', 'has_more'},
     'malformed_metadata_ids': [int],       # only when non-empty
@@ -175,7 +212,13 @@ find_tasks_by_metadata(
 ```
 
 - Results are ordered by task id ascending, so pages tile the match set.
-- `matched_value` is the task's whole `metadata[key]` (the list, when it is a list).
+- `matched_value` is present only when `include_value=True`. It holds the task's whole
+  `metadata[key]` (the list, when it is a list), except on a lone over-budget row
+  (decision 6). There it is `{"_elided": true, "bytes": N}`, with `truncated_value: true`.
+- With `include_value=True`, the tool stops a page before the serialized `results`
+  would exceed `RESULT_BYTE_BUDGET`. `returned` may then be below `page_size`, and the
+  caller pages on `has_more` with `offset += returned`. `include_value` must be a real
+  `bool`; any other type is a `ValidationError`.
 - Validation errors return `{'error', 'error_type': 'ValidationError'}` naming the
   offending argument and value, before the store is touched (`tools.py::_validate_paging`
   for `limit`/`offset`; bare-string `statuses` rejected as in `get_tasks`).
@@ -194,7 +237,7 @@ internals (Tests stance, `docs/code-quality.md`).
 | # | Scenario | Preconditions | Postconditions |
 |---|---|---|---|
 | 1 | Scalar match across statuses | three tasks with `x_finding_key="fk-aaa…"` in `pending`, `deferred`, `cancelled` | all three returned, ids ascending; `tasks_with_key == 3` |
-| 2 | List membership | task with `x_finding_key=["fk-a","fk-b"]` | `value="fk-b"` returns it; `matched_value` is the list |
+| 2 | List membership | task with `x_finding_key=["fk-a","fk-b"]` | `value="fk-b"` returns it. With `include_value=True`, `matched_value` is the list |
 | 3 | Presence | `value=None`, one task with `x_k: null`, one without `x_k` | the first is returned, the second is not |
 | 4 | Int value against an int list | `related_tasks=[12, 40]` | `value=40` matches; `value="40"` does not |
 | 5 | Bool rejected | `value=True` | `ValidationError` naming `value=True`; store not read |
@@ -205,6 +248,9 @@ internals (Tests stance, `docs/code-quality.md`).
 | 10 | Status filter | `statuses=['cancelled']` | only `cancelled` rows; `tasks_with_key` counted within the filter |
 | 11 | Unknown key | key nobody carries | `results == []`, `tasks_with_key == 0` |
 | 12 | Consumer face | `scripts/legibility/census_trigger.py::post_mcp_tool_call` against a live server in the fused-memory MCP integration harness | the unwrapped payload has the Contract shape |
+| 13 | Budget cut mid-page | `include_value=True`, `limit=10`, 10 matches each carrying a ~10,000 B value | first page `returned < 10` with serialized `results` ≤ 48,000 B and `has_more=True`; paging on `offset += returned` reaches all 10 with no overlap and no gap |
+| 14 | Lone over-budget row | `include_value=True`, one match whose value serializes past 48,000 B | the page holds that row alone, with `truncated_value: true` and `matched_value == {"_elided": true, "bytes": N}`, where N is the value's serialized size; no error; `get_task` on the id returns the whole value |
+| 15 | Default omits the value | the row-14 store, `include_value` omitted | rows carry no `matched_value`, and the page is cut only by `limit` |
 
 ## Decomposition plan
 
@@ -232,10 +278,12 @@ with the code.
   `skills/` and `docs/` at implementation time and removes any further fallback it finds.
   **Signal:** after the service restarts onto the landed code, an MCP call
   `find_tasks_by_metadata(project_root="/home/leo/src/dark-factory", key="files",
-  value="scripts/merge_lane_metrics.py")` returns task 5414 with `status`, `priority`
-  and `matched_value`, and `pagination.total` equals the count from the forensic query in
-  `CLAUDE.md` §"Forensic reads of tasks.db" at the same moment; boundary rows 1–11 (and
-  row 12, subject to open question 2) are green in the fused-memory suite. Consumers: the completion-triggers and
+  value="scripts/merge_lane_metrics.py", include_value=True)` returns task 5021 with
+  `status`, `priority` and its `files` list as `matched_value`, and `pagination.total`
+  equals the count from a read-only forensic membership query (`CLAUDE.md` §"Forensic
+  reads of tasks.db") run at the same moment. The same call without `include_value`
+  returns rows with no `matched_value`. Boundary rows 1–11 and 13–15 (and row 12,
+  subject to open question 2) are green in the fused-memory suite. Consumers: the completion-triggers and
   census-incremental tasks (dependency wired at their decompose), and every instrument's
   §8 step 1.
 
@@ -250,7 +298,8 @@ with the code.
 | Tool plumbing | `tools.py::_normalize_project_root`, `tools.py::_log_read`, `fused-memory/src/fused_memory/server/tool_errors.py::mcp_tool_errors` |
 | Pass-through precedent | `task_interceptor.py::TaskInterceptor.get_task` |
 | Script transport | `scripts/legibility/census_trigger.py::post_mcp_tool_call` |
-| Live list-valued key for the signal | `files` on 5,297 rows; task 5414 carries `scripts/merge_lane_metrics.py` |
+| Live list-valued key for the signal | `files` on 5,297 rows; task 5021 (`done` since 2026-09-11) carries `scripts/merge_lane_metrics.py`, re-measured read-only 2026-10-05T16:43Z with 14 matches in all. The first exemplar, 5414, was wrong: it was open when chosen and its `files` was rewritten when it landed |
+| Page fits the MCP envelope (decision 6) | Measured read-only 2026-10-05T16:57Z on 6,340 rows. Without `matched_value`: worst row 2,036 B, worst 100 rows 40,798 B. With it, the 48,000 B budget bounds the page, and the largest single live row is 44,375 B. The wall is the `tools.py` comment on the `get_statuses` cap (task 3064) |
 
 G7 walk (advisory at author time): INV-11 `no-silent-fail-soft` — decision 6 and the
 Contract's error rule; INV-13 `readers-prove-their-producer` — decision 7 (no `x_finding*` producer

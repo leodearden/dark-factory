@@ -11,17 +11,28 @@ consumers ≥ 2").
 **Ruling (Leo, 2026-10-04):** the whole-repo metrics snapshot is a REPORT — never a gate,
 never a line-count ranking. First consumer `/review-all` phase 1; then `/review` and
 `/hotspot-survey` for module selection.
+**Rulings (Leo, 2026-10-05):** the task 5414 Part 2 re-point (decision 3) is approved, so
+its decompose-time actions are authorised; the domain includes `scripts/` and top-level
+`tests/` as pseudo-members (decision 3).
+**Amended at decompose (2026-10-05, lead ruling within Leo's 2026-10-05 ruling):** task
+5414 was already done when this PRD reached decompose (merged `cdc15a6b56`, 2026-10-05).
+Its Part 2 shipped as `scripts/suite_census_pinning.py` with its own whole-tree enumeration.
+There is no task left to re-point, so S1 re-points that landed code onto
+`workspace_domain` (decision 3), and 5414 gets no `update_task` and no `add_dependency`.
+S1's move list also covers the seams 5414 added to `merge_lane_metrics.py` (decision 1).
 
 ## Goal
 
-One command measures every workspace member's `src/` and `tests/` at one commit and writes
-one JSON snapshot; a second invocation says what moved since the previous snapshot.
+One command measures every workspace member's `src/` and `tests/`, plus the `scripts` and
+`tests` pseudo-members, at one commit and writes one JSON snapshot; a second invocation
+says what moved since the previous snapshot.
 Observable when it lands:
 
 - `uv run python scripts/quality_metrics_snapshot.py --run-id <run_id> --out <path>` on a
   clean checkout writes a snapshot whose `evidence.complete` is `true` and whose
-  `evidence.measured_files` equals the tracked `.py` count under the members' `src/` and
-  `tests/` (1,957 at `92af0716e8`).
+  `evidence.measured_files` equals the tracked `.py` count of the domain: the members'
+  `src/` and `tests/` plus `scripts/` and top-level `tests/` (1,957 + 204 + 94 = 2,255 at
+  `92af0716e8`).
 - `--diff <previous snapshot>` prints, per module, the complexity pair as
   `docs/code-quality.md` §"What to measure" reads it, every file that crossed heuristic
   14's 1,500 or 2,000 raw-line marks (labelled "measure, not fix"), and the import and
@@ -78,19 +89,24 @@ heavy load, without a cache.
 complexipy 7.x would make it unusable (`merge_lane_metrics.py`'s `COMPLEXIPY_*` note:
 247 s on one file), which the shared version pin already prevents.
 
-Task **5414** (pending; ruling R5 of `plans/agent-capacity-study-2026-09-09.md`, which
-lives untracked in the main checkout) Part 2 asks to "widen the 5021 ratchet enumeration
-to the whole first-party tree in a report-only mode" for test-pinning counts. That is the
-same enumeration and two of the same measures this snapshot takes; two copies would
-violate heuristic 11 (SPOT).
+Task **5414** (ruling R5 of `plans/agent-capacity-study-2026-09-09.md`, which lives
+untracked in the main checkout) Part 2 asked to "widen the 5021 ratchet enumeration to the
+whole first-party tree in a report-only mode" for test-pinning counts. That is the same
+enumeration and two of the same measures this snapshot takes; two copies would violate
+heuristic 11 (SPOT). 5414 is done (`cdc15a6b56`, 2026-10-05). Part 2 shipped as
+`scripts/suite_census_pinning.py::measure_python_tree`, with its own tracked-`tests/` walk and
+`_FirstParty` module map, and it imports `PatchCall`, `patch_calls_in_tree` and
+`tracked_files`, seams 5414 added to `merge_lane_metrics.py`. The duplicate this PRD set out
+to prevent has therefore landed, and S1 removes it (decision 3).
 
 ## Sketch of approach
 
 Two layers. Below: `scripts/source_measures.py`, the measures and the domain enumeration,
 knowing nothing of the merge lane or of snapshots. Above it, two consumers that import it
 downward: `scripts/merge_lane_metrics.py` (the cluster ratchet, a gate) and
-`scripts/quality_metrics_snapshot.py` (the whole-repo report, never a gate). Task 5414
-becomes a third consumer of the same enumeration and of the snapshot's numbers.
+`scripts/quality_metrics_snapshot.py` (the whole-repo report, never a gate). Task 5414's
+landed census, `scripts/suite_census_pinning.py`, becomes a third consumer of the same
+enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
 
 ## Resolved design decisions
 
@@ -98,7 +114,8 @@ becomes a third consumer of the same enumeration and of the snapshot's numbers.
    `file_size_measures*`, `function_local_imports*`, `reexport_names*`, the complexipy
    adapter and its version pin (`COMPLEXIPY_MIN`, `COMPLEXIPY_MAX_EXCLUSIVE`,
    `require_complexipy`, `file_cognitive_measures`), `maintainability_index`,
-   `private_reads*`, `patch_targets*`, `src_module_name`, `tracked_python_files` and
+   `private_reads*`, `patch_targets*`, `PatchCall`, `patch_calls_in_tree`,
+   `src_module_name`, `tracked_files` (with `_git_output`), `tracked_python_files` and
    `MetricsError` move from `scripts/merge_lane_metrics.py` to
    `scripts/source_measures.py`. The cluster spec, lane-specific predicates
    (`LANE_PATCH_MODULES`, `lane_module_names`, `imports_lane_module*`,
@@ -110,7 +127,11 @@ becomes a third consumer of the same enumeration and of the snapshot's numbers.
    stays importable from `merge_lane_metrics.py`: every importer
    (`scripts/check_staged_ratchet_raise.py`, `orchestrator/tests/test_merge_lane_ratchet.py`,
    `orchestrator/tests/test_merge_lane_ratchet_commit_gate.py`,
-   `orchestrator/tests/test_merge_lane_alias_names.py`) is re-pointed, because a
+   `orchestrator/tests/test_merge_lane_alias_names.py`, and, since 5414 landed,
+   `scripts/suite_census.py`, `scripts/suite_census_evidence.py`,
+   `scripts/suite_census_pinning.py`, `scripts/suite_census_rust.py`,
+   `scripts/tests/test_merge_lane_metrics_patch_calls.py`,
+   `scripts/tests/test_suite_census_pinning.py`) is re-pointed, because a
    compatibility re-export is the heuristic-13 symptom the snapshot itself counts.
 2. **`patch_targets` takes its module set as an argument.** Today it reads
    `LANE_PATCH_MODULES` from module scope. It becomes
@@ -123,13 +144,30 @@ becomes a third consumer of the same enumeration and of the snapshot's numbers.
    reads the member list from root `pyproject.toml` with `tomllib` (one home for the
    member list), lists `<member>/src/**.py` and `<member>/tests/**.py` from
    `git ls-files -s` (path and blob sha), and is the enumeration both the snapshot and
-   5414's Part 2 use. The ratchet keeps its own fixed `CLUSTER_PATHS` manifest, which is a
-   different question (a named cluster where a missing path is the finding). At
-   decompose, 5414 gains a dependency on S2 and its Part 2 is re-pointed: pinning counts
-   per package are aggregated from the snapshot's test-file records, and its extra
-   measures (prose-constant assertions, duplicate bodies) iterate `workspace_domain`;
-   no report-only mode is added to `merge_lane_metrics.py`. That re-pointing edits a
-   task that carries a ruling — see Open questions for Leo.
+   5414's Part 2 use. It appends two pseudo-members (Leo, 2026-10-05), each a domain entry
+   of the same shape as a real member with `pseudo: true` in `evidence.members`: member
+   `scripts`, whose `src` is tracked `scripts/**.py` outside `scripts/tests/` and whose
+   `tests` is `scripts/tests/**.py` (94 and 110 files at `92af0716e8`); and member `tests`,
+   whose `tests` is top-level `tests/**.py` (94) and which has no `src`. The pseudo-member
+   names and roots are one constant in `source_measures.py`, beside the member-list read,
+   not a second member list. `scripts` files' import-graph module names resolve with
+   `scripts/` as the import root, as `sys.path[0]` makes them at run time. `hooks/` stays
+   outside the domain. The ratchet keeps its own fixed `CLUSTER_PATHS` manifest, which is a
+   different question (a named cluster where a missing path is the finding). *Amended
+   2026-10-05:* 5414 was done before decompose (`cdc15a6b56`), and its Part 2 shipped as
+   `scripts/suite_census_pinning.py`. So the second consumer is that landed code, not a
+   task to re-point. S1 replaces its two enumerations: the walk over every tracked `.py`
+   with a `tests` path segment (`measure_python_tree` / `_in_test_tree`) and the
+   `_FirstParty` module map, which reads `src` paths plus `_SCRIPT_DIRS`. Both now come
+   from `workspace_domain(root)`. The census keeps its root argument, so it still measures
+   any tree it is pointed at. `_SCRIPT_DIRS` folds into the `scripts` pseudo-member rule:
+   `scripts/` is the import root, and `scripts/legibility` modules resolve through it as
+   `legibility.<name>`. At `2bdfa20ce2` the census's test-file set equals the domain's
+   `tests` kind exactly (1,656 = 1,443 member + 117 `scripts/tests` + 96 top-level), so its
+   per-package file, line, prose-line, test-function and private-read counts cannot move.
+   Only the first-party-dependent columns can move, and only for a test that imports a
+   `scripts/legibility` module by its bare name. 5414 gets no `update_task` and no
+   `add_dependency`. No report-only mode is added to `merge_lane_metrics.py`.
 4. **Measure the checked-out commit, refuse a dirty domain.** `as_of_sha` is
    `git rev-parse HEAD`; if `git status --porcelain` lists any path under the domain the
    run exits 2 naming the paths. Files are read from the work tree and measured with
@@ -204,7 +242,7 @@ becomes a third consumer of the same enumeration and of the snapshot's numbers.
 | Other PRD / surface | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
 | `plans/merge-lane-quality-prd.md` (ratchet α = task 5021, landed) | shares measures | `scripts/source_measures.py`, imported by `scripts/merge_lane_metrics.py` | **this PRD** (S1) moves the measures; the merge-lane PRD keeps the ratchet, its baseline, ceilings and gate unchanged — S1's signal is a byte-identical `--json` report | S1 queued at decompose |
-| task 5414 (R5 test census, pending) | consumes | `source_measures.workspace_domain` + the snapshot's test-file records | **this PRD** owns enumeration and measures; 5414 depends on S2 and stops adding a report-only mode to `merge_lane_metrics.py` | needs Leo's confirmation (Open questions) |
+| task 5414 (R5 test census) — done, `cdc15a6b56`, 2026-10-05; Part 2 is `scripts/suite_census_pinning.py` | consumes | `source_measures.workspace_domain` + the moved measures (`patch_calls_in_tree`, `tracked_files`, `private_reads_in_tree`, …) | **this PRD**: S1 re-points the census's imports, S1b re-points its enumeration and `_FirstParty` map onto `workspace_domain`; no `update_task`/`add_dependency` on 5414 (amended 2026-10-05) | landed code; S1 + S1b queued at decompose |
 | `skills/review-all/**` (phase 1) | consumes | the snapshot file, its `import_graph` section, the `summary` output | **this PRD** owns the script and JSON contract; the skill owns invocation, the snapshot's committed home and how the summary enters `metrics_summary` | skill in authoring |
 | `skills/review/**`, `skills/hotspot-survey/**` | consume | latest committed snapshot for module selection (contract §9) | the skills own the reading rule; this PRD owns the fields | skills in authoring |
 | `plans/task-metadata-lookup-prd.md` | none | — | — | independent |
@@ -258,7 +296,7 @@ members; no measure is patched (Tests stance).
 | # | Scenario | Preconditions | Postconditions |
 |---|---|---|---|
 | 1 | Ratchet unchanged by S1 | the real repository at one commit, measured by the pre-S1 and post-S1 script | `merge_lane_metrics.py --json` byte-identical; `--check` green against the unchanged committed baseline |
-| 2 | Domain from members | fixture with 2 members, an untracked `.py`, a `scripts/x.py` | snapshot lists exactly the tracked member `src`/`tests` files |
+| 2 | Domain from members | fixture with 2 members, an untracked `.py`, a tracked `scripts/x.py`, `scripts/tests/test_x.py`, `tests/test_y.py` and `hooks/h.py` | snapshot lists exactly the tracked member `src`/`tests` files plus `scripts/x.py` (member `scripts`, `src`), `scripts/tests/test_x.py` (member `scripts`, `tests`) and `tests/test_y.py` (member `tests`, `tests`); both pseudo-members carry `pseudo: true`; no `hooks/` file |
 | 3 | Dirty domain | modify one tracked member file | exit 2 naming the path; no file written |
 | 4 | Unparseable member file | commit a file with a syntax error | exit 0; path in `evidence.unreadable`; `complete: false` |
 | 5 | Complexity pair | commit 2 splits one function into two, same total | `--diff` shows max down, total flat, with the doc's reading |
@@ -269,29 +307,58 @@ members; no measure is patched (Tests stance).
 | 10 | Private patch targets | test patches `pkg.mod._x` by string, `pkg.mod.public`, and `patch.object(mod, "_y")` | `private_patch_targets == ["pkg.mod._x", "pkg.mod._y"]` |
 | 11 | No previous snapshot | measure without `--diff`; then with `--diff` naming a missing file | first: `since == "none"` and the "no previous snapshot given" line; second: exit 2 naming the path |
 | 12 | Cluster agreement | real repo | for every cluster path, snapshot `lines`/`prose_lines`/`cognitive_total` equal the ratchet report's |
+| 13 | Census enumerates the domain (S1b) | the row-2 fixture plus `hooks/tests/test_h.py`, and a `scripts/tests` test patching `legibility.mod._x` | `suite_census_pinning.measure_python_tree` counts exactly the domain's `tests` files (no `hooks/` file), grouped under the member names; `legibility.mod._x` counts as a first-party private target |
 
 ## Decomposition plan
 
-Two leaves, both `task_kind='normal'`. S1 is quality-motivated: heuristic 14 (the host
+Three leaves, all `task_kind='normal'` (amended 2026-10-05 from two: the 5414 census
+re-point is S1b, see decision 3). S1 is quality-motivated: heuristic 14 (the host
 file is over the alarm), heuristic 6 (*well-defined purpose* — measures versus ratchet),
 heuristic 13 (the new file must make sense alone), heuristic 11 (one copy of each
 measure). The S1 task text cites them by name and requires the heuristic-14 measurement
-in the commit message.
+in the commit message. S1 is split from S1b so that S1 stays a pure move with an exact
+signal. S1 has 14 declared files, under the overlay's >15 review trigger, and the one
+behaviour change (the census's enumeration) lands alone in S1b.
 
 - **S1 — Extract `scripts/source_measures.py`; generalise `patch_targets`; add
-  `workspace_domain`.** [high; ~1,000–1,500 changed LOC, mostly moves; ~8 files]
+  `workspace_domain`.** [high; ~1,000–1,500 changed LOC, mostly moves; 14 files]
   Files: `scripts/source_measures.py` (new), `scripts/merge_lane_metrics.py`,
   `scripts/check_staged_ratchet_raise.py`, `orchestrator/tests/test_merge_lane_ratchet.py`,
   `orchestrator/tests/test_merge_lane_ratchet_commit_gate.py`,
   `orchestrator/tests/test_merge_lane_alias_names.py`, a new test module for the measures
   under `tests/scripts/` (the measure unit tests move with the measures),
   `tests/scripts/test_pyright_unnecessary_ignore_opt_in.py` (its
-  `merge_lane_metrics.py::_import_complexipy` pointer). **Signal:** boundary row 1 —
-  `python scripts/merge_lane_metrics.py --json` is byte-identical before and after on the
-  same tree and `pytest orchestrator/tests/test_merge_lane_ratchet.py` is green against
-  the unchanged committed baseline; `git grep -n "^def file_size_measures\|^def patch_targets" scripts/merge_lane_metrics.py`
-  is empty; `source_measures.py` imports nothing from `merge_lane_metrics`. Unlocks S2 and
-  (re-pointed) 5414.
+  `merge_lane_metrics.py::_import_complexipy` pointer), and the six 5414 importers whose
+  imports change only (`scripts/suite_census.py`, `scripts/suite_census_evidence.py`,
+  `scripts/suite_census_pinning.py`, `scripts/suite_census_rust.py`,
+  `scripts/tests/test_merge_lane_metrics_patch_calls.py`,
+  `scripts/tests/test_suite_census_pinning.py`). `workspace_domain` entries carry each
+  file's import name: the `src_module_name` rule for member `src`, and `scripts/` as the
+  import root for the `scripts` pseudo-member. That keeps one home for module resolution,
+  which S1b and S2 both read. **Signal:** boundary row 1 — `python
+  scripts/merge_lane_metrics.py --json --root <tree>` is byte-identical between the pre-S1
+  and post-S1 script on the same tree, and `pytest orchestrator/tests/test_merge_lane_ratchet.py`
+  is green against the unchanged committed baseline. This holds only if no file S1 edits is
+  or becomes lane-importing (`imports_lane_module_in_tree`), because such a file would enter
+  the report's `tests` section. `git grep -nE "^def (file_size_measures|patch_targets|tracked_files|patch_calls_in_tree)" scripts/merge_lane_metrics.py`
+  is empty, and `source_measures.py` imports nothing from `merge_lane_metrics`. Unlocks S1b
+  and S2.
+- **S1b — Re-point the landed 5414 census enumeration onto `workspace_domain`.** [medium;
+  ~200–400 LOC; 2 files] Files: `scripts/suite_census_pinning.py`,
+  `scripts/tests/test_suite_census_pinning.py`. `measure_python_tree` replaces its
+  `tracked_files` walk and `_in_test_tree` with the `tests`-kind entries of
+  `workspace_domain(tree_root)`, grouped by member. `_FirstParty.of` reads the domain's
+  import names, and `_SCRIPT_DIRS` is deleted (decision 3). The tree-root argument stays. A
+  tree whose root `pyproject.toml` names no workspace members gets a `MetricsError`, which
+  `suite_census.py` already maps to exit 2. **Signal:** boundary row 13 green. The pre-S1b
+  and post-S1b `suite_census.py --ecosystem pytest --root /home/leo/src/dark-factory --tree
+  <checkout of S1b's parent>` reports carry identical Part 2 `test_files`, `lines`,
+  `prose_lines`, `test_functions` and `private_reads` per package. Any delta in a
+  first-party-dependent column is confined to tests importing a `scripts/legibility` module
+  by bare name, and the commit message lists it. `git grep -n "_SCRIPT_DIRS\|tracked_files"
+  scripts/suite_census_pinning.py` is empty. Consumer: the operator re-running the 5414
+  census and the merge-lane programme's pinning-reduction clusters, which read its
+  per-package counts. Depends on S1.
 - **S2 — `scripts/quality_metrics_snapshot.py` (measure, `--diff`, `--summary`) and the
   `/review-all` phase-1 wiring.** [high; ~900–1,300 LOC with fixture tests; ~6 files]
   Files: `scripts/quality_metrics_snapshot.py` (new), its fixture-repo test module under
@@ -306,52 +373,54 @@ in the commit message.
   the next attended `/review-all` run commits its first snapshot (contract §11 human gate).
   Depends on S1.
 
-Decompose-time actions: `add_dependency(5414, S2)`; `update_task(5414)` re-pointing Part 2
-(decision 3) — only after Leo confirms.
+Decompose-time actions: none on task 5414 (amended 2026-10-05). 5414 is done
+(`cdc15a6b56`, 2026-10-05), and its Part 2 shipped as `scripts/suite_census_pinning.py`,
+which S1 and S1b re-point. The earlier `add_dependency(5414, S2)` and `update_task(5414)`
+are withdrawn.
 
 ### Capability bindings (draft for the decompose manifest)
 
 | Leaf | Capability | Evidence at `92af0716e8` |
 |---|---|---|
 | S1 | measures to move | `scripts/merge_lane_metrics.py::file_size_measures_in_tree`, `::function_local_imports_in_tree`, `::reexport_names_in_tree`, `::file_cognitive_measures`, `::require_complexipy`, `::maintainability_index`, `::patch_targets_in_tree`, `::private_reads_in_tree`, `::src_module_name`, `::tracked_python_files`, `::MetricsError` |
-| S1 | importers to re-point | `scripts/check_staged_ratchet_raise.py` (uses `metrics.MetricsError`, `metrics.AppendOnlyViolation`, ledger and compare functions); three `orchestrator/tests/` modules importing `merge_lane_metrics` |
+| S1 | importers to re-point | `scripts/check_staged_ratchet_raise.py` (uses `metrics.MetricsError`, `metrics.AppendOnlyViolation`, ledger and compare functions); three `orchestrator/tests/` modules importing `merge_lane_metrics`; at `2bdfa20ce2` also the six 5414 importers (decision 1) |
+| S1 | 5414 seams to move (re-verified at decompose, `2bdfa20ce2`) | `scripts/merge_lane_metrics.py::PatchCall`, `::patch_calls_in_tree`, `::tracked_files`, `::_git_output` |
+| S1b | census enumeration to replace | `scripts/suite_census_pinning.py::measure_python_tree`, `::_in_test_tree`, `::_FirstParty`, `::_SCRIPT_DIRS` |
 | S2 | complexipy per-file API, version pin | `complexipy.file_complexity` 6.2.0 in the workspace venv; `merge_lane_metrics.py::COMPLEXIPY_MIN` / `::COMPLEXIPY_MAX_EXCLUSIVE` |
-| S2 | member list | root `pyproject.toml` `[tool.uv.workspace].members` (7 entries) |
-| S2 | consumer's expected graph shape | `skills/review-all/references/orchestration.md` `import_graph_path` description (uncommitted in this worktree on 2026-10-04 — re-verify at decompose) |
+| S2 | member list | root `pyproject.toml` `[tool.uv.workspace].members` (7 entries), plus the two pseudo-members (decision 3) |
+| S2 | consumer's expected graph shape | `skills/review-all/references/orchestration.md` `import_graph_path` description (committed; re-verified at decompose, `2bdfa20ce2`) |
 
 G7 walk (advisory at author time): INV-11 `no-silent-fail-soft` — decision 7;
 INV-13 `readers-prove-their-producer` — a run with no previous snapshot says so;
 INV-5 `no-lockstep-duplication` and INV-9 `one-fact-one-home` — decisions 1, 3 and 6;
 INV-10 `guards-exercise-behaviour` — boundary rows run the measures on a real fixture
-repository. No waiver.
+repository. No waiver. Decompose walk (2026-10-05) adds S1b: it removes the landed
+duplicate enumeration (INV-5, INV-9), and its unparseable-file path keeps the census's
+`unreadable` / `complete` result fields (INV-11). Still no waiver.
 
 ## Out of scope
 
 - Any gate, ratchet, threshold, severity input or ranking built on the snapshot (ruling;
   contract §10).
 - Changing the merge-lane ratchet's cluster, baseline, ceilings or runtime.
-- Non-Python projects (reify's cargo-side measures are 5414's Part 2 business).
-- Measuring `scripts/`, top-level `tests/` and `hooks/` (see Open questions).
+- Non-Python projects (reify's cargo-side measures shipped with 5414 as
+  `scripts/suite_census_rust.py`; S1 changes only its import).
+- Measuring `hooks/` (`scripts/` and top-level `tests/` are in the domain, decision 3).
 - Mutation scores, coverage, churn and fix-rate history (other rows of the doc's table;
   `/hotspot-survey` owns history).
 - Committing the snapshot (decision 8).
 
 ## Open questions
 
-For Leo (gates needing a human):
-
-1. **Re-pointing task 5414 Part 2.** R5 says "widen the 5021 ratchet enumeration to the
-   whole tree". Decision 3 meets that by sharing the ratchet's measures and one
-   whole-tree enumeration, and drops the "report-only mode in
-   `scripts/merge_lane_metrics.py`" from 5414's text. Confirm before decompose edits a
-   task that carries your ruling.
-2. **Domain breadth.** The team brief scoped the domain to members' `src/` and `tests/`;
-   `scripts/` (204 tracked `.py`, including `merge_lane_metrics.py` itself) and top-level
-   `tests/` (94) are excluded. Include them as a pseudo-member `repo-scripts`?
+Decided by Leo, 2026-10-05 (no longer open): the 5414 Part 2 re-point (decision 3). It
+was amended the same day at decompose: 5414 was already done, so the re-point acts on
+the landed census code (S1, S1b), not on the task. The domain includes `scripts/` and
+top-level `tests/` as pseudo-members (decision 3).
 
 Tactical (decide in the leaf):
 
-3. Committed snapshot size (~1 MB estimated from 1,957 file records and 7,006 function
-   entries): accept, or drop the per-function `src` map in favour of each file's pair.
-4. The `--summary` columns, within the rule that every column is a count, total or
+1. Committed snapshot size (~1 MB estimated from 1,957 member file records and 7,006
+   function entries, before the pseudo-members' 298 files and `scripts` `src` functions):
+   accept, or drop the per-function `src` map in favour of each file's pair.
+2. The `--summary` columns, within the rule that every column is a count, total or
    pair, rows are members in name order, and nothing is averaged or ranked.

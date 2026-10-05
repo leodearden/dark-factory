@@ -510,6 +510,8 @@ that populates the field is owned by `plans/confusion-reduction-prd.md`,
 which ships the field in its γ task and names this doc reciprocally in its
 §10 (Cross-PRD relationship). A slug violated repeatedly across census
 batches is an enforcement gap: file a guard task.
+Populating the field and checking its slugs are owned by
+`plans/census-incremental-prd.md` leaf L9 (as of 2026-10-05).
 
 ## Fixtures
 

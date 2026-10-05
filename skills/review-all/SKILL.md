@@ -67,7 +67,7 @@ The snapshot's home is the committed `plans/quality-metrics/<run_id>.json` (the 
 - `--diff` against the one previous snapshot nearest `since` (the `plans/quality-metrics/*.json` whose `as_of_sha` is `since`, else the newest one older than `AS_OF`); same instrument, same rule — the report writes which snapshot it diffed.
 - under `<scratch>/review-all/<run_id>/`: `import_graph.json` (the snapshot's section copied unchanged — the path seats read) and `metrics_summary`, ≤ 4k chars of tables for the seat prompts including the delta column.
 
-Task 5414 widens the merge-lane ratchet enumeration — reuse its enumeration when it has landed rather than re-deriving a count it already pins.
+Task 5414 is done (`cdc15a6b56`, 2026-10-05): its per-package pinning counts live in `scripts/suite_census_pinning.py`, which after the metrics PRD's S1 enumerates through `scripts/source_measures.py::workspace_domain` as the snapshot does — reuse those counts rather than re-deriving them.
 
 **Slices.** Hand-author the slice list (never delegate it): one seat per area; an area over ~40k source lines is split along the import graph's package clusters (overlay seeds first) into slices of ≤ ~40k lines. Within a slice, `read_fully` is the top ~15k lines ranked by cognitive max, fan-in, reach-back imports, re-exports, patch targets and fix density — never by line count — and `index_only` is the rest. `tests_reaching_internals` comes from the patch-target measure; `size_alarms` from the ceilings; `prior_open` and `leads` from Phase 0, filtered to the area.
 

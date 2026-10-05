@@ -13,7 +13,7 @@ The census stays automated. After this batch, a run spends only on transcripts n
 - `## Filed Tasks` names task ids as well as tickets, and says which §8 dedup step decided each finding. `## Dispositions` carries the previous runs' tickets forward to tasks, and those tasks' outcomes back to codebook entries.
 - `## Screened` counts the clusters attached to an existing record with no verify spend. `## Adjudication` reports the pending-candidate queue's depth, how many entries it processed this run, and an audit line for every similarity attach.
 - `## Synthesis` is rendered from validated JSON, split into new findings and re-observed ones, with no re-narrated history.
-- `scripts/legibility/census_trigger.py evaluate` prints these reason lines: completion share of the previous run's filed tasks, a relative novelty spike measured against its trailing baseline, the max-interval backstop, and the floor measured against the session watermark.
+- `scripts/legibility/census_trigger.py evaluate` prints these reason lines: completion share of the previous run's filed tasks, a relative novelty spike measured against its trailing baseline, and the floor measured against the session watermark. There is no max-interval line: the calendar backstop is dropped (C7).
 
 Consumers: Leo and the operator, through the report and `skills/census/SKILL.md`. The nightly trickle's `scripts/legibility/nightly.py::evaluate_census_step` consumes the trigger. Through the codebook's `finding_key`/`finding_anchor`, contract §9 makes `/review`, `/hotspot-survey` and `/review-all` consumers too. `scripts/check_run_completion.py` (owned by `plans/completion-driven-triggers-prd.md`) reads `x_finding_run`.
 
@@ -29,7 +29,7 @@ These facts come from the census study of **2026-09-30**, which was verified aga
 - All 89 census-promoted entries have severity `medium`, and every ticket defaults to priority `medium`; no stage assigns either. `invariant_violated` is non-null on 230 of 3,714 sightings, and none of those 230 equals an INV slug. The coder prompt shows the field as `null` and gives no slug list. Ownership of the slug check is circular between `plans/confusion-reduction-prd.md` §10 and `docs/legibility/design-invariants.md` §Census seam.
 - Tickets carry only `{source, origin_project_id, x_fix_surface?}`. Entries record no ticket or task id. Task `done`/`cancelled` never flows back to an entry. The default verifier always returns `fixed=[]` (`census.py::_build_default_verify_fn`).
 - 11 of 13 reports said "none filed", because `run_census` read `submit_task`'s result as `{"id"}` instead of `{"ticket"}`. Task 4965 fixed this on 09-23. 23 tasks with `source=legibility_census` exist, 19 of them done. The report still cannot name task ids, because the curator decides after the report is rendered.
-- The date-only anchor makes each run re-mine the anchor day, and same-day reruns overwrote the 09-20 report. Cadence sits at the 5-day floor (median gap 5.0 days over 12 gaps), because condition (c) always fires: 19–86 candidates per 72 h against a threshold of 4.
+- The date-only anchor makes each run re-mine the anchor day, and same-day reruns overwrote the 09-20 report. Cadence sits at the 5-day floor (median gap 5.0 days over 12 gaps), because today's condition (c), the absolute novelty spike, always fires: 19–86 candidates per 72 h against a threshold of 4.
 
 Measured for this PRD on **2026-10-04** (committed codebook at `92af0716e8`, read-only):
 
@@ -40,7 +40,7 @@ Measured for this PRD on **2026-10-04** (committed codebook at `92af0716e8`, rea
 
 ## 3. Sketch of approach
 
-Thirteen tasks. **L1** gives every run an identity (`run_id`, `as_of_sha`, the §5 header) and a host-local processed-session ledger. The trickle and the census both write that ledger, and the census mines only un-ledgered, non-zero-signal sessions inside a fixed retention window, so a capped run resumes instead of losing its remainder. **L8a** repairs the trigger's novelty and floor conditions. **L2** makes the verifier return a typed verdict: anchor, tags, severity with a reason, route, and remediation, judged against the rendered quality definition. **L9** gives the coder the project's invariant slugs and makes the merger slug-check them. **L3** mints finding keys onto codebook records and tickets. **L4** runs the contract §8 dedup protocol and back-links tickets to tasks. **L5** feeds task outcomes back to entries. **L6** screens novel clusters against the codebook before any verify spend. **L7** makes pending candidates reachable through a similarity index and a capped adjudication queue. **L10** structures synthesis. **L8b** replaces the tasks-landed condition with contract §11 completion. **L11** and gate **G** prove the whole chain on a live report.
+Thirteen tasks. **L1** gives every run an identity (`run_id`, `as_of_sha`, the §5 header) and a host-local processed-session ledger. The trickle and the census both write that ledger, and the census mines only un-ledgered, non-zero-signal sessions inside a fixed retention window, so a capped run resumes instead of losing its remainder. **L8a** repairs the trigger's novelty and floor conditions. **L2** makes the verifier return a typed verdict: anchor, tags, severity with a reason, route, and remediation, judged against the rendered quality definition. **L9** gives the coder the project's invariant slugs and the quality definition's `## Definition` section as its minting test, and makes the merger slug-check the slugs. **L3** mints finding keys onto codebook records and tickets. **L4** runs the contract §8 dedup protocol and back-links tickets to tasks. **L5** feeds task outcomes back to entries. **L6** screens novel clusters against the codebook before any verify spend. **L7** makes pending candidates reachable through a similarity index and a capped adjudication queue. **L10** structures synthesis. **L8b** replaces the tasks-landed condition with contract §11 completion. **L11** and gate **G** prove the whole chain on a live report.
 
 New mechanisms land in new modules. `scripts/legibility/census.py` is 4,035 lines, which is past heuristic 14's alarm. Each leaf grows it only by wiring, and no new module imports `census.py` (heuristic 13). Splitting `census.py` is a structural finding under contract §6, out of scope here.
 
@@ -121,13 +121,14 @@ Every normalisation is counted and reported, never silent (INV-11). The verifier
 
 ### 4.5 C5: finding key, area, ticket metadata
 
-- **Key:** a new `shared/src/shared/finding_key.py::finding_key(area, anchor, primary_tag)` implements contract §2 verbatim, with §2's anchor normalisation (trailing `:N`, `:N-M` and comma lists stripped). Contract §2 names it the one key implementation (heuristic 11). Until it lands, `skills/hotspot-survey/scripts/findings_artefact.py::finding_key` is the interim reference, and L3's tests assert agreement with it on that script's fixture.
+- **Key:** a new `shared/src/shared/finding_key.py::finding_key(area, anchor, primary_tag)` implements contract §2 verbatim, with §2's anchor normalisation (trailing `:N`, `:N-M` and comma lists stripped). Contract §2 names it the one key implementation (heuristic 11). Until it lands, `skills/hotspot-survey/scripts/findings_artefact.py::finding_key` is the interim reference, and L3's tests assert agreement with it on a fixture L3 commits (contract §2 parity test). That script is small skill-local tooling, which is exempt from "code via /prd" and stays (Leo, 2026-10-05); `shared.finding_key` supersedes only its key function, and nothing else of it moves (its adoption is out of scope here, §7).
 - **Area:** contract §3's single path→area rule, applied to the verdict's anchor path (in practice the verifier's remediation path).
   - The area is the `review/briefing.yaml` subproject whose member directory contains the path.
   - A path under no member takes the rule named by the project's `/review-all` overlay (schema: `skills/review-all/references/project-overlay.md` "Path → area map"; for dark-factory, `scripts/legibility/**` → `shared`).
   - A `slug:` anchor, or a path that neither rule maps, gets `repo`.
   - The area is always a plain key, never `<area>/<sub>`. `sub_area` is null for the census.
   - A project with no briefing makes every area `repo`, and the report says so.
+  - Caveat: `review/briefing.yaml` omits the workspace member `cockpit` (a briefing defect for `/review-briefing`, contract §3), so until it is fixed the census keys `cockpit/` anchors under `repo` while `/review-all` reports them as uncovered, and their keys can diverge.
 - **Tickets** carry `metadata: {source: "legibility_census", origin_project_id, x_fix_surface?, x_finding_key, x_finding_run, x_supersedes_task?}`. `priority` equals the entry's severity.
 
 ### 4.6 C6: synthesis output (validated by a new `scripts/legibility/synthesis.py`; prose rendered from it)
@@ -146,10 +147,10 @@ The runner computes "standing, no new evidence" from the codebook and renders it
 
 ### 4.7 C7: trigger (`census_trigger.py::evaluate` / `decide_for_project`)
 
-- **(a) Completion** (L8b). `scripts/check_run_completion.py` is invoked for `last_census_run_id` against the observed project, per its CLI in `plans/completion-driven-triggers-prd.md`, with threshold `census.completion_threshold_pct` (default 70, contract §11). Exit 0 means FIRE and exit 75 means not yet. Any other exit, a state with no `last_census_run_id`, or a previous run that filed no tasks (contract §11) means N/A plus one WARNING (fail safe).
+- **(a) Completion** (L8b). `scripts/check_run_completion.py` is invoked for `last_census_run_id` against the observed project, per its CLI in `plans/completion-driven-triggers-prd.md`, with threshold `census.completion_threshold_pct` (default 70, contract §11). Exit 0 means FIRE and exit 75 means not yet. Any other exit, a state with no `last_census_run_id`, or a previous run that filed no tasks (contract §11) means N/A plus one WARNING (fail safe). An N/A caused by an error exit, as distinct from those two standing states, counts toward a consecutive-error streak in host-local trickle state; at 3 consecutive such evaluations one info escalation is filed through the existing legibility `escalate_info` poster, and the next successful evaluation (exit 0 or 75) resets the streak (INV-4).
 - **(b) Novelty spike, relative** (L8a). The 72 h count of candidate `first_seen` must be ≥ `novelty_spike.count`, and also ≥ `novelty_spike.multiple` × the median of the daily 72 h counts over the trailing `novelty_spike.baseline_days`. Defaults are 4, 2 and 30. While fewer than `baseline_days` of history exist, the condition is N/A.
-- **(c) Max interval** (`max_interval_days`, 10). **Open for Leo (Q2).** Contract §11 and ruling R2 allow the calendar only as the transcript-window minimum, and today's backstop is a calendar trigger. Until Leo rules, L8a keeps the existing condition unchanged and L8b leaves it in place, measured from `session_watermark` (fallbacks: `last_census_at`, then the earliest codebook date for a never-censused project). If the ruling is to drop it, L8b deletes it, and a project with no completion signal then fires only on (b).
-- **Floor:** `floor_days` is the minimum transcript window. No condition fires until `now − session_watermark ≥ floor_days`. It is anchored on the watermark, not the date, and a never-censused project measures it from its earliest codebook date. `tasks_landed_*` and `last_census_done_count` are retired by L8b.
+- **No max-interval condition** (decided, R8). Today's calendar backstop is deleted by L8b. The trigger fires on (a) or (b) only, each subject to the floor. A project with no completion signal (no previous run id, or a previous run that filed nothing) therefore fires only on (b) or by hand (`skills/census/SKILL.md`).
+- **Floor:** `floor_days` is the minimum transcript window, and the calendar's only role (R2). It never fires a census by itself. No condition fires until `now − session_watermark ≥ floor_days`. It is anchored on the watermark, not the date, and a never-censused project measures it from its earliest codebook date. `tasks_landed_*` and `last_census_done_count` are retired by L8b.
 - Every threshold remains an unquoted non-negative int, validated by `census_trigger.py::CensusConfig.from_mapping`.
 
 ### 4.8 Boundary-test sketch
@@ -165,15 +166,16 @@ All rows run with real sqlite in tmp, real git fixtures for `as_of_sha`, and fak
 | 5 | verdict → key → ticket | verdict anchor `orchestrator/x.py::f`, tags `[h13]` | entry `finding_key == finding_key("orchestrator", anchor, "h13")`; ticket `x_finding_key`/`x_finding_run` set; `priority == severity` |
 | 6 | malformed verdict | unknown tag, missing anchor path, severity `critical` | normalised per C4, each counted; run completes |
 | 7 | dedup step 1 hit | `find_tasks_by_metadata` returns a `pending` task with the key | no `submit_task`; `filed_tickets` row `resolution: existing, step: key` |
-| 8 | store unreachable | `find_tasks_by_metadata` raises | files nothing; report states it (contract §8) |
+| 8 | store unreachable | `find_tasks_by_metadata` returns an error payload (or the transport raises) | files nothing; report states it (contract §8) |
 | 9 | outcome: done | back-linked task `done`; re-verify says gone / present | `status: fixed`, `fixed_at_sha = as_of_sha` / re-filed with `x_supersedes_task` |
 | 10 | outcome: cancelled | cancelled task with / without acceptance reason | `status: accepted`, `accepted_by` / back to `open` |
 | 11 | pre-screen | novel cluster, title equals an adjudicated candidate's | zero verify calls; sighting attached; `screened == 1`; no unresolved verdict |
 | 12 | adjudication | pending candidate ≥ attach threshold to an entry; queue over cap; embedding endpoint down | attached with `attached_by.similarity`; verify calls ≤ cap; when down: stage skipped, one escalation, run completes |
-| 13 | trigger | 72 h = 43 vs median 40 / 90 vs 40; watermark 3 d ago; completion exit 0 / 75 / 2; no prior run id | no-spike / spike; floor blocks; FIRE / not / N/A+WARNING; N/A |
+| 13 | trigger | 72 h = 43 vs median 40 / 90 vs 40; watermark 3 d ago; completion exit 0 / 75 / 2; no prior run id; config still carrying the deprecated backstop key (L8b), watermark 30 d ago, no spike, no completion | no-spike / spike; floor blocks; FIRE / not / N/A+WARNING; N/A; no fire, one deprecation WARNING |
 | 14 | synthesis invalid | model returns non-JSON | "synthesis unavailable" rendered; data sections intact; one info escalation |
 | 15 | invariant slug | coder emits a known slug and an unknown string | known persists; unknown stored as absent and counted |
 | 16 | checker | newest report lacks `SECTION_SCREENED` / has every key | exit 1 naming it / exit 0 |
+| 17 | coder minting test | a digest whose confusion does not meet the definition (no cost or risk to the next change); fake coder seam returns no candidate for it | no candidate minted; ledger `outcome: empty`; the prompt the seam received carries the `## Definition` body and none of the fourteen heuristics |
 
 ## 5. Resolved design decisions
 
@@ -187,6 +189,11 @@ R5 The census never re-mines sessions that are already coded and never re-verifi
 R6 Judging prompts read the quality definition by reference.
 R7 `find_tasks_by_metadata` is consumed by name from `plans/task-metadata-lookup-prd.md`.
 
+Leo, 2026-10-05 (binding; closes the former Q1 and Q2):
+
+R8 The calendar backstop (today's max-interval condition) is dropped. The trigger conditions are (a) weighted completion of the previous run's filed tasks (contract §11) and (b) the relative novelty spike; the floor stays only as the minimum transcript window. There is no max-interval condition (C7).
+R9 The coder (Haiku trickle and Sonnet miner) does not receive the fourteen heuristics. It receives only `docs/code-quality.md`'s `## Definition` section, rendered by the `code_quality.py` slicer, as the test for minting a candidate. All heuristic tagging stays with the verifier (L2). Closes the former Q1 (D5, L9).
+
 ### 5.2 Decisions made in this PRD (not in the contract or the rulings; flagged for review in §13)
 
 - **D1 Ledger is host-local sqlite** (C2). Losing it fails toward re-mining, which costs money but stays correct (the merge is idempotent). The report shows `ledger_created_this_run`, so an empty ledger is never read as "nothing coded" (INV-13).
@@ -197,7 +204,7 @@ R7 `find_tasks_by_metadata` is consumed by name from `plans/task-metadata-lookup
   - One-time backlog cost is about 1,001 × ~300 chars ≈ 75 k tokens, a fraction of a cent at list price. Steady state is under 100 new candidates per run.
   - The queue spends at most `census.adjudication.max_clusters_per_run` verify calls (default 10). Recurring clusters, by distinct sessions, go first, then the newest. The 1,001 backlog drains over many runs, and the report shows the depth.
 - **D4 Thresholds for similarity are provisional** (`attach_min_similarity` 0.90, `cluster_min_similarity` 0.85; G6). Every attach is audited in the report until they are calibrated.
-- **D5 The verifier and synthesis get the rendered quality definition; the coder (trickle and miner) does not.** The coder judges transcripts, not code. Tags are assigned where code is read, and candidates are not findings until verified (contract §1). The cost of including the coder is about 2.8 k tokens on every miner and trickle call (Open question Q1).
+- **D5 The verifier and synthesis get the full rendered quality block (`guidance()`); the coder (trickle and miner) gets only the definition** (R9). The coder judges transcripts, not code. Tags are assigned where code is read (L2), and candidates are not findings until verified (contract §1).
 - **D6 Structural findings are recorded, not filed** (contract §6). The verdict's `route` decides. Today such clusters are filed whenever they recur.
 - **D7 Tickets resolve in-run, with a bound:** `resolve_ticket` per ticket, 300 s in total, before render. The remainder resolve on the next run.
 - **D8 `fixed` requires re-verification.** A back-linked task going `done` queues one verify call at `as_of_sha`, counted against the same verify cap. "Gone" sets `status: fixed` and `fixed_at_sha`. "Present" re-files with `x_supersedes_task` (contract §7, §8 1c). The codebook status is a projection reconciled from the task store on every run, never an independent copy (INV-9).
@@ -262,10 +269,10 @@ L1–L10 are intermediates whose user-observable completion is G's check of a li
   - **Signal:** after the next nightly run, `session_ledger.py stats --project-id dark_factory` prints non-zero `trickle` rows written by the real trickle.
 - **L8a: trigger, relative novelty and watermark floor** (normal; deps L1; ~350 LOC).
   - **Files:** `census_trigger.py` (`evaluate`, `CensusConfig`, `decide_for_project`), `config.py::NoveltySpike`, `docs/legibility/legibility.yaml`, tests.
-  - **Behaviour:** C7 (b), (c) and the floor. The tasks-landed condition is untouched (L8b).
+  - **Behaviour:** C7 (b) and the floor. The tasks-landed condition and today's max-interval condition are untouched here; L8b retires both.
   - **Tests:** row 13, minus completion. A replay test over a fixture codebook with a recorded daily-count series.
   - **Consumer:** `nightly.py::evaluate_census_step`.
-  - **Signal:** `census_trigger.py evaluate --project-root /home/leo/src/dark-factory` prints the `novelty-spike: N within 72h (baseline median M, ×2)` and `floor: … since session watermark` lines.
+  - **Signal:** `census_trigger.py evaluate --project-root /home/leo/src/dark-factory` prints the `novelty-spike: N within 72h (baseline median M, ×2)` line and a `floor:` line naming its anchor. The anchor is `since session watermark` once a census has run after L1. Until then it is the named fallback `since last_census_at (no watermark yet)`, because only a real census run writes the watermark (G6).
 - **L2: verifier verdict contract and judging by reference** (normal; deps L8a by chain; ~500 LOC).
   - **Files:** new `scripts/legibility/verdict.py`; `census.py` (`_verify_prompt`, `_build_default_verify_fn`, promotion severity; delete `_VALID_ENTRY_SEVERITIES`); tests.
   - **Behaviour:** C4. Heuristic 12: a typed `Verdict` replaces dict reads. Heuristic 10: the severity enum is checked at parse time and again at `codebook.validate`, and both read one definition.
@@ -274,14 +281,15 @@ L1–L10 are intermediates whose user-observable completion is G's check of a li
   - **Signal:** G (Findings rows carry severities other than `medium`, each with a reason).
 - **L9: invariant slugs to the coder, slug check in the merger** (normal; deps L1 (`nightly.py`); ~350 LOC).
   - **Files:** new `scripts/legibility/invariants.py`; `coder.py::build_prompt` (slug list from the observed project's doc; absent doc → empty list, stated in the prompt); `codebook.py::validate_coding_record` (an unknown slug is stored as absent, counted in a new stat, one WARNING per run naming the values); `nightly.py` journal summary line; `scripts/tests/test_design_invariants_consistency.py` imports the reader.
-  - **Tests:** row 15; reify-form headings.
+  - **Definition as the minting test (R9):** `coder.py::build_prompt` is the one prompt both the trickle and the miner use, so L9 (the leaf that already edits it) adds the `## Definition` section of the normative doc, sliced by `orchestrator/src/orchestrator/agents/code_quality.py::section(text, '## Definition')` over `code_quality.py::NORMATIVE_DOC`, never restated, as the test a confusion must meet before it is minted as a candidate. The prompt carries no heuristic and asks for no tag. Cost: the whole section, 138 words, about 200 tokens per miner and trickle call. Rationale: a heuristic tag is a judgement about code the coder has not read, and the primary tag is part of the finding key, so pre-tagging would churn keys across the trickle→census boundary.
+  - **Tests:** rows 15 and 17; reify-form headings.
   - **Consumers:** the report's invariant counts (L10); the design-invariants §Census seam guard-task rule (Leo).
   - **Signal:** the next trickle journal shows `invariant slugs: N valid, M rejected`.
 - **L3: finding keys on codebook records and tickets** (normal; deps L2, L9; ~900 LOC).
   - **Files:** new `shared/src/shared/finding_key.py` and its tests in `shared/tests/`; new `scripts/legibility/finding_area.py`; `codebook.py` (the whole C1 schema delta, with `pattern` support); `census.py` (stamping at promotion and rejection, appending this run's id to `last_seen_runs` on every entry sighted this run, `build_task_payloads` metadata and priority, the record's findings with every §1 field, `SECTION_FINDINGS`); tests.
   - **Area:** comes from contract §3's path→area rule (C5), applied to the verifier's anchor or remediation path: the briefing member directory first, then the project's `/review-all` overlay rule, then `repo`. It is never the path's first segment taken by itself.
   - **Behaviour:** C1, C5, contract §1 fields in the report. Heuristic 11: one key function for every instrument.
-  - **Tests:** row 5; a key-stability test (reworded statement → same key; renamed symbol → new key, recorded in `supersedes`); agreement with `skills/hotspot-survey/scripts/findings_artefact.py::finding_key` on its fixture; area cases (member path, overlay-mapped `scripts/legibility/x.py` → `shared`, unmapped → `repo`).
+  - **Tests:** row 5; a key-stability test (reworded statement → same key; renamed symbol → new key, recorded in `supersedes`); agreement with `skills/hotspot-survey/scripts/findings_artefact.py::finding_key` on a fixture L3 commits (contract §2 parity test); area cases (member path, overlay-mapped `scripts/legibility/x.py` → `shared`, unmapped → `repo`).
   - **Consumers:** L4, L6, L8b, and `/review`/`/hotspot-survey` through contract §9.
   - **Signal:** G (Findings rows with `fk-` keys; the filed task's metadata carries `x_finding_key`).
 - **L4: dedup protocol and ticket→task back-link** (normal; deps L3, external `find_tasks_by_metadata`; ~700 LOC).
@@ -324,8 +332,8 @@ L1–L10 are intermediates whose user-observable completion is G's check of a li
   - **Signal:** G (`## Synthesis` has "New" and "Re-observed" sub-blocks; a standing count; the matrix reflects refinements).
 - **L8b: completion condition, retire tasks-landed** (normal; deps L10 by chain, L3, external `check_run_completion.py`; ~450 LOC).
   - **Files:** `census_trigger.py`, `config.py::Census`, `legibility.yaml`, `nightly.py::evaluate_census_step`, `census.py` (`main`'s `decide_for_project` call; stop writing `last_census_done_count`); tests.
-  - **Behaviour:** C7 (a), D9.
-  - **Tests:** row 13 completion arms.
+  - **Behaviour:** C7 (a), D9, and R8: delete the `max_interval_days` condition from `census_trigger.py::evaluate`, the field from `config.py::Census`, and the key from the `census` block of `docs/legibility/legibility.yaml`. `census_trigger.py::CensusConfig.from_mapping` stops reading it: a mapping that still carries `max_interval_days` (a not-yet-migrated project's `legibility.yaml`) is accepted, the key is ignored as deprecated, and one WARNING per evaluation names it, never a validation failure. It also adds C7 (a)'s consecutive-error streak in host-local trickle state: one `escalate_info` at 3 consecutive error-exit N/As, reset by the next successful evaluation (exit 0 or 75; G7 `storm-escape-required`).
+  - **Tests:** row 13 completion arms; a config carrying the deprecated key evaluates with no max-interval reason line and one deprecation WARNING; three consecutive error exits file exactly one escalation, while "no previous run id" and "filed nothing" never count toward the streak, and an exit 0 or 75 resets it.
   - **Consumer:** `nightly.py::evaluate_census_step`.
   - **Signal:** `census_trigger.py evaluate` prints `completion: <share> of <run_id> (threshold 0.70)` or a named N/A.
 - **L11: report conformance checker** (normal; no deps; ~250 LOC).
@@ -334,9 +342,9 @@ L1–L10 are intermediates whose user-observable completion is G's check of a li
   - **Tests:** row 16.
   - **Consumer:** G.
   - **Signal:** run on main, it exits 1 naming the 10-03 report's missing `## Method`.
-- **G: live census conformance gate** (deterministic predicate; deps L8b, L9, L11; `metadata.milestone: {mode: delayed, after_secs: 950400}`, eleven days, which exceeds the 10-day backstop if Q2 keeps it (§10); `before_done: {kind: predicate, script: scripts/legibility/check_census_report.py, args: ["--project-root", "/home/leo/src/dark-factory"], timeout_secs: 120}`).
+- **G: live census conformance gate** (deterministic predicate; deps L8b, L9, L11; `metadata.milestone: {mode: delayed, after_secs: 1209600}`, a fixed fourteen days (§10); `before_done: {kind: predicate, script: scripts/legibility/check_census_report.py, args: ["--project-root", "/home/leo/src/dark-factory"], timeout_secs: 120}`).
   - **On pass:** done. The batch is proven on a report written by the real automatic census.
-  - **On fail:** a born-at-L2 `milestone_check_failed` naming the missing keys. Nothing is cancelled.
+  - **On fail:** a born-at-L2 `milestone_check_failed` naming the missing keys. Nothing is cancelled. When the cause is that no census has fired since the batch landed ("no conforming report yet", L11), the remedy is a forced census by hand (`skills/census/SKILL.md`), then `resume`.
 
 Sizing (overlay bands): L1, L3, L7 are near the top of the band. L6, L8a, L9 and L11 sit at the floor and above it. G is deterministic and exempt. No leaf declares more than 10 files.
 
@@ -350,7 +358,7 @@ Sizing (overlay bands): L1, L3, L7 are near the top of the band. L6, L8a, L9 and
 | adjudication cap 10/run | spend bound, a choice; the backlog drain time is reported, not asserted | choice |
 | similarity 0.90 / 0.85 | none | **provisional (D4)**; no leaf signal asserts a precision |
 | embedding backlog ≈ 75 k tokens | 1,001 × ~300 chars (§2) | estimate, reported as `embedding_calls` |
-| G's eleven-day delay | 10-day `max_interval_days` backstop + 1 day | holds only if Q2 keeps (c). If (c) is dropped, G instead waits for the first report after the batch: a delayed predicate that exits non-zero until a conforming report exists, with the delay re-derived at decompose |
+| G's fourteen-day delay | a fixed choice. With the backstop dropped (R8), neither trigger condition has a predictable cadence: the relative spike replays at 3 fires in 50 days (§2, about one per 17 days), and completion (a) is N/A until a run has filed tasks carrying `x_finding_run` (L3) | choice; a fail with "no conforming report yet" is answered by a forced census, not a longer delay |
 | "6 of 12 already catalogued" | 09-30 study | motivates L6; no signal asserts a screened ratio |
 
 Each end-to-end signal is produced by its own leaf or an upstream one. G is the only leaf that reads a live report, and it depends on every producer.
@@ -358,7 +366,7 @@ Each end-to-end signal is produced by its own leaf or an upstream one. G is the 
 ## 11. G7: advisory walk (`docs/legibility/design-invariants.md`)
 
 - `structured-facts-at-failure` (INV-2) and `no-silent-fail-soft` (INV-11): every normalisation in C4, every rejected slug and every skipped stage is counted, rendered and named with its values.
-- `storm-escape-required` (INV-4): the embedding failure path skips the stage once per run instead of retrying per candidate.
+- `storm-escape-required` (INV-4): the embedding failure path skips the stage once per run instead of retrying per candidate. The completion arm's error-exit N/A carries a consecutive-error streak that escalates once at 3 and resets on the next successful evaluation (C7 (a), L8b). Without it, a broken completion arm would silently reduce cadence to novelty-only (hit found at decompose, 2026-10-05; redesigned, not waived).
 - `no-lockstep-duplication` (INV-5): one key function, one heading reader, one severity enum.
 - `holds-owned-and-bounded` (INV-7): the ledger is pruned to the retention window. The embedding cache drops vectors for records that are no longer pending and are not entries. The adjudication cap bounds per-run spend.
 - `one-fact-one-home` (INV-9): codebook `status`/`filed_tickets` are pointers, reconciled from the task store every run (D8).
@@ -371,6 +379,7 @@ No unwaived hit.
 
 - **L1:** `session_ledger.stats` reads rows written by `nightly.py::run_nightly` (producer: L1 itself, wired on the production path); `sampling` public scorer (producer: L1).
 - **L8a:** `census_trigger.py::evaluate` (grep-wired from `decide_for_project` → `nightly.py::evaluate_census_step`); watermark (producer: L1, upstream).
+- **L9:** `orchestrator/src/orchestrator/agents/code_quality.py::section` and `::NORMATIVE_DOC` (exist; consumed read-only through the same src path as L2).
 - **L2:** `orchestrator/src/orchestrator/agents/code_quality.py::guidance` (exists, wired in `orchestrator/src/orchestrator/agents/roles.py`); verdict fields consumed at promotion (producer: L2).
 - **L3:** `run_id` (L1, upstream); verdict anchor/tags (L2, upstream); slug field (L9, upstream); briefing `subprojects` (exists).
 - **L4:** `find_tasks_by_metadata` (external producer, upstream dep); `resolve_ticket`/`search_tasks`/`get_task` (exist).
@@ -385,8 +394,6 @@ No unwaived hit.
 
 Questions for Leo (design-level, defaults stated; work proceeds on the default):
 
-- **Q1** Should the coder (the Haiku trickle and Sonnet miner) also get the rendered quality definition? Default: no (D5). Including it costs about 2.8 k tokens on every miner and trickle call.
-- **Q2** Keep or drop the `max_interval_days` backstop (C7 (c))? Contract §11 and R2 allow the calendar only as the transcript-window minimum. Keeping it guarantees a census at least every 10 days. Dropping it makes (a) completion and (b) novelty the only triggers, so a project whose previous run filed nothing waits for a novelty spike. Until Leo rules, the condition stays as it is today. G's delay depends on the answer (§10).
 - **Q3** Accept D6? Under it, structural findings stop being auto-filed, a policy change from today.
 
 These are settled by the amended contract and are no longer open:
@@ -396,6 +403,8 @@ These are settled by the amended contract and are no longer open:
 - The acceptance-reason field (§7, §8: `x_acceptance_reason`).
 - Embedding the `guidance()` block for code-assembled prompts (§10).
 - A run that files no tasks (§11: it files no chain; for the census, (a) is then N/A, D9).
+- The calendar backstop (former Q2): dropped (R8, Leo, 2026-10-05).
+- What the coder receives (former Q1): the `## Definition` section only, never the heuristics (R9, D5, L9).
 
 Tactical (decided at implementation):
 
