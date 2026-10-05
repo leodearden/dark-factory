@@ -5984,9 +5984,13 @@ async def _validate_done_provenance(
        ``middleware/done_provenance_authz.py``.
 
     That module also carries the honest caveat, repeated here because this is
-    where the refusal is issued: the identity is SELF-REPORTED (a caller
-    sending no ``agent_id`` falls back to the clientInfo name it chose, via
-    ``server/tools.py::_resolve_identity``). The bar DETERS a cooperating
+    where the refusal is issued: the identity is SELF-REPORTED. Under
+    stateless HTTP a tool call carries no clientInfo for
+    ``server/tools.py::_resolve_identity`` to fall back to, so a caller that
+    sends no ``agent_id`` arrives as ``None`` and is refused; the orchestrator
+    therefore sends ``agent_id='orchestrator'`` explicitly
+    (``orchestrator/src/orchestrator/scheduler.py::Scheduler.set_task_status``).
+    The bar DETERS a cooperating
     caller; it is not a security boundary. The residual is made visible rather
     than prevented — every done write, accepted or refused, leaves a
     write-journal row naming the resolved caller and the provenance kind.

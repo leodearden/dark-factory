@@ -10,9 +10,12 @@ gate task from inside reconciliation Stage 2.
 
 HONEST CAVEAT, carried over verbatim in spirit from
 ``server/mem0_update_authz.py``: the ``agent_id`` this bar reads is
-SELF-REPORTED. A caller that sends none falls back to the clientInfo name
-(``server/tools.py::_resolve_identity``), which the caller also chose. So this
-DETERS a cooperating caller from reaching for a primitive it was not meant to
+SELF-REPORTED: it is whatever ``agent_id`` the tool call carries. Under
+stateless HTTP (``server.stateless_http``, the default) a tool call carries no
+clientInfo, so ``server/tools.py::_resolve_identity`` has nothing to fall back
+to and a caller that sends no ``agent_id`` arrives unidentified and is refused.
+That is why ``orchestrator/src/orchestrator/scheduler.py::Scheduler.set_task_status``
+sends ``agent_id='orchestrator'`` explicitly. So this DETERS a cooperating caller from reaching for a primitive it was not meant to
 touch; it is not a security boundary, and a determined caller can claim any
 prefix. The residual is made visible instead of prevented: every done write,
 accepted or refused, leaves a write-journal row naming the resolved caller

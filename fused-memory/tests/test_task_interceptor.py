@@ -5141,9 +5141,9 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
 # refusal is covered only by direct `_validate_done_provenance` calls, so
 # nothing previously proved the bar actually holds at the MCP-facing seam.
 #
-# The identity is SELF-REPORTED (`server/tools.py::_resolve_identity` falls
-# back to clientInfo.name), so this is a misuse deterrent, not a boundary —
-# see `middleware/done_provenance_authz.py`'s docstring.
+# The identity is SELF-REPORTED (whatever `agent_id` the caller sends), so
+# this is a misuse deterrent, not a boundary — see
+# `middleware/done_provenance_authz.py`'s docstring.
 
 _DETERMINISTIC_KINDS = sorted(DETERMINISTIC_PROVENANCE_KINDS)
 
@@ -5214,8 +5214,8 @@ class TestDeterministicProvenanceCallerBar:
     async def test_unlisted_client_is_refused_and_told_the_bar(
         self, taskmaster, reconciler, event_buffer, tmp_path,
     ):
-        """'dashboard' is a real MCP client's advertised clientInfo — the
-        omitted-agent_id / wrong-client class the allowlist catches."""
+        """'dashboard' stands for any non-allowlisted caller identity — the
+        wrong-caller class the allowlist catches."""
         interceptor = TaskInterceptor(
             taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
         )

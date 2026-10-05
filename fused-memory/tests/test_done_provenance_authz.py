@@ -80,7 +80,7 @@ class TestDeniesCaller:
     """A caller matching no prefix is refused with a self-remedying message."""
 
     @pytest.mark.parametrize('agent_id', [
-        'dashboard',                        # a real MCP client's clientInfo
+        'dashboard',                        # a non-allowlisted caller identity
         'cgl-sched-gate',                   # the retired one-shot (PRD §7)
         'recon-stage-task_knowledge_sync',  # the 5156 incident's writer
         'claude-interactive',

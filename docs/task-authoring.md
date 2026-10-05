@@ -170,17 +170,22 @@ runner-stamped close. Both refusals carry
 `error_type='DeterministicProvenanceCallerNotPermitted'`, on the fresh
 `done` transition and the same-status repair path alike.
 
-That identity is **self-reported**: a caller sending no `agent_id` falls
-back to the `clientInfo.name` it chose
-(`fused-memory/src/fused_memory/server/tools.py::_resolve_identity`). The
-bar therefore deters a cooperating caller; it is not a security boundary.
+That identity is **self-reported**: it is whatever `agent_id` the caller
+sends. fused-memory serves stateless HTTP (`server.stateless_http`, default
+true), where a tool call carries no clientInfo, so the clientInfo fallback in
+`fused-memory/src/fused_memory/server/tools.py::_resolve_identity` does not
+fire. A caller that sends no `agent_id` therefore arrives unidentified and is
+refused. That is why the orchestrator sends `agent_id='orchestrator'` on
+every status write
+(`orchestrator/src/orchestrator/scheduler.py::Scheduler.set_task_status`).
+The bar therefore deters a cooperating caller; it is not a security boundary.
 The residual — a deliberate spoof — is made *visible* rather than
 prevented: every `done` write, accepted or refused, leaves a write-journal
 row carrying the resolved caller and the provenance kind.
 
 The one other historical producer,
-`fused-memory/scripts/cgl_eta_finalize_gate.py::_gate_done_provenance`
-(clientInfo `cgl-sched-gate`), is deliberately **not** allowlisted. It is a
+`fused-memory/scripts/cgl_eta_finalize_gate.py::_gate_done_provenance`,
+which sends no `agent_id`, is deliberately **not** allowlisted. It is a
 finished one-shot for the already-`done` task 2273; a re-run being refused
 is the correct outcome for a retired caller, and shipping one in an
 allowlist is how an allowlist stops meaning anything.
