@@ -35,6 +35,7 @@ SECTIONS = (
     "Structural",
     "Synthesis",
 )
+RUN_ID_RE = re.compile(r"^census-(?P<project>[a-z0-9_]+)-(?P<date>\d{8})(?:-(?P<n>\d+))?$")
 METHOD_KEYS = ("run_id", "as_of_sha", "since", "evidence", "verification", "cost", "inputs_consumed", "extra")
 METHOD_BLOCK = "## Method yaml block"
 FINDING_FIELDS = (
@@ -177,19 +178,29 @@ def method_block(md_text: str) -> dict | Gap:
     return parse_method_yaml("\n".join(rest[:close]))
 
 
-def check_method_mapping(mapping: dict, prefix: str) -> list[Gap]:
+def check_run_id(run_id: object, name: str, report: Report) -> list[Gap]:
+    match = RUN_ID_RE.match(run_id) if isinstance(run_id, str) else None
+    if match is None:
+        return [Gap(GapKind.MALFORMED, name, f"not census-<project_id>-<YYYYMMDD>[-<n>]: {run_id}")]
+    if (match["date"], match["n"]) != (report.date.replace("-", ""), report.suffix):
+        return [Gap(GapKind.MALFORMED, name, f"{run_id} disagrees with basename {report.stem}")]
+    return []
+
+
+def check_method_mapping(mapping: dict, prefix: str, report: Report) -> list[Gap]:
     missing = [Gap(GapKind.MISSING, f"{prefix}.{key}") for key in METHOD_KEYS if key not in mapping]
     stray = [
         Gap(GapKind.MALFORMED, f"{prefix}.{key}", "outside extra (contract §5)") for key in mapping if key not in METHOD_KEYS
     ]
-    return missing + stray
+    run_id = check_run_id(mapping["run_id"], f"{prefix}.run_id", report) if "run_id" in mapping else []
+    return missing + stray + run_id
 
 
-def check_rendered_method(md_text: str) -> list[Gap]:
+def check_rendered_method(md_text: str, report: Report) -> list[Gap]:
     if METHOD_TITLE not in level2_titles(md_text):
         return []
     block = method_block(md_text)
-    return [block] if isinstance(block, Gap) else check_method_mapping(block, "method")
+    return [block] if isinstance(block, Gap) else check_method_mapping(block, "method", report)
 
 
 def load_record(path: Path, shown: str) -> dict | Gap:
@@ -202,12 +213,12 @@ def load_record(path: Path, shown: str) -> dict | Gap:
     return record
 
 
-def check_record_method(record: dict) -> list[Gap]:
+def check_record_method(record: dict, report: Report) -> list[Gap]:
     if "method" not in record:
         return [Gap(GapKind.MISSING, "record.method")]
     if not isinstance(record["method"], dict):
         return [Gap(GapKind.MALFORMED, "record.method", f"{type(record['method']).__name__}, not a mapping")]
-    return check_method_mapping(record["method"], "record.method")
+    return check_method_mapping(record["method"], "record.method", report)
 
 
 def check_finding(index: int, finding: object) -> list[Gap]:
@@ -230,18 +241,18 @@ def check_findings(record: dict) -> list[Gap]:
     return [gap for index, finding in enumerate(findings) for gap in check_finding(index, finding)]
 
 
-def check_record(record: dict | Gap | None) -> list[Gap]:
+def check_record(record: dict | Gap | None, report: Report) -> list[Gap]:
     if record is None:
         return []
     if isinstance(record, Gap):
         return [record]
-    return check_record_method(record) + check_findings(record)
+    return check_record_method(record, report) + check_findings(record)
 
 
-def check_rendering(md_text: str | None) -> list[Gap]:
+def check_rendering(md_text: str | None, report: Report) -> list[Gap]:
     if md_text is None:
         return []
-    return check_sections(md_text) + check_rendered_method(md_text)
+    return check_sections(md_text) + check_rendered_method(md_text, report)
 
 
 def predates_header(report: Report, titles: list[str]) -> bool:
@@ -278,7 +289,7 @@ def nonconforming_headline(report: str, gaps: tuple[Gap, ...]) -> str:
 
 def post_header_result(report: Report, md_text: str | None) -> Result:
     record = load_record(report.record, report.shown("json")) if report.record else None
-    gaps = tuple(check_halves(report) + check_rendering(md_text) + check_record(record))
+    gaps = tuple(check_halves(report) + check_rendering(md_text, report) + check_record(record, report))
     if not gaps and isinstance(record, dict):
         headline = f"{report.shown_path} conforms ({len(record['findings'])} findings)"
         return Result(Verdict.CONFORMS, report.shown_path, (), headline)
