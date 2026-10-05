@@ -18,12 +18,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, NamedTuple, Protocol
 
+from graphiti_core.llm_client import LLMClient
 from graphiti_core.nodes import EpisodeType
 from pydantic import BaseModel, ConfigDict
 
 from fused_memory.arm_harness.arm_config import llm_arm_config
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
-from fused_memory.arm_harness.conformance import ConformanceLedger, install_conformance_audit
+from fused_memory.arm_harness.conformance import (
+    ConformanceLedger,
+    ResponseValidator,
+    install_conformance_audit,
+    validate_response,
+)
 from fused_memory.arm_harness.metrics_record import IndexConfiguration
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
 from fused_memory.backends.falkor_indices import IndexSpec
@@ -396,11 +402,7 @@ async def open_arm_backend(
     """
     require_scratch_name(spec.scratch_group_id, checkpoint=GuardCheckpoint.REPLAY)
     cfg = llm_arm_config(spec, base_config)
-    client = build_llm_client(cfg)
-    if client is None:
-        raise RuntimeError(f'arm {spec.arm_id!r}: build_llm_client built no client (no api_key)')
-    ledger = ConformanceLedger()
-    install_conformance_audit(client, ledger)
+    client, ledger = audited_arm_client(spec, cfg)
     backend = GraphitiBackend(cfg, registered_graph_ids=frozenset())
     try:
         await backend.initialize(skip_maintenance=True, llm_client=client)
@@ -409,6 +411,21 @@ async def open_arm_backend(
         yield backend, ledger
     finally:
         await backend.close()
+
+
+def audited_arm_client(
+    spec: LlmArmSpec,
+    arm_config: FusedMemoryConfig,
+    *,
+    validator: ResponseValidator = validate_response,
+) -> tuple[LLMClient, ConformanceLedger]:
+    """The arm's client, built by β's seam from its arm config, with the conformance audit on."""
+    client = build_llm_client(arm_config)
+    if client is None:
+        raise RuntimeError(f'arm {spec.arm_id!r}: build_llm_client built no client (no api_key)')
+    ledger = ConformanceLedger()
+    install_conformance_audit(client, ledger, validator=validator)
+    return client, ledger
 
 
 async def _build_scratch_indices(backend: GraphitiBackend, group_id: str) -> None:

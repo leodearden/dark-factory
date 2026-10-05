@@ -23,6 +23,9 @@ from fused_memory.arm_harness.metrics_record import LlmMetricId
 _JSON_OBJECT: TypeAdapter[dict[str, Any]] = TypeAdapter(dict[str, Any])
 _SEAM = '_generate_response'
 
+ResponseValidator = Callable[[object, type[BaseModel] | None], None]
+"""Raises ``ValidationError`` (or ``JSONDecodeError``) when a response is off-schema."""
+
 
 @dataclass(frozen=True)
 class ConformanceCounts:
@@ -64,7 +67,20 @@ class ConformanceLedger:
         )
 
 
-def install_conformance_audit(client: LLMClient, ledger: ConformanceLedger) -> None:
+def validate_response(result: object, response_model: type[BaseModel] | None) -> None:
+    """The audit's default validator: ``response_model`` when given, else any JSON object."""
+    if response_model is None:
+        _JSON_OBJECT.validate_python(result)
+    else:
+        response_model.model_validate(result)
+
+
+def install_conformance_audit(
+    client: LLMClient,
+    ledger: ConformanceLedger,
+    *,
+    validator: ResponseValidator = validate_response,
+) -> None:
     attempt = getattr(client, _SEAM, None)
     if not callable(attempt):
         raise TypeError(
@@ -73,18 +89,18 @@ def install_conformance_audit(client: LLMClient, ledger: ConformanceLedger) -> N
             'and auditing without it would be silently inert'
         )
     # Instance attribute shadows the class method: upstream's retry loop calls self._generate_response.
-    setattr(client, _SEAM, _audited(attempt, ledger))
+    setattr(client, _SEAM, _audited(attempt, ledger, validator))
 
 
 def _audited(
-    attempt: Callable[..., Any], ledger: ConformanceLedger
+    attempt: Callable[..., Any], ledger: ConformanceLedger, validator: ResponseValidator
 ) -> Callable[..., Awaitable[dict[str, Any]]]:
     async def audited_attempt(
         messages: Any, response_model: type[BaseModel] | None = None, **kwargs: Any
     ) -> dict[str, Any]:
         try:
             result = await attempt(messages, response_model, **kwargs)
-            _validate(result, response_model)
+            validator(result, response_model)
         except (json.JSONDecodeError, ValidationError) as error:
             ledger.record_invalid(error)
             raise
@@ -95,13 +111,6 @@ def _audited(
         return result
 
     return audited_attempt
-
-
-def _validate(result: object, response_model: type[BaseModel] | None) -> None:
-    if response_model is None:
-        _JSON_OBJECT.validate_python(result)
-    else:
-        response_model.model_validate(result)
 
 
 def conformance_rate_metric(counts: ConformanceCounts) -> Metric | None:

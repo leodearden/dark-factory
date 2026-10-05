@@ -25,6 +25,9 @@ class InstrumentCheckId(StrEnum):
     REFERENCE_NONEMPTY = 'reference-nonempty'
     ARM_CONFIG_SYMMETRY = 'arm-config-symmetry'
     SINGLE_CODE_SHA = 'single-code-sha'
+    ENDPOINT_CONFORMANCE = 'endpoint-conformance'
+    VALIDATOR_NEGATIVE_CONTROL = 'validator-negative-control'
+    INDEX_CONFIGURATION = 'index-configuration'
 
 
 @dataclass(frozen=True)

@@ -190,6 +190,7 @@ async def test_the_seeded_probe_node_is_removed_afterwards():
     assert len(graph.writes) == 2
     (_, seed_params), (cleanup_cypher, cleanup_params) = graph.writes
     assert 'DELETE' in cleanup_cypher
+    assert seed_params is not None
     assert cleanup_params == {'uuid': seed_params['uuid']}
 
 
