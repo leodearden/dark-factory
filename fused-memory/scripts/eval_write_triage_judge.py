@@ -83,6 +83,7 @@ Usage
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -219,6 +220,8 @@ PROVENANCE_KEYS: tuple[str, ...] = (
     'fixture_path',
     'judge_provider',
     'judge_model',
+    # The system prompt wording the verdicts came from (PRD C2'').
+    'judge_system_prompt_sha256',
     'limit',
     'canonical_aliases_path',
     'canonical_aliases_count',
@@ -1891,6 +1894,7 @@ def _run(args: Any) -> int:
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        JUDGE_SYSTEM_PROMPT,
         resolve_judge_candidate_count,
         resolve_judge_enabled,
         resolve_judge_model,
@@ -1975,6 +1979,9 @@ def _run(args: Any) -> int:
             'fixture_path': package_relative(args.fixture),
             'judge_provider': provider,
             'judge_model': model,
+            'judge_system_prompt_sha256': hashlib.sha256(
+                JUDGE_SYSTEM_PROMPT.encode('utf-8'),
+            ).hexdigest(),
             # Present on EVERY run, `None` on a full one. An absent key
             # would be indistinguishable from an artifact predating the
             # field, and this is the one field that says a committed
