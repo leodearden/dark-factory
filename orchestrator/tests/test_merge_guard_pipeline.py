@@ -515,6 +515,52 @@ class TestClassifyAndMergeSpeculativeWorker:
         assert result.merge_result.success
         assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
 
+    async def test_patch_id_fail_open_falls_through_to_merge(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+    ):
+        """Safety arm (task 2945, signal 4): the content is genuinely
+        patch-id-contained on main, but the containment predicate answers False
+        (the production helper's fail-open on a ``git cherry`` error).  The
+        guard must trust that answer and merge, never skip.
+        """
+        from orchestrator.merge_queue import classify_and_merge, patch_content_contained
+
+        # Rebased-landing contained setup (branch content genuinely on main).
+        worktree = await _make_branch_with_file(git_ops, 'failopen-2945', 'reb.py', 'x = 1\n')
+        branch_sha = await git_ops.resolve_branch_sha('task/failopen-2945')
+        assert branch_sha is not None
+        (git_ops.project_root / 'other.py').write_text('other = 1\n')
+        await _run(['git', 'add', '-A'], cwd=git_ops.project_root)
+        await _run(['git', 'commit', '-m', 'Unrelated main advance'], cwd=git_ops.project_root)
+        await _run(['git', 'cherry-pick', branch_sha], cwd=git_ops.project_root)
+        main_reb = await git_ops.get_main_sha()
+
+        assert not await git_ops.is_ancestor(branch_sha, main_reb)
+        assert await patch_content_contained(branch_sha, main_reb, git_ops) is True
+
+        asked: list[tuple[str, str]] = []
+
+        async def _fail_open(head: str, upstream: str, git_ops: GitOps) -> bool:
+            asked.append((head, upstream))
+            return False
+
+        es = _make_event_store(tmp_path)
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, queue, event_store=es)
+        req = _make_request('failopen-2945', 'failopen-2945', worktree, config)
+
+        result = await classify_and_merge(
+            worker, req, main_reb, speculative=False, started_monotonic=time.monotonic(),
+            content_contained=_fail_open,
+        )
+
+        assert asked == [(branch_sha, main_reb)]
+        assert isinstance(result, MergedOk), (
+            f'fail-open (False) must fall through to a normal merge; got {result!r}'
+        )
+        assert result.merge_result.success
+        assert 'already_merged' not in _merge_attempt_subtypes(es.db_path)
+
     async def test_uncommitted_work_vetoes_patch_id_skip(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
