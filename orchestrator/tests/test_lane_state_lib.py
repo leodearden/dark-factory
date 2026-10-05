@@ -1620,3 +1620,88 @@ class TestProtectGlobFallbackDrift:
                 f'the fallback protects pool band {band!r} via {offenders!r} — a '
                 f'python3 outage would freeze reclaim instead of degrading it'
             )
+
+
+class TestProtectGlobFallbackIsAVerbatimRender:
+    """``LANE_PROTECT_GLOB_FALLBACK`` must EQUAL the render, byte for byte.
+
+    The fallback has two consumers with two contracts, and this class gates
+    the stricter one.
+
+    The production python3-outage backstop needs fallback ⊇ render and must
+    never protect an owned pool band.  :class:`TestProtectGlobFallbackDrift`
+    gates that; under-coverage there is a PRODUCTION hazard, since a live
+    managed worktree becomes reclaimable during an outage.
+
+    Both gc suites (``test_warm_lane_gc.sh`` ``_run_gc`` pin mode and
+    ``test_warm_lane_gc_sweep.sh`` ``run_sweep``) pin
+    ``REIFY_WARM_LANE_GC_PROTECT_GLOB`` to the fallback to skip the
+    per-invocation python render.  That pin is behaviour-neutral only if
+    fallback == render, so any difference is a TEST-FIDELITY hazard: a band
+    removed from the registry, an exact-name band an existing glob already
+    covers, and a fallback-only band all pass containment while the suites
+    exercise ``warm-lane-gc.sh`` with a protect set production never renders.
+
+    Folding equality into the containment gate would merge those two
+    severities into one message and lose the production-hazard one, so
+    containment stays the looser production contract and this class is the
+    separate, stricter one the pins depend on.  The dangerous direction trips
+    both.
+
+    Byte equality, not set equality: ``lib_lane_state.sh`` documents the
+    fallback as a verbatim render an operator can diff against
+    ``lane_protect_glob`` output directly, and the report hands over the exact
+    replacement, so an order-only failure costs one paste.
+
+    The comparison is against the PYTHON render rather than a bash subprocess.
+    ``TestLaneProtectGlobBridge.test_owned_pool_bands_render_exactly_as_python_computes_them``
+    already pins bash == python for these owned bands, and the python render
+    keeps the gate monkeypatch-seedable and free of an interpreter start.
+    """
+
+    @staticmethod
+    def _render() -> str:
+        from orchestrator import git_ops
+
+        return git_ops.render_protect_glob(owned=git_ops.PROTECT_GLOB_OWNED_POOL_BANDS)
+
+    def test_the_fallback_is_a_verbatim_render_of_the_registry(self, fallback) -> None:
+        rendered = self._render()
+        assert _fallback_drift_report(rendered, fallback) is None, (
+            _fallback_drift_report(rendered, fallback)
+        )
+
+    def test_the_equality_gate_fires_on_an_unmirrored_new_band(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        monkeypatch.setitem(git_ops.PROTECTED_PREFIXES, '_newband-', 'test-only')
+        rendered = self._render()
+        assert _fallback_band_diff(rendered, fallback) == (['_newband-*'], [])
+        report = _fallback_drift_report(rendered, fallback)
+        assert report is not None
+        assert '_newband-*' in report, report
+        assert f"LANE_PROTECT_GLOB_FALLBACK='{rendered}'" in report, report
+
+    def test_the_equality_gate_catches_a_band_containment_waves_through(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        monkeypatch.setitem(git_ops.PROTECTED_PREFIXES, '_merge-extra', 'test-only')
+        rendered = self._render()
+        assert _uncovered_bands(rendered, fallback) == []
+        assert _fallback_band_diff(rendered, fallback) == (['_merge-extra'], [])
+        assert _fallback_drift_report(rendered, fallback) is not None
+
+    def test_the_equality_gate_catches_a_strict_superset_fallback(
+        self, fallback, monkeypatch,
+    ) -> None:
+        from orchestrator import git_ops
+
+        monkeypatch.delitem(git_ops.PROTECTED_PREFIXES, '_solo-')
+        rendered = self._render()
+        assert _uncovered_bands(rendered, fallback) == []
+        assert _fallback_band_diff(rendered, fallback) == ([], ['_solo-*'])
+        assert _fallback_drift_report(rendered, fallback) is not None
