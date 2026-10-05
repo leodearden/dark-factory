@@ -406,11 +406,15 @@ class TestProposalArm:
 
         assert err is None, err
 
-    def test_canonical_content_passed_with_limits_is_refused_by_name(self):
+    @pytest.mark.parametrize(
+        'content', [_CONTENT, '', '   '], ids=['text', 'empty', 'whitespace']
+    )
+    def test_canonical_content_passed_with_limits_is_refused_by_name(self, content):
         """Fails CLOSED on a caller that believes it is submitting the op shape:
         a silently dropped canonical text is the mirror of the silently dropped
-        claim the op arm already refuses."""
-        err, _, _ = _propose(canonical_content=_CONTENT)
+        claim the op arm already refuses. The boundary is `is not None`, so a
+        blank string is refused too rather than dropped."""
+        err, _, _ = _propose(canonical_content=content)
 
         assert err is not None
         assert err['error_type'] == 'ValidationError'
