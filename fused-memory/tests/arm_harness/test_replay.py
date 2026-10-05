@@ -221,6 +221,17 @@ def test_default_settings_follow_a_changed_write_timeout(mock_config):
     assert settings.episode_timeout_s == 7.0
 
 
+@pytest.mark.asyncio
+async def test_repeated_episode_ids_are_refused_before_any_write():
+    graph = FakeArmGraph()
+    items = _items(2) + _items(1)
+
+    with pytest.raises(ValueError, match='ep-0'):
+        await _replay(graph, items)
+
+    assert graph.add_calls == []
+
+
 def test_settings_reject_zero_concurrency():
     with pytest.raises(ValueError, match='concurrency'):
         _settings(concurrency=0)
