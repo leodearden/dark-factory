@@ -403,8 +403,9 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     idempotent).
 
     Procedure:
-      1. Seed worker._redispatch with a SpeculativeItem marker.
-      2. Seed worker._inflight with an InflightEntry marker (verify_task=None).
+      1. Seed worker._redispatch with one DecidedItem (request 'sv7-park').
+      2. Seed worker._inflight with an InflightEntry (verify_task=None) wrapping
+         a second, distinct DecidedItem (request 'sv7-task').
       3. Replace _verifier_loop with an idle stub.
       4. Build a dead task (RuntimeError) and invoke _on_loop_task_done directly.
       5. Assert: escalation submitted, new task spawned, _redispatch and _inflight
@@ -413,31 +414,35 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
     eq = RecordingEscalations()
     worker = SpeculativeMergeWorker(git_ops, queue, escalation_queue=eq)
+    loop = asyncio.get_running_loop()
 
-    # Build a minimal MergeRequest with a pending Future
-    future: asyncio.Future[MergeOutcome] = asyncio.get_running_loop().create_future()
-    req = MergeRequest(
-        task_id='sv7-task',
-        branch=QueuedBranch.parse('task/sv7', config.git.branch_prefix),
-        worktree=git_ops.project_root,  # doesn't need to be a real worktree
-        pre_rebased=False,
-        task_files=None,
-        module_configs=[],
-        config=config,
-        result=future,
-    )
+    def decided_item(task_id: str, result: asyncio.Future[MergeOutcome]) -> DecidedItem:
+        request = MergeRequest(
+            task_id=task_id,
+            branch=QueuedBranch.parse(f'task/{task_id}', config.git.branch_prefix),
+            worktree=git_ops.project_root,  # doesn't need to be a real worktree
+            pre_rebased=False,
+            task_files=None,
+            module_configs=[],
+            config=config,
+            result=result,
+        )
+        return DecidedItem(
+            request=request,
+            base_sha='abc123dead',
+            speculative=False,
+            immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
+        )
 
-    # Build a minimal DecidedItem
-    item = DecidedItem(
-        request=req,
-        base_sha='abc123dead',
-        speculative=False,
-        immediate_outcome=MergeOutcome('blocked', reason='test-filler'),
-    )
+    # Two distinct requests: snapshot() renders one row per request_id, so a
+    # single item seeded into both containers would collapse to one row.
+    future: asyncio.Future[MergeOutcome] = loop.create_future()
+    inflight_item = decided_item('sv7-task', future)
+    parked_item = decided_item('sv7-park', loop.create_future())
 
     # Build a minimal InflightEntry (passthrough: verify_task=None)
     inflight_entry = InflightEntry(
-        item=item,
+        item=inflight_item,
         lease=None,
         verify_task=None,
         merge_wt=None,
@@ -445,7 +450,7 @@ async def test_verifier_restart_preserves_inflight_and_redispatch(
     )
 
     # Seed the instance deques
-    worker._redispatch.append(item)
+    worker._redispatch.append(parked_item)
     worker._inflight.append(inflight_entry)
 
     # Replace _verifier_loop with an idle stub so the spawned restart task

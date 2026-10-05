@@ -1280,12 +1280,13 @@ class InflightStatus(StrEnum):
     """Sentinel status values for :class:`InflightEntry` / :class:`InflightVerifyResult`.
 
     A single str-compatible Enum (task 1990 / MQ-invariants ε) shared by both
-    dataclasses' ``status`` fields — ``InflightEntry.status`` may carry any of
-    the five members; ``InflightVerifyResult.status`` carries only the first
-    three (DROPPED / REQUEUED / RUNNER_UNAVAILABLE).  Members are ``str``
-    instances (mirrors ``event_store.EventType`` / ``verify_runner.DriftVerdict``),
-    so every existing ``==`` / ``in`` comparison against the raw sentinel
-    strings keeps working unchanged.
+    dataclasses' ``status`` fields — ``InflightEntry.status`` carries the two
+    PREDISPATCH members, or DROPPED / REQUEUED once a verify has vacated the
+    entry (see :attr:`InflightEntry.vacated`); ``InflightVerifyResult.status``
+    carries only the first three (DROPPED / REQUEUED / RUNNER_UNAVAILABLE).
+    Members are ``str`` instances (mirrors ``event_store.EventType`` /
+    ``verify_runner.DriftVerdict``), so every existing ``==`` / ``in``
+    comparison against the raw sentinel strings keeps working unchanged.
     """
 
     DROPPED = 'DROPPED'
@@ -1532,8 +1533,9 @@ class InflightEntry:
                          that are enqueued without a real verify task so finalize can deliver
                          them in submission order
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
-    status         : optional sentinel string ('DROPPED', 'REQUEUED', 'RUNNER_UNAVAILABLE')
-                     returned by _run_inflight_verify to signal special handling by _finalize_inflight
+    status         : optional sentinel.  ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH are
+                     set by _dispatch_item; DROPPED / REQUEUED by the entry's own verify
+                     when it vacates the entry (see :attr:`vacated`, task 4582).
     chain          : the :class:`ChainResult` this dispatch's verify was
                      REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
                      ordinary adjacent-verify path.  Its READER is
@@ -1578,6 +1580,12 @@ class InflightEntry:
     verify_wt: VerifyWorktreeHandle | None = None  # δ (task 3186): the verify's POST-swap worktree
     spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
 
+    @property
+    def vacated(self) -> bool:
+        """True once the verify dropped or requeued this entry's request and
+        released its lease; only the head-of-line finalize remains."""
+        return self.status in (InflightStatus.REQUEUED, InflightStatus.DROPPED)
+
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).
 
@@ -1591,6 +1599,19 @@ class InflightEntry:
                 f'passthrough_outcome={self.passthrough_outcome!r} on an item of type '
                 f'{type(self.item).__name__}',
             )
+
+
+@dataclass
+class InflightEntrySlot:
+    """The :class:`InflightEntry` wrapping a verify, handed to that verify (task 4582).
+
+    Built empty before the verify task for the reason
+    :class:`VerifyWorktreeHandle` gives, and filled by ``_dispatch_item`` once
+    the entry exists, so a verify that requeues or drops its request vacates
+    its OWN entry.
+    """
+
+    entry: InflightEntry | None = None
 
 
 @dataclass
