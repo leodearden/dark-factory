@@ -29,6 +29,7 @@ const {
   plottableMax,
   axisY,
   formatCountTick,
+  niceCountMax,
   axisPaths,
   barFractions,
   stackedAreaPaths,
@@ -637,4 +638,4 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   return result;
 }
 
-window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick };
+window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick, niceCountMax };

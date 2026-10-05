@@ -265,7 +265,7 @@ function OriginPanel({ origin, win, generatedAt, regimeMarkers }) {
       </div>
       {stacks.length > 0 && (
         <TimeChart labels={dates} markers={regimeMarkers}>
-          <C.StackedAreaChart stacks={stacks} labels={dates} formatX={fmtDateTime} />
+          <C.StackedAreaChart stacks={stacks} labels={dates} snapMax={C.niceCountMax} formatX={fmtDateTime} />
         </TimeChart>
       )}
       <table className="tbl" style={{ marginTop: 10 }}>
@@ -557,6 +557,7 @@ function WorkflowPanel({ workflow, terminal, win, generatedAt, regimeMarkers }) 
               series={[{ key: 'churn', color: C.PALETTE.bad, values: churnDates.map(d => churnDaily[d] || 0) }]}
               labels={churnDates}
               formatY={C.formatCountTick}
+              snapMax={C.niceCountMax}
               formatX={fmtDateTime}
             />
           </TimeChart>
