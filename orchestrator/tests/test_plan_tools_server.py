@@ -146,6 +146,17 @@ class TestCoerceFiles:
             'residual bracket/quote characters' in r.getMessage() for r in caplog.records
         )
 
+    @pytest.mark.parametrize('value', [{'a.py': 1}, 42])
+    def test_unrecognized_type_maps_to_empty_and_logs_warning(self, caplog, value):
+        """A ``files`` value read back from a stored plan has passed no
+        pydantic boundary, so a type that is neither list, str nor None must
+        degrade to no files, loudly, rather than raise."""
+        with caplog.at_level(logging.WARNING, logger='orchestrator.mcp.plan_tools'):
+            result = _coerce_files(value)
+
+        assert result == []
+        assert any('unrecognized type' in r.getMessage() for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # Architect tool tests
@@ -935,9 +946,10 @@ class TestDropPlanFile:
     def test_stringified_files_single_entry_still_refuses_last_drop(
         self, artifacts
     ):
+        stored = '["mod_a/only.py"]'
         self._three_file_plan(artifacts)
         plan = artifacts.read_plan()
-        plan['files'] = '["mod_a/only.py"]'
+        plan['files'] = stored
         artifacts.write_plan(plan)
 
         result = _drop_plan_file(
@@ -945,7 +957,25 @@ class TestDropPlanFile:
         )
 
         assert result['status'] == 'error'
-        assert artifacts.read_plan().get('dropped_files', []) == []
+        assert 'last file' in result['message']
+        self._assert_record_untouched(artifacts, stored)
+
+    @pytest.mark.parametrize('stored', [{'mod_a/foo.py': True}, 42])
+    def test_unrecognized_stored_files_type_is_refused_not_raised(
+        self, artifacts, stored
+    ):
+        self._three_file_plan(artifacts)
+        plan = artifacts.read_plan()
+        plan['files'] = stored
+        artifacts.write_plan(plan)
+
+        result = _drop_plan_file(
+            artifacts, path='mod_a/foo.py', reason='Needed no edit'
+        )
+
+        assert result['status'] == 'error'
+        assert 'not in the plan files list' in result['message']
+        self._assert_record_untouched(artifacts, stored)
 
 
 class TestRemovePlanStep:

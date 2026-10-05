@@ -116,8 +116,8 @@ logger = logging.getLogger(__name__)
 _RESIDUAL_CORRUPTION_CHARS = frozenset("[]{}'\"")
 
 
-def _coerce_files(files: list[str] | str | None) -> list[str]:
-    """Coerce a possibly mis-serialized ``files`` MCP arg into a clean list.
+def _coerce_files(files: object) -> list[str]:
+    """Coerce a possibly mis-serialized ``files`` value into a clean list.
 
     The agent harness intermittently mis-serializes the ``create_plan``
     (and ``update_plan_metadata``) call when a large/complex ``analysis``
@@ -128,11 +128,23 @@ def _coerce_files(files: list[str] | str | None) -> list[str]:
     ``list[str]``; ``None`` maps to ``[]``. Shapes that cannot be
     confidently recovered are logged (rather than silently accepted) so
     the corruption stays visible to operators.
+
+    A ``files`` read back out of a stored plan has passed no pydantic
+    boundary, so it may be any JSON type: one that is neither list, str nor
+    ``None`` maps to ``[]``, logged, rather than raising.
     """
     if files is None:
         return []
     if isinstance(files, list):
         return [str(f).strip() for f in files if str(f).strip()]
+    if not isinstance(files, str):
+        logger.warning(
+            "_coerce_files: files value has unrecognized type %s (expected "
+            "list, str or None); treating it as no files: %r",
+            type(files).__name__,
+            files,
+        )
+        return []
 
     text = files.strip()
     if not text:
@@ -1221,8 +1233,11 @@ def _drop_plan_file(
     Atomicity is the invariant, not a convenience. Because the removal and the
     note are the same write, it is structurally impossible to note a file that
     was kept, to drop without a reason, or to ADD a file — so
-    ``workflow._try_narrow_plan``'s ``after.issubset(before)`` guard holds by
-    construction and needs no change.
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._try_narrow_plan``'s
+    ``after.issubset(before)`` guard holds by construction whenever the stored
+    ``files`` is a list. A stored non-list ``files`` breaks that: this function
+    coerces it and writes back a real list, but the guard takes ``before``
+    from the raw stored value.
     """
     plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
