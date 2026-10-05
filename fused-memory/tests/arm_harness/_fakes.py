@@ -3,8 +3,9 @@
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
+from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec
 from fused_memory.backends.llm_token_usage import (
@@ -12,6 +13,9 @@ from fused_memory.backends.llm_token_usage import (
     TokenMeasurement,
     measure_llm_tokens,
 )
+
+if TYPE_CHECKING:  # RED: a plain import at GREEN
+    from fused_memory.arm_harness.run_manifest import RunManifest
 
 CODE_SHA = 'a' * 40
 CORPUS_SHA = 'b' * 64
@@ -68,6 +72,35 @@ def embedding_spec(*, base_url: str = UNREACHABLE_BASE_URL, **overrides) -> Embe
         'arm_role': 'candidate',
     }
     return EmbeddingArmSpec.model_validate(data | overrides)
+
+
+STARTED_AT = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+FINISHED_AT = datetime(2026, 10, 5, 13, 30, tzinfo=UTC)
+
+
+def run_manifest_for(spec: LlmArmSpec | EmbeddingArmSpec, **overrides) -> 'RunManifest':
+    """A complete run of ``spec`` over three episodes; override any field by keyword."""
+    from fused_memory.arm_harness.run_manifest import RunManifest  # RED: hoisted at GREEN
+
+    data = {
+        'schema_version': 1,
+        'spec': spec,
+        'settings_summary': {
+            'concurrency': 4,
+            'index_configuration': 'with-indices',
+            'episode_timeout_s': 120.0,
+        },
+        'effective_embedder': {'model': 'text-embedding-3-small', 'dimensions': 1536},
+        'graphiti_max_coroutines': 5,
+        'graphiti_semaphore_limit': 20,
+        'episode_ids': ('e1', 'e2', 'e3'),
+        'incomplete': False,
+        'abort': None,
+        'check_results': (),
+        'started_at': STARTED_AT,
+        'finished_at': FINISHED_AT,
+    }
+    return RunManifest.model_validate(data | overrides)
 
 
 def fake_add_result(
