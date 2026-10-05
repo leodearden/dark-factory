@@ -111,9 +111,11 @@ class TestJudgeWordingOverride:
 
     def test_nesting_a_different_wording_is_refused_naming_both(self) -> None:
         with _mod().judge_wording(_mod().WORDING_PRE_PSI):
-            with pytest.raises(RuntimeError, match='shipped') as excinfo:
-                with _mod().judge_wording(_mod().WORDING_SHIPPED):
-                    pass  # pragma: no cover - the enter refuses
+            with (
+                pytest.raises(RuntimeError, match='shipped') as excinfo,
+                _mod().judge_wording(_mod().WORDING_SHIPPED),
+            ):
+                pass  # pragma: no cover - the enter refuses
             assert 'pre-psi' in str(excinfo.value)
             assert write_triage_judge.JUDGE_SYSTEM_PROMPT == _mod().PRE_PSI_JUDGE_SYSTEM_PROMPT
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
@@ -122,10 +124,12 @@ class TestJudgeWordingOverride:
 
     @pytest.mark.parametrize('wording', ['shipped', 'pre-psi'])
     def test_re_entering_the_same_wording_is_refused(self, wording: str) -> None:
-        with _mod().judge_wording(wording):
-            with pytest.raises(RuntimeError):
-                with _mod().judge_wording(wording):
-                    pass  # pragma: no cover - the enter refuses
+        with (
+            _mod().judge_wording(wording),
+            pytest.raises(RuntimeError),
+            _mod().judge_wording(wording),
+        ):
+            pass  # pragma: no cover - the enter refuses
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _mod().system_prompt(
             _mod().WORDING_SHIPPED,
         )
