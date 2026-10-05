@@ -1787,7 +1787,11 @@ _REVIEWER_HEURISTICS_TEMPLATE = """\
    - Design concerns that are valid but outside this task's scope
    - Edge cases that cannot occur given the task's stated constraints
    - Missing features that belong in a follow-up task
-   - Style, naming, or structural preferences
+   - Formatting or layout preferences
+
+   Naming and structure are NOT preferences: judge them under the code-quality heuristics
+   below (heuristic 1 informative names, heuristic 13 files make internal sense in
+   isolation), which govern here.
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
 """ + CODE_QUALITY_GUIDANCE + """
