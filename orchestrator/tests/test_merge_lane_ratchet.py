@@ -117,6 +117,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
+import source_measures  # type: ignore[import-not-found]  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
 
@@ -412,6 +413,64 @@ class TestEnumerationRoundTrip:
         unreadable = enumeration.to_dict()['unreadable']
         assert isinstance(unreadable, list)
         assert 'a.py' in unreadable
+
+
+# ---------------------------------------------------------------------------
+# The per-file measures live in scripts/source_measures.py, and the ratchet
+# reaches them through that module rather than re-exporting them.
+
+_MOVED_PUBLIC_NAMES = (
+    'MetricsError',
+    'FileSizeMeasures',
+    'file_size_measures',
+    'file_size_measures_in_tree',
+    'function_local_imports',
+    'function_local_imports_in_tree',
+    'reexport_names',
+    'reexport_names_in_tree',
+    'COMPLEXIPY_MIN',
+    'COMPLEXIPY_MAX_EXCLUSIVE',
+    'COMPLEXIPY_REQUIRED',
+    'satisfies_complexipy_requirement',
+    'complexipy_version',
+    'require_complexipy',
+    'FileCognitive',
+    'file_cognitive_measures',
+    'maintainability_index',
+    'PatchCall',
+    'patch_calls_in_tree',
+    'patch_targets',
+    'patch_targets_in_tree',
+    'private_reads',
+    'private_reads_in_tree',
+    'src_module_name',
+    'tracked_files',
+    'tracked_python_files',
+    'parse_source',
+    'read_source',
+    'docstring_of',
+)
+
+_RETIRED_PRIVATE_NAMES = (
+    '_parse',
+    '_read_source',
+    '_docstring_of',
+    '_git_output',
+    '_import_complexipy',
+    '_file_complexity',
+    '_lane_module_aliases',
+)
+
+
+class TestTheMeasuresLiveInSourceMeasures:
+    @pytest.mark.parametrize('name', _MOVED_PUBLIC_NAMES)
+    def test_a_moved_name_has_one_home(self, name: str) -> None:
+        assert hasattr(source_measures, name)
+        assert not hasattr(metrics, name)
+
+    @pytest.mark.parametrize('name', _RETIRED_PRIVATE_NAMES)
+    def test_a_retired_private_name_is_gone_from_the_ratchet(self, name: str) -> None:
+        assert not hasattr(metrics, name)
 
 
 # ---------------------------------------------------------------------------
