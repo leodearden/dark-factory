@@ -37,6 +37,22 @@ SECTIONS = (
 )
 METHOD_KEYS = ("run_id", "as_of_sha", "since", "evidence", "verification", "cost", "inputs_consumed", "extra")
 METHOD_BLOCK = "## Method yaml block"
+FINDING_FIELDS = (
+    "key",
+    "area",
+    "sub_area",
+    "anchor",
+    "tags",
+    "severity",
+    "evidence_source",
+    "statement",
+    "proposal",
+    "verdict",
+    "disposition",
+    "first_seen",
+    "last_seen",
+    "supersedes",
+)
 NOTE_CAP = 400
 
 
@@ -194,11 +210,38 @@ def check_record_method(record: dict) -> list[Gap]:
     return check_method_mapping(record["method"], "record.method")
 
 
-def check_record(path: Path, shown: str) -> list[Gap]:
-    record = load_record(path, shown)
+def check_finding(index: int, finding: object) -> list[Gap]:
+    if not isinstance(finding, dict):
+        return [Gap(GapKind.MALFORMED, f"findings[{index}]", f"{type(finding).__name__}, not a JSON object")]
+    label = finding.get("key", "without a key")
+    return [
+        Gap(GapKind.MISSING, f"findings[{index}].{field}", f"finding {label} lacks {field}")
+        for field in FINDING_FIELDS
+        if field not in finding
+    ]
+
+
+def check_findings(record: dict) -> list[Gap]:
+    if "findings" not in record:
+        return [Gap(GapKind.MISSING, "findings")]
+    findings = record["findings"]
+    if not isinstance(findings, list):
+        return [Gap(GapKind.MALFORMED, "findings", f"{type(findings).__name__}, not a list")]
+    return [gap for index, finding in enumerate(findings) for gap in check_finding(index, finding)]
+
+
+def check_record(record: dict | Gap | None) -> list[Gap]:
+    if record is None:
+        return []
     if isinstance(record, Gap):
         return [record]
-    return check_record_method(record)
+    return check_record_method(record) + check_findings(record)
+
+
+def check_rendering(md_text: str | None) -> list[Gap]:
+    if md_text is None:
+        return []
+    return check_sections(md_text) + check_rendered_method(md_text)
 
 
 def predates_header(report: Report, titles: list[str]) -> bool:
@@ -233,19 +276,13 @@ def nonconforming_headline(report: str, gaps: tuple[Gap, ...]) -> str:
     return f"{report} does not conform -- " + "; ".join(parts)
 
 
-def post_header_result(report: Report, gaps: tuple[Gap, ...]) -> Result:
-    if gaps:
-        return Result(Verdict.NONCONFORMING, report.shown_path, gaps, nonconforming_headline(report.shown_path, gaps))
-    return Result(Verdict.CONFORMS, report.shown_path, (), f"{report.shown_path} conforms")
-
-
-def post_header_gaps(report: Report, md_text: str | None) -> list[Gap]:
-    gaps = check_halves(report)
-    if md_text is not None:
-        gaps += check_sections(md_text) + check_rendered_method(md_text)
-    if report.record is not None:
-        gaps += check_record(report.record, report.shown("json"))
-    return gaps
+def post_header_result(report: Report, md_text: str | None) -> Result:
+    record = load_record(report.record, report.shown("json")) if report.record else None
+    gaps = tuple(check_halves(report) + check_rendering(md_text) + check_record(record))
+    if not gaps and isinstance(record, dict):
+        headline = f"{report.shown_path} conforms ({len(record['findings'])} findings)"
+        return Result(Verdict.CONFORMS, report.shown_path, (), headline)
+    return Result(Verdict.NONCONFORMING, report.shown_path, gaps, nonconforming_headline(report.shown_path, gaps))
 
 
 def check(project_root: Path) -> Result:
@@ -255,7 +292,7 @@ def check(project_root: Path) -> Result:
     md_text = report.rendering.read_text(encoding="utf-8") if report.rendering else None
     if predates_header(report, level2_titles(md_text or "")):
         return predates_header_result(report)
-    return post_header_result(report, tuple(post_header_gaps(report, md_text)))
+    return post_header_result(report, md_text)
 
 
 def gap_line(gap: Gap) -> str:
