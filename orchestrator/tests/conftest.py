@@ -773,8 +773,11 @@ def _forbid_agent_cli_spawn(monkeypatch, request):
 
     Fails at the spawn seam, and again at teardown for a spawn whose raise a
     caller absorbed. The guard is ``_agent_cli_guard.py``; its tests are
-    ``test_agent_cli_guard.py``.
+    ``test_agent_cli_guard.py``. Opt out with the ``spawns_agent_cli`` marker.
     """
+    if request.node.get_closest_marker('spawns_agent_cli'):
+        yield None
+        return
     guard = AgentCliSpawnGuard(request.node.nodeid)
     monkeypatch.setattr(subprocess.Popen, '__init__', guard.guarded(subprocess.Popen.__init__))
     yield guard
