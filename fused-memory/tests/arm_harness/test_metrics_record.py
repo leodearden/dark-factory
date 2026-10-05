@@ -4,17 +4,6 @@ import json
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from fused_memory.arm_harness.metrics_record import (
-    EMBEDDING_METRIC_IDS,
-    LLM_METRIC_IDS,
-    DeltaOf,
-    IndexConfiguration,
-    MetricsRecord,
-    load_metrics_record,
-    record_for,
-    serialize_metrics_record,
-    write_metrics_record,
-)
 from pydantic import ValidationError
 from shared.memory_eval_metrics import Metric, canonical_json_text
 
@@ -25,6 +14,17 @@ from arm_harness._fakes import (
     embedding_spec,
     incumbent_control_spec,
     llm_spec,
+)
+from fused_memory.arm_harness.metrics_record import (
+    EMBEDDING_METRIC_IDS,
+    LLM_METRIC_IDS,
+    DeltaOf,
+    IndexConfiguration,
+    MetricsRecord,
+    load_metrics_record,
+    record_for,
+    serialize_metrics_record,
+    write_metrics_record,
 )
 
 MEASURED_AT = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
