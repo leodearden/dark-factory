@@ -44,7 +44,7 @@ class TestFakeVerifierRecordsEachScopedVerify:
         assert verifier.verified == ['a', 'b']
 
     @pytest.mark.asyncio
-    async def test_the_recorded_module_configs_are_a_snapshot(self):
+    async def test_the_record_is_an_immutable_snapshot(self):
         verifier = FakeVerifier()
         m1, m2 = object(), object()
         handed = [m1]
@@ -52,9 +52,11 @@ class TestFakeVerifierRecordsEachScopedVerify:
         await verifier.run_scoped(Path('wt'), None, handed, task_id='a')
         handed.append(m2)
 
-        recorded = verifier.verify_calls[0].module_configs
-        assert isinstance(recorded, tuple)
-        assert recorded == (m1,)
+        record = verifier.verify_calls[0]
+        assert isinstance(record.module_configs, tuple)
+        assert record.module_configs == (m1,)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            record.module_configs = (m1, m2)  # type: ignore[misc]
 
     @pytest.mark.asyncio
     async def test_the_record_exists_once_await_entry_returns(self):
@@ -76,12 +78,6 @@ class TestFakeVerifierRecordsEachScopedVerify:
         finally:
             parked.cancel()
             await asyncio.gather(parked, return_exceptions=True)
-
-    def test_a_frozen_record(self):
-        record = ScopedVerifyCall(task_id='a', worktree=Path('wt'), module_configs=())
-
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            record.task_id = 'b'  # type: ignore[misc]
 
 
 class TestFakeVerifierOrderedScripts:

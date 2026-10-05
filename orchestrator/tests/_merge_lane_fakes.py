@@ -107,7 +107,7 @@ def lane_scene_config(
 
 @dataclasses.dataclass(frozen=True)
 class VerifyScript:
-    """What ``FakeVerifier.run_scoped`` does for one task.
+    """What one ``FakeVerifier.run_scoped`` call does.
 
     Exactly one of the shapes below applies: return ``result``, raise
     ``error``, or wait for ``release`` first and then return ``result``.
@@ -169,13 +169,14 @@ class FakeVerifier:
     call was handed in ``verify_calls``, one ``ScopedVerifyCall`` per entry
     into the BASE ``run_scoped`` (an override that does not delegate records
     only ``verified``/``entered_count``, through ``_note_entry``).
-    ``await_entry(n)`` waits for the *n*-th entry into ``run_scoped``, which is how a test waits for a scripted hang to be
-    genuinely under way before it probes the lane -- per CALL, so a test
-    that drives two verifies can wait for the SECOND one instead of being
-    let through early by the first. The gates a merge passes through after a
-    green scoped verify all report clean, the disk guard reports
-    *disk_reason* (``None``, the default, being "proceed"), and dry-run
-    investigations are recorded in ``investigations`` rather than run.
+    ``await_entry(n)`` waits for the *n*-th entry into ``run_scoped``, which
+    is how a test waits for a scripted hang to be genuinely under way before
+    it probes the lane -- per CALL, so a test that drives two verifies can
+    wait for the SECOND one instead of being let through early by the first.
+    The gates a merge passes through after a green scoped verify all report
+    clean, the disk guard reports *disk_reason* (``None``, the default, being
+    "proceed"), and dry-run investigations are recorded in ``investigations``
+    rather than run.
 
     Script a per-CALL sequence with ``sequence=``; a subclass that must vary
     the selection further overrides ``next_script``. A legacy subclass that
