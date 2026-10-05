@@ -10,8 +10,21 @@ import dataclasses
 from pathlib import Path
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, ScopedVerifyCall, hangs_until
+from _merge_lane_fakes import (
+    FakeVerifier,
+    ScopedVerifyCall,
+    VerifyScript,
+    fails,
+    hangs_until,
+    passes,
+    raises,
+)
 from _orch_helpers import wait_responsive
+from orchestrator.verify import VerifyResult
+
+
+async def _verify(verifier: FakeVerifier, task_id: str) -> VerifyResult:
+    return await verifier.run_scoped(Path(f'wt-{task_id}'), None, [], task_id=task_id)
 
 
 class TestFakeVerifierRecordsEachScopedVerify:
@@ -68,3 +81,106 @@ class TestFakeVerifierRecordsEachScopedVerify:
 
         with pytest.raises(dataclasses.FrozenInstanceError):
             record.task_id = 'b'  # type: ignore[misc]
+
+
+class TestFakeVerifierOrderedScripts:
+    @pytest.mark.asyncio
+    async def test_sequence_is_consumed_in_call_order_then_the_standing_verdict_applies(self):
+        verifier = FakeVerifier(
+            default=fails(category='x', summary='standing'),
+            sequence=[passes('first'), fails(category='x', summary='second')],
+        )
+
+        summaries = [(await _verify(verifier, 't')).summary for _ in range(3)]
+
+        assert summaries == ['first', 'second', 'standing']
+
+    @pytest.mark.asyncio
+    async def test_sequence_takes_precedence_over_task_scripts_until_exhausted(self):
+        verifier = FakeVerifier(
+            scripts={'t': fails(category='x', summary='keyed')},
+            sequence=[passes('ordered')],
+        )
+
+        assert (await _verify(verifier, 't')).summary == 'ordered'
+        assert (await _verify(verifier, 't')).summary == 'keyed'
+        assert (await _verify(verifier, 'u')).summary == 'fake verify passed'
+
+    @pytest.mark.asyncio
+    async def test_the_sequence_is_copied_at_construction(self):
+        ordered = [passes('ordered')]
+        verifier = FakeVerifier(sequence=ordered)
+        ordered[:] = [fails(category='x', summary='swapped'), fails(category='x', summary='added')]
+
+        assert (await _verify(verifier, 't')).summary == 'ordered'
+        assert (await _verify(verifier, 't')).summary == 'fake verify passed'
+
+    @pytest.mark.asyncio
+    async def test_an_ordered_script_can_raise(self):
+        verifier = FakeVerifier(sequence=[raises(RuntimeError('boom'))])
+
+        with pytest.raises(RuntimeError, match='boom'):
+            await _verify(verifier, 't')
+        assert (await _verify(verifier, 't')).passed
+
+
+class TestVerifyScriptEntered:
+    @pytest.mark.asyncio
+    async def test_hangs_until_sets_entered_before_waiting_for_release(self):
+        release, entered = asyncio.Event(), asyncio.Event()
+        verifier = FakeVerifier(sequence=[hangs_until(release, entered=entered)])
+        parked = asyncio.create_task(_verify(verifier, 't'))
+        try:
+            await wait_responsive(entered.wait(), label='hung verify arrived')
+            assert not parked.done()
+
+            release.set()
+            result = await wait_responsive(parked, label='released verify returned')
+            assert result.summary == 'fake verify passed'
+        finally:
+            parked.cancel()
+            await asyncio.gather(parked, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_entered_is_set_for_a_script_that_does_not_hang(self):
+        entered = asyncio.Event()
+        verifier = FakeVerifier(scripts={'t': dataclasses.replace(passes(), entered=entered)})
+
+        await _verify(verifier, 't')
+
+        assert entered.is_set()
+
+    @pytest.mark.asyncio
+    async def test_first_call_gate_as_a_constructor_call(self):
+        release, entered = asyncio.Event(), asyncio.Event()
+        verifier = FakeVerifier(sequence=[hangs_until(release, entered=entered)])
+        first = asyncio.create_task(_verify(verifier, 'first'))
+        try:
+            await wait_responsive(entered.wait(), label='gated first verify arrived')
+
+            assert (await _verify(verifier, 'second')).passed
+            assert not first.done()
+
+            release.set()
+            assert (await wait_responsive(first, label='gated first verify returned')).passed
+            assert verifier.verified == ['first', 'second']
+        finally:
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+
+
+class TestNextScriptSeam:
+    @pytest.mark.asyncio
+    async def test_a_subclass_overriding_next_script_keeps_the_base_recording(self):
+        class _PickingVerifier(FakeVerifier):
+            def next_script(self, task_id: str | None) -> VerifyScript:
+                if task_id == 'p':
+                    return fails(category='x', summary='picked')
+                return super().next_script(task_id)
+
+        verifier = _PickingVerifier()
+
+        assert (await _verify(verifier, 'p')).summary == 'picked'
+        assert (await _verify(verifier, 'q')).summary == 'fake verify passed'
+        assert [call.task_id for call in verifier.verify_calls] == ['p', 'q']
+        assert verifier.verified == ['p', 'q']
