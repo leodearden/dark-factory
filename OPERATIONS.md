@@ -1650,6 +1650,51 @@ writing streak state: `is_unit_enabled` (operator intent) and the 120s
 `STARTUP_GRACE_SECS` window after the unit starts (a not-yet-bound port is
 neither failure evidence nor recovery).
 
+### Dashboard unit-parity check
+
+Each orchestrator-watchdog tick also runs
+`scripts/check_dashboard_unit_parity.py`, read-only, comparing the three
+installed dashboard units (`dark-factory-dashboard.service` and the
+`dark-factory-dashboard-watchdog` `.service`/`.timer` pair) against their
+committed copies. It runs at most once per
+`ORCH_UNIT_PARITY_MIN_INTERVAL_SECS` (default `3600`; `<=0` disables the
+throttle), gated by its own clock `ORCH_UNIT_PARITY_CLOCK` (default
+`data/orchestrator/last_unit_parity_check.json`). That clock is independent
+of every deploy clock, and it is stamped on each *attempt*, so a broken
+checker is retried hourly rather than on every tick. The pass logs a
+`WARNING` only on drift, one plain line when the checker could not run, and
+nothing on parity or when the dashboard units are not installed on the host:
+
+```bash
+journalctl --user -t orchestrator-watchdog | grep 'unit parity'
+```
+
+**Why it runs here, not on a new timer.** `orchestrator-watchdog.service`
+runs the script from the repo checkout on an already-armed timer, so the
+check went live on merge with no install action. A new unit starts working
+only once someone runs the installer, and that is the very condition that
+let the installed dashboard unit drift unreported for weeks while the check
+ran only under `scripts/setup-host.sh`.
+
+**Scope.** The checker compares a registered set of directives, plus four
+uvicorn flags inside `ExecStart` (`--host`, `--port`,
+`--timeout-graceful-shutdown`, `--timeout-keep-alive`). The test suite
+guards that set for completeness: every directive a committed unit declares
+must be compared or explicitly waived with a reason. Other `ExecStart`
+tokens, such as `uv run --no-sync`, are not compared.
+
+**Remediation.** The check is detection only; there is no `--fix`. On
+drift, take one of two safe paths:
+
+- Re-run `scripts/setup-host.sh`. Since task 4793 it renders the dashboard
+  unit through `scripts/render_systemd_unit.py`, which preserves this host's
+  local `DASHBOARD_KNOWN_PROJECT_ROOTS`.
+- Edit the installed unit surgically, then run `systemctl --user
+  daemon-reload`.
+
+Never re-render the template with a bare `sed`: that drops every locally
+added project root.
+
 ### Reading `--report`
 
 ```bash
@@ -1705,9 +1750,25 @@ costing you the whole row:
   `FM_LIVENESS_RESTART_MIN_INTERVAL_SECS` to see how much of the window
   remains.
 
+A last labelled `dashboard unit parity` row follows, on the same terms: it
+is **informational only, never alters `--report`'s exit code**, and writes
+no clock. Unlike the hourly pass it is **not** clock-gated: it runs the
+checker now. Its `CHECKER:` field names the script that ran. The verdict is
+one of:
+
+- **`parity`** — the installed units match their committed copies on every
+  registered directive.
+- **`drift`** — one or more compared directives disagree. The checker's own
+  report follows the row, naming the directive.
+- **`absent`** — the dashboard units are not installed on this host. This is
+  benign, the same reading `setup-host.sh` gives the checker's exit 2.
+- **`unknown`** — the checker could not be run, and the reason follows the
+  row. This is a tooling problem, not a parity claim.
+
 Run `--report` before manually restarting a unit, to check whether an
-upcoming fleet deploy is likely to be held up by an in-flight merge, or to
-see why fused-memory has (or has not) been revived.
+upcoming fleet deploy is likely to be held up by an in-flight merge, to
+see why fused-memory has (or has not) been revived, or to check that the
+installed dashboard units match their committed copies.
 
 ### Known gap: the watched list is hardcoded
 
