@@ -8,6 +8,7 @@ anti-vacuity anchors, not definitions.
 from __future__ import annotations
 
 import dataclasses
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -878,6 +879,133 @@ class TestWorkspaceDomain:
         script_kinds = [f.kind for f in by_name['scripts'].values()]
         assert script_kinds.count(source_measures.FileKind.SRC) >= 50
         assert script_kinds.count(source_measures.FileKind.TESTS) >= 50
+
+
+def _workspace(*members: str) -> str:
+    return '[tool.uv.workspace]\nmembers = [{}]\n'.format(
+        ', '.join(f'"{member}"' for member in members)
+    )
+
+
+def _stage_conflict(root: Path, relpath: str) -> None:
+    """Leave *relpath* unmerged in *root*'s index: stage 1 and stage 2, two blobs."""
+    blobs = []
+    for content in ('base\n', 'ours\n'):
+        source = root / 'conflict-content'
+        source.write_text(content, encoding='utf-8')
+        blobs.append(git(root, 'hash-object', '-w', str(source)).strip())
+        source.unlink()
+    records = ''.join(
+        f'100644 {blob} {stage}\t{relpath}\n' for stage, blob in enumerate(blobs, start=1)
+    )
+    env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+    proc = subprocess.run(
+        ['git', 'update-index', '--index-info'],
+        cwd=root,
+        input=records,
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+class TestWorkspaceDomainFailsHard:
+    """A domain that cannot be enumerated whole raises, never reads as partial."""
+
+    def test_a_missing_pyproject_is_refused(self, tmp_path: Path) -> None:
+        root = _domain_repo(tmp_path / 'repo', pyproject=None)
+        with pytest.raises(source_measures.MetricsError, match='pyproject.toml'):
+            source_measures.workspace_domain(root)
+
+    @pytest.mark.parametrize(
+        ('pyproject', 'pattern'),
+        [
+            pytest.param('[tool.uv.workspace\n', 'pyproject.toml', id='invalid-toml'),
+            pytest.param(
+                '[project]\nname = "x"\n', r'tool\.uv\.workspace', id='no-workspace-table'
+            ),
+            pytest.param(_workspace(), r'tool\.uv\.workspace', id='no-members'),
+            pytest.param(
+                '[tool.uv.workspace]\nmembers = ["alpha", 3]\n',
+                r'tool\.uv\.workspace',
+                id='non-string-member',
+            ),
+            pytest.param(
+                _workspace('alpha', 'packages/*'), r"glob.*'packages/\*'", id='glob-member'
+            ),
+            pytest.param(
+                _workspace('alpha', 'scripts'),
+                r"'scripts'.*pseudo-member",
+                id='scripts-pseudo-member-collision',
+            ),
+            pytest.param(
+                _workspace('alpha', 'tests'),
+                r"'tests'.*pseudo-member",
+                id='tests-pseudo-member-collision',
+            ),
+            pytest.param(
+                _workspace('alpha', 'alpha'), r"duplicate.*'alpha'", id='duplicate-member'
+            ),
+        ],
+    )
+    def test_a_malformed_member_list_is_refused_by_name(
+        self, tmp_path: Path, pyproject: str, pattern: str
+    ) -> None:
+        root = _domain_repo(tmp_path / 'repo', pyproject=pyproject)
+        with pytest.raises(source_measures.MetricsError, match=pattern):
+            source_measures.workspace_domain(root)
+
+    def test_a_declared_member_with_no_tracked_python_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        root = _domain_repo(
+            tmp_path / 'repo',
+            pyproject=_workspace('alpha', 'gamma'),
+            tracked=('alpha/src/alpha/a.py', 'gamma/pyproject.toml'),
+        )
+        with pytest.raises(source_measures.MetricsError, match='gamma'):
+            source_measures.workspace_domain(root)
+
+    def test_an_empty_pseudo_member_is_returned_empty(self, tmp_path: Path) -> None:
+        # Pseudo-members are conventions, not declarations: a tree without
+        # scripts/ or tests/ legitimately has none there.
+        root = _domain_repo(
+            tmp_path / 'repo', pyproject=_workspace('alpha'), tracked=('alpha/src/alpha/a.py',)
+        )
+        members = source_measures.workspace_domain(root)
+        assert [(member.name, member.files) for member in members[1:]] == [
+            ('scripts', ()),
+            ('tests', ()),
+        ]
+
+    def test_an_unmerged_index_entry_is_refused_naming_the_path(
+        self, tmp_path: Path
+    ) -> None:
+        root = _domain_repo(tmp_path / 'repo')
+        _stage_conflict(root, 'alpha/src/alpha/conflict.py')
+        with pytest.raises(
+            source_measures.MetricsError, match=r'unmerged.*alpha/src/alpha/conflict\.py'
+        ):
+            source_measures.workspace_domain(root)
+
+    def test_a_missing_git_is_a_named_hard_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        root = _domain_repo(tmp_path / 'repo')
+        empty_bin = tmp_path / 'empty-bin'
+        empty_bin.mkdir()
+        monkeypatch.setenv('PATH', str(empty_bin))
+        with pytest.raises(source_measures.MetricsError, match='could not run git'):
+            source_measures.workspace_domain(root)
+
+    def test_a_subdirectory_of_the_work_tree_is_refused(self, tmp_path: Path) -> None:
+        root = _domain_repo(tmp_path / 'repo')
+        with pytest.raises(
+            source_measures.MetricsError, match='not the top of a git work tree'
+        ):
+            source_measures.workspace_domain(root / 'alpha')
 
 
 # ---------------------------------------------------------------------------
