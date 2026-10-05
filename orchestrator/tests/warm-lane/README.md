@@ -74,6 +74,27 @@ above still describe the ported baseline, not the current file:
   `lib_lane_state.sh`, with `lib_live_refs.sh` deliberately PRESENT in the
   fixture so A9's guard cannot account for the result.
 
+`test_thin_warm_lane.sh` has likewise grown DARK-FACTORY-NATIVE coverage, added
+by **task 5307** with the script's live-process-reference gate (see
+[`orchestrator/scripts/warm-lane/README.md`](../../scripts/warm-lane/README.md)
+"Delta 12"); the line count and SHA above still describe the ported baseline.
+It is ported from reify task 5823's coverage of reify's own gate (merged as
+reify `3112547dee`), keeping reify's labels so the two files stay diffable:
+
+- **A12** (3 asserts) — a copy without its sibling `lib_live_refs.sh` exits 2
+  on `--help`, so the guard fires before argv parsing.
+- **B3 token pair** (2 asserts) and **B3b** (6 asserts) — a flock refusal
+  carries `LANE_LOCK_CONTENDED:` and never `LANE_LIVE_REF:`; on a lane that is
+  BOTH flock-held and live-referenced, the flock gate fires first.
+- **Block F** (19 asserts) — with every `<lane>.lock` FREE, a cwd reference
+  (`F-cwd`) and an open-fd reference alone (`F-fd`) each refuse with 75 and
+  `LANE_LIVE_REF:`; an unreferenced lane still thins (`F-free`); the refusal
+  lifts once the reference clears (`F-temp`); and `--reseed` is gated too
+  (`F-reseed`).
+
+reify's **Block E** (its seed-abort discard of an uncertified clone) is
+deliberately absent: dark-factory's thin has no such discard to test.
+
 ## Why these eight
 
 The port set was confirmed against **what α actually relocated**, not against a

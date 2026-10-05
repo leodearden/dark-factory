@@ -115,7 +115,7 @@ SCRIPT_COVERAGE = {
 #:
 #: ``test_thin_warm_lane.sh``'s Block C df-delta assert is not a deduction: it is
 #: gated on ``REIFY_WARM_LANE_MOUNT``, which ``_sanitized_env`` always strips, so
-#: 45 is both its floor and its measured count under this driver.
+#: 75 is both its floor and its measured count under this driver.
 #:
 #: Any OTHER shortfall — a block short-circuited by a future edit — fails loudly
 #: here instead of passing as a green item that ran less than it claims.  Leaf γ
@@ -152,10 +152,18 @@ SCRIPT_COVERAGE = {
 #: that satisfies ``REQUIRED_HOST_TOOLS`` — it needs only ``git``.  NON-VACUOUS
 #: by construction: against the pre-port inline predicate the same block reports
 #: ``75 passed, 6 failed`` (K1/K5/K6, two asserts each).
+#:
+#: Dark-factory task 5307 then ported reify task 5823's live-process-reference
+#: gate into ``thin-warm-lane.sh`` with its coverage — A12, the B3 token pair,
+#: B3b and Block F — so the thin floor moved 45 → 75.  RE-MEASURED against the
+#: suite (``Results: 75 passed, 0 failed``), not raised to absorb a red.  The new
+#: asserts carry no skip guard; they need only ``flock`` and a readable ``/proc``.
+#: NON-VACUOUS by construction: against the pre-port script the same file reports
+#: ``61 passed, 14 failed``.
 ASSERT_FLOORS = {
     'test_warm_lane_disk_guard.sh': 62,
     'test_warm_lane_degenerate_ref.sh': 81,  # 70 + 11 (K1-K6: the conventional-commit citation arm)
-    'test_thin_warm_lane.sh': 45,
+    'test_thin_warm_lane.sh': 75,  # 45 + 30 (A12 3, B3 2, B3b 6, Block F 19)
     'test_warm_lane_gc.sh': 278,  # 214 + 64 (S-pressure 17 + S-age 16 + S-age-degrade 14
                                  #           + A11 12 + A11-boundary 5)
     'test_warm_lane_gc_sweep.sh': 90,  # 86 + 4 (Block Y: bridge-cost seam contract)
