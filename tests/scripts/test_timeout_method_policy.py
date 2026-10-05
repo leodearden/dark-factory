@@ -101,8 +101,8 @@ PROBE_PLUGINS = ('xdist', 'timeout')
 # trivial test can take longer than 2s, and the tally must not depend on that.
 NON_BLOCKING_TIMEOUT_SECS = 60
 
-# Below each probe's @pytest.mark.timeout, so a wedged child surfaces as a
-# TimeoutExpired carrying its captured output rather than as pytest's axe.
+# Below each probe's @pytest.mark.timeout, so a wedged child fails its probe
+# with a message naming this budget and printing its partial output.
 PROBE_SUBPROCESS_TIMEOUT_SECS = 100
 
 # Keeps the two probes on one worker wherever --dist loadgroup is in force, so
@@ -181,24 +181,35 @@ def _run_probe_suite(suite: _ProbeSuite, *extra: str) -> subprocess.CompletedPro
     )
     env = {key: value for key, value in os.environ.items() if not key.startswith('PYTEST_')}
     env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
-    result = subprocess.run(
-        [
-            sys.executable, '-m', 'pytest',
-            '-c', str(suite.ini),
-            '-p', 'no:cacheprovider',
-            *(arg for name in PROBE_PLUGINS for arg in ('-p', name)),
-            '-n', str(PROBE_WORKERS),
-            '--dist', 'loadgroup',
-            '-rA',
-            *extra,
-        ],
-        cwd=str(suite.root),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable, '-m', 'pytest',
+                '-c', str(suite.ini),
+                '-p', 'no:cacheprovider',
+                *(arg for name in PROBE_PLUGINS for arg in ('-p', name)),
+                '-n', str(PROBE_WORKERS),
+                '--dist', 'loadgroup',
+                '-rA',
+                *extra,
+            ],
+            cwd=str(suite.root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            'the probe child did not finish within PROBE_SUBPROCESS_TIMEOUT_SECS '
+            f'= {PROBE_SUBPROCESS_TIMEOUT_SECS}s. A starved child and a wedged '
+            'one look the same here; the partial output shows how far it got: '
+            'the header alone means it was stuck in startup, and progress '
+            f'characters without an F mean {BLOCKING_TEST} never timed out.\n'
+            f'{_captured(exc)}',
+            pytrace=False,
+        )
     loaded = _header_plugins(result.stdout)
     assert loaded == set(PROBE_PLUGINS), (
         f'the probe child loaded the plugins {loaded!r}, not exactly xdist and '
@@ -216,8 +227,17 @@ def _header_plugins(output: str) -> set[str] | None:
     return {entry.rsplit('-', 1)[0] for entry in header.group(1).split(', ')}
 
 
-def _captured(result: subprocess.CompletedProcess[str]) -> str:
-    return f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+def _captured(result: subprocess.CompletedProcess[str] | subprocess.TimeoutExpired) -> str:
+    return f'stdout:\n{_text(result.stdout)}\nstderr:\n{_text(result.stderr)}'
+
+
+def _text(stream: str | bytes | None) -> str:
+    """*stream* as text: a TimeoutExpired holds bytes or None even under ``text=True``."""
+    if stream is None:
+        return ''
+    if isinstance(stream, bytes):
+        return stream.decode('utf-8', errors='replace')
+    return stream
 
 
 @pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
