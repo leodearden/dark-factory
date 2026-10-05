@@ -146,8 +146,14 @@ correct, and knowing which you are in is the whole point of asking.
 
 ### Anchoring ad-hoc paths
 
-The Bash working directory PERSISTS across calls, and any earlier `cd` moved it
-— including one buried in a compound command several turns ago. Your own
+In an interactive session the Bash working directory PERSISTS across calls, and
+any earlier `cd` moved it — including one buried in a compound command several
+turns ago. An orchestrator-dispatched Claude session is launched with
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`
+(`orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`),
+which the CLI reads as a request to put its shell back at the dispatch root,
+silently, after every call. The anchor below is correct whether or not that
+happens; use it regardless. Your own
 command text does not show where the command will run: in the transcript behind
 `plans/confusion-census-2026-09-20.md` §1.4, two adjacent Bash calls in one
 session carried different tracked cwds.
@@ -194,13 +200,15 @@ the probe.
 Prefixing a probe this way puts every path inside it on repo-relative footing
 no matter which directory the call started in — including inside a
 `python3 - <<'PY'` heredoc, which is exactly where the sighting behind this
-subsection failed. The `cd` is scoped to that one command, it does not have to
-be re-derived per path, and it is cheaper than reasoning about where you
-currently are.
+subsection failed. It does not have to be re-derived per path, and it is
+cheaper than reasoning about where you currently are.
 
-Reach for it only when you need a Bash probe at all: the `Read`, `Glob` and
-`Grep` tools take repo-anchored paths and are not affected by the Bash cwd, so
-when they can answer there is nothing to anchor.
+The `Read`, `Glob` and `Grep` tools need the same care: give them an ABSOLUTE
+path. `Read` with one is unaffected by the Bash cwd, but a relative or omitted
+`path` given to `Grep` or `Glob` resolves against that same drifted cwd —
+measured 2026-09-27 (CLI 2.1.283), `Grep` answered "Path does not exist:
+orchestrator/src/orchestrator. Note: your current working directory is
+.../orchestrator/src".
 
 ## Memory Usage
 

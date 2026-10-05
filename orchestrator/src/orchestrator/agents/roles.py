@@ -6,6 +6,7 @@ from typing import Literal
 
 from shared.prompt_artifact import PromptSpec
 
+from orchestrator.agents.bash_cwd_guidance import BASH_CWD_ANCHOR_GUIDANCE
 from orchestrator.agents.chained_command_guidance import CHAINED_COMMAND_STATUS_GUIDANCE
 from orchestrator.agents.code_quality import guidance
 from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
@@ -1281,6 +1282,7 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
     + MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
     + PATH_NOT_FOUND_GUIDANCE
+    + BASH_CWD_ANCHOR_GUIDANCE
 )
 
 
