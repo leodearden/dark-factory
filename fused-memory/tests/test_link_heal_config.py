@@ -111,6 +111,12 @@ class TestTrackedConfigAdmitsTheLinkHealPrefixOnTheMetadataArmOnly:
         for prefix in ('recon-stage-', 'curator-', 'link-heal-'):
             assert prefix in prefixes
 
+    def test_metadata_arm_keeps_every_schema_default_prefix(self, tracked_config):
+        """The YAML list replaces the schema default, so a prefix added there must be mirrored."""
+        listed = set(tracked_config.mem0_update.metadata_patch_allowed_agent_prefixes)
+        default = set(Mem0UpdateConfig().metadata_patch_allowed_agent_prefixes)
+        assert default <= listed, f'missing from config.yaml: {sorted(default - listed)}'
+
     def test_content_amend_arm_stays_at_the_schema_default(self, tracked_config):
         assert (
             tracked_config.mem0_update.content_amend_allowed_agent_prefixes
