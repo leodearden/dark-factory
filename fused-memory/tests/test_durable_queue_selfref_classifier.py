@@ -537,6 +537,35 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
         finally:
             await q.close()
 
+    @pytest.mark.asyncio
+    async def test_shipped_queue_maps_no_operation(self, tmp_path):
+        """A queue built with the shipped defaults never classifies permanent:
+        even the pre-3561 add_episode shape, failing with a not-found naming its
+        own payload 'uuid', keeps the plain max_attempts budget."""
+        u = _uuid()
+        execute = AsyncMock(side_effect=NodeNotFoundError(u))
+        q = _queue(tmp_path, execute)
+        await q.initialize()
+        try:
+            await q.enqueue(
+                group_id='proj1', operation='add_episode',
+                payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
+            )
+            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+
+            dead = await q.get_dead_items()
+            failure = (
+                'The shipped queue must map no operation: the self-identity rule '
+                'is opt-in through identity_payload_keys=, and add_episode\'s '
+                'payload has carried no graph uuid since task 3561. Expected the '
+                f'plain budget (5); got attempts={dead[0]["attempts"]}, '
+                f'await_count={execute.await_count}.'
+            )
+            assert dead[0]['attempts'] == 5, failure
+            assert execute.await_count == 5, failure
+        finally:
+            await q.close()
+
 
 class TestDeadLetterLogNamesOperationAndGroup:
     """The dead-letter WARNING must name the operation, the group_id and the
