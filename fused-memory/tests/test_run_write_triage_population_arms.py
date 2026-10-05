@@ -25,7 +25,11 @@ from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 from fused_memory.server import write_triage_judge
-from fused_memory.server.write_triage_judge import _ELIDED_MARKER, resolve_judge_field_chars
+from fused_memory.server.write_triage_judge import (
+    _ELIDED_MARKER,
+    resolve_judge_field_chars,
+    resolve_judge_timeout,
+)
 
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 
@@ -247,6 +251,8 @@ class TestTheRow:
         assert row == {
             'arm': arm.name, 'judge_model': arm.model, 'reasoning_effort': 'low',
             'width': 5, 'wording': 'shipped', 'snapshot_sha256': SNAPSHOT_SHA,
+            'field_chars': resolve_judge_field_chars(_service()),
+            'timeout_seconds': resolve_judge_timeout(_service()),
             'memory_id': 'w', 'project_id': 'reify', 'category': 'procedural_knowledge',
             'recon_marker': True, 'declares_attach_keys': False,
             'band': 'judge', 'band_winner_id': 'c12',
@@ -582,3 +588,356 @@ class TestConcurrencyAndWording:
         assert [sent for _, sent, _ in provider.calls] == [pre_psi] * 8 + [shipped] * 8
         assert all(sent == in_force for _, sent, in_force in provider.calls)
         assert write_triage_judge.JUDGE_SYSTEM_PROMPT is shipped
+
+
+# ---------------------------------------------------------------------------
+# Publish
+# ---------------------------------------------------------------------------
+
+def _calibrate() -> types.ModuleType:
+    return load_script_module(SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
+
+
+def _sha(data: bytes | str) -> str:
+    import hashlib  # noqa: PLC0415
+
+    return hashlib.sha256(data.encode() if isinstance(data, str) else data).hexdigest()
+
+
+_LONG = 'z' * 5_000
+
+
+def _publish_write(memory_id: str, band: str = 'judge', created_at: str | None = None) -> dict:
+    write = _write(
+        candidates=[
+            _candidate('a', 0.7),
+            _candidate('kid', 0.65, kind='sighting', parent_id='P'),
+            _candidate('b', 0.6, content=_LONG),
+        ],
+        band_winner_id='a' if band != 'stored' else None,
+    )
+    return {
+        **write, 'memory_id': memory_id, 'content': f'entry {memory_id}', 'band': band,
+        'project_id': 'reify' if memory_id.endswith(('1', '3')) else 'dark_factory',
+        'category': 'observations_and_summaries' if memory_id == 'w02' else 'procedural_knowledge',
+        'recon_marker': memory_id in {'w00', 'det'},
+        'declares_attach_keys': memory_id == 'w04',
+        'created_at': created_at or '2026-10-01T00:00:00+00:00',
+    }
+
+
+class _Published:
+    """A frozen snapshot of six judge-band writes, with arm files over a 4-write prefix."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        (tmp_path / '.git').mkdir()
+        writes = [
+            _publish_write(f'w{i:02d}', created_at='2026-09-29T12:00:00-07:00' if i < 2 else None)
+            for i in range(6)
+        ]
+        writes += [_publish_write('det', 'restated'), _publish_write('low', 'stored')]
+        self.path = _freeze_mod().write_snapshot(tmp_path / 'data', {
+            'schema_version': 1, 'frozen_at': '2026-10-05T07:00:00+00:00',
+            'projects': ['dark_factory', 'reify'], 'candidate_k': 20, 'writes': writes,
+            'targets': {'P': {'project_id': 'reify', 'content': 'the parent'}},
+            'excluded': {
+                'undated': 1, 'vanished': 2, 'own_children_dropped': 3, 'self_retrieved': 4,
+            },
+        })
+        self.snapshot, self.sha = _freeze_mod().load_snapshot(self.path)
+        self.order = [w['memory_id'] for w in _mod().judge_band_order(self.snapshot, self.sha)]
+        self.run_set = self.order[:4]
+        self.rows = {arm.name: self._stored_rows(arm) for arm in _mod().ARMS}
+        r0, r1, r2, r3 = self.run_set
+        self._answer('gpt-4o-mini@5', {
+            r0: ('contested', 'a'), r1: ('contested', 'a'), r2: ('amended', 'a'),
+        })
+        self._answer('gpt-4o-mini@5+pre-psi', {
+            r1: ('contested', 'a'), r2: ('contested', 'a'), r3: ('contested', 'b'),
+        })
+        self._answer('gpt-6.1-sol:low@20', {r0: ('amended', 'P'), r1: ('restated', 'gone')})
+        mini = self.rows['gpt-4o-mini@5']
+        for row, seconds in zip(mini, (1.0, 2.0, 3.0, 4.0), strict=True):
+            row['judge_seconds'] = seconds
+        mini[0]['transport_failures'] = ['TimeoutError', 'RateLimitError']
+        mini[1]['transport_failures'] = ['TimeoutError']
+        mini[2]['usd'] = None
+        mini[3]['parse_failure'] = True
+
+    def _stored_rows(self, arm: Any) -> list[dict]:
+        return [{
+            'arm': arm.name, 'judge_model': arm.model, 'reasoning_effort': arm.reasoning_effort,
+            'width': arm.width, 'wording': arm.wording, 'snapshot_sha256': self.sha,
+            'field_chars': 4_000, 'timeout_seconds': 15.0,
+            'memory_id': memory_id, 'band': 'judge', 'band_winner_id': 'a',
+            'outcome': 'stored', 'verdict_candidate_id': None, 'judged_candidate_id': None,
+            'raw_text': '{"verdict": "distinct"}', 'usage': None, 'usd': 0.001,
+            'judge_seconds': 1.0, 'parse_failure': False, 'failure': None,
+            'attempts': 1, 'transport_failures': [],
+        } for memory_id in self.run_set]
+
+    def _answer(self, arm_name: str, answers: dict[str, tuple[str, str]]) -> None:
+        for row in self.rows[arm_name]:
+            if row['memory_id'] in answers:
+                outcome, target = answers[row['memory_id']]
+                row.update(outcome=outcome, verdict_candidate_id=target, judged_candidate_id=target)
+
+    def write_arm_files(self) -> None:
+        arms_dir = self.path.parent / 'arms'
+        arms_dir.mkdir(exist_ok=True)
+        for name, rows in self.rows.items():
+            _mod().arm_path(arms_dir, name).write_text(
+                ''.join(json.dumps(row, sort_keys=True) + '\n' for row in rows),
+            )
+
+    def artifact(self, **kwargs: Any) -> dict:
+        self.write_arm_files()
+        return _mod().build_population_artifact(
+            self.snapshot, self.sha, self.path, self.rows, budget_usd=40.0, **kwargs,
+        )
+
+    def pairs(self, already_rated: Any = frozenset()) -> tuple[list[dict], dict]:
+        return _mod().build_pairs_to_rate(
+            self.snapshot, self.sha, self.rows, already_rated=already_rated,
+        )
+
+
+@pytest.fixture
+def published(tmp_path: Path) -> _Published:
+    return _Published(tmp_path)
+
+
+class TestThePopulationBlock:
+    def test_counts_over_the_frozen_population_and_the_run_set(
+        self, published: _Published,
+    ) -> None:
+        population = published.artifact()['population']
+        later = sum(1 for m in published.run_set if m in {'w00', 'w01'})
+        assert population == {
+            'n_writes': 8,
+            'n_judge_band': 4,
+            'n_judge_band_frozen': 6,
+            'judge_band_sample': {
+                'order': 'sha256(snapshot_sha256:memory_id)', 'size': 4, 'of': 6,
+            },
+            'projects': ['dark_factory', 'reify'],
+            'frozen_at': '2026-10-05T07:00:00+00:00',
+            'snapshot_sha256': published.sha,
+            'snapshot_path': 'data/write-triage-population-2026-10-05/snapshot.json',
+            'by_category': {'observations_and_summaries': 1, 'procedural_knowledge': 7},
+            'by_project': {'dark_factory': 6, 'reify': 2},
+            'by_band': {'judge': 6, 'restated': 1, 'stored': 1},
+            'recon_marker_writes': 2,
+            'recon_marker_run_set': sum(1 for m in published.run_set if m == 'w00'),
+            'declares_attach_keys_writes': 1,
+            'excluded': {
+                'undated': 1, 'vanished': 2, 'own_children_dropped': 3, 'self_retrieved': 4,
+            },
+            'judge_band_with_later_candidates': later,
+        }
+
+    def test_an_unsampled_run_records_no_sample(self, published: _Published) -> None:
+        published.run_set = published.order
+        published.rows = {arm.name: published._stored_rows(arm) for arm in _mod().ARMS}
+        population = published.artifact()['population']
+        assert (population['n_judge_band'], population['judge_band_sample']) == (6, None)
+
+
+class TestTheArmRows:
+    def test_one_row_per_arm_in_arms_order(self, published: _Published) -> None:
+        arms = published.artifact()['arms']
+        assert [row['arm'] for row in arms] == [arm.name for arm in _mod().ARMS]
+        for row, arm in zip(arms, _mod().ARMS, strict=True):
+            assert (row['model'], row['reasoning_effort'], row['width'], row['wording']) == (
+                arm.model, arm.reasoning_effort, arm.width, arm.wording,
+            )
+            assert row['system_prompt_sha256'] == _sha(_wording().system_prompt(arm.wording))
+            assert row['calls'] == 4
+
+    def test_an_arms_provenance_and_measurements(self, published: _Published) -> None:
+        [row] = [r for r in published.artifact()['arms'] if r['arm'] == 'gpt-4o-mini@5']
+        cases = published.path.parent / 'arms' / 'gpt-4o-mini@5.jsonl'
+        seconds = _calibrate().summarize_distribution([1.0, 2.0, 3.0, 4.0])
+        assert row == {
+            'arm': 'gpt-4o-mini@5', 'model': 'gpt-4o-mini', 'provider': 'openai',
+            'reasoning_effort': None, 'width': 5, 'wording': 'shipped',
+            'system_prompt_sha256': _sha(_wording().system_prompt('shipped')),
+            'field_chars': 4_000, 'timeout_seconds': 15.0,
+            'calls': 4, 'parse_failures': 1,
+            'transport_failures': 3,
+            'transport_failures_by_type': {'RateLimitError': 1, 'TimeoutError': 2},
+            'usd': 0.003, 'unpriced_calls': 1,
+            'p50_seconds': seconds['median'], 'p95_seconds': seconds['p95'],
+            'outcomes': {'amended': 1, 'contested': 2, 'stored': 1},
+            'cases_path': 'data/write-triage-population-2026-10-05/arms/gpt-4o-mini@5.jsonl',
+            'cases_sha256': _sha(cases.read_bytes()),
+        }
+
+    def test_rows_disagreeing_on_the_field_cap_are_refused(self, published: _Published) -> None:
+        published.rows['gpt-6-luna:low@5'][2]['field_chars'] = 1_200
+        with pytest.raises(ValueError, match='gpt-6-luna:low@5'):
+            published.artifact()
+
+
+class TestPublishRefuses:
+    def test_a_missing_arm(self, published: _Published) -> None:
+        del published.rows['gpt-5.6-terra:none@20']
+        with pytest.raises(ValueError, match='gpt-5.6-terra:none@20'):
+            published.artifact()
+
+    def test_a_row_from_another_snapshot(self, published: _Published) -> None:
+        published.rows['gpt-6-luna:low@20'][1]['snapshot_sha256'] = 'f' * 64
+        with pytest.raises(ValueError, match='gpt-6-luna:low@20'):
+            published.artifact()
+
+    def test_an_arm_covering_another_set_of_writes(self, published: _Published) -> None:
+        published.rows['gpt-6.1-sol:low@5'][3]['memory_id'] = published.order[4]
+        with pytest.raises(ValueError, match='gpt-6.1-sol:low@5'):
+            published.artifact()
+
+    def test_an_arm_with_a_write_judged_twice(self, published: _Published) -> None:
+        rows = published.rows['gpt-6.1-sol:low@5']
+        rows.append(dict(rows[0]))
+        with pytest.raises(ValueError, match='gpt-6.1-sol:low@5'):
+            published.artifact()
+
+    def test_a_run_set_that_is_not_the_order_prefix(self, published: _Published) -> None:
+        for rows in published.rows.values():
+            rows[0]['memory_id'] = published.order[5]
+        with pytest.raises(ValueError, match='prefix'):
+            published.artifact()
+
+
+class TestTheSpend:
+    def test_the_total_and_the_price_table_it_was_priced_at(self, published: _Published) -> None:
+        spend = published.artifact()['spend']
+        assert spend == {
+            'usd_total': pytest.approx(0.001 * 39),
+            'budget_usd': 40.0,
+            'list_prices_as_of': _scorer().LIST_PRICES_AS_OF,
+            'list_prices_source': _scorer().LIST_PRICES_SOURCE,
+        }
+
+
+class TestThePairsToRate:
+    def test_one_blind_row_per_distinct_judged_pair(self, published: _Published) -> None:
+        rows, stats = published.pairs()
+        r0, r1, r2, r3 = published.run_set
+        assert {(row['entry_id'], row['target_id']) for row in rows} == {
+            (r0, 'a'), (r1, 'a'), (r2, 'a'), (r3, 'b'), (r0, 'P'), (r1, 'gone'),
+        }
+        assert all(
+            set(row) == {'entry_id', 'target_id', 'entry_text', 'target_text'} for row in rows
+        )
+        assert stats['n_pairs'] == 6
+
+    def test_texts_come_from_the_slate_then_the_targets_and_are_cut_at_4000(
+        self, published: _Published,
+    ) -> None:
+        rows, stats = published.pairs()
+        text = {(row['entry_id'], row['target_id']): row for row in rows}
+        r0, r1, _, r3 = published.run_set
+        assert text[(r0, 'a')]['entry_text'] == f'entry {r0}'
+        assert text[(r0, 'a')]['target_text'] == 'content of a'
+        assert text[(r0, 'P')]['target_text'] == 'the parent'
+        assert text[(r3, 'b')]['target_text'] == _LONG[:4_000] + '…[truncated, 5000 chars total]'
+        assert text[(r1, 'gone')]['target_text'] is None
+        assert stats['missing_target_text'] == 1
+
+    def test_the_order_is_the_snapshot_hash_order_of_the_pair(self, published: _Published) -> None:
+        rows, stats = published.pairs()
+        keys = [f'{published.sha}:{row["entry_id"]}:{row["target_id"]}' for row in rows]
+        assert keys == sorted(keys, key=_sha)
+        assert stats['order'] == 'sha256(snapshot_sha256:entry_id:target_id)'
+
+    def test_pairs_already_rated_are_left_out_and_counted(self, published: _Published) -> None:
+        r2 = published.run_set[2]
+        rows, stats = published.pairs(already_rated={(r2, 'a')})
+        assert (r2, 'a') not in {(row['entry_id'], row['target_id']) for row in rows}
+        assert (stats['n_pairs'], stats['excluded_already_rated']) == (5, 1)
+
+    def test_the_artifact_carries_the_pairs_block_it_was_given(
+        self, published: _Published,
+    ) -> None:
+        block = {'n_pairs': 5, 'sha256': 'b' * 64}
+        assert published.artifact(pairs_to_rate=block)['pairs_to_rate'] == block
+
+
+class TestTheWordingReadout:
+    def test_the_population_half_is_a_label_free_paired_readout(
+        self, published: _Published,
+    ) -> None:
+        readout = published.artifact()['wording_attribution']['population']
+        five = readout['5']
+        assert five['shipped'] == {
+            'outcomes': {'amended': 1, 'contested': 2, 'stored': 1},
+            'attaches': 3, 'contested': 2, 'contested_share_of_attaches': pytest.approx(2 / 3),
+        }
+        assert five['pre-psi'] == {
+            'outcomes': {'contested': 3, 'stored': 1},
+            'attaches': 3, 'contested': 3, 'contested_share_of_attaches': 1.0,
+        }
+        assert (five['contested_only_shipped'], five['contested_only_pre_psi']) == (1, 2)
+        assert five['mcnemar_p'] == 1.0
+        assert readout['20']['shipped']['contested_share_of_attaches'] is None
+
+    def test_no_fixture_reports_means_no_fixture_half(self, published: _Published) -> None:
+        assert published.artifact()['wording_attribution']['fixture'] is None
+
+
+def _fixture_report(wording: str, **provenance: Any) -> dict:
+    contested = {'shipped': 18, 'pre-psi': 9}[wording]
+    return {
+        'per_class': {
+            'duplicate': {'n': 75, 'correct': 55, 'accuracy': 0.7333},
+            'pseudo_contradiction': {'n': 6, 'correct': 3, 'accuracy': 0.5},
+        },
+        'confusion': {
+            'duplicate': {'amended': 34, 'contested': contested, 'restated': 21, 'stored': 2},
+            'pseudo_contradiction': {'amended': 2, 'contested': 3, 'restated': 1, 'stored': 0},
+        },
+        'false_contested': contested + 3,
+        'production_shape': {'middle_band': {'n': 73, 'correct': 48, 'accuracy': 0.6575}},
+        'provenance': {
+            'field_chars': 4_000, 'slate_mode': 'retrieved', 'project_id': 'reify',
+            'judge_model': 'gpt-4o-mini',
+            'judge_system_prompt_sha256': _sha(_wording().system_prompt(wording)),
+            **provenance,
+        },
+    }
+
+
+class TestTheFixtureReadout:
+    def test_per_wording_at_matched_width(self, published: _Published) -> None:
+        fixture = published.artifact(fixture_reports={
+            'shipped': _fixture_report('shipped'), 'pre-psi': _fixture_report('pre-psi'),
+        })['wording_attribution']['fixture']
+        assert fixture['shipped'] == {
+            'duplicates_n': 75, 'duplicates_contested': 18, 'duplicates_contested_rate': 0.24,
+            'false_contested': 21,
+            'middle_band': {'n': 73, 'correct': 48, 'accuracy': 0.6575},
+            'pseudo_contradiction_n': 6, 'pseudo_contradiction_contested': 3,
+            'field_chars': 4_000, 'judge_model': 'gpt-4o-mini',
+            'judge_system_prompt_sha256': _sha(_wording().system_prompt('shipped')),
+        }
+        assert (fixture['pre-psi']['duplicates_contested'], fixture['pre-psi']['false_contested']) == (
+            9, 12,
+        )
+
+    @pytest.mark.parametrize('field', ['field_chars', 'slate_mode', 'project_id', 'judge_model'])
+    def test_reports_that_are_not_matched_are_refused(
+        self, published: _Published, field: str,
+    ) -> None:
+        mismatched = _fixture_report('pre-psi', **{field: 'other'})
+        with pytest.raises(ValueError, match=field):
+            published.artifact(fixture_reports={
+                'shipped': _fixture_report('shipped'), 'pre-psi': mismatched,
+            })
+
+    def test_a_report_measured_under_the_other_wording_is_refused(
+        self, published: _Published,
+    ) -> None:
+        with pytest.raises(ValueError, match='pre-psi'):
+            published.artifact(fixture_reports={
+                'shipped': _fixture_report('shipped'), 'pre-psi': _fixture_report('shipped'),
+            })
