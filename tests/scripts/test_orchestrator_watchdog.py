@@ -4380,6 +4380,30 @@ def _observe_lease(args):
     return obs
 
 
+def _observe_drain_requests():
+    """Snapshot every drain request in the fleet dir as of THIS call (task 5371).
+
+    The same vantage point as _observe_lease: this fake runs mid-sweep, so it
+    is the only place a test can see which requests the sweep holds at the
+    moment each unit is restarted. {filename: parsed body (None if unparseable)}.
+    """
+    fleet_dir = os.environ.get("ORCH_FLEET_DIR", "")
+    seen = {}
+    try:
+        names = sorted(os.listdir(fleet_dir))
+    except OSError:
+        return seen
+    for name in names:
+        if not name.endswith(".drain.json"):
+            continue
+        try:
+            with open(os.path.join(fleet_dir, name)) as f:
+                seen[name] = json.load(f)
+        except (OSError, ValueError):
+            seen[name] = None
+    return seen
+
+
 def main(argv):
     args = [a for a in argv[1:] if a != "--user"]
     if not args:
@@ -4389,6 +4413,9 @@ def main(argv):
     state = _load()
     state.setdefault("calls", []).append(argv[1:])
     state.setdefault("lease_observations", []).append(_observe_lease(args))
+    state.setdefault("drain_request_observations", []).append(
+        {"args": args, "requests": _observe_drain_requests()}
+    )
 
     if verb == "list-units":
         for unit in state.get("running_units", []):
