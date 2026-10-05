@@ -61,7 +61,11 @@ StackedAreaChart's call into the real ``stackedAreaPaths``) against the real
 spark_path.js.  They emit those statements in SOURCE ORDER, so a snap line that
 reads ``ticks`` before its declaration throws the same TDZ ReferenceError the
 browser would, and they return RAW ticks rather than labels, so one expectation
-table holds across callers whose formatters differ.
+table holds across callers whose formatters differ.  The caller audit is pinned
+in both directions: the seven COUNT call sites must pass ``snapMax``, and the
+three FRACTION sites (the esc-per-done ratio, the 100%-normalized stack and the
+ECDF percent axis) must not, because a snapped 1 reads as 400%.  The duration
+and dollar charts are deliberately left unpinned either way.
 """
 
 from __future__ import annotations
@@ -344,10 +348,12 @@ def _spark_path_module_surface() -> dict:
 # is why a MISSING ELEMENT asserts instead of also returning None.
 # ---------------------------------------------------------------------------
 
-# Both spellings the two tabs use: tabs.jsx aliases `LineChart: LC` in its
-# line-2 DF_CHARTS destructure, tab_escalation_analytics.jsx goes through its
-# `const C = window.DF_CHARTS` namespace.
-_LINE_CHART_TAG_RE = re.compile(r'<(?:LC|C\.LineChart)\b')
+# Every spelling the tabs use: tabs.jsx aliases `LineChart: LC` (and
+# `StackedAreaChart: SA`) in its line-2 DF_CHARTS destructure,
+# tab_escalation_analytics.jsx goes through its `const C = window.DF_CHARTS`
+# namespace, and tab_overview.jsx binds `LineChart` unaliased.
+_LINE_CHART_TAG_RE = re.compile(r'<(?:LC|LineChart|C\.LineChart)\b')
+_STACKED_AREA_TAG_RE = re.compile(r'<(?:SA|C\.StackedAreaChart)\b')
 
 
 def _jsx_elements(body: str, tag_re: re.Pattern) -> list:
@@ -374,24 +380,24 @@ def _jsx_elements(body: str, tag_re: re.Pattern) -> list:
     return out
 
 
-def _line_chart_format_y(body: str, anchor: str):
-    """The `formatY={...}` expression of the LineChart call site containing `anchor`.
+def _chart_prop(body: str, tag_re: re.Pattern, anchor: str, prop: str):
+    """The `<prop>={...}` expression of the chart call site containing `anchor`.
 
-    Returns the expression text, or ``None`` when the site passes no formatY at
-    all and therefore inherits LineChart's default. `body` is an already-sliced
-    COMPONENT body: several tabs render more than one LineChart, and the anchor
+    Returns the expression text, or ``None`` when the site does not pass `prop`
+    and therefore inherits the component's default. `body` is an already-sliced
+    COMPONENT body: several tabs render more than one chart, and the anchor
     (a series expression such as ``MEMORY_OPS.reads``) is what names the axis.
     """
-    matches = [el for el in _jsx_elements(body, _LINE_CHART_TAG_RE) if anchor in el]
+    matches = [el for el in _jsx_elements(body, tag_re) if anchor in el]
     assert len(matches) == 1, (
-        f'expected exactly one <LC>/<C.LineChart> element whose props mention '
-        f'{anchor!r}, found {len(matches)}. The chart was renamed, removed, or '
-        'its series expression changed — either way the caller-audit assertion '
-        'that depends on it must FAIL rather than quietly measure a different '
-        'chart (or nothing at all).'
+        f'expected exactly one chart element matching {tag_re.pattern!r} whose '
+        f'props mention {anchor!r}, found {len(matches)}. The chart was renamed, '
+        'removed, or its series expression changed — either way the caller-audit '
+        'assertion that depends on it must FAIL rather than quietly measure a '
+        'different chart (or nothing at all).'
     )
     element = matches[0]
-    m = re.search(r'formatY=\{', element)
+    m = re.search(rf'\b{prop}=\{{', element)
     if m is None:
         return None
     depth = 1
@@ -402,8 +408,13 @@ def _line_chart_format_y(body: str, anchor: str):
         elif element[i] == '}':
             depth -= 1
         i += 1
-    assert depth == 0, f'unbalanced formatY={{...}} in the element anchored at {anchor!r}'
+    assert depth == 0, f'unbalanced {prop}={{...}} in the element anchored at {anchor!r}'
     return element[m.end() : i - 1].strip()
+
+
+def _line_chart_format_y(body: str, anchor: str):
+    """The `formatY={...}` of the LineChart call site at `anchor`, or None (task 4232)."""
+    return _chart_prop(body, _LINE_CHART_TAG_RE, anchor, 'formatY')
 
 
 def _line_chart_axis_scalars(body: str) -> str:
@@ -440,7 +451,7 @@ def _line_chart_axis_program(body: str, format_y: str, max_vs) -> str:
 
     `C` is bound to the spark_path API rather than to the real DF_CHARTS (which
     is charts.jsx, unparseable by node). That is sound precisely because
-    test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts pins
+    test_charts_jsx_routes_count_axis_helper_from_spark_path_to_df_charts pins
     the DF_SPARK_PATH -> DF_CHARTS hop separately: this program measures what the
     caller's expression RENDERS, that one measures that the name is routed.
     """
@@ -512,6 +523,23 @@ def _stacked_area_scaled_axis_program(body: str, snap_max: str, data_maxes) -> s
         '  const geom = { x0: 38, y0: 8, width: 100, height: 190, count: 1 };',
         _const_statements_in_source_order(body, ['ticks', 'maxV', 'yTicks']),
     )
+
+
+_SCALED_AXIS_PROGRAMS = {
+    'LineChart': _line_chart_scaled_axis_program,
+    'StackedAreaChart': _stacked_area_scaled_axis_program,
+}
+
+
+def _render_snapped_caller_axis(
+    charts_jsx_body: str, component: str, caller_body: str, tag_re: re.Pattern, anchor: str, data_maxes
+) -> dict:
+    """The raw ticks the caller at `anchor` actually draws, its snapMax default included."""
+    snap_max = _chart_prop(caller_body, tag_re, anchor, 'snapMax')
+    if snap_max is None:
+        snap_max = _signature_default(charts_jsx_body, component, 'snapMax')
+    program = _SCALED_AXIS_PROGRAMS[component]
+    return _run_node(program(_component_body(charts_jsx_body, component), snap_max, data_maxes))
 
 
 # ---------------------------------------------------------------------------
@@ -704,24 +732,39 @@ console.log(JSON.stringify(received));
 # ---------------------------------------------------------------------------
 
 
-def test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts(
-    charts_jsx_body: str,
+# What a missing hop costs, per routed helper. The two differ in kind:
+# formatCountTick fails loudly at its first label, niceCountMax fails SILENTLY,
+# because `snapMax={undefined}` falls back to the identity default.
+_MISSING_ROUTE_CONSEQUENCE = {
+    'formatCountTick': (
+        'the count callers render `formatY={undefined}`, LineChart silently '
+        'falls back to its own default, and the fractional labels come straight back'
+    ),
+    'niceCountMax': (
+        'the count callers render `snapMax={undefined}`, the identity default '
+        'kicks in, and every count axis silently stops snapping'
+    ),
+}
+
+
+@pytest.mark.parametrize('helper', ['formatCountTick', 'niceCountMax'])
+def test_charts_jsx_routes_count_axis_helper_from_spark_path_to_df_charts(
+    charts_jsx_body: str, helper: str
 ) -> None:
-    """charts.jsx must import `formatCountTick` and re-export it on DF_CHARTS.
+    """charts.jsx must import each count-axis helper and re-export it on DF_CHARTS.
 
     This is the wiring the caller fix depends on, and it is invisible to every
-    other test in the repo: tabs.jsx and tab_escalation_analytics.jsx reach the
-    helper only through `window.DF_CHARTS`, so a missing hop here renders as
-    `formatY={undefined}` — LineChart silently falls back to its own default and
-    the fractional labels come straight back, with no error anywhere.
+    other test in the repo: the tabs reach these helpers only through
+    `window.DF_CHARTS`, so a missing hop here raises no error anywhere — see
+    `_MISSING_ROUTE_CONSEQUENCE` for what each helper's absence renders as.
 
     The last assertion executes the real spark_path.js, so the name charts.jsx
     binds is proven to EXIST rather than merely to be spelled consistently in
     two files.
     """
     destructured = _spark_path_destructure(charts_jsx_body)
-    assert 'formatCountTick' in destructured, (
-        'charts.jsx does not destructure `formatCountTick` off window.DF_SPARK_PATH. '
+    assert helper in destructured, (
+        f'charts.jsx does not destructure `{helper}` off window.DF_SPARK_PATH. '
         f'It binds {sorted(destructured)}. Without it the re-export below is a '
         'reference to an undefined identifier.'
     )
@@ -745,48 +788,73 @@ def test_charts_jsx_routes_format_count_tick_from_spark_path_to_df_charts(
     )
 
     exported = _df_charts_export_names(charts_jsx_body)
-    assert 'formatCountTick' in exported, (
-        'charts.jsx does not re-export `formatCountTick` on window.DF_CHARTS. '
-        f'It exports {sorted(exported)}. tabs.jsx and tab_escalation_analytics.jsx '
-        'have no other route to the helper — they never touch DF_SPARK_PATH.'
+    assert helper in exported, (
+        f'charts.jsx does not re-export `{helper}` on window.DF_CHARTS. '
+        f'It exports {sorted(exported)}. The tabs have no other route to the '
+        f'helper — they never touch DF_SPARK_PATH — so {_MISSING_ROUTE_CONSEQUENCE[helper]}.'
     )
 
     surface = _spark_path_module_surface()
-    assert surface.get('formatCountTick') == 'function', (
-        'requiring the real spark_path.js did not yield a `formatCountTick` '
-        f'function — its surface is {surface}. charts.jsx would then destructure '
-        '`undefined` and hand it to LineChart as formatY, which throws on the '
-        'first tick and blanks the entire chart.'
+    assert surface.get(helper) == 'function', (
+        f'requiring the real spark_path.js did not yield a `{helper}` function — '
+        f'its surface is {surface}. charts.jsx would then destructure `undefined`, '
+        f'so {_MISSING_ROUTE_CONSEQUENCE[helper]}.'
     )
 
 
-def test_tabs_jsx_binds_format_count_tick_off_df_charts(tabs_jsx_body: str) -> None:
-    """tabs.jsx must DESTRUCTURE `formatCountTick`, or its two call sites throw.
+@pytest.mark.parametrize(
+    ('fixture', 'helper', 'consequence'),
+    [
+        pytest.param(
+            'tabs_jsx_body',
+            'formatCountTick',
+            'Its MemoryTab reads/writes chart and MergeTab attempt-depth chart both '
+            'pass `formatY={formatCountTick}`',
+            id='tabs.jsx-formatCountTick',
+        ),
+        pytest.param(
+            'tabs_jsx_body',
+            'niceCountMax',
+            'Its MemoryTab, MergeTab and both BurnTab count charts pass '
+            '`snapMax={niceCountMax}`, so the Memory, Merge and Burndown tabs blank',
+            id='tabs.jsx-niceCountMax',
+        ),
+        pytest.param(
+            'tab_overview_jsx_body',
+            'niceCountMax',
+            'OverviewTab\'s memory-ops chart passes `snapMax={niceCountMax}`, so the '
+            'Overview tab blanks — the landing page',
+            id='tab_overview.jsx-niceCountMax',
+        ),
+    ],
+)
+def test_consumer_binds_count_axis_helper_off_df_charts(
+    request: pytest.FixtureRequest, fixture: str, helper: str, consequence: str
+) -> None:
+    """A consumer that names a helper bare must DESTRUCTURE it, or its call sites throw.
 
     The last hop of the route, and the only one no other test in the repo can
     see. spark_path.js -> charts.jsx -> DF_CHARTS is pinned above; from there
-    the two tabs diverge. tab_escalation_analytics.jsx reads
-    `C.formatCountTick` off a namespace binding, so it needs no per-name entry
-    and cannot lose one. tabs.jsx names it in the line-2 destructure, and if
-    that entry were dropped the two `formatY={formatCountTick}` references
-    below become free identifiers: the shipped page throws a ReferenceError at
-    render and blanks the Memory and Merge tabs.
+    the tabs diverge. tab_escalation_analytics.jsx reads `C.<helper>` off a
+    namespace binding, so it needs no per-name entry and cannot lose one.
+    tabs.jsx and tab_overview.jsx name their helpers in a line-2 destructure,
+    and if an entry were dropped every bare reference below becomes a free
+    identifier: the shipped page throws a ReferenceError at render.
 
-    The behavioural tests further down do NOT cover this, and would stay GREEN
-    through it: `_line_chart_axis_program` binds `formatCountTick` off the real
-    spark_path module directly, precisely so it measures what the caller's
-    expression RENDERS rather than how the name reached it. Nor does
+    The behavioural tests in this file do NOT cover this, and would stay GREEN
+    through it: their programs bind the helpers off the real spark_path module
+    directly, precisely so they measure what the caller's expression RENDERS
+    rather than how the name reached it. Nor does
     test_charts_consumer_bindings.py, which only checks the opposite direction
     (destructured-but-never-used). This is the same silent two-token join the
     routing test above exists to prevent, one file further along.
     """
-    bound = _df_charts_destructure(tabs_jsx_body)
-    assert 'formatCountTick' in bound, (
-        'tabs.jsx does not bind `formatCountTick` in its `const { ... } = '
-        f'window.DF_CHARTS` destructure. It binds {sorted(bound)}. Its MemoryTab '
-        'reads/writes chart and MergeTab attempt-depth chart both pass '
-        '`formatY={formatCountTick}`, which without this entry is an undefined '
-        'identifier — a ReferenceError at render, not a fallback to the default.'
+    bound = _df_charts_destructure(request.getfixturevalue(fixture))
+    assert helper in bound, (
+        f'{fixture} does not bind `{helper}` in its `const {{ ... }} = '
+        f'window.DF_CHARTS` destructure. It binds {sorted(bound)}. {consequence}, '
+        'which without this entry is an undefined identifier — a ReferenceError '
+        'at render, not a fallback to the default.'
     )
 
 # ---------------------------------------------------------------------------
@@ -984,6 +1052,11 @@ def test_probes_and_extractors_actually_fire_on_pre_fix_source(tab_analytics_jsx
 # 1.75 / 3.5 / 5.25); maxV=1 is the `plottableMax(values, 1)` seed floor that
 # every idle count series sits at, and the case a ROUNDING helper would render
 # as the duplicate 0/0/1/1/1.
+#
+# These maxima are fed straight to the tick generator, BYPASSING snapMax (task
+# 5121). So the three caller tests below now pin the formatY wiring as defence
+# in depth, not what the snapped chart draws; the snapped axes are pinned by
+# test_count_axis_call_site_snaps_its_maximum.
 _COUNT_AXIS_MAX_VS = [7, 1]
 _COUNT_AXIS_EXPECTED = {'7': ['0', '', '', '', '7'], '1': ['0', '', '', '', '1']}
 
@@ -1184,6 +1257,10 @@ def test_routing_guards_actually_fire_on_pre_fix_and_nested_brace_source() -> No
         'source that predates the wiring, so it can no longer tell a wired '
         'consumer from an unwired one and its assertion is vacuous.'
     )
+    assert 'niceCountMax' not in pre_fix, (
+        'the DF_CHARTS destructure extractor reports `niceCountMax` bound in a '
+        'source that predates the wiring — see the formatCountTick assertion above.'
+    )
 
     assert DF_CHARTS_EXPORT_RE.search(_NESTED_BRACE_EXPORT) is None, (
         'the brace-hostile export pattern now matches a literal containing a '
@@ -1290,3 +1367,68 @@ def test_scaled_axis_harness_is_discriminating() -> None:
         _run_node(
             _line_chart_scaled_axis_program(_component_body(_TDZ_LINE_CHART, 'LineChart'), 'niceCountMax', [7])
         )
+
+
+# ---------------------------------------------------------------------------
+# The count-axis snapping caller audit (task 5121), pinned in both directions.
+#
+# A COUNT axis must pass snapMax, so its maximum snaps to a multiple of the tick
+# count. A FRACTION axis must not: a snapped 1 is 4, so a percent axis reads
+# 0%..400%. The duration (fmtMs) and dollar charts are deliberately unpinned.
+# ---------------------------------------------------------------------------
+
+_COUNT_AXIS_SITES = [
+    pytest.param('tabs_jsx_body', 'MemoryTab', 'LineChart', _LINE_CHART_TAG_RE, 'MEMORY_OPS.reads', id='MemoryTab-reads-writes'),
+    pytest.param('tabs_jsx_body', 'MergeTab', 'LineChart', _LINE_CHART_TAG_RE, 'd.depth.values', id='MergeTab-attempt-depth'),
+    pytest.param('tab_analytics_jsx_body', 'WorkflowPanel', 'LineChart', _LINE_CHART_TAG_RE, 'churnDaily', id='WorkflowPanel-churn'),
+    pytest.param('tab_overview_jsx_body', 'OverviewTab', 'LineChart', _LINE_CHART_TAG_RE, 'D.MEMORY_OPS.reads', id='OverviewTab-memory-ops'),
+    pytest.param('tab_analytics_jsx_body', 'OriginPanel', 'StackedAreaChart', _STACKED_AREA_TAG_RE, 'stacks={stacks}', id='OriginPanel-filings-by-source'),
+    pytest.param('tabs_jsx_body', 'BurnTab', 'StackedAreaChart', _STACKED_AREA_TAG_RE, 'burndownStacks(b,', id='BurnTab-aggregate'),
+    pytest.param('tabs_jsx_body', 'BurnTab', 'StackedAreaChart', _STACKED_AREA_TAG_RE, 'burndownStacks(pb,', id='BurnTab-per-project'),
+]
+
+_FRACTION_AXIS_SITES = [
+    pytest.param('tab_analytics_jsx_body', 'WorkflowPanel', 'LineChart', _LINE_CHART_TAG_RE, 'row.ratio', id='WorkflowPanel-esc-per-done-ratio'),
+    pytest.param('tab_analytics_jsx_body', 'WorkflowPanel', 'StackedAreaChart', _STACKED_AREA_TAG_RE, 'labels={weeks}', id='WorkflowPanel-100pct-stack'),
+    pytest.param('tab_analytics_jsx_body', 'LifespanPanel', 'LineChart', _LINE_CHART_TAG_RE, 'gridLabels', id='LifespanPanel-ECDF-percent'),
+]
+
+
+@pytest.mark.parametrize(('fixture', 'caller', 'component', 'tag_re', 'anchor'), _COUNT_AXIS_SITES)
+def test_count_axis_call_site_snaps_its_maximum(
+    request: pytest.FixtureRequest, charts_jsx_body: str, fixture: str, caller: str, component: str, tag_re, anchor: str
+) -> None:
+    """Every count axis snaps its maximum, so every one of its ticks is whole."""
+    caller_body = _component_body(request.getfixturevalue(fixture), caller)
+    assert _chart_prop(caller_body, tag_re, anchor, 'snapMax') is not None, (
+        f'{caller}\'s {component} anchored at {anchor!r} passes no snapMax, so it '
+        'still takes its count-axis maximum as given: at a data max of 7 it '
+        'draws gridlines at 1.75 / 3.5 / 5.25 and labels only the floor and peak.'
+    )
+
+    ticks = _render_snapped_caller_axis(charts_jsx_body, component, caller_body, tag_re, anchor, [7, 0, 999])
+    assert ticks == _SNAPPED_COUNT_TICKS, (
+        f'{caller}\'s {component} anchored at {anchor!r} draws raw ticks {ticks}, '
+        f'expected {_SNAPPED_COUNT_TICKS}. Its snapMax does not snap to a multiple '
+        'of the tick count.'
+    )
+
+
+@pytest.mark.parametrize(('fixture', 'caller', 'component', 'tag_re', 'anchor'), _FRACTION_AXIS_SITES)
+def test_fraction_axis_call_site_does_not_snap(
+    request: pytest.FixtureRequest, charts_jsx_body: str, fixture: str, caller: str, component: str, tag_re, anchor: str
+) -> None:
+    """A fraction axis keeps its exact maximum: snapped, a 0..1 axis would read 0%..400%."""
+    caller_body = _component_body(request.getfixturevalue(fixture), caller)
+    assert _chart_prop(caller_body, tag_re, anchor, 'snapMax') is None, (
+        f'{caller}\'s {component} anchored at {anchor!r} has gained a snapMax. It '
+        'plots a FRACTION: niceCountMax snaps 1 up to 4, so its axis would read '
+        '0%..400% (or 0..4 for a ratio) with the data squashed into the bottom quarter.'
+    )
+
+    ticks = _render_snapped_caller_axis(charts_jsx_body, component, caller_body, tag_re, anchor, [1, 2.5])
+    expected = {'1': [0, 0.25, 0.5, 0.75, 1], '2.5': [0, 0.625, 1.25, 1.875, 2.5]}
+    assert ticks == expected, (
+        f'{caller}\'s {component} anchored at {anchor!r} draws raw ticks {ticks}, '
+        f'expected {expected}. A fraction axis no longer keeps its exact maximum.'
+    )
