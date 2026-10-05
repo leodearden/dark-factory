@@ -51,6 +51,17 @@ site is pinned as an ANTI-regression alongside the three fixes, with a frozen
 rounding-default control proving the guard actually fires.  The helper itself
 lives in spark_path.js and is behaviourally tested under ``node --test``; what
 is measured HERE is the wiring only charts.jsx and the tabs can express.
+
+ALSO HERE: COUNT-AXIS SNAPPING (task 5121) — LineChart and StackedAreaChart
+take an opt-in ``snapMax`` that maps the folded data maximum to the axis
+maximum, and count callers pass spark_path.js's ``niceCountMax``.  The
+scaled-axis programs below execute each component's REAL ``const`` statements
+that carry a data maximum to its raw ticks (LineChart's own scale lines;
+StackedAreaChart's call into the real ``stackedAreaPaths``) against the real
+spark_path.js.  They emit those statements in SOURCE ORDER, so a snap line that
+reads ``ticks`` before its declaration throws the same TDZ ReferenceError the
+browser would, and they return RAW ticks rather than labels, so one expectation
+table holds across callers whose formatters differ.
 """
 
 from __future__ import annotations
@@ -61,6 +72,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
 from _dashboard_helpers import (
     DF_CHARTS_DESTRUCTURE_RE,
     DF_CHARTS_EXPORT_RE,
@@ -83,10 +95,10 @@ def _extract_signature(src: str, fn_name: str) -> str:
 
     A thin projection over the shared `find_function_params` paren-depth walk.
     It stays module-local rather than being hoisted because it has exactly one
-    consumer (`_default_format_y` below); what was worth sharing was the WALK,
+    consumer (`_signature_default` below); what was worth sharing was the WALK,
     not this slice of its result.  It cannot be replaced by
     `extract_function_body` either: that returns the BODY, and the two slices
-    are disjoint — `_default_format_y` regexes `formatY = <default>` out of the
+    are disjoint — `_signature_default` regexes `<prop> = <default>` out of the
     PARAMETER LIST, which the body excludes.
 
     The miss message is kept file-specific: naming the vacuous-GREEN
@@ -123,23 +135,25 @@ def _component_body(src: str, name: str) -> str:
     return extract_function_body(src, name)
 
 
-def _default_format_y(charts_jsx_body: str, component: str = 'StackedAreaChart') -> str:
-    """The ``formatY = ...`` default from ``component``'s signature.
+def _signature_default(src: str, component: str, prop: str) -> str:
+    """The ``<prop> = <default>`` expression from ``component``'s signature.
 
-    The default arrow contains neither a comma nor a brace (``v => String(v)``
-    before the fix, ``v => String(Math.round(v))`` after), so a ``[^,}]+`` run
-    over the signature slice captures exactly it. ``component`` defaults to
-    StackedAreaChart, whose default task 4059 moved the rounding into; task
-    4232's caller audit passes ``'LineChart'`` to read the default the four
-    no-formatY callers actually inherit.
+    Every default read here is an arrow containing neither a comma nor a brace
+    (``v => String(Math.round(v))``, ``(dataMax) => dataMax``), so a ``[^,}]+``
+    run over the signature slice captures exactly it.
     """
-    signature = _extract_signature(charts_jsx_body, component)
-    m = re.search(r'formatY\s*=\s*([^,}]+)', signature)
+    signature = _extract_signature(src, component)
+    m = re.search(rf'\b{prop}\s*=\s*([^,}}]+)', signature)
     assert m is not None, (
-        f'{component} no longer declares a `formatY = <default>` in its '
+        f'{component} no longer declares a `{prop} = <default>` in its '
         f'signature. Signature was: {signature!r}'
     )
     return m.group(1).strip()
+
+
+def _default_format_y(charts_jsx_body: str, component: str = 'StackedAreaChart') -> str:
+    """The ``formatY`` default: StackedAreaChart's (task 4059) unless told otherwise."""
+    return _signature_default(charts_jsx_body, component, 'formatY')
 
 
 def _tick_label_arg(body: str) -> str:
@@ -184,6 +198,30 @@ def _tick_generator(body: str) -> str:
         'would no longer run the real generator.'
     )
     return f'{ticks.group(1)}\n  {y_ticks.group(1)}'
+
+
+def _const_statements_in_source_order(body: str, names) -> str:
+    """The one single-line ``const`` binding each of ``names``, joined in SOURCE order.
+
+    A name is bound either plainly (``const maxV = ...;``) or inside a
+    destructure pattern (``const { max: maxV, paths, stepX } = ...;``).  Source
+    order is the point: a statement that reads a name before its ``const`` is
+    declared then throws the same TDZ ReferenceError the browser would.
+    """
+    found = []
+    for name in names:
+        pattern = (
+            rf'^[ \t]*(const\s+(?:{name}\b|\{{[^}}\n]*\b{name}\b[^}}\n]*\}})\s*=.*;)[ \t]*$'
+        )
+        matches = list(re.finditer(pattern, body, re.MULTILINE))
+        assert len(matches) == 1, (
+            f'expected exactly one single-line `const` binding `{name}` in the '
+            f'component body, found {len(matches)}. The axis scale arithmetic '
+            'changed shape, so the scaled-axis program would no longer run the '
+            'real committed statements.'
+        )
+        found.append(matches[0])
+    return '\n  '.join(m.group(1) for m in sorted(found, key=lambda m: m.start()))
 
 
 def _workflow_panel_format_y(tab_analytics_jsx_body: str) -> str:
@@ -431,6 +469,49 @@ def _render_caller_axis(charts_jsx_body: str, caller_body: str, anchor: str, max
     if format_y is None:
         format_y = _default_format_y(charts_jsx_body, 'LineChart')
     return _run_node(_line_chart_axis_program(line_chart, format_y, max_vs))
+
+
+def _scaled_axis_program(snap_max: str, data_maxes, fixture: str, statements: str) -> str:
+    """Run real axis statements per data maximum and print ``{dataMax: rawTicks}``.
+
+    Binds the real spark_path.js, and `C` to its API, for the same reason as
+    `_line_chart_axis_program`: a caller's `niceCountMax` / `C.niceCountMax`
+    then resolves to the genuinely SHIPPED function.
+    """
+    return f"""
+const DF_SPARK_PATH = require({json.dumps(str(_SPARK_PATH_JS))});
+const {{ plottableMax, niceCountMax, stackedAreaPaths }} = DF_SPARK_PATH;
+const C = Object.assign({{}}, DF_SPARK_PATH);
+const snapMax = {snap_max};
+const out = {{}};
+for (const dataMax of {json.dumps(list(data_maxes))}) {{
+  {fixture}
+  {statements}
+  out[dataMax] = yTicks;
+}}
+console.log(JSON.stringify(out));
+"""
+
+
+def _line_chart_scaled_axis_program(body: str, snap_max: str, data_maxes) -> str:
+    """LineChart's real data-max -> raw-ticks statements, under `snap_max`."""
+    return _scaled_axis_program(
+        snap_max,
+        data_maxes,
+        'const series = [{ values: [0, dataMax] }];',
+        _const_statements_in_source_order(body, ['all', 'ticks', 'maxV', 'minV', 'range', 'yTicks']),
+    )
+
+
+def _stacked_area_scaled_axis_program(body: str, snap_max: str, data_maxes) -> str:
+    """StackedAreaChart's real statements, through the real ``stackedAreaPaths``."""
+    return _scaled_axis_program(
+        snap_max,
+        data_maxes,
+        "const stacks = [{ key: 'a', values: [dataMax] }];\n"
+        '  const geom = { x0: 38, y0: 8, width: 100, height: 190, count: 1 };',
+        _const_statements_in_source_order(body, ['ticks', 'maxV', 'yTicks']),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1111,3 +1192,101 @@ def test_routing_guards_actually_fire_on_pre_fix_and_nested_brace_source() -> No
         '`_dashboard_helpers.py::DF_CHARTS_EXPORT_RE`, and test_tab_burndown.py '
         'would go on to fail opaquely on an empty export set.'
     )
+
+
+# ---------------------------------------------------------------------------
+# Count-axis snapping (task 5121) — the axis MAXIMUM, executed.
+#
+# `snapMax` maps the folded data maximum to the axis maximum. The default is
+# the identity, so a chart that does not opt in keeps its exact geometry; with
+# niceCountMax the maximum snaps up to a multiple of the tick count and every
+# raw tick is whole. Every value below is an exact binary fraction, so `==` is
+# a real comparison.
+# ---------------------------------------------------------------------------
+
+_SNAPPED_COUNT_TICKS = {'7': [0, 2, 4, 6, 8], '0': [0, 1, 2, 3, 4], '999': [0, 250, 500, 750, 1000]}
+_UNSNAPPED_TICKS = {'7': [0, 1.75, 3.5, 5.25, 7], '2.5': [0, 0.625, 1.25, 1.875, 2.5]}
+
+
+def _assert_axis_max_is_snap_max(charts_jsx_body: str, component: str, program) -> None:
+    """``component``'s axis maximum is ``snapMax`` of the folded data maximum, default included."""
+    body = _component_body(charts_jsx_body, component)
+
+    snapped = _run_node(program(body, 'niceCountMax', [7, 0, 999]))
+    assert snapped == _SNAPPED_COUNT_TICKS, (
+        f'{component} with snapMax={{niceCountMax}} draws raw ticks {snapped}, '
+        f'expected {_SNAPPED_COUNT_TICKS}. Its axis maximum does not go through '
+        'snapMax, so a count axis still takes its maximum as given.'
+    )
+
+    default = _signature_default(charts_jsx_body, component, 'snapMax')
+    unsnapped = _run_node(program(body, default, [7, 2.5]))
+    assert unsnapped == _UNSNAPPED_TICKS, (
+        f'{component} with its default snapMax ({default}) draws raw ticks '
+        f'{unsnapped}, expected {_UNSNAPPED_TICKS}. An axis that does not opt in '
+        'must keep its exact geometry.'
+    )
+
+
+def test_line_chart_axis_max_is_its_snap_max_of_the_folded_data_max(charts_jsx_body: str) -> None:
+    """LineChart's gridlines and points share one maxV, so that line is the whole snap.
+
+    Data max 0 exercises the ``plottableMax(all, 1)`` seed floor: 1 snaps to 4.
+    """
+    _assert_axis_max_is_snap_max(charts_jsx_body, 'LineChart', _line_chart_scaled_axis_program)
+
+
+def test_stacked_area_chart_axis_max_is_its_snap_max_of_the_folded_stack_max(charts_jsx_body: str) -> None:
+    """StackedAreaChart's snap runs inside the real ``stackedAreaPaths``, before any band is scaled."""
+    _assert_axis_max_is_snap_max(charts_jsx_body, 'StackedAreaChart', _stacked_area_scaled_axis_program)
+
+
+# LineChart's signature and axis lines verbatim from before task 5121: no
+# snapMax, and `const ticks = 4;` declared after the scale.
+_PRE_SNAP_LINE_CHART = """
+function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v }) {
+  const all = series.flatMap(s => s.values);
+  const maxV = plottableMax(all, 1);
+  const minV = 0;
+  const range = maxV - minV || 1;
+  const ticks = 4;
+  const yTicks = Array.from({ length: ticks + 1 }, (_, i) => minV + (range * i) / ticks);
+}
+"""
+
+# The snap line reading `ticks` ABOVE its declaration: a TDZ ReferenceError at
+# render that blanks the chart.
+_TDZ_LINE_CHART = """
+function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, snapMax = (dataMax) => dataMax }) {
+  const all = series.flatMap(s => s.values);
+  const maxV = snapMax(plottableMax(all, 1), ticks);
+  const minV = 0;
+  const range = maxV - minV || 1;
+  const ticks = 4;
+  const yTicks = Array.from({ length: ticks + 1 }, (_, i) => minV + (range * i) / ticks);
+}
+"""
+
+
+def test_scaled_axis_harness_is_discriminating() -> None:
+    """The scaled-axis harness can fail: it neither invents a snap nor hides a TDZ.
+
+    Mirrors `_PRE_FIX_SOURCE`'s role above. (a) A maxV line that ignores
+    snapMax renders unsnapped ticks even when handed niceCountMax, so the
+    snapped expectations above are not produced by the harness itself. (b)
+    Emitting the statements in source order reproduces the ordering bug as the
+    browser's own ReferenceError.
+    """
+    pre_snap = _run_node(
+        _line_chart_scaled_axis_program(_component_body(_PRE_SNAP_LINE_CHART, 'LineChart'), 'niceCountMax', [7])
+    )
+    assert pre_snap == {'7': [0, 1.75, 3.5, 5.25, 7]}, (
+        f'the harness drew {pre_snap} for a LineChart whose maxV line ignores '
+        'snapMax. It is snapping on its own, so the snapped expectations prove '
+        'nothing about charts.jsx.'
+    )
+
+    with pytest.raises(AssertionError, match='before initialization'):
+        _run_node(
+            _line_chart_scaled_axis_program(_component_body(_TDZ_LINE_CHART, 'LineChart'), 'niceCountMax', [7])
+        )
