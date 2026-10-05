@@ -2170,6 +2170,10 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
     never complete, so teardown cancels everything outstanding.
     """
 
+    BOUND_SECONDS = 0.02
+    CALLER_INTERVAL_SECONDS = BOUND_SECONDS / 2
+    HOST_STALL_SECONDS = 0.35
+
     @staticmethod
     async def _cancel_all(*tasks):
         live = [t for t in tasks if t is not None]
@@ -2308,11 +2312,18 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
-        monkeypatch.setattr(fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', 0.02)
+        monkeypatch.setattr(
+            fanout_mod, '_LOCK_ACQUIRE_TIMEOUT_SECONDS', self.BOUND_SECONDS
+        )
+        monkeypatch.setattr(fanout_mod, '_MAX_LIVE_BYPASSES_PER_KEY', 3)
         cache: TTLCache[str] = TTLCache(ttl_seconds=60.0)
+        calls = {'n': 0}
         wedged = asyncio.Event()  # never set
 
         async def _refresh():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                time.sleep(self.HOST_STALL_SECONDS)
             await wedged.wait()
             raise AssertionError('unreachable: the wedged event is never set')
 
@@ -2329,6 +2340,11 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
                     )
                     await asyncio.sleep(0.01)
 
+            assert calls['n'] == 3, (
+                'precondition: the key must reach the live-bypass cap (3 '
+                'started refreshes) before a decline can be logged, got '
+                f"{calls['n']}"
+            )
             records = [
                 r for r in caplog.records if r.name == 'dashboard.data.mcp_fanout'
             ]
