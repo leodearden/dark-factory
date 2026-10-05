@@ -1545,7 +1545,9 @@ class GraphitiBackend:
         for graph_name in sorted(set(existing) & self._registered_graph_ids):
             await self._ensure_indices(graph_name)
 
-    async def initialize(self, *, skip_maintenance: bool = False) -> None:
+    async def initialize(
+        self, *, skip_maintenance: bool = False, llm_client: LLMClient | None = None
+    ) -> None:
         """Create FalkorDriver + Graphiti client from unified config.
 
         skip_maintenance: when True, skip both startup maintenance blocks
@@ -1555,11 +1557,15 @@ class GraphitiBackend:
         the ζ migrate_cross_graph_leak.py dry-run/census) that need a
         driver/client-wired backend without mutating on init or contending
         with a running service's maintenance sweep.
+
+        llm_client: when given, used instead of ``build_llm_client(cfg)``, so a
+        per-arm caller (e.g. the arm-runner harness) can wrap the client
+        ``build_llm_client`` built before this backend shares it.
         """
         cfg = self.config
 
         # --- LLM client ---
-        llm_client = build_llm_client(cfg)
+        llm_client = llm_client if llm_client is not None else build_llm_client(cfg)
 
         # --- Embedder ---
         embedder_client = None
