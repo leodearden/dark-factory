@@ -1,0 +1,96 @@
+"""``GitOps._run_thin_warm_lane`` against the REAL shipped thin-warm-lane.sh.
+
+Task 5307.  The script now refuses to thin a lane a live process references
+(its T4 gate; ``orchestrator/scripts/warm-lane/README.md`` "Delta 12") with the
+same exit 75 it uses for a held flock.  This pins the wrapper's side of that
+contract end to end: the refusal stays a benign DEBUG skip (never WARNING,
+inv.11), and dark-factory's log can still tell WHICH gate refused, because the
+script's ``LANE_LIVE_REF:`` token reaches it.
+
+Driven through ``_run_thin_warm_lane`` rather than ``release_warm_lane``, which
+composes it as its last step and passes its rc through unchanged: the public
+path would need a configured pool and a git lane, and would emit unrelated
+WARNINGs that collide with the no-WARNING assertion.
+"""
+from __future__ import annotations
+
+import logging
+import subprocess
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from test_warm_lane_scripts_shipped import WARM_LANE_SCRIPT_DIR
+
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import GitOps
+
+pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+def git_ops(tmp_path: Path, monkeypatch, df_warm_lane_script_dir) -> GitOps:
+    """A pool-less GitOps whose thin-warm-lane.sh resolves to dark-factory's copy.
+
+    No ``<project>/scripts/`` exists, so resolution falls through to the REAL
+    shipped directory, and being pool-less keeps the pool-storage guard quiet.
+    ``REIFY_WARM_LANE_MOUNT`` is cleared so an ambient mount cannot trip the
+    script's under-mount guard.
+    """
+    df_warm_lane_script_dir(WARM_LANE_SCRIPT_DIR)
+    monkeypatch.delenv('REIFY_WARM_LANE_MOUNT', raising=False)
+    project = tmp_path / 'proj'
+    project.mkdir()
+    return GitOps(GitConfig(), project)
+
+
+@pytest.fixture
+def lane(tmp_path: Path) -> Path:
+    lane_dir = tmp_path / 'pool' / '_lane-1'
+    (lane_dir / 'target').mkdir(parents=True)
+    (lane_dir / 'target' / 'DIVERGENT_MARKER').touch()
+    return lane_dir
+
+
+@pytest.fixture
+def holder(lane: Path) -> Iterator[subprocess.Popen[bytes]]:
+    """A live process whose cwd is ``<lane>/target``.
+
+    ``Popen`` returns only after the child's chdir + exec, so the reference is
+    causally established before the test proceeds — no sleep.
+    """
+    proc = subprocess.Popen(['sleep', '300'], cwd=lane / 'target')
+    try:
+        yield proc
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+async def test_live_reference_is_a_benign_debug_skip_attributed_to_the_live_ref_gate(
+    git_ops: GitOps, lane: Path, holder: subprocess.Popen[bytes], caplog,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger='orchestrator.git_ops'):
+        rc = await git_ops._run_thin_warm_lane(lane)
+
+    assert rc == 75
+    assert (lane / 'target' / 'DIVERGENT_MARKER').exists()
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings == [], f'a live-reference skip must never WARN: {warnings}'
+    debug = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+    assert any('LANE_LIVE_REF:' in message for message in debug), (
+        'the rc=75 DEBUG line does not attribute the skip to the live-reference '
+        f'gate, so it reads as a flock refusal: {debug}'
+    )
+
+
+async def test_once_the_reference_clears_the_lane_thins(
+    git_ops: GitOps, lane: Path, holder: subprocess.Popen[bytes],
+) -> None:
+    holder.kill()
+    holder.wait()
+
+    rc = await git_ops._run_thin_warm_lane(lane)
+
+    assert rc == 0
+    assert not (lane / 'target').exists()
