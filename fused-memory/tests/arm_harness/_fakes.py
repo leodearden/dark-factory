@@ -1,6 +1,17 @@
 """Shared arm-harness test doubles: valid spec builders and public-Protocol fakes."""
 
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager
+from types import SimpleNamespace
+from typing import Any
+
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec
+from fused_memory.backends.llm_token_usage import (
+    AttributingTokenUsageTracker,
+    TokenMeasurement,
+    measure_llm_tokens,
+)
 
 CODE_SHA = 'a' * 40
 CORPUS_SHA = 'b' * 64
@@ -57,3 +68,116 @@ def embedding_spec(*, base_url: str = UNREACHABLE_BASE_URL, **overrides) -> Embe
         'arm_role': 'candidate',
     }
     return EmbeddingArmSpec.model_validate(data | overrides)
+
+
+def fake_add_result(
+    episode_uuid: str,
+    entity_names: tuple[str, ...] = (),
+    edges: tuple[tuple[str, str, str], ...] = (),
+) -> SimpleNamespace:
+    """A minimal AddEpisodeResults-shaped value: episode.uuid, nodes, edges (by node name)."""
+    nodes = [SimpleNamespace(uuid=f'node-{name}', name=name) for name in entity_names]
+    entity_edges = [
+        SimpleNamespace(
+            uuid=f'edge-{source}-{relation}-{target}',
+            source_node_uuid=f'node-{source}',
+            target_node_uuid=f'node-{target}',
+            name=relation,
+            episodes=[episode_uuid],
+        )
+        for source, relation, target in edges
+    ]
+    return SimpleNamespace(
+        episode=SimpleNamespace(uuid=episode_uuid), nodes=nodes, edges=entity_edges
+    )
+
+
+Behaviour = Callable[[dict[str, Any]], Awaitable[Any]]
+
+
+async def succeed(call: dict[str, Any]) -> Any:
+    return fake_add_result(f'replay-{call["name"]}', entity_names=('alice', 'bob'))
+
+
+async def fail(call: dict[str, Any]) -> Any:
+    raise RuntimeError(f'extraction failed for {call["name"]}')
+
+
+async def hang(call: dict[str, Any]) -> Any:
+    await asyncio.Event().wait()
+
+
+def slow(behaviour: Behaviour, seconds: float) -> Behaviour:
+    async def delayed(call: dict[str, Any]) -> Any:
+        await asyncio.sleep(seconds)
+        return await behaviour(call)
+
+    return delayed
+
+
+class FakeArmGraph:
+    """A public-``ArmGraph`` double: per-episode-name behaviours, recorded calls, overlap.
+
+    ``usage`` is recorded on an attributing tracker inside each add_episode, so the
+    real ``measure_llm_tokens`` window credits it to that episode.
+    """
+
+    def __init__(
+        self,
+        behaviours: Mapping[str, Behaviour] | None = None,
+        *,
+        default: Behaviour = succeed,
+        usage: tuple[int, int] | None = (30, 10),
+        llm_client: Any = None,
+        search_results: Callable[[str], list[Any]] | None = None,
+    ) -> None:
+        self._behaviours = dict(behaviours or {})
+        self._default = default
+        self._usage = usage
+        self.llm_client = llm_client or SimpleNamespace(
+            token_tracker=AttributingTokenUsageTracker()
+        )
+        self._search_results = search_results or (lambda query: [])
+        self.add_calls: list[dict[str, Any]] = []
+        self.search_calls: list[dict[str, Any]] = []
+        self.events: list[str] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def add_episode(self, **call: Any) -> Any:
+        self.add_calls.append(call)
+        self.events.append('add_episode')
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            result = await self._behaviours.get(call['name'], self._default)(call)
+            if self._usage is not None:
+                self.llm_client.token_tracker.record('extract_nodes', *self._usage)
+            return result
+        finally:
+            self.in_flight -= 1
+
+    async def search(
+        self, query: str, group_ids: list[str] | None = None, num_results: int = 10
+    ) -> list[Any]:
+        self.search_calls.append(
+            {'query': query, 'group_ids': group_ids, 'num_results': num_results}
+        )
+        self.events.append('search')
+        return self._search_results(query)[:num_results]
+
+    def token_probe(self) -> AbstractAsyncContextManager[TokenMeasurement]:
+        return measure_llm_tokens(self.llm_client)
+
+
+class RecordingJournal:
+    """A journal double recording each log call's keyword arguments, in order."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def log_write_op(self, **kwargs: Any) -> None:
+        self.calls.append(('log_write_op', kwargs))
+
+    async def log_backend_op(self, **kwargs: Any) -> None:
+        self.calls.append(('log_backend_op', kwargs))
