@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from _orch_helpers import wait_responsive
 
-from orchestrator.config import OrchestratorConfig
+from orchestrator.config import OrchestratorConfig, ReviewConfig
 from orchestrator.harness import Harness, HarnessReport, TaskReport
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.service_restart import StaleServiceRestartCoordinator
@@ -115,7 +115,7 @@ def _harness(tmp_path: Path, dispatch: _Dispatch, slots: _Slots) -> Harness:
         merge_heartbeat_interval_secs=_TICK,
         stale_service_restart_poll_secs=_TICK,
         watcher_supervisor_enabled=False,
-        review={'full_review_on_complete': False},
+        review=ReviewConfig(full_review_on_complete=False),
     )
     with patch('orchestrator.harness.McpLifecycle') as mcp_cls, \
          patch('orchestrator.harness.Scheduler'), \
@@ -127,10 +127,10 @@ def _harness(tmp_path: Path, dispatch: _Dispatch, slots: _Slots) -> Harness:
     h.git_ops = MagicMock()
     h.git_ops.disable_shared_repo_auto_maintenance = AsyncMock()
     h.git_ops.has_dirty_working_tree = AsyncMock(return_value=None)
+    h.git_ops.reap_interactive_worktrees = AsyncMock(return_value=[])
     h.git_ops.worktree_base = tmp_path / '.worktrees'
     h.usage_gate = None
-    h.review_checkpoint = MagicMock()
-    h.review_checkpoint.should_trigger.return_value = False
+    h.review_checkpoint = None
 
     h.scheduler = MagicMock()
     h.scheduler.is_paused = False
@@ -148,7 +148,7 @@ def _harness(tmp_path: Path, dispatch: _Dispatch, slots: _Slots) -> Harness:
     return h
 
 
-async def _owed_fused_memory_restart(
+def _fused_memory_restart(
     h: Harness, clock: _Clock, fired: asyncio.Event,
 ) -> StaleServiceRestartCoordinator:
     async def executor() -> None:
@@ -162,12 +162,15 @@ async def _owed_fused_memory_restart(
         restart_executor=executor,
         clock=clock,
     )
+    h._service_restart_coordinators = [coord]
+    return coord
+
+
+async def _arm(coord: StaleServiceRestartCoordinator) -> None:
     armed = await coord.note_merge(
         '7', 'base', 'head', prefetched_diff=['fused-memory/src/fused_memory/x.py'],
     )
     assert armed
-    h._service_restart_coordinators = [coord]
-    return coord
 
 
 def _heartbeat_ts(fleet_dir: Path) -> float | None:
@@ -221,6 +224,9 @@ class TestParkedLoop:
     ) -> None:
         dispatch, slots = _Dispatch(['1', '2', '3']), _Slots()
         h = _harness(tmp_path, dispatch, slots)
+        review = MagicMock()
+        review.should_trigger.return_value = False
+        h.review_checkpoint = review
 
         async def drive() -> None:
             for tid, calls in (('1', 2), ('2', 3), ('3', 4)):
@@ -231,8 +237,7 @@ class TestParkedLoop:
 
         assert sorted(r.task_id for r in report.task_reports) == ['1', '2', '3']
         assert report.completed == 3
-        assert h.review_checkpoint is not None
-        assert h.review_checkpoint.record_merge.call_count == 3
+        assert review.record_merge.call_count == 3
 
     async def test_owed_restart_force_fires_while_parked(
         self, tmp_path: Path, fleet_dir: Path,
@@ -240,12 +245,13 @@ class TestParkedLoop:
         dispatch, slots = _Dispatch(['1', '2']), _Slots()
         h = _harness(tmp_path, dispatch, slots)
         clock, fired = _Clock(), asyncio.Event()
-        await _owed_fused_memory_restart(h, clock, fired)
+        coord = _fused_memory_restart(h, clock, fired)
 
         async def drive() -> None:
             await _until(lambda: dispatch.calls >= 2, 'loop parked on slot 1')
-            reads_when_parked = clock.reads
-            await _until(lambda: clock.reads >= reads_when_parked + 3, 'restart polled while parked')
+            await _arm(coord)
+            reads_when_armed = clock.reads
+            await _until(lambda: clock.reads >= reads_when_armed + 3, 'restart polled while parked')
             assert not fired.is_set(), 'a polite restart must wait while a slot is live'
             clock.now += _FORCE_FIRE_AFTER_SECS
             await _until(fired.is_set, 'owed restart force-fired while parked')
@@ -292,7 +298,7 @@ class TestParkedLoop:
         dispatch, slots = _Dispatch([]), _Slots()
         h = _harness(tmp_path, dispatch, slots)
         clock, fired = _Clock(), asyncio.Event()
-        await _owed_fused_memory_restart(h, clock, fired)
+        await _arm(_fused_memory_restart(h, clock, fired))
 
         async def startup_recovery() -> None:
             await _until(lambda: clock.reads >= 4, 'restart polled during startup')
