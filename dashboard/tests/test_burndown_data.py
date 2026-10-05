@@ -170,15 +170,12 @@ def _assert_one_value(rows_by_project: dict[str, list], root):
 
 @pytest.fixture(autouse=True)
 def _isolate_caches():
-    """Neither the snapshot unit cache nor the fetch_tasks cache may cross a test."""
+    """The snapshot unit cache may not cross a test."""
     import dashboard.data.task_snapshot as snapshot_mod
-    import dashboard.data.tasks as tasks_mod
 
     snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
     yield
     snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
 
 # ---------------------------------------------------------------------------
 # Helpers

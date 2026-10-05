@@ -89,13 +89,7 @@ from dashboard.data.reconciliation import (
     partition_burst_state,
 )
 from dashboard.data.scheduler import get_scheduler_snapshot
-from dashboard.data.tasks import (
-    _FETCH_TASKS_TTL_SECONDS,
-    _CompleteRead,
-    _fetch_tasks_cache,
-    _TasksRead,
-    fetch_tasks,
-)
+from dashboard.data.tasks import fetch_tasks
 from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import empty_memory_ops, get_memory_ops
 from dashboard.http_pool import reaper_loop
@@ -466,44 +460,33 @@ _HEALTHZ_TOTAL_BUDGET = 3.0
 #
 # NOTHING WAS WIDENED to make room: _DB_PROBE_TIMEOUT and _HEALTHZ_TOTAL_BUDGET
 # are untouched. 0.2s is sufficient precisely BECAUSE the probe never needs to
-# see a healthy fetch FINISH -- it either finds warmth or grace for free, or it
-# leaves a background task running for the NEXT /healthz to observe. See
+# see a healthy fetch FINISH -- it either finds grace for free, or it leaves a
+# background task running for the NEXT /healthz to observe. See
 # _probe_mcp_fanout.
 _MCP_PROBE_TIMEOUT = 0.2
 
 # How long a single observed fan-out COMPLETION answers for.
 #
-# Must be at least one ``tasks._FETCH_TASKS_TTL_SECONDS`` (20.0) wide: the warm
-# signal below goes stale every TTL by construction, so a grace narrower than
-# the TTL would let an ordinary expiry between two 3s browser polls read as a
-# wedge. 30.0 gives 1.5 TTLs, which also absorbs the journal's routine ~2.0s
+# A lapsed grace is cheap rather than alarming: the next /healthz starts a
+# probe, and a probe younger than _MCP_PROBE_OUTSTANDING_LIMIT reports
+# 'probing', never 'timeout'. So this window only decides how often /healthz
+# spends an MCP traversal. 30.0 also absorbs the journal's routine ~2.0s
 # ReadTimeout/recovered cycles against localhost:8002 without flipping the
 # verdict.
 _MCP_FANOUT_OK_GRACE_SECONDS = 30.0
 
 # How long a LIVE probe may be outstanding before it is reported as a wedge.
 #
-# WHAT THIS CLOSES, and why it is not a widening of anything. Nothing
-# SERVER-side refreshes the primary root's full-tree cache key: the only
-# steady-state writer is the browser's 3 s
-# ``/api/v2/dashboard/orchestrators`` poll. On an UNATTENDED dashboard the
-# warm signal (one TTL) and the grace (30.0 s) therefore BOTH lapse, so
-# without this bound every later /healthz would launch a probe it cannot
-# possibly observe inside a 0.2 s budget and report ``'timeout'`` — a strict
-# 503/200 alternation on an idle but perfectly healthy dashboard, which is a
-# false alarm on the very signal this check adds.
-#
-# So a probe that is merely YOUNG reports ``'probing'``, not ``'timeout'``: a
-# fan-out started a moment ago has demonstrated nothing yet, and saying
-# otherwise is the same unknown-reported-as-fact the ``degraded`` vs
-# ``offline`` split exists to prevent. Once a probe has been outstanding for a
-# WHOLE TTL without landing it is no longer young — a healthy cold fetch of
-# the largest measured tree costs ~6 s — and the wedge is reported for as long
-# as it lasts, which is the 19.8 h fact nothing reported.
-#
-# Bound to the TTL BY REFERENCE rather than restated: the window this must
-# outlast is exactly the one a stored value is trusted for.
-_MCP_PROBE_OUTSTANDING_LIMIT = _FETCH_TASKS_TTL_SECONDS
+# Only a completed probe stamps the grace, so an unattended dashboard's grace
+# lapses every 30.0 s and the next /healthz launches a probe it cannot observe
+# inside 0.2 s. Younger than this, that probe reports 'probing' -- it has shown
+# nothing yet -- rather than a false 'timeout'. Older, it has outlived
+# tasks.DEFAULT_WHOLE_OPERATION_BUDGET (the cap on a healthy cold whole-tree
+# fetch) nearly three times over, and the wedge is reported for as long as it
+# lasts. Invariant (machine-checked by
+# test_healthz_data_plane_budget_is_structurally_deliverable):
+#   _MCP_PROBE_OUTSTANDING_LIMIT >= tasks.DEFAULT_WHOLE_OPERATION_BUDGET
+_MCP_PROBE_OUTSTANDING_LIMIT = 20.0
 
 
 def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
@@ -697,29 +680,27 @@ async def _probe_mcp_fanout(
     closes. Conversely a probe keyed on the fetch SUCCEEDING false-alarms: the
     journal's routine ReadTimeout/recovered cycles return the
     ``{'offline': True, ...}`` marker after ~2.0s, longer than any budget that
-    fits inside _HEALTHZ_TOTAL_BUDGET. Only "could a caller get THROUGH the
-    cache in front of the substrate, inside a bound" separates the two, and
-    that is the property the incident actually violated. So a COMPLETED
-    fan-out is 'ok' whatever it returned, the offline marker included.
+    fits inside _HEALTHZ_TOTAL_BUDGET. Only "could a caller get THROUGH to
+    the substrate, inside a bound" separates the two, and that is the property
+    the incident actually violated. So a COMPLETED fan-out is 'ok' whatever it
+    returned, the offline marker included.
 
-    Three signals, cheapest first:
+    Two signals, cheapest first:
 
-    1. WARM -- a fresh entry in ``tasks._fetch_tasks_cache`` for the routes'
-       own key. Free, and conclusive: a stored value proves a refresh COMPLETED
-       inside the TTL. ``get_or_refresh``'s own docstring records that during
-       the incident "nothing was ever stored for the wedged key", which is why
-       this is the right signal rather than a proxy for one. With the browser
-       polling every 3s this is the steady state, so /healthz normally costs
-       ZERO MCP calls.
-    2. GRACE -- a fan-out completion observed within
+    1. GRACE -- a completion of THIS probe observed within
        _MCP_FANOUT_OK_GRACE_SECONDS. This is what keeps an occasional 2.0s
-       ReadTimeout, or one expired cache entry between polls, from flipping the
-       verdict.
-    3. PROBE -- start, or JOIN if one is already live, a single-flight
+       ReadTimeout from flipping the verdict.
+    2. PROBE -- start, or JOIN if one is already live, a single-flight
        background ``fetch_tasks`` and wait at most *budget* using
        ``asyncio.wait({task}, timeout=...)`` (NOT ``wait_for``, which awaits
        the cancelled operation's unwinding -- the same reason _probe_db uses
        this idiom).
+
+    The probe is deliberately the RAW, uncached ``fetch_tasks``, and nothing
+    another caller stored is consulted: a stored value must never answer for a
+    traversal (one-datum-one-path PRD decision 17), because a read that
+    completed before a wedge began says nothing about whether a caller can get
+    through now.
 
     The task is NOT cancelled on expiry and NOT relaunched while live. That is
     what makes the two cases distinguishable at all: a healthy-but-COLD system
@@ -731,24 +712,12 @@ async def _probe_mcp_fanout(
     watchdog tick, and single-flight is what stops three /healthz calls costing
     three.
 
-    WHAT WARMTH DOES NOT DO, stated because an earlier version of this
-    docstring claimed the opposite: warmth does NOT carry an unattended
-    dashboard. Nothing server-side refreshes the primary root's key -- the only
-    steady-state writer is the browser's 3s poll -- so with no browser attached
-    both warmth and grace lapse on a healthy system, and the 'probing' verdict
-    is what stops that lapse reading as a wedge. See
+    The grace lapses on a healthy but unattended dashboard too, and the
+    'probing' verdict is what stops that lapse reading as a wedge. See
     _MCP_PROBE_OUTSTANDING_LIMIT.
     """
     global _mcp_probe, _mcp_fanout_last_ok
     loop = asyncio.get_running_loop()
-
-    # The SAME read record _fanout_probe_completion's own unnarrowed
-    # ``fetch_tasks(client, config, config.project_root)`` builds (task 5018
-    # made the cache key a structured record): whole tree, no status
-    # narrowing, one unpaginated request.
-    key = _TasksRead(str(config.project_root), None, _CompleteRead(None))
-    if _fetch_tasks_cache.get_fresh(key) is not None:
-        return 'ok'
 
     last_ok = _mcp_fanout_last_ok
     if last_ok is not None and (loop.time() - last_ok) < _MCP_FANOUT_OK_GRACE_SECONDS:
@@ -902,8 +871,8 @@ async def healthz(request: Request) -> JSONResponse:
         checks['mcp_fanout'] = status
         # 'probing' is NOT a claim of ill-health, exactly as the DB loop's
         # 'unavailable' is not: a fan-out started moments ago has demonstrated
-        # nothing yet, and an unattended dashboard reaches that state on every
-        # cache expiry. Folding it into the verdict would 503 an idle but
+        # nothing yet, and an unattended dashboard reaches that state every
+        # time the grace lapses. Folding it into the verdict would 503 an idle but
         # perfectly healthy dashboard on a fixed cadence forever — a false
         # alarm on the exact signal this check adds. See
         # _MCP_PROBE_OUTSTANDING_LIMIT for the bound that keeps 'probing' from

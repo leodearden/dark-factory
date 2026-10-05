@@ -277,7 +277,7 @@ class TestFetchTask:
 
         tree_read = AsyncMock(return_value={'tasks': [_RAW_ROW]})
         with patch('dashboard.data.tasks.mcp_tool_call', new=tree_read):
-            [tree_row] = await fetch_tasks(None, config, root, cached=False)  # type: ignore[arg-type]
+            [tree_row] = await fetch_tasks(None, config, root)  # type: ignore[arg-type]
         assert row == tree_row
         assert row == {
             'id': 19,

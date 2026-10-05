@@ -19,26 +19,21 @@ membership (rowTouchesModule) is the only thing it adds.
 from __future__ import annotations
 
 import json
-import pathlib
 import subprocess
 
 import pytest
-from _dashboard_helpers import extract_function_body, find_function_params
 from _lock_chip_matrix import (
     CELL_MATRIX,
     MODULE_PATH,
     ROW_PROJECT,
     ROW_TASK,
     SCHED_UTILS_PATH,
+    heatmap_cell_and_chip,
     heatmap_module,
     heatmap_row,
     lock_chip_states_for,
     node_path,
 )
-
-_REDUX_DIR = pathlib.Path(__file__).parent.parent / 'src/dashboard/static/redux'
-HEATMAP_BOUNDS_PATH = str(_REDUX_DIR / 'scheduler_heatmap_bounds.js')
-HEATMAP_PATH = _REDUX_DIR / 'scheduler_heatmap.jsx'
 
 # Node driver: extracts the pure-JS helper section from scheduler_utils.jsx
 # (everything before the window.DF_SCHED_UTILS export line) and runs it in a
@@ -185,48 +180,9 @@ class TestLockChipStateForDecidesMine:
 
 # ---------------------------------------------------------------------------
 # The heatmap cell is classified by lockChipStateFor too (PRD sketch #12,
-# second half). cellStateFor is EXECUTED, not grepped: its declaration is sliced out
-# of scheduler_heatmap.jsx (raising on a miss) and run in one vm context with
-# the two classic scripts it reaches at runtime — scheduler_heatmap_bounds.js
-# for rowTouchesModule, scheduler_utils.jsx for window.DF_SCHED_UTILS.
+# second half). cellStateFor is EXECUTED, not grepped, by
+# _lock_chip_matrix.heatmap_cell_and_chip.
 # ---------------------------------------------------------------------------
-
-_CELL_DRIVER = r"""
-const vm = require('vm');
-const fs = require('fs');
-const [boundsPath, utilsPath, cellStateForSrc, argsJson] = process.argv.slice(1);
-const context = vm.createContext({ console, window: {} });
-vm.runInContext(fs.readFileSync(boundsPath, 'utf8'), context, { filename: boundsPath });
-vm.runInContext(fs.readFileSync(utilsPath, 'utf8'), context, { filename: utilsPath });
-vm.runInContext(cellStateForSrc, context, { filename: 'scheduler_heatmap.jsx::cellStateFor' });
-context.__args = JSON.parse(argsJson);
-const out = vm.runInContext(
-  '({ cell: cellStateFor(__args[0], __args[1]), chip: window.DF_SCHED_UTILS.lockChipStateFor(__args[1], __args[0].task_id, __args[0].project) })',
-  context,
-);
-process.stdout.write(JSON.stringify(out) + '\n');
-"""
-
-
-def _cell_state_for_source() -> str:
-    """``function cellStateFor(<params>) <body>`` exactly as scheduler_heatmap.jsx declares it."""
-    source = HEATMAP_PATH.read_text()
-    _masked, params_start, params_end = find_function_params(source, 'cellStateFor')
-    body = extract_function_body(source, 'cellStateFor')
-    return f'function cellStateFor({source[params_start:params_end]}) {body}'
-
-
-def heatmap_cell_and_chip(row, module):
-    """(cellStateFor(row, module), the row task's LockChip answer) from one vm context."""
-    result = subprocess.run(
-        [node_path(), '-e', _CELL_DRIVER, HEATMAP_BOUNDS_PATH, SCHED_UTILS_PATH,
-         _cell_state_for_source(), json.dumps([row, module])],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    out = json.loads(result.stdout.strip())
-    return out['cell'], out['chip']
 
 
 class TestHeatmapCellIsTheLockChip:

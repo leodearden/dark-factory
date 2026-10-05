@@ -1,14 +1,11 @@
-"""Tests for the ``_TasksRead`` record and the two things it derives.
+"""Tests for the ``_TasksRead`` record and the wire arguments it derives.
 
-Those are the ``get_tasks`` wire arguments and the cache key, covered directly
-and as observed through ``fetch_tasks``/``fetch_task_page``: statuses
-canonicalisation, the page window, the per-request timeout, and cache-key
-discrimination.
+Covered directly and as observed through ``fetch_tasks``/``fetch_task_page``:
+statuses canonicalisation, the page window and the per-request timeout.
 """
 
 from __future__ import annotations
 
-import dataclasses
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -18,97 +15,26 @@ import dashboard.data.tasks as tasks_mod
 
 
 class TestTasksReadRecord:
-    """The structured cache key: `_OnePage` | `_CompleteRead` inside `_TasksRead`.
+    """The structured read record: `_OnePage` | `_CompleteRead` inside `_TasksRead`.
 
-    RED source (step-2): dashboard.data.tasks has no _TasksRead yet.
+    The record is the one source of a read's MCP wire arguments, so a read and
+    the request it sends cannot disagree. Two properties carry that:
 
-    These records replace the hand-encoded key string built by
-    ``_fetch_tasks_cache_key`` (the ``*`` sentinel, ``|`` separators and
-    ``\x1f`` unit separator). Both defects that encoding produced are
-    reproduced here as assertions, so neither can come back:
-
-      * OFFSET DRIFT — the encoder rendered ``|o={offset}`` unconditionally
-        while ``offset`` only reached the wire when ``page_size`` was set, so
-        two reads with a byte-identical wire request minted two entries.
-        After this change the only read carrying an offset is ``_OnePage``,
-        which always sends one, so the invalid combination is not
-        constructible.
-      * STATUSES ORDER — ``['a','b']`` and ``['b','a']`` rendered as
-        ``s=a\x1fb`` vs ``s=b\x1fa``: two entries for one order-insensitive
-        SQL ``IN`` list. ``frozenset`` collapses them.
+      * THE WINDOW COMES FROM THE MODE — the only read carrying an offset is
+        ``_OnePage``, whose window ``wire_arguments`` reads off the mode and
+        refuses to be handed a second time; a ``_CompleteRead`` walk varies
+        only the window it is given, page by page.
+      * STATUSES CROSS THE WIRE BY MEANING — ``None`` (whole tree) omits the
+        key, an empty set is SENT as ``[]`` ("no tasks"), and a set crosses
+        ``sorted()`` because the SQL ``IN`` list it becomes has no order.
     """
 
-    @pytest.mark.parametrize(
-        ('name', 'build'),
-        [
-            ('_OnePage', lambda m: m._OnePage(10, 0)),
-            ('_CompleteRead', lambda m: m._CompleteRead(None)),
-            (
-                '_TasksRead',
-                lambda m: m._TasksRead('/r', None, m._CompleteRead(None)),
-            ),
-        ],
-    )
-    def test_each_record_is_frozen_and_usable_as_a_dict_key(self, name, build):
-        """A cache key that can be mutated after insertion is not a key.
-
-        These are the two properties a cache key genuinely needs, and both are
-        asserted against live behaviour rather than against the decorator's
-        arguments: a mutated key is unfindable in the dict it was filed under,
-        and an equal-but-distinct rebuild must find the entry the original
-        wrote.
-        """
-        record = build(tasks_mod)
-
-        field = dataclasses.fields(record)[0].name
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            setattr(record, field, 'mutated')
-
-        # A real dict round trip, not `hash()` alone — that would pass for a
-        # type whose __eq__ and __hash__ disagree, which is precisely the way
-        # a key silently stops finding its own entry.
-        assert {record: 'v'}[build(tasks_mod)] == 'v', (
-            f'{name} does not round-trip as a dict key'
-        )
-
-    def test_statuses_order_does_not_change_the_key(self):
-        """['a','b'] and ['b','a'] are ONE read, so they are ONE key.
-
-        The old encoder rendered s=a\x1fb vs s=b\x1fa — two entries for an
-        identical, order-insensitive SQL IN list. Reproduced live on this tip
-        before the change.
-        """
-        ab = tasks_mod._TasksRead(
-            '/r', frozenset({'a', 'b'}), tasks_mod._CompleteRead(None)
-        )
-        ba = tasks_mod._TasksRead(
-            '/r', frozenset({'b', 'a'}), tasks_mod._CompleteRead(None)
-        )
-        assert ab == ba
-        assert hash(ab) == hash(ba)
-
-    def test_none_statuses_is_distinct_from_empty_statuses(self):
-        """None (whole tree) and frozenset() (no tasks at all) are opposites.
-
-        The old encoder spelled these ``s=*`` vs ``s=`` and the distinction was
-        load-bearing: collapsing them onto one key serves an empty list as if
-        it were the full tree.
-        """
-        whole_tree = tasks_mod._TasksRead(
-            '/r', None, tasks_mod._CompleteRead(None)
-        )
-        nothing = tasks_mod._TasksRead(
-            '/r', frozenset(), tasks_mod._CompleteRead(None)
-        )
-        assert whole_tree != nothing
-
     def test_a_page_and_a_same_size_walk_are_distinct_and_named(self):
-        """THE esc-4360-7 COLLISION, as the user-observable signal.
+        """A 10-row PAGE and a walk 10 rows at a time are different reads.
 
-        A 10-row PAGE and the complete tree walked 10 rows at a time differ in
-        length and content while agreeing on every other component. The
-        discriminator is now the record's TYPE — readable as a named field,
-        not parsed out of a string.
+        They differ in length and content while agreeing on every other
+        component, so the mode's TYPE is what says which answer a read
+        returns — readable as a named field, not parsed out of a string.
         """
         page = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(10, 0))
         walk = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(10))
@@ -157,12 +83,7 @@ class TestTasksReadRecord:
         assert read.wire_arguments(None)['statuses'] == ['blocked', 'done', 'pending']
 
     def test_wire_arguments_adds_page_size_and_offset_together_or_not_at_all(self):
-        """The pair is what the tool needs; half of it is the drift defect.
-
-        The old encoder put ``offset`` in the KEY unconditionally while the
-        wire only carried it alongside ``page_size``. One encoder building both
-        is what makes that disagreement unrepresentable.
-        """
+        """The tool takes a window as a pair, so the wire carries both or neither."""
         read = tasks_mod._TasksRead('/r', None, tasks_mod._CompleteRead(None))
 
         without = read.wire_arguments(None)
@@ -192,12 +113,11 @@ class TestTasksReadRecord:
         assert second['offset'] == 10
 
     def test_a_page_read_takes_its_wire_window_from_its_own_mode(self):
-        """The bytes on the wire come from the field the KEY hashes.
+        """The bytes on the wire come from the record's own mode.
 
         A page read passes no window: `_OnePage` already fixes one, so the
-        request is derived from `mode` itself. That is what makes the offset
-        drift the old two-encoder shape produced unrepresentable rather than
-        merely absent — there is no second copy to disagree with.
+        request is derived from `mode` itself and there is no second copy of
+        the offset to disagree with.
         """
         read = tasks_mod._TasksRead('/r', None, tasks_mod._OnePage(25, 50))
 
@@ -208,9 +128,9 @@ class TestTasksReadRecord:
     def test_a_page_read_refuses_a_second_window(self):
         """Offering a window to a page read RAISES rather than overriding.
 
-        Silently preferring either one would reintroduce exactly the key/wire
-        disagreement this record exists to eliminate: the key would carry
-        `mode` while the wire carried the argument. `TypeError`, not
+        Silently preferring either one would reintroduce exactly the read/wire
+        disagreement this record exists to eliminate: the record would name
+        one window while the wire carried another. `TypeError`, not
         `ValueError` — `first_success` treats `ValueError` as a soft per-url
         failure and would launder a programming error into an offline marker.
         """
@@ -222,7 +142,7 @@ class TestTasksReadRecord:
 
 # ---------------------------------------------------------------------------
 # TestFetchTasksNarrowing — server-side narrowing args on the get_tasks wire
-# (task 3857 step-1 RED; step-3 adds the cache-key discrimination tests)
+# (task 3857)
 # ---------------------------------------------------------------------------
 
 
@@ -234,18 +154,10 @@ class TestFetchTasksNarrowing:
     the MCP boundary — not what the dashboard discards afterwards. These
     tests therefore assert on ``mcp_tool_call``'s recorded call args.
 
-    The unnarrowed shape is pinned byte-identical because four callers
-    (``app._load_task_cards``, ``data/orchestrator.py``,
-    ``data/merge_queue.py``, ``data/burndown.py``) still need the full tree
-    and must be unaffected by this change.
+    The unnarrowed shape is pinned byte-identical because the full-tree
+    caller (``app._fanout_probe_completion``, the /healthz probe) must be
+    unaffected by narrowing.
     """
-
-    @pytest.fixture(autouse=True)
-    def reset_fetch_tasks_cache(self):
-        import dashboard.data.tasks as tasks_mod
-        tasks_mod._fetch_tasks_cache_clear()
-        yield
-        tasks_mod._fetch_tasks_cache_clear()
 
     @staticmethod
     def _args_of(mock_mcp, index=0):
@@ -257,7 +169,7 @@ class TestFetchTasksNarrowing:
     ):
         """(a) No narrowing → the arguments dict is EXACTLY {'project_root': ...}.
 
-        Backward-compatibility guard for the four full-tree callers: no
+        Backward-compatibility guard for the full-tree caller: no
         ``statuses``, no ``page_size``, no ``offset`` key may appear.
         """
         from dashboard.data.tasks import fetch_tasks
@@ -269,7 +181,7 @@ class TestFetchTasksNarrowing:
         assert mock_mcp.call_count == 1
         assert self._args_of(mock_mcp) == {'project_root': '/proj/A'}, (
             'the unnarrowed arguments dict must stay byte-identical for the '
-            'four full-tree callers'
+            'full-tree caller'
         )
 
     async def test_statuses_forwarded_in_canonical_order(
@@ -277,11 +189,9 @@ class TestFetchTasksNarrowing:
     ):
         """(b) ``statuses`` crosses the wire ``sorted()`` — canonical, not verbatim.
 
-        AMENDS the former `test_statuses_forwarded_verbatim`, which asserted
-        the list was "not re-sorted". Statuses are now held as a
-        `frozenset[str]` so that `['a','b']` and `['b','a']` hit ONE cache
-        entry, and a frozenset has no iteration order — something must
-        canonicalise the wire list. `sorted()` is the only sane choice:
+        Statuses are held as a `frozenset[str]` because `['a','b']` and
+        `['b','a']` are one read, and a frozenset has no iteration order —
+        something must canonicalise the wire list. `sorted()` is the only sane choice:
         arbitrary frozenset order would make the wire bytes nondeterministic
         across runs and this very assertion FLAKY.
 
@@ -426,218 +336,3 @@ class TestFetchTasksNarrowing:
             f'strictly tighter than mcp_tool_call default={mcp_default}'
         )
         assert tasks_mod.DEFAULT_PER_CALL_TIMEOUT > 0
-
-
-    # -----------------------------------------------------------------
-    # Cache-key discrimination (task 3857 step-3)
-    #
-    # fetch_tasks has five callers and only ONE of them narrows. Keying the
-    # TTL cache on the bare project_root would let active_tasks' narrowed
-    # entry be served to app._load_task_cards / merge_queue.load_task_titles
-    # / burndown.collect_snapshot / data.orchestrator, silently truncating
-    # them for up to the 20 s TTL — non-deterministically, depending on
-    # which caller raced in first.
-    #
-    # Each test below uses distinct per-narrowing payloads so a cross-served
-    # entry is detectable by CONTENT, not merely by call count.
-    # -----------------------------------------------------------------
-
-    @staticmethod
-    def _payload(task_id: int, title: str, status: str = 'pending') -> dict:
-        return {'tasks': [{
-            'id': str(task_id), 'title': title, 'status': status,
-            'dependencies': [], 'metadata': {},
-        }]}
-
-    async def test_differing_statuses_key_separately(
-        self, dummy_client, dummy_config
-    ):
-        """(a) Same root, different ``statuses``, within TTL → two MCP calls."""
-        from dashboard.data.tasks import fetch_tasks
-
-        active_payload = self._payload(1, 'ACTIVE ROW', 'in-progress')
-        terminal_payload = self._payload(2, 'TERMINAL ROW', 'done')
-
-        async def _by_statuses(client, url, tool, args, **_kw):
-            if args.get('statuses') == ['in-progress']:
-                return active_payload
-            if args.get('statuses') == ['done']:
-                return terminal_payload
-            raise AssertionError(f'unexpected statuses: {args.get("statuses")!r}')
-
-        mock_mcp = AsyncMock(side_effect=_by_statuses)
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            active = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/K', statuses=['in-progress'],
-            )
-            terminal = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/K', statuses=['done'],
-            )
-
-        assert mock_mcp.call_count == 2, (
-            f'differing statuses must key separately, got {mock_mcp.call_count} call(s)'
-        )
-        assert [t['title'] for t in active] == ['ACTIVE ROW']
-        assert [t['title'] for t in terminal] == ['TERMINAL ROW'], (
-            'the second narrowing was served the first narrowing’s rows'
-        )
-
-    async def test_narrowed_entry_never_served_to_the_full_tree_caller(
-        self, dummy_client, dummy_config
-    ):
-        """(b) A narrowed call must not poison the unnarrowed callers' entry.
-
-        This is the concrete production bug: ``active_tasks`` narrows while
-        ``app._load_task_cards`` / ``merge_queue.load_task_titles`` /
-        ``burndown.collect_snapshot`` do not.
-        """
-        from dashboard.data.tasks import fetch_tasks
-
-        narrowed_payload = self._payload(1, 'NARROWED ONLY', 'in-progress')
-        full_payload = {'tasks': [
-            {'id': '1', 'title': 'NARROWED ONLY', 'status': 'in-progress',
-             'dependencies': [], 'metadata': {}},
-            {'id': '2', 'title': 'FULL TREE EXTRA', 'status': 'done',
-             'dependencies': [], 'metadata': {}},
-        ]}
-
-        async def _by_narrowing(client, url, tool, args, **_kw):
-            return narrowed_payload if 'statuses' in args else full_payload
-
-        mock_mcp = AsyncMock(side_effect=_by_narrowing)
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            await fetch_tasks(
-                dummy_client, dummy_config, '/proj/L', statuses=['in-progress'],
-            )
-            full = await fetch_tasks(dummy_client, dummy_config, '/proj/L')
-
-        assert mock_mcp.call_count == 2, (
-            'the unnarrowed caller must issue its own MCP call, not ride the '
-            f'narrowed entry (got {mock_mcp.call_count} call(s))'
-        )
-        assert [t['title'] for t in full] == ['NARROWED ONLY', 'FULL TREE EXTRA'], (
-            'the full-tree caller was served a status-filtered subset'
-        )
-
-    async def test_unnarrowed_entry_never_served_to_the_narrowed_caller(
-        self, dummy_client, dummy_config
-    ):
-        """(b, reversed) Order must not matter — the full entry is not a narrowed one."""
-        from dashboard.data.tasks import fetch_tasks
-
-        async def _by_narrowing(client, url, tool, args, **_kw):
-            if 'statuses' in args:
-                return self._payload(1, 'NARROWED ONLY', 'in-progress')
-            return {'tasks': [
-                {'id': '1', 'title': 'NARROWED ONLY', 'status': 'in-progress',
-                 'dependencies': [], 'metadata': {}},
-                {'id': '2', 'title': 'FULL TREE EXTRA', 'status': 'done',
-                 'dependencies': [], 'metadata': {}},
-            ]}
-
-        mock_mcp = AsyncMock(side_effect=_by_narrowing)
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            await fetch_tasks(dummy_client, dummy_config, '/proj/M')
-            narrowed = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/M', statuses=['in-progress'],
-            )
-
-        assert mock_mcp.call_count == 2
-        assert [t['title'] for t in narrowed] == ['NARROWED ONLY']
-
-    async def test_none_statuses_keys_distinctly_from_empty_list(
-        self, dummy_client, dummy_config
-    ):
-        """``statuses=None`` and ``statuses=[]`` are opposite requests, not one key."""
-        from dashboard.data.tasks import fetch_tasks
-
-        async def _by_narrowing(client, url, tool, args, **_kw):
-            if args.get('statuses') == []:
-                return {'tasks': []}
-            return self._payload(1, 'FULL TREE', 'pending')
-
-        mock_mcp = AsyncMock(side_effect=_by_narrowing)
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            full = await fetch_tasks(dummy_client, dummy_config, '/proj/N')
-            empty = await fetch_tasks(dummy_client, dummy_config, '/proj/N', statuses=[])
-
-        assert mock_mcp.call_count == 2
-        assert [t['title'] for t in full] == ['FULL TREE']
-        assert empty == []
-
-    async def test_differing_page_size_and_offset_key_separately(
-        self, dummy_client, dummy_config
-    ):
-        """(c) The window position is part of the identity of a result."""
-        from dashboard.data.tasks import fetch_task_page
-
-        async def _by_window(client, url, tool, args, **_kw):
-            return self._payload(
-                args.get('offset', 0) or 1,
-                f'window p={args.get("page_size")} o={args.get("offset")}',
-            )
-
-        mock_mcp = AsyncMock(side_effect=_by_window)
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            first = await fetch_task_page(
-                dummy_client, dummy_config, '/proj/O', page_size=10, offset=0,
-            )
-            second = await fetch_task_page(
-                dummy_client, dummy_config, '/proj/O', page_size=10, offset=10,
-            )
-            third = await fetch_task_page(
-                dummy_client, dummy_config, '/proj/O', page_size=20, offset=10,
-            )
-
-        assert mock_mcp.call_count == 3, (
-            f'page_size/offset must key separately, got {mock_mcp.call_count} call(s)'
-        )
-        assert first[0]['title'] == 'window p=10 o=0'
-        assert second[0]['title'] == 'window p=10 o=10'
-        assert third[0]['title'] == 'window p=20 o=10'
-
-    async def test_identical_narrowing_still_single_flights(
-        self, dummy_client, dummy_config
-    ):
-        """(d) Regression guard — the existing single-flight contract is unchanged."""
-        from dashboard.data.tasks import fetch_task_page
-
-        mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            first = await fetch_task_page(
-                dummy_client, dummy_config, '/proj/P',
-                statuses=['pending'], page_size=50, offset=5,
-            )
-            second = await fetch_task_page(
-                dummy_client, dummy_config, '/proj/P',
-                statuses=['pending'], page_size=50, offset=5,
-            )
-
-        assert mock_mcp.call_count == 1, (
-            f'identical narrowing within TTL must reuse the entry, got '
-            f'{mock_mcp.call_count} call(s)'
-        )
-        assert first == second
-        assert isinstance(first, list)
-
-    async def test_narrowed_keys_stay_per_project_root(
-        self, dummy_client, dummy_config
-    ):
-        """The same narrowing on two roots must not collapse onto one entry."""
-        from dashboard.data.tasks import fetch_tasks
-
-        async def _by_root(client, url, tool, args, **_kw):
-            return self._payload(1, f'row for {args["project_root"]}')
-
-        mock_mcp = AsyncMock(side_effect=_by_root)
-        with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
-            a = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/Q', statuses=['pending'],
-            )
-            b = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/R', statuses=['pending'],
-            )
-
-        assert mock_mcp.call_count == 2
-        assert a[0]['title'] == 'row for /proj/Q'
-        assert b[0]['title'] == 'row for /proj/R'

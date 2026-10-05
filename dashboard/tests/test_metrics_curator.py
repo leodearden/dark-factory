@@ -2227,7 +2227,7 @@ class TestFanOutListTicketsStreakIsolation:
     """Per-root throttle-key isolation and single-prefix rendering for list_tickets.
 
     Grouped into a class purely to carry ``_clean_state``, mirroring
-    test_tasks_cached_fanout.py's ``TestFanoutStreakIsolationAcrossProjectRoots``.
+    test_tasks_fanout.py's ``TestFanoutStreakIsolationAcrossProjectRoots``.
     """
 
     @pytest.fixture(autouse=True)
