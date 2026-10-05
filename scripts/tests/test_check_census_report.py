@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -527,3 +528,39 @@ def test_run_id_off_pattern_is_malformed(tmp_path, capsys, run_id):
 
     assert_nonconforming(rc, verdict)
     assert "method.run_id" in verdict["malformed"]
+
+
+ELISION_RE = re.compile(r"^\.\.\.\+(\d+) more$")
+NOTE_CAP = 400
+
+
+def test_trailing_verdict_fits_the_note_cap(tmp_path, capsys):
+    dropped = ("proposal", "supersedes", "statement")
+    findings = [finding_lacking(*dropped, key=f"fk-{index:012x}") for index in range(30)]
+    write_report(tmp_path / "plans", STEM, findings=findings, sections=["Method"])
+    expected = [f"## {title}" for title in SECTIONS if title != "Method"]
+    expected += [f"findings[{index}].{field}" for index in range(30) for field in dropped]
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert rc == 1
+    assert len(lines[-1]) <= NOTE_CAP
+    assert verdict["verdict"] == "nonconforming"
+    assert verdict["report"] == f"plans/{STEM}.md"
+    *kept, marker = verdict["missing"]
+    elided = ELISION_RE.match(marker)
+    assert elided is not None
+    assert kept == expected[: len(kept)]
+    assert len(kept) + int(elided.group(1)) == len(expected)
+    for name in expected:
+        assert any(f"missing {name}" in line for line in lines[1:-1]), name
+
+
+def test_complete_report_verdict_is_compact(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM)
+
+    rc, lines, _ = run(tmp_path, capsys)
+
+    assert rc == 0
+    assert ", " not in lines[-1]
+    assert ": " not in lines[-1]
