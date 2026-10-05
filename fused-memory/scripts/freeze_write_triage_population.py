@@ -112,7 +112,7 @@ def is_recon_marker(metadata: Mapping[str, Any]) -> bool:
     )
 
 
-def _parse_created_at(value: object) -> datetime | None:
+def parse_created_at(value: object) -> datetime | None:
     """*value* as an aware instant, or ``None`` when it is naive, absent or unparseable."""
     if not isinstance(value, str):
         return None
@@ -161,7 +161,7 @@ async def enumerate_population(
         for category in POPULATION_CATEGORIES:
             records = memory_service.mem0.scroll_all_by_metadata(scope, {'category': category})
             async for record in records:
-                instant = _parse_created_at(record.get('created_at'))
+                instant = parse_created_at(record.get('created_at'))
                 if instant is None:
                     excluded['undated'] += 1
                     continue
@@ -360,7 +360,7 @@ def load_snapshot(path: Path) -> tuple[dict[str, Any], str]:
 # --- CLI ---------------------------------------------------------------------
 
 def _aware_datetime(text: str) -> datetime:
-    parsed = _parse_created_at(text)
+    parsed = parse_created_at(text)
     if parsed is None:
         raise argparse.ArgumentTypeError(f'{text!r} is not an ISO timestamp with an offset')
     return parsed

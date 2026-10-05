@@ -20,21 +20,29 @@ calls within an arm run concurrently.
       --max-writes N --budget-usd 40
 
 Rows land in ``arms/<arm>.jsonl`` beside the snapshot. A long run belongs
-detached (``setsid … > log 2>&1``), polled by reading the log.
+detached (``setsid … > log 2>&1``), polled by reading the log. ``publish``
+then refuses anything partial and writes the two committed artifacts:
+
+  uv run python scripts/run_write_triage_population_arms.py publish \\
+      --snapshot <snapshot.json> \\
+      --fixture-report shipped=<dir>/fixture-shipped.json \\
+      --fixture-report pre-psi=<dir>/fixture-pre-psi.json
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import sys
 import time
 import types
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,7 +51,13 @@ import openai
 
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server.write_triage import OUTCOME_JUDGE, OUTCOME_STORED, JudgeUsage
+from fused_memory.server.write_triage import (
+    OUTCOME_CONTESTED,
+    OUTCOME_JUDGE,
+    OUTCOME_STORED,
+    TRIAGE_OUTCOMES,
+    JudgeUsage,
+)
 
 # `_call_llm` is the one PRIVATE reach: an arm needs the raw text, the usage of
 # an unparseable answer, and parse failures kept apart from transport failures,
@@ -60,6 +74,7 @@ from fused_memory.server.write_triage_judge import (
 )
 
 _SCRIPTS = Path(__file__).resolve().parent
+_PACKAGE_ROOT = _SCRIPTS.parent
 
 
 def _load_script(path: Path, mod_name: str) -> types.ModuleType:
@@ -85,6 +100,7 @@ _freeze = _load_script(
 )
 _wording = _load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
 _scorer = _load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
+_calibrate = _load_script(_SCRIPTS / 'calibrate_write_triage.py', 'calibrate_write_triage')
 
 logger = logging.getLogger(__name__)
 
@@ -155,8 +171,11 @@ def _usd(model: str, usage: Mapping[str, Any] | None) -> float | None:
     return price.usd(usage['prompt_tokens'], usage['completion_tokens'])
 
 
-def _identity(write: Mapping[str, Any], arm: Arm, snapshot_sha256: str) -> dict[str, Any]:
-    """What a row says about the arm and the write, before any answer."""
+def _identity(
+    write: Mapping[str, Any], arm: Arm, snapshot_sha256: str, *,
+    field_chars: int, timeout_seconds: float,
+) -> dict[str, Any]:
+    """What a row says about the arm, the call settings and the write, before any answer."""
     return {
         'arm': arm.name,
         'judge_model': arm.model,
@@ -164,6 +183,8 @@ def _identity(write: Mapping[str, Any], arm: Arm, snapshot_sha256: str) -> dict[
         'width': arm.width,
         'wording': arm.wording,
         'snapshot_sha256': snapshot_sha256,
+        'field_chars': field_chars,
+        'timeout_seconds': timeout_seconds,
         'memory_id': write['memory_id'],
         'project_id': write['project_id'],
         'category': write['category'],
@@ -241,15 +262,17 @@ async def judge_for_arm(
         [_as_memory_result(c) for c in write['candidates']], arm.width,
         canonical_id=write['band_winner_id'],
     )
-    prompt = build_judge_prompt(
-        write['content'], selected, field_chars=resolve_judge_field_chars(service),
+    field_chars = resolve_judge_field_chars(service)
+    timeout_seconds = resolve_judge_timeout(service)
+    prompt = build_judge_prompt(write['content'], selected, field_chars=field_chars)
+    identity = _identity(
+        write, arm, snapshot_sha256, field_chars=field_chars, timeout_seconds=timeout_seconds,
     )
-    identity = _identity(write, arm, snapshot_sha256)
     started = clock()
     try:
         reply = await _call_llm(
             provider=provider, model=arm.model, prompt=prompt, memory_service=service,
-            timeout=resolve_judge_timeout(service), reasoning_effort=arm.reasoning_effort,
+            timeout=timeout_seconds, reasoning_effort=arm.reasoning_effort,
         )
     except JudgeOutputError as exc:
         seconds = clock() - started
@@ -480,6 +503,326 @@ async def run_arms(
     return {'arms': coverage, 'budget_exhausted': budget.refused, 'spent_usd': budget.spent}
 
 
+# --- publish -------------------------------------------------------------------
+
+_RUN_SET_ORDER = 'sha256(snapshot_sha256:memory_id)'
+_PAIR_ORDER = 'sha256(snapshot_sha256:entry_id:target_id)'
+#: The rater brief's per-text cap and truncation marker.
+_PAIR_TEXT_CHARS = 4_000
+_ATTACH_OUTCOMES = TRIAGE_OUTCOMES - {OUTCOME_STORED}
+#: Provenance two fixture reports must share for their wordings to be compared.
+_MATCHED_FIXTURE_PROVENANCE = ('field_chars', 'slate_mode', 'project_id', 'judge_model')
+
+DEFAULT_POPULATION_OUT = _PACKAGE_ROOT / 'calibration' / 'write_triage_population.json'
+DEFAULT_PAIRS_OUT = _PACKAGE_ROOT / 'calibration' / 'write_triage_pairs_to_rate.jsonl'
+DEFAULT_ALREADY_RATED = _PACKAGE_ROOT / 'tests' / 'fixtures' / 'write_triage_pair_verdicts_seed.jsonl'
+
+
+def _sha256(data: bytes | str) -> str:
+    return hashlib.sha256(data.encode('utf-8') if isinstance(data, str) else data).hexdigest()
+
+
+def repo_relative(path: Path) -> str:
+    """*path* relative to the checkout that holds it (the first parent with ``.git``)."""
+    resolved = Path(path).resolve()
+    for parent in resolved.parents:
+        if (parent / '.git').exists():
+            return resolved.relative_to(parent).as_posix()
+    raise ValueError(f'{path} is not inside a git checkout')
+
+
+def _count(rows: Iterable[Mapping[str, Any]], key: str) -> dict[str, int]:
+    return dict(sorted(collections.Counter(row[key] for row in rows).items()))
+
+
+def _validated_run_set(
+    snapshot: Mapping[str, Any], snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> list[dict[str, Any]]:
+    """The run set every arm covers, refusing anything that would read as partial."""
+    for arm in ARMS:
+        if not arm_rows_by_name.get(arm.name):
+            raise ValueError(f'arm {arm.name} has no rows to publish')
+    for arm in ARMS:
+        rows = arm_rows_by_name[arm.name]
+        foreign = sorted({str(row.get('snapshot_sha256')) for row in rows} - {snapshot_sha256})
+        if foreign:
+            raise ValueError(f'arm {arm.name} holds rows from another snapshot: {foreign}')
+        if len({row['memory_id'] for row in rows}) != len(rows):
+            raise ValueError(f'arm {arm.name} judged a write more than once')
+    prefix = judge_band_order(snapshot, snapshot_sha256)[:len(arm_rows_by_name[ARMS[0].name])]
+    expected = {write['memory_id'] for write in prefix}
+    for arm in ARMS:
+        if {row['memory_id'] for row in arm_rows_by_name[arm.name]} != expected:
+            raise ValueError(
+                f'arm {arm.name} does not cover the common prefix of the judge-band '
+                f'order, its first {len(prefix)} writes',
+            )
+    return prefix
+
+
+def _has_later_candidate(write: Mapping[str, Any]) -> bool:
+    written = _freeze.parse_created_at(write['created_at'])
+    instants = (_freeze.parse_created_at(c.get('created_at')) for c in write['candidates'])
+    return written is not None and any(i is not None and i > written for i in instants)
+
+
+def _population_block(
+    snapshot: Mapping[str, Any], snapshot_sha256: str, snapshot_path: Path,
+    run_set: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    writes = snapshot['writes']
+    frozen = sum(1 for write in writes if write['band'] == OUTCOME_JUDGE)
+    return {
+        'n_writes': len(writes),
+        'n_judge_band': len(run_set),
+        'n_judge_band_frozen': frozen,
+        'judge_band_sample': None if len(run_set) == frozen else {
+            'order': _RUN_SET_ORDER, 'size': len(run_set), 'of': frozen,
+        },
+        'projects': list(snapshot['projects']),
+        'frozen_at': snapshot['frozen_at'],
+        'snapshot_sha256': snapshot_sha256,
+        'snapshot_path': repo_relative(snapshot_path),
+        'by_category': _count(writes, 'category'),
+        'by_project': _count(writes, 'project_id'),
+        'by_band': _count(writes, 'band'),
+        'recon_marker_writes': sum(1 for write in writes if write['recon_marker']),
+        'recon_marker_run_set': sum(1 for write in run_set if write['recon_marker']),
+        'declares_attach_keys_writes': sum(1 for w in writes if w['declares_attach_keys']),
+        'excluded': dict(snapshot['excluded']),
+        'judge_band_with_later_candidates': sum(1 for w in run_set if _has_later_candidate(w)),
+    }
+
+
+def _one_value(arm: Arm, rows: Sequence[Mapping[str, Any]], key: str) -> Any:
+    values = {row.get(key) for row in rows}
+    if len(values) != 1:
+        raise ValueError(f'arm {arm.name} rows disagree on {key}: {sorted(map(str, values))}')
+    return values.pop()
+
+
+def _arm_row(arm: Arm, rows: Sequence[Mapping[str, Any]], cases_path: Path) -> dict[str, Any]:
+    seconds = _calibrate.summarize_distribution(
+        [row['judge_seconds'] for row in rows if row['judge_seconds'] is not None],
+    )
+    failures = collections.Counter(name for row in rows for name in row['transport_failures'])
+    priced = [row['usd'] for row in rows if row['usd'] is not None]
+    return {
+        'arm': arm.name,
+        'model': arm.model,
+        'provider': _ARM_PROVIDER,
+        'reasoning_effort': arm.reasoning_effort,
+        'width': arm.width,
+        'wording': arm.wording,
+        'system_prompt_sha256': _sha256(_wording.system_prompt(arm.wording)),
+        'field_chars': _one_value(arm, rows, 'field_chars'),
+        'timeout_seconds': _one_value(arm, rows, 'timeout_seconds'),
+        'calls': len(rows),
+        'parse_failures': sum(1 for row in rows if row['parse_failure']),
+        'transport_failures': sum(failures.values()),
+        'transport_failures_by_type': dict(sorted(failures.items())),
+        'usd': round(math.fsum(priced), 6),
+        'unpriced_calls': len(rows) - len(priced),
+        'p50_seconds': seconds['median'],
+        'p95_seconds': seconds['p95'],
+        'outcomes': _count(rows, 'outcome'),
+        'cases_path': repo_relative(cases_path),
+        'cases_sha256': _sha256(cases_path.read_bytes()),
+    }
+
+
+def _spend_block(arm_rows: Sequence[Mapping[str, Any]], budget_usd: float) -> dict[str, Any]:
+    return {
+        'usd_total': round(math.fsum(row['usd'] for row in arm_rows), 6),
+        'budget_usd': budget_usd,
+        'list_prices_as_of': _scorer.LIST_PRICES_AS_OF,
+        'list_prices_source': _scorer.LIST_PRICES_SOURCE,
+    }
+
+
+def _wording_side(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    attaches = sum(1 for row in rows if row['outcome'] in _ATTACH_OUTCOMES)
+    contested = sum(1 for row in rows if row['outcome'] == OUTCOME_CONTESTED)
+    return {
+        'outcomes': _count(rows, 'outcome'),
+        'attaches': attaches,
+        'contested': contested,
+        'contested_share_of_attaches': contested / attaches if attaches else None,
+    }
+
+
+def _wording_population(
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    """Each non-shipped arm against its shipped twin on the same writes, keyed by width.
+
+    Label-free: contested shares and the paired discordance, with ι's exact
+    McNemar p on the discordant counts.
+    """
+    readout: dict[str, Any] = {}
+    for arm in ARMS:
+        if arm.wording == _SHIPPED:
+            continue
+        twin = Arm(arm.model, arm.reasoning_effort, arm.width, _SHIPPED)
+        shipped, other = arm_rows_by_name[twin.name], arm_rows_by_name[arm.name]
+        contested_shipped = {r['memory_id'] for r in shipped if r['outcome'] == OUTCOME_CONTESTED}
+        contested_other = {r['memory_id'] for r in other if r['outcome'] == OUTCOME_CONTESTED}
+        only_shipped = len(contested_shipped - contested_other)
+        only_other = len(contested_other - contested_shipped)
+        readout[str(arm.width)] = {
+            'shipped_arm': twin.name,
+            'other_arm': arm.name,
+            _SHIPPED: _wording_side(shipped),
+            arm.wording: _wording_side(other),
+            'contested_only_shipped': only_shipped,
+            f'contested_only_{arm.wording.replace("-", "_")}': only_other,
+            # ι is the one home of the flip-gate statistics; its test is reused, not re-spelled.
+            'mcnemar_p': _scorer._mcnemar_exact(only_shipped, only_other),
+        }
+    return readout
+
+
+def _fixture_side(report: Mapping[str, Any]) -> dict[str, Any]:
+    provenance = report['provenance']
+    duplicates = report['per_class']['duplicate']
+    duplicates_contested = report['confusion']['duplicate']['contested']
+    middle_band = report['production_shape']['middle_band']
+    return {
+        'duplicates_n': duplicates['n'],
+        'duplicates_contested': duplicates_contested,
+        'duplicates_contested_rate': (
+            round(duplicates_contested / duplicates['n'], 4) if duplicates['n'] else None
+        ),
+        'false_contested': report['false_contested'],
+        'middle_band': {key: middle_band[key] for key in ('n', 'correct', 'accuracy')},
+        'pseudo_contradiction_n': report['per_class']['pseudo_contradiction']['n'],
+        'pseudo_contradiction_contested': (
+            report['confusion']['pseudo_contradiction']['contested']
+        ),
+        'field_chars': provenance['field_chars'],
+        'judge_model': provenance['judge_model'],
+        'judge_system_prompt_sha256': provenance['judge_system_prompt_sha256'],
+    }
+
+
+def _wording_fixture(
+    fixture_reports: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """Per wording, the fixture eval's readout, refused unless the two runs are matched."""
+    if fixture_reports is None:
+        return None
+    if set(fixture_reports) != set(_wording.WORDINGS):
+        raise ValueError(
+            f'fixture reports are needed for exactly {list(_wording.WORDINGS)}, '
+            f'got {sorted(fixture_reports)}',
+        )
+    for field in _MATCHED_FIXTURE_PROVENANCE:
+        values = {w: r['provenance'].get(field) for w, r in fixture_reports.items()}
+        if len({json.dumps(v) for v in values.values()}) != 1:
+            raise ValueError(f'the fixture reports are not matched on {field}: {values}')
+    for wording, report in fixture_reports.items():
+        measured = report['provenance'].get('judge_system_prompt_sha256')
+        expected = _sha256(_wording.system_prompt(wording))
+        if measured != expected:
+            raise ValueError(
+                f'the {wording} fixture report measured prompt {measured}, '
+                f'not the {wording} wording {expected}',
+            )
+    return {wording: _fixture_side(fixture_reports[wording]) for wording in _wording.WORDINGS}
+
+
+def build_population_artifact(
+    snapshot: Mapping[str, Any],
+    snapshot_sha256: str,
+    snapshot_path: Path,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    budget_usd: float,
+    fixture_reports: Mapping[str, Mapping[str, Any]] | None = None,
+    pairs_to_rate: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The committed population artifact; refuses (``ValueError``) any partial arm.
+
+    Every arm of :data:`ARMS` must cover the same prefix of
+    :func:`judge_band_order` with rows of this snapshot, once each. Arm files
+    are read from ``arms/`` beside *snapshot_path* for their path and digest.
+    """
+    run_set = _validated_run_set(snapshot, snapshot_sha256, arm_rows_by_name)
+    arms_dir = Path(snapshot_path).parent / 'arms'
+    arms = [
+        _arm_row(arm, arm_rows_by_name[arm.name], arm_path(arms_dir, arm.name)) for arm in ARMS
+    ]
+    return {
+        'population': _population_block(snapshot, snapshot_sha256, snapshot_path, run_set),
+        'arms': arms,
+        'spend': _spend_block(arms, budget_usd),
+        'pairs_to_rate': None if pairs_to_rate is None else dict(pairs_to_rate),
+        'wording_attribution': {
+            'population': _wording_population(arm_rows_by_name),
+            'fixture': _wording_fixture(fixture_reports),
+        },
+    }
+
+
+def _capped(text: str | None) -> str | None:
+    if text is None or len(text) <= _PAIR_TEXT_CHARS:
+        return text
+    return f'{text[:_PAIR_TEXT_CHARS]}…[truncated, {len(text)} chars total]'
+
+
+def _target_text(snapshot: Mapping[str, Any], write: Mapping[str, Any], target_id: str) -> str | None:
+    on_slate = [c for c in write['candidates'] if c['memory_id'] == target_id]
+    if on_slate:
+        return on_slate[0]['content']
+    return (snapshot['targets'].get(target_id) or {}).get('content')
+
+
+def build_pairs_to_rate(
+    snapshot: Mapping[str, Any],
+    snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    already_rated: Collection[tuple[str, str]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The blind rater rows, one per distinct judged (write, target) pair, and their stats.
+
+    Rows carry texts only: no arm, outcome, band or score. Pairs already in
+    *already_rated* are left out and counted; a target whose text is gone is
+    kept as ``null`` and counted.
+    """
+    writes = {write['memory_id']: write for write in snapshot['writes']}
+    judged = {
+        (row['memory_id'], row['judged_candidate_id'])
+        for rows in arm_rows_by_name.values() for row in rows
+        if row['band'] == OUTCOME_JUDGE and row['judged_candidate_id'] is not None
+    }
+    rated = judged & set(already_rated)
+    pairs = sorted(
+        judged - rated, key=lambda pair: _sha256(f'{snapshot_sha256}:{pair[0]}:{pair[1]}'),
+    )
+    rows = [{
+        'entry_id': entry_id,
+        'target_id': target_id,
+        'entry_text': _capped(writes[entry_id]['content']),
+        'target_text': _capped(_target_text(snapshot, writes[entry_id], target_id)),
+    } for entry_id, target_id in pairs]
+    return rows, {
+        'n_pairs': len(rows),
+        'excluded_already_rated': len(rated),
+        'missing_target_text': sum(1 for row in rows if row['target_text'] is None),
+        'order': _PAIR_ORDER,
+    }
+
+
+def load_rated_pairs(paths: Iterable[Path]) -> set[tuple[str, str]]:
+    """Every (entry_id, target_id) a verdict file already holds."""
+    return {
+        (row['entry_id'], row['target_id'])
+        for path in paths for row in read_rows(Path(path))
+    }
+
+
 # --- CLI -----------------------------------------------------------------------
 
 def _command_run(args: argparse.Namespace) -> int:
@@ -507,6 +850,49 @@ def _command_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fixture_reports(values: Sequence[str]) -> dict[str, dict[str, Any]] | None:
+    if not values:
+        return None
+    reports: dict[str, dict[str, Any]] = {}
+    for value in values:
+        wording, _, path = value.partition('=')
+        if wording not in _wording.WORDINGS or not path:
+            raise ValueError(f'--fixture-report takes WORDING=PATH with WORDING in '
+                             f'{list(_wording.WORDINGS)}, got {value!r}')
+        reports[wording] = json.loads(Path(path).read_text(encoding='utf-8'))
+    return reports
+
+
+def _command_publish(args: argparse.Namespace) -> int:
+    snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
+    arms_dir = Path(args.snapshot).parent / 'arms'
+    arm_rows = {arm.name: read_rows(arm_path(arms_dir, arm.name)) for arm in ARMS}
+    pairs, stats = build_pairs_to_rate(
+        snapshot, snapshot_sha256, arm_rows,
+        already_rated=load_rated_pairs(args.already_rated),
+    )
+    pairs_body = ''.join(json.dumps(p, sort_keys=True, ensure_ascii=False) + '\n' for p in pairs)
+    artifact = build_population_artifact(
+        snapshot, snapshot_sha256, args.snapshot, arm_rows,
+        budget_usd=args.budget_usd,
+        fixture_reports=_fixture_reports(args.fixture_report),
+        pairs_to_rate={
+            **stats, 'path': repo_relative(args.pairs_out), 'sha256': _sha256(pairs_body),
+        },
+    )
+    Path(args.pairs_out).write_text(pairs_body, encoding='utf-8')
+    Path(args.population_out).write_text(
+        json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=False) + '\n',
+        encoding='utf-8',
+    )
+    print(json.dumps({
+        'population_out': str(args.population_out), 'pairs_out': str(args.pairs_out),
+        'n_judge_band': artifact['population']['n_judge_band'],
+        'n_pairs': stats['n_pairs'], 'usd_total': artifact['spend']['usd_total'],
+    }, indent=2))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     parser = argparse.ArgumentParser(
@@ -527,6 +913,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument('--arms', nargs='+', choices=[arm.name for arm in ARMS], default=None,
                      help='arms to run, in ARMS order whatever the order given (default: all)')
     run.set_defaults(handler=_command_run)
+    publish = commands.add_parser(
+        'publish', help='refuse anything partial, then write the committed artifacts',
+    )
+    publish.add_argument('--snapshot', type=Path, required=True,
+                         help="the frozen snapshot.json whose arms/ to publish")
+    publish.add_argument('--population-out', dest='population_out', type=Path,
+                         default=DEFAULT_POPULATION_OUT)
+    publish.add_argument('--pairs-out', dest='pairs_out', type=Path, default=DEFAULT_PAIRS_OUT)
+    publish.add_argument('--already-rated', dest='already_rated', type=Path, nargs='+',
+                         default=[DEFAULT_ALREADY_RATED],
+                         help='verdict files whose pairs are left out of the rater file')
+    publish.add_argument('--fixture-report', dest='fixture_report', action='append',
+                         default=[], metavar='WORDING=PATH',
+                         help='a fixture eval report per wording; both or neither')
+    publish.add_argument('--budget-usd', dest='budget_usd', type=float, default=40.0)
+    publish.set_defaults(handler=_command_publish)
     args = parser.parse_args(argv)
     if getattr(args, 'config', None):
         os.environ['CONFIG_PATH'] = str(args.config)
