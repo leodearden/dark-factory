@@ -80,7 +80,8 @@ POPULATION_SINCE = datetime(2026, 9, 29, tzinfo=UTC)
 POPULATION_PROJECTS = ('dark_factory', 'reify')
 POPULATION_CATEGORIES = tuple(sorted(category.value for category in MEM0_PRIMARY))
 
-SNAPSHOT_SCHEMA_VERSION = 1
+#: 2 split schema 1's mixed ``excluded`` block by unit (see :func:`exclusions`).
+SNAPSHOT_SCHEMA_VERSION = 2
 SNAPSHOT_DIR_PREFIX = 'write-triage-population-'
 SNAPSHOT_NAME = 'snapshot.json'
 SNAPSHOT_DIGEST_NAME = 'snapshot.sha256'
@@ -262,11 +263,13 @@ async def freeze_population(
     One shipped retrieval per write (own id dropped), the write's own children
     dropped, then the shipped banding with nothing comparable trimmed below
     *k*. Refuses (``ValueError``) if any retrieval is degraded. Returns
-    ``writes``, the off-slate hoisted ``targets`` and the ``excluded`` counts.
+    ``writes``, the off-slate hoisted ``targets`` and ``slate_rows_dropped``,
+    the slate rows (not writes) left out: each write's ``self`` row and its
+    ``own_children``.
     """
     frozen: list[dict[str, Any]] = []
     targets: dict[str, dict[str, Any]] = {}
-    excluded = {'own_children_dropped': 0, 'self_retrieved': 0}
+    slate_rows_dropped = {'self': 0, 'own_children': 0}
     for project_id, project_writes in _by_project(writes).items():
         records = [
             {'memory_id': w['memory_id'], 'content': w['content'], 'cluster_id': w['memory_id']}
@@ -287,11 +290,11 @@ async def freeze_population(
             )
             for write, slate in zip(project_writes, slates, strict=True)
         ]
-        excluded['own_children_dropped'] += sum(w['own_children_dropped'] for w in project_frozen)
-        excluded['self_retrieved'] += sum(1 for w in project_frozen if w['self_retrieved'])
+        slate_rows_dropped['own_children'] += sum(w['own_children_dropped'] for w in project_frozen)
+        slate_rows_dropped['self'] += sum(1 for w in project_frozen if w['self_retrieved'])
         targets |= await _off_slate_targets(memory_service, project_id, project_frozen)
         frozen.extend(project_frozen)
-    return {'writes': frozen, 'targets': targets, 'excluded': excluded}
+    return {'writes': frozen, 'targets': targets, 'slate_rows_dropped': slate_rows_dropped}
 
 
 async def freeze_snapshot(
@@ -305,7 +308,7 @@ async def freeze_snapshot(
     t_low: float | None,
 ) -> dict[str, Any]:
     """The whole snapshot: the enumerated population, frozen, with how it was made."""
-    writes, enumeration_excluded = await enumerate_population(
+    writes, excluded_writes = await enumerate_population(
         memory_service, projects=projects, since=since, frozen_at=frozen_at,
     )
     frozen = await freeze_population(memory_service, writes, k=k, t_high=t_high, t_low=t_low)
@@ -318,23 +321,49 @@ async def freeze_snapshot(
         'candidate_k': k,
         't_high': t_high,
         't_low': t_low,
-        'excluded': {**enumeration_excluded, **frozen['excluded']},
+        'excluded_writes': excluded_writes,
+        'slate_rows_dropped': frozen['slate_rows_dropped'],
         'writes': frozen['writes'],
         'targets': frozen['targets'],
     }
 
 
+def exclusions(snapshot: Mapping[str, Any]) -> dict[str, dict[str, int]]:
+    """What the freeze left out, by unit: whole ``excluded_writes``, and ``slate_rows_dropped``.
+
+    Schema 1 recorded both units in one ``excluded`` block; it is split here,
+    so every reader sees the current shape.
+    """
+    version = snapshot.get('schema_version')
+    if version == 1:
+        mixed = snapshot['excluded']
+        return {
+            'excluded_writes': {'undated': mixed['undated'], 'vanished': mixed['vanished']},
+            'slate_rows_dropped': {
+                'self': mixed['self_retrieved'], 'own_children': mixed['own_children_dropped'],
+            },
+        }
+    if version != SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError(f'snapshot schema_version {version} is not one this script reads')
+    return {key: dict(snapshot[key]) for key in ('excluded_writes', 'slate_rows_dropped')}
+
+
 # --- snapshot files ----------------------------------------------------------
 
-def write_snapshot(out_root: Path, snapshot: Mapping[str, Any]) -> Path:
-    """Write *snapshot* and its sha256 sidecar into a fresh dated directory.
+def snapshot_dir(out_root: Path, frozen_at: datetime) -> Path:
+    """The directory a population frozen at *frozen_at* lives in, named for its UTC date."""
+    frozen_on = frozen_at.astimezone(UTC).date()
+    return Path(out_root) / f'{SNAPSHOT_DIR_PREFIX}{frozen_on.isoformat()}'
 
-    The directory is named for the UTC date of ``frozen_at`` and must not
-    exist yet (``FileExistsError``): a frozen population is never re-frozen in
-    place. Returns the path of ``snapshot.json``.
+
+def write_snapshot(out_root: Path, snapshot: Mapping[str, Any]) -> Path:
+    """Write *snapshot* and its sha256 sidecar into a fresh :func:`snapshot_dir`.
+
+    The directory must not exist yet (``FileExistsError``): a frozen
+    population is never re-frozen in place. Returns the path of
+    ``snapshot.json``.
     """
-    frozen_on = datetime.fromisoformat(snapshot['frozen_at']).astimezone(UTC).date()
-    directory = Path(out_root) / f'{SNAPSHOT_DIR_PREFIX}{frozen_on.isoformat()}'
+    directory = snapshot_dir(out_root, datetime.fromisoformat(snapshot['frozen_at']))
     directory.mkdir(parents=True, exist_ok=False)
     body = json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode('utf-8')
     path = directory / SNAPSHOT_NAME
@@ -378,7 +407,7 @@ def _summary(snapshot: Mapping[str, Any], path: Path, sha256: str) -> dict[str, 
         'by_category': count('category'),
         'by_band': count('band'),
         'recon_marker_writes': sum(1 for w in writes if w['recon_marker']),
-        'excluded': snapshot['excluded'],
+        **exclusions(snapshot),
         'path': str(path),
         'sha256': sha256,
     }
@@ -389,6 +418,12 @@ async def _freeze_live(args: argparse.Namespace) -> dict[str, Any]:
     from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
 
     frozen_at = datetime.now(UTC)
+    directory = snapshot_dir(args.out_root, frozen_at)
+    if directory.exists():
+        raise FileExistsError(
+            f'{directory} already holds a population frozen today; it is never re-frozen '
+            f'in place, so nothing was read from the store',
+        )
     config = FusedMemoryConfig()
     configured = types.SimpleNamespace(config=config)
     t_high, t_low = resolve_bands(configured)

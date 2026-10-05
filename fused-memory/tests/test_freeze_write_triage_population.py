@@ -11,7 +11,7 @@ import hashlib
 import json
 import types
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -307,7 +307,7 @@ class TestFreezePopulation:
         assert _slate_ids(w1) == ['x']
         assert w1['self_retrieved'] is True
         assert _frozen_write(frozen, 'w2')['self_retrieved'] is False
-        assert frozen['excluded']['self_retrieved'] == 1
+        assert frozen['slate_rows_dropped']['self'] == 1
 
     def test_a_retrieved_child_of_the_write_is_dropped_before_banding_and_counted(
         self,
@@ -321,7 +321,7 @@ class TestFreezePopulation:
         assert _slate_ids(w) == ['x']
         assert (w['band'], w['band_winner_id'], w['similarity']) == ('judge', 'x', 0.6)
         assert w['own_children_dropped'] == 1
-        assert frozen['excluded']['own_children_dropped'] == 1
+        assert frozen['slate_rows_dropped']['own_children'] == 1
 
     @pytest.mark.parametrize(('cosines', 'band'), [
         ((0.95, 0.7), 'restated'),
@@ -452,15 +452,59 @@ class TestFreezeSnapshot:
             'schema_version', 'frozen_at', 'since', 'projects', 'categories',
             'candidate_k', 't_high', 't_low',
         )} == {
-            'schema_version': 1,
+            'schema_version': 2,
             'frozen_at': '2026-10-05T12:00:00+00:00',
             'since': '2026-09-29T00:00:00+00:00',
             'projects': ['reify'],
             'categories': CATEGORIES,
             'candidate_k': K, 't_high': T_HIGH, 't_low': T_LOW,
         }
-        assert snapshot['excluded'] == {
-            'undated': 1, 'vanished': 0, 'own_children_dropped': 0, 'self_retrieved': 0,
-        }
+        assert snapshot['excluded_writes'] == {'undated': 1, 'vanished': 0}
+        assert snapshot['slate_rows_dropped'] == {'self': 0, 'own_children': 0}
+        assert 'excluded' not in snapshot
         assert _slate_ids(_frozen_write(snapshot, 'm')) == ['x']
         assert snapshot['targets'] == {}
+
+
+class TestExclusions:
+    """Whole writes left out of the population, and slate rows dropped, never one count."""
+
+    def test_the_two_units_are_read_from_the_current_schema(self) -> None:
+        snapshot = {
+            'schema_version': 2,
+            'excluded_writes': {'undated': 1, 'vanished': 2},
+            'slate_rows_dropped': {'self': 3, 'own_children': 4},
+        }
+        assert _mod().exclusions(snapshot) == {
+            'excluded_writes': {'undated': 1, 'vanished': 2},
+            'slate_rows_dropped': {'self': 3, 'own_children': 4},
+        }
+
+    def test_a_schema_1_snapshots_mixed_block_is_split_by_unit(self) -> None:
+        snapshot = {'schema_version': 1, 'excluded': {
+            'undated': 1, 'vanished': 2, 'own_children_dropped': 4, 'self_retrieved': 3,
+        }}
+        assert _mod().exclusions(snapshot) == {
+            'excluded_writes': {'undated': 1, 'vanished': 2},
+            'slate_rows_dropped': {'self': 3, 'own_children': 4},
+        }
+
+    def test_an_unknown_schema_is_refused_naming_it(self) -> None:
+        with pytest.raises(ValueError, match='schema_version 99'):
+            _mod().exclusions({'schema_version': 99})
+
+
+class TestTheCommandLine:
+    def test_an_existing_dated_directory_is_refused_before_the_store_is_opened(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        today = datetime.now(UTC).date()
+        for day in (today, today + timedelta(days=1)):
+            (tmp_path / f'write-triage-population-{day.isoformat()}').mkdir()
+
+        def never_opened(*_args: Any, **_kwargs: Any) -> None:
+            pytest.fail('the store was opened before the snapshot directory was checked')
+
+        monkeypatch.setattr('fused_memory.services.memory_service.MemoryService', never_opened)
+        with pytest.raises(FileExistsError, match='write-triage-population-'):
+            _mod().main(['--out-root', str(tmp_path)])
