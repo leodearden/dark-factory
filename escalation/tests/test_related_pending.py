@@ -19,7 +19,7 @@ from _pending_tool_fixtures import _file
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 from escalation.related_pending import related_pending
-from escalation.server import create_server
+from escalation.server import _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID, create_server
 
 _ENTRY_KEYS = {'id', 'category', 'severity', 'level', 'same_task', 'shared_member'}
 
@@ -95,6 +95,22 @@ class TestRelatedPending:
             'id': 'esc-T1-9', 'category': 'design_concern', 'severity': 'blocking',
             'level': 2, 'same_task': True, 'shared_member': 'm1',
         }]
+
+    def test_records_under_one_synthetic_anchor_are_all_same_task_twins(self):
+        """Documented breadth: a synthetic anchor is one task_id for every instance."""
+        anchor = _AMENDMENT_TRUNCATION_ANCHOR_TASK_ID
+        resolved = _esc('esc-a-1', task_id=anchor, severity='info', category='infra_issue')
+        others = [
+            _esc(f'esc-a-{i}', task_id=anchor, severity='info', category='infra_issue')
+            for i in (2, 3)
+        ]
+
+        census = _by_id(related_pending(others, resolved=resolved))
+
+        assert set(census) == {'esc-a-2', 'esc-a-3'}
+        for entry in census.values():
+            assert entry['same_task'] is True
+            assert entry['shared_member'] is None
 
     def test_the_resolved_record_itself_is_never_listed(self):
         resolved = _esc('esc-T1-1', level=2, members=['m1'])

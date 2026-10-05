@@ -15,6 +15,14 @@ twins", never "no such record ever existed".
 
 The resolved record's own id is a match key too: an L1 resolved directly while
 a pending L2 still clusters it is the same twin relation seen from the member.
+
+``same_task`` is raw ``task_id`` equality, so it is BROAD under a synthetic
+anchor: a slug such as ``escalation/server.py::_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``
+that every instance of one alarm files under.  Such a twin is the same kind of
+alarm, not necessarily the same incident.  No anchor is excluded: anchors are
+minted across the escalation, fused-memory and orchestrator packages with no
+registry, so an exclusion list here would drift, and dropping them would hide
+real twins under one anchor.  ``shared_member`` is the strong key.
 """
 
 from __future__ import annotations

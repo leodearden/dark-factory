@@ -2263,7 +2263,10 @@ could not be computed — fall back to running `get_pending_escalations(task_id=
 task and scanning for other pending L2s sharing any member id. Either way, disposition them in the
 same sitting — close them against the same ruling, or park them with a world-facing predicate
 naming where the ruling lives. Never auto-close from the census alone: it reports candidates, and
-a pin looks exactly like an answered question on member evidence. A ruling recorded on one twin
+a pin looks exactly like an answered question on member evidence. An entry with `same_task: true`
+and `shared_member: null` under a synthetic anchor task id (a slug such as
+`l2-amendment-truncation`, not a task number) is the same KIND of alarm, not necessarily the same
+incident — read it before applying your ruling to it. A ruling recorded on one twin
 while another survives is the answered-but-unrecorded class (see "Ruled-elsewhere check" above);
 all five measured instances were minted exactly this way, in sittings that ruled the record in
 front of them and never looked sideways.
