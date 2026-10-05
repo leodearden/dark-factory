@@ -24,6 +24,7 @@ import functools
 import hashlib
 import json
 import logging
+import re
 import types
 from pathlib import Path
 
@@ -899,6 +900,76 @@ class TestBuildReport:
 
     def test_the_prompt_hash_is_provenance_vocabulary(self) -> None:
         assert 'judge_system_prompt_sha256' in _mod().PROVENANCE_KEYS
+
+    @staticmethod
+    def _pseudo_report(
+        cases: list[dict], pseudo_answers, *, production_shape=None,
+    ) -> dict:
+        """*cases* scored with the pseudo_contradiction cases answering in turn
+        from *pseudo_answers* and every other case answering `restated`."""
+        answers = iter(pseudo_answers)
+        verdicts = [
+            next(answers)
+            if case['expected_class'] == _mod().LABEL_PSEUDO_CONTRADICTION
+            else OUTCOME_RESTATED
+            for case in cases
+        ]
+        return _mod().build_report(
+            scored=_mod().score_cases(cases, verdicts),
+            provenance=dict(_PROVENANCE),
+            production_shape=production_shape,
+        )
+
+    @staticmethod
+    def _k_of_n(report: dict) -> str:
+        label = _mod().LABEL_PSEUDO_CONTRADICTION
+        k = report['confusion'][label][OUTCOME_CONTESTED]
+        n = report['per_class'][label]['n']
+        return f'{k} of {n}'
+
+    def test_the_caveats_report_how_the_pseudo_contradictions_read(self) -> None:
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        report = self._pseudo_report(cases, [OUTCOME_CONTESTED] * len(cases))
+        label = _mod().LABEL_PSEUDO_CONTRADICTION
+        assert report['per_class'][label]['n'] > 0, 'the corpus lost its pseudo case'
+        k_of_n = self._k_of_n(report)
+        naming = [caveat for caveat in report['caveats'] if k_of_n in caveat]
+        assert len(naming) == 1, (k_of_n, report['caveats'])
+        assert label in naming[0]
+
+    def test_the_pseudo_contradiction_caveat_follows_the_verdicts(self) -> None:
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        contested = self._pseudo_report(cases, [OUTCOME_CONTESTED] * len(cases))
+        amended = self._pseudo_report(cases, [OUTCOME_AMENDED] * len(cases))
+        assert contested['caveats'] != amended['caveats']
+        for report in (contested, amended):
+            k_of_n = self._k_of_n(report)
+            assert any(k_of_n in caveat for caveat in report['caveats']), (
+                k_of_n, report['caveats'],
+            )
+
+    def test_the_judged_share_is_named_when_the_band_split_is_known(self) -> None:
+        label = _mod().LABEL_PSEUDO_CONTRADICTION
+        cases = _cases(*((f'p{i}', label) for i in range(6)))
+        answers = [
+            OUTCOME_RESTATED, OUTCOME_CONTESTED, OUTCOME_CONTESTED,
+            OUTCOME_AMENDED, OUTCOME_AMENDED, OUTCOME_AMENDED,
+        ]
+        shape = {'band_split': {label: {
+            OUTCOME_RESTATED: 1, OUTCOME_JUDGE: 5, OUTCOME_STORED: 0,
+        }}}
+
+        def pseudo_caveat(report: dict) -> str:
+            k_of_n = self._k_of_n(report)
+            [caveat] = [c for c in report['caveats'] if k_of_n in c]
+            return caveat
+
+        with_split = pseudo_caveat(
+            self._pseudo_report(cases, answers, production_shape=shape),
+        )
+        without_split = pseudo_caveat(self._pseudo_report(cases, answers))
+        assert re.search(r'\b5\b', with_split), with_split
+        assert not re.search(r'\b5\b', without_split), without_split
 
 
 class TestRenderMarkdown:
