@@ -554,6 +554,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
             await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
 
             dead = await q.get_dead_items()
+            assert len(dead) == 1, f'expected one dead item, got {dead!r}'
             failure = (
                 'The shipped queue must map no operation: the self-identity rule '
                 'is opt-in through identity_payload_keys=, and add_episode\'s '

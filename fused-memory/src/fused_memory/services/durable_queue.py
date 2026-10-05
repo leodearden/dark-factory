@@ -91,10 +91,10 @@ _DELETE_DEAD_BATCH_SIZE = 500
 # blunter "terminal error names" counterpart 3585 offered as a fallback. It
 # does NOT act on this set or on any name list — it fires only when the
 # not-found names the very uuid the operation exists to create, a proof derived
-# from the item's own payload. So the two mechanisms stay independent: editing
-# the names here cannot switch the permanent rule on or off, and 3586's rule is
-# checked FIRST precisely so re-adding a name here cannot hand a
-# provably-doomed write the extended budget back.
+# from the item's own payload, and only for an operation a caller has mapped
+# through identity_payload_keys= (none by default; see REINSTATEMENT IS ONE
+# EDIT above). So the two mechanisms stay independent: editing the names here cannot switch the
+# permanent rule on or off.
 DEFAULT_TRANSIENT_ERROR_NAMES = frozenset({
     'TimeoutError',
     'ConnectionError',
@@ -298,16 +298,7 @@ class DurableWriteQueue:
             frozenset(transient_error_names) if transient_error_names is not None
             else DEFAULT_TRANSIENT_ERROR_NAMES
         )
-        # operation -> the payload key holding the graph uuid that operation
-        # CREATES (never one it merely references); feeds _classify_failure's
-        # ('permanent', 1) rule. Ships EMPTY, so the rule is an opt-in seam with
-        # no shipped user. add_episode is deliberately unmapped: since task 3561
-        # its payload carries no graph uuid, and its 'correlation_id' is a
-        # fused-memory id no graph not-found names
-        # (memory_service.py::MemoryService.add_episode). A mapping describes
-        # payload vocabulary, not operator tuning, so it belongs beside that
-        # vocabulary at memory_service.py::MemoryService.initialize, not in
-        # QueueConfig.
+        # operation -> payload key of the graph uuid it CREATES; empty = rule off.
         self._identity_payload_keys: Mapping[str, str] = dict(identity_payload_keys or {})
 
         self._semaphore = asyncio.Semaphore(semaphore_limit)
