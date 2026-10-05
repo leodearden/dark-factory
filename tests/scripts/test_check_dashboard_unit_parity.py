@@ -1422,6 +1422,30 @@ def test_unchecked_directives_all_carry_a_nonempty_reason():
             )
 
 
+def test_unchecked_directive_that_is_also_covered_is_rejected():
+    """A directive both compared and waived raises at construction.
+
+    Its reason string would tell a reviewer the directive is deliberately not
+    compared while a branch compares it, so the waiver stops meaning what it
+    says. Rejected at import time, on the same terms as an env_matches_directive
+    pair registered with no environment_section.
+    """
+    mod = _load_checker()
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.UnitSpec(
+            name="fixture.service",
+            repo_relpath="dashboard/fixture.service",
+            compared=(("Service", "TimeoutStopSec"),),
+            unchecked_directives=(("Service", "TimeoutStopSec", "contradictory waiver"),),
+        )
+
+    message = str(excinfo.value)
+    assert "fixture.service" in message, message
+    assert "[Service] TimeoutStopSec" in message, message
+    assert "contradictory waiver" in message, message
+
+
 def test_registry_env_matches_directive_entries_are_declared_in_the_committed_units():
     """STALENESS GUARD, intra-copy-relation edition.
 

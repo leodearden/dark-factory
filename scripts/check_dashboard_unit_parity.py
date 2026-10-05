@@ -369,17 +369,53 @@ class UnitSpec:
     # test_registry_env_matches_directive_entries_are_declared_in_the_committed_units
     # rejects a variable or directive name that section does not declare.
     env_matches_directive: tuple[tuple[str, str], ...] = ()
+    # (section, key, reason) triples for directives the committed unit declares
+    # that are DELIBERATELY not compared. The reasoned counterpart to
+    # DIVERGENCE_ALLOWLIST, and held to its preamble's rule: keep it small, and
+    # keep every reason specific enough that a reviewer can check it.
+    #
+    # Bounded comparison is right (see the module docstring's case against an
+    # unbounded diff), but "bounded" has to mean every directive was
+    # CONSIDERED, not that someone remembered to register it. The completeness
+    # guard in tests/scripts/test_check_dashboard_unit_parity.py therefore
+    # requires every directive in the committed unit to be either in
+    # covered_directives() or named here.
+    #
+    # That guard is DIRECTIVE-granular. Tokens inside ExecStart are reached
+    # only through exec_start_flags, and nothing enforces that list's
+    # completeness.
+    unchecked_directives: tuple[tuple[str, str, str], ...] = ()
+
+    def covered_directives(self) -> frozenset[tuple[str, str]]:
+        """Every ``(section, key)`` some comparison branch actually checks.
+
+        The single enumeration of the branches in compare_unit that compare a
+        directive. The completeness guard and ``__post_init__`` both read it
+        rather than re-deriving the list, so a future comparison branch added
+        here cannot leave either of them silently behind.
+        """
+        covered = {*self.compared, *self.present_only, *self.override_directives}
+        if self.environment_section is not None:
+            covered.add((self.environment_section, "Environment"))
+        return frozenset(covered)
 
     def __post_init__(self) -> None:
-        """Reject a registry entry whose relation branch could never run.
+        """Reject a registry entry that contradicts itself or could never run.
 
         ``env_matches_directive`` reads both halves out of
         ``environment_section``, so registering a pair without setting that
         field makes the branch a silent no-op: the spec reads as though the
         value were checked while nothing is compared at all — the one failure
         mode a gate must not have, and the one its own report cannot reveal.
-        Raising here turns it into an import-time error on the registry, where
-        it is unmissable, instead of a green run that checked less than it says.
+
+        A directive both covered by a branch and listed in
+        ``unchecked_directives`` is the same defect from the other side: its
+        reason string tells a reviewer the directive is deliberately not
+        compared while a branch compares it, so the waiver can no longer be
+        trusted to mean what it says.
+
+        Raising turns either into an import-time error on the registry, where
+        it is unmissable, instead of a green run that checked other than it says.
         """
         if self.env_matches_directive and self.environment_section is None:
             raise ValueError(
@@ -388,6 +424,15 @@ class UnitSpec:
                 "be set — both the variable and the directive are read from that "
                 "section, so the comparison would silently check nothing"
             )
+        covered = self.covered_directives()
+        for section, key, reason in self.unchecked_directives:
+            if (section, key) in covered:
+                raise ValueError(
+                    f"{self.name}: [{section}] {key} is listed in "
+                    f"unchecked_directives (reason: {reason!r}) but is also "
+                    "covered by a comparison branch — remove one of the two so "
+                    "the registry says what it actually checks"
+                )
 
 
 def _render(values: list[str] | None) -> str:
@@ -750,18 +795,24 @@ def compare_unit(
 # The unit registry
 # ---------------------------------------------------------------------------
 
-# Every entry names WHY a key is on its list. Description= and After= are
-# deliberately absent from all three: they are cosmetic, they legitimately
-# differ (the installed timer's Description predates the incident rewrite),
-# and comparing them would spend the gate's credibility on nothing.
+# Every entry names WHY a key is on its list. Directives deliberately left
+# uncompared live in each spec's unchecked_directives, each with its reason.
 #
 # Registry KEYS are curated; expected VALUES are not — they are read from the
 # committed unit at run time. See UnitSpec's docstring for why. The keys are
-# guarded against rot by the staleness tests in
-# tests/scripts/test_check_dashboard_unit_parity.py, which assert every key
-# listed here is genuinely declared in the committed unit; a key that is not
-# would compare absent-to-absent and check nothing, forever, while still
-# reporting green.
+# guarded against rot in BOTH directions by
+# tests/scripts/test_check_dashboard_unit_parity.py: the staleness tests assert
+# every key listed here is genuinely declared in the committed unit (a key that
+# is not would compare absent-to-absent and check nothing, forever, while still
+# reporting green), and the completeness guard asserts every directive the
+# committed unit declares is listed here or in unchecked_directives (one that is
+# neither would drift unreported, forever, while still reporting green).
+_DESCRIPTION_IS_COSMETIC = (
+    "Cosmetic label, read only by `systemctl status` and journal output. "
+    "Comparing it would turn a wording reflow into reported supervision drift "
+    "— the unbounded-diff noise the module docstring rejects."
+)
+
 UNITS: dict[str, UnitSpec] = {
     "dark-factory-dashboard.service": UnitSpec(
         name="dark-factory-dashboard.service",
@@ -833,10 +884,24 @@ UNITS: dict[str, UnitSpec] = {
             ("Install", "WantedBy"),
         ),
         present_only=(
-            # Both carry absolute host paths (/home/leo/.local/bin/uv, the
-            # repo root). Presence only; content reached via exec_start_flags.
+            # All three carry absolute host paths (/home/leo/.local/bin/uv,
+            # the repo root). Presence only; ExecStart's content is reached
+            # via exec_start_flags.
+            ("Unit", "Documentation"),
             ("Service", "ExecStart"),
             ("Service", "WorkingDirectory"),
+        ),
+        unchecked_directives=(
+            ("Unit", "Description", _DESCRIPTION_IS_COSMETIC),
+            (
+                "Unit",
+                "After",
+                "Ordering-only dependency on units this checker does not own "
+                "(network.target, fused-memory.service). A host running "
+                "fused-memory under another unit name would report permanent "
+                "drift, and a start-ordering failure surfaces as availability, "
+                "which the dashboard watchdog owns.",
+            ),
         ),
         # Neither copy declares one today. Registered so that a locally added
         # EnvironmentFile= is VISIBLE: it could override any Environment= the
@@ -899,6 +964,7 @@ UNITS: dict[str, UnitSpec] = {
         # EnvironmentFile= was registered to close — on the same unit, left
         # open until now.
         environment_section="Service",
+        unchecked_directives=(("Unit", "Description", _DESCRIPTION_IS_COSMETIC),),
     ),
     "dark-factory-dashboard-watchdog.timer": UnitSpec(
         name="dark-factory-dashboard-watchdog.timer",
@@ -915,6 +981,7 @@ UNITS: dict[str, UnitSpec] = {
             # about.
             ("Install", "WantedBy"),
         ),
+        unchecked_directives=(("Unit", "Description", _DESCRIPTION_IS_COSMETIC),),
     ),
 }
 
