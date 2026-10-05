@@ -2,12 +2,15 @@
 
 import asyncio
 import json
+import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 import pytest_asyncio
 
+from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.services.memory_service import ReferentFinding
 from fused_memory.services.write_journal import OPERATOR_TELEMETRY_QUERY, WriteJournal
 from fused_memory.utils.canonical_labels import Referent
@@ -111,6 +114,79 @@ async def test_log_backend_op_without_duration_ms_stores_null(journal):
     assert row['duration_ms'] is None
 
 
+@pytest.mark.asyncio
+async def test_log_backend_op_nests_the_result_beside_its_measured_llm_tokens(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='graphiti',
+        operation='add_episode',
+        result_summary='episode-result',
+        llm_tokens=LlmTokenUsage(input_tokens=120, output_tokens=45, llm_calls=1),
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert json.loads(row['result_summary']) == {
+        'result': 'episode-result',
+        'tokens': {
+            'input_tokens': 120,
+            'output_tokens': 45,
+            'total_tokens': 165,
+            'llm_calls': 1,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_journals_measured_tokens_even_without_a_result(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='graphiti',
+        operation='add_episode',
+        success=False,
+        error='RuntimeError: extraction failed',
+        llm_tokens=LlmTokenUsage(input_tokens=10, output_tokens=2, llm_calls=1),
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert json.loads(row['result_summary']) == {
+        'result': None,
+        'tokens': {'input_tokens': 10, 'output_tokens': 2, 'total_tokens': 12, 'llm_calls': 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_without_llm_tokens_keeps_the_plain_result_summary(journal):
+    write_op_id = str(uuid.uuid4())
+    await journal.log_backend_op(
+        write_op_id=write_op_id,
+        backend='mem0',
+        operation='add',
+        result_summary='plain-result',
+    )
+    [row] = await journal.get_backend_ops_for_write_op(write_op_id)
+    assert row['result_summary'] == 'plain-result'
+
+
+@pytest.mark.asyncio
+async def test_log_backend_op_names_llm_tokens_that_are_not_an_llm_token_usage(
+    journal, caplog
+):
+    write_op_id = str(uuid.uuid4())
+    not_a_usage: Any = {'input_tokens': 1, 'output_tokens': 1, 'llm_calls': 1}
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.services.write_journal'):
+        await journal.log_backend_op(
+            write_op_id=write_op_id,
+            backend='graphiti',
+            operation='add_episode',
+            llm_tokens=not_a_usage,
+        )
+
+    assert await journal.get_backend_ops_for_write_op(write_op_id) == []
+    assert journal.journal_drop_stats()['by_operation'] == {'add_episode': 1}
+    assert 'llm_tokens must be an LlmTokenUsage or None, got dict' in caplog.text
+
+
 async def _seed_backend_op(
     journal: WriteJournal,
     *,
@@ -119,6 +195,7 @@ async def _seed_backend_op(
     backend_operation: str,
     duration_ms: float | None,
     result_summary: dict | str | None,
+    llm_tokens: LlmTokenUsage | None = None,
 ) -> None:
     write_op_id = str(uuid.uuid4())
     await journal.log_write_op(
@@ -130,6 +207,7 @@ async def _seed_backend_op(
         operation=backend_operation,
         result_summary=result_summary,
         duration_ms=duration_ms,
+        llm_tokens=llm_tokens,
     )
 
 
@@ -175,15 +253,8 @@ async def test_operator_telemetry_query_reports_duration_and_tokens_per_write(jo
         backend='graphiti',
         backend_operation='add_episode',
         duration_ms=812.5,
-        result_summary={
-            'result': 'x',
-            'tokens': {
-                'input_tokens': 120,
-                'output_tokens': 45,
-                'total_tokens': 165,
-                'llm_calls': 1,
-            },
-        },
+        result_summary='x',
+        llm_tokens=LlmTokenUsage(input_tokens=120, output_tokens=45, llm_calls=1),
     )
 
     rows = await _run_operator_telemetry_query(journal, since, 100)

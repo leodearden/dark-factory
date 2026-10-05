@@ -16,6 +16,7 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import load_script_module
 
+from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.services.write_journal import WriteJournal
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'telemetry_query.py'
@@ -41,7 +42,7 @@ async def _seed(
     operation: str,
     backend: str,
     duration_ms: float | None,
-    result_summary: dict | str | None = None,
+    llm_tokens: LlmTokenUsage | None = None,
 ) -> None:
     write_op_id = str(uuid.uuid4())
     await journal.log_write_op(write_op_id=write_op_id, operation=operation, project_id='p')
@@ -49,8 +50,9 @@ async def _seed(
         write_op_id=write_op_id,
         backend=backend,
         operation=operation,
-        result_summary=result_summary,
+        result_summary='result',
         duration_ms=duration_ms,
+        llm_tokens=llm_tokens,
     )
 
 
@@ -67,15 +69,7 @@ async def test_prints_one_json_row_per_backend_op_most_recent_first(journal, cap
         operation='add_episode',
         backend='graphiti',
         duration_ms=812.5,
-        result_summary={
-            'result': 'x',
-            'tokens': {
-                'input_tokens': 120,
-                'output_tokens': 45,
-                'total_tokens': 165,
-                'llm_calls': 1,
-            },
-        },
+        llm_tokens=LlmTokenUsage(input_tokens=120, output_tokens=45, llm_calls=1),
     )
 
     rc = _script.main(['--journal', str(_journal_path(journal)), '--since', since])

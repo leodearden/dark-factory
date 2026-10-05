@@ -25,6 +25,8 @@ from pathlib import Path
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
 
+from fused_memory.backends.llm_token_usage import LlmTokenUsage
+
 logger = logging.getLogger(__name__)
 
 #: The clock ``prune_write_ops`` measures its wall-clock deadline against, named
@@ -307,6 +309,20 @@ LIMIT ?
 """
 
 
+def _backend_result_summary(
+    result_summary: dict | str | None, llm_tokens: LlmTokenUsage | None
+) -> dict | str | None:
+    """The persisted ``result_summary``: nested under ``result`` beside the
+    ``tokens`` block ``OPERATOR_TELEMETRY_QUERY`` reads, when tokens were measured."""
+    if llm_tokens is None:
+        return result_summary
+    if not isinstance(llm_tokens, LlmTokenUsage):
+        raise TypeError(
+            f'llm_tokens must be an LlmTokenUsage or None, got {type(llm_tokens).__name__}'
+        )
+    return {'result': result_summary, 'tokens': llm_tokens.as_journal_dict()}
+
+
 class WriteJournal:
     """Two-layer write journal backed by SQLite (WAL mode)."""
 
@@ -506,9 +522,11 @@ class WriteJournal:
         success: bool = True,
         error: str | None = None,
         duration_ms: float | None = None,
+        llm_tokens: LlmTokenUsage | None = None,
     ) -> None:
         """Log a Layer 2 backend dispatch. Fire-and-forget — never raises."""
         try:
+            summary = _backend_result_summary(result_summary, llm_tokens)
             async with self._txn() as db:
                 await db.execute(
                     """INSERT INTO backend_ops
@@ -523,7 +541,7 @@ class WriteJournal:
                         backend,
                         operation,
                         json.dumps(payload) if payload else '{}',
-                        json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
+                        json.dumps(summary) if isinstance(summary, dict) else summary,
                         1 if success else 0,
                         error,
                         datetime.now(UTC).isoformat(),

@@ -37,6 +37,7 @@ def service(mock_config, write_journal):
     svc.graphiti.add_episode = AsyncMock(return_value=None)
     svc.graphiti.remove_episode = AsyncMock()
     svc.graphiti.remove_edge = AsyncMock()
+    svc.graphiti.token_probe = lambda: measure_llm_tokens(None)
     install_identity_mocks(svc.graphiti)
 
     svc.mem0 = MagicMock()
@@ -591,7 +592,6 @@ async def test_failed_backend_call_still_persists_measured_duration_ms(
     service, write_journal
 ):
     cid = str(uuid.uuid4())
-    op_id = str(uuid.uuid4())
 
     async def _slow_failing_add(*_args, **_kwargs):
         await asyncio.sleep(_SLEEP_SECONDS)
@@ -599,18 +599,15 @@ async def test_failed_backend_call_still_persists_measured_duration_ms(
 
     service.mem0.add = _slow_failing_add
 
-    with pytest.raises(RuntimeError):
-        await service._execute_mem0_write(
-            {
-                'content': 'a fact that never lands',
-                'project_id': 'test',
-                '_causation_id': cid,
-                '_write_op_id': op_id,
-                'metadata': {'category': 'preferences_and_norms'},
-            }
-        )
+    await service.add_memory(
+        content='a fact that never lands',
+        category='preferences_and_norms',
+        project_id='test',
+        causation_id=cid,
+    )
 
-    [backend_row] = await write_journal.get_backend_ops_for_write_op(op_id)
+    ops = await write_journal.get_ops_by_causation(cid)
+    [backend_row] = [o for o in ops if o['layer'] == 'backend_op']
     assert backend_row['success'] == 0
     assert isinstance(backend_row['duration_ms'], float)
     assert backend_row['duration_ms'] >= _MIN_MEASURED_MS
@@ -711,11 +708,10 @@ async def test_mem0_backend_row_keeps_its_plain_string_result_summary(
 
 
 @pytest.mark.asyncio
-async def test_graphiti_row_is_still_persisted_when_the_probe_is_a_bare_mock(
+async def test_unmeasured_graphiti_write_keeps_its_plain_result_summary(
     service, write_journal
 ):
-    """The fixture's MagicMock graphiti auto-creates ``token_probe``; its usage
-    is not a measurement and must never reach the journal's ``json.dumps``."""
+    service.graphiti.add_episode = AsyncMock(return_value=_EPISODE_RESULT)
     wid = str(uuid.uuid4())
 
     await service._execute_graphiti_write(
@@ -724,4 +720,26 @@ async def test_graphiti_row_is_still_persisted_when_the_probe_is_a_bare_mock(
 
     [row] = await write_journal.get_backend_ops_for_write_op(wid)
     assert row['success'] == 1
-    assert row['result_summary'] is None
+    assert row['result_summary'] == _EPISODE_RESULT
+
+
+@pytest.mark.asyncio
+async def test_a_token_probe_that_cannot_open_is_journaled_as_the_backend_failure(
+    service, write_journal
+):
+    def _unopenable_probe():
+        raise RuntimeError('token probe unavailable')
+
+    service.graphiti.token_probe = _unopenable_probe
+    wid = str(uuid.uuid4())
+
+    with pytest.raises(RuntimeError, match='token probe unavailable'):
+        await service._execute_graphiti_write(
+            'add_episode', _graphiti_write_payload(str(uuid.uuid4()), wid)
+        )
+
+    [row] = await write_journal.get_backend_ops_for_write_op(wid)
+    assert row['success'] == 0
+    assert row['error'] == 'RuntimeError: token probe unavailable'
+    assert isinstance(row['duration_ms'], float)
+    service.graphiti.add_episode.assert_not_awaited()
