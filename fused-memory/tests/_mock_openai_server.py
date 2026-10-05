@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -35,7 +35,7 @@ from typing import Any
 DEFAULT_EMBEDDING_LEN = 1536
 
 
-def _chat_completion_body(content: str) -> dict[str, Any]:
+def chat_completion_body(content: str) -> dict[str, Any]:
     """A minimal valid chat.completions payload.
 
     ``content`` is a JSON *string*: OpenAIGenericClient._generate_response does
@@ -82,7 +82,7 @@ class MockOpenAIServer:
         # ThreadingHTTPServer serves concurrently — guard the record list.
         self._lock = threading.Lock()
         self._requests: list[dict[str, Any]] = []
-        self._responses: dict[str, dict[str, Any]] = {}
+        self._responses: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         self.chat_content = '{"ok": true}'
         self.embedding_len = DEFAULT_EMBEDDING_LEN
 
@@ -104,8 +104,16 @@ class MockOpenAIServer:
 
     def set_response(self, path_suffix: str, body: dict[str, Any]) -> None:
         """Override the canned response for paths ending in ``path_suffix``."""
+        self.set_response_sequence(path_suffix, [(200, body)])
+
+    def set_response_sequence(
+        self, path_suffix: str, bodies: Sequence[tuple[int, dict[str, Any]]]
+    ) -> None:
+        """Serve ``(status, body)`` pairs in order for ``path_suffix``; the last one repeats."""
+        if not bodies:
+            raise ValueError('a response sequence needs at least one (status, body) pair')
         with self._lock:
-            self._responses[path_suffix] = body
+            self._responses[path_suffix] = list(bodies)
 
     # -- internals used by the handler --
 
@@ -113,11 +121,11 @@ class MockOpenAIServer:
         with self._lock:
             self._requests.append(entry)
 
-    def _canned(self, path: str) -> dict[str, Any] | None:
+    def _canned(self, path: str) -> tuple[int, dict[str, Any]] | None:
         with self._lock:
-            for suffix, body in self._responses.items():
+            for suffix, sequence in self._responses.items():
                 if path.endswith(suffix):
-                    return body
+                    return sequence.pop(0) if len(sequence) > 1 else sequence[0]
         return None
 
 
@@ -153,11 +161,11 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
 
             canned = state._canned(self.path)
             if canned is not None:
-                self._send_json(200, canned)
+                self._send_json(*canned)
                 return
 
             if self.path.endswith('/chat/completions'):
-                self._send_json(200, _chat_completion_body(state.chat_content))
+                self._send_json(200, chat_completion_body(state.chat_content))
                 return
 
             if self.path.endswith('/embeddings'):
