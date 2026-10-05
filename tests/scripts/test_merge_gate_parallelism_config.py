@@ -267,7 +267,8 @@ def test_cockpit_addopts_keeps_its_smoke_deselection() -> None:
 
 
 # ---------------------------------------------------------------------------
-# The internal-sense invariant: `-n` requires a DECLARED plugin (task 5408)
+# The internal-sense invariant: `-n` requires a DECLARED plugin (task 5408),
+# counting the `-n` verify injects as well as the declared one (task 5486)
 # ---------------------------------------------------------------------------
 
 # The distribution that supplies `-n`, PEP 503-normalised for comparison.
@@ -604,7 +605,9 @@ RULED_SERIAL_MEMBERS = {
         'Workers on a test leg that short buy nothing measurable, so task 5408 '
         "spent this module's budget on `pyright --threads 8` instead. NOT an "
         'oversight: sampler is the one module 5408 touched for its TYPE leg '
-        'and deliberately left alone on its test leg'
+        'and deliberately left alone on its test leg. Task 5486 still declared '
+        'pytest-xdist for sampler, because verify injects -n at the gated '
+        "roles, WITHOUT touching sampler's own addopts"
     ),
 }
 
