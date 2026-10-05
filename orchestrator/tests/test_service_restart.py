@@ -2546,9 +2546,10 @@ async def test_missing_lease_is_silent(tmp_path: Path, caplog) -> None:
 #
 # A positive int too large for the platform's C pid_t passes every type guard
 # lease_is_live applies -- isinstance(pid, int), not a bool, > 0 -- reaches
-# os.kill, and raises OverflowError, which is not an OSError and is caught by
-# nobody between there and Harness._maybe_restart_stale_service's run-forever
-# loop. These are CONTRACT tests against lease_is_live's own sentence:
+# os.kill, and raises OverflowError, which is not an OSError. Nothing in the
+# coordinator catches it: it would reach the stale-service-restart
+# BackgroundService, whose loop logs it and backs off, so the pending restart
+# would never fire. These are CONTRACT tests against lease_is_live's own sentence:
 # "FAIL-OPEN throughout: a missing, corrupt, unreadable or nonsensical lease
 # reads as 'no sweep in flight' and never raises."
 # ---------------------------------------------------------------------------
@@ -2581,8 +2582,9 @@ async def test_out_of_range_lease_pid_fires_fail_open(tmp_path: Path) -> None:
     Returning False from the predicate is only half the contract; the half
     that matters operationally is that a nonsensical lease costs at most one
     un-gated restart, the same fail-open direction every other unusable-lease
-    case takes. An OverflowError here escapes maybe_restart into
-    Harness._maybe_restart_stale_service, which has no try/except.
+    case takes. An OverflowError here would escape maybe_restart; the caller's
+    loop (``background_service.py::BackgroundService._loop``) would log it and
+    back off, so the restart would never fire.
     """
     lease = _write_lease(tmp_path / 'lease.json', pid=_UNREPRESENTABLE_PID)
     coord, current_time, _, executor = _make_force_fire_coordinator(

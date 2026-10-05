@@ -2,7 +2,8 @@
 orchestrator fleet-redeploy PRD).
 
 Every orchestrator unit writes a tiny JSON heartbeat to a fleet-common
-directory, keyed by its own ``ORCH_UNIT``, on each run-loop tick.  This
+directory, keyed by its own ``ORCH_UNIT``, from the harness's merge-heartbeat
+background service (task 5344).  This
 module owns the on-disk contract (directory resolution, payload shape, and
 the atomic writer) so producer (``Harness._write_merge_heartbeat``, this
 task) and future readers — γ (the drain gate) and ε (``--report``'s

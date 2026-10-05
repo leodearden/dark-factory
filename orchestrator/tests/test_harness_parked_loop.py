@@ -45,6 +45,7 @@ class _Slots:
 
     def __init__(self) -> None:
         self.gates: defaultdict[str, asyncio.Event] = defaultdict(asyncio.Event)
+        self.finished: set[str] = set()
         self._all_open = False
 
     def open_all(self) -> None:
@@ -62,19 +63,26 @@ class _Slots:
         except asyncio.CancelledError:
             return TaskReport(task_id=tid, title=tid, outcome=WorkflowOutcome.CANCELLED)
         finally:
+            self.finished.add(tid)
             sem.release()
 
 
 class _Dispatch:
-    """``acquire_next`` stand-in handing out ``task_ids`` in order, then None."""
+    """``acquire_next`` stand-in handing out ``task_ids`` in order, then None.
+
+    Call number N blocks until ``held_ticks[N]`` is set, like a long tick.
+    """
 
     def __init__(self, task_ids: list[str]) -> None:
         self._pending = list(task_ids)
         self.calls = 0
         self.stop_when: Callable[[], bool] = lambda: False
+        self.held_ticks: dict[int, asyncio.Event] = {}
 
     async def acquire_next(self) -> TaskAssignment | None:
         self.calls += 1
+        if self.calls in self.held_ticks:
+            await self.held_ticks[self.calls].wait()
         if self.stop_when():
             raise _Stop
         if not self._pending:
@@ -113,7 +121,7 @@ def _harness(tmp_path: Path, dispatch: _Dispatch, slots: _Slots) -> Harness:
         max_concurrent_tasks=1,
         idle_poll_secs=_TICK,
         merge_heartbeat_interval_secs=_TICK,
-        stale_service_restart_poll_secs=_TICK,
+        stale_service_restart_interval_secs=_TICK,
         watcher_supervisor_enabled=False,
         review=ReviewConfig(full_review_on_complete=False),
     )
@@ -150,6 +158,7 @@ def _harness(tmp_path: Path, dispatch: _Dispatch, slots: _Slots) -> Harness:
 
 def _fused_memory_restart(
     h: Harness, clock: _Clock, fired: asyncio.Event,
+    *, force_fire_after_secs: float = _FORCE_FIRE_AFTER_SECS,
 ) -> StaleServiceRestartCoordinator:
     async def executor() -> None:
         fired.set()
@@ -158,7 +167,7 @@ def _fused_memory_restart(
         git_ops=MagicMock(),
         event_store=None,
         debounce_secs=0.0,
-        force_fire_after_secs=_FORCE_FIRE_AFTER_SECS,
+        force_fire_after_secs=force_fire_after_secs,
         restart_executor=executor,
         clock=clock,
     )
@@ -186,8 +195,6 @@ def fleet_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv('ORCH_UNIT', _UNIT)
     monkeypatch.setenv('ORCH_FLEET_DIR', str(fleet))
     return fleet
-
-
 
 
 async def _run_driven(
@@ -238,6 +245,26 @@ class TestParkedLoop:
         assert sorted(r.task_id for r in report.task_reports) == ['1', '2', '3']
         assert report.completed == 3
         assert review.record_merge.call_count == 3
+
+    async def test_slot_finishing_during_a_long_acquire_next_tick_is_collected(
+        self, tmp_path: Path, fleet_dir: Path,
+    ) -> None:
+        dispatch, slots = _Dispatch(['1']), _Slots()
+        tick = asyncio.Event()
+        dispatch.held_ticks[2] = tick
+        h = _harness(tmp_path, dispatch, slots)
+
+        async def drive() -> None:
+            try:
+                await _until(lambda: dispatch.calls >= 2, 'acquire_next tick in progress')
+                slots.gates['1'].set()
+                await _until(lambda: '1' in slots.finished, 'slot 1 finished mid-tick')
+            finally:
+                tick.set()
+
+        report = await _run_driven(h, slots, drive)
+
+        assert [r.task_id for r in report.task_reports] == ['1']
 
     async def test_owed_restart_force_fires_while_parked(
         self, tmp_path: Path, fleet_dir: Path,
@@ -310,3 +337,47 @@ class TestParkedLoop:
         with pytest.raises(_Stop):
             await h.run()
         assert fired.is_set()
+
+    async def test_polite_restart_waits_out_an_inline_full_review(
+        self, tmp_path: Path, fleet_dir: Path,
+    ) -> None:
+        dispatch, slots = _Dispatch(['1']), _Slots()
+        h = _harness(tmp_path, dispatch, slots)
+        h.config.review.full_review_on_complete = True
+        review_started, review_done = asyncio.Event(), asyncio.Event()
+
+        async def run_full() -> MagicMock:
+            review_started.set()
+            await review_done.wait()
+            return MagicMock(findings_count=0, tasks_created=[], cost_usd=0.0, parse_failed=False)
+
+        review = MagicMock()
+        review.should_trigger.return_value = False
+        review.should_run_full.return_value = True
+        review.run_full = run_full
+        h.review_checkpoint = review
+        clock, fired = _Clock(), asyncio.Event()
+        coord = _fused_memory_restart(h, clock, fired, force_fire_after_secs=0.0)
+        observed: dict[str, bool] = {}
+
+        async def drive() -> None:
+            await _until(lambda: dispatch.calls >= 1, 'slot 1 dispatched')
+            slots.gates['1'].set()
+            try:
+                await _until(review_started.is_set, 'full review running inline')
+                await _arm(coord)
+                reads = clock.reads
+                await _until(
+                    lambda: fired.is_set() or clock.reads >= reads + 3,
+                    'restart polled during the full review',
+                )
+                observed['fired_during_review'] = fired.is_set()
+            finally:
+                review_done.set()
+
+        dispatch.stop_when = fired.is_set
+        with pytest.raises(_Stop):
+            await _run_driven(h, slots, drive, until_idle=False)
+
+        assert observed == {'fired_during_review': False}
+        assert fired.is_set(), 'the polite restart fires once the loop idles'

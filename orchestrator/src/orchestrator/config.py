@@ -3156,12 +3156,14 @@ class OrchestratorConfig(BaseSettings):
     # separate from the paused-idle constant (_PAUSED_IDLE_POLL_SECS) so the
     # poll cadence can be tuned independently of the pause-recovery cadence.
     idle_poll_secs: float = Field(default=15.0)
-    # Cadences of the two duties that run beside the dispatch loop, whatever
-    # it is doing (task 5344).  The heartbeat must refresh well inside
-    # scripts/drain_check.py's 120 s fresh window; the restart poll bounds how
-    # late an owed force-fire can be.
+    # Cadences of the merge-heartbeat and stale-service-restart background
+    # services, which run whatever the dispatch loop is doing (task 5344).
+    # The heartbeat must refresh well inside the fresh window of
+    # scripts/drain_check.py::classify; the restart interval bounds how late
+    # an owed force-fire can be.  Restart-only (not in RELOADABLE_FIELDS):
+    # captured once by Harness._build_lifecycle_registry.
     merge_heartbeat_interval_secs: float = Field(default=15.0, gt=0)
-    stale_service_restart_poll_secs: float = Field(default=15.0, gt=0)
+    stale_service_restart_interval_secs: float = Field(default=15.0, gt=0)
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
@@ -3856,8 +3858,8 @@ class OrchestratorConfig(BaseSettings):
     # polite path needs agents_idle, which chronic fleet saturation can deny
     # indefinitely (esc-2814-1). Once a restart has been owed this long,
     # maybe_restart bypasses agents_idle and the debounce; the
-    # stale-service-restart poll (stale_service_restart_poll_secs) evaluates
-    # it whatever the dispatch loop is doing (task 5344). 0 disables. No
+    # stale-service-restart service evaluates it whatever the dispatch loop
+    # is doing (task 5344). 0 disables. No
     # min_interval cap throttles it. Restart-only (not in RELOADABLE_FIELDS),
     # like orchestrator_restart_force_fire_after_secs.
     fused_memory_restart_force_fire_after_secs: float = Field(

@@ -1921,11 +1921,14 @@ class Harness:
             ReviewCheckpoint(config, self.mcp, self.usage_gate)
             if config.review.enabled else None
         )
-        self._review_running = False
+        # The running focused review checkpoint, if any; dispatch pauses while set.
+        self._review_task: asyncio.Task | None = None
         # Slot and review-checkpoint tasks still running.  Each task removes
         # itself from its done-callback, so the set is never rebound.
         self._live_tasks: set[asyncio.Task] = set()
-        self._dispatch_loop_running = False
+        # True only while the run-forever idle branch sleeps between polls:
+        # the one quiet window a polite service restart may use.
+        self._idle_poll_sleeping = False
         self._task_modules: dict[str, list[str]] = {}  # task_id -> modules
 
         # Escalation support
@@ -2417,7 +2420,7 @@ class Harness:
         registry.register(BackgroundService(
             name='stale-service-restart',
             pass_fn=self._run_stale_service_restart_pass,
-            interval_secs=self.config.stale_service_restart_poll_secs,
+            interval_secs=self.config.stale_service_restart_interval_secs,
             backoff=sweep_backoff,
             stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
             max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
@@ -2466,12 +2469,15 @@ class Harness:
     async def _run_stale_service_restart_pass(self) -> None:
         """``pass_fn`` for the stale-service-restart service.
 
-        ``agents_idle`` is True only once the dispatch loop runs with no slot
-        or review task live, so the polite path never fires during startup
-        recovery; an owed force-fire ignores it (see
-        ``StaleServiceRestartCoordinator.maybe_restart``).
+        ``agents_idle`` is True only while the idle branch sleeps with nothing
+        live — never during startup recovery, a full review, a dispatch tick
+        or a mid-run reconcile.  An owed force-fire ignores it (see
+        ``StaleServiceRestartCoordinator.maybe_restart``).  Nothing fires once
+        shutdown has begun.
         """
-        agents_idle = self._dispatch_loop_running and not self._live_tasks
+        if self._draining:
+            return
+        agents_idle = self._idle_poll_sleeping and not self._live_tasks
         await self._maybe_restart_stale_service(agents_idle=agents_idle)
 
     async def run(
@@ -2872,12 +2878,11 @@ class Harness:
 
             # 3. Run workflow slots
             sem = asyncio.Semaphore(self.config.max_concurrent_tasks)
-            self._dispatch_loop_running = True
 
             while True:
                 # If a review checkpoint is running, don't acquire new tasks —
                 # wait for in-flight tasks (and the review, itself live) to end.
-                if self._review_running:
+                if self._review_task is not None:
                     await asyncio.wait(
                         set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
                     )
@@ -2901,7 +2906,7 @@ class Harness:
                             # service.  Idle in-process instead so an in-process
                             # resume_scheduler() (via the still-running
                             # escalation MCP) resumes dispatch without a restart.
-                            # The six background loops keep running while we idle.
+                            # The background services keep running while we idle.
                             now = time.monotonic()
                             if (
                                 now - self._last_paused_idle_log
@@ -2977,7 +2982,11 @@ class Harness:
                                 self.config.idle_poll_secs,
                             )
                             self._last_idle_poll_log = now
-                        await asyncio.sleep(self.config.idle_poll_secs)
+                        self._idle_poll_sleeping = True
+                        try:
+                            await asyncio.sleep(self.config.idle_poll_secs)
+                        finally:
+                            self._idle_poll_sleeping = False
                         continue
                     # Wait for any live task to complete, then retry.
                     # Timeout ensures newly-added tasks are discovered
@@ -3020,9 +3029,6 @@ class Harness:
                     lambda _t, tid=_tid: self._escalation_events.pop(tid, None)
                 )
 
-            while self._live_tasks:
-                await asyncio.wait(set(self._live_tasks))
-
             self._compute_tallies(task_reports)
 
             # 3b. Optional full review after all tasks complete.  This is the
@@ -3041,7 +3047,6 @@ class Harness:
             # attribute its cancel to the drain rather than falling into the
             # unattributed residue bucket.
             self._draining = True
-            self._dispatch_loop_running = False
             # 4. Shutdown
             # 4a. Cancel any in-flight workflow tasks BEFORE shutting down
             # usage_gate — otherwise a cap-hit in a still-running agent can
@@ -11770,13 +11775,19 @@ class Harness:
         """
         self._live_tasks.discard(t)
         if t.cancelled():
+            logger.warning('%s was cancelled before it ran; no report', t.get_name())
+            return
+        error = t.exception()
+        if error is not None:
+            logger.error('%s raised: %s', t.get_name(), error, exc_info=error)
+            return
+        report = t.result()
+        if not report:
             return
         try:
-            report = t.result()
-            if report:
-                self._record_slot_report(report, task_reports)
-        except Exception as e:
-            logger.error(f'Workflow slot error: {e}')
+            self._record_slot_report(report, task_reports)
+        except Exception:
+            logger.exception('Recording the report of task %s failed', report.task_id)
 
     def _record_slot_report(
         self, report: TaskReport, task_reports: list[TaskReport],
@@ -11793,16 +11804,16 @@ class Harness:
         if report.outcome == WorkflowOutcome.DONE and self.review_checkpoint:
             self.review_checkpoint.record_merge(self._task_modules.pop(report.task_id, []))
             if (self.review_checkpoint.should_trigger()
-                    and not self._review_running
+                    and self._review_task is None
                     and not self._draining):
                 self._trigger_review_checkpoint()
 
     def _compute_tallies(self, task_reports: list[TaskReport]) -> None:
         """Fill ``self.report`` aggregates from the collected task reports.
 
-        Shared by the post-loop (exit / --until-idle) block and the
-        run-forever idle branch, which recomputes per-cycle before logging the
-        cycle summary.
+        Shared by the post-loop (exit / --until-idle) block, the run-forever
+        idle branch, which recomputes per-cycle before logging the cycle
+        summary, and the ``finally``, which counts slots cancelled at shutdown.
         """
         self.report.task_reports = task_reports
         self.report.completed = sum(
@@ -11856,21 +11867,20 @@ class Harness:
     def _trigger_review_checkpoint(self) -> None:
         """Spawn a review checkpoint as a concurrent task.
 
-        The main loop will pause task acquisition while the review runs
-        (``_review_running`` flag) but in-flight tasks continue in their
-        worktrees.
+        The main loop will pause task acquisition while ``_review_task`` is
+        set, but in-flight tasks continue in their worktrees.
         """
-        self._review_running = True
         task = asyncio.create_task(
             self._run_review_checkpoint(), name='review-checkpoint',
         )
+        self._review_task = task
         self._live_tasks.add(task)
         task.add_done_callback(self._finish_review_checkpoint)
 
     def _finish_review_checkpoint(self, t: asyncio.Task) -> None:
         """Done-callback of the review task: let the loop dispatch again."""
         self._live_tasks.discard(t)
-        self._review_running = False
+        self._review_task = None
         error = None if t.cancelled() else t.exception()
         if error is not None:
             logger.error(f'Review checkpoint error: {error}')
