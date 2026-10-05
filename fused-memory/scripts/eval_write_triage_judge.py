@@ -83,7 +83,6 @@ Usage
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import importlib.util
 import json
 import logging
@@ -162,6 +161,22 @@ def load_retrieval() -> types.ModuleType:
     stack, and the whole pure core below is testable without it.
     """
     return _load_script(_RETRIEVAL_PATH, 'eval_write_triage_retrieval')
+
+
+_WORDING_PATH = _PACKAGE_ROOT / 'scripts' / 'write_triage_judge_wording.py'
+
+
+def load_wording() -> types.ModuleType:
+    """Load the judge-wording knob (PRD §11 D16), the same by-path way.
+
+    Loaded at import, unlike the retrieval edge: it pulls in only the judge
+    module, and the guard's default wording is one of its names.
+    """
+    return _load_script(_WORDING_PATH, 'write_triage_judge_wording')
+
+
+_wording = load_wording()
+
 
 # Alpha's vocabulary and fixture handling, re-exported rather than re-spelled.
 LABEL_CANONICAL = _calibrate.LABEL_CANONICAL
@@ -1595,6 +1610,7 @@ def _is_committed_report(report_path: str) -> bool:
 
 def guard_committed_report(
     report_path: str, *, dry_run: bool, limit: int | None, slate_mode: str,
+    wording: str = _wording.WORDING_SHIPPED,
 ) -> str:
     """Keep a non-measurement run from publishing itself as the measurement.
 
@@ -1612,6 +1628,8 @@ def guard_committed_report(
       a temp path — the documented "prove the pipeline" invocation keeps
       working and still prints its report, it just cannot overwrite the
       committed one.
+    - a non-shipped ``--wording`` measures a prompt production does not
+      send, so it is refused outright beside the slate-mode refusal.
     - ``--limit N`` measures REALLY, just partially. Its numbers are the
       judge's own, and ``provenance.limit`` records the truncation in the
       artifact itself, so an operator (and
@@ -1640,6 +1658,12 @@ def guard_committed_report(
         raise ValueError(
             f"the committed artifact is the retrieved-slate arbiter (PRD C2'); pass "
             f'--report-path for a {slate_mode} run',
+        )
+
+    if wording != _wording.WORDING_SHIPPED:
+        raise ValueError(
+            f'the committed artifact measures the shipped wording; pass '
+            f'--report-path for a {wording} run',
         )
 
     if limit is not None:
@@ -1970,7 +1994,6 @@ def _run(args: Any) -> int:
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
-        JUDGE_SYSTEM_PROMPT,
         resolve_judge_candidate_count,
         resolve_judge_enabled,
         resolve_judge_model,
@@ -1994,7 +2017,7 @@ def _run(args: Any) -> int:
     # artifacts with fixed-answer numbers.
     report_path = guard_committed_report(
         args.report_path, dry_run=args.dry_run, limit=args.limit,
-        slate_mode=args.slate_mode,
+        slate_mode=args.slate_mode, wording=args.wording,
     )
     aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
 
@@ -2046,34 +2069,36 @@ def _run(args: Any) -> int:
             else build_judge_fn(config)
         )
 
-    report = run_judge_eval(
-        plan=plan,
-        judge_fn=judge_fn,
-        report_path=report_path,
-        cases_path=args.cases_path,
-        provenance={
-            'fixture_path': package_relative(args.fixture),
-            'judge_provider': provider,
-            'judge_model': model,
-            'judge_system_prompt_sha256': hashlib.sha256(
-                JUDGE_SYSTEM_PROMPT.encode('utf-8'),
-            ).hexdigest(),
-            # Present on EVERY run, `None` on a full one. An absent key
-            # would be indistinguishable from an artifact predating the
-            # field, and this is the one field that says a committed
-            # report is a partial smoke rather than the corpus-wide
-            # measurement the task-3169 flip gate reads it as.
-            'limit': args.limit,
-            'canonical_aliases_path': (
-                package_relative(args.canonical_aliases) if args.canonical_aliases else None
-            ),
-            'canonical_aliases_count': len(aliases),
-            'cases_path': package_relative(args.cases_path) if args.cases_path else None,
-            'field_chars': field_chars,
-            'judge_candidate_count': judge_candidate_count,
-            'judge_enabled': judge_enabled,
-        },
-    )
+    with _wording.judge_wording(args.wording) as prompt_sha256:
+        report = run_judge_eval(
+            plan=plan,
+            judge_fn=judge_fn,
+            report_path=report_path,
+            cases_path=args.cases_path,
+            provenance={
+                'fixture_path': package_relative(args.fixture),
+                'judge_provider': provider,
+                'judge_model': model,
+                'judge_system_prompt_sha256': prompt_sha256,
+                # Present on EVERY run, `None` on a full one. An absent key
+                # would be indistinguishable from an artifact predating the
+                # field, and this is the one field that says a committed
+                # report is a partial smoke rather than the corpus-wide
+                # measurement the task-3169 flip gate reads it as.
+                'limit': args.limit,
+                'canonical_aliases_path': (
+                    package_relative(args.canonical_aliases)
+                    if args.canonical_aliases else None
+                ),
+                'canonical_aliases_count': len(aliases),
+                'cases_path': (
+                    package_relative(args.cases_path) if args.cases_path else None
+                ),
+                'field_chars': field_chars,
+                'judge_candidate_count': judge_candidate_count,
+                'judge_enabled': judge_enabled,
+            },
+        )
     print(json.dumps(report, indent=2))
     return 0
 
@@ -2129,6 +2154,13 @@ def main() -> int:
                              'slate, band winner, the candidate the verdict '
                              'named, attach target, band, verdict, outcome and '
                              'elision flags (default: no per-case dump)')
+    parser.add_argument('--wording', default=_wording.WORDING_SHIPPED,
+                        choices=_wording.WORDINGS,
+                        help='the judge system prompt the run is made under; '
+                             'pre-psi is the pre-psi wording as an eval-side '
+                             'override. Recorded as '
+                             'provenance.judge_system_prompt_sha256 '
+                             '(default: shipped)')
     return _run(parser.parse_args())
 
 
