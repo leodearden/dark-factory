@@ -12133,7 +12133,7 @@ def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPa
 
     Modelled on test_orch_restart_min_interval_secs_matches_config_default
     above. The bound is what makes a SIGKILLed sweep cost at most one delayed
-    window, and its 7200s value is DERIVED (worst legitimate sweep ~= 6270s),
+    window, and its 14400s value is DERIVED (worst legitimate sweep ~= 13,300s),
     not chosen — so a tier drifting off it is a silent correctness change, not
     a cosmetic one.
 

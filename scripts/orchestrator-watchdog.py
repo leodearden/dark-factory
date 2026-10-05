@@ -248,17 +248,17 @@ FLEET_LEASE_PATH = os.environ.get(
 
 # How long a lease may go unrefreshed before every reader treats it as expired,
 # whatever its pid says. DERIVED from the drain knobs rather than guessed, so a
-# reviewer can re-check it: the worst LEGITIMATE sweep is one permanently-busy
-# unit burning the full ORCH_RESTART_FORCE_FIRE_AFTER_SECS busy grace (4500s)
-# + ~6 stale/absent units at ORCH_DRAIN_UNKNOWN_GRACE_SECS (120s each) + 7 x
-# (RESTART_VERIFY_TIMEOUT 30 + RESTART_VERIFY_GRACE_SECS 120) = 4500 + 720 +
-# 1050 = 6270s ~= 1.74h. 7200 clears that with ~15% headroom while staying far
-# below the 8h ORCH_RESTART_MIN_INTERVAL_SECS, and that inequality is the whole
+# reviewer can re-check it: the worst LEGITIMATE --drain sweep (task 5371) waits
+# out the whole ORCH_DRAIN_VERIFY_MAX_WAIT_SECS verify-wait cap (11400s, counted
+# once from Stage A) + 7 x (RESTART_VERIFY_TIMEOUT 30 + RESTART_VERIFY_GRACE_SECS
+# 120) + 7 x ORCH_DRAIN_UNKNOWN_GRACE_SECS (120s) = 11400 + 1050 + 840 =
+# 13290s ~= 3.7h. 14400 clears that with ~8% headroom while staying far below
+# the 8h ORCH_RESTART_MIN_INTERVAL_SECS, and that inequality is the whole
 # point: a leaked lease can therefore delay at most ONE redeploy window and can
 # never wedge the fleet indefinitely — the same reasoning that makes the pid
-# test alone insufficient. A sweep with TWO simultaneously-busy units does
-# exceed the bound and loses the lease mid-sweep, degrading to exactly the
-# pre-4755 collision; that is bounded and deliberate, never a new failure.
+# test alone insufficient. A sweep that overruns the bound loses the lease
+# mid-sweep and degrades to exactly the pre-4755 collision; that is bounded and
+# deliberate, never a new failure.
 #
 # Mirrors OrchestratorConfig.orchestrator_restart_lease_max_age_secs (this
 # stdlib script cannot import it), pinned by
@@ -268,7 +268,7 @@ FLEET_LEASE_PATH = os.environ.get(
 try:
     FLEET_LEASE_MAX_AGE_SECS = int(os.environ["ORCH_FLEET_LEASE_MAX_AGE_SECS"])
 except (KeyError, ValueError):
-    FLEET_LEASE_MAX_AGE_SECS = 7200
+    FLEET_LEASE_MAX_AGE_SECS = 14400
 
 # staleness_pass() is a stateless oneshot: every ~60s timer tick
 # (orchestrator-watchdog.timer's OnUnitActiveSec=60) is a FRESH process (see
